@@ -1,5 +1,5 @@
-# ABOUTME: Fastly Compute service configuration
-# ABOUTME: Defines backends (B2), KV stores, and config stores
+# ABOUTME: Example Fastly Compute service configuration
+# ABOUTME: Copy to fastly.toml and fill in your credentials
 
 manifest_version = 3
 name = "fastly-blossom"
@@ -24,7 +24,7 @@ language = "rust"
     [local_server.config_stores.blossom_config]
 
       [local_server.config_stores.blossom_config.contents]
-      b2_bucket = "your-bucket-name"
+      b2_bucket = "YOUR_BUCKET_NAME"
       b2_region = "us-west-004"
 
   [local_server.secret_stores]
@@ -34,10 +34,10 @@ language = "rust"
       [local_server.secret_stores.blossom_secrets.contents]
 
         [local_server.secret_stores.blossom_secrets.contents.b2_key_id]
-        plaintext = "your-key-id"
+        plaintext = "YOUR_B2_KEY_ID"
 
         [local_server.secret_stores.blossom_secrets.contents.b2_app_key]
-        plaintext = "your-app-key"
+        plaintext = "YOUR_B2_APP_KEY"
 
 [setup]
 

@@ -58,9 +58,15 @@ fastly secret-store-entry create --store-id <id> --key b2_app_key --value your-a
 ### Local development
 
 ```bash
-# Edit fastly.toml with your B2 credentials for local testing
+# Copy the example config and fill in your credentials
+cp fastly.toml.example fastly.toml
+
+# Edit fastly.toml with your B2 credentials (this file is gitignored)
+# Then run:
 fastly compute serve
 ```
+
+**Note**: `fastly.toml` is gitignored to prevent accidentally committing secrets. The `[local_server.secret_stores]` section is only used for local testing.
 
 ### Deploy
 
