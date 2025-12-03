@@ -41,9 +41,12 @@ fn handle_request(req: Request) -> Result<Response> {
     let path = req.get_path().to_string();
 
     match (method, path.as_str()) {
+        // Landing page
+        (Method::GET, "/") => Ok(handle_landing_page()),
+
         // Version check
         (Method::GET, "/version") => Ok(Response::from_status(StatusCode::OK)
-            .with_body("v57-fixbackend-20251203")),
+            .with_body("v62-baseurl-fix")),
 
         // BUD-01: Blob retrieval
         (Method::GET, p) if is_hash_path(p) => handle_get_blob(req, p),
@@ -178,7 +181,7 @@ fn handle_upload(mut req: Request) -> Result<Response> {
     if blob_exists(&hash)? {
         // Return existing blob descriptor
         if let Some(metadata) = get_blob_metadata(&hash)? {
-            let descriptor = metadata.to_descriptor(&get_base_url());
+            let descriptor = metadata.to_descriptor(&get_base_url(&req));
             return Ok(json_response(StatusCode::OK, &descriptor));
         }
     }
@@ -209,7 +212,7 @@ fn handle_upload(mut req: Request) -> Result<Response> {
     add_to_user_list(&auth.pubkey, &hash)?;
 
     // Return blob descriptor
-    let descriptor = metadata.to_descriptor(&get_base_url());
+    let descriptor = metadata.to_descriptor(&get_base_url(&req));
     let mut resp = json_response(StatusCode::OK, &descriptor);
     add_cors_headers(&mut resp);
 
@@ -277,7 +280,7 @@ fn handle_list(req: Request, path: &str) -> Result<Response> {
     let blobs = list_blobs_with_metadata(pubkey, is_owner)?;
 
     // Convert to descriptors
-    let base_url = get_base_url();
+    let base_url = get_base_url(&req);
     let descriptors: Vec<BlobDescriptor> = blobs
         .iter()
         .map(|m| m.to_descriptor(&base_url))
@@ -287,6 +290,232 @@ fn handle_list(req: Request, path: &str) -> Result<Response> {
     add_cors_headers(&mut resp);
 
     Ok(resp)
+}
+
+/// GET / - Landing page
+fn handle_landing_page() -> Response {
+    let html = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Divine Blossom Server</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background: #f8fafc;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+        header {
+            text-align: center;
+            margin-bottom: 3rem;
+            padding: 2rem 0;
+        }
+        h1 {
+            font-size: 2.5rem;
+            color: #1a202c;
+            margin-bottom: 0.5rem;
+        }
+        .badge {
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            border-radius: 9999px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            margin-left: 0.5rem;
+        }
+        .badge-beta { background: #c6f6d5; color: #276749; }
+        .badge-fastly { background: #fed7d7; color: #c53030; }
+        .tagline {
+            color: #718096;
+            font-size: 1.1rem;
+            margin-top: 1rem;
+        }
+        section {
+            background: white;
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        h2 {
+            font-size: 1.25rem;
+            color: #2d3748;
+            margin-bottom: 1rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 2px solid #e2e8f0;
+        }
+        .endpoint {
+            display: flex;
+            align-items: flex-start;
+            padding: 0.75rem 0;
+            border-bottom: 1px solid #edf2f7;
+        }
+        .endpoint:last-child { border-bottom: none; }
+        .method {
+            display: inline-block;
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 700;
+            font-family: monospace;
+            min-width: 60px;
+            text-align: center;
+            margin-right: 1rem;
+        }
+        .method-get { background: #c6f6d5; color: #276749; }
+        .method-head { background: #bee3f8; color: #2b6cb0; }
+        .method-put { background: #feebc8; color: #c05621; }
+        .method-delete { background: #fed7d7; color: #c53030; }
+        .endpoint-info { flex: 1; }
+        .endpoint-path {
+            font-family: monospace;
+            font-weight: 600;
+            color: #5a67d8;
+        }
+        .endpoint-desc {
+            color: #718096;
+            font-size: 0.9rem;
+            margin-top: 0.25rem;
+        }
+        .features {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+        }
+        .feature {
+            padding: 1rem;
+            background: #f7fafc;
+            border-radius: 8px;
+        }
+        .feature h3 {
+            font-size: 0.9rem;
+            color: #4a5568;
+            margin-bottom: 0.5rem;
+        }
+        .feature p {
+            font-size: 0.85rem;
+            color: #718096;
+        }
+        footer {
+            text-align: center;
+            padding: 2rem 0;
+            color: #a0aec0;
+            font-size: 0.875rem;
+        }
+        footer a {
+            color: #5a67d8;
+            text-decoration: none;
+        }
+        footer a:hover { text-decoration: underline; }
+        code {
+            background: #edf2f7;
+            padding: 0.125rem 0.375rem;
+            border-radius: 4px;
+            font-size: 0.875rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Divine Blossom Server <span class="badge badge-beta">BETA</span><span class="badge badge-fastly">FASTLY</span></h1>
+            <p class="tagline">Content-addressable blob storage implementing the Blossom protocol with AI-powered content moderation</p>
+        </header>
+
+        <section>
+            <h2>API Endpoints</h2>
+            <div class="endpoint">
+                <span class="method method-get">GET</span>
+                <div class="endpoint-info">
+                    <span class="endpoint-path">/&lt;sha256&gt;</span>
+                    <p class="endpoint-desc">Retrieve a blob by its SHA-256 hash. Supports optional file extension.</p>
+                </div>
+            </div>
+            <div class="endpoint">
+                <span class="method method-head">HEAD</span>
+                <div class="endpoint-info">
+                    <span class="endpoint-path">/&lt;sha256&gt;</span>
+                    <p class="endpoint-desc">Check if a blob exists and get its metadata.</p>
+                </div>
+            </div>
+            <div class="endpoint">
+                <span class="method method-put">PUT</span>
+                <div class="endpoint-info">
+                    <span class="endpoint-path">/upload</span>
+                    <p class="endpoint-desc">Upload a new blob. Requires Nostr authentication.</p>
+                </div>
+            </div>
+            <div class="endpoint">
+                <span class="method method-head">HEAD</span>
+                <div class="endpoint-info">
+                    <span class="endpoint-path">/upload</span>
+                    <p class="endpoint-desc">Get upload requirements (max size, allowed types).</p>
+                </div>
+            </div>
+            <div class="endpoint">
+                <span class="method method-get">GET</span>
+                <div class="endpoint-info">
+                    <span class="endpoint-path">/list/&lt;pubkey&gt;</span>
+                    <p class="endpoint-desc">List all blobs uploaded by a public key.</p>
+                </div>
+            </div>
+            <div class="endpoint">
+                <span class="method method-delete">DELETE</span>
+                <div class="endpoint-info">
+                    <span class="endpoint-path">/&lt;sha256&gt;</span>
+                    <p class="endpoint-desc">Delete a blob. Requires Nostr authentication and ownership.</p>
+                </div>
+            </div>
+        </section>
+
+        <section>
+            <h2>Features</h2>
+            <div class="features">
+                <div class="feature">
+                    <h3>Nostr Authentication</h3>
+                    <p>Secure uploads using NIP-98 HTTP Auth with Schnorr signatures.</p>
+                </div>
+                <div class="feature">
+                    <h3>Content Moderation</h3>
+                    <p>AI-powered moderation with SAFE, REVIEW, AGE_RESTRICTED, and PERMANENT_BAN levels.</p>
+                </div>
+                <div class="feature">
+                    <h3>Edge Computing</h3>
+                    <p>Powered by Fastly Compute for low-latency global delivery.</p>
+                </div>
+                <div class="feature">
+                    <h3>GCS Storage</h3>
+                    <p>Reliable blob storage backed by Google Cloud Storage.</p>
+                </div>
+            </div>
+        </section>
+
+        <section>
+            <h2>Protocol</h2>
+            <p>This server implements the <a href="https://github.com/hzrd149/blossom">Blossom protocol</a> (BUD-01 and BUD-02) for decentralized media hosting on Nostr.</p>
+            <p style="margin-top: 0.5rem;">Maximum upload size: <code>100 MB</code></p>
+        </section>
+
+        <footer>
+            <p>Powered by <a href="https://www.fastly.com/products/edge-compute">Fastly Compute</a> | <a href="https://divine.video">Divine</a></p>
+        </footer>
+    </div>
+</body>
+</html>"#;
+
+    let mut resp = Response::from_status(StatusCode::OK);
+    resp.set_header(header::CONTENT_TYPE, "text/html; charset=utf-8");
+    resp.set_body(html);
+    resp
 }
 
 /// Create JSON response
@@ -328,9 +557,10 @@ fn cors_preflight_response() -> Response {
     resp
 }
 
-/// Get base URL for blob descriptors
-fn get_base_url() -> String {
-    // In production, this would come from config
-    // For now, use a placeholder that should be configured
-    std::env::var("BLOSSOM_BASE_URL").unwrap_or_else(|_| "https://blossom.example.com".into())
+/// Get base URL for blob descriptors from request Host header
+fn get_base_url(req: &Request) -> String {
+    req.get_header(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .map(|host| format!("https://{}", host))
+        .unwrap_or_else(|| "https://blossom.divine.video".into())
 }

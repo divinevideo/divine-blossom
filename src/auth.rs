@@ -137,14 +137,15 @@ fn verify_signature(event: &BlossomAuthEvent) -> Result<()> {
     let signature = Signature::try_from(sig_bytes.as_slice())
         .map_err(|_| BlossomError::AuthInvalid("Invalid signature format".into()))?;
 
-    // Parse message (event ID as raw bytes)
+    // Parse message (event ID as raw bytes - this is already a SHA-256 hash)
     let msg_bytes = hex::decode(&event.id)
         .map_err(|_| BlossomError::AuthInvalid("Invalid event ID hex".into()))?;
 
-    // Verify using BIP-340 Schnorr
-    use k256::schnorr::signature::Verifier;
+    // Verify using BIP-340 Schnorr with prehashed message
+    // The event ID is already a SHA-256 hash, so we use verify_prehash
+    use k256::schnorr::signature::hazmat::PrehashVerifier;
     verifying_key
-        .verify(&msg_bytes, &signature)
+        .verify_prehash(&msg_bytes, &signature)
         .map_err(|_| BlossomError::AuthInvalid("Invalid signature".into()))?;
 
     Ok(())

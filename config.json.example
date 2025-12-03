@@ -1,4 +1,3 @@
 {
-  "b2_bucket": "YOUR_BUCKET_NAME",
-  "b2_region": "us-west-004"
+  "gcs_bucket": "YOUR_GCS_BUCKET_NAME"
 }
