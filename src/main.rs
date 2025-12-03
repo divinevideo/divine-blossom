@@ -199,6 +199,8 @@ fn handle_upload(mut req: Request) -> Result<Response> {
         uploaded: current_timestamp(),
         owner: auth.pubkey.clone(),
         status: BlobStatus::Pending, // Start as pending for moderation
+        thumbnail: None,
+        moderation: None,
     };
 
     put_blob_metadata(&metadata)?;

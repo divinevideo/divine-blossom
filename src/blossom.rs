@@ -36,6 +36,12 @@ pub struct BlobMetadata {
     pub owner: String,
     /// Content status for moderation
     pub status: BlobStatus,
+    /// Path to thumbnail for videos
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<String>,
+    /// Moderation check results
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moderation: Option<ModerationResult>,
 }
 
 /// Moderation status for blobs
@@ -54,6 +60,29 @@ impl Default for BlobStatus {
     fn default() -> Self {
         BlobStatus::Pending
     }
+}
+
+/// Moderation result from content safety checks
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModerationResult {
+    /// When the check was performed (ISO 8601)
+    pub checked_at: String,
+    /// Whether content passed safety checks
+    pub is_safe: bool,
+    /// Detailed safety scores
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scores: Option<SafetyScores>,
+}
+
+/// Detailed safety scores from moderation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SafetyScores {
+    /// Adult content score
+    pub adult: String,
+    /// Violence content score
+    pub violence: String,
+    /// Racy content score
+    pub racy: String,
 }
 
 /// Upload requirements response (HEAD /upload)
