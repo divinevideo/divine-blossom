@@ -1,0 +1,55 @@
+# ABOUTME: Cargo manifest for Rust Cloud Run upload service
+# ABOUTME: Handles large file uploads with streaming to GCS
+
+[package]
+name = "blossom-upload"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Web framework
+axum = { version = "0.7", features = ["multipart", "http2"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["cors"] }
+tower = "0.5"
+hyper = { version = "1", features = ["http2", "server"] }
+hyper-util = { version = "0.1", features = ["server", "http2", "tokio", "service"] }
+
+# GCS - pinned to avoid edition2024 dependency issues
+google-cloud-storage = "=0.17.0"
+google-cloud-auth = "=0.12.0"
+
+# Pin home crate to avoid edition2024
+home = "=0.5.9"
+
+# Crypto - Nostr signature verification
+# Pin to 0.13.3 to avoid base64ct 1.8+ which requires edition2024
+k256 = { version = "=0.13.3", features = ["schnorr"] }
+# Pin base64ct to avoid edition2024 requirement
+base64ct = "=1.6.0"
+sha2 = "0.10"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Encoding
+hex = "0.4"
+base64 = "0.22"
+
+# Async utilities
+futures = "0.3"
+bytes = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = true
+opt-level = 3
+strip = true
