@@ -138,8 +138,11 @@ pub fn upload_blob(hash: &str, body: Body, content_type: &str, size: u64) -> Res
 pub fn download_blob(hash: &str, range: Option<&str>) -> Result<Response> {
     let config = GCSConfig::load()?;
     let path = format!("/{}/{}", config.bucket, hash);
+    let url = format!("{}{}", config.endpoint(), path);
 
-    let mut req = Request::new(Method::GET, format!("{}{}", config.endpoint(), path));
+    eprintln!("[GCS DEBUG] Downloading hash={} bucket={} url={}", hash, config.bucket, url);
+
+    let mut req = Request::new(Method::GET, &url);
     req.set_header("Host", config.host());
 
     if let Some(range_value) = range {
@@ -153,10 +156,13 @@ pub fn download_blob(hash: &str, range: Option<&str>) -> Result<Response> {
         .send(GCS_BACKEND)
         .map_err(|e| BlossomError::StorageError(format!("Failed to download: {}", e)))?;
 
-    match resp.get_status() {
+    let status = resp.get_status();
+    eprintln!("[GCS DEBUG] Response status={}", status);
+
+    match status {
         StatusCode::OK | StatusCode::PARTIAL_CONTENT => Ok(resp),
         StatusCode::NOT_FOUND => Err(BlossomError::NotFound("Blob not found in storage".into())),
-        status => Err(BlossomError::StorageError(format!(
+        _ => Err(BlossomError::StorageError(format!(
             "Download failed with status: {}",
             status
         ))),
@@ -925,8 +931,10 @@ pub fn trigger_background_migration(hash: &str, source_backend: &str) -> Result<
 
     // Send async request to Cloud Run /migrate endpoint
     // We use send_async so we don't block waiting for the migration to complete
-    let mut req = Request::new(Method::POST, "https://blossom-upload-rust-149672065768.us-central1.run.app/migrate");
-    req.set_header("Host", "blossom-upload-rust-149672065768.us-central1.run.app");
+    // NOTE: Use actual Cloud Run hostname, not custom domain, for proper routing
+    const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
+    let mut req = Request::new(Method::POST, format!("https://{}/migrate", CLOUD_RUN_HOST));
+    req.set_header("Host", CLOUD_RUN_HOST);
     req.set_header("Content-Type", "application/json");
     req.set_header("Content-Length", request_body.len().to_string());
     req.set_body(request_body);

@@ -49,7 +49,7 @@ fn handle_request(req: Request) -> Result<Response> {
 
         // Version check
         (Method::GET, "/version") => Ok(Response::from_status(StatusCode::OK)
-            .with_body("v110-bud04-mirror")),
+            .with_body("v111-cloudrun-host-fix")),
 
         // BUD-01: Blob retrieval
         (Method::GET, p) if is_hash_path(p) => handle_get_blob(req, p),
