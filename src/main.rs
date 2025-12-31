@@ -39,6 +39,9 @@ fn main(req: Request) -> std::result::Result<Response, Error> {
 fn handle_request(req: Request) -> Result<Response> {
     let method = req.get_method().clone();
     let path = req.get_path().to_string();
+    let host = req.get_header_str("host").unwrap_or("unknown");
+
+    eprintln!("[BLOSSOM ROUTE] method={} path={} host={}", method, path, host);
 
     match (method, path.as_str()) {
         // Landing page
@@ -79,11 +82,16 @@ fn handle_request(req: Request) -> Result<Response> {
 
 /// GET /<sha256>[.ext] - Retrieve blob
 fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
+    eprintln!("[BLOSSOM DEBUG] handle_get_blob path={}", path);
+
     let hash = parse_hash_from_path(path)
         .ok_or_else(|| BlossomError::BadRequest("Invalid hash in path".into()))?;
 
+    eprintln!("[BLOSSOM DEBUG] parsed hash={}", hash);
+
     // Check metadata for access control
     let metadata = get_blob_metadata(&hash)?;
+    eprintln!("[BLOSSOM DEBUG] metadata={:?}", metadata.is_some());
 
     if let Some(ref meta) = metadata {
         // Handle restricted content
@@ -269,11 +277,15 @@ fn handle_cloud_run_proxy(
     let body = req.take_body();
 
     // Build request to Cloud Run
+    // NOTE: Use the actual Cloud Run hostname as the Host header, not the custom domain
+    // Cloud Run uses the Host header for routing - if the custom domain isn't configured,
+    // Cloud Run returns 404
+    const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
     let mut proxy_req = Request::new(
         fastly::http::Method::PUT,
-        "https://blossom-upload-rust-149672065768.us-central1.run.app/upload",
+        format!("https://{}/upload", CLOUD_RUN_HOST),
     );
-    proxy_req.set_header("Host", "blossom-upload-rust-149672065768.us-central1.run.app");
+    proxy_req.set_header("Host", CLOUD_RUN_HOST);
     proxy_req.set_header(header::AUTHORIZATION, &auth_header);
     proxy_req.set_header(header::CONTENT_TYPE, &content_type);
     proxy_req.set_header(header::CONTENT_LENGTH, content_length.to_string());
@@ -621,11 +633,13 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
     let migrate_json = serde_json::to_string(&migrate_body)
         .map_err(|e| BlossomError::Internal(format!("JSON error: {}", e)))?;
 
+    // Use actual Cloud Run hostname - see handle_cloud_run_proxy comment
+    const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
     let mut proxy_req = Request::new(
         fastly::http::Method::POST,
-        "https://blossom-upload-rust-149672065768.us-central1.run.app/migrate",
+        format!("https://{}/migrate", CLOUD_RUN_HOST),
     );
-    proxy_req.set_header("Host", "blossom-upload-rust-149672065768.us-central1.run.app");
+    proxy_req.set_header("Host", CLOUD_RUN_HOST);
     proxy_req.set_header("Content-Type", "application/json");
     proxy_req.set_header("Content-Length", migrate_json.len().to_string());
     proxy_req.set_body(migrate_json);
