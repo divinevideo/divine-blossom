@@ -1,0 +1,4 @@
+{
+  "gcs_bucket": "test-bucket",
+  "gcs_project_id": "test-project"
+}
