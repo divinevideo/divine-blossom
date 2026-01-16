@@ -15,7 +15,7 @@ use crate::blossom::{
 use crate::error::{BlossomError, Result};
 use crate::metadata::{
     add_to_user_list, check_ownership, delete_blob_metadata, get_blob_metadata,
-    list_blobs_with_metadata, put_blob_metadata, remove_from_user_list,
+    list_blobs_with_metadata, put_blob_metadata, remove_from_user_list, update_blob_status,
 };
 use crate::storage::{blob_exists, current_timestamp, delete_blob as storage_delete, download_blob_with_fallback, trigger_background_migration, upload_blob};
 
@@ -72,6 +72,9 @@ fn handle_request(req: Request) -> Result<Response> {
         // BUD-04: Mirror
         (Method::PUT, "/mirror") => handle_mirror(req),
 
+        // Admin: Moderation webhook from divine-moderation-service
+        (Method::POST, "/admin/moderate") => handle_admin_moderate(req),
+
         // CORS preflight
         (Method::OPTIONS, _) => Ok(cors_preflight_response()),
 
@@ -94,6 +97,11 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
     eprintln!("[BLOSSOM DEBUG] metadata={:?}", metadata.is_some());
 
     if let Some(ref meta) = metadata {
+        // Handle banned content - no access for anyone
+        if meta.status == BlobStatus::Banned {
+            return Err(BlossomError::NotFound("Blob not found".into()));
+        }
+
         // Handle restricted content
         if meta.status == BlobStatus::Restricted {
             // Check if requester is owner
@@ -147,8 +155,8 @@ fn handle_head_blob(path: &str) -> Result<Response> {
     let metadata = get_blob_metadata(&hash)?
         .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
 
-    // Don't reveal restricted content exists
-    if metadata.status == BlobStatus::Restricted {
+    // Don't reveal restricted or banned content exists
+    if metadata.status == BlobStatus::Restricted || metadata.status == BlobStatus::Banned {
         return Err(BlossomError::NotFound("Blob not found".into()));
     }
 
@@ -702,6 +710,108 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
     add_cors_headers(&mut resp);
 
     Ok(resp)
+}
+
+/// POST /admin/moderate - Webhook from divine-moderation-service
+/// Receives moderation decisions and updates blob status
+fn handle_admin_moderate(mut req: Request) -> Result<Response> {
+    // Try to get webhook secret from secret store (optional)
+    let expected_secret: Option<String> = fastly::secret_store::SecretStore::open("blossom_secrets")
+        .ok()
+        .and_then(|store| store.get("webhook_secret"))
+        .map(|secret| {
+            String::from_utf8(secret.plaintext().to_vec())
+                .unwrap_or_default()
+        });
+
+    // Get Authorization header
+    let auth_header = req
+        .get_header(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
+    // Validate secret if configured
+    if let Some(ref expected) = expected_secret {
+        match auth_header {
+            Some(ref header) if header.starts_with("Bearer ") => {
+                let provided = header.strip_prefix("Bearer ").unwrap_or("");
+                if provided != expected.trim() {
+                    eprintln!("[ADMIN] Invalid webhook secret");
+                    return Err(BlossomError::Forbidden("Invalid webhook secret".into()));
+                }
+            }
+            _ => {
+                eprintln!("[ADMIN] Missing or invalid Authorization header");
+                return Err(BlossomError::AuthRequired("Webhook secret required".into()));
+            }
+        }
+    } else {
+        eprintln!("[ADMIN] Warning: webhook_secret not configured, accepting all requests");
+    }
+
+    // Parse JSON body
+    let body = req.take_body().into_string();
+    let payload: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| BlossomError::BadRequest(format!("Invalid JSON: {}", e)))?;
+
+    let sha256 = payload["sha256"]
+        .as_str()
+        .ok_or_else(|| BlossomError::BadRequest("Missing 'sha256' field".into()))?;
+
+    let action = payload["action"]
+        .as_str()
+        .ok_or_else(|| BlossomError::BadRequest("Missing 'action' field".into()))?;
+
+    eprintln!("[ADMIN] Moderation webhook: sha256={}, action={}", sha256, action);
+
+    // Validate sha256 format
+    if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(BlossomError::BadRequest("Invalid sha256 format".into()));
+    }
+
+    // Map action to BlobStatus
+    let new_status = match action.to_uppercase().as_str() {
+        "BLOCK" | "BAN" | "PERMANENT_BAN" => BlobStatus::Banned,
+        "RESTRICT" | "AGE_RESTRICTED" => BlobStatus::Restricted,
+        "APPROVE" | "SAFE" => BlobStatus::Active,
+        _ => {
+            return Err(BlossomError::BadRequest(format!(
+                "Unknown action: {}. Expected BLOCK, RESTRICT, or APPROVE",
+                action
+            )));
+        }
+    };
+
+    // Update blob status
+    match update_blob_status(sha256, new_status) {
+        Ok(()) => {
+            eprintln!("[ADMIN] Updated blob {} to status {:?}", sha256, new_status);
+            let response = serde_json::json!({
+                "success": true,
+                "sha256": sha256,
+                "status": format!("{:?}", new_status).to_lowercase(),
+                "message": "Blob status updated"
+            });
+            let mut resp = json_response(StatusCode::OK, &response);
+            add_cors_headers(&mut resp);
+            Ok(resp)
+        }
+        Err(BlossomError::NotFound(_)) => {
+            eprintln!("[ADMIN] Blob {} not found", sha256);
+            let response = serde_json::json!({
+                "success": false,
+                "sha256": sha256,
+                "error": "Blob not found"
+            });
+            let mut resp = json_response(StatusCode::NOT_FOUND, &response);
+            add_cors_headers(&mut resp);
+            Ok(resp)
+        }
+        Err(e) => {
+            eprintln!("[ADMIN] Failed to update blob {}: {:?}", sha256, e);
+            Err(e)
+        }
+    }
 }
 
 /// GET / - Landing page

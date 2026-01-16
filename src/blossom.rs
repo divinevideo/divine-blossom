@@ -54,6 +54,8 @@ pub enum BlobStatus {
     Restricted,
     /// Awaiting moderation review
     Pending,
+    /// Permanently banned by moderation - not accessible to anyone
+    Banned,
 }
 
 impl Default for BlobStatus {

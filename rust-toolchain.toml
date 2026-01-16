@@ -1,6 +1,6 @@
 # ABOUTME: Specifies Rust toolchain version for Fastly Compute compatibility
-# ABOUTME: Uses stable channel with wasm32-wasi target
+# ABOUTME: Uses stable channel with wasm32-wasip1 target
 
 [toolchain]
 channel = "1.83.0"
-targets = ["wasm32-wasi"]
+targets = ["wasm32-wasip1"]
