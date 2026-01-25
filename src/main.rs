@@ -746,7 +746,9 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
             }
         }
     } else {
-        eprintln!("[ADMIN] Warning: webhook_secret not configured, accepting all requests");
+        // Fail closed: reject requests if webhook_secret is not configured
+        eprintln!("[ADMIN] webhook_secret not configured, rejecting request");
+        return Err(BlossomError::Forbidden("Webhook secret not configured".into()));
     }
 
     // Parse JSON body
