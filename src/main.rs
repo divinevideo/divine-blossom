@@ -9,7 +9,7 @@ mod storage;
 
 use crate::auth::{optional_auth, validate_auth, validate_hash_match};
 use crate::blossom::{
-    is_hash_path, parse_hash_from_path, AuthAction, BlobDescriptor, BlobMetadata, BlobStatus,
+    is_hash_path, is_video_mime_type, parse_hash_from_path, parse_thumbnail_path, AuthAction, BlobDescriptor, BlobMetadata, BlobStatus,
     UploadRequirements,
 };
 use crate::error::{BlossomError, Result};
@@ -17,7 +17,7 @@ use crate::metadata::{
     add_to_user_list, check_ownership, delete_blob_metadata, get_blob_metadata,
     list_blobs_with_metadata, put_blob_metadata, remove_from_user_list, update_blob_status,
 };
-use crate::storage::{blob_exists, current_timestamp, delete_blob as storage_delete, download_blob_with_fallback, trigger_background_migration, upload_blob};
+use crate::storage::{blob_exists, current_timestamp, delete_blob as storage_delete, download_blob_with_fallback, download_thumbnail, trigger_background_migration, upload_blob};
 
 use fastly::http::{header, Method, StatusCode};
 use fastly::{Error, Request, Response};
@@ -49,7 +49,7 @@ fn handle_request(req: Request) -> Result<Response> {
 
         // Version check
         (Method::GET, "/version") => Ok(Response::from_status(StatusCode::OK)
-            .with_body("v111-cloudrun-host-fix")),
+            .with_body("v117-thumbnails")),
 
         // BUD-01: Blob retrieval
         (Method::GET, p) if is_hash_path(p) => handle_get_blob(req, p),
@@ -85,16 +85,36 @@ fn handle_request(req: Request) -> Result<Response> {
 
 /// GET /<sha256>[.ext] - Retrieve blob
 fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
-    eprintln!("[BLOSSOM DEBUG] handle_get_blob path={}", path);
+    // Check if this is a thumbnail request ({hash}.jpg)
+    if let Some(thumbnail_key) = parse_thumbnail_path(path) {
+        // Try to download existing thumbnail from GCS
+        match download_thumbnail(&thumbnail_key) {
+            Ok(mut resp) => {
+                resp.set_header("Content-Type", "image/jpeg");
+                add_cors_headers(&mut resp);
+                return Ok(resp);
+            }
+            Err(BlossomError::NotFound(_)) => {
+                // Thumbnail doesn't exist, generate on-demand via Cloud Run
+                let hash = thumbnail_key.trim_end_matches(".jpg");
+                match generate_thumbnail_on_demand(hash) {
+                    Ok(mut resp) => {
+                        resp.set_header("Content-Type", "image/jpeg");
+                        add_cors_headers(&mut resp);
+                        return Ok(resp);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
 
     let hash = parse_hash_from_path(path)
         .ok_or_else(|| BlossomError::BadRequest("Invalid hash in path".into()))?;
 
-    eprintln!("[BLOSSOM DEBUG] parsed hash={}", hash);
-
     // Check metadata for access control
     let metadata = get_blob_metadata(&hash)?;
-    eprintln!("[BLOSSOM DEBUG] metadata={:?}", metadata.is_some());
 
     if let Some(ref meta) = metadata {
         // Handle banned content - no access for anyone
@@ -148,6 +168,20 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
 
 /// HEAD /<sha256>[.ext] - Check blob existence
 fn handle_head_blob(path: &str) -> Result<Response> {
+    // Check if this is a thumbnail request ({hash}.jpg)
+    if let Some(thumbnail_key) = parse_thumbnail_path(path) {
+        let resp = download_thumbnail(&thumbnail_key)?;
+        let content_length = resp.get_header_str("x-goog-stored-content-length")
+            .or_else(|| resp.get_header_str("content-length"))
+            .unwrap_or("0")
+            .to_string();
+        let mut head_resp = Response::from_status(StatusCode::OK);
+        head_resp.set_header("Content-Type", "image/jpeg");
+        head_resp.set_header("Content-Length", &content_length);
+        add_cors_headers(&mut head_resp);
+        return Ok(head_resp);
+    }
+
     let hash = parse_hash_from_path(path)
         .ok_or_else(|| BlossomError::BadRequest("Invalid hash in path".into()))?;
 
@@ -174,6 +208,27 @@ const CLOUD_RUN_THRESHOLD: u64 = 500 * 1024;
 
 /// Cloud Run upload backend name (must match fastly.toml)
 const CLOUD_RUN_BACKEND: &str = "cloud_run_upload";
+
+/// Cloud Run host for on-demand thumbnail generation
+const CLOUD_RUN_THUMBNAIL_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
+
+/// Generate thumbnail on-demand by proxying to Cloud Run
+fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
+    let url = format!("https://{}/thumbnail/{}", CLOUD_RUN_THUMBNAIL_HOST, hash);
+
+    let mut proxy_req = Request::new(Method::GET, &url);
+    proxy_req.set_header("Host", CLOUD_RUN_THUMBNAIL_HOST);
+
+    let resp = proxy_req
+        .send(CLOUD_RUN_BACKEND)
+        .map_err(|e| BlossomError::StorageError(format!("Cloud Run thumbnail request failed: {}", e)))?;
+
+    match resp.get_status() {
+        StatusCode::OK => Ok(resp),
+        StatusCode::NOT_FOUND => Err(BlossomError::NotFound("Video not found for thumbnail generation".into())),
+        status => Err(BlossomError::StorageError(format!("Thumbnail generation failed with status: {}", status))),
+    }
+}
 
 /// PUT /upload - Upload blob
 fn handle_upload(mut req: Request) -> Result<Response> {
@@ -203,8 +258,10 @@ fn handle_upload(mut req: Request) -> Result<Response> {
 
     let base_url = get_base_url(&req);
 
-    // Proxy large uploads to Cloud Run to avoid WASM memory limits
-    if content_length > CLOUD_RUN_THRESHOLD {
+    // Proxy to Cloud Run for:
+    // 1. Large uploads (> 500KB) to avoid WASM memory limits
+    // 2. Video uploads (any size) for thumbnail generation
+    if content_length > CLOUD_RUN_THRESHOLD || is_video_mime_type(&content_type) {
         return handle_cloud_run_proxy(req, auth, content_type, content_length, base_url);
     }
 
@@ -232,12 +289,13 @@ fn handle_upload(mut req: Request) -> Result<Response> {
         }
     }
 
-    // Upload to GCS
+    // Upload to GCS (with owner metadata for durability)
     upload_blob(
         &hash,
         fastly::Body::from(body_bytes),
         &content_type,
         actual_size,
+        &auth.pubkey,
     )?;
 
     // Store metadata
@@ -328,6 +386,11 @@ fn handle_cloud_run_proxy(
         .as_u64()
         .unwrap_or(content_length);
 
+    // Parse thumbnail URL if present (for video uploads)
+    let thumbnail_url = cloud_run_resp["thumbnail_url"]
+        .as_str()
+        .map(|s| s.to_string());
+
     // Check if metadata already exists (dedupe case)
     if let Some(metadata) = get_blob_metadata(&hash)? {
         let descriptor = metadata.to_descriptor(&base_url);
@@ -344,7 +407,7 @@ fn handle_cloud_run_proxy(
         uploaded: current_timestamp(),
         owner: auth.pubkey.clone(),
         status: BlobStatus::Pending,
-        thumbnail: None,
+        thumbnail: thumbnail_url,
         moderation: None,
     };
 
@@ -627,14 +690,17 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
 
     // Proxy to Cloud Run /migrate endpoint which handles the actual work
     // This avoids WASM memory limits for large blobs
+    // Include owner pubkey for GCS metadata durability
     let migrate_body = if let Some(hash) = &expected_hash {
         serde_json::json!({
             "source_url": url,
-            "expected_hash": hash
+            "expected_hash": hash,
+            "owner": &auth.pubkey
         })
     } else {
         serde_json::json!({
-            "source_url": url
+            "source_url": url,
+            "owner": &auth.pubkey
         })
     };
 
@@ -961,7 +1027,7 @@ fn handle_landing_page() -> Response {
                 <span class="method method-get">GET</span>
                 <div class="endpoint-info">
                     <span class="endpoint-path">/&lt;sha256&gt;[.ext]</span>
-                    <p class="endpoint-desc">Retrieve a blob by its SHA-256 hash. Supports optional file extension and range requests. <em>(BUD-01)</em></p>
+                    <p class="endpoint-desc">Retrieve a blob by its SHA-256 hash. Supports optional file extension and range requests. Use <code>.jpg</code> extension to get video thumbnails. <em>(BUD-01)</em></p>
                 </div>
             </div>
             <div class="endpoint">
@@ -975,7 +1041,7 @@ fn handle_landing_page() -> Response {
                 <span class="method method-put">PUT</span>
                 <div class="endpoint-info">
                     <span class="endpoint-path">/upload</span>
-                    <p class="endpoint-desc">Upload a new blob. Requires Nostr authentication (kind 24242 event). <em>(BUD-02)</em></p>
+                    <p class="endpoint-desc">Upload a new blob. Requires Nostr authentication (kind 24242 event). Video uploads automatically generate a thumbnail. <em>(BUD-02)</em></p>
                 </div>
             </div>
             <div class="endpoint">
@@ -1029,6 +1095,10 @@ fn handle_landing_page() -> Response {
                 <div class="feature">
                     <h3>Edge Computing</h3>
                     <p>Powered by Fastly Compute for low-latency global delivery.</p>
+                </div>
+                <div class="feature">
+                    <h3>Video Thumbnails</h3>
+                    <p>Automatic JPEG thumbnail generation for uploaded videos, accessible at <code>/&lt;sha256&gt;.jpg</code>.</p>
                 </div>
                 <div class="feature">
                     <h3>GCS Storage</h3>
@@ -1101,5 +1171,5 @@ fn get_base_url(req: &Request) -> String {
     req.get_header(header::HOST)
         .and_then(|h| h.to_str().ok())
         .map(|host| format!("https://{}", host))
-        .unwrap_or_else(|| "https://blossom.divine.video".into())
+        .unwrap_or_else(|| "https://media.divine.video".into())
 }

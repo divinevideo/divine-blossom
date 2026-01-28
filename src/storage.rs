@@ -100,12 +100,13 @@ impl GCSConfig {
 }
 
 /// Upload a blob to GCS (simple PUT for small files)
-pub fn upload_blob(hash: &str, body: Body, content_type: &str, size: u64) -> Result<()> {
+/// owner: pubkey of the blob owner (stored in x-amz-meta-owner for durability)
+pub fn upload_blob(hash: &str, body: Body, content_type: &str, size: u64, owner: &str) -> Result<()> {
     let config = GCSConfig::load()?;
 
     // For large files, use multipart upload
     if size > MULTIPART_THRESHOLD {
-        return upload_blob_multipart(hash, body, content_type, size);
+        return upload_blob_multipart(hash, body, content_type, size, owner);
     }
 
     let path = format!("/{}/{}", config.bucket, hash);
@@ -114,9 +115,11 @@ pub fn upload_blob(hash: &str, body: Body, content_type: &str, size: u64) -> Res
     req.set_header("Content-Type", content_type);
     req.set_header("Content-Length", size.to_string());
     req.set_header("Host", config.host());
+    // Store owner pubkey in GCS object metadata for durability
+    req.set_header("x-amz-meta-owner", owner);
 
-    // Sign the request
-    sign_request(&mut req, &config, Some(hash_body_for_signing(size)))?;
+    // Sign the request (includes x-amz-meta-owner in signature)
+    sign_request_with_owner(&mut req, &config, Some(hash_body_for_signing(size)), owner)?;
 
     req.set_body(body);
 
@@ -134,13 +137,36 @@ pub fn upload_blob(hash: &str, body: Body, content_type: &str, size: u64) -> Res
     Ok(())
 }
 
+/// Download a thumbnail from GCS (stored as {hash}.jpg)
+pub fn download_thumbnail(gcs_key: &str) -> Result<Response> {
+    let config = GCSConfig::load()?;
+    let path = format!("/{}/{}", config.bucket, gcs_key);
+    let url = format!("{}{}", config.endpoint(), path);
+
+    let mut req = Request::new(Method::GET, &url);
+    req.set_header("Host", config.host());
+
+    sign_request(&mut req, &config, Some("UNSIGNED-PAYLOAD".into()))?;
+
+    let resp = req
+        .send(GCS_BACKEND)
+        .map_err(|e| BlossomError::StorageError(format!("Failed to download thumbnail: {}", e)))?;
+
+    match resp.get_status() {
+        StatusCode::OK => Ok(resp),
+        StatusCode::NOT_FOUND => Err(BlossomError::NotFound("Thumbnail not found".into())),
+        status => Err(BlossomError::StorageError(format!(
+            "Thumbnail download failed with status: {}",
+            status
+        ))),
+    }
+}
+
 /// Download a blob from GCS (returns the response to stream back)
 pub fn download_blob(hash: &str, range: Option<&str>) -> Result<Response> {
     let config = GCSConfig::load()?;
     let path = format!("/{}/{}", config.bucket, hash);
     let url = format!("{}{}", config.endpoint(), path);
-
-    eprintln!("[GCS DEBUG] Downloading hash={} bucket={} url={}", hash, config.bucket, url);
 
     let mut req = Request::new(Method::GET, &url);
     req.set_header("Host", config.host());
@@ -157,8 +183,6 @@ pub fn download_blob(hash: &str, range: Option<&str>) -> Result<Response> {
         .map_err(|e| BlossomError::StorageError(format!("Failed to download: {}", e)))?;
 
     let status = resp.get_status();
-    eprintln!("[GCS DEBUG] Response status={}", status);
-
     match status {
         StatusCode::OK | StatusCode::PARTIAL_CONTENT => Ok(resp),
         StatusCode::NOT_FOUND => Err(BlossomError::NotFound("Blob not found in storage".into())),
@@ -323,6 +347,43 @@ fn initiate_multipart_upload(key: &str, content_type: &str) -> Result<String> {
     Ok(upload_id)
 }
 
+/// Initiate a multipart upload to GCS with owner metadata
+fn initiate_multipart_upload_with_owner(key: &str, content_type: &str, owner: &str) -> Result<String> {
+    let config = GCSConfig::load()?;
+    // Note: query string must be "uploads=" not just "uploads" for correct AWS4 signing
+    let path = format!("/{}/{}?uploads=", config.bucket, key);
+
+    let mut req = Request::new(Method::POST, format!("{}{}", config.endpoint(), path));
+    req.set_header("Host", config.host());
+    req.set_header("Content-Type", content_type);
+    req.set_header("Content-Length", "0");
+    // Store owner pubkey in GCS object metadata for durability
+    req.set_header("x-amz-meta-owner", owner);
+
+    sign_request_with_owner(&mut req, &config, Some("UNSIGNED-PAYLOAD".into()), owner)?;
+
+    let mut resp = req
+        .send(GCS_BACKEND)
+        .map_err(|e| BlossomError::StorageError(format!("Failed to initiate multipart: {}", e)))?;
+
+    if !resp.get_status().is_success() {
+        let body = resp.take_body().into_string();
+        return Err(BlossomError::StorageError(format!(
+            "Initiate multipart failed with status: {}, body: {}",
+            resp.get_status(), body
+        )));
+    }
+
+    // Parse XML response to get UploadId
+    let body = resp.take_body().into_string();
+
+    // Simple XML parsing for UploadId
+    let upload_id = extract_upload_id(&body)
+        .ok_or_else(|| BlossomError::StorageError("Failed to parse UploadId from response".into()))?;
+
+    Ok(upload_id)
+}
+
 /// Extract UploadId from XML response
 fn extract_upload_id(xml: &str) -> Option<String> {
     // Look for <UploadId>...</UploadId>
@@ -425,7 +486,8 @@ fn complete_multipart_upload(
 }
 
 /// Upload a large blob using multipart upload (legacy - buffers entire body)
-fn upload_blob_multipart(hash: &str, body: Body, content_type: &str, size: u64) -> Result<()> {
+/// owner: pubkey of the blob owner (stored in x-amz-meta-owner for durability)
+fn upload_blob_multipart(hash: &str, body: Body, content_type: &str, size: u64, owner: &str) -> Result<()> {
     // Read entire body into memory (required for chunking)
     let body_bytes = body.into_bytes();
 
@@ -435,8 +497,8 @@ fn upload_blob_multipart(hash: &str, body: Body, content_type: &str, size: u64) 
         ));
     }
 
-    // Initiate multipart upload
-    let upload_id = initiate_multipart_upload(hash, content_type)?;
+    // Initiate multipart upload with owner metadata
+    let upload_id = initiate_multipart_upload_with_owner(hash, content_type, owner)?;
 
     // Upload parts
     let mut parts: Vec<(u32, String)> = Vec::new();
@@ -854,6 +916,80 @@ fn sign_request(req: &mut Request, config: &GCSConfig, payload_hash: Option<Stri
     let canonical_headers = format!(
         "host:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n",
         host, payload_hash, amz_date
+    );
+
+    let canonical_request = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        method, uri, query, canonical_headers, signed_headers, payload_hash
+    );
+
+    // Create string to sign
+    let credential_scope = format!("{}/{}/{}/aws4_request", date_stamp, config.region(), SERVICE);
+
+    let canonical_request_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
+
+    let string_to_sign = format!(
+        "{}\n{}\n{}\n{}",
+        AWS_ALGORITHM, amz_date, credential_scope, canonical_request_hash
+    );
+
+    // Calculate signature
+    let signing_key = get_signing_key(&config.secret_key, &date_stamp, config.region())?;
+    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes())?);
+
+    // Create authorization header
+    let authorization = format!(
+        "{} Credential={}/{}, SignedHeaders={}, Signature={}",
+        AWS_ALGORITHM, config.access_key, credential_scope, signed_headers, signature
+    );
+
+    req.set_header("Authorization", authorization);
+
+    Ok(())
+}
+
+/// AWS v4 request signing with owner metadata header included
+/// This is needed because custom headers must be in the canonical/signed headers
+/// or GCS will reject the request with a signature mismatch
+fn sign_request_with_owner(req: &mut Request, config: &GCSConfig, payload_hash: Option<String>, owner: &str) -> Result<()> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+
+    let secs = now.as_secs();
+    let days_since_epoch = secs / 86400;
+    let time_of_day = secs % 86400;
+
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+
+    let (year, month, day) = days_to_ymd(days_since_epoch);
+
+    let date_stamp = format!("{:04}{:02}{:02}", year, month, day);
+    let amz_date = format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        year, month, day, hours, minutes, seconds
+    );
+
+    // Set required headers
+    req.set_header("x-amz-date", &amz_date);
+
+    let payload_hash = payload_hash.unwrap_or_else(|| "UNSIGNED-PAYLOAD".into());
+    req.set_header("x-amz-content-sha256", &payload_hash);
+
+    // Create canonical request
+    let method = req.get_method_str();
+    let uri = req.get_path();
+    let query = req.get_query_str().unwrap_or("");
+
+    let host = config.host();
+    // Include x-amz-meta-owner in signed headers (alphabetical order!)
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date;x-amz-meta-owner";
+
+    let canonical_headers = format!(
+        "host:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\nx-amz-meta-owner:{}\n",
+        host, payload_hash, amz_date, owner
     );
 
     let canonical_request = format!(

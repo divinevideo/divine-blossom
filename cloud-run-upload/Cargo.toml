@@ -49,6 +49,9 @@ url = "2"
 anyhow = "1"
 thiserror = "1"
 
+# Temp files for thumbnail extraction
+tempfile = "3"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

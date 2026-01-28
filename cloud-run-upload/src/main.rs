@@ -1,13 +1,15 @@
 // ABOUTME: Rust Cloud Run service for Blossom blob uploads
 // ABOUTME: Handles Nostr auth validation, streaming upload to GCS, and SHA-256 hashing
 
+mod thumbnail;
+
 use anyhow::{anyhow, Result};
 use axum::{
     body::Body,
-    extract::State,
+    extract::{Path, State},
     http::{header, Method, StatusCode},
     response::{IntoResponse, Json, Response},
-    routing::{put, post, options},
+    routing::{get, put, post, options},
     Router,
 };
 use bytes::Bytes;
@@ -15,6 +17,8 @@ use futures::StreamExt;
 use google_cloud_storage::{
     client::{Client as GcsClient, ClientConfig},
     http::objects::{
+        download::Range as DownloadRange,
+        get::GetObjectRequest,
         upload::{Media, UploadObjectRequest, UploadType},
         Object,
     },
@@ -41,7 +45,7 @@ impl Config {
     fn from_env() -> Self {
         Self {
             gcs_bucket: env::var("GCS_BUCKET").unwrap_or_else(|_| "divine-blossom-media".to_string()),
-            cdn_base_url: env::var("CDN_BASE_URL").unwrap_or_else(|_| "https://cdn.divine.video".to_string()),
+            cdn_base_url: env::var("CDN_BASE_URL").unwrap_or_else(|_| "https://media.divine.video".to_string()),
             port: env::var("PORT").unwrap_or_else(|_| "8080".to_string()).parse().unwrap_or(8080),
             migration_nsec: env::var("MIGRATION_NSEC").ok(),
         }
@@ -75,6 +79,8 @@ struct UploadResponse {
     content_type: String,
     uploaded: u64,
     url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thumbnail_url: Option<String>,
 }
 
 // Migration request
@@ -82,6 +88,7 @@ struct UploadResponse {
 struct MigrateRequest {
     source_url: String,
     expected_hash: Option<String>,
+    owner: Option<String>,  // Owner pubkey for GCS metadata durability
 }
 
 // Migration response
@@ -125,7 +132,7 @@ async fn main() -> Result<()> {
     // CORS configuration
     let cors = CorsLayer::new()
         .allow_origin(Any)
-        .allow_methods([Method::PUT, Method::POST, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::PUT, Method::POST, Method::OPTIONS])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
         .max_age(std::time::Duration::from_secs(86400));
 
@@ -135,6 +142,8 @@ async fn main() -> Result<()> {
         .route("/upload", options(handle_cors_preflight))
         .route("/migrate", post(handle_migrate))
         .route("/migrate", options(handle_cors_preflight))
+        .route("/thumbnail/:hash", get(handle_thumbnail_generate))
+        .route("/thumbnail/:hash", options(handle_cors_preflight))
         .route("/", put(handle_upload))
         .route("/", options(handle_cors_preflight))
         .layer(cors)
@@ -194,7 +203,7 @@ async fn process_upload(
     body: Body,
 ) -> Result<UploadResponse> {
     // Validate auth
-    let _auth_event = validate_auth(&headers, "upload")?;
+    let auth_event = validate_auth(&headers, "upload")?;
 
     // Get content type
     let content_type = headers
@@ -203,13 +212,36 @@ async fn process_upload(
         .unwrap_or("application/octet-stream")
         .to_string();
 
-    // Stream body while hashing
-    let (sha256_hash, size) = stream_to_gcs_with_hash(
+    // Stream body while hashing (with owner metadata for durability)
+    let (sha256_hash, size, all_bytes) = stream_to_gcs_with_hash(
         &state.gcs_client,
         &state.config.gcs_bucket,
         &content_type,
         body,
+        &auth_event.pubkey,
     ).await?;
+
+    // Extract thumbnail for videos (non-blocking - failures don't fail the upload)
+    let thumbnail_url = if thumbnail::is_video_type(&content_type) {
+        match extract_and_upload_thumbnail(
+            &state.gcs_client,
+            &state.config.gcs_bucket,
+            &state.config.cdn_base_url,
+            &sha256_hash,
+            &all_bytes,
+        ).await {
+            Ok(url) => {
+                info!("Generated thumbnail for {}", sha256_hash);
+                Some(url)
+            }
+            Err(e) => {
+                error!("Thumbnail extraction failed for {}: {}", sha256_hash, e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Build response
     let extension = get_extension(&content_type);
@@ -224,6 +256,7 @@ async fn process_upload(
         content_type,
         uploaded,
         url: format!("{}/{}.{}", state.config.cdn_base_url, sha256_hash, extension),
+        thumbnail_url,
     })
 }
 
@@ -232,7 +265,8 @@ async fn stream_to_gcs_with_hash(
     bucket: &str,
     content_type: &str,
     body: Body,
-) -> Result<(String, u64)> {
+    owner: &str,
+) -> Result<(String, u64, Vec<u8>)> {
     let mut hasher = Sha256::new();
     let mut total_size: u64 = 0;
     let mut all_bytes = Vec::new();
@@ -261,7 +295,7 @@ async fn stream_to_gcs_with_hash(
 
     if exists {
         info!("Blob {} already exists, skipping upload", sha256_hash);
-        return Ok((sha256_hash, total_size));
+        return Ok((sha256_hash, total_size, all_bytes));
     }
 
     // Upload to GCS
@@ -272,24 +306,173 @@ async fn stream_to_gcs_with_hash(
     };
 
     client
-        .upload_object(&req, Bytes::from(all_bytes), &upload_type)
+        .upload_object(&req, Bytes::from(all_bytes.clone()), &upload_type)
         .await
         .map_err(|e| anyhow!("GCS upload failed: {}", e))?;
 
-    // Set content type
+    // Set content type and owner metadata for durability
+    let mut metadata_map = std::collections::HashMap::new();
+    metadata_map.insert("owner".to_string(), owner.to_string());
+
     let update_req = google_cloud_storage::http::objects::patch::PatchObjectRequest {
         bucket: bucket.to_string(),
         object: sha256_hash.clone(),
         metadata: Some(Object {
             content_type: Some(content_type.to_string()),
+            metadata: Some(metadata_map),
             ..Default::default()
         }),
         ..Default::default()
     };
     let _ = client.patch_object(&update_req).await;
 
-    info!("Uploaded {} bytes as {}", total_size, sha256_hash);
-    Ok((sha256_hash, total_size))
+    info!("Uploaded {} bytes as {} (owner: {})", total_size, sha256_hash, owner);
+    Ok((sha256_hash, total_size, all_bytes))
+}
+
+/// Extract thumbnail from video and upload to GCS
+/// Returns the thumbnail URL on success
+async fn extract_and_upload_thumbnail(
+    client: &GcsClient,
+    bucket: &str,
+    cdn_base_url: &str,
+    hash: &str,
+    video_data: &[u8],
+) -> Result<String> {
+    // Extract thumbnail using ffmpeg
+    let thumb_result = thumbnail::extract_thumbnail(video_data)?;
+
+    // Upload thumbnail to GCS with path: {hash}.jpg (same as video hash but with .jpg extension)
+    // This allows serving via CDN at media.divine.video/{hash}.jpg
+    let thumb_path = format!("{}.jpg", hash);
+
+    let mut media = Media::new(thumb_path.clone());
+    media.content_type = "image/jpeg".into();
+    let upload_type = UploadType::Simple(media);
+    let req = UploadObjectRequest {
+        bucket: bucket.to_string(),
+        ..Default::default()
+    };
+
+    client
+        .upload_object(&req, Bytes::from(thumb_result.data), &upload_type)
+        .await
+        .map_err(|e| anyhow!("GCS thumbnail upload failed: {}", e))?;
+
+    // Return CDN URL for thumbnail - stored at {hash}.jpg, served via CDN
+    Ok(format!("{}/{}.jpg", cdn_base_url, hash))
+}
+
+/// On-demand thumbnail generation endpoint
+/// Downloads video from GCS, generates thumbnail, stores it, returns the image
+async fn handle_thumbnail_generate(
+    State(state): State<Arc<AppState>>,
+    Path(hash): Path<String>,
+) -> impl IntoResponse {
+    // Validate hash format (64 hex characters)
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "application/json")],
+            Json(ErrorResponse { error: "Invalid hash format".to_string() }).into_response(),
+        ).into_response();
+    }
+
+    let hash = hash.to_lowercase();
+
+    // First check if thumbnail already exists
+    let thumb_path = format!("{}.jpg", hash);
+    let thumb_exists = state.gcs_client
+        .get_object(&GetObjectRequest {
+            bucket: state.config.gcs_bucket.clone(),
+            object: thumb_path.clone(),
+            ..Default::default()
+        })
+        .await
+        .is_ok();
+
+    if thumb_exists {
+        // Thumbnail already exists, download and return it
+        match state.gcs_client.download_object(
+            &GetObjectRequest {
+                bucket: state.config.gcs_bucket.clone(),
+                object: thumb_path,
+                ..Default::default()
+            },
+            &DownloadRange::default(),
+        ).await {
+            Ok(data) => {
+                return (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "image/jpeg")],
+                    data,
+                ).into_response();
+            }
+            Err(e) => {
+                error!("Failed to download existing thumbnail: {}", e);
+            }
+        }
+    }
+
+    // Download the video from GCS
+    let video_data = match state.gcs_client.download_object(
+        &GetObjectRequest {
+            bucket: state.config.gcs_bucket.clone(),
+            object: hash.clone(),
+            ..Default::default()
+        },
+        &DownloadRange::default(),
+    ).await {
+        Ok(data) => data,
+        Err(e) => {
+            error!("Failed to download video {}: {}", hash, e);
+            return (
+                StatusCode::NOT_FOUND,
+                [(header::CONTENT_TYPE, "application/json")],
+                Json(ErrorResponse { error: "Video not found".to_string() }).into_response(),
+            ).into_response();
+        }
+    };
+
+    // Generate thumbnail
+    let thumb_result = match thumbnail::extract_thumbnail(&video_data) {
+        Ok(result) => result,
+        Err(e) => {
+            error!("Failed to generate thumbnail for {}: {}", hash, e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CONTENT_TYPE, "application/json")],
+                Json(ErrorResponse { error: "Failed to generate thumbnail".to_string() }).into_response(),
+            ).into_response();
+        }
+    };
+
+    // Upload thumbnail to GCS
+    let thumb_path = format!("{}.jpg", hash);
+    let mut media = Media::new(thumb_path.clone());
+    media.content_type = "image/jpeg".into();
+    let upload_type = UploadType::Simple(media);
+    let req = UploadObjectRequest {
+        bucket: state.config.gcs_bucket.clone(),
+        ..Default::default()
+    };
+
+    if let Err(e) = state.gcs_client
+        .upload_object(&req, Bytes::from(thumb_result.data.clone()), &upload_type)
+        .await
+    {
+        error!("Failed to upload thumbnail for {}: {}", hash, e);
+        // Still return the thumbnail even if upload failed
+    }
+
+    info!("Generated on-demand thumbnail for {}", hash);
+
+    // Return the thumbnail image
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "image/jpeg")],
+        thumb_result.data,
+    ).into_response()
 }
 
 fn validate_auth(headers: &axum::http::HeaderMap, required_action: &str) -> Result<NostrEvent> {
@@ -573,19 +756,26 @@ async fn process_migrate(
         .await
         .map_err(|e| anyhow!("GCS upload failed: {}", e))?;
 
-    // Set content type
+    // Set content type and owner metadata for durability
+    let metadata_map = request.owner.as_ref().map(|owner| {
+        let mut m = std::collections::HashMap::new();
+        m.insert("owner".to_string(), owner.clone());
+        m
+    });
+
     let update_req = google_cloud_storage::http::objects::patch::PatchObjectRequest {
         bucket: state.config.gcs_bucket.clone(),
         object: sha256_hash.clone(),
         metadata: Some(Object {
             content_type: Some(content_type.clone()),
+            metadata: metadata_map,
             ..Default::default()
         }),
         ..Default::default()
     };
     let _ = state.gcs_client.patch_object(&update_req).await;
 
-    info!("Migrated {} bytes as {} from {}", total_size, sha256_hash, request.source_url);
+    info!("Migrated {} bytes as {} from {} (owner: {:?})", total_size, sha256_hash, request.source_url, request.owner);
 
     Ok(MigrateResponse {
         sha256: sha256_hash,

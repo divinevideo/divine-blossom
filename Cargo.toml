@@ -9,8 +9,8 @@ authors = ["Divine <hello@divine.video>"]
 description = "Blossom media server for Nostr running on Fastly Compute"
 
 [dependencies]
-# Fastly Compute SDK
-fastly = "0.11"
+# Fastly Compute SDK - pin to avoid edition2024 dependencies
+fastly = "=0.11.12"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -24,6 +24,9 @@ sha2 = "0.10"
 k256 = { version = "=0.13.3", features = ["schnorr"] }
 # Pin base64ct to avoid edition2024 requirement
 base64ct = "=1.6.0"
+# Pin wit-bindgen and wasip2 to avoid edition2024 requirement
+wit-bindgen = "=0.46.0"
+wasip2 = "=1.0.1"
 
 # Cryptography - AWS v4 signing for B2
 hmac = "0.12"

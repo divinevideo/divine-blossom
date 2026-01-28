@@ -18,6 +18,9 @@ pub struct BlobDescriptor {
     /// Upload timestamp (ISO 8601)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uploaded: Option<String>,
+    /// Thumbnail URL for videos (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<String>,
 }
 
 /// Blob metadata stored in KV store
@@ -107,6 +110,7 @@ impl BlobMetadata {
             size: self.size,
             mime_type: Some(self.mime_type.clone()),
             uploaded: Some(self.uploaded.clone()),
+            thumbnail: self.thumbnail.clone(),
         }
     }
 }
@@ -208,6 +212,21 @@ pub fn parse_hash_from_path(path: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Check if path is a thumbnail request ({hash}.jpg)
+/// Returns the GCS key if it's a thumbnail request
+pub fn parse_thumbnail_path(path: &str) -> Option<String> {
+    let path = path.trim_start_matches('/');
+
+    if path.ends_with(".jpg") {
+        let hash = &path[..path.len() - 4]; // Remove .jpg
+        if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            // Return full path including .jpg extension as GCS key
+            return Some(format!("{}.jpg", hash.to_lowercase()));
+        }
+    }
+    None
 }
 
 /// Check if a path looks like a hash path (for routing)
