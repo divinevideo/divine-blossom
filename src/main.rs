@@ -148,8 +148,10 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
     // Add CORS headers
     add_cors_headers(&mut resp);
 
-    // Add Blossom headers
-    if let Some(meta) = metadata {
+    // Add Blossom headers and ensure correct Content-Type from metadata
+    if let Some(ref meta) = metadata {
+        // Set Content-Type from stored metadata (more reliable than origin server)
+        resp.set_header("Content-Type", &meta.mime_type);
         resp.set_header("X-Sha256", &meta.sha256);
         resp.set_header("X-Content-Length", meta.size.to_string());
     }
