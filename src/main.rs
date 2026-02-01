@@ -10,7 +10,7 @@ mod storage;
 use crate::auth::{optional_auth, validate_auth, validate_hash_match};
 use crate::blossom::{
     is_hash_path, is_video_mime_type, parse_hash_from_path, parse_thumbnail_path, AuthAction, BlobDescriptor, BlobMetadata, BlobStatus,
-    UploadRequirements,
+    TranscodeStatus, UploadRequirements,
 };
 use crate::error::{BlossomError, Result};
 use crate::metadata::{
@@ -49,7 +49,15 @@ fn handle_request(req: Request) -> Result<Response> {
 
         // Version check
         (Method::GET, "/version") => Ok(Response::from_status(StatusCode::OK)
-            .with_body("v120-headers-fix")),
+            .with_body("v124-update-size-on-faststart")),
+
+        // HLS: /{sha256}.hls -> serve master manifest
+        (Method::GET, p) if p.ends_with(".hls") => handle_get_hls_master(req, p),
+        (Method::HEAD, p) if p.ends_with(".hls") => handle_head_hls_master(p),
+
+        // HLS: /{sha256}/hls/* -> serve HLS segments/playlists
+        (Method::GET, p) if p.contains("/hls/") => handle_get_hls_content(req, p),
+        (Method::HEAD, p) if p.contains("/hls/") => handle_head_hls_content(p),
 
         // BUD-01: Blob retrieval
         (Method::GET, p) if is_hash_path(p) => handle_get_blob(req, p),
@@ -74,6 +82,9 @@ fn handle_request(req: Request) -> Result<Response> {
 
         // Admin: Moderation webhook from divine-moderation-service
         (Method::POST, "/admin/moderate") => handle_admin_moderate(req),
+
+        // Admin: Transcode status webhook from divine-transcoder service
+        (Method::POST, "/admin/transcode-status") => handle_transcode_status(req),
 
         // CORS preflight
         (Method::OPTIONS, _) => Ok(cors_preflight_response()),
@@ -169,10 +180,21 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
             resp.set_header("Content-Length", meta.size.to_string());
         }
     } else {
-        // No metadata - try to infer MIME type from file extension in path
+        // No metadata in KV store - get info from GCS response headers
+        // This handles videos uploaded directly to Cloud Run (bypassing Fastly)
         if let Some(mime_type) = infer_mime_from_path(path) {
             resp.set_header("Content-Type", mime_type);
         }
+        // Try to get Content-Length from GCS response (extract first to avoid borrow issues)
+        if !is_partial {
+            let content_length: Option<String> = resp.get_header_str("content-length")
+                .map(|s| s.to_string())
+                .or_else(|| resp.get_header_str("x-goog-stored-content-length").map(|s| s.to_string()));
+            if let Some(cl) = content_length {
+                resp.set_header("Content-Length", &cl);
+            }
+        }
+        resp.set_header("X-Sha256", &hash);
     }
 
     // Add header indicating the source (useful for debugging/monitoring)
@@ -229,6 +251,220 @@ fn handle_head_blob(path: &str) -> Result<Response> {
     Ok(resp)
 }
 
+/// GET /<sha256>.hls - Serve HLS master manifest
+fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
+    // Extract hash from path (remove leading / and .hls suffix)
+    let path_trimmed = path.trim_start_matches('/');
+    let hash = path_trimmed
+        .strip_suffix(".hls")
+        .ok_or_else(|| BlossomError::BadRequest("Invalid HLS path".into()))?;
+
+    // Validate hash format
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(BlossomError::BadRequest("Invalid hash in path".into()));
+    }
+    let hash = hash.to_lowercase();
+
+    // Check metadata for access control and transcode status
+    let metadata = get_blob_metadata(&hash)?;
+
+    if let Some(ref meta) = metadata {
+        // Handle banned content
+        if meta.status == BlobStatus::Banned {
+            return Err(BlossomError::NotFound("Content not found".into()));
+        }
+
+        // Handle restricted content
+        if meta.status == BlobStatus::Restricted {
+            if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
+                if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
+                    return Err(BlossomError::NotFound("Content not found".into()));
+                }
+            } else {
+                return Err(BlossomError::NotFound("Content not found".into()));
+            }
+        }
+
+        // Check transcode status
+        match meta.transcode_status {
+            Some(TranscodeStatus::Complete) => {
+                // Transcoding done, serve the manifest
+            }
+            Some(TranscodeStatus::Processing) => {
+                // Transcoding in progress, return 202 Accepted with Retry-After
+                let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                resp.set_header("Retry-After", "5");
+                resp.set_header("Content-Type", "application/json");
+                resp.set_body(r#"{"status":"processing","message":"HLS transcoding in progress"}"#);
+                add_cors_headers(&mut resp);
+                return Ok(resp);
+            }
+            Some(TranscodeStatus::Failed) => {
+                return Err(BlossomError::Internal("HLS transcoding failed".into()));
+            }
+            Some(TranscodeStatus::Pending) | None => {
+                // Not yet started - trigger on-demand transcoding
+                // Update status to Processing first to prevent duplicate triggers
+                use crate::metadata::update_transcode_status;
+                if let Err(e) = update_transcode_status(&hash, TranscodeStatus::Processing) {
+                    eprintln!("[HLS] Failed to update transcode status: {}", e);
+                }
+
+                // Trigger transcoding (fire and forget)
+                let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
+
+                // Return 202 Accepted with Retry-After
+                let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                resp.set_header("Retry-After", "10");
+                resp.set_header("Content-Type", "application/json");
+                resp.set_body(r#"{"status":"processing","message":"HLS transcoding started, please retry in 10 seconds"}"#);
+                add_cors_headers(&mut resp);
+                return Ok(resp);
+            }
+        }
+    } else {
+        return Err(BlossomError::NotFound("Content not found".into()));
+    }
+
+    // Download master manifest from GCS
+    let gcs_path = format!("{}/hls/master.m3u8", hash);
+    let result = download_hls_content(&gcs_path)?;
+    let mut resp = result;
+
+    // Set correct content type for HLS manifest
+    resp.set_header("Content-Type", "application/vnd.apple.mpegurl");
+    resp.set_header("Cache-Control", "public, max-age=31536000"); // HLS manifests are immutable for VOD
+    add_cors_headers(&mut resp);
+
+    Ok(resp)
+}
+
+/// HEAD /<sha256>.hls - Check HLS master manifest existence
+fn handle_head_hls_master(path: &str) -> Result<Response> {
+    // Extract hash from path
+    let path_trimmed = path.trim_start_matches('/');
+    let hash = path_trimmed
+        .strip_suffix(".hls")
+        .ok_or_else(|| BlossomError::BadRequest("Invalid HLS path".into()))?;
+
+    // Validate hash format
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(BlossomError::BadRequest("Invalid hash in path".into()));
+    }
+    let hash = hash.to_lowercase();
+
+    // Check metadata for transcode status
+    let metadata = get_blob_metadata(&hash)?
+        .ok_or_else(|| BlossomError::NotFound("Content not found".into()))?;
+
+    // Don't reveal restricted/banned content
+    if metadata.status == BlobStatus::Restricted || metadata.status == BlobStatus::Banned {
+        return Err(BlossomError::NotFound("Content not found".into()));
+    }
+
+    match metadata.transcode_status {
+        Some(TranscodeStatus::Complete) => {
+            let mut resp = Response::from_status(StatusCode::OK);
+            resp.set_header("Content-Type", "application/vnd.apple.mpegurl");
+            add_cors_headers(&mut resp);
+            Ok(resp)
+        }
+        Some(TranscodeStatus::Processing) => {
+            let mut resp = Response::from_status(StatusCode::ACCEPTED);
+            resp.set_header("Retry-After", "5");
+            add_cors_headers(&mut resp);
+            Ok(resp)
+        }
+        _ => Err(BlossomError::NotFound("HLS not available".into())),
+    }
+}
+
+/// GET /<sha256>/hls/* - Serve HLS segments and variant playlists
+fn handle_get_hls_content(_req: Request, path: &str) -> Result<Response> {
+    // Path format: /{hash}/hls/{filename}
+    // Extract hash and validate
+    let path_trimmed = path.trim_start_matches('/');
+    let parts: Vec<&str> = path_trimmed.splitn(3, '/').collect();
+
+    if parts.len() < 3 || parts[1] != "hls" {
+        return Err(BlossomError::BadRequest("Invalid HLS path format".into()));
+    }
+
+    let hash = parts[0];
+    let filename = parts[2];
+
+    // Validate hash format
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(BlossomError::BadRequest("Invalid hash in path".into()));
+    }
+
+    // Construct GCS path
+    let gcs_path = format!("{}/hls/{}", hash.to_lowercase(), filename);
+
+    // Download from GCS
+    let mut resp = download_hls_content(&gcs_path)?;
+
+    // Set content type based on file extension
+    let content_type = if filename.ends_with(".m3u8") {
+        "application/vnd.apple.mpegurl"
+    } else if filename.ends_with(".ts") {
+        "video/mp2t"
+    } else {
+        "application/octet-stream"
+    };
+
+    resp.set_header("Content-Type", content_type);
+    resp.set_header("Cache-Control", "public, max-age=31536000"); // Immutable for VOD
+    add_cors_headers(&mut resp);
+
+    Ok(resp)
+}
+
+/// HEAD /<sha256>/hls/* - Check HLS content existence
+fn handle_head_hls_content(path: &str) -> Result<Response> {
+    // Path format: /{hash}/hls/{filename}
+    let path_trimmed = path.trim_start_matches('/');
+    let parts: Vec<&str> = path_trimmed.splitn(3, '/').collect();
+
+    if parts.len() < 3 || parts[1] != "hls" {
+        return Err(BlossomError::BadRequest("Invalid HLS path format".into()));
+    }
+
+    let hash = parts[0];
+    let filename = parts[2];
+
+    // Validate hash format
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(BlossomError::BadRequest("Invalid hash in path".into()));
+    }
+
+    // Check if file exists in GCS
+    let gcs_path = format!("{}/hls/{}", hash.to_lowercase(), filename);
+
+    // Try to get the content (HEAD-like check)
+    download_hls_content(&gcs_path)?;
+
+    let content_type = if filename.ends_with(".m3u8") {
+        "application/vnd.apple.mpegurl"
+    } else if filename.ends_with(".ts") {
+        "video/mp2t"
+    } else {
+        "application/octet-stream"
+    };
+
+    let mut resp = Response::from_status(StatusCode::OK);
+    resp.set_header("Content-Type", content_type);
+    add_cors_headers(&mut resp);
+
+    Ok(resp)
+}
+
+/// Download HLS content from GCS
+fn download_hls_content(gcs_path: &str) -> Result<Response> {
+    use crate::storage::download_hls_from_gcs;
+    download_hls_from_gcs(gcs_path)
+}
+
 /// Maximum size for in-process upload (500KB) - larger files proxy to Cloud Run
 const CLOUD_RUN_THRESHOLD: u64 = 500 * 1024;
 
@@ -237,6 +473,9 @@ const CLOUD_RUN_BACKEND: &str = "cloud_run_upload";
 
 /// Cloud Run host for on-demand thumbnail generation
 const CLOUD_RUN_THUMBNAIL_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
+
+/// Cloud Run host for on-demand transcoding
+const CLOUD_RUN_TRANSCODER_HOST: &str = "divine-transcoder-149672065768.us-central1.run.app";
 
 /// Generate thumbnail on-demand by proxying to Cloud Run
 fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
@@ -253,6 +492,35 @@ fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
         StatusCode::OK => Ok(resp),
         StatusCode::NOT_FOUND => Err(BlossomError::NotFound("Video not found for thumbnail generation".into())),
         status => Err(BlossomError::StorageError(format!("Thumbnail generation failed with status: {}", status))),
+    }
+}
+
+/// Trigger on-demand HLS transcoding via Cloud Run transcoder service
+/// This is fire-and-forget - we update metadata to Processing and return immediately
+fn trigger_on_demand_transcoding(hash: &str, owner: &str) -> Result<()> {
+    let url = format!("https://{}/transcode", CLOUD_RUN_TRANSCODER_HOST);
+
+    let body = format!(
+        r#"{{"hash":"{}","owner":"{}"}}"#,
+        hash, owner
+    );
+
+    let mut proxy_req = Request::new(Method::POST, &url);
+    proxy_req.set_header("Host", CLOUD_RUN_TRANSCODER_HOST);
+    proxy_req.set_header("Content-Type", "application/json");
+    proxy_req.set_body(body);
+
+    // Fire and forget - we don't wait for transcoding to complete
+    // The transcoder will callback via webhook when done
+    match proxy_req.send_async(CLOUD_RUN_BACKEND) {
+        Ok(_) => {
+            eprintln!("[HLS] Triggered on-demand transcoding for {}", hash);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("[HLS] Failed to trigger transcoding for {}: {}", hash, e);
+            Err(BlossomError::Internal(format!("Failed to trigger transcoding: {}", e)))
+        }
     }
 }
 
@@ -328,12 +596,17 @@ fn handle_upload(mut req: Request) -> Result<Response> {
     let metadata = BlobMetadata {
         sha256: hash.clone(),
         size: actual_size,
-        mime_type: content_type,
+        mime_type: content_type.clone(),
         uploaded: current_timestamp(),
         owner: auth.pubkey.clone(),
         status: BlobStatus::Pending, // Start as pending for moderation
         thumbnail: None,
         moderation: None,
+        transcode_status: if is_video_mime_type(&content_type) {
+            Some(TranscodeStatus::Pending)
+        } else {
+            None
+        },
     };
 
     put_blob_metadata(&metadata)?;
@@ -426,15 +699,21 @@ fn handle_cloud_run_proxy(
     }
 
     // Store metadata in Fastly's KV store
+    // For video uploads, transcode_status starts as Pending (Cloud Run upload service triggers transcoder)
     let metadata = BlobMetadata {
         sha256: hash.clone(),
         size,
-        mime_type: content_type,
+        mime_type: content_type.clone(),
         uploaded: current_timestamp(),
         owner: auth.pubkey.clone(),
         status: BlobStatus::Pending,
         thumbnail: thumbnail_url,
         moderation: None,
+        transcode_status: if is_video_mime_type(&content_type) {
+            Some(TranscodeStatus::Pending)
+        } else {
+            None
+        },
     };
 
     put_blob_metadata(&metadata)?;
@@ -785,12 +1064,17 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
     let metadata = BlobMetadata {
         sha256: hash.clone(),
         size,
-        mime_type: content_type,
+        mime_type: content_type.clone(),
         uploaded: current_timestamp(),
         owner: auth.pubkey.clone(),
         status: BlobStatus::Pending,
         thumbnail: None,
         moderation: None,
+        transcode_status: if is_video_mime_type(&content_type) {
+            Some(TranscodeStatus::Pending)
+        } else {
+            None
+        },
     };
 
     put_blob_metadata(&metadata)?;
@@ -903,6 +1187,125 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
         }
         Err(e) => {
             eprintln!("[ADMIN] Failed to update blob {}: {:?}", sha256, e);
+            Err(e)
+        }
+    }
+}
+
+/// POST /admin/transcode-status - Webhook from divine-transcoder service
+/// Updates transcode status for a blob after HLS generation
+fn handle_transcode_status(mut req: Request) -> Result<Response> {
+    // Try to get webhook secret from secret store (same as moderation webhook)
+    let expected_secret: Option<String> = fastly::secret_store::SecretStore::open("blossom_secrets")
+        .ok()
+        .and_then(|store| store.get("webhook_secret"))
+        .map(|secret| {
+            String::from_utf8(secret.plaintext().to_vec())
+                .unwrap_or_default()
+        });
+
+    // Get Authorization header
+    let auth_header = req
+        .get_header(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
+    // Validate secret if configured
+    if let Some(ref expected) = expected_secret {
+        match auth_header {
+            Some(ref header) if header.starts_with("Bearer ") => {
+                let provided = header.strip_prefix("Bearer ").unwrap_or("");
+                if provided != expected.trim() {
+                    eprintln!("[TRANSCODE] Invalid webhook secret");
+                    return Err(BlossomError::Forbidden("Invalid webhook secret".into()));
+                }
+            }
+            _ => {
+                eprintln!("[TRANSCODE] Missing or invalid Authorization header");
+                return Err(BlossomError::AuthRequired("Webhook secret required".into()));
+            }
+        }
+    } else {
+        // Fail closed: reject requests if webhook_secret is not configured
+        eprintln!("[TRANSCODE] webhook_secret not configured, rejecting request");
+        return Err(BlossomError::Forbidden("Webhook secret not configured".into()));
+    }
+
+    // Parse JSON body
+    let body = req.take_body().into_string();
+    let payload: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| BlossomError::BadRequest(format!("Invalid JSON: {}", e)))?;
+
+    let sha256 = payload["sha256"]
+        .as_str()
+        .ok_or_else(|| BlossomError::BadRequest("Missing 'sha256' field".into()))?;
+
+    let status_str = payload["status"]
+        .as_str()
+        .ok_or_else(|| BlossomError::BadRequest("Missing 'status' field".into()))?;
+
+    // Optional new_size field - provided when faststart optimization replaces the original file
+    let new_size = payload["new_size"].as_u64();
+
+    eprintln!(
+        "[TRANSCODE] Status webhook: sha256={}, status={}, new_size={:?}",
+        sha256, status_str, new_size
+    );
+
+    // Validate sha256 format
+    if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(BlossomError::BadRequest("Invalid sha256 format".into()));
+    }
+
+    // Map status string to TranscodeStatus
+    let new_status = match status_str.to_lowercase().as_str() {
+        "pending" => TranscodeStatus::Pending,
+        "processing" => TranscodeStatus::Processing,
+        "complete" | "completed" => TranscodeStatus::Complete,
+        "failed" | "error" => TranscodeStatus::Failed,
+        _ => {
+            return Err(BlossomError::BadRequest(format!(
+                "Unknown status: {}. Expected pending, processing, complete, or failed",
+                status_str
+            )));
+        }
+    };
+
+    // Update transcode status (and optionally file size if provided)
+    use crate::metadata::update_transcode_status_with_size;
+    match update_transcode_status_with_size(sha256, new_status, new_size) {
+        Ok(()) => {
+            if let Some(size) = new_size {
+                eprintln!(
+                    "[TRANSCODE] Updated blob {} to transcode status {:?} with new size {}",
+                    sha256, new_status, size
+                );
+            } else {
+                eprintln!("[TRANSCODE] Updated blob {} to transcode status {:?}", sha256, new_status);
+            }
+            let response = serde_json::json!({
+                "success": true,
+                "sha256": sha256,
+                "transcode_status": format!("{:?}", new_status).to_lowercase(),
+                "message": "Transcode status updated"
+            });
+            let mut resp = json_response(StatusCode::OK, &response);
+            add_cors_headers(&mut resp);
+            Ok(resp)
+        }
+        Err(BlossomError::NotFound(_)) => {
+            eprintln!("[TRANSCODE] Blob {} not found", sha256);
+            let response = serde_json::json!({
+                "success": false,
+                "sha256": sha256,
+                "error": "Blob not found"
+            });
+            let mut resp = json_response(StatusCode::NOT_FOUND, &response);
+            add_cors_headers(&mut resp);
+            Ok(resp)
+        }
+        Err(e) => {
+            eprintln!("[TRANSCODE] Failed to update blob {}: {:?}", sha256, e);
             Err(e)
         }
     }

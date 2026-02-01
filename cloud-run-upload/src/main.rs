@@ -39,6 +39,7 @@ struct Config {
     cdn_base_url: String,
     port: u16,
     migration_nsec: Option<String>,
+    transcoder_url: Option<String>,
 }
 
 impl Config {
@@ -48,6 +49,8 @@ impl Config {
             cdn_base_url: env::var("CDN_BASE_URL").unwrap_or_else(|_| "https://media.divine.video".to_string()),
             port: env::var("PORT").unwrap_or_else(|_| "8080".to_string()).parse().unwrap_or(8080),
             migration_nsec: env::var("MIGRATION_NSEC").ok(),
+            // URL of the divine-transcoder service for HLS generation
+            transcoder_url: env::var("TRANSCODER_URL").ok(),
         }
     }
 }
@@ -242,6 +245,23 @@ async fn process_upload(
     } else {
         None
     };
+
+    // Trigger HLS transcoding for videos (fire-and-forget)
+    if thumbnail::is_video_type(&content_type) {
+        if let Some(ref transcoder_url) = state.config.transcoder_url {
+            // Spawn background task to trigger transcoder - don't block upload response
+            let transcoder_url = transcoder_url.clone();
+            let hash = sha256_hash.clone();
+            let owner = auth_event.pubkey.clone();
+            tokio::spawn(async move {
+                if let Err(e) = trigger_transcoding(&transcoder_url, &hash, &owner).await {
+                    error!("Failed to trigger transcoding for {}: {}", hash, e);
+                }
+            });
+        } else {
+            info!("TRANSCODER_URL not configured, skipping HLS transcoding for {}", sha256_hash);
+        }
+    }
 
     // Build response
     let extension = get_extension(&content_type);
@@ -603,6 +623,35 @@ fn get_extension(content_type: &str) -> &'static str {
         "audio/ogg" => "ogg",
         "application/pdf" => "pdf",
         _ => "bin",
+    }
+}
+
+/// Trigger HLS transcoding for a video (fire-and-forget)
+/// Sends a POST request to the divine-transcoder service
+async fn trigger_transcoding(transcoder_url: &str, hash: &str, owner: &str) -> Result<()> {
+    info!("Triggering HLS transcoding for {} via {}", hash, transcoder_url);
+
+    let client = reqwest::Client::new();
+    let transcode_request = serde_json::json!({
+        "hash": hash,
+        "owner": owner
+    });
+
+    let response = client
+        .post(format!("{}/transcode", transcoder_url))
+        .header("Content-Type", "application/json")
+        .json(&transcode_request)
+        .send()
+        .await
+        .map_err(|e| anyhow!("Failed to call transcoder: {}", e))?;
+
+    if response.status().is_success() {
+        info!("Transcoding triggered successfully for {}", hash);
+        Ok(())
+    } else {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        Err(anyhow!("Transcoder returned error {}: {}", status, body))
     }
 }
 

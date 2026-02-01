@@ -21,6 +21,9 @@ pub struct BlobDescriptor {
     /// Thumbnail URL for videos (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumbnail: Option<String>,
+    /// HLS manifest URL for videos (optional, present when transcoding complete)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hls: Option<String>,
 }
 
 /// Blob metadata stored in KV store
@@ -45,6 +48,9 @@ pub struct BlobMetadata {
     /// Moderation check results
     #[serde(skip_serializing_if = "Option::is_none")]
     pub moderation: Option<ModerationResult>,
+    /// Transcode status for video HLS generation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcode_status: Option<TranscodeStatus>,
 }
 
 /// Moderation status for blobs
@@ -59,6 +65,26 @@ pub enum BlobStatus {
     Pending,
     /// Permanently banned by moderation - not accessible to anyone
     Banned,
+}
+
+/// Transcode status for video blobs
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TranscodeStatus {
+    /// Transcoding not yet started
+    Pending,
+    /// Transcoding in progress
+    Processing,
+    /// Transcoding completed successfully
+    Complete,
+    /// Transcoding failed
+    Failed,
+}
+
+impl Default for TranscodeStatus {
+    fn default() -> Self {
+        TranscodeStatus::Pending
+    }
 }
 
 impl Default for BlobStatus {
@@ -104,6 +130,15 @@ pub struct UploadRequirements {
 impl BlobMetadata {
     /// Convert to BlobDescriptor for API response
     pub fn to_descriptor(&self, base_url: &str) -> BlobDescriptor {
+        // Include HLS URL if video transcoding is complete
+        let hls = if is_video_mime_type(&self.mime_type)
+            && self.transcode_status == Some(TranscodeStatus::Complete)
+        {
+            Some(format!("{}/{}.hls", base_url, self.sha256))
+        } else {
+            None
+        };
+
         BlobDescriptor {
             url: format!("{}/{}", base_url, self.sha256),
             sha256: self.sha256.clone(),
@@ -111,6 +146,7 @@ impl BlobMetadata {
             mime_type: Some(self.mime_type.clone()),
             uploaded: Some(self.uploaded.clone()),
             thumbnail: self.thumbnail.clone(),
+            hls,
         }
     }
 }

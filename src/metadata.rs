@@ -179,6 +179,39 @@ pub fn update_blob_status(hash: &str, status: BlobStatus) -> Result<()> {
     Ok(())
 }
 
+/// Update transcode status for a video blob
+pub fn update_transcode_status(hash: &str, status: crate::blossom::TranscodeStatus) -> Result<()> {
+    let mut metadata = get_blob_metadata(hash)?
+        .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
+
+    metadata.transcode_status = Some(status);
+    put_blob_metadata(&metadata)?;
+
+    Ok(())
+}
+
+/// Update transcode status and optionally the file size for a video blob
+/// The new_size is provided when faststart optimization replaces the original file
+pub fn update_transcode_status_with_size(
+    hash: &str,
+    status: crate::blossom::TranscodeStatus,
+    new_size: Option<u64>,
+) -> Result<()> {
+    let mut metadata = get_blob_metadata(hash)?
+        .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
+
+    metadata.transcode_status = Some(status);
+
+    // Update size if provided (faststart optimization replaced the original file)
+    if let Some(size) = new_size {
+        metadata.size = size;
+    }
+
+    put_blob_metadata(&metadata)?;
+
+    Ok(())
+}
+
 /// Check if user owns the blob
 pub fn check_ownership(hash: &str, pubkey: &str) -> Result<bool> {
     let metadata = get_blob_metadata(hash)?
