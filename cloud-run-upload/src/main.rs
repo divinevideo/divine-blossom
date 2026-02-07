@@ -84,6 +84,9 @@ struct UploadResponse {
     url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     thumbnail_url: Option<String>,
+    /// Video dimensions as "WIDTHxHEIGHT" (display dimensions after rotation)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dim: Option<String>,
 }
 
 // Migration request
@@ -246,6 +249,22 @@ async fn process_upload(
         None
     };
 
+    // Probe video dimensions (non-blocking - failures don't fail the upload)
+    let dim = if thumbnail::is_video_type(&content_type) {
+        match probe_video_dimensions(&all_bytes).await {
+            Ok(d) => {
+                info!("Probed video dimensions for {}: {}", sha256_hash, d);
+                Some(d)
+            }
+            Err(e) => {
+                error!("Video probe failed for {}: {}", sha256_hash, e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Trigger HLS transcoding for videos (fire-and-forget)
     if thumbnail::is_video_type(&content_type) {
         if let Some(ref transcoder_url) = state.config.transcoder_url {
@@ -277,6 +296,7 @@ async fn process_upload(
         uploaded,
         url: format!("{}/{}.{}", state.config.cdn_base_url, sha256_hash, extension),
         thumbnail_url,
+        dim,
     })
 }
 
@@ -287,20 +307,34 @@ async fn stream_to_gcs_with_hash(
     body: Body,
     owner: &str,
 ) -> Result<(String, u64, Vec<u8>)> {
-    let mut hasher = Sha256::new();
-    let mut total_size: u64 = 0;
     let mut all_bytes = Vec::new();
 
-    // Collect body stream while hashing
+    // Collect body stream first (hash after potential sanitization)
     let mut stream = body.into_data_stream();
     while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.map_err(|e| anyhow!("Stream error: {}", e))?;
-        hasher.update(&chunk);
-        total_size += chunk.len() as u64;
         all_bytes.extend_from_slice(&chunk);
     }
 
-    // Get final hash
+    // Sanitize video files: remux with ffmpeg to strip invalid MP4 atoms
+    // (e.g. invalid clap boxes from iPhone) and ensure faststart for web playback
+    if thumbnail::is_video_type(content_type) {
+        match sanitize_video(&all_bytes).await {
+            Ok(sanitized) => {
+                info!("Sanitized video: {} -> {} bytes", all_bytes.len(), sanitized.len());
+                all_bytes = sanitized;
+            }
+            Err(e) => {
+                // Non-fatal: use original bytes if sanitization fails
+                error!("Video sanitization failed, using original: {}", e);
+            }
+        }
+    }
+
+    // Hash the (possibly sanitized) bytes
+    let mut hasher = Sha256::new();
+    hasher.update(&all_bytes);
+    let total_size = all_bytes.len() as u64;
     let sha256_hash = hex::encode(hasher.finalize());
 
     // Check if blob already exists
@@ -493,6 +527,134 @@ async fn handle_thumbnail_generate(
         [(header::CONTENT_TYPE, "image/jpeg")],
         thumb_result.data,
     ).into_response()
+}
+
+/// Sanitize a video file by remuxing with ffmpeg
+/// This strips invalid MP4 atoms (e.g. malformed clap boxes from iPhone),
+/// ensures faststart (moov before mdat), and produces a web-compatible MP4.
+/// Uses -c copy so it's lossless and fast (no re-encoding).
+async fn sanitize_video(input_bytes: &[u8]) -> Result<Vec<u8>> {
+    use tokio::process::Command;
+
+    let tmp_dir = std::env::temp_dir();
+    let input_path = tmp_dir.join("sanitize_input.mp4");
+    let output_path = tmp_dir.join("sanitize_output.mp4");
+
+    // Write input to temp file
+    tokio::fs::write(&input_path, input_bytes).await
+        .map_err(|e| anyhow!("Failed to write temp input: {}", e))?;
+
+    // Remux with ffmpeg: -c copy (no re-encode), +faststart (moov at front)
+    let output = Command::new("ffmpeg")
+        .args([
+            "-y",              // Overwrite output
+            "-v", "warning",   // Only show warnings/errors
+            "-i", input_path.to_str().unwrap(),
+            "-c", "copy",      // Copy streams without re-encoding
+            "-movflags", "+faststart",  // Put moov atom at front
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .map_err(|e| anyhow!("Failed to run ffmpeg: {}", e))?;
+
+    // Clean up input
+    let _ = tokio::fs::remove_file(&input_path).await;
+
+    if !output.status.success() {
+        let _ = tokio::fs::remove_file(&output_path).await;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("ffmpeg sanitize failed: {}", stderr));
+    }
+
+    // Read sanitized output
+    let sanitized = tokio::fs::read(&output_path).await
+        .map_err(|e| anyhow!("Failed to read sanitized output: {}", e))?;
+
+    // Clean up output
+    let _ = tokio::fs::remove_file(&output_path).await;
+
+    Ok(sanitized)
+}
+
+/// Probe video data with ffprobe to get display dimensions (respecting rotation metadata).
+/// Returns "WIDTHxHEIGHT" string suitable for the Nostr `dim` imeta tag.
+async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
+    use tokio::process::Command;
+
+    let tmp_dir = std::env::temp_dir();
+    let probe_path = tmp_dir.join("probe_input.mp4");
+
+    // Write to temp file for ffprobe
+    tokio::fs::write(&probe_path, video_bytes).await
+        .map_err(|e| anyhow!("Failed to write temp file for probe: {}", e))?;
+
+    let output = Command::new("ffprobe")
+        .args([
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_streams",
+            "-select_streams", "v:0",
+            probe_path.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .map_err(|e| anyhow!("Failed to run ffprobe: {}", e))?;
+
+    // Clean up temp file
+    let _ = tokio::fs::remove_file(&probe_path).await;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("ffprobe failed: {}", stderr));
+    }
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| anyhow!("Failed to parse ffprobe output: {}", e))?;
+
+    let stream = json["streams"]
+        .as_array()
+        .and_then(|s| s.first())
+        .ok_or_else(|| anyhow!("No video stream found"))?;
+
+    let width = stream["width"].as_u64().unwrap_or(0) as u32;
+    let height = stream["height"].as_u64().unwrap_or(0) as u32;
+
+    if width == 0 || height == 0 {
+        return Err(anyhow!("Could not determine video dimensions"));
+    }
+
+    // Check rotation from tags (older FFmpeg / older files)
+    let mut rotation: i32 = stream["tags"]["rotate"]
+        .as_str()
+        .and_then(|r| r.parse().ok())
+        .unwrap_or(0);
+
+    // Check side_data_list for Display Matrix rotation (newer FFmpeg)
+    if rotation == 0 {
+        if let Some(side_data) = stream["side_data_list"].as_array() {
+            for sd in side_data {
+                if sd["side_data_type"].as_str() == Some("Display Matrix") {
+                    if let Some(r) = sd["rotation"].as_f64() {
+                        rotation = r.round() as i32;
+                    } else if let Some(r) = sd["rotation"].as_str().and_then(|s| s.parse::<f64>().ok()) {
+                        rotation = r.round() as i32;
+                    }
+                }
+            }
+        }
+    }
+
+    let rotation_abs = rotation.unsigned_abs() % 360;
+
+    // Compute display dimensions (after applying rotation)
+    let (display_width, display_height) = if rotation_abs == 90 || rotation_abs == 270 {
+        (height, width)
+    } else {
+        (width, height)
+    };
+
+    Ok(format!("{}x{}", display_width, display_height))
 }
 
 fn validate_auth(headers: &axum::http::HeaderMap, required_action: &str) -> Result<NostrEvent> {

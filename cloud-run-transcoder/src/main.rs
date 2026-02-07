@@ -85,6 +85,27 @@ struct TranscodeResponse {
     status: String,
     hls_master: String,
     variants: Vec<HlsVariant>,
+    /// Display width after rotation (visual width)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_width: Option<u32>,
+    /// Display height after rotation (visual height)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_height: Option<u32>,
+}
+
+/// Video probe result from ffprobe
+#[derive(Debug, Clone)]
+struct VideoInfo {
+    /// Raw pixel width from codec
+    width: u32,
+    /// Raw pixel height from codec
+    height: u32,
+    /// Rotation from metadata (0, 90, 180, 270)
+    rotation: u32,
+    /// Visual width after applying rotation
+    display_width: u32,
+    /// Visual height after applying rotation
+    display_height: u32,
 }
 
 #[derive(Serialize)]
@@ -222,7 +243,7 @@ async fn process_transcode(
     if check_gcs_exists(&state.gcs_client, &state.config.gcs_bucket, &master_path).await? {
         info!("HLS already exists for {}, skipping transcode", hash);
         // Still update status to complete in case it was pending (no size change for already-transcoded)
-        send_status_webhook(&state.config, &hash, "complete", None).await;
+        send_status_webhook(&state.config, &hash, "complete", None, None).await;
         return Ok(TranscodeResponse {
             hash: hash.clone(),
             status: "already_exists".to_string(),
@@ -239,11 +260,13 @@ async fn process_transcode(
                     bandwidth: 1_000_000,
                 },
             ],
+            display_width: None,
+            display_height: None,
         });
     }
 
     // Update status to processing
-    send_status_webhook(&state.config, &hash, "processing", None).await;
+    send_status_webhook(&state.config, &hash, "processing", None, None).await;
 
     // Create temp directory for processing
     let temp_dir = TempDir::new()?;
@@ -260,11 +283,27 @@ async fn process_transcode(
     .await;
 
     if let Err(e) = download_result {
-        send_status_webhook(&state.config, &hash, "failed", None).await;
+        send_status_webhook(&state.config, &hash, "failed", None, None).await;
         return Err(e);
     }
 
     info!("Downloaded video to {:?}", input_path);
+
+    // Probe video to get dimensions and rotation metadata
+    let video_info = match probe_video(&input_path).await {
+        Ok(info) => info,
+        Err(e) => {
+            warn!("Failed to probe video, using default landscape dimensions: {}", e);
+            // Fallback: assume landscape 1920x1080 so old behavior is preserved
+            VideoInfo {
+                width: 1920,
+                height: 1080,
+                rotation: 0,
+                display_width: 1920,
+                display_height: 1080,
+            }
+        }
+    };
 
     // NOTE: We do NOT modify the original file - SHA256 hash must remain valid for
     // content-addressable storage and ProofMode verification. HLS provides streaming.
@@ -273,13 +312,13 @@ async fn process_transcode(
     let output_dir = temp_path.join("hls");
     tokio::fs::create_dir_all(&output_dir).await?;
 
-    // Run FFmpeg to generate HLS
-    let ffmpeg_result = run_ffmpeg_hls(&input_path, &output_dir, state.config.use_gpu).await;
+    // Run FFmpeg to generate HLS with orientation-aware scaling
+    let ffmpeg_result = run_ffmpeg_hls(&input_path, &output_dir, state.config.use_gpu, &video_info).await;
 
     let variants = match ffmpeg_result {
         Ok(v) => v,
         Err(e) => {
-            send_status_webhook(&state.config, &hash, "failed", None).await;
+            send_status_webhook(&state.config, &hash, "failed", None, Some(&video_info)).await;
             return Err(e);
         }
     };
@@ -296,20 +335,22 @@ async fn process_transcode(
     .await;
 
     if let Err(e) = upload_result {
-        send_status_webhook(&state.config, &hash, "failed", None).await;
+        send_status_webhook(&state.config, &hash, "failed", None, Some(&video_info)).await;
         return Err(e);
     }
 
     info!("Uploaded HLS files for {}", hash);
 
-    // Update status to complete (no size change - original file preserved)
-    send_status_webhook(&state.config, &hash, "complete", None).await;
+    // Update status to complete with video dimensions for the edge service
+    send_status_webhook(&state.config, &hash, "complete", None, Some(&video_info)).await;
 
     Ok(TranscodeResponse {
         hash: hash.clone(),
         status: "complete".to_string(),
         hls_master: format!("{}/hls/master.m3u8", hash),
         variants,
+        display_width: Some(video_info.display_width),
+        display_height: Some(video_info.display_height),
     })
 }
 
@@ -412,21 +453,152 @@ async fn upload_faststart_to_gcs(
     Ok(new_size)
 }
 
+/// Probe video file with ffprobe to get dimensions and rotation metadata
+async fn probe_video(input_path: &Path) -> Result<VideoInfo> {
+    let input_str = input_path.to_string_lossy();
+
+    let output = Command::new("ffprobe")
+        .args([
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_streams",
+            "-select_streams", "v:0",
+            &input_str,
+        ])
+        .output()
+        .await
+        .map_err(|e| anyhow!("Failed to run ffprobe: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("ffprobe failed: {}", stderr));
+    }
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| anyhow!("Failed to parse ffprobe output: {}", e))?;
+
+    let stream = json["streams"]
+        .as_array()
+        .and_then(|s| s.first())
+        .ok_or_else(|| anyhow!("No video stream found"))?;
+
+    let width = stream["width"].as_u64().unwrap_or(0) as u32;
+    let height = stream["height"].as_u64().unwrap_or(0) as u32;
+
+    if width == 0 || height == 0 {
+        return Err(anyhow!("Could not determine video dimensions: {}x{}", width, height));
+    }
+
+    // Check rotation from tags (older FFmpeg / older files)
+    let mut rotation: i32 = stream["tags"]["rotate"]
+        .as_str()
+        .and_then(|r| r.parse().ok())
+        .unwrap_or(0);
+
+    // Check side_data_list for Display Matrix rotation (newer FFmpeg)
+    if rotation == 0 {
+        if let Some(side_data) = stream["side_data_list"].as_array() {
+            for sd in side_data {
+                if sd["side_data_type"].as_str() == Some("Display Matrix") {
+                    // rotation can be a number or string in ffprobe output
+                    if let Some(r) = sd["rotation"].as_f64() {
+                        rotation = r.round() as i32;
+                    } else if let Some(r) = sd["rotation"].as_str().and_then(|s| s.parse::<f64>().ok()) {
+                        rotation = r.round() as i32;
+                    }
+                }
+            }
+        }
+    }
+
+    let rotation_abs = rotation.unsigned_abs();
+    // Normalize to 0, 90, 180, 270
+    let rotation_abs = match rotation_abs % 360 {
+        r @ (0 | 90 | 180 | 270) => r,
+        r if r > 315 || r < 45 => 0,
+        r if r >= 45 && r < 135 => 90,
+        r if r >= 135 && r < 225 => 180,
+        _ => 270,
+    };
+
+    // Compute display dimensions (after applying rotation)
+    let (display_width, display_height) = if rotation_abs == 90 || rotation_abs == 270 {
+        (height, width)
+    } else {
+        (width, height)
+    };
+
+    info!(
+        "Video probe: raw={}x{}, rotation={}, display={}x{}",
+        width, height, rotation_abs, display_width, display_height
+    );
+
+    Ok(VideoInfo {
+        width,
+        height,
+        rotation: rotation_abs,
+        display_width,
+        display_height,
+    })
+}
+
+/// Compute target scale dimensions that fit within a bounding box while preserving aspect ratio.
+/// Returns (target_width, target_height) with both values even (required by h264).
+fn compute_scale_dimensions(display_width: u32, display_height: u32, max_long: u32, max_short: u32) -> (u32, u32) {
+    let is_portrait = display_height > display_width;
+
+    let (max_w, max_h) = if is_portrait {
+        (max_short, max_long)
+    } else {
+        (max_long, max_short)
+    };
+
+    // Scale to fit within max_w x max_h while maintaining aspect ratio
+    let scale_w = max_w as f64 / display_width as f64;
+    let scale_h = max_h as f64 / display_height as f64;
+    let scale = scale_w.min(scale_h).min(1.0); // Don't upscale
+
+    // Round to even numbers (h264 requirement)
+    let target_w = (((display_width as f64 * scale).round() as u32) + 1) & !1;
+    let target_h = (((display_height as f64 * scale).round() as u32) + 1) & !1;
+
+    (target_w.max(2), target_h.max(2))
+}
+
 async fn run_ffmpeg_hls(
     input_path: &Path,
     output_dir: &Path,
     use_gpu: bool,
+    video_info: &VideoInfo,
 ) -> Result<Vec<HlsVariant>> {
     let input_str = input_path.to_string_lossy();
     let output_pattern = output_dir.join("stream_%v.m3u8");
     let master_playlist = output_dir.join("master.m3u8");
 
-    // Build FFmpeg command based on GPU availability
+    // Compute orientation-aware target dimensions
+    let (w_720, h_720) = compute_scale_dimensions(video_info.display_width, video_info.display_height, 1280, 720);
+    let (w_480, h_480) = compute_scale_dimensions(video_info.display_width, video_info.display_height, 854, 480);
+    let has_rotation = video_info.rotation == 90 || video_info.rotation == 270;
+
+    info!(
+        "Scale targets: 720p={}x{}, 480p={}x{}, has_rotation={}",
+        w_720, h_720, w_480, h_480, has_rotation
+    );
+
+    // GPU path cannot handle rotation (scale_cuda doesn't auto-rotate),
+    // so fall back to CPU when rotation metadata is present
+    let effective_gpu = use_gpu && !has_rotation;
+
+    if has_rotation && use_gpu {
+        warn!("Video has {}° rotation - falling back to CPU encoding for correct orientation", video_info.rotation);
+    }
+
+    // Build FFmpeg command
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-y"); // Overwrite output
 
-    if use_gpu {
-        // GPU-accelerated encoding with NVENC
+    if effective_gpu {
+        // GPU-accelerated decoding with NVENC
         // -hwaccel cuda: Use CUDA for decoding
         // -hwaccel_output_format cuda: Keep frames in GPU memory
         cmd.args(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]);
@@ -440,19 +612,42 @@ async fn run_ffmpeg_hls(
         "-map", "0:v:0", "-map", "0:a:0?", // 480p with audio (audio optional)
     ]);
 
-    if use_gpu {
-        // GPU encoding with scale_cuda for in-GPU scaling
+    // Build scale filter strings with computed dimensions.
+    // For CPU path, use -2 for the non-constraining dimension so FFmpeg auto-computes
+    // the exact value to preserve aspect ratio (rounded to even).
+    // For GPU path (scale_cuda), we must specify both dimensions explicitly since
+    // scale_cuda doesn't support -2.
+    let is_portrait = video_info.display_height > video_info.display_width;
+
+    let scale_720 = if effective_gpu {
+        format!("scale_cuda={}:{}:interp_algo=lanczos", w_720, h_720)
+    } else if is_portrait {
+        // Portrait: constrain height to h_720, auto-compute width
+        format!("scale=-2:{}", h_720)
+    } else {
+        // Landscape: constrain width to w_720, auto-compute height
+        format!("scale={}:-2", w_720)
+    };
+    let scale_480 = if effective_gpu {
+        format!("scale_cuda={}:{}:interp_algo=lanczos", w_480, h_480)
+    } else if is_portrait {
+        format!("scale=-2:{}", h_480)
+    } else {
+        format!("scale={}:-2", w_480)
+    };
+
+    if effective_gpu {
         cmd.args([
             // 720p variant
-            "-filter:v:0", "scale_cuda=1280:720:interp_algo=lanczos",
+            "-filter:v:0", &scale_720,
             "-c:v:0", "h264_nvenc",
-            "-profile:v:0", "main",  // main profile for better compatibility
+            "-profile:v:0", "main",
             "-level:v:0", "3.1",
             "-cq:v:0", "23",
             "-maxrate:v:0", "2500k",
             "-bufsize:v:0", "5000k",
             // 480p variant
-            "-filter:v:1", "scale_cuda=854:480:interp_algo=lanczos",
+            "-filter:v:1", &scale_480,
             "-c:v:1", "h264_nvenc",
             "-profile:v:1", "main",
             "-level:v:1", "3.0",
@@ -461,10 +656,10 @@ async fn run_ffmpeg_hls(
             "-bufsize:v:1", "2000k",
         ]);
     } else {
-        // CPU encoding fallback with libx264
+        // CPU encoding with libx264 (also used as fallback for rotated videos)
         cmd.args([
             // 720p variant
-            "-filter:v:0", "scale=1280:720",
+            "-filter:v:0", &scale_720,
             "-c:v:0", "libx264",
             "-profile:v:0", "main",
             "-level:v:0", "3.1",
@@ -473,7 +668,7 @@ async fn run_ffmpeg_hls(
             "-bufsize:v:0", "5000k",
             "-preset:v:0", "fast",
             // 480p variant
-            "-filter:v:1", "scale=854:480",
+            "-filter:v:1", &scale_480,
             "-c:v:1", "libx264",
             "-profile:v:1", "main",
             "-level:v:1", "3.0",
@@ -589,7 +784,13 @@ async fn upload_hls_to_gcs(
 
 /// Send transcode status update to the Fastly edge webhook
 /// This is fire-and-forget - failures are logged but don't fail the transcode
-async fn send_status_webhook(config: &Config, hash: &str, status: &str, new_size: Option<u64>) {
+async fn send_status_webhook(
+    config: &Config,
+    hash: &str,
+    status: &str,
+    new_size: Option<u64>,
+    video_info: Option<&VideoInfo>,
+) {
     let webhook_url = match &config.webhook_url {
         Some(url) => url,
         None => {
@@ -608,6 +809,16 @@ async fn send_status_webhook(config: &Config, hash: &str, status: &str, new_size
     if let Some(size) = new_size {
         payload["new_size"] = serde_json::json!(size);
         info!("Including new_size {} in webhook for {}", size, hash);
+    }
+
+    // Include display dimensions so the edge can store them for the `dim` tag
+    if let Some(info) = video_info {
+        payload["display_width"] = serde_json::json!(info.display_width);
+        payload["display_height"] = serde_json::json!(info.display_height);
+        info!(
+            "Including dimensions {}x{} in webhook for {}",
+            info.display_width, info.display_height, hash
+        );
     }
 
     let mut request = client.post(webhook_url).json(&payload);
