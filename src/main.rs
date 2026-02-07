@@ -1,6 +1,7 @@
 // ABOUTME: Main entry point for Fastly Blossom server
 // ABOUTME: Routes requests to appropriate handlers for BUD-01 and BUD-02
 
+mod admin;
 mod auth;
 mod blossom;
 mod error;
@@ -14,8 +15,10 @@ use crate::blossom::{
 };
 use crate::error::{BlossomError, Result};
 use crate::metadata::{
-    add_to_user_list, check_ownership, delete_blob_metadata, get_blob_metadata,
-    list_blobs_with_metadata, put_blob_metadata, remove_from_user_list, update_blob_status,
+    add_to_recent_index, add_to_user_index, add_to_user_list, check_ownership,
+    delete_blob_metadata, get_blob_metadata, list_blobs_with_metadata, put_blob_metadata,
+    remove_from_recent_index, remove_from_user_list, update_blob_status, update_stats_on_add,
+    update_stats_on_remove,
 };
 use crate::storage::{blob_exists, current_timestamp, delete_blob as storage_delete, download_blob_with_fallback, download_thumbnail, trigger_background_migration, upload_blob};
 
@@ -59,6 +62,10 @@ fn handle_request(req: Request) -> Result<Response> {
         (Method::GET, p) if p.contains("/hls/") => handle_get_hls_content(req, p),
         (Method::HEAD, p) if p.contains("/hls/") => handle_head_hls_content(p),
 
+        // Direct quality variant access: /{sha256}/720p, /{sha256}/480p
+        (Method::GET, p) if is_quality_variant_path(p) => handle_get_quality_variant(req, p),
+        (Method::HEAD, p) if is_quality_variant_path(p) => handle_head_quality_variant(p),
+
         // BUD-01: Blob retrieval
         (Method::GET, p) if is_hash_path(p) => handle_get_blob(req, p),
         (Method::HEAD, p) if is_hash_path(p) => handle_head_blob(p),
@@ -86,6 +93,28 @@ fn handle_request(req: Request) -> Result<Response> {
         // Admin: Transcode status webhook from divine-transcoder service
         (Method::POST, "/admin/transcode-status") => handle_transcode_status(req),
 
+        // Admin: OAuth login
+        (Method::POST, "/admin/auth/google") => admin::handle_google_auth(req),
+        (Method::GET, "/admin/auth/github") => admin::handle_github_auth_redirect(req),
+        (Method::GET, p) if p.starts_with("/admin/auth/github/callback") => admin::handle_github_callback(req),
+        (Method::POST, "/admin/logout") => admin::handle_logout(req),
+
+        // Admin Dashboard
+        (Method::GET, "/admin") => admin::handle_admin_dashboard(req),
+        (Method::GET, "/admin/api/stats") => admin::handle_admin_stats(req),
+        (Method::GET, "/admin/api/recent") => admin::handle_admin_recent(req),
+        (Method::GET, "/admin/api/users") => admin::handle_admin_users(req),
+        (Method::GET, p) if p.starts_with("/admin/api/user/") => {
+            let pubkey = p.strip_prefix("/admin/api/user/").unwrap_or("");
+            admin::handle_admin_user_blobs(req, pubkey)
+        }
+        (Method::GET, p) if p.starts_with("/admin/api/blob/") => {
+            let hash = p.strip_prefix("/admin/api/blob/").unwrap_or("");
+            admin::handle_admin_blob_detail(req, hash)
+        }
+        (Method::POST, "/admin/api/moderate") => admin::handle_admin_moderate_action(req),
+        (Method::POST, "/admin/api/backfill") => admin::handle_admin_backfill(req),
+
         // CORS preflight
         (Method::OPTIONS, _) => Ok(cors_preflight_response()),
 
@@ -98,6 +127,25 @@ fn handle_request(req: Request) -> Result<Response> {
 fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
     // Check if this is a thumbnail request ({hash}.jpg)
     if let Some(thumbnail_key) = parse_thumbnail_path(path) {
+        let video_hash = thumbnail_key.trim_end_matches(".jpg");
+
+        // Check parent video's moderation status - thumbnails inherit video access rules
+        if let Ok(Some(meta)) = get_blob_metadata(video_hash) {
+            if meta.status == BlobStatus::Banned {
+                return Err(BlossomError::NotFound("Blob not found".into()));
+            }
+            if meta.status == BlobStatus::Restricted {
+                // Check if requester is owner
+                if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
+                    if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
+                        return Err(BlossomError::NotFound("Blob not found".into()));
+                    }
+                } else {
+                    return Err(BlossomError::NotFound("Blob not found".into()));
+                }
+            }
+        }
+
         // Try to download existing thumbnail from GCS
         match download_thumbnail(&thumbnail_key) {
             Ok(mut resp) => {
@@ -108,8 +156,7 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
             }
             Err(BlossomError::NotFound(_)) => {
                 // Thumbnail doesn't exist, generate on-demand via Cloud Run
-                let hash = thumbnail_key.trim_end_matches(".jpg");
-                match generate_thumbnail_on_demand(hash) {
+                match generate_thumbnail_on_demand(video_hash) {
                     Ok(mut resp) => {
                         resp.set_header("Content-Type", "image/jpeg");
                         resp.set_header("Accept-Ranges", "bytes");
@@ -397,27 +444,97 @@ fn handle_get_hls_content(_req: Request, path: &str) -> Result<Response> {
     if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(BlossomError::BadRequest("Invalid hash in path".into()));
     }
+    let hash = hash.to_lowercase();
 
     // Construct GCS path
-    let gcs_path = format!("{}/hls/{}", hash.to_lowercase(), filename);
+    let gcs_path = format!("{}/hls/{}", hash, filename);
 
-    // Download from GCS
-    let mut resp = download_hls_content(&gcs_path)?;
+    // Try to download from GCS first
+    match download_hls_content(&gcs_path) {
+        Ok(mut resp) => {
+            // Set content type based on file extension
+            let content_type = if filename.ends_with(".m3u8") {
+                "application/vnd.apple.mpegurl"
+            } else if filename.ends_with(".ts") {
+                "video/mp2t"
+            } else {
+                "application/octet-stream"
+            };
 
-    // Set content type based on file extension
-    let content_type = if filename.ends_with(".m3u8") {
-        "application/vnd.apple.mpegurl"
-    } else if filename.ends_with(".ts") {
-        "video/mp2t"
-    } else {
-        "application/octet-stream"
-    };
+            resp.set_header("Content-Type", content_type);
+            resp.set_header("Cache-Control", "public, max-age=31536000"); // Immutable for VOD
+            add_cors_headers(&mut resp);
+            Ok(resp)
+        }
+        Err(BlossomError::NotFound(_)) if filename == "master.m3u8" => {
+            // HLS not found - check metadata and trigger on-demand transcoding
+            let metadata = get_blob_metadata(&hash)?;
 
-    resp.set_header("Content-Type", content_type);
-    resp.set_header("Cache-Control", "public, max-age=31536000"); // Immutable for VOD
-    add_cors_headers(&mut resp);
+            if let Some(ref meta) = metadata {
+                // Handle banned content
+                if meta.status == BlobStatus::Banned {
+                    return Err(BlossomError::NotFound("Content not found".into()));
+                }
 
-    Ok(resp)
+                match meta.transcode_status {
+                    Some(TranscodeStatus::Complete) => {
+                        // Metadata says complete but file not in GCS - re-trigger
+                        eprintln!("[HLS] master.m3u8 not found in GCS for {} despite Complete status, re-triggering", hash);
+                        use crate::metadata::update_transcode_status;
+                        let _ = update_transcode_status(&hash, TranscodeStatus::Processing);
+                        let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
+
+                        let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                        resp.set_header("Retry-After", "10");
+                        resp.set_header("Content-Type", "application/json");
+                        resp.set_body(r#"{"status":"processing","message":"HLS transcoding re-triggered, please retry"}"#);
+                        add_cors_headers(&mut resp);
+                        Ok(resp)
+                    }
+                    Some(TranscodeStatus::Processing) => {
+                        let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                        resp.set_header("Retry-After", "5");
+                        resp.set_header("Content-Type", "application/json");
+                        resp.set_body(r#"{"status":"processing","message":"HLS transcoding in progress"}"#);
+                        add_cors_headers(&mut resp);
+                        Ok(resp)
+                    }
+                    Some(TranscodeStatus::Failed) => {
+                        // Failed previously - re-trigger
+                        eprintln!("[HLS] Re-triggering failed transcode for {}", hash);
+                        use crate::metadata::update_transcode_status;
+                        let _ = update_transcode_status(&hash, TranscodeStatus::Processing);
+                        let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
+
+                        let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                        resp.set_header("Retry-After", "10");
+                        resp.set_header("Content-Type", "application/json");
+                        resp.set_body(r#"{"status":"processing","message":"HLS transcoding re-started, please retry"}"#);
+                        add_cors_headers(&mut resp);
+                        Ok(resp)
+                    }
+                    Some(TranscodeStatus::Pending) | None => {
+                        // Not yet started - trigger on-demand transcoding
+                        use crate::metadata::update_transcode_status;
+                        if let Err(e) = update_transcode_status(&hash, TranscodeStatus::Processing) {
+                            eprintln!("[HLS] Failed to update transcode status: {}", e);
+                        }
+                        let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
+
+                        let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                        resp.set_header("Retry-After", "10");
+                        resp.set_header("Content-Type", "application/json");
+                        resp.set_body(r#"{"status":"processing","message":"HLS transcoding started, please retry in 10 seconds"}"#);
+                        add_cors_headers(&mut resp);
+                        Ok(resp)
+                    }
+                }
+            } else {
+                Err(BlossomError::NotFound("Content not found".into()))
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// HEAD /<sha256>/hls/* - Check HLS content existence
@@ -463,6 +580,128 @@ fn handle_head_hls_content(path: &str) -> Result<Response> {
 fn download_hls_content(gcs_path: &str) -> Result<Response> {
     use crate::storage::download_hls_from_gcs;
     download_hls_from_gcs(gcs_path)
+}
+
+/// Valid quality variant suffixes
+const QUALITY_VARIANTS: &[(&str, &str)] = &[
+    ("/720p", "stream_720p.ts"),
+    ("/480p", "stream_480p.ts"),
+];
+
+/// Check if a path is a quality variant request like /{hash}/720p
+fn is_quality_variant_path(path: &str) -> bool {
+    let path = path.trim_start_matches('/');
+    for (suffix, _) in QUALITY_VARIANTS {
+        let suffix = suffix.trim_start_matches('/');
+        if path.ends_with(suffix) {
+            let hash_part = &path[..path.len() - suffix.len() - 1]; // -1 for the /
+            if hash_part.len() == 64 && hash_part.chars().all(|c| c.is_ascii_hexdigit()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Parse quality variant path into (hash, ts_filename)
+fn parse_quality_variant_path(path: &str) -> Option<(String, &'static str)> {
+    let path = path.trim_start_matches('/');
+    for (suffix, ts_file) in QUALITY_VARIANTS {
+        let suffix = suffix.trim_start_matches('/');
+        if path.ends_with(suffix) {
+            let hash_part = &path[..path.len() - suffix.len() - 1];
+            if hash_part.len() == 64 && hash_part.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Some((hash_part.to_lowercase(), ts_file));
+            }
+        }
+    }
+    None
+}
+
+/// GET /<sha256>/720p or /<sha256>/480p - Direct access to transcoded quality variant
+fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
+    let (hash, ts_filename) = parse_quality_variant_path(path)
+        .ok_or_else(|| BlossomError::BadRequest("Invalid quality variant path".into()))?;
+
+    // Check metadata for access control
+    let metadata = get_blob_metadata(&hash)?;
+    if let Some(ref meta) = metadata {
+        if meta.status == BlobStatus::Banned {
+            return Err(BlossomError::NotFound("Content not found".into()));
+        }
+        if meta.status == BlobStatus::Restricted {
+            if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
+                if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
+                    return Err(BlossomError::NotFound("Content not found".into()));
+                }
+            } else {
+                return Err(BlossomError::NotFound("Content not found".into()));
+            }
+        }
+    } else {
+        return Err(BlossomError::NotFound("Content not found".into()));
+    }
+
+    let meta = metadata.as_ref().unwrap();
+    let gcs_path = format!("{}/hls/{}", hash, ts_filename);
+
+    match download_hls_content(&gcs_path) {
+        Ok(mut resp) => {
+            resp.set_header("Content-Type", "video/mp2t");
+            resp.set_header("Cache-Control", "public, max-age=31536000");
+            resp.set_header("Accept-Ranges", "bytes");
+            add_cors_headers(&mut resp);
+            Ok(resp)
+        }
+        Err(BlossomError::NotFound(_)) => {
+            // HLS not ready - trigger on-demand transcoding
+            match meta.transcode_status {
+                Some(TranscodeStatus::Processing) => {
+                    let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                    resp.set_header("Retry-After", "5");
+                    resp.set_header("Content-Type", "application/json");
+                    resp.set_body(r#"{"status":"processing","message":"Video is being transcoded, please retry"}"#);
+                    add_cors_headers(&mut resp);
+                    Ok(resp)
+                }
+                Some(TranscodeStatus::Complete) | Some(TranscodeStatus::Failed) | Some(TranscodeStatus::Pending) | None => {
+                    use crate::metadata::update_transcode_status;
+                    let _ = update_transcode_status(&hash, TranscodeStatus::Processing);
+                    let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
+
+                    let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                    resp.set_header("Retry-After", "10");
+                    resp.set_header("Content-Type", "application/json");
+                    resp.set_body(r#"{"status":"processing","message":"Transcoding started, please retry in 10 seconds"}"#);
+                    add_cors_headers(&mut resp);
+                    Ok(resp)
+                }
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// HEAD /<sha256>/720p or /<sha256>/480p
+fn handle_head_quality_variant(path: &str) -> Result<Response> {
+    let (hash, ts_filename) = parse_quality_variant_path(path)
+        .ok_or_else(|| BlossomError::BadRequest("Invalid quality variant path".into()))?;
+
+    let metadata = get_blob_metadata(&hash)?
+        .ok_or_else(|| BlossomError::NotFound("Content not found".into()))?;
+
+    if metadata.status == BlobStatus::Banned || metadata.status == BlobStatus::Restricted {
+        return Err(BlossomError::NotFound("Content not found".into()));
+    }
+
+    let gcs_path = format!("{}/hls/{}", hash, ts_filename);
+    download_hls_content(&gcs_path)?;
+
+    let mut resp = Response::from_status(StatusCode::OK);
+    resp.set_header("Content-Type", "video/mp2t");
+    resp.set_header("Accept-Ranges", "bytes");
+    add_cors_headers(&mut resp);
+    Ok(resp)
 }
 
 /// Maximum size for in-process upload (500KB) - larger files proxy to Cloud Run
@@ -607,12 +846,23 @@ fn handle_upload(mut req: Request) -> Result<Response> {
         } else {
             None
         },
+        dim: None, // Set by transcoder webhook when transcoding completes
     };
 
     put_blob_metadata(&metadata)?;
 
     // Add to user's list
     add_to_user_list(&auth.pubkey, &hash)?;
+
+    // Update admin indices (best effort - don't fail upload if these fail)
+    let _ = update_stats_on_add(&metadata);
+    let _ = add_to_recent_index(&hash);
+    // Add user to index if new, increment unique_uploaders count
+    if let Ok(is_new) = add_to_user_index(&auth.pubkey) {
+        if is_new {
+            let _ = crate::metadata::increment_unique_uploaders();
+        }
+    }
 
     // Return blob descriptor
     let descriptor = metadata.to_descriptor(&base_url);
@@ -690,8 +940,18 @@ fn handle_cloud_run_proxy(
         .as_str()
         .map(|s| s.to_string());
 
+    // Parse video dimensions if present (from ffprobe in upload service)
+    let dim = cloud_run_resp["dim"]
+        .as_str()
+        .map(|s| s.to_string());
+
     // Check if metadata already exists (dedupe case)
-    if let Some(metadata) = get_blob_metadata(&hash)? {
+    if let Some(mut metadata) = get_blob_metadata(&hash)? {
+        // Even for dedupe, update dim if we got it and it wasn't set before
+        if dim.is_some() && metadata.dim.is_none() {
+            metadata.dim = dim;
+            let _ = put_blob_metadata(&metadata);
+        }
         let descriptor = metadata.to_descriptor(&base_url);
         let mut resp = json_response(StatusCode::OK, &descriptor);
         add_cors_headers(&mut resp);
@@ -714,12 +974,23 @@ fn handle_cloud_run_proxy(
         } else {
             None
         },
+        dim: dim.clone(), // From ffprobe in upload service; updated by transcoder webhook
     };
 
     put_blob_metadata(&metadata)?;
 
     // Add to user's list
     add_to_user_list(&auth.pubkey, &hash)?;
+
+    // Update admin indices (best effort - don't fail upload if these fail)
+    let _ = update_stats_on_add(&metadata);
+    let _ = add_to_recent_index(&hash);
+    // Add user to index if new, increment unique_uploaders count
+    if let Ok(is_new) = add_to_user_index(&auth.pubkey) {
+        if is_new {
+            let _ = crate::metadata::increment_unique_uploaders();
+        }
+    }
 
     // Return blob descriptor with Fastly's CDN URL
     let descriptor = metadata.to_descriptor(&base_url);
@@ -825,6 +1096,9 @@ fn handle_delete(req: Request, path: &str) -> Result<Response> {
         ));
     }
 
+    // Get metadata before deletion for stats update
+    let metadata = get_blob_metadata(&hash)?;
+
     // Delete from B2
     storage_delete(&hash)?;
 
@@ -833,6 +1107,12 @@ fn handle_delete(req: Request, path: &str) -> Result<Response> {
 
     // Remove from user's list
     remove_from_user_list(&auth.pubkey, &hash)?;
+
+    // Update admin indices (best effort)
+    if let Some(meta) = metadata {
+        let _ = update_stats_on_remove(&meta);
+    }
+    let _ = remove_from_recent_index(&hash);
 
     let mut resp = Response::from_status(StatusCode::OK);
     add_cors_headers(&mut resp);
@@ -1075,10 +1355,21 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
         } else {
             None
         },
+        dim: None, // Set by transcoder webhook when transcoding completes
     };
 
     put_blob_metadata(&metadata)?;
     add_to_user_list(&auth.pubkey, &hash)?;
+
+    // Update admin indices (best effort - don't fail mirror if these fail)
+    let _ = update_stats_on_add(&metadata);
+    let _ = add_to_recent_index(&hash);
+    // Add user to index if new, increment unique_uploaders count
+    if let Ok(is_new) = add_to_user_index(&auth.pubkey) {
+        if is_new {
+            let _ = crate::metadata::increment_unique_uploaders();
+        }
+    }
 
     // Return blob descriptor per BUD-04
     let descriptor = metadata.to_descriptor(&base_url);
@@ -1247,9 +1538,17 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
     // Optional new_size field - provided when faststart optimization replaces the original file
     let new_size = payload["new_size"].as_u64();
 
+    // Optional display dimensions from transcoder's ffprobe
+    let display_width = payload["display_width"].as_u64().map(|v| v as u32);
+    let display_height = payload["display_height"].as_u64().map(|v| v as u32);
+    let dim = match (display_width, display_height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => Some(format!("{}x{}", w, h)),
+        _ => None,
+    };
+
     eprintln!(
-        "[TRANSCODE] Status webhook: sha256={}, status={}, new_size={:?}",
-        sha256, status_str, new_size
+        "[TRANSCODE] Status webhook: sha256={}, status={}, new_size={:?}, dim={:?}",
+        sha256, status_str, new_size, dim
     );
 
     // Validate sha256 format
@@ -1271,11 +1570,16 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
         }
     };
 
-    // Update transcode status (and optionally file size if provided)
+    // Update transcode status (and optionally file size and dimensions if provided)
     use crate::metadata::update_transcode_status_with_size;
-    match update_transcode_status_with_size(sha256, new_status, new_size) {
+    match update_transcode_status_with_size(sha256, new_status, new_size, dim.clone()) {
         Ok(()) => {
-            if let Some(size) = new_size {
+            if let Some(ref d) = dim {
+                eprintln!(
+                    "[TRANSCODE] Updated blob {} to transcode status {:?} with dim {}",
+                    sha256, new_status, d
+                );
+            } else if let Some(size) = new_size {
                 eprintln!(
                     "[TRANSCODE] Updated blob {} to transcode status {:?} with new size {}",
                     sha256, new_status, size
@@ -1460,6 +1764,34 @@ fn handle_landing_page() -> Response {
                 </div>
             </div>
             <div class="endpoint">
+                <span class="method method-get">GET</span>
+                <div class="endpoint-info">
+                    <span class="endpoint-path">/&lt;sha256&gt;.hls</span>
+                    <p class="endpoint-desc">Get HLS master manifest for adaptive streaming. Automatically triggers on-demand transcoding for videos that haven't been transcoded yet. Returns <code>202 Accepted</code> with <code>Retry-After</code> header while transcoding is in progress.</p>
+                </div>
+            </div>
+            <div class="endpoint">
+                <span class="method method-get">GET</span>
+                <div class="endpoint-info">
+                    <span class="endpoint-path">/&lt;sha256&gt;/hls/master.m3u8</span>
+                    <p class="endpoint-desc">Alternative HLS manifest URL for player compatibility. Same behavior as the <code>.hls</code> endpoint above.</p>
+                </div>
+            </div>
+            <div class="endpoint">
+                <span class="method method-get">GET</span>
+                <div class="endpoint-info">
+                    <span class="endpoint-path">/&lt;sha256&gt;/720p</span>
+                    <p class="endpoint-desc">Direct download of the 720p H.264 transcoded variant (2.5 Mbps). Triggers transcoding on-demand if not yet available.</p>
+                </div>
+            </div>
+            <div class="endpoint">
+                <span class="method method-get">GET</span>
+                <div class="endpoint-info">
+                    <span class="endpoint-path">/&lt;sha256&gt;/480p</span>
+                    <p class="endpoint-desc">Direct download of the 480p H.264 transcoded variant (1 Mbps). Triggers transcoding on-demand if not yet available.</p>
+                </div>
+            </div>
+            <div class="endpoint">
                 <span class="method method-head">HEAD</span>
                 <div class="endpoint-info">
                     <span class="endpoint-path">/&lt;sha256&gt;[.ext]</span>
@@ -1528,6 +1860,10 @@ fn handle_landing_page() -> Response {
                 <div class="feature">
                     <h3>Video Thumbnails</h3>
                     <p>Automatic JPEG thumbnail generation for uploaded videos, accessible at <code>/&lt;sha256&gt;.jpg</code>.</p>
+                </div>
+                <div class="feature">
+                    <h3>HLS Video Streaming</h3>
+                    <p>On-demand H.264 transcoding to 720p and 480p with HLS adaptive streaming. Direct quality access via <code>/&lt;sha256&gt;/720p</code> and <code>/&lt;sha256&gt;/480p</code>.</p>
                 </div>
                 <div class="feature">
                     <h3>GCS Storage</h3>
