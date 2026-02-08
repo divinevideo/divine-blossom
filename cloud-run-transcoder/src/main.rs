@@ -106,6 +106,8 @@ struct VideoInfo {
     display_width: u32,
     /// Visual height after applying rotation
     display_height: u32,
+    /// Whether the video has an audio stream
+    has_audio: bool,
 }
 
 #[derive(Serialize)]
@@ -294,13 +296,14 @@ async fn process_transcode(
         Ok(info) => info,
         Err(e) => {
             warn!("Failed to probe video, using default landscape dimensions: {}", e);
-            // Fallback: assume landscape 1920x1080 so old behavior is preserved
+            // Fallback: assume landscape 1920x1080 with audio so old behavior is preserved
             VideoInfo {
                 width: 1920,
                 height: 1080,
                 rotation: 0,
                 display_width: 1920,
                 display_height: 1080,
+                has_audio: true,
             }
         }
     };
@@ -528,9 +531,12 @@ async fn probe_video(input_path: &Path) -> Result<VideoInfo> {
         (width, height)
     };
 
+    // Check for audio streams with a second ffprobe call
+    let has_audio = check_has_audio(input_path).await;
+
     info!(
-        "Video probe: raw={}x{}, rotation={}, display={}x{}",
-        width, height, rotation_abs, display_width, display_height
+        "Video probe: raw={}x{}, rotation={}, display={}x{}, has_audio={}",
+        width, height, rotation_abs, display_width, display_height, has_audio
     );
 
     Ok(VideoInfo {
@@ -539,7 +545,37 @@ async fn probe_video(input_path: &Path) -> Result<VideoInfo> {
         rotation: rotation_abs,
         display_width,
         display_height,
+        has_audio,
     })
+}
+
+/// Check if the video file has an audio stream
+async fn check_has_audio(input_path: &Path) -> bool {
+    let input_str = input_path.to_string_lossy();
+    let output = Command::new("ffprobe")
+        .args([
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_streams",
+            "-select_streams", "a:0",
+            &input_str,
+        ])
+        .output()
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => {
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                json["streams"]
+                    .as_array()
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false)
+            } else {
+                true // assume audio exists if parse fails (safe default)
+            }
+        }
+        _ => true, // assume audio exists if probe fails (safe default)
+    }
 }
 
 /// Compute target scale dimensions that fit within a bounding box while preserving aspect ratio.
@@ -606,11 +642,18 @@ async fn run_ffmpeg_hls(
 
     cmd.args(["-i", &input_str]);
 
-    // Output mapping: create two video streams (720p, 480p) with audio
-    cmd.args([
-        "-map", "0:v:0", "-map", "0:a:0?", // 720p with audio (audio optional)
-        "-map", "0:v:0", "-map", "0:a:0?", // 480p with audio (audio optional)
-    ]);
+    // Output mapping: create two video streams (720p, 480p), with audio if present
+    if video_info.has_audio {
+        cmd.args([
+            "-map", "0:v:0", "-map", "0:a:0", // 720p with audio
+            "-map", "0:v:0", "-map", "0:a:0", // 480p with audio
+        ]);
+    } else {
+        cmd.args([
+            "-map", "0:v:0", // 720p video only
+            "-map", "0:v:0", // 480p video only
+        ]);
+    }
 
     // Build scale filter strings with computed dimensions.
     // For CPU path, use -2 for the non-constraining dimension so FFmpeg auto-computes
@@ -679,12 +722,14 @@ async fn run_ffmpeg_hls(
         ]);
     }
 
-    // Audio encoding (same for both)
-    cmd.args([
-        "-c:a", "aac",
-        "-b:a:0", "128k",
-        "-b:a:1", "96k",
-    ]);
+    // Audio encoding (only if audio stream exists)
+    if video_info.has_audio {
+        cmd.args([
+            "-c:a", "aac",
+            "-b:a:0", "128k",
+            "-b:a:1", "96k",
+        ]);
+    }
 
     // HLS output settings
     // -hls_time 10: 10 second segments (but for 6s clips, this means 1 segment)
@@ -692,13 +737,19 @@ async fn run_ffmpeg_hls(
     // -hls_flags single_file: Put all segments in single .ts file (efficient for short clips)
     // -master_pl_name: Name of master playlist
     // -var_stream_map: Map variants to output streams
+    let var_stream_map = if video_info.has_audio {
+        "v:0,a:0,name:720p v:1,a:1,name:480p"
+    } else {
+        "v:0,name:720p v:1,name:480p"
+    };
+
     cmd.args([
         "-f", "hls",
         "-hls_time", "10",
         "-hls_playlist_type", "vod",
         "-hls_flags", "single_file",
         "-master_pl_name", "master.m3u8",
-        "-var_stream_map", "v:0,a:0,name:720p v:1,a:1,name:480p",
+        "-var_stream_map", var_stream_map,
         &output_pattern.to_string_lossy(),
     ]);
 
