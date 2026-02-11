@@ -15,13 +15,15 @@ use google_cloud_storage::{
     http::objects::{
         download::Range as DownloadRange,
         get::GetObjectRequest,
+        patch::PatchObjectRequest,
         upload::{Media, UploadObjectRequest, UploadType},
+        Object,
     },
 };
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder;
 use serde::{Deserialize, Serialize};
-use std::{env, path::Path, sync::Arc};
+use std::{collections::HashMap, env, path::Path, sync::Arc};
 use tempfile::TempDir;
 use tokio::process::Command;
 use tower::Service;
@@ -115,6 +117,12 @@ struct HlsVariant {
     resolution: String,
     playlist: String,
     bandwidth: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SourceObjectMetadata {
+    content_type: Option<String>,
+    custom: HashMap<String, String>,
 }
 
 // Error response
@@ -291,6 +299,23 @@ async fn process_transcode(
 
     info!("Downloaded video to {:?}", input_path);
 
+    // Read source metadata once so HLS derivatives can preserve provenance.
+    let mut source_metadata =
+        match get_source_object_metadata(&state.gcs_client, &state.config.gcs_bucket, &hash).await
+        {
+            Ok(meta) => meta,
+            Err(e) => {
+                warn!("Failed to load source metadata for {}: {}", hash, e);
+                SourceObjectMetadata::default()
+            }
+        };
+    if let Some(owner) = request.owner.clone() {
+        source_metadata
+            .custom
+            .entry("owner".to_string())
+            .or_insert(owner);
+    }
+
     // Probe video to get dimensions and rotation metadata
     let video_info = match probe_video(&input_path).await {
         Ok(info) => info,
@@ -334,6 +359,7 @@ async fn process_transcode(
         &state.config.gcs_bucket,
         &hash,
         &output_dir,
+        &source_metadata,
     )
     .await;
 
@@ -787,6 +813,7 @@ async fn upload_hls_to_gcs(
     bucket: &str,
     hash: &str,
     hls_dir: &Path,
+    source_metadata: &SourceObjectMetadata,
 ) -> Result<()> {
     // Read directory and upload each file
     let mut entries = tokio::fs::read_dir(hls_dir).await?;
@@ -827,10 +854,54 @@ async fn upload_hls_to_gcs(
             .await
             .map_err(|e| anyhow!("Failed to upload {}: {}", gcs_path, e))?;
 
+        let mut derivative_metadata = source_metadata.custom.clone();
+        derivative_metadata.insert("source_sha256".to_string(), hash.to_string());
+        derivative_metadata.insert("derivative".to_string(), "hls".to_string());
+        derivative_metadata.insert("hls_filename".to_string(), filename.to_string());
+        if let Some(src_ct) = &source_metadata.content_type {
+            derivative_metadata
+                .entry("source_content_type".to_string())
+                .or_insert_with(|| src_ct.clone());
+        }
+
+        let patch_req = PatchObjectRequest {
+            bucket: bucket.to_string(),
+            object: gcs_path.clone(),
+            metadata: Some(Object {
+                metadata: Some(derivative_metadata),
+                cache_control: Some("public, max-age=31536000, immutable".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        if let Err(e) = client.patch_object(&patch_req).await {
+            warn!("Failed to patch metadata for {}: {}", gcs_path, e);
+        }
+
         info!("Uploaded {}", gcs_path);
     }
 
     Ok(())
+}
+
+async fn get_source_object_metadata(
+    client: &GcsClient,
+    bucket: &str,
+    hash: &str,
+) -> Result<SourceObjectMetadata> {
+    let obj = client
+        .get_object(&GetObjectRequest {
+            bucket: bucket.to_string(),
+            object: hash.to_string(),
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| anyhow!("Failed to read source object metadata: {}", e))?;
+
+    Ok(SourceObjectMetadata {
+        content_type: obj.content_type,
+        custom: obj.metadata.unwrap_or_default(),
+    })
 }
 
 /// Send transcode status update to the Fastly edge webhook

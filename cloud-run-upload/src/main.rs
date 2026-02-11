@@ -307,34 +307,41 @@ async fn stream_to_gcs_with_hash(
     body: Body,
     owner: &str,
 ) -> Result<(String, u64, Vec<u8>)> {
-    let mut all_bytes = Vec::new();
+    let mut original_bytes = Vec::new();
 
-    // Collect body stream first (hash after potential sanitization)
+    // Collect body stream first; original bytes remain the source of truth for hashing/storage.
     let mut stream = body.into_data_stream();
     while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.map_err(|e| anyhow!("Stream error: {}", e))?;
-        all_bytes.extend_from_slice(&chunk);
+        original_bytes.extend_from_slice(&chunk);
     }
 
-    // Sanitize video files: remux with ffmpeg to strip invalid MP4 atoms
-    // (e.g. invalid clap boxes from iPhone) and ensure faststart for web playback
+    // Keep original bytes immutable for hash/storage integrity.
+    // Derivative generation (thumbnail/probe/transcode) can use sanitized bytes.
+    let mut derivative_bytes = original_bytes.clone();
+
+    // Sanitize video bytes for derivative processing only.
     if thumbnail::is_video_type(content_type) {
-        match sanitize_video(&all_bytes).await {
+        match sanitize_video(&derivative_bytes).await {
             Ok(sanitized) => {
-                info!("Sanitized video: {} -> {} bytes", all_bytes.len(), sanitized.len());
-                all_bytes = sanitized;
+                info!(
+                    "Prepared sanitized derivative bytes: {} -> {} bytes",
+                    derivative_bytes.len(),
+                    sanitized.len()
+                );
+                derivative_bytes = sanitized;
             }
             Err(e) => {
-                // Non-fatal: use original bytes if sanitization fails
-                error!("Video sanitization failed, using original: {}", e);
+                // Non-fatal: keep original bytes for derivative processing if sanitization fails
+                error!("Video sanitization failed for derivatives, using original: {}", e);
             }
         }
     }
 
-    // Hash the (possibly sanitized) bytes
+    // Hash and store the original uploaded bytes.
     let mut hasher = Sha256::new();
-    hasher.update(&all_bytes);
-    let total_size = all_bytes.len() as u64;
+    hasher.update(&original_bytes);
+    let total_size = original_bytes.len() as u64;
     let sha256_hash = hex::encode(hasher.finalize());
 
     // Check if blob already exists
@@ -349,7 +356,7 @@ async fn stream_to_gcs_with_hash(
 
     if exists {
         info!("Blob {} already exists, skipping upload", sha256_hash);
-        return Ok((sha256_hash, total_size, all_bytes));
+        return Ok((sha256_hash, total_size, derivative_bytes));
     }
 
     // Upload to GCS
@@ -360,7 +367,7 @@ async fn stream_to_gcs_with_hash(
     };
 
     client
-        .upload_object(&req, Bytes::from(all_bytes.clone()), &upload_type)
+        .upload_object(&req, Bytes::from(original_bytes.clone()), &upload_type)
         .await
         .map_err(|e| anyhow!("GCS upload failed: {}", e))?;
 
@@ -381,7 +388,7 @@ async fn stream_to_gcs_with_hash(
     let _ = client.patch_object(&update_req).await;
 
     info!("Uploaded {} bytes as {} (owner: {})", total_size, sha256_hash, owner);
-    Ok((sha256_hash, total_size, all_bytes))
+    Ok((sha256_hash, total_size, derivative_bytes))
 }
 
 /// Extract thumbnail from video and upload to GCS

@@ -205,6 +205,14 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
     let result = download_blob_with_fallback(&hash, range.as_deref())?;
     let mut resp = result.response;
 
+    // Surface provenance metadata if present on the origin object.
+    let c2pa_manifest_id = resp
+        .get_header_str("x-goog-meta-c2pa-manifest-id")
+        .map(|s| s.to_string());
+    let source_sha256 = resp
+        .get_header_str("x-goog-meta-source-sha256")
+        .map(|s| s.to_string());
+
     // Add CORS headers
     add_cors_headers(&mut resp);
 
@@ -242,6 +250,13 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
             }
         }
         resp.set_header("X-Sha256", &hash);
+    }
+
+    if let Some(c2pa) = c2pa_manifest_id {
+        resp.set_header("X-C2PA-Manifest-Id", &c2pa);
+    }
+    if let Some(source_hash) = source_sha256 {
+        resp.set_header("X-Source-Sha256", &source_hash);
     }
 
     // Add header indicating the source (useful for debugging/monitoring)
@@ -378,9 +393,23 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
     let result = download_hls_content(&gcs_path)?;
     let mut resp = result;
 
+    let c2pa_manifest_id = resp
+        .get_header_str("x-goog-meta-c2pa-manifest-id")
+        .map(|s| s.to_string());
+    let source_sha256 = resp
+        .get_header_str("x-goog-meta-source-sha256")
+        .map(|s| s.to_string());
+
     // Set correct content type for HLS manifest
     resp.set_header("Content-Type", "application/vnd.apple.mpegurl");
     resp.set_header("Cache-Control", "public, max-age=31536000"); // HLS manifests are immutable for VOD
+    resp.set_header("X-Sha256", &hash);
+    if let Some(c2pa) = c2pa_manifest_id {
+        resp.set_header("X-C2PA-Manifest-Id", &c2pa);
+    }
+    if let Some(source_hash) = source_sha256 {
+        resp.set_header("X-Source-Sha256", &source_hash);
+    }
     add_cors_headers(&mut resp);
 
     Ok(resp)
@@ -413,6 +442,7 @@ fn handle_head_hls_master(path: &str) -> Result<Response> {
         Some(TranscodeStatus::Complete) => {
             let mut resp = Response::from_status(StatusCode::OK);
             resp.set_header("Content-Type", "application/vnd.apple.mpegurl");
+            resp.set_header("X-Sha256", &hash);
             add_cors_headers(&mut resp);
             Ok(resp)
         }
@@ -452,6 +482,13 @@ fn handle_get_hls_content(_req: Request, path: &str) -> Result<Response> {
     // Try to download from GCS first
     match download_hls_content(&gcs_path) {
         Ok(mut resp) => {
+            let c2pa_manifest_id = resp
+                .get_header_str("x-goog-meta-c2pa-manifest-id")
+                .map(|s| s.to_string());
+            let source_sha256 = resp
+                .get_header_str("x-goog-meta-source-sha256")
+                .map(|s| s.to_string());
+
             // Set content type based on file extension
             let content_type = if filename.ends_with(".m3u8") {
                 "application/vnd.apple.mpegurl"
@@ -463,6 +500,13 @@ fn handle_get_hls_content(_req: Request, path: &str) -> Result<Response> {
 
             resp.set_header("Content-Type", content_type);
             resp.set_header("Cache-Control", "public, max-age=31536000"); // Immutable for VOD
+            resp.set_header("X-Sha256", &hash);
+            if let Some(c2pa) = c2pa_manifest_id {
+                resp.set_header("X-C2PA-Manifest-Id", &c2pa);
+            }
+            if let Some(source_hash) = source_sha256 {
+                resp.set_header("X-Source-Sha256", &source_hash);
+            }
             add_cors_headers(&mut resp);
             Ok(resp)
         }
@@ -571,6 +615,7 @@ fn handle_head_hls_content(path: &str) -> Result<Response> {
 
     let mut resp = Response::from_status(StatusCode::OK);
     resp.set_header("Content-Type", content_type);
+    resp.set_header("X-Sha256", hash.to_lowercase());
     add_cors_headers(&mut resp);
 
     Ok(resp)
@@ -1920,7 +1965,10 @@ fn add_cors_headers(resp: &mut Response) {
     resp.set_header("Access-Control-Allow-Origin", "*");
     resp.set_header("Access-Control-Allow-Methods", "GET, HEAD, PUT, DELETE, OPTIONS");
     resp.set_header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Sha256");
-    resp.set_header("Access-Control-Expose-Headers", "X-Sha256, X-Content-Length");
+    resp.set_header(
+        "Access-Control-Expose-Headers",
+        "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256",
+    );
 }
 
 /// CORS preflight response
