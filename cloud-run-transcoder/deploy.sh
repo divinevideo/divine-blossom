@@ -26,7 +26,10 @@ gcloud run deploy "${SERVICE_NAME}" \
   --no-cpu-throttling \
   --set-env-vars "GCS_BUCKET=divine-blossom-media" \
   --set-env-vars "WEBHOOK_URL=https://media.divine.video/admin/transcode-status" \
-  --set-secrets "WEBHOOK_SECRET=webhook_secret:latest" \
+  --set-env-vars "TRANSCRIPT_WEBHOOK_URL=https://media.divine.video/admin/transcript-status" \
+  --set-env-vars "TRANSCRIPTION_API_URL=https://api.openai.com/v1/audio/transcriptions" \
+  --set-env-vars "TRANSCRIPTION_MODEL=whisper-1" \
+  --set-secrets "WEBHOOK_SECRET=webhook_secret:latest,TRANSCRIPTION_API_KEY=openai_api_key:latest" \
   --allow-unauthenticated
 
 echo "Done! Service URL:"

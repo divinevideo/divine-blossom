@@ -2,6 +2,7 @@
 // ABOUTME: Implements BUD-01 and BUD-02 data structures
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Blob descriptor returned by the server (BUD-02)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,6 +25,12 @@ pub struct BlobDescriptor {
     /// HLS manifest URL for videos (optional, present when transcoding complete)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hls: Option<String>,
+    /// Video dimensions as "WIDTHxHEIGHT" (display dimensions after rotation)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dim: Option<String>,
+    /// Transcript URL in WebVTT format (optional, present when transcription complete)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vtt: Option<String>,
 }
 
 /// Blob metadata stored in KV store
@@ -51,6 +58,12 @@ pub struct BlobMetadata {
     /// Transcode status for video HLS generation
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transcode_status: Option<TranscodeStatus>,
+    /// Video dimensions as "WIDTHxHEIGHT" (display dimensions after rotation)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dim: Option<String>,
+    /// Transcript status for audio/video transcription
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript_status: Option<TranscriptStatus>,
 }
 
 /// Moderation status for blobs
@@ -84,6 +97,26 @@ pub enum TranscodeStatus {
 impl Default for TranscodeStatus {
     fn default() -> Self {
         TranscodeStatus::Pending
+    }
+}
+
+/// Transcript status for audio/video blobs
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TranscriptStatus {
+    /// Transcription not yet started
+    Pending,
+    /// Transcription in progress
+    Processing,
+    /// Transcription completed successfully
+    Complete,
+    /// Transcription failed
+    Failed,
+}
+
+impl Default for TranscriptStatus {
+    fn default() -> Self {
+        TranscriptStatus::Pending
     }
 }
 
@@ -127,6 +160,53 @@ pub struct UploadRequirements {
     pub allowed_types: Option<Vec<String>>,
 }
 
+/// Subtitle job status returned by /v1/subtitles APIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SubtitleJobStatus {
+    Queued,
+    Processing,
+    Ready,
+    Failed,
+}
+
+/// Subtitle job metadata persisted in KV.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubtitleJob {
+    pub job_id: String,
+    pub video_sha256: String,
+    pub status: SubtitleJobStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_track_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cue_count: Option<u32>,
+    pub sha256: String,
+    pub attempt_count: u32,
+    pub max_attempts: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_retry_at_unix: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Request payload for creating subtitle jobs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubtitleJobCreateRequest {
+    pub video_sha256: String,
+    #[serde(default)]
+    pub lang: Option<String>,
+    #[serde(default)]
+    pub force: bool,
+}
+
 impl BlobMetadata {
     /// Convert to BlobDescriptor for API response
     pub fn to_descriptor(&self, base_url: &str) -> BlobDescriptor {
@@ -135,6 +215,13 @@ impl BlobMetadata {
             && self.transcode_status == Some(TranscodeStatus::Complete)
         {
             Some(format!("{}/{}.hls", base_url, self.sha256))
+        } else {
+            None
+        };
+        let vtt = if is_transcribable_mime_type(&self.mime_type)
+            && self.transcript_status == Some(TranscriptStatus::Complete)
+        {
+            Some(format!("{}/{}.vtt", base_url, self.sha256))
         } else {
             None
         };
@@ -147,6 +234,8 @@ impl BlobMetadata {
             uploaded: Some(self.uploaded.clone()),
             thumbnail: self.thumbnail.clone(),
             hls,
+            dim: self.dim.clone(),
+            vtt,
         }
     }
 }
@@ -215,6 +304,167 @@ impl BlossomAuthEvent {
     }
 }
 
+// ============================================================================
+// Admin Dashboard Data Structures
+// ============================================================================
+
+/// Global statistics for admin dashboard
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GlobalStats {
+    /// Total number of blobs
+    pub total_blobs: u64,
+    /// Total size of all blobs in bytes
+    pub total_size_bytes: u64,
+    /// Counts by blob status
+    pub status_counts: HashMap<String, u64>,
+    /// Counts by transcode status
+    pub transcode_counts: HashMap<String, u64>,
+    /// Counts by MIME type
+    pub mime_type_counts: HashMap<String, u64>,
+    /// Number of unique uploaders
+    pub unique_uploaders: u64,
+}
+
+impl GlobalStats {
+    /// Create a new empty stats object
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Increment stats for a new blob
+    pub fn add_blob(&mut self, metadata: &BlobMetadata) {
+        self.total_blobs += 1;
+        self.total_size_bytes += metadata.size;
+
+        let status_key = format!("{:?}", metadata.status).to_lowercase();
+        *self.status_counts.entry(status_key).or_insert(0) += 1;
+
+        if let Some(transcode) = &metadata.transcode_status {
+            let transcode_key = format!("{:?}", transcode).to_lowercase();
+            *self.transcode_counts.entry(transcode_key).or_insert(0) += 1;
+        }
+
+        *self
+            .mime_type_counts
+            .entry(metadata.mime_type.clone())
+            .or_insert(0) += 1;
+    }
+
+    /// Decrement stats when a blob is removed
+    pub fn remove_blob(&mut self, metadata: &BlobMetadata) {
+        self.total_blobs = self.total_blobs.saturating_sub(1);
+        self.total_size_bytes = self.total_size_bytes.saturating_sub(metadata.size);
+
+        let status_key = format!("{:?}", metadata.status).to_lowercase();
+        if let Some(count) = self.status_counts.get_mut(&status_key) {
+            *count = count.saturating_sub(1);
+        }
+
+        if let Some(transcode) = &metadata.transcode_status {
+            let transcode_key = format!("{:?}", transcode).to_lowercase();
+            if let Some(count) = self.transcode_counts.get_mut(&transcode_key) {
+                *count = count.saturating_sub(1);
+            }
+        }
+
+        if let Some(count) = self.mime_type_counts.get_mut(&metadata.mime_type) {
+            *count = count.saturating_sub(1);
+        }
+    }
+
+    /// Update status count when blob status changes
+    pub fn update_status(&mut self, old_status: BlobStatus, new_status: BlobStatus) {
+        let old_key = format!("{:?}", old_status).to_lowercase();
+        let new_key = format!("{:?}", new_status).to_lowercase();
+
+        if let Some(count) = self.status_counts.get_mut(&old_key) {
+            *count = count.saturating_sub(1);
+        }
+        *self.status_counts.entry(new_key).or_insert(0) += 1;
+    }
+
+    /// Update transcode count when transcode status changes
+    pub fn update_transcode(
+        &mut self,
+        old_status: Option<TranscodeStatus>,
+        new_status: TranscodeStatus,
+    ) {
+        if let Some(old) = old_status {
+            let old_key = format!("{:?}", old).to_lowercase();
+            if let Some(count) = self.transcode_counts.get_mut(&old_key) {
+                *count = count.saturating_sub(1);
+            }
+        }
+        let new_key = format!("{:?}", new_status).to_lowercase();
+        *self.transcode_counts.entry(new_key).or_insert(0) += 1;
+    }
+}
+
+/// Rolling list of recent uploads (max 200 hashes)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RecentIndex {
+    /// List of blob hashes, most recent first
+    pub hashes: Vec<String>,
+}
+
+impl RecentIndex {
+    /// Maximum number of recent uploads to track
+    pub const MAX_RECENT: usize = 200;
+
+    /// Create a new empty recent index
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a hash to the front of the list, maintaining max size
+    pub fn add(&mut self, hash: String) {
+        // Remove if already present to avoid duplicates
+        self.hashes.retain(|h| h != &hash);
+        // Add to front
+        self.hashes.insert(0, hash);
+        // Trim to max size
+        self.hashes.truncate(Self::MAX_RECENT);
+    }
+
+    /// Remove a hash from the list
+    pub fn remove(&mut self, hash: &str) {
+        self.hashes.retain(|h| h != hash);
+    }
+}
+
+/// Index of all uploaders' pubkeys
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UserIndex {
+    /// List of uploader pubkeys (hex encoded)
+    pub pubkeys: Vec<String>,
+}
+
+impl UserIndex {
+    /// Create a new empty user index
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a pubkey if not already present
+    pub fn add(&mut self, pubkey: String) -> bool {
+        if !self.pubkeys.contains(&pubkey) {
+            self.pubkeys.push(pubkey);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Check if a pubkey exists
+    pub fn contains(&self, pubkey: &str) -> bool {
+        self.pubkeys.contains(&pubkey.to_string())
+    }
+}
+
+// ============================================================================
+// Video/Media Types
+// ============================================================================
+
 /// MIME types we consider video
 pub const VIDEO_MIME_TYPES: &[&str] = &[
     "video/mp4",
@@ -225,9 +475,28 @@ pub const VIDEO_MIME_TYPES: &[&str] = &[
     "video/x-matroska",
 ];
 
+/// MIME types we consider audio
+pub const AUDIO_MIME_TYPES: &[&str] = &[
+    "audio/mpeg",
+    "audio/mp3",
+    "audio/mp4",
+    "audio/x-m4a",
+    "audio/wav",
+    "audio/x-wav",
+    "audio/ogg",
+    "audio/flac",
+    "audio/webm",
+    "audio/aac",
+];
+
 /// Check if a MIME type is a video type
 pub fn is_video_mime_type(mime_type: &str) -> bool {
     VIDEO_MIME_TYPES.iter().any(|&t| mime_type.starts_with(t))
+}
+
+/// Check if a MIME type can be transcribed (audio or video)
+pub fn is_transcribable_mime_type(mime_type: &str) -> bool {
+    is_video_mime_type(mime_type) || AUDIO_MIME_TYPES.iter().any(|&t| mime_type.starts_with(t))
 }
 
 /// Parse SHA-256 hash from URL path
@@ -278,9 +547,18 @@ mod tests {
     fn test_parse_hash_from_path() {
         let hash = "a".repeat(64);
 
-        assert_eq!(parse_hash_from_path(&format!("/{}", hash)), Some(hash.clone()));
-        assert_eq!(parse_hash_from_path(&format!("/{}.mp4", hash)), Some(hash.clone()));
-        assert_eq!(parse_hash_from_path(&format!("/{}.webm", hash)), Some(hash.clone()));
+        assert_eq!(
+            parse_hash_from_path(&format!("/{}", hash)),
+            Some(hash.clone())
+        );
+        assert_eq!(
+            parse_hash_from_path(&format!("/{}.mp4", hash)),
+            Some(hash.clone())
+        );
+        assert_eq!(
+            parse_hash_from_path(&format!("/{}.webm", hash)),
+            Some(hash.clone())
+        );
 
         // Invalid cases
         assert_eq!(parse_hash_from_path("/upload"), None);
@@ -294,5 +572,14 @@ mod tests {
         assert!(is_video_mime_type("video/webm"));
         assert!(!is_video_mime_type("image/png"));
         assert!(!is_video_mime_type("application/json"));
+    }
+
+    #[test]
+    fn test_is_transcribable_mime_type() {
+        assert!(is_transcribable_mime_type("video/mp4"));
+        assert!(is_transcribable_mime_type("audio/mpeg"));
+        assert!(is_transcribable_mime_type("audio/wav"));
+        assert!(!is_transcribable_mime_type("image/png"));
+        assert!(!is_transcribable_mime_type("application/json"));
     }
 }

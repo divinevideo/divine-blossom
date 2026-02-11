@@ -9,7 +9,7 @@ use axum::{
     extract::{Path, State},
     http::{header, Method, StatusCode},
     response::{IntoResponse, Json, Response},
-    routing::{get, put, post, options},
+    routing::{get, options, post, put},
     Router,
 };
 use bytes::Bytes;
@@ -25,12 +25,18 @@ use google_cloud_storage::{
 };
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder;
-use k256::schnorr::{signature::hazmat::PrehashVerifier, signature::Signer, Signature, SigningKey, VerifyingKey};
+use k256::schnorr::{
+    signature::hazmat::PrehashVerifier, signature::Signer, Signature, SigningKey, VerifyingKey,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{env, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
-use tower_http::cors::{Any, CorsLayer};
+use std::{
+    env,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tower::Service;
+use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info};
 
 // Configuration
@@ -40,17 +46,27 @@ struct Config {
     port: u16,
     migration_nsec: Option<String>,
     transcoder_url: Option<String>,
+    transcriber_url: Option<String>,
 }
 
 impl Config {
     fn from_env() -> Self {
         Self {
-            gcs_bucket: env::var("GCS_BUCKET").unwrap_or_else(|_| "divine-blossom-media".to_string()),
-            cdn_base_url: env::var("CDN_BASE_URL").unwrap_or_else(|_| "https://media.divine.video".to_string()),
-            port: env::var("PORT").unwrap_or_else(|_| "8080".to_string()).parse().unwrap_or(8080),
+            gcs_bucket: env::var("GCS_BUCKET")
+                .unwrap_or_else(|_| "divine-blossom-media".to_string()),
+            cdn_base_url: env::var("CDN_BASE_URL")
+                .unwrap_or_else(|_| "https://media.divine.video".to_string()),
+            port: env::var("PORT")
+                .unwrap_or_else(|_| "8080".to_string())
+                .parse()
+                .unwrap_or(8080),
             migration_nsec: env::var("MIGRATION_NSEC").ok(),
             // URL of the divine-transcoder service for HLS generation
             transcoder_url: env::var("TRANSCODER_URL").ok(),
+            // URL of the transcription service (defaults to TRANSCODER_URL when not explicitly set)
+            transcriber_url: env::var("TRANSCRIBER_URL")
+                .ok()
+                .or_else(|| env::var("TRANSCODER_URL").ok()),
         }
     }
 }
@@ -84,6 +100,9 @@ struct UploadResponse {
     url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     thumbnail_url: Option<String>,
+    /// Video dimensions as "WIDTHxHEIGHT" (display dimensions after rotation)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dim: Option<String>,
 }
 
 // Migration request
@@ -91,7 +110,7 @@ struct UploadResponse {
 struct MigrateRequest {
     source_url: String,
     expected_hash: Option<String>,
-    owner: Option<String>,  // Owner pubkey for GCS metadata durability
+    owner: Option<String>, // Owner pubkey for GCS metadata durability
 }
 
 // Migration response
@@ -119,7 +138,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("blossom_upload=info".parse()?)
+                .add_directive("blossom_upload=info".parse()?),
         )
         .init();
 
@@ -165,12 +184,16 @@ async fn main() -> Result<()> {
 
         tokio::spawn(async move {
             let builder = Builder::new(hyper_util::rt::TokioExecutor::new());
-            if let Err(e) = builder.serve_connection(io, hyper::service::service_fn(move |req| {
-                let mut app = app.clone();
-                async move {
-                    app.call(req).await
-                }
-            })).await {
+            if let Err(e) = builder
+                .serve_connection(
+                    io,
+                    hyper::service::service_fn(move |req| {
+                        let mut app = app.clone();
+                        async move { app.call(req).await }
+                    }),
+                )
+                .await
+            {
                 error!("Connection error: {}", e);
             }
         });
@@ -195,7 +218,13 @@ async fn handle_upload(
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
-            (status, Json(ErrorResponse { error: e.to_string() })).into_response()
+            (
+                status,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response()
         }
     }
 }
@@ -222,7 +251,8 @@ async fn process_upload(
         &content_type,
         body,
         &auth_event.pubkey,
-    ).await?;
+    )
+    .await?;
 
     // Extract thumbnail for videos (non-blocking - failures don't fail the upload)
     let thumbnail_url = if thumbnail::is_video_type(&content_type) {
@@ -232,13 +262,31 @@ async fn process_upload(
             &state.config.cdn_base_url,
             &sha256_hash,
             &all_bytes,
-        ).await {
+        )
+        .await
+        {
             Ok(url) => {
                 info!("Generated thumbnail for {}", sha256_hash);
                 Some(url)
             }
             Err(e) => {
                 error!("Thumbnail extraction failed for {}: {}", sha256_hash, e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Probe video dimensions (non-blocking - failures don't fail the upload)
+    let dim = if thumbnail::is_video_type(&content_type) {
+        match probe_video_dimensions(&all_bytes).await {
+            Ok(d) => {
+                info!("Probed video dimensions for {}: {}", sha256_hash, d);
+                Some(d)
+            }
+            Err(e) => {
+                error!("Video probe failed for {}: {}", sha256_hash, e);
                 None
             }
         }
@@ -259,7 +307,29 @@ async fn process_upload(
                 }
             });
         } else {
-            info!("TRANSCODER_URL not configured, skipping HLS transcoding for {}", sha256_hash);
+            info!(
+                "TRANSCODER_URL not configured, skipping HLS transcoding for {}",
+                sha256_hash
+            );
+        }
+    }
+
+    // Trigger transcript generation for transcribable media (audio/video)
+    if is_transcribable_type(&content_type) {
+        if let Some(ref transcriber_url) = state.config.transcriber_url {
+            let transcriber_url = transcriber_url.clone();
+            let hash = sha256_hash.clone();
+            let owner = auth_event.pubkey.clone();
+            tokio::spawn(async move {
+                if let Err(e) = trigger_transcription(&transcriber_url, &hash, &owner).await {
+                    error!("Failed to trigger transcription for {}: {}", hash, e);
+                }
+            });
+        } else {
+            info!(
+                "TRANSCRIBER_URL not configured, skipping transcript generation for {}",
+                sha256_hash
+            );
         }
     }
 
@@ -275,8 +345,12 @@ async fn process_upload(
         size,
         content_type,
         uploaded,
-        url: format!("{}/{}.{}", state.config.cdn_base_url, sha256_hash, extension),
+        url: format!(
+            "{}/{}.{}",
+            state.config.cdn_base_url, sha256_hash, extension
+        ),
         thumbnail_url,
+        dim,
     })
 }
 
@@ -287,35 +361,58 @@ async fn stream_to_gcs_with_hash(
     body: Body,
     owner: &str,
 ) -> Result<(String, u64, Vec<u8>)> {
-    let mut hasher = Sha256::new();
-    let mut total_size: u64 = 0;
-    let mut all_bytes = Vec::new();
+    let mut original_bytes = Vec::new();
 
-    // Collect body stream while hashing
+    // Collect body stream first; original bytes remain the source of truth for hashing/storage.
     let mut stream = body.into_data_stream();
     while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.map_err(|e| anyhow!("Stream error: {}", e))?;
-        hasher.update(&chunk);
-        total_size += chunk.len() as u64;
-        all_bytes.extend_from_slice(&chunk);
+        original_bytes.extend_from_slice(&chunk);
     }
 
-    // Get final hash
+    // Keep original bytes immutable for hash/storage integrity.
+    // Derivative generation (thumbnail/probe/transcode) can use sanitized bytes.
+    let mut derivative_bytes = original_bytes.clone();
+
+    // Sanitize video bytes for derivative processing only.
+    if thumbnail::is_video_type(content_type) {
+        match sanitize_video(&derivative_bytes).await {
+            Ok(sanitized) => {
+                info!(
+                    "Prepared sanitized derivative bytes: {} -> {} bytes",
+                    derivative_bytes.len(),
+                    sanitized.len(),
+                );
+                derivative_bytes = sanitized;
+            }
+            Err(e) => {
+                // Non-fatal: keep original bytes for derivative processing if sanitization fails
+                error!("Video sanitization failed for derivatives, using original: {}", e);
+            }
+        }
+    }
+
+    // Hash and store the original uploaded bytes.
+    let mut hasher = Sha256::new();
+    hasher.update(&original_bytes);
+    let total_size = original_bytes.len() as u64;
     let sha256_hash = hex::encode(hasher.finalize());
 
     // Check if blob already exists
     let exists = client
-        .get_object(&google_cloud_storage::http::objects::get::GetObjectRequest {
-            bucket: bucket.to_string(),
-            object: sha256_hash.clone(),
-            ..Default::default()
-        })
+        .get_object(
+            &google_cloud_storage::http::objects::get::GetObjectRequest {
+                bucket: bucket.to_string(),
+                object: sha256_hash.clone(),
+                ..Default::default()
+            },
+        )
         .await
         .is_ok();
 
     if exists {
         info!("Blob {} already exists, skipping upload", sha256_hash);
-        return Ok((sha256_hash, total_size, all_bytes));
+        return Ok((sha256_hash, total_size, derivative_bytes));
     }
 
     // Upload to GCS
@@ -326,7 +423,7 @@ async fn stream_to_gcs_with_hash(
     };
 
     client
-        .upload_object(&req, Bytes::from(all_bytes.clone()), &upload_type)
+        .upload_object(&req, Bytes::from(original_bytes.clone()), &upload_type)
         .await
         .map_err(|e| anyhow!("GCS upload failed: {}", e))?;
 
@@ -347,7 +444,7 @@ async fn stream_to_gcs_with_hash(
     let _ = client.patch_object(&update_req).await;
 
     info!("Uploaded {} bytes as {} (owner: {})", total_size, sha256_hash, owner);
-    Ok((sha256_hash, total_size, all_bytes))
+    Ok((sha256_hash, total_size, derivative_bytes))
 }
 
 /// Extract thumbnail from video and upload to GCS
@@ -394,15 +491,20 @@ async fn handle_thumbnail_generate(
         return (
             StatusCode::BAD_REQUEST,
             [(header::CONTENT_TYPE, "application/json")],
-            Json(ErrorResponse { error: "Invalid hash format".to_string() }).into_response(),
-        ).into_response();
+            Json(ErrorResponse {
+                error: "Invalid hash format".to_string(),
+            })
+            .into_response(),
+        )
+            .into_response();
     }
 
     let hash = hash.to_lowercase();
 
     // First check if thumbnail already exists
     let thumb_path = format!("{}.jpg", hash);
-    let thumb_exists = state.gcs_client
+    let thumb_exists = state
+        .gcs_client
         .get_object(&GetObjectRequest {
             bucket: state.config.gcs_bucket.clone(),
             object: thumb_path.clone(),
@@ -413,20 +515,21 @@ async fn handle_thumbnail_generate(
 
     if thumb_exists {
         // Thumbnail already exists, download and return it
-        match state.gcs_client.download_object(
-            &GetObjectRequest {
-                bucket: state.config.gcs_bucket.clone(),
-                object: thumb_path,
-                ..Default::default()
-            },
-            &DownloadRange::default(),
-        ).await {
+        match state
+            .gcs_client
+            .download_object(
+                &GetObjectRequest {
+                    bucket: state.config.gcs_bucket.clone(),
+                    object: thumb_path,
+                    ..Default::default()
+                },
+                &DownloadRange::default(),
+            )
+            .await
+        {
             Ok(data) => {
-                return (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, "image/jpeg")],
-                    data,
-                ).into_response();
+                return (StatusCode::OK, [(header::CONTENT_TYPE, "image/jpeg")], data)
+                    .into_response();
             }
             Err(e) => {
                 error!("Failed to download existing thumbnail: {}", e);
@@ -435,22 +538,30 @@ async fn handle_thumbnail_generate(
     }
 
     // Download the video from GCS
-    let video_data = match state.gcs_client.download_object(
-        &GetObjectRequest {
-            bucket: state.config.gcs_bucket.clone(),
-            object: hash.clone(),
-            ..Default::default()
-        },
-        &DownloadRange::default(),
-    ).await {
+    let video_data = match state
+        .gcs_client
+        .download_object(
+            &GetObjectRequest {
+                bucket: state.config.gcs_bucket.clone(),
+                object: hash.clone(),
+                ..Default::default()
+            },
+            &DownloadRange::default(),
+        )
+        .await
+    {
         Ok(data) => data,
         Err(e) => {
             error!("Failed to download video {}: {}", hash, e);
             return (
                 StatusCode::NOT_FOUND,
                 [(header::CONTENT_TYPE, "application/json")],
-                Json(ErrorResponse { error: "Video not found".to_string() }).into_response(),
-            ).into_response();
+                Json(ErrorResponse {
+                    error: "Video not found".to_string(),
+                })
+                .into_response(),
+            )
+                .into_response();
         }
     };
 
@@ -462,8 +573,12 @@ async fn handle_thumbnail_generate(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 [(header::CONTENT_TYPE, "application/json")],
-                Json(ErrorResponse { error: "Failed to generate thumbnail".to_string() }).into_response(),
-            ).into_response();
+                Json(ErrorResponse {
+                    error: "Failed to generate thumbnail".to_string(),
+                })
+                .into_response(),
+            )
+                .into_response();
         }
     };
 
@@ -477,7 +592,8 @@ async fn handle_thumbnail_generate(
         ..Default::default()
     };
 
-    if let Err(e) = state.gcs_client
+    if let Err(e) = state
+        .gcs_client
         .upload_object(&req, Bytes::from(thumb_result.data.clone()), &upload_type)
         .await
     {
@@ -492,7 +608,148 @@ async fn handle_thumbnail_generate(
         StatusCode::OK,
         [(header::CONTENT_TYPE, "image/jpeg")],
         thumb_result.data,
-    ).into_response()
+    )
+        .into_response()
+}
+
+/// Sanitize a video file by remuxing with ffmpeg
+/// This strips invalid MP4 atoms (e.g. malformed clap boxes from iPhone),
+/// ensures faststart (moov before mdat), and produces a web-compatible MP4.
+/// Uses -c copy so it's lossless and fast (no re-encoding).
+async fn sanitize_video(input_bytes: &[u8]) -> Result<Vec<u8>> {
+    use tokio::process::Command;
+
+    let tmp_dir = std::env::temp_dir();
+    let input_path = tmp_dir.join("sanitize_input.mp4");
+    let output_path = tmp_dir.join("sanitize_output.mp4");
+
+    // Write input to temp file
+    tokio::fs::write(&input_path, input_bytes)
+        .await
+        .map_err(|e| anyhow!("Failed to write temp input: {}", e))?;
+
+    // Remux with ffmpeg: -c copy (no re-encode), +faststart (moov at front)
+    let output = Command::new("ffmpeg")
+        .args([
+            "-y", // Overwrite output
+            "-v",
+            "warning", // Only show warnings/errors
+            "-i",
+            input_path.to_str().unwrap(),
+            "-c",
+            "copy", // Copy streams without re-encoding
+            "-movflags",
+            "+faststart", // Put moov atom at front
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .map_err(|e| anyhow!("Failed to run ffmpeg: {}", e))?;
+
+    // Clean up input
+    let _ = tokio::fs::remove_file(&input_path).await;
+
+    if !output.status.success() {
+        let _ = tokio::fs::remove_file(&output_path).await;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("ffmpeg sanitize failed: {}", stderr));
+    }
+
+    // Read sanitized output
+    let sanitized = tokio::fs::read(&output_path)
+        .await
+        .map_err(|e| anyhow!("Failed to read sanitized output: {}", e))?;
+
+    // Clean up output
+    let _ = tokio::fs::remove_file(&output_path).await;
+
+    Ok(sanitized)
+}
+
+/// Probe video data with ffprobe to get display dimensions (respecting rotation metadata).
+/// Returns "WIDTHxHEIGHT" string suitable for the Nostr `dim` imeta tag.
+async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
+    use tokio::process::Command;
+
+    let tmp_dir = std::env::temp_dir();
+    let probe_path = tmp_dir.join("probe_input.mp4");
+
+    // Write to temp file for ffprobe
+    tokio::fs::write(&probe_path, video_bytes)
+        .await
+        .map_err(|e| anyhow!("Failed to write temp file for probe: {}", e))?;
+
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_streams",
+            "-select_streams",
+            "v:0",
+            probe_path.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .map_err(|e| anyhow!("Failed to run ffprobe: {}", e))?;
+
+    // Clean up temp file
+    let _ = tokio::fs::remove_file(&probe_path).await;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("ffprobe failed: {}", stderr));
+    }
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| anyhow!("Failed to parse ffprobe output: {}", e))?;
+
+    let stream = json["streams"]
+        .as_array()
+        .and_then(|s| s.first())
+        .ok_or_else(|| anyhow!("No video stream found"))?;
+
+    let width = stream["width"].as_u64().unwrap_or(0) as u32;
+    let height = stream["height"].as_u64().unwrap_or(0) as u32;
+
+    if width == 0 || height == 0 {
+        return Err(anyhow!("Could not determine video dimensions"));
+    }
+
+    // Check rotation from tags (older FFmpeg / older files)
+    let mut rotation: i32 = stream["tags"]["rotate"]
+        .as_str()
+        .and_then(|r| r.parse().ok())
+        .unwrap_or(0);
+
+    // Check side_data_list for Display Matrix rotation (newer FFmpeg)
+    if rotation == 0 {
+        if let Some(side_data) = stream["side_data_list"].as_array() {
+            for sd in side_data {
+                if sd["side_data_type"].as_str() == Some("Display Matrix") {
+                    if let Some(r) = sd["rotation"].as_f64() {
+                        rotation = r.round() as i32;
+                    } else if let Some(r) =
+                        sd["rotation"].as_str().and_then(|s| s.parse::<f64>().ok())
+                    {
+                        rotation = r.round() as i32;
+                    }
+                }
+            }
+        }
+    }
+
+    let rotation_abs = rotation.unsigned_abs() % 360;
+
+    // Compute display dimensions (after applying rotation)
+    let (display_width, display_height) = if rotation_abs == 90 || rotation_abs == 270 {
+        (height, width)
+    } else {
+        (width, height)
+    };
+
+    Ok(format!("{}x{}", display_width, display_height))
 }
 
 fn validate_auth(headers: &axum::http::HeaderMap, required_action: &str) -> Result<NostrEvent> {
@@ -513,8 +770,8 @@ fn validate_auth(headers: &axum::http::HeaderMap, required_action: &str) -> Resu
     )
     .map_err(|e| anyhow!("Invalid base64: {}", e))?;
 
-    let event: NostrEvent = serde_json::from_slice(&event_json)
-        .map_err(|e| anyhow!("Invalid event JSON: {}", e))?;
+    let event: NostrEvent =
+        serde_json::from_slice(&event_json).map_err(|e| anyhow!("Invalid event JSON: {}", e))?;
 
     validate_event(&event, required_action)?;
 
@@ -524,7 +781,10 @@ fn validate_auth(headers: &axum::http::HeaderMap, required_action: &str) -> Resu
 fn validate_event(event: &NostrEvent, required_action: &str) -> Result<()> {
     // Check kind
     if event.kind != BLOSSOM_AUTH_KIND {
-        return Err(anyhow!("Invalid event kind: expected {}", BLOSSOM_AUTH_KIND));
+        return Err(anyhow!(
+            "Invalid event kind: expected {}",
+            BLOSSOM_AUTH_KIND
+        ));
     }
 
     // Check action tag
@@ -584,20 +844,17 @@ fn compute_event_id(event: &NostrEvent) -> Result<String> {
 }
 
 fn verify_signature(event: &NostrEvent) -> Result<()> {
-    let pubkey_bytes = hex::decode(&event.pubkey)
-        .map_err(|_| anyhow!("Invalid pubkey hex"))?;
-    let sig_bytes = hex::decode(&event.sig)
-        .map_err(|_| anyhow!("Invalid signature hex"))?;
-    let msg_bytes = hex::decode(&event.id)
-        .map_err(|_| anyhow!("Invalid event ID hex"))?;
+    let pubkey_bytes = hex::decode(&event.pubkey).map_err(|_| anyhow!("Invalid pubkey hex"))?;
+    let sig_bytes = hex::decode(&event.sig).map_err(|_| anyhow!("Invalid signature hex"))?;
+    let msg_bytes = hex::decode(&event.id).map_err(|_| anyhow!("Invalid event ID hex"))?;
 
     // Convert Vec<u8> to [u8; 32] for pubkey
     let pubkey_array: [u8; 32] = pubkey_bytes
         .try_into()
         .map_err(|_| anyhow!("Invalid pubkey length"))?;
 
-    let verifying_key = VerifyingKey::from_bytes(&pubkey_array)
-        .map_err(|e| anyhow!("Invalid pubkey: {}", e))?;
+    let verifying_key =
+        VerifyingKey::from_bytes(&pubkey_array).map_err(|e| anyhow!("Invalid pubkey: {}", e))?;
 
     let signature = Signature::try_from(sig_bytes.as_slice())
         .map_err(|e| anyhow!("Invalid signature: {}", e))?;
@@ -626,10 +883,17 @@ fn get_extension(content_type: &str) -> &'static str {
     }
 }
 
+fn is_transcribable_type(content_type: &str) -> bool {
+    content_type.starts_with("video/") || content_type.starts_with("audio/")
+}
+
 /// Trigger HLS transcoding for a video (fire-and-forget)
 /// Sends a POST request to the divine-transcoder service
 async fn trigger_transcoding(transcoder_url: &str, hash: &str, owner: &str) -> Result<()> {
-    info!("Triggering HLS transcoding for {} via {}", hash, transcoder_url);
+    info!(
+        "Triggering HLS transcoding for {} via {}",
+        hash, transcoder_url
+    );
 
     let client = reqwest::Client::new();
     let transcode_request = serde_json::json!({
@@ -655,6 +919,37 @@ async fn trigger_transcoding(transcoder_url: &str, hash: &str, owner: &str) -> R
     }
 }
 
+/// Trigger transcript generation for audio/video (fire-and-forget)
+async fn trigger_transcription(transcriber_url: &str, hash: &str, owner: &str) -> Result<()> {
+    info!(
+        "Triggering transcript generation for {} via {}",
+        hash, transcriber_url
+    );
+
+    let client = reqwest::Client::new();
+    let request_payload = serde_json::json!({
+        "hash": hash,
+        "owner": owner
+    });
+
+    let response = client
+        .post(format!("{}/transcribe", transcriber_url))
+        .header("Content-Type", "application/json")
+        .json(&request_payload)
+        .send()
+        .await
+        .map_err(|e| anyhow!("Failed to call transcriber: {}", e))?;
+
+    if response.status().is_success() {
+        info!("Transcription triggered successfully for {}", hash);
+        Ok(())
+    } else {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        Err(anyhow!("Transcriber returned error {}: {}", status, body))
+    }
+}
+
 /// Handle migration requests - fetch from URL and upload to GCS
 /// POST /migrate { "source_url": "https://cdn.example.com/hash", "expected_hash": "abc123" }
 async fn handle_migrate(
@@ -665,15 +960,18 @@ async fn handle_migrate(
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => {
             error!("Migration error: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response()
         }
     }
 }
 
-async fn process_migrate(
-    state: Arc<AppState>,
-    request: MigrateRequest,
-) -> Result<MigrateResponse> {
+async fn process_migrate(state: Arc<AppState>, request: MigrateRequest) -> Result<MigrateResponse> {
     info!("Migration request for: {}", request.source_url);
 
     // Validate URL is from allowed Blossom/CDN sources
@@ -703,17 +1001,19 @@ async fn process_migrate(
         "blossom.f7z.io",
         "nostrcheck.me",
     ];
-    let url = url::Url::parse(&request.source_url)
-        .map_err(|e| anyhow!("Invalid URL: {}", e))?;
+    let url = url::Url::parse(&request.source_url).map_err(|e| anyhow!("Invalid URL: {}", e))?;
 
-    let host = url.host_str().ok_or_else(|| anyhow!("URL must have a host"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("URL must have a host"))?;
     if !allowed_domains.iter().any(|d| host.ends_with(d)) {
         return Err(anyhow!("Source URL must be from an allowed domain"));
     }
 
     // Fetch content from source
     let client = reqwest::Client::new();
-    let mut response = client.get(&request.source_url)
+    let mut response = client
+        .get(&request.source_url)
         .send()
         .await
         .map_err(|e| anyhow!("Failed to fetch source: {}", e))?;
@@ -724,13 +1024,16 @@ async fn process_migrate(
 
         if let Some(nsec) = &state.config.migration_nsec {
             let auth_header = create_blossom_auth(nsec, "get", &request.source_url)?;
-            response = client.get(&request.source_url)
+            response = client
+                .get(&request.source_url)
                 .header("Authorization", auth_header)
                 .send()
                 .await
                 .map_err(|e| anyhow!("Failed to fetch source with auth: {}", e))?;
         } else {
-            return Err(anyhow!("Source requires auth but no MIGRATION_NSEC configured"));
+            return Err(anyhow!(
+                "Source requires auth but no MIGRATION_NSEC configured"
+            ));
         }
     }
 
@@ -773,12 +1076,15 @@ async fn process_migrate(
     }
 
     // Check if blob already exists in GCS
-    let exists = state.gcs_client
-        .get_object(&google_cloud_storage::http::objects::get::GetObjectRequest {
-            bucket: state.config.gcs_bucket.clone(),
-            object: sha256_hash.clone(),
-            ..Default::default()
-        })
+    let exists = state
+        .gcs_client
+        .get_object(
+            &google_cloud_storage::http::objects::get::GetObjectRequest {
+                bucket: state.config.gcs_bucket.clone(),
+                object: sha256_hash.clone(),
+                ..Default::default()
+            },
+        )
         .await
         .is_ok();
 
@@ -800,7 +1106,8 @@ async fn process_migrate(
         ..Default::default()
     };
 
-    state.gcs_client
+    state
+        .gcs_client
         .upload_object(&req, Bytes::from(all_bytes), &upload_type)
         .await
         .map_err(|e| anyhow!("GCS upload failed: {}", e))?;
@@ -824,7 +1131,10 @@ async fn process_migrate(
     };
     let _ = state.gcs_client.patch_object(&update_req).await;
 
-    info!("Migrated {} bytes as {} from {} (owner: {:?})", total_size, sha256_hash, request.source_url, request.owner);
+    info!(
+        "Migrated {} bytes as {} from {} (owner: {:?})",
+        total_size, sha256_hash, request.source_url, request.owner
+    );
 
     Ok(MigrateResponse {
         sha256: sha256_hash,
@@ -866,14 +1176,7 @@ fn create_blossom_auth(nsec: &str, action: &str, _url: &str) -> Result<String> {
     ];
 
     // Create event (without id and sig)
-    let event_data = serde_json::json!([
-        0,
-        pubkey_hex,
-        now,
-        BLOSSOM_AUTH_KIND,
-        tags,
-        ""
-    ]);
+    let event_data = serde_json::json!([0, pubkey_hex, now, BLOSSOM_AUTH_KIND, tags, ""]);
 
     // Hash to get event ID
     let event_str = serde_json::to_string(&event_data)?;
@@ -918,7 +1221,9 @@ fn decode_nsec(nsec: &str) -> Result<[u8; 32]> {
 
     let mut bits: Vec<u8> = Vec::new();
     for c in data.chars() {
-        let val = CHARSET.find(c).ok_or_else(|| anyhow!("Invalid bech32 character: {}", c))? as u8;
+        let val = CHARSET
+            .find(c)
+            .ok_or_else(|| anyhow!("Invalid bech32 character: {}", c))? as u8;
         bits.push(val);
     }
 

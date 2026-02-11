@@ -1,6 +1,7 @@
 // ABOUTME: Main entry point for Fastly Blossom server
 // ABOUTME: Routes requests to appropriate handlers for BUD-01 and BUD-02
 
+mod admin;
 mod auth;
 mod blossom;
 mod error;
@@ -9,22 +10,33 @@ mod storage;
 
 use crate::auth::{optional_auth, validate_auth, validate_hash_match};
 use crate::blossom::{
-    is_hash_path, is_video_mime_type, parse_hash_from_path, parse_thumbnail_path, AuthAction, BlobDescriptor, BlobMetadata, BlobStatus,
-    TranscodeStatus, UploadRequirements,
+    is_hash_path, is_transcribable_mime_type, is_video_mime_type, parse_hash_from_path,
+    parse_thumbnail_path, AuthAction, BlobDescriptor, BlobMetadata, BlobStatus, SubtitleJob,
+    SubtitleJobCreateRequest, SubtitleJobStatus, TranscodeStatus, TranscriptStatus,
+    UploadRequirements,
 };
 use crate::error::{BlossomError, Result};
 use crate::metadata::{
-    add_to_user_list, check_ownership, delete_blob_metadata, get_blob_metadata,
-    list_blobs_with_metadata, put_blob_metadata, remove_from_user_list, update_blob_status,
+    add_to_recent_index, add_to_user_index, add_to_user_list, check_ownership,
+    delete_blob_metadata, get_blob_metadata, get_subtitle_job, get_subtitle_job_by_hash,
+    put_blob_metadata, put_subtitle_job, set_subtitle_job_id_for_hash, list_blobs_with_metadata,
+    remove_from_recent_index, remove_from_user_list, update_blob_status, update_stats_on_add,
+    update_stats_on_remove,
 };
-use crate::storage::{blob_exists, current_timestamp, delete_blob as storage_delete, download_blob_with_fallback, download_thumbnail, trigger_background_migration, upload_blob};
+use crate::storage::{
+    blob_exists, current_timestamp, delete_blob as storage_delete, download_blob_with_fallback,
+    download_thumbnail, trigger_background_migration, upload_blob,
+};
 
 use fastly::http::{header, Method, StatusCode};
 use fastly::{Error, Request, Response};
 use sha2::{Digest, Sha256};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Maximum upload size (50 GB) - Cloud Run with HTTP/2 has no size limit
 const MAX_UPLOAD_SIZE: u64 = 50 * 1024 * 1024 * 1024;
+/// Max automatic subtitle transcription attempts before poison state.
+const SUBTITLE_MAX_ATTEMPTS: u32 = 3;
 
 /// Entry point
 #[fastly::main]
@@ -41,15 +53,19 @@ fn handle_request(req: Request) -> Result<Response> {
     let path = req.get_path().to_string();
     let host = req.get_header_str("host").unwrap_or("unknown");
 
-    eprintln!("[BLOSSOM ROUTE] method={} path={} host={}", method, path, host);
+    eprintln!(
+        "[BLOSSOM ROUTE] method={} path={} host={}",
+        method, path, host
+    );
 
     match (method, path.as_str()) {
         // Landing page
         (Method::GET, "/") => Ok(handle_landing_page()),
 
         // Version check
-        (Method::GET, "/version") => Ok(Response::from_status(StatusCode::OK)
-            .with_body("v124-update-size-on-faststart")),
+        (Method::GET, "/version") => {
+            Ok(Response::from_status(StatusCode::OK).with_body("v124-update-size-on-faststart"))
+        }
 
         // HLS: /{sha256}.hls -> serve master manifest
         (Method::GET, p) if p.ends_with(".hls") => handle_get_hls_master(req, p),
@@ -58,6 +74,27 @@ fn handle_request(req: Request) -> Result<Response> {
         // HLS: /{sha256}/hls/* -> serve HLS segments/playlists
         (Method::GET, p) if p.contains("/hls/") => handle_get_hls_content(req, p),
         (Method::HEAD, p) if p.contains("/hls/") => handle_head_hls_content(p),
+
+        // Transcript file URL: /{sha256}.vtt
+        (Method::GET, p) if is_vtt_file_path(p) => handle_get_transcript_file(req, p),
+        (Method::HEAD, p) if is_vtt_file_path(p) => handle_head_transcript_file(p),
+
+        // Transcript: /{sha256}/VTT or /{sha256}/vtt
+        (Method::GET, p) if is_transcript_path(p) => handle_get_transcript(req, p),
+        (Method::HEAD, p) if is_transcript_path(p) => handle_head_transcript(p),
+
+        // Subtitle jobs API
+        (Method::POST, "/v1/subtitles/jobs") => handle_create_subtitle_job(req),
+        (Method::GET, p) if p.starts_with("/v1/subtitles/jobs/") => {
+            handle_get_subtitle_job(p)
+        }
+        (Method::GET, p) if p.starts_with("/v1/subtitles/by-hash/") => {
+            handle_get_subtitle_by_hash(req, p)
+        }
+
+        // Direct quality variant access: /{sha256}/720p, /{sha256}/480p
+        (Method::GET, p) if is_quality_variant_path(p) => handle_get_quality_variant(req, p),
+        (Method::HEAD, p) if is_quality_variant_path(p) => handle_head_quality_variant(p),
 
         // BUD-01: Blob retrieval
         (Method::GET, p) if is_hash_path(p) => handle_get_blob(req, p),
@@ -85,6 +122,31 @@ fn handle_request(req: Request) -> Result<Response> {
 
         // Admin: Transcode status webhook from divine-transcoder service
         (Method::POST, "/admin/transcode-status") => handle_transcode_status(req),
+        (Method::POST, "/admin/transcript-status") => handle_transcript_status(req),
+
+        // Admin: OAuth login
+        (Method::POST, "/admin/auth/google") => admin::handle_google_auth(req),
+        (Method::GET, "/admin/auth/github") => admin::handle_github_auth_redirect(req),
+        (Method::GET, p) if p.starts_with("/admin/auth/github/callback") => {
+            admin::handle_github_callback(req)
+        }
+        (Method::POST, "/admin/logout") => admin::handle_logout(req),
+
+        // Admin Dashboard
+        (Method::GET, "/admin") => admin::handle_admin_dashboard(req),
+        (Method::GET, "/admin/api/stats") => admin::handle_admin_stats(req),
+        (Method::GET, "/admin/api/recent") => admin::handle_admin_recent(req),
+        (Method::GET, "/admin/api/users") => admin::handle_admin_users(req),
+        (Method::GET, p) if p.starts_with("/admin/api/user/") => {
+            let pubkey = p.strip_prefix("/admin/api/user/").unwrap_or("");
+            admin::handle_admin_user_blobs(req, pubkey)
+        }
+        (Method::GET, p) if p.starts_with("/admin/api/blob/") => {
+            let hash = p.strip_prefix("/admin/api/blob/").unwrap_or("");
+            admin::handle_admin_blob_detail(req, hash)
+        }
+        (Method::POST, "/admin/api/moderate") => admin::handle_admin_moderate_action(req),
+        (Method::POST, "/admin/api/backfill") => admin::handle_admin_backfill(req),
 
         // CORS preflight
         (Method::OPTIONS, _) => Ok(cors_preflight_response()),
@@ -98,6 +160,25 @@ fn handle_request(req: Request) -> Result<Response> {
 fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
     // Check if this is a thumbnail request ({hash}.jpg)
     if let Some(thumbnail_key) = parse_thumbnail_path(path) {
+        let video_hash = thumbnail_key.trim_end_matches(".jpg");
+
+        // Check parent video's moderation status - thumbnails inherit video access rules
+        if let Ok(Some(meta)) = get_blob_metadata(video_hash) {
+            if meta.status == BlobStatus::Banned {
+                return Err(BlossomError::NotFound("Blob not found".into()));
+            }
+            if meta.status == BlobStatus::Restricted {
+                // Check if requester is owner
+                if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
+                    if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
+                        return Err(BlossomError::NotFound("Blob not found".into()));
+                    }
+                } else {
+                    return Err(BlossomError::NotFound("Blob not found".into()));
+                }
+            }
+        }
+
         // Try to download existing thumbnail from GCS
         match download_thumbnail(&thumbnail_key) {
             Ok(mut resp) => {
@@ -108,8 +189,7 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
             }
             Err(BlossomError::NotFound(_)) => {
                 // Thumbnail doesn't exist, generate on-demand via Cloud Run
-                let hash = thumbnail_key.trim_end_matches(".jpg");
-                match generate_thumbnail_on_demand(hash) {
+                match generate_thumbnail_on_demand(video_hash) {
                     Ok(mut resp) => {
                         resp.set_header("Content-Type", "image/jpeg");
                         resp.set_header("Accept-Ranges", "bytes");
@@ -158,6 +238,14 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
     let result = download_blob_with_fallback(&hash, range.as_deref())?;
     let mut resp = result.response;
 
+    // Surface provenance metadata if present on the origin object.
+    let c2pa_manifest_id = resp
+        .get_header_str("x-goog-meta-c2pa-manifest-id")
+        .map(|s| s.to_string());
+    let source_sha256 = resp
+        .get_header_str("x-goog-meta-source-sha256")
+        .map(|s| s.to_string());
+
     // Add CORS headers
     add_cors_headers(&mut resp);
 
@@ -187,14 +275,25 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         }
         // Try to get Content-Length from GCS response (extract first to avoid borrow issues)
         if !is_partial {
-            let content_length: Option<String> = resp.get_header_str("content-length")
+            let content_length: Option<String> = resp
+                .get_header_str("content-length")
                 .map(|s| s.to_string())
-                .or_else(|| resp.get_header_str("x-goog-stored-content-length").map(|s| s.to_string()));
+                .or_else(|| {
+                    resp.get_header_str("x-goog-stored-content-length")
+                        .map(|s| s.to_string())
+                });
             if let Some(cl) = content_length {
                 resp.set_header("Content-Length", &cl);
             }
         }
         resp.set_header("X-Sha256", &hash);
+    }
+
+    if let Some(c2pa) = c2pa_manifest_id {
+        resp.set_header("X-C2PA-Manifest-Id", &c2pa);
+    }
+    if let Some(source_hash) = source_sha256 {
+        resp.set_header("X-Source-Sha256", &source_hash);
     }
 
     // Add header indicating the source (useful for debugging/monitoring)
@@ -214,7 +313,8 @@ fn handle_head_blob(path: &str) -> Result<Response> {
     // Check if this is a thumbnail request ({hash}.jpg)
     if let Some(thumbnail_key) = parse_thumbnail_path(path) {
         let resp = download_thumbnail(&thumbnail_key)?;
-        let content_length = resp.get_header_str("x-goog-stored-content-length")
+        let content_length = resp
+            .get_header_str("x-goog-stored-content-length")
             .or_else(|| resp.get_header_str("content-length"))
             .unwrap_or("0")
             .to_string();
@@ -230,8 +330,8 @@ fn handle_head_blob(path: &str) -> Result<Response> {
         .ok_or_else(|| BlossomError::BadRequest("Invalid hash in path".into()))?;
 
     // Check metadata
-    let metadata = get_blob_metadata(&hash)?
-        .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
+    let metadata =
+        get_blob_metadata(&hash)?.ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
 
     // Don't reveal restricted or banned content exists
     if metadata.status == BlobStatus::Restricted || metadata.status == BlobStatus::Banned {
@@ -331,9 +431,23 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
     let result = download_hls_content(&gcs_path)?;
     let mut resp = result;
 
+    let c2pa_manifest_id = resp
+        .get_header_str("x-goog-meta-c2pa-manifest-id")
+        .map(|s| s.to_string());
+    let source_sha256 = resp
+        .get_header_str("x-goog-meta-source-sha256")
+        .map(|s| s.to_string());
+
     // Set correct content type for HLS manifest
     resp.set_header("Content-Type", "application/vnd.apple.mpegurl");
     resp.set_header("Cache-Control", "public, max-age=31536000"); // HLS manifests are immutable for VOD
+    resp.set_header("X-Sha256", &hash);
+    if let Some(c2pa) = c2pa_manifest_id {
+        resp.set_header("X-C2PA-Manifest-Id", &c2pa);
+    }
+    if let Some(source_hash) = source_sha256 {
+        resp.set_header("X-Source-Sha256", &source_hash);
+    }
     add_cors_headers(&mut resp);
 
     Ok(resp)
@@ -366,6 +480,7 @@ fn handle_head_hls_master(path: &str) -> Result<Response> {
         Some(TranscodeStatus::Complete) => {
             let mut resp = Response::from_status(StatusCode::OK);
             resp.set_header("Content-Type", "application/vnd.apple.mpegurl");
+            resp.set_header("X-Sha256", &hash);
             add_cors_headers(&mut resp);
             Ok(resp)
         }
@@ -397,27 +512,114 @@ fn handle_get_hls_content(_req: Request, path: &str) -> Result<Response> {
     if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(BlossomError::BadRequest("Invalid hash in path".into()));
     }
+    let hash = hash.to_lowercase();
 
     // Construct GCS path
-    let gcs_path = format!("{}/hls/{}", hash.to_lowercase(), filename);
+    let gcs_path = format!("{}/hls/{}", hash, filename);
 
-    // Download from GCS
-    let mut resp = download_hls_content(&gcs_path)?;
+    // Try to download from GCS first
+    match download_hls_content(&gcs_path) {
+        Ok(mut resp) => {
+            let c2pa_manifest_id = resp
+                .get_header_str("x-goog-meta-c2pa-manifest-id")
+                .map(|s| s.to_string());
+            let source_sha256 = resp
+                .get_header_str("x-goog-meta-source-sha256")
+                .map(|s| s.to_string());
 
-    // Set content type based on file extension
-    let content_type = if filename.ends_with(".m3u8") {
-        "application/vnd.apple.mpegurl"
-    } else if filename.ends_with(".ts") {
-        "video/mp2t"
-    } else {
-        "application/octet-stream"
-    };
+            // Set content type based on file extension
+            let content_type = if filename.ends_with(".m3u8") {
+                "application/vnd.apple.mpegurl"
+            } else if filename.ends_with(".ts") {
+                "video/mp2t"
+            } else {
+                "application/octet-stream"
+            };
 
-    resp.set_header("Content-Type", content_type);
-    resp.set_header("Cache-Control", "public, max-age=31536000"); // Immutable for VOD
-    add_cors_headers(&mut resp);
+            resp.set_header("Content-Type", content_type);
+            resp.set_header("Cache-Control", "public, max-age=31536000"); // Immutable for VOD
+            resp.set_header("X-Sha256", &hash);
+            if let Some(c2pa) = c2pa_manifest_id {
+                resp.set_header("X-C2PA-Manifest-Id", &c2pa);
+            }
+            if let Some(source_hash) = source_sha256 {
+                resp.set_header("X-Source-Sha256", &source_hash);
+            }
+            add_cors_headers(&mut resp);
+            Ok(resp)
+        }
+        Err(BlossomError::NotFound(_)) if filename == "master.m3u8" => {
+            // HLS not found - check metadata and trigger on-demand transcoding
+            let metadata = get_blob_metadata(&hash)?;
 
-    Ok(resp)
+            if let Some(ref meta) = metadata {
+                // Handle banned content
+                if meta.status == BlobStatus::Banned {
+                    return Err(BlossomError::NotFound("Content not found".into()));
+                }
+
+                match meta.transcode_status {
+                    Some(TranscodeStatus::Complete) => {
+                        // Metadata says complete but file not in GCS - re-trigger
+                        eprintln!("[HLS] master.m3u8 not found in GCS for {} despite Complete status, re-triggering", hash);
+                        use crate::metadata::update_transcode_status;
+                        let _ = update_transcode_status(&hash, TranscodeStatus::Processing);
+                        let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
+
+                        let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                        resp.set_header("Retry-After", "10");
+                        resp.set_header("Content-Type", "application/json");
+                        resp.set_body(r#"{"status":"processing","message":"HLS transcoding re-triggered, please retry"}"#);
+                        add_cors_headers(&mut resp);
+                        Ok(resp)
+                    }
+                    Some(TranscodeStatus::Processing) => {
+                        let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                        resp.set_header("Retry-After", "5");
+                        resp.set_header("Content-Type", "application/json");
+                        resp.set_body(
+                            r#"{"status":"processing","message":"HLS transcoding in progress"}"#,
+                        );
+                        add_cors_headers(&mut resp);
+                        Ok(resp)
+                    }
+                    Some(TranscodeStatus::Failed) => {
+                        // Failed previously - re-trigger
+                        eprintln!("[HLS] Re-triggering failed transcode for {}", hash);
+                        use crate::metadata::update_transcode_status;
+                        let _ = update_transcode_status(&hash, TranscodeStatus::Processing);
+                        let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
+
+                        let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                        resp.set_header("Retry-After", "10");
+                        resp.set_header("Content-Type", "application/json");
+                        resp.set_body(r#"{"status":"processing","message":"HLS transcoding re-started, please retry"}"#);
+                        add_cors_headers(&mut resp);
+                        Ok(resp)
+                    }
+                    Some(TranscodeStatus::Pending) | None => {
+                        // Not yet started - trigger on-demand transcoding
+                        use crate::metadata::update_transcode_status;
+                        if let Err(e) = update_transcode_status(&hash, TranscodeStatus::Processing)
+                        {
+                            eprintln!("[HLS] Failed to update transcode status: {}", e);
+                        }
+                        let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
+
+                        let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                        resp.set_header("Retry-After", "10");
+                        resp.set_header("Content-Type", "application/json");
+                        resp.set_body(r#"{"status":"processing","message":"HLS transcoding started, please retry in 10 seconds"}"#);
+                        add_cors_headers(&mut resp);
+                        Ok(resp)
+                    }
+                }
+            } else {
+                Err(BlossomError::NotFound("Content not found".into()))
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// HEAD /<sha256>/hls/* - Check HLS content existence
@@ -454,6 +656,7 @@ fn handle_head_hls_content(path: &str) -> Result<Response> {
 
     let mut resp = Response::from_status(StatusCode::OK);
     resp.set_header("Content-Type", content_type);
+    resp.set_header("X-Sha256", hash.to_lowercase());
     add_cors_headers(&mut resp);
 
     Ok(resp)
@@ -463,6 +666,576 @@ fn handle_head_hls_content(path: &str) -> Result<Response> {
 fn download_hls_content(gcs_path: &str) -> Result<Response> {
     use crate::storage::download_hls_from_gcs;
     download_hls_from_gcs(gcs_path)
+}
+
+/// Parse transcript path: /{sha256}/VTT (case-insensitive).
+fn parse_transcript_path(path: &str) -> Option<String> {
+    let path_trimmed = path.trim_start_matches('/');
+    let mut parts = path_trimmed.split('/');
+    let hash = parts.next()?;
+    let suffix = parts.next()?;
+
+    if parts.next().is_some() {
+        return None;
+    }
+
+    if suffix.eq_ignore_ascii_case("vtt")
+        && hash.len() == 64
+        && hash.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        Some(hash.to_lowercase())
+    } else {
+        None
+    }
+}
+
+/// Parse transcript file path: /{sha256}.vtt.
+fn parse_vtt_file_path(path: &str) -> Option<String> {
+    let path_trimmed = path.trim_start_matches('/');
+    if !path_trimmed.ends_with(".vtt") {
+        return None;
+    }
+    let hash = path_trimmed.strip_suffix(".vtt")?;
+    if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(hash.to_lowercase())
+    } else {
+        None
+    }
+}
+
+/// Check if a path is a transcript request path.
+fn is_transcript_path(path: &str) -> bool {
+    parse_transcript_path(path).is_some()
+}
+
+/// Check if a path is a transcript file request path.
+fn is_vtt_file_path(path: &str) -> bool {
+    parse_vtt_file_path(path).is_some()
+}
+
+/// Download transcript content from GCS
+fn download_transcript_content(gcs_path: &str) -> Result<Response> {
+    use crate::storage::download_transcript_from_gcs;
+    download_transcript_from_gcs(gcs_path)
+}
+
+fn serve_transcript_by_hash(req: Option<&Request>, hash: &str, can_trigger: bool) -> Result<Response> {
+    let metadata = get_blob_metadata(hash)?
+        .ok_or_else(|| BlossomError::NotFound("Content not found".into()))?;
+
+    if metadata.status == BlobStatus::Banned {
+        return Err(BlossomError::NotFound("Content not found".into()));
+    }
+
+    if metadata.status == BlobStatus::Restricted {
+        if let Some(request) = req {
+            if let Ok(Some(auth)) = optional_auth(request, AuthAction::List) {
+                if auth.pubkey.to_lowercase() != metadata.owner.to_lowercase() {
+                    return Err(BlossomError::NotFound("Content not found".into()));
+                }
+            } else {
+                return Err(BlossomError::NotFound("Content not found".into()));
+            }
+        } else {
+            return Err(BlossomError::NotFound("Content not found".into()));
+        }
+    }
+
+    if !is_transcribable_mime_type(&metadata.mime_type) {
+        return Err(BlossomError::NotFound(
+            "Transcript not available for this media type".into(),
+        ));
+    }
+
+    let gcs_path = format!("{}/vtt/main.vtt", hash);
+
+    match download_transcript_content(&gcs_path) {
+        Ok(mut resp) => {
+            resp.set_header("Content-Type", "text/vtt; charset=utf-8");
+            resp.set_header("Cache-Control", "public, max-age=31536000, immutable");
+            add_cors_headers(&mut resp);
+            Ok(resp)
+        }
+        Err(BlossomError::NotFound(_)) if can_trigger => {
+            // Transcript does not exist yet. Trigger transcription if needed.
+            match metadata.transcript_status {
+                Some(TranscriptStatus::Processing) => {
+                    let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                    resp.set_header("Retry-After", "5");
+                    resp.set_header("Content-Type", "application/json");
+                    resp.set_body(
+                        r#"{"status":"processing","message":"Transcript generation in progress"}"#,
+                    );
+                    add_cors_headers(&mut resp);
+                    Ok(resp)
+                }
+                Some(TranscriptStatus::Complete)
+                | Some(TranscriptStatus::Failed)
+                | Some(TranscriptStatus::Pending)
+                | None => {
+                    use crate::metadata::update_transcript_status;
+                    let _ = update_transcript_status(hash, TranscriptStatus::Processing);
+                    let _ = trigger_on_demand_transcription(hash, &metadata.owner, None, None);
+
+                    let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                    resp.set_header("Retry-After", "10");
+                    resp.set_header("Content-Type", "application/json");
+                    resp.set_body(r#"{"status":"processing","message":"Transcript generation started, please retry in 10 seconds"}"#);
+                    add_cors_headers(&mut resp);
+                    Ok(resp)
+                }
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// GET /<sha256>/VTT - Serve transcript in WebVTT format
+fn handle_get_transcript(req: Request, path: &str) -> Result<Response> {
+    let hash = parse_transcript_path(path)
+        .ok_or_else(|| BlossomError::BadRequest("Invalid transcript path".into()))?;
+    serve_transcript_by_hash(Some(&req), &hash, true)
+}
+
+/// HEAD /<sha256>/VTT - Check transcript existence/status
+fn handle_head_transcript(path: &str) -> Result<Response> {
+    let hash = parse_transcript_path(path)
+        .ok_or_else(|| BlossomError::BadRequest("Invalid transcript path".into()))?;
+    handle_head_transcript_by_hash(&hash)
+}
+
+/// GET /<sha256>.vtt - Stable transcript file URL
+fn handle_get_transcript_file(req: Request, path: &str) -> Result<Response> {
+    let hash = parse_vtt_file_path(path)
+        .ok_or_else(|| BlossomError::BadRequest("Invalid VTT path".into()))?;
+    serve_transcript_by_hash(Some(&req), &hash, true)
+}
+
+/// HEAD /<sha256>.vtt - Check transcript file URL status
+fn handle_head_transcript_file(path: &str) -> Result<Response> {
+    let hash = parse_vtt_file_path(path)
+        .ok_or_else(|| BlossomError::BadRequest("Invalid VTT path".into()))?;
+    handle_head_transcript_by_hash(&hash)
+}
+
+fn handle_head_transcript_by_hash(hash: &str) -> Result<Response> {
+    let metadata = get_blob_metadata(hash)?
+        .ok_or_else(|| BlossomError::NotFound("Content not found".into()))?;
+
+    if metadata.status == BlobStatus::Restricted || metadata.status == BlobStatus::Banned {
+        return Err(BlossomError::NotFound("Content not found".into()));
+    }
+
+    if !is_transcribable_mime_type(&metadata.mime_type) {
+        return Err(BlossomError::NotFound(
+            "Transcript not available for this media type".into(),
+        ));
+    }
+
+    match metadata.transcript_status {
+        Some(TranscriptStatus::Complete) => {
+            let mut resp = Response::from_status(StatusCode::OK);
+            resp.set_header("Content-Type", "text/vtt; charset=utf-8");
+            add_cors_headers(&mut resp);
+            Ok(resp)
+        }
+        Some(TranscriptStatus::Processing) => {
+            let mut resp = Response::from_status(StatusCode::ACCEPTED);
+            resp.set_header("Retry-After", "5");
+            add_cors_headers(&mut resp);
+            Ok(resp)
+        }
+        Some(TranscriptStatus::Pending) => {
+            let mut resp = Response::from_status(StatusCode::ACCEPTED);
+            resp.set_header("Retry-After", "10");
+            add_cors_headers(&mut resp);
+            Ok(resp)
+        }
+        _ => Err(BlossomError::NotFound("Transcript not available".into())),
+    }
+}
+
+fn unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn generate_subtitle_job_id(hash: &str) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let seed = format!("{}:{}:{}", hash, now.as_secs(), now.subsec_nanos());
+    let mut hasher = Sha256::new();
+    hasher.update(seed.as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    format!("sub_{}", &digest[..24])
+}
+
+fn subtitle_backoff_seconds(attempt_count: u32) -> u64 {
+    match attempt_count {
+        0 | 1 => 30,
+        2 => 120,
+        _ => 300,
+    }
+}
+
+fn apply_subtitle_job_failure(
+    job: &mut SubtitleJob,
+    error_code: Option<String>,
+    error_message: Option<String>,
+) {
+    job.status = SubtitleJobStatus::Failed;
+    job.updated_at = current_timestamp();
+    job.error_code = error_code;
+    job.error_message = error_message;
+
+    if job.attempt_count >= job.max_attempts {
+        if job.error_code.is_none() {
+            job.error_code = Some("poison_queue".to_string());
+        }
+        if job.error_message.is_none() {
+            job.error_message =
+                Some("Maximum retry attempts reached; job moved to poison queue".to_string());
+        }
+        job.next_retry_at_unix = None;
+    } else {
+        let delay = subtitle_backoff_seconds(job.attempt_count);
+        job.next_retry_at_unix = Some(unix_timestamp_secs() + delay);
+    }
+}
+
+fn dispatch_subtitle_job(job: &mut SubtitleJob, owner: &str) -> Result<()> {
+    job.status = SubtitleJobStatus::Processing;
+    job.updated_at = current_timestamp();
+    job.attempt_count = job.attempt_count.saturating_add(1);
+    job.next_retry_at_unix = None;
+    job.error_code = None;
+    job.error_message = None;
+    put_subtitle_job(job)?;
+    let _ = crate::metadata::update_transcript_status(&job.video_sha256, TranscriptStatus::Processing);
+
+    let lang_for_provider = job
+        .language
+        .as_deref()
+        .filter(|lang| !lang.eq_ignore_ascii_case("auto") && !lang.eq_ignore_ascii_case("und"));
+
+    match trigger_on_demand_transcription(
+        &job.video_sha256,
+        owner,
+        Some(&job.job_id),
+        lang_for_provider,
+    ) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            apply_subtitle_job_failure(
+                job,
+                Some("dispatch_failed".to_string()),
+                Some(e.to_string()),
+            );
+            let _ = put_subtitle_job(job);
+            Err(e)
+        }
+    }
+}
+
+/// POST /v1/subtitles/jobs
+fn handle_create_subtitle_job(mut req: Request) -> Result<Response> {
+    let body = req.take_body().into_string();
+    let create_req: SubtitleJobCreateRequest = serde_json::from_str(&body)
+        .map_err(|e| BlossomError::BadRequest(format!("Invalid JSON: {}", e)))?;
+
+    let hash = create_req.video_sha256.to_lowercase();
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(BlossomError::BadRequest(
+            "Invalid video_sha256 format".into(),
+        ));
+    }
+
+    let metadata = get_blob_metadata(&hash)?
+        .ok_or_else(|| BlossomError::NotFound("Video hash not found".into()))?;
+
+    if !is_transcribable_mime_type(&metadata.mime_type) {
+        return Err(BlossomError::BadRequest(
+            "Media type is not transcribable".into(),
+        ));
+    }
+
+    if !create_req.force {
+        if let Some(mut existing) = get_subtitle_job_by_hash(&hash)? {
+            if existing.status == SubtitleJobStatus::Failed
+                && existing.attempt_count < existing.max_attempts
+            {
+                let now = unix_timestamp_secs();
+                if existing.next_retry_at_unix.map(|t| now >= t).unwrap_or(true) {
+                    let _ = dispatch_subtitle_job(&mut existing, &metadata.owner);
+                }
+            }
+            let mut resp = json_response(StatusCode::OK, &existing);
+            add_cors_headers(&mut resp);
+            return Ok(resp);
+        }
+    }
+
+    if !create_req.force && metadata.transcript_status == Some(TranscriptStatus::Complete) {
+        let ready_job = SubtitleJob {
+            job_id: generate_subtitle_job_id(&hash),
+            video_sha256: hash.clone(),
+            status: SubtitleJobStatus::Ready,
+            text_track_url: Some(format!("{}/{}.vtt", get_base_url(&req), hash)),
+            language: create_req
+                .lang
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .or_else(|| Some("auto".to_string())),
+            duration_ms: None,
+            cue_count: None,
+            sha256: hash.clone(),
+            attempt_count: 1,
+            max_attempts: SUBTITLE_MAX_ATTEMPTS,
+            next_retry_at_unix: None,
+            error_code: None,
+            error_message: None,
+            created_at: current_timestamp(),
+            updated_at: current_timestamp(),
+        };
+        put_subtitle_job(&ready_job)?;
+        set_subtitle_job_id_for_hash(&hash, &ready_job.job_id)?;
+
+        let mut resp = json_response(StatusCode::OK, &ready_job);
+        add_cors_headers(&mut resp);
+        return Ok(resp);
+    }
+
+    let text_track_url = format!("{}/{}.vtt", get_base_url(&req), hash);
+    let language = create_req
+        .lang
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .or_else(|| Some("auto".to_string()));
+    let mut job = SubtitleJob {
+        job_id: generate_subtitle_job_id(&hash),
+        video_sha256: hash.clone(),
+        status: SubtitleJobStatus::Queued,
+        text_track_url: Some(text_track_url),
+        language,
+        duration_ms: None,
+        cue_count: None,
+        sha256: hash.clone(),
+        attempt_count: 0,
+        max_attempts: SUBTITLE_MAX_ATTEMPTS,
+        next_retry_at_unix: None,
+        error_code: None,
+        error_message: None,
+        created_at: current_timestamp(),
+        updated_at: current_timestamp(),
+    };
+
+    put_subtitle_job(&job)?;
+    set_subtitle_job_id_for_hash(&hash, &job.job_id)?;
+
+    let dispatch_result = dispatch_subtitle_job(&mut job, &metadata.owner);
+    if let Err(e) = dispatch_result {
+        let mut resp = json_response(StatusCode::BAD_GATEWAY, &job);
+        add_cors_headers(&mut resp);
+        resp.set_header("X-Error", format!("Dispatch failed: {}", e));
+        return Ok(resp);
+    }
+
+    let mut resp = json_response(StatusCode::ACCEPTED, &job);
+    add_cors_headers(&mut resp);
+    Ok(resp)
+}
+
+/// GET /v1/subtitles/jobs/{job_id}
+fn handle_get_subtitle_job(path: &str) -> Result<Response> {
+    let job_id = path
+        .strip_prefix("/v1/subtitles/jobs/")
+        .ok_or_else(|| BlossomError::BadRequest("Invalid subtitle job path".into()))?;
+
+    if job_id.is_empty() {
+        return Err(BlossomError::BadRequest("Missing job_id".into()));
+    }
+
+    let job = get_subtitle_job(job_id)?
+        .ok_or_else(|| BlossomError::NotFound("Subtitle job not found".into()))?;
+
+    let mut resp = json_response(StatusCode::OK, &job);
+    add_cors_headers(&mut resp);
+    Ok(resp)
+}
+
+/// GET /v1/subtitles/by-hash/{sha256}
+fn handle_get_subtitle_by_hash(req: Request, path: &str) -> Result<Response> {
+    let hash = path
+        .strip_prefix("/v1/subtitles/by-hash/")
+        .ok_or_else(|| BlossomError::BadRequest("Invalid subtitle hash path".into()))?
+        .to_lowercase();
+
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(BlossomError::BadRequest("Invalid sha256 format".into()));
+    }
+
+    if let Some(job) = get_subtitle_job_by_hash(&hash)? {
+        let mut resp = json_response(StatusCode::OK, &job);
+        add_cors_headers(&mut resp);
+        return Ok(resp);
+    }
+
+    let metadata = get_blob_metadata(&hash)?
+        .ok_or_else(|| BlossomError::NotFound("Video hash not found".into()))?;
+
+    if metadata.transcript_status == Some(TranscriptStatus::Complete) {
+        let job = SubtitleJob {
+            job_id: generate_subtitle_job_id(&hash),
+            video_sha256: hash.clone(),
+            status: SubtitleJobStatus::Ready,
+            text_track_url: Some(format!("{}/{}.vtt", get_base_url(&req), hash)),
+            language: None,
+            duration_ms: None,
+            cue_count: None,
+            sha256: hash.clone(),
+            attempt_count: 1,
+            max_attempts: SUBTITLE_MAX_ATTEMPTS,
+            next_retry_at_unix: None,
+            error_code: None,
+            error_message: None,
+            created_at: current_timestamp(),
+            updated_at: current_timestamp(),
+        };
+        put_subtitle_job(&job)?;
+        set_subtitle_job_id_for_hash(&hash, &job.job_id)?;
+
+        let mut resp = json_response(StatusCode::OK, &job);
+        add_cors_headers(&mut resp);
+        return Ok(resp);
+    }
+
+    Err(BlossomError::NotFound("Subtitle job not found for hash".into()))
+}
+
+/// Valid quality variant suffixes
+const QUALITY_VARIANTS: &[(&str, &str)] =
+    &[("/720p", "stream_720p.ts"), ("/480p", "stream_480p.ts")];
+
+/// Check if a path is a quality variant request like /{hash}/720p
+fn is_quality_variant_path(path: &str) -> bool {
+    let path = path.trim_start_matches('/');
+    for (suffix, _) in QUALITY_VARIANTS {
+        let suffix = suffix.trim_start_matches('/');
+        if path.ends_with(suffix) {
+            let hash_part = &path[..path.len() - suffix.len() - 1]; // -1 for the /
+            if hash_part.len() == 64 && hash_part.chars().all(|c| c.is_ascii_hexdigit()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Parse quality variant path into (hash, ts_filename)
+fn parse_quality_variant_path(path: &str) -> Option<(String, &'static str)> {
+    let path = path.trim_start_matches('/');
+    for (suffix, ts_file) in QUALITY_VARIANTS {
+        let suffix = suffix.trim_start_matches('/');
+        if path.ends_with(suffix) {
+            let hash_part = &path[..path.len() - suffix.len() - 1];
+            if hash_part.len() == 64 && hash_part.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Some((hash_part.to_lowercase(), ts_file));
+            }
+        }
+    }
+    None
+}
+
+/// GET /<sha256>/720p or /<sha256>/480p - Direct access to transcoded quality variant
+fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
+    let (hash, ts_filename) = parse_quality_variant_path(path)
+        .ok_or_else(|| BlossomError::BadRequest("Invalid quality variant path".into()))?;
+
+    // Check metadata for access control
+    let metadata = get_blob_metadata(&hash)?;
+    if let Some(ref meta) = metadata {
+        if meta.status == BlobStatus::Banned {
+            return Err(BlossomError::NotFound("Content not found".into()));
+        }
+        if meta.status == BlobStatus::Restricted {
+            if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
+                if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
+                    return Err(BlossomError::NotFound("Content not found".into()));
+                }
+            } else {
+                return Err(BlossomError::NotFound("Content not found".into()));
+            }
+        }
+    } else {
+        return Err(BlossomError::NotFound("Content not found".into()));
+    }
+
+    let meta = metadata.as_ref().unwrap();
+    let gcs_path = format!("{}/hls/{}", hash, ts_filename);
+
+    match download_hls_content(&gcs_path) {
+        Ok(mut resp) => {
+            resp.set_header("Content-Type", "video/mp2t");
+            resp.set_header("Cache-Control", "public, max-age=31536000");
+            resp.set_header("Accept-Ranges", "bytes");
+            add_cors_headers(&mut resp);
+            Ok(resp)
+        }
+        Err(BlossomError::NotFound(_)) => {
+            // HLS not ready - trigger on-demand transcoding
+            match meta.transcode_status {
+                Some(TranscodeStatus::Processing) => {
+                    let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                    resp.set_header("Retry-After", "5");
+                    resp.set_header("Content-Type", "application/json");
+                    resp.set_body(r#"{"status":"processing","message":"Video is being transcoded, please retry"}"#);
+                    add_cors_headers(&mut resp);
+                    Ok(resp)
+                }
+                Some(TranscodeStatus::Complete)
+                | Some(TranscodeStatus::Failed)
+                | Some(TranscodeStatus::Pending)
+                | None => {
+                    use crate::metadata::update_transcode_status;
+                    let _ = update_transcode_status(&hash, TranscodeStatus::Processing);
+                    let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
+
+                    let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                    resp.set_header("Retry-After", "10");
+                    resp.set_header("Content-Type", "application/json");
+                    resp.set_body(r#"{"status":"processing","message":"Transcoding started, please retry in 10 seconds"}"#);
+                    add_cors_headers(&mut resp);
+                    Ok(resp)
+                }
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// HEAD /<sha256>/720p or /<sha256>/480p
+fn handle_head_quality_variant(path: &str) -> Result<Response> {
+    let (hash, ts_filename) = parse_quality_variant_path(path)
+        .ok_or_else(|| BlossomError::BadRequest("Invalid quality variant path".into()))?;
+
+    let metadata = get_blob_metadata(&hash)?
+        .ok_or_else(|| BlossomError::NotFound("Content not found".into()))?;
+
+    if metadata.status == BlobStatus::Banned || metadata.status == BlobStatus::Restricted {
+        return Err(BlossomError::NotFound("Content not found".into()));
+    }
+
+    let gcs_path = format!("{}/hls/{}", hash, ts_filename);
+    download_hls_content(&gcs_path)?;
+
+    let mut resp = Response::from_status(StatusCode::OK);
+    resp.set_header("Content-Type", "video/mp2t");
+    resp.set_header("Accept-Ranges", "bytes");
+    add_cors_headers(&mut resp);
+    Ok(resp)
 }
 
 /// Maximum size for in-process upload (500KB) - larger files proxy to Cloud Run
@@ -484,14 +1257,19 @@ fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
     let mut proxy_req = Request::new(Method::GET, &url);
     proxy_req.set_header("Host", CLOUD_RUN_THUMBNAIL_HOST);
 
-    let resp = proxy_req
-        .send(CLOUD_RUN_BACKEND)
-        .map_err(|e| BlossomError::StorageError(format!("Cloud Run thumbnail request failed: {}", e)))?;
+    let resp = proxy_req.send(CLOUD_RUN_BACKEND).map_err(|e| {
+        BlossomError::StorageError(format!("Cloud Run thumbnail request failed: {}", e))
+    })?;
 
     match resp.get_status() {
         StatusCode::OK => Ok(resp),
-        StatusCode::NOT_FOUND => Err(BlossomError::NotFound("Video not found for thumbnail generation".into())),
-        status => Err(BlossomError::StorageError(format!("Thumbnail generation failed with status: {}", status))),
+        StatusCode::NOT_FOUND => Err(BlossomError::NotFound(
+            "Video not found for thumbnail generation".into(),
+        )),
+        status => Err(BlossomError::StorageError(format!(
+            "Thumbnail generation failed with status: {}",
+            status
+        ))),
     }
 }
 
@@ -500,10 +1278,7 @@ fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
 fn trigger_on_demand_transcoding(hash: &str, owner: &str) -> Result<()> {
     let url = format!("https://{}/transcode", CLOUD_RUN_TRANSCODER_HOST);
 
-    let body = format!(
-        r#"{{"hash":"{}","owner":"{}"}}"#,
-        hash, owner
-    );
+    let body = format!(r#"{{"hash":"{}","owner":"{}"}}"#, hash, owner);
 
     let mut proxy_req = Request::new(Method::POST, &url);
     proxy_req.set_header("Host", CLOUD_RUN_TRANSCODER_HOST);
@@ -519,7 +1294,51 @@ fn trigger_on_demand_transcoding(hash: &str, owner: &str) -> Result<()> {
         }
         Err(e) => {
             eprintln!("[HLS] Failed to trigger transcoding for {}: {}", hash, e);
-            Err(BlossomError::Internal(format!("Failed to trigger transcoding: {}", e)))
+            Err(BlossomError::Internal(format!(
+                "Failed to trigger transcoding: {}",
+                e
+            )))
+        }
+    }
+}
+
+/// Trigger on-demand transcript generation via Cloud Run transcoder service.
+fn trigger_on_demand_transcription(
+    hash: &str,
+    owner: &str,
+    job_id: Option<&str>,
+    lang: Option<&str>,
+) -> Result<()> {
+    let url = format!("https://{}/transcribe", CLOUD_RUN_TRANSCODER_HOST);
+
+    let mut payload = serde_json::json!({
+        "hash": hash,
+        "owner": owner
+    });
+    if let Some(id) = job_id {
+        payload["job_id"] = serde_json::json!(id);
+    }
+    if let Some(language) = lang {
+        payload["lang"] = serde_json::json!(language);
+    }
+    let body = payload.to_string();
+
+    let mut proxy_req = Request::new(Method::POST, &url);
+    proxy_req.set_header("Host", CLOUD_RUN_TRANSCODER_HOST);
+    proxy_req.set_header("Content-Type", "application/json");
+    proxy_req.set_body(body);
+
+    match proxy_req.send_async(CLOUD_RUN_BACKEND) {
+        Ok(_) => {
+            eprintln!("[VTT] Triggered on-demand transcription for {}", hash);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("[VTT] Failed to trigger transcription for {}: {}", hash, e);
+            Err(BlossomError::Internal(format!(
+                "Failed to trigger transcription: {}",
+                e
+            )))
         }
     }
 }
@@ -577,7 +1396,13 @@ fn handle_upload(mut req: Request) -> Result<Response> {
     // Check if blob already exists
     if blob_exists(&hash)? {
         // Return existing blob descriptor
-        if let Some(metadata) = get_blob_metadata(&hash)? {
+        if let Some(mut metadata) = get_blob_metadata(&hash)? {
+            if is_transcribable_mime_type(&metadata.mime_type)
+                && metadata.transcript_status.is_none()
+            {
+                metadata.transcript_status = Some(TranscriptStatus::Pending);
+                let _ = put_blob_metadata(&metadata);
+            }
             let descriptor = metadata.to_descriptor(&base_url);
             return Ok(json_response(StatusCode::OK, &descriptor));
         }
@@ -607,12 +1432,28 @@ fn handle_upload(mut req: Request) -> Result<Response> {
         } else {
             None
         },
+        dim: None, // Set by transcoder webhook when transcoding completes
+        transcript_status: if is_transcribable_mime_type(&content_type) {
+            Some(TranscriptStatus::Pending)
+        } else {
+            None
+        },
     };
 
     put_blob_metadata(&metadata)?;
 
     // Add to user's list
     add_to_user_list(&auth.pubkey, &hash)?;
+
+    // Update admin indices (best effort - don't fail upload if these fail)
+    let _ = update_stats_on_add(&metadata);
+    let _ = add_to_recent_index(&hash);
+    // Add user to index if new, increment unique_uploaders count
+    if let Ok(is_new) = add_to_user_index(&auth.pubkey) {
+        if is_new {
+            let _ = crate::metadata::increment_unique_uploaders();
+        }
+    }
 
     // Return blob descriptor
     let descriptor = metadata.to_descriptor(&base_url);
@@ -681,17 +1522,26 @@ fn handle_cloud_run_proxy(
         .ok_or_else(|| BlossomError::Internal("Missing sha256 in Cloud Run response".into()))?
         .to_string();
 
-    let size = cloud_run_resp["size"]
-        .as_u64()
-        .unwrap_or(content_length);
+    let size = cloud_run_resp["size"].as_u64().unwrap_or(content_length);
 
     // Parse thumbnail URL if present (for video uploads)
     let thumbnail_url = cloud_run_resp["thumbnail_url"]
         .as_str()
         .map(|s| s.to_string());
 
+    // Parse video dimensions if present (from ffprobe in upload service)
+    let dim = cloud_run_resp["dim"].as_str().map(|s| s.to_string());
+
     // Check if metadata already exists (dedupe case)
-    if let Some(metadata) = get_blob_metadata(&hash)? {
+    if let Some(mut metadata) = get_blob_metadata(&hash)? {
+        // Even for dedupe, update dim if we got it and it wasn't set before
+        if dim.is_some() && metadata.dim.is_none() {
+            metadata.dim = dim;
+        }
+        if is_transcribable_mime_type(&metadata.mime_type) && metadata.transcript_status.is_none() {
+            metadata.transcript_status = Some(TranscriptStatus::Pending);
+        }
+        let _ = put_blob_metadata(&metadata);
         let descriptor = metadata.to_descriptor(&base_url);
         let mut resp = json_response(StatusCode::OK, &descriptor);
         add_cors_headers(&mut resp);
@@ -714,12 +1564,28 @@ fn handle_cloud_run_proxy(
         } else {
             None
         },
+        dim: dim.clone(), // From ffprobe in upload service; updated by transcoder webhook
+        transcript_status: if is_transcribable_mime_type(&content_type) {
+            Some(TranscriptStatus::Pending)
+        } else {
+            None
+        },
     };
 
     put_blob_metadata(&metadata)?;
 
     // Add to user's list
     add_to_user_list(&auth.pubkey, &hash)?;
+
+    // Update admin indices (best effort - don't fail upload if these fail)
+    let _ = update_stats_on_add(&metadata);
+    let _ = add_to_recent_index(&hash);
+    // Add user to index if new, increment unique_uploaders count
+    if let Ok(is_new) = add_to_user_index(&auth.pubkey) {
+        if is_new {
+            let _ = crate::metadata::increment_unique_uploaders();
+        }
+    }
 
     // Return blob descriptor with Fastly's CDN URL
     let descriptor = metadata.to_descriptor(&base_url);
@@ -753,7 +1619,10 @@ fn handle_upload_requirements(req: Request) -> Result<Response> {
         if let Some(ref hash) = sha256 {
             if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
                 let mut resp = Response::from_status(StatusCode::BAD_REQUEST);
-                resp.set_header("X-Reason", "Invalid X-SHA-256 format (must be 64 hex characters)");
+                resp.set_header(
+                    "X-Reason",
+                    "Invalid X-SHA-256 format (must be 64 hex characters)",
+                );
                 add_cors_headers(&mut resp);
                 return Ok(resp);
             }
@@ -772,10 +1641,10 @@ fn handle_upload_requirements(req: Request) -> Result<Response> {
         if let Some(size) = content_length {
             if size > MAX_UPLOAD_SIZE {
                 let mut resp = Response::from_status(StatusCode::from_u16(413).unwrap());
-                resp.set_header("X-Reason", &format!(
-                    "File too large. Maximum size is {} bytes",
-                    MAX_UPLOAD_SIZE
-                ));
+                resp.set_header(
+                    "X-Reason",
+                    &format!("File too large. Maximum size is {} bytes", MAX_UPLOAD_SIZE),
+                );
                 add_cors_headers(&mut resp);
                 return Ok(resp);
             }
@@ -820,10 +1689,11 @@ fn handle_delete(req: Request, path: &str) -> Result<Response> {
 
     // Verify ownership
     if !check_ownership(&hash, &auth.pubkey)? {
-        return Err(BlossomError::Forbidden(
-            "You don't own this blob".into(),
-        ));
+        return Err(BlossomError::Forbidden("You don't own this blob".into()));
     }
+
+    // Get metadata before deletion for stats update
+    let metadata = get_blob_metadata(&hash)?;
 
     // Delete from B2
     storage_delete(&hash)?;
@@ -833,6 +1703,12 @@ fn handle_delete(req: Request, path: &str) -> Result<Response> {
 
     // Remove from user's list
     remove_from_user_list(&auth.pubkey, &hash)?;
+
+    // Update admin indices (best effort)
+    if let Some(meta) = metadata {
+        let _ = update_stats_on_remove(&meta);
+    }
+    let _ = remove_from_recent_index(&hash);
 
     let mut resp = Response::from_status(StatusCode::OK);
     add_cors_headers(&mut resp);
@@ -858,10 +1734,8 @@ fn handle_list(req: Request, path: &str) -> Result<Response> {
 
     // Convert to descriptors
     let base_url = get_base_url(&req);
-    let descriptors: Vec<BlobDescriptor> = blobs
-        .iter()
-        .map(|m| m.to_descriptor(&base_url))
-        .collect();
+    let descriptors: Vec<BlobDescriptor> =
+        blobs.iter().map(|m| m.to_descriptor(&base_url)).collect();
 
     let mut resp = json_response(StatusCode::OK, &descriptors);
     add_cors_headers(&mut resp);
@@ -878,7 +1752,8 @@ fn handle_report(mut req: Request) -> Result<Response> {
         .map_err(|e| BlossomError::BadRequest(format!("Invalid JSON: {}", e)))?;
 
     // Validate it's a NIP-56 report event (kind 1984)
-    let kind = report_event["kind"].as_u64()
+    let kind = report_event["kind"]
+        .as_u64()
         .ok_or_else(|| BlossomError::BadRequest("Missing 'kind' field".into()))?;
 
     if kind != 1984 {
@@ -889,7 +1764,8 @@ fn handle_report(mut req: Request) -> Result<Response> {
     }
 
     // Extract x tags (blob sha256 hashes being reported)
-    let tags = report_event["tags"].as_array()
+    let tags = report_event["tags"]
+        .as_array()
         .ok_or_else(|| BlossomError::BadRequest("Missing 'tags' field".into()))?;
 
     let mut reported_hashes: Vec<String> = Vec::new();
@@ -919,7 +1795,7 @@ fn handle_report(mut req: Request) -> Result<Response> {
 
     if reported_hashes.is_empty() {
         return Err(BlossomError::BadRequest(
-            "No valid 'x' tags found with blob hashes".into()
+            "No valid 'x' tags found with blob hashes".into(),
         ));
     }
 
@@ -927,17 +1803,15 @@ fn handle_report(mut req: Request) -> Result<Response> {
     let content = report_event["content"].as_str().unwrap_or("");
 
     // Get reporter pubkey
-    let reporter = report_event["pubkey"].as_str()
+    let reporter = report_event["pubkey"]
+        .as_str()
         .ok_or_else(|| BlossomError::BadRequest("Missing 'pubkey' field".into()))?;
 
     // Log the report for operator review
     // In production, this would be stored in a database or sent to a moderation queue
     eprintln!(
         "BUD-09 REPORT: reporter={}, hashes={:?}, type={:?}, content={}",
-        reporter,
-        reported_hashes,
-        report_type,
-        content
+        reporter, reported_hashes, report_type, content
     );
 
     // Check which blobs actually exist
@@ -985,7 +1859,9 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
 
     // Basic URL validation
     if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err(BlossomError::BadRequest("Invalid URL: must start with http:// or https://".into()));
+        return Err(BlossomError::BadRequest(
+            "Invalid URL: must start with http:// or https://".into(),
+        ));
     }
 
     // Get expected hash from auth event's x tag (optional per BUD-04)
@@ -1053,7 +1929,11 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
         .to_string();
 
     // Check if metadata already exists
-    if let Some(metadata) = get_blob_metadata(&hash)? {
+    if let Some(mut metadata) = get_blob_metadata(&hash)? {
+        if is_transcribable_mime_type(&metadata.mime_type) && metadata.transcript_status.is_none() {
+            metadata.transcript_status = Some(TranscriptStatus::Pending);
+            let _ = put_blob_metadata(&metadata);
+        }
         let descriptor = metadata.to_descriptor(&base_url);
         let mut resp = json_response(StatusCode::OK, &descriptor);
         add_cors_headers(&mut resp);
@@ -1075,10 +1955,26 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
         } else {
             None
         },
+        dim: None, // Set by transcoder webhook when transcoding completes
+        transcript_status: if is_transcribable_mime_type(&content_type) {
+            Some(TranscriptStatus::Pending)
+        } else {
+            None
+        },
     };
 
     put_blob_metadata(&metadata)?;
     add_to_user_list(&auth.pubkey, &hash)?;
+
+    // Update admin indices (best effort - don't fail mirror if these fail)
+    let _ = update_stats_on_add(&metadata);
+    let _ = add_to_recent_index(&hash);
+    // Add user to index if new, increment unique_uploaders count
+    if let Ok(is_new) = add_to_user_index(&auth.pubkey) {
+        if is_new {
+            let _ = crate::metadata::increment_unique_uploaders();
+        }
+    }
 
     // Return blob descriptor per BUD-04
     let descriptor = metadata.to_descriptor(&base_url);
@@ -1092,13 +1988,11 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
 /// Receives moderation decisions and updates blob status
 fn handle_admin_moderate(mut req: Request) -> Result<Response> {
     // Try to get webhook secret from secret store (optional)
-    let expected_secret: Option<String> = fastly::secret_store::SecretStore::open("blossom_secrets")
-        .ok()
-        .and_then(|store| store.get("webhook_secret"))
-        .map(|secret| {
-            String::from_utf8(secret.plaintext().to_vec())
-                .unwrap_or_default()
-        });
+    let expected_secret: Option<String> =
+        fastly::secret_store::SecretStore::open("blossom_secrets")
+            .ok()
+            .and_then(|store| store.get("webhook_secret"))
+            .map(|secret| String::from_utf8(secret.plaintext().to_vec()).unwrap_or_default());
 
     // Get Authorization header
     let auth_header = req
@@ -1124,7 +2018,9 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
     } else {
         // Fail closed: reject requests if webhook_secret is not configured
         eprintln!("[ADMIN] webhook_secret not configured, rejecting request");
-        return Err(BlossomError::Forbidden("Webhook secret not configured".into()));
+        return Err(BlossomError::Forbidden(
+            "Webhook secret not configured".into(),
+        ));
     }
 
     // Parse JSON body
@@ -1140,7 +2036,10 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
         .as_str()
         .ok_or_else(|| BlossomError::BadRequest("Missing 'action' field".into()))?;
 
-    eprintln!("[ADMIN] Moderation webhook: sha256={}, action={}", sha256, action);
+    eprintln!(
+        "[ADMIN] Moderation webhook: sha256={}, action={}",
+        sha256, action
+    );
 
     // Validate sha256 format
     if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -1196,13 +2095,11 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
 /// Updates transcode status for a blob after HLS generation
 fn handle_transcode_status(mut req: Request) -> Result<Response> {
     // Try to get webhook secret from secret store (same as moderation webhook)
-    let expected_secret: Option<String> = fastly::secret_store::SecretStore::open("blossom_secrets")
-        .ok()
-        .and_then(|store| store.get("webhook_secret"))
-        .map(|secret| {
-            String::from_utf8(secret.plaintext().to_vec())
-                .unwrap_or_default()
-        });
+    let expected_secret: Option<String> =
+        fastly::secret_store::SecretStore::open("blossom_secrets")
+            .ok()
+            .and_then(|store| store.get("webhook_secret"))
+            .map(|secret| String::from_utf8(secret.plaintext().to_vec()).unwrap_or_default());
 
     // Get Authorization header
     let auth_header = req
@@ -1228,7 +2125,9 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
     } else {
         // Fail closed: reject requests if webhook_secret is not configured
         eprintln!("[TRANSCODE] webhook_secret not configured, rejecting request");
-        return Err(BlossomError::Forbidden("Webhook secret not configured".into()));
+        return Err(BlossomError::Forbidden(
+            "Webhook secret not configured".into(),
+        ));
     }
 
     // Parse JSON body
@@ -1247,9 +2146,17 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
     // Optional new_size field - provided when faststart optimization replaces the original file
     let new_size = payload["new_size"].as_u64();
 
+    // Optional display dimensions from transcoder's ffprobe
+    let display_width = payload["display_width"].as_u64().map(|v| v as u32);
+    let display_height = payload["display_height"].as_u64().map(|v| v as u32);
+    let dim = match (display_width, display_height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => Some(format!("{}x{}", w, h)),
+        _ => None,
+    };
+
     eprintln!(
-        "[TRANSCODE] Status webhook: sha256={}, status={}, new_size={:?}",
-        sha256, status_str, new_size
+        "[TRANSCODE] Status webhook: sha256={}, status={}, new_size={:?}, dim={:?}",
+        sha256, status_str, new_size, dim
     );
 
     // Validate sha256 format
@@ -1271,17 +2178,25 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
         }
     };
 
-    // Update transcode status (and optionally file size if provided)
+    // Update transcode status (and optionally file size and dimensions if provided)
     use crate::metadata::update_transcode_status_with_size;
-    match update_transcode_status_with_size(sha256, new_status, new_size) {
+    match update_transcode_status_with_size(sha256, new_status, new_size, dim.clone()) {
         Ok(()) => {
-            if let Some(size) = new_size {
+            if let Some(ref d) = dim {
+                eprintln!(
+                    "[TRANSCODE] Updated blob {} to transcode status {:?} with dim {}",
+                    sha256, new_status, d
+                );
+            } else if let Some(size) = new_size {
                 eprintln!(
                     "[TRANSCODE] Updated blob {} to transcode status {:?} with new size {}",
                     sha256, new_status, size
                 );
             } else {
-                eprintln!("[TRANSCODE] Updated blob {} to transcode status {:?}", sha256, new_status);
+                eprintln!(
+                    "[TRANSCODE] Updated blob {} to transcode status {:?}",
+                    sha256, new_status
+                );
             }
             let response = serde_json::json!({
                 "success": true,
@@ -1306,6 +2221,166 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
         }
         Err(e) => {
             eprintln!("[TRANSCODE] Failed to update blob {}: {:?}", sha256, e);
+            Err(e)
+        }
+    }
+}
+
+/// POST /admin/transcript-status - Webhook from divine-transcoder service
+/// Updates transcript status for a blob after VTT generation
+fn handle_transcript_status(mut req: Request) -> Result<Response> {
+    // Try to get webhook secret from secret store (same as moderation/transcode webhook)
+    let expected_secret: Option<String> =
+        fastly::secret_store::SecretStore::open("blossom_secrets")
+            .ok()
+            .and_then(|store| store.get("webhook_secret"))
+            .map(|secret| String::from_utf8(secret.plaintext().to_vec()).unwrap_or_default());
+
+    // Get Authorization header
+    let auth_header = req
+        .get_header(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
+    // Validate secret if configured
+    if let Some(ref expected) = expected_secret {
+        match auth_header {
+            Some(ref header) if header.starts_with("Bearer ") => {
+                let provided = header.strip_prefix("Bearer ").unwrap_or("");
+                if provided != expected.trim() {
+                    eprintln!("[TRANSCRIPT] Invalid webhook secret");
+                    return Err(BlossomError::Forbidden("Invalid webhook secret".into()));
+                }
+            }
+            _ => {
+                eprintln!("[TRANSCRIPT] Missing or invalid Authorization header");
+                return Err(BlossomError::AuthRequired("Webhook secret required".into()));
+            }
+        }
+    } else {
+        // Fail closed: reject requests if webhook_secret is not configured
+        eprintln!("[TRANSCRIPT] webhook_secret not configured, rejecting request");
+        return Err(BlossomError::Forbidden(
+            "Webhook secret not configured".into(),
+        ));
+    }
+
+    // Parse JSON body
+    let body = req.take_body().into_string();
+    let payload: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| BlossomError::BadRequest(format!("Invalid JSON: {}", e)))?;
+
+    let sha256 = payload["sha256"]
+        .as_str()
+        .ok_or_else(|| BlossomError::BadRequest("Missing 'sha256' field".into()))?;
+
+    let status_str = payload["status"]
+        .as_str()
+        .ok_or_else(|| BlossomError::BadRequest("Missing 'status' field".into()))?;
+    let job_id = payload["job_id"].as_str().map(|s| s.to_string());
+    let language = payload["language"].as_str().map(|s| s.to_string());
+    let duration_ms = payload["duration_ms"].as_u64();
+    let cue_count = payload["cue_count"].as_u64().map(|v| v as u32);
+    let error_code = payload["error_code"].as_str().map(|s| s.to_string());
+    let error_message = payload["error_message"].as_str().map(|s| s.to_string());
+
+    eprintln!(
+        "[TRANSCRIPT] Status webhook: sha256={}, status={}, job_id={:?}",
+        sha256, status_str, job_id
+    );
+
+    // Validate sha256 format
+    if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(BlossomError::BadRequest("Invalid sha256 format".into()));
+    }
+
+    // Map status string to TranscriptStatus
+    let new_status = match status_str.to_lowercase().as_str() {
+        "pending" => TranscriptStatus::Pending,
+        "processing" => TranscriptStatus::Processing,
+        "complete" | "completed" | "ready" => TranscriptStatus::Complete,
+        "failed" | "error" => TranscriptStatus::Failed,
+        _ => {
+            return Err(BlossomError::BadRequest(format!(
+                "Unknown status: {}. Expected pending, processing, complete, or failed",
+                status_str
+            )));
+        }
+    };
+
+    use crate::metadata::update_transcript_status;
+    match update_transcript_status(sha256, new_status) {
+        Ok(()) => {
+            eprintln!(
+                "[TRANSCRIPT] Updated blob {} to transcript status {:?}",
+                sha256, new_status
+            );
+
+            // If a subtitle job exists, keep it in sync with webhook status and metadata.
+            let mut updated_job: Option<SubtitleJob> = if let Some(ref id) = job_id {
+                get_subtitle_job(id)?
+            } else {
+                get_subtitle_job_by_hash(sha256)?
+            };
+
+            if let Some(mut job) = updated_job.take() {
+                job.updated_at = current_timestamp();
+                match new_status {
+                    TranscriptStatus::Pending => {
+                        job.status = SubtitleJobStatus::Queued;
+                    }
+                    TranscriptStatus::Processing => {
+                        job.status = SubtitleJobStatus::Processing;
+                    }
+                    TranscriptStatus::Complete => {
+                        job.status = SubtitleJobStatus::Ready;
+                        if job.text_track_url.is_none() {
+                            job.text_track_url = Some(format!("https://media.divine.video/{}.vtt", sha256));
+                        }
+                        if let Some(lang) = language.clone() {
+                            job.language = Some(lang);
+                        }
+                        if let Some(ms) = duration_ms {
+                            job.duration_ms = Some(ms);
+                        }
+                        if let Some(cues) = cue_count {
+                            job.cue_count = Some(cues);
+                        }
+                        job.next_retry_at_unix = None;
+                        job.error_code = None;
+                        job.error_message = None;
+                    }
+                    TranscriptStatus::Failed => {
+                        apply_subtitle_job_failure(&mut job, error_code.clone(), error_message.clone());
+                    }
+                }
+                set_subtitle_job_id_for_hash(sha256, &job.job_id)?;
+                put_subtitle_job(&job)?;
+            }
+
+            let response = serde_json::json!({
+                "success": true,
+                "sha256": sha256,
+                "transcript_status": format!("{:?}", new_status).to_lowercase(),
+                "message": "Transcript status updated"
+            });
+            let mut resp = json_response(StatusCode::OK, &response);
+            add_cors_headers(&mut resp);
+            Ok(resp)
+        }
+        Err(BlossomError::NotFound(_)) => {
+            eprintln!("[TRANSCRIPT] Blob {} not found", sha256);
+            let response = serde_json::json!({
+                "success": false,
+                "sha256": sha256,
+                "error": "Blob not found"
+            });
+            let mut resp = json_response(StatusCode::NOT_FOUND, &response);
+            add_cors_headers(&mut resp);
+            Ok(resp)
+        }
+        Err(e) => {
+            eprintln!("[TRANSCRIPT] Failed to update blob {}: {:?}", sha256, e);
             Err(e)
         }
     }
@@ -1447,7 +2522,7 @@ fn handle_landing_page() -> Response {
     <div class="container">
         <header>
             <h1>Divine Blossom Server <span class="badge badge-beta">BETA</span><span class="badge badge-fastly">FASTLY</span></h1>
-            <p class="tagline">Content-addressable blob storage implementing the Blossom protocol with AI-powered content moderation</p>
+            <p class="tagline">Content-addressable blob storage implementing the Blossom protocol with AI-powered moderation, HLS, and transcript generation</p>
         </header>
 
         <section>
@@ -1457,6 +2532,69 @@ fn handle_landing_page() -> Response {
                 <div class="endpoint-info">
                     <span class="endpoint-path">/&lt;sha256&gt;[.ext]</span>
                     <p class="endpoint-desc">Retrieve a blob by its SHA-256 hash. Supports optional file extension and range requests. Use <code>.jpg</code> extension to get video thumbnails. <em>(BUD-01)</em></p>
+                </div>
+            </div>
+            <div class="endpoint">
+                <span class="method method-get">GET</span>
+                <div class="endpoint-info">
+                    <span class="endpoint-path">/&lt;sha256&gt;.hls</span>
+                    <p class="endpoint-desc">Get HLS master manifest for adaptive streaming. Automatically triggers on-demand transcoding for videos that haven't been transcoded yet. Returns <code>202 Accepted</code> with <code>Retry-After</code> header while transcoding is in progress.</p>
+                </div>
+            </div>
+            <div class="endpoint">
+                <span class="method method-get">GET</span>
+                <div class="endpoint-info">
+                    <span class="endpoint-path">/&lt;sha256&gt;/hls/master.m3u8</span>
+                    <p class="endpoint-desc">Alternative HLS manifest URL for player compatibility. Same behavior as the <code>.hls</code> endpoint above.</p>
+                </div>
+            </div>
+            <div class="endpoint">
+                <span class="method method-get">GET</span>
+                <div class="endpoint-info">
+                    <span class="endpoint-path">/&lt;sha256&gt;/720p</span>
+                    <p class="endpoint-desc">Direct download of the 720p H.264 transcoded variant (2.5 Mbps). Triggers transcoding on-demand if not yet available.</p>
+                </div>
+            </div>
+            <div class="endpoint">
+                <span class="method method-get">GET</span>
+                <div class="endpoint-info">
+                    <span class="endpoint-path">/&lt;sha256&gt;/480p</span>
+                    <p class="endpoint-desc">Direct download of the 480p H.264 transcoded variant (1 Mbps). Triggers transcoding on-demand if not yet available.</p>
+                </div>
+            </div>
+            <div class="endpoint">
+                <span class="method method-get">GET</span>
+                <div class="endpoint-info">
+                    <span class="endpoint-path">/&lt;sha256&gt;.vtt</span>
+                    <p class="endpoint-desc">Stable WebVTT URL for audio/video transcripts. Automatically triggers on-demand transcription if it has not been generated yet.</p>
+                </div>
+            </div>
+            <div class="endpoint">
+                <span class="method method-get">GET</span>
+                <div class="endpoint-info">
+                    <span class="endpoint-path">/&lt;sha256&gt;/VTT</span>
+                    <p class="endpoint-desc">Alias for transcript retrieval, compatible with legacy clients.</p>
+                </div>
+            </div>
+            <div class="endpoint">
+                <span class="method method-put">POST</span>
+                <div class="endpoint-info">
+                    <span class="endpoint-path">/v1/subtitles/jobs</span>
+                    <p class="endpoint-desc">Create or reuse a subtitle job by hash. Request body: <code>video_sha256</code>, optional <code>lang</code>, optional <code>force</code>.</p>
+                </div>
+            </div>
+            <div class="endpoint">
+                <span class="method method-get">GET</span>
+                <div class="endpoint-info">
+                    <span class="endpoint-path">/v1/subtitles/jobs/&lt;job_id&gt;</span>
+                    <p class="endpoint-desc">Get subtitle job status: <code>queued</code>, <code>processing</code>, <code>ready</code>, or <code>failed</code>.</p>
+                </div>
+            </div>
+            <div class="endpoint">
+                <span class="method method-get">GET</span>
+                <div class="endpoint-info">
+                    <span class="endpoint-path">/v1/subtitles/by-hash/&lt;sha256&gt;</span>
+                    <p class="endpoint-desc">Idempotent lookup for the current subtitle job by media hash.</p>
                 </div>
             </div>
             <div class="endpoint">
@@ -1530,6 +2668,14 @@ fn handle_landing_page() -> Response {
                     <p>Automatic JPEG thumbnail generation for uploaded videos, accessible at <code>/&lt;sha256&gt;.jpg</code>.</p>
                 </div>
                 <div class="feature">
+                    <h3>HLS Video Streaming</h3>
+                    <p>On-demand H.264 transcoding to 720p and 480p with HLS adaptive streaming. Direct quality access via <code>/&lt;sha256&gt;/720p</code> and <code>/&lt;sha256&gt;/480p</code>.</p>
+                </div>
+                <div class="feature">
+                    <h3>WebVTT Transcripts</h3>
+                    <p>On-demand transcript generation for audio/video blobs, served from immutable URLs at <code>/&lt;sha256&gt;.vtt</code>.</p>
+                </div>
+                <div class="feature">
                     <h3>GCS Storage</h3>
                     <p>Reliable blob storage backed by Google Cloud Storage.</p>
                 </div>
@@ -1582,9 +2728,18 @@ fn error_response(error: &BlossomError) -> Response {
 /// Add CORS headers
 fn add_cors_headers(resp: &mut Response) {
     resp.set_header("Access-Control-Allow-Origin", "*");
-    resp.set_header("Access-Control-Allow-Methods", "GET, HEAD, PUT, DELETE, OPTIONS");
-    resp.set_header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Sha256");
-    resp.set_header("Access-Control-Expose-Headers", "X-Sha256, X-Content-Length");
+    resp.set_header(
+        "Access-Control-Allow-Methods",
+        "GET, HEAD, PUT, POST, DELETE, OPTIONS",
+    );
+    resp.set_header(
+        "Access-Control-Allow-Headers",
+        "Authorization, Content-Type, X-Sha256",
+    );
+    resp.set_header(
+        "Access-Control-Expose-Headers",
+        "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256",
+    );
 }
 
 /// CORS preflight response
@@ -1662,6 +2817,9 @@ fn infer_mime_from_path(path: &str) -> Option<&'static str> {
     }
     if path_lower.ends_with(".m4a") {
         return Some("audio/mp4");
+    }
+    if path_lower.ends_with(".vtt") {
+        return Some("text/vtt");
     }
 
     None

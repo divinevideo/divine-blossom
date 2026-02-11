@@ -17,6 +17,7 @@ Fastly Compute (Rust) → Backblaze B2 (blobs) + Fastly KV (metadata)
 - **Nostr auth**: Kind 24242 signature validation
 - **Shadow restriction**: Moderated content only visible to owner
 - **Range requests**: Native video seeking support
+- **WebVTT transcripts**: Stable transcript URL at `/<sha256>.vtt` with async generation
 - **Free egress**: B2 → Fastly bandwidth is free
 
 ## Setup
@@ -82,6 +83,17 @@ fastly compute publish
 |--------|------|-------------|
 | `GET` | `/<sha256>[.ext]` | Retrieve blob |
 | `HEAD` | `/<sha256>[.ext]` | Check blob exists |
+| `GET` | `/<sha256>.vtt` | Retrieve WebVTT transcript (on-demand generation) |
+| `HEAD` | `/<sha256>.vtt` | Check transcript status/existence |
+| `GET` | `/<sha256>/VTT` | Alias for transcript retrieval |
+
+### Subtitle Jobs API
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/v1/subtitles/jobs` | Create subtitle job (`video_sha256`, optional `lang`, optional `force`) |
+| `GET` | `/v1/subtitles/jobs/<job_id>` | Get subtitle job status (`queued`, `processing`, `ready`, `failed`) |
+| `GET` | `/v1/subtitles/by-hash/<sha256>` | Idempotent hash lookup for existing subtitle job |
 
 ### BUD-02: Management
 
