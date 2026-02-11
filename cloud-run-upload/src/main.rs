@@ -443,10 +443,7 @@ async fn stream_to_gcs_with_hash(
     };
     let _ = client.patch_object(&update_req).await;
 
-    info!(
-        "Uploaded {} bytes as {} (owner: {})",
-        total_size, sha256_hash, owner
-    );
+    info!("Uploaded {} bytes as {} (owner: {})", total_size, sha256_hash, owner);
     Ok((sha256_hash, total_size, derivative_bytes))
 }
 
