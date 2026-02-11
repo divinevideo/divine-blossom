@@ -72,8 +72,8 @@ fn get_secret(key: &str) -> Result<String> {
 
 /// GCS configuration
 struct GCSConfig {
-    access_key: String,    // HMAC access key
-    secret_key: String,    // HMAC secret key
+    access_key: String, // HMAC access key
+    secret_key: String, // HMAC secret key
     bucket: String,
 }
 
@@ -101,7 +101,13 @@ impl GCSConfig {
 
 /// Upload a blob to GCS (simple PUT for small files)
 /// owner: pubkey of the blob owner (stored in x-amz-meta-owner for durability)
-pub fn upload_blob(hash: &str, body: Body, content_type: &str, size: u64, owner: &str) -> Result<()> {
+pub fn upload_blob(
+    hash: &str,
+    body: Body,
+    content_type: &str,
+    size: u64,
+    owner: &str,
+) -> Result<()> {
     let config = GCSConfig::load()?;
 
     // For large files, use multipart upload
@@ -174,15 +180,43 @@ pub fn download_hls_from_gcs(gcs_key: &str) -> Result<Response> {
 
     sign_request(&mut req, &config, Some("UNSIGNED-PAYLOAD".into()))?;
 
-    let resp = req
-        .send(GCS_BACKEND)
-        .map_err(|e| BlossomError::StorageError(format!("Failed to download HLS content: {}", e)))?;
+    let resp = req.send(GCS_BACKEND).map_err(|e| {
+        BlossomError::StorageError(format!("Failed to download HLS content: {}", e))
+    })?;
 
     match resp.get_status() {
         StatusCode::OK => Ok(resp),
         StatusCode::NOT_FOUND => Err(BlossomError::NotFound("HLS content not found".into())),
         status => Err(BlossomError::StorageError(format!(
             "HLS download failed with status: {}",
+            status
+        ))),
+    }
+}
+
+/// Download transcript content from GCS (WebVTT files)
+/// gcs_key format: {hash}/vtt/{filename}
+pub fn download_transcript_from_gcs(gcs_key: &str) -> Result<Response> {
+    let config = GCSConfig::load()?;
+    let path = format!("/{}/{}", config.bucket, gcs_key);
+    let url = format!("{}{}", config.endpoint(), path);
+
+    let mut req = Request::new(Method::GET, &url);
+    req.set_header("Host", config.host());
+
+    sign_request(&mut req, &config, Some("UNSIGNED-PAYLOAD".into()))?;
+
+    let resp = req.send(GCS_BACKEND).map_err(|e| {
+        BlossomError::StorageError(format!("Failed to download transcript content: {}", e))
+    })?;
+
+    match resp.get_status() {
+        StatusCode::OK => Ok(resp),
+        StatusCode::NOT_FOUND => Err(BlossomError::NotFound(
+            "Transcript content not found".into(),
+        )),
+        status => Err(BlossomError::StorageError(format!(
+            "Transcript download failed with status: {}",
             status
         ))),
     }
@@ -228,7 +262,10 @@ pub struct FallbackDownloadResult {
 /// Download a blob with fallback to CDNs
 /// Tries GCS first, then falls back to configured CDN backends
 /// Returns the response and the source that served it
-pub fn download_blob_with_fallback(hash: &str, range: Option<&str>) -> Result<FallbackDownloadResult> {
+pub fn download_blob_with_fallback(
+    hash: &str,
+    range: Option<&str>,
+) -> Result<FallbackDownloadResult> {
     // Try GCS first
     match download_blob(hash, range) {
         Ok(resp) => {
@@ -263,7 +300,9 @@ pub fn download_blob_with_fallback(hash: &str, range: Option<&str>) -> Result<Fa
     }
 
     // All sources failed
-    Err(BlossomError::NotFound("Blob not found in any storage".into()))
+    Err(BlossomError::NotFound(
+        "Blob not found in any storage".into(),
+    ))
 }
 
 /// Try to download from a fallback CDN (simple HTTP GET, no auth)
@@ -283,13 +322,16 @@ fn try_fallback_download(
         req.set_header("Range", range_value);
     }
 
-    let resp = req
-        .send(backend_name)
-        .map_err(|e| BlossomError::StorageError(format!("Fallback {} failed: {}", backend_name, e)))?;
+    let resp = req.send(backend_name).map_err(|e| {
+        BlossomError::StorageError(format!("Fallback {} failed: {}", backend_name, e))
+    })?;
 
     match resp.get_status() {
         StatusCode::OK | StatusCode::PARTIAL_CONTENT => Ok(resp),
-        StatusCode::NOT_FOUND => Err(BlossomError::NotFound(format!("Not found on {}", backend_name))),
+        StatusCode::NOT_FOUND => Err(BlossomError::NotFound(format!(
+            "Not found on {}",
+            backend_name
+        ))),
         status => Err(BlossomError::StorageError(format!(
             "Fallback {} returned status: {}",
             backend_name, status
@@ -359,7 +401,8 @@ fn initiate_multipart_upload(key: &str, content_type: &str) -> Result<String> {
         let body = resp.take_body().into_string();
         return Err(BlossomError::StorageError(format!(
             "Initiate multipart failed with status: {}, body: {}",
-            resp.get_status(), body
+            resp.get_status(),
+            body
         )));
     }
 
@@ -367,14 +410,19 @@ fn initiate_multipart_upload(key: &str, content_type: &str) -> Result<String> {
     let body = resp.take_body().into_string();
 
     // Simple XML parsing for UploadId
-    let upload_id = extract_upload_id(&body)
-        .ok_or_else(|| BlossomError::StorageError("Failed to parse UploadId from response".into()))?;
+    let upload_id = extract_upload_id(&body).ok_or_else(|| {
+        BlossomError::StorageError("Failed to parse UploadId from response".into())
+    })?;
 
     Ok(upload_id)
 }
 
 /// Initiate a multipart upload to GCS with owner metadata
-fn initiate_multipart_upload_with_owner(key: &str, content_type: &str, owner: &str) -> Result<String> {
+fn initiate_multipart_upload_with_owner(
+    key: &str,
+    content_type: &str,
+    owner: &str,
+) -> Result<String> {
     let config = GCSConfig::load()?;
     // Note: query string must be "uploads=" not just "uploads" for correct AWS4 signing
     let path = format!("/{}/{}?uploads=", config.bucket, key);
@@ -396,7 +444,8 @@ fn initiate_multipart_upload_with_owner(key: &str, content_type: &str, owner: &s
         let body = resp.take_body().into_string();
         return Err(BlossomError::StorageError(format!(
             "Initiate multipart failed with status: {}, body: {}",
-            resp.get_status(), body
+            resp.get_status(),
+            body
         )));
     }
 
@@ -404,8 +453,9 @@ fn initiate_multipart_upload_with_owner(key: &str, content_type: &str, owner: &s
     let body = resp.take_body().into_string();
 
     // Simple XML parsing for UploadId
-    let upload_id = extract_upload_id(&body)
-        .ok_or_else(|| BlossomError::StorageError("Failed to parse UploadId from response".into()))?;
+    let upload_id = extract_upload_id(&body).ok_or_else(|| {
+        BlossomError::StorageError("Failed to parse UploadId from response".into())
+    })?;
 
     Ok(upload_id)
 }
@@ -423,12 +473,7 @@ fn extract_upload_id(xml: &str) -> Option<String> {
 }
 
 /// Upload a single part of a multipart upload
-fn upload_part(
-    hash: &str,
-    upload_id: &str,
-    part_number: u32,
-    body: &[u8],
-) -> Result<String> {
+fn upload_part(hash: &str, upload_id: &str, part_number: u32, body: &[u8]) -> Result<String> {
     let config = GCSConfig::load()?;
     let path = format!(
         "/{}/{}?partNumber={}&uploadId={}",
@@ -513,7 +558,13 @@ fn complete_multipart_upload(
 
 /// Upload a large blob using multipart upload (legacy - buffers entire body)
 /// owner: pubkey of the blob owner (stored in x-amz-meta-owner for durability)
-fn upload_blob_multipart(hash: &str, body: Body, content_type: &str, size: u64, owner: &str) -> Result<()> {
+fn upload_blob_multipart(
+    hash: &str,
+    body: Body,
+    content_type: &str,
+    size: u64,
+    owner: &str,
+) -> Result<()> {
     // Read entire body into memory (required for chunking)
     let body_bytes = body.into_bytes();
 
@@ -580,7 +631,13 @@ pub fn upload_blob_streaming(body: Body, content_type: &str, expected_size: u64)
 
 /// True streaming upload: Upload body to temp, then download to compute hash, then copy to final
 /// This approach never buffers the entire file in memory
-fn upload_blob_streaming_simple(body: Body, content_type: &str, expected_size: u64, temp_key: &str, config: &GCSConfig) -> Result<String> {
+fn upload_blob_streaming_simple(
+    body: Body,
+    content_type: &str,
+    expected_size: u64,
+    temp_key: &str,
+    config: &GCSConfig,
+) -> Result<String> {
     // Step 1: Stream body directly to temp location (no buffering!)
     let path = format!("/{}/{}", config.bucket, temp_key);
     let mut req = Request::new(Method::PUT, format!("{}{}", config.endpoint(), path));
@@ -634,9 +691,9 @@ fn compute_hash_from_gcs(key: &str) -> Result<String> {
 
     sign_request(&mut req, &config, Some("UNSIGNED-PAYLOAD".into()))?;
 
-    let resp = req
-        .send(GCS_BACKEND)
-        .map_err(|e| BlossomError::StorageError(format!("Failed to download for hashing: {}", e)))?;
+    let resp = req.send(GCS_BACKEND).map_err(|e| {
+        BlossomError::StorageError(format!("Failed to download for hashing: {}", e))
+    })?;
 
     if !resp.get_status().is_success() {
         return Err(BlossomError::StorageError(format!(
@@ -664,7 +721,13 @@ fn compute_hash_from_gcs(key: &str) -> Result<String> {
 /// can't stream without knowing the hash, and we can't buffer 5GB+).
 /// Instead, we use the simple streaming approach: upload to temp, download to hash, copy.
 /// This works for files up to any size supported by GCS PUT (5GB per object).
-fn upload_blob_streaming_multipart(body: Body, content_type: &str, expected_size: u64, temp_key: &str, config: &GCSConfig) -> Result<String> {
+fn upload_blob_streaming_multipart(
+    body: Body,
+    content_type: &str,
+    expected_size: u64,
+    temp_key: &str,
+    config: &GCSConfig,
+) -> Result<String> {
     // For large files, still use the streaming approach:
     // 1. Stream body directly to temp (Fastly handles the streaming)
     // 2. Download from temp to compute hash
@@ -798,7 +861,12 @@ fn sign_copy_request(req: &mut Request, config: &GCSConfig, copy_source: &str) -
     );
 
     // Create string to sign
-    let credential_scope = format!("{}/{}/{}/aws4_request", date_stamp, config.region(), SERVICE);
+    let credential_scope = format!(
+        "{}/{}/{}/aws4_request",
+        date_stamp,
+        config.region(),
+        SERVICE
+    );
 
     let canonical_request_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
 
@@ -950,7 +1018,12 @@ fn sign_request(req: &mut Request, config: &GCSConfig, payload_hash: Option<Stri
     );
 
     // Create string to sign
-    let credential_scope = format!("{}/{}/{}/aws4_request", date_stamp, config.region(), SERVICE);
+    let credential_scope = format!(
+        "{}/{}/{}/aws4_request",
+        date_stamp,
+        config.region(),
+        SERVICE
+    );
 
     let canonical_request_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
 
@@ -977,7 +1050,12 @@ fn sign_request(req: &mut Request, config: &GCSConfig, payload_hash: Option<Stri
 /// AWS v4 request signing with owner metadata header included
 /// This is needed because custom headers must be in the canonical/signed headers
 /// or GCS will reject the request with a signature mismatch
-fn sign_request_with_owner(req: &mut Request, config: &GCSConfig, payload_hash: Option<String>, owner: &str) -> Result<()> {
+fn sign_request_with_owner(
+    req: &mut Request,
+    config: &GCSConfig,
+    payload_hash: Option<String>,
+    owner: &str,
+) -> Result<()> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -1024,7 +1102,12 @@ fn sign_request_with_owner(req: &mut Request, config: &GCSConfig, payload_hash: 
     );
 
     // Create string to sign
-    let credential_scope = format!("{}/{}/{}/aws4_request", date_stamp, config.region(), SERVICE);
+    let credential_scope = format!(
+        "{}/{}/{}/aws4_request",
+        date_stamp,
+        config.region(),
+        SERVICE
+    );
 
     let canonical_request_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
 
@@ -1050,7 +1133,10 @@ fn sign_request_with_owner(req: &mut Request, config: &GCSConfig, payload_hash: 
 
 /// Generate AWS v4 signing key
 fn get_signing_key(secret_key: &str, date_stamp: &str, region: &str) -> Result<Vec<u8>> {
-    let k_date = hmac_sha256(format!("AWS4{}", secret_key).as_bytes(), date_stamp.as_bytes())?;
+    let k_date = hmac_sha256(
+        format!("AWS4{}", secret_key).as_bytes(),
+        date_stamp.as_bytes(),
+    )?;
     let k_region = hmac_sha256(&k_date, region.as_bytes())?;
     let k_service = hmac_sha256(&k_region, SERVICE.as_bytes())?;
     let k_signing = hmac_sha256(&k_service, b"aws4_request")?;
@@ -1080,9 +1166,17 @@ fn hash_body_for_signing(_size: u64) -> String {
 /// Returns Ok if the request was sent successfully (not if migration completed)
 pub fn trigger_background_migration(hash: &str, source_backend: &str) -> Result<()> {
     // Find the CDN URL for this backend
-    let source_url = match FALLBACK_BACKENDS.iter().find(|(name, _, _)| *name == source_backend) {
+    let source_url = match FALLBACK_BACKENDS
+        .iter()
+        .find(|(name, _, _)| *name == source_backend)
+    {
         Some((_, host, path_prefix)) => format!("https://{}{}{}", host, path_prefix, hash),
-        None => return Err(BlossomError::Internal(format!("Unknown fallback backend: {}", source_backend))),
+        None => {
+            return Err(BlossomError::Internal(format!(
+                "Unknown fallback backend: {}",
+                source_backend
+            )))
+        }
     };
 
     // Build migration request JSON
@@ -1111,7 +1205,10 @@ pub fn trigger_background_migration(hash: &str, source_backend: &str) -> Result<
         }
         Err(e) => {
             // Log error but don't fail the request - migration is best-effort
-            Err(BlossomError::Internal(format!("Failed to trigger migration: {}", e)))
+            Err(BlossomError::Internal(format!(
+                "Failed to trigger migration: {}",
+                e
+            )))
         }
     }
 }

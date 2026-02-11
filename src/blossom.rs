@@ -28,6 +28,9 @@ pub struct BlobDescriptor {
     /// Video dimensions as "WIDTHxHEIGHT" (display dimensions after rotation)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dim: Option<String>,
+    /// Transcript URL in WebVTT format (optional, present when transcription complete)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vtt: Option<String>,
 }
 
 /// Blob metadata stored in KV store
@@ -58,6 +61,9 @@ pub struct BlobMetadata {
     /// Video dimensions as "WIDTHxHEIGHT" (display dimensions after rotation)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dim: Option<String>,
+    /// Transcript status for audio/video transcription
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript_status: Option<TranscriptStatus>,
 }
 
 /// Moderation status for blobs
@@ -91,6 +97,26 @@ pub enum TranscodeStatus {
 impl Default for TranscodeStatus {
     fn default() -> Self {
         TranscodeStatus::Pending
+    }
+}
+
+/// Transcript status for audio/video blobs
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TranscriptStatus {
+    /// Transcription not yet started
+    Pending,
+    /// Transcription in progress
+    Processing,
+    /// Transcription completed successfully
+    Complete,
+    /// Transcription failed
+    Failed,
+}
+
+impl Default for TranscriptStatus {
+    fn default() -> Self {
+        TranscriptStatus::Pending
     }
 }
 
@@ -134,6 +160,53 @@ pub struct UploadRequirements {
     pub allowed_types: Option<Vec<String>>,
 }
 
+/// Subtitle job status returned by /v1/subtitles APIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SubtitleJobStatus {
+    Queued,
+    Processing,
+    Ready,
+    Failed,
+}
+
+/// Subtitle job metadata persisted in KV.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubtitleJob {
+    pub job_id: String,
+    pub video_sha256: String,
+    pub status: SubtitleJobStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_track_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cue_count: Option<u32>,
+    pub sha256: String,
+    pub attempt_count: u32,
+    pub max_attempts: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_retry_at_unix: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Request payload for creating subtitle jobs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubtitleJobCreateRequest {
+    pub video_sha256: String,
+    #[serde(default)]
+    pub lang: Option<String>,
+    #[serde(default)]
+    pub force: bool,
+}
+
 impl BlobMetadata {
     /// Convert to BlobDescriptor for API response
     pub fn to_descriptor(&self, base_url: &str) -> BlobDescriptor {
@@ -142,6 +215,13 @@ impl BlobMetadata {
             && self.transcode_status == Some(TranscodeStatus::Complete)
         {
             Some(format!("{}/{}.hls", base_url, self.sha256))
+        } else {
+            None
+        };
+        let vtt = if is_transcribable_mime_type(&self.mime_type)
+            && self.transcript_status == Some(TranscriptStatus::Complete)
+        {
+            Some(format!("{}/{}.vtt", base_url, self.sha256))
         } else {
             None
         };
@@ -155,6 +235,7 @@ impl BlobMetadata {
             thumbnail: self.thumbnail.clone(),
             hls,
             dim: self.dim.clone(),
+            vtt,
         }
     }
 }
@@ -263,7 +344,10 @@ impl GlobalStats {
             *self.transcode_counts.entry(transcode_key).or_insert(0) += 1;
         }
 
-        *self.mime_type_counts.entry(metadata.mime_type.clone()).or_insert(0) += 1;
+        *self
+            .mime_type_counts
+            .entry(metadata.mime_type.clone())
+            .or_insert(0) += 1;
     }
 
     /// Decrement stats when a blob is removed
@@ -300,7 +384,11 @@ impl GlobalStats {
     }
 
     /// Update transcode count when transcode status changes
-    pub fn update_transcode(&mut self, old_status: Option<TranscodeStatus>, new_status: TranscodeStatus) {
+    pub fn update_transcode(
+        &mut self,
+        old_status: Option<TranscodeStatus>,
+        new_status: TranscodeStatus,
+    ) {
         if let Some(old) = old_status {
             let old_key = format!("{:?}", old).to_lowercase();
             if let Some(count) = self.transcode_counts.get_mut(&old_key) {
@@ -387,9 +475,28 @@ pub const VIDEO_MIME_TYPES: &[&str] = &[
     "video/x-matroska",
 ];
 
+/// MIME types we consider audio
+pub const AUDIO_MIME_TYPES: &[&str] = &[
+    "audio/mpeg",
+    "audio/mp3",
+    "audio/mp4",
+    "audio/x-m4a",
+    "audio/wav",
+    "audio/x-wav",
+    "audio/ogg",
+    "audio/flac",
+    "audio/webm",
+    "audio/aac",
+];
+
 /// Check if a MIME type is a video type
 pub fn is_video_mime_type(mime_type: &str) -> bool {
     VIDEO_MIME_TYPES.iter().any(|&t| mime_type.starts_with(t))
+}
+
+/// Check if a MIME type can be transcribed (audio or video)
+pub fn is_transcribable_mime_type(mime_type: &str) -> bool {
+    is_video_mime_type(mime_type) || AUDIO_MIME_TYPES.iter().any(|&t| mime_type.starts_with(t))
 }
 
 /// Parse SHA-256 hash from URL path
@@ -440,9 +547,18 @@ mod tests {
     fn test_parse_hash_from_path() {
         let hash = "a".repeat(64);
 
-        assert_eq!(parse_hash_from_path(&format!("/{}", hash)), Some(hash.clone()));
-        assert_eq!(parse_hash_from_path(&format!("/{}.mp4", hash)), Some(hash.clone()));
-        assert_eq!(parse_hash_from_path(&format!("/{}.webm", hash)), Some(hash.clone()));
+        assert_eq!(
+            parse_hash_from_path(&format!("/{}", hash)),
+            Some(hash.clone())
+        );
+        assert_eq!(
+            parse_hash_from_path(&format!("/{}.mp4", hash)),
+            Some(hash.clone())
+        );
+        assert_eq!(
+            parse_hash_from_path(&format!("/{}.webm", hash)),
+            Some(hash.clone())
+        );
 
         // Invalid cases
         assert_eq!(parse_hash_from_path("/upload"), None);
@@ -456,5 +572,14 @@ mod tests {
         assert!(is_video_mime_type("video/webm"));
         assert!(!is_video_mime_type("image/png"));
         assert!(!is_video_mime_type("application/json"));
+    }
+
+    #[test]
+    fn test_is_transcribable_mime_type() {
+        assert!(is_transcribable_mime_type("video/mp4"));
+        assert!(is_transcribable_mime_type("audio/mpeg"));
+        assert!(is_transcribable_mime_type("audio/wav"));
+        assert!(!is_transcribable_mime_type("image/png"));
+        assert!(!is_transcribable_mime_type("application/json"));
     }
 }
