@@ -170,13 +170,17 @@ pub fn download_thumbnail(gcs_key: &str) -> Result<Response> {
 
 /// Download HLS content from GCS (manifests and segments)
 /// gcs_key format: {hash}/hls/{filename}
-pub fn download_hls_from_gcs(gcs_key: &str) -> Result<Response> {
+pub fn download_hls_from_gcs(gcs_key: &str, range: Option<&str>) -> Result<Response> {
     let config = GCSConfig::load()?;
     let path = format!("/{}/{}", config.bucket, gcs_key);
     let url = format!("{}{}", config.endpoint(), path);
 
     let mut req = Request::new(Method::GET, &url);
     req.set_header("Host", config.host());
+
+    if let Some(range_value) = range {
+        req.set_header("Range", range_value);
+    }
 
     sign_request(&mut req, &config, Some("UNSIGNED-PAYLOAD".into()))?;
 
@@ -185,7 +189,7 @@ pub fn download_hls_from_gcs(gcs_key: &str) -> Result<Response> {
     })?;
 
     match resp.get_status() {
-        StatusCode::OK => Ok(resp),
+        StatusCode::OK | StatusCode::PARTIAL_CONTENT => Ok(resp),
         StatusCode::NOT_FOUND => Err(BlossomError::NotFound("HLS content not found".into())),
         status => Err(BlossomError::StorageError(format!(
             "HLS download failed with status: {}",
