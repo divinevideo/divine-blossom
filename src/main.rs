@@ -428,7 +428,7 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
 
     // Download master manifest from GCS
     let gcs_path = format!("{}/hls/master.m3u8", hash);
-    let result = download_hls_content(&gcs_path)?;
+    let result = download_hls_content(&gcs_path, None)?;
     let mut resp = result;
 
     let c2pa_manifest_id = resp
@@ -518,7 +518,7 @@ fn handle_get_hls_content(_req: Request, path: &str) -> Result<Response> {
     let gcs_path = format!("{}/hls/{}", hash, filename);
 
     // Try to download from GCS first
-    match download_hls_content(&gcs_path) {
+    match download_hls_content(&gcs_path, None) {
         Ok(mut resp) => {
             let c2pa_manifest_id = resp
                 .get_header_str("x-goog-meta-c2pa-manifest-id")
@@ -644,7 +644,7 @@ fn handle_head_hls_content(path: &str) -> Result<Response> {
     let gcs_path = format!("{}/hls/{}", hash.to_lowercase(), filename);
 
     // Try to get the content (HEAD-like check)
-    download_hls_content(&gcs_path)?;
+    download_hls_content(&gcs_path, None)?;
 
     let content_type = if filename.ends_with(".m3u8") {
         "application/vnd.apple.mpegurl"
@@ -663,9 +663,9 @@ fn handle_head_hls_content(path: &str) -> Result<Response> {
 }
 
 /// Download HLS content from GCS
-fn download_hls_content(gcs_path: &str) -> Result<Response> {
+fn download_hls_content(gcs_path: &str, range: Option<&str>) -> Result<Response> {
     use crate::storage::download_hls_from_gcs;
-    download_hls_from_gcs(gcs_path)
+    download_hls_from_gcs(gcs_path, range)
 }
 
 /// Parse transcript path: /{sha256}/VTT (case-insensitive).
@@ -1176,7 +1176,13 @@ fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
     let meta = metadata.as_ref().unwrap();
     let gcs_path = format!("{}/hls/{}", hash, ts_filename);
 
-    match download_hls_content(&gcs_path) {
+    // Extract Range header from client request to forward to GCS
+    let range = req
+        .get_header(header::RANGE)
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
+    match download_hls_content(&gcs_path, range.as_deref()) {
         Ok(mut resp) => {
             resp.set_header("Content-Type", "video/mp2t");
             resp.set_header("Cache-Control", "public, max-age=31536000");
@@ -1229,7 +1235,7 @@ fn handle_head_quality_variant(path: &str) -> Result<Response> {
     }
 
     let gcs_path = format!("{}/hls/{}", hash, ts_filename);
-    download_hls_content(&gcs_path)?;
+    download_hls_content(&gcs_path, None)?;
 
     let mut resp = Response::from_status(StatusCode::OK);
     resp.set_header("Content-Type", "video/mp2t");

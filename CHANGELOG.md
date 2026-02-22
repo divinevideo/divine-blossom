@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- Fixed HTTP Range request handling for quality variant endpoints (`/{hash}/720p`, `/{hash}/480p`)
+  - iOS AVPlayer `CoreMediaErrorDomain -12939` ("byte range length mismatch") caused by returning full file instead of requested byte range
+  - Quality variant handler now forwards client `Range` header to GCS and returns proper `206 Partial Content` responses
+  - Fixes video playback on iOS for transcoded quality variants
+
 ### Added
 - MIME type inference from file extension when metadata is missing
   - Supports video (mp4, webm, mov, avi, mkv, ogv), image (jpg, png, gif, webp, svg, avif), and audio (mp3, wav, ogg, flac, m4a) formats
