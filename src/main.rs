@@ -194,8 +194,7 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         match download_thumbnail(&thumbnail_key) {
             Ok(mut resp) => {
                 resp.set_header("Content-Type", "image/jpeg");
-                resp.set_header("Cache-Control", "public, max-age=31536000, immutable");
-                resp.set_header("Surrogate-Control", "max-age=31536000");
+                add_cache_headers(&mut resp, video_hash);
                 resp.set_header("Accept-Ranges", "bytes");
                 add_cors_headers(&mut resp);
                 return Ok(resp);
@@ -205,8 +204,7 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
                 match generate_thumbnail_on_demand(video_hash) {
                     Ok(mut resp) => {
                         resp.set_header("Content-Type", "image/jpeg");
-                        resp.set_header("Cache-Control", "public, max-age=31536000, immutable");
-                        resp.set_header("Surrogate-Control", "max-age=31536000");
+                        add_cache_headers(&mut resp, video_hash);
                         resp.set_header("Accept-Ranges", "bytes");
                         add_cors_headers(&mut resp);
                         return Ok(resp);
@@ -305,8 +303,7 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
     }
 
     // Content is addressed by SHA256 hash, so it's immutable - cache aggressively
-    resp.set_header("Cache-Control", "public, max-age=31536000, immutable");
-    resp.set_header("Surrogate-Control", "max-age=31536000");
+    add_cache_headers(&mut resp, &hash);
 
     if let Some(c2pa) = c2pa_manifest_id {
         resp.set_header("X-C2PA-Manifest-Id", &c2pa);
@@ -340,8 +337,8 @@ fn handle_head_blob(path: &str) -> Result<Response> {
         let mut head_resp = Response::from_status(StatusCode::OK);
         head_resp.set_header("Content-Type", "image/jpeg");
         head_resp.set_header("Content-Length", &content_length);
-        head_resp.set_header("Cache-Control", "public, max-age=31536000, immutable");
-        head_resp.set_header("Surrogate-Control", "max-age=31536000");
+        let thumb_hash = thumbnail_key.trim_end_matches(".jpg");
+        add_cache_headers(&mut head_resp, thumb_hash);
         head_resp.set_header("Accept-Ranges", "bytes");
         add_cors_headers(&mut head_resp);
         return Ok(head_resp);
@@ -366,8 +363,7 @@ fn handle_head_blob(path: &str) -> Result<Response> {
     resp.set_header(header::CONTENT_LENGTH, metadata.size.to_string());
     resp.set_header("X-Sha256", &metadata.sha256);
     resp.set_header("X-Content-Length", metadata.size.to_string());
-    resp.set_header("Cache-Control", "public, max-age=31536000, immutable");
-    resp.set_header("Surrogate-Control", "max-age=31536000");
+    add_cache_headers(&mut resp, &hash);
     resp.set_header("Accept-Ranges", "bytes");
     add_cors_headers(&mut resp);
 
@@ -463,8 +459,7 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
 
     // Set correct content type for HLS manifest
     resp.set_header("Content-Type", "application/vnd.apple.mpegurl");
-    resp.set_header("Cache-Control", "public, max-age=31536000, immutable");
-    resp.set_header("Surrogate-Control", "max-age=31536000");
+    add_cache_headers(&mut resp, &hash);
     resp.set_header("X-Sha256", &hash);
     if let Some(c2pa) = c2pa_manifest_id {
         resp.set_header("X-C2PA-Manifest-Id", &c2pa);
@@ -504,8 +499,7 @@ fn handle_head_hls_master(path: &str) -> Result<Response> {
         Some(TranscodeStatus::Complete) => {
             let mut resp = Response::from_status(StatusCode::OK);
             resp.set_header("Content-Type", "application/vnd.apple.mpegurl");
-            resp.set_header("Cache-Control", "public, max-age=31536000, immutable");
-            resp.set_header("Surrogate-Control", "max-age=31536000");
+            add_cache_headers(&mut resp, &hash);
             resp.set_header("X-Sha256", &hash);
             add_cors_headers(&mut resp);
             Ok(resp)
@@ -563,8 +557,7 @@ fn handle_get_hls_content(_req: Request, path: &str) -> Result<Response> {
             };
 
             resp.set_header("Content-Type", content_type);
-            resp.set_header("Cache-Control", "public, max-age=31536000, immutable");
-            resp.set_header("Surrogate-Control", "max-age=31536000");
+            add_cache_headers(&mut resp, &hash);
             resp.set_header("X-Sha256", &hash);
             if let Some(c2pa) = c2pa_manifest_id {
                 resp.set_header("X-C2PA-Manifest-Id", &c2pa);
@@ -682,10 +675,10 @@ fn handle_head_hls_content(path: &str) -> Result<Response> {
     };
 
     let mut resp = Response::from_status(StatusCode::OK);
+    let hash_lower = hash.to_lowercase();
     resp.set_header("Content-Type", content_type);
-    resp.set_header("Cache-Control", "public, max-age=31536000, immutable");
-    resp.set_header("Surrogate-Control", "max-age=31536000");
-    resp.set_header("X-Sha256", hash.to_lowercase());
+    add_cache_headers(&mut resp, &hash_lower);
+    resp.set_header("X-Sha256", &hash_lower);
     add_cors_headers(&mut resp);
 
     Ok(resp)
@@ -781,8 +774,7 @@ fn serve_transcript_by_hash(req: Option<&Request>, hash: &str, can_trigger: bool
     match download_transcript_content(&gcs_path) {
         Ok(mut resp) => {
             resp.set_header("Content-Type", "text/vtt; charset=utf-8");
-            resp.set_header("Cache-Control", "public, max-age=31536000, immutable");
-            resp.set_header("Surrogate-Control", "max-age=31536000");
+            add_cache_headers(&mut resp, &hash);
             add_cors_headers(&mut resp);
             Ok(resp)
         }
@@ -866,8 +858,7 @@ fn handle_head_transcript_by_hash(hash: &str) -> Result<Response> {
         Some(TranscriptStatus::Complete) => {
             let mut resp = Response::from_status(StatusCode::OK);
             resp.set_header("Content-Type", "text/vtt; charset=utf-8");
-            resp.set_header("Cache-Control", "public, max-age=31536000, immutable");
-            resp.set_header("Surrogate-Control", "max-age=31536000");
+            add_cache_headers(&mut resp, hash);
             add_cors_headers(&mut resp);
             Ok(resp)
         }
@@ -1217,8 +1208,7 @@ fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
     match download_hls_content(&gcs_path, range.as_deref()) {
         Ok(mut resp) => {
             resp.set_header("Content-Type", "video/mp2t");
-            resp.set_header("Cache-Control", "public, max-age=31536000, immutable");
-            resp.set_header("Surrogate-Control", "max-age=31536000");
+            add_cache_headers(&mut resp, &hash);
             resp.set_header("Accept-Ranges", "bytes");
             add_cors_headers(&mut resp);
             Ok(resp)
@@ -2961,6 +2951,16 @@ fn error_response(error: &BlossomError) -> Response {
 }
 
 /// Add CORS headers
+/// Set immutable cache headers and surrogate key for content-addressed responses.
+/// - Cache-Control: tells browsers to cache for 1 year
+/// - Surrogate-Control: tells Fastly edge to cache for 1 year (stripped before client)
+/// - Surrogate-Key: enables targeted purging via `fastly purge --key {hash}`
+fn add_cache_headers(resp: &mut Response, hash: &str) {
+    resp.set_header("Cache-Control", "public, max-age=31536000, immutable");
+    resp.set_header("Surrogate-Control", "max-age=31536000");
+    resp.set_header("Surrogate-Key", hash);
+}
+
 fn add_cors_headers(resp: &mut Response) {
     resp.set_header("Access-Control-Allow-Origin", "*");
     resp.set_header(
