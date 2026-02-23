@@ -147,6 +147,7 @@ fn handle_request(req: Request) -> Result<Response> {
         }
         (Method::POST, "/admin/api/moderate") => admin::handle_admin_moderate_action(req),
         (Method::POST, "/admin/api/backfill") => admin::handle_admin_backfill(req),
+        (Method::POST, "/admin/api/backfill-vtt") => handle_admin_backfill_vtt(req),
 
         // CORS preflight
         (Method::OPTIONS, _) => Ok(cors_preflight_response()),
@@ -183,6 +184,7 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         match download_thumbnail(&thumbnail_key) {
             Ok(mut resp) => {
                 resp.set_header("Content-Type", "image/jpeg");
+                resp.set_header("Cache-Control", "public, max-age=31536000, immutable");
                 resp.set_header("Accept-Ranges", "bytes");
                 add_cors_headers(&mut resp);
                 return Ok(resp);
@@ -192,6 +194,7 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
                 match generate_thumbnail_on_demand(video_hash) {
                     Ok(mut resp) => {
                         resp.set_header("Content-Type", "image/jpeg");
+                        resp.set_header("Cache-Control", "public, max-age=31536000, immutable");
                         resp.set_header("Accept-Ranges", "bytes");
                         add_cors_headers(&mut resp);
                         return Ok(resp);
@@ -289,6 +292,9 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         resp.set_header("X-Sha256", &hash);
     }
 
+    // Content is addressed by SHA256 hash, so it's immutable - cache aggressively
+    resp.set_header("Cache-Control", "public, max-age=31536000, immutable");
+
     if let Some(c2pa) = c2pa_manifest_id {
         resp.set_header("X-C2PA-Manifest-Id", &c2pa);
     }
@@ -321,6 +327,7 @@ fn handle_head_blob(path: &str) -> Result<Response> {
         let mut head_resp = Response::from_status(StatusCode::OK);
         head_resp.set_header("Content-Type", "image/jpeg");
         head_resp.set_header("Content-Length", &content_length);
+        head_resp.set_header("Cache-Control", "public, max-age=31536000, immutable");
         head_resp.set_header("Accept-Ranges", "bytes");
         add_cors_headers(&mut head_resp);
         return Ok(head_resp);
@@ -345,6 +352,7 @@ fn handle_head_blob(path: &str) -> Result<Response> {
     resp.set_header(header::CONTENT_LENGTH, metadata.size.to_string());
     resp.set_header("X-Sha256", &metadata.sha256);
     resp.set_header("X-Content-Length", metadata.size.to_string());
+    resp.set_header("Cache-Control", "public, max-age=31536000, immutable");
     resp.set_header("Accept-Ranges", "bytes");
     add_cors_headers(&mut resp);
 
@@ -440,7 +448,7 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
 
     // Set correct content type for HLS manifest
     resp.set_header("Content-Type", "application/vnd.apple.mpegurl");
-    resp.set_header("Cache-Control", "public, max-age=31536000"); // HLS manifests are immutable for VOD
+    resp.set_header("Cache-Control", "public, max-age=31536000, immutable");
     resp.set_header("X-Sha256", &hash);
     if let Some(c2pa) = c2pa_manifest_id {
         resp.set_header("X-C2PA-Manifest-Id", &c2pa);
@@ -537,7 +545,7 @@ fn handle_get_hls_content(_req: Request, path: &str) -> Result<Response> {
             };
 
             resp.set_header("Content-Type", content_type);
-            resp.set_header("Cache-Control", "public, max-age=31536000"); // Immutable for VOD
+            resp.set_header("Cache-Control", "public, max-age=31536000, immutable");
             resp.set_header("X-Sha256", &hash);
             if let Some(c2pa) = c2pa_manifest_id {
                 resp.set_header("X-C2PA-Manifest-Id", &c2pa);
@@ -1185,7 +1193,7 @@ fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
     match download_hls_content(&gcs_path, range.as_deref()) {
         Ok(mut resp) => {
             resp.set_header("Content-Type", "video/mp2t");
-            resp.set_header("Cache-Control", "public, max-age=31536000");
+            resp.set_header("Cache-Control", "public, max-age=31536000, immutable");
             resp.set_header("Accept-Ranges", "bytes");
             add_cors_headers(&mut resp);
             Ok(resp)
@@ -1987,6 +1995,149 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
     let mut resp = json_response(StatusCode::OK, &descriptor);
     add_cors_headers(&mut resp);
 
+    Ok(resp)
+}
+
+/// POST /admin/api/backfill-vtt - Trigger VTT transcription for all video/audio blobs missing transcripts
+/// Iterates through user index, finds transcribable blobs without VTT, and triggers transcription.
+/// Query params: ?offset=N&limit=M (paginate through users, default limit=50)
+fn handle_admin_backfill_vtt(req: Request) -> Result<Response> {
+    // Accept webhook secret (same as transcoder uses) OR admin session
+    let webhook_ok = fastly::secret_store::SecretStore::open("blossom_secrets")
+        .ok()
+        .and_then(|store| store.get("webhook_secret"))
+        .and_then(|secret| {
+            let expected = String::from_utf8(secret.plaintext().to_vec()).unwrap_or_default();
+            let provided = req
+                .get_header(header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.strip_prefix("Bearer "))?;
+            if provided.trim() == expected.trim() {
+                Some(())
+            } else {
+                None
+            }
+        })
+        .is_some();
+
+    if !webhook_ok {
+        admin::validate_admin_auth(&req)?;
+    }
+
+    let url = req.get_url();
+    let query_pairs: std::collections::HashMap<_, _> = url
+        .query_pairs()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+    let offset: usize = query_pairs
+        .get("offset")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let limit: usize = query_pairs
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+
+    // Max triggers per request to avoid Fastly Compute timeout (~30s wall time)
+    let max_triggers: u32 = query_pairs
+        .get("max_triggers")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+
+    // Reset stale "processing" items back to pending so they get re-triggered
+    let reset_processing: bool = query_pairs
+        .get("reset_processing")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    let user_index = crate::metadata::get_user_index()?;
+    let total_users = user_index.pubkeys.len();
+    let end = std::cmp::min(offset + limit, total_users);
+    let pubkeys_to_process = if offset < total_users {
+        &user_index.pubkeys[offset..end]
+    } else {
+        &[] as &[String]
+    };
+
+    let mut triggered = 0u32;
+    let mut already_complete = 0u32;
+    let mut already_processing = 0u32;
+    let mut reset_count = 0u32;
+    let mut not_transcribable = 0u32;
+    let mut errors = 0u32;
+    let mut hit_limit = false;
+
+    for pubkey in pubkeys_to_process {
+        if hit_limit {
+            break;
+        }
+        let hashes = crate::metadata::get_user_blobs(pubkey).unwrap_or_default();
+
+        for hash in hashes {
+            if let Ok(Some(mut metadata)) = get_blob_metadata(&hash) {
+                if !is_transcribable_mime_type(&metadata.mime_type) {
+                    not_transcribable += 1;
+                    continue;
+                }
+
+                match metadata.transcript_status {
+                    Some(TranscriptStatus::Complete) => {
+                        already_complete += 1;
+                        continue;
+                    }
+                    Some(TranscriptStatus::Processing) if !reset_processing => {
+                        already_processing += 1;
+                        continue;
+                    }
+                    Some(TranscriptStatus::Processing) => {
+                        // Reset stale processing items
+                        reset_count += 1;
+                        // Fall through to trigger
+                    }
+                    _ => {}
+                }
+
+                if triggered >= max_triggers {
+                    hit_limit = true;
+                    break;
+                }
+
+                // Update status to Processing and trigger transcription (async/fire-and-forget)
+                metadata.transcript_status = Some(TranscriptStatus::Processing);
+                let _ = put_blob_metadata(&metadata);
+
+                match trigger_on_demand_transcription(&hash, &metadata.owner, None, None) {
+                    Ok(_) => triggered += 1,
+                    Err(_) => errors += 1,
+                }
+            }
+        }
+    }
+
+    let has_more = end < total_users;
+    let response = serde_json::json!({
+        "success": true,
+        "batch": {
+            "offset": offset,
+            "limit": limit,
+            "processed_users": pubkeys_to_process.len(),
+            "next_offset": if has_more { Some(end) } else { None },
+            "has_more": has_more
+        },
+        "results": {
+            "triggered": triggered,
+            "already_complete": already_complete,
+            "already_processing": already_processing,
+            "not_transcribable": not_transcribable,
+            "reset_from_processing": reset_count,
+            "errors": errors,
+            "hit_trigger_limit": hit_limit
+        }
+    });
+
+    let mut resp = json_response(StatusCode::OK, &response);
+    add_cors_headers(&mut resp);
     Ok(resp)
 }
 
