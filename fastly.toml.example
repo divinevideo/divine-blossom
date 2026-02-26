@@ -36,6 +36,9 @@ language = "rust"
     [local_server.backends.cloud_run_upload]
     url = "https://blossom-upload-rust-149672065768.us-central1.run.app"
 
+    [local_server.backends.moderation_api]
+    url = "https://moderation-api.divine.video"
+
     [local_server.backends.r2_storage]
     url = "https://YOUR_R2_BUCKET.r2.cloudflarestorage.com"
 
@@ -63,6 +66,9 @@ language = "rust"
 
         [local_server.secret_stores.blossom_secrets.contents.gcs_secret_key]
         plaintext = "YOUR_GCS_SECRET_KEY"
+
+        [local_server.secret_stores.blossom_secrets.contents.moderation_api_token]
+        plaintext = "YOUR_MODERATION_API_BEARER_TOKEN"
 
 [setup]
 
@@ -107,6 +113,11 @@ language = "rust"
     [setup.backends.cloud_run_upload]
     description = "Cloud Run upload/migration service"
     address = "blossom-upload-rust-149672065768.us-central1.run.app"
+    port = 443
+
+    [setup.backends.moderation_api]
+    description = "Divine moderation API (CF Worker)"
+    address = "moderation-api.divine.video"
     port = 443
 
     [setup.backends.r2_storage]
