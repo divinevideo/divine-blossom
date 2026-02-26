@@ -141,6 +141,16 @@ fn handle_request(req: Request) -> Result<Response> {
             let pubkey = p.strip_prefix("/admin/api/user/").unwrap_or("");
             admin::handle_admin_user_blobs(req, pubkey)
         }
+        (Method::GET, p)
+            if p.starts_with("/admin/api/blob/") && p.ends_with("/content") =>
+        {
+            let hash = p
+                .strip_prefix("/admin/api/blob/")
+                .unwrap_or("")
+                .strip_suffix("/content")
+                .unwrap_or("");
+            admin::handle_admin_blob_content(req, hash)
+        }
         (Method::GET, p) if p.starts_with("/admin/api/blob/") => {
             let hash = p.strip_prefix("/admin/api/blob/").unwrap_or("");
             admin::handle_admin_blob_detail(req, hash)

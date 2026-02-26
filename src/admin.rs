@@ -8,6 +8,7 @@ use crate::metadata::{
     replace_global_stats, replace_recent_index, replace_user_index, update_blob_status,
     update_stats_on_status_change,
 };
+use crate::storage::download_blob_with_fallback;
 use fastly::http::{header, Method, StatusCode};
 use fastly::kv_store::KVStore;
 use fastly::{Request, Response};
@@ -688,6 +689,48 @@ pub fn handle_admin_blob_detail(req: Request, hash: &str) -> Result<Response> {
         get_blob_metadata(hash)?.ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
 
     json_response(StatusCode::OK, &metadata)
+}
+
+/// GET /admin/api/blob/{hash}/content - Serve blob content regardless of moderation status
+/// Used by divine-moderation-service admin proxy for moderator review of flagged content
+pub fn handle_admin_blob_content(req: Request, hash: &str) -> Result<Response> {
+    validate_admin_auth(&req)?;
+
+    // Verify blob exists in metadata (but don't check moderation status)
+    let metadata = get_blob_metadata(hash)?
+        .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
+
+    // Get Range header for partial content support
+    let range = req
+        .get_header(header::RANGE)
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
+    // Download from storage (GCS with CDN fallback) — no moderation gating
+    let result = download_blob_with_fallback(hash, range.as_deref())?;
+    let mut resp = result.response;
+
+    // Don't overwrite Content-Length for 206 Partial Content (backend sets it)
+    let is_partial = resp.get_status() == StatusCode::PARTIAL_CONTENT;
+
+    resp.set_header("Content-Type", &metadata.mime_type);
+    resp.set_header("X-Sha256", &metadata.sha256);
+    resp.set_header("X-Moderation-Status", &format!("{:?}", metadata.status));
+    if !is_partial {
+        resp.set_header("Content-Length", metadata.size.to_string());
+    }
+    resp.set_header("Cache-Control", "private, no-store");
+    resp.set_header("Accept-Ranges", "bytes");
+
+    // Inline CORS headers (add_cors_headers is private to main.rs)
+    resp.set_header("Access-Control-Allow-Origin", "*");
+    resp.set_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+    resp.set_header(
+        "Access-Control-Allow-Headers",
+        "Authorization, Content-Type, Range",
+    );
+
+    Ok(resp)
 }
 
 /// POST /admin/api/moderate - Change blob status
