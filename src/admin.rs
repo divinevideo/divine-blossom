@@ -50,51 +50,41 @@ pub fn validate_admin_auth(req: &Request) -> Result<()> {
 }
 
 /// Validate Bearer token from Authorization header
+/// Accepts either admin_token or webhook_secret from the Fastly Secret Store.
 fn validate_bearer_token(req: &Request) -> Result<()> {
-    let expected_token: Option<String> = fastly::secret_store::SecretStore::open("blossom_secrets")
-        .ok()
-        .and_then(|store| {
-            store
-                .get("admin_token")
-                .map(|secret| {
-                    String::from_utf8(secret.plaintext().to_vec())
-                        .unwrap_or_default()
-                        .trim()
-                        .to_string()
-                })
-                .filter(|s| !s.is_empty())
-                .or_else(|| {
-                    store
-                        .get("webhook_secret")
-                        .map(|secret| {
-                            String::from_utf8(secret.plaintext().to_vec())
-                                .unwrap_or_default()
-                                .trim()
-                                .to_string()
-                        })
-                        .filter(|s| !s.is_empty())
-                })
-        });
-
-    let auth_header = req
+    let provided = req
         .get_header(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string());
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|s| s.trim().to_string())
+        .ok_or_else(|| BlossomError::AuthRequired("Admin authentication required".into()))?;
 
-    match (expected_token, auth_header) {
-        (Some(expected), Some(header)) if header.starts_with("Bearer ") => {
-            let provided = header.strip_prefix("Bearer ").unwrap_or("").trim();
-            if provided == expected {
-                Ok(())
-            } else {
-                Err(BlossomError::Forbidden("Invalid admin token".into()))
-            }
+    let store = fastly::secret_store::SecretStore::open("blossom_secrets")
+        .map_err(|_| BlossomError::Forbidden("Secret store not available".into()))?;
+
+    // Accept admin_token
+    if let Some(secret) = store.get("admin_token") {
+        let token = String::from_utf8(secret.plaintext().to_vec())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !token.is_empty() && provided == token {
+            return Ok(());
         }
-        (Some(_), _) => Err(BlossomError::AuthRequired(
-            "Admin authentication required".into(),
-        )),
-        (None, _) => Err(BlossomError::Forbidden("Admin token not configured".into())),
     }
+
+    // Accept webhook_secret (used by divine-moderation-service)
+    if let Some(secret) = store.get("webhook_secret") {
+        let token = String::from_utf8(secret.plaintext().to_vec())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !token.is_empty() && provided == token {
+            return Ok(());
+        }
+    }
+
+    Err(BlossomError::Forbidden("Invalid admin token".into()))
 }
 
 /// Extract session token from Cookie header
