@@ -1357,6 +1357,49 @@ fn trigger_on_demand_transcription(
     }
 }
 
+/// Moderation API backend name (must match fastly.toml)
+const MODERATION_API_BACKEND: &str = "moderation_api";
+
+/// Trigger content moderation scan via divine-moderation-api worker.
+/// Fire-and-forget — upload should never fail because moderation is down.
+fn trigger_moderation_scan(sha256: &str, pubkey: &str) {
+    let token = match fastly::secret_store::SecretStore::open("blossom_secrets")
+        .ok()
+        .and_then(|store| store.get("moderation_api_token"))
+        .map(|secret| String::from_utf8(secret.plaintext().to_vec()).unwrap_or_default())
+    {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            eprintln!("[MODERATION] moderation_api_token not configured, skipping scan");
+            return;
+        }
+    };
+
+    let body = format!(
+        r#"{{"sha256":"{}","source":"blossom","pubkey":"{}"}}"#,
+        sha256, pubkey
+    );
+
+    let mut req = Request::new(
+        Method::POST,
+        "https://moderation-api.divine.video/api/v1/scan",
+    );
+    req.set_header("Host", "moderation-api.divine.video");
+    req.set_header("Content-Type", "application/json");
+    req.set_header("Authorization", &format!("Bearer {}", token.trim()));
+    req.set_body(body);
+
+    match req.send_async(MODERATION_API_BACKEND) {
+        Ok(_) => {
+            eprintln!("[MODERATION] Queued scan for {}", sha256);
+        }
+        Err(e) => {
+            eprintln!("[MODERATION] Failed to queue scan for {}: {}", sha256, e);
+            // Don't fail the upload — moderation is best-effort
+        }
+    }
+}
+
 /// PUT /upload - Upload blob
 fn handle_upload(mut req: Request) -> Result<Response> {
     // Validate auth
@@ -1467,6 +1510,11 @@ fn handle_upload(mut req: Request) -> Result<Response> {
         if is_new {
             let _ = crate::metadata::increment_unique_uploaders();
         }
+    }
+
+    // Trigger content moderation for video uploads (fire-and-forget)
+    if is_video_mime_type(&content_type) {
+        trigger_moderation_scan(&hash, &auth.pubkey);
     }
 
     // Return blob descriptor
@@ -1599,6 +1647,11 @@ fn handle_cloud_run_proxy(
         if is_new {
             let _ = crate::metadata::increment_unique_uploaders();
         }
+    }
+
+    // Trigger content moderation for video uploads (fire-and-forget)
+    if is_video_mime_type(&content_type) {
+        trigger_moderation_scan(&hash, &auth.pubkey);
     }
 
     // Return blob descriptor with Fastly's CDN URL
