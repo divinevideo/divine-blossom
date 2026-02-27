@@ -1,0 +1,26 @@
+# Build stage
+FROM rust:latest AS builder
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
+COPY hooks/ hooks/
+COPY scripts/ scripts/
+COPY skills/ skills/
+COPY opencode-plugin/ opencode-plugin/
+COPY .mcp.json ./
+RUN cargo build --release
+
+# Runtime stage — clean image with NO Rust, tmux, or claude.
+# Must match rust:latest glibc (currently trixie/glibc 2.41).
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl jq ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/ouija /usr/local/bin/ouija
+COPY tests/e2e/lib.sh /lib.sh
+COPY tests/e2e/run-install-tests.sh /run-install-tests.sh
+RUN chmod +x /run-install-tests.sh
+
+ENV OUIJA_E2E=1
+ENTRYPOINT ["/run-install-tests.sh"]

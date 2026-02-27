@@ -1,0 +1,52 @@
+#!/bin/bash
+# Bump alpha version, commit, push, publish to crates.io, then ouija update
+set -euo pipefail
+
+PORT="${OUIJA_PORT:-7880}"
+BASE="http://localhost:${PORT}"
+
+# Read current version
+CURRENT=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+echo "Current version: $CURRENT"
+
+# Bump alpha number: 0.1.0-alpha.65 -> 0.1.0-alpha.66
+PREFIX=$(echo "$CURRENT" | sed 's/\.[0-9]*$//')
+NUM=$(echo "$CURRENT" | grep -o '[0-9]*$')
+NEXT="$PREFIX.$((NUM + 1))"
+echo "Next version: $NEXT"
+
+# Update Cargo.toml and regenerate Cargo.lock
+# macOS sed -i requires '' arg, GNU sed does not
+if [[ "$(uname)" == "Darwin" ]]; then
+  sed -i '' "s/^version = \"$CURRENT\"/version = \"$NEXT\"/" Cargo.toml
+else
+  sed -i "s/^version = \"$CURRENT\"/version = \"$NEXT\"/" Cargo.toml
+fi
+cargo check --quiet 2>/dev/null || true
+
+# Commit, tag, and push
+git add Cargo.toml Cargo.lock
+git commit -m "v$NEXT"
+git tag "v$NEXT"
+git push && git push origin "v$NEXT"
+
+# Publish
+cargo publish
+
+# Update local daemon
+ouija update
+
+# Request macOS builds from the Mac via ouija (non-blocking, best-effort)
+MAC_NODE=$(curl -sf "${BASE}/api/nodes" 2>/dev/null | jq -r '[.nodes[] | select(.name != null and .status == "connected") | .name] | first // empty')
+if [ -n "$MAC_NODE" ]; then
+  echo "Requesting macOS builds from ${MAC_NODE}..."
+  curl -sf -X POST "${BASE}/api/send" \
+    -H "Content-Type: application/json" \
+    -d "{\"from\":\"release-task\",\"to\":\"${MAC_NODE}/ouija\",\"message\":\"Release v${NEXT} published. Build macOS binaries and upload to the GitHub release. Steps: (1) cd ~/code/ouija && git pull (2) cargo build --release --target x86_64-apple-darwin (3) cargo build --release --target aarch64-apple-darwin (4) package: for TARGET in x86_64-apple-darwin aarch64-apple-darwin; do DIR=ouija-\\\$TARGET; mkdir -p \\\$DIR; cp target/\\\$TARGET/release/ouija \\\$DIR/; tar cJf \\\$DIR.tar.xz \\\$DIR; rm -rf \\\$DIR; done (5) wait for the GitHub release to exist (CI creates it): while ! gh release view v${NEXT} --repo dcadenas/ouija >/dev/null 2>&1; do echo waiting for release...; sleep 15; done (6) upload: gh release upload v${NEXT} --repo dcadenas/ouija ouija-x86_64-apple-darwin.tar.xz ouija-aarch64-apple-darwin.tar.xz (7) clean up tarballs. IMPORTANT: do NOT use gh release create. Only use gh release upload. The CI workflow creates the release.\",\"expects_reply\":false}" 2>/dev/null \
+    && echo "macOS build request sent" \
+    || echo "warning: could not send macOS build request"
+else
+  echo "warning: no remote Mac node connected, skipping macOS builds"
+fi
+
+echo "Released $NEXT"

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "ouija",
+  "version": "1.0.0",
+  "description": "Ouija - cross-machine AI session communication daemon",
+  "owner": {
+    "name": "Daniel Cadenas",
+    "url": "https://github.com/dcadenas"
+  },
+  "plugins": [
+    {
+      "name": "ouija",
+      "version": "0.1.0",
+      "description": "Connect Claude Code sessions across terminals, machines, and projects via Nostr.",
+      "source": "./",
+      "author": {
+        "name": "Daniel Cadenas",
+        "url": "https://github.com/dcadenas"
+      },
+      "homepage": "https://github.com/dcadenas/ouija",
+      "keywords": ["sessions", "communication", "nostr", "mcp", "tmux"],
+      "strict": true
+    }
+  ]
+}

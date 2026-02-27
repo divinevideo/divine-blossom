@@ -1,0 +1,14 @@
+/target
+/docs/*
+!/docs/plans/
+!/docs/workflows.md
+/demo
+IDEAS.md
+firebase-debug.log
+.claude/
+*.png
+!screenshot.png
+.playwright-mcp/
+workflow-state.json
+stress-state.json
+.ouija/

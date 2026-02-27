@@ -1,0 +1,12 @@
+{
+  "name": "ouija",
+  "version": "0.1.0",
+  "description": "Cross-machine AI session communication daemon. Connect Claude Code sessions across terminals, machines, and projects via Nostr.",
+  "author": {
+    "name": "Daniel Cadenas",
+    "url": "https://github.com/dcadenas"
+  },
+  "repository": "https://github.com/dcadenas/ouija",
+  "license": "MIT",
+  "skills": "./skills/"
+}

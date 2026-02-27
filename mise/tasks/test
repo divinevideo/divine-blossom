@@ -1,0 +1,30 @@
+#!/bin/bash
+set -euo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+log() { echo -e "\n${YELLOW}═══ $* ═══${NC}\n"; }
+fail() { echo -e "${RED}FAILED: $*${NC}"; exit 1; }
+
+log "cargo clippy"
+cargo clippy --all-targets --all-features || fail "clippy"
+
+log "cargo test"
+cargo test --all-features || fail "unit tests"
+
+log "e2e: single-daemon"
+docker build -t brain-e2e -f tests/e2e/Dockerfile . || fail "e2e docker build"
+docker run --rm brain-e2e || fail "e2e single-daemon"
+
+log "e2e: p2p (nostr + relay)"
+docker compose -f tests/e2e/docker-compose.nostr.yml up --build --abort-on-container-exit --exit-code-from tests || fail "e2e nostr"
+docker compose -f tests/e2e/docker-compose.nostr.yml down -v
+
+log "e2e: opencode integration"
+docker compose -f tests/e2e/docker-compose.opencode.yml up --build --abort-on-container-exit --exit-code-from tests || fail "e2e opencode"
+docker compose -f tests/e2e/docker-compose.opencode.yml down -v
+
+echo -e "\n${GREEN}═══ ALL TESTS PASSED ═══${NC}\n"

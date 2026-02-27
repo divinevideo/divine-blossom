@@ -1,0 +1,58 @@
+[package]
+name = "ouija"
+version = "0.1.0-alpha.133"
+edition = "2024"
+rust-version = "1.85"
+description = "Cross-machine AI session daemon — bridges Claude Code sessions via tmux injection and Nostr P2P"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/dcadenas/ouija"
+keywords = ["claude", "mcp", "tmux", "nostr", "ai"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [
+    ".claude/",
+    ".playwright-mcp/",
+    "firebase-debug.log",
+    "mise.toml",
+    "mise/",
+    "tests/e2e/",
+    "*.png",
+    "src/bin/human_dm_helper.rs",
+    "demo/",
+    "docs/",
+]
+
+[dependencies]
+rmcp = { version = "0.16", features = ["server", "macros", "transport-streamable-http-server"] }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+hostname = "0.4"
+rand = "0.9"
+croner = "3"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+async-trait = "0.1"
+ractor = { version = "0.15", default-features = false, features = ["async-trait"] }
+nostr-sdk = { version = "0.44", features = ["nip59"] }
+
+[dev-dependencies]
+stateright = "0.31.0"
+tempfile = "3"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/ouija-{ target }.tar.xz"
+bin-dir = "ouija-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "txz"

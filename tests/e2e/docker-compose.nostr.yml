@@ -1,0 +1,19 @@
+services:
+  relay:
+    image: ghcr.io/verse-pbc/relay_builder:latest
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/localhost/8080"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  tests:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Dockerfile.nostr
+    depends_on:
+      relay:
+        condition: service_healthy
+    network_mode: "service:relay"

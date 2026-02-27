@@ -1,0 +1,25 @@
+#!/bin/bash
+# Install ouija from local source, restart daemon
+set -euo pipefail
+
+echo "Building from local source..."
+# Touch main.rs to force recompilation — cargo install --force reuses cached
+# build artifacts and may skip recompiling changed source files.
+touch src/main.rs
+cargo install --path . --force
+
+# Clean crates.io marker if present
+rm -f ~/.local/share/ouija/.published
+
+ouija stop 2>/dev/null || true
+sleep 1
+
+# Copy to wherever ouija is on PATH
+OUIJA_BIN=$(which ouija 2>/dev/null || echo "$HOME/.local/bin/ouija")
+CARGO_BIN="$HOME/.cargo/bin/ouija"
+if [ "$OUIJA_BIN" != "$CARGO_BIN" ] && [ -f "$CARGO_BIN" ]; then
+    cp "$CARGO_BIN" "$OUIJA_BIN"
+fi
+
+ouija start
+echo "Running local build: $(ouija --version)"

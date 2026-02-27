@@ -1,0 +1,28 @@
+FROM rust:latest AS builder
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
+COPY hooks/ hooks/
+COPY scripts/ scripts/
+COPY skills/ skills/
+COPY .mcp.json ./
+COPY opencode-plugin/ opencode-plugin/
+RUN cargo build --release 2>&1
+
+FROM rust:latest
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tmux curl procps jq \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install opencode — installer puts it in ~/.local/bin, copy to /usr/local/bin for reliability
+RUN curl -fsSL https://opencode.ai/install | bash \
+    && cp "$(find /root -name opencode -type f 2>/dev/null | head -1)" /usr/local/bin/opencode \
+    && chmod +x /usr/local/bin/opencode
+ENV PATH="/usr/local/bin:${PATH}"
+
+COPY --from=builder /app/target/release/ouija /usr/local/bin/ouija
+COPY tests/e2e/lib.sh /lib.sh
+COPY tests/e2e/run-opencode-tests.sh /run-opencode-tests.sh
+RUN chmod +x /run-opencode-tests.sh
+
+ENTRYPOINT ["/run-opencode-tests.sh"]
