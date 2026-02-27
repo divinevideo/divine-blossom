@@ -17,15 +17,16 @@ use crate::blossom::{
 };
 use crate::error::{BlossomError, Result};
 use crate::metadata::{
-    add_to_recent_index, add_to_user_index, add_to_user_list, check_ownership,
-    delete_blob_metadata, get_blob_metadata, get_subtitle_job, get_subtitle_job_by_hash,
-    put_blob_metadata, put_subtitle_job, set_subtitle_job_id_for_hash, list_blobs_with_metadata,
+    add_to_blob_refs, add_to_recent_index, add_to_user_index, add_to_user_list, check_ownership,
+    delete_blob_metadata, get_auth_event, get_blob_metadata, get_blob_refs, get_subtitle_job,
+    get_subtitle_job_by_hash, get_tombstone, put_auth_event, put_blob_metadata, put_subtitle_job,
+    put_tombstone, set_subtitle_job_id_for_hash, list_blobs_with_metadata,
     remove_from_recent_index, remove_from_user_list, update_blob_status, update_stats_on_add,
     update_stats_on_remove,
 };
 use crate::storage::{
     blob_exists, current_timestamp, delete_blob as storage_delete, download_blob_with_fallback,
-    download_thumbnail, trigger_background_migration, upload_blob,
+    download_thumbnail, upload_blob, write_audit_log,
 };
 
 use fastly::http::{header, Method, StatusCode};
@@ -64,7 +65,7 @@ fn handle_request(req: Request) -> Result<Response> {
 
         // Version check
         (Method::GET, "/version") => {
-            Ok(Response::from_status(StatusCode::OK).with_body("v124-update-size-on-faststart"))
+            Ok(Response::from_status(StatusCode::OK).with_body("v126-audit-cloud-logging"))
         }
 
         // HLS: /{sha256}.hls -> serve master manifest
@@ -91,6 +92,9 @@ fn handle_request(req: Request) -> Result<Response> {
         (Method::GET, p) if p.starts_with("/v1/subtitles/by-hash/") => {
             handle_get_subtitle_by_hash(req, p)
         }
+
+        // Provenance: /{sha256}/provenance - get cryptographic proof of upload
+        (Method::GET, p) if p.ends_with("/provenance") => handle_get_provenance(p),
 
         // Direct quality variant access: /{sha256}/720p, /{sha256}/480p
         (Method::GET, p) if is_quality_variant_path(p) => handle_get_quality_variant(req, p),
@@ -156,6 +160,7 @@ fn handle_request(req: Request) -> Result<Response> {
             admin::handle_admin_blob_detail(req, hash)
         }
         (Method::POST, "/admin/api/moderate") => admin::handle_admin_moderate_action(req),
+        (Method::POST, "/admin/api/delete") => handle_admin_force_delete(req),
         (Method::POST, "/admin/api/backfill") => admin::handle_admin_backfill(req),
         (Method::POST, "/admin/api/backfill-vtt") => handle_admin_backfill_vtt(req),
 
@@ -174,6 +179,7 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         let video_hash = thumbnail_key.trim_end_matches(".jpg");
 
         // Check parent video's moderation status - thumbnails inherit video access rules
+        let mut is_restricted = false;
         if let Ok(Some(meta)) = get_blob_metadata(video_hash) {
             if meta.status == BlobStatus::Banned {
                 return Err(BlossomError::NotFound("Blob not found".into()));
@@ -187,14 +193,22 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
                 } else {
                     return Err(BlossomError::NotFound("Blob not found".into()));
                 }
+                is_restricted = true;
             }
         }
 
         // Try to download existing thumbnail from GCS
+        let set_thumb_cache = |resp: &mut Response| {
+            if is_restricted {
+                add_private_cache_headers(resp, video_hash);
+            } else {
+                add_cache_headers(resp, video_hash);
+            }
+        };
         match download_thumbnail(&thumbnail_key) {
             Ok(mut resp) => {
                 resp.set_header("Content-Type", "image/jpeg");
-                add_cache_headers(&mut resp, video_hash);
+                set_thumb_cache(&mut resp);
                 resp.set_header("Accept-Ranges", "bytes");
                 add_cors_headers(&mut resp);
                 return Ok(resp);
@@ -204,7 +218,7 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
                 match generate_thumbnail_on_demand(video_hash) {
                     Ok(mut resp) => {
                         resp.set_header("Content-Type", "image/jpeg");
-                        add_cache_headers(&mut resp, video_hash);
+                        set_thumb_cache(&mut resp);
                         resp.set_header("Accept-Ranges", "bytes");
                         add_cors_headers(&mut resp);
                         return Ok(resp);
@@ -302,23 +316,23 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         resp.set_header("X-Sha256", &hash);
     }
 
-    // Content is addressed by SHA256 hash, so it's immutable - cache aggressively
-    add_cache_headers(&mut resp, &hash);
+    // Content is addressed by SHA256 hash, so it's immutable - cache aggressively.
+    // Exception: restricted content served to the owner must not be publicly cached.
+    let is_restricted = metadata
+        .as_ref()
+        .map(|m| m.status != BlobStatus::Active)
+        .unwrap_or(false);
+    if is_restricted {
+        add_private_cache_headers(&mut resp, &hash);
+    } else {
+        add_cache_headers(&mut resp, &hash);
+    }
 
     if let Some(c2pa) = c2pa_manifest_id {
         resp.set_header("X-C2PA-Manifest-Id", &c2pa);
     }
     if let Some(source_hash) = source_sha256 {
         resp.set_header("X-Source-Sha256", &source_hash);
-    }
-
-    // Add header indicating the source (useful for debugging/monitoring)
-    if result.source != "gcs" {
-        resp.set_header("X-Blossom-Source", &result.source);
-
-        // Trigger background migration to GCS via Cloud Run
-        // This is fire-and-forget - we don't wait for completion
-        let _ = trigger_background_migration(&hash, &result.source);
     }
 
     Ok(resp)
@@ -384,7 +398,7 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
     }
     let hash = hash.to_lowercase();
 
-    // Check metadata for access control and transcode status
+    // Check metadata for access control
     let metadata = get_blob_metadata(&hash)?;
 
     if let Some(ref meta) = metadata {
@@ -403,73 +417,76 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
                 return Err(BlossomError::NotFound("Content not found".into()));
             }
         }
-
-        // Check transcode status
-        match meta.transcode_status {
-            Some(TranscodeStatus::Complete) => {
-                // Transcoding done, serve the manifest
-            }
-            Some(TranscodeStatus::Processing) => {
-                // Transcoding in progress, return 202 Accepted with Retry-After
-                let mut resp = Response::from_status(StatusCode::ACCEPTED);
-                resp.set_header("Retry-After", "5");
-                resp.set_header("Content-Type", "application/json");
-                resp.set_body(r#"{"status":"processing","message":"HLS transcoding in progress"}"#);
-                add_cors_headers(&mut resp);
-                return Ok(resp);
-            }
-            Some(TranscodeStatus::Failed) => {
-                return Err(BlossomError::Internal("HLS transcoding failed".into()));
-            }
-            Some(TranscodeStatus::Pending) | None => {
-                // Not yet started - trigger on-demand transcoding
-                // Update status to Processing first to prevent duplicate triggers
-                use crate::metadata::update_transcode_status;
-                if let Err(e) = update_transcode_status(&hash, TranscodeStatus::Processing) {
-                    eprintln!("[HLS] Failed to update transcode status: {}", e);
-                }
-
-                // Trigger transcoding (fire and forget)
-                let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
-
-                // Return 202 Accepted with Retry-After
-                let mut resp = Response::from_status(StatusCode::ACCEPTED);
-                resp.set_header("Retry-After", "10");
-                resp.set_header("Content-Type", "application/json");
-                resp.set_body(r#"{"status":"processing","message":"HLS transcoding started, please retry in 10 seconds"}"#);
-                add_cors_headers(&mut resp);
-                return Ok(resp);
-            }
-        }
     } else {
         return Err(BlossomError::NotFound("Content not found".into()));
     }
 
-    // Download master manifest from GCS
+    // Try GCS first — many videos have HLS in GCS but metadata wasn't updated.
+    // GCS is the source of truth: if the manifest exists, serve it.
     let gcs_path = format!("{}/hls/master.m3u8", hash);
-    let result = download_hls_content(&gcs_path, None)?;
-    let mut resp = result;
+    match download_hls_content(&gcs_path, None) {
+        Ok(result) => {
+            // HLS exists in GCS — serve it and fix metadata if needed
+            let meta = metadata.as_ref().unwrap();
+            if meta.transcode_status != Some(TranscodeStatus::Complete) {
+                eprintln!("[HLS] Fixing metadata: {} has HLS in GCS but status was {:?}", hash, meta.transcode_status);
+                use crate::metadata::update_transcode_status;
+                let _ = update_transcode_status(&hash, TranscodeStatus::Complete);
+            }
+            let mut resp = result;
 
-    let c2pa_manifest_id = resp
-        .get_header_str("x-goog-meta-c2pa-manifest-id")
-        .map(|s| s.to_string());
-    let source_sha256 = resp
-        .get_header_str("x-goog-meta-source-sha256")
-        .map(|s| s.to_string());
+            let c2pa_manifest_id = resp
+                .get_header_str("x-goog-meta-c2pa-manifest-id")
+                .map(|s| s.to_string());
+            let source_sha256 = resp
+                .get_header_str("x-goog-meta-source-sha256")
+                .map(|s| s.to_string());
 
-    // Set correct content type for HLS manifest
-    resp.set_header("Content-Type", "application/vnd.apple.mpegurl");
-    add_cache_headers(&mut resp, &hash);
-    resp.set_header("X-Sha256", &hash);
-    if let Some(c2pa) = c2pa_manifest_id {
-        resp.set_header("X-C2PA-Manifest-Id", &c2pa);
+            resp.set_header("Content-Type", "application/vnd.apple.mpegurl");
+            add_cache_headers(&mut resp, &hash);
+            resp.set_header("X-Sha256", &hash);
+            if let Some(c2pa) = c2pa_manifest_id {
+                resp.set_header("X-C2PA-Manifest-Id", &c2pa);
+            }
+            if let Some(source_hash) = source_sha256 {
+                resp.set_header("X-Source-Sha256", &source_hash);
+            }
+            add_cors_headers(&mut resp);
+
+            Ok(resp)
+        }
+        Err(_) => {
+            // HLS not in GCS — check metadata and trigger transcoding if needed
+            let meta = metadata.as_ref().unwrap();
+            match meta.transcode_status {
+                Some(TranscodeStatus::Processing) => {
+                    let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                    resp.set_header("Retry-After", "5");
+                    resp.set_header("Content-Type", "application/json");
+                    resp.set_body(r#"{"status":"processing","message":"HLS transcoding in progress"}"#);
+                    add_no_cache_headers(&mut resp);
+                    add_cors_headers(&mut resp);
+                    Ok(resp)
+                }
+                _ => {
+                    // Pending, Failed, Complete-but-missing, or None — trigger transcoding
+                    use crate::metadata::update_transcode_status;
+                    if let Err(e) = update_transcode_status(&hash, TranscodeStatus::Processing) {
+                        eprintln!("[HLS] Failed to update transcode status: {}", e);
+                    }
+                    let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
+
+                    let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                    resp.set_header("Retry-After", "10");
+                    resp.set_header("Content-Type", "application/json");
+                    resp.set_body(r#"{"status":"processing","message":"HLS transcoding started, please retry in 10 seconds"}"#);
+                    add_no_cache_headers(&mut resp);
+                    add_cors_headers(&mut resp);
+                    Ok(resp)
+                }
+            }
+        }
     }
-    if let Some(source_hash) = source_sha256 {
-        resp.set_header("X-Source-Sha256", &source_hash);
-    }
-    add_cors_headers(&mut resp);
-
-    Ok(resp)
 }
 
 /// HEAD /<sha256>.hls - Check HLS master manifest existence
@@ -495,8 +512,15 @@ fn handle_head_hls_master(path: &str) -> Result<Response> {
         return Err(BlossomError::NotFound("Content not found".into()));
     }
 
-    match metadata.transcode_status {
-        Some(TranscodeStatus::Complete) => {
+    // Check GCS first (source of truth), then fall back to metadata status
+    let gcs_path = format!("{}/hls/master.m3u8", hash);
+    match download_hls_content(&gcs_path, None) {
+        Ok(_) => {
+            // Fix metadata if needed
+            if metadata.transcode_status != Some(TranscodeStatus::Complete) {
+                use crate::metadata::update_transcode_status;
+                let _ = update_transcode_status(&hash, TranscodeStatus::Complete);
+            }
             let mut resp = Response::from_status(StatusCode::OK);
             resp.set_header("Content-Type", "application/vnd.apple.mpegurl");
             add_cache_headers(&mut resp, &hash);
@@ -504,13 +528,16 @@ fn handle_head_hls_master(path: &str) -> Result<Response> {
             add_cors_headers(&mut resp);
             Ok(resp)
         }
-        Some(TranscodeStatus::Processing) => {
-            let mut resp = Response::from_status(StatusCode::ACCEPTED);
-            resp.set_header("Retry-After", "5");
-            add_cors_headers(&mut resp);
-            Ok(resp)
-        }
-        _ => Err(BlossomError::NotFound("HLS not available".into())),
+        Err(_) => match metadata.transcode_status {
+            Some(TranscodeStatus::Processing) => {
+                let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                resp.set_header("Retry-After", "5");
+                add_no_cache_headers(&mut resp);
+                add_cors_headers(&mut resp);
+                Ok(resp)
+            }
+            _ => Err(BlossomError::NotFound("HLS not available".into())),
+        },
     }
 }
 
@@ -590,6 +617,7 @@ fn handle_get_hls_content(_req: Request, path: &str) -> Result<Response> {
                         resp.set_header("Retry-After", "10");
                         resp.set_header("Content-Type", "application/json");
                         resp.set_body(r#"{"status":"processing","message":"HLS transcoding re-triggered, please retry"}"#);
+                        add_no_cache_headers(&mut resp);
                         add_cors_headers(&mut resp);
                         Ok(resp)
                     }
@@ -600,6 +628,7 @@ fn handle_get_hls_content(_req: Request, path: &str) -> Result<Response> {
                         resp.set_body(
                             r#"{"status":"processing","message":"HLS transcoding in progress"}"#,
                         );
+                        add_no_cache_headers(&mut resp);
                         add_cors_headers(&mut resp);
                         Ok(resp)
                     }
@@ -614,6 +643,7 @@ fn handle_get_hls_content(_req: Request, path: &str) -> Result<Response> {
                         resp.set_header("Retry-After", "10");
                         resp.set_header("Content-Type", "application/json");
                         resp.set_body(r#"{"status":"processing","message":"HLS transcoding re-started, please retry"}"#);
+                        add_no_cache_headers(&mut resp);
                         add_cors_headers(&mut resp);
                         Ok(resp)
                     }
@@ -630,6 +660,7 @@ fn handle_get_hls_content(_req: Request, path: &str) -> Result<Response> {
                         resp.set_header("Retry-After", "10");
                         resp.set_header("Content-Type", "application/json");
                         resp.set_body(r#"{"status":"processing","message":"HLS transcoding started, please retry in 10 seconds"}"#);
+                        add_no_cache_headers(&mut resp);
                         add_cors_headers(&mut resp);
                         Ok(resp)
                     }
@@ -788,6 +819,7 @@ fn serve_transcript_by_hash(req: Option<&Request>, hash: &str, can_trigger: bool
                     resp.set_body(
                         r#"{"status":"processing","message":"Transcript generation in progress"}"#,
                     );
+                    add_no_cache_headers(&mut resp);
                     add_cors_headers(&mut resp);
                     Ok(resp)
                 }
@@ -803,6 +835,7 @@ fn serve_transcript_by_hash(req: Option<&Request>, hash: &str, can_trigger: bool
                     resp.set_header("Retry-After", "10");
                     resp.set_header("Content-Type", "application/json");
                     resp.set_body(r#"{"status":"processing","message":"Transcript generation started, please retry in 10 seconds"}"#);
+                    add_no_cache_headers(&mut resp);
                     add_cors_headers(&mut resp);
                     Ok(resp)
                 }
@@ -865,12 +898,14 @@ fn handle_head_transcript_by_hash(hash: &str) -> Result<Response> {
         Some(TranscriptStatus::Processing) => {
             let mut resp = Response::from_status(StatusCode::ACCEPTED);
             resp.set_header("Retry-After", "5");
+            add_no_cache_headers(&mut resp);
             add_cors_headers(&mut resp);
             Ok(resp)
         }
         Some(TranscriptStatus::Pending) => {
             let mut resp = Response::from_status(StatusCode::ACCEPTED);
             resp.set_header("Retry-After", "10");
+            add_no_cache_headers(&mut resp);
             add_cors_headers(&mut resp);
             Ok(resp)
         }
@@ -1067,6 +1102,7 @@ fn handle_create_subtitle_job(mut req: Request) -> Result<Response> {
     }
 
     let mut resp = json_response(StatusCode::ACCEPTED, &job);
+    add_no_cache_headers(&mut resp);
     add_cors_headers(&mut resp);
     Ok(resp)
 }
@@ -1221,6 +1257,7 @@ fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
                     resp.set_header("Retry-After", "5");
                     resp.set_header("Content-Type", "application/json");
                     resp.set_body(r#"{"status":"processing","message":"Video is being transcoded, please retry"}"#);
+                    add_no_cache_headers(&mut resp);
                     add_cors_headers(&mut resp);
                     Ok(resp)
                 }
@@ -1236,6 +1273,7 @@ fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
                     resp.set_header("Retry-After", "10");
                     resp.set_header("Content-Type", "application/json");
                     resp.set_body(r#"{"status":"processing","message":"Transcoding started, please retry in 10 seconds"}"#);
+                    add_no_cache_headers(&mut resp);
                     add_cors_headers(&mut resp);
                     Ok(resp)
                 }
@@ -1420,6 +1458,9 @@ fn handle_upload(mut req: Request) -> Result<Response> {
     // Validate auth
     let auth = validate_auth(&req, AuthAction::Upload)?;
 
+    // Serialize auth event for provenance (before consuming request)
+    let auth_event_json = serde_json::to_string(&auth).unwrap_or_default();
+
     // Get content type
     let content_type = req
         .get_header(header::CONTENT_TYPE)
@@ -1465,10 +1506,21 @@ fn handle_upload(mut req: Request) -> Result<Response> {
     hasher.update(&body_bytes);
     let hash = hex::encode(hasher.finalize());
 
-    // Check if blob already exists
+    // Check for tombstone (legally removed content cannot be re-uploaded)
+    if let Ok(Some(_tombstone)) = get_tombstone(&hash) {
+        return Err(BlossomError::Forbidden(
+            "This content has been removed and cannot be re-uploaded".into(),
+        ));
+    }
+
+    // Check if blob already exists (first-uploader-wins)
     if blob_exists(&hash)? {
-        // Return existing blob descriptor
+        // Return existing blob descriptor but track this re-uploader
         if let Some(mut metadata) = get_blob_metadata(&hash)? {
+            // Add re-uploader to their list and refs (best effort)
+            let _ = add_to_user_list(&auth.pubkey, &hash);
+            let _ = add_to_blob_refs(&hash, &auth.pubkey);
+
             if is_transcribable_mime_type(&metadata.mime_type)
                 && metadata.transcript_status.is_none()
             {
@@ -1514,8 +1566,23 @@ fn handle_upload(mut req: Request) -> Result<Response> {
 
     put_blob_metadata(&metadata)?;
 
-    // Add to user's list
+    // Add to user's list and refs
     add_to_user_list(&auth.pubkey, &hash)?;
+    let _ = add_to_blob_refs(&hash, &auth.pubkey);
+
+    // Store provenance: signed auth event as cryptographic proof of upload
+    let _ = put_auth_event(&hash, "upload", &auth_event_json);
+
+    // Write audit log to GCS (best effort)
+    let meta_json = serde_json::to_string(&metadata).ok();
+    write_audit_log(
+        &hash,
+        "upload",
+        &auth.pubkey,
+        Some(&auth_event_json),
+        meta_json.as_deref(),
+        None,
+    );
 
     // Update admin indices (best effort - don't fail upload if these fail)
     let _ = update_stats_on_add(&metadata);
@@ -1599,7 +1666,17 @@ fn handle_cloud_run_proxy(
         .ok_or_else(|| BlossomError::Internal("Missing sha256 in Cloud Run response".into()))?
         .to_string();
 
+    // Check for tombstone (legally removed content cannot be re-uploaded)
+    if let Ok(Some(_tombstone)) = get_tombstone(&hash) {
+        return Err(BlossomError::Forbidden(
+            "This content has been removed and cannot be re-uploaded".into(),
+        ));
+    }
+
     let size = cloud_run_resp["size"].as_u64().unwrap_or(content_length);
+
+    // Serialize auth event for provenance
+    let auth_event_json = serde_json::to_string(&auth).unwrap_or_default();
 
     // Parse thumbnail URL if present (for video uploads)
     let thumbnail_url = cloud_run_resp["thumbnail_url"]
@@ -1609,8 +1686,12 @@ fn handle_cloud_run_proxy(
     // Parse video dimensions if present (from ffprobe in upload service)
     let dim = cloud_run_resp["dim"].as_str().map(|s| s.to_string());
 
-    // Check if metadata already exists (dedupe case)
+    // Check if metadata already exists (dedupe/re-upload case)
     if let Some(mut metadata) = get_blob_metadata(&hash)? {
+        // Track re-uploader in refs and their list
+        let _ = add_to_user_list(&auth.pubkey, &hash);
+        let _ = add_to_blob_refs(&hash, &auth.pubkey);
+
         // Even for dedupe, update dim if we got it and it wasn't set before
         if dim.is_some() && metadata.dim.is_none() {
             metadata.dim = dim;
@@ -1651,8 +1732,23 @@ fn handle_cloud_run_proxy(
 
     put_blob_metadata(&metadata)?;
 
-    // Add to user's list
+    // Add to user's list and refs
     add_to_user_list(&auth.pubkey, &hash)?;
+    let _ = add_to_blob_refs(&hash, &auth.pubkey);
+
+    // Store provenance: signed auth event as cryptographic proof of upload
+    let _ = put_auth_event(&hash, "upload", &auth_event_json);
+
+    // Write audit log to GCS (best effort)
+    let meta_json = serde_json::to_string(&metadata).ok();
+    write_audit_log(
+        &hash,
+        "upload",
+        &auth.pubkey,
+        Some(&auth_event_json),
+        meta_json.as_deref(),
+        None,
+    );
 
     // Update admin indices (best effort - don't fail upload if these fail)
     let _ = update_stats_on_add(&metadata);
@@ -1769,15 +1865,34 @@ fn handle_delete(req: Request, path: &str) -> Result<Response> {
     let auth = validate_auth(&req, AuthAction::Delete)?;
     validate_hash_match(&auth, &hash)?;
 
+    // Serialize auth event for provenance before ownership check
+    let auth_event_json = serde_json::to_string(&auth).unwrap_or_default();
+
     // Verify ownership
     if !check_ownership(&hash, &auth.pubkey)? {
         return Err(BlossomError::Forbidden("You don't own this blob".into()));
     }
 
-    // Get metadata before deletion for stats update
+    // Get metadata before deletion for audit + stats
     let metadata = get_blob_metadata(&hash)?;
+    let meta_json = metadata
+        .as_ref()
+        .and_then(|m| serde_json::to_string(m).ok());
 
-    // Delete from B2
+    // Store provenance: signed delete auth event
+    let _ = put_auth_event(&hash, "delete", &auth_event_json);
+
+    // Write audit log to GCS (before deletion so we have the record even if delete fails)
+    write_audit_log(
+        &hash,
+        "delete",
+        &auth.pubkey,
+        Some(&auth_event_json),
+        meta_json.as_deref(),
+        None,
+    );
+
+    // Delete from GCS
     storage_delete(&hash)?;
 
     // Delete metadata
@@ -1795,6 +1910,147 @@ fn handle_delete(req: Request, path: &str) -> Result<Response> {
     let mut resp = Response::from_status(StatusCode::OK);
     add_cors_headers(&mut resp);
 
+    Ok(resp)
+}
+
+/// GET /{sha256}/provenance - Get cryptographic proof of upload authorization
+fn handle_get_provenance(path: &str) -> Result<Response> {
+    let hash = path
+        .trim_start_matches('/')
+        .strip_suffix("/provenance")
+        .and_then(|h| {
+            if h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()) {
+                Some(h.to_lowercase())
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| BlossomError::BadRequest("Invalid hash in provenance path".into()))?;
+
+    let upload_auth = get_auth_event(&hash, "upload")?;
+    let delete_auth = get_auth_event(&hash, "delete")?;
+
+    // Get blob refs (all uploaders)
+    let refs = get_blob_refs(&hash).unwrap_or_default();
+
+    // Get current metadata if it exists
+    let metadata = get_blob_metadata(&hash)?;
+    let owner = metadata.as_ref().map(|m| m.owner.as_str());
+
+    let mut provenance = serde_json::json!({
+        "sha256": hash,
+        "owner": owner,
+        "uploaders": refs,
+    });
+
+    if let Some(auth) = upload_auth {
+        if let Ok(event) = serde_json::from_str::<serde_json::Value>(&auth) {
+            provenance["upload_auth_event"] = event;
+        }
+    }
+    if let Some(auth) = delete_auth {
+        if let Ok(event) = serde_json::from_str::<serde_json::Value>(&auth) {
+            provenance["delete_auth_event"] = event;
+        }
+    }
+
+    // Check tombstone
+    if let Ok(Some(tombstone)) = get_tombstone(&hash) {
+        if let Ok(t) = serde_json::from_str::<serde_json::Value>(&tombstone) {
+            provenance["tombstone"] = t;
+        }
+    }
+
+    let mut resp = json_response(StatusCode::OK, &provenance);
+    add_cors_headers(&mut resp);
+    Ok(resp)
+}
+
+/// POST /admin/api/delete - Admin force-delete for legal/DMCA compliance
+fn handle_admin_force_delete(req: Request) -> Result<Response> {
+    // Validate admin auth
+    admin::validate_admin_auth(&req)?;
+
+    // Parse request body
+    let body = req.into_body_str();
+    let request: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| BlossomError::BadRequest(format!("Invalid JSON: {}", e)))?;
+
+    let hash = request["sha256"]
+        .as_str()
+        .ok_or_else(|| BlossomError::BadRequest("Missing 'sha256' field".into()))?
+        .to_lowercase();
+
+    let reason = request["reason"]
+        .as_str()
+        .unwrap_or("Admin force-delete");
+
+    let legal_hold = request["legal_hold"].as_bool().unwrap_or(false);
+
+    // Validate hash format
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(BlossomError::BadRequest("Invalid SHA-256 hash".into()));
+    }
+
+    // Get metadata before deletion for audit
+    let metadata = get_blob_metadata(&hash)?;
+    let meta_json = metadata
+        .as_ref()
+        .and_then(|m| serde_json::to_string(m).ok());
+
+    // Write audit log BEFORE deletion
+    write_audit_log(
+        &hash,
+        "admin_delete",
+        "admin",
+        None,
+        meta_json.as_deref(),
+        Some(reason),
+    );
+
+    // Delete from GCS (main blob)
+    let _ = storage_delete(&hash);
+
+    // Delete thumbnail
+    let _ = storage_delete(&format!("{}.jpg", hash));
+
+    // Delete KV metadata
+    let _ = delete_blob_metadata(&hash);
+
+    // Remove from ALL users' lists (owner + all refs)
+    if let Some(ref meta) = metadata {
+        let _ = remove_from_user_list(&meta.owner, &hash);
+    }
+    if let Ok(refs) = get_blob_refs(&hash) {
+        for pubkey in &refs {
+            let _ = remove_from_user_list(pubkey, &hash);
+        }
+    }
+
+    // Update stats
+    if let Some(meta) = metadata {
+        let _ = update_stats_on_remove(&meta);
+    }
+    let _ = remove_from_recent_index(&hash);
+
+    // Set tombstone if legal hold requested
+    if legal_hold {
+        let _ = put_tombstone(&hash, reason);
+    }
+
+    eprintln!(
+        "[ADMIN DELETE] hash={} reason={} legal_hold={}",
+        hash, reason, legal_hold
+    );
+
+    let result = serde_json::json!({
+        "deleted": true,
+        "sha256": hash,
+        "legal_hold": legal_hold,
+    });
+
+    let mut resp = json_response(StatusCode::OK, &result);
+    add_cors_headers(&mut resp);
     Ok(resp)
 }
 
@@ -2288,6 +2544,11 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
     match update_blob_status(sha256, new_status) {
         Ok(()) => {
             eprintln!("[ADMIN] Updated blob {} to status {:?}", sha256, new_status);
+
+            // Purge VCL cache so the new status takes effect immediately.
+            // Banned/restricted content will 404 on next request; approved content will 200.
+            purge_vcl_cache(sha256);
+
             let response = serde_json::json!({
                 "success": true,
                 "sha256": sha256,
@@ -2423,6 +2684,13 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
                     sha256, new_status
                 );
             }
+
+            // Purge VCL cache on transcode completion so any cached 202 is evicted
+            // and clients get the actual content on next request.
+            if matches!(new_status, TranscodeStatus::Complete | TranscodeStatus::Failed) {
+                purge_vcl_cache(sha256);
+            }
+
             let response = serde_json::json!({
                 "success": true,
                 "sha256": sha256,
@@ -2581,6 +2849,11 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
                 }
                 set_subtitle_job_id_for_hash(sha256, &job.job_id)?;
                 put_subtitle_job(&job)?;
+            }
+
+            // Purge VCL cache on transcript completion so cached 202s are evicted
+            if matches!(new_status, TranscriptStatus::Complete | TranscriptStatus::Failed) {
+                purge_vcl_cache(sha256);
             }
 
             let response = serde_json::json!({
@@ -2961,6 +3234,68 @@ fn add_cache_headers(resp: &mut Response, hash: &str) {
     resp.set_header("Surrogate-Key", hash);
 }
 
+/// Like add_cache_headers but for restricted content served only to the owner.
+/// Uses private/no-store so VCL doesn't cache it, but still sets Surrogate-Key for purging.
+fn add_private_cache_headers(resp: &mut Response, hash: &str) {
+    resp.set_header("Cache-Control", "private, no-store");
+    resp.set_header("Surrogate-Control", "no-store");
+    resp.set_header("Surrogate-Key", hash);
+}
+
+/// Mark a response as explicitly uncacheable (used for 202 in-progress responses).
+/// Defence-in-depth: VCL vcl_fetch also marks 202s uncacheable, but belt-and-suspenders.
+fn add_no_cache_headers(resp: &mut Response) {
+    resp.set_header("Cache-Control", "no-store");
+    resp.set_header("Surrogate-Control", "no-store");
+}
+
+/// Purge content from the VCL caching layer by Surrogate-Key.
+/// Calls POST /service/{service_id}/purge/{key} on api.fastly.com.
+/// Best-effort: logs errors but never fails the calling request.
+pub(crate) fn purge_vcl_cache(surrogate_key: &str) {
+    let api_token = match fastly::secret_store::SecretStore::open("blossom_secrets")
+        .ok()
+        .and_then(|store| store.get("fastly_api_token"))
+        .map(|secret| String::from_utf8(secret.plaintext().to_vec()).unwrap_or_default())
+    {
+        Some(token) if !token.is_empty() => token,
+        _ => {
+            eprintln!("[PURGE] fastly_api_token not configured, skipping VCL cache purge");
+            return;
+        }
+    };
+
+    // VCL service ID for the caching layer (Divine.Video's website)
+    let vcl_service_id = "ML7R82HKfmTaqTpHExIDVN";
+    let url = format!(
+        "https://api.fastly.com/service/{}/purge/{}",
+        vcl_service_id, surrogate_key
+    );
+
+    let mut purge_req = Request::new(Method::POST, &url);
+    purge_req.set_header("Host", "api.fastly.com");
+    purge_req.set_header("Fastly-Key", &api_token);
+    purge_req.set_header("Accept", "application/json");
+
+    match purge_req.send("fastly_api") {
+        Ok(resp) => {
+            let status = resp.get_status();
+            if status.is_success() {
+                eprintln!("[PURGE] VCL cache purged for key={}", surrogate_key);
+            } else {
+                eprintln!(
+                    "[PURGE] VCL purge failed for key={}: HTTP {}",
+                    surrogate_key,
+                    status.as_u16()
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("[PURGE] VCL purge request failed for key={}: {}", surrogate_key, e);
+        }
+    }
+}
+
 fn add_cors_headers(resp: &mut Response) {
     resp.set_header("Access-Control-Allow-Origin", "*");
     resp.set_header(
@@ -2985,10 +3320,15 @@ fn cors_preflight_response() -> Response {
     resp
 }
 
-/// Get base URL for blob descriptors from request Host header
+/// Get base URL for blob descriptors from request Host header.
+/// Prefers X-Original-Host (set by VCL when service-chaining) over the Host header,
+/// so that BlobDescriptor URLs reflect the public-facing domain.
 fn get_base_url(req: &Request) -> String {
-    req.get_header(header::HOST)
-        .and_then(|h| h.to_str().ok())
+    req.get_header_str("X-Original-Host")
+        .or_else(|| {
+            req.get_header(header::HOST)
+                .and_then(|h| h.to_str().ok())
+        })
         .map(|host| format!("https://{}", host))
         .unwrap_or_else(|| "https://media.divine.video".into())
 }

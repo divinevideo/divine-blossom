@@ -776,6 +776,11 @@ pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
     // Update blob status
     update_blob_status(&moderate_req.sha256, new_status)?;
 
+    // Purge VCL cache so moderation takes effect immediately
+    if old_status != new_status {
+        crate::purge_vcl_cache(&moderate_req.sha256);
+    }
+
     // Update global stats for the status change
     if old_status != new_status {
         let _ = update_stats_on_status_change(old_status, new_status);

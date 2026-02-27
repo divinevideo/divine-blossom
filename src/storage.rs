@@ -14,17 +14,9 @@ const GCS_BACKEND: &str = "gcs_storage";
 /// Cloud Run backend for uploads/migrations
 const CLOUD_RUN_BACKEND: &str = "cloud_run_upload";
 
-/// Fallback backend names and their URL paths (must match fastly.toml)
-/// Each tuple is (backend_name, host, path_prefix)
-/// Path format: {path_prefix}{hash}
-/// Order matters: first match wins, so put fastest/most reliable first
-const FALLBACK_BACKENDS: &[(&str, &str, &str)] = &[
-    ("cdn_divine", "cdn.divine.video", "/"),
-    ("blossom_divine", "blossom.divine.video", "/"),
-    ("cdn_satellite", "cdn.satellite.earth", "/"),
-    // nostr.build uses image subdomain for media
-    ("nostr_build", "image.nostr.build", "/"),
-];
+/// Fallback backends removed — all content is now in GCS.
+/// Bunny CDN (cdn.divine.video) migration completed 2026-02-27.
+const FALLBACK_BACKENDS: &[(&str, &str, &str)] = &[];
 
 /// Config store name
 const CONFIG_STORE: &str = "blossom_config";
@@ -1165,9 +1157,63 @@ fn hash_body_for_signing(_size: u64) -> String {
     "UNSIGNED-PAYLOAD".into()
 }
 
-/// Trigger background migration of a blob from a fallback CDN to GCS
-/// This sends an async request to Cloud Run and doesn't wait for completion
-/// Returns Ok if the request was sent successfully (not if migration completed)
+/// Write an audit log entry via Cloud Run (which writes structured logs to Cloud Logging).
+/// Fire-and-forget: failures are logged to stderr but never block the caller.
+///
+/// Cloud Run auto-ingests JSON stdout/stderr as structured logs into Cloud Logging,
+/// so the audit endpoint just needs to print the JSON and return 200.
+/// Cloud Logging provides: querying, retention policies, export to BigQuery, alerting.
+pub fn write_audit_log(
+    sha256: &str,
+    action: &str,
+    actor_pubkey: &str,
+    auth_event_json: Option<&str>,
+    metadata_snapshot: Option<&str>,
+    reason: Option<&str>,
+) {
+    let timestamp = current_timestamp();
+
+    let mut entry = format!(
+        r#"{{"action":"{}","sha256":"{}","actor_pubkey":"{}","timestamp":"{}""#,
+        action, sha256, actor_pubkey, timestamp
+    );
+
+    if let Some(auth) = auth_event_json {
+        entry.push_str(&format!(r#","auth_event":{}"#, auth));
+    }
+    if let Some(meta) = metadata_snapshot {
+        entry.push_str(&format!(r#","metadata_snapshot":{}"#, meta));
+    }
+    if let Some(r) = reason {
+        entry.push_str(&format!(r#","reason":"{}""#, r.replace('"', "\\\"")));
+    }
+    entry.push('}');
+
+    // Fire-and-forget POST to Cloud Run /audit endpoint
+    // Cloud Run prints structured JSON → auto-ingested by Cloud Logging
+    const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
+    let mut req = Request::new(
+        Method::POST,
+        format!("https://{}/audit", CLOUD_RUN_HOST),
+    );
+    req.set_header("Host", CLOUD_RUN_HOST);
+    req.set_header("Content-Type", "application/json");
+    req.set_body(Body::from(entry));
+
+    match req.send_async(CLOUD_RUN_BACKEND) {
+        Ok(_) => {
+            eprintln!("[AUDIT] {} sha256={} actor={}", action, sha256, actor_pubkey);
+        }
+        Err(e) => {
+            eprintln!("[AUDIT] Failed to send audit log: {}", e);
+        }
+    }
+}
+
+/// Trigger synchronous migration of a blob from a fallback CDN to GCS.
+/// Sends the request to Cloud Run and waits for completion (up to timeout).
+/// With VCL caching in front, this only runs once per blob on cache miss,
+/// so the latency is acceptable to ensure migration actually succeeds.
 pub fn trigger_background_migration(hash: &str, source_backend: &str) -> Result<()> {
     // Find the CDN URL for this backend
     let source_url = match FALLBACK_BACKENDS
@@ -1189,9 +1235,11 @@ pub fn trigger_background_migration(hash: &str, source_backend: &str) -> Result<
         source_url, hash
     );
 
-    // Send async request to Cloud Run /migrate endpoint
-    // We use send_async so we don't block waiting for the migration to complete
-    // NOTE: Use actual Cloud Run hostname, not custom domain, for proper routing
+    // Send synchronous request to Cloud Run /migrate endpoint.
+    // Previously this was send_async (fire-and-forget), but the PendingRequest
+    // was dropped immediately, causing the worker to terminate before Cloud Run
+    // could process the migration. Using synchronous send ensures the migration
+    // actually completes before the response goes back through VCL.
     const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
     let mut req = Request::new(Method::POST, format!("https://{}/migrate", CLOUD_RUN_HOST));
     req.set_header("Host", CLOUD_RUN_HOST);
@@ -1199,20 +1247,20 @@ pub fn trigger_background_migration(hash: &str, source_backend: &str) -> Result<
     req.set_header("Content-Length", request_body.len().to_string());
     req.set_body(request_body);
 
-    // Send async - fire and forget
-    // We use send_async with streaming disabled to fire the request without waiting
-    match req.send_async(CLOUD_RUN_BACKEND) {
-        Ok(_pending) => {
-            // Request sent successfully - we don't wait for response
-            // The PendingRequest will be dropped, but the request is already in flight
+    match req.send(CLOUD_RUN_BACKEND) {
+        Ok(resp) => {
+            let status = resp.get_status();
+            if status.is_success() {
+                eprintln!("[MIGRATE] Successfully migrated {} from {}", hash, source_backend);
+            } else {
+                eprintln!("[MIGRATE] Cloud Run returned {} for {} migration", status, hash);
+            }
             Ok(())
         }
         Err(e) => {
-            // Log error but don't fail the request - migration is best-effort
-            Err(BlossomError::Internal(format!(
-                "Failed to trigger migration: {}",
-                e
-            )))
+            eprintln!("[MIGRATE] Failed to migrate {} from {}: {}", hash, source_backend, e);
+            // Don't fail the request - migration is best-effort
+            Ok(())
         }
     }
 }

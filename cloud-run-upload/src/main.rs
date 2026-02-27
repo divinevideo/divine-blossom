@@ -164,6 +164,7 @@ async fn main() -> Result<()> {
         .route("/upload", options(handle_cors_preflight))
         .route("/migrate", post(handle_migrate))
         .route("/migrate", options(handle_cors_preflight))
+        .route("/audit", post(handle_audit_log))
         .route("/thumbnail/:hash", get(handle_thumbnail_generate))
         .route("/thumbnail/:hash", options(handle_cors_preflight))
         .route("/", put(handle_upload))
@@ -202,6 +203,30 @@ async fn main() -> Result<()> {
 
 async fn handle_cors_preflight() -> impl IntoResponse {
     StatusCode::NO_CONTENT
+}
+
+/// POST /audit - Receive audit log entries from Fastly edge and write as structured logs.
+/// Cloud Run structured logging: JSON on stdout is auto-ingested by Cloud Logging.
+/// This gives us: queryable logs, retention policies, export to BigQuery, alerting.
+async fn handle_audit_log(body: axum::body::Bytes) -> impl IntoResponse {
+    // Parse and re-emit as structured log with severity
+    match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(mut entry) => {
+            // Add Cloud Logging severity field for proper log level
+            entry["severity"] = serde_json::json!("NOTICE");
+            entry["logging.googleapis.com/labels"] = serde_json::json!({
+                "service": "divine-blossom",
+                "component": "audit"
+            });
+            // Print as JSON to stdout — Cloud Run auto-ingests this into Cloud Logging
+            println!("{}", entry);
+            StatusCode::OK
+        }
+        Err(e) => {
+            error!("Invalid audit log entry: {}", e);
+            StatusCode::BAD_REQUEST
+        }
+    }
 }
 
 async fn handle_upload(

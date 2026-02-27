@@ -23,6 +23,15 @@ const RECENT_INDEX_KEY: &str = "index:recent";
 /// Key for user index (list of all uploaders)
 const USER_INDEX_KEY: &str = "index:users";
 
+/// Key prefix for auth event provenance
+const AUTH_PREFIX: &str = "auth:";
+
+/// Key prefix for tombstones (legally removed content)
+const TOMBSTONE_PREFIX: &str = "tombstone:";
+
+/// Key prefix for blob references (all uploaders of same content)
+const REFS_PREFIX: &str = "refs:";
+
 /// Key prefix for subtitle jobs
 const SUBTITLE_JOB_PREFIX: &str = "subtitle_job:";
 
@@ -638,4 +647,136 @@ pub fn add_to_user_index(pubkey: &str) -> Result<bool> {
 /// Replace user index entirely (used for backfill)
 pub fn replace_user_index(index: &UserIndex) -> Result<()> {
     put_user_index(index)
+}
+
+// ============================================================================
+// Provenance: Signed Auth Event Storage
+// ============================================================================
+
+/// Store a signed auth event for provenance (upload or delete)
+pub fn put_auth_event(hash: &str, action: &str, auth_event_json: &str) -> Result<()> {
+    let store = open_store()?;
+    let key = format!("{}{}:{}", AUTH_PREFIX, hash.to_lowercase(), action);
+
+    store
+        .insert(&key, auth_event_json.to_string())
+        .map_err(|e| BlossomError::MetadataError(format!("Failed to store auth event: {}", e)))?;
+
+    Ok(())
+}
+
+/// Get a stored auth event for provenance
+pub fn get_auth_event(hash: &str, action: &str) -> Result<Option<String>> {
+    let store = open_store()?;
+    let key = format!("{}{}:{}", AUTH_PREFIX, hash.to_lowercase(), action);
+
+    match store.lookup(&key) {
+        Ok(mut lookup_result) => {
+            let body = lookup_result.take_body().into_string();
+            Ok(Some(body))
+        }
+        Err(KVStoreError::ItemNotFound) => Ok(None),
+        Err(e) => Err(BlossomError::MetadataError(format!(
+            "Failed to lookup auth event: {}",
+            e
+        ))),
+    }
+}
+
+// ============================================================================
+// Tombstones: Prevent re-upload of legally removed content
+// ============================================================================
+
+/// Store a tombstone for legally removed content
+pub fn put_tombstone(hash: &str, reason: &str) -> Result<()> {
+    let store = open_store()?;
+    let key = format!("{}{}", TOMBSTONE_PREFIX, hash.to_lowercase());
+
+    let timestamp = crate::storage::current_timestamp();
+    let json = format!(r#"{{"reason":"{}","removed_at":"{}"}}"#,
+        reason.replace('"', "\\\""), timestamp);
+
+    store
+        .insert(&key, json)
+        .map_err(|e| BlossomError::MetadataError(format!("Failed to store tombstone: {}", e)))?;
+
+    Ok(())
+}
+
+/// Check if a hash has a tombstone (legally removed)
+pub fn get_tombstone(hash: &str) -> Result<Option<String>> {
+    let store = open_store()?;
+    let key = format!("{}{}", TOMBSTONE_PREFIX, hash.to_lowercase());
+
+    match store.lookup(&key) {
+        Ok(mut lookup_result) => {
+            let body = lookup_result.take_body().into_string();
+            Ok(Some(body))
+        }
+        Err(KVStoreError::ItemNotFound) => Ok(None),
+        Err(e) => Err(BlossomError::MetadataError(format!(
+            "Failed to lookup tombstone: {}",
+            e
+        ))),
+    }
+}
+
+// ============================================================================
+// Blob References: Track all uploaders of same content-addressed blob
+// ============================================================================
+
+/// Get all pubkeys that have uploaded this blob
+pub fn get_blob_refs(hash: &str) -> Result<Vec<String>> {
+    let store = open_store()?;
+    let key = format!("{}{}", REFS_PREFIX, hash.to_lowercase());
+
+    match store.lookup(&key) {
+        Ok(mut lookup_result) => {
+            let body = lookup_result.take_body().into_string();
+            let refs: Vec<String> = serde_json::from_str(&body)
+                .map_err(|e| BlossomError::MetadataError(format!("Failed to parse refs: {}", e)))?;
+            Ok(refs)
+        }
+        Err(KVStoreError::ItemNotFound) => Ok(Vec::new()),
+        Err(e) => Err(BlossomError::MetadataError(format!(
+            "Failed to lookup refs: {}",
+            e
+        ))),
+    }
+}
+
+/// Add a pubkey to the blob's references list
+pub fn add_to_blob_refs(hash: &str, pubkey: &str) -> Result<()> {
+    let pubkey_lower = pubkey.to_lowercase();
+
+    for attempt in 0..5 {
+        let mut refs = get_blob_refs(hash)?;
+
+        if refs.contains(&pubkey_lower) {
+            return Ok(());
+        }
+
+        refs.push(pubkey_lower.clone());
+
+        let store = open_store()?;
+        let key = format!("{}{}", REFS_PREFIX, hash.to_lowercase());
+        let json = serde_json::to_string(&refs)
+            .map_err(|e| BlossomError::MetadataError(format!("Failed to serialize refs: {}", e)))?;
+
+        match store.insert(&key, json) {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < 4 => {
+                eprintln!("[KV] Retry {} for refs update: {}", attempt + 1, e);
+                continue;
+            }
+            Err(e) => return Err(BlossomError::MetadataError(format!(
+                "Failed to store refs: {}",
+                e
+            ))),
+        }
+    }
+
+    Err(BlossomError::MetadataError(
+        "Max retries exceeded for refs update".into(),
+    ))
 }
