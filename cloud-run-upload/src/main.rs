@@ -1005,7 +1005,6 @@ async fn process_migrate(state: Arc<AppState>, request: MigrateRequest) -> Resul
         // Divine infrastructure
         "cdn.divine.video",
         "blossom.divine.video",
-        "stream.bunny.net",
         // Satellite.earth
         "cdn.satellite.earth",
         "satellite.earth",

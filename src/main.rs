@@ -29,10 +29,17 @@ use crate::storage::{
     download_thumbnail, upload_blob, write_audit_log,
 };
 
+use fastly::cache::simple as simple_cache;
 use fastly::http::{header, Method, StatusCode};
 use fastly::{Error, Request, Response};
 use sha2::{Digest, Sha256};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// TTL for cached HLS manifests (1 hour) — immutable once transcoding completes
+const HLS_CACHE_TTL: Duration = Duration::from_secs(3600);
+/// TTL for cached transcript content (1 hour) — immutable once transcription completes
+const TRANSCRIPT_CACHE_TTL: Duration = Duration::from_secs(3600);
 
 /// Maximum upload size (50 GB) - Cloud Run with HTTP/2 has no size limit
 const MAX_UPLOAD_SIZE: u64 = 50 * 1024 * 1024 * 1024;
@@ -236,21 +243,26 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
     // Check metadata for access control
     let metadata = get_blob_metadata(&hash)?;
 
-    if let Some(ref meta) = metadata {
-        // Handle banned content - no access for anyone
-        if meta.status == BlobStatus::Banned {
-            return Err(BlossomError::NotFound("Blob not found".into()));
-        }
+    // Admin Bearer token bypasses moderation checks (used by moderation service proxy)
+    let is_admin = admin::validate_bearer_token(&req).is_ok();
 
-        // Handle restricted content
-        if meta.status == BlobStatus::Restricted {
-            // Check if requester is owner
-            if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
-                if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
+    if let Some(ref meta) = metadata {
+        if !is_admin {
+            // Handle banned content - no access for anyone
+            if meta.status == BlobStatus::Banned {
+                return Err(BlossomError::NotFound("Blob not found".into()));
+            }
+
+            // Handle restricted content
+            if meta.status == BlobStatus::Restricted {
+                // Check if requester is owner
+                if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
+                    if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
+                        return Err(BlossomError::NotFound("Blob not found".into()));
+                    }
+                } else {
                     return Err(BlossomError::NotFound("Blob not found".into()));
                 }
-            } else {
-                return Err(BlossomError::NotFound("Blob not found".into()));
             }
         }
     }
@@ -317,15 +329,23 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
     }
 
     // Content is addressed by SHA256 hash, so it's immutable - cache aggressively.
-    // Exception: restricted content served to the owner must not be publicly cached.
-    let is_restricted = metadata
-        .as_ref()
-        .map(|m| m.status != BlobStatus::Active)
-        .unwrap_or(false);
-    if is_restricted {
-        add_private_cache_headers(&mut resp, &hash);
+    // Exception: restricted/admin content must not be publicly cached.
+    if is_admin {
+        // Admin bypass: never cache, expose moderation status
+        resp.set_header("Cache-Control", "private, no-store");
+        if let Some(ref meta) = metadata {
+            resp.set_header("X-Moderation-Status", &format!("{:?}", meta.status));
+        }
     } else {
-        add_cache_headers(&mut resp, &hash);
+        let is_restricted = metadata
+            .as_ref()
+            .map(|m| m.status != BlobStatus::Active)
+            .unwrap_or(false);
+        if is_restricted {
+            add_private_cache_headers(&mut resp, &hash);
+        } else {
+            add_cache_headers(&mut resp, &hash);
+        }
     }
 
     if let Some(c2pa) = c2pa_manifest_id {
@@ -715,10 +735,44 @@ fn handle_head_hls_content(path: &str) -> Result<Response> {
     Ok(resp)
 }
 
-/// Download HLS content from GCS
+/// Download HLS content from GCS (with POP-local Simple Cache for non-range requests)
 fn download_hls_content(gcs_path: &str, range: Option<&str>) -> Result<Response> {
     use crate::storage::download_hls_from_gcs;
-    download_hls_from_gcs(gcs_path, range)
+
+    // Only cache full (non-range) requests for m3u8 manifests (small text)
+    if range.is_some() || !gcs_path.ends_with(".m3u8") {
+        return download_hls_from_gcs(gcs_path, range);
+    }
+
+    let cache_key = format!("hls:{}", gcs_path);
+
+    // Try Simple Cache first
+    if let Ok(Some(body)) = simple_cache::get(cache_key.clone()) {
+        let mut resp = Response::from_status(StatusCode::OK);
+        resp.set_body(body);
+        return Ok(resp);
+    }
+
+    // Cache miss: fetch from GCS
+    let mut gcs_resp = download_hls_from_gcs(gcs_path, None)?;
+
+    // Extract body, cache it, return a new response
+    let body_bytes = gcs_resp.take_body().into_bytes();
+
+    // Cache the manifest content
+    let _ = simple_cache::get_or_set(cache_key, body_bytes.as_slice(), HLS_CACHE_TTL);
+
+    // Reconstruct response with the body and preserve GCS metadata headers
+    let mut resp = Response::from_status(gcs_resp.get_status());
+    // Preserve provenance headers from GCS
+    if let Some(val) = gcs_resp.get_header_str("x-goog-meta-c2pa-manifest-id") {
+        resp.set_header("x-goog-meta-c2pa-manifest-id", val);
+    }
+    if let Some(val) = gcs_resp.get_header_str("x-goog-meta-source-sha256") {
+        resp.set_header("x-goog-meta-source-sha256", val);
+    }
+    resp.set_body(body_bytes);
+    Ok(resp)
 }
 
 /// Parse transcript path: /{sha256}/VTT (case-insensitive).
@@ -767,9 +821,31 @@ fn is_vtt_file_path(path: &str) -> bool {
 }
 
 /// Download transcript content from GCS
+/// Download transcript content from GCS (with POP-local Simple Cache)
 fn download_transcript_content(gcs_path: &str) -> Result<Response> {
     use crate::storage::download_transcript_from_gcs;
-    download_transcript_from_gcs(gcs_path)
+
+    let cache_key = format!("vtt:{}", gcs_path);
+
+    // Try Simple Cache first
+    if let Ok(Some(body)) = simple_cache::get(cache_key.clone()) {
+        let mut resp = Response::from_status(StatusCode::OK);
+        resp.set_body(body);
+        return Ok(resp);
+    }
+
+    // Cache miss: fetch from GCS
+    let mut gcs_resp = download_transcript_from_gcs(gcs_path)?;
+
+    // Extract body, cache it, return a new response
+    let body_bytes = gcs_resp.take_body().into_bytes();
+
+    // Cache the transcript content
+    let _ = simple_cache::get_or_set(cache_key, body_bytes.as_slice(), TRANSCRIPT_CACHE_TTL);
+
+    let mut resp = Response::from_status(gcs_resp.get_status());
+    resp.set_body(body_bytes);
+    Ok(resp)
 }
 
 fn serve_transcript_by_hash(req: Option<&Request>, hash: &str, can_trigger: bool) -> Result<Response> {

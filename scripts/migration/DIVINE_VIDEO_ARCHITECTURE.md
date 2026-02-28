@@ -144,8 +144,7 @@ Authorization: Nostr <base64-encoded-event-json>
 ## New Storage: Google Cloud Storage
 
 ### Bucket
-- **Staging**: `divine-blossom-media-staging`
-- **Production**: TBD
+- **Production**: `divine-blossom-media`
 
 ### GCS Project
 - Project ID: `rich-compiler-479518-d2`
@@ -215,6 +214,22 @@ pub struct BlobMetadata {
 - `active` - Public, accessible
 - `restricted` - Shadow-banned, only owner can access
 - `pending` - Awaiting moderation
+
+### KV Store Key Prefixes
+
+| Prefix | Format | Description |
+|--------|--------|-------------|
+| (none) | `<sha256>` | BlobMetadata JSON |
+| `user:` | `user:<pubkey>` | JSON array of blob hashes owned by user |
+| `auth:` | `auth:<sha256>:<action>` | Signed Nostr auth event (kind 24242) for provenance |
+| `tombstone:` | `tombstone:<sha256>` | Legal hold marker preventing re-upload |
+| `refs:` | `refs:<sha256>` | JSON array of all pubkeys who uploaded this content |
+
+### Provenance Chain
+- Every upload/delete stores the original signed Nostr auth event in KV under `auth:<hash>:<action>`
+- First uploader becomes owner; re-uploaders added to refs list
+- Audit logs sent to Cloud Logging via Cloud Run `/audit` endpoint
+- Admin force-delete creates tombstones for legal holds and writes audit entries
 
 ## Video MIME Types
 ```
