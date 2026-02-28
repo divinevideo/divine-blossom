@@ -50,7 +50,7 @@ pub fn validate_admin_auth(req: &Request) -> Result<()> {
 }
 
 /// Validate Bearer token from Authorization header
-fn validate_bearer_token(req: &Request) -> Result<()> {
+pub fn validate_bearer_token(req: &Request) -> Result<()> {
     let expected_token: Option<String> = fastly::secret_store::SecretStore::open("blossom_secrets")
         .ok()
         .and_then(|store| {

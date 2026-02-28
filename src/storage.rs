@@ -15,7 +15,6 @@ const GCS_BACKEND: &str = "gcs_storage";
 const CLOUD_RUN_BACKEND: &str = "cloud_run_upload";
 
 /// Fallback backends removed — all content is now in GCS.
-/// Bunny CDN (cdn.divine.video) migration completed 2026-02-27.
 const FALLBACK_BACKENDS: &[(&str, &str, &str)] = &[];
 
 /// Config store name

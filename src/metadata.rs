@@ -3,7 +3,12 @@
 
 use crate::blossom::{BlobMetadata, BlobStatus, GlobalStats, RecentIndex, SubtitleJob, UserIndex};
 use crate::error::{BlossomError, Result};
+use fastly::cache::simple as simple_cache;
 use fastly::kv_store::{KVStore, KVStoreError};
+use std::time::Duration;
+
+/// TTL for cached metadata (5 minutes) — short because moderation status can change
+const METADATA_CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// KV store name (must match fastly.toml)
 const KV_STORE_NAME: &str = "blossom_metadata";
@@ -45,8 +50,40 @@ fn open_store() -> Result<KVStore> {
         .ok_or_else(|| BlossomError::MetadataError("KV store not found".into()))
 }
 
-/// Get blob metadata by hash
+/// Get blob metadata by hash (with POP-local Simple Cache)
 pub fn get_blob_metadata(hash: &str) -> Result<Option<BlobMetadata>> {
+    let hash_lower = hash.to_lowercase();
+    let cache_key = format!("meta:{}", hash_lower);
+
+    // Try Simple Cache first
+    if let Ok(Some(body)) = simple_cache::get(cache_key.clone()) {
+        let json = body.into_string();
+        if json == "null" {
+            return Ok(None);
+        }
+        if let Ok(metadata) = serde_json::from_str::<BlobMetadata>(&json) {
+            return Ok(Some(metadata));
+        }
+        // Cache had invalid data — fall through to KV
+    }
+
+    // Cache miss: fetch from KV store
+    let result = get_blob_metadata_uncached(&hash_lower)?;
+
+    // Cache the result (including None → "null" to avoid repeated KV misses)
+    let json = match &result {
+        Some(m) => serde_json::to_string(m).unwrap_or_default(),
+        None => "null".to_string(),
+    };
+    if !json.is_empty() {
+        let _ = simple_cache::get_or_set(cache_key.clone(), json, METADATA_CACHE_TTL);
+    }
+
+    Ok(result)
+}
+
+/// Get blob metadata directly from KV store (bypasses cache)
+fn get_blob_metadata_uncached(hash: &str) -> Result<Option<BlobMetadata>> {
     let store = open_store()?;
     let key = format!("{}{}", BLOB_PREFIX, hash.to_lowercase());
 
@@ -68,6 +105,12 @@ pub fn get_blob_metadata(hash: &str) -> Result<Option<BlobMetadata>> {
     }
 }
 
+/// Invalidate cached metadata for a hash
+pub fn invalidate_metadata_cache(hash: &str) {
+    let cache_key = format!("meta:{}", hash.to_lowercase());
+    let _ = simple_cache::purge(cache_key);
+}
+
 /// Store blob metadata
 pub fn put_blob_metadata(metadata: &BlobMetadata) -> Result<()> {
     let store = open_store()?;
@@ -80,6 +123,7 @@ pub fn put_blob_metadata(metadata: &BlobMetadata) -> Result<()> {
         .insert(&key, json)
         .map_err(|e| BlossomError::MetadataError(format!("Failed to store metadata: {}", e)))?;
 
+    invalidate_metadata_cache(&metadata.sha256);
     Ok(())
 }
 
@@ -92,6 +136,7 @@ pub fn delete_blob_metadata(hash: &str) -> Result<()> {
         .delete(&key)
         .map_err(|e| BlossomError::MetadataError(format!("Failed to delete metadata: {}", e)))?;
 
+    invalidate_metadata_cache(hash);
     Ok(())
 }
 

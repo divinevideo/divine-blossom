@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Provenance & Audit System** (v126)
+  - `GET /<sha256>/provenance` endpoint - returns owner, uploaders list, stored auth events, and tombstone status
+  - Signed Nostr auth events (kind 24242) stored in KV as cryptographic proof of upload/delete authorization
+  - Audit logging via Cloud Run → Google Cloud Logging (structured JSON with `service=divine-blossom, component=audit` labels)
+  - Re-upload tracking: first uploader is owner, subsequent uploaders tracked in refs list
+  - Tombstone system: legally removed content blocked from re-upload (returns 403)
+  - Admin force-delete endpoint (`POST /admin/api/delete`) with reason, legal hold, and full audit trail
+  - Cleans up GCS blobs, KV metadata, thumbnails, and all user lists on admin delete
+
 ### Fixed
 - Fixed HTTP Range request handling for quality variant endpoints (`/{hash}/720p`, `/{hash}/480p`)
   - iOS AVPlayer `CoreMediaErrorDomain -12939` ("byte range length mismatch") caused by returning full file instead of requested byte range

@@ -18,12 +18,6 @@ language = "rust"
     [local_server.backends.cdn_divine]
     url = "https://cdn.divine.video"
 
-    [local_server.backends.stream_bunny]
-    url = "https://stream.bunny.net"
-
-    [local_server.backends.stream_cloudflare]
-    url = "https://stream.cloudflare.video"
-
     [local_server.backends.blossom_divine]
     url = "https://blossom.divine.video"
 
@@ -38,9 +32,6 @@ language = "rust"
 
     [local_server.backends.moderation_api]
     url = "https://moderation-api.divine.video"
-
-    [local_server.backends.r2_storage]
-    url = "https://YOUR_R2_BUCKET.r2.cloudflarestorage.com"
 
   [local_server.kv_stores]
 
@@ -85,16 +76,6 @@ language = "rust"
     address = "cdn.divine.video"
     port = 443
 
-    [setup.backends.stream_bunny]
-    description = "Bunny.net stream fallback"
-    address = "stream.bunny.net"
-    port = 443
-
-    [setup.backends.stream_cloudflare]
-    description = "Cloudflare stream fallback"
-    address = "stream.cloudflare.video"
-    port = 443
-
     [setup.backends.blossom_divine]
     description = "Divine Blossom server fallback"
     address = "blossom.divine.video"
@@ -118,11 +99,6 @@ language = "rust"
     [setup.backends.moderation_api]
     description = "Divine moderation API (CF Worker)"
     address = "moderation-api.divine.video"
-    port = 443
-
-    [setup.backends.r2_storage]
-    description = "Cloudflare R2 fallback storage"
-    address = "YOUR_R2_BUCKET.r2.cloudflarestorage.com"
     port = 443
 
   [setup.kv_stores]

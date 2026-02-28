@@ -5,20 +5,31 @@ A [Blossom](https://github.com/hzrd149/blossom) media server for Nostr running o
 ## Architecture
 
 ```
-Fastly Compute (Rust) → Backblaze B2 (blobs) + Fastly KV (metadata)
-                     → GCP (async moderation)
+Client → Fastly Compute (Rust WASM) → GCS (blobs) + Fastly KV (metadata)
+           ├── Cloud Run Upload (Rust) → GCS + Transcoder trigger
+           ├── Cloud Run Transcoder (Rust, NVIDIA GPU) → HLS segments to GCS
+           └── Cloud Logging (audit trail)
 ```
+
+- **Fastly Compute Edge** (`src/`) - Rust WASM service on Fastly. Handles uploads, metadata KV, HLS proxying, admin, provenance
+- **Cloud Run Upload** (`cloud-run-upload/`) - Rust service on GCP. Receives video bytes, sanitizes (ffmpeg -c copy), hashes, uploads to GCS, triggers transcoder, receives audit logs
+- **Cloud Run Transcoder** (`cloud-run-transcoder/`) - Rust service on GCP with NVIDIA GPU. Downloads from GCS, transcodes to HLS via FFmpeg NVENC, uploads segments back
+- **GCS bucket**: `divine-blossom-media`
+- **CDN**: `media.divine.video` (Fastly)
 
 ## Features
 
 - **BUD-01**: Blob retrieval (GET/HEAD)
 - **BUD-02**: Upload/delete/list management
 - **BUD-03**: User server list support
-- **Nostr auth**: Kind 24242 signature validation
+- **Nostr auth**: Kind 24242 signature validation (Schnorr signatures)
 - **Shadow restriction**: Moderated content only visible to owner
 - **Range requests**: Native video seeking support
+- **HLS transcoding**: Multi-quality adaptive streaming (1080p, 720p, 480p, 360p)
 - **WebVTT transcripts**: Stable transcript URL at `/<sha256>.vtt` with async generation
-- **Free egress**: B2 → Fastly bandwidth is free
+- **Provenance & audit**: Cryptographic proof of upload/delete authorship with Cloud Logging audit trail
+- **Tombstones**: Legal hold prevents re-upload of removed content
+- **Admin force-delete**: DMCA/legal removal with full audit trail
 
 ## Setup
 
@@ -26,7 +37,7 @@ Fastly Compute (Rust) → Backblaze B2 (blobs) + Fastly KV (metadata)
 
 - [Fastly CLI](https://developer.fastly.com/learning/tools/cli/)
 - [Rust](https://rustup.rs/) with wasm32-wasi target
-- Backblaze B2 account
+- GCP project with GCS bucket and Cloud Run
 - Fastly account with Compute enabled
 
 ### Install Rust target
@@ -37,9 +48,8 @@ rustup target add wasm32-wasi
 
 ### Configure secrets
 
-1. Create a Backblaze B2 bucket
-2. Create an application key with read/write access
-3. Set up Fastly stores:
+1. Create a GCS bucket with HMAC credentials
+2. Set up Fastly stores:
 
 ```bash
 # Create KV store
@@ -47,13 +57,9 @@ fastly kv-store create --name blossom_metadata
 
 # Create config store
 fastly config-store create --name blossom_config
-fastly config-store-entry create --store-id <id> --key b2_bucket --value your-bucket-name
-fastly config-store-entry create --store-id <id> --key b2_region --value us-west-004
 
-# Create secret store
+# Create secret store with GCS HMAC credentials
 fastly secret-store create --name blossom_secrets
-fastly secret-store-entry create --store-id <id> --key b2_key_id --value your-key-id
-fastly secret-store-entry create --store-id <id> --key b2_app_key --value your-app-key
 ```
 
 ### Local development
@@ -62,7 +68,7 @@ fastly secret-store-entry create --store-id <id> --key b2_app_key --value your-a
 # Copy the example config and fill in your credentials
 cp fastly.toml.example fastly.toml
 
-# Edit fastly.toml with your B2 credentials (this file is gitignored)
+# Edit fastly.toml with your GCS credentials (this file is gitignored)
 # Then run:
 fastly compute serve
 ```
@@ -103,6 +109,43 @@ fastly compute publish
 | `HEAD` | `/upload` | None | Get upload requirements |
 | `DELETE` | `/<sha256>` | Required | Delete blob |
 | `GET` | `/list/<pubkey>` | Optional | List user's blobs |
+
+### Provenance & Admin
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/<sha256>/provenance` | None | Get provenance info (owner, uploaders, auth events) |
+| `POST` | `/admin/api/delete` | Admin | Force-delete blob with audit trail and optional legal hold |
+
+### Provenance
+
+Every upload and delete stores the signed Nostr auth event (kind 24242) in KV as cryptographic proof of who authorized the action. The `/provenance` endpoint returns:
+
+```json
+{
+  "sha256": "abc123...",
+  "owner": "<nostr_pubkey>",
+  "uploaders": ["<pubkey1>", "<pubkey2>"],
+  "upload_auth_event": { ... },
+  "delete_auth_event": null,
+  "tombstone": null
+}
+```
+
+### Audit Logging
+
+All uploads and deletes are logged to Google Cloud Logging via the Cloud Run upload service. Each audit entry includes: action, SHA-256, actor pubkey, timestamp, the signed auth event, and a metadata snapshot. Logs are queryable via Cloud Logging with labels `service=divine-blossom, component=audit`.
+
+### Admin Force-Delete
+
+```bash
+curl -X POST https://media.divine.video/admin/api/delete \
+  -H "Authorization: Bearer <admin_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"sha256": "abc123...", "reason": "DMCA #1234", "legal_hold": true}'
+```
+
+When `legal_hold: true`, a tombstone is set preventing re-upload of the removed content (returns 403).
 
 ## Authentication
 
