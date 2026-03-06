@@ -136,9 +136,58 @@ struct TranscribeResponse {
 
 struct ParsedVtt {
     content: String,
+    text: String,
     language: Option<String>,
     duration_ms: u64,
     cue_count: u32,
+}
+
+impl ParsedVtt {
+    fn empty(duration_ms: u64) -> Self {
+        Self {
+            content: "WEBVTT\n\n".to_string(),
+            text: String::new(),
+            language: None,
+            duration_ms,
+            cue_count: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AudioAnalysis {
+    duration_ms: u64,
+    silent_duration_ms: u64,
+    mean_volume_db: Option<f64>,
+    max_volume_db: Option<f64>,
+}
+
+impl AudioAnalysis {
+    fn silence_ratio(&self) -> f64 {
+        if self.duration_ms == 0 {
+            return 0.0;
+        }
+        self.silent_duration_ms as f64 / self.duration_ms as f64
+    }
+
+    fn is_effectively_silent(&self) -> bool {
+        let silence_ratio = self.silence_ratio();
+        let max_is_very_quiet = self.max_volume_db.map(|db| db <= -33.0).unwrap_or(false);
+        let mean_is_very_quiet = self.mean_volume_db.map(|db| db <= -45.0).unwrap_or(false);
+
+        self.duration_ms > 0
+            && (silence_ratio >= 0.98
+                || (silence_ratio >= 0.90 && max_is_very_quiet)
+                || (max_is_very_quiet && mean_is_very_quiet))
+    }
+
+    fn is_low_signal(&self) -> bool {
+        let silence_ratio = self.silence_ratio();
+        let max_is_quiet = self.max_volume_db.map(|db| db <= -26.0).unwrap_or(false);
+        let mean_is_quiet = self.mean_volume_db.map(|db| db <= -38.0).unwrap_or(false);
+
+        silence_ratio >= 0.85 || (max_is_quiet && (mean_is_quiet || silence_ratio >= 0.60))
+    }
 }
 
 /// Video probe result from ffprobe
@@ -374,15 +423,19 @@ async fn process_transcode(
     info!("Downloaded video to {:?}", input_path);
 
     // Read source metadata once so HLS derivatives can preserve provenance.
-    let mut source_metadata =
-        match get_source_object_metadata(&state.gcs_client, &state.config.gcs_bucket, &hash).await
-        {
-            Ok(meta) => meta,
-            Err(e) => {
-                warn!("Failed to load source metadata for {}: {}", hash, e);
-                SourceObjectMetadata::default()
-            }
-        };
+    let mut source_metadata = match get_source_object_metadata(
+        &state.gcs_client,
+        &state.config.gcs_bucket,
+        &hash,
+    )
+    .await
+    {
+        Ok(meta) => meta,
+        Err(e) => {
+            warn!("Failed to load source metadata for {}: {}", hash, e);
+            SourceObjectMetadata::default()
+        }
+    };
     if let Some(owner) = request.owner.clone() {
         source_metadata
             .custom
@@ -541,6 +594,23 @@ async fn process_transcribe(
         return Err(e);
     }
 
+    if !check_has_audio(&input_path).await {
+        info!(
+            "Skipping provider call for {} because the source has no audio stream",
+            hash
+        );
+        let parsed_vtt = ParsedVtt::empty(0);
+        return finalize_transcript(
+            &state,
+            &hash,
+            job_id.as_deref(),
+            requested_lang.as_deref(),
+            parsed_vtt,
+            &vtt_path,
+        )
+        .await;
+    }
+
     let audio_path = temp_path.join("transcribe.wav");
     if let Err(e) = extract_audio_for_transcription(&input_path, &audio_path).await {
         send_transcript_status_webhook(
@@ -558,24 +628,61 @@ async fn process_transcribe(
         return Err(e);
     }
 
-    let raw_output = match transcribe_audio_via_provider(&state.config, &audio_path, requested_lang.as_deref()).await {
-        Ok(output) => output,
+    let audio_analysis = match analyze_audio_signal(&audio_path).await {
+        Ok(analysis) => analysis,
         Err(e) => {
-            send_transcript_status_webhook(
-                &state.config,
-                &hash,
-                "failed",
-                job_id.as_deref(),
-                requested_lang.as_deref(),
-                None,
-                None,
-                Some("provider_failed"),
-                Some(&e.to_string()),
-            )
-            .await;
-            return Err(e);
+            warn!(
+                "Audio analysis failed for {}; continuing without silence guardrails: {}",
+                hash, e
+            );
+            AudioAnalysis {
+                duration_ms: audio_duration_ms(&audio_path).await.unwrap_or(0),
+                ..AudioAnalysis::default()
+            }
         }
     };
+    if audio_analysis.is_effectively_silent() {
+        info!(
+            "Skipping provider call for {} because audio is effectively silent (duration_ms={}, silence_ratio={:.3}, mean_volume_db={:?}, max_volume_db={:?})",
+            hash,
+            audio_analysis.duration_ms,
+            audio_analysis.silence_ratio(),
+            audio_analysis.mean_volume_db,
+            audio_analysis.max_volume_db
+        );
+        let parsed_vtt = ParsedVtt::empty(audio_analysis.duration_ms);
+        return finalize_transcript(
+            &state,
+            &hash,
+            job_id.as_deref(),
+            requested_lang.as_deref(),
+            parsed_vtt,
+            &vtt_path,
+        )
+        .await;
+    }
+
+    let raw_output =
+        match transcribe_audio_via_provider(&state.config, &audio_path, requested_lang.as_deref())
+            .await
+        {
+            Ok(output) => output,
+            Err(e) => {
+                send_transcript_status_webhook(
+                    &state.config,
+                    &hash,
+                    "failed",
+                    job_id.as_deref(),
+                    requested_lang.as_deref(),
+                    None,
+                    None,
+                    Some("provider_failed"),
+                    Some(&e.to_string()),
+                )
+                .await;
+                return Err(e);
+            }
+        };
 
     let parsed_vtt = match normalize_transcript_to_vtt(&raw_output) {
         Ok(vtt) => vtt,
@@ -596,47 +703,29 @@ async fn process_transcribe(
         }
     };
 
-    if let Err(e) = upload_transcript_to_gcs(
-        &state.gcs_client,
-        &state.config.gcs_bucket,
+    let parsed_vtt = if should_drop_low_signal_transcript(&audio_analysis, &parsed_vtt) {
+        warn!(
+            "Dropping likely hallucinated transcript for {} (silence_ratio={:.3}, mean_volume_db={:?}, max_volume_db={:?}, text={:?})",
+            hash,
+            audio_analysis.silence_ratio(),
+            audio_analysis.mean_volume_db,
+            audio_analysis.max_volume_db,
+            parsed_vtt.text
+        );
+        ParsedVtt::empty(audio_analysis.duration_ms)
+    } else {
+        parsed_vtt
+    };
+
+    finalize_transcript(
+        &state,
         &hash,
-        &parsed_vtt.content,
+        job_id.as_deref(),
+        requested_lang.as_deref(),
+        parsed_vtt,
+        &vtt_path,
     )
     .await
-    {
-        send_transcript_status_webhook(
-            &state.config,
-            &hash,
-            "failed",
-            job_id.as_deref(),
-            requested_lang.as_deref(),
-            Some(parsed_vtt.duration_ms),
-            Some(parsed_vtt.cue_count),
-            Some("upload_failed"),
-            Some(&e.to_string()),
-        )
-        .await;
-        return Err(e);
-    }
-
-    send_transcript_status_webhook(
-        &state.config,
-        &hash,
-        "complete",
-        job_id.as_deref(),
-        parsed_vtt.language.as_deref().or(requested_lang.as_deref()),
-        Some(parsed_vtt.duration_ms),
-        Some(parsed_vtt.cue_count),
-        None,
-        None,
-    )
-    .await;
-
-    Ok(TranscribeResponse {
-        hash,
-        status: "complete".to_string(),
-        vtt_path,
-    })
 }
 
 async fn check_gcs_exists(client: &GcsClient, bucket: &str, object: &str) -> Result<bool> {
@@ -712,6 +801,111 @@ async fn extract_audio_for_transcription(input_path: &Path, audio_path: &Path) -
     }
 
     Ok(())
+}
+
+async fn analyze_audio_signal(audio_path: &Path) -> Result<AudioAnalysis> {
+    let duration_ms = audio_duration_ms(audio_path).await?;
+    let audio_str = audio_path.to_string_lossy().to_string();
+
+    let output = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-nostats",
+            "-i",
+            &audio_str,
+            "-af",
+            "silencedetect=noise=-38dB:d=0.5,volumedetect",
+            "-f",
+            "null",
+            "-",
+        ])
+        .output()
+        .await
+        .map_err(|e| anyhow!("Failed to analyze extracted audio: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("ffmpeg audio analysis failed: {}", stderr));
+    }
+
+    Ok(parse_audio_analysis_output(
+        &String::from_utf8_lossy(&output.stderr),
+        duration_ms,
+    ))
+}
+
+async fn audio_duration_ms(audio_path: &Path) -> Result<u64> {
+    let metadata = tokio::fs::metadata(audio_path)
+        .await
+        .map_err(|e| anyhow!("Failed to stat extracted audio: {}", e))?;
+
+    if metadata.len() <= 44 {
+        return Ok(0);
+    }
+
+    let pcm_bytes = metadata.len().saturating_sub(44);
+    Ok(((pcm_bytes as f64 / 32000.0) * 1000.0).round() as u64)
+}
+
+fn parse_audio_analysis_output(stderr: &str, duration_ms: u64) -> AudioAnalysis {
+    let mut analysis = AudioAnalysis {
+        duration_ms,
+        ..AudioAnalysis::default()
+    };
+    let mut current_silence_start_ms: Option<u64> = None;
+
+    for line in stderr.lines() {
+        if let Some(value) = line.split("silence_start:").nth(1) {
+            current_silence_start_ms = parse_seconds_to_ms(value.trim());
+            continue;
+        }
+
+        if let Some(value) = line.split("silence_end:").nth(1) {
+            let end_ms = value
+                .split('|')
+                .next()
+                .and_then(|part| parse_seconds_to_ms(part.trim()))
+                .unwrap_or(duration_ms);
+            if let Some(start_ms) = current_silence_start_ms.take() {
+                analysis.silent_duration_ms = analysis
+                    .silent_duration_ms
+                    .saturating_add(end_ms.saturating_sub(start_ms));
+            }
+            continue;
+        }
+
+        if let Some(value) = line.split("mean_volume:").nth(1) {
+            analysis.mean_volume_db = parse_volume_db(value.trim());
+            continue;
+        }
+
+        if let Some(value) = line.split("max_volume:").nth(1) {
+            analysis.max_volume_db = parse_volume_db(value.trim());
+        }
+    }
+
+    if let Some(start_ms) = current_silence_start_ms {
+        analysis.silent_duration_ms = analysis
+            .silent_duration_ms
+            .saturating_add(duration_ms.saturating_sub(start_ms));
+    }
+
+    analysis.silent_duration_ms = analysis.silent_duration_ms.min(duration_ms);
+    analysis
+}
+
+fn parse_seconds_to_ms(input: &str) -> Option<u64> {
+    let value = input.split_whitespace().next()?;
+    let seconds = value.parse::<f64>().ok()?;
+    Some((seconds.max(0.0) * 1000.0).round() as u64)
+}
+
+fn parse_volume_db(input: &str) -> Option<f64> {
+    let value = input.split_whitespace().next()?;
+    if value.eq_ignore_ascii_case("-inf") {
+        return Some(f64::NEG_INFINITY);
+    }
+    value.parse::<f64>().ok()
 }
 
 /// Call a configured transcription provider and return raw response text.
@@ -803,6 +997,7 @@ fn normalize_transcript_to_vtt(raw: &str) -> Result<ParsedVtt> {
         let (cue_count, duration_ms) = summarize_vtt(&normalized);
         return Ok(ParsedVtt {
             content: normalized,
+            text: extract_text_from_vtt(trimmed),
             language: None,
             duration_ms,
             cue_count,
@@ -816,6 +1011,7 @@ fn normalize_transcript_to_vtt(raw: &str) -> Result<ParsedVtt> {
             let mut vtt = String::from("WEBVTT\n\n");
             let mut cue_index: usize = 1;
             let mut last_end_secs = 0.0_f64;
+            let mut text_parts: Vec<String> = Vec::new();
 
             for segment in segments {
                 let start = segment["start"]
@@ -843,6 +1039,7 @@ fn normalize_transcript_to_vtt(raw: &str) -> Result<ParsedVtt> {
                     continue;
                 }
 
+                text_parts.push(text.to_string());
                 let end_secs = end.max(start + 0.001);
                 last_end_secs = last_end_secs.max(end_secs);
 
@@ -859,6 +1056,7 @@ fn normalize_transcript_to_vtt(raw: &str) -> Result<ParsedVtt> {
             if cue_index > 1 {
                 return Ok(ParsedVtt {
                     content: vtt,
+                    text: text_parts.join(" "),
                     language: parsed_language,
                     duration_ms: (last_end_secs * 1000.0).round() as u64,
                     cue_count: (cue_index - 1) as u32,
@@ -875,10 +1073,8 @@ fn normalize_transcript_to_vtt(raw: &str) -> Result<ParsedVtt> {
                 .join(" ");
             if !merged.is_empty() {
                 return Ok(ParsedVtt {
-                    content: format!(
-                        "WEBVTT\n\n1\n00:00:00.000 --> 99:59:59.000\n{}\n",
-                        merged
-                    ),
+                    content: format!("WEBVTT\n\n1\n00:00:00.000 --> 99:59:59.000\n{}\n", merged),
+                    text: merged,
                     language: parsed_language,
                     duration_ms: 0,
                     cue_count: 1,
@@ -900,19 +1096,117 @@ fn normalize_transcript_to_vtt(raw: &str) -> Result<ParsedVtt> {
     }
 
     Ok(ParsedVtt {
-        content: format!(
-            "WEBVTT\n\n1\n00:00:00.000 --> 99:59:59.000\n{}\n",
-            merged
-        ),
+        content: format!("WEBVTT\n\n1\n00:00:00.000 --> 99:59:59.000\n{}\n", merged),
+        text: merged,
         language: None,
         duration_ms: 0,
         cue_count: 1,
     })
 }
 
+fn extract_text_from_vtt(vtt: &str) -> String {
+    vtt.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.eq_ignore_ascii_case("WEBVTT"))
+        .filter(|line| !line.contains("-->"))
+        .filter(|line| !line.chars().all(|c| c.is_ascii_digit()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn should_drop_low_signal_transcript(audio: &AudioAnalysis, parsed_vtt: &ParsedVtt) -> bool {
+    if parsed_vtt.text.trim().is_empty() || !audio.is_low_signal() {
+        return false;
+    }
+
+    let normalized = parsed_vtt
+        .text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let word_count = normalized.split_whitespace().count();
+    let short_transcript = parsed_vtt.cue_count <= 2 || word_count <= 12;
+    let has_url = normalized.contains("http://")
+        || normalized.contains("https://")
+        || normalized.contains("www.")
+        || normalized.contains(".com")
+        || normalized.contains(".net")
+        || normalized.contains(".org")
+        || normalized.contains(".io");
+    let has_outro_phrase = [
+        "thank you for watching",
+        "thanks for watching",
+        "subscribe",
+        "follow for more",
+        "see you next time",
+        "visit our website",
+        "links in the description",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase));
+
+    short_transcript && (has_url || has_outro_phrase)
+}
+
+async fn finalize_transcript(
+    state: &AppState,
+    hash: &str,
+    job_id: Option<&str>,
+    requested_lang: Option<&str>,
+    parsed_vtt: ParsedVtt,
+    vtt_path: &str,
+) -> Result<TranscribeResponse> {
+    if let Err(e) = upload_transcript_to_gcs(
+        &state.gcs_client,
+        &state.config.gcs_bucket,
+        hash,
+        &parsed_vtt.content,
+    )
+    .await
+    {
+        send_transcript_status_webhook(
+            &state.config,
+            hash,
+            "failed",
+            job_id,
+            requested_lang,
+            Some(parsed_vtt.duration_ms),
+            Some(parsed_vtt.cue_count),
+            Some("upload_failed"),
+            Some(&e.to_string()),
+        )
+        .await;
+        return Err(e);
+    }
+
+    send_transcript_status_webhook(
+        &state.config,
+        hash,
+        "complete",
+        job_id,
+        parsed_vtt.language.as_deref().or(requested_lang),
+        Some(parsed_vtt.duration_ms),
+        Some(parsed_vtt.cue_count),
+        None,
+        None,
+    )
+    .await;
+
+    Ok(TranscribeResponse {
+        hash: hash.to_string(),
+        status: "complete".to_string(),
+        vtt_path: vtt_path.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::transcription_response_format;
+    use super::{
+        parse_audio_analysis_output, should_drop_low_signal_transcript,
+        transcription_response_format, AudioAnalysis, ParsedVtt,
+    };
 
     #[test]
     fn gpt_transcribe_uses_json_response_format() {
@@ -926,6 +1220,62 @@ mod tests {
     #[test]
     fn whisper_uses_vtt_response_format() {
         assert_eq!(transcription_response_format("whisper-1"), "vtt");
+    }
+
+    #[test]
+    fn audio_analysis_parses_silence_and_volume() {
+        let stderr = r#"
+[silencedetect @ 0x1] silence_start: 0
+[silencedetect @ 0x1] silence_end: 9.9 | silence_duration: 9.9
+[Parsed_volumedetect_1 @ 0x2] mean_volume: -58.3 dB
+[Parsed_volumedetect_1 @ 0x2] max_volume: -34.7 dB
+"#;
+        let analysis = parse_audio_analysis_output(stderr, 10_000);
+        assert_eq!(analysis.silent_duration_ms, 9_900);
+        assert_eq!(analysis.mean_volume_db, Some(-58.3));
+        assert_eq!(analysis.max_volume_db, Some(-34.7));
+        assert!(analysis.is_effectively_silent());
+    }
+
+    #[test]
+    fn drops_common_hallucination_when_audio_is_low_signal() {
+        let analysis = AudioAnalysis {
+            duration_ms: 20_000,
+            silent_duration_ms: 19_000,
+            mean_volume_db: Some(-52.0),
+            max_volume_db: Some(-31.0),
+        };
+        let parsed_vtt = ParsedVtt {
+            content: "WEBVTT\n\n1\n00:00:00.000 --> 00:00:03.000\nThank you for watching\n"
+                .to_string(),
+            text: "Thank you for watching".to_string(),
+            language: None,
+            duration_ms: 3_000,
+            cue_count: 1,
+        };
+
+        assert!(should_drop_low_signal_transcript(&analysis, &parsed_vtt));
+    }
+
+    #[test]
+    fn keeps_real_transcript_when_audio_has_signal() {
+        let analysis = AudioAnalysis {
+            duration_ms: 20_000,
+            silent_duration_ms: 2_000,
+            mean_volume_db: Some(-20.0),
+            max_volume_db: Some(-3.0),
+        };
+        let parsed_vtt = ParsedVtt {
+            content:
+                "WEBVTT\n\n1\n00:00:00.000 --> 00:00:03.000\nthank you for watching this demo\n"
+                    .to_string(),
+            text: "thank you for watching this demo".to_string(),
+            language: None,
+            duration_ms: 3_000,
+            cue_count: 1,
+        };
+
+        assert!(!should_drop_low_signal_transcript(&analysis, &parsed_vtt));
     }
 }
 
