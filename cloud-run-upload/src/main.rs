@@ -35,6 +35,7 @@ use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
+use tempfile::NamedTempFile;
 use tower::Service;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info};
@@ -637,6 +638,12 @@ async fn handle_thumbnail_generate(
         .into_response()
 }
 
+fn new_temp_media_path(suffix: &str) -> Result<tempfile::TempPath> {
+    NamedTempFile::with_suffix(suffix)
+        .map(|file| file.into_temp_path())
+        .map_err(|e| anyhow!("Failed to create temp file {}: {}", suffix, e))
+}
+
 /// Sanitize a video file by remuxing with ffmpeg
 /// This strips invalid MP4 atoms (e.g. malformed clap boxes from iPhone),
 /// ensures faststart (moov before mdat), and produces a web-compatible MP4.
@@ -644,9 +651,8 @@ async fn handle_thumbnail_generate(
 async fn sanitize_video(input_bytes: &[u8]) -> Result<Vec<u8>> {
     use tokio::process::Command;
 
-    let tmp_dir = std::env::temp_dir();
-    let input_path = tmp_dir.join("sanitize_input.mp4");
-    let output_path = tmp_dir.join("sanitize_output.mp4");
+    let input_path = new_temp_media_path(".mp4")?;
+    let output_path = new_temp_media_path(".mp4")?;
 
     // Write input to temp file
     tokio::fs::write(&input_path, input_bytes)
@@ -672,10 +678,10 @@ async fn sanitize_video(input_bytes: &[u8]) -> Result<Vec<u8>> {
         .map_err(|e| anyhow!("Failed to run ffmpeg: {}", e))?;
 
     // Clean up input
-    let _ = tokio::fs::remove_file(&input_path).await;
+    let _ = input_path.close();
 
     if !output.status.success() {
-        let _ = tokio::fs::remove_file(&output_path).await;
+        let _ = output_path.close();
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow!("ffmpeg sanitize failed: {}", stderr));
     }
@@ -686,7 +692,7 @@ async fn sanitize_video(input_bytes: &[u8]) -> Result<Vec<u8>> {
         .map_err(|e| anyhow!("Failed to read sanitized output: {}", e))?;
 
     // Clean up output
-    let _ = tokio::fs::remove_file(&output_path).await;
+    let _ = output_path.close();
 
     Ok(sanitized)
 }
@@ -696,8 +702,7 @@ async fn sanitize_video(input_bytes: &[u8]) -> Result<Vec<u8>> {
 async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
     use tokio::process::Command;
 
-    let tmp_dir = std::env::temp_dir();
-    let probe_path = tmp_dir.join("probe_input.mp4");
+    let probe_path = new_temp_media_path(".mp4")?;
 
     // Write to temp file for ffprobe
     tokio::fs::write(&probe_path, video_bytes)
@@ -720,7 +725,7 @@ async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
         .map_err(|e| anyhow!("Failed to run ffprobe: {}", e))?;
 
     // Clean up temp file
-    let _ = tokio::fs::remove_file(&probe_path).await;
+    let _ = probe_path.close();
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -775,6 +780,23 @@ async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
     };
 
     Ok(format!("{}x{}", display_width, display_height))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::new_temp_media_path;
+
+    #[test]
+    fn temp_media_paths_are_unique_per_request() {
+        let first = new_temp_media_path(".mp4").expect("first temp path");
+        let second = new_temp_media_path(".mp4").expect("second temp path");
+        let first_path = first.to_string_lossy().to_string();
+        let second_path = second.to_string_lossy().to_string();
+
+        assert_ne!(first_path, second_path);
+        assert!(first_path.ends_with(".mp4"));
+        assert!(second_path.ends_with(".mp4"));
+    }
 }
 
 fn validate_auth(headers: &axum::http::HeaderMap, required_action: &str) -> Result<NostrEvent> {
