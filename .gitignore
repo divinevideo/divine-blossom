@@ -6,6 +6,7 @@
 **/target/
 **/*.rs.bk
 Cargo.lock
+!/cloud-run-transcoder/Cargo.lock
 
 # Fastly artifacts
 /bin/
