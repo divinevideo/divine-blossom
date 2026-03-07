@@ -473,16 +473,24 @@ async fn process_transcode(
     let mut source_metadata = match get_source_object_metadata(
         &state.gcs_client,
         &state.config.gcs_bucket,
+<<<<<<< HEAD
         &source_object,
+=======
+        &hash,
+>>>>>>> ee3a7d5 (fix: reject low-confidence phantom transcripts)
     )
     .await
     {
         Ok(meta) => meta,
         Err(e) => {
+<<<<<<< HEAD
             warn!(
                 "Failed to load source metadata for {} via {}: {}",
                 hash, source_object, e
             );
+=======
+            warn!("Failed to load source metadata for {}: {}", hash, e);
+>>>>>>> ee3a7d5 (fix: reject low-confidence phantom transcripts)
             SourceObjectMetadata::default()
         }
     };
@@ -1413,7 +1421,11 @@ async fn finalize_transcript(
 #[cfg(test)]
 mod tests {
     use super::{
+<<<<<<< HEAD
         media_source_candidates, normalize_transcript_to_vtt, parse_audio_analysis_output,
+=======
+        normalize_transcript_to_vtt, parse_audio_analysis_output,
+>>>>>>> ee3a7d5 (fix: reject low-confidence phantom transcripts)
         should_drop_low_signal_transcript, transcript_drop_reason, transcription_response_format,
         AudioAnalysis, ParsedVtt, TranscriptConfidence, TranscriptDropReason,
     };
@@ -1570,6 +1582,7 @@ mod tests {
             Some(TranscriptDropReason::LowProviderConfidence)
         );
     }
+<<<<<<< HEAD
 
     #[test]
     fn media_source_candidates_prefer_original_then_hls_variants() {
@@ -1581,6 +1594,8 @@ mod tests {
         assert_eq!(candidates[1], format!("{}/hls/stream_720p.ts", hash));
         assert_eq!(candidates[2], format!("{}/hls/stream_480p.ts", hash));
     }
+=======
+>>>>>>> ee3a7d5 (fix: reject low-confidence phantom transcripts)
 }
 
 fn summarize_vtt(vtt: &str) -> (u32, u64) {
