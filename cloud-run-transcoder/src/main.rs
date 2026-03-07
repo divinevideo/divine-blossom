@@ -132,6 +132,8 @@ struct TranscribeResponse {
     hash: String,
     status: String,
     vtt_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transcript_confidence: Option<TranscriptConfidence>,
 }
 
 struct ParsedVtt {
@@ -140,6 +142,7 @@ struct ParsedVtt {
     language: Option<String>,
     duration_ms: u64,
     cue_count: u32,
+    confidence: Option<TranscriptConfidence>,
 }
 
 impl ParsedVtt {
@@ -150,7 +153,47 @@ impl ParsedVtt {
             language: None,
             duration_ms,
             cue_count: 0,
+            confidence: None,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+struct TranscriptConfidence {
+    average_token_confidence: f64,
+    average_logprob: f64,
+    low_confidence_token_ratio: f64,
+    token_count: u32,
+}
+
+impl TranscriptConfidence {
+    fn from_logprobs(logprobs: &[f64]) -> Option<Self> {
+        if logprobs.is_empty() {
+            return None;
+        }
+
+        let token_count = logprobs.len().min(u32::MAX as usize) as u32;
+        let average_logprob = logprobs.iter().sum::<f64>() / logprobs.len() as f64;
+        let average_token_confidence = logprobs
+            .iter()
+            .map(|logprob| logprob.exp().clamp(0.0, 1.0))
+            .sum::<f64>()
+            / logprobs.len() as f64;
+        let low_confidence_token_ratio =
+            logprobs.iter().filter(|&&v| v <= -1.0).count() as f64 / logprobs.len() as f64;
+
+        Some(Self {
+            average_token_confidence,
+            average_logprob,
+            low_confidence_token_ratio,
+            token_count,
+        })
+    }
+
+    fn is_low_confidence(&self) -> bool {
+        self.average_logprob <= -1.0
+            || self.low_confidence_token_ratio >= 0.5
+            || (self.token_count <= 4 && self.average_token_confidence <= 0.45)
     }
 }
 
@@ -177,6 +220,7 @@ impl AudioAnalysis {
 
         self.duration_ms > 0
             && (silence_ratio >= 0.98
+                || (silence_ratio >= 0.95 && mean_is_very_quiet)
                 || (silence_ratio >= 0.90 && max_is_very_quiet)
                 || (max_is_very_quiet && mean_is_very_quiet))
     }
@@ -545,12 +589,14 @@ async fn process_transcribe(
             None,
             None,
             None,
+            None,
         )
         .await;
         return Ok(TranscribeResponse {
             hash,
             status: "already_exists".to_string(),
             vtt_path,
+            transcript_confidence: None,
         });
     }
 
@@ -560,6 +606,7 @@ async fn process_transcribe(
         "processing",
         job_id.as_deref(),
         requested_lang.as_deref(),
+        None,
         None,
         None,
         None,
@@ -585,6 +632,7 @@ async fn process_transcribe(
             "failed",
             job_id.as_deref(),
             requested_lang.as_deref(),
+            None,
             None,
             None,
             Some("download_failed"),
@@ -619,6 +667,7 @@ async fn process_transcribe(
             "failed",
             job_id.as_deref(),
             requested_lang.as_deref(),
+            None,
             None,
             None,
             Some("audio_extract_failed"),
@@ -676,6 +725,7 @@ async fn process_transcribe(
                     requested_lang.as_deref(),
                     None,
                     None,
+                    None,
                     Some("provider_failed"),
                     Some(&e.to_string()),
                 )
@@ -695,6 +745,7 @@ async fn process_transcribe(
                 requested_lang.as_deref(),
                 None,
                 None,
+                None,
                 Some("normalize_failed"),
                 Some(&e.to_string()),
             )
@@ -703,18 +754,37 @@ async fn process_transcribe(
         }
     };
 
-    let parsed_vtt = if should_drop_low_signal_transcript(&audio_analysis, &parsed_vtt) {
-        warn!(
-            "Dropping likely hallucinated transcript for {} (silence_ratio={:.3}, mean_volume_db={:?}, max_volume_db={:?}, text={:?})",
+    if let Some(confidence) = parsed_vtt.confidence {
+        info!(
+            "Provider transcript confidence for {}: avg_token_confidence={:.3}, avg_logprob={:.3}, low_confidence_token_ratio={:.3}, token_count={}",
             hash,
-            audio_analysis.silence_ratio(),
-            audio_analysis.mean_volume_db,
-            audio_analysis.max_volume_db,
-            parsed_vtt.text
+            confidence.average_token_confidence,
+            confidence.average_logprob,
+            confidence.low_confidence_token_ratio,
+            confidence.token_count
         );
-        ParsedVtt::empty(audio_analysis.duration_ms)
-    } else {
-        parsed_vtt
+    }
+
+    let parsed_vtt = match transcript_drop_reason(&audio_analysis, &parsed_vtt) {
+        Some(TranscriptDropReason::LowProviderConfidence) => {
+            warn!(
+                "Dropping low-confidence transcript for {} (text={:?}, confidence={:?})",
+                hash, parsed_vtt.text, parsed_vtt.confidence
+            );
+            ParsedVtt::empty(audio_analysis.duration_ms)
+        }
+        Some(TranscriptDropReason::LowSignalHeuristic) => {
+            warn!(
+                "Dropping likely hallucinated transcript for {} (silence_ratio={:.3}, mean_volume_db={:?}, max_volume_db={:?}, text={:?})",
+                hash,
+                audio_analysis.silence_ratio(),
+                audio_analysis.mean_volume_db,
+                audio_analysis.max_volume_db,
+                parsed_vtt.text
+            );
+            ParsedVtt::empty(audio_analysis.duration_ms)
+        }
+        None => parsed_vtt,
     };
 
     finalize_transcript(
@@ -938,6 +1008,9 @@ async fn transcribe_audio_via_provider(
         .text("model", config.transcription_model.clone())
         .text("response_format", response_format.to_string())
         .part("file", file_part);
+    if transcription_supports_logprobs(&config.transcription_model) {
+        form = form.text("include[]", "logprobs");
+    }
     if let Some(lang) = language {
         if !lang.trim().is_empty() {
             form = form.text("language", lang.trim().to_string());
@@ -973,12 +1046,15 @@ async fn transcribe_audio_via_provider(
     Ok(body)
 }
 
-fn transcription_response_format(model: &str) -> &'static str {
+fn transcription_supports_logprobs(model: &str) -> bool {
     let model = model.trim().to_ascii_lowercase();
+    model.contains("gpt-4o-mini-transcribe") || model.contains("gpt-4o-transcribe")
+}
 
+fn transcription_response_format(model: &str) -> &'static str {
     // OpenAI gpt-* transcribe models reject `response_format=vtt`.
     // `json` keeps compatibility; the response is normalized into VTT downstream.
-    if model.contains("gpt-4o-mini-transcribe") || model.contains("gpt-4o-transcribe") {
+    if transcription_supports_logprobs(model) {
         "json"
     } else {
         "vtt"
@@ -1001,11 +1077,13 @@ fn normalize_transcript_to_vtt(raw: &str) -> Result<ParsedVtt> {
             language: None,
             duration_ms,
             cue_count,
+            confidence: None,
         });
     }
 
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
         let mut parsed_language = json["language"].as_str().map(|s| s.to_string());
+        let confidence = extract_transcript_confidence(&json);
 
         if let Some(segments) = json["segments"].as_array() {
             let mut vtt = String::from("WEBVTT\n\n");
@@ -1060,6 +1138,7 @@ fn normalize_transcript_to_vtt(raw: &str) -> Result<ParsedVtt> {
                     language: parsed_language,
                     duration_ms: (last_end_secs * 1000.0).round() as u64,
                     cue_count: (cue_index - 1) as u32,
+                    confidence,
                 });
             }
         }
@@ -1078,6 +1157,7 @@ fn normalize_transcript_to_vtt(raw: &str) -> Result<ParsedVtt> {
                     language: parsed_language,
                     duration_ms: 0,
                     cue_count: 1,
+                    confidence,
                 });
             }
         }
@@ -1101,7 +1181,33 @@ fn normalize_transcript_to_vtt(raw: &str) -> Result<ParsedVtt> {
         language: None,
         duration_ms: 0,
         cue_count: 1,
+        confidence: None,
     })
+}
+
+fn extract_transcript_confidence(json: &serde_json::Value) -> Option<TranscriptConfidence> {
+    let mut logprobs = Vec::new();
+    collect_logprob_values(json, &mut logprobs);
+    TranscriptConfidence::from_logprobs(&logprobs)
+}
+
+fn collect_logprob_values(value: &serde_json::Value, out: &mut Vec<f64>) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_logprob_values(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if let Some(logprob) = map.get("logprob").and_then(|v| v.as_f64()) {
+                out.push(logprob);
+            }
+            for child in map.values() {
+                collect_logprob_values(child, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn extract_text_from_vtt(vtt: &str) -> String {
@@ -1126,6 +1232,19 @@ fn should_drop_low_signal_transcript(audio: &AudioAnalysis, parsed_vtt: &ParsedV
         .collect::<Vec<_>>()
         .join(" ")
         .to_ascii_lowercase();
+    let normalized_words_only = normalized
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch.is_ascii_whitespace() {
+                ch
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     let word_count = normalized.split_whitespace().count();
     let short_transcript = parsed_vtt.cue_count <= 2 || word_count <= 12;
     let has_url = normalized.contains("http://")
@@ -1146,8 +1265,49 @@ fn should_drop_low_signal_transcript(audio: &AudioAnalysis, parsed_vtt: &ParsedV
     ]
     .iter()
     .any(|phrase| normalized.contains(phrase));
+    let is_trivial_courtesy_phrase = [
+        "thank you",
+        "thank you so much",
+        "thanks",
+        "thanks so much",
+        "okay",
+        "ok",
+        "bye",
+        "goodbye",
+    ]
+    .iter()
+    .any(|phrase| normalized_words_only == *phrase);
 
-    short_transcript && (has_url || has_outro_phrase)
+    short_transcript && (has_url || has_outro_phrase || is_trivial_courtesy_phrase)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptDropReason {
+    LowProviderConfidence,
+    LowSignalHeuristic,
+}
+
+fn transcript_drop_reason(
+    audio: &AudioAnalysis,
+    parsed_vtt: &ParsedVtt,
+) -> Option<TranscriptDropReason> {
+    if parsed_vtt.text.trim().is_empty() {
+        return None;
+    }
+
+    if parsed_vtt
+        .confidence
+        .map(|confidence| confidence.is_low_confidence())
+        .unwrap_or(false)
+    {
+        return Some(TranscriptDropReason::LowProviderConfidence);
+    }
+
+    if should_drop_low_signal_transcript(audio, parsed_vtt) {
+        return Some(TranscriptDropReason::LowSignalHeuristic);
+    }
+
+    None
 }
 
 async fn finalize_transcript(
@@ -1174,6 +1334,7 @@ async fn finalize_transcript(
             requested_lang,
             Some(parsed_vtt.duration_ms),
             Some(parsed_vtt.cue_count),
+            parsed_vtt.confidence,
             Some("upload_failed"),
             Some(&e.to_string()),
         )
@@ -1189,6 +1350,7 @@ async fn finalize_transcript(
         parsed_vtt.language.as_deref().or(requested_lang),
         Some(parsed_vtt.duration_ms),
         Some(parsed_vtt.cue_count),
+        parsed_vtt.confidence,
         None,
         None,
     )
@@ -1198,14 +1360,16 @@ async fn finalize_transcript(
         hash: hash.to_string(),
         status: "complete".to_string(),
         vtt_path: vtt_path.to_string(),
+        transcript_confidence: parsed_vtt.confidence,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_audio_analysis_output, should_drop_low_signal_transcript,
-        transcription_response_format, AudioAnalysis, ParsedVtt,
+        normalize_transcript_to_vtt, parse_audio_analysis_output,
+        should_drop_low_signal_transcript, transcript_drop_reason, transcription_response_format,
+        AudioAnalysis, ParsedVtt, TranscriptConfidence, TranscriptDropReason,
     };
 
     #[test]
@@ -1220,6 +1384,27 @@ mod tests {
     #[test]
     fn whisper_uses_vtt_response_format() {
         assert_eq!(transcription_response_format("whisper-1"), "vtt");
+    }
+
+    #[test]
+    fn extracts_confidence_from_json_logprobs() {
+        let parsed = normalize_transcript_to_vtt(
+            r#"{
+                "text": "hello there",
+                "language": "en",
+                "logprobs": [
+                    {"token": "hello", "logprob": -0.05},
+                    {"token": "there", "logprob": -0.20}
+                ]
+            }"#,
+        )
+        .expect("json transcript should parse");
+
+        let confidence = parsed.confidence.expect("confidence should be present");
+        assert_eq!(confidence.token_count, 2);
+        assert!(confidence.average_token_confidence > 0.85);
+        assert!(confidence.average_logprob > -0.2);
+        assert_eq!(confidence.low_confidence_token_ratio, 0.0);
     }
 
     #[test]
@@ -1238,6 +1423,18 @@ mod tests {
     }
 
     #[test]
+    fn treats_mostly_silent_very_quiet_audio_as_effectively_silent() {
+        let analysis = AudioAnalysis {
+            duration_ms: 6_303,
+            silent_duration_ms: 6_037,
+            mean_volume_db: Some(-48.3),
+            max_volume_db: Some(-31.7),
+        };
+
+        assert!(analysis.is_effectively_silent());
+    }
+
+    #[test]
     fn drops_common_hallucination_when_audio_is_low_signal() {
         let analysis = AudioAnalysis {
             duration_ms: 20_000,
@@ -1252,6 +1449,27 @@ mod tests {
             language: None,
             duration_ms: 3_000,
             cue_count: 1,
+            confidence: None,
+        };
+
+        assert!(should_drop_low_signal_transcript(&analysis, &parsed_vtt));
+    }
+
+    #[test]
+    fn drops_trivial_courtesy_phrase_when_audio_is_low_signal() {
+        let analysis = AudioAnalysis {
+            duration_ms: 6_303,
+            silent_duration_ms: 6_037,
+            mean_volume_db: Some(-48.3),
+            max_volume_db: Some(-31.7),
+        };
+        let parsed_vtt = ParsedVtt {
+            content: "WEBVTT\n\n1\n00:00:00.000 --> 00:00:05.000\nThank you.\n".to_string(),
+            text: "Thank you.".to_string(),
+            language: None,
+            duration_ms: 5_000,
+            cue_count: 1,
+            confidence: None,
         };
 
         assert!(should_drop_low_signal_transcript(&analysis, &parsed_vtt));
@@ -1273,9 +1491,38 @@ mod tests {
             language: None,
             duration_ms: 3_000,
             cue_count: 1,
+            confidence: None,
         };
 
         assert!(!should_drop_low_signal_transcript(&analysis, &parsed_vtt));
+    }
+
+    #[test]
+    fn drops_low_confidence_transcript_even_with_audio_signal() {
+        let analysis = AudioAnalysis {
+            duration_ms: 6_000,
+            silent_duration_ms: 0,
+            mean_volume_db: Some(-18.0),
+            max_volume_db: Some(-2.0),
+        };
+        let parsed_vtt = ParsedVtt {
+            content: "WEBVTT\n\n1\n00:00:00.000 --> 00:00:05.000\nrandom guess\n".to_string(),
+            text: "random guess".to_string(),
+            language: Some("en".to_string()),
+            duration_ms: 5_000,
+            cue_count: 1,
+            confidence: Some(TranscriptConfidence {
+                average_token_confidence: 0.31,
+                average_logprob: -1.28,
+                low_confidence_token_ratio: 1.0,
+                token_count: 2,
+            }),
+        };
+
+        assert_eq!(
+            transcript_drop_reason(&analysis, &parsed_vtt),
+            Some(TranscriptDropReason::LowProviderConfidence)
+        );
     }
 }
 
@@ -2003,6 +2250,7 @@ async fn send_transcript_status_webhook(
     language: Option<&str>,
     duration_ms: Option<u64>,
     cue_count: Option<u32>,
+    transcript_confidence: Option<TranscriptConfidence>,
     error_code: Option<&str>,
     error_message: Option<&str>,
 ) {
@@ -2033,6 +2281,9 @@ async fn send_transcript_status_webhook(
     }
     if let Some(cues) = cue_count {
         payload["cue_count"] = serde_json::json!(cues);
+    }
+    if let Some(confidence) = transcript_confidence {
+        payload["transcript_confidence"] = serde_json::json!(confidence);
     }
     if let Some(code) = error_code {
         payload["error_code"] = serde_json::json!(code);
