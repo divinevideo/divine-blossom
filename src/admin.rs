@@ -4,9 +4,9 @@
 use crate::blossom::{BlobMetadata, BlobStatus, GlobalStats, RecentIndex, UserIndex};
 use crate::error::{BlossomError, Result};
 use crate::metadata::{
-    get_blob_metadata, get_global_stats, get_recent_index, get_user_blobs, get_user_index,
-    replace_global_stats, replace_recent_index, replace_user_index, update_blob_status,
-    update_stats_on_status_change,
+    add_to_recent_index, add_to_user_list, get_blob_metadata, get_blob_refs, get_global_stats,
+    get_recent_index, get_user_blobs, get_user_index, replace_global_stats, replace_recent_index,
+    replace_user_index, update_blob_status, update_stats_on_status_change,
 };
 use crate::storage::download_blob_with_fallback;
 use fastly::http::{header, Method, StatusCode};
@@ -731,6 +731,35 @@ struct ModerateRequest {
     action: String,
 }
 
+#[derive(Deserialize)]
+struct RestoreRequest {
+    sha256: String,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+fn restore_soft_deleted_blob(hash: &str, metadata: &BlobMetadata, new_status: BlobStatus) -> Result<()> {
+    if new_status == BlobStatus::Deleted {
+        return Err(BlossomError::BadRequest(
+            "Restore target status cannot be deleted".into(),
+        ));
+    }
+
+    update_blob_status(hash, new_status)?;
+    let _ = update_stats_on_status_change(metadata.status, new_status);
+
+    let _ = add_to_user_list(&metadata.owner, hash);
+    if let Ok(refs) = get_blob_refs(hash) {
+        for pubkey in &refs {
+            let _ = add_to_user_list(pubkey, hash);
+        }
+    }
+    let _ = add_to_recent_index(hash);
+    crate::purge_vcl_cache(hash);
+
+    Ok(())
+}
+
 pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
     validate_admin_auth(&req)?;
 
@@ -764,22 +793,73 @@ pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
         }
     };
 
-    // Update blob status
-    update_blob_status(&moderate_req.sha256, new_status)?;
-
-    // Purge VCL cache so moderation takes effect immediately
     if old_status != new_status {
-        crate::purge_vcl_cache(&moderate_req.sha256);
+        if old_status == BlobStatus::Deleted {
+            restore_soft_deleted_blob(&moderate_req.sha256, &metadata, new_status)?;
+        } else {
+            update_blob_status(&moderate_req.sha256, new_status)?;
+            crate::purge_vcl_cache(&moderate_req.sha256);
+            let _ = update_stats_on_status_change(old_status, new_status);
+        }
     }
-
-    // Update global stats for the status change
-    if old_status != new_status {
-        let _ = update_stats_on_status_change(old_status, new_status);
-    }
-
     let response = serde_json::json!({
         "success": true,
         "sha256": moderate_req.sha256,
+        "old_status": format!("{:?}", old_status).to_lowercase(),
+        "new_status": format!("{:?}", new_status).to_lowercase()
+    });
+
+    json_response(StatusCode::OK, &response)
+}
+
+/// POST /admin/api/restore - Restore a previously soft-deleted blob
+pub fn handle_admin_restore_action(mut req: Request) -> Result<Response> {
+    validate_admin_auth(&req)?;
+
+    let body = req.take_body().into_string();
+    let restore_req: RestoreRequest = serde_json::from_str(&body)
+        .map_err(|e| BlossomError::BadRequest(format!("Invalid JSON: {}", e)))?;
+
+    if restore_req.sha256.len() != 64
+        || !restore_req.sha256.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err(BlossomError::BadRequest("Invalid sha256 format".into()));
+    }
+
+    let metadata = get_blob_metadata(&restore_req.sha256)?
+        .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
+    let old_status = metadata.status;
+
+    if old_status != BlobStatus::Deleted {
+        return Err(BlossomError::BadRequest(
+            "Blob is not soft-deleted".into(),
+        ));
+    }
+
+    let new_status = match restore_req
+        .status
+        .as_deref()
+        .unwrap_or("active")
+        .to_uppercase()
+        .as_str()
+    {
+        "APPROVE" | "ACTIVE" => BlobStatus::Active,
+        "PENDING" => BlobStatus::Pending,
+        "RESTRICT" | "RESTRICTED" => BlobStatus::Restricted,
+        other => {
+            return Err(BlossomError::BadRequest(format!(
+                "Unknown restore status: {}",
+                other
+            )))
+        }
+    };
+
+    restore_soft_deleted_blob(&restore_req.sha256, &metadata, new_status)?;
+
+    let response = serde_json::json!({
+        "success": true,
+        "restored": true,
+        "sha256": restore_req.sha256,
         "old_status": format!("{:?}", old_status).to_lowercase(),
         "new_status": format!("{:?}", new_status).to_lowercase()
     });
@@ -1382,17 +1462,25 @@ const ADMIN_HTML: &str = r#"<!DOCTYPE html>
                                     <td><span class="status status-${b.status}">${b.status}</span></td>
                                     <td><span class="pubkey" onclick="showUserBlobs('${b.owner}')">${b.owner.substring(0,12)}...</span></td>
                                     <td><span class="date">${new Date(b.uploaded).toLocaleDateString()}</span></td>
-                                    <td class="actions">
-                                        <button class="btn btn-approve" onclick="moderate('${b.sha256}','approve')">OK</button>
-                                        <button class="btn btn-restrict" onclick="moderate('${b.sha256}','restrict')">R</button>
-                                        <button class="btn btn-ban" onclick="moderate('${b.sha256}','ban')">X</button>
-                                    </td>
+                                    <td class="actions">${renderBlobActions(b)}</td>
                                 </tr>
                             `).join('')}
                         </tbody>
                     </table>
                 </div>
                 ${pagination ? renderPagination(pagination) : ''}
+            `;
+        }
+
+        function renderBlobActions(blob) {
+            if (blob.status === 'deleted') {
+                return `<button class="btn btn-approve" onclick="restoreBlob('${blob.sha256}')">Restore</button>`;
+            }
+
+            return `
+                <button class="btn btn-approve" onclick="moderate('${blob.sha256}','approve')">OK</button>
+                <button class="btn btn-restrict" onclick="moderate('${blob.sha256}','restrict')">R</button>
+                <button class="btn btn-ban" onclick="moderate('${blob.sha256}','ban')">X</button>
             `;
         }
 
@@ -1455,6 +1543,22 @@ const ADMIN_HTML: &str = r#"<!DOCTYPE html>
             }
         }
 
+        async function restoreBlob(sha256, status = 'active') {
+            try {
+                const resp = await fetch('/admin/api/restore', {
+                    method: 'POST',
+                    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sha256, status })
+                });
+                if (!resp.ok) throw new Error('Restore failed');
+                await resp.json();
+                loadStats();
+                loadTabContent(currentOffset);
+            } catch (e) {
+                showError(e.message);
+            }
+        }
+
         async function showBlobDetail(hash) {
             const panel = document.getElementById('detailPanel');
             const content = document.getElementById('detailContent');
@@ -1470,6 +1574,14 @@ const ADMIN_HTML: &str = r#"<!DOCTYPE html>
                 const isImage = blob.type?.startsWith('image');
                 const thumbUrl = blob.thumbnail || (isVideo ? '/' + blob.sha256 + '.jpg' : null);
                 const previewUrl = isImage ? '/' + blob.sha256 : thumbUrl;
+
+                const actionButtons = blob.status === 'deleted'
+                    ? `<button class="btn btn-approve" onclick="restoreBlob('${blob.sha256}');closeDetail()">Restore</button>`
+                    : `
+                        <button class="btn btn-approve" onclick="moderate('${blob.sha256}','approve');closeDetail()">Approve</button>
+                        <button class="btn btn-restrict" onclick="moderate('${blob.sha256}','restrict');closeDetail()">Restrict</button>
+                        <button class="btn btn-ban" onclick="moderate('${blob.sha256}','ban');closeDetail()">Ban</button>
+                    `;
 
                 content.innerHTML = `
                     ${isVideo ? `<video src="/${blob.sha256}" class="detail-preview" controls poster="${thumbUrl}" style="max-width:100%"></video>` : (previewUrl ? `<img src="${previewUrl}" class="detail-preview">` : '')}
@@ -1504,9 +1616,7 @@ const ADMIN_HTML: &str = r#"<!DOCTYPE html>
                     </div>
                     ` : ''}
                     <div class="actions" style="margin-top:1rem">
-                        <button class="btn btn-approve" onclick="moderate('${blob.sha256}','approve');closeDetail()">Approve</button>
-                        <button class="btn btn-restrict" onclick="moderate('${blob.sha256}','restrict');closeDetail()">Restrict</button>
-                        <button class="btn btn-ban" onclick="moderate('${blob.sha256}','ban');closeDetail()">Ban</button>
+                        ${actionButtons}
                     </div>
                     <div style="margin-top:1rem">
                         <a href="/${blob.sha256}" target="_blank" class="btn btn-approve">View File</a>

@@ -11,8 +11,15 @@ All notable changes to this project will be documented in this file.
   - Audit logging via Cloud Run → Google Cloud Logging (structured JSON with `service=divine-blossom, component=audit` labels)
   - Re-upload tracking: first uploader is owner, subsequent uploaders tracked in refs list
   - Tombstone system: legally removed content blocked from re-upload (returns 403)
-  - Admin force-delete endpoint (`POST /admin/api/delete`) with reason, legal hold, and full audit trail
-  - Cleans up GCS blobs, KV metadata, thumbnails, and all user lists on admin delete
+  - Admin soft-delete endpoint (`POST /admin/api/delete`) with reason, legal hold, and full audit trail
+  - Admin restore endpoint (`POST /admin/api/restore`) to recover soft-deleted blobs and re-index them
+  - Admin soft-delete now preserves storage, marks the blob `deleted`, and removes it from public serving/indexes
+
+### Fixed
+- Broken derivative recovery when the canonical blob is missing but HLS still exists
+  - Cloud Run thumbnail generation now falls back to HLS transport streams
+  - Cloud Run transcode/transcript jobs now fall back to HLS transport streams
+  - Allows thumbnails and VTTs to be regenerated for already-broken uploads without violating content-addressed raw blob semantics
 
 ### Fixed
 - Fixed HTTP Range request handling for quality variant endpoints (`/{hash}/720p`, `/{hash}/480p`)

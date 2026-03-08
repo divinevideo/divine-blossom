@@ -38,7 +38,7 @@ use std::{
 use tempfile::NamedTempFile;
 use tower::Service;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 // Configuration
 struct Config {
@@ -506,6 +506,55 @@ async fn extract_and_upload_thumbnail(
     Ok(format!("{}/{}.jpg", cdn_base_url, hash))
 }
 
+fn media_source_candidates(hash: &str) -> [String; 3] {
+    [
+        hash.to_string(),
+        format!("{}/hls/stream_720p.ts", hash),
+        format!("{}/hls/stream_480p.ts", hash),
+    ]
+}
+
+async fn download_best_available_media_bytes(
+    client: &GcsClient,
+    bucket: &str,
+    hash: &str,
+) -> Result<(Vec<u8>, String)> {
+    let mut failures = Vec::new();
+
+    for object in media_source_candidates(hash) {
+        match client
+            .download_object(
+                &GetObjectRequest {
+                    bucket: bucket.to_string(),
+                    object: object.clone(),
+                    ..Default::default()
+                },
+                &DownloadRange::default(),
+            )
+            .await
+        {
+            Ok(data) => {
+                if object == hash {
+                    return Ok((data, object));
+                }
+
+                warn!(
+                    "Original blob missing for {}, using fallback media source {} for thumbnail generation",
+                    hash, object
+                );
+                return Ok((data, object));
+            }
+            Err(e) => failures.push(format!("{}: {}", object, e)),
+        }
+    }
+
+    Err(anyhow!(
+        "No recoverable media source found for {} ({})",
+        hash,
+        failures.join(" | ")
+    ))
+}
+
 /// On-demand thumbnail generation endpoint
 /// Downloads video from GCS, generates thumbnail, stores it, returns the image
 async fn handle_thumbnail_generate(
@@ -563,20 +612,15 @@ async fn handle_thumbnail_generate(
         }
     }
 
-    // Download the video from GCS
-    let video_data = match state
-        .gcs_client
-        .download_object(
-            &GetObjectRequest {
-                bucket: state.config.gcs_bucket.clone(),
-                object: hash.clone(),
-                ..Default::default()
-            },
-            &DownloadRange::default(),
-        )
-        .await
+    // Download the original blob, or fall back to the best available HLS transport stream.
+    let (video_data, source_object) = match download_best_available_media_bytes(
+        &state.gcs_client,
+        &state.config.gcs_bucket,
+        &hash,
+    )
+    .await
     {
-        Ok(data) => data,
+        Ok(result) => result,
         Err(e) => {
             error!("Failed to download video {}: {}", hash, e);
             return (
@@ -590,6 +634,13 @@ async fn handle_thumbnail_generate(
                 .into_response();
         }
     };
+
+    if source_object != hash {
+        warn!(
+            "Generating thumbnail for {} from fallback source {}",
+            hash, source_object
+        );
+    }
 
     // Generate thumbnail
     let thumb_result = match thumbnail::extract_thumbnail(&video_data) {
@@ -784,7 +835,7 @@ async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::new_temp_media_path;
+    use super::{media_source_candidates, new_temp_media_path};
 
     #[test]
     fn temp_media_paths_are_unique_per_request() {
@@ -796,6 +847,17 @@ mod tests {
         assert_ne!(first_path, second_path);
         assert!(first_path.ends_with(".mp4"));
         assert!(second_path.ends_with(".mp4"));
+    }
+
+    #[test]
+    fn media_source_candidates_prefer_original_then_hls_variants() {
+        let hash =
+            "5b48aa1fcf30af61243ac9307eb98b7fa22df1c58573c3ca5d1b14fc30099929";
+        let candidates = media_source_candidates(hash);
+
+        assert_eq!(candidates[0], hash);
+        assert_eq!(candidates[1], format!("{}/hls/stream_720p.ts", hash));
+        assert_eq!(candidates[2], format!("{}/hls/stream_480p.ts", hash));
     }
 }
 
