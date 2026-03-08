@@ -29,7 +29,8 @@ Client → Fastly Compute (Rust WASM) → GCS (blobs) + Fastly KV (metadata)
 - **WebVTT transcripts**: Stable transcript URL at `/<sha256>.vtt` with async generation
 - **Provenance & audit**: Cryptographic proof of upload/delete authorship with Cloud Logging audit trail
 - **Tombstones**: Legal hold prevents re-upload of removed content
-- **Admin force-delete**: DMCA/legal removal with full audit trail
+- **Admin soft-delete**: DMCA/legal removal with full audit trail while preserving recoverable storage
+- **Admin restore**: Re-index and restore previously soft-deleted blobs
 
 ## Setup
 
@@ -107,7 +108,7 @@ fastly compute publish
 |--------|------|------|-------------|
 | `PUT` | `/upload` | Required | Upload blob |
 | `HEAD` | `/upload` | None | Get upload requirements |
-| `DELETE` | `/<sha256>` | Required | Delete blob |
+| `DELETE` | `/<sha256>` | Required | Permanently delete your own blob |
 | `GET` | `/list/<pubkey>` | Optional | List user's blobs |
 
 ### Provenance & Admin
@@ -115,7 +116,8 @@ fastly compute publish
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | `GET` | `/<sha256>/provenance` | None | Get provenance info (owner, uploaders, auth events) |
-| `POST` | `/admin/api/delete` | Admin | Force-delete blob with audit trail and optional legal hold |
+| `POST` | `/admin/api/delete` | Admin | Soft-delete blob, remove it from public serving/indexes, and optionally set legal hold |
+| `POST` | `/admin/api/restore` | Admin | Restore a soft-deleted blob to `active`, `pending`, or `restricted` |
 
 ### Provenance
 
@@ -136,13 +138,29 @@ Every upload and delete stores the signed Nostr auth event (kind 24242) in KV as
 
 All uploads and deletes are logged to Google Cloud Logging via the Cloud Run upload service. Each audit entry includes: action, SHA-256, actor pubkey, timestamp, the signed auth event, and a metadata snapshot. Logs are queryable via Cloud Logging with labels `service=divine-blossom, component=audit`.
 
-### Admin Force-Delete
+### Delete Semantics
+
+- `DELETE /<sha256>` is a direct user delete and permanently removes the canonical blob.
+- `POST /admin/api/delete` is an admin soft-delete. It marks the blob as `deleted`, stops all public serving, removes it from user/recent indexes, and preserves the stored blob so it can be recovered later.
+- `POST /admin/api/restore` restores a soft-deleted blob and re-indexes it.
+- `legal_hold: true` sets a tombstone that prevents re-upload of the same hash even if the stored blob is preserved.
+
+### Admin Soft-Delete
 
 ```bash
 curl -X POST https://media.divine.video/admin/api/delete \
   -H "Authorization: Bearer <admin_token>" \
   -H "Content-Type: application/json" \
   -d '{"sha256": "abc123...", "reason": "DMCA #1234", "legal_hold": true}'
+```
+
+### Admin Restore
+
+```bash
+curl -X POST https://media.divine.video/admin/api/restore \
+  -H "Authorization: Bearer <admin_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"sha256": "abc123...", "status": "active"}'
 ```
 
 When `legal_hold: true`, a tombstone is set preventing re-upload of the removed content (returns 403).

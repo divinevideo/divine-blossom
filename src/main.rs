@@ -22,7 +22,7 @@ use crate::metadata::{
     get_subtitle_job_by_hash, get_tombstone, put_auth_event, put_blob_metadata, put_subtitle_job,
     put_tombstone, set_subtitle_job_id_for_hash, list_blobs_with_metadata,
     remove_from_recent_index, remove_from_user_list, update_blob_status, update_stats_on_add,
-    update_stats_on_remove,
+    update_stats_on_remove, update_stats_on_status_change,
 };
 use crate::storage::{
     blob_exists, current_timestamp, delete_blob as storage_delete, download_blob_with_fallback,
@@ -168,6 +168,7 @@ fn handle_request(req: Request) -> Result<Response> {
         }
         (Method::POST, "/admin/api/moderate") => admin::handle_admin_moderate_action(req),
         (Method::POST, "/admin/api/delete") => handle_admin_force_delete(req),
+        (Method::POST, "/admin/api/restore") => admin::handle_admin_restore_action(req),
         (Method::POST, "/admin/api/backfill") => admin::handle_admin_backfill(req),
         (Method::POST, "/admin/api/backfill-vtt") => handle_admin_backfill_vtt(req),
 
@@ -188,10 +189,10 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         // Check parent video's moderation status - thumbnails inherit video access rules
         let mut is_restricted = false;
         if let Ok(Some(meta)) = get_blob_metadata(video_hash) {
-            if meta.status == BlobStatus::Banned {
+            if meta.status.blocks_public_access() {
                 return Err(BlossomError::NotFound("Blob not found".into()));
             }
-            if meta.status == BlobStatus::Restricted {
+            if meta.status.requires_owner_auth() {
                 // Check if requester is owner
                 if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
                     if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
@@ -247,14 +248,13 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
     let is_admin = admin::validate_bearer_token(&req).is_ok();
 
     if let Some(ref meta) = metadata {
-        if !is_admin {
-            // Handle banned content - no access for anyone
-            if meta.status == BlobStatus::Banned {
-                return Err(BlossomError::NotFound("Blob not found".into()));
-            }
+        if meta.status.blocks_public_access() {
+            return Err(BlossomError::NotFound("Blob not found".into()));
+        }
 
+        if !is_admin {
             // Handle restricted content
-            if meta.status == BlobStatus::Restricted {
+            if meta.status.requires_owner_auth() {
                 // Check if requester is owner
                 if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
                     if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
@@ -386,7 +386,7 @@ fn handle_head_blob(path: &str) -> Result<Response> {
         get_blob_metadata(&hash)?.ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
 
     // Don't reveal restricted or banned content exists
-    if metadata.status == BlobStatus::Restricted || metadata.status == BlobStatus::Banned {
+    if metadata.status.requires_owner_auth() || metadata.status.blocks_public_access() {
         return Err(BlossomError::NotFound("Blob not found".into()));
     }
 
@@ -423,12 +423,12 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
 
     if let Some(ref meta) = metadata {
         // Handle banned content
-        if meta.status == BlobStatus::Banned {
+        if meta.status.blocks_public_access() {
             return Err(BlossomError::NotFound("Content not found".into()));
         }
 
         // Handle restricted content
-        if meta.status == BlobStatus::Restricted {
+        if meta.status.requires_owner_auth() {
             if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
                 if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
                     return Err(BlossomError::NotFound("Content not found".into()));
@@ -528,7 +528,7 @@ fn handle_head_hls_master(path: &str) -> Result<Response> {
         .ok_or_else(|| BlossomError::NotFound("Content not found".into()))?;
 
     // Don't reveal restricted/banned content
-    if metadata.status == BlobStatus::Restricted || metadata.status == BlobStatus::Banned {
+    if metadata.status.requires_owner_auth() || metadata.status.blocks_public_access() {
         return Err(BlossomError::NotFound("Content not found".into()));
     }
 
@@ -621,7 +621,7 @@ fn handle_get_hls_content(_req: Request, path: &str) -> Result<Response> {
 
             if let Some(ref meta) = metadata {
                 // Handle banned content
-                if meta.status == BlobStatus::Banned {
+                if meta.status.blocks_public_access() {
                     return Err(BlossomError::NotFound("Content not found".into()));
                 }
 
@@ -852,11 +852,11 @@ fn serve_transcript_by_hash(req: Option<&Request>, hash: &str, can_trigger: bool
     let metadata = get_blob_metadata(hash)?
         .ok_or_else(|| BlossomError::NotFound("Content not found".into()))?;
 
-    if metadata.status == BlobStatus::Banned {
+    if metadata.status.blocks_public_access() {
         return Err(BlossomError::NotFound("Content not found".into()));
     }
 
-    if metadata.status == BlobStatus::Restricted {
+    if metadata.status.requires_owner_auth() {
         if let Some(request) = req {
             if let Ok(Some(auth)) = optional_auth(request, AuthAction::List) {
                 if auth.pubkey.to_lowercase() != metadata.owner.to_lowercase() {
@@ -953,7 +953,7 @@ fn handle_head_transcript_by_hash(hash: &str) -> Result<Response> {
     let metadata = get_blob_metadata(hash)?
         .ok_or_else(|| BlossomError::NotFound("Content not found".into()))?;
 
-    if metadata.status == BlobStatus::Restricted || metadata.status == BlobStatus::Banned {
+    if metadata.status.requires_owner_auth() || metadata.status.blocks_public_access() {
         return Err(BlossomError::NotFound("Content not found".into()));
     }
 
@@ -1292,10 +1292,10 @@ fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
     // Check metadata for access control
     let metadata = get_blob_metadata(&hash)?;
     if let Some(ref meta) = metadata {
-        if meta.status == BlobStatus::Banned {
+        if meta.status.blocks_public_access() {
             return Err(BlossomError::NotFound("Content not found".into()));
         }
-        if meta.status == BlobStatus::Restricted {
+        if meta.status.requires_owner_auth() {
             if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
                 if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
                     return Err(BlossomError::NotFound("Content not found".into()));
@@ -1367,7 +1367,7 @@ fn handle_head_quality_variant(path: &str) -> Result<Response> {
     let metadata = get_blob_metadata(&hash)?
         .ok_or_else(|| BlossomError::NotFound("Content not found".into()))?;
 
-    if metadata.status == BlobStatus::Banned || metadata.status == BlobStatus::Restricted {
+    if metadata.status.blocks_public_access() || metadata.status.requires_owner_auth() {
         return Err(BlossomError::NotFound("Content not found".into()));
     }
 
@@ -2042,7 +2042,8 @@ fn handle_get_provenance(path: &str) -> Result<Response> {
     Ok(resp)
 }
 
-/// POST /admin/api/delete - Admin force-delete for legal/DMCA compliance
+/// POST /admin/api/delete - Admin soft-delete for legal/DMCA compliance
+/// Preserves storage unless the blob has no metadata record to gate public access with.
 fn handle_admin_force_delete(req: Request) -> Result<Response> {
     // Validate admin auth
     admin::validate_admin_auth(&req)?;
@@ -2084,14 +2085,18 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
         Some(reason),
     );
 
-    // Delete from GCS (main blob)
-    let _ = storage_delete(&hash);
-
-    // Delete thumbnail
-    let _ = storage_delete(&format!("{}.jpg", hash));
-
-    // Delete KV metadata
-    let _ = delete_blob_metadata(&hash);
+    let preserved = if let Some(ref meta) = metadata {
+        if meta.status != BlobStatus::Deleted {
+            update_blob_status(&hash, BlobStatus::Deleted)?;
+            let _ = update_stats_on_status_change(meta.status, BlobStatus::Deleted);
+        }
+        true
+    } else {
+        // Without metadata there is no status gate, so fall back to hard delete.
+        let _ = storage_delete(&hash);
+        let _ = storage_delete(&format!("{}.jpg", hash));
+        false
+    };
 
     // Remove from ALL users' lists (owner + all refs)
     if let Some(ref meta) = metadata {
@@ -2103,9 +2108,11 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
         }
     }
 
-    // Update stats
-    if let Some(meta) = metadata {
-        let _ = update_stats_on_remove(&meta);
+    // Update stats for the hard-delete fallback only.
+    if !preserved {
+        if let Some(meta) = metadata {
+            let _ = update_stats_on_remove(&meta);
+        }
     }
     let _ = remove_from_recent_index(&hash);
 
@@ -2114,13 +2121,17 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
         let _ = put_tombstone(&hash, reason);
     }
 
+    purge_vcl_cache(&hash);
+
     eprintln!(
-        "[ADMIN DELETE] hash={} reason={} legal_hold={}",
-        hash, reason, legal_hold
+        "[ADMIN DELETE] hash={} reason={} legal_hold={} preserved={}",
+        hash, reason, legal_hold, preserved
     );
 
     let result = serde_json::json!({
         "deleted": true,
+        "soft_deleted": preserved,
+        "preserved": preserved,
         "sha256": hash,
         "legal_hold": legal_hold,
     });
@@ -3203,7 +3214,7 @@ fn handle_landing_page() -> Response {
                 <span class="method method-delete">DELETE</span>
                 <div class="endpoint-info">
                     <span class="endpoint-path">/&lt;sha256&gt;</span>
-                    <p class="endpoint-desc">Delete a blob. Requires Nostr authentication and ownership. <em>(BUD-02)</em></p>
+                    <p class="endpoint-desc">Permanently delete your own blob. Requires Nostr authentication and ownership. <em>(BUD-02)</em></p>
                 </div>
             </div>
             <div class="endpoint">
@@ -3252,6 +3263,10 @@ fn handle_landing_page() -> Response {
                 <div class="feature">
                     <h3>GCS Storage</h3>
                     <p>Reliable blob storage backed by Google Cloud Storage.</p>
+                </div>
+                <div class="feature">
+                    <h3>Soft Delete Recovery</h3>
+                    <p>Admin deletes preserve stored media as internal soft-deletes, with explicit restore support for recovery and legal workflows.</p>
                 </div>
             </div>
         </section>

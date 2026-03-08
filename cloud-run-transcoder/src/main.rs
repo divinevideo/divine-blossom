@@ -449,9 +449,9 @@ async fn process_transcode(
     let temp_dir = TempDir::new()?;
     let temp_path = temp_dir.path();
 
-    // Download original video from GCS
-    let input_path = temp_path.join("input.mp4");
-    let download_result = download_from_gcs(
+    // Download the original blob, or fall back to the best available HLS transport stream.
+    let input_path = temp_path.join("input_media");
+    let download_result = download_best_available_media_to_path(
         &state.gcs_client,
         &state.config.gcs_bucket,
         &hash,
@@ -459,10 +459,13 @@ async fn process_transcode(
     )
     .await;
 
-    if let Err(e) = download_result {
-        send_status_webhook(&state.config, &hash, "failed", None, None).await;
-        return Err(e);
-    }
+    let source_object = match download_result {
+        Ok(source_object) => source_object,
+        Err(e) => {
+            send_status_webhook(&state.config, &hash, "failed", None, None).await;
+            return Err(e);
+        }
+    };
 
     info!("Downloaded video to {:?}", input_path);
 
@@ -470,13 +473,16 @@ async fn process_transcode(
     let mut source_metadata = match get_source_object_metadata(
         &state.gcs_client,
         &state.config.gcs_bucket,
-        &hash,
+        &source_object,
     )
     .await
     {
         Ok(meta) => meta,
         Err(e) => {
-            warn!("Failed to load source metadata for {}: {}", hash, e);
+            warn!(
+                "Failed to load source metadata for {} via {}: {}",
+                hash, source_object, e
+            );
             SourceObjectMetadata::default()
         }
     };
@@ -618,7 +624,7 @@ async fn process_transcribe(
     let temp_path = temp_dir.path();
 
     let input_path = temp_path.join("input_media");
-    if let Err(e) = download_from_gcs(
+    if let Err(e) = download_best_available_media_to_path(
         &state.gcs_client,
         &state.config.gcs_bucket,
         &hash,
@@ -812,6 +818,14 @@ async fn check_gcs_exists(client: &GcsClient, bucket: &str, object: &str) -> Res
     }
 }
 
+fn media_source_candidates(hash: &str) -> [String; 3] {
+    [
+        hash.to_string(),
+        format!("{}/hls/stream_720p.ts", hash),
+        format!("{}/hls/stream_480p.ts", hash),
+    ]
+}
+
 async fn download_from_gcs(
     client: &GcsClient,
     bucket: &str,
@@ -832,6 +846,38 @@ async fn download_from_gcs(
 
     tokio::fs::write(output_path, &data).await?;
     Ok(())
+}
+
+async fn download_best_available_media_to_path(
+    client: &GcsClient,
+    bucket: &str,
+    hash: &str,
+    output_path: &Path,
+) -> Result<String> {
+    let mut failures = Vec::new();
+
+    for object in media_source_candidates(hash) {
+        match download_from_gcs(client, bucket, &object, output_path).await {
+            Ok(()) => {
+                if object == hash {
+                    return Ok(object);
+                }
+
+                warn!(
+                    "Original blob missing for {}, using fallback media source {}",
+                    hash, object
+                );
+                return Ok(object);
+            }
+            Err(e) => failures.push(format!("{}: {}", object, e)),
+        }
+    }
+
+    Err(anyhow!(
+        "No recoverable media source found for {} ({})",
+        hash,
+        failures.join(" | ")
+    ))
 }
 
 /// Extract mono 16kHz PCM WAV audio for transcription.
@@ -1367,7 +1413,7 @@ async fn finalize_transcript(
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_transcript_to_vtt, parse_audio_analysis_output,
+        media_source_candidates, normalize_transcript_to_vtt, parse_audio_analysis_output,
         should_drop_low_signal_transcript, transcript_drop_reason, transcription_response_format,
         AudioAnalysis, ParsedVtt, TranscriptConfidence, TranscriptDropReason,
     };
@@ -1523,6 +1569,17 @@ mod tests {
             transcript_drop_reason(&analysis, &parsed_vtt),
             Some(TranscriptDropReason::LowProviderConfidence)
         );
+    }
+
+    #[test]
+    fn media_source_candidates_prefer_original_then_hls_variants() {
+        let hash =
+            "5b48aa1fcf30af61243ac9307eb98b7fa22df1c58573c3ca5d1b14fc30099929";
+        let candidates = media_source_candidates(hash);
+
+        assert_eq!(candidates[0], hash);
+        assert_eq!(candidates[1], format!("{}/hls/stream_720p.ts", hash));
+        assert_eq!(candidates[2], format!("{}/hls/stream_480p.ts", hash));
     }
 }
 

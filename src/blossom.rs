@@ -78,6 +78,18 @@ pub enum BlobStatus {
     Pending,
     /// Permanently banned by moderation - not accessible to anyone
     Banned,
+    /// Soft-deleted internally; preserved in storage but never served publicly
+    Deleted,
+}
+
+impl BlobStatus {
+    pub fn blocks_public_access(self) -> bool {
+        matches!(self, BlobStatus::Banned | BlobStatus::Deleted)
+    }
+
+    pub fn requires_owner_auth(self) -> bool {
+        matches!(self, BlobStatus::Restricted)
+    }
 }
 
 /// Transcode status for video blobs
