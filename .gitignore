@@ -31,6 +31,9 @@ Thumbs.db
 # Private journal (local only)
 .private-journal/
 
+# Git worktrees
+.worktrees/
+
 # Secrets and config (contain API keys)
 secrets.json
 config.json
