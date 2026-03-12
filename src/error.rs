@@ -65,3 +65,62 @@ impl std::error::Error for BlossomError {}
 
 /// Result type alias for Blossom operations
 pub type Result<T> = std::result::Result<T, BlossomError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_status_codes() {
+        assert_eq!(
+            BlossomError::AuthRequired("".into()).status_code(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            BlossomError::AuthInvalid("".into()).status_code(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            BlossomError::Forbidden("".into()).status_code(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            BlossomError::NotFound("".into()).status_code(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            BlossomError::BadRequest("".into()).status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            BlossomError::StorageError("".into()).status_code(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            BlossomError::MetadataError("".into()).status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            BlossomError::Internal("".into()).status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn test_message_extraction() {
+        assert_eq!(
+            BlossomError::AuthRequired("auth needed".into()).message(),
+            "auth needed"
+        );
+        assert_eq!(
+            BlossomError::NotFound("blob gone".into()).message(),
+            "blob gone"
+        );
+    }
+
+    #[test]
+    fn test_display_impl() {
+        let err = BlossomError::BadRequest("bad input".into());
+        assert_eq!(format!("{}", err), "bad input");
+    }
+}

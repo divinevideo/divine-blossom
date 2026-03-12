@@ -743,6 +743,218 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_thumbnail_path_valid() {
+        let hash = "a".repeat(64);
+        let result = parse_thumbnail_path(&format!("/{}.jpg", hash));
+        assert_eq!(result, Some(format!("{}.jpg", hash)));
+    }
+
+    #[test]
+    fn test_parse_thumbnail_path_no_jpg() {
+        let hash = "a".repeat(64);
+        assert_eq!(parse_thumbnail_path(&format!("/{}.png", hash)), None);
+        assert_eq!(parse_thumbnail_path(&format!("/{}", hash)), None);
+    }
+
+    #[test]
+    fn test_parse_thumbnail_path_invalid_hash() {
+        assert_eq!(parse_thumbnail_path("/short.jpg"), None);
+        assert_eq!(parse_thumbnail_path("/upload.jpg"), None);
+    }
+
+    #[test]
+    fn test_is_hash_path() {
+        let hash = "a".repeat(64);
+        assert!(is_hash_path(&format!("/{}", hash)));
+        assert!(is_hash_path(&format!("/{}.mp4", hash)));
+        assert!(!is_hash_path("/upload"));
+        assert!(!is_hash_path("/list/abc"));
+    }
+
+    #[test]
+    fn test_auth_event_get_action() {
+        let event = BlossomAuthEvent {
+            id: "test".into(),
+            pubkey: "a".repeat(64),
+            created_at: 0,
+            kind: 24242,
+            tags: vec![vec!["t".into(), "upload".into()]],
+            content: String::new(),
+            sig: "b".repeat(128),
+        };
+        assert_eq!(event.get_action(), Some(AuthAction::Upload));
+
+        let delete_event = BlossomAuthEvent {
+            tags: vec![vec!["t".into(), "delete".into()]],
+            ..event.clone()
+        };
+        assert_eq!(delete_event.get_action(), Some(AuthAction::Delete));
+
+        let list_event = BlossomAuthEvent {
+            tags: vec![vec!["t".into(), "list".into()]],
+            ..event.clone()
+        };
+        assert_eq!(list_event.get_action(), Some(AuthAction::List));
+
+        let unknown_event = BlossomAuthEvent {
+            tags: vec![vec!["t".into(), "unknown".into()]],
+            ..event.clone()
+        };
+        assert_eq!(unknown_event.get_action(), None);
+
+        let no_tag_event = BlossomAuthEvent {
+            tags: vec![],
+            ..event.clone()
+        };
+        assert_eq!(no_tag_event.get_action(), None);
+    }
+
+    #[test]
+    fn test_auth_event_get_hash() {
+        let event = BlossomAuthEvent {
+            id: "test".into(),
+            pubkey: "a".repeat(64),
+            created_at: 0,
+            kind: 24242,
+            tags: vec![
+                vec!["t".into(), "delete".into()],
+                vec!["x".into(), "c".repeat(64)],
+            ],
+            content: String::new(),
+            sig: "b".repeat(128),
+        };
+        assert_eq!(event.get_hash(), Some("c".repeat(64).as_str()));
+
+        let no_hash = BlossomAuthEvent {
+            tags: vec![vec!["t".into(), "upload".into()]],
+            ..event.clone()
+        };
+        assert_eq!(no_hash.get_hash(), None);
+    }
+
+    #[test]
+    fn test_auth_event_get_expiration() {
+        let event = BlossomAuthEvent {
+            id: "test".into(),
+            pubkey: "a".repeat(64),
+            created_at: 0,
+            kind: 24242,
+            tags: vec![vec!["expiration".into(), "1700000000".into()]],
+            content: String::new(),
+            sig: "b".repeat(128),
+        };
+        assert_eq!(event.get_expiration(), Some(1700000000));
+
+        let no_exp = BlossomAuthEvent {
+            tags: vec![],
+            ..event.clone()
+        };
+        assert_eq!(no_exp.get_expiration(), None);
+
+        let bad_exp = BlossomAuthEvent {
+            tags: vec![vec!["expiration".into(), "not-a-number".into()]],
+            ..event.clone()
+        };
+        assert_eq!(bad_exp.get_expiration(), None);
+    }
+
+    #[test]
+    fn test_global_stats_add_and_remove_blob() {
+        let mut stats = GlobalStats::new();
+        let meta = test_metadata("video/mp4");
+
+        stats.add_blob(&meta);
+        assert_eq!(stats.total_blobs, 1);
+        assert_eq!(stats.total_size_bytes, 1024);
+        assert_eq!(stats.mime_type_counts.get("video/mp4"), Some(&1));
+        assert_eq!(stats.status_counts.get("active"), Some(&1));
+
+        stats.remove_blob(&meta);
+        assert_eq!(stats.total_blobs, 0);
+        assert_eq!(stats.total_size_bytes, 0);
+    }
+
+    #[test]
+    fn test_global_stats_update_status() {
+        let mut stats = GlobalStats::new();
+        stats.status_counts.insert("active".into(), 5);
+
+        stats.update_status(BlobStatus::Active, BlobStatus::Banned);
+        assert_eq!(stats.status_counts.get("active"), Some(&4));
+        assert_eq!(stats.status_counts.get("banned"), Some(&1));
+    }
+
+    #[test]
+    fn test_global_stats_update_transcode() {
+        let mut stats = GlobalStats::new();
+        stats.transcode_counts.insert("pending".into(), 3);
+
+        stats.update_transcode(Some(TranscodeStatus::Pending), TranscodeStatus::Complete);
+        assert_eq!(stats.transcode_counts.get("pending"), Some(&2));
+        assert_eq!(stats.transcode_counts.get("complete"), Some(&1));
+
+        // From None (new entry)
+        stats.update_transcode(None, TranscodeStatus::Pending);
+        assert_eq!(stats.transcode_counts.get("pending"), Some(&3));
+    }
+
+    #[test]
+    fn test_recent_index_add_and_truncate() {
+        let mut index = RecentIndex::new();
+        for i in 0..210 {
+            index.add(format!("hash_{}", i));
+        }
+        assert_eq!(index.hashes.len(), RecentIndex::MAX_RECENT);
+        assert_eq!(index.hashes[0], "hash_209");
+    }
+
+    #[test]
+    fn test_recent_index_dedup() {
+        let mut index = RecentIndex::new();
+        index.add("aaa".into());
+        index.add("bbb".into());
+        index.add("aaa".into()); // re-add moves to front
+        assert_eq!(index.hashes.len(), 2);
+        assert_eq!(index.hashes[0], "aaa");
+        assert_eq!(index.hashes[1], "bbb");
+    }
+
+    #[test]
+    fn test_recent_index_remove() {
+        let mut index = RecentIndex::new();
+        index.add("aaa".into());
+        index.add("bbb".into());
+        index.remove("aaa");
+        assert_eq!(index.hashes, vec!["bbb"]);
+    }
+
+    #[test]
+    fn test_user_index_add_and_contains() {
+        let mut idx = UserIndex::new();
+        assert!(idx.add("pk1".into()));
+        assert!(!idx.add("pk1".into())); // duplicate returns false
+        assert!(idx.contains("pk1"));
+        assert!(!idx.contains("pk2"));
+    }
+
+    #[test]
+    fn test_subtitle_job_status_serialization() {
+        assert_eq!(
+            serde_json::to_string(&SubtitleJobStatus::Queued).unwrap(),
+            "\"queued\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SubtitleJobStatus::Ready).unwrap(),
+            "\"ready\""
+        );
+    }
+
+    #[test]
+    fn test_blob_status_default_is_pending() {
+        assert_eq!(BlobStatus::default(), BlobStatus::Pending);
+    }
+
+    #[test]
     fn test_descriptor_after_local_mode_sets_all_statuses() {
         let mut meta = test_metadata("video/mp4");
         meta.status = BlobStatus::Active;
