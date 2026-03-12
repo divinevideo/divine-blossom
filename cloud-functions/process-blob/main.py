@@ -191,7 +191,7 @@ def _run_c2patool_read(file_path):
     """Run c2patool to read manifest. Returns parsed JSON or None."""
     try:
         proc = subprocess.run(
-            ['c2patool', file_path, '--detailed'],
+            ['c2patool', '--detailed', file_path],
             capture_output=True, text=True, timeout=60
         )
         if proc.returncode == 0 and proc.stdout.strip():
@@ -214,16 +214,36 @@ def _run_c2patool_trust(file_path):
     """Run c2patool trust check against configured trust anchors. Returns True if trusted."""
     try:
         proc = subprocess.run(
-            ['c2patool', file_path, 'trust',
-             '--trust_anchors', C2PA_TRUST_ANCHORS],
+            ['c2patool', '--detailed', file_path, 'trust',
+             '--allowed_list', C2PA_TRUST_ANCHORS],
             capture_output=True, text=True, timeout=60
         )
-        if proc.returncode == 0:
-            print(f"c2patool trust: TRUSTED")
-            return True
-        else:
+        if proc.returncode != 0:
             print(f"c2patool trust: NOT TRUSTED stderr={proc.stderr.strip()}")
             return False
+
+        if not proc.stdout.strip():
+            print("c2patool trust: no output")
+            return False
+
+        try:
+            output = json.loads(proc.stdout)
+        except json.JSONDecodeError as e:
+            print(f"c2patool trust: invalid JSON: {e}")
+            return False
+
+        validation_state = output.get('validation_state', '')
+        is_trusted = validation_state == 'Trusted'
+
+        # Also check for failures in validation_results
+        validation_results = output.get('validation_results', {})
+        active_failures = validation_results.get('activeManifest', {}).get('failure', [])
+        if active_failures:
+            print(f"c2patool trust: validation failures: {active_failures}")
+            is_trusted = False
+
+        print(f"c2patool trust: validation_state={validation_state} trusted={is_trusted}")
+        return is_trusted
     except subprocess.TimeoutExpired:
         print("c2patool trust check timed out")
         return False
