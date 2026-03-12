@@ -1,3 +1,5 @@
+flask==3.*
+gunicorn==22.*
 functions-framework==3.*
 google-cloud-storage==2.*
 google-cloud-vision==3.*
