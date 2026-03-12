@@ -37,6 +37,7 @@ Thumbs.db
 # Secrets and config (contain API keys)
 secrets.json
 config.json
+secret-store-data.json
 
 # Test files
 test*.mjs

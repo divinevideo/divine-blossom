@@ -1,7 +1,7 @@
 # Multi-stage build: compile WASM, then run with Viceroy
 # Usage: docker build -f Dockerfile.local -t divine-blossom-local .
 
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.83-bookworm AS builder
 
 # Install wasm32-wasip1 target
 RUN rustup target add wasm32-wasip1
@@ -11,7 +11,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 
 # Build the WASM binary
-RUN cargo build --target wasm32-wasip1 --release
+RUN cargo build --locked --target wasm32-wasip1 --release
 RUN mkdir -p bin && cp target/wasm32-wasip1/release/fastly-blossom.wasm bin/main.wasm
 
 # Runtime: Viceroy
@@ -34,7 +34,7 @@ COPY --from=builder /app/bin/main.wasm ./bin/main.wasm
 # Copy config and store data files
 COPY fastly.toml.docker ./fastly.toml
 COPY config-store-data.json ./
-COPY secret-store-data.json ./
+COPY secret-store-data.json.example ./secret-store-data.json
 RUN echo '{}' > kv-store-data.json
 
 EXPOSE 7676

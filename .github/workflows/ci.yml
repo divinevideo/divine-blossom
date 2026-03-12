@@ -80,6 +80,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # TODO: replace with fastly/compute-actions when it supports wasm32-wasip1
       - name: Install Fastly CLI
         run: |
           curl -sL https://github.com/fastly/cli/releases/download/v14.0.4/fastly_v14.0.4_linux-amd64.tar.gz \
