@@ -4,6 +4,7 @@
 mod admin;
 mod auth;
 mod blossom;
+mod c2pa;
 mod error;
 mod metadata;
 mod storage;
@@ -1608,6 +1609,22 @@ fn handle_upload(mut req: Request) -> Result<Response> {
         }
     }
 
+    // C2PA policy check (for small buffered uploads, Cloud Run path handles its own)
+    // Note: actual C2PA manifest parsing for small files is not yet implemented
+    // (requires c2pa crate compiled for wasm32-wasip1). For now we record no_manifest
+    // and rely on Cloud Run path for video C2PA validation.
+    let c2pa_mode = c2pa::get_c2pa_mode();
+    let c2pa_validation = if c2pa_mode != c2pa::C2paMode::Off {
+        let validation = c2pa::no_manifest(&current_timestamp());
+        let policy = c2pa::evaluate_c2pa_policy(&validation, &content_type, c2pa_mode);
+        if policy.reject {
+            return Err(BlossomError::Forbidden(policy.reason));
+        }
+        Some(validation)
+    } else {
+        None
+    };
+
     // Upload to GCS (with owner metadata for durability)
     upload_blob(
         &hash,
@@ -1638,6 +1655,7 @@ fn handle_upload(mut req: Request) -> Result<Response> {
         } else {
             None
         },
+        c2pa: c2pa_validation,
     };
 
     put_blob_metadata(&metadata)?;
@@ -1762,6 +1780,22 @@ fn handle_cloud_run_proxy(
     // Parse video dimensions if present (from ffprobe in upload service)
     let dim = cloud_run_resp["dim"].as_str().map(|s| s.to_string());
 
+    // Parse C2PA validation results from Cloud Run response
+    let c2pa_mode = c2pa::get_c2pa_mode();
+    let c2pa_validation = if c2pa_mode != c2pa::C2paMode::Off {
+        let validation = cloud_run_resp
+            .get("c2pa")
+            .and_then(|v| c2pa::parse_cloud_run_c2pa(v, &current_timestamp()))
+            .unwrap_or_else(|| c2pa::no_manifest(&current_timestamp()));
+        let policy = c2pa::evaluate_c2pa_policy(&validation, &content_type, c2pa_mode);
+        if policy.reject {
+            return Err(BlossomError::Forbidden(policy.reason));
+        }
+        Some(validation)
+    } else {
+        None
+    };
+
     // Check if metadata already exists (dedupe/re-upload case)
     if let Some(mut metadata) = get_blob_metadata(&hash)? {
         // Track re-uploader in refs and their list
@@ -1804,6 +1838,7 @@ fn handle_cloud_run_proxy(
         } else {
             None
         },
+        c2pa: c2pa_validation,
     };
 
     put_blob_metadata(&metadata)?;

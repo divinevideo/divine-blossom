@@ -1,6 +1,7 @@
 // ABOUTME: Blossom protocol types and constants
 // ABOUTME: Implements BUD-01 and BUD-02 data structures
 
+use crate::c2pa::{C2paPublicInfo, C2paValidation};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -31,6 +32,9 @@ pub struct BlobDescriptor {
     /// Transcript URL in WebVTT format (optional, present when transcription complete)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vtt: Option<String>,
+    /// C2PA content credentials info (present if manifest was found)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub c2pa: Option<C2paPublicInfo>,
 }
 
 /// Blob metadata stored in KV store
@@ -64,6 +68,9 @@ pub struct BlobMetadata {
     /// Transcript status for audio/video transcription
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transcript_status: Option<TranscriptStatus>,
+    /// C2PA content credentials validation result
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub c2pa: Option<C2paValidation>,
 }
 
 /// Moderation status for blobs
@@ -238,6 +245,8 @@ impl BlobMetadata {
             None
         };
 
+        let c2pa = self.c2pa.as_ref().map(|v| v.to_public());
+
         BlobDescriptor {
             url: format!("{}/{}", base_url, self.sha256),
             sha256: self.sha256.clone(),
@@ -248,6 +257,7 @@ impl BlobMetadata {
             hls,
             dim: self.dim.clone(),
             vtt,
+            c2pa,
         }
     }
 }
