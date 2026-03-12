@@ -45,6 +45,15 @@ language = "rust"
       [local_server.config_stores.blossom_config.contents]
       gcs_bucket = "YOUR_BUCKET_NAME"
       gcs_project_id = "YOUR_GCP_PROJECT_ID"
+      # C2PA content credentials validation
+      # Mode: "off" (default), "log" (validate but don't reject), "enforce" (reject untrusted)
+      c2pa_mode = "off"
+      # JSON array of trusted certificate issuer names (case-insensitive substring match)
+      c2pa_trusted_issuers = '["ProofMode CA", "Guardian Project"]'
+      # JSON array of trusted claim generators (case-insensitive prefix match)
+      c2pa_trusted_generators = '["ProofMode", "eyeWitness"]'
+      # Whether to require C2PA for video uploads ("true" or "false")
+      c2pa_require_for_video = "false"
 
   [local_server.secret_stores]
 
@@ -113,6 +122,10 @@ language = "rust"
     items = [
       { key = "gcs_bucket", description = "GCS bucket name" },
       { key = "gcs_project_id", description = "GCP project ID" },
+      { key = "c2pa_mode", description = "C2PA enforcement mode: off, log, or enforce" },
+      { key = "c2pa_trusted_issuers", description = "JSON array of trusted certificate issuer names" },
+      { key = "c2pa_trusted_generators", description = "JSON array of trusted claim generator prefixes" },
+      { key = "c2pa_require_for_video", description = "Require C2PA for video uploads: true or false" },
     ]
 
   [setup.secret_stores]
