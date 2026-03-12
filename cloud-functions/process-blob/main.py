@@ -20,6 +20,8 @@ METADATA_WEBHOOK_SECRET = os.environ.get('METADATA_WEBHOOK_SECRET', '')
 C2PA_MODE = os.environ.get('C2PA_MODE', 'off')  # off, log, enforce
 C2PA_TRUST_ANCHORS = os.environ.get('C2PA_TRUST_ANCHORS', '/app/trust_anchors.pem')
 C2PA_CHECK_IMAGES = os.environ.get('C2PA_CHECK_IMAGES', 'false').lower() == 'true'
+C2PA_MAX_FILE_SIZE = int(os.environ.get('C2PA_MAX_FILE_SIZE', str(2 * 1024 * 1024 * 1024)))  # default 2GB
+C2PA_WARN_FILE_SIZE = int(os.environ.get('C2PA_WARN_FILE_SIZE', str(500 * 1024 * 1024)))  # default 500MB
 
 app = Flask(__name__)
 
@@ -132,6 +134,20 @@ def check_c2pa_trust(bucket_name, blob_name):
     storage_client = storage.Client()
     bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(blob_name)
+    blob.reload()  # fetch metadata including size
+
+    # File size guard — skip C2PA for very large files, warn for moderately large ones
+    file_size = blob.size or 0
+    if file_size > C2PA_MAX_FILE_SIZE:
+        mb = file_size / (1024 * 1024)
+        limit_mb = C2PA_MAX_FILE_SIZE / (1024 * 1024)
+        print(f"WARNING: Skipping C2PA validation for {blob_name} — "
+              f"file size {mb:.0f}MB exceeds limit {limit_mb:.0f}MB")
+        result['errors'].append(f'file too large for C2PA validation ({mb:.0f}MB)')
+        return result
+    elif file_size > C2PA_WARN_FILE_SIZE:
+        mb = file_size / (1024 * 1024)
+        print(f"WARNING: Large file for C2PA validation: {blob_name} ({mb:.0f}MB)")
 
     # Download blob to temp file for c2patool inspection
     suffix = _suffix_for_blob(blob_name, blob)
