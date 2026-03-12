@@ -2617,11 +2617,11 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
     // Map action to BlobStatus
     let new_status = match action.to_uppercase().as_str() {
         "BLOCK" | "BAN" | "PERMANENT_BAN" => BlobStatus::Banned,
-        "RESTRICT" | "AGE_RESTRICTED" => BlobStatus::Restricted,
+        "RESTRICT" | "AGE_RESTRICTED" | "QUARANTINE" => BlobStatus::Restricted,
         "APPROVE" | "SAFE" => BlobStatus::Active,
         _ => {
             return Err(BlossomError::BadRequest(format!(
-                "Unknown action: {}. Expected BLOCK, RESTRICT, or APPROVE",
+                "Unknown action: {}. Expected BLOCK, RESTRICT, QUARANTINE, or APPROVE",
                 action
             )));
         }
