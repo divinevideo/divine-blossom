@@ -18,15 +18,25 @@ use crate::blossom::{
 use crate::error::{BlossomError, Result};
 use crate::metadata::{
     add_to_blob_refs, add_to_recent_index, add_to_user_index, add_to_user_list, check_ownership,
+<<<<<<< HEAD
     delete_blob_metadata, get_auth_event, get_blob_metadata, get_blob_refs, get_subtitle_job,
     get_subtitle_job_by_hash, get_tombstone, put_auth_event, put_blob_metadata, put_subtitle_job,
     put_tombstone, set_subtitle_job_id_for_hash, list_blobs_with_metadata,
     remove_from_recent_index, remove_from_user_list, update_blob_status, update_stats_on_add,
     update_stats_on_remove, update_stats_on_status_change,
+=======
+    delete_auth_events, delete_blob_metadata, delete_blob_refs, delete_subtitle_data,
+    delete_user_list, get_auth_event, get_blob_metadata, get_blob_refs, get_subtitle_job,
+    get_subtitle_job_by_hash, get_tombstone, get_user_blobs, list_blobs_with_metadata,
+    put_auth_event, put_blob_metadata, put_subtitle_job, put_tombstone, remove_from_blob_refs,
+    remove_from_recent_index, remove_from_user_index, remove_from_user_list,
+    set_subtitle_job_id_for_hash, update_blob_status, update_stats_on_add, update_stats_on_remove,
+>>>>>>> b22632b (fix: handle QUARANTINE moderation action for AI-detected content)
 };
 use crate::storage::{
     blob_exists, current_timestamp, delete_blob as storage_delete, download_blob_with_fallback,
-    download_thumbnail, upload_blob, write_audit_log,
+    download_thumbnail, trigger_audit_anonymize, trigger_cloud_run_bulk_delete,
+    trigger_cloud_run_delete_blob, upload_blob, write_audit_log,
 };
 
 use fastly::cache::simple as simple_cache;
@@ -72,7 +82,7 @@ fn handle_request(req: Request) -> Result<Response> {
 
         // Version check
         (Method::GET, "/version") => {
-            Ok(Response::from_status(StatusCode::OK).with_body("v126-audit-cloud-logging"))
+            Ok(Response::from_status(StatusCode::OK).with_body("v127-gdpr-vanish-delete-cleanup"))
         }
 
         // HLS: /{sha256}.hls -> serve master manifest
@@ -93,9 +103,7 @@ fn handle_request(req: Request) -> Result<Response> {
 
         // Subtitle jobs API
         (Method::POST, "/v1/subtitles/jobs") => handle_create_subtitle_job(req),
-        (Method::GET, p) if p.starts_with("/v1/subtitles/jobs/") => {
-            handle_get_subtitle_job(p)
-        }
+        (Method::GET, p) if p.starts_with("/v1/subtitles/jobs/") => handle_get_subtitle_job(p),
         (Method::GET, p) if p.starts_with("/v1/subtitles/by-hash/") => {
             handle_get_subtitle_by_hash(req, p)
         }
@@ -118,6 +126,9 @@ fn handle_request(req: Request) -> Result<Response> {
 
         // BUD-02: Delete
         (Method::DELETE, p) if is_hash_path(p) => handle_delete(req, p),
+
+        // GDPR Right to Erasure: user-initiated vanish
+        (Method::DELETE, "/vanish") => handle_vanish(req),
 
         // BUD-02: List
         (Method::GET, p) if p.starts_with("/list/") => handle_list(req, p),
@@ -152,9 +163,7 @@ fn handle_request(req: Request) -> Result<Response> {
             let pubkey = p.strip_prefix("/admin/api/user/").unwrap_or("");
             admin::handle_admin_user_blobs(req, pubkey)
         }
-        (Method::GET, p)
-            if p.starts_with("/admin/api/blob/") && p.ends_with("/content") =>
-        {
+        (Method::GET, p) if p.starts_with("/admin/api/blob/") && p.ends_with("/content") => {
             let hash = p
                 .strip_prefix("/admin/api/blob/")
                 .unwrap_or("")
@@ -167,8 +176,14 @@ fn handle_request(req: Request) -> Result<Response> {
             admin::handle_admin_blob_detail(req, hash)
         }
         (Method::POST, "/admin/api/moderate") => admin::handle_admin_moderate_action(req),
+        (Method::POST, "/admin/api/bulk-approve") => admin::handle_admin_bulk_approve(req),
+        (Method::POST, "/admin/api/scan-flagged") => admin::handle_admin_scan_flagged(req),
         (Method::POST, "/admin/api/delete") => handle_admin_force_delete(req),
+<<<<<<< HEAD
         (Method::POST, "/admin/api/restore") => admin::handle_admin_restore_action(req),
+=======
+        (Method::POST, "/admin/api/vanish") => handle_admin_vanish(req),
+>>>>>>> b22632b (fix: handle QUARANTINE moderation action for AI-detected content)
         (Method::POST, "/admin/api/backfill") => admin::handle_admin_backfill(req),
         (Method::POST, "/admin/api/backfill-vtt") => handle_admin_backfill_vtt(req),
 
@@ -186,9 +201,13 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
     if let Some(thumbnail_key) = parse_thumbnail_path(path) {
         let video_hash = thumbnail_key.trim_end_matches(".jpg");
 
+        // Admin Bearer token bypasses moderation checks (used by moderation service proxy)
+        let is_admin = admin::validate_bearer_token(&req).is_ok();
+
         // Check parent video's moderation status - thumbnails inherit video access rules
         let mut is_restricted = false;
         if let Ok(Some(meta)) = get_blob_metadata(video_hash) {
+<<<<<<< HEAD
             if meta.status.blocks_public_access() {
                 return Err(BlossomError::NotFound("Blob not found".into()));
             }
@@ -199,9 +218,23 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
                         return Err(BlossomError::NotFound("Blob not found".into()));
                     }
                 } else {
+=======
+            if !is_admin {
+                if meta.status == BlobStatus::Banned {
+>>>>>>> b22632b (fix: handle QUARANTINE moderation action for AI-detected content)
                     return Err(BlossomError::NotFound("Blob not found".into()));
                 }
-                is_restricted = true;
+                if meta.status == BlobStatus::Restricted {
+                    // Check if requester is owner
+                    if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
+                        if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
+                            return Err(BlossomError::NotFound("Blob not found".into()));
+                        }
+                    } else {
+                        return Err(BlossomError::NotFound("Blob not found".into()));
+                    }
+                    is_restricted = true;
+                }
             }
         }
 
@@ -421,6 +454,7 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
     // Check metadata for access control
     let metadata = get_blob_metadata(&hash)?;
 
+<<<<<<< HEAD
     if let Some(ref meta) = metadata {
         // Handle banned content
         if meta.status.blocks_public_access() {
@@ -431,10 +465,27 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
         if meta.status.requires_owner_auth() {
             if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
                 if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
+=======
+    // Admin Bearer token bypasses moderation checks (used by moderation service proxy)
+    let is_admin = admin::validate_bearer_token(&req).is_ok();
+
+    if let Some(ref meta) = metadata {
+        if !is_admin {
+            // Handle banned content
+            if meta.status == BlobStatus::Banned {
+                return Err(BlossomError::NotFound("Content not found".into()));
+            }
+
+            // Handle restricted content
+            if meta.status == BlobStatus::Restricted {
+                if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
+                    if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
+                        return Err(BlossomError::NotFound("Content not found".into()));
+                    }
+                } else {
+>>>>>>> b22632b (fix: handle QUARANTINE moderation action for AI-detected content)
                     return Err(BlossomError::NotFound("Content not found".into()));
                 }
-            } else {
-                return Err(BlossomError::NotFound("Content not found".into()));
             }
         }
     } else {
@@ -449,7 +500,10 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
             // HLS exists in GCS — serve it and fix metadata if needed
             let meta = metadata.as_ref().unwrap();
             if meta.transcode_status != Some(TranscodeStatus::Complete) {
-                eprintln!("[HLS] Fixing metadata: {} has HLS in GCS but status was {:?}", hash, meta.transcode_status);
+                eprintln!(
+                    "[HLS] Fixing metadata: {} has HLS in GCS but status was {:?}",
+                    hash, meta.transcode_status
+                );
                 use crate::metadata::update_transcode_status;
                 let _ = update_transcode_status(&hash, TranscodeStatus::Complete);
             }
@@ -483,7 +537,9 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
                     let mut resp = Response::from_status(StatusCode::ACCEPTED);
                     resp.set_header("Retry-After", "5");
                     resp.set_header("Content-Type", "application/json");
-                    resp.set_body(r#"{"status":"processing","message":"HLS transcoding in progress"}"#);
+                    resp.set_body(
+                        r#"{"status":"processing","message":"HLS transcoding in progress"}"#,
+                    );
                     add_no_cache_headers(&mut resp);
                     add_cors_headers(&mut resp);
                     Ok(resp)
@@ -527,8 +583,13 @@ fn handle_head_hls_master(path: &str) -> Result<Response> {
     let metadata = get_blob_metadata(&hash)?
         .ok_or_else(|| BlossomError::NotFound("Content not found".into()))?;
 
+<<<<<<< HEAD
     // Don't reveal restricted/banned content
     if metadata.status.requires_owner_auth() || metadata.status.blocks_public_access() {
+=======
+    // Don't reveal restricted/banned content (HEAD has no req, no admin bypass)
+    if metadata.status == BlobStatus::Restricted || metadata.status == BlobStatus::Banned {
+>>>>>>> b22632b (fix: handle QUARANTINE moderation action for AI-detected content)
         return Err(BlossomError::NotFound("Content not found".into()));
     }
 
@@ -562,7 +623,7 @@ fn handle_head_hls_master(path: &str) -> Result<Response> {
 }
 
 /// GET /<sha256>/hls/* - Serve HLS segments and variant playlists
-fn handle_get_hls_content(_req: Request, path: &str) -> Result<Response> {
+fn handle_get_hls_content(req: Request, path: &str) -> Result<Response> {
     // Path format: /{hash}/hls/{filename}
     // Extract hash and validate
     let path_trimmed = path.trim_start_matches('/');
@@ -618,10 +679,15 @@ fn handle_get_hls_content(_req: Request, path: &str) -> Result<Response> {
         Err(BlossomError::NotFound(_)) if filename == "master.m3u8" => {
             // HLS not found - check metadata and trigger on-demand transcoding
             let metadata = get_blob_metadata(&hash)?;
+            let is_admin = admin::validate_bearer_token(&req).is_ok();
 
             if let Some(ref meta) = metadata {
                 // Handle banned content
+<<<<<<< HEAD
                 if meta.status.blocks_public_access() {
+=======
+                if !is_admin && meta.status == BlobStatus::Banned {
+>>>>>>> b22632b (fix: handle QUARANTINE moderation action for AI-detected content)
                     return Err(BlossomError::NotFound("Content not found".into()));
                 }
 
@@ -829,9 +895,18 @@ fn download_transcript_content(gcs_path: &str) -> Result<Response> {
 
     // Try Simple Cache first
     if let Ok(Some(body)) = simple_cache::get(cache_key.clone()) {
-        let mut resp = Response::from_status(StatusCode::OK);
-        resp.set_body(body);
-        return Ok(resp);
+        // Detect corrupted VTT (raw JSON stored as subtitles) and skip cache
+        let body_bytes = body.into_bytes();
+        let body_str = std::str::from_utf8(&body_bytes).unwrap_or("");
+        let is_corrupted =
+            body_str.contains("\"total_tokens\"") || body_str.contains("\"usage\":{");
+        if !is_corrupted {
+            let mut resp = Response::from_status(StatusCode::OK);
+            resp.set_body(body_bytes);
+            return Ok(resp);
+        }
+        // Corrupted VTT in cache — purge and fetch fresh from GCS
+        let _ = simple_cache::purge(cache_key.clone());
     }
 
     // Cache miss: fetch from GCS
@@ -848,10 +923,20 @@ fn download_transcript_content(gcs_path: &str) -> Result<Response> {
     Ok(resp)
 }
 
-fn serve_transcript_by_hash(req: Option<&Request>, hash: &str, can_trigger: bool) -> Result<Response> {
+fn purge_transcript_content_cache(hash: &str) {
+    let cache_key = format!("vtt:{}/vtt/main.vtt", hash.to_lowercase());
+    let _ = simple_cache::purge(cache_key);
+}
+
+fn serve_transcript_by_hash(
+    req: Option<&Request>,
+    hash: &str,
+    can_trigger: bool,
+) -> Result<Response> {
     let metadata = get_blob_metadata(hash)?
         .ok_or_else(|| BlossomError::NotFound("Content not found".into()))?;
 
+<<<<<<< HEAD
     if metadata.status.blocks_public_access() {
         return Err(BlossomError::NotFound("Content not found".into()));
     }
@@ -860,13 +945,30 @@ fn serve_transcript_by_hash(req: Option<&Request>, hash: &str, can_trigger: bool
         if let Some(request) = req {
             if let Ok(Some(auth)) = optional_auth(request, AuthAction::List) {
                 if auth.pubkey.to_lowercase() != metadata.owner.to_lowercase() {
+=======
+    // Admin Bearer token bypasses moderation checks
+    let is_admin = req
+        .map(|r| admin::validate_bearer_token(r).is_ok())
+        .unwrap_or(false);
+
+    if !is_admin {
+        if metadata.status == BlobStatus::Banned {
+            return Err(BlossomError::NotFound("Content not found".into()));
+        }
+
+        if metadata.status == BlobStatus::Restricted {
+            if let Some(request) = req {
+                if let Ok(Some(auth)) = optional_auth(request, AuthAction::List) {
+                    if auth.pubkey.to_lowercase() != metadata.owner.to_lowercase() {
+                        return Err(BlossomError::NotFound("Content not found".into()));
+                    }
+                } else {
+>>>>>>> b22632b (fix: handle QUARANTINE moderation action for AI-detected content)
                     return Err(BlossomError::NotFound("Content not found".into()));
                 }
             } else {
                 return Err(BlossomError::NotFound("Content not found".into()));
             }
-        } else {
-            return Err(BlossomError::NotFound("Content not found".into()));
         }
     }
 
@@ -1048,7 +1150,8 @@ fn dispatch_subtitle_job(job: &mut SubtitleJob, owner: &str) -> Result<()> {
     job.error_code = None;
     job.error_message = None;
     put_subtitle_job(job)?;
-    let _ = crate::metadata::update_transcript_status(&job.video_sha256, TranscriptStatus::Processing);
+    let _ =
+        crate::metadata::update_transcript_status(&job.video_sha256, TranscriptStatus::Processing);
 
     let lang_for_provider = job
         .language
@@ -1102,7 +1205,11 @@ fn handle_create_subtitle_job(mut req: Request) -> Result<Response> {
                 && existing.attempt_count < existing.max_attempts
             {
                 let now = unix_timestamp_secs();
-                if existing.next_retry_at_unix.map(|t| now >= t).unwrap_or(true) {
+                if existing
+                    .next_retry_at_unix
+                    .map(|t| now >= t)
+                    .unwrap_or(true)
+                {
                     let _ = dispatch_subtitle_job(&mut existing, &metadata.owner);
                 }
             }
@@ -1247,7 +1354,9 @@ fn handle_get_subtitle_by_hash(req: Request, path: &str) -> Result<Response> {
         return Ok(resp);
     }
 
-    Err(BlossomError::NotFound("Subtitle job not found for hash".into()))
+    Err(BlossomError::NotFound(
+        "Subtitle job not found for hash".into(),
+    ))
 }
 
 /// Valid quality variant suffixes
@@ -1290,18 +1399,30 @@ fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
         .ok_or_else(|| BlossomError::BadRequest("Invalid quality variant path".into()))?;
 
     // Check metadata for access control
+    let is_admin = admin::validate_bearer_token(&req).is_ok();
     let metadata = get_blob_metadata(&hash)?;
     if let Some(ref meta) = metadata {
+<<<<<<< HEAD
         if meta.status.blocks_public_access() {
             return Err(BlossomError::NotFound("Content not found".into()));
         }
         if meta.status.requires_owner_auth() {
             if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
                 if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
+=======
+        if !is_admin {
+            if meta.status == BlobStatus::Banned {
+                return Err(BlossomError::NotFound("Content not found".into()));
+            }
+            if meta.status == BlobStatus::Restricted {
+                if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
+                    if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
+                        return Err(BlossomError::NotFound("Content not found".into()));
+                    }
+                } else {
+>>>>>>> b22632b (fix: handle QUARANTINE moderation action for AI-detected content)
                     return Err(BlossomError::NotFound("Content not found".into()));
                 }
-            } else {
-                return Err(BlossomError::NotFound("Content not found".into()));
             }
         }
     } else {
@@ -1932,7 +2053,46 @@ fn handle_upload_requirements(req: Request) -> Result<Response> {
     Ok(resp)
 }
 
-/// DELETE /<sha256> - Delete blob
+/// Delete all GCS artifacts for a blob (thumbnail, HLS, VTT).
+/// The main blob itself is NOT deleted here (caller handles that).
+/// Best-effort: logs errors but never fails.
+fn delete_blob_gcs_artifacts(hash: &str) {
+    // Thumbnail
+    let _ = storage_delete(&format!("{}.jpg", hash));
+
+    // HLS files (deterministic paths from transcoder using -hls_flags single_file)
+    let hls_paths = [
+        format!("{}/hls/master.m3u8", hash),
+        format!("{}/hls/stream_720p.m3u8", hash),
+        format!("{}/hls/stream_720p.ts", hash),
+        format!("{}/hls/stream_480p.m3u8", hash),
+        format!("{}/hls/stream_480p.ts", hash),
+    ];
+    for path in &hls_paths {
+        let _ = storage_delete(path);
+    }
+
+    // VTT transcript
+    let _ = storage_delete(&format!("{}/vtt/main.vtt", hash));
+
+    // Fire-and-forget Cloud Run request for thorough prefix-based cleanup
+    // (catches any files we missed with deterministic paths)
+    trigger_cloud_run_delete_blob(hash);
+}
+
+/// Delete all KV artifacts for a blob (refs, auth events, subtitle data).
+/// Best-effort: logs errors but never fails.
+fn delete_blob_kv_artifacts(hash: &str) {
+    let _ = delete_blob_refs(hash);
+    let _ = delete_auth_events(hash);
+    let _ = delete_subtitle_data(hash);
+}
+
+/// DELETE /<sha256> - Delete blob with ref-counting
+///
+/// - Sole owner (no other refs): full delete of blob, all GCS artifacts, all KV data
+/// - Owner but shared (other refs exist): transfer ownership to next ref, remove self
+/// - Non-owner ref: just unlink (remove from own list + refs)
 fn handle_delete(req: Request, path: &str) -> Result<Response> {
     let hash = parse_hash_from_path(path)
         .ok_or_else(|| BlossomError::BadRequest("Invalid hash in path".into()))?;
@@ -1941,24 +2101,28 @@ fn handle_delete(req: Request, path: &str) -> Result<Response> {
     let auth = validate_auth(&req, AuthAction::Delete)?;
     validate_hash_match(&auth, &hash)?;
 
-    // Serialize auth event for provenance before ownership check
+    // Serialize auth event for provenance
     let auth_event_json = serde_json::to_string(&auth).unwrap_or_default();
 
-    // Verify ownership
-    if !check_ownership(&hash, &auth.pubkey)? {
+    // Get metadata and refs
+    let metadata =
+        get_blob_metadata(&hash)?.ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
+    let meta_json = serde_json::to_string(&metadata).ok();
+    let refs = get_blob_refs(&hash).unwrap_or_default();
+
+    let is_owner = metadata.owner.to_lowercase() == auth.pubkey.to_lowercase();
+    let is_ref = refs
+        .iter()
+        .any(|r| r.to_lowercase() == auth.pubkey.to_lowercase());
+
+    if !is_owner && !is_ref {
         return Err(BlossomError::Forbidden("You don't own this blob".into()));
     }
-
-    // Get metadata before deletion for audit + stats
-    let metadata = get_blob_metadata(&hash)?;
-    let meta_json = metadata
-        .as_ref()
-        .and_then(|m| serde_json::to_string(m).ok());
 
     // Store provenance: signed delete auth event
     let _ = put_auth_event(&hash, "delete", &auth_event_json);
 
-    // Write audit log to GCS (before deletion so we have the record even if delete fails)
+    // Write audit log before deletion
     write_audit_log(
         &hash,
         "delete",
@@ -1968,20 +2132,49 @@ fn handle_delete(req: Request, path: &str) -> Result<Response> {
         None,
     );
 
-    // Delete from GCS
-    storage_delete(&hash)?;
+    // Remove self from user list and refs
+    let _ = remove_from_user_list(&auth.pubkey, &hash);
+    let remaining_refs = remove_from_blob_refs(&hash, &auth.pubkey).unwrap_or_default();
 
-    // Delete metadata
-    delete_blob_metadata(&hash)?;
+    if is_owner {
+        // Check if there are other refs who can take ownership
+        let other_refs: Vec<String> = remaining_refs
+            .iter()
+            .filter(|r| r.to_lowercase() != auth.pubkey.to_lowercase())
+            .cloned()
+            .collect();
 
-    // Remove from user's list
-    remove_from_user_list(&auth.pubkey, &hash)?;
+        if other_refs.is_empty() {
+            // Sole owner: full delete
+            storage_delete(&hash)?;
+            delete_blob_gcs_artifacts(&hash);
+            delete_blob_metadata(&hash)?;
+            delete_blob_kv_artifacts(&hash);
 
-    // Update admin indices (best effort)
-    if let Some(meta) = metadata {
-        let _ = update_stats_on_remove(&meta);
+            // Update admin indices
+            let _ = update_stats_on_remove(&metadata);
+            let _ = remove_from_recent_index(&hash);
+
+            // Purge VCL cache
+            purge_vcl_cache(&hash);
+
+            eprintln!("[DELETE] Full delete of {} by owner {}", hash, auth.pubkey);
+        } else {
+            // Shared content: transfer ownership to next ref
+            let new_owner = other_refs[0].clone();
+            let mut updated_meta = metadata.clone();
+            updated_meta.owner = new_owner.clone();
+            let _ = put_blob_metadata(&updated_meta);
+
+            eprintln!(
+                "[DELETE] Ownership of {} transferred from {} to {}",
+                hash, auth.pubkey, new_owner
+            );
+        }
+    } else {
+        // Non-owner ref: just unlinked above, nothing else to do
+        eprintln!("[DELETE] Unlinked ref {} from blob {}", auth.pubkey, hash);
     }
-    let _ = remove_from_recent_index(&hash);
 
     let mut resp = Response::from_status(StatusCode::OK);
     add_cors_headers(&mut resp);
@@ -2042,8 +2235,13 @@ fn handle_get_provenance(path: &str) -> Result<Response> {
     Ok(resp)
 }
 
+<<<<<<< HEAD
 /// POST /admin/api/delete - Admin soft-delete for legal/DMCA compliance
 /// Preserves storage unless the blob has no metadata record to gate public access with.
+=======
+/// POST /admin/api/delete - Admin force-delete for legal/DMCA compliance
+/// Full cleanup: main blob + thumbnail + HLS + VTT + all KV artifacts + VCL cache purge
+>>>>>>> b22632b (fix: handle QUARANTINE moderation action for AI-detected content)
 fn handle_admin_force_delete(req: Request) -> Result<Response> {
     // Validate admin auth
     admin::validate_admin_auth(&req)?;
@@ -2058,9 +2256,7 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
         .ok_or_else(|| BlossomError::BadRequest("Missing 'sha256' field".into()))?
         .to_lowercase();
 
-    let reason = request["reason"]
-        .as_str()
-        .unwrap_or("Admin force-delete");
+    let reason = request["reason"].as_str().unwrap_or("Admin force-delete");
 
     let legal_hold = request["legal_hold"].as_bool().unwrap_or(false);
 
@@ -2085,6 +2281,7 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
         Some(reason),
     );
 
+<<<<<<< HEAD
     let preserved = if let Some(ref meta) = metadata {
         if meta.status != BlobStatus::Deleted {
             update_blob_status(&hash, BlobStatus::Deleted)?;
@@ -2097,6 +2294,14 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
         let _ = storage_delete(&format!("{}.jpg", hash));
         false
     };
+=======
+    // Delete from GCS (main blob + all artifacts)
+    let _ = storage_delete(&hash);
+    delete_blob_gcs_artifacts(&hash);
+
+    // Delete KV metadata
+    let _ = delete_blob_metadata(&hash);
+>>>>>>> b22632b (fix: handle QUARANTINE moderation action for AI-detected content)
 
     // Remove from ALL users' lists (owner + all refs)
     if let Some(ref meta) = metadata {
@@ -2108,11 +2313,20 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
         }
     }
 
+<<<<<<< HEAD
     // Update stats for the hard-delete fallback only.
     if !preserved {
         if let Some(meta) = metadata {
             let _ = update_stats_on_remove(&meta);
         }
+=======
+    // Delete all KV artifacts (refs, auth events, subtitle data)
+    delete_blob_kv_artifacts(&hash);
+
+    // Update stats
+    if let Some(meta) = metadata {
+        let _ = update_stats_on_remove(&meta);
+>>>>>>> b22632b (fix: handle QUARANTINE moderation action for AI-detected content)
     }
     let _ = remove_from_recent_index(&hash);
 
@@ -2121,6 +2335,10 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
         let _ = put_tombstone(&hash, reason);
     }
 
+<<<<<<< HEAD
+=======
+    // Purge VCL cache
+>>>>>>> b22632b (fix: handle QUARANTINE moderation action for AI-detected content)
     purge_vcl_cache(&hash);
 
     eprintln!(
@@ -2134,6 +2352,168 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
         "preserved": preserved,
         "sha256": hash,
         "legal_hold": legal_hold,
+    });
+
+    let mut resp = json_response(StatusCode::OK, &result);
+    add_cors_headers(&mut resp);
+    Ok(resp)
+}
+
+/// Execute vanish (GDPR right to erasure) for a given pubkey.
+/// For each blob the user owns or references:
+/// - Sole owner: full delete (GCS + KV + VCL cache purge)
+/// - Shared content: unlink (remove from refs, transfer ownership if needed)
+/// Returns (fully_deleted, unlinked, errors) counts.
+fn execute_vanish(pubkey: &str) -> (u32, u32, u32) {
+    let mut fully_deleted: u32 = 0;
+    let mut unlinked: u32 = 0;
+    let mut errors: u32 = 0;
+
+    // Get all hashes from user's list
+    let hashes = match get_user_blobs(pubkey) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("[VANISH] Failed to get user blobs for {}: {}", pubkey, e);
+            return (0, 0, 1);
+        }
+    };
+
+    let hashes_for_cloud_run = hashes.clone();
+
+    for hash in &hashes {
+        // Get metadata for this blob
+        let metadata = match get_blob_metadata(hash) {
+            Ok(Some(m)) => m,
+            Ok(None) => {
+                // Metadata missing - clean up refs and move on
+                let _ = remove_from_blob_refs(hash, pubkey);
+                continue;
+            }
+            Err(e) => {
+                eprintln!("[VANISH] Failed to get metadata for {}: {}", hash, e);
+                errors += 1;
+                continue;
+            }
+        };
+
+        let is_owner = metadata.owner.to_lowercase() == pubkey.to_lowercase();
+
+        // Remove self from refs
+        let remaining_refs = remove_from_blob_refs(hash, pubkey).unwrap_or_default();
+        let other_refs: Vec<String> = remaining_refs
+            .iter()
+            .filter(|r| r.to_lowercase() != pubkey.to_lowercase())
+            .cloned()
+            .collect();
+
+        if is_owner && other_refs.is_empty() {
+            // Sole owner: full delete
+            let _ = storage_delete(hash);
+            delete_blob_gcs_artifacts(hash);
+            let _ = delete_blob_metadata(hash);
+            delete_blob_kv_artifacts(hash);
+            let _ = update_stats_on_remove(&metadata);
+            let _ = remove_from_recent_index(hash);
+            purge_vcl_cache(hash);
+            fully_deleted += 1;
+        } else if is_owner {
+            // Transfer ownership to next ref
+            let new_owner = other_refs[0].clone();
+            let mut updated_meta = metadata;
+            updated_meta.owner = new_owner;
+            let _ = put_blob_metadata(&updated_meta);
+            unlinked += 1;
+        } else {
+            // Non-owner ref: already unlinked from refs above
+            unlinked += 1;
+        }
+    }
+
+    // Delete user's KV list and remove from user index
+    let _ = delete_user_list(pubkey);
+    let _ = remove_from_user_index(pubkey);
+
+    // Fire-and-forget Cloud Run bulk delete for thorough GCS cleanup
+    trigger_cloud_run_bulk_delete(pubkey, &hashes_for_cloud_run);
+
+    // Trigger audit anonymization
+    trigger_audit_anonymize(pubkey);
+
+    eprintln!(
+        "[VANISH] pubkey={} fully_deleted={} unlinked={} errors={}",
+        pubkey, fully_deleted, unlinked, errors
+    );
+
+    (fully_deleted, unlinked, errors)
+}
+
+/// DELETE /vanish - User-initiated GDPR right to erasure
+fn handle_vanish(req: Request) -> Result<Response> {
+    // Validate auth (NIP-98/Blossom)
+    let auth = validate_auth(&req, AuthAction::Delete)?;
+    let auth_event_json = serde_json::to_string(&auth).unwrap_or_default();
+
+    // Write audit log before erasure
+    write_audit_log(
+        "all",
+        "vanish",
+        &auth.pubkey,
+        Some(&auth_event_json),
+        None,
+        Some("User-initiated GDPR right to erasure"),
+    );
+
+    let (fully_deleted, unlinked, errors) = execute_vanish(&auth.pubkey);
+
+    let result = serde_json::json!({
+        "vanished": true,
+        "pubkey": auth.pubkey,
+        "fully_deleted": fully_deleted,
+        "unlinked": unlinked,
+        "errors": errors,
+    });
+
+    let mut resp = json_response(StatusCode::OK, &result);
+    add_cors_headers(&mut resp);
+    Ok(resp)
+}
+
+/// POST /admin/api/vanish - Admin-initiated vanish (for funnelcake janitor NIP-62 integration)
+fn handle_admin_vanish(req: Request) -> Result<Response> {
+    // Validate admin auth
+    admin::validate_admin_auth(&req)?;
+
+    // Parse request body
+    let body = req.into_body_str();
+    let request: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| BlossomError::BadRequest(format!("Invalid JSON: {}", e)))?;
+
+    let pubkey = request["pubkey"]
+        .as_str()
+        .ok_or_else(|| BlossomError::BadRequest("Missing 'pubkey' field".into()))?
+        .to_lowercase();
+
+    let reason = request["reason"]
+        .as_str()
+        .unwrap_or("Admin-initiated vanish");
+
+    // Validate pubkey format (64 hex chars)
+    if pubkey.len() != 64 || !pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(BlossomError::BadRequest("Invalid pubkey format".into()));
+    }
+
+    // Write audit log before erasure
+    write_audit_log("all", "admin_vanish", &pubkey, None, None, Some(reason));
+
+    let (fully_deleted, unlinked, errors) = execute_vanish(&pubkey);
+
+    let result = serde_json::json!({
+        "vanished": true,
+        "pubkey": pubkey,
+        "reason": reason,
+        "fully_deleted": fully_deleted,
+        "unlinked": unlinked,
+        "errors": errors,
     });
 
     let mut resp = json_response(StatusCode::OK, &result);
@@ -2462,6 +2842,12 @@ fn handle_admin_backfill_vtt(req: Request) -> Result<Response> {
         .map(|v| v == "true")
         .unwrap_or(false);
 
+    // Force re-transcription of "complete" items (to re-run with updated phantom detection)
+    let force_retranscribe: bool = query_pairs
+        .get("force_retranscribe")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
     let user_index = crate::metadata::get_user_index()?;
     let total_users = user_index.pubkeys.len();
     let end = std::cmp::min(offset + limit, total_users);
@@ -2486,16 +2872,22 @@ fn handle_admin_backfill_vtt(req: Request) -> Result<Response> {
         let hashes = crate::metadata::get_user_blobs(pubkey).unwrap_or_default();
 
         for hash in hashes {
-            if let Ok(Some(mut metadata)) = get_blob_metadata(&hash) {
+            // Use uncached lookup to avoid stale Simple Cache reads during bulk operations
+            if let Ok(Some(mut metadata)) = crate::metadata::get_blob_metadata_uncached(&hash) {
                 if !is_transcribable_mime_type(&metadata.mime_type) {
                     not_transcribable += 1;
                     continue;
                 }
 
                 match metadata.transcript_status {
-                    Some(TranscriptStatus::Complete) => {
+                    Some(TranscriptStatus::Complete) if !force_retranscribe => {
                         already_complete += 1;
                         continue;
+                    }
+                    Some(TranscriptStatus::Complete) => {
+                        // Force re-transcription with updated phantom detection
+                        reset_count += 1;
+                        // Fall through to trigger
                     }
                     Some(TranscriptStatus::Processing) if !reset_processing => {
                         already_processing += 1;
@@ -2774,7 +3166,10 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
 
             // Purge VCL cache on transcode completion so any cached 202 is evicted
             // and clients get the actual content on next request.
-            if matches!(new_status, TranscodeStatus::Complete | TranscodeStatus::Failed) {
+            if matches!(
+                new_status,
+                TranscodeStatus::Complete | TranscodeStatus::Failed
+            ) {
                 purge_vcl_cache(sha256);
             }
 
@@ -2915,7 +3310,8 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
                     TranscriptStatus::Complete => {
                         job.status = SubtitleJobStatus::Ready;
                         if job.text_track_url.is_none() {
-                            job.text_track_url = Some(format!("https://media.divine.video/{}.vtt", sha256));
+                            job.text_track_url =
+                                Some(format!("https://media.divine.video/{}.vtt", sha256));
                         }
                         if let Some(lang) = language.clone() {
                             job.language = Some(lang);
@@ -2931,7 +3327,11 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
                         job.error_message = None;
                     }
                     TranscriptStatus::Failed => {
-                        apply_subtitle_job_failure(&mut job, error_code.clone(), error_message.clone());
+                        apply_subtitle_job_failure(
+                            &mut job,
+                            error_code.clone(),
+                            error_message.clone(),
+                        );
                     }
                 }
                 set_subtitle_job_id_for_hash(sha256, &job.job_id)?;
@@ -2939,7 +3339,11 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
             }
 
             // Purge VCL cache on transcript completion so cached 202s are evicted
-            if matches!(new_status, TranscriptStatus::Complete | TranscriptStatus::Failed) {
+            if matches!(
+                new_status,
+                TranscriptStatus::Complete | TranscriptStatus::Failed
+            ) {
+                purge_transcript_content_cache(sha256);
                 purge_vcl_cache(sha256);
             }
 
@@ -3214,7 +3618,18 @@ fn handle_landing_page() -> Response {
                 <span class="method method-delete">DELETE</span>
                 <div class="endpoint-info">
                     <span class="endpoint-path">/&lt;sha256&gt;</span>
+<<<<<<< HEAD
                     <p class="endpoint-desc">Permanently delete your own blob. Requires Nostr authentication and ownership. <em>(BUD-02)</em></p>
+=======
+                    <p class="endpoint-desc">Delete a blob with ref-counting. Sole owner: full delete. Shared: transfers ownership. Non-owner ref: unlinks. Requires Nostr authentication. <em>(BUD-02)</em></p>
+                </div>
+            </div>
+            <div class="endpoint">
+                <span class="method method-delete">DELETE</span>
+                <div class="endpoint-info">
+                    <span class="endpoint-path">/vanish</span>
+                    <p class="endpoint-desc">GDPR Right to Erasure. Deletes all blobs and data for the authenticated user. Requires Nostr authentication.</p>
+>>>>>>> b22632b (fix: handle QUARANTINE moderation action for AI-detected content)
                 </div>
             </div>
             <div class="endpoint">
@@ -3382,7 +3797,10 @@ pub(crate) fn purge_vcl_cache(surrogate_key: &str) {
             }
         }
         Err(e) => {
-            eprintln!("[PURGE] VCL purge request failed for key={}: {}", surrogate_key, e);
+            eprintln!(
+                "[PURGE] VCL purge request failed for key={}: {}",
+                surrogate_key, e
+            );
         }
     }
 }
@@ -3416,10 +3834,7 @@ fn cors_preflight_response() -> Response {
 /// so that BlobDescriptor URLs reflect the public-facing domain.
 fn get_base_url(req: &Request) -> String {
     req.get_header_str("X-Original-Host")
-        .or_else(|| {
-            req.get_header(header::HOST)
-                .and_then(|h| h.to_str().ok())
-        })
+        .or_else(|| req.get_header(header::HOST).and_then(|h| h.to_str().ok()))
         .map(|host| format!("https://{}", host))
         .unwrap_or_else(|| "https://media.divine.video".into())
 }
