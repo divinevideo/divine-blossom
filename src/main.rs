@@ -1414,13 +1414,15 @@ fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
             0x00, 0x7B, 0x94, 0x11, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xD9,
         ];
         let thumb_key = format!("{}.jpg", hash);
-        let _ = crate::storage::upload_blob(
+        if let Err(e) = crate::storage::upload_blob(
             &thumb_key,
             fastly::Body::from(jpeg.as_slice()),
             "image/jpeg",
             jpeg.len() as u64,
             "",
-        );
+        ) {
+            eprintln!("[THUMB][LOCAL] Failed to store placeholder: {}", e);
+        }
         let mut resp = Response::from_status(StatusCode::OK);
         resp.set_header("Content-Type", "image/jpeg");
         resp.set_body(fastly::Body::from(jpeg));
@@ -1655,13 +1657,15 @@ fn handle_upload(mut req: Request) -> Result<Response> {
     // Proxy to Cloud Run for:
     // 1. Large uploads (> 500KB) to avoid WASM memory limits
     // 2. Video uploads (any size) for thumbnail generation
+    // In local mode, handle all uploads inline (no Cloud Run available).
+    // Viceroy doesn't have WASM heap limits, but very large files (>50MB) may be slow.
     if !crate::storage::is_local_mode()
         && (content_length > CLOUD_RUN_THRESHOLD || is_video_mime_type(&content_type))
     {
         return handle_cloud_run_proxy(req, auth, content_type, content_length, base_url);
     }
 
-    // For small files, buffer in memory (safe for <= 500KB)
+    // For small files (or all files in local mode), buffer in memory
     let body_bytes = req.take_body().into_bytes();
     let actual_size = body_bytes.len() as u64;
 
