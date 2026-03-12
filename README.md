@@ -196,6 +196,8 @@ Controlled by the `C2PA_MODE` environment variable:
 | `C2PA_MODE` | Validation mode (`off`, `log`, `enforce`) | `off` |
 | `C2PA_TRUST_ANCHORS` | Path to trusted CA certificates (PEM) | `/app/trust_anchors.pem` |
 | `C2PA_CHECK_IMAGES` | Also validate image uploads (`true`/`false`) | `false` |
+| `C2PA_MAX_FILE_SIZE` | Skip C2PA validation for files above this size (bytes) | `2147483648` (2GB) |
+| `C2PA_WARN_FILE_SIZE` | Log a warning for files above this size (bytes) | `524288000` (500MB) |
 
 ### Trust anchors
 
