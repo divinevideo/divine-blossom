@@ -8,15 +8,16 @@ A [Blossom](https://github.com/hzrd149/blossom) media server for Nostr running o
 Client → Fastly Compute (Rust WASM) → GCS (blobs) + Fastly KV (metadata)
            ├── Cloud Run Upload (Rust) → GCS + Transcoder trigger
            ├── Cloud Run Transcoder (Rust, NVIDIA GPU) → HLS segments to GCS
+           ├── Cloud Run Process-Blob (Python) → C2PA validation + SafeSearch moderation
            └── Cloud Logging (audit trail)
 ```
 
 - **Fastly Compute Edge** (`src/`) - Rust WASM service on Fastly. Handles uploads, metadata KV, HLS proxying, admin, provenance
-- **Cloud Run Upload** (`cloud-run-upload/`) - Rust service on GCP. Receives legacy `PUT /upload` bytes, owns resumable upload sessions, writes temp/final objects in GCS, triggers transcoder, receives audit logs
+- **Cloud Run Upload** (`cloud-run-upload/`) - Rust service on GCP. Receives video bytes, sanitizes (ffmpeg -c copy), hashes, uploads to GCS, triggers transcoder, receives audit logs
 - **Cloud Run Transcoder** (`cloud-run-transcoder/`) - Rust service on GCP with NVIDIA GPU. Downloads from GCS, transcodes to HLS via FFmpeg NVENC, uploads segments back
+- **Cloud Run Process-Blob** (`cloud-functions/process-blob/`) - Python/Flask service on GCP. Triggered by GCS object finalization via Eventarc. Validates C2PA Content Credentials (c2patool) and runs SafeSearch moderation (Vision API), then updates Fastly KV metadata via webhook
 - **GCS bucket**: `divine-blossom-media`
-- **Control plane**: `media.divine.video` (Fastly)
-- **Data plane**: `upload.divine.video` (GKE-hosted resumable `HEAD`/`PUT`/`DELETE` service)
+- **CDN**: `media.divine.video` (Fastly)
 
 ## Features
 
@@ -28,11 +29,11 @@ Client → Fastly Compute (Rust WASM) → GCS (blobs) + Fastly KV (metadata)
 - **Range requests**: Native video seeking support
 - **HLS transcoding**: Multi-quality adaptive streaming (1080p, 720p, 480p, 360p)
 - **WebVTT transcripts**: Stable transcript URL at `/<sha256>.vtt` with async generation
-- **Audio extraction**: Stable audio-only URL at `/<sha256>.audio.m4a` with Funnelcake permission gating
 - **Provenance & audit**: Cryptographic proof of upload/delete authorship with Cloud Logging audit trail
 - **Tombstones**: Legal hold prevents re-upload of removed content
 - **Admin soft-delete**: DMCA/legal removal with full audit trail while preserving recoverable storage
 - **Admin restore**: Re-index and restore previously soft-deleted blobs
+- **C2PA trust checking**: Validates Content Credentials (C2PA) manifests and signer trust chains on uploaded media
 
 ## Setup
 
@@ -65,8 +66,6 @@ fastly config-store create --name blossom_config
 fastly secret-store create --name blossom_secrets
 ```
 
-If you want audio extraction enabled in production, add `funnelcake_api_url` to `blossom_config`. The example `fastly.toml.example` points it at `https://relay.divine.video`, which serves the public audio-reuse lookup used by the edge service.
-
 ### Local development
 
 ```bash
@@ -79,20 +78,6 @@ fastly compute serve
 ```
 
 **Note**: `fastly.toml` is gitignored to prevent accidentally committing secrets. The `[local_server.secret_stores]` section is only used for local testing.
-
-### Cloud Run upload service configuration
-
-`cloud-run-upload` now expects these runtime values in addition to the existing bucket and transcoder settings:
-
-- `UPLOAD_BASE_URL=https://upload.divine.video`
-- `RESUMABLE_SESSION_TTL_SECS=86400`
-- `RESUMABLE_CHUNK_SIZE=8388608`
-
-For browser/web clients, the `upload.divine.video` service must allow:
-
-- Methods: `HEAD`, `PUT`, `POST`, `DELETE`, `OPTIONS`
-- Request headers: `Authorization`, `Content-Type`, `Content-Range`
-- Exposed response headers: `Upload-Offset`, `Upload-Length`, `Upload-Expires`, `X-Divine-Chunk-Size`
 
 ### Deploy
 
@@ -111,10 +96,6 @@ fastly compute publish
 | `GET` | `/<sha256>.vtt` | Retrieve WebVTT transcript (on-demand generation) |
 | `HEAD` | `/<sha256>.vtt` | Check transcript status/existence |
 | `GET` | `/<sha256>/VTT` | Alias for transcript retrieval |
-| `GET` | `/<sha256>.audio.m4a` | Extract and serve audio-only M4A for eligible videos |
-| `HEAD` | `/<sha256>.audio.m4a` | Check audio extraction availability |
-
-`GET /<sha256>.vtt` returns `202 Accepted` with `Retry-After` while transcription is still running or cooling down after a retryable provider failure. Clients should poll again instead of treating that response as "no subtitles".
 
 ### Subtitle Jobs API
 
@@ -130,33 +111,8 @@ fastly compute publish
 |--------|------|------|-------------|
 | `PUT` | `/upload` | Required | Upload blob |
 | `HEAD` | `/upload` | None | Get upload requirements |
-| `POST` | `/upload/init` | Required | Create a Divine resumable upload session |
-| `POST` | `/upload/<uploadId>/complete` | Required | Publish a completed resumable upload into canonical metadata |
-| `DELETE` | `/<sha256>` | Required | Soft-delete your own blob and stop serving it publicly |
+| `DELETE` | `/<sha256>` | Required | Permanently delete your own blob |
 | `GET` | `/list/<pubkey>` | Optional | List user's blobs |
-
-When resumable support is available, `HEAD /upload` includes these discovery headers:
-
-- `X-Divine-Upload-Extensions: resumable-sessions`
-- `X-Divine-Upload-Control-Host: <public Blossom host>`
-- `X-Divine-Upload-Data-Host: upload.divine.video`
-
-`POST /upload/init` returns camelCase fields for the mobile client contract:
-
-- `uploadId`
-- `uploadUrl`
-- `expiresAt`
-- `chunkSize`
-- `nextOffset`
-- `requiredHeaders`
-
-The session byte stream itself is served from `upload.divine.video`:
-
-| Method | Host | Path | Auth | Description |
-|--------|------|------|------|-------------|
-| `HEAD` | `upload.divine.video` | `/sessions/<uploadId>` | Session bearer token | Query the committed offset |
-| `PUT` | `upload.divine.video` | `/sessions/<uploadId>` | Session bearer token | Upload a contiguous chunk with `Content-Range` |
-| `DELETE` | `upload.divine.video` | `/upload/<uploadId>` | Session bearer token | Abort a resumable upload session |
 
 ### Provenance & Admin
 
@@ -187,10 +143,9 @@ All uploads and deletes are logged to Google Cloud Logging via the Cloud Run upl
 
 ### Delete Semantics
 
-- `DELETE /<sha256>` is a direct user soft-delete. It marks the blob as `deleted`, stops public serving, removes it from user/recent indexes, and preserves stored media plus derivatives for possible restoration.
+- `DELETE /<sha256>` is a direct user delete and permanently removes the canonical blob.
 - `POST /admin/api/delete` is an admin soft-delete. It marks the blob as `deleted`, stops all public serving, removes it from user/recent indexes, and preserves the stored blob so it can be recovered later.
 - `POST /admin/api/restore` restores a soft-deleted blob and re-indexes it.
-- `DELETE /vanish` remains the explicit erasure path for authenticated right-to-erasure requests.
 - `legal_hold: true` sets a tombstone that prevents re-upload of the same hash even if the stored blob is preserved.
 
 ### Admin Soft-Delete
@@ -213,68 +168,42 @@ curl -X POST https://media.divine.video/admin/api/restore \
 
 When `legal_hold: true`, a tombstone is set preventing re-upload of the removed content (returns 403).
 
-## Transcript Recovery
+## C2PA Trust Checking
 
-Use the repo-level backfill wrapper to inspect or enqueue missing transcripts through the existing `/admin/api/backfill-vtt` endpoint.
+The `cloud-functions/process-blob` module validates [C2PA](https://c2pa.org/) Content Credentials on uploaded media using [c2patool](https://github.com/contentauth/c2patool).
 
-Dry-run the recent upload window without triggering work:
+### How it works
 
-```bash
-ADMIN_BEARER_TOKEN=<webhook_or_admin_token> \
-bash scripts/backfill_missing_transcripts.sh --dry-run --limit 20
-```
+1. **Manifest extraction** — runs `c2patool --detailed <file>` to read the embedded C2PA manifest
+2. **Trust chain validation** — runs `c2patool --detailed <file> trust --allowed_list <trust_anchors.pem>` to verify the signer against trusted certificate authorities
 
-Enqueue the recent backfill at a controlled pace after Cloud Run and Blossom fixes are deployed:
+Validation results (manifest presence, trust status, claim generator, issuer) are attached to the blob's metadata via the Fastly KV webhook.
 
-```bash
-ADMIN_BEARER_TOKEN=<webhook_or_admin_token> \
-bash scripts/backfill_missing_transcripts.sh --limit 200 --sleep 2
-```
+### Modes
 
-Notes:
-- Set either `ADMIN_BEARER_TOKEN` or `ADMIN_COOKIE`.
-- `--scope recent` is the default and scans the rolling recent-upload index first.
-- Use `--scope users` for a full corpus sweep when the recent window is not enough.
-- `--reset-processing` requeues blobs stuck in `processing`, and `--force-retranscribe` reruns blobs marked `complete`.
+Controlled by the `C2PA_MODE` environment variable:
 
-## Debug Upload Harness
+| Mode | Behavior |
+|------|----------|
+| `off` (default) | No C2PA validation |
+| `log` | Validates and logs results but does not block content |
+| `enforce` | Rejects unsigned or untrusted content (sets status to `restricted`) |
 
-Use the upload harness to replay the upload control plane with a full HTTP transcript. The first version stops at upload completion and does not create the publish event.
+### Configuration
 
-Resumable upload example:
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `C2PA_MODE` | Validation mode (`off`, `log`, `enforce`) | `off` |
+| `C2PA_TRUST_ANCHORS` | Path to trusted CA certificates (PEM) | `/app/trust_anchors.pem` |
+| `C2PA_CHECK_IMAGES` | Also validate image uploads (`true`/`false`) | `false` |
 
-```bash
-python3 scripts/debug_upload_harness.py \
-  --server https://media.divine.video \
-  --file /absolute/path/to/video.mp4 \
-  --mode resumable \
-  --auth-header 'Nostr <signed-event>'
-```
+### Trust anchors
 
-ProofMode completion example:
+The bundled `trust_anchors.pem` contains ProofSign CA certificates (ECDSA P-256) for verifying C2PA manifests signed by [ProofMode](https://proofmode.org/) on Android and iOS. Replace or extend this file with additional CA certificates as needed.
 
-```bash
-python3 scripts/debug_upload_harness.py \
-  --server https://media.divine.video \
-  --file /absolute/path/to/video.mp4 \
-  --mode resumable \
-  --auth-header 'Nostr <signed-event>' \
-  --proof-json /absolute/path/to/proofmode.json \
-  --dump-json /tmp/upload-transcript.json
-```
+### Container
 
-Replay only the completion request for an existing session:
-
-```bash
-python3 scripts/debug_upload_harness.py \
-  --server https://media.divine.video \
-  --mode resumable \
-  --auth-header 'Nostr <signed-event>' \
-  --complete-only \
-  --upload-id up_example123 \
-  --file-hash 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
-  --file-size 1234567
-```
+The module runs on Cloud Run as a Flask/gunicorn service. The Dockerfile installs c2patool v0.26.33 from GitHub releases. C2PA validation runs before SafeSearch moderation to short-circuit untrusted content early and save Vision API costs.
 
 ## Authentication
 
