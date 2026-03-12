@@ -1,0 +1,42 @@
+# Multi-stage build: compile WASM, then run with Viceroy
+# Usage: docker build -f Dockerfile.local -t divine-blossom-local .
+
+FROM rust:1.88-bookworm AS builder
+
+# Install wasm32-wasip1 target
+RUN rustup target add wasm32-wasip1
+
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
+
+# Build the WASM binary
+RUN cargo build --target wasm32-wasip1 --release
+RUN mkdir -p bin && cp target/wasm32-wasip1/release/fastly-blossom.wasm bin/main.wasm
+
+# Runtime: Viceroy
+FROM debian:bookworm-slim
+
+ARG TARGETARCH
+ARG VICEROY_VERSION=0.16.4
+
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
+    ARCH=$(case ${TARGETARCH} in arm64) echo "arm64" ;; *) echo "amd64" ;; esac) && \
+    curl -sL "https://github.com/fastly/Viceroy/releases/download/v${VICEROY_VERSION}/viceroy_v${VICEROY_VERSION}_linux-${ARCH}.tar.gz" \
+    | tar xz -C /usr/local/bin/ && \
+    apt-get remove -y curl && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy WASM binary from builder
+COPY --from=builder /app/bin/main.wasm ./bin/main.wasm
+
+# Copy config and store data files
+COPY fastly.toml.docker ./fastly.toml
+COPY config-store-data.json ./
+COPY secret-store-data.json ./
+RUN echo '{}' > kv-store-data.json
+
+EXPOSE 7676
+
+CMD ["viceroy", "bin/main.wasm", "-C", "fastly.toml", "--addr", "0.0.0.0:7676"]

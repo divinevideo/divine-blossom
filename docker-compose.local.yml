@@ -1,6 +1,11 @@
 # Local development stack for divine-blossom e2e testing.
 # Usage: docker compose -f docker-compose.local.yml up -d
-# Then: cp fastly.toml.local fastly.toml && fastly compute serve
+#
+# This starts:
+#   - minio (S3-compatible storage) on port 9000
+#   - divine-blossom (Viceroy/WASM) on port 7676 (host: 7677 if 7676 is in use)
+#
+# Build first: docker compose -f docker-compose.local.yml build
 
 services:
   minio:
@@ -29,3 +34,13 @@ services:
       mc mb --ignore-existing local/divine-blossom-local;
       echo 'Bucket created successfully';
       "
+
+  blossom:
+    build:
+      context: .
+      dockerfile: Dockerfile.local
+    ports:
+      - "7676:7676"
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
