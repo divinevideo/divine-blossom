@@ -9,6 +9,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  FASTLY_SERVICE_ID: pOvEEWykEbpnylqst1KTrR
 
 jobs:
   test:
@@ -69,3 +70,32 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Fastly CLI
+        run: |
+          curl -sL https://github.com/fastly/cli/releases/download/v14.0.4/fastly_v14.0.4_linux-amd64.tar.gz \
+            | tar xz -C /usr/local/bin/
+
+      - name: Install Rust toolchain
+        run: rustup target add wasm32-wasip1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm32-wasip1
+
+      - name: Deploy to Fastly
+        env:
+          FASTLY_API_TOKEN: ${{ secrets.FASTLY_API_TOKEN }}
+        run: fastly compute publish --token "$FASTLY_API_TOKEN" --service-id "$FASTLY_SERVICE_ID" --comment "deploy from ${{ github.sha }}"
+
+      - name: Purge CDN cache
+        env:
+          FASTLY_API_TOKEN: ${{ secrets.FASTLY_API_TOKEN }}
+        run: fastly purge --all --service-id "$FASTLY_SERVICE_ID" --token "$FASTLY_API_TOKEN"
