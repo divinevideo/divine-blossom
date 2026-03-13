@@ -8,12 +8,14 @@ A [Blossom](https://github.com/hzrd149/blossom) media server for Nostr running o
 Client → Fastly Compute (Rust WASM) → GCS (blobs) + Fastly KV (metadata)
            ├── Cloud Run Upload (Rust) → GCS + Transcoder trigger
            ├── Cloud Run Transcoder (Rust, NVIDIA GPU) → HLS segments to GCS
+           ├── Cloud Run Process-Blob (Python) → C2PA validation + SafeSearch moderation
            └── Cloud Logging (audit trail)
 ```
 
 - **Fastly Compute Edge** (`src/`) - Rust WASM service on Fastly. Handles uploads, metadata KV, HLS proxying, admin, provenance
 - **Cloud Run Upload** (`cloud-run-upload/`) - Rust service on GCP. Receives video bytes, sanitizes (ffmpeg -c copy), hashes, uploads to GCS, triggers transcoder, receives audit logs
 - **Cloud Run Transcoder** (`cloud-run-transcoder/`) - Rust service on GCP with NVIDIA GPU. Downloads from GCS, transcodes to HLS via FFmpeg NVENC, uploads segments back
+- **Cloud Run Process-Blob** (`cloud-functions/process-blob/`) - Python/Flask service on GCP. Triggered by GCS object finalization via Eventarc. Validates C2PA Content Credentials (c2patool) and runs SafeSearch moderation (Vision API), then updates Fastly KV metadata via webhook
 - **GCS bucket**: `divine-blossom-media`
 - **CDN**: `media.divine.video` (Fastly)
 
@@ -31,6 +33,7 @@ Client → Fastly Compute (Rust WASM) → GCS (blobs) + Fastly KV (metadata)
 - **Tombstones**: Legal hold prevents re-upload of removed content
 - **Admin soft-delete**: DMCA/legal removal with full audit trail while preserving recoverable storage
 - **Admin restore**: Re-index and restore previously soft-deleted blobs
+- **C2PA trust checking**: Validates Content Credentials (C2PA) manifests and signer trust chains on uploaded media
 
 ## Setup
 
@@ -164,6 +167,45 @@ curl -X POST https://media.divine.video/admin/api/restore \
 ```
 
 When `legal_hold: true`, a tombstone is set preventing re-upload of the removed content (returns 403).
+
+## C2PA Trust Checking
+
+The `cloud-functions/process-blob` module validates [C2PA](https://c2pa.org/) Content Credentials on uploaded media using [c2patool](https://github.com/contentauth/c2patool).
+
+### How it works
+
+1. **Manifest extraction** — runs `c2patool --detailed <file>` to read the embedded C2PA manifest
+2. **Trust chain validation** — runs `c2patool --detailed <file> trust --allowed_list <trust_anchors.pem>` to verify the signer against trusted certificate authorities
+
+Validation results (manifest presence, trust status, claim generator, issuer) are attached to the blob's metadata via the Fastly KV webhook.
+
+### Modes
+
+Controlled by the `C2PA_MODE` environment variable:
+
+| Mode | Behavior |
+|------|----------|
+| `off` (default) | No C2PA validation |
+| `log` | Validates and logs results but does not block content |
+| `enforce` | Rejects unsigned or untrusted content (sets status to `restricted`) |
+
+### Configuration
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `C2PA_MODE` | Validation mode (`off`, `log`, `enforce`) | `off` |
+| `C2PA_TRUST_ANCHORS` | Path to trusted CA certificates (PEM) | `/app/trust_anchors.pem` |
+| `C2PA_CHECK_IMAGES` | Also validate image uploads (`true`/`false`) | `false` |
+| `C2PA_MAX_FILE_SIZE` | Skip C2PA validation for files above this size (bytes) | `2147483648` (2GB) |
+| `C2PA_WARN_FILE_SIZE` | Log a warning for files above this size (bytes) | `524288000` (500MB) |
+
+### Trust anchors
+
+The bundled `trust_anchors.pem` contains ProofSign CA certificates (ECDSA P-256) for verifying C2PA manifests signed by [ProofMode](https://proofmode.org/) on Android and iOS. Replace or extend this file with additional CA certificates as needed.
+
+### Container
+
+The module runs on Cloud Run as a Flask/gunicorn service. The Dockerfile installs c2patool v0.26.33 from GitHub releases. C2PA validation runs before SafeSearch moderation to short-circuit untrusted content early and save Vision API costs.
 
 ## Authentication
 

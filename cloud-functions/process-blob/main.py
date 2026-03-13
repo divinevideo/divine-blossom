@@ -1,23 +1,54 @@
-# ABOUTME: Cloud Function triggered by GCS object finalize events
-# ABOUTME: Performs content moderation and video thumbnail extraction
+# ABOUTME: Cloud Run service triggered by GCS object finalize events (via Eventarc)
+# ABOUTME: Performs C2PA trust validation and content moderation for uploaded media
 
 import os
 import json
+import subprocess
+import tempfile
 import requests
 from datetime import datetime
+from flask import Flask, request as flask_request
 from google.cloud import storage
 from google.cloud import vision
 from google.cloud.vision_v1 import types
 
 # Fastly KV API endpoint for metadata updates
-# This would be a webhook endpoint on your Fastly service
 METADATA_WEBHOOK_URL = os.environ.get('METADATA_WEBHOOK_URL', '')
 METADATA_WEBHOOK_SECRET = os.environ.get('METADATA_WEBHOOK_SECRET', '')
+
+# C2PA validation configuration
+C2PA_MODE = os.environ.get('C2PA_MODE', 'off')  # off, log, enforce
+C2PA_TRUST_ANCHORS = os.environ.get('C2PA_TRUST_ANCHORS', '/app/trust_anchors.pem')
+C2PA_CHECK_IMAGES = os.environ.get('C2PA_CHECK_IMAGES', 'false').lower() == 'true'
+C2PA_MAX_FILE_SIZE = int(os.environ.get('C2PA_MAX_FILE_SIZE', str(2 * 1024 * 1024 * 1024)))  # default 2GB
+C2PA_WARN_FILE_SIZE = int(os.environ.get('C2PA_WARN_FILE_SIZE', str(500 * 1024 * 1024)))  # default 500MB
+
+app = Flask(__name__)
+
+
+@app.route('/', methods=['POST'])
+def handle_eventarc():
+    """Handle Eventarc GCS finalization events (Cloud Run entry point)."""
+    envelope = flask_request.get_json()
+    if not envelope:
+        return 'Bad Request: no JSON payload', 400
+
+    # Eventarc wraps GCS events in a CloudEvents envelope
+    data = envelope.get('data', envelope)
+    bucket_name = data.get('bucket', '')
+    blob_name = data.get('name', '')
+    content_type = data.get('contentType', 'application/octet-stream')
+
+    if not bucket_name or not blob_name:
+        return 'Bad Request: missing bucket or name', 400
+
+    process_blob_event(bucket_name, blob_name, content_type)
+    return 'OK', 200
 
 
 def process_blob(event, context):
     """
-    Triggered by a new object in GCS bucket.
+    Cloud Function entry point (kept for backward compatibility).
 
     Args:
         event: GCS event data
@@ -26,31 +57,287 @@ def process_blob(event, context):
     bucket_name = event['bucket']
     blob_name = event['name']
     content_type = event.get('contentType', 'application/octet-stream')
+    process_blob_event(bucket_name, blob_name, content_type)
 
+
+def process_blob_event(bucket_name, blob_name, content_type):
+    """
+    Core processing logic for a new GCS blob.
+
+    Runs C2PA trust validation (if enabled) before content moderation.
+    """
     print(f"Processing: gs://{bucket_name}/{blob_name} ({content_type})")
 
-    # Skip thumbnails (they're our output, not input)
-    if blob_name.startswith('thumbnails/'):
-        print("Skipping thumbnail")
+    # Skip thumbnails and derivatives
+    if blob_name.startswith('thumbnails/') or blob_name.startswith('hls/'):
+        print("Skipping derivative")
         return
 
-    # Process based on content type
+    # --- C2PA Trust Validation (runs before SafeSearch to save costs) ---
+    c2pa_result = None
+    should_check_c2pa = (
+        C2PA_MODE != 'off' and
+        (content_type.startswith('video/') or
+         (C2PA_CHECK_IMAGES and content_type.startswith('image/')))
+    )
+
+    if should_check_c2pa:
+        c2pa_result = check_c2pa_trust(bucket_name, blob_name)
+        print(f"C2PA result: {json.dumps(c2pa_result)}")
+
+        if C2PA_MODE == 'enforce' and not c2pa_result.get('is_trusted', False):
+            print(f"C2PA enforce: rejecting untrusted content {blob_name}")
+            reason = 'no C2PA manifest' if not c2pa_result.get('has_manifest') else 'untrusted C2PA signer'
+            update_metadata(blob_name, 'restricted', None,
+                            create_moderation_result(False, reason=reason),
+                            c2pa=c2pa_result)
+            return
+
+    # --- Content Moderation (existing SafeSearch flow) ---
     if content_type.startswith('image/'):
         result = check_image_safety(bucket_name, blob_name)
-        handle_moderation_result(bucket_name, blob_name, result)
+        handle_moderation_result(bucket_name, blob_name, result, c2pa=c2pa_result)
 
     elif content_type.startswith('video/'):
-        # For videos: extract thumbnail, then check thumbnail
         thumbnail_path = extract_video_thumbnail(bucket_name, blob_name)
         if thumbnail_path:
             result = check_image_safety(bucket_name, thumbnail_path)
-            handle_moderation_result(bucket_name, blob_name, result, thumbnail_path)
+            handle_moderation_result(bucket_name, blob_name, result,
+                                     thumbnail_path, c2pa=c2pa_result)
         else:
-            # Thumbnail extraction failed, mark as pending review
-            update_metadata(blob_name, 'pending', None, None)
+            update_metadata(blob_name, 'pending', None, None, c2pa=c2pa_result)
     else:
-        # Non-image/video content, auto-approve
-        update_metadata(blob_name, 'active', None, create_moderation_result(True))
+        update_metadata(blob_name, 'active', None,
+                        create_moderation_result(True), c2pa=c2pa_result)
+
+
+# ─── C2PA Validation ─────────────────────────────────────────────────────────
+
+
+def check_c2pa_trust(bucket_name, blob_name):
+    """
+    Download blob and validate C2PA manifest + trust chain using c2patool.
+
+    Returns:
+        dict with has_manifest, is_trusted, claim_generator, issuer, errors
+    """
+    result = {
+        'has_manifest': False,
+        'is_trusted': False,
+        'claim_generator': None,
+        'issuer': None,
+        'trust_chain_valid': False,
+        'digital_source_type': None,
+        'is_digital_capture': False,
+        'errors': [],
+        'validated_at': datetime.utcnow().isoformat() + 'Z',
+    }
+
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    blob.reload()  # fetch metadata including size
+
+    # File size guard — skip C2PA for very large files, warn for moderately large ones
+    file_size = blob.size or 0
+    if file_size > C2PA_MAX_FILE_SIZE:
+        mb = file_size / (1024 * 1024)
+        limit_mb = C2PA_MAX_FILE_SIZE / (1024 * 1024)
+        print(f"WARNING: Skipping C2PA validation for {blob_name} — "
+              f"file size {mb:.0f}MB exceeds limit {limit_mb:.0f}MB")
+        result['errors'].append(f'file too large for C2PA validation ({mb:.0f}MB)')
+        return result
+    elif file_size > C2PA_WARN_FILE_SIZE:
+        mb = file_size / (1024 * 1024)
+        print(f"WARNING: Large file for C2PA validation: {blob_name} ({mb:.0f}MB)")
+
+    # Download blob to temp file for c2patool inspection
+    suffix = _suffix_for_blob(blob_name, blob)
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
+        try:
+            blob.download_to_filename(tmp.name)
+        except Exception as e:
+            result['errors'].append(f'download failed: {e}')
+            print(f"Failed to download blob for C2PA check: {e}")
+            return result
+
+        # Step 1: Read manifest
+        manifest = _run_c2patool_read(tmp.name)
+        if manifest is None:
+            result['errors'].append('no C2PA manifest found')
+            return result
+
+        result['has_manifest'] = True
+        result['claim_generator'] = _extract_claim_generator(manifest)
+        result['issuer'] = _extract_issuer(manifest)
+
+        # Step 2: Check digitalSourceType from c2pa.actions
+        source_type = _extract_digital_source_type(manifest)
+        result['digital_source_type'] = source_type
+        is_capture = (source_type ==
+                      'http://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture')
+        result['is_digital_capture'] = is_capture
+        if not is_capture:
+            result['errors'].append(
+                f'digitalSourceType is not digitalCapture: {source_type}')
+
+        # Step 3: Validate trust chain against configured trust anchors
+        if os.path.isfile(C2PA_TRUST_ANCHORS) and os.path.getsize(C2PA_TRUST_ANCHORS) > 100:
+            trust_ok = _run_c2patool_trust(tmp.name)
+            result['trust_chain_valid'] = trust_ok
+            # Trusted only if both trust chain passes AND source is digitalCapture
+            result['is_trusted'] = trust_ok and is_capture
+        else:
+            # No trust anchors configured — manifest present but trust not verifiable
+            result['errors'].append('no trust anchors configured')
+            result['is_trusted'] = False
+
+    return result
+
+
+def _suffix_for_blob(blob_name, blob):
+    """Determine file suffix so c2patool can detect the format."""
+    content_type = blob.content_type or ''
+    ct_map = {
+        'video/mp4': '.mp4',
+        'video/quicktime': '.mov',
+        'image/jpeg': '.jpg',
+        'image/png': '.png',
+        'image/webp': '.webp',
+        'image/avif': '.avif',
+        'audio/mpeg': '.mp3',
+        'audio/mp4': '.m4a',
+    }
+    if content_type in ct_map:
+        return ct_map[content_type]
+    # Fall back to blob name extension
+    if '.' in blob_name:
+        return '.' + blob_name.rsplit('.', 1)[-1]
+    return '.mp4'
+
+
+def _run_c2patool_read(file_path):
+    """Run c2patool to read manifest. Returns parsed JSON or None."""
+    try:
+        proc = subprocess.run(
+            ['c2patool', '--detailed', file_path],
+            capture_output=True, text=True, timeout=60
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return json.loads(proc.stdout)
+        else:
+            print(f"c2patool read: exit={proc.returncode} stderr={proc.stderr.strip()}")
+            return None
+    except subprocess.TimeoutExpired:
+        print("c2patool read timed out")
+        return None
+    except json.JSONDecodeError as e:
+        print(f"c2patool read: invalid JSON: {e}")
+        return None
+    except FileNotFoundError:
+        print("c2patool binary not found")
+        return None
+
+
+def _run_c2patool_trust(file_path):
+    """Run c2patool trust check against configured trust anchors. Returns True if trusted."""
+    try:
+        proc = subprocess.run(
+            ['c2patool', '--detailed', file_path, 'trust',
+             '--allowed_list', C2PA_TRUST_ANCHORS],
+            capture_output=True, text=True, timeout=60
+        )
+        if proc.returncode != 0:
+            print(f"c2patool trust: NOT TRUSTED stderr={proc.stderr.strip()}")
+            return False
+
+        if not proc.stdout.strip():
+            print("c2patool trust: no output")
+            return False
+
+        try:
+            output = json.loads(proc.stdout)
+        except json.JSONDecodeError as e:
+            print(f"c2patool trust: invalid JSON: {e}")
+            return False
+
+        validation_state = output.get('validation_state', '')
+        is_trusted = validation_state == 'Trusted'
+
+        # Also check for failures in validation_results
+        validation_results = output.get('validation_results', {})
+        active_failures = validation_results.get('activeManifest', {}).get('failure', [])
+        if active_failures:
+            print(f"c2patool trust: validation failures: {active_failures}")
+            is_trusted = False
+
+        print(f"c2patool trust: validation_state={validation_state} trusted={is_trusted}")
+        return is_trusted
+    except subprocess.TimeoutExpired:
+        print("c2patool trust check timed out")
+        return False
+    except FileNotFoundError:
+        print("c2patool binary not found")
+        return False
+
+
+def _extract_claim_generator(manifest):
+    """Extract claim_generator from c2patool manifest JSON."""
+    # c2patool --detailed returns { "manifests": { "<urn>": { "claim": { "claim_generator_info": {...} } } } }
+    manifests = manifest.get('manifests', {})
+    for _urn, m in manifests.items():
+        # v0.26+ structure: claim.claim_generator_info.name
+        claim = m.get('claim', {})
+        cg_info = claim.get('claim_generator_info', {})
+        if isinstance(cg_info, dict) and cg_info.get('name'):
+            version = cg_info.get('version', '')
+            name = cg_info['name']
+            return f"{name}/{version}" if version else name
+        # Legacy structure: direct claim_generator field
+        cg = m.get('claim_generator') or claim.get('claim_generator')
+        if cg:
+            return cg
+    return None
+
+
+def _extract_issuer(manifest):
+    """Extract certificate issuer from c2patool manifest JSON."""
+    manifests = manifest.get('manifests', {})
+    for _urn, m in manifests.items():
+        # v0.26+ structure: signature.issuer
+        sig = m.get('signature', {})
+        if isinstance(sig, dict):
+            issuer = sig.get('issuer')
+            if issuer:
+                return issuer
+        # Legacy structure: signature_info.issuer
+        sig_info = m.get('signature_info', {})
+        if isinstance(sig_info, dict):
+            issuer = sig_info.get('issuer')
+            if issuer:
+                return issuer
+            cert_serial = sig_info.get('cert_serial_number')
+            if cert_serial:
+                return f"cert:{cert_serial}"
+    return None
+
+
+def _extract_digital_source_type(manifest):
+    """Extract digitalSourceType from c2pa.actions assertion."""
+    manifests = manifest.get('manifests', {})
+    for _urn, m in manifests.items():
+        store = m.get('assertion_store', {})
+        # Check both v2 and v1 action assertion labels
+        for key in ('c2pa.actions.v2', 'c2pa.actions'):
+            actions_data = store.get(key, {})
+            for action in actions_data.get('actions', []):
+                dst = action.get('digitalSourceType')
+                if dst:
+                    return dst
+    return None
+
+
+# ─── Content Moderation (existing) ───────────────────────────────────────────
 
 
 def check_image_safety(bucket_name: str, blob_name: str) -> dict:
@@ -71,10 +358,8 @@ def check_image_safety(bucket_name: str, blob_name: str) -> dict:
     response = client.safe_search_detection(image=image)
     safe = response.safe_search_annotation
 
-    # Get likelihood values
     likelihood_name = vision.Likelihood
 
-    # Flag if LIKELY or VERY_LIKELY for adult or violence
     is_flagged = (
         safe.adult >= likelihood_name.LIKELY or
         safe.violence >= likelihood_name.LIKELY
@@ -105,30 +390,22 @@ def check_image_safety(bucket_name: str, blob_name: str) -> dict:
 def extract_video_thumbnail(bucket_name: str, blob_name: str) -> str:
     """
     Extract a thumbnail frame from video.
-    For now, uses first frame via simple ffmpeg or Cloud Video Intelligence.
 
     Returns:
         Path to uploaded thumbnail, or None if failed
     """
-    # Simple approach: download video, extract frame with ffprobe/ffmpeg
-    # For production, consider Cloud Video Intelligence API
-
     storage_client = storage.Client()
     bucket = storage_client.bucket(bucket_name)
 
-    # For MVP: just copy first frame as thumbnail
-    # This is a placeholder - real implementation would use ffmpeg or Video Intelligence
     thumbnail_path = f'thumbnails/{blob_name}'
 
     # TODO: Implement actual thumbnail extraction
-    # Option 1: Cloud Run with ffmpeg
-    # Option 2: Video Intelligence API shot detection
-
     print(f"TODO: Extract thumbnail to {thumbnail_path}")
-    return None  # Return None until implemented
+    return None
 
 
-def handle_moderation_result(bucket_name: str, blob_name: str, result: dict, thumbnail_path: str = None):
+def handle_moderation_result(bucket_name: str, blob_name: str, result: dict,
+                             thumbnail_path: str = None, c2pa: dict = None):
     """Handle the moderation result - delete if flagged, update metadata."""
     storage_client = storage.Client()
     bucket = storage_client.bucket(bucket_name)
@@ -136,12 +413,10 @@ def handle_moderation_result(bucket_name: str, blob_name: str, result: dict, thu
     if result['is_flagged']:
         print(f"Content flagged: {result['reason']}")
 
-        # Delete the blob
         blob = bucket.blob(blob_name)
         blob.delete()
         print(f"Deleted: {blob_name}")
 
-        # Delete thumbnail if exists
         if thumbnail_path:
             thumb_blob = bucket.blob(thumbnail_path)
             try:
@@ -150,16 +425,16 @@ def handle_moderation_result(bucket_name: str, blob_name: str, result: dict, thu
             except Exception:
                 pass
 
-        # Update metadata to restricted/deleted
         update_metadata(blob_name, 'restricted', thumbnail_path,
-                       create_moderation_result(False, result['scores']))
+                        create_moderation_result(False, result['scores']),
+                        c2pa=c2pa)
     else:
-        # Content is safe
         update_metadata(blob_name, 'active', thumbnail_path,
-                       create_moderation_result(True, result['scores']))
+                        create_moderation_result(True, result['scores']),
+                        c2pa=c2pa)
 
 
-def create_moderation_result(is_safe: bool, scores: dict = None) -> dict:
+def create_moderation_result(is_safe: bool, scores: dict = None, reason: str = None) -> dict:
     """Create a moderation result object."""
     result = {
         'checked_at': datetime.utcnow().isoformat() + 'Z',
@@ -167,19 +442,23 @@ def create_moderation_result(is_safe: bool, scores: dict = None) -> dict:
     }
     if scores:
         result['scores'] = scores
+    if reason:
+        result['reason'] = reason
     return result
 
 
-def update_metadata(blob_name: str, status: str, thumbnail: str, moderation: dict):
+def update_metadata(blob_name: str, status: str, thumbnail: str,
+                    moderation: dict, c2pa: dict = None):
     """
     Update blob metadata in Fastly KV store via webhook.
-
-    In production, this calls a secure webhook endpoint on your Fastly service
-    that updates the KV store metadata.
     """
     if not METADATA_WEBHOOK_URL:
         print(f"METADATA_WEBHOOK_URL not set, skipping update for {blob_name}")
-        print(f"  status={status}, thumbnail={thumbnail}, moderation={moderation}")
+        print(f"  status={status}, thumbnail={thumbnail}")
+        if moderation:
+            print(f"  moderation={moderation}")
+        if c2pa:
+            print(f"  c2pa={json.dumps(c2pa)}")
         return
 
     payload = {
@@ -188,6 +467,8 @@ def update_metadata(blob_name: str, status: str, thumbnail: str, moderation: dic
         'thumbnail': thumbnail,
         'moderation': moderation
     }
+    if c2pa is not None:
+        payload['c2pa'] = c2pa
 
     headers = {
         'Content-Type': 'application/json',
