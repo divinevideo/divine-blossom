@@ -127,6 +127,8 @@ def check_c2pa_trust(bucket_name, blob_name):
         'claim_generator': None,
         'issuer': None,
         'trust_chain_valid': False,
+        'digital_source_type': None,
+        'is_digital_capture': False,
         'errors': [],
         'validated_at': datetime.utcnow().isoformat() + 'Z',
     }
@@ -169,11 +171,22 @@ def check_c2pa_trust(bucket_name, blob_name):
         result['claim_generator'] = _extract_claim_generator(manifest)
         result['issuer'] = _extract_issuer(manifest)
 
-        # Step 2: Validate trust chain against configured trust anchors
+        # Step 2: Check digitalSourceType from c2pa.actions
+        source_type = _extract_digital_source_type(manifest)
+        result['digital_source_type'] = source_type
+        is_capture = (source_type ==
+                      'http://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture')
+        result['is_digital_capture'] = is_capture
+        if not is_capture:
+            result['errors'].append(
+                f'digitalSourceType is not digitalCapture: {source_type}')
+
+        # Step 3: Validate trust chain against configured trust anchors
         if os.path.isfile(C2PA_TRUST_ANCHORS) and os.path.getsize(C2PA_TRUST_ANCHORS) > 100:
             trust_ok = _run_c2patool_trust(tmp.name)
             result['trust_chain_valid'] = trust_ok
-            result['is_trusted'] = trust_ok
+            # Trusted only if both trust chain passes AND source is digitalCapture
+            result['is_trusted'] = trust_ok and is_capture
         else:
             # No trust anchors configured — manifest present but trust not verifiable
             result['errors'].append('no trust anchors configured')
@@ -306,6 +319,21 @@ def _extract_issuer(manifest):
             cert_serial = sig_info.get('cert_serial_number')
             if cert_serial:
                 return f"cert:{cert_serial}"
+    return None
+
+
+def _extract_digital_source_type(manifest):
+    """Extract digitalSourceType from c2pa.actions assertion."""
+    manifests = manifest.get('manifests', {})
+    for _urn, m in manifests.items():
+        store = m.get('assertion_store', {})
+        # Check both v2 and v1 action assertion labels
+        for key in ('c2pa.actions.v2', 'c2pa.actions'):
+            actions_data = store.get(key, {})
+            for action in actions_data.get('actions', []):
+                dst = action.get('digitalSourceType')
+                if dst:
+                    return dst
     return None
 
 

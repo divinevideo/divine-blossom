@@ -288,6 +288,63 @@ class TestExtractHelpers(unittest.TestCase):
     def test_extract_issuer_empty(self):
         self.assertIsNone(main._extract_issuer({'manifests': {}}))
 
+    def test_extract_digital_source_type(self):
+        manifest = {
+            'manifests': {
+                'urn:c2pa:test': {
+                    'assertion_store': {
+                        'c2pa.actions.v2': {
+                            'actions': [{
+                                'action': 'c2pa.created',
+                                'digitalSourceType': 'http://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture'
+                            }]
+                        }
+                    }
+                }
+            }
+        }
+        self.assertEqual(
+            main._extract_digital_source_type(manifest),
+            'http://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture'
+        )
+
+    def test_extract_digital_source_type_v1_key(self):
+        manifest = {
+            'manifests': {
+                'urn:c2pa:test': {
+                    'assertion_store': {
+                        'c2pa.actions': {
+                            'actions': [{
+                                'action': 'c2pa.created',
+                                'digitalSourceType': 'http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia'
+                            }]
+                        }
+                    }
+                }
+            }
+        }
+        self.assertEqual(
+            main._extract_digital_source_type(manifest),
+            'http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia'
+        )
+
+    def test_extract_digital_source_type_missing(self):
+        manifest = {
+            'manifests': {
+                'urn:c2pa:test': {
+                    'assertion_store': {
+                        'c2pa.actions.v2': {
+                            'actions': [{'action': 'c2pa.created'}]
+                        }
+                    }
+                }
+            }
+        }
+        self.assertIsNone(main._extract_digital_source_type(manifest))
+
+    def test_extract_digital_source_type_no_actions(self):
+        self.assertIsNone(main._extract_digital_source_type({'manifests': {}}))
+
 
 class TestFlaskEndpoint(unittest.TestCase):
     """Test the Cloud Run HTTP endpoint with mocked GCS/Vision."""
@@ -436,6 +493,42 @@ class TestSampleFiles(unittest.TestCase):
             self.skipTest(f"sample not found: {path}")
         result = main._run_c2patool_read(path)
         self.assertIsNone(result, "Expected None for corrupt file")
+
+    def test_signed_sample_is_digital_capture(self):
+        """ProofMode samples should have digitalSourceType = digitalCapture."""
+        path = self._sample(
+            '51dd154c7b7f4f59ca12b4d496b3d8a8eca61f3d03de6093cd0395ba53b14060.mp4'
+        )
+        if not os.path.exists(path):
+            self.skipTest(f"sample not found: {path}")
+        manifest = main._run_c2patool_read(path)
+        self.assertIsNotNone(manifest)
+        dst = main._extract_digital_source_type(manifest)
+        self.assertEqual(
+            dst,
+            'http://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture',
+            f"Expected digitalCapture, got {dst}"
+        )
+
+    def test_all_signed_samples_are_digital_capture(self):
+        """All hash-named ProofMode samples should claim digitalCapture."""
+        count = 0
+        for fname in os.listdir(SAMPLES_DIR):
+            if not fname.endswith('.mp4'):
+                continue
+            name_no_ext = fname.rsplit('.', 1)[0]
+            if len(name_no_ext) == 64 and all(c in '0123456789abcdef' for c in name_no_ext):
+                path = self._sample(fname)
+                manifest = main._run_c2patool_read(path)
+                self.assertIsNotNone(manifest, f"Expected manifest in {fname}")
+                dst = main._extract_digital_source_type(manifest)
+                self.assertEqual(
+                    dst,
+                    'http://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture',
+                    f"{fname}: expected digitalCapture, got {dst}"
+                )
+                count += 1
+        self.assertGreater(count, 0)
 
     def test_all_signed_samples_have_manifests(self):
         """All hash-named MP4 samples should have C2PA manifests."""
