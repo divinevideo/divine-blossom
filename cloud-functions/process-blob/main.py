@@ -270,16 +270,20 @@ def _run_c2patool_trust(file_path):
 
 def _extract_claim_generator(manifest):
     """Extract claim_generator from c2patool manifest JSON."""
-    # c2patool --detailed returns { "manifests": { "<urn>": { "claim_generator": "..." } } }
+    # c2patool --detailed returns { "manifests": { "<urn>": { "claim": { "claim_generator_info": {...} } } } }
     manifests = manifest.get('manifests', {})
     for _urn, m in manifests.items():
-        cg = m.get('claim_generator')
+        # v0.26+ structure: claim.claim_generator_info.name
+        claim = m.get('claim', {})
+        cg_info = claim.get('claim_generator_info', {})
+        if isinstance(cg_info, dict) and cg_info.get('name'):
+            version = cg_info.get('version', '')
+            name = cg_info['name']
+            return f"{name}/{version}" if version else name
+        # Legacy structure: direct claim_generator field
+        cg = m.get('claim_generator') or claim.get('claim_generator')
         if cg:
             return cg
-    # Also check top-level active_manifest
-    active = manifest.get('active_manifest')
-    if active and active in manifests:
-        return manifests[active].get('claim_generator')
     return None
 
 
@@ -287,15 +291,21 @@ def _extract_issuer(manifest):
     """Extract certificate issuer from c2patool manifest JSON."""
     manifests = manifest.get('manifests', {})
     for _urn, m in manifests.items():
-        # The signature_info contains issuer details
+        # v0.26+ structure: signature.issuer
+        sig = m.get('signature', {})
+        if isinstance(sig, dict):
+            issuer = sig.get('issuer')
+            if issuer:
+                return issuer
+        # Legacy structure: signature_info.issuer
         sig_info = m.get('signature_info', {})
-        issuer = sig_info.get('issuer')
-        if issuer:
-            return issuer
-        # Some versions use cert_chain
-        cert_serial = sig_info.get('cert_serial_number')
-        if cert_serial:
-            return f"cert:{cert_serial}"
+        if isinstance(sig_info, dict):
+            issuer = sig_info.get('issuer')
+            if issuer:
+                return issuer
+            cert_serial = sig_info.get('cert_serial_number')
+            if cert_serial:
+                return f"cert:{cert_serial}"
     return None
 
 
