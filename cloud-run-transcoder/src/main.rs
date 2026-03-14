@@ -13,6 +13,7 @@ use bytes::Bytes;
 use google_cloud_storage::{
     client::{Client as GcsClient, ClientConfig},
     http::objects::{
+        delete::DeleteObjectRequest,
         download::Range as DownloadRange,
         get::GetObjectRequest,
         patch::PatchObjectRequest,
@@ -23,9 +24,16 @@ use google_cloud_storage::{
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, env, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    env,
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 use tempfile::TempDir;
 use tokio::process::Command;
+use tokio::sync::Semaphore;
 use tower::Service;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
@@ -47,44 +55,88 @@ struct Config {
     transcription_model: String,
     /// URL of the Fastly edge service for transcript status webhook callbacks
     transcript_webhook_url: Option<String>,
+    transcription_max_in_flight: usize,
+    transcription_max_retries: u32,
+    transcription_retry_base_ms: u64,
+    transcription_retry_max_ms: u64,
+    transcription_retry_total_ms: u64,
 }
 
 impl Config {
     fn from_env() -> Self {
+        Self::from_lookup(|key| env::var(key).ok())
+    }
+
+    fn from_lookup<F>(mut lookup: F) -> Self
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        fn parse_value<F, T>(lookup: &mut F, key: &str, default: T) -> T
+        where
+            F: FnMut(&str) -> Option<String>,
+            T: std::str::FromStr,
+        {
+            lookup(key)
+                .and_then(|value| value.parse::<T>().ok())
+                .unwrap_or(default)
+        }
+
+        fn parse_bool<F>(lookup: &mut F, key: &str, default: bool) -> bool
+        where
+            F: FnMut(&str) -> Option<String>,
+        {
+            lookup(key)
+                .map(|value| {
+                    let normalized = value.to_ascii_lowercase();
+                    normalized == "true" || normalized == "1"
+                })
+                .unwrap_or(default)
+        }
+
         // Check if GPU is explicitly enabled via env var (more reliable than checking NVIDIA_VISIBLE_DEVICES)
         // Set USE_GPU=true when deploying with actual GPU support
-        let use_gpu = env::var("USE_GPU")
-            .map(|v| v.to_lowercase() == "true" || v == "1")
-            .unwrap_or(false);
-
         Self {
-            gcs_bucket: env::var("GCS_BUCKET")
-                .unwrap_or_else(|_| "divine-blossom-media".to_string()),
-            port: env::var("PORT")
-                .unwrap_or_else(|_| "8080".to_string())
-                .parse()
-                .unwrap_or(8080),
-            use_gpu,
+            gcs_bucket: lookup("GCS_BUCKET").unwrap_or_else(|| "divine-blossom-media".to_string()),
+            port: parse_value(&mut lookup, "PORT", 8080),
+            use_gpu: parse_bool(&mut lookup, "USE_GPU", false),
             // Webhook URL for status updates (e.g., https://media.divine.video/admin/transcode-status)
-            webhook_url: env::var("WEBHOOK_URL").ok(),
+            webhook_url: lookup("WEBHOOK_URL"),
             // Secret for webhook authentication
-            webhook_secret: env::var("WEBHOOK_SECRET").ok(),
+            webhook_secret: lookup("WEBHOOK_SECRET"),
             // Transcription provider URL (defaults to OpenAI transcription endpoint)
-            transcription_api_url: env::var("TRANSCRIPTION_API_URL")
-                .ok()
-                .or_else(|| env::var("OPENAI_API_URL").ok())
+            transcription_api_url: lookup("TRANSCRIPTION_API_URL")
+                .or_else(|| lookup("OPENAI_API_URL"))
                 .or_else(|| Some("https://api.openai.com/v1/audio/transcriptions".to_string())),
             // Provider auth token
-            transcription_api_key: env::var("TRANSCRIPTION_API_KEY")
-                .ok()
-                .or_else(|| env::var("OPENAI_API_KEY").ok()),
+            transcription_api_key: lookup("TRANSCRIPTION_API_KEY")
+                .or_else(|| lookup("OPENAI_API_KEY")),
             // Provider model
-            transcription_model: env::var("TRANSCRIPTION_MODEL")
-                .ok()
-                .or_else(|| env::var("OPENAI_MODEL").ok())
+            transcription_model: lookup("TRANSCRIPTION_MODEL")
+                .or_else(|| lookup("OPENAI_MODEL"))
                 .unwrap_or_else(|| "whisper-1".to_string()),
             // Transcript webhook URL (defaults to same host + /admin/transcript-status)
-            transcript_webhook_url: env::var("TRANSCRIPT_WEBHOOK_URL").ok(),
+            transcript_webhook_url: lookup("TRANSCRIPT_WEBHOOK_URL"),
+            transcription_max_in_flight: parse_value(&mut lookup, "TRANSCRIPTION_MAX_IN_FLIGHT", 4)
+                .max(1),
+            transcription_max_retries: parse_value(&mut lookup, "TRANSCRIPTION_MAX_RETRIES", 3),
+            transcription_retry_base_ms: parse_value(
+                &mut lookup,
+                "TRANSCRIPTION_RETRY_BASE_MS",
+                1_000,
+            )
+            .max(1),
+            transcription_retry_max_ms: parse_value(
+                &mut lookup,
+                "TRANSCRIPTION_RETRY_MAX_MS",
+                15_000,
+            )
+            .max(1),
+            transcription_retry_total_ms: parse_value(
+                &mut lookup,
+                "TRANSCRIPTION_RETRY_TOTAL_MS",
+                30_000,
+            )
+            .max(1_000),
         }
     }
 }
@@ -93,6 +145,7 @@ impl Config {
 struct AppState {
     gcs_client: GcsClient,
     config: Config,
+    provider_semaphore: Arc<Semaphore>,
 }
 
 // Transcode request
@@ -164,6 +217,115 @@ struct TranscriptConfidence {
     average_logprob: f64,
     low_confidence_token_ratio: f64,
     token_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderFailure {
+    status_code: Option<u16>,
+    retry_after: Option<Duration>,
+    body: String,
+    timed_out: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderError {
+    failure: ProviderFailure,
+    exhausted_retryable: bool,
+    attempts: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TranscriptLockStatus {
+    Processing,
+    CoolingDown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct TranscriptLockState {
+    status: TranscriptLockStatus,
+    started_at_epoch_secs: u64,
+    cooldown_until_epoch_secs: Option<u64>,
+    error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptLockAction {
+    StartWork,
+    AlreadyProcessing,
+    ReclaimStaleLock,
+    CoolingDown,
+}
+
+#[derive(Debug, Clone)]
+struct TranscriptLockHandle {
+    path: String,
+    generation: i64,
+}
+
+impl ProviderError {
+    fn error_code(&self) -> &'static str {
+        if self.exhausted_retryable {
+            "provider_rate_limited"
+        } else {
+            "provider_failed"
+        }
+    }
+
+    fn retry_after(&self) -> Option<Duration> {
+        self.failure.retry_after
+    }
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let suffix = if self.exhausted_retryable {
+            " after exhausting retries"
+        } else {
+            ""
+        };
+        match self.failure.status_code {
+            Some(status) => write!(
+                f,
+                "Transcription provider returned {}{}: {}",
+                status, suffix, self.failure.body
+            ),
+            None => write!(
+                f,
+                "Transcription provider request failed{}: {}",
+                suffix, self.failure.body
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProviderError {}
+
+fn decide_transcript_lock_action(
+    now_epoch_secs: u64,
+    existing: Option<&TranscriptLockState>,
+    stale_after_secs: u64,
+) -> TranscriptLockAction {
+    let Some(existing) = existing else {
+        return TranscriptLockAction::StartWork;
+    };
+
+    match existing.status {
+        TranscriptLockStatus::CoolingDown
+            if existing
+                .cooldown_until_epoch_secs
+                .map(|cooldown_until| cooldown_until > now_epoch_secs)
+                .unwrap_or(false) =>
+        {
+            TranscriptLockAction::CoolingDown
+        }
+        TranscriptLockStatus::Processing
+            if now_epoch_secs.saturating_sub(existing.started_at_epoch_secs) < stale_after_secs =>
+        {
+            TranscriptLockAction::AlreadyProcessing
+        }
+        _ => TranscriptLockAction::ReclaimStaleLock,
+    }
 }
 
 impl TranscriptConfidence {
@@ -303,8 +465,13 @@ async fn main() -> Result<()> {
     // Initialize GCS client
     let gcs_config = ClientConfig::default().with_auth().await?;
     let gcs_client = GcsClient::new(gcs_config);
+    let provider_semaphore = Arc::new(Semaphore::new(config.transcription_max_in_flight));
 
-    let state = Arc::new(AppState { gcs_client, config });
+    let state = Arc::new(AppState {
+        gcs_client,
+        config,
+        provider_semaphore,
+    });
 
     // CORS configuration
     let cors = CorsLayer::new()
@@ -449,9 +616,9 @@ async fn process_transcode(
     let temp_dir = TempDir::new()?;
     let temp_path = temp_dir.path();
 
-    // Download the original blob, or fall back to the best available HLS transport stream.
-    let input_path = temp_path.join("input_media");
-    let download_result = download_best_available_media_to_path(
+    // Download original video from GCS
+    let input_path = temp_path.join("input.mp4");
+    let download_result = download_from_gcs(
         &state.gcs_client,
         &state.config.gcs_bucket,
         &hash,
@@ -459,13 +626,10 @@ async fn process_transcode(
     )
     .await;
 
-    let source_object = match download_result {
-        Ok(source_object) => source_object,
-        Err(e) => {
-            send_status_webhook(&state.config, &hash, "failed", None, None).await;
-            return Err(e);
-        }
-    };
+    if let Err(e) = download_result {
+        send_status_webhook(&state.config, &hash, "failed", None, None).await;
+        return Err(e);
+    }
 
     info!("Downloaded video to {:?}", input_path);
 
@@ -473,24 +637,13 @@ async fn process_transcode(
     let mut source_metadata = match get_source_object_metadata(
         &state.gcs_client,
         &state.config.gcs_bucket,
-<<<<<<< HEAD
-        &source_object,
-=======
         &hash,
->>>>>>> ee3a7d5 (fix: reject low-confidence phantom transcripts)
     )
     .await
     {
         Ok(meta) => meta,
         Err(e) => {
-<<<<<<< HEAD
-            warn!(
-                "Failed to load source metadata for {} via {}: {}",
-                hash, source_object, e
-            );
-=======
             warn!("Failed to load source metadata for {}: {}", hash, e);
->>>>>>> ee3a7d5 (fix: reject low-confidence phantom transcripts)
             SourceObjectMetadata::default()
         }
     };
@@ -604,6 +757,7 @@ async fn process_transcribe(
             None,
             None,
             None,
+            None,
         )
         .await;
         return Ok(TranscribeResponse {
@@ -613,6 +767,38 @@ async fn process_transcribe(
             transcript_confidence: None,
         });
     }
+
+    let transcript_lock = match acquire_transcript_lock(
+        &state.gcs_client,
+        &state.config.gcs_bucket,
+        &hash,
+        900,
+    )
+    .await?
+    {
+        Ok(handle) => handle,
+        Err(TranscriptLockAction::AlreadyProcessing) => {
+            info!("Transcript already processing for {}, skipping duplicate request", hash);
+            return Ok(TranscribeResponse {
+                hash,
+                status: "already_processing".to_string(),
+                vtt_path,
+                transcript_confidence: None,
+            });
+        }
+        Err(TranscriptLockAction::CoolingDown) => {
+            info!("Transcript cooldown active for {}, skipping duplicate request", hash);
+            return Ok(TranscribeResponse {
+                hash,
+                status: "cooling_down".to_string(),
+                vtt_path,
+                transcript_confidence: None,
+            });
+        }
+        Err(TranscriptLockAction::StartWork | TranscriptLockAction::ReclaimStaleLock) => {
+            unreachable!("acquire_transcript_lock resolves start/reclaim internally")
+        }
+    };
 
     send_transcript_status_webhook(
         &state.config,
@@ -625,6 +811,7 @@ async fn process_transcribe(
         None,
         None,
         None,
+        None,
     )
     .await;
 
@@ -632,20 +819,27 @@ async fn process_transcribe(
     let temp_path = temp_dir.path();
 
     let input_path = temp_path.join("input_media");
-    if let Err(e) = download_best_available_media_to_path(
+    if let Err(e) = download_from_gcs(
         &state.gcs_client,
         &state.config.gcs_bucket,
         &hash,
         &input_path,
-    )
-    .await
+        )
+        .await
     {
+        if let Err(lock_error) =
+            delete_transcript_lock(&state.gcs_client, &state.config.gcs_bucket, &transcript_lock)
+                .await
+        {
+            warn!("Failed to release transcript lock for {}: {}", hash, lock_error);
+        }
         send_transcript_status_webhook(
             &state.config,
             &hash,
             "failed",
             job_id.as_deref(),
             requested_lang.as_deref(),
+            None,
             None,
             None,
             None,
@@ -662,7 +856,7 @@ async fn process_transcribe(
             hash
         );
         let parsed_vtt = ParsedVtt::empty(0);
-        return finalize_transcript(
+        let result = finalize_transcript(
             &state,
             &hash,
             job_id.as_deref(),
@@ -671,16 +865,30 @@ async fn process_transcribe(
             &vtt_path,
         )
         .await;
+        if let Err(lock_error) =
+            delete_transcript_lock(&state.gcs_client, &state.config.gcs_bucket, &transcript_lock)
+                .await
+        {
+            warn!("Failed to release transcript lock for {}: {}", hash, lock_error);
+        }
+        return result;
     }
 
     let audio_path = temp_path.join("transcribe.wav");
     if let Err(e) = extract_audio_for_transcription(&input_path, &audio_path).await {
+        if let Err(lock_error) =
+            delete_transcript_lock(&state.gcs_client, &state.config.gcs_bucket, &transcript_lock)
+                .await
+        {
+            warn!("Failed to release transcript lock for {}: {}", hash, lock_error);
+        }
         send_transcript_status_webhook(
             &state.config,
             &hash,
             "failed",
             job_id.as_deref(),
             requested_lang.as_deref(),
+            None,
             None,
             None,
             None,
@@ -714,7 +922,7 @@ async fn process_transcribe(
             audio_analysis.max_volume_db
         );
         let parsed_vtt = ParsedVtt::empty(audio_analysis.duration_ms);
-        return finalize_transcript(
+        let result = finalize_transcript(
             &state,
             &hash,
             job_id.as_deref(),
@@ -723,40 +931,107 @@ async fn process_transcribe(
             &vtt_path,
         )
         .await;
+        if let Err(lock_error) =
+            delete_transcript_lock(&state.gcs_client, &state.config.gcs_bucket, &transcript_lock)
+                .await
+        {
+            warn!("Failed to release transcript lock for {}: {}", hash, lock_error);
+        }
+        return result;
     }
 
-    let raw_output =
-        match transcribe_audio_via_provider(&state.config, &audio_path, requested_lang.as_deref())
-            .await
-        {
-            Ok(output) => output,
-            Err(e) => {
-                send_transcript_status_webhook(
-                    &state.config,
-                    &hash,
-                    "failed",
-                    job_id.as_deref(),
-                    requested_lang.as_deref(),
-                    None,
-                    None,
-                    None,
-                    Some("provider_failed"),
-                    Some(&e.to_string()),
-                )
-                .await;
-                return Err(e);
-            }
-        };
+    let provider_wait_started = Instant::now();
+    let provider_permit = state
+        .provider_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|e| anyhow!("Provider semaphore closed: {}", e))?;
+    let provider_wait_ms = provider_wait_started
+        .elapsed()
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    let in_flight = state
+        .config
+        .transcription_max_in_flight
+        .saturating_sub(state.provider_semaphore.available_permits());
+    info!(
+        hash,
+        in_flight,
+        provider_wait_ms,
+        "Acquired transcription provider permit"
+    );
 
-    let parsed_vtt = match normalize_transcript_to_vtt(&raw_output) {
-        Ok(vtt) => vtt,
+    let raw_output = match transcribe_audio_via_provider(
+        &state.config,
+        &audio_path,
+        requested_lang.as_deref(),
+    )
+    .await
+    {
+        Ok(output) => output,
         Err(e) => {
+            drop(provider_permit);
+            if e.exhausted_retryable {
+                let retry_after = e
+                    .retry_after()
+                    .unwrap_or_else(|| Duration::from_millis(state.config.transcription_retry_max_ms));
+                if let Err(lock_error) = write_transcript_cooldown(
+                    &state.gcs_client,
+                    &state.config.gcs_bucket,
+                    &hash,
+                    &transcript_lock,
+                    retry_after,
+                    e.error_code(),
+                )
+                .await
+                {
+                    warn!("Failed to persist transcript cooldown for {}: {}", hash, lock_error);
+                }
+            } else if let Err(lock_error) = delete_transcript_lock(
+                &state.gcs_client,
+                &state.config.gcs_bucket,
+                &transcript_lock,
+            )
+            .await
+            {
+                warn!("Failed to release transcript lock for {}: {}", hash, lock_error);
+            }
             send_transcript_status_webhook(
                 &state.config,
                 &hash,
                 "failed",
                 job_id.as_deref(),
                 requested_lang.as_deref(),
+                None,
+                None,
+                None,
+                e.retry_after().map(|duration| duration.as_secs().max(1)),
+                Some(e.error_code()),
+                Some(&e.to_string()),
+            )
+            .await;
+            return Err(e.into());
+        }
+    };
+    drop(provider_permit);
+
+    let parsed_vtt = match normalize_transcript_to_vtt(&raw_output) {
+        Ok(vtt) => vtt,
+        Err(e) => {
+            if let Err(lock_error) =
+                delete_transcript_lock(&state.gcs_client, &state.config.gcs_bucket, &transcript_lock)
+                    .await
+            {
+                warn!("Failed to release transcript lock for {}: {}", hash, lock_error);
+            }
+            send_transcript_status_webhook(
+                &state.config,
+                &hash,
+                "failed",
+                job_id.as_deref(),
+                requested_lang.as_deref(),
+                None,
                 None,
                 None,
                 None,
@@ -801,7 +1076,7 @@ async fn process_transcribe(
         None => parsed_vtt,
     };
 
-    finalize_transcript(
+    let result = finalize_transcript(
         &state,
         &hash,
         job_id.as_deref(),
@@ -809,7 +1084,13 @@ async fn process_transcribe(
         parsed_vtt,
         &vtt_path,
     )
-    .await
+    .await;
+    if let Err(lock_error) =
+        delete_transcript_lock(&state.gcs_client, &state.config.gcs_bucket, &transcript_lock).await
+    {
+        warn!("Failed to release transcript lock for {}: {}", hash, lock_error);
+    }
+    result
 }
 
 async fn check_gcs_exists(client: &GcsClient, bucket: &str, object: &str) -> Result<bool> {
@@ -824,14 +1105,6 @@ async fn check_gcs_exists(client: &GcsClient, bucket: &str, object: &str) -> Res
         Ok(_) => Ok(true),
         Err(_) => Ok(false),
     }
-}
-
-fn media_source_candidates(hash: &str) -> [String; 3] {
-    [
-        hash.to_string(),
-        format!("{}/hls/stream_720p.ts", hash),
-        format!("{}/hls/stream_480p.ts", hash),
-    ]
 }
 
 async fn download_from_gcs(
@@ -854,38 +1127,6 @@ async fn download_from_gcs(
 
     tokio::fs::write(output_path, &data).await?;
     Ok(())
-}
-
-async fn download_best_available_media_to_path(
-    client: &GcsClient,
-    bucket: &str,
-    hash: &str,
-    output_path: &Path,
-) -> Result<String> {
-    let mut failures = Vec::new();
-
-    for object in media_source_candidates(hash) {
-        match download_from_gcs(client, bucket, &object, output_path).await {
-            Ok(()) => {
-                if object == hash {
-                    return Ok(object);
-                }
-
-                warn!(
-                    "Original blob missing for {}, using fallback media source {}",
-                    hash, object
-                );
-                return Ok(object);
-            }
-            Err(e) => failures.push(format!("{}: {}", object, e)),
-        }
-    }
-
-    Err(anyhow!(
-        "No recoverable media source found for {} ({})",
-        hash,
-        failures.join(" | ")
-    ))
 }
 
 /// Extract mono 16kHz PCM WAV audio for transcription.
@@ -1032,20 +1273,248 @@ fn parse_volume_db(input: &str) -> Option<f64> {
     value.parse::<f64>().ok()
 }
 
-/// Call a configured transcription provider and return raw response text.
-async fn transcribe_audio_via_provider(
+fn parse_retry_after_header(value: Option<&str>) -> Option<Duration> {
+    let seconds = value?.trim().parse::<u64>().ok()?;
+    Some(Duration::from_secs(seconds))
+}
+
+fn parse_provider_status(
+    status_code: Option<u16>,
+    retry_after_header: Option<&str>,
+    body: &str,
+    timed_out: bool,
+) -> ProviderFailure {
+    ProviderFailure {
+        status_code,
+        retry_after: parse_retry_after_header(retry_after_header),
+        body: body.to_string(),
+        timed_out,
+    }
+}
+
+fn is_retryable_provider_failure(failure: &ProviderFailure) -> bool {
+    failure.timed_out
+        || matches!(failure.status_code, Some(429 | 500 | 502 | 503 | 504))
+}
+
+fn retry_delay_for_attempt(
+    attempt: u32,
+    base_delay_ms: u64,
+    max_delay_ms: u64,
+    retry_after: Option<Duration>,
+    jitter_ratio: f64,
+) -> Duration {
+    let exponential = base_delay_ms
+        .saturating_mul(2u64.saturating_pow(attempt))
+        .min(max_delay_ms);
+    let requested_delay = retry_after
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(exponential)
+        .min(max_delay_ms);
+    if requested_delay >= max_delay_ms {
+        return Duration::from_millis(max_delay_ms.max(1));
+    }
+    let clamped_ratio = jitter_ratio.clamp(0.0, 1.0);
+    let jittered = ((requested_delay as f64) * (0.75 + (0.25 * clamped_ratio))).round() as u64;
+    Duration::from_millis(jittered.max(1))
+}
+
+fn retry_jitter_ratio() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| f64::from(duration.subsec_micros()) / 1_000_000.0)
+        .unwrap_or(0.5)
+}
+
+fn current_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn transcript_lock_path(hash: &str) -> String {
+    format!("{}/vtt/.lock", hash)
+}
+
+async fn fetch_transcript_lock(
+    client: &GcsClient,
+    bucket: &str,
+    hash: &str,
+) -> Result<Option<(TranscriptLockState, i64)>> {
+    let path = transcript_lock_path(hash);
+    let object = match client
+        .get_object(&GetObjectRequest {
+            bucket: bucket.to_string(),
+            object: path.clone(),
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(object) => object,
+        Err(_) => return Ok(None),
+    };
+
+    let raw = client
+        .download_object(
+            &GetObjectRequest {
+                bucket: bucket.to_string(),
+                object: path,
+                ..Default::default()
+            },
+            &DownloadRange::default(),
+        )
+        .await
+        .map_err(|e| anyhow!("Failed to download transcript lock: {}", e))?;
+    let state = serde_json::from_slice::<TranscriptLockState>(&raw)
+        .map_err(|e| anyhow!("Failed to parse transcript lock: {}", e))?;
+
+    Ok(Some((state, object.generation)))
+}
+
+async fn write_transcript_lock(
+    client: &GcsClient,
+    bucket: &str,
+    hash: &str,
+    state: &TranscriptLockState,
+    if_generation_match: Option<i64>,
+) -> Result<TranscriptLockHandle> {
+    let path = transcript_lock_path(hash);
+    let mut media = Media::new(path.clone());
+    media.content_type = "application/json".into();
+    let upload = client
+        .upload_object(
+            &UploadObjectRequest {
+                bucket: bucket.to_string(),
+                if_generation_match,
+                ..Default::default()
+            },
+            Bytes::from(
+                serde_json::to_vec(state)
+                    .map_err(|e| anyhow!("Failed to serialize transcript lock: {}", e))?,
+            ),
+            &UploadType::Simple(media),
+        )
+        .await
+        .map_err(|e| anyhow!("Failed to write transcript lock: {}", e))?;
+
+    Ok(TranscriptLockHandle {
+        path,
+        generation: upload.generation,
+    })
+}
+
+async fn delete_transcript_lock(
+    client: &GcsClient,
+    bucket: &str,
+    handle: &TranscriptLockHandle,
+) -> Result<()> {
+    client
+        .delete_object(&DeleteObjectRequest {
+            bucket: bucket.to_string(),
+            object: handle.path.clone(),
+            if_generation_match: Some(handle.generation),
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| anyhow!("Failed to delete transcript lock: {}", e))?;
+    Ok(())
+}
+
+async fn acquire_transcript_lock(
+    client: &GcsClient,
+    bucket: &str,
+    hash: &str,
+    stale_after_secs: u64,
+) -> Result<std::result::Result<TranscriptLockHandle, TranscriptLockAction>> {
+    let processing_state = TranscriptLockState {
+        status: TranscriptLockStatus::Processing,
+        started_at_epoch_secs: current_epoch_secs(),
+        cooldown_until_epoch_secs: None,
+        error_code: None,
+    };
+
+    match write_transcript_lock(client, bucket, hash, &processing_state, Some(0)).await {
+        Ok(handle) => return Ok(Ok(handle)),
+        Err(write_error) => {
+            let Some((existing, generation)) = fetch_transcript_lock(client, bucket, hash).await?
+            else {
+                return Err(write_error);
+            };
+            let action = decide_transcript_lock_action(
+                current_epoch_secs(),
+                Some(&existing),
+                stale_after_secs,
+            );
+            if action != TranscriptLockAction::ReclaimStaleLock {
+                return Ok(Err(action));
+            }
+
+            let stale_handle = TranscriptLockHandle {
+                path: transcript_lock_path(hash),
+                generation,
+            };
+            delete_transcript_lock(client, bucket, &stale_handle).await?;
+            write_transcript_lock(client, bucket, hash, &processing_state, Some(0))
+                .await
+                .map(Ok)
+        }
+    }
+}
+
+async fn write_transcript_cooldown(
+    client: &GcsClient,
+    bucket: &str,
+    hash: &str,
+    handle: &TranscriptLockHandle,
+    retry_after: Duration,
+    error_code: &str,
+) -> Result<()> {
+    let now = current_epoch_secs();
+    let retry_after_secs = retry_after.as_secs().max(1);
+    let cooldown_state = TranscriptLockState {
+        status: TranscriptLockStatus::CoolingDown,
+        started_at_epoch_secs: now,
+        cooldown_until_epoch_secs: Some(now.saturating_add(retry_after_secs)),
+        error_code: Some(error_code.to_string()),
+    };
+
+    write_transcript_lock(
+        client,
+        bucket,
+        hash,
+        &cooldown_state,
+        Some(handle.generation),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn transcribe_audio_via_provider_once(
     config: &Config,
     audio_path: &Path,
     language: Option<&str>,
-) -> Result<String> {
+) -> std::result::Result<String, ProviderFailure> {
     let api_url = config
         .transcription_api_url
         .as_ref()
-        .ok_or_else(|| anyhow!("TRANSCRIPTION_API_URL is not configured"))?;
+        .ok_or_else(|| {
+            parse_provider_status(
+                None,
+                None,
+                "TRANSCRIPTION_API_URL is not configured",
+                false,
+            )
+        })?;
 
-    let audio_bytes = tokio::fs::read(audio_path)
-        .await
-        .map_err(|e| anyhow!("Failed to read extracted audio: {}", e))?;
+    let audio_bytes = tokio::fs::read(audio_path).await.map_err(|e| {
+        parse_provider_status(
+            None,
+            None,
+            &format!("Failed to read extracted audio: {}", e),
+            false,
+        )
+    })?;
     let filename = audio_path
         .file_name()
         .and_then(|f| f.to_str())
@@ -1055,7 +1524,14 @@ async fn transcribe_audio_via_provider(
     let file_part = reqwest::multipart::Part::bytes(audio_bytes)
         .file_name(filename)
         .mime_str("audio/wav")
-        .map_err(|e| anyhow!("Failed to build multipart audio part: {}", e))?;
+        .map_err(|e| {
+            parse_provider_status(
+                None,
+                None,
+                &format!("Failed to build multipart audio part: {}", e),
+                false,
+            )
+        })?;
 
     let response_format = transcription_response_format(&config.transcription_model);
     let mut form = reqwest::multipart::Form::new()
@@ -1078,26 +1554,102 @@ async fn transcribe_audio_via_provider(
         request = request.bearer_auth(api_key);
     }
 
-    let response = request
-        .send()
-        .await
-        .map_err(|e| anyhow!("Failed to call transcription provider: {}", e))?;
+    let response = request.send().await.map_err(|e| {
+        parse_provider_status(
+            None,
+            None,
+            &format!("Failed to call transcription provider: {}", e),
+            e.is_timeout(),
+        )
+    })?;
 
     let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|e| anyhow!("Failed to read transcription response: {}", e))?;
+    let retry_after_header = response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+    let body = response.text().await.map_err(|e| {
+        parse_provider_status(
+            Some(status.as_u16()),
+            retry_after_header.as_deref(),
+            &format!("Failed to read transcription response: {}", e),
+            e.is_timeout(),
+        )
+    })?;
 
     if !status.is_success() {
-        return Err(anyhow!(
-            "Transcription provider returned {}: {}",
-            status,
-            body
+        return Err(parse_provider_status(
+            Some(status.as_u16()),
+            retry_after_header.as_deref(),
+            &body,
+            false,
         ));
     }
 
     Ok(body)
+}
+
+/// Call a configured transcription provider and return raw response text.
+async fn transcribe_audio_via_provider(
+    config: &Config,
+    audio_path: &Path,
+    language: Option<&str>,
+) -> std::result::Result<String, ProviderError> {
+    let started = Instant::now();
+    let mut attempt: u32 = 0;
+
+    loop {
+        match transcribe_audio_via_provider_once(config, audio_path, language).await {
+            Ok(body) => return Ok(body),
+            Err(failure) if !is_retryable_provider_failure(&failure) => {
+                return Err(ProviderError {
+                    failure,
+                    exhausted_retryable: false,
+                    attempts: attempt.saturating_add(1),
+                });
+            }
+            Err(failure) => {
+                if attempt >= config.transcription_max_retries {
+                    return Err(ProviderError {
+                        failure,
+                        exhausted_retryable: true,
+                        attempts: attempt.saturating_add(1),
+                    });
+                }
+
+                let delay = retry_delay_for_attempt(
+                    attempt,
+                    config.transcription_retry_base_ms,
+                    config.transcription_retry_max_ms,
+                    failure.retry_after,
+                    retry_jitter_ratio(),
+                );
+                let waited_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                let next_wait_ms = delay.as_millis().min(u64::MAX as u128) as u64;
+                if waited_ms.saturating_add(next_wait_ms) > config.transcription_retry_total_ms {
+                    return Err(ProviderError {
+                        failure,
+                        exhausted_retryable: true,
+                        attempts: attempt.saturating_add(1),
+                    });
+                }
+
+                warn!(
+                    attempt = attempt.saturating_add(1),
+                    delay_ms = next_wait_ms,
+                    retry_after_ms = failure
+                        .retry_after
+                        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64),
+                    status_code = failure.status_code,
+                    timed_out = failure.timed_out,
+                    "Retrying transcription provider call"
+                );
+                tokio::time::sleep(delay).await;
+                attempt = attempt.saturating_add(1);
+            }
+        }
+    }
 }
 
 fn transcription_supports_logprobs(model: &str) -> bool {
@@ -1389,6 +1941,7 @@ async fn finalize_transcript(
             Some(parsed_vtt.duration_ms),
             Some(parsed_vtt.cue_count),
             parsed_vtt.confidence,
+            None,
             Some("upload_failed"),
             Some(&e.to_string()),
         )
@@ -1407,6 +1960,7 @@ async fn finalize_transcript(
         parsed_vtt.confidence,
         None,
         None,
+        None,
     )
     .await;
 
@@ -1421,14 +1975,13 @@ async fn finalize_transcript(
 #[cfg(test)]
 mod tests {
     use super::{
-<<<<<<< HEAD
-        media_source_candidates, normalize_transcript_to_vtt, parse_audio_analysis_output,
-=======
-        normalize_transcript_to_vtt, parse_audio_analysis_output,
->>>>>>> ee3a7d5 (fix: reject low-confidence phantom transcripts)
+        decide_transcript_lock_action, is_retryable_provider_failure, normalize_transcript_to_vtt,
+        parse_audio_analysis_output, parse_provider_status, retry_delay_for_attempt,
         should_drop_low_signal_transcript, transcript_drop_reason, transcription_response_format,
-        AudioAnalysis, ParsedVtt, TranscriptConfidence, TranscriptDropReason,
+        AudioAnalysis, Config, ParsedVtt, TranscriptConfidence, TranscriptDropReason,
+        TranscriptLockAction, TranscriptLockState, TranscriptLockStatus,
     };
+    use std::time::Duration;
 
     #[test]
     fn gpt_transcribe_uses_json_response_format() {
@@ -1582,20 +2135,119 @@ mod tests {
             Some(TranscriptDropReason::LowProviderConfidence)
         );
     }
-<<<<<<< HEAD
 
     #[test]
-    fn media_source_candidates_prefer_original_then_hls_variants() {
-        let hash =
-            "5b48aa1fcf30af61243ac9307eb98b7fa22df1c58573c3ca5d1b14fc30099929";
-        let candidates = media_source_candidates(hash);
+    fn classifies_rate_limited_provider_responses_as_retryable() {
+        let failure = parse_provider_status(
+            Some(429),
+            Some("12"),
+            "rate limit exceeded",
+            false,
+        );
 
-        assert_eq!(candidates[0], hash);
-        assert_eq!(candidates[1], format!("{}/hls/stream_720p.ts", hash));
-        assert_eq!(candidates[2], format!("{}/hls/stream_480p.ts", hash));
+        assert_eq!(failure.status_code, Some(429));
+        assert_eq!(failure.retry_after, Some(Duration::from_secs(12)));
+        assert_eq!(failure.body, "rate limit exceeded");
+        assert!(is_retryable_provider_failure(&failure));
     }
-=======
->>>>>>> ee3a7d5 (fix: reject low-confidence phantom transcripts)
+
+    #[test]
+    fn classifies_transient_5xx_provider_responses_as_retryable() {
+        for status in [500, 502, 503, 504] {
+            let failure = parse_provider_status(Some(status), None, "temporary failure", false);
+
+            assert_eq!(failure.status_code, Some(status));
+            assert!(is_retryable_provider_failure(&failure));
+        }
+    }
+
+    #[test]
+    fn classifies_bad_request_provider_responses_as_non_retryable() {
+        let failure = parse_provider_status(Some(400), None, "invalid request", false);
+
+        assert_eq!(failure.status_code, Some(400));
+        assert!(!is_retryable_provider_failure(&failure));
+    }
+
+    #[test]
+    fn caps_exponential_backoff_at_maximum_delay() {
+        assert_eq!(
+            retry_delay_for_attempt(0, 1_000, 5_000, None, 0.0),
+            Duration::from_millis(750)
+        );
+        assert_eq!(
+            retry_delay_for_attempt(3, 1_000, 5_000, None, 0.0),
+            Duration::from_millis(5_000)
+        );
+        assert_eq!(
+            retry_delay_for_attempt(2, 1_000, 5_000, Some(Duration::from_secs(10)), 0.0),
+            Duration::from_millis(5_000)
+        );
+    }
+
+    #[test]
+    fn config_defaults_provider_retry_settings() {
+        let config = Config::from_lookup(|_| None);
+
+        assert_eq!(config.transcription_max_in_flight, 4);
+        assert_eq!(config.transcription_max_retries, 3);
+        assert_eq!(config.transcription_retry_base_ms, 1_000);
+        assert_eq!(config.transcription_retry_max_ms, 15_000);
+    }
+
+    #[test]
+    fn config_parses_provider_retry_settings_from_env() {
+        let config = Config::from_lookup(|key| match key {
+            "TRANSCRIPTION_MAX_IN_FLIGHT" => Some("7".to_string()),
+            "TRANSCRIPTION_MAX_RETRIES" => Some("5".to_string()),
+            "TRANSCRIPTION_RETRY_BASE_MS" => Some("250".to_string()),
+            "TRANSCRIPTION_RETRY_MAX_MS" => Some("4000".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(config.transcription_max_in_flight, 7);
+        assert_eq!(config.transcription_max_retries, 5);
+        assert_eq!(config.transcription_retry_base_ms, 250);
+        assert_eq!(config.transcription_retry_max_ms, 4_000);
+    }
+
+    #[test]
+    fn lock_state_without_existing_lock_starts_work() {
+        assert_eq!(
+            decide_transcript_lock_action(1_000, None, 600),
+            TranscriptLockAction::StartWork
+        );
+    }
+
+    #[test]
+    fn lock_state_with_fresh_processing_lock_returns_already_processing() {
+        let existing = TranscriptLockState {
+            status: TranscriptLockStatus::Processing,
+            started_at_epoch_secs: 1_000,
+            cooldown_until_epoch_secs: None,
+            error_code: None,
+        };
+
+        assert_eq!(
+            decide_transcript_lock_action(1_300, Some(&existing), 600),
+            TranscriptLockAction::AlreadyProcessing
+        );
+    }
+
+    #[test]
+    fn lock_state_with_stale_processing_lock_can_be_reclaimed() {
+        let existing = TranscriptLockState {
+            status: TranscriptLockStatus::Processing,
+            started_at_epoch_secs: 1_000,
+            cooldown_until_epoch_secs: None,
+            error_code: None,
+        };
+
+        assert_eq!(
+            decide_transcript_lock_action(1_700, Some(&existing), 600),
+            TranscriptLockAction::ReclaimStaleLock
+        );
+    }
 }
 
 fn summarize_vtt(vtt: &str) -> (u32, u64) {
@@ -2323,6 +2975,7 @@ async fn send_transcript_status_webhook(
     duration_ms: Option<u64>,
     cue_count: Option<u32>,
     transcript_confidence: Option<TranscriptConfidence>,
+    retry_after_secs: Option<u64>,
     error_code: Option<&str>,
     error_message: Option<&str>,
 ) {
@@ -2356,6 +3009,9 @@ async fn send_transcript_status_webhook(
     }
     if let Some(confidence) = transcript_confidence {
         payload["transcript_confidence"] = serde_json::json!(confidence);
+    }
+    if let Some(retry_after_secs) = retry_after_secs {
+        payload["retry_after"] = serde_json::json!(retry_after_secs);
     }
     if let Some(code) = error_code {
         payload["error_code"] = serde_json::json!(code);

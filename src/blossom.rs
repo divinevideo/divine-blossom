@@ -64,6 +64,18 @@ pub struct BlobMetadata {
     /// Transcript status for audio/video transcription
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transcript_status: Option<TranscriptStatus>,
+    /// Stable error code from the last transcript attempt
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript_error_code: Option<String>,
+    /// Human-readable error message from the last transcript attempt
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript_error_message: Option<String>,
+    /// ISO timestamp for the most recent transcript attempt
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript_last_attempt_at: Option<String>,
+    /// UNIX timestamp after which transcript generation may be retried
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript_retry_after: Option<u64>,
 }
 
 /// Moderation status for blobs
@@ -470,6 +482,11 @@ impl UserIndex {
     /// Check if a pubkey exists
     pub fn contains(&self, pubkey: &str) -> bool {
         self.pubkeys.contains(&pubkey.to_string())
+    }
+
+    /// Remove a pubkey from the index
+    pub fn remove(&mut self, pubkey: &str) {
+        self.pubkeys.retain(|p| p != pubkey);
     }
 }
 

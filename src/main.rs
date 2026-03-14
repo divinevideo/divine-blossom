@@ -18,20 +18,13 @@ use crate::blossom::{
 use crate::error::{BlossomError, Result};
 use crate::metadata::{
     add_to_blob_refs, add_to_recent_index, add_to_user_index, add_to_user_list, check_ownership,
-<<<<<<< HEAD
-    delete_blob_metadata, get_auth_event, get_blob_metadata, get_blob_refs, get_subtitle_job,
-    get_subtitle_job_by_hash, get_tombstone, put_auth_event, put_blob_metadata, put_subtitle_job,
-    put_tombstone, set_subtitle_job_id_for_hash, list_blobs_with_metadata,
-    remove_from_recent_index, remove_from_user_list, update_blob_status, update_stats_on_add,
-    update_stats_on_remove, update_stats_on_status_change,
-=======
     delete_auth_events, delete_blob_metadata, delete_blob_refs, delete_subtitle_data,
     delete_user_list, get_auth_event, get_blob_metadata, get_blob_refs, get_subtitle_job,
     get_subtitle_job_by_hash, get_tombstone, get_user_blobs, list_blobs_with_metadata,
     put_auth_event, put_blob_metadata, put_subtitle_job, put_tombstone, remove_from_blob_refs,
     remove_from_recent_index, remove_from_user_index, remove_from_user_list,
     set_subtitle_job_id_for_hash, update_blob_status, update_stats_on_add, update_stats_on_remove,
->>>>>>> b22632b (fix: handle QUARANTINE moderation action for AI-detected content)
+    TranscriptMetadataUpdate,
 };
 use crate::storage::{
     blob_exists, current_timestamp, delete_blob as storage_delete, download_blob_with_fallback,
@@ -179,11 +172,7 @@ fn handle_request(req: Request) -> Result<Response> {
         (Method::POST, "/admin/api/bulk-approve") => admin::handle_admin_bulk_approve(req),
         (Method::POST, "/admin/api/scan-flagged") => admin::handle_admin_scan_flagged(req),
         (Method::POST, "/admin/api/delete") => handle_admin_force_delete(req),
-<<<<<<< HEAD
-        (Method::POST, "/admin/api/restore") => admin::handle_admin_restore_action(req),
-=======
         (Method::POST, "/admin/api/vanish") => handle_admin_vanish(req),
->>>>>>> b22632b (fix: handle QUARANTINE moderation action for AI-detected content)
         (Method::POST, "/admin/api/backfill") => admin::handle_admin_backfill(req),
         (Method::POST, "/admin/api/backfill-vtt") => handle_admin_backfill_vtt(req),
 
@@ -207,21 +196,8 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         // Check parent video's moderation status - thumbnails inherit video access rules
         let mut is_restricted = false;
         if let Ok(Some(meta)) = get_blob_metadata(video_hash) {
-<<<<<<< HEAD
-            if meta.status.blocks_public_access() {
-                return Err(BlossomError::NotFound("Blob not found".into()));
-            }
-            if meta.status.requires_owner_auth() {
-                // Check if requester is owner
-                if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
-                    if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
-                        return Err(BlossomError::NotFound("Blob not found".into()));
-                    }
-                } else {
-=======
             if !is_admin {
                 if meta.status == BlobStatus::Banned {
->>>>>>> b22632b (fix: handle QUARANTINE moderation action for AI-detected content)
                     return Err(BlossomError::NotFound("Blob not found".into()));
                 }
                 if meta.status == BlobStatus::Restricted {
@@ -281,13 +257,14 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
     let is_admin = admin::validate_bearer_token(&req).is_ok();
 
     if let Some(ref meta) = metadata {
-        if meta.status.blocks_public_access() {
-            return Err(BlossomError::NotFound("Blob not found".into()));
-        }
-
         if !is_admin {
+            // Handle banned content - no access for anyone
+            if meta.status == BlobStatus::Banned {
+                return Err(BlossomError::NotFound("Blob not found".into()));
+            }
+
             // Handle restricted content
-            if meta.status.requires_owner_auth() {
+            if meta.status == BlobStatus::Restricted {
                 // Check if requester is owner
                 if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
                     if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
@@ -419,7 +396,7 @@ fn handle_head_blob(path: &str) -> Result<Response> {
         get_blob_metadata(&hash)?.ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
 
     // Don't reveal restricted or banned content exists
-    if metadata.status.requires_owner_auth() || metadata.status.blocks_public_access() {
+    if metadata.status == BlobStatus::Restricted || metadata.status == BlobStatus::Banned {
         return Err(BlossomError::NotFound("Blob not found".into()));
     }
 
@@ -454,18 +431,6 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
     // Check metadata for access control
     let metadata = get_blob_metadata(&hash)?;
 
-<<<<<<< HEAD
-    if let Some(ref meta) = metadata {
-        // Handle banned content
-        if meta.status.blocks_public_access() {
-            return Err(BlossomError::NotFound("Content not found".into()));
-        }
-
-        // Handle restricted content
-        if meta.status.requires_owner_auth() {
-            if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
-                if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
-=======
     // Admin Bearer token bypasses moderation checks (used by moderation service proxy)
     let is_admin = admin::validate_bearer_token(&req).is_ok();
 
@@ -483,7 +448,6 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
                         return Err(BlossomError::NotFound("Content not found".into()));
                     }
                 } else {
->>>>>>> b22632b (fix: handle QUARANTINE moderation action for AI-detected content)
                     return Err(BlossomError::NotFound("Content not found".into()));
                 }
             }
@@ -583,13 +547,8 @@ fn handle_head_hls_master(path: &str) -> Result<Response> {
     let metadata = get_blob_metadata(&hash)?
         .ok_or_else(|| BlossomError::NotFound("Content not found".into()))?;
 
-<<<<<<< HEAD
-    // Don't reveal restricted/banned content
-    if metadata.status.requires_owner_auth() || metadata.status.blocks_public_access() {
-=======
     // Don't reveal restricted/banned content (HEAD has no req, no admin bypass)
     if metadata.status == BlobStatus::Restricted || metadata.status == BlobStatus::Banned {
->>>>>>> b22632b (fix: handle QUARANTINE moderation action for AI-detected content)
         return Err(BlossomError::NotFound("Content not found".into()));
     }
 
@@ -683,11 +642,7 @@ fn handle_get_hls_content(req: Request, path: &str) -> Result<Response> {
 
             if let Some(ref meta) = metadata {
                 // Handle banned content
-<<<<<<< HEAD
-                if meta.status.blocks_public_access() {
-=======
                 if !is_admin && meta.status == BlobStatus::Banned {
->>>>>>> b22632b (fix: handle QUARANTINE moderation action for AI-detected content)
                     return Err(BlossomError::NotFound("Content not found".into()));
                 }
 
@@ -928,6 +883,113 @@ fn purge_transcript_content_cache(hash: &str) {
     let _ = simple_cache::purge(cache_key);
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedTranscriptStatusWebhook {
+    sha256: String,
+    status: TranscriptStatus,
+    job_id: Option<String>,
+    language: Option<String>,
+    duration_ms: Option<u64>,
+    cue_count: Option<u32>,
+    error_code: Option<String>,
+    error_message: Option<String>,
+    retry_after_epoch_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptPendingState {
+    InProgress,
+    CoolingDown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptFetchAction {
+    Accepted {
+        state: TranscriptPendingState,
+        retry_after_secs: u64,
+    },
+    Trigger {
+        retry_after_secs: u64,
+        should_repair: bool,
+    },
+}
+
+fn parse_optional_retry_after_epoch(
+    payload: &serde_json::Value,
+    now_epoch_secs: u64,
+) -> Option<u64> {
+    let retry_after_secs = payload["retry_after"]
+        .as_u64()
+        .or_else(|| payload["retry_after"].as_str().and_then(|value| value.parse().ok()))?;
+    Some(now_epoch_secs.saturating_add(retry_after_secs))
+}
+
+fn parse_transcript_status_webhook_payload(
+    payload: &serde_json::Value,
+    now_epoch_secs: u64,
+) -> Result<ParsedTranscriptStatusWebhook> {
+    let sha256 = payload["sha256"]
+        .as_str()
+        .ok_or_else(|| BlossomError::BadRequest("Missing 'sha256' field".into()))?
+        .to_string();
+
+    let status_str = payload["status"]
+        .as_str()
+        .ok_or_else(|| BlossomError::BadRequest("Missing 'status' field".into()))?;
+
+    let status = match status_str.to_lowercase().as_str() {
+        "pending" => TranscriptStatus::Pending,
+        "processing" => TranscriptStatus::Processing,
+        "complete" | "completed" | "ready" => TranscriptStatus::Complete,
+        "failed" | "error" => TranscriptStatus::Failed,
+        _ => {
+            return Err(BlossomError::BadRequest(format!(
+                "Unknown status: {}. Expected pending, processing, complete, or failed",
+                status_str
+            )));
+        }
+    };
+
+    Ok(ParsedTranscriptStatusWebhook {
+        sha256,
+        status,
+        job_id: payload["job_id"].as_str().map(|s| s.to_string()),
+        language: payload["language"].as_str().map(|s| s.to_string()),
+        duration_ms: payload["duration_ms"].as_u64(),
+        cue_count: payload["cue_count"].as_u64().map(|value| value as u32),
+        error_code: payload["error_code"].as_str().map(|s| s.to_string()),
+        error_message: payload["error_message"].as_str().map(|s| s.to_string()),
+        retry_after_epoch_secs: parse_optional_retry_after_epoch(payload, now_epoch_secs),
+    })
+}
+
+fn decide_transcript_fetch_action(
+    status: Option<TranscriptStatus>,
+    retry_after_epoch_secs: Option<u64>,
+    now_epoch_secs: u64,
+) -> TranscriptFetchAction {
+    if matches!(status, Some(TranscriptStatus::Processing)) {
+        return TranscriptFetchAction::Accepted {
+            state: TranscriptPendingState::InProgress,
+            retry_after_secs: 5,
+        };
+    }
+
+    if let Some(retry_after_epoch_secs) = retry_after_epoch_secs {
+        if retry_after_epoch_secs > now_epoch_secs {
+            return TranscriptFetchAction::Accepted {
+                state: TranscriptPendingState::CoolingDown,
+                retry_after_secs: retry_after_epoch_secs.saturating_sub(now_epoch_secs).max(1),
+            };
+        }
+    }
+
+    TranscriptFetchAction::Trigger {
+        retry_after_secs: 10,
+        should_repair: matches!(status, Some(TranscriptStatus::Complete)),
+    }
+}
+
 fn serve_transcript_by_hash(
     req: Option<&Request>,
     hash: &str,
@@ -936,16 +998,6 @@ fn serve_transcript_by_hash(
     let metadata = get_blob_metadata(hash)?
         .ok_or_else(|| BlossomError::NotFound("Content not found".into()))?;
 
-<<<<<<< HEAD
-    if metadata.status.blocks_public_access() {
-        return Err(BlossomError::NotFound("Content not found".into()));
-    }
-
-    if metadata.status.requires_owner_auth() {
-        if let Some(request) = req {
-            if let Ok(Some(auth)) = optional_auth(request, AuthAction::List) {
-                if auth.pubkey.to_lowercase() != metadata.owner.to_lowercase() {
-=======
     // Admin Bearer token bypasses moderation checks
     let is_admin = req
         .map(|r| admin::validate_bearer_token(r).is_ok())
@@ -963,7 +1015,6 @@ fn serve_transcript_by_hash(
                         return Err(BlossomError::NotFound("Content not found".into()));
                     }
                 } else {
->>>>>>> b22632b (fix: handle QUARANTINE moderation action for AI-detected content)
                     return Err(BlossomError::NotFound("Content not found".into()));
                 }
             } else {
@@ -989,30 +1040,58 @@ fn serve_transcript_by_hash(
         }
         Err(BlossomError::NotFound(_)) if can_trigger => {
             // Transcript does not exist yet. Trigger transcription if needed.
-            match metadata.transcript_status {
-                Some(TranscriptStatus::Processing) => {
+            match decide_transcript_fetch_action(
+                metadata.transcript_status,
+                metadata.transcript_retry_after,
+                unix_timestamp_secs(),
+            ) {
+                TranscriptFetchAction::Accepted {
+                    state,
+                    retry_after_secs,
+                } => {
                     let mut resp = Response::from_status(StatusCode::ACCEPTED);
-                    resp.set_header("Retry-After", "5");
+                    resp.set_header("Retry-After", retry_after_secs.to_string());
                     resp.set_header("Content-Type", "application/json");
-                    resp.set_body(
-                        r#"{"status":"processing","message":"Transcript generation in progress"}"#,
-                    );
+                    let body = match state {
+                        TranscriptPendingState::InProgress => {
+                            r#"{"status":"in_progress","message":"Transcript generation in progress"}"#
+                        }
+                        TranscriptPendingState::CoolingDown => {
+                            r#"{"status":"cooling_down","message":"Transcript generation cooling down before retry"}"#
+                        }
+                    };
+                    resp.set_body(body);
                     add_no_cache_headers(&mut resp);
                     add_cors_headers(&mut resp);
                     Ok(resp)
                 }
-                Some(TranscriptStatus::Complete)
-                | Some(TranscriptStatus::Failed)
-                | Some(TranscriptStatus::Pending)
-                | None => {
+                TranscriptFetchAction::Trigger {
+                    retry_after_secs,
+                    should_repair,
+                } => {
                     use crate::metadata::update_transcript_status;
-                    let _ = update_transcript_status(hash, TranscriptStatus::Processing);
+                    let _ = update_transcript_status(
+                        hash,
+                        TranscriptStatus::Processing,
+                        TranscriptMetadataUpdate {
+                            last_attempt_at: Some(current_timestamp()),
+                            ..Default::default()
+                        },
+                    );
                     let _ = trigger_on_demand_transcription(hash, &metadata.owner, None, None);
 
                     let mut resp = Response::from_status(StatusCode::ACCEPTED);
-                    resp.set_header("Retry-After", "10");
+                    resp.set_header("Retry-After", retry_after_secs.to_string());
                     resp.set_header("Content-Type", "application/json");
-                    resp.set_body(r#"{"status":"processing","message":"Transcript generation started, please retry in 10 seconds"}"#);
+                    if should_repair {
+                        resp.set_body(
+                            r#"{"status":"repairing","message":"Transcript repair started, please retry soon"}"#,
+                        );
+                    } else {
+                        resp.set_body(
+                            r#"{"status":"processing","message":"Transcript generation started, please retry soon"}"#,
+                        );
+                    }
                     add_no_cache_headers(&mut resp);
                     add_cors_headers(&mut resp);
                     Ok(resp)
@@ -1055,7 +1134,7 @@ fn handle_head_transcript_by_hash(hash: &str) -> Result<Response> {
     let metadata = get_blob_metadata(hash)?
         .ok_or_else(|| BlossomError::NotFound("Content not found".into()))?;
 
-    if metadata.status.requires_owner_auth() || metadata.status.blocks_public_access() {
+    if metadata.status == BlobStatus::Restricted || metadata.status == BlobStatus::Banned {
         return Err(BlossomError::NotFound("Content not found".into()));
     }
 
@@ -1151,7 +1230,14 @@ fn dispatch_subtitle_job(job: &mut SubtitleJob, owner: &str) -> Result<()> {
     job.error_message = None;
     put_subtitle_job(job)?;
     let _ =
-        crate::metadata::update_transcript_status(&job.video_sha256, TranscriptStatus::Processing);
+        crate::metadata::update_transcript_status(
+            &job.video_sha256,
+            TranscriptStatus::Processing,
+            TranscriptMetadataUpdate {
+                last_attempt_at: Some(current_timestamp()),
+                ..Default::default()
+            },
+        );
 
     let lang_for_provider = job
         .language
@@ -1402,14 +1488,6 @@ fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
     let is_admin = admin::validate_bearer_token(&req).is_ok();
     let metadata = get_blob_metadata(&hash)?;
     if let Some(ref meta) = metadata {
-<<<<<<< HEAD
-        if meta.status.blocks_public_access() {
-            return Err(BlossomError::NotFound("Content not found".into()));
-        }
-        if meta.status.requires_owner_auth() {
-            if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
-                if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
-=======
         if !is_admin {
             if meta.status == BlobStatus::Banned {
                 return Err(BlossomError::NotFound("Content not found".into()));
@@ -1420,7 +1498,6 @@ fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
                         return Err(BlossomError::NotFound("Content not found".into()));
                     }
                 } else {
->>>>>>> b22632b (fix: handle QUARANTINE moderation action for AI-detected content)
                     return Err(BlossomError::NotFound("Content not found".into()));
                 }
             }
@@ -1488,7 +1565,7 @@ fn handle_head_quality_variant(path: &str) -> Result<Response> {
     let metadata = get_blob_metadata(&hash)?
         .ok_or_else(|| BlossomError::NotFound("Content not found".into()))?;
 
-    if metadata.status.blocks_public_access() || metadata.status.requires_owner_auth() {
+    if metadata.status == BlobStatus::Banned || metadata.status == BlobStatus::Restricted {
         return Err(BlossomError::NotFound("Content not found".into()));
     }
 
@@ -1759,6 +1836,10 @@ fn handle_upload(mut req: Request) -> Result<Response> {
         } else {
             None
         },
+        transcript_error_code: None,
+        transcript_error_message: None,
+        transcript_last_attempt_at: None,
+        transcript_retry_after: None,
     };
 
     put_blob_metadata(&metadata)?;
@@ -1925,6 +2006,10 @@ fn handle_cloud_run_proxy(
         } else {
             None
         },
+        transcript_error_code: None,
+        transcript_error_message: None,
+        transcript_last_attempt_at: None,
+        transcript_retry_after: None,
     };
 
     put_blob_metadata(&metadata)?;
@@ -2235,13 +2320,8 @@ fn handle_get_provenance(path: &str) -> Result<Response> {
     Ok(resp)
 }
 
-<<<<<<< HEAD
-/// POST /admin/api/delete - Admin soft-delete for legal/DMCA compliance
-/// Preserves storage unless the blob has no metadata record to gate public access with.
-=======
 /// POST /admin/api/delete - Admin force-delete for legal/DMCA compliance
 /// Full cleanup: main blob + thumbnail + HLS + VTT + all KV artifacts + VCL cache purge
->>>>>>> b22632b (fix: handle QUARANTINE moderation action for AI-detected content)
 fn handle_admin_force_delete(req: Request) -> Result<Response> {
     // Validate admin auth
     admin::validate_admin_auth(&req)?;
@@ -2281,27 +2361,12 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
         Some(reason),
     );
 
-<<<<<<< HEAD
-    let preserved = if let Some(ref meta) = metadata {
-        if meta.status != BlobStatus::Deleted {
-            update_blob_status(&hash, BlobStatus::Deleted)?;
-            let _ = update_stats_on_status_change(meta.status, BlobStatus::Deleted);
-        }
-        true
-    } else {
-        // Without metadata there is no status gate, so fall back to hard delete.
-        let _ = storage_delete(&hash);
-        let _ = storage_delete(&format!("{}.jpg", hash));
-        false
-    };
-=======
     // Delete from GCS (main blob + all artifacts)
     let _ = storage_delete(&hash);
     delete_blob_gcs_artifacts(&hash);
 
     // Delete KV metadata
     let _ = delete_blob_metadata(&hash);
->>>>>>> b22632b (fix: handle QUARANTINE moderation action for AI-detected content)
 
     // Remove from ALL users' lists (owner + all refs)
     if let Some(ref meta) = metadata {
@@ -2313,20 +2378,12 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
         }
     }
 
-<<<<<<< HEAD
-    // Update stats for the hard-delete fallback only.
-    if !preserved {
-        if let Some(meta) = metadata {
-            let _ = update_stats_on_remove(&meta);
-        }
-=======
     // Delete all KV artifacts (refs, auth events, subtitle data)
     delete_blob_kv_artifacts(&hash);
 
     // Update stats
     if let Some(meta) = metadata {
         let _ = update_stats_on_remove(&meta);
->>>>>>> b22632b (fix: handle QUARANTINE moderation action for AI-detected content)
     }
     let _ = remove_from_recent_index(&hash);
 
@@ -2335,21 +2392,16 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
         let _ = put_tombstone(&hash, reason);
     }
 
-<<<<<<< HEAD
-=======
     // Purge VCL cache
->>>>>>> b22632b (fix: handle QUARANTINE moderation action for AI-detected content)
     purge_vcl_cache(&hash);
 
     eprintln!(
-        "[ADMIN DELETE] hash={} reason={} legal_hold={} preserved={}",
-        hash, reason, legal_hold, preserved
+        "[ADMIN DELETE] hash={} reason={} legal_hold={}",
+        hash, reason, legal_hold
     );
 
     let result = serde_json::json!({
         "deleted": true,
-        "soft_deleted": preserved,
-        "preserved": preserved,
         "sha256": hash,
         "legal_hold": legal_hold,
     });
@@ -2766,6 +2818,10 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
         } else {
             None
         },
+        transcript_error_code: None,
+        transcript_error_message: None,
+        transcript_last_attempt_at: None,
+        transcript_retry_after: None,
     };
 
     put_blob_metadata(&metadata)?;
@@ -2792,6 +2848,16 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
 /// POST /admin/api/backfill-vtt - Trigger VTT transcription for all video/audio blobs missing transcripts
 /// Iterates through user index, finds transcribable blobs without VTT, and triggers transcription.
 /// Query params: ?offset=N&limit=M (paginate through users, default limit=50)
+#[derive(Debug, Clone, serde::Serialize)]
+struct TranscriptBackfillCandidate {
+    sha256: String,
+    owner: String,
+    uploaded: String,
+    transcript_status: Option<String>,
+    retry_after_epoch_secs: Option<u64>,
+    cooldown_remaining_secs: Option<u64>,
+}
+
 fn handle_admin_backfill_vtt(req: Request) -> Result<Response> {
     // Accept webhook secret (same as transcoder uses) OR admin session
     let webhook_ok = fastly::secret_store::SecretStore::open("blossom_secrets")
@@ -2829,6 +2895,14 @@ fn handle_admin_backfill_vtt(req: Request) -> Result<Response> {
         .get("limit")
         .and_then(|v| v.parse().ok())
         .unwrap_or(50);
+    let scope = query_pairs
+        .get("scope")
+        .map(|value| value.as_str())
+        .unwrap_or("users");
+    let dry_run = query_pairs
+        .get("dry_run")
+        .map(|value| value == "true")
+        .unwrap_or(false);
 
     // Max triggers per request to avoid Fastly Compute timeout (~30s wall time)
     let max_triggers: u32 = query_pairs
@@ -2848,94 +2922,167 @@ fn handle_admin_backfill_vtt(req: Request) -> Result<Response> {
         .map(|v| v == "true")
         .unwrap_or(false);
 
-    let user_index = crate::metadata::get_user_index()?;
-    let total_users = user_index.pubkeys.len();
-    let end = std::cmp::min(offset + limit, total_users);
-    let pubkeys_to_process = if offset < total_users {
-        &user_index.pubkeys[offset..end]
-    } else {
-        &[] as &[String]
-    };
-
+    let now_epoch_secs = unix_timestamp_secs();
     let mut triggered = 0u32;
     let mut already_complete = 0u32;
     let mut already_processing = 0u32;
+    let mut cooling_down = 0u32;
     let mut reset_count = 0u32;
     let mut not_transcribable = 0u32;
     let mut errors = 0u32;
     let mut hit_limit = false;
+    let mut candidates = Vec::new();
+    let mut processed_hashes = 0usize;
 
-    for pubkey in pubkeys_to_process {
-        if hit_limit {
-            break;
+    let mut process_hash = |hash: &str| -> bool {
+        let Ok(Some(mut metadata)) = crate::metadata::get_blob_metadata_uncached(hash) else {
+            return false;
+        };
+
+        processed_hashes += 1;
+
+        if !is_transcribable_mime_type(&metadata.mime_type) {
+            not_transcribable += 1;
+            return false;
         }
-        let hashes = crate::metadata::get_user_blobs(pubkey).unwrap_or_default();
 
-        for hash in hashes {
-            // Use uncached lookup to avoid stale Simple Cache reads during bulk operations
-            if let Ok(Some(mut metadata)) = crate::metadata::get_blob_metadata_uncached(&hash) {
-                if !is_transcribable_mime_type(&metadata.mime_type) {
-                    not_transcribable += 1;
-                    continue;
+        match metadata.transcript_status {
+            Some(TranscriptStatus::Complete) if !force_retranscribe => {
+                already_complete += 1;
+                return false;
+            }
+            Some(TranscriptStatus::Complete) => {
+                reset_count += 1;
+            }
+            Some(TranscriptStatus::Processing) if !reset_processing => {
+                already_processing += 1;
+                return false;
+            }
+            Some(TranscriptStatus::Processing) => {
+                reset_count += 1;
+            }
+            _ => {}
+        }
+
+        if metadata
+            .transcript_retry_after
+            .map(|retry_after| retry_after > now_epoch_secs)
+            .unwrap_or(false)
+            && !force_retranscribe
+        {
+            cooling_down += 1;
+            return false;
+        }
+
+        if dry_run {
+            candidates.push(TranscriptBackfillCandidate {
+                sha256: metadata.sha256.clone(),
+                owner: metadata.owner.clone(),
+                uploaded: metadata.uploaded.clone(),
+                transcript_status: metadata
+                    .transcript_status
+                    .map(|status| format!("{:?}", status).to_lowercase()),
+                retry_after_epoch_secs: metadata.transcript_retry_after,
+                cooldown_remaining_secs: metadata
+                    .transcript_retry_after
+                    .map(|retry_after| retry_after.saturating_sub(now_epoch_secs))
+                    .filter(|remaining| *remaining > 0),
+            });
+            return false;
+        }
+
+        if triggered >= max_triggers {
+            return true;
+        }
+
+        // Update status to Processing and trigger transcription (async/fire-and-forget)
+        metadata.transcript_status = Some(TranscriptStatus::Processing);
+        let _ = put_blob_metadata(&metadata);
+
+        match trigger_on_demand_transcription(hash, &metadata.owner, None, None) {
+            Ok(_) => triggered += 1,
+            Err(_) => errors += 1,
+        }
+        false
+    };
+
+    let (has_more, next_offset, processed_users) = if scope == "recent" {
+        let recent_index = crate::metadata::get_recent_index()?;
+        let total_hashes = recent_index.hashes.len();
+        let end = std::cmp::min(offset + limit, total_hashes);
+        let hashes_to_process = if offset < total_hashes {
+            &recent_index.hashes[offset..end]
+        } else {
+            &[] as &[String]
+        };
+
+        for hash in hashes_to_process {
+            if hit_limit {
+                break;
+            }
+            if process_hash(hash) {
+                hit_limit = true;
+                break;
+            }
+        }
+
+        (end < total_hashes, if end < total_hashes { Some(end) } else { None }, None)
+    } else {
+        let user_index = crate::metadata::get_user_index()?;
+        let total_users = user_index.pubkeys.len();
+        let end = std::cmp::min(offset + limit, total_users);
+        let pubkeys_to_process = if offset < total_users {
+            &user_index.pubkeys[offset..end]
+        } else {
+            &[] as &[String]
+        };
+
+        for pubkey in pubkeys_to_process {
+            if hit_limit {
+                break;
+            }
+
+            let hashes = crate::metadata::get_user_blobs(pubkey).unwrap_or_default();
+            for hash in hashes {
+                if hit_limit {
+                    break;
                 }
-
-                match metadata.transcript_status {
-                    Some(TranscriptStatus::Complete) if !force_retranscribe => {
-                        already_complete += 1;
-                        continue;
-                    }
-                    Some(TranscriptStatus::Complete) => {
-                        // Force re-transcription with updated phantom detection
-                        reset_count += 1;
-                        // Fall through to trigger
-                    }
-                    Some(TranscriptStatus::Processing) if !reset_processing => {
-                        already_processing += 1;
-                        continue;
-                    }
-                    Some(TranscriptStatus::Processing) => {
-                        // Reset stale processing items
-                        reset_count += 1;
-                        // Fall through to trigger
-                    }
-                    _ => {}
-                }
-
-                if triggered >= max_triggers {
+                if process_hash(&hash) {
                     hit_limit = true;
                     break;
                 }
-
-                // Update status to Processing and trigger transcription (async/fire-and-forget)
-                metadata.transcript_status = Some(TranscriptStatus::Processing);
-                let _ = put_blob_metadata(&metadata);
-
-                match trigger_on_demand_transcription(&hash, &metadata.owner, None, None) {
-                    Ok(_) => triggered += 1,
-                    Err(_) => errors += 1,
-                }
             }
         }
-    }
 
-    let has_more = end < total_users;
+        (
+            end < total_users,
+            if end < total_users { Some(end) } else { None },
+            Some(pubkeys_to_process.len()),
+        )
+    };
+
     let response = serde_json::json!({
         "success": true,
         "batch": {
+            "scope": scope,
             "offset": offset,
             "limit": limit,
-            "processed_users": pubkeys_to_process.len(),
-            "next_offset": if has_more { Some(end) } else { None },
+            "processed_users": processed_users,
+            "processed_hashes": processed_hashes,
+            "next_offset": next_offset,
             "has_more": has_more
         },
         "results": {
+            "dry_run": dry_run,
             "triggered": triggered,
             "already_complete": already_complete,
             "already_processing": already_processing,
+            "cooling_down": cooling_down,
             "not_transcribable": not_transcribable,
             "reset_from_processing": reset_count,
             "errors": errors,
-            "hit_trigger_limit": hit_limit
+            "hit_trigger_limit": hit_limit,
+            "candidates": candidates
         }
     });
 
@@ -3245,23 +3392,12 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
     let payload: serde_json::Value = serde_json::from_str(&body)
         .map_err(|e| BlossomError::BadRequest(format!("Invalid JSON: {}", e)))?;
 
-    let sha256 = payload["sha256"]
-        .as_str()
-        .ok_or_else(|| BlossomError::BadRequest("Missing 'sha256' field".into()))?;
-
-    let status_str = payload["status"]
-        .as_str()
-        .ok_or_else(|| BlossomError::BadRequest("Missing 'status' field".into()))?;
-    let job_id = payload["job_id"].as_str().map(|s| s.to_string());
-    let language = payload["language"].as_str().map(|s| s.to_string());
-    let duration_ms = payload["duration_ms"].as_u64();
-    let cue_count = payload["cue_count"].as_u64().map(|v| v as u32);
-    let error_code = payload["error_code"].as_str().map(|s| s.to_string());
-    let error_message = payload["error_message"].as_str().map(|s| s.to_string());
+    let parsed = parse_transcript_status_webhook_payload(&payload, unix_timestamp_secs())?;
+    let sha256 = parsed.sha256.as_str();
 
     eprintln!(
-        "[TRANSCRIPT] Status webhook: sha256={}, status={}, job_id={:?}",
-        sha256, status_str, job_id
+        "[TRANSCRIPT] Status webhook: sha256={}, status={:?}, job_id={:?}",
+        sha256, parsed.status, parsed.job_id
     );
 
     // Validate sha256 format
@@ -3269,30 +3405,25 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
         return Err(BlossomError::BadRequest("Invalid sha256 format".into()));
     }
 
-    // Map status string to TranscriptStatus
-    let new_status = match status_str.to_lowercase().as_str() {
-        "pending" => TranscriptStatus::Pending,
-        "processing" => TranscriptStatus::Processing,
-        "complete" | "completed" | "ready" => TranscriptStatus::Complete,
-        "failed" | "error" => TranscriptStatus::Failed,
-        _ => {
-            return Err(BlossomError::BadRequest(format!(
-                "Unknown status: {}. Expected pending, processing, complete, or failed",
-                status_str
-            )));
-        }
-    };
-
     use crate::metadata::update_transcript_status;
-    match update_transcript_status(sha256, new_status) {
+    match update_transcript_status(
+        sha256,
+        parsed.status,
+        TranscriptMetadataUpdate {
+            error_code: parsed.error_code.clone(),
+            error_message: parsed.error_message.clone(),
+            last_attempt_at: Some(current_timestamp()),
+            retry_after: parsed.retry_after_epoch_secs,
+        },
+    ) {
         Ok(()) => {
             eprintln!(
                 "[TRANSCRIPT] Updated blob {} to transcript status {:?}",
-                sha256, new_status
+                sha256, parsed.status
             );
 
             // If a subtitle job exists, keep it in sync with webhook status and metadata.
-            let mut updated_job: Option<SubtitleJob> = if let Some(ref id) = job_id {
+            let mut updated_job: Option<SubtitleJob> = if let Some(ref id) = parsed.job_id {
                 get_subtitle_job(id)?
             } else {
                 get_subtitle_job_by_hash(sha256)?
@@ -3300,7 +3431,7 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
 
             if let Some(mut job) = updated_job.take() {
                 job.updated_at = current_timestamp();
-                match new_status {
+                match parsed.status {
                     TranscriptStatus::Pending => {
                         job.status = SubtitleJobStatus::Queued;
                     }
@@ -3313,13 +3444,13 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
                             job.text_track_url =
                                 Some(format!("https://media.divine.video/{}.vtt", sha256));
                         }
-                        if let Some(lang) = language.clone() {
+                        if let Some(lang) = parsed.language.clone() {
                             job.language = Some(lang);
                         }
-                        if let Some(ms) = duration_ms {
+                        if let Some(ms) = parsed.duration_ms {
                             job.duration_ms = Some(ms);
                         }
-                        if let Some(cues) = cue_count {
+                        if let Some(cues) = parsed.cue_count {
                             job.cue_count = Some(cues);
                         }
                         job.next_retry_at_unix = None;
@@ -3329,8 +3460,8 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
                     TranscriptStatus::Failed => {
                         apply_subtitle_job_failure(
                             &mut job,
-                            error_code.clone(),
-                            error_message.clone(),
+                            parsed.error_code.clone(),
+                            parsed.error_message.clone(),
                         );
                     }
                 }
@@ -3340,7 +3471,7 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
 
             // Purge VCL cache on transcript completion so cached 202s are evicted
             if matches!(
-                new_status,
+                parsed.status,
                 TranscriptStatus::Complete | TranscriptStatus::Failed
             ) {
                 purge_transcript_content_cache(sha256);
@@ -3350,7 +3481,7 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
             let response = serde_json::json!({
                 "success": true,
                 "sha256": sha256,
-                "transcript_status": format!("{:?}", new_status).to_lowercase(),
+                "transcript_status": format!("{:?}", parsed.status).to_lowercase(),
                 "message": "Transcript status updated"
             });
             let mut resp = json_response(StatusCode::OK, &response);
@@ -3358,13 +3489,20 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
             Ok(resp)
         }
         Err(BlossomError::NotFound(_)) => {
-            eprintln!("[TRANSCRIPT] Blob {} not found", sha256);
+            eprintln!(
+                "[TRANSCRIPT] Reconciliation pending for missing blob {} status={:?} error_code={:?} retry_after={:?}",
+                sha256,
+                parsed.status,
+                parsed.error_code,
+                parsed.retry_after_epoch_secs
+            );
             let response = serde_json::json!({
-                "success": false,
+                "success": true,
                 "sha256": sha256,
-                "error": "Blob not found"
+                "reconciliation": "pending",
+                "message": "Transcript status accepted for later reconciliation"
             });
-            let mut resp = json_response(StatusCode::NOT_FOUND, &response);
+            let mut resp = json_response(StatusCode::ACCEPTED, &response);
             add_cors_headers(&mut resp);
             Ok(resp)
         }
@@ -3618,9 +3756,6 @@ fn handle_landing_page() -> Response {
                 <span class="method method-delete">DELETE</span>
                 <div class="endpoint-info">
                     <span class="endpoint-path">/&lt;sha256&gt;</span>
-<<<<<<< HEAD
-                    <p class="endpoint-desc">Permanently delete your own blob. Requires Nostr authentication and ownership. <em>(BUD-02)</em></p>
-=======
                     <p class="endpoint-desc">Delete a blob with ref-counting. Sole owner: full delete. Shared: transfers ownership. Non-owner ref: unlinks. Requires Nostr authentication. <em>(BUD-02)</em></p>
                 </div>
             </div>
@@ -3629,7 +3764,6 @@ fn handle_landing_page() -> Response {
                 <div class="endpoint-info">
                     <span class="endpoint-path">/vanish</span>
                     <p class="endpoint-desc">GDPR Right to Erasure. Deletes all blobs and data for the authenticated user. Requires Nostr authentication.</p>
->>>>>>> b22632b (fix: handle QUARANTINE moderation action for AI-detected content)
                 </div>
             </div>
             <div class="endpoint">
@@ -3678,10 +3812,6 @@ fn handle_landing_page() -> Response {
                 <div class="feature">
                     <h3>GCS Storage</h3>
                     <p>Reliable blob storage backed by Google Cloud Storage.</p>
-                </div>
-                <div class="feature">
-                    <h3>Soft Delete Recovery</h3>
-                    <p>Admin deletes preserve stored media as internal soft-deletes, with explicit restore support for recovery and legal workflows.</p>
                 </div>
             </div>
         </section>
@@ -3904,4 +4034,104 @@ fn infer_mime_from_path(path: &str) -> Option<&'static str> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        decide_transcript_fetch_action, parse_transcript_status_webhook_payload,
+        TranscriptFetchAction, TranscriptPendingState,
+    };
+    use crate::blossom::TranscriptStatus;
+
+    #[test]
+    fn parses_transcript_webhook_error_code_fields() {
+        let payload = serde_json::json!({
+            "sha256": "50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a",
+            "status": "failed",
+            "error_code": "normalize_failed",
+            "error_message": "bad transcript body"
+        });
+
+        let parsed = parse_transcript_status_webhook_payload(&payload, 1_000).unwrap();
+
+        assert_eq!(parsed.error_code.as_deref(), Some("normalize_failed"));
+        assert_eq!(parsed.error_message.as_deref(), Some("bad transcript body"));
+        assert_eq!(parsed.retry_after_epoch_secs, None);
+    }
+
+    #[test]
+    fn parses_transcript_webhook_retry_after_for_provider_rate_limited() {
+        let payload = serde_json::json!({
+            "sha256": "50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a",
+            "status": "failed",
+            "error_code": "provider_rate_limited",
+            "retry_after": 15
+        });
+
+        let parsed = parse_transcript_status_webhook_payload(&payload, 1_000).unwrap();
+
+        assert_eq!(parsed.error_code.as_deref(), Some("provider_rate_limited"));
+        assert_eq!(parsed.retry_after_epoch_secs, Some(1_015));
+    }
+
+    #[test]
+    fn transcript_fetch_action_cools_down_when_retry_after_is_in_future() {
+        assert_eq!(
+            decide_transcript_fetch_action(
+                Some(TranscriptStatus::Failed),
+                Some(1_030),
+                1_000,
+            ),
+            TranscriptFetchAction::Accepted {
+                state: TranscriptPendingState::CoolingDown,
+                retry_after_secs: 30,
+            }
+        );
+    }
+
+    #[test]
+    fn transcript_fetch_action_keeps_processing_items_in_progress() {
+        assert_eq!(
+            decide_transcript_fetch_action(
+                Some(TranscriptStatus::Processing),
+                None,
+                1_000,
+            ),
+            TranscriptFetchAction::Accepted {
+                state: TranscriptPendingState::InProgress,
+                retry_after_secs: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn transcript_fetch_action_triggers_pending_items_without_cooldown() {
+        assert_eq!(
+            decide_transcript_fetch_action(
+                Some(TranscriptStatus::Pending),
+                None,
+                1_000,
+            ),
+            TranscriptFetchAction::Trigger {
+                retry_after_secs: 10,
+                should_repair: false,
+            }
+        );
+    }
+
+    #[test]
+    fn transcript_fetch_action_repairs_missing_vtt_for_complete_status() {
+        assert_eq!(
+            decide_transcript_fetch_action(
+                Some(TranscriptStatus::Complete),
+                None,
+                1_000,
+            ),
+            TranscriptFetchAction::Trigger {
+                retry_after_secs: 10,
+                should_repair: true,
+            }
+        );
+    }
 }

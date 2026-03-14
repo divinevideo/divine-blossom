@@ -83,7 +83,7 @@ pub fn get_blob_metadata(hash: &str) -> Result<Option<BlobMetadata>> {
 }
 
 /// Get blob metadata directly from KV store (bypasses cache)
-fn get_blob_metadata_uncached(hash: &str) -> Result<Option<BlobMetadata>> {
+pub fn get_blob_metadata_uncached(hash: &str) -> Result<Option<BlobMetadata>> {
     let store = open_store()?;
     let key = format!("{}{}", BLOB_PREFIX, hash.to_lowercase());
 
@@ -265,14 +265,27 @@ pub fn update_transcode_status(hash: &str, status: crate::blossom::TranscodeStat
 }
 
 /// Update transcript status for an audio/video blob
+#[derive(Debug, Clone, Default)]
+pub struct TranscriptMetadataUpdate {
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub last_attempt_at: Option<String>,
+    pub retry_after: Option<u64>,
+}
+
 pub fn update_transcript_status(
     hash: &str,
     status: crate::blossom::TranscriptStatus,
+    update: TranscriptMetadataUpdate,
 ) -> Result<()> {
     let mut metadata =
         get_blob_metadata(hash)?.ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
 
     metadata.transcript_status = Some(status);
+    metadata.transcript_error_code = update.error_code;
+    metadata.transcript_error_message = update.error_message;
+    metadata.transcript_last_attempt_at = update.last_attempt_at;
+    metadata.transcript_retry_after = update.retry_after;
     put_blob_metadata(&metadata)?;
 
     Ok(())
@@ -303,8 +316,9 @@ pub fn get_subtitle_job(job_id: &str) -> Result<Option<SubtitleJob>> {
 pub fn put_subtitle_job(job: &SubtitleJob) -> Result<()> {
     let store = open_store()?;
     let key = format!("{}{}", SUBTITLE_JOB_PREFIX, job.job_id);
-    let json = serde_json::to_string(job)
-        .map_err(|e| BlossomError::MetadataError(format!("Failed to serialize subtitle job: {}", e)))?;
+    let json = serde_json::to_string(job).map_err(|e| {
+        BlossomError::MetadataError(format!("Failed to serialize subtitle job: {}", e))
+    })?;
 
     store
         .insert(&key, json)
@@ -340,11 +354,9 @@ pub fn get_subtitle_job_id_by_hash(hash: &str) -> Result<Option<String>> {
 pub fn set_subtitle_job_id_for_hash(hash: &str, job_id: &str) -> Result<()> {
     let store = open_store()?;
     let key = format!("{}{}", SUBTITLE_HASH_PREFIX, hash.to_lowercase());
-    store
-        .insert(&key, job_id.to_string())
-        .map_err(|e| {
-            BlossomError::MetadataError(format!("Failed to store subtitle hash mapping: {}", e))
-        })?;
+    store.insert(&key, job_id.to_string()).map_err(|e| {
+        BlossomError::MetadataError(format!("Failed to store subtitle hash mapping: {}", e))
+    })?;
     Ok(())
 }
 
@@ -738,8 +750,11 @@ pub fn put_tombstone(hash: &str, reason: &str) -> Result<()> {
     let key = format!("{}{}", TOMBSTONE_PREFIX, hash.to_lowercase());
 
     let timestamp = crate::storage::current_timestamp();
-    let json = format!(r#"{{"reason":"{}","removed_at":"{}"}}"#,
-        reason.replace('"', "\\\""), timestamp);
+    let json = format!(
+        r#"{{"reason":"{}","removed_at":"{}"}}"#,
+        reason.replace('"', "\\\""),
+        timestamp
+    );
 
     store
         .insert(&key, json)
@@ -790,6 +805,159 @@ pub fn get_blob_refs(hash: &str) -> Result<Vec<String>> {
     }
 }
 
+/// Remove a pubkey from the blob's references list. Returns the remaining refs.
+pub fn remove_from_blob_refs(hash: &str, pubkey: &str) -> Result<Vec<String>> {
+    let pubkey_lower = pubkey.to_lowercase();
+
+    for attempt in 0..5 {
+        let mut refs = get_blob_refs(hash)?;
+
+        if !refs.contains(&pubkey_lower) {
+            return Ok(refs);
+        }
+
+        refs.retain(|p| p != &pubkey_lower);
+
+        let store = open_store()?;
+        let key = format!("{}{}", REFS_PREFIX, hash.to_lowercase());
+        let json = serde_json::to_string(&refs)
+            .map_err(|e| BlossomError::MetadataError(format!("Failed to serialize refs: {}", e)))?;
+
+        match store.insert(&key, json) {
+            Ok(()) => return Ok(refs),
+            Err(e) if attempt < 4 => {
+                eprintln!("[KV] Retry {} for refs removal: {}", attempt + 1, e);
+                continue;
+            }
+            Err(e) => {
+                return Err(BlossomError::MetadataError(format!(
+                    "Failed to store refs: {}",
+                    e
+                )))
+            }
+        }
+    }
+
+    Err(BlossomError::MetadataError(
+        "Max retries exceeded for refs removal".into(),
+    ))
+}
+
+/// Delete the entire blob refs entry
+pub fn delete_blob_refs(hash: &str) -> Result<()> {
+    let store = open_store()?;
+    let key = format!("{}{}", REFS_PREFIX, hash.to_lowercase());
+
+    match store.delete(&key) {
+        Ok(()) => Ok(()),
+        Err(KVStoreError::ItemNotFound) => Ok(()),
+        Err(e) => Err(BlossomError::MetadataError(format!(
+            "Failed to delete blob refs: {}",
+            e
+        ))),
+    }
+}
+
+/// Delete auth events for a hash (both upload and delete provenance)
+pub fn delete_auth_events(hash: &str) -> Result<()> {
+    let store = open_store()?;
+    let hash_lower = hash.to_lowercase();
+
+    for action in &["upload", "delete"] {
+        let key = format!("{}{}:{}", AUTH_PREFIX, hash_lower, action);
+        match store.delete(&key) {
+            Ok(()) => {}
+            Err(KVStoreError::ItemNotFound) => {}
+            Err(e) => {
+                eprintln!(
+                    "[KV] Failed to delete auth event {}:{}: {}",
+                    hash_lower, action, e
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Delete subtitle data for a hash (job mapping + job record)
+pub fn delete_subtitle_data(hash: &str) -> Result<()> {
+    let hash_lower = hash.to_lowercase();
+
+    // Look up the job ID from the hash mapping
+    if let Some(job_id) = get_subtitle_job_id_by_hash(&hash_lower)? {
+        let store = open_store()?;
+
+        // Delete the job record
+        let job_key = format!("{}{}", SUBTITLE_JOB_PREFIX, job_id);
+        match store.delete(&job_key) {
+            Ok(()) => {}
+            Err(KVStoreError::ItemNotFound) => {}
+            Err(e) => {
+                eprintln!("[KV] Failed to delete subtitle job {}: {}", job_id, e);
+            }
+        }
+
+        // Delete the hash -> job_id mapping
+        let hash_key = format!("{}{}", SUBTITLE_HASH_PREFIX, hash_lower);
+        match store.delete(&hash_key) {
+            Ok(()) => {}
+            Err(KVStoreError::ItemNotFound) => {}
+            Err(e) => {
+                eprintln!(
+                    "[KV] Failed to delete subtitle hash mapping {}: {}",
+                    hash_lower, e
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Delete a user's entire blob list
+pub fn delete_user_list(pubkey: &str) -> Result<()> {
+    let store = open_store()?;
+    let key = format!("{}{}", LIST_PREFIX, pubkey.to_lowercase());
+
+    match store.delete(&key) {
+        Ok(()) => Ok(()),
+        Err(KVStoreError::ItemNotFound) => Ok(()),
+        Err(e) => Err(BlossomError::MetadataError(format!(
+            "Failed to delete user list: {}",
+            e
+        ))),
+    }
+}
+
+/// Remove a pubkey from the user index (with retry for concurrent writes)
+pub fn remove_from_user_index(pubkey: &str) -> Result<()> {
+    let pubkey_lower = pubkey.to_lowercase();
+
+    for attempt in 0..5 {
+        let mut index = get_user_index()?;
+
+        if !index.contains(&pubkey_lower) {
+            return Ok(());
+        }
+
+        index.remove(&pubkey_lower);
+
+        match put_user_index(&index) {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < 4 => {
+                eprintln!("[KV] Retry {} for user index removal: {}", attempt + 1, e);
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(BlossomError::MetadataError(
+        "Max retries exceeded for user index removal".into(),
+    ))
+}
+
 /// Add a pubkey to the blob's references list
 pub fn add_to_blob_refs(hash: &str, pubkey: &str) -> Result<()> {
     let pubkey_lower = pubkey.to_lowercase();
@@ -814,10 +982,12 @@ pub fn add_to_blob_refs(hash: &str, pubkey: &str) -> Result<()> {
                 eprintln!("[KV] Retry {} for refs update: {}", attempt + 1, e);
                 continue;
             }
-            Err(e) => return Err(BlossomError::MetadataError(format!(
-                "Failed to store refs: {}",
-                e
-            ))),
+            Err(e) => {
+                return Err(BlossomError::MetadataError(format!(
+                    "Failed to store refs: {}",
+                    e
+                )))
+            }
         }
     }
 
