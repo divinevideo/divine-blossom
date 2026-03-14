@@ -5,7 +5,7 @@
 /target/
 **/target/
 **/*.rs.bk
-Cargo.lock
+!/Cargo.lock
 !/cloud-run-transcoder/Cargo.lock
 
 # Fastly artifacts
@@ -31,9 +31,13 @@ Thumbs.db
 # Private journal (local only)
 .private-journal/
 
+# Git worktrees
+.worktrees/
+
 # Secrets and config (contain API keys)
 secrets.json
 config.json
+secret-store-data.json
 
 # Test files
 test*.mjs

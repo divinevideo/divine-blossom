@@ -1,0 +1,56 @@
+# Local development config for divine-blossom with zero external dependencies.
+# Requires: Fastly CLI >= 14.0.4, MinIO running on localhost:9000
+#
+# Usage:
+#   1. Start MinIO: docker compose -f docker-compose.local.yml up minio minio-init -d
+#   2. Copy this file: cp fastly.toml.local fastly.toml
+#   3. Run: fastly compute serve
+
+manifest_version = 3
+name = "fastly-blossom"
+description = "Blossom media server for Nostr (local mode)"
+authors = ["Divine <hello@divine.video>"]
+language = "rust"
+
+[local_server]
+
+  [local_server.backends]
+
+    [local_server.backends.gcs_storage]
+    url = "http://localhost:9000"
+
+    [local_server.backends.cdn_divine]
+    url = "http://localhost:9000"
+
+    [local_server.backends.blossom_divine]
+    url = "http://localhost:9000"
+
+    [local_server.backends.cdn_satellite]
+    url = "http://localhost:9000"
+
+    [local_server.backends.nostr_build]
+    url = "http://localhost:9000"
+
+    [local_server.backends.cloud_run_upload]
+    url = "http://localhost:9000"
+
+    [local_server.backends.moderation_api]
+    url = "http://localhost:9000"
+
+  [local_server.kv_stores]
+
+    [local_server.kv_stores.blossom_metadata]
+    file = "kv-store-data.json"
+    format = "json"
+
+  [local_server.config_stores]
+
+    [local_server.config_stores.blossom_config]
+    file = "config-store-data.json"
+    format = "json"
+
+  [local_server.secret_stores]
+
+    [local_server.secret_stores.blossom_secrets]
+    file = "secret-store-data.json"
+    format = "json"

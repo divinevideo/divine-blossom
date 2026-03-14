@@ -1593,6 +1593,40 @@ const CLOUD_RUN_TRANSCODER_HOST: &str = "divine-transcoder-149672065768.us-centr
 
 /// Generate thumbnail on-demand by proxying to Cloud Run
 fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
+    if crate::storage::is_local_mode() {
+        eprintln!("[THUMB][LOCAL] Returning placeholder thumbnail for {}", hash);
+        // Minimal valid JPEG (smallest possible)
+        let jpeg: Vec<u8> = vec![
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01,
+            0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43,
+            0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08, 0x07, 0x07, 0x07, 0x09,
+            0x09, 0x08, 0x0A, 0x0C, 0x14, 0x0D, 0x0C, 0x0B, 0x0B, 0x0C, 0x19, 0x12,
+            0x13, 0x0F, 0x14, 0x1D, 0x1A, 0x1F, 0x1E, 0x1D, 0x1A, 0x1C, 0x1C, 0x20,
+            0x24, 0x2E, 0x27, 0x20, 0x22, 0x2C, 0x23, 0x1C, 0x1C, 0x28, 0x37, 0x29,
+            0x2C, 0x30, 0x31, 0x34, 0x34, 0x34, 0x1F, 0x27, 0x39, 0x3D, 0x38, 0x32,
+            0x3C, 0x2E, 0x33, 0x34, 0x32, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01,
+            0x00, 0x01, 0x01, 0x01, 0x11, 0x00, 0xFF, 0xC4, 0x00, 0x1F, 0x00, 0x00,
+            0x01, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+            0x09, 0x0A, 0x0B, 0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F,
+            0x00, 0x7B, 0x94, 0x11, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xD9,
+        ];
+        let thumb_key = format!("{}.jpg", hash);
+        if let Err(e) = crate::storage::upload_blob(
+            &thumb_key,
+            fastly::Body::from(jpeg.as_slice()),
+            "image/jpeg",
+            jpeg.len() as u64,
+            "",
+        ) {
+            eprintln!("[THUMB][LOCAL] Failed to store placeholder: {}", e);
+        }
+        let mut resp = Response::from_status(StatusCode::OK);
+        resp.set_header("Content-Type", "image/jpeg");
+        resp.set_body(fastly::Body::from(jpeg));
+        return Ok(resp);
+    }
+
     let url = format!("https://{}/thumbnail/{}", CLOUD_RUN_THUMBNAIL_HOST, hash);
 
     let mut proxy_req = Request::new(Method::GET, &url);
@@ -1617,6 +1651,37 @@ fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
 /// Trigger on-demand HLS transcoding via Cloud Run transcoder service
 /// This is fire-and-forget - we update metadata to Processing and return immediately
 fn trigger_on_demand_transcoding(hash: &str, owner: &str) -> Result<()> {
+    if crate::storage::is_local_mode() {
+        eprintln!("[HLS][LOCAL] Stubbing transcode for {}", hash);
+        let manifest = format!(
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720\n/{}/hls/720p.m3u8\n",
+            hash
+        );
+        let manifest_key = format!("{}/hls/master.m3u8", hash);
+        crate::storage::upload_blob(
+            &manifest_key,
+            fastly::Body::from(manifest.as_bytes()),
+            "application/vnd.apple.mpegurl",
+            manifest.len() as u64,
+            owner,
+        )?;
+        let variant = format!(
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:3600\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:3600.0,\n/{}\n#EXT-X-ENDLIST\n",
+            hash
+        );
+        let variant_key = format!("{}/hls/720p.m3u8", hash);
+        crate::storage::upload_blob(
+            &variant_key,
+            fastly::Body::from(variant.as_bytes()),
+            "application/vnd.apple.mpegurl",
+            variant.len() as u64,
+            owner,
+        )?;
+        use crate::metadata::update_transcode_status;
+        update_transcode_status(hash, crate::blossom::TranscodeStatus::Complete)?;
+        return Ok(());
+    }
+
     let url = format!("https://{}/transcode", CLOUD_RUN_TRANSCODER_HOST);
 
     let body = format!(r#"{{"hash":"{}","owner":"{}"}}"#, hash, owner);
@@ -1650,6 +1715,29 @@ fn trigger_on_demand_transcription(
     job_id: Option<&str>,
     lang: Option<&str>,
 ) -> Result<()> {
+    if crate::storage::is_local_mode() {
+        eprintln!("[VTT][LOCAL] Stubbing transcription for {}", hash);
+        let vtt = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n[local mode stub transcript]\n";
+        let vtt_key = format!("{}/vtt/main.vtt", hash);
+        crate::storage::upload_blob(
+            &vtt_key,
+            fastly::Body::from(vtt.as_bytes()),
+            "text/vtt",
+            vtt.len() as u64,
+            owner,
+        )?;
+        use crate::metadata::update_transcript_status;
+        update_transcript_status(hash, crate::blossom::TranscriptStatus::Complete)?;
+        if let Some(id) = job_id {
+            if let Ok(Some(mut job)) = crate::metadata::get_subtitle_job(id) {
+                job.status = crate::blossom::SubtitleJobStatus::Ready;
+                job.text_track_url = Some(format!("/{}.vtt", hash));
+                let _ = crate::metadata::put_subtitle_job(&job);
+            }
+        }
+        return Ok(());
+    }
+
     let url = format!("https://{}/transcribe", CLOUD_RUN_TRANSCODER_HOST);
 
     let mut payload = serde_json::json!({
@@ -1690,6 +1778,12 @@ const MODERATION_API_BACKEND: &str = "moderation_api";
 /// Trigger content moderation scan via divine-moderation-api worker.
 /// Fire-and-forget — upload should never fail because moderation is down.
 fn trigger_moderation_scan(sha256: &str, pubkey: &str) {
+    if crate::storage::is_local_mode() {
+        eprintln!("[MODERATION][LOCAL] Auto-approving {} for {}", sha256, pubkey);
+        let _ = crate::metadata::update_blob_status(sha256, crate::blossom::BlobStatus::Active);
+        return;
+    }
+
     let token = match fastly::secret_store::SecretStore::open("blossom_secrets")
         .ok()
         .and_then(|store| store.get("moderation_api_token"))
@@ -1761,11 +1855,15 @@ fn handle_upload(mut req: Request) -> Result<Response> {
     // Proxy to Cloud Run for:
     // 1. Large uploads (> 500KB) to avoid WASM memory limits
     // 2. Video uploads (any size) for thumbnail generation
-    if content_length > CLOUD_RUN_THRESHOLD || is_video_mime_type(&content_type) {
+    // In local mode, handle all uploads inline (no Cloud Run available).
+    // Viceroy doesn't have WASM heap limits, but very large files (>50MB) may be slow.
+    if !crate::storage::is_local_mode()
+        && (content_length > CLOUD_RUN_THRESHOLD || is_video_mime_type(&content_type))
+    {
         return handle_cloud_run_proxy(req, auth, content_type, content_length, base_url);
     }
 
-    // For small files, buffer in memory (safe for <= 500KB)
+    // For small files (or all files in local mode), buffer in memory
     let body_bytes = req.take_body().into_bytes();
     let actual_size = body_bytes.len() as u64;
 

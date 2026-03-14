@@ -46,6 +46,13 @@ fn get_config(key: &str) -> Result<String> {
         .ok_or_else(|| BlossomError::Internal(format!("Missing config: {}", key)))
 }
 
+/// Check if running in local/e2e mode (stubs external services)
+pub fn is_local_mode() -> bool {
+    get_config("local_mode")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
 /// Get secret value
 fn get_secret(key: &str) -> Result<String> {
     let store = fastly::secret_store::SecretStore::open(SECRET_STORE)

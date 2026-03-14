@@ -1,0 +1,5 @@
+{
+  "gcs_bucket": "divine-blossom-local",
+  "gcs_project_id": "local",
+  "local_mode": "true"
+}
