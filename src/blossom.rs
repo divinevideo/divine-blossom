@@ -626,6 +626,10 @@ mod tests {
             transcode_status: None,
             dim: None,
             transcript_status: None,
+            transcript_error_code: None,
+            transcript_error_message: None,
+            transcript_last_attempt_at: None,
+            transcript_retry_after: None,
         }
     }
 

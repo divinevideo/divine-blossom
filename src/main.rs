@@ -1726,8 +1726,8 @@ fn trigger_on_demand_transcription(
             vtt.len() as u64,
             owner,
         )?;
-        use crate::metadata::update_transcript_status;
-        update_transcript_status(hash, crate::blossom::TranscriptStatus::Complete)?;
+        use crate::metadata::{update_transcript_status, TranscriptMetadataUpdate};
+        update_transcript_status(hash, crate::blossom::TranscriptStatus::Complete, TranscriptMetadataUpdate::default())?;
         if let Some(id) = job_id {
             if let Ok(Some(mut job)) = crate::metadata::get_subtitle_job(id) {
                 job.status = crate::blossom::SubtitleJobStatus::Ready;
