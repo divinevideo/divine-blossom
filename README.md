@@ -175,7 +175,7 @@ The `cloud-functions/process-blob` module validates [C2PA](https://c2pa.org/) Co
 ### How it works
 
 1. **Manifest extraction** — runs `c2patool --detailed <file>` to read the embedded C2PA manifest
-2. **Trust chain validation** — runs `c2patool --detailed <file> trust --allowed_list <trust_anchors.pem>` to verify the signer against trusted certificate authorities
+2. **Trust chain validation** — runs `c2patool --detailed <file> trust --trust_anchors <trust_anchors.pem>` to verify the signer against trusted certificate authorities
 
 Validation results (manifest presence, trust status, claim generator, issuer) are attached to the blob's metadata via the Fastly KV webhook.
 

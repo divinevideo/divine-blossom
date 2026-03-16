@@ -244,7 +244,7 @@ def _run_c2patool_trust(file_path):
     try:
         proc = subprocess.run(
             ['c2patool', '--detailed', file_path, 'trust',
-             '--allowed_list', C2PA_TRUST_ANCHORS],
+             '--trust_anchors', C2PA_TRUST_ANCHORS],
             capture_output=True, text=True, timeout=60
         )
         if proc.returncode != 0:
