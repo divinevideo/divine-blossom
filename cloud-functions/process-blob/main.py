@@ -3,6 +3,7 @@
 
 import os
 import json
+import re
 import subprocess
 import tempfile
 import requests
@@ -68,9 +69,14 @@ def process_blob_event(bucket_name, blob_name, content_type):
     """
     print(f"Processing: gs://{bucket_name}/{blob_name} ({content_type})")
 
+    # Blob name must start with a 64-char hex SHA256 hash
+    if not re.match(r'^[0-9a-fA-F]{64}', blob_name):
+        print(f"Skipping blob without SHA256 prefix: {blob_name}")
+        return
+
     # Skip thumbnails and derivatives
-    if blob_name.startswith('thumbnails/') or blob_name.startswith('hls/'):
-        print("Skipping derivative")
+    if blob_name.endswith('.jpg') or blob_name.endswith('/hls/master.m3u8') or blob_name.endswith('/vtt/main.vtt'):
+        print("Skipping derivatives")
         return
 
     # --- C2PA Trust Validation (runs before SafeSearch to save costs) ---
