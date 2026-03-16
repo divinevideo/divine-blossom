@@ -1,0 +1,125 @@
+# ABOUTME: Fastly Compute service manifest (used by CI autodeploy)
+# ABOUTME: The [local_server] section is only used by Viceroy for local dev
+
+manifest_version = 3
+name = "fastly-blossom"
+description = "Blossom media server for Nostr"
+authors = ["Divine <hello@divine.video>"]
+language = "rust"
+
+[local_server]
+
+  [local_server.backends]
+
+    [local_server.backends.gcs_storage]
+    url = "https://storage.googleapis.com"
+
+    # Fallback CDN backends (checked when GCS returns 404)
+    [local_server.backends.cdn_divine]
+    url = "https://cdn.divine.video"
+
+    [local_server.backends.blossom_divine]
+    url = "https://blossom.divine.video"
+
+    [local_server.backends.cdn_satellite]
+    url = "https://cdn.satellite.earth"
+
+    [local_server.backends.nostr_build]
+    url = "https://image.nostr.build"
+
+    [local_server.backends.cloud_run_upload]
+    url = "https://blossom-upload-rust-149672065768.us-central1.run.app"
+
+    [local_server.backends.moderation_api]
+    url = "https://moderation-api.divine.video"
+
+  [local_server.kv_stores]
+
+    [local_server.kv_stores.blossom_metadata]
+    file = "kv-store-data.json"
+
+  [local_server.config_stores]
+
+    [local_server.config_stores.blossom_config]
+
+      [local_server.config_stores.blossom_config.contents]
+      gcs_bucket = "YOUR_BUCKET_NAME"
+      gcs_project_id = "YOUR_GCP_PROJECT_ID"
+
+  [local_server.secret_stores]
+
+    [local_server.secret_stores.blossom_secrets]
+
+      [local_server.secret_stores.blossom_secrets.contents]
+
+        [local_server.secret_stores.blossom_secrets.contents.gcs_access_key]
+        plaintext = "YOUR_GCS_ACCESS_KEY"
+
+        [local_server.secret_stores.blossom_secrets.contents.gcs_secret_key]
+        plaintext = "YOUR_GCS_SECRET_KEY"
+
+        [local_server.secret_stores.blossom_secrets.contents.moderation_api_token]
+        plaintext = "YOUR_MODERATION_API_BEARER_TOKEN"
+
+[setup]
+
+  [setup.backends]
+
+    [setup.backends.gcs_storage]
+    description = "Google Cloud Storage S3-compatible backend"
+    address = "storage.googleapis.com"
+    port = 443
+
+    # Fallback CDN backends (checked when GCS returns 404)
+    [setup.backends.cdn_divine]
+    description = "Divine CDN fallback"
+    address = "cdn.divine.video"
+    port = 443
+
+    [setup.backends.blossom_divine]
+    description = "Divine Blossom server fallback"
+    address = "blossom.divine.video"
+    port = 443
+
+    [setup.backends.cdn_satellite]
+    description = "Satellite.earth CDN fallback"
+    address = "cdn.satellite.earth"
+    port = 443
+
+    [setup.backends.nostr_build]
+    description = "nostr.build media fallback"
+    address = "image.nostr.build"
+    port = 443
+
+    [setup.backends.cloud_run_upload]
+    description = "Cloud Run upload/migration service"
+    address = "blossom-upload-rust-149672065768.us-central1.run.app"
+    port = 443
+
+    [setup.backends.moderation_api]
+    description = "Divine moderation API (CF Worker)"
+    address = "moderation-api.divine.video"
+    port = 443
+
+  [setup.kv_stores]
+
+    [setup.kv_stores.blossom_metadata]
+    description = "Blob metadata storage"
+
+  [setup.config_stores]
+
+    [setup.config_stores.blossom_config]
+    description = "Service configuration"
+    items = [
+      { key = "gcs_bucket", description = "GCS bucket name" },
+      { key = "gcs_project_id", description = "GCP project ID" },
+    ]
+
+  [setup.secret_stores]
+
+    [setup.secret_stores.blossom_secrets]
+    description = "Sensitive credentials"
+    entries = [
+      { key = "gcs_access_key", description = "GCS HMAC access key" },
+      { key = "gcs_secret_key", description = "GCS HMAC secret key" },
+    ]
