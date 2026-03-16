@@ -22,9 +22,9 @@ pub fn validate_auth(req: &Request, required_action: AuthAction) -> Result<Bloss
         .map_err(|_| BlossomError::AuthInvalid("Invalid authorization header".into()))?;
 
     // Parse "Nostr <base64>" format
-    let base64_event = auth_header
-        .strip_prefix("Nostr ")
-        .ok_or_else(|| BlossomError::AuthInvalid("Authorization must start with 'Nostr '".into()))?;
+    let base64_event = auth_header.strip_prefix("Nostr ").ok_or_else(|| {
+        BlossomError::AuthInvalid("Authorization must start with 'Nostr '".into())
+    })?;
 
     // Decode base64
     let event_json = BASE64

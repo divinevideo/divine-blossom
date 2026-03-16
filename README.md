@@ -97,6 +97,8 @@ fastly compute publish
 | `HEAD` | `/<sha256>.vtt` | Check transcript status/existence |
 | `GET` | `/<sha256>/VTT` | Alias for transcript retrieval |
 
+`GET /<sha256>.vtt` returns `202 Accepted` with `Retry-After` while transcription is still running or cooling down after a retryable provider failure. Clients should poll again instead of treating that response as "no subtitles".
+
 ### Subtitle Jobs API
 
 | Method | Path | Description |
@@ -206,6 +208,30 @@ The bundled `trust_anchors.pem` contains ProofSign CA certificates (ECDSA P-256)
 ### Container
 
 The module runs on Cloud Run as a Flask/gunicorn service. The Dockerfile installs c2patool v0.26.33 from GitHub releases. C2PA validation runs before SafeSearch moderation to short-circuit untrusted content early and save Vision API costs.
+
+## Transcript Recovery
+
+Use the repo-level backfill wrapper to inspect or enqueue missing transcripts through the existing `/admin/api/backfill-vtt` endpoint.
+
+Dry-run the recent upload window without triggering work:
+
+```bash
+ADMIN_BEARER_TOKEN=<webhook_or_admin_token> \
+bash scripts/backfill_missing_transcripts.sh --dry-run --limit 20
+```
+
+Enqueue the recent backfill at a controlled pace after Cloud Run and Blossom fixes are deployed:
+
+```bash
+ADMIN_BEARER_TOKEN=<webhook_or_admin_token> \
+bash scripts/backfill_missing_transcripts.sh --limit 200 --sleep 2
+```
+
+Notes:
+- Set either `ADMIN_BEARER_TOKEN` or `ADMIN_COOKIE`.
+- `--scope recent` is the default and scans the rolling recent-upload index first.
+- Use `--scope users` for a full corpus sweep when the recent window is not enough.
+- `--reset-processing` requeues blobs stuck in `processing`, and `--force-retranscribe` reruns blobs marked `complete`.
 
 ## Authentication
 

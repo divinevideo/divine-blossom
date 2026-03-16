@@ -4,9 +4,9 @@
 use crate::blossom::{BlobMetadata, BlobStatus, GlobalStats, RecentIndex, UserIndex};
 use crate::error::{BlossomError, Result};
 use crate::metadata::{
-    add_to_recent_index, add_to_user_list, get_blob_metadata, get_blob_refs, get_global_stats,
-    get_recent_index, get_user_blobs, get_user_index, replace_global_stats, replace_recent_index,
-    replace_user_index, update_blob_status, update_stats_on_status_change,
+    get_blob_metadata, get_global_stats, get_recent_index, get_user_blobs, get_user_index,
+    replace_global_stats, replace_recent_index, replace_user_index, update_blob_status,
+    update_stats_on_status_change,
 };
 use crate::storage::download_blob_with_fallback;
 use fastly::http::{header, Method, StatusCode};
@@ -688,8 +688,8 @@ pub fn handle_admin_blob_content(req: Request, hash: &str) -> Result<Response> {
     validate_admin_auth(&req)?;
 
     // Verify blob exists in metadata (but don't check moderation status)
-    let metadata = get_blob_metadata(hash)?
-        .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
+    let metadata =
+        get_blob_metadata(hash)?.ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
 
     // Get Range header for partial content support
     let range = req
@@ -731,35 +731,6 @@ struct ModerateRequest {
     action: String,
 }
 
-#[derive(Deserialize)]
-struct RestoreRequest {
-    sha256: String,
-    #[serde(default)]
-    status: Option<String>,
-}
-
-fn restore_soft_deleted_blob(hash: &str, metadata: &BlobMetadata, new_status: BlobStatus) -> Result<()> {
-    if new_status == BlobStatus::Deleted {
-        return Err(BlossomError::BadRequest(
-            "Restore target status cannot be deleted".into(),
-        ));
-    }
-
-    update_blob_status(hash, new_status)?;
-    let _ = update_stats_on_status_change(metadata.status, new_status);
-
-    let _ = add_to_user_list(&metadata.owner, hash);
-    if let Ok(refs) = get_blob_refs(hash) {
-        for pubkey in &refs {
-            let _ = add_to_user_list(pubkey, hash);
-        }
-    }
-    let _ = add_to_recent_index(hash);
-    crate::purge_vcl_cache(hash);
-
-    Ok(())
-}
-
 pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
     validate_admin_auth(&req)?;
 
@@ -793,15 +764,19 @@ pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
         }
     };
 
+    // Update blob status
+    update_blob_status(&moderate_req.sha256, new_status)?;
+
+    // Purge VCL cache so moderation takes effect immediately
     if old_status != new_status {
-        if old_status == BlobStatus::Deleted {
-            restore_soft_deleted_blob(&moderate_req.sha256, &metadata, new_status)?;
-        } else {
-            update_blob_status(&moderate_req.sha256, new_status)?;
-            crate::purge_vcl_cache(&moderate_req.sha256);
-            let _ = update_stats_on_status_change(old_status, new_status);
-        }
+        crate::purge_vcl_cache(&moderate_req.sha256);
     }
+
+    // Update global stats for the status change
+    if old_status != new_status {
+        let _ = update_stats_on_status_change(old_status, new_status);
+    }
+
     let response = serde_json::json!({
         "success": true,
         "sha256": moderate_req.sha256,
@@ -812,56 +787,134 @@ pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
     json_response(StatusCode::OK, &response)
 }
 
-/// POST /admin/api/restore - Restore a previously soft-deleted blob
-pub fn handle_admin_restore_action(mut req: Request) -> Result<Response> {
+/// POST /admin/api/bulk-approve - Approve all banned/restricted blobs in a batch
+/// Body: {"hashes": ["hash1", "hash2", ...]} or {"approve_all_flagged": true}
+/// When approve_all_flagged is true, hashes is used as the list to scan
+pub fn handle_admin_bulk_approve(mut req: Request) -> Result<Response> {
     validate_admin_auth(&req)?;
 
     let body = req.take_body().into_string();
-    let restore_req: RestoreRequest = serde_json::from_str(&body)
+    let payload: serde_json::Value = serde_json::from_str(&body)
         .map_err(|e| BlossomError::BadRequest(format!("Invalid JSON: {}", e)))?;
 
-    if restore_req.sha256.len() != 64
-        || !restore_req.sha256.chars().all(|c| c.is_ascii_hexdigit())
-    {
-        return Err(BlossomError::BadRequest("Invalid sha256 format".into()));
+    let hashes: Vec<String> = payload["hashes"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // skip_purge=true skips per-blob VCL purge (caller should do purge --all after)
+    let skip_purge = payload["skip_purge"].as_bool().unwrap_or(false);
+
+    if hashes.is_empty() {
+        return Err(BlossomError::BadRequest("No hashes provided".into()));
     }
 
-    let metadata = get_blob_metadata(&restore_req.sha256)?
-        .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
-    let old_status = metadata.status;
+    let mut approved = 0u32;
+    let mut already_ok = 0u32;
+    let mut not_found = 0u32;
+    let mut errors = 0u32;
+    let mut approved_hashes: Vec<String> = Vec::new();
 
-    if old_status != BlobStatus::Deleted {
-        return Err(BlossomError::BadRequest(
-            "Blob is not soft-deleted".into(),
-        ));
-    }
-
-    let new_status = match restore_req
-        .status
-        .as_deref()
-        .unwrap_or("active")
-        .to_uppercase()
-        .as_str()
-    {
-        "APPROVE" | "ACTIVE" => BlobStatus::Active,
-        "PENDING" => BlobStatus::Pending,
-        "RESTRICT" | "RESTRICTED" => BlobStatus::Restricted,
-        other => {
-            return Err(BlossomError::BadRequest(format!(
-                "Unknown restore status: {}",
-                other
-            )))
+    for hash in &hashes {
+        if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            errors += 1;
+            continue;
         }
-    };
 
-    restore_soft_deleted_blob(&restore_req.sha256, &metadata, new_status)?;
+        match get_blob_metadata(hash) {
+            Ok(Some(meta)) => {
+                if meta.status == BlobStatus::Banned || meta.status == BlobStatus::Restricted {
+                    match update_blob_status(hash, BlobStatus::Active) {
+                        Ok(()) => {
+                            if !skip_purge {
+                                let _ = update_stats_on_status_change(meta.status, BlobStatus::Active);
+                                crate::purge_vcl_cache(hash);
+                            }
+                            approved += 1;
+                            approved_hashes.push(hash.clone());
+                        }
+                        Err(_) => errors += 1,
+                    }
+                } else {
+                    already_ok += 1;
+                }
+            }
+            Ok(None) => not_found += 1,
+            Err(_) => errors += 1,
+        }
+    }
+
+    eprintln!(
+        "[ADMIN] Bulk approve: {} approved, {} already_ok, {} not_found, {} errors (of {} hashes)",
+        approved, already_ok, not_found, errors, hashes.len()
+    );
 
     let response = serde_json::json!({
         "success": true,
-        "restored": true,
-        "sha256": restore_req.sha256,
-        "old_status": format!("{:?}", old_status).to_lowercase(),
-        "new_status": format!("{:?}", new_status).to_lowercase()
+        "total": hashes.len(),
+        "approved": approved,
+        "already_ok": already_ok,
+        "not_found": not_found,
+        "errors": errors,
+        "approved_hashes": approved_hashes,
+    });
+
+    json_response(StatusCode::OK, &response)
+}
+
+/// POST /admin/api/scan-flagged - Scan a batch of hashes and return banned/restricted ones
+/// Body: {"hashes": ["hash1", "hash2", ...]}
+/// Returns which ones are banned/restricted without changing them
+pub fn handle_admin_scan_flagged(mut req: Request) -> Result<Response> {
+    validate_admin_auth(&req)?;
+
+    let body = req.take_body().into_string();
+    let payload: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| BlossomError::BadRequest(format!("Invalid JSON: {}", e)))?;
+
+    let hashes: Vec<String> = payload["hashes"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut banned: Vec<String> = Vec::new();
+    let mut restricted: Vec<String> = Vec::new();
+    let mut active = 0u32;
+    let mut pending = 0u32;
+    let mut not_found = 0u32;
+
+    for hash in &hashes {
+        if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        match get_blob_metadata(hash) {
+            Ok(Some(meta)) => match meta.status {
+                BlobStatus::Banned => banned.push(hash.clone()),
+                BlobStatus::Restricted => restricted.push(hash.clone()),
+                BlobStatus::Active => active += 1,
+                BlobStatus::Pending => pending += 1,
+                BlobStatus::Deleted => not_found += 1,
+            },
+            Ok(None) => not_found += 1,
+            Err(_) => not_found += 1,
+        }
+    }
+
+    let response = serde_json::json!({
+        "total_scanned": hashes.len(),
+        "banned": banned,
+        "restricted": restricted,
+        "active": active,
+        "pending": pending,
+        "not_found": not_found,
     });
 
     json_response(StatusCode::OK, &response)
@@ -1462,25 +1515,17 @@ const ADMIN_HTML: &str = r#"<!DOCTYPE html>
                                     <td><span class="status status-${b.status}">${b.status}</span></td>
                                     <td><span class="pubkey" onclick="showUserBlobs('${b.owner}')">${b.owner.substring(0,12)}...</span></td>
                                     <td><span class="date">${new Date(b.uploaded).toLocaleDateString()}</span></td>
-                                    <td class="actions">${renderBlobActions(b)}</td>
+                                    <td class="actions">
+                                        <button class="btn btn-approve" onclick="moderate('${b.sha256}','approve')">OK</button>
+                                        <button class="btn btn-restrict" onclick="moderate('${b.sha256}','restrict')">R</button>
+                                        <button class="btn btn-ban" onclick="moderate('${b.sha256}','ban')">X</button>
+                                    </td>
                                 </tr>
                             `).join('')}
                         </tbody>
                     </table>
                 </div>
                 ${pagination ? renderPagination(pagination) : ''}
-            `;
-        }
-
-        function renderBlobActions(blob) {
-            if (blob.status === 'deleted') {
-                return `<button class="btn btn-approve" onclick="restoreBlob('${blob.sha256}')">Restore</button>`;
-            }
-
-            return `
-                <button class="btn btn-approve" onclick="moderate('${blob.sha256}','approve')">OK</button>
-                <button class="btn btn-restrict" onclick="moderate('${blob.sha256}','restrict')">R</button>
-                <button class="btn btn-ban" onclick="moderate('${blob.sha256}','ban')">X</button>
             `;
         }
 
@@ -1543,22 +1588,6 @@ const ADMIN_HTML: &str = r#"<!DOCTYPE html>
             }
         }
 
-        async function restoreBlob(sha256, status = 'active') {
-            try {
-                const resp = await fetch('/admin/api/restore', {
-                    method: 'POST',
-                    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ sha256, status })
-                });
-                if (!resp.ok) throw new Error('Restore failed');
-                await resp.json();
-                loadStats();
-                loadTabContent(currentOffset);
-            } catch (e) {
-                showError(e.message);
-            }
-        }
-
         async function showBlobDetail(hash) {
             const panel = document.getElementById('detailPanel');
             const content = document.getElementById('detailContent');
@@ -1574,14 +1603,6 @@ const ADMIN_HTML: &str = r#"<!DOCTYPE html>
                 const isImage = blob.type?.startsWith('image');
                 const thumbUrl = blob.thumbnail || (isVideo ? '/' + blob.sha256 + '.jpg' : null);
                 const previewUrl = isImage ? '/' + blob.sha256 : thumbUrl;
-
-                const actionButtons = blob.status === 'deleted'
-                    ? `<button class="btn btn-approve" onclick="restoreBlob('${blob.sha256}');closeDetail()">Restore</button>`
-                    : `
-                        <button class="btn btn-approve" onclick="moderate('${blob.sha256}','approve');closeDetail()">Approve</button>
-                        <button class="btn btn-restrict" onclick="moderate('${blob.sha256}','restrict');closeDetail()">Restrict</button>
-                        <button class="btn btn-ban" onclick="moderate('${blob.sha256}','ban');closeDetail()">Ban</button>
-                    `;
 
                 content.innerHTML = `
                     ${isVideo ? `<video src="/${blob.sha256}" class="detail-preview" controls poster="${thumbUrl}" style="max-width:100%"></video>` : (previewUrl ? `<img src="${previewUrl}" class="detail-preview">` : '')}
@@ -1616,7 +1637,9 @@ const ADMIN_HTML: &str = r#"<!DOCTYPE html>
                     </div>
                     ` : ''}
                     <div class="actions" style="margin-top:1rem">
-                        ${actionButtons}
+                        <button class="btn btn-approve" onclick="moderate('${blob.sha256}','approve');closeDetail()">Approve</button>
+                        <button class="btn btn-restrict" onclick="moderate('${blob.sha256}','restrict');closeDetail()">Restrict</button>
+                        <button class="btn btn-ban" onclick="moderate('${blob.sha256}','ban');closeDetail()">Ban</button>
                     </div>
                     <div style="margin-top:1rem">
                         <a href="/${blob.sha256}" target="_blank" class="btn btn-approve">View File</a>

@@ -1,0 +1,51 @@
+# Fastly config for running inside Docker (backends use Docker network hostnames).
+# Used by Dockerfile.local. For standalone local dev, use fastly.toml.local instead.
+
+manifest_version = 3
+name = "fastly-blossom"
+description = "Blossom media server for Nostr (local mode - Docker)"
+authors = ["Divine <hello@divine.video>"]
+language = "rust"
+
+[local_server]
+
+  [local_server.backends]
+
+    [local_server.backends.gcs_storage]
+    url = "http://minio:9000"
+
+    [local_server.backends.cdn_divine]
+    url = "http://minio:9000"
+
+    [local_server.backends.blossom_divine]
+    url = "http://minio:9000"
+
+    [local_server.backends.cdn_satellite]
+    url = "http://minio:9000"
+
+    [local_server.backends.nostr_build]
+    url = "http://minio:9000"
+
+    [local_server.backends.cloud_run_upload]
+    url = "http://minio:9000"
+
+    [local_server.backends.moderation_api]
+    url = "http://minio:9000"
+
+  [local_server.kv_stores]
+
+    [local_server.kv_stores.blossom_metadata]
+    file = "kv-store-data.json"
+    format = "json"
+
+  [local_server.config_stores]
+
+    [local_server.config_stores.blossom_config]
+    file = "config-store-data.json"
+    format = "json"
+
+  [local_server.secret_stores]
+
+    [local_server.secret_stores.blossom_secrets]
+    file = "secret-store-data.json"
+    format = "json"
