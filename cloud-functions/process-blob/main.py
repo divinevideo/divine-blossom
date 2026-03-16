@@ -20,8 +20,8 @@ METADATA_WEBHOOK_SECRET = os.environ.get('METADATA_WEBHOOK_SECRET', '')
 C2PA_MODE = os.environ.get('C2PA_MODE', 'off')  # off, log, enforce
 C2PA_TRUST_ANCHORS = os.environ.get('C2PA_TRUST_ANCHORS', '/app/trust_anchors.pem')
 C2PA_CHECK_IMAGES = os.environ.get('C2PA_CHECK_IMAGES', 'false').lower() == 'true'
-C2PA_MAX_FILE_SIZE = int(os.environ.get('C2PA_MAX_FILE_SIZE', str(2 * 1024 * 1024 * 1024)))  # default 2GB
-C2PA_WARN_FILE_SIZE = int(os.environ.get('C2PA_WARN_FILE_SIZE', str(500 * 1024 * 1024)))  # default 500MB
+C2PA_MAX_FILE_SIZE = int(os.environ.get('C2PA_MAX_FILE_SIZE', str(1024 * 1024 * 512)))  # default 512MB 
+C2PA_WARN_FILE_SIZE = int(os.environ.get('C2PA_WARN_FILE_SIZE', str(256 * 1024 * 1024)))  # default 256MB
 
 app = Flask(__name__)
 
