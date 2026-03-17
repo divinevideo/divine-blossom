@@ -37,6 +37,7 @@ language = "rust"
 
     [local_server.kv_stores.blossom_metadata]
     file = "kv-store-data.json"
+    format = "json"
 
   [local_server.config_stores]
 
