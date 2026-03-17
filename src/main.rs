@@ -1653,9 +1653,16 @@ fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
 fn trigger_on_demand_transcoding(hash: &str, owner: &str) -> Result<()> {
     if crate::storage::is_local_mode() {
         eprintln!("[HLS][LOCAL] Stubbing transcode for {}", hash);
+
+        // Master playlist — matches production transcoder output (two variants)
         let manifest = format!(
-            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720\n/{}/hls/720p.m3u8\n",
-            hash
+            "#EXTM3U\n\
+             #EXT-X-VERSION:3\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720\n\
+             /{}/hls/stream_720p.m3u8\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=854x480\n\
+             /{}/hls/stream_480p.m3u8\n",
+            hash, hash
         );
         let manifest_key = format!("{}/hls/master.m3u8", hash);
         crate::storage::upload_blob(
@@ -1665,18 +1672,52 @@ fn trigger_on_demand_transcoding(hash: &str, owner: &str) -> Result<()> {
             manifest.len() as u64,
             owner,
         )?;
-        let variant = format!(
-            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:3600\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:3600.0,\n/{}\n#EXT-X-ENDLIST\n",
+
+        // Variant playlists — each points to the raw blob as a single segment
+        let variant_playlist = format!(
+            "#EXTM3U\n\
+             #EXT-X-VERSION:3\n\
+             #EXT-X-TARGETDURATION:3600\n\
+             #EXT-X-MEDIA-SEQUENCE:0\n\
+             #EXT-X-PLAYLIST-TYPE:VOD\n\
+             #EXTINF:3600.0,\n\
+             /{}\n\
+             #EXT-X-ENDLIST\n",
             hash
         );
-        let variant_key = format!("{}/hls/720p.m3u8", hash);
-        crate::storage::upload_blob(
-            &variant_key,
-            fastly::Body::from(variant.as_bytes()),
-            "application/vnd.apple.mpegurl",
-            variant.len() as u64,
-            owner,
-        )?;
+        for variant_name in &["stream_720p", "stream_480p"] {
+            let key = format!("{}/hls/{}.m3u8", hash, variant_name);
+            crate::storage::upload_blob(
+                &key,
+                fastly::Body::from(variant_playlist.as_bytes()),
+                "application/vnd.apple.mpegurl",
+                variant_playlist.len() as u64,
+                owner,
+            )?;
+        }
+
+        // Stub .ts files — write raw blob reference so /{hash}/720p and /{hash}/480p routes work.
+        // Downloads the original blob from storage and writes it as both .ts variants.
+        match crate::storage::download_blob(hash, None) {
+            Ok(blob_resp) => {
+                let blob_bytes: Vec<u8> = blob_resp.into_body().into_bytes();
+                let blob_len = blob_bytes.len() as u64;
+                for variant_name in &["stream_720p", "stream_480p"] {
+                    let key = format!("{}/hls/{}.ts", hash, variant_name);
+                    crate::storage::upload_blob(
+                        &key,
+                        fastly::Body::from(blob_bytes.as_slice()),
+                        "video/mp2t",
+                        blob_len,
+                        owner,
+                    )?;
+                }
+            }
+            Err(e) => {
+                eprintln!("[HLS][LOCAL] Could not copy blob as .ts stubs: {}", e);
+            }
+        }
+
         use crate::metadata::update_transcode_status;
         update_transcode_status(hash, crate::blossom::TranscodeStatus::Complete)?;
         return Ok(());
