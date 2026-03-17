@@ -1454,8 +1454,9 @@ fn is_quality_variant_path(path: &str) -> bool {
     let path = path.trim_start_matches('/');
     for (suffix, _) in QUALITY_VARIANTS {
         let suffix = suffix.trim_start_matches('/');
-        if path.ends_with(suffix) {
-            let hash_part = &path[..path.len() - suffix.len() - 1]; // -1 for the /
+        // Need at least hash(64) + '/' + suffix
+        if path.ends_with(suffix) && path.len() > suffix.len() + 1 {
+            let hash_part = &path[..path.len() - suffix.len() - 1];
             if hash_part.len() == 64 && hash_part.chars().all(|c| c.is_ascii_hexdigit()) {
                 return true;
             }
@@ -1469,7 +1470,7 @@ fn parse_quality_variant_path(path: &str) -> Option<(String, &'static str)> {
     let path = path.trim_start_matches('/');
     for (suffix, ts_file) in QUALITY_VARIANTS {
         let suffix = suffix.trim_start_matches('/');
-        if path.ends_with(suffix) {
+        if path.ends_with(suffix) && path.len() > suffix.len() + 1 {
             let hash_part = &path[..path.len() - suffix.len() - 1];
             if hash_part.len() == 64 && hash_part.chars().all(|c| c.is_ascii_hexdigit()) {
                 return Some((hash_part.to_lowercase(), ts_file));
@@ -4178,10 +4179,32 @@ fn infer_mime_from_path(path: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decide_transcript_fetch_action, parse_transcript_status_webhook_payload,
-        TranscriptFetchAction, TranscriptPendingState,
+        decide_transcript_fetch_action, is_quality_variant_path, parse_quality_variant_path,
+        parse_transcript_status_webhook_payload, TranscriptFetchAction, TranscriptPendingState,
     };
     use crate::blossom::TranscriptStatus;
+
+    #[test]
+    fn quality_variant_path_valid() {
+        let hash = "a".repeat(64);
+        assert!(is_quality_variant_path(&format!("/{}/720p", hash)));
+        assert!(is_quality_variant_path(&format!("/{}/480p", hash)));
+        let (parsed_hash, ts) = parse_quality_variant_path(&format!("/{}/720p", hash)).unwrap();
+        assert_eq!(parsed_hash, hash);
+        assert_eq!(ts, "stream_720p.ts");
+    }
+
+    #[test]
+    fn quality_variant_path_no_underflow_on_short_input() {
+        // These must not panic (previously caused u32::MAX underflow)
+        assert!(!is_quality_variant_path("/720p"));
+        assert!(!is_quality_variant_path("/480p"));
+        assert!(!is_quality_variant_path("720p"));
+        assert!(!is_quality_variant_path("480p"));
+        assert!(!is_quality_variant_path(""));
+        assert!(parse_quality_variant_path("/480p").is_none());
+        assert!(parse_quality_variant_path("720p").is_none());
+    }
 
     #[test]
     fn parses_transcript_webhook_error_code_fields() {
