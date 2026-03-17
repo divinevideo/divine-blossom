@@ -25,6 +25,7 @@ gcloud run deploy "${SERVICE_NAME}" \
   --min-instances 1 \
   --max-instances 10 \
   --no-cpu-throttling \
+  --set-env-vars "USE_GPU=true" \
   --set-env-vars "GCS_BUCKET=divine-blossom-media" \
   --set-env-vars "WEBHOOK_URL=https://media.divine.video/admin/transcode-status" \
   --set-env-vars "TRANSCRIPT_WEBHOOK_URL=https://media.divine.video/admin/transcript-status" \

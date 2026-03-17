@@ -2705,6 +2705,8 @@ async fn run_ffmpeg_hls(
             "5000k",
             "-preset:v:0",
             "fast",
+            "-bf:v:0",
+            "0",
             // 480p variant
             "-filter:v:1",
             &scale_480,
@@ -2722,6 +2724,8 @@ async fn run_ffmpeg_hls(
             "2000k",
             "-preset:v:1",
             "fast",
+            "-bf:v:1",
+            "0",
         ]);
     }
 
