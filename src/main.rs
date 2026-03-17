@@ -732,6 +732,13 @@ fn handle_head_hls_content(path: &str) -> Result<Response> {
         return Err(BlossomError::BadRequest("Invalid hash in path".into()));
     }
 
+    // Don't reveal restricted/banned/deleted content (HEAD has no req, no admin bypass)
+    if let Ok(Some(meta)) = get_blob_metadata(&hash.to_lowercase()) {
+        if meta.status.requires_owner_auth() || meta.status.blocks_public_access() {
+            return Err(BlossomError::NotFound("Content not found".into()));
+        }
+    }
+
     // Check if file exists in GCS
     let gcs_path = format!("{}/hls/{}", hash.to_lowercase(), filename);
 
@@ -1403,6 +1410,13 @@ fn handle_get_subtitle_by_hash(req: Request, path: &str) -> Result<Response> {
 
     if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(BlossomError::BadRequest("Invalid sha256 format".into()));
+    }
+
+    // Don't leak subtitle info for moderated content
+    if let Some(meta) = get_blob_metadata(&hash)? {
+        if meta.status.requires_owner_auth() || meta.status.blocks_public_access() {
+            return Err(BlossomError::NotFound("Video hash not found".into()));
+        }
     }
 
     if let Some(job) = get_subtitle_job_by_hash(&hash)? {
