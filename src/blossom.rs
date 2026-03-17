@@ -709,25 +709,88 @@ mod tests {
     fn test_local_mode_stub_hls_manifest_format() {
         let hash = "a".repeat(64);
         let manifest = format!(
-            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720\n/{}/hls/720p.m3u8\n",
-            hash
+            "#EXTM3U\n\
+             #EXT-X-VERSION:3\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720\n\
+             /{}/hls/stream_720p.m3u8\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=854x480\n\
+             /{}/hls/stream_480p.m3u8\n",
+            hash, hash
         );
         assert!(manifest.starts_with("#EXTM3U"));
-        assert!(manifest.contains("EXT-X-STREAM-INF"));
-        assert!(manifest.contains(&format!("/{}/hls/720p.m3u8", hash)));
+        assert!(manifest.contains("BANDWIDTH=2500000,RESOLUTION=1280x720"));
+        assert!(manifest.contains("BANDWIDTH=1000000,RESOLUTION=854x480"));
+        assert!(manifest.contains(&format!("/{}/hls/stream_720p.m3u8", hash)));
+        assert!(manifest.contains(&format!("/{}/hls/stream_480p.m3u8", hash)));
     }
 
     #[test]
     fn test_local_mode_stub_variant_playlist_format() {
         let hash = "a".repeat(64);
         let variant = format!(
-            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:3600\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:3600.0,\n/{}\n#EXT-X-ENDLIST\n",
+            "#EXTM3U\n\
+             #EXT-X-VERSION:3\n\
+             #EXT-X-TARGETDURATION:3600\n\
+             #EXT-X-MEDIA-SEQUENCE:0\n\
+             #EXT-X-PLAYLIST-TYPE:VOD\n\
+             #EXTINF:3600.0,\n\
+             /{}\n\
+             #EXT-X-ENDLIST\n",
             hash
         );
         assert!(variant.starts_with("#EXTM3U"));
         assert!(variant.contains("EXT-X-TARGETDURATION"));
+        assert!(variant.contains("EXT-X-PLAYLIST-TYPE:VOD"));
         assert!(variant.contains("EXT-X-ENDLIST"));
         assert!(variant.contains(&format!("/{}", hash)));
+    }
+
+    #[test]
+    fn test_local_mode_stub_filenames_match_quality_variants() {
+        // QUALITY_VARIANTS in main.rs defines the route-to-filename mapping:
+        //   ("/720p", "stream_720p.ts"), ("/480p", "stream_480p.ts")
+        // The local mode stub must write files with these exact base names.
+        // This test catches drift between the stub and route handler.
+        let expected_variants = &["stream_720p", "stream_480p"];
+
+        let hash = "b".repeat(64);
+
+        // Master playlist must reference each variant's .m3u8
+        let master = format!(
+            "#EXTM3U\n\
+             #EXT-X-VERSION:3\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720\n\
+             /{}/hls/stream_720p.m3u8\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=854x480\n\
+             /{}/hls/stream_480p.m3u8\n",
+            hash, hash
+        );
+        for name in expected_variants {
+            assert!(
+                master.contains(&format!("{}.m3u8", name)),
+                "master.m3u8 missing reference to {}.m3u8",
+                name
+            );
+        }
+
+        // The delete cleanup paths must also match (keep in sync with delete_blob_gcs_artifacts)
+        let cleanup_paths: Vec<String> = expected_variants
+            .iter()
+            .flat_map(|name| {
+                vec![
+                    format!("{}/hls/{}.m3u8", hash, name),
+                    format!("{}/hls/{}.ts", hash, name),
+                ]
+            })
+            .collect();
+        assert_eq!(cleanup_paths.len(), 4);
+        for path in &cleanup_paths {
+            assert!(
+                path.contains("/hls/stream_"),
+                "cleanup path has unexpected format: {}",
+                path
+            );
+        }
     }
 
     #[test]
