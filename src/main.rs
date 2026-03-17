@@ -933,9 +933,9 @@ fn handle_head_hls_content(path: &str) -> Result<Response> {
 
     let hash_lower = hash.to_lowercase();
 
-    // Check moderation status — HEAD has no auth, so block both banned and restricted
-    if let Ok(Some(ref meta)) = get_blob_metadata(&hash_lower) {
-        if meta.status == BlobStatus::Banned || meta.status == BlobStatus::Restricted {
+    // Don't reveal restricted/banned/deleted content (HEAD has no req, no admin bypass)
+    if let Ok(Some(meta)) = get_blob_metadata(&hash_lower) {
+        if meta.status.requires_owner_auth() || meta.status.blocks_public_access() {
             return Err(BlossomError::NotFound("Content not found".into()));
         }
     }
@@ -1611,6 +1611,13 @@ fn handle_get_subtitle_by_hash(req: Request, path: &str) -> Result<Response> {
 
     if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(BlossomError::BadRequest("Invalid sha256 format".into()));
+    }
+
+    // Don't leak subtitle info for moderated content
+    if let Some(meta) = get_blob_metadata(&hash)? {
+        if meta.status.requires_owner_auth() || meta.status.blocks_public_access() {
+            return Err(BlossomError::NotFound("Video hash not found".into()));
+        }
     }
 
     if let Some(job) = get_subtitle_job_by_hash(&hash)? {
