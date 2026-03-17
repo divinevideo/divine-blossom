@@ -363,10 +363,10 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         let mut is_restricted = false;
         if let Ok(Some(meta)) = get_blob_metadata(video_hash) {
             if !is_admin {
-                if meta.status == BlobStatus::Banned {
+                if meta.status.blocks_public_access() {
                     return Err(BlossomError::NotFound("Blob not found".into()));
                 }
-                if meta.status == BlobStatus::Restricted {
+                if meta.status.requires_owner_auth() {
                     // Check if requester is owner
                     if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
                         if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
@@ -428,13 +428,13 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
 
     if let Some(ref meta) = metadata {
         if !is_admin {
-            // Handle banned content - no access for anyone
-            if meta.status == BlobStatus::Banned {
+            // Handle banned/deleted content - no access for anyone
+            if meta.status.blocks_public_access() {
                 return Err(BlossomError::NotFound("Blob not found".into()));
             }
 
-            // Handle restricted content
-            if meta.status == BlobStatus::Restricted {
+            // Handle restricted content - owner can still access
+            if meta.status.requires_owner_auth() {
                 // Check if requester is owner
                 if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
                     if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
@@ -569,8 +569,8 @@ fn handle_head_blob(path: &str) -> Result<Response> {
     let metadata =
         get_blob_metadata(&hash)?.ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
 
-    // Don't reveal restricted or banned content exists
-    if metadata.status == BlobStatus::Restricted || metadata.status == BlobStatus::Banned {
+    // Don't reveal restricted, banned, or deleted content exists
+    if metadata.status.requires_owner_auth() || metadata.status.blocks_public_access() {
         return Err(BlossomError::NotFound("Blob not found".into()));
     }
 
@@ -610,13 +610,13 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
 
     if let Some(ref meta) = metadata {
         if !is_admin {
-            // Handle banned content
-            if meta.status == BlobStatus::Banned {
+            // Handle banned/deleted content
+            if meta.status.blocks_public_access() {
                 return Err(BlossomError::NotFound("Content not found".into()));
             }
 
-            // Handle restricted content
-            if meta.status == BlobStatus::Restricted {
+            // Handle restricted content - owner can still access
+            if meta.status.requires_owner_auth() {
                 if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
                     if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
                         return Err(BlossomError::NotFound("Content not found".into()));
@@ -721,8 +721,8 @@ fn handle_head_hls_master(path: &str) -> Result<Response> {
     let metadata = get_blob_metadata(&hash)?
         .ok_or_else(|| BlossomError::NotFound("Content not found".into()))?;
 
-    // Don't reveal restricted/banned content (HEAD has no req, no admin bypass)
-    if metadata.status == BlobStatus::Restricted || metadata.status == BlobStatus::Banned {
+    // Don't reveal restricted/banned/deleted content (HEAD has no req, no admin bypass)
+    if metadata.status.requires_owner_auth() || metadata.status.blocks_public_access() {
         return Err(BlossomError::NotFound("Content not found".into()));
     }
 
@@ -840,6 +840,11 @@ fn handle_get_hls_content(req: Request, path: &str) -> Result<Response> {
             let metadata = get_blob_metadata(&hash)?;
 
             if let Some(ref meta) = metadata {
+                // Handle banned/deleted content
+                if !is_admin && meta.status.blocks_public_access() {
+                    return Err(BlossomError::NotFound("Content not found".into()));
+                }
+
                 match meta.transcode_status {
                     Some(TranscodeStatus::Complete) => {
                         // Metadata says complete but file not in GCS - re-trigger
@@ -1208,11 +1213,11 @@ fn serve_transcript_by_hash(
         .unwrap_or(false);
 
     if !is_admin {
-        if metadata.status == BlobStatus::Banned {
+        if metadata.status.blocks_public_access() {
             return Err(BlossomError::NotFound("Content not found".into()));
         }
 
-        if metadata.status == BlobStatus::Restricted {
+        if metadata.status.requires_owner_auth() {
             if let Some(request) = req {
                 if let Ok(Some(auth)) = optional_auth(request, AuthAction::List) {
                     if auth.pubkey.to_lowercase() != metadata.owner.to_lowercase() {
@@ -1338,7 +1343,7 @@ fn handle_head_transcript_by_hash(hash: &str) -> Result<Response> {
     let metadata = get_blob_metadata(hash)?
         .ok_or_else(|| BlossomError::NotFound("Content not found".into()))?;
 
-    if metadata.status == BlobStatus::Restricted || metadata.status == BlobStatus::Banned {
+    if metadata.status.requires_owner_auth() || metadata.status.blocks_public_access() {
         return Err(BlossomError::NotFound("Content not found".into()));
     }
 
@@ -1869,10 +1874,10 @@ fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
     let metadata = get_blob_metadata(&hash)?;
     if let Some(ref meta) = metadata {
         if !is_admin {
-            if meta.status == BlobStatus::Banned {
+            if meta.status.blocks_public_access() {
                 return Err(BlossomError::NotFound("Content not found".into()));
             }
-            if meta.status == BlobStatus::Restricted {
+            if meta.status.requires_owner_auth() {
                 if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
                     if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
                         return Err(BlossomError::NotFound("Content not found".into()));
@@ -1964,7 +1969,7 @@ fn handle_head_quality_variant(path: &str) -> Result<Response> {
     let metadata = get_blob_metadata(&hash)?
         .ok_or_else(|| BlossomError::NotFound("Content not found".into()))?;
 
-    if metadata.status == BlobStatus::Banned || metadata.status == BlobStatus::Restricted {
+    if metadata.status.blocks_public_access() || metadata.status.requires_owner_auth() {
         return Err(BlossomError::NotFound("Content not found".into()));
     }
 
