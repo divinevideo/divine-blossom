@@ -1445,14 +1445,18 @@ fn handle_get_subtitle_by_hash(req: Request, path: &str) -> Result<Response> {
     ))
 }
 
-/// Valid quality variant suffixes
-const QUALITY_VARIANTS: &[(&str, &str)] =
-    &[("/720p", "stream_720p.ts"), ("/480p", "stream_480p.ts")];
+/// Valid quality variant suffixes: (url_suffix, gcs_filename, content_type)
+const QUALITY_VARIANTS: &[(&str, &str, &str)] = &[
+    ("/720p", "stream_720p.ts", "video/mp2t"),
+    ("/480p", "stream_480p.ts", "video/mp2t"),
+    ("/720p.mp4", "stream_720p.mp4", "video/mp4"),
+    ("/480p.mp4", "stream_480p.mp4", "video/mp4"),
+];
 
 /// Check if a path is a quality variant request like /{hash}/720p
 fn is_quality_variant_path(path: &str) -> bool {
     let path = path.trim_start_matches('/');
-    for (suffix, _) in QUALITY_VARIANTS {
+    for (suffix, _, _) in QUALITY_VARIANTS {
         let suffix = suffix.trim_start_matches('/');
         // Need at least hash(64) + '/' + suffix
         if path.ends_with(suffix) && path.len() > suffix.len() + 1 {
@@ -1465,15 +1469,15 @@ fn is_quality_variant_path(path: &str) -> bool {
     false
 }
 
-/// Parse quality variant path into (hash, ts_filename)
-fn parse_quality_variant_path(path: &str) -> Option<(String, &'static str)> {
+/// Parse quality variant path into (hash, gcs_filename, content_type)
+fn parse_quality_variant_path(path: &str) -> Option<(String, &'static str, &'static str)> {
     let path = path.trim_start_matches('/');
-    for (suffix, ts_file) in QUALITY_VARIANTS {
+    for (suffix, filename, content_type) in QUALITY_VARIANTS {
         let suffix = suffix.trim_start_matches('/');
         if path.ends_with(suffix) && path.len() > suffix.len() + 1 {
             let hash_part = &path[..path.len() - suffix.len() - 1];
             if hash_part.len() == 64 && hash_part.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Some((hash_part.to_lowercase(), ts_file));
+                return Some((hash_part.to_lowercase(), filename, content_type));
             }
         }
     }
@@ -1482,7 +1486,7 @@ fn parse_quality_variant_path(path: &str) -> Option<(String, &'static str)> {
 
 /// GET /<sha256>/720p or /<sha256>/480p - Direct access to transcoded quality variant
 fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
-    let (hash, ts_filename) = parse_quality_variant_path(path)
+    let (hash, ts_filename, content_type) = parse_quality_variant_path(path)
         .ok_or_else(|| BlossomError::BadRequest("Invalid quality variant path".into()))?;
 
     // Check metadata for access control
@@ -1518,7 +1522,7 @@ fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
 
     match download_hls_content(&gcs_path, range.as_deref()) {
         Ok(mut resp) => {
-            resp.set_header("Content-Type", "video/mp2t");
+            resp.set_header("Content-Type", content_type);
             add_cache_headers(&mut resp, &hash);
             resp.set_header("Accept-Ranges", "bytes");
             add_cors_headers(&mut resp);
@@ -1560,7 +1564,7 @@ fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
 
 /// HEAD /<sha256>/720p or /<sha256>/480p
 fn handle_head_quality_variant(path: &str) -> Result<Response> {
-    let (hash, ts_filename) = parse_quality_variant_path(path)
+    let (hash, ts_filename, content_type) = parse_quality_variant_path(path)
         .ok_or_else(|| BlossomError::BadRequest("Invalid quality variant path".into()))?;
 
     let metadata = get_blob_metadata(&hash)?
@@ -1574,7 +1578,7 @@ fn handle_head_quality_variant(path: &str) -> Result<Response> {
     download_hls_content(&gcs_path, None)?;
 
     let mut resp = Response::from_status(StatusCode::OK);
-    resp.set_header("Content-Type", "video/mp2t");
+    resp.set_header("Content-Type", content_type);
     resp.set_header("Accept-Ranges", "bytes");
     add_cors_headers(&mut resp);
     Ok(resp)
@@ -1697,8 +1701,9 @@ fn trigger_on_demand_transcoding(hash: &str, owner: &str) -> Result<()> {
             )?;
         }
 
-        // Stub .ts files — write raw blob reference so /{hash}/720p and /{hash}/480p routes work.
-        // Downloads the original blob from storage and writes it as both .ts variants.
+        // Stub .ts and .mp4 files — write raw blob reference so /{hash}/720p, /{hash}/480p,
+        // /{hash}/720p.mp4, and /{hash}/480p.mp4 routes work.
+        // Downloads the original blob from storage and writes it as both variant types.
         match crate::storage::download_blob(hash, None) {
             Ok(blob_resp) => {
                 let blob_bytes: Vec<u8> = blob_resp.into_body().into_bytes();
@@ -1712,10 +1717,19 @@ fn trigger_on_demand_transcoding(hash: &str, owner: &str) -> Result<()> {
                         blob_len,
                         owner,
                     )?;
+                    // New .mp4 stub (same bytes, different content-type)
+                    let mp4_key = format!("{}/hls/{}.mp4", hash, variant_name);
+                    crate::storage::upload_blob(
+                        &mp4_key,
+                        fastly::Body::from(blob_bytes.as_slice()),
+                        "video/mp4",
+                        blob_len,
+                        owner,
+                    )?;
                 }
             }
             Err(e) => {
-                eprintln!("[HLS][LOCAL] Could not copy blob as .ts stubs: {}", e);
+                eprintln!("[HLS][LOCAL] Could not copy blob as .ts/.mp4 stubs: {}", e);
             }
         }
 
@@ -2292,6 +2306,8 @@ fn delete_blob_gcs_artifacts(hash: &str) {
         format!("{}/hls/stream_720p.ts", hash),
         format!("{}/hls/stream_480p.m3u8", hash),
         format!("{}/hls/stream_480p.ts", hash),
+        format!("{}/hls/stream_720p.mp4", hash),
+        format!("{}/hls/stream_480p.mp4", hash),
     ];
     for path in &hls_paths {
         let _ = storage_delete(path);
@@ -4189,9 +4205,20 @@ mod tests {
         let hash = "a".repeat(64);
         assert!(is_quality_variant_path(&format!("/{}/720p", hash)));
         assert!(is_quality_variant_path(&format!("/{}/480p", hash)));
-        let (parsed_hash, ts) = parse_quality_variant_path(&format!("/{}/720p", hash)).unwrap();
+        assert!(is_quality_variant_path(&format!("/{}/720p.mp4", hash)));
+        assert!(is_quality_variant_path(&format!("/{}/480p.mp4", hash)));
+
+        let (parsed_hash, filename, ct) =
+            parse_quality_variant_path(&format!("/{}/720p", hash)).unwrap();
         assert_eq!(parsed_hash, hash);
-        assert_eq!(ts, "stream_720p.ts");
+        assert_eq!(filename, "stream_720p.ts");
+        assert_eq!(ct, "video/mp2t");
+
+        let (parsed_hash, filename, ct) =
+            parse_quality_variant_path(&format!("/{}/720p.mp4", hash)).unwrap();
+        assert_eq!(parsed_hash, hash);
+        assert_eq!(filename, "stream_720p.mp4");
+        assert_eq!(ct, "video/mp4");
     }
 
     #[test]
@@ -4199,11 +4226,13 @@ mod tests {
         // These must not panic (previously caused u32::MAX underflow)
         assert!(!is_quality_variant_path("/720p"));
         assert!(!is_quality_variant_path("/480p"));
+        assert!(!is_quality_variant_path("/720p.mp4"));
+        assert!(!is_quality_variant_path("/480p.mp4"));
         assert!(!is_quality_variant_path("720p"));
         assert!(!is_quality_variant_path("480p"));
         assert!(!is_quality_variant_path(""));
         assert!(parse_quality_variant_path("/480p").is_none());
-        assert!(parse_quality_variant_path("720p").is_none());
+        assert!(parse_quality_variant_path("/720p.mp4").is_none());
     }
 
     #[test]
