@@ -4232,7 +4232,9 @@ mod tests {
         assert!(!is_quality_variant_path("480p"));
         assert!(!is_quality_variant_path(""));
         assert!(parse_quality_variant_path("/480p").is_none());
+        assert!(parse_quality_variant_path("720p").is_none());
         assert!(parse_quality_variant_path("/720p.mp4").is_none());
+        assert!(parse_quality_variant_path("480p.mp4").is_none());
     }
 
     #[test]
