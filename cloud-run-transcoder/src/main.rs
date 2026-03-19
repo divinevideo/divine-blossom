@@ -486,6 +486,7 @@ async fn main() -> Result<()> {
         .route("/transcode", options(handle_cors_preflight))
         .route("/transcribe", post(handle_transcribe))
         .route("/transcribe", options(handle_cors_preflight))
+        .route("/backfill-fmp4", post(handle_backfill_fmp4))
         .route("/health", get(handle_health))
         .route("/", get(handle_health))
         .layer(cors)
@@ -567,6 +568,69 @@ async fn handle_transcribe(
                 .into_response()
         }
     }
+}
+
+async fn handle_backfill_fmp4(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<TranscodeRequest>,
+) -> Response {
+    let hash = request.hash.to_lowercase();
+
+    // Download .ts files from GCS
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+
+    for variant in &["stream_720p", "stream_480p"] {
+        let gcs_key = format!("{}/hls/{}.ts", hash, variant);
+        let ts_path = temp_path.join(format!("{}.ts", variant));
+
+        if let Err(e) = download_from_gcs(
+            &state.gcs_client,
+            &state.config.gcs_bucket,
+            &gcs_key,
+            &ts_path,
+        )
+        .await
+        {
+            warn!("Backfill: {} not found for {}: {}", variant, hash, e);
+            continue;
+        }
+    }
+
+    // Remux .ts to .mp4
+    if let Err(e) = remux_ts_to_fmp4(temp_path).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+
+    // Remove .ts files from temp dir so upload_hls_to_gcs only uploads .mp4
+    for variant in &["stream_720p", "stream_480p"] {
+        let ts_path = temp_path.join(format!("{}.ts", variant));
+        let _ = tokio::fs::remove_file(&ts_path).await;
+    }
+
+    // Upload only the new .mp4 files
+    let source_metadata = SourceObjectMetadata::default();
+    if let Err(e) = upload_hls_to_gcs(
+        &state.gcs_client,
+        &state.config.gcs_bucket,
+        &hash,
+        temp_path,
+        &source_metadata,
+    )
+    .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+
+    Json(serde_json::json!({"status": "ok", "hash": hash})).into_response()
 }
 
 async fn process_transcode(
@@ -694,6 +758,10 @@ async fn process_transcode(
     };
 
     info!("Generated HLS with {} variants", variants.len());
+
+    if let Err(e) = remux_ts_to_fmp4(&output_dir).await {
+        warn!("fMP4 remux step failed: {} (continuing with .ts only)", e);
+    }
 
     // Upload all HLS files to GCS
     let upload_result = upload_hls_to_gcs(
@@ -2791,6 +2859,45 @@ async fn run_ffmpeg_hls(
     ])
 }
 
+/// Remux HLS .ts files to fragmented MP4 for progressive download.
+/// Video is copied without re-encoding. Audio is re-encoded to AAC-LC
+/// because the ADTS-to-ASC bitstream filter produces invalid headers.
+async fn remux_ts_to_fmp4(hls_dir: &Path) -> Result<()> {
+    for variant in &["stream_720p", "stream_480p"] {
+        let ts_path = hls_dir.join(format!("{}.ts", variant));
+        let mp4_path = hls_dir.join(format!("{}.mp4", variant));
+
+        if !ts_path.exists() {
+            warn!("Skipping fMP4 remux: {} not found", ts_path.display());
+            continue;
+        }
+
+        let output = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-v", "warning",
+                "-i", &ts_path.to_string_lossy(),
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+                &mp4_path.to_string_lossy(),
+            ])
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!("fMP4 remux failed for {}: {}", variant, stderr);
+            continue;
+        }
+
+        info!("Remuxed {} to fMP4", variant);
+    }
+
+    Ok(())
+}
+
 async fn upload_hls_to_gcs(
     client: &GcsClient,
     bucket: &str,
@@ -2815,6 +2922,8 @@ async fn upload_hls_to_gcs(
             "application/vnd.apple.mpegurl"
         } else if filename.ends_with(".ts") {
             "video/mp2t"
+        } else if filename.ends_with(".mp4") {
+            "video/mp4"
         } else {
             "application/octet-stream"
         };

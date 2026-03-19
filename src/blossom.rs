@@ -780,10 +780,11 @@ mod tests {
                 vec![
                     format!("{}/hls/{}.m3u8", hash, name),
                     format!("{}/hls/{}.ts", hash, name),
+                    format!("{}/hls/{}.mp4", hash, name),
                 ]
             })
             .collect();
-        assert_eq!(cleanup_paths.len(), 4);
+        assert_eq!(cleanup_paths.len(), 6);
         for path in &cleanup_paths {
             assert!(
                 path.contains("/hls/stream_"),
