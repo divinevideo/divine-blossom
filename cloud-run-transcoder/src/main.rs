@@ -2860,7 +2860,8 @@ async fn run_ffmpeg_hls(
 }
 
 /// Remux HLS .ts files to fragmented MP4 for progressive download.
-/// Uses -c copy (no re-encoding) — just rewraps the bitstream.
+/// Video is copied without re-encoding. Audio is re-encoded to AAC-LC
+/// because the ADTS-to-ASC bitstream filter produces invalid headers.
 async fn remux_ts_to_fmp4(hls_dir: &Path) -> Result<()> {
     for variant in &["stream_720p", "stream_480p"] {
         let ts_path = hls_dir.join(format!("{}.ts", variant));
@@ -2876,7 +2877,9 @@ async fn remux_ts_to_fmp4(hls_dir: &Path) -> Result<()> {
                 "-y",
                 "-v", "warning",
                 "-i", &ts_path.to_string_lossy(),
-                "-c", "copy",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-b:a", "128k",
                 "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
                 &mp4_path.to_string_lossy(),
             ])
