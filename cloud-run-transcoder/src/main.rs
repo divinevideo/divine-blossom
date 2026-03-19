@@ -695,6 +695,10 @@ async fn process_transcode(
 
     info!("Generated HLS with {} variants", variants.len());
 
+    if let Err(e) = remux_ts_to_fmp4(&output_dir).await {
+        warn!("fMP4 remux step failed: {} (continuing with .ts only)", e);
+    }
+
     // Upload all HLS files to GCS
     let upload_result = upload_hls_to_gcs(
         &state.gcs_client,
@@ -2791,6 +2795,42 @@ async fn run_ffmpeg_hls(
     ])
 }
 
+/// Remux HLS .ts files to fragmented MP4 for progressive download.
+/// Uses -c copy (no re-encoding) — just rewraps the bitstream.
+async fn remux_ts_to_fmp4(hls_dir: &Path) -> Result<()> {
+    for variant in &["stream_720p", "stream_480p"] {
+        let ts_path = hls_dir.join(format!("{}.ts", variant));
+        let mp4_path = hls_dir.join(format!("{}.mp4", variant));
+
+        if !ts_path.exists() {
+            warn!("Skipping fMP4 remux: {} not found", ts_path.display());
+            continue;
+        }
+
+        let output = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-v", "warning",
+                "-i", &ts_path.to_string_lossy(),
+                "-c", "copy",
+                "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+                &mp4_path.to_string_lossy(),
+            ])
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!("fMP4 remux failed for {}: {}", variant, stderr);
+            continue;
+        }
+
+        info!("Remuxed {} to fMP4", variant);
+    }
+
+    Ok(())
+}
+
 async fn upload_hls_to_gcs(
     client: &GcsClient,
     bucket: &str,
@@ -2815,6 +2855,8 @@ async fn upload_hls_to_gcs(
             "application/vnd.apple.mpegurl"
         } else if filename.ends_with(".ts") {
             "video/mp2t"
+        } else if filename.ends_with(".mp4") {
+            "video/mp4"
         } else {
             "application/octet-stream"
         };
