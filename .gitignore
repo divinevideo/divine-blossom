@@ -50,3 +50,6 @@ package.json
 package-lock.json
 .env
 migration_progress.json
+scripts/backfill-fmp4-all-hashes.txt
+scripts/backfill-fmp4-done.txt
+scripts/backfill-fmp4-failed.txt
