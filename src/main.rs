@@ -1529,6 +1529,25 @@ fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
             Ok(resp)
         }
         Err(BlossomError::NotFound(_)) => {
+            // For .mp4 requests, check if the .ts counterpart exists for lazy remux
+            if content_type == "video/mp4" {
+                let ts_name = ts_filename.replace(".mp4", ".ts");
+                let ts_gcs_path = format!("{}/hls/{}", hash, ts_name);
+                if download_hls_content(&ts_gcs_path, Some("bytes=0-0")).is_ok() {
+                    let _ = trigger_fmp4_backfill(&hash);
+
+                    let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                    resp.set_header("Retry-After", "3");
+                    resp.set_header("Content-Type", "application/json");
+                    resp.set_body(
+                        r#"{"status":"processing","message":"Remuxing to fMP4, please retry"}"#,
+                    );
+                    add_no_cache_headers(&mut resp);
+                    add_cors_headers(&mut resp);
+                    return Ok(resp);
+                }
+            }
+
             // HLS not ready - trigger on-demand transcoding
             match meta.transcode_status {
                 Some(TranscodeStatus::Processing) => {
@@ -1758,6 +1777,36 @@ fn trigger_on_demand_transcoding(hash: &str, owner: &str) -> Result<()> {
             eprintln!("[HLS] Failed to trigger transcoding for {}: {}", hash, e);
             Err(BlossomError::Internal(format!(
                 "Failed to trigger transcoding: {}",
+                e
+            )))
+        }
+    }
+}
+
+/// Trigger fMP4 backfill via Cloud Run transcoder — remuxes existing .ts to .mp4
+fn trigger_fmp4_backfill(hash: &str) -> Result<()> {
+    if crate::storage::is_local_mode() {
+        eprintln!("[HLS][LOCAL] Stubbing fMP4 backfill for {}", hash);
+        return Ok(());
+    }
+
+    let url = format!("https://{}/backfill-fmp4", CLOUD_RUN_TRANSCODER_HOST);
+    let body = format!(r#"{{"hash":"{}"}}"#, hash);
+
+    let mut proxy_req = Request::new(Method::POST, &url);
+    proxy_req.set_header("Host", CLOUD_RUN_TRANSCODER_HOST);
+    proxy_req.set_header("Content-Type", "application/json");
+    proxy_req.set_body(body);
+
+    match proxy_req.send_async(CLOUD_RUN_BACKEND) {
+        Ok(_) => {
+            eprintln!("[HLS] Triggered fMP4 backfill for {}", hash);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("[HLS] Failed to trigger fMP4 backfill for {}: {}", hash, e);
+            Err(BlossomError::Internal(format!(
+                "Failed to trigger fMP4 backfill: {}",
                 e
             )))
         }
@@ -4235,6 +4284,27 @@ mod tests {
         assert!(parse_quality_variant_path("720p").is_none());
         assert!(parse_quality_variant_path("/720p.mp4").is_none());
         assert!(parse_quality_variant_path("480p.mp4").is_none());
+    }
+
+    #[test]
+    fn mp4_variant_maps_to_ts_counterpart() {
+        let hash = "a".repeat(64);
+
+        // 720p.mp4 derives correct .ts counterpart for backfill check
+        let (_, filename, ct) =
+            parse_quality_variant_path(&format!("/{}/720p.mp4", hash)).unwrap();
+        assert_eq!(ct, "video/mp4");
+        assert_eq!(filename.replace(".mp4", ".ts"), "stream_720p.ts");
+
+        // 480p.mp4 likewise
+        let (_, filename, ct) =
+            parse_quality_variant_path(&format!("/{}/480p.mp4", hash)).unwrap();
+        assert_eq!(ct, "video/mp4");
+        assert_eq!(filename.replace(".mp4", ".ts"), "stream_480p.ts");
+
+        // .ts variants have different content type — backfill path won't trigger
+        let (_, _, ct) = parse_quality_variant_path(&format!("/{}/720p", hash)).unwrap();
+        assert_eq!(ct, "video/mp2t");
     }
 
     #[test]
