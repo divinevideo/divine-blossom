@@ -370,7 +370,7 @@ class TestFlaskEndpoint(unittest.TestCase):
             data=json.dumps({
                 'data': {
                     'bucket': 'test-bucket',
-                    'name': 'thumbnails/abc123.jpg',
+                    'name': f'{"c" * 64}.jpg',
                     'contentType': 'image/jpeg'
                 }
             }),
@@ -384,13 +384,41 @@ class TestFlaskEndpoint(unittest.TestCase):
             data=json.dumps({
                 'data': {
                     'bucket': 'test-bucket',
-                    'name': 'hls/abc123/playlist.m3u8',
+                    'name': f'{"d" * 64}/hls/stream_720p.m3u8',
                     'contentType': 'application/x-mpegURL'
                 }
             }),
             content_type='application/json'
         )
         self.assertEqual(resp.status_code, 200)
+
+
+class TestDerivativeFiltering(unittest.TestCase):
+    """Test filtering for real derivative object paths produced by the app."""
+
+    def test_skips_real_hls_variant_playlist(self):
+        blob_name = f'{"a" * 64}/hls/stream_720p.m3u8'
+
+        with patch.object(main, 'check_image_safety') as check_image_safety, \
+             patch.object(main, 'extract_video_thumbnail') as extract_video_thumbnail, \
+             patch.object(main, 'update_metadata') as update_metadata:
+            main.process_blob_event('test-bucket', blob_name, 'application/vnd.apple.mpegurl')
+
+        check_image_safety.assert_not_called()
+        extract_video_thumbnail.assert_not_called()
+        update_metadata.assert_not_called()
+
+    def test_skips_real_hls_segment(self):
+        blob_name = f'{"b" * 64}/hls/stream_720p.ts'
+
+        with patch.object(main, 'check_image_safety') as check_image_safety, \
+             patch.object(main, 'extract_video_thumbnail') as extract_video_thumbnail, \
+             patch.object(main, 'update_metadata') as update_metadata:
+            main.process_blob_event('test-bucket', blob_name, 'video/mp2t')
+
+        check_image_safety.assert_not_called()
+        extract_video_thumbnail.assert_not_called()
+        update_metadata.assert_not_called()
 
 
 class TestSuffixForBlob(unittest.TestCase):
