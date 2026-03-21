@@ -1837,6 +1837,14 @@ fn normalize_transcript_to_vtt(raw: &str) -> Result<ParsedVtt> {
         }
     }
 
+    // If we parsed valid JSON but found no segments and no text,
+    // this is a valid API response with no transcribable content (e.g. silent video).
+    // Don't let it fall through to the plain text path, which would wrap the raw
+    // JSON string in a VTT cue and render it as captions.
+    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+        return Err(anyhow!("Transcription response contained no usable text"));
+    }
+
     // Plain text fallback when the provider does not return timestamps.
     let merged = trimmed
         .split('\n')
@@ -2315,6 +2323,88 @@ mod tests {
             decide_transcript_lock_action(1_700, Some(&existing), 600),
             TranscriptLockAction::ReclaimStaleLock
         );
+    }
+
+    #[test]
+    fn empty_text_json_response_is_rejected_not_rendered() {
+        // Whisper returns this for silent videos. The raw JSON must not
+        // fall through to the plain text path and become a VTT cue.
+        let result = normalize_transcript_to_vtt(
+            r#"{"text":"","usage":{"type":"tokens","total_tokens":52,"input_tokens":50,"input_token_details":{"text_tokens":0,"audio_tokens":50},"output_tokens":2}}"#,
+        );
+        assert!(result.is_err(), "empty-text JSON should be rejected");
+    }
+
+    #[test]
+    fn empty_segments_json_response_is_rejected() {
+        // gpt-4o-transcribe with no speech: segments array present but empty
+        let result = normalize_transcript_to_vtt(
+            r#"{"text":"","language":"en","segments":[]}"#,
+        );
+        assert!(result.is_err(), "empty-segments JSON should be rejected");
+    }
+
+    #[test]
+    fn json_with_only_whitespace_text_is_rejected() {
+        let result = normalize_transcript_to_vtt(
+            r#"{"text":"   \n  "}"#,
+        );
+        assert!(result.is_err(), "whitespace-only text JSON should be rejected");
+    }
+
+    #[test]
+    fn json_with_null_text_is_rejected() {
+        let result = normalize_transcript_to_vtt(
+            r#"{"text":null,"language":"en"}"#,
+        );
+        assert!(result.is_err(), "null-text JSON should be rejected");
+    }
+
+    #[test]
+    fn json_with_no_text_field_is_rejected() {
+        // API error response or malformed output
+        let result = normalize_transcript_to_vtt(
+            r#"{"error":{"message":"Invalid file format","type":"invalid_request_error"}}"#,
+        );
+        assert!(result.is_err(), "error JSON should be rejected");
+    }
+
+    #[test]
+    fn json_with_text_is_still_accepted() {
+        let parsed = normalize_transcript_to_vtt(
+            r#"{"text":"hello world"}"#,
+        )
+        .expect("json with text should parse");
+        assert!(parsed.content.starts_with("WEBVTT"));
+        assert_eq!(parsed.text, "hello world");
+    }
+
+    #[test]
+    fn json_with_segments_is_still_accepted() {
+        let parsed = normalize_transcript_to_vtt(
+            r#"{"text":"hello there","language":"en","segments":[{"start":0.0,"end":1.5,"text":"hello there"}]}"#,
+        )
+        .expect("json with segments should parse");
+        assert!(parsed.content.starts_with("WEBVTT"));
+        assert!(parsed.content.contains("hello there"));
+        assert_eq!(parsed.cue_count, 1);
+    }
+
+    #[test]
+    fn valid_vtt_passthrough_still_works() {
+        let vtt = "WEBVTT\n\n1\n00:00:00.000 --> 00:00:02.000\nHello\n";
+        let parsed = normalize_transcript_to_vtt(vtt)
+            .expect("valid VTT should pass through");
+        assert!(parsed.content.starts_with("WEBVTT"));
+        assert_eq!(parsed.text, "Hello");
+    }
+
+    #[test]
+    fn plain_text_input_still_works() {
+        let parsed = normalize_transcript_to_vtt("This is spoken text from the video")
+            .expect("plain text should still work");
+        assert!(parsed.content.starts_with("WEBVTT"));
+        assert_eq!(parsed.text, "This is spoken text from the video");
     }
 }
 
