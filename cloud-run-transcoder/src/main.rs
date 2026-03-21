@@ -1837,6 +1837,14 @@ fn normalize_transcript_to_vtt(raw: &str) -> Result<ParsedVtt> {
         }
     }
 
+    // If we parsed valid JSON but found no segments and no text,
+    // this is a valid API response with no transcribable content (e.g. silent video).
+    // Don't let it fall through to the plain text path, which would wrap the raw
+    // JSON string in a VTT cue and render it as captions.
+    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+        return Err(anyhow!("Transcription response contained no usable text"));
+    }
+
     // Plain text fallback when the provider does not return timestamps.
     let merged = trimmed
         .split('\n')
