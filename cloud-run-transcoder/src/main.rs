@@ -2324,6 +2324,26 @@ mod tests {
             TranscriptLockAction::ReclaimStaleLock
         );
     }
+
+    #[test]
+    fn empty_text_json_response_is_rejected_not_rendered() {
+        // Whisper returns this for silent videos. The raw JSON must not
+        // fall through to the plain text path and become a VTT cue.
+        let result = normalize_transcript_to_vtt(
+            r#"{"text":"","usage":{"type":"tokens","total_tokens":52,"input_tokens":50,"input_token_details":{"text_tokens":0,"audio_tokens":50},"output_tokens":2}}"#,
+        );
+        assert!(result.is_err(), "empty-text JSON should be rejected");
+    }
+
+    #[test]
+    fn json_with_text_is_still_accepted() {
+        let parsed = normalize_transcript_to_vtt(
+            r#"{"text":"hello world"}"#,
+        )
+        .expect("json with text should parse");
+        assert!(parsed.content.starts_with("WEBVTT"));
+        assert_eq!(parsed.text, "hello world");
+    }
 }
 
 fn summarize_vtt(vtt: &str) -> (u32, u64) {
