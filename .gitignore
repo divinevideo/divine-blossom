@@ -32,6 +32,7 @@ Thumbs.db
 
 # Git worktrees
 .worktrees/
+worktrees/
 
 # Secrets and config (contain API keys)
 secrets.json
