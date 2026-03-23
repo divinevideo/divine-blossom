@@ -1405,6 +1405,26 @@ pub struct AudioExtractionResponse {
     pub error: Option<String>,
 }
 
+fn parse_funnelcake_audio_reuse_response(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|json| {
+            json.get("allow_audio_reuse")
+                .and_then(|value| value.as_bool())
+        })
+        .unwrap_or(false)
+}
+
+fn parse_audio_extraction_error_response(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|json| {
+            json.get("error")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
+        })
+}
+
 /// Check Funnelcake permission for audio reuse.
 /// Returns Ok(true) if allowed, Ok(false) if denied, Err for unavailability.
 pub fn check_funnelcake_audio_reuse(hash: &str) -> Result<bool> {
@@ -1416,17 +1436,13 @@ pub fn check_funnelcake_audio_reuse(hash: &str) -> Result<bool> {
     let funnelcake_url = get_config("funnelcake_api_url").map_err(|_| {
         BlossomError::Internal("Funnelcake API URL not configured".into())
     })?;
-    let funnelcake_token = get_secret("funnelcake_api_token").map_err(|_| {
-        BlossomError::Internal("Funnelcake API token not configured".into())
-    })?;
 
     let url = format!(
-        "{}/api/internal/videos/by-sha256/{}/audio-reuse",
+        "{}/api/videos/by-sha256/{}/audio-reuse",
         funnelcake_url, hash
     );
 
     let mut req = Request::new(Method::GET, &url);
-    req.set_header("Authorization", &format!("Bearer {}", funnelcake_token));
     // Set Host header from the URL
     if let Some(host) = funnelcake_url
         .strip_prefix("https://")
@@ -1443,14 +1459,7 @@ pub fn check_funnelcake_audio_reuse(hash: &str) -> Result<bool> {
     match resp.get_status() {
         StatusCode::OK => {
             let body = resp.take_body().into_string();
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
-                Ok(json
-                    .get("allow_audio_reuse")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false))
-            } else {
-                Ok(false)
-            }
+            Ok(parse_funnelcake_audio_reuse_response(&body))
         }
         StatusCode::NOT_FOUND => Ok(false),
         status => Err(BlossomError::Internal(format!(
@@ -1495,27 +1504,51 @@ pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtracti
                 ))
             }),
         StatusCode::UNPROCESSABLE_ENTITY => {
-            // Parse error response and return it as a structured response
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&resp_body) {
-                let error = json
-                    .get("error")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("extraction_failed")
-                    .to_string();
-                Ok(AudioExtractionResponse {
-                    audio_sha256: None,
-                    duration: None,
-                    size: None,
-                    mime_type: None,
-                    error: Some(error),
-                })
-            } else {
-                Err(BlossomError::Internal("Audio extraction failed".into()))
-            }
+            let error = parse_audio_extraction_error_response(&resp_body)
+                .unwrap_or_else(|| "extraction_failed".to_string());
+            Ok(AudioExtractionResponse {
+                audio_sha256: None,
+                duration: None,
+                size: None,
+                mime_type: None,
+                error: Some(error),
+            })
         }
         _ => Err(BlossomError::Internal(format!(
             "Audio extraction failed with status: {}",
             status.as_u16()
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        parse_audio_extraction_error_response, parse_funnelcake_audio_reuse_response,
+    };
+
+    #[test]
+    fn parses_funnelcake_audio_reuse_allow_flag() {
+        assert!(parse_funnelcake_audio_reuse_response(
+            r#"{"allow_audio_reuse":true}"#
+        ));
+        assert!(!parse_funnelcake_audio_reuse_response(
+            r#"{"allow_audio_reuse":false}"#
+        ));
+    }
+
+    #[test]
+    fn defaults_funnelcake_audio_reuse_to_false_on_invalid_body() {
+        assert!(!parse_funnelcake_audio_reuse_response("not json"));
+        assert!(!parse_funnelcake_audio_reuse_response(r#"{"unexpected":true}"#));
+    }
+
+    #[test]
+    fn parses_audio_extraction_error_response() {
+        assert_eq!(
+            parse_audio_extraction_error_response(r#"{"error":"no_audio_track"}"#),
+            Some("no_audio_track".to_string())
+        );
+        assert_eq!(parse_audio_extraction_error_response("not json"), None);
     }
 }

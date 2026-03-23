@@ -65,8 +65,6 @@ language = "rust"
         [local_server.secret_stores.blossom_secrets.contents.moderation_api_token]
         plaintext = "YOUR_MODERATION_API_BEARER_TOKEN"
 
-        [local_server.secret_stores.blossom_secrets.contents.funnelcake_api_token]
-        plaintext = "YOUR_FUNNELCAKE_API_TOKEN"
 
 [setup]
 
@@ -135,5 +133,4 @@ language = "rust"
     entries = [
       { key = "gcs_access_key", description = "GCS HMAC access key" },
       { key = "gcs_secret_key", description = "GCS HMAC secret key" },
-      { key = "funnelcake_api_token", description = "Funnelcake API bearer token" },
     ]
