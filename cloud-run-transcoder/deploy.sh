@@ -29,7 +29,7 @@ gcloud run deploy "${SERVICE_NAME}" \
   --set-env-vars "WEBHOOK_URL=https://media.divine.video/admin/transcode-status" \
   --set-env-vars "TRANSCRIPT_WEBHOOK_URL=https://media.divine.video/admin/transcript-status" \
   --set-env-vars "TRANSCRIPTION_API_URL=https://api.openai.com/v1/audio/transcriptions" \
-  --set-env-vars "TRANSCRIPTION_MODEL=whisper-1" \
+  --set-env-vars "TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe" \
   --set-env-vars "TRANSCRIPTION_MAX_IN_FLIGHT=4" \
   --set-env-vars "TRANSCRIPTION_MAX_RETRIES=3" \
   --set-env-vars "TRANSCRIPTION_RETRY_BASE_MS=1000" \

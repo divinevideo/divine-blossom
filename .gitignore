@@ -53,3 +53,8 @@ migration_progress.json
 scripts/backfill-fmp4-all-hashes.txt
 scripts/backfill-fmp4-done.txt
 scripts/backfill-fmp4-failed.txt
+
+# Local/ephemeral
+.claude/
+__pycache__/
+*.log
