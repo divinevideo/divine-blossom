@@ -1,7 +1,7 @@
 // ABOUTME: Fastly KV store operations for blob metadata
 // ABOUTME: Handles blob metadata and per-user blob lists
 
-use crate::blossom::{BlobMetadata, BlobStatus, GlobalStats, RecentIndex, SubtitleJob, UserIndex};
+use crate::blossom::{AudioMapping, BlobMetadata, BlobStatus, GlobalStats, RecentIndex, SubtitleJob, UserIndex};
 use crate::error::{BlossomError, Result};
 use fastly::cache::simple as simple_cache;
 use fastly::kv_store::{KVStore, KVStoreError};
@@ -42,6 +42,9 @@ const SUBTITLE_JOB_PREFIX: &str = "subtitle_job:";
 
 /// Key prefix for hash -> subtitle job id mapping
 const SUBTITLE_HASH_PREFIX: &str = "subtitle_hash:";
+
+/// Key prefix for audio mapping (source video -> derived audio)
+const AUDIO_MAP_PREFIX: &str = "audio_map:";
 
 /// Open the metadata KV store
 fn open_store() -> Result<KVStore> {
@@ -994,4 +997,41 @@ pub fn add_to_blob_refs(hash: &str, pubkey: &str) -> Result<()> {
     Err(BlossomError::MetadataError(
         "Max retries exceeded for refs update".into(),
     ))
+}
+
+/// Get audio mapping by source video hash
+pub fn get_audio_mapping(source_hash: &str) -> Result<Option<AudioMapping>> {
+    let store = open_store()?;
+    let key = format!("{}{}", AUDIO_MAP_PREFIX, source_hash.to_lowercase());
+
+    match store.lookup(&key) {
+        Ok(mut lookup_result) => {
+            let body = lookup_result.take_body().into_string();
+            let mapping: AudioMapping = serde_json::from_str(&body).map_err(|e| {
+                BlossomError::MetadataError(format!("Failed to parse audio mapping: {}", e))
+            })?;
+            Ok(Some(mapping))
+        }
+        Err(KVStoreError::ItemNotFound) => Ok(None),
+        Err(e) => Err(BlossomError::MetadataError(format!(
+            "Failed to lookup audio mapping: {}",
+            e
+        ))),
+    }
+}
+
+/// Store audio mapping
+pub fn put_audio_mapping(mapping: &AudioMapping) -> Result<()> {
+    let store = open_store()?;
+    let key = format!(
+        "{}{}",
+        AUDIO_MAP_PREFIX,
+        mapping.source_sha256.to_lowercase()
+    );
+    let json = serde_json::to_string(mapping)
+        .map_err(|e| BlossomError::MetadataError(format!("Failed to serialize audio mapping: {}", e)))?;
+    store
+        .insert(&key, json)
+        .map_err(|e| BlossomError::MetadataError(format!("Failed to store audio mapping: {}", e)))?;
+    Ok(())
 }

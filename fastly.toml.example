@@ -33,6 +33,9 @@ language = "rust"
     [local_server.backends.moderation_api]
     url = "https://moderation-api.divine.video"
 
+    [local_server.backends.funnelcake_api]
+    url = "https://funnelcake.divine.video"
+
   [local_server.kv_stores]
 
     [local_server.kv_stores.blossom_metadata]
@@ -99,6 +102,11 @@ language = "rust"
     [setup.backends.moderation_api]
     description = "Divine moderation API (CF Worker)"
     address = "moderation-api.divine.video"
+    port = 443
+
+    [setup.backends.funnelcake_api]
+    description = "Funnelcake permission API"
+    address = "funnelcake.divine.video"
     port = 443
 
   [setup.kv_stores]

@@ -10,25 +10,26 @@ mod storage;
 
 use crate::auth::{optional_auth, validate_auth, validate_hash_match};
 use crate::blossom::{
-    is_hash_path, is_transcribable_mime_type, is_video_mime_type, parse_hash_from_path,
-    parse_thumbnail_path, AuthAction, BlobDescriptor, BlobMetadata, BlobStatus, SubtitleJob,
-    SubtitleJobCreateRequest, SubtitleJobStatus, TranscodeStatus, TranscriptStatus,
-    UploadRequirements,
+    is_audio_path, is_hash_path, is_transcribable_mime_type, is_video_mime_type,
+    parse_audio_path, parse_hash_from_path, parse_thumbnail_path, AudioMapping, AuthAction,
+    BlobDescriptor, BlobMetadata, BlobStatus, SubtitleJob, SubtitleJobCreateRequest,
+    SubtitleJobStatus, TranscodeStatus, TranscriptStatus, UploadRequirements,
 };
 use crate::error::{BlossomError, Result};
 use crate::metadata::{
     add_to_blob_refs, add_to_recent_index, add_to_user_index, add_to_user_list, check_ownership,
     delete_auth_events, delete_blob_metadata, delete_blob_refs, delete_subtitle_data,
-    delete_user_list, get_auth_event, get_blob_metadata, get_blob_refs, get_subtitle_job,
-    get_subtitle_job_by_hash, get_tombstone, get_user_blobs, list_blobs_with_metadata,
-    put_auth_event, put_blob_metadata, put_subtitle_job, put_tombstone, remove_from_blob_refs,
-    remove_from_recent_index, remove_from_user_index, remove_from_user_list,
-    set_subtitle_job_id_for_hash, update_blob_status, update_stats_on_add, update_stats_on_remove,
-    TranscriptMetadataUpdate,
+    delete_user_list, get_audio_mapping, get_auth_event, get_blob_metadata, get_blob_refs,
+    get_subtitle_job, get_subtitle_job_by_hash, get_tombstone, get_user_blobs,
+    list_blobs_with_metadata, put_audio_mapping, put_auth_event, put_blob_metadata,
+    put_subtitle_job, put_tombstone, remove_from_blob_refs, remove_from_recent_index,
+    remove_from_user_index, remove_from_user_list, set_subtitle_job_id_for_hash,
+    update_blob_status, update_stats_on_add, update_stats_on_remove, TranscriptMetadataUpdate,
 };
 use crate::storage::{
-    blob_exists, current_timestamp, delete_blob as storage_delete, download_blob_with_fallback,
-    download_thumbnail, trigger_audit_anonymize, trigger_cloud_run_bulk_delete,
+    blob_exists, check_funnelcake_audio_reuse, current_timestamp,
+    delete_blob as storage_delete, download_blob_with_fallback, download_thumbnail,
+    trigger_audio_extraction, trigger_audit_anonymize, trigger_cloud_run_bulk_delete,
     trigger_cloud_run_delete_blob, upload_blob, write_audit_log,
 };
 
@@ -103,6 +104,10 @@ fn handle_request(req: Request) -> Result<Response> {
 
         // Provenance: /{sha256}/provenance - get cryptographic proof of upload
         (Method::GET, p) if p.ends_with("/provenance") => handle_get_provenance(p),
+
+        // Audio extraction: /{sha256}.audio.m4a
+        (Method::GET, p) if is_audio_path(p) => handle_get_audio(req, p),
+        (Method::HEAD, p) if is_audio_path(p) => handle_head_audio(p),
 
         // Direct quality variant access: /{sha256}/720p, /{sha256}/480p
         (Method::GET, p) if is_quality_variant_path(p) => handle_get_quality_variant(req, p),
@@ -1452,6 +1457,179 @@ const QUALITY_VARIANTS: &[(&str, &str, &str)] = &[
     ("/720p.mp4", "stream_720p.mp4", "video/mp4"),
     ("/480p.mp4", "stream_480p.mp4", "video/mp4"),
 ];
+
+/// GET /{sha256}.audio.m4a - Extract and serve audio from a video blob.
+///
+/// Permission is hash-level: if ANY public current video event for this sha256
+/// opts into audio reuse via Funnelcake, extraction is allowed. This collapses
+/// event-level permission to hash-level because Blossom is content-addressed.
+fn handle_get_audio(_req: Request, path: &str) -> Result<Response> {
+    let hash = parse_audio_path(path)
+        .ok_or_else(|| BlossomError::BadRequest("Invalid hash in audio path".into()))?;
+
+    // 1. Look up source blob metadata
+    let metadata = get_blob_metadata(&hash)?
+        .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
+
+    // 2. Access control: banned/deleted content is not served
+    if metadata.status.blocks_public_access() {
+        return Err(BlossomError::NotFound("Blob not found".into()));
+    }
+    // Restricted content requires owner auth - not supported for audio extraction
+    if metadata.status.requires_owner_auth() {
+        return Err(BlossomError::NotFound("Blob not found".into()));
+    }
+
+    // 3. Check Funnelcake permission
+    let allowed = match check_funnelcake_audio_reuse(&hash) {
+        Ok(allowed) => allowed,
+        Err(e) => {
+            eprintln!("[AUDIO] Funnelcake unavailable for {}: {}", hash, e);
+            // 503 Service Unavailable
+            let mut resp = Response::from_status(StatusCode::SERVICE_UNAVAILABLE);
+            resp.set_header("Content-Type", "application/json");
+            resp.set_body(r#"{"error":"permission_lookup_unavailable"}"#);
+            resp.set_header("Retry-After", "30");
+            add_cors_headers(&mut resp);
+            return Ok(resp);
+        }
+    };
+
+    if !allowed {
+        let mut resp = Response::from_status(StatusCode::FORBIDDEN);
+        resp.set_header("Content-Type", "application/json");
+        resp.set_body(r#"{"error":"audio_reuse_not_allowed"}"#);
+        add_cors_headers(&mut resp);
+        return Ok(resp);
+    }
+
+    // 4. Must be a video source
+    if !is_video_mime_type(&metadata.mime_type) {
+        let mut resp = Response::from_status(StatusCode::UNPROCESSABLE_ENTITY);
+        resp.set_header("Content-Type", "application/json");
+        resp.set_body(r#"{"error":"not_a_video"}"#);
+        add_cors_headers(&mut resp);
+        return Ok(resp);
+    }
+
+    // 5. Check cache: source->audio mapping
+    if let Some(mapping) = get_audio_mapping(&hash)? {
+        // Verify the audio blob still exists in GCS
+        if blob_exists(&mapping.audio_sha256)? {
+            // Serve cached audio via redirect or proxy
+            let result = download_blob_with_fallback(&mapping.audio_sha256, None)?;
+            let mut resp = result.response;
+            resp.set_header("Content-Type", &mapping.mime_type);
+            resp.set_header("Content-Length", mapping.size_bytes.to_string());
+            resp.set_header("X-Content-SHA256", &mapping.audio_sha256);
+            resp.set_header("X-Audio-Duration", format!("{}", mapping.duration_seconds));
+            resp.set_header("X-Audio-Size", mapping.size_bytes.to_string());
+            add_cache_headers(&mut resp, &hash);
+            add_cors_headers(&mut resp);
+            return Ok(resp);
+        }
+        // Audio blob gone, fall through to re-extract
+    }
+
+    // 6. Trigger Cloud Run audio extraction (synchronous)
+    let extraction = trigger_audio_extraction(&hash, &metadata.owner)?;
+
+    // Handle extraction-level errors
+    if let Some(ref error) = extraction.error {
+        if error == "not_a_video" || error == "no_audio_track" {
+            let mut resp = Response::from_status(StatusCode::UNPROCESSABLE_ENTITY);
+            resp.set_header("Content-Type", "application/json");
+            resp.set_body(format!(r#"{{"error":"{}"}}"#, error));
+            add_cors_headers(&mut resp);
+            return Ok(resp);
+        }
+        return Err(BlossomError::Internal(format!(
+            "Audio extraction failed: {}",
+            error
+        )));
+    }
+
+    let audio_sha256 = extraction.audio_sha256.ok_or_else(|| {
+        BlossomError::Internal("Audio extraction returned no hash".into())
+    })?;
+    let duration = extraction.duration.unwrap_or(0.0);
+    let size = extraction.size.unwrap_or(0);
+    let mime_type = extraction
+        .mime_type
+        .unwrap_or_else(|| "audio/mp4".to_string());
+
+    // 7. Store audio blob metadata (so /{audio_sha256} works as normal Blossom blob)
+    // Do NOT add to user lists or recent indexes for derived blobs.
+    let audio_metadata = BlobMetadata {
+        sha256: audio_sha256.clone(),
+        size,
+        mime_type: mime_type.clone(),
+        uploaded: current_timestamp(),
+        owner: metadata.owner.clone(),
+        status: BlobStatus::Active,
+        thumbnail: None,
+        moderation: None,
+        transcode_status: None,
+        dim: None,
+        transcript_status: None,
+        transcript_error_code: None,
+        transcript_error_message: None,
+        transcript_last_attempt_at: None,
+        transcript_retry_after: None,
+    };
+    let _ = put_blob_metadata(&audio_metadata);
+
+    // 8. Store source->audio mapping
+    let mapping = AudioMapping {
+        source_sha256: hash.clone(),
+        audio_sha256: audio_sha256.clone(),
+        duration_seconds: duration,
+        size_bytes: size,
+        mime_type: mime_type.clone(),
+    };
+    let _ = put_audio_mapping(&mapping);
+
+    // 9. Download and serve the audio
+    let result = download_blob_with_fallback(&audio_sha256, None)?;
+    let mut resp = result.response;
+    resp.set_header("Content-Type", &mime_type);
+    resp.set_header("Content-Length", size.to_string());
+    resp.set_header("X-Content-SHA256", &audio_sha256);
+    resp.set_header("X-Audio-Duration", format!("{}", duration));
+    resp.set_header("X-Audio-Size", size.to_string());
+    add_cache_headers(&mut resp, &hash);
+    add_cors_headers(&mut resp);
+    Ok(resp)
+}
+
+/// HEAD /{sha256}.audio.m4a - Check audio extraction status
+fn handle_head_audio(path: &str) -> Result<Response> {
+    let hash = parse_audio_path(path)
+        .ok_or_else(|| BlossomError::BadRequest("Invalid hash in audio path".into()))?;
+
+    let metadata = get_blob_metadata(&hash)?
+        .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
+
+    if metadata.status.blocks_public_access() || metadata.status.requires_owner_auth() {
+        return Err(BlossomError::NotFound("Blob not found".into()));
+    }
+
+    // Check if audio mapping exists
+    if let Some(mapping) = get_audio_mapping(&hash)? {
+        let mut resp = Response::from_status(StatusCode::OK);
+        resp.set_header("Content-Type", &mapping.mime_type);
+        resp.set_header("Content-Length", mapping.size_bytes.to_string());
+        resp.set_header("X-Content-SHA256", &mapping.audio_sha256);
+        resp.set_header("X-Audio-Duration", format!("{}", mapping.duration_seconds));
+        resp.set_header("X-Audio-Size", mapping.size_bytes.to_string());
+        add_cache_headers(&mut resp, &hash);
+        add_cors_headers(&mut resp);
+        return Ok(resp);
+    }
+
+    // No audio extracted yet
+    Err(BlossomError::NotFound("Audio not yet extracted".into()))
+}
 
 /// Check if a path is a quality variant request like /{hash}/720p
 fn is_quality_variant_path(path: &str) -> bool {
@@ -4152,7 +4330,7 @@ fn add_cors_headers(resp: &mut Response) {
     );
     resp.set_header(
         "Access-Control-Expose-Headers",
-        "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256",
+        "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256, X-Content-SHA256, X-Audio-Duration, X-Audio-Size",
     );
 }
 

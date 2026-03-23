@@ -164,6 +164,24 @@ struct TranscodeRequest {
     lang: Option<String>,
 }
 
+// Audio extraction request
+#[derive(Debug, Deserialize)]
+struct AudioExtractRequest {
+    /// SHA256 hash of the source video
+    sha256: String,
+    /// Owner pubkey
+    owner: String,
+}
+
+// Audio extraction response
+#[derive(Serialize)]
+struct AudioExtractResponse {
+    audio_sha256: String,
+    duration: f64,
+    size: u64,
+    mime_type: String,
+}
+
 // Transcode response
 #[derive(Serialize)]
 struct TranscodeResponse {
@@ -487,6 +505,8 @@ async fn main() -> Result<()> {
         .route("/transcribe", post(handle_transcribe))
         .route("/transcribe", options(handle_cors_preflight))
         .route("/backfill-fmp4", post(handle_backfill_fmp4))
+        .route("/audio/extract", post(handle_audio_extract))
+        .route("/audio/extract", options(handle_cors_preflight))
         .route("/health", get(handle_health))
         .route("/", get(handle_health))
         .layer(cors)
@@ -631,6 +651,202 @@ async fn handle_backfill_fmp4(
     }
 
     Json(serde_json::json!({"status": "ok", "hash": hash})).into_response()
+}
+
+async fn handle_audio_extract(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<AudioExtractRequest>,
+) -> Response {
+    match process_audio_extract(state, request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("not_a_video") {
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(ErrorResponse {
+                        error: "not_a_video".to_string(),
+                    }),
+                )
+                    .into_response()
+            } else if msg.contains("no_audio_track") {
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(ErrorResponse {
+                        error: "no_audio_track".to_string(),
+                    }),
+                )
+                    .into_response()
+            } else {
+                error!("Audio extract error: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: e.to_string(),
+                    }),
+                )
+                    .into_response()
+            }
+        }
+    }
+}
+
+async fn process_audio_extract(
+    state: Arc<AppState>,
+    request: AudioExtractRequest,
+) -> Result<AudioExtractResponse> {
+    let hash = request.sha256.to_lowercase();
+
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(anyhow!("Invalid hash format"));
+    }
+
+    info!("Starting audio extraction for {}", hash);
+
+    let temp_dir = TempDir::new()?;
+    let input_path = temp_dir.path().join("input");
+
+    // Download source video from GCS
+    download_from_gcs(
+        &state.gcs_client,
+        &state.config.gcs_bucket,
+        &hash,
+        &input_path,
+    )
+    .await?;
+
+    // Verify it's a video with an audio track using ffprobe
+    let probe_output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_streams",
+            &input_path.to_string_lossy(),
+        ])
+        .output()
+        .await?;
+
+    let probe_json: serde_json::Value = serde_json::from_slice(&probe_output.stdout)
+        .map_err(|_| anyhow!("not_a_video"))?;
+
+    let streams = probe_json
+        .get("streams")
+        .and_then(|s| s.as_array())
+        .ok_or_else(|| anyhow!("not_a_video"))?;
+
+    let has_video = streams
+        .iter()
+        .any(|s| s.get("codec_type").and_then(|t| t.as_str()) == Some("video"));
+    let has_audio = streams
+        .iter()
+        .any(|s| s.get("codec_type").and_then(|t| t.as_str()) == Some("audio"));
+
+    if !has_video {
+        return Err(anyhow!("not_a_video"));
+    }
+    if !has_audio {
+        return Err(anyhow!("no_audio_track"));
+    }
+
+    // Extract audio with ffmpeg: AAC in M4A container
+    let output_path = temp_dir.path().join("output.m4a");
+    let extract_output = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-i",
+            &input_path.to_string_lossy(),
+            "-vn",
+            "-acodec",
+            "aac",
+            "-b:a",
+            "128k",
+            &output_path.to_string_lossy().to_string(),
+        ])
+        .output()
+        .await?;
+
+    if !extract_output.status.success() {
+        let stderr = String::from_utf8_lossy(&extract_output.stderr);
+        return Err(anyhow!("FFmpeg audio extraction failed: {}", stderr));
+    }
+
+    // Get duration with ffprobe
+    let duration_output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "quiet",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "csv=p=0",
+            &output_path.to_string_lossy().to_string(),
+        ])
+        .output()
+        .await?;
+
+    let duration: f64 = String::from_utf8_lossy(&duration_output.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0.0);
+
+    // SHA256 the output file
+    let audio_data = tokio::fs::read(&output_path).await?;
+    use sha2::{Digest, Sha256};
+    let audio_sha256 = hex::encode(Sha256::digest(&audio_data));
+    let size = audio_data.len() as u64;
+
+    // Upload to GCS if not already present
+    if !check_gcs_exists(&state.gcs_client, &state.config.gcs_bucket, &audio_sha256).await? {
+        let mut custom_metadata = HashMap::new();
+        custom_metadata.insert("source_sha256".to_string(), hash.clone());
+        custom_metadata.insert("derivative".to_string(), "audio".to_string());
+        custom_metadata.insert("owner".to_string(), request.owner.clone());
+
+        let mut media = Media::new(audio_sha256.clone());
+        media.content_type = "audio/mp4".into();
+        let upload_type = UploadType::Simple(media);
+
+        let req = UploadObjectRequest {
+            bucket: state.config.gcs_bucket.clone(),
+            ..Default::default()
+        };
+
+        state
+            .gcs_client
+            .upload_object(&req, Bytes::from(audio_data), &upload_type)
+            .await
+            .map_err(|e| anyhow!("Failed to upload audio to GCS: {}", e))?;
+
+        // Set custom metadata on the uploaded object
+        let patch_req = PatchObjectRequest {
+            bucket: state.config.gcs_bucket.clone(),
+            object: audio_sha256.clone(),
+            metadata: Some(Object {
+                metadata: Some(custom_metadata),
+                cache_control: Some("public, max-age=31536000, immutable".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let _ = state.gcs_client.patch_object(&patch_req).await;
+
+        info!(
+            "Uploaded audio {} ({} bytes) for source {}",
+            audio_sha256, size, hash
+        );
+    } else {
+        info!("Audio {} already exists in GCS", audio_sha256);
+    }
+
+    Ok(AudioExtractResponse {
+        audio_sha256,
+        duration,
+        size,
+        mime_type: "audio/mp4".to_string(),
+    })
 }
 
 async fn process_transcode(
@@ -2393,78 +2609,6 @@ async fn upload_transcript_to_gcs(
 
     info!("Uploaded transcript {}", gcs_path);
     Ok(())
-}
-
-/// Optimize video for web streaming by moving moov atom to the beginning
-/// This enables progressive download/streaming in browsers
-async fn run_ffmpeg_faststart(input_path: &Path, output_path: &Path) -> Result<()> {
-    let input_str = input_path.to_string_lossy();
-    let output_str = output_path.to_string_lossy();
-
-    info!(
-        "Running faststart optimization: {} -> {}",
-        input_str, output_str
-    );
-
-    let mut cmd = Command::new("ffmpeg");
-    cmd.args([
-        "-y", // Overwrite output
-        "-i",
-        &input_str, // Input file
-        "-c",
-        "copy", // Copy streams without re-encoding (fast!)
-        "-movflags",
-        "+faststart", // Move moov atom to beginning
-        &output_str,  // Output file
-    ]);
-
-    let output = cmd.output().await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        error!("FFmpeg faststart failed: {}", stderr);
-        return Err(anyhow!("FFmpeg faststart failed: {}", stderr));
-    }
-
-    info!("Faststart optimization complete");
-    Ok(())
-}
-
-/// Upload the faststart-optimized video to GCS, replacing the original
-/// Returns the new file size in bytes
-async fn upload_faststart_to_gcs(
-    client: &GcsClient,
-    bucket: &str,
-    object: &str,
-    file_path: &Path,
-) -> Result<u64> {
-    let data = tokio::fs::read(file_path).await?;
-    let new_size = data.len() as u64;
-    let content_type = "video/mp4";
-
-    info!(
-        "Uploading faststart video ({} bytes) to gs://{}/{}",
-        new_size, bucket, object
-    );
-
-    let bytes_data: Bytes = data.into();
-    client
-        .upload_object(
-            &UploadObjectRequest {
-                bucket: bucket.to_string(),
-                ..Default::default()
-            },
-            bytes_data,
-            &UploadType::Simple(Media {
-                name: object.to_string().into(),
-                content_type: content_type.to_string().into(),
-                content_length: None,
-            }),
-        )
-        .await
-        .map_err(|e| anyhow!("Failed to upload faststart video: {}", e))?;
-
-    Ok(new_size)
 }
 
 /// Probe video file with ffprobe to get dimensions and rotation metadata

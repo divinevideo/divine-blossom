@@ -563,6 +563,39 @@ pub fn parse_thumbnail_path(path: &str) -> Option<String> {
     None
 }
 
+/// Parse audio extraction path: /{sha256}.audio.m4a
+pub fn parse_audio_path(path: &str) -> Option<String> {
+    let path = path.trim_start_matches('/');
+    if path.ends_with(".audio.m4a") {
+        let hash = &path[..path.len() - ".audio.m4a".len()];
+        if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Some(hash.to_lowercase());
+        }
+    }
+    None
+}
+
+/// Check if a path is an audio extraction request
+pub fn is_audio_path(path: &str) -> bool {
+    parse_audio_path(path).is_some()
+}
+
+/// Mapping from source video SHA256 to derived audio blob metadata.
+/// Stored in KV as "audio_map:{source_sha256}".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioMapping {
+    /// SHA256 of the source video
+    pub source_sha256: String,
+    /// SHA256 of the derived audio file
+    pub audio_sha256: String,
+    /// Duration in seconds
+    pub duration_seconds: f64,
+    /// Size in bytes
+    pub size_bytes: u64,
+    /// MIME type of the audio
+    pub mime_type: String,
+}
+
 /// Check if a path looks like a hash path (for routing)
 pub fn is_hash_path(path: &str) -> bool {
     parse_hash_from_path(path).is_some()
@@ -1032,6 +1065,58 @@ mod tests {
             serde_json::to_string(&SubtitleJobStatus::Ready).unwrap(),
             "\"ready\""
         );
+    }
+
+    #[test]
+    fn test_parse_audio_path_valid() {
+        let hash = "a".repeat(64);
+        assert_eq!(
+            parse_audio_path(&format!("/{}.audio.m4a", hash)),
+            Some(hash.clone())
+        );
+    }
+
+    #[test]
+    fn test_parse_audio_path_no_suffix() {
+        let hash = "a".repeat(64);
+        assert_eq!(parse_audio_path(&format!("/{}", hash)), None);
+    }
+
+    #[test]
+    fn test_parse_audio_path_short_hash() {
+        assert_eq!(parse_audio_path("/tooshort.audio.m4a"), None);
+    }
+
+    #[test]
+    fn test_parse_audio_path_wrong_extension() {
+        let hash = "a".repeat(64);
+        assert_eq!(parse_audio_path(&format!("/{}.mp4", hash)), None);
+    }
+
+    #[test]
+    fn test_is_audio_path() {
+        let hash = "a".repeat(64);
+        assert!(is_audio_path(&format!("/{}.audio.m4a", hash)));
+        assert!(!is_audio_path(&format!("/{}.mp4", hash)));
+        assert!(!is_audio_path("/upload"));
+    }
+
+    #[test]
+    fn test_audio_mapping_serialization() {
+        let mapping = AudioMapping {
+            source_sha256: "a".repeat(64),
+            audio_sha256: "b".repeat(64),
+            duration_seconds: 120.5,
+            size_bytes: 1024000,
+            mime_type: "audio/mp4".to_string(),
+        };
+        let json = serde_json::to_string(&mapping).unwrap();
+        let parsed: AudioMapping = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.source_sha256, "a".repeat(64));
+        assert_eq!(parsed.audio_sha256, "b".repeat(64));
+        assert_eq!(parsed.duration_seconds, 120.5);
+        assert_eq!(parsed.size_bytes, 1024000);
+        assert_eq!(parsed.mime_type, "audio/mp4");
     }
 
     #[test]

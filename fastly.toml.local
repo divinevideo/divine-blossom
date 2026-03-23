@@ -37,6 +37,9 @@ language = "rust"
     [local_server.backends.moderation_api]
     url = "http://localhost:9000"
 
+    [local_server.backends.funnelcake_api]
+    url = "http://localhost:9000"
+
   [local_server.kv_stores]
 
     [local_server.kv_stores.blossom_metadata]
