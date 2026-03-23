@@ -46,6 +46,9 @@ const SUBTITLE_HASH_PREFIX: &str = "subtitle_hash:";
 /// Key prefix for audio mapping (source video -> derived audio)
 const AUDIO_MAP_PREFIX: &str = "audio_map:";
 
+/// Key prefix for reverse audio refs (derived audio -> source video hashes)
+const AUDIO_REFS_PREFIX: &str = "audio_refs:";
+
 /// Open the metadata KV store
 fn open_store() -> Result<KVStore> {
     KVStore::open(KV_STORE_NAME)
@@ -1034,4 +1037,131 @@ pub fn put_audio_mapping(mapping: &AudioMapping) -> Result<()> {
         .insert(&key, json)
         .map_err(|e| BlossomError::MetadataError(format!("Failed to store audio mapping: {}", e)))?;
     Ok(())
+}
+
+/// Delete audio mapping for a source hash
+pub fn delete_audio_mapping(source_hash: &str) -> Result<()> {
+    let store = open_store()?;
+    let key = format!("{}{}", AUDIO_MAP_PREFIX, source_hash.to_lowercase());
+
+    match store.delete(&key) {
+        Ok(()) => Ok(()),
+        Err(KVStoreError::ItemNotFound) => Ok(()),
+        Err(e) => Err(BlossomError::MetadataError(format!(
+            "Failed to delete audio mapping: {}",
+            e
+        ))),
+    }
+}
+
+/// Get all source video hashes that reference a derived audio hash.
+pub fn get_audio_source_refs(audio_hash: &str) -> Result<Vec<String>> {
+    let store = open_store()?;
+    let key = format!("{}{}", AUDIO_REFS_PREFIX, audio_hash.to_lowercase());
+
+    match store.lookup(&key) {
+        Ok(mut lookup_result) => {
+            let body = lookup_result.take_body().into_string();
+            let refs: Vec<String> = serde_json::from_str(&body).map_err(|e| {
+                BlossomError::MetadataError(format!("Failed to parse audio refs: {}", e))
+            })?;
+            Ok(refs)
+        }
+        Err(KVStoreError::ItemNotFound) => Ok(Vec::new()),
+        Err(e) => Err(BlossomError::MetadataError(format!(
+            "Failed to lookup audio refs: {}",
+            e
+        ))),
+    }
+}
+
+/// Add a source video hash to the derived audio refs list.
+pub fn add_to_audio_source_refs(audio_hash: &str, source_hash: &str) -> Result<()> {
+    let source_hash_lower = source_hash.to_lowercase();
+
+    for attempt in 0..5 {
+        let mut refs = get_audio_source_refs(audio_hash)?;
+
+        if refs.contains(&source_hash_lower) {
+            return Ok(());
+        }
+
+        refs.push(source_hash_lower.clone());
+
+        let store = open_store()?;
+        let key = format!("{}{}", AUDIO_REFS_PREFIX, audio_hash.to_lowercase());
+        let json = serde_json::to_string(&refs)
+            .map_err(|e| BlossomError::MetadataError(format!("Failed to serialize audio refs: {}", e)))?;
+
+        match store.insert(&key, json) {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < 4 => {
+                eprintln!("[KV] Retry {} for audio refs update: {}", attempt + 1, e);
+                continue;
+            }
+            Err(e) => {
+                return Err(BlossomError::MetadataError(format!(
+                    "Failed to store audio refs: {}",
+                    e
+                )))
+            }
+        }
+    }
+
+    Err(BlossomError::MetadataError(
+        "Max retries exceeded for audio refs update".into(),
+    ))
+}
+
+/// Remove a source video hash from the derived audio refs list. Returns the remaining refs.
+pub fn remove_from_audio_source_refs(audio_hash: &str, source_hash: &str) -> Result<Vec<String>> {
+    let source_hash_lower = source_hash.to_lowercase();
+
+    for attempt in 0..5 {
+        let mut refs = get_audio_source_refs(audio_hash)?;
+
+        if !refs.contains(&source_hash_lower) {
+            return Ok(refs);
+        }
+
+        refs.retain(|hash| hash != &source_hash_lower);
+
+        let store = open_store()?;
+        let key = format!("{}{}", AUDIO_REFS_PREFIX, audio_hash.to_lowercase());
+        let json = serde_json::to_string(&refs)
+            .map_err(|e| BlossomError::MetadataError(format!("Failed to serialize audio refs: {}", e)))?;
+
+        match store.insert(&key, json) {
+            Ok(()) => return Ok(refs),
+            Err(e) if attempt < 4 => {
+                eprintln!("[KV] Retry {} for audio refs removal: {}", attempt + 1, e);
+                continue;
+            }
+            Err(e) => {
+                return Err(BlossomError::MetadataError(format!(
+                    "Failed to store audio refs: {}",
+                    e
+                )))
+            }
+        }
+    }
+
+    Err(BlossomError::MetadataError(
+        "Max retries exceeded for audio refs removal".into(),
+    ))
+}
+
+/// Delete the entire derived audio refs entry.
+pub fn delete_audio_source_refs(audio_hash: &str) -> Result<()> {
+    let store = open_store()?;
+    let key = format!("{}{}", AUDIO_REFS_PREFIX, audio_hash.to_lowercase());
+
+    match store.delete(&key) {
+        Ok(()) => Ok(()),
+        Err(KVStoreError::ItemNotFound) => Ok(()),
+        Err(e) => Err(BlossomError::MetadataError(format!(
+            "Failed to delete audio refs: {}",
+            e
+        ))),
+    }
 }
