@@ -279,6 +279,22 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
                     return Err(BlossomError::NotFound("Blob not found".into()));
                 }
             }
+
+            // Self-healing: re-trigger moderation for stale pending videos.
+            // If a video has been pending for more than 5 minutes, the original
+            // moderation trigger likely failed. Fire-and-forget a retry.
+            if meta.status == BlobStatus::Pending && is_video_mime_type(&meta.mime_type) {
+                let now = unix_timestamp_secs();
+                if let Some(uploaded_at) = crate::storage::parse_iso8601_to_epoch(&meta.uploaded) {
+                    if now.saturating_sub(uploaded_at) > 300 {
+                        eprintln!(
+                            "[MODERATION] Re-triggering scan for stale pending video {}",
+                            hash
+                        );
+                        trigger_moderation_scan(&hash, &meta.owner);
+                    }
+                }
+            }
         }
     }
 
