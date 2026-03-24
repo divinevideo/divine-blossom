@@ -180,6 +180,7 @@ fn handle_request(req: Request) -> Result<Response> {
         (Method::POST, "/admin/api/vanish") => handle_admin_vanish(req),
         (Method::POST, "/admin/api/backfill") => admin::handle_admin_backfill(req),
         (Method::POST, "/admin/api/backfill-vtt") => handle_admin_backfill_vtt(req),
+        (Method::POST, "/admin/api/backfill-moderation") => handle_admin_backfill_moderation(req),
 
         // CORS preflight
         (Method::OPTIONS, _) => Ok(cors_preflight_response()),
@@ -3485,6 +3486,183 @@ fn handle_admin_backfill_vtt(req: Request) -> Result<Response> {
             "not_transcribable": not_transcribable,
             "reset_from_processing": reset_count,
             "errors": errors,
+            "hit_trigger_limit": hit_limit,
+            "candidates": candidates
+        }
+    });
+
+    let mut resp = json_response(StatusCode::OK, &response);
+    add_cors_headers(&mut resp);
+    Ok(resp)
+}
+
+/// POST /admin/api/backfill-moderation - Re-trigger moderation for stuck pending videos
+/// Iterates through recent index or user index, finds video blobs with BlobStatus::Pending,
+/// and re-triggers the moderation scan. Useful for batch remediation of stuck content.
+/// Query params: ?offset=N&limit=M&scope=recent|users&dry_run=true&max_triggers=10
+fn handle_admin_backfill_moderation(req: Request) -> Result<Response> {
+    let webhook_ok = fastly::secret_store::SecretStore::open("blossom_secrets")
+        .ok()
+        .and_then(|store| store.get("webhook_secret"))
+        .and_then(|secret| {
+            let expected = String::from_utf8(secret.plaintext().to_vec()).unwrap_or_default();
+            let provided = req
+                .get_header(header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.strip_prefix("Bearer "))?;
+            if provided.trim() == expected.trim() {
+                Some(())
+            } else {
+                None
+            }
+        })
+        .is_some();
+
+    if !webhook_ok {
+        admin::validate_admin_auth(&req)?;
+    }
+
+    let url = req.get_url();
+    let query_pairs: std::collections::HashMap<_, _> = url
+        .query_pairs()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+    let offset: usize = query_pairs
+        .get("offset")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let limit: usize = query_pairs
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+    let scope = query_pairs
+        .get("scope")
+        .map(|value| value.as_str())
+        .unwrap_or("recent");
+    let dry_run = query_pairs
+        .get("dry_run")
+        .map(|value| value == "true")
+        .unwrap_or(false);
+    let max_triggers: u32 = query_pairs
+        .get("max_triggers")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+
+    let mut triggered = 0u32;
+    let mut already_moderated = 0u32;
+    let mut not_video = 0u32;
+    let mut hit_limit = false;
+    let mut candidates: Vec<serde_json::Value> = Vec::new();
+    let mut processed_hashes = 0usize;
+
+    let mut process_hash = |hash: &str| -> bool {
+        let Ok(Some(metadata)) = crate::metadata::get_blob_metadata_uncached(hash) else {
+            return false;
+        };
+
+        processed_hashes += 1;
+
+        if !is_video_mime_type(&metadata.mime_type) {
+            not_video += 1;
+            return false;
+        }
+
+        if metadata.status != BlobStatus::Pending {
+            already_moderated += 1;
+            return false;
+        }
+
+        if dry_run {
+            candidates.push(serde_json::json!({
+                "sha256": metadata.sha256,
+                "owner": metadata.owner,
+                "uploaded": metadata.uploaded,
+                "status": "pending",
+            }));
+            return false;
+        }
+
+        if triggered >= max_triggers {
+            return true;
+        }
+
+        trigger_moderation_scan(hash, &metadata.owner);
+        triggered += 1;
+        false
+    };
+
+    let (has_more, next_offset, processed_users) = if scope == "recent" {
+        let recent_index = crate::metadata::get_recent_index()?;
+        let total_hashes = recent_index.hashes.len();
+        let end = std::cmp::min(offset + limit, total_hashes);
+        let hashes_to_process = if offset < total_hashes {
+            &recent_index.hashes[offset..end]
+        } else {
+            &[] as &[String]
+        };
+
+        for hash in hashes_to_process {
+            if process_hash(hash) {
+                hit_limit = true;
+                break;
+            }
+        }
+
+        (
+            end < total_hashes,
+            if end < total_hashes { Some(end) } else { None },
+            None,
+        )
+    } else {
+        let user_index = crate::metadata::get_user_index()?;
+        let total_users = user_index.pubkeys.len();
+        let end = std::cmp::min(offset + limit, total_users);
+        let pubkeys_to_process = if offset < total_users {
+            &user_index.pubkeys[offset..end]
+        } else {
+            &[] as &[String]
+        };
+
+        for pubkey in pubkeys_to_process {
+            if hit_limit {
+                break;
+            }
+            let hashes = crate::metadata::get_user_blobs(pubkey).unwrap_or_default();
+            for hash in hashes {
+                if hit_limit {
+                    break;
+                }
+                if process_hash(&hash) {
+                    hit_limit = true;
+                    break;
+                }
+            }
+        }
+
+        (
+            end < total_users,
+            if end < total_users { Some(end) } else { None },
+            Some(pubkeys_to_process.len()),
+        )
+    };
+
+    let response = serde_json::json!({
+        "success": true,
+        "batch": {
+            "scope": scope,
+            "offset": offset,
+            "limit": limit,
+            "processed_users": processed_users,
+            "processed_hashes": processed_hashes,
+            "next_offset": next_offset,
+            "has_more": has_more
+        },
+        "results": {
+            "dry_run": dry_run,
+            "triggered": triggered,
+            "already_moderated": already_moderated,
+            "not_video": not_video,
             "hit_trigger_limit": hit_limit,
             "candidates": candidates
         }
