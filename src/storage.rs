@@ -1559,6 +1559,7 @@ pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtracti
 mod tests {
     use super::{
         parse_audio_extraction_error_response, parse_funnelcake_audio_reuse_response,
+        parse_iso8601_to_epoch,
     };
 
     #[test]
@@ -1584,5 +1585,28 @@ mod tests {
             Some("no_audio_track".to_string())
         );
         assert_eq!(parse_audio_extraction_error_response("not json"), None);
+    }
+
+    #[test]
+    fn parses_iso8601_epoch_timestamp() {
+        // Unix epoch itself
+        assert_eq!(parse_iso8601_to_epoch("1970-01-01T00:00:00Z"), Some(0));
+        // 2025-01-01T00:00:00Z = 1735689600
+        assert_eq!(
+            parse_iso8601_to_epoch("2025-01-01T00:00:00Z"),
+            Some(1735689600)
+        );
+        // 2026-03-06T12:00:00Z = 1772798400
+        assert_eq!(
+            parse_iso8601_to_epoch("2026-03-06T12:00:00Z"),
+            Some(1772798400)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_iso8601() {
+        assert_eq!(parse_iso8601_to_epoch("not a date"), None);
+        assert_eq!(parse_iso8601_to_epoch("2026-03-24"), None);
+        assert_eq!(parse_iso8601_to_epoch(""), None);
     }
 }
