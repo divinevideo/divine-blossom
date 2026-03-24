@@ -203,16 +203,16 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         if let Ok(Some(meta)) = get_blob_metadata(video_hash) {
             if !is_admin {
                 if meta.status == BlobStatus::Banned {
-                    return Err(BlossomError::NotFound("Blob not found".into()));
+                    return Err(BlossomError::ContentRestricted("banned".into()));
                 }
                 if meta.status == BlobStatus::Restricted {
                     // Check if requester is owner
                     if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
                         if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
-                            return Err(BlossomError::NotFound("Blob not found".into()));
+                            return Err(BlossomError::ContentRestricted("restricted".into()));
                         }
                     } else {
-                        return Err(BlossomError::NotFound("Blob not found".into()));
+                        return Err(BlossomError::ContentRestricted("restricted".into()));
                     }
                     is_restricted = true;
                 }
@@ -265,7 +265,7 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         if !is_admin {
             // Handle banned content - no access for anyone
             if meta.status == BlobStatus::Banned {
-                return Err(BlossomError::NotFound("Blob not found".into()));
+                return Err(BlossomError::ContentRestricted("banned".into()));
             }
 
             // Handle restricted content
@@ -273,10 +273,10 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
                 // Check if requester is owner
                 if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
                     if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
-                        return Err(BlossomError::NotFound("Blob not found".into()));
+                        return Err(BlossomError::ContentRestricted("restricted".into()));
                     }
                 } else {
-                    return Err(BlossomError::NotFound("Blob not found".into()));
+                    return Err(BlossomError::ContentRestricted("restricted".into()));
                 }
             }
         }
@@ -400,9 +400,12 @@ fn handle_head_blob(path: &str) -> Result<Response> {
     let metadata =
         get_blob_metadata(&hash)?.ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
 
-    // Don't reveal restricted or banned content exists
-    if metadata.status == BlobStatus::Restricted || metadata.status == BlobStatus::Banned {
-        return Err(BlossomError::NotFound("Blob not found".into()));
+    // Restricted or banned content returns 403 so clients can distinguish from missing
+    if metadata.status == BlobStatus::Banned {
+        return Err(BlossomError::ContentRestricted("banned".into()));
+    }
+    if metadata.status == BlobStatus::Restricted {
+        return Err(BlossomError::ContentRestricted("restricted".into()));
     }
 
     let mut resp = Response::from_status(StatusCode::OK);
@@ -1472,12 +1475,15 @@ fn handle_get_audio(_req: Request, path: &str) -> Result<Response> {
         .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
 
     // 2. Access control: banned/deleted content is not served
-    if metadata.status.blocks_public_access() {
+    if metadata.status == BlobStatus::Banned {
+        return Err(BlossomError::ContentRestricted("banned".into()));
+    }
+    if metadata.status == BlobStatus::Deleted {
         return Err(BlossomError::NotFound("Blob not found".into()));
     }
     // Restricted content requires owner auth - not supported for audio extraction
     if metadata.status.requires_owner_auth() {
-        return Err(BlossomError::NotFound("Blob not found".into()));
+        return Err(BlossomError::ContentRestricted("restricted".into()));
     }
 
     // 3. Check Funnelcake permission
@@ -1610,8 +1616,14 @@ fn handle_head_audio(path: &str) -> Result<Response> {
     let metadata = get_blob_metadata(&hash)?
         .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
 
-    if metadata.status.blocks_public_access() || metadata.status.requires_owner_auth() {
+    if metadata.status == BlobStatus::Banned {
+        return Err(BlossomError::ContentRestricted("banned".into()));
+    }
+    if metadata.status == BlobStatus::Deleted {
         return Err(BlossomError::NotFound("Blob not found".into()));
+    }
+    if metadata.status.requires_owner_auth() {
+        return Err(BlossomError::ContentRestricted("restricted".into()));
     }
 
     // Check if audio mapping exists
@@ -3555,7 +3567,7 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
             eprintln!("[ADMIN] Updated blob {} to status {:?}", sha256, new_status);
 
             // Purge VCL cache so the new status takes effect immediately.
-            // Banned/restricted content will 404 on next request; approved content will 200.
+            // Banned/restricted content will 403 on next request; approved content will 200.
             purge_vcl_cache(sha256);
 
             let response = serde_json::json!({
