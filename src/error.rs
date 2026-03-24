@@ -13,6 +13,8 @@ pub enum BlossomError {
     AuthInvalid(String),
     /// Forbidden - authenticated but not authorized
     Forbidden(String),
+    /// Content exists but is restricted by moderation (403 with status field)
+    ContentRestricted(String),
     /// Blob not found
     NotFound(String),
     /// Bad request - malformed input
@@ -32,11 +34,20 @@ impl BlossomError {
             BlossomError::AuthRequired(_) => StatusCode::UNAUTHORIZED,
             BlossomError::AuthInvalid(_) => StatusCode::UNAUTHORIZED,
             BlossomError::Forbidden(_) => StatusCode::FORBIDDEN,
+            BlossomError::ContentRestricted(_) => StatusCode::FORBIDDEN,
             BlossomError::NotFound(_) => StatusCode::NOT_FOUND,
             BlossomError::BadRequest(_) => StatusCode::BAD_REQUEST,
             BlossomError::StorageError(_) => StatusCode::BAD_GATEWAY,
             BlossomError::MetadataError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             BlossomError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    /// Get the moderation status string for ContentRestricted errors
+    pub fn moderation_status(&self) -> Option<&str> {
+        match self {
+            BlossomError::ContentRestricted(status) => Some(status),
+            _ => None,
         }
     }
 
@@ -46,6 +57,7 @@ impl BlossomError {
             BlossomError::AuthRequired(msg) => msg,
             BlossomError::AuthInvalid(msg) => msg,
             BlossomError::Forbidden(msg) => msg,
+            BlossomError::ContentRestricted(_) => "Content restricted",
             BlossomError::NotFound(msg) => msg,
             BlossomError::BadRequest(msg) => msg,
             BlossomError::StorageError(msg) => msg,
@@ -85,6 +97,10 @@ mod tests {
             StatusCode::FORBIDDEN
         );
         assert_eq!(
+            BlossomError::ContentRestricted("restricted".into()).status_code(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
             BlossomError::NotFound("".into()).status_code(),
             StatusCode::NOT_FOUND
         );
@@ -116,6 +132,25 @@ mod tests {
             BlossomError::NotFound("blob gone".into()).message(),
             "blob gone"
         );
+        assert_eq!(
+            BlossomError::ContentRestricted("banned".into()).message(),
+            "Content restricted"
+        );
+    }
+
+    #[test]
+    fn test_content_restricted_moderation_status() {
+        let err = BlossomError::ContentRestricted("restricted".into());
+        assert_eq!(err.moderation_status(), Some("restricted"));
+        assert_eq!(err.status_code(), StatusCode::FORBIDDEN);
+        assert_eq!(err.message(), "Content restricted");
+
+        let err = BlossomError::ContentRestricted("banned".into());
+        assert_eq!(err.moderation_status(), Some("banned"));
+
+        // Other variants return None for moderation_status
+        assert_eq!(BlossomError::NotFound("".into()).moderation_status(), None);
+        assert_eq!(BlossomError::Forbidden("".into()).moderation_status(), None);
     }
 
     #[test]

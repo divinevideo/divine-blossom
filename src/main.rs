@@ -4233,9 +4233,16 @@ fn error_response(error: &BlossomError) -> Response {
     let mut resp = Response::from_status(error.status_code());
     resp.set_header(header::CONTENT_TYPE, "application/json");
 
-    let body = serde_json::json!({
-        "error": error.message()
-    });
+    let body = if let Some(status) = error.moderation_status() {
+        serde_json::json!({
+            "error": error.message(),
+            "status": status
+        })
+    } else {
+        serde_json::json!({
+            "error": error.message()
+        })
+    };
     resp.set_body(body.to_string());
     add_cors_headers(&mut resp);
 
