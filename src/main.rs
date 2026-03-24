@@ -3220,6 +3220,11 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
         }
     }
 
+    // Trigger content moderation for video mirrors (fire-and-forget)
+    if is_video_mime_type(&content_type) {
+        trigger_moderation_scan(&hash, &auth.pubkey);
+    }
+
     // Return blob descriptor per BUD-04
     let descriptor = metadata.to_descriptor(&base_url);
     let mut resp = json_response(StatusCode::OK, &descriptor);
