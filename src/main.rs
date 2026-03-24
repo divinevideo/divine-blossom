@@ -606,6 +606,28 @@ fn handle_get_hls_content(req: Request, path: &str) -> Result<Response> {
     }
     let hash = hash.to_lowercase();
 
+    // Check metadata for moderation/access control
+    let is_admin = admin::validate_bearer_token(&req).is_ok();
+    let mut is_restricted = false;
+
+    if let Ok(Some(ref meta)) = get_blob_metadata(&hash) {
+        if !is_admin {
+            if meta.status == BlobStatus::Banned {
+                return Err(BlossomError::NotFound("Blob not found".into()));
+            }
+            if meta.status == BlobStatus::Restricted {
+                if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
+                    if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
+                        return Err(BlossomError::NotFound("Blob not found".into()));
+                    }
+                } else {
+                    return Err(BlossomError::NotFound("Blob not found".into()));
+                }
+                is_restricted = true;
+            }
+        }
+    }
+
     // Construct GCS path
     let gcs_path = format!("{}/hls/{}", hash, filename);
 
@@ -629,7 +651,11 @@ fn handle_get_hls_content(req: Request, path: &str) -> Result<Response> {
             };
 
             resp.set_header("Content-Type", content_type);
-            add_cache_headers(&mut resp, &hash);
+            if is_restricted {
+                add_private_cache_headers(&mut resp, &hash);
+            } else {
+                add_cache_headers(&mut resp, &hash);
+            }
             resp.set_header("X-Sha256", &hash);
             if let Some(c2pa) = c2pa_manifest_id {
                 resp.set_header("X-C2PA-Manifest-Id", &c2pa);
@@ -643,14 +669,8 @@ fn handle_get_hls_content(req: Request, path: &str) -> Result<Response> {
         Err(BlossomError::NotFound(_)) if filename == "master.m3u8" => {
             // HLS not found - check metadata and trigger on-demand transcoding
             let metadata = get_blob_metadata(&hash)?;
-            let is_admin = admin::validate_bearer_token(&req).is_ok();
 
             if let Some(ref meta) = metadata {
-                // Handle banned content
-                if !is_admin && meta.status == BlobStatus::Banned {
-                    return Err(BlossomError::NotFound("Content not found".into()));
-                }
-
                 match meta.transcode_status {
                     Some(TranscodeStatus::Complete) => {
                         // Metadata says complete but file not in GCS - re-trigger
@@ -737,8 +757,17 @@ fn handle_head_hls_content(path: &str) -> Result<Response> {
         return Err(BlossomError::BadRequest("Invalid hash in path".into()));
     }
 
+    let hash_lower = hash.to_lowercase();
+
+    // Check moderation status — HEAD has no auth, so block both banned and restricted
+    if let Ok(Some(ref meta)) = get_blob_metadata(&hash_lower) {
+        if meta.status == BlobStatus::Banned || meta.status == BlobStatus::Restricted {
+            return Err(BlossomError::NotFound("Content not found".into()));
+        }
+    }
+
     // Check if file exists in GCS
-    let gcs_path = format!("{}/hls/{}", hash.to_lowercase(), filename);
+    let gcs_path = format!("{}/hls/{}", hash_lower, filename);
 
     // Try to get the content (HEAD-like check)
     download_hls_content(&gcs_path, None)?;
@@ -752,7 +781,6 @@ fn handle_head_hls_content(path: &str) -> Result<Response> {
     };
 
     let mut resp = Response::from_status(StatusCode::OK);
-    let hash_lower = hash.to_lowercase();
     resp.set_header("Content-Type", content_type);
     add_cache_headers(&mut resp, &hash_lower);
     resp.set_header("X-Sha256", &hash_lower);
