@@ -49,6 +49,8 @@ language = "rust"
       gcs_bucket = "YOUR_BUCKET_NAME"
       gcs_project_id = "YOUR_GCP_PROJECT_ID"
       funnelcake_api_url = "https://relay.divine.video"
+      cloud_run_upload_host = "blossom-upload-rust-PROJECTNUM.us-central1.run.app"
+      cloud_run_transcoder_host = "divine-transcoder-PROJECTNUM.us-central1.run.app"
 
   [local_server.secret_stores]
 
@@ -124,6 +126,8 @@ language = "rust"
       { key = "gcs_bucket", description = "GCS bucket name" },
       { key = "gcs_project_id", description = "GCP project ID" },
       { key = "funnelcake_api_url", description = "Funnelcake API base URL" },
+      { key = "cloud_run_upload_host", description = "Cloud Run upload service hostname" },
+      { key = "cloud_run_transcoder_host", description = "Cloud Run transcoder service hostname" },
     ]
 
   [setup.secret_stores]

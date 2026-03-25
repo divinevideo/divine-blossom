@@ -8,12 +8,13 @@
 #
 # To resume from a specific offset: OFFSET=500 ./backfill-vtt-force.sh
 
-URL="https://separately-robust-roughy.edgecompute.app/admin/api/backfill-vtt"
+URL="${BACKFILL_URL:-https://separately-robust-roughy.edgecompute.app/admin/api/backfill-vtt}"
+GCP_PROJECT="${GCP_PROJECT:-rich-compiler-479518-d2}"
 
 # Auth: prefer webhook secret from env, fall back to GCP Secret Manager
 if [[ -z "$WEBHOOK_SECRET" ]]; then
-    echo "Fetching webhook secret from GCP..."
-    WEBHOOK_SECRET=$(gcloud secrets versions access latest --secret=webhook_secret --project=rich-compiler-479518-d2 2>/dev/null || true)
+    echo "Fetching webhook secret from GCP (project=${GCP_PROJECT})..."
+    WEBHOOK_SECRET=$(gcloud secrets versions access latest --secret=webhook_secret --project="${GCP_PROJECT}" 2>/dev/null || true)
 fi
 
 if [[ -z "$WEBHOOK_SECRET" ]]; then

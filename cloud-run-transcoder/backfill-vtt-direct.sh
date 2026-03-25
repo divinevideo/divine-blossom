@@ -11,9 +11,10 @@ RESET_STALE="${RESET_STALE:-false}"  # set to true to re-trigger stuck "processi
 MAX_RETRIES=3
 
 # Auth: prefer webhook secret from GCP, fall back to env var or cookie
+GCP_PROJECT="${GCP_PROJECT:-rich-compiler-479518-d2}"
 if [[ -z "$WEBHOOK_SECRET" ]]; then
-    echo "Fetching webhook secret from GCP..."
-    WEBHOOK_SECRET=$(gcloud secrets versions access latest --secret=webhook_secret --project=rich-compiler-479518-d2 2>/dev/null || true)
+    echo "Fetching webhook secret from GCP (project=${GCP_PROJECT})..."
+    WEBHOOK_SECRET=$(gcloud secrets versions access latest --secret=webhook_secret --project="${GCP_PROJECT}" 2>/dev/null || true)
 fi
 
 if [[ -n "$WEBHOOK_SECRET" ]]; then
