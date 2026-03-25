@@ -23,6 +23,24 @@ const CONFIG_STORE: &str = "blossom_config";
 /// Secret store name
 const SECRET_STORE: &str = "blossom_secrets";
 
+/// Default Cloud Run upload host (poc project — will move to prod)
+const DEFAULT_CLOUD_RUN_UPLOAD_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
+
+/// Default Cloud Run transcoder host (poc project — will move to prod)
+const DEFAULT_CLOUD_RUN_TRANSCODER_HOST: &str =
+    "divine-transcoder-149672065768.us-central1.run.app";
+
+/// Get Cloud Run upload service host from config store, falling back to hardcoded default.
+pub fn cloud_run_upload_host() -> String {
+    get_config("cloud_run_upload_host").unwrap_or_else(|_| DEFAULT_CLOUD_RUN_UPLOAD_HOST.to_string())
+}
+
+/// Get Cloud Run transcoder service host from config store, falling back to hardcoded default.
+pub fn cloud_run_transcoder_host() -> String {
+    get_config("cloud_run_transcoder_host")
+        .unwrap_or_else(|_| DEFAULT_CLOUD_RUN_TRANSCODER_HOST.to_string())
+}
+
 /// AWS signature version (works with GCS HMAC)
 const AWS_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 
@@ -1197,9 +1215,9 @@ pub fn write_audit_log(
 
     // Fire-and-forget POST to Cloud Run /audit endpoint
     // Cloud Run prints structured JSON → auto-ingested by Cloud Logging
-    const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
-    let mut req = Request::new(Method::POST, format!("https://{}/audit", CLOUD_RUN_HOST));
-    req.set_header("Host", CLOUD_RUN_HOST);
+    let host = cloud_run_upload_host();
+    let mut req = Request::new(Method::POST, format!("https://{}/audit", host));
+    req.set_header("Host", &host);
     req.set_header("Content-Type", "application/json");
     req.set_body(Body::from(entry));
 
@@ -1230,12 +1248,12 @@ pub fn trigger_cloud_run_delete_blob(hash: &str) {
 
     let body = format!(r#"{{"hash":"{}"}}"#, hash);
 
-    const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
+    let host = cloud_run_upload_host();
     let mut req = Request::new(
         Method::POST,
-        format!("https://{}/delete-blob", CLOUD_RUN_HOST),
+        format!("https://{}/delete-blob", host),
     );
-    req.set_header("Host", CLOUD_RUN_HOST);
+    req.set_header("Host", &host);
     req.set_header("Content-Type", "application/json");
     req.set_header("Authorization", format!("Bearer {}", webhook_secret));
     req.set_body(Body::from(body));
@@ -1270,12 +1288,12 @@ pub fn trigger_cloud_run_bulk_delete(pubkey: &str, hashes: &[String]) {
     })
     .to_string();
 
-    const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
+    let host = cloud_run_upload_host();
     let mut req = Request::new(
         Method::POST,
-        format!("https://{}/delete-blobs-by-owner", CLOUD_RUN_HOST),
+        format!("https://{}/delete-blobs-by-owner", host),
     );
-    req.set_header("Host", CLOUD_RUN_HOST);
+    req.set_header("Host", &host);
     req.set_header("Content-Type", "application/json");
     req.set_header("Authorization", format!("Bearer {}", webhook_secret));
     req.set_body(Body::from(body));
@@ -1305,12 +1323,12 @@ pub fn trigger_audit_anonymize(pubkey: &str) {
 
     let body = format!(r#"{{"pubkey":"{}"}}"#, pubkey);
 
-    const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
+    let host = cloud_run_upload_host();
     let mut req = Request::new(
         Method::POST,
-        format!("https://{}/audit/anonymize", CLOUD_RUN_HOST),
+        format!("https://{}/audit/anonymize", host),
     );
-    req.set_header("Host", CLOUD_RUN_HOST);
+    req.set_header("Host", &host);
     req.set_header("Content-Type", "application/json");
     req.set_header("Authorization", format!("Bearer {}", webhook_secret));
     req.set_body(Body::from(body));
@@ -1355,9 +1373,9 @@ pub fn trigger_background_migration(hash: &str, source_backend: &str) -> Result<
     // was dropped immediately, causing the worker to terminate before Cloud Run
     // could process the migration. Using synchronous send ensures the migration
     // actually completes before the response goes back through VCL.
-    const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
-    let mut req = Request::new(Method::POST, format!("https://{}/migrate", CLOUD_RUN_HOST));
-    req.set_header("Host", CLOUD_RUN_HOST);
+    let host = cloud_run_upload_host();
+    let mut req = Request::new(Method::POST, format!("https://{}/migrate", host));
+    req.set_header("Host", &host);
     req.set_header("Content-Type", "application/json");
     req.set_header("Content-Length", request_body.len().to_string());
     req.set_body(request_body);
@@ -1391,9 +1409,6 @@ pub fn trigger_background_migration(hash: &str, source_backend: &str) -> Result<
 
 /// Backend name for Funnelcake API
 const FUNNELCAKE_BACKEND: &str = "funnelcake_api";
-
-/// Cloud Run transcoder host for audio extraction
-const CLOUD_RUN_TRANSCODER_HOST: &str = "divine-transcoder-149672065768.us-central1.run.app";
 
 /// Response from Cloud Run audio extraction endpoint
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1481,9 +1496,10 @@ pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtracti
         "owner": owner
     });
 
-    let url = format!("https://{}/audio/extract", CLOUD_RUN_TRANSCODER_HOST);
+    let transcoder_host = cloud_run_transcoder_host();
+    let url = format!("https://{}/audio/extract", transcoder_host);
     let mut req = Request::new(Method::POST, &url);
-    req.set_header("Host", CLOUD_RUN_TRANSCODER_HOST);
+    req.set_header("Host", &transcoder_host);
     req.set_header("Content-Type", "application/json");
     req.set_header("Authorization", format!("Bearer {}", webhook_secret));
     req.set_body(body.to_string());

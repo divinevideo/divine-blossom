@@ -27,10 +27,11 @@ use crate::metadata::{
     update_blob_status, update_stats_on_add, update_stats_on_remove, TranscriptMetadataUpdate,
 };
 use crate::storage::{
-    blob_exists, check_funnelcake_audio_reuse, current_timestamp,
-    delete_blob as storage_delete, download_blob_with_fallback, download_thumbnail,
-    trigger_audio_extraction, trigger_audit_anonymize, trigger_cloud_run_bulk_delete,
-    trigger_cloud_run_delete_blob, upload_blob, write_audit_log,
+    blob_exists, check_funnelcake_audio_reuse, cloud_run_transcoder_host,
+    cloud_run_upload_host, current_timestamp, delete_blob as storage_delete,
+    download_blob_with_fallback, download_thumbnail, trigger_audio_extraction,
+    trigger_audit_anonymize, trigger_cloud_run_bulk_delete, trigger_cloud_run_delete_blob,
+    upload_blob, write_audit_log,
 };
 
 use fastly::cache::simple as simple_cache;
@@ -1787,11 +1788,6 @@ const CLOUD_RUN_THRESHOLD: u64 = 500 * 1024;
 /// Cloud Run upload backend name (must match fastly.toml)
 const CLOUD_RUN_BACKEND: &str = "cloud_run_upload";
 
-/// Cloud Run host for on-demand thumbnail generation
-const CLOUD_RUN_THUMBNAIL_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
-
-/// Cloud Run host for on-demand transcoding
-const CLOUD_RUN_TRANSCODER_HOST: &str = "divine-transcoder-149672065768.us-central1.run.app";
 
 /// Generate thumbnail on-demand by proxying to Cloud Run
 fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
@@ -1829,10 +1825,11 @@ fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
         return Ok(resp);
     }
 
-    let url = format!("https://{}/thumbnail/{}", CLOUD_RUN_THUMBNAIL_HOST, hash);
+    let upload_host = cloud_run_upload_host();
+    let url = format!("https://{}/thumbnail/{}", upload_host, hash);
 
     let mut proxy_req = Request::new(Method::GET, &url);
-    proxy_req.set_header("Host", CLOUD_RUN_THUMBNAIL_HOST);
+    proxy_req.set_header("Host", &upload_host);
 
     let resp = proxy_req.send(CLOUD_RUN_BACKEND).map_err(|e| {
         BlossomError::StorageError(format!("Cloud Run thumbnail request failed: {}", e))
@@ -1935,12 +1932,13 @@ fn trigger_on_demand_transcoding(hash: &str, owner: &str) -> Result<()> {
         return Ok(());
     }
 
-    let url = format!("https://{}/transcode", CLOUD_RUN_TRANSCODER_HOST);
+    let transcoder_host = cloud_run_transcoder_host();
+    let url = format!("https://{}/transcode", transcoder_host);
 
     let body = format!(r#"{{"hash":"{}","owner":"{}"}}"#, hash, owner);
 
     let mut proxy_req = Request::new(Method::POST, &url);
-    proxy_req.set_header("Host", CLOUD_RUN_TRANSCODER_HOST);
+    proxy_req.set_header("Host", &transcoder_host);
     proxy_req.set_header("Content-Type", "application/json");
     proxy_req.set_body(body);
 
@@ -1968,11 +1966,12 @@ fn trigger_fmp4_backfill(hash: &str) -> Result<()> {
         return Ok(());
     }
 
-    let url = format!("https://{}/backfill-fmp4", CLOUD_RUN_TRANSCODER_HOST);
+    let transcoder_host = cloud_run_transcoder_host();
+    let url = format!("https://{}/backfill-fmp4", transcoder_host);
     let body = format!(r#"{{"hash":"{}"}}"#, hash);
 
     let mut proxy_req = Request::new(Method::POST, &url);
-    proxy_req.set_header("Host", CLOUD_RUN_TRANSCODER_HOST);
+    proxy_req.set_header("Host", &transcoder_host);
     proxy_req.set_header("Content-Type", "application/json");
     proxy_req.set_body(body);
 
@@ -2021,7 +2020,8 @@ fn trigger_on_demand_transcription(
         return Ok(());
     }
 
-    let url = format!("https://{}/transcribe", CLOUD_RUN_TRANSCODER_HOST);
+    let transcoder_host = cloud_run_transcoder_host();
+    let url = format!("https://{}/transcribe", transcoder_host);
 
     let mut payload = serde_json::json!({
         "hash": hash,
@@ -2036,7 +2036,7 @@ fn trigger_on_demand_transcription(
     let body = payload.to_string();
 
     let mut proxy_req = Request::new(Method::POST, &url);
-    proxy_req.set_header("Host", CLOUD_RUN_TRANSCODER_HOST);
+    proxy_req.set_header("Host", &transcoder_host);
     proxy_req.set_header("Content-Type", "application/json");
     proxy_req.set_body(body);
 
@@ -2289,12 +2289,12 @@ fn handle_cloud_run_proxy(
     // NOTE: Use the actual Cloud Run hostname as the Host header, not the custom domain
     // Cloud Run uses the Host header for routing - if the custom domain isn't configured,
     // Cloud Run returns 404
-    const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
+    let upload_host = cloud_run_upload_host();
     let mut proxy_req = Request::new(
         fastly::http::Method::PUT,
-        format!("https://{}/upload", CLOUD_RUN_HOST),
+        format!("https://{}/upload", upload_host),
     );
-    proxy_req.set_header("Host", CLOUD_RUN_HOST);
+    proxy_req.set_header("Host", &upload_host);
     proxy_req.set_header(header::AUTHORIZATION, &auth_header);
     proxy_req.set_header(header::CONTENT_TYPE, &content_type);
     proxy_req.set_header(header::CONTENT_LENGTH, content_length.to_string());
@@ -3129,12 +3129,12 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
         .map_err(|e| BlossomError::Internal(format!("JSON error: {}", e)))?;
 
     // Use actual Cloud Run hostname - see handle_cloud_run_proxy comment
-    const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
+    let upload_host = cloud_run_upload_host();
     let mut proxy_req = Request::new(
         fastly::http::Method::POST,
-        format!("https://{}/migrate", CLOUD_RUN_HOST),
+        format!("https://{}/migrate", upload_host),
     );
-    proxy_req.set_header("Host", CLOUD_RUN_HOST);
+    proxy_req.set_header("Host", &upload_host);
     proxy_req.set_header("Content-Type", "application/json");
     proxy_req.set_header("Content-Length", migrate_json.len().to_string());
     proxy_req.set_body(migrate_json);
