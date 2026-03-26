@@ -19,7 +19,7 @@ Inspired by the Ruby [state_pattern](https://github.com/dcadenas/state_pattern) 
 An optimization loop. The LLM iterates: make one change, measure, report. The workflow commits improvements and reverts regressions.
 
 ```
-session_start(
+ouija.start(
     name="optimizer",
     workflow="examples/simple-loop-workflow.py",
     workflow_params={"max_iterations": 10},
@@ -39,11 +39,11 @@ Your project directory needs an **INSTRUCTIONS.md** describing what to optimize 
 A structured implementation workflow that guides the LLM through planning, chunked implementation with build verification, and final test verification.
 
 ```
-session_start(
+ouija.start(
     name="feat-1",
     workflow="examples/feature-workflow.py",
     workflow_params={"issue": "Add rate limiting to /api/upload"},
-    prompt="You are implementing a feature. Call workflow('init') to start.",
+    prompt="You are implementing a feature. Call ouija.workflow('init') to start.",
     project_dir="/path/to/project",
 )
 ```
@@ -60,20 +60,20 @@ Two sessions share one workflow: a worker implements, a reviewer approves or req
 
 ```
 # Worker
-session_start(
+ouija.start(
     name="feat-worker",
     workflow="examples/review-workflow.py",
     workflow_params={"role": "worker", "issue": "Add caching layer"},
-    prompt="Implement the feature. Call workflow('init').",
+    prompt="Implement the feature. Call ouija.workflow('init').",
     project_dir="/path/to/project",
 )
 
 # Reviewer
-session_start(
+ouija.start(
     name="feat-reviewer",
     workflow="examples/review-workflow.py",
     workflow_params={"role": "reviewer", "worker_session": "feat-worker"},
-    prompt="Review code changes. Call workflow('init').",
+    prompt="Review code changes. Call ouija.workflow('init').",
     project_dir="/path/to/project",
 )
 ```
@@ -107,7 +107,7 @@ from ouija_workflow import Workflow, State
 
 class MyState(State):
     def handle_init(self, ctx, params):
-        return self.respond("Do the thing. Call workflow('done_it').")
+        return self.respond("Do the thing. Call ouija.workflow('done_it').")
 
     def handle_done_it(self, ctx, params):
         return self.transition_to(Finished, "Nice work.")
@@ -115,7 +115,7 @@ class MyState(State):
 class Finished(State):
     terminal = True
     def on_enter(self, ctx):
-        return "Call session_send(done=true)."
+        return "Call ouija.send(done=true)."
 
 Workflow(
     initial=MyState,
@@ -133,10 +133,10 @@ A workflow is any executable that reads one JSON object from stdin and writes on
 // stdin
 {"event": "register", "session_id": "worker-1", "params": {"issue_id": 123}}
 // stdout
-{"instructions": "You are a worker...", "inject_on_start": "Call workflow('init').", "max_calls": 200}
+{"instructions": "You are a worker...", "inject_on_start": "Call ouija.workflow('init').", "max_calls": 200}
 ```
 
-**Runtime** (LLM calls workflow tool):
+**Runtime** (LLM calls ouija.workflow tool):
 ```json
 // stdin
 {"action": "chunk_done", "session_id": "worker-1", "params": {"chunk": "auth"}}
@@ -156,8 +156,8 @@ A workflow is any executable that reads one JSON object from stdin and writes on
 
 | Level | What | When loaded | Purpose |
 |---|---|---|---|
-| 1. Tool description | The `workflow` MCP tool | Always in context | LLM knows the tool exists |
+| 1. Tool description | The `ouija.workflow` MCP tool | Always in context | LLM knows the tool exists |
 | 2. Registration instructions | `instructions` from register | Session start | Orients — purpose, rhythm, constraints |
-| 3. Runtime responses | Each `workflow()` return | On demand | Directs — current state, next task, criteria |
+| 3. Runtime responses | Each `ouija.workflow()` return | On demand | Directs — current state, next task, criteria |
 
 Don't bleed between levels. If you're putting step-specific detail in registration instructions, move it to a runtime response.

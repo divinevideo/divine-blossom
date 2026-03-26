@@ -261,7 +261,7 @@ pub async fn dashboard(State(state): State<SharedState>) -> Html<String> {
     }
     if sorted_tasks.is_empty() {
         tasks_html.push_str(
-            r#"<tr><td colspan="10" class="empty">No scheduled tasks.<br>CLI: <b>ouija task add "check-logs" "0 9 * * *" "check the error logs"</b><br>MCP: use the <b>task_create</b> tool from any coding session</td></tr>"#,
+            r#"<tr><td colspan="10" class="empty">No scheduled tasks.<br>CLI: <b>ouija task add "check-logs" "0 9 * * *" "check the error logs"</b><br>MCP: use the <b>ouija.task-create</b> tool from any coding session</td></tr>"#,
         );
     }
 
@@ -319,7 +319,7 @@ pub async fn dashboard(State(state): State<SharedState>) -> Html<String> {
     };
 
     let log_empty = if msg_count == 0 {
-        r#"<tr><td colspan="5" class="empty">No messages yet. Send one with <b>session_send</b> from a coding session.</td></tr>"#
+        r#"<tr><td colspan="5" class="empty">No messages yet. Send one with <b>ouija.send</b> from a coding session.</td></tr>"#
     } else {
         ""
     };

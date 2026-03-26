@@ -8,50 +8,50 @@ lets the workflow notify sessions without polling.
 
 Launch:
     # Worker
-    session_start(
+    ouija.start(
         name="feat-worker",
         workflow="examples/review-workflow.py",
         workflow_params={"role": "worker", "issue": "Add caching layer"},
-        prompt="Implement the feature. Call workflow('init').",
+        prompt="Implement the feature. Call ouija.workflow('init').",
         project_dir="/path/to/project",
     )
 
     # Reviewer (spawn after worker submits, or let it idle)
-    session_start(
+    ouija.start(
         name="feat-reviewer",
         workflow="examples/review-workflow.py",
         workflow_params={"role": "reviewer", "worker_session": "feat-worker"},
-        prompt="Review code changes. Call workflow('init').",
+        prompt="Review code changes. Call ouija.workflow('init').",
         project_dir="/path/to/project",
     )
 
 ── Worker LLM trace ────────────────────────────────────────────────────
 
-  System prompt: "You are a feature worker. workflow('init') gives your task."
-  Inject: "Call workflow('init') to start."
+  System prompt: "You are a feature worker. ouija.workflow('init') gives your task."
+  Inject: "Call ouija.workflow('init') to start."
 
-  LLM → workflow('init')                              # WorkerImpl state
+  LLM → ouija.workflow('init')                        # WorkerImpl state
     ← "## Implementing
         Issue: Add caching layer
 
         Implement the feature.
-        Call workflow('submit', {summary: '...'}) when done."
+        Call ouija.workflow('submit', {summary: '...'}) when done."
     ← verify: "cargo test passes"
 
   LLM implements caching, runs tests...
 
-  LLM → workflow('submit', {summary: "Redis cache, 5min TTL on /api/search"})
+  LLM → ouija.workflow('submit', {summary: "Redis cache, 5min TTL on /api/search"})
     ← "Submitted for review."                         # → WorkerWaiting
     ← "Idle or work on docs while reviewer checks."
 
   [Injected by workflow: "Changes requested: make TTL configurable"]
 
-  LLM → workflow('init')                              # back in WorkerImpl!
+  LLM → ouija.workflow('init')                        # back in WorkerImpl!
     ← "## Changes requested
         Feedback: make TTL configurable
 
         Address the feedback.
-        Call workflow('submit', {summary: '...'})."
+        Call ouija.workflow('submit', {summary: '...'})."
 
   LLM fixes, resubmits...
 
@@ -59,33 +59,33 @@ Launch:
 
 ── Reviewer LLM trace ──────────────────────────────────────────────────
 
-  System prompt: "You are a code reviewer. workflow('init') shows what to review."
-  Inject: "Call workflow('init') to see the submission."
+  System prompt: "You are a code reviewer. ouija.workflow('init') shows what to review."
+  Inject: "Call ouija.workflow('init') to see the submission."
 
-  LLM → workflow('init')                              # Reviewing state
+  LLM → ouija.workflow('init')                        # Reviewing state
     ← "## Review round 1
         Worker summary: Redis cache, 5min TTL on /api/search
 
         Read the diff. Then:
-        - workflow('approve') if it looks good
-        - workflow('request_changes', {feedback: '...'}) if not"
+        - ouija.workflow('approve') if it looks good
+        - ouija.workflow('request_changes', {feedback: '...'}) if not"
 
   LLM reads diff, spots hardcoded TTL...
 
-  LLM → workflow('request_changes', {feedback: "TTL should be configurable"})
+  LLM → ouija.workflow('request_changes', {feedback: "TTL should be configurable"})
     ← "Feedback sent to worker. Wait for resubmission."
 
-  [Injected: "Worker resubmitted. Call workflow('init')."]
+  [Injected: "Worker resubmitted. Call ouija.workflow('init')."]
 
-  LLM → workflow('init')
+  LLM → ouija.workflow('init')
     ← "## Review round 2
         Worker summary: TTL from CACHE_TTL_SECS env var
 
-        workflow('approve') or workflow('request_changes')."
+        ouija.workflow('approve') or ouija.workflow('request_changes')."
 
-  LLM → workflow('approve')
+  LLM → ouija.workflow('approve')
     ← "Approved! Feature complete."                   # → ReviewerDone
-    ← "Call session_send(done=true)."
+    ← "Call ouija.send(done=true)."
 
   Worker receives inject: "Review approved!"
 
@@ -108,7 +108,7 @@ class WorkerImpl(State):
             return self.respond(
                 f"## Changes requested\nFeedback: {feedback}\n\n"
                 "Address the feedback.\n"
-                "Call workflow('submit', {summary: '...'}) when done.",
+                "Call ouija.workflow('submit', {summary: '...'}) when done.",
                 verify="cargo test passes",
             )
 
@@ -116,13 +116,13 @@ class WorkerImpl(State):
         return self.respond(
             f"## Implementing\nIssue: {issue}\n\n"
             "Implement the feature.\n"
-            "Call workflow('submit', {summary: '...'}) when done.",
+            "Call ouija.workflow('submit', {summary: '...'}) when done.",
             verify="cargo test passes",
         )
 
     def handle_submit(self, ctx, params):
         if "summary" not in params:
-            return self.respond("Error: submit requires {summary: '<what you built>'}.")
+            return self.respond("Error: ouija.workflow('submit') requires {summary: '<what you built>'}.")
 
         ctx.data["summary"] = params["summary"]
         ctx.data["submitted"] = True
@@ -134,7 +134,7 @@ class WorkerImpl(State):
             ctx.api.inject(
                 rid,
                 f"Worker resubmitted (round {ctx.data['review_round']}). "
-                "Call workflow('init') to review.",
+                "Call ouija.workflow('init') to review.",
             )
 
         round_label = f" (round {ctx.data['review_round']})" if ctx.data["review_round"] > 1 else ""
@@ -172,15 +172,15 @@ class Reviewing(State):
             f"## Review round {round_n}\n"
             f"Worker summary: {summary}\n\n"
             "Read the diff. Then:\n"
-            "- workflow('approve') if it looks good\n"
-            "- workflow('request_changes', {feedback: '...'}) if not"
+            "- ouija.workflow('approve') if it looks good\n"
+            "- ouija.workflow('request_changes', {feedback: '...'}) if not"
         )
 
     def handle_approve(self, ctx, params):
         ctx.data["approved"] = True
         worker = ctx.params.get("worker_session")
         if worker:
-            ctx.api.inject(worker, "Review approved! Call workflow('init').")
+            ctx.api.inject(worker, "Review approved! Call ouija.workflow('init').")
         return self.transition_to(ReviewerDone, "Approved! Feature complete.")
 
     def handle_request_changes(self, ctx, params):
@@ -194,11 +194,11 @@ class Reviewing(State):
             ctx.api.inject(
                 worker,
                 f"Changes requested: {ctx.data['feedback']}\n"
-                "Address the feedback and call workflow('submit', {summary: '...'}).",
+                "Address the feedback and call ouija.workflow('submit', {summary: '...'}).",
             )
         return self.respond(
             "Feedback sent to worker. Wait for resubmission, "
-            "then call workflow('init')."
+            "then call ouija.workflow('init')."
         )
 
 
@@ -206,7 +206,7 @@ class ReviewerDone(State):
     terminal = True
 
     def on_enter(self, ctx):
-        return "Call session_send(done=true)."
+        return "Call ouija.send(done=true)."
 
 
 # ── Workflow: role-based dispatch ─────────────────────────────────────
@@ -236,13 +236,13 @@ class ReviewWorkflow(Workflow):
 
         if role == "reviewer":
             return {
-                "instructions": "You are a code reviewer. workflow('init') shows what to review.",
-                "inject_on_start": "Call workflow('init') to see the submission.",
+                "instructions": "You are a code reviewer. ouija.workflow('init') shows what to review.",
+                "inject_on_start": "Call ouija.workflow('init') to see the submission.",
                 "max_calls": 50,
             }
         return {
-            "instructions": "You are a feature worker. workflow('init') gives your task.",
-            "inject_on_start": "Call workflow('init') to start.",
+            "instructions": "You are a feature worker. ouija.workflow('init') gives your task.",
+            "inject_on_start": "Call ouija.workflow('init') to start.",
             "max_calls": 100,
         }
 

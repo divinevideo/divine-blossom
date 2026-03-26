@@ -595,10 +595,10 @@ pub async fn send_msg(
             .map(|k| k.as_str())
             .collect();
         let hint = if suggestions.is_empty() {
-            "If you meant a remote session, use the full node-prefixed name (e.g. 'node/session'). Run session_list to see all available targets.".to_string()
+            "If you meant a remote session, use the full node-prefixed name (e.g. 'node/session'). Run ouija.list to see all available targets.".to_string()
         } else {
             format!(
-                "Did you mean one of these remote sessions? {} — use session_list to check.",
+                "Did you mean one of these remote sessions? {} — use ouija.list to check.",
                 suggestions.join(", ")
             )
         };

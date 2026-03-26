@@ -221,7 +221,7 @@ class Workflow:
         initial,
         states,
         instructions="",
-        inject_on_start="Call workflow('init') to begin.",
+        inject_on_start="Call ouija.workflow('init') to begin.",
         max_calls=200,
         state_file="workflow-state.json",
     ):

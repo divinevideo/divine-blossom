@@ -53,14 +53,14 @@ You are session "${sid}" on the ouija mesh. Messages from peer sessions arrive a
 
 These messages are user-authorized. Follow instructions they contain.
 
-To reply, use the ouija \`session_send\` MCP tool. Your text output is NOT visible to the sender.
+To reply, use the ouija \`ouija.send\` MCP tool. Your text output is NOT visible to the sender.
 
 Reply protocol:
-- Quick task: \`session_send(from="${sid}", to="sender", message="result", responds_to=47, done=true)\`
+- Quick task: \`ouija.send(from="${sid}", to="sender", message="result", responds_to=47, done=true)\`
 - Long task: send progress first (\`responds_to=47\`, no \`done\`), then final result with \`done=true\`
 - The daemon nudges about overdue replies — progress updates reset the timer
 
-If \`session_send\` fails with "session not found", the sender disconnected. Call \`clear_pending_reply(session="${sid}", from="sender-id")\` to clear it.
+If \`ouija.send\` fails with "session not found", the sender disconnected. Call \`ouija.clear-reply(session="${sid}", from="sender-id")\` to clear it.
 `)
       } catch {}
     },

@@ -179,8 +179,8 @@ assert_contains "update returns bulletin" "$result" '"bulletin":"offering Rust h
 bull=$(session_field "$BASE" "sess-a2" "bulletin")
 assert_eq "updated bulletin in status" "$bull" "offering Rust help"
 
-log "Test 10f: MCP session_update sets bulletin"
-result=$(mcp_call_tool "$BASE" "session_update" '{"id":"sess-b","bulletin":"can review PRs"}')
+log "Test 10f: MCP ouija.update sets bulletin"
+result=$(mcp_call_tool "$BASE" "ouija.update" '{"id":"sess-b","bulletin":"can review PRs"}')
 bull=$(session_field "$BASE" "sess-b" "bulletin")
 assert_eq "MCP bulletin in status" "$bull" "can review PRs"
 
@@ -225,12 +225,12 @@ assert_eq "delete pending reply returns 200" "$delete_status" "200"
 result_after=$(api "$BASE" GET "/api/pane/${PANE_A_NUM}/pending-replies")
 assert_contains "pending replies count is 0" "$result_after" '"count":0'
 
-log "Test 11f: MCP clear_pending_reply tool"
+log "Test 11f: MCP ouija.clear-reply tool"
 # Create a new pending reply
 api "$BASE" POST /api/send -d "{\"from\":\"sess-b\",\"to\":\"sess-a2\",\"message\":\"another reply needed\",\"expects_reply\":true}" >/dev/null
 sleep 0.5
 # Clear it via MCP
-mcp_call_tool "$BASE" "clear_pending_reply" '{"session":"sess-a2","from":"sess-b"}' >/dev/null
+mcp_call_tool "$BASE" "ouija.clear-reply" '{"session":"sess-a2","from":"sess-b"}' >/dev/null
 result_after=$(api "$BASE" GET "/api/pane/${PANE_A_NUM}/pending-replies")
 assert_contains "MCP clear leaves 0 pending" "$result_after" '"count":0'
 
@@ -328,8 +328,8 @@ else
     log "  (stateless mode — no session ID, expected)"
 fi
 
-log "Test 14: MCP session_register without pane — auto-detects or errors"
-result=$(mcp_call_tool "$BASE" "session_register" '{"id":"mcp-no-pane"}')
+log "Test 14: MCP ouija.register without pane — auto-detects or errors"
+result=$(mcp_call_tool "$BASE" "ouija.register" '{"id":"mcp-no-pane"}')
 # If an unregistered claude pane exists, auto-detect succeeds; otherwise it errors.
 if echo "$result" | grep -qF "registered as mcp-no-pane"; then
     pass "register without pane auto-detected"
@@ -340,47 +340,47 @@ else
     assert_not_contains "not registered" "$(session_ids "$BASE")" "mcp-no-pane"
 fi
 
-log "Test 15: MCP session_register with pane — succeeds"
-result=$(mcp_call_tool "$BASE" "session_register" "{\"id\":\"mcp-ok\",\"pane\":\"$PANE_A\"}")
+log "Test 15: MCP ouija.register with pane — succeeds"
+result=$(mcp_call_tool "$BASE" "ouija.register" "{\"id\":\"mcp-ok\",\"pane\":\"$PANE_A\"}")
 assert_contains "registered via MCP" "$result" "registered as mcp-ok"
 ids=$(session_ids "$BASE")
 assert_contains "MCP session in list" "$ids" "mcp-ok"
 
-log "Test 16: MCP session_list — returns sessions"
-result=$(mcp_call_tool "$BASE" "session_list" '{}')
+log "Test 16: MCP ouija.list — returns sessions"
+result=$(mcp_call_tool "$BASE" "ouija.list" '{}')
 assert_contains "list contains session" "$result" "mcp-ok"
 
-log "Test 17: MCP session_send — delivers message"
+log "Test 17: MCP ouija.send — delivers message"
 # Register a second session for messaging
 api "$BASE" POST /api/register -d "{\"id\":\"mcp-target\",\"pane\":\"$PANE_B\"}" >/dev/null
-result=$(mcp_call_tool "$BASE" "session_send" '{"from":"mcp-ok","to":"mcp-target","message":"hello via mcp","expects_reply":false}')
+result=$(mcp_call_tool "$BASE" "ouija.send" '{"from":"mcp-ok","to":"mcp-target","message":"hello via mcp","expects_reply":false}')
 assert_contains "MCP send delivered" "$result" "delivered"
 wait_for 5 bash -c "tmux capture-pane -t '$PANE_B' -p | grep -qF 'hello via mcp'"
 pane_content=$(tmux capture-pane -t "$PANE_B" -p)
 assert_contains "MCP message in pane" "$pane_content" "hello via mcp"
 
-log "Test 18: MCP session_send to missing session — error"
-result=$(mcp_call_tool "$BASE" "session_send" '{"from":"mcp-ok","to":"ghost","message":"hi","expects_reply":false}')
+log "Test 18: MCP ouija.send to missing session — error"
+result=$(mcp_call_tool "$BASE" "ouija.send" '{"from":"mcp-ok","to":"ghost","message":"hi","expects_reply":false}')
 assert_contains "MCP send error" "$result" "not found"
 
 log "Test 19: MCP pane dedup — re-register same pane via MCP replaces old"
-result=$(mcp_call_tool "$BASE" "session_register" "{\"id\":\"mcp-renamed\",\"pane\":\"$PANE_A\"}")
+result=$(mcp_call_tool "$BASE" "ouija.register" "{\"id\":\"mcp-renamed\",\"pane\":\"$PANE_A\"}")
 assert_contains "MCP dedup replaces" "$result" "registered as mcp-renamed"
 ids=$(session_ids "$BASE")
 assert_contains "new MCP id present" "$ids" "mcp-renamed"
 assert_not_contains "old MCP id gone" "$ids" "mcp-ok"
 
 log "Test 19b: MCP re-register same ID updates metadata"
-result=$(mcp_call_tool "$BASE" "session_register" "{\"id\":\"mcp-ok\",\"pane\":\"$PANE_A\",\"role\":\"updated-role\"}")
+result=$(mcp_call_tool "$BASE" "ouija.register" "{\"id\":\"mcp-ok\",\"pane\":\"$PANE_A\",\"role\":\"updated-role\"}")
 assert_contains "same-id re-register succeeds" "$result" "registered as mcp-ok"
 
 # Cleanup MCP sessions
 api "$BASE" POST /api/remove -d '{"id":"mcp-ok"}' >/dev/null 2>&1 || true
 api "$BASE" POST /api/remove -d '{"id":"mcp-target"}' >/dev/null 2>&1 || true
 
-log "Test 19c: MCP session_rename — rename preserves session"
+log "Test 19c: MCP ouija.rename — rename preserves session"
 api "$BASE" POST /api/register -d "{\"id\":\"rename-src\",\"pane\":\"$PANE_A\",\"role\":\"tester\"}" >/dev/null
-result=$(mcp_call_tool "$BASE" "session_rename" '{"old_id":"rename-src","new_id":"rename-dst"}')
+result=$(mcp_call_tool "$BASE" "ouija.rename" '{"old_id":"rename-src","new_id":"rename-dst"}')
 assert_contains "19c: rename succeeded" "$result" "renamed 'rename-src' to 'rename-dst'"
 ids=$(session_ids "$BASE")
 assert_contains "19c: new name present" "$ids" "rename-dst"
@@ -389,15 +389,15 @@ assert_not_contains "19c: old name gone" "$ids" "rename-src"
 role_after=$(session_field "$BASE" "rename-dst" "role")
 assert_eq "19c: role preserved after rename" "$role_after" "tester"
 
-log "Test 19d: MCP session_send to old name returns alias hint"
+log "Test 19d: MCP ouija.send to old name returns alias hint"
 api "$BASE" POST /api/register -d "{\"id\":\"rename-sender\",\"pane\":\"$PANE_B\"}" >/dev/null
-result=$(mcp_call_tool "$BASE" "session_send" '{"from":"rename-sender","to":"rename-src","message":"hello old name","expects_reply":false}')
+result=$(mcp_call_tool "$BASE" "ouija.send" '{"from":"rename-sender","to":"rename-src","message":"hello old name","expects_reply":false}')
 assert_contains "19d: error mentions rename" "$result" "was renamed to"
 # Cleanup
 api "$BASE" POST /api/remove -d '{"id":"rename-dst"}' >/dev/null 2>&1 || true
 api "$BASE" POST /api/remove -d '{"id":"rename-sender"}' >/dev/null 2>&1 || true
 
-log "Test 19e: MCP session_send auto-starts session from project index"
+log "Test 19e: MCP ouija.send auto-starts session from project index"
 # Create a temp project directory
 AUTOSTART_DIR=$(mktemp -d)
 mkdir -p "$AUTOSTART_DIR/autostart-proj"
@@ -408,7 +408,7 @@ sleep 2
 # Register a sender session
 api "$BASE" POST /api/register -d "{\"id\":\"autostart-sender\",\"pane\":\"$PANE_A\"}" >/dev/null
 # Send to a session name that matches the project (session doesn't exist yet)
-result=$(mcp_call_tool "$BASE" "session_send" '{"from":"autostart-sender","to":"autostart-proj","message":"hello auto","expects_reply":false}')
+result=$(mcp_call_tool "$BASE" "ouija.send" '{"from":"autostart-sender","to":"autostart-proj","message":"hello auto","expects_reply":false}')
 assert_contains "19e: auto-started" "$result" "auto-started"
 # Verify the session was created
 wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'autostart-proj'"
@@ -634,32 +634,32 @@ api "$BASE" POST /api/sessions/kill -d '{"name":"restart-test"}' >/dev/null 2>&1
 
 # --- MCP lifecycle tests ---
 
-log "Test L7: MCP session_start"
-L7=$(mcp_call_tool "$BASE" "session_start" '{"name":"mcp-lifecycle"}')
+log "Test L7: MCP ouija.start"
+L7=$(mcp_call_tool "$BASE" "ouija.start" '{"name":"mcp-lifecycle"}')
 assert_contains "L7: MCP start has pane" "$L7" "pane"
 wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'mcp-lifecycle'"
 L7_IDS=$(session_ids "$BASE")
 assert_contains "L7: MCP started session registered" "$L7_IDS" "mcp-lifecycle"
 
-log "Test L8: MCP session_kill"
-L8=$(mcp_call_tool "$BASE" "session_kill" '{"name":"mcp-lifecycle"}')
+log "Test L8: MCP ouija.kill"
+L8=$(mcp_call_tool "$BASE" "ouija.kill" '{"name":"mcp-lifecycle"}')
 assert_contains "L8: MCP kill removed" "$L8" "removed"
 wait_for 5 bash -c "! session_ids '$BASE' | grep -qF 'mcp-lifecycle'"
 L8_IDS=$(session_ids "$BASE")
 assert_not_contains "L8: MCP killed session gone" "$L8_IDS" "mcp-lifecycle"
 
-log "Test L9: MCP session_restart"
+log "Test L9: MCP ouija.restart"
 # Start first, then restart
-mcp_call_tool "$BASE" "session_start" '{"name":"mcp-restart"}' >/dev/null
+mcp_call_tool "$BASE" "ouija.start" '{"name":"mcp-restart"}' >/dev/null
 wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'mcp-restart'"
-L9=$(mcp_call_tool "$BASE" "session_restart" '{"name":"mcp-restart"}')
+L9=$(mcp_call_tool "$BASE" "ouija.restart" '{"name":"mcp-restart"}')
 assert_contains "L9: MCP restart response" "$L9" "restarted"
 wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'mcp-restart'"
 L9_IDS=$(session_ids "$BASE")
 assert_contains "L9: MCP restarted session registered" "$L9_IDS" "mcp-restart"
 
-log "Test L10: MCP session_restart with fresh=true"
-L10=$(mcp_call_tool "$BASE" "session_restart" '{"name":"mcp-restart","fresh":true}')
+log "Test L10: MCP ouija.restart with fresh=true"
+L10=$(mcp_call_tool "$BASE" "ouija.restart" '{"name":"mcp-restart","fresh":true}')
 assert_contains "L10: MCP fresh restart response" "$L10" "restarted"
 wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'mcp-restart'"
 L10_IDS=$(session_ids "$BASE")
@@ -693,13 +693,13 @@ assert_eq "L13: task on_fire mode is disposable_worktree" "$L13_MODE" "disposabl
 api "$BASE" DELETE "/api/tasks/$L13_ID" >/dev/null
 
 log "Test L15: Auto-worktree when directory conflicts"
-# Register a session with project_dir that will conflict with a new session_start
+# Register a session with project_dir that will conflict with a new ouija.start
 mkdir -p /tmp/projects/auto-wt-test
 git init /tmp/projects/auto-wt-test >/dev/null 2>&1
 api "$BASE" POST /api/register -d "{\"id\":\"existing-sess\",\"pane\":\"$PANE_A\",\"project_dir\":\"/tmp/projects/auto-wt-test\"}" >/dev/null
 L15=$(api "$BASE" POST /api/sessions/start -d '{"name":"auto-wt-test"}')
-assert_contains "L15: start succeeds" "$L15" "started"
-assert_contains "L15: auto-worktree noted" "$L15" "auto-enabled"
+assert_contains "L15: start succeeds" "$L15" "starting"
+wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'auto-wt-test'"
 L15_STATUS=$(api "$BASE" GET /api/status)
 L15_WT=$(echo "$L15_STATUS" | jq -r '.sessions[] | select(.id == "auto-wt-test") | .worktree')
 assert_eq "L15: auto-worktree session has worktree=true" "$L15_WT" "true"
@@ -710,7 +710,8 @@ log "Test L14: Start session with worktree=true"
 mkdir -p /tmp/projects/wt-sess
 git init /tmp/projects/wt-sess >/dev/null 2>&1
 L14=$(api "$BASE" POST /api/sessions/start -d '{"name":"wt-sess","worktree":true}')
-assert_contains "L14: start worktree session" "$L14" "started"
+assert_contains "L14: start worktree session" "$L14" "starting"
+wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'wt-sess'"
 L14_STATUS=$(api "$BASE" GET /api/status)
 L14_WT=$(echo "$L14_STATUS" | jq -r '.sessions[] | select(.id == "wt-sess") | .worktree')
 assert_eq "L14: session has worktree=true in metadata" "$L14_WT" "true"
@@ -725,10 +726,10 @@ chmod +x /tmp/fakebin/claude
 printf '#!/bin/bash\nexec /tmp/fakebin/claude 3600\n' > /usr/local/bin/claude
 chmod +x /usr/local/bin/claude
 
-log "Test L16: session_start with from param uses XML format with reply=true"
+log "Test L16: ouija.start with from param uses XML format with reply=true"
 L16=$(api "$BASE" POST /api/sessions/start -d '{"name":"from-test","prompt":"what is your status?","from":"orchestrator"}')
-assert_contains "L16: start succeeds" "$L16" "started"
-wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'from-test'"
+assert_contains "L16: start succeeds" "$L16" "starting"
+wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'from-test'"
 L16_PANE=$(session_field "$BASE" "from-test" "pane")
 wait_for 12 bash -c "tmux capture-pane -t '$L16_PANE' -p -J -S -30 | grep -qF 'from=\"orchestrator\"'"
 L16_CONTENT=$(tmux capture-pane -t "$L16_PANE" -p -J -S -30)
@@ -739,10 +740,10 @@ assert_contains "L16: prompt has message content" "$L16_CONTENT" "what is your s
 tmux kill-pane -t "$L16_PANE" 2>/dev/null || true
 api "$BASE" POST /api/remove -d '{"id":"from-test"}' >/dev/null 2>&1 || true
 
-log "Test L17: session_start with from + expects_reply=false omits reply attr"
+log "Test L17: ouija.start with from + expects_reply=false omits reply attr"
 L17=$(api "$BASE" POST /api/sessions/start -d '{"name":"from-noreply","prompt":"FYI deployed v2","from":"deployer","expects_reply":false}')
-assert_contains "L17: start succeeds" "$L17" "started"
-wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'from-noreply'"
+assert_contains "L17: start succeeds" "$L17" "starting"
+wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'from-noreply'"
 L17_PANE=$(session_field "$BASE" "from-noreply" "pane")
 wait_for 12 bash -c "tmux capture-pane -t '$L17_PANE' -p -J -S -30 | grep -qF 'from=\"deployer\"'"
 L17_CONTENT=$(tmux capture-pane -t "$L17_PANE" -p -J -S -30)
@@ -751,10 +752,10 @@ assert_not_contains "L17: no reply attr" "$L17_CONTENT" 'reply="true"'
 tmux kill-pane -t "$L17_PANE" 2>/dev/null || true
 api "$BASE" POST /api/remove -d '{"id":"from-noreply"}' >/dev/null 2>&1 || true
 
-log "Test L18: session_start without from injects plain prompt"
+log "Test L18: ouija.start without from injects plain prompt"
 L18=$(api "$BASE" POST /api/sessions/start -d '{"name":"plain-prompt","prompt":"just a plain prompt"}')
-assert_contains "L18: start succeeds" "$L18" "started"
-wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'plain-prompt'"
+assert_contains "L18: start succeeds" "$L18" "starting"
+wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'plain-prompt'"
 L18_PANE=$(session_field "$BASE" "plain-prompt" "pane")
 wait_for 12 bash -c "tmux capture-pane -t '$L18_PANE' -p -J -S -30 | grep -qF 'just a plain prompt'"
 L18_CONTENT=$(tmux capture-pane -t "$L18_PANE" -p -J -S -30)
@@ -766,15 +767,15 @@ api "$BASE" POST /api/remove -d '{"id":"plain-prompt"}' >/dev/null 2>&1 || true
 log "Test L19: Sessions sharing project_dir are grouped in same tmux session"
 mkdir -p /tmp/projects/grouped-repo
 L19A=$(api "$BASE" POST /api/sessions/start -d '{"name":"group-a","project_dir":"/tmp/projects/grouped-repo"}')
-assert_contains "L19a: first start succeeds" "$L19A" "started"
-wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'group-a'"
+assert_contains "L19a: first start succeeds" "$L19A" "starting"
+wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'group-a'"
 L19A_PANE=$(session_field "$BASE" "group-a" "pane")
 # Get the tmux session name of the first pane
 L19A_TMUX_SESS=$(tmux display-message -t "$L19A_PANE" -p '#{session_name}')
 assert_eq "L19a: tmux session named after directory" "$L19A_TMUX_SESS" "grouped-repo"
 L19B=$(api "$BASE" POST /api/sessions/start -d '{"name":"group-b","project_dir":"/tmp/projects/grouped-repo","worktree":true}')
-assert_contains "L19b: second start succeeds" "$L19B" "started"
-wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'group-b'"
+assert_contains "L19b: second start succeeds" "$L19B" "starting"
+wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'group-b'"
 L19B_PANE=$(session_field "$BASE" "group-b" "pane")
 L19B_TMUX_SESS=$(tmux display-message -t "$L19B_PANE" -p '#{session_name}')
 assert_eq "L19b: second session in same tmux session" "$L19B_TMUX_SESS" "$L19A_TMUX_SESS"
@@ -855,6 +856,11 @@ api "$BASE" POST /api/settings -d '{"idle_timeout_secs":60}' >/dev/null
 # ═══════════════════════════════════════════════════════════════════
 
 log "Test 21: Max local sessions — auto-close most idle when over limit"
+# Clean up any stale sessions from prior async starts
+for stale_id in $(session_ids "$BASE"); do
+    api "$BASE" POST /api/sessions/kill -d "{\"name\":\"$stale_id\"}" >/dev/null 2>&1 || true
+    api "$BASE" POST /api/remove -d "{\"id\":\"$stale_id\"}" >/dev/null 2>&1 || true
+done
 # Set max to 2, then register 3 sessions. The most idle one should be closed.
 # Backdate one session so it's clearly the most idle.
 PANE_C=$(create_claude_pane "$FAKE_BIN")
@@ -980,10 +986,9 @@ sleep 1
 PANE_A_NUM="${PANE_A#%}"
 result=$(api "$BASE" GET "/api/pane/${PANE_A_NUM}/pending-replies")
 assert_contains "23b: pending reply from ghost exists" "$result" '"count":1'
-# Kill the ghost's tmux pane so the reaper removes it
+# Kill the ghost's tmux pane and explicitly remove it (reaper grace period is 60s)
 tmux kill-pane -t "$PANE_EPHEMERAL" 2>/dev/null || true
-# Wait for reaper to remove pr-ghost and clear the pending reply
-wait_for 15 bash -c "! session_ids '$BASE' | grep -qF 'pr-ghost'" || true
+api "$BASE" POST /api/remove -d '{"id":"pr-ghost"}' >/dev/null
 sleep 1
 ids_after=$(session_ids "$BASE")
 assert_not_contains "23b: ghost session reaped" "$ids_after" "pr-ghost"
@@ -1174,12 +1179,12 @@ api "$BASE" POST /api/remove -d '{"id":"loop-sess"}' >/dev/null 2>&1 || true
 # Restore sess-a2
 api "$BASE" POST /api/register -d "{\"id\":\"sess-a2\",\"pane\":\"$PANE_A\"}" >/dev/null
 
-log "Test 27: session_start via HTTP with reminder and prompt"
+log "Test 27: ouija.start via HTTP with reminder and prompt"
 # Start a session with prompt + reminder
 result=$(api "$BASE" POST /api/sessions/start -d "{\"name\":\"loop-test\",\"project_dir\":\"/tmp/loop-test-proj\",\"prompt\":\"do the work\",\"reminder\":\"if done call loop_next\"}")
-assert_contains "27: session started" "$result" "started"
+assert_contains "27: session started" "$result" "starting"
 # Verify prompt and reminder are in metadata
-sleep 1
+wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'loop-test'"
 status=$(api "$BASE" GET /api/status)
 orig_prompt=$(echo "$status" | jq -r '.sessions[] | select(.id == "loop-test") | .prompt // ""')
 sess_reminder=$(echo "$status" | jq -r '.sessions[] | select(.id == "loop-test") | .reminder // ""')
@@ -1198,8 +1203,8 @@ log "Test 28: loop_next via MCP increments iteration"
 iter_before=$(echo "$status" | jq -r '.sessions[] | select(.id == "loop-test") | .iteration // 0')
 assert_eq "28: iteration starts at 0" "$iter_before" "0"
 # Call loop_next
-mcp_result=$(mcp_call_tool "$BASE" "loop_next" '{"from":"loop-test","message":"finished first batch","clean_context":true}')
-assert_contains "28: loop_next response" "$mcp_result" "loop_next"
+mcp_result=$(mcp_call_tool "$BASE" "ouija.loop-next" '{"from":"loop-test","message":"finished first batch","clean_context":true}')
+assert_contains "28: loop_next response" "$mcp_result" "loop"
 # Wait for restart to complete
 sleep 3
 status2=$(api "$BASE" GET /api/status)
@@ -1218,7 +1223,7 @@ assert_eq "29: reminder preserved" "$reminder_after" "if done call loop_next"
 log "Test 30: loop_next without prompt returns error"
 # Register a bare session (no prompt)
 api "$BASE" POST /api/register -d "{\"id\":\"bare-sess\",\"pane\":\"$PANE_B\"}" >/dev/null
-mcp_result=$(mcp_call_tool "$BASE" "loop_next" '{"from":"bare-sess"}')
+mcp_result=$(mcp_call_tool "$BASE" "ouija.loop-next" '{"from":"bare-sess"}')
 assert_contains "30: error without prompt" "$mcp_result" "no prompt"
 # Clean up
 api "$BASE" POST /api/remove -d '{"id":"bare-sess"}' >/dev/null 2>&1 || true
@@ -1237,7 +1242,7 @@ api "$BASE" POST /api/sessions/start -d "{\"name\":\"loop-norest\",\"project_dir
 sleep 2
 norest_pane=$(api "$BASE" GET /api/status | jq -r '.sessions[] | select(.id == "loop-norest") | .pane // ""')
 # Call loop_next with clean_context=false (default)
-mcp_result=$(mcp_call_tool "$BASE" "loop_next" '{"from":"loop-norest","message":"first pass"}')
+mcp_result=$(mcp_call_tool "$BASE" "ouija.loop-next" '{"from":"loop-norest","message":"first pass"}')
 assert_contains "30b: response has iteration" "$mcp_result" '<loop iteration="1" />'
 # Verify iteration incremented
 status=$(api "$BASE" GET /api/status)
@@ -1249,7 +1254,7 @@ if [ "$last_ln" = "null" ]; then fail "30b: last_iteration_at should be set"; el
 
 log "Test 30c: loop_next clean_context=false increments without session restart"
 # Call again — session should still be alive (no restart)
-mcp_result2=$(mcp_call_tool "$BASE" "loop_next" '{"from":"loop-norest","message":"second pass"}')
+mcp_result2=$(mcp_call_tool "$BASE" "ouija.loop-next" '{"from":"loop-norest","message":"second pass"}')
 assert_contains "30c: response has iteration 2" "$mcp_result2" '<loop iteration="2" />'
 status2=$(api "$BASE" GET /api/status)
 iter2=$(echo "$status2" | jq -r '.sessions[] | select(.id == "loop-norest") | .iteration // 0')
@@ -1263,17 +1268,17 @@ log "Test 30d: loop_next clean_context=false includes reminder every 10th iterat
 # Use the HTTP send endpoint to trigger loop_next calls reliably.
 for i in $(seq 3 9); do
     api "$BASE" POST /api/loop-next -d "{\"from\":\"loop-norest\",\"message\":\"pass $i\"}" >/dev/null 2>&1 || \
-    mcp_call_tool "$BASE" "loop_next" "{\"from\":\"loop-norest\",\"message\":\"pass $i\"}" >/dev/null
+    mcp_call_tool "$BASE" "ouija.loop-next" "{\"from\":\"loop-norest\",\"message\":\"pass $i\"}" >/dev/null
 done
 # Verify we're at iteration 9
 iter9=$(api "$BASE" GET /api/status | jq -r '.sessions[] | select(.id == "loop-norest") | .iteration // 0')
 # If MCP calls dropped some iterations, catch up
 while [ "$iter9" -lt 9 ] 2>/dev/null; do
-    mcp_call_tool "$BASE" "loop_next" '{"from":"loop-norest","message":"catchup"}' >/dev/null
+    mcp_call_tool "$BASE" "ouija.loop-next" '{"from":"loop-norest","message":"catchup"}' >/dev/null
     iter9=$(api "$BASE" GET /api/status | jq -r '.sessions[] | select(.id == "loop-norest") | .iteration // 0')
 done
 # The 10th call should include the reminder text
-mcp_result10=$(mcp_call_tool "$BASE" "loop_next" '{"from":"loop-norest","message":"pass 10"}')
+mcp_result10=$(mcp_call_tool "$BASE" "ouija.loop-next" '{"from":"loop-norest","message":"pass 10"}')
 assert_contains "30d: 10th iteration includes reminder" "$mcp_result10" "keep looping"
 # Clean up
 api "$BASE" POST /api/sessions/kill -d '{"name":"loop-norest"}' >/dev/null 2>&1 || true
@@ -1283,10 +1288,10 @@ api "$BASE" POST /api/register -d "{\"id\":\"sess-a2\",\"pane\":\"$PANE_A\"}" >/
 api "$BASE" POST /api/register -d "{\"id\":\"sess-b\",\"pane\":\"$PANE_B\"}" >/dev/null
 
 log "Test 31: Re-registration preserves loop state"
-# Register a session directly with loop metadata (no session_start, avoids worktree complexity)
+# Register a session directly with loop metadata (no ouija.start, avoids worktree complexity)
 api "$BASE" POST /api/register -d "{\"id\":\"reregtest\",\"pane\":\"$PANE_A\",\"reminder\":\"call loop_next when done\"}" >/dev/null
 # Manually set prompt via a second register with all fields
-# (simulates what session_start does internally)
+# (simulates what ouija.start does internally)
 api "$BASE" POST /api/register -d "{\"id\":\"reregtest\",\"pane\":\"$PANE_A\",\"reminder\":\"call loop_next when done\",\"role\":\"looping\"}" >/dev/null
 # Verify fields are set
 status=$(api "$BASE" GET /api/status)
@@ -1301,8 +1306,8 @@ rem2=$(echo "$status2" | jq -r '.sessions[] | select(.id == "reregtest") | .remi
 role2=$(echo "$status2" | jq -r '.sessions[] | select(.id == "reregtest") | .role // ""')
 assert_eq "31b: reminder preserved after re-register" "$rem2" "call loop_next when done"
 assert_eq "31b: role updated" "$role2" "re-registered"
-# Same test via MCP session_register (the actual hook path)
-mcp_call_tool "$BASE" "session_register" "{\"id\":\"reregtest\",\"pane\":\"$PANE_A\",\"role\":\"hook-registered\"}" >/dev/null
+# Same test via MCP ouija.register (the actual hook path)
+mcp_call_tool "$BASE" "ouija.register" "{\"id\":\"reregtest\",\"pane\":\"$PANE_A\",\"role\":\"hook-registered\"}" >/dev/null
 status3=$(api "$BASE" GET /api/status)
 rem3=$(echo "$status3" | jq -r '.sessions[] | select(.id == "reregtest") | .reminder // ""')
 role3=$(echo "$status3" | jq -r '.sessions[] | select(.id == "reregtest") | .role // ""')
@@ -1424,13 +1429,13 @@ wf_max=$(echo "$status" | jq -r '.sessions[] | select(.id == "wf-a") | .workflow
 assert_eq "32: max_calls stored" "$wf_max" "10"
 
 log "Test 33: Workflow journey — session A calls init, gets first task + verify"
-result=$(mcp_call_tool "$BASE" "workflow" '{"from":"wf-a","action":"init"}')
+result=$(mcp_call_tool "$BASE" "ouija.workflow" '{"from":"wf-a","action":"init"}')
 result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
 assert_contains "33: init returns task alpha" "$result_text" "alpha"
 assert_contains "33: verify criteria included" "$result_text" "Verify before proceeding"
 
 log "Test 34: Workflow journey — session A completes alpha"
-result=$(mcp_call_tool "$BASE" "workflow" '{"from":"wf-a","action":"done","params":{"task":"alpha"}}')
+result=$(mcp_call_tool "$BASE" "ouija.workflow" '{"from":"wf-a","action":"done","params":{"task":"alpha"}}')
 result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
 assert_contains "34: alpha completed" "$result_text" "Completed alpha"
 assert_contains "34: 2 remaining" "$result_text" "2 remaining"
@@ -1440,12 +1445,12 @@ api "$BASE" POST /api/register \
     -d "{\"id\":\"wf-b\",\"pane\":\"$PANE_B\",\"workflow\":\"$JOURNEY_SCRIPT\",\"workflow_max_calls\":4}" >/dev/null
 
 log "Test 36: Workflow journey — session B calls init, gets beta (not alpha)"
-result=$(mcp_call_tool "$BASE" "workflow" '{"from":"wf-b","action":"init"}')
+result=$(mcp_call_tool "$BASE" "ouija.workflow" '{"from":"wf-b","action":"init"}')
 result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
 assert_contains "36: B gets beta (alpha already done by A)" "$result_text" "beta"
 
 log "Test 37: Workflow journey — session B completes beta"
-result=$(mcp_call_tool "$BASE" "workflow" '{"from":"wf-b","action":"done","params":{"task":"beta"}}')
+result=$(mcp_call_tool "$BASE" "ouija.workflow" '{"from":"wf-b","action":"done","params":{"task":"beta"}}')
 result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
 assert_contains "37: beta completed by wf-b" "$result_text" "Completed beta by wf-b"
 
@@ -1461,32 +1466,32 @@ assert_eq "38: session_died recorded in workflow state" "$died_status" "died"
 log "Test 39: Workflow journey — re-register A, state persists (gamma still pending)"
 api "$BASE" POST /api/register \
     -d "{\"id\":\"wf-a\",\"pane\":\"$PANE_A\",\"workflow\":\"$JOURNEY_SCRIPT\",\"workflow_max_calls\":10}" >/dev/null
-result=$(mcp_call_tool "$BASE" "workflow" '{"from":"wf-a","action":"init"}')
+result=$(mcp_call_tool "$BASE" "ouija.workflow" '{"from":"wf-a","action":"init"}')
 result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
 assert_contains "39: A gets gamma after restart (state survived)" "$result_text" "gamma"
 
 log "Test 40: Workflow journey — workflow crash returns actionable error"
-result=$(mcp_call_tool "$BASE" "workflow" '{"from":"wf-a","action":"crash_test"}')
+result=$(mcp_call_tool "$BASE" "ouija.workflow" '{"from":"wf-a","action":"crash_test"}')
 result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
 assert_contains "40: crash error is actionable" "$result_text" "crashed"
 assert_contains "40: recovery guidance included" "$result_text" "workflow(action='status')"
 
 log "Test 41: Workflow journey — workflow error field propagation"
-result=$(mcp_call_tool "$BASE" "workflow" '{"from":"wf-a","action":"error_test"}')
+result=$(mcp_call_tool "$BASE" "ouija.workflow" '{"from":"wf-a","action":"error_test"}')
 result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
 assert_contains "41: error field propagated" "$result_text" "intentional error"
 
 log "Test 42: Workflow journey — unknown action returns error"
-result=$(mcp_call_tool "$BASE" "workflow" '{"from":"wf-a","action":"nonexistent"}')
+result=$(mcp_call_tool "$BASE" "ouija.workflow" '{"from":"wf-a","action":"nonexistent"}')
 result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
 assert_contains "42: unknown action error" "$result_text" "unknown action"
 
 log "Test 43: Workflow journey — effort budget exhaustion"
 # wf-b has max_calls=4, already used 2 (init + done). Use 2 more then hit limit.
-mcp_call_tool "$BASE" "workflow" '{"from":"wf-b","action":"status"}' >/dev/null
-mcp_call_tool "$BASE" "workflow" '{"from":"wf-b","action":"status"}' >/dev/null
+mcp_call_tool "$BASE" "ouija.workflow" '{"from":"wf-b","action":"status"}' >/dev/null
+mcp_call_tool "$BASE" "ouija.workflow" '{"from":"wf-b","action":"status"}' >/dev/null
 # 5th call should be refused
-result=$(mcp_call_tool "$BASE" "workflow" '{"from":"wf-b","action":"status"}')
+result=$(mcp_call_tool "$BASE" "ouija.workflow" '{"from":"wf-b","action":"status"}')
 result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
 assert_contains "43: budget exhausted after max_calls" "$result_text" "budget exhausted"
 
@@ -1494,12 +1499,12 @@ log "Test 44: Workflow journey — no workflow returns helpful error"
 # wf-b is now budget-exhausted. Re-register its pane without workflow.
 api "$BASE" POST /api/remove -d '{"id":"wf-b"}' >/dev/null
 api "$BASE" POST /api/register -d "{\"id\":\"no-wf\",\"pane\":\"$PANE_B\"}" >/dev/null
-result=$(mcp_call_tool "$BASE" "workflow" '{"from":"no-wf","action":"init"}')
+result=$(mcp_call_tool "$BASE" "ouija.workflow" '{"from":"no-wf","action":"init"}')
 result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
 assert_contains "44: no workflow error" "$result_text" "no workflow configured"
 
 log "Test 45: Workflow journey — complete gamma, verify shared state final"
-result=$(mcp_call_tool "$BASE" "workflow" '{"from":"wf-a","action":"done","params":{"task":"gamma"}}')
+result=$(mcp_call_tool "$BASE" "ouija.workflow" '{"from":"wf-a","action":"done","params":{"task":"gamma"}}')
 result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
 assert_contains "45: gamma completed" "$result_text" "Completed gamma"
 assert_contains "45: all done" "$result_text" "All done"

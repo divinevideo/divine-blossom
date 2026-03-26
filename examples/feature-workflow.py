@@ -6,27 +6,27 @@ Demonstrates prompt chaining — the simplest of Anthropic's five composable age
 patterns. Each state reveals only its own actions; the LLM never sees ahead.
 
 Launch:
-    session_start(
+    ouija.start(
         name="feat-1",
         workflow="examples/feature-workflow.py",
         workflow_params={"issue": "Add rate limiting to /api/upload"},
-        prompt="You are implementing a feature. Call workflow('init') to start.",
+        prompt="You are implementing a feature. Call ouija.workflow('init') to start.",
         project_dir="/path/to/project",
     )
 
 ── LLM conversation trace ──────────────────────────────────────────────
 
-  LLM → workflow('init')                          # lands in Planning
+  LLM → ouija.workflow('init')                     # lands in Planning
     ← "## Planning
         Issue: Add rate limiting to /api/upload
 
         Analyze the codebase and create an implementation plan.
-        Call workflow('plan_done', {plan: '...', chunks: [...]})."
+        Call ouija.workflow('plan_done', {plan: '...', chunks: [...]})."
 
   LLM reads code, thinks, creates plan...
 
-  LLM → workflow('plan_done', {plan: "Token bucket...",
-                               chunks: ["rate_limiter", "middleware", "tests"]})
+  LLM → ouija.workflow('plan_done', {plan: "Token bucket...",
+                                     chunks: ["rate_limiter", "middleware", "tests"]})
     ← "Plan accepted. 3 chunks."                  # transition → Implementing
     ← "Start: rate_limiter."                       # on_enter fires
     ← verify: "cargo build succeeds"
@@ -36,18 +36,18 @@ Launch:
 
   LLM builds the rate limiter module, cargo build passes...
 
-  LLM → workflow('chunk_done')
+  LLM → ouija.workflow('chunk_done')
     ← "Chunk 1/3 done. Next: middleware."
     ← verify: "cargo build succeeds"
 
   LLM builds middleware, cargo build passes...
 
-  LLM → workflow('chunk_done')
+  LLM → ouija.workflow('chunk_done')
     ← "Chunk 2/3 done. Next: tests."
 
   LLM writes tests...
 
-  LLM → workflow('chunk_done')
+  LLM → ouija.workflow('chunk_done')
     ← "All 3 chunks implemented."                 # transition → Verifying
     ← "Run the full test suite and review."        # on_enter fires
     ← verify: "cargo test passes with 0 failures"
@@ -56,9 +56,9 @@ Launch:
 
   LLM runs cargo test (passes), reviews diff...
 
-  LLM → workflow('verified', {summary: "Rate limiter: 100 req/min/IP, 12 tests"})
+  LLM → ouija.workflow('verified', {summary: "Rate limiter: 100 req/min/IP, 12 tests"})
     ← "Feature complete."                          # transition → Done
-    ← "Call session_send(done=true)."              # on_enter fires
+    ← "Call ouija.send(done=true)."                # on_enter fires
 
 ─────────────────────────────────────────────────────────────────────────
 """
@@ -72,7 +72,7 @@ class Planning(State):
         return self.respond(
             f"## Planning\nIssue: {issue}\n\n"
             "Analyze the codebase and create an implementation plan.\n"
-            "Call workflow('plan_done', {plan: '<plan>', chunks: ['chunk1', ...]})."
+            "Call ouija.workflow('plan_done', {plan: '<plan>', chunks: ['chunk1', ...]})."
         )
 
     def handle_plan_done(self, ctx, params):
@@ -96,7 +96,7 @@ class Implementing(State):
         chunks = ctx.data["chunks"]
         done = ctx.data["chunks_done"]
         if done < len(chunks):
-            return f"Start: {chunks[done]}. Call workflow('chunk_done') when finished."
+            return f"Start: {chunks[done]}. Call ouija.workflow('chunk_done') when finished."
 
     def handle_init(self, ctx, params):
         """Handles restart/resume — LLM calls init again after context reset."""
@@ -105,7 +105,7 @@ class Implementing(State):
         nxt = chunks[done] if done < len(chunks) else "?"
         return self.respond(
             f"## Resuming: Implementing\n"
-            f"Chunk {done + 1}/{len(chunks)}: {nxt}. Call workflow('chunk_done')."
+            f"Chunk {done + 1}/{len(chunks)}: {nxt}. Call ouija.workflow('chunk_done')."
         )
 
     def handle_chunk_done(self, ctx, params):
@@ -121,7 +121,7 @@ class Implementing(State):
 
         nxt = ctx.data["chunks"][done]
         return self.respond(
-            f"Chunk {done}/{total} done. Next: {nxt}. Call workflow('chunk_done').",
+            f"Chunk {done}/{total} done. Next: {nxt}. Call ouija.workflow('chunk_done').",
             verify="cargo build succeeds",
         )
 
@@ -131,12 +131,12 @@ class Verifying(State):
     def on_enter(self, ctx):
         return (
             "Run the full test suite and review your changes.\n"
-            "Call workflow('verified', {summary: '<what you built>'})."
+            "Call ouija.workflow('verified', {summary: '<what you built>'})."
         )
 
     def handle_init(self, ctx, params):
         return self.respond(
-            "Run tests and review. Call workflow('verified', {summary: '...'}).",
+            "Run tests and review. Call ouija.workflow('verified', {summary: '...'}).",
             verify="cargo test passes with 0 failures",
         )
 
@@ -149,7 +149,7 @@ class Done(State):
     terminal = True
 
     def on_enter(self, ctx):
-        return "Call session_send(done=true)."
+        return "Call ouija.send(done=true)."
 
 
 Workflow(

@@ -149,7 +149,7 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════
-# OUIJA INTEGRATION TESTS — session_start + session_send via HTTP API
+# OUIJA INTEGRATION TESTS — ouija.start + ouija.send via HTTP API
 # The daemon expects opencode serve on daemon_port + 320. Start it
 # on that port for integration tests (daemon does not spawn it).
 # ═══════════════════════════════════════════════════════════════════
@@ -171,13 +171,13 @@ if ! wait_for 15 curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/global/health" -o /
 fi
 log "opencode serve ready on port $OC_SERVE_PORT"
 
-log "Test 7: ouija session_start with backend=opencode"
-start_result=$(mcp_call_tool "$BASE" "session_start" \
+log "Test 7: ouija ouija.start with backend=opencode"
+start_result=$(mcp_call_tool "$BASE" "ouija.start" \
     '{"name":"oc-e2e","project_dir":"/tmp","backend":"opencode"}')
 if echo "$start_result" | grep -q "started.*oc-e2e"; then
     pass "ouija started opencode session 'oc-e2e'"
 else
-    fail "session_start opencode" "contains 'started'" "$(echo "$start_result" | head -c 200)"
+    fail "ouija.start opencode" "contains 'started'" "$(echo "$start_result" | head -c 200)"
 fi
 
 log "Test 8: ouija detects opencode serve readiness"
@@ -205,8 +205,8 @@ else
     fail "backend_session_id" "non-empty value" "empty in status"
 fi
 
-log "Test 9: ouija session_send delivers to opencode via HTTP API"
-send_result=$(mcp_call_tool "$BASE" "session_send" \
+log "Test 9: ouija ouija.send delivers to opencode via HTTP API"
+send_result=$(mcp_call_tool "$BASE" "ouija.send" \
     '{"from":"test-sender","to":"oc-e2e","message":"Reply with only the word hello","expects_reply":false}')
 if echo "$send_result" | grep -qi "delivered\|success"; then
     pass "ouija delivered message to opencode session"
@@ -216,7 +216,7 @@ else
     if grep -q "delivered message via prompt_async.*oc-e2e" /tmp/ouija-test/daemon.log 2>/dev/null; then
         pass "ouija delivered message via HTTP API (confirmed in daemon log)"
     else
-        fail "session_send to opencode" "delivery via HTTP" "$(echo "$send_result" | head -c 200)"
+        fail "ouija.send to opencode" "delivery via HTTP" "$(echo "$send_result" | head -c 200)"
     fi
 fi
 
@@ -227,7 +227,7 @@ sleep 15
 OC_SERVE_PORT=$((PORT + 320))
 # Verify it's reachable
 if curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/global/health" -o /dev/null 2>/dev/null; then
-    # Find the most recent session (the one created by session_start for oc-e2e)
+    # Find the most recent session (the one created by ouija.start for oc-e2e)
     latest_session=$(curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/session" 2>/dev/null \
         | jq -r 'sort_by(.time.updated) | last | .id // empty' 2>/dev/null)
     if [ -n "$latest_session" ]; then
@@ -271,7 +271,7 @@ log "Test 10c: second message exercises plugin chat.message hook"
 # message. The second message also triggers the mesh diff path (joined/left).
 # This is the exact code path that had the Zod validation bug.
 mcp_init "$BASE" >/dev/null 2>&1
-send2_result=$(mcp_call_tool "$BASE" "session_send" \
+send2_result=$(mcp_call_tool "$BASE" "ouija.send" \
     '{"from":"test-sender","to":"oc-e2e","message":"What is 1+1? Reply with just the number.","expects_reply":false}')
 sleep 20
 if curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/global/health" -o /dev/null 2>/dev/null; then
@@ -307,14 +307,14 @@ if [ -f "$OC_SERVE_LOG" ]; then
     fi
 fi
 
-log "Test 11: ouija session_kill cleans up opencode session"
+log "Test 11: ouija ouija.kill cleans up opencode session"
 # Re-init MCP in case the session expired during the long wait
 mcp_init "$BASE" >/dev/null 2>&1
-kill_result=$(mcp_call_tool "$BASE" "session_kill" '{"name":"oc-e2e"}')
+kill_result=$(mcp_call_tool "$BASE" "ouija.kill" '{"name":"oc-e2e"}')
 if echo "$kill_result" | grep -qi "killed\|removed"; then
     pass "ouija killed opencode session"
 else
-    fail "session_kill" "killed or removed" "$(echo "$kill_result" | head -c 200)"
+    fail "ouija.kill" "killed or removed" "$(echo "$kill_result" | head -c 200)"
 fi
 
 # Verify it's gone
@@ -330,12 +330,12 @@ log "Test 12: second session on same serve works"
 # The original bug manifested as "first session works, subsequent ones fail."
 # This test creates a second session on the same shared serve instance.
 mcp_init "$BASE" >/dev/null 2>&1
-start2_result=$(mcp_call_tool "$BASE" "session_start" \
+start2_result=$(mcp_call_tool "$BASE" "ouija.start" \
     '{"name":"oc-e2e2","project_dir":"/tmp","backend":"opencode","text":"Reply with only the word ping"}')
 if echo "$start2_result" | grep -q "started.*oc-e2e2"; then
     pass "second opencode session started"
 else
-    fail "second session_start" "contains 'started'" "$(echo "$start2_result" | head -c 200)"
+    fail "second ouija.start" "contains 'started'" "$(echo "$start2_result" | head -c 200)"
 fi
 
 sleep 5
@@ -349,7 +349,7 @@ fi
 
 # Send a message to the second session
 mcp_init "$BASE" >/dev/null 2>&1
-mcp_call_tool "$BASE" "session_send" \
+mcp_call_tool "$BASE" "ouija.send" \
     '{"from":"test-sender","to":"oc-e2e2","message":"Reply with only the word ping","expects_reply":false}' >/dev/null 2>&1
 sleep 20
 
@@ -376,17 +376,17 @@ fi
 
 # Clean up second session
 mcp_init "$BASE" >/dev/null 2>&1
-mcp_call_tool "$BASE" "session_kill" '{"name":"oc-e2e2"}' >/dev/null 2>&1
+mcp_call_tool "$BASE" "ouija.kill" '{"name":"oc-e2e2"}' >/dev/null 2>&1
 
 log "Test 13: soft restart creates new opencode session via HTTP API"
 # Start a session with prompt and reminder
 mcp_init "$BASE" >/dev/null 2>&1
-start13=$(mcp_call_tool "$BASE" "session_start" \
+start13=$(mcp_call_tool "$BASE" "ouija.start" \
     "{\"name\":\"oc-soft\",\"project_dir\":\"/tmp/soft-test\",\"backend\":\"opencode\",\"prompt\":\"say hello\",\"reminder\":\"call loop_next when done\"}")
 if echo "$start13" | grep -q "started.*oc-soft"; then
     pass "13a: started session for soft restart test"
 else
-    fail "13a: session_start" "contains started" "$(echo "$start13" | head -c 200)"
+    fail "13a: ouija.start" "contains started" "$(echo "$start13" | head -c 200)"
 fi
 sleep 5
 # Verify session has prompt and reminder
@@ -403,7 +403,7 @@ else
 fi
 # Now restart with fresh=true — should trigger soft restart (POST /session + prompt_async)
 mcp_init "$BASE" >/dev/null 2>&1
-restart13=$(mcp_call_tool "$BASE" "session_restart" \
+restart13=$(mcp_call_tool "$BASE" "ouija.restart" \
     '{"name":"oc-soft","fresh":true,"prompt":"say goodbye","reminder":"call loop_next when done"}')
 if echo "$restart13" | grep -qi "soft-restarted\|restarted"; then
     pass "13c: soft restart succeeded"
@@ -438,7 +438,7 @@ rem13b=$(echo "$status13b" | jq -r '.sessions[] | select(.id == "oc-soft") | .re
 assert_eq "13g: reminder preserved after soft restart" "$rem13b" "call loop_next when done"
 # Clean up
 mcp_init "$BASE" >/dev/null 2>&1
-mcp_call_tool "$BASE" "session_kill" '{"name":"oc-soft"}' >/dev/null 2>&1
+mcp_call_tool "$BASE" "ouija.kill" '{"name":"oc-soft"}' >/dev/null 2>&1
 
 # ═══════════════════════════════════════════════════════════════════
 # WORKFLOW ACTOR TEST — Real LLM follows workflow instructions
@@ -520,12 +520,12 @@ chmod +x "$OC_WF_SCRIPT"
 
 log "Test 14: Workflow — start session with workflow actor"
 mcp_init "$BASE" >/dev/null 2>&1
-wf_start=$(mcp_call_tool "$BASE" "session_start" \
+wf_start=$(mcp_call_tool "$BASE" "ouija.start" \
     "{\"name\":\"oc-wf\",\"project_dir\":\"/tmp\",\"backend\":\"opencode\",\"workflow\":\"$OC_WF_SCRIPT\"}")
 if echo "$wf_start" | grep -q "started.*oc-wf"; then
     pass "14a: workflow session started"
 else
-    fail "14a: workflow session_start" "contains started" "$(echo "$wf_start" | head -c 200)"
+    fail "14a: workflow ouija.start" "contains started" "$(echo "$wf_start" | head -c 200)"
 fi
 
 # Verify workflow metadata was set
@@ -655,7 +655,7 @@ fi  # end GEMINI_API_KEY guard
 
 # Clean up workflow session
 mcp_init "$BASE" >/dev/null 2>&1
-mcp_call_tool "$BASE" "session_kill" '{"name":"oc-wf"}' >/dev/null 2>&1
+mcp_call_tool "$BASE" "ouija.kill" '{"name":"oc-wf"}' >/dev/null 2>&1
 
 # ── Daemon logs ──────────────────────────────────────────────────
 log "Daemon logs (last 20 lines):"

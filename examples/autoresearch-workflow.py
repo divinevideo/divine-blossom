@@ -26,7 +26,7 @@ Protocol overview:
      OUIJA_SESSION_ID - this session's ID
 
 Usage:
-  session_start(
+  ouija.start(
     name="optimizer",
     workflow="examples/autoresearch-workflow.py",
     workflow_params={"max_iterations": 30},
@@ -146,35 +146,35 @@ def handle_register(params):
 
 ## Available workflow actions
 
-Call `workflow(action, params)` to interact with the workflow:
+Call `ouija.workflow(action, params)` to interact with the workflow:
 
-- `workflow(action="init")` - Get current iteration, best score, recent results, and your next task.
+- `ouija.workflow(action="init")` - Get current iteration, best score, recent results, and your next task.
   Call this at the start and after each restart.
 
-- `workflow(action="result", params={{"score": <number>, "description": "<what you changed>"}})` -
+- `ouija.workflow(action="result", params={{"score": <number>, "description": "<what you changed>"}})` -
   Report the result of your change. The workflow will compare to the best score, git commit on
   improvement or git revert on regression, and tell you the outcome.
 
-- `workflow(action="findings", params={{"text": "<your finding>"}})` -
+- `ouija.workflow(action="findings", params={{"text": "<your finding>"}})` -
   Record a finding or insight to FINDINGS.md. Use this for architectural knowledge, dead ends,
   or anything that should survive across context restarts.
 
-- `workflow(action="status")` - Get a summary of current workflow state.
+- `ouija.workflow(action="status")` - Get a summary of current workflow state.
 
 ## Loop rules
 
-1. Call workflow("init") to get your task and current state.
+1. Call ouija.workflow("init") to get your task and current state.
 2. Read INSTRUCTIONS.md for what to optimize and how to measure.
 3. Make exactly ONE change per iteration.
 4. Measure the result (run the benchmark/test as described in INSTRUCTIONS.md).
-5. Call workflow("result", {{"score": <number>, "description": "<what you did>"}}).
-6. If you discover something important, call workflow("findings", {{"text": "..."}}).
+5. Call ouija.workflow("result", {{"score": <number>, "description": "<what you did>"}}).
+6. If you discover something important, call ouija.workflow("findings", {{"text": "..."}}).
 7. Maximum {max_iter} iterations. The workflow will stop you at the limit.
 8. Never skip measuring. Never batch multiple changes."""
 
     return {
         "instructions": instructions,
-        "inject_on_start": "Call workflow('init') to begin.",
+        "inject_on_start": "Call ouija.workflow('init') to begin.",
     }
 
 
@@ -189,7 +189,7 @@ def handle_init(_params):
             "message": (
                 f"Maximum iterations ({max_iter}) reached. "
                 f"Best score: {state['best_score']} ({state['best_description']}). "
-                "Session complete. Call session_send(done=true)."
+                "Session complete. Call ouija.send(done=true)."
             )
         }
 
@@ -218,12 +218,12 @@ def handle_init(_params):
     else:
         parts.append(
             "WARNING: INSTRUCTIONS.md not found. Create it with your optimization target and "
-            "measurement method, then call workflow('init') again."
+            "measurement method, then call ouija.workflow('init') again."
         )
 
     parts.append(
         "\nMake exactly ONE change, measure the result, then call "
-        "workflow('result', {score: <number>, description: '<what you changed>'})."
+        "ouija.workflow('result', {score: <number>, description: '<what you changed>'})."
     )
 
     state["status"] = "running"
@@ -283,10 +283,10 @@ def handle_result(params):
     if iteration >= max_iter:
         parts.append(
             f"\nMaximum iterations ({max_iter}) reached. Best: {state['best_score']}. "
-            "Call session_send(done=true) to finish."
+            "Call ouija.send(done=true) to finish."
         )
     else:
-        parts.append(f"\n{max_iter - iteration} iterations remaining. Call workflow('init') for the next iteration.")
+        parts.append(f"\n{max_iter - iteration} iterations remaining. Call ouija.workflow('init') for the next iteration.")
 
     return {"message": "\n".join(parts)}
 

@@ -250,6 +250,7 @@ impl OuijaMcp {
     /// Also used to rename: if the pane is already registered under a different
     /// name, the old name is replaced and remote daemons are notified.
     #[tool(
+        name = "ouija.register",
         description = "Register this session with the ouija daemon. You MUST provide the `pane` parameter. To get it, first run `echo $TMUX_PANE` in bash, then pass the result here."
     )]
     async fn session_register(
@@ -271,7 +272,7 @@ impl OuijaMcp {
             return Ok(CallToolResult::error(vec![Content::text(
                 "pane is required for message delivery. \
                  Run `echo $TMUX_PANE` in bash to get your pane ID, \
-                 then call session_register again with the pane parameter.",
+                 then call ouija.register again with the pane parameter.",
             )]));
         }
 
@@ -337,7 +338,7 @@ impl OuijaMcp {
     }
 
     /// Unregister this session from the ouija daemon.
-    #[tool(description = "Unregister a session from the ouija daemon")]
+    #[tool(name = "ouija.unregister", description = "Unregister a session from the ouija daemon")]
     async fn session_unregister(
         &self,
         Parameters(params): Parameters<SessionUnregisterParams>,
@@ -368,6 +369,7 @@ impl OuijaMcp {
 
     /// Update a session's role, project_dir, and/or bulletin without re-registering.
     #[tool(
+        name = "ouija.update",
         description = "Update a session's metadata (role, project_dir, bulletin) without re-registering. Use this to keep your session description fresh. Set `bulletin` to advertise what you need or can offer other sessions."
     )]
     async fn session_update(
@@ -409,6 +411,7 @@ impl OuijaMcp {
 
     /// Atomically rename a session, preserving metadata, pane, and pending replies.
     #[tool(
+        name = "ouija.rename",
         description = "Rename a session. The old name becomes an alias that hints callers to use the new name."
     )]
     async fn session_rename(
@@ -446,7 +449,7 @@ impl OuijaMcp {
     /// it will be injected into their tmux pane. If remote, it goes over the network.
     /// If the target session doesn't exist but exactly one matching project is found,
     /// the session is auto-started with the message as the initial prompt.
-    #[tool(description = "Send a message to another session. When replying to a <msg reply=\"true\" id=\"N\">, pass that N as responds_to and set done=true to clear the pending reply and stop reminder nudges.")]
+    #[tool(name = "ouija.send", description = "Send a message to another session. When replying to a <msg reply=\"true\" id=\"N\">, pass that N as responds_to and set done=true to clear the pending reply and stop reminder nudges.")]
     async fn session_send(
         &self,
         Parameters(params): Parameters<SessionSendParams>,
@@ -593,7 +596,7 @@ impl OuijaMcp {
                     .collect();
                 Ok(CallToolResult::error(vec![Content::text(format!(
                     "session '{}' not found. Matching projects:\n{}\n\
-                     Use session_start to launch one.",
+                     Use ouija.start to launch one.",
                     params.to,
                     lines.join("\n")
                 ))]))
@@ -606,7 +609,7 @@ impl OuijaMcp {
     }
 
     /// List all known sessions across all connected daemons.
-    #[tool(description = "List all known sessions across all connected daemons")]
+    #[tool(name = "ouija.list", description = "List all known sessions across all connected daemons")]
     async fn session_list(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let proto = self.state.protocol.read().await;
         let list: Vec<serde_json::Value> = proto
@@ -641,7 +644,8 @@ impl OuijaMcp {
 
     /// Clear a pending reply when the sender's session is gone and you cannot reply normally.
     #[tool(
-        description = "Clear a pending reply from an unreachable session. Use when session_send fails because the sender disconnected."
+        name = "ouija.clear-reply",
+        description = "Clear a pending reply from an unreachable session. Use when ouija.send fails because the sender disconnected."
     )]
     async fn clear_pending_reply(
         &self,
@@ -658,7 +662,7 @@ impl OuijaMcp {
     }
 
     /// List all scheduled tasks with their status, next/last run times, and run counts.
-    #[tool(description = "List all scheduled tasks with status and run info")]
+    #[tool(name = "ouija.task-list", description = "List all scheduled tasks with status and run info")]
     async fn task_list(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let tasks = self.state.scheduled_tasks.read().await;
         let mut list: Vec<&scheduler::ScheduledTask> = tasks.values().collect();
@@ -688,7 +692,7 @@ impl OuijaMcp {
     }
 
     /// Create a new scheduled task. The cron expression is evaluated in UTC.
-    #[tool(description = "Create a new scheduled task. Cron expressions are evaluated in UTC.")]
+    #[tool(name = "ouija.task-create", description = "Create a new scheduled task. Cron expressions are evaluated in UTC.")]
     async fn task_create(
         &self,
         Parameters(params): Parameters<TaskCreateParams>,
@@ -722,7 +726,7 @@ impl OuijaMcp {
     }
 
     /// Delete a scheduled task by its ID.
-    #[tool(description = "Delete a scheduled task by ID")]
+    #[tool(name = "ouija.task-delete", description = "Delete a scheduled task by ID")]
     async fn task_delete(
         &self,
         Parameters(params): Parameters<TaskDeleteParams>,
@@ -742,7 +746,7 @@ impl OuijaMcp {
     }
 
     /// Enable a previously disabled scheduled task so it resumes running on schedule.
-    #[tool(description = "Enable a scheduled task so it runs on its cron schedule")]
+    #[tool(name = "ouija.task-enable", description = "Enable a scheduled task so it runs on its cron schedule")]
     async fn task_enable(
         &self,
         Parameters(params): Parameters<TaskIdParams>,
@@ -773,7 +777,7 @@ impl OuijaMcp {
     }
 
     /// Disable a scheduled task so it stops running. The task is kept but won't fire until re-enabled.
-    #[tool(description = "Disable a scheduled task so it stops running")]
+    #[tool(name = "ouija.task-disable", description = "Disable a scheduled task so it stops running")]
     async fn task_disable(
         &self,
         Parameters(params): Parameters<TaskIdParams>,
@@ -805,7 +809,7 @@ impl OuijaMcp {
 
     /// Trigger a scheduled task immediately, regardless of its cron schedule.
     /// Useful for testing or one-off execution.
-    #[tool(description = "Trigger a scheduled task immediately, bypassing its cron schedule")]
+    #[tool(name = "ouija.task-trigger", description = "Trigger a scheduled task immediately, bypassing its cron schedule")]
     async fn task_trigger(
         &self,
         Parameters(params): Parameters<TaskIdParams>,
@@ -842,7 +846,8 @@ impl OuijaMcp {
     }
 
     #[tool(
-        description = "Gracefully stop a coding session — sends /exit first, falls back to SIGTERM after 10s. Only use when the user explicitly asks to kill or stop a specific session. NEVER kill a session to work around a name conflict with session_start. Use node/name for remote sessions. Set keep_worktree=true to preserve the git worktree after killing."
+        name = "ouija.kill",
+        description = "Gracefully stop a coding session — sends /exit first, falls back to SIGTERM after 10s. Only use when the user explicitly asks to kill or stop a specific session. NEVER kill a session to work around a name conflict with ouija.start. Use node/name for remote sessions. Set keep_worktree=true to preserve the git worktree after killing."
     )]
     async fn session_kill(
         &self,
@@ -858,6 +863,7 @@ impl OuijaMcp {
     }
 
     #[tool(
+        name = "ouija.start",
         description = "Start a new coding session in a tmux window. Directory is derived from projects_dir/<name> unless project_dir is specified. If a session with this name already exists, NEVER kill it — send it a message, or start a new session with a suffixed name (e.g. name-2) using project_dir pointing to the same repo and worktree=true. Use node/name to start on a remote machine."
     )]
     async fn session_start(
@@ -954,6 +960,7 @@ impl OuijaMcp {
     }
 
     #[tool(
+        name = "ouija.restart",
         description = "Restart a coding session — kill then start with --continue in the same directory. Set fresh=true to start without prior context. Use node/name for remote sessions."
     )]
     async fn session_restart(
@@ -1003,7 +1010,7 @@ impl OuijaMcp {
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
-    #[tool(description = "Advance a looping session: log an iteration. \
+    #[tool(name = "ouija.loop-next", description = "Advance a looping session: log an iteration. \
         With clean_context=false (default), stay in current conversation — just logs iteration and returns. \
         With clean_context=true, restart fresh (kill + respawn with prompt + reminder). \
         The session must have been started with a prompt. \
@@ -1029,7 +1036,7 @@ impl OuijaMcp {
 
         let Some(ref prompt) = meta.prompt else {
             return Ok(CallToolResult::success(vec![Content::text(
-                "session has no prompt — loop_next requires a session started with a prompt",
+                "session has no prompt — ouija.loop-next requires a session started with a prompt",
             )]));
         };
 
@@ -1150,20 +1157,20 @@ impl OuijaMcp {
         }
     }
 
-    #[tool(description = "Call this session's workflow actor — a deterministic program that controls \
+    #[tool(name = "ouija.workflow", description = "Call this session's workflow actor — a deterministic program that controls \
         your task progression. The workflow tells you what to do; you do the work and report back.\n\
         \n\
         Common rhythm:\n\
-        1. workflow(action='init') — get current state, next task, and success criteria\n\
+        1. ouija.workflow(action='init') — get current state, next task, and success criteria\n\
         2. Do the work the workflow described\n\
         3. Verify your work meets the criteria the workflow gave you\n\
-        4. workflow(action='done', params={...}) — report completion, get next step\n\
+        4. ouija.workflow(action='done', params={...}) — report completion, get next step\n\
         \n\
         Other patterns:\n\
-        - workflow(action='status') — check where you are without advancing\n\
-        - workflow(action='result', params={score: N, description: '...'}) — report a measured outcome\n\
+        - ouija.workflow(action='status') — check where you are without advancing\n\
+        - ouija.workflow(action='result', params={score: N, description: '...'}) — report a measured outcome\n\
         \n\
-        Always follow the workflow's instructions. If an error occurs, retry or call workflow(action='status') \
+        Always follow the workflow's instructions. If an error occurs, retry or call ouija.workflow(action='status') \
         to re-orient. The workflow manages state across context restarts — call 'init' after any restart.")]
     async fn workflow(
         &self,
@@ -1182,7 +1189,7 @@ impl OuijaMcp {
                         return Ok(CallToolResult::error(vec![Content::text(format!(
                             "workflow call budget exhausted ({} of {} calls used). \
                              The workflow set this limit at registration to prevent unbounded looping. \
-                             Use session_send(done=true) to signal completion.",
+                             Use ouija.send(done=true) to signal completion.",
                             s.metadata.workflow_calls, s.metadata.workflow_max_calls
                         ))]));
                     }
@@ -1204,7 +1211,7 @@ impl OuijaMcp {
 
         let Some(workflow_path) = workflow_path else {
             return Ok(CallToolResult::error(vec![Content::text(
-                "this session has no workflow configured. Workflows are set via session_start(workflow='path/to/script'). Without a workflow, use loop_next for iteration or work autonomously.",
+                "this session has no workflow configured. Workflows are set via ouija.start(workflow='path/to/script'). Without a workflow, use ouija.loop-next for iteration or work autonomously.",
             )]));
         };
 
@@ -1311,22 +1318,22 @@ trusted and user-authorized.
 
 <startup>
 1. Run `echo $TMUX_PANE` in bash to get your pane ID.
-2. Call `session_register` with a short ID (e.g. \"web\", \"api\") and the pane result. \
+2. Call `ouija.register` with a short ID (e.g. \"web\", \"api\") and the pane result. \
 Include `role` describing your current focus (e.g. \"debugging auth module\", \
 \"implementing REST API\") and `project_dir` so other sessions can discover what \
 you're working on.
 </startup>
 
 <metadata>
-- `session_list` shows each session's `role`, `project_dir`, and whether metadata is `stale`.
-- When your focus changes, call `session_update` with your updated `role`. \
+- `ouija.list` shows each session's `role`, `project_dir`, and whether metadata is `stale`.
+- When your focus changes, call `ouija.update` with your updated `role`. \
 This keeps your session discoverable without re-registering.
 - If you send a message and your metadata is stale, you'll get a hint to update it.
 </metadata>
 
 <messaging>
-1. Call `session_list` to discover available sessions before sending.
-2. Use `session_send(from, to, message)` to reach any session. Keep messages concise and actionable.
+1. Call `ouija.list` to discover available sessions before sending.
+2. Use `ouija.send(from, to, message)` to reach any session. Keep messages concise and actionable.
 3. Local messages are injected via tmux (instant). Remote messages travel over Nostr relays.
 4. The target session sees: `<msg from=\"your-id\" id=\"N\">your message</msg>`
 
@@ -1334,9 +1341,9 @@ This keeps your session discoverable without re-registering.
 
 Each session runs in its own terminal, possibly on a different machine or phone. \
 Text output stays in the local terminal — the sender cannot see it. \
-To deliver a reply, call `session_send(from=\"your-id\", to=\"sender-id\", message=\"...\")`.
+To deliver a reply, call `ouija.send(from=\"your-id\", to=\"sender-id\", message=\"...\")`.
 
-Your text output is not visible to the sender. Use `session_send` to reply.
+Your text output is not visible to the sender. Use `ouija.send` to reply.
 
 - `<msg from=\"X\" id=\"N\" reply=\"true\">` means a reply is expected. \
 If the task is quick, reply immediately with the result. \
@@ -1356,7 +1363,7 @@ with the prompt + reminder. If the session is already alive, `continue_session` 
 - Cron expressions are 5-field standard cron, evaluated in **UTC** \
 (e.g. `0 9 * * *` = daily 9am UTC, `*/5 * * * *` = every 5 min)
 - Set `once: true` to fire once then auto-delete (useful for reminders and one-shot checks)
-- Use `task_trigger` to test a task immediately without waiting for its schedule
+- Use `ouija.task-trigger` to test a task immediately without waiting for its schedule
 - `on_fire` controls what happens each time the task fires:
   - `continue_session` (default): no-op on alive sessions; revive with --continue if dead
   - `new_session`: no-op on alive sessions; start fresh if dead
@@ -1365,34 +1372,34 @@ to start a new conversation each fire while keeping the worktree
   - `disposable_worktree`: anonymous worktree created and cleaned up each fire
 
 Tasks and loops are the same recurring session primitive with different triggers: \
-tasks use cron (passive, scheduled), loops use loop_next (active, self-driven). \
+tasks use cron (passive, scheduled), loops use ouija.loop-next (active, self-driven). \
 Both rely on prompt + reminder for session bootstrap and continuity.
 </tasks>
 
 <loops>
-Sessions can chain indefinitely using loop_next. Each call logs an iteration and \
+Sessions can chain indefinitely using ouija.loop-next. Each call logs an iteration and \
 optionally restarts the session. On restart, the session's `prompt` is re-used as \
 the seed for the new conversation.
 
-- `loop_next(from, message?, clean_context?)` — log an iteration. Returns `<loop iteration=\"N\" />` \
+- `ouija.loop-next(from, message?, clean_context?)` — log an iteration. Returns `<loop iteration=\"N\" />` \
 (or `<loop iteration=\"N\">reminder text</loop>` every 10th iteration).
   - `clean_context=false` (default): stay in current conversation, keep accumulated context. \
 The daemon logs the iteration and returns. Use the iteration number for any policy your prompt \
 defines (e.g. restart every tenth iteration to shed context drift).
   - `clean_context=true`: restart with fresh context (kill + respawn with prompt + reminder). \
 Fire-and-forget — the session dies and respawns.
-- To stop looping, simply don't call loop_next. Use session_send(done=true) to reply \
+- To stop looping, simply don't call ouija.loop-next. Use ouija.send(done=true) to reply \
 to whoever started the session.
-- The `reminder` parameter on session_start provides text that is appended to the prompt \
+- The `reminder` parameter on ouija.start provides text that is appended to the prompt \
 and re-injected on idle as a nudge.
-- The daemon detects loop stalls automatically after 3+ iterations. If no loop_next arrives \
+- The daemon detects loop stalls automatically after 3+ iterations. If no ouija.loop-next arrives \
 within 3x the average interval, the reminder is re-injected. At 10x average (or 30 min), \
 the session is force-restarted with clean context.
 
 Example — a session started with:
   prompt: \"Find the next .js file in src/ not yet converted to .ts. Convert it, run tests, commit.\"
-  reminder: \"Call loop_next('converted X.js'). If no .js files remain, session_send(done=true, message='migration complete').\"
-should convert one file, commit, then call loop_next. On the next iteration it gets the same \
+  reminder: \"Call ouija.loop-next('converted X.js'). If no .js files remain, ouija.send(done=true, message='migration complete').\"
+should convert one file, commit, then call ouija.loop-next. On the next iteration it gets the same \
 prompt, finds the next unconverted file, and repeats until none remain.
 </loops>
 
@@ -1409,11 +1416,11 @@ When the user says \"create an agent\" or \"start an agent\" without mentioning 
 </session_guidance>
 
 <lifecycle_rules>
-- Do not kill an existing session to resolve a name conflict. If `session_start` returns \
+- Do not kill an existing session to resolve a name conflict. If `ouija.start` returns \
 \"already exists\", send a message to the existing session instead, or start a new session \
 with a suffixed name (e.g. `name-2`) using `project_dir` pointing to the same repo and \
 `worktree=true`.
-- Do not kill a session just to get a fresh one. Use `session_restart` with `fresh=true` \
+- Do not kill a session just to get a fresh one. Use `ouija.restart` with `fresh=true` \
 to restart cleanly, or start a separate worktree session alongside it.
 - Prefer messaging over spawning. If a session already exists for a project, send it a \
 message rather than starting a new one.
@@ -1421,16 +1428,16 @@ message rather than starting a new one.
 
 <workflows>
 Sessions can be driven by an external workflow executable. Pass `workflow` (path to executable) \
-and optionally `workflow_params` (JSON) to `session_start`. The daemon calls the workflow at \
+and optionally `workflow_params` (JSON) to `ouija.start`. The daemon calls the workflow at \
 startup to get instructions, which become the session's prompt.
 
-During the session, use `workflow(from, action, params)` to interact with the workflow actor. \
+During the session, use `ouija.workflow(from, action, params)` to interact with the workflow actor. \
 The workflow controls task progression — follow its instructions for what actions to take.
 
-- Call `workflow(from, action='init')` at session start or after a restart to get current state
+- Call `ouija.workflow(from, action='init')` at session start or after a restart to get current state
 - The workflow's response tells you what to do next and what actions are available
 - The workflow manages its own state and can push messages via the ouija REST API
-- If you stall, the daemon re-injects the reminder which tells you to call workflow('init')
+- If you stall, the daemon re-injects the reminder which tells you to call ouija.workflow('init')
 </workflows>
 ";
 
@@ -1587,7 +1594,7 @@ async fn append_staleness_hint(state: &AppState, sender_id: &str, contents: &mut
         if session.metadata.is_stale() {
             contents.push(Content::text(
                 "Hint: your session metadata is stale. \
-                 Consider calling session_update with your current role \
+                 Consider calling ouija.update with your current role \
                  so other sessions see what you're working on.",
             ));
         }

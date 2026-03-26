@@ -1,6 +1,6 @@
 # Workflow Actors
 
-A workflow actor is an external program that drives an LLM session through a deterministic process. The LLM calls a `workflow()` tool; the program controls state, verification, and progression. Think of it as a process engine where the LLM is the task worker.
+A workflow actor is an external program that drives an LLM session through a deterministic process. The LLM calls an `ouija.workflow()` tool; the program controls state, verification, and progression. Think of it as a process engine where the LLM is the task worker.
 
 ## The idea
 
@@ -14,7 +14,7 @@ The pattern is the same as an MCP tool: the LLM calls deterministic code and get
 Classical harness:    Code → LLM API → Code → LLM API → Code → ...
                       (code is the loop, LLM is a function)
 
-Workflow actor:       LLM → workflow() → LLM → workflow() → LLM → ...
+Workflow actor:       LLM → ouija.workflow() → LLM → ouija.workflow() → LLM → ...
                       (LLM is the loop, workflow is a function)
 ```
 
@@ -25,14 +25,14 @@ Same control flow, inverted. One continuous LLM session instead of many API call
 A workflow doesn't explain itself upfront. It reveals the process one step at a time, like [HATEOAS](https://en.wikipedia.org/wiki/HATEOAS) in REST APIs — the response tells the client what it can do next, so the client never needs a map of the full API.
 
 ```
-LLM: workflow('init')
-  → "Implement the auth module. Call workflow('chunk_done', {chunk: 'auth'}) when finished."
+LLM: ouija.workflow('init')
+  → "Implement the auth module. Call ouija.workflow('chunk_done', {chunk: 'auth'}) when finished."
 
-LLM: workflow('chunk_done', {chunk: 'auth'})
-  → "Tests pass. Next: implement the logging module. Call workflow('chunk_done', {chunk: 'logging'})."
+LLM: ouija.workflow('chunk_done', {chunk: 'auth'})
+  → "Tests pass. Next: implement the logging module. Call ouija.workflow('chunk_done', {chunk: 'logging'})."
 
-LLM: workflow('chunk_done', {chunk: 'logging'})
-  → "All chunks done. Review your diff, then call workflow('verify', {summary: '...'})."
+LLM: ouija.workflow('chunk_done', {chunk: 'logging'})
+  → "All chunks done. Review your diff, then call ouija.workflow('verify', {summary: '...'})."
 ```
 
 The LLM didn't know about the verify phase until it got there. The prompt didn't describe a three-phase process. Each response disclosed exactly what was needed — no more, no less.
@@ -43,7 +43,7 @@ This is the same principle as BPM systems (Camunda, Activiti): the task particip
 
 - **Less context consumed** — the LLM holds only the current step, not a full process description
 - **Less drift** — the LLM can't skip ahead because it doesn't know what's ahead
-- **Survives restarts** — `workflow('init')` reconstructs state from the state file; no prompt memory needed
+- **Survives restarts** — `ouija.workflow('init')` reconstructs state from the state file; no prompt memory needed
 - **Adaptable** — the workflow can change the next step based on results without conflicting with the LLM's cached understanding
 
 ### Three levels of context
@@ -52,9 +52,9 @@ Information reaches the LLM at three levels:
 
 | Level | What | When loaded | Purpose |
 |---|---|---|---|
-| 1. Tool description | The `workflow` MCP tool description | Always in context | Tells the LLM the tool exists and how to call it |
+| 1. Tool description | The `ouija.workflow` MCP tool description | Always in context | Tells the LLM the tool exists and how to call it |
 | 2. Registration instructions | From the workflow's `register` response | At session start | Orients the LLM — purpose, rhythm, constraints |
-| 3. Runtime responses | From each `workflow()` call | On demand | Step-specific: current state, next task, verification criteria |
+| 3. Runtime responses | From each `ouija.workflow()` call | On demand | Step-specific: current state, next task, verification criteria |
 
 Level 1 helps recognize. Level 2 orients. Level 3 directs. Don't bleed between levels — if you're putting step-specific detail in registration instructions, move it to a runtime response.
 
@@ -64,16 +64,16 @@ Level 1 helps recognize. Level 2 orients. Level 3 directs. Don't bleed between l
 
 A workflow is any executable that reads JSON from stdin and writes JSON to stdout. The daemon spawns it once per interaction (stateless process, stateful files).
 
-**Registration** (called by the daemon at `session_start`):
+**Registration** (called by the daemon at `ouija.start`):
 ```json
 // stdin
 {"event": "register", "session_id": "worker-1", "params": {"issue_id": 123}}
 
 // stdout
-{"instructions": "You are a worker...", "inject_on_start": "Call workflow('init').", "max_calls": 200}
+{"instructions": "You are a worker...", "inject_on_start": "Call ouija.workflow('init').", "max_calls": 200}
 ```
 
-**Runtime** (called when the LLM uses the `workflow()` MCP tool):
+**Runtime** (called when the LLM uses the `ouija.workflow()` MCP tool):
 ```json
 // stdin
 {"action": "chunk_done", "session_id": "worker-1", "params": {"chunk": "auth"}}
@@ -93,7 +93,7 @@ A workflow is any executable that reads JSON from stdin and writes JSON to stdou
 
 ### What the daemon provides
 
-- **MCP tool**: Routes LLM `workflow()` calls to the executable, injects trusted `session_id`
+- **MCP tool**: Routes LLM `ouija.workflow()` calls to the executable, injects trusted `session_id`
 - **Registration**: Calls the workflow at session start, merges instructions into the prompt
 - **Effort budgets**: Enforces `max_calls` from registration — refuses further calls when exhausted
 - **Lifecycle events**: Notifies the workflow when sessions die or restart
@@ -111,7 +111,7 @@ A workflow is any executable that reads JSON from stdin and writes JSON to stdou
 
 The workflow communicates with LLM sessions in two directions:
 
-**LLM → Workflow** (synchronous, via MCP tool): The LLM calls `workflow('action')`, the daemon pipes to the executable, returns the response. This is request-response — the LLM initiates.
+**LLM → Workflow** (synchronous, via MCP tool): The LLM calls `ouija.workflow('action')`, the daemon pipes to the executable, returns the response. This is request-response — the LLM initiates.
 
 **Workflow → LLM** (asynchronous, via ouija REST API): The workflow calls `POST /api/inject` to push text into any session at any time. This is how a reviewer's approval can wake up an idle worker, or how a coordinator can dispatch new tasks.
 
@@ -120,11 +120,11 @@ The workflow communicates with LLM sessions in two directions:
 import requests, os
 requests.post(f"{os.environ['OUIJA_API']}/api/inject", json={
     "pane": worker_pane_id,
-    "message": "Review approved. Call workflow('init') to continue."
+    "message": "Review approved. Call ouija.workflow('init') to continue."
 })
 ```
 
-Without the async push channel, the workflow would be limited to request-response — a polling-based model where the LLM must keep calling `workflow('status')` to check for updates. The ouija REST API makes it reactive.
+Without the async push channel, the workflow would be limited to request-response — a polling-based model where the LLM must keep calling `ouija.workflow('status')` to check for updates. The ouija REST API makes it reactive.
 
 ## Multi-session coordination
 
@@ -145,7 +145,7 @@ Multiple LLM sessions can share one workflow. The workflow distinguishes them by
          └─────────┘ └─────────┘ └──────────┘
 ```
 
-Each session calls `workflow('init')` and gets role-appropriate instructions. The workflow is the coordinator — no coordinator LLM session needed, zero tokens spent on orchestration logic.
+Each session calls `ouija.workflow('init')` and gets role-appropriate instructions. The workflow is the coordinator — no coordinator LLM session needed, zero tokens spent on orchestration logic.
 
 The workflow can:
 - Assign different roles at registration based on `workflow_params`
@@ -154,7 +154,7 @@ The workflow can:
 - Track a kanban board, manage concurrent slots
 - Interact with external systems (Forgejo, GitHub, Slack) deterministically
 
-This replaces patterns where a coordinator LLM session reads a prompt, calls `session_start` to spawn workers, polls for `done:` messages, and manages state through conversation context. The workflow script does all of this with deterministic code.
+This replaces patterns where a coordinator LLM session reads a prompt, calls `ouija.start` to spawn workers, polls for `done:` messages, and manages state through conversation context. The workflow script does all of this with deterministic code.
 
 ## Verification
 
@@ -173,7 +173,7 @@ This is the VERIFY phase from gather-act-verify-repeat loops. The workflow defin
 
 ## Effort budgets
 
-Workflows set a `max_calls` limit at registration. The daemon enforces it — after the limit, further `workflow()` calls return an error. This prevents the biggest failure mode in multi-agent systems: unbounded looping.
+Workflows set a `max_calls` limit at registration. The daemon enforces it — after the limit, further `ouija.workflow()` calls return an error. This prevents the biggest failure mode in multi-agent systems: unbounded looping.
 
 The limit is set by the workflow (deterministic code), not the LLM (probabilistic). The LLM can't override it.
 
@@ -219,7 +219,7 @@ The workflow must lock its own state file. Use `fcntl.flock()` with `LOCK_EX` be
 
 ### Handle `init` in every state
 
-The LLM calls `workflow('init')` after every context reset (session restart, compaction). The workflow's current state must handle `init` gracefully — return a summary of where things stand and what to do next. This is how workflows survive restarts without losing progress.
+The LLM calls `ouija.workflow('init')` after every context reset (session restart, compaction). The workflow's current state must handle `init` gracefully — return a summary of where things stand and what to do next. This is how workflows survive restarts without losing progress.
 
 ### Split heavy actions into phases
 
@@ -230,17 +230,17 @@ def handle_complete(self, ctx, params):
     if not ctx.data.get("pushed"):
         git_push()
         ctx.data["pushed"] = True
-        return self.respond("Pushed. Call workflow('complete') again to finalize.")
+        return self.respond("Pushed. Call ouija.workflow('complete') again to finalize.")
     # Second call: do the slow stuff
     ctx.api.session_start(...)
     return self.transition_to(Done, "Finalized.")
 ```
 
-The LLM calls `workflow('complete')` twice. First call does the fast part and returns a continuation prompt. Second call finishes. HATEOAS drives the continuation — no special retry logic needed.
+The LLM calls `ouija.workflow('complete')` twice. First call does the fast part and returns a continuation prompt. Second call finishes. HATEOAS drives the continuation — no special retry logic needed.
 
 ### The LLM will adapt around broken workflows
 
-If a workflow returns the wrong response (e.g. reviewer instructions to a worker), the LLM will often "work around it" — using other tools like `session_send` instead of workflow actions, or interpreting instructions creatively. This makes bugs hard to detect. Always verify the state file during testing to confirm sessions are in the expected states, not just that the end result looks correct.
+If a workflow returns the wrong response (e.g. reviewer instructions to a worker), the LLM will often "work around it" — using other tools like `ouija.send` instead of workflow actions, or interpreting instructions creatively. This makes bugs hard to detect. Always verify the state file during testing to confirm sessions are in the expected states, not just that the end result looks correct.
 
 ### Expand tilde paths before sending to the REST API
 
@@ -252,20 +252,20 @@ project_dir = str(Path(project_dir).expanduser())
 
 ### Async spawn + self-kill = worktree race
 
-A common multi-session pattern: worker spawns reviewer, then kills itself. But `session_start` returns 202 (async) — the reviewer might not be alive yet. If the worker's worktree is cleaned up before the reviewer boots, the reviewer has no code to review.
+A common multi-session pattern: worker spawns reviewer, then kills itself. But `ouija.start` returns 202 (async) — the reviewer might not be alive yet. If the worker's worktree is cleaned up before the reviewer boots, the reviewer has no code to review.
 
-Fix: poll for the new session before exiting. The retry-after pattern works here — `handle_complete` returns "call again to confirm reviewer" until the reviewer appears in `session_list`.
+Fix: poll for the new session before exiting. The retry-after pattern works here — `handle_complete` returns "call again to confirm reviewer" until the reviewer appears in `ouija.list`.
 
 ```python
 def handle_complete(self, ctx, params):
     if not ctx.data.get("reviewer_spawned"):
         ctx.api.session_start(name="reviewer", ...)
         ctx.data["reviewer_spawned"] = True
-        return self.respond("Reviewer spawning. Call workflow('complete') again to confirm.")
+        return self.respond("Reviewer spawning. Call ouija.workflow('complete') again to confirm.")
     # Check if reviewer is alive
     sessions = ctx.api.get_sessions()
     if "reviewer" not in sessions:
-        return self.respond("Reviewer not ready yet. Call workflow('complete') again.")
+        return self.respond("Reviewer not ready yet. Call ouija.workflow('complete') again.")
     return self.transition_to(Done, "Reviewer is up. Handing off.")
 ```
 
@@ -285,19 +285,19 @@ def handle_request_changes(self, ctx, params):
 
 ### Registration does not mean the session is ready
 
-The workflow's `register` event fires early — it writes to the state file, but the session might not have the `workflow()` tool available yet. Don't assume registration = operational. The first `workflow('init')` call is the real signal that the session is running and can receive instructions.
+The workflow's `register` event fires early — it writes to the state file, but the session might not have the `ouija.workflow()` tool available yet. Don't assume registration = operational. The first `ouija.workflow('init')` call is the real signal that the session is running and can receive instructions.
 
-### Don't tell the LLM to call `session_kill`
+### Don't tell the LLM to call `ouija.kill`
 
 Asking the LLM to kill its own session is unreliable. It sometimes ignores `keep_worktree=true`, creates race conditions with shared worktrees, or simply doesn't do it. Better patterns:
 
 - Let sessions idle out naturally after completing their work
 - Have a coordinator script (tick) clean up finished sessions
-- Use `session_send(done=true)` to signal completion without self-destructing
+- Use `ouija.send(done=true)` to signal completion without self-destructing
 
 ### Synchronous spawning from a workflow call will timeout
 
-`session_start` is async (returns 202). If a workflow action tries to spawn a session and wait for it to be ready in the same call, it will hit the daemon's tool timeout. Always spawn-and-continue: spawn in one action, check readiness in the next. The retry-after pattern handles this naturally.
+`ouija.start` is async (returns 202). If a workflow action tries to spawn a session and wait for it to be ready in the same call, it will hit the daemon's tool timeout. Always spawn-and-continue: spawn in one action, check readiness in the next. The retry-after pattern handles this naturally.
 
 ## Writing workflows
 
@@ -310,7 +310,7 @@ from ouija_workflow import Workflow, State
 
 class Planning(State):
     def handle_init(self, ctx, params):
-        return self.respond("Analyze and plan. Call workflow('plan_done', {chunks: [...]}).")
+        return self.respond("Analyze and plan. Call ouija.workflow('plan_done', {chunks: [...]}).")
     def handle_plan_done(self, ctx, params):
         ctx.data['chunks'] = params['chunks']
         return self.transition_to(Implementing, "Plan accepted.")
@@ -328,7 +328,7 @@ This approach maps to [Anthropic's five composable agent patterns](https://docs.
 |---|---|
 | Prompt chaining | Linear `transition_to(NextState)` sequence |
 | Routing | Conditional logic in a handler, or `initial=lambda ctx: ...` for role dispatch |
-| Parallelization | A state calls `ctx.api.session_start()` N times, tracks completion in `ctx.data` |
+| Parallelization | A state calls `ctx.api.session_start()` N times, tracks completion in `ctx.data` (REST API, not MCP tool) |
 | Orchestrator-worker | The workflow IS the orchestrator; LLM sessions are workers |
 | Evaluator-optimizer | Back-transitions: `Review → Implementing` when changes are requested |
 

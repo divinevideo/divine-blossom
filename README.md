@@ -35,28 +35,28 @@ Sessions auto-register using the working directory name (e.g. `/code/api` become
 
 **Message any session**, local or remote. Sessions discover each other automatically.
 
-**Spawn sessions on the fly.** `session_start("gateway-debug")` creates a tmux window, launches a coding session, and registers it. Pass a `prompt` to seed the session with context, and `backend` to choose the assistant (`"claude-code"` or `"opencode"`). Works on `session_restart` too.
+**Spawn sessions on the fly.** `ouija.start("gateway-debug")` creates a tmux window, launches a coding session, and registers it. Pass a `prompt` to seed the session with context, and `backend` to choose the assistant (`"claude-code"` or `"opencode"`). Works on `ouija.restart` too.
 
 **Long-running work.** Three mechanisms for recurring work, from simple to structured:
 
-- **Loops** (`loop_next`) -- the session drives itself. Good for migrations, simple iteration. Each call logs an iteration; `clean_context=true` restarts with a fresh conversation seeded by the same prompt.
+- **Loops** (`ouija.loop-next`) -- the session drives itself. Good for migrations, simple iteration. Each call logs an iteration; `clean_context=true` restarts with a fresh conversation seeded by the same prompt.
 - **Tasks** (cron) -- the daemon drives the session. Good for periodic checks, daily reports, scheduled maintenance. If the target session is dead, the daemon revives it with the task's prompt + reminder.
-- **Workflows** -- a deterministic program drives the session. Good for multi-phase processes, optimization loops, coordinated multi-session work. The LLM calls a `workflow()` tool; the program controls state, verification, and progression.
+- **Workflows** -- a deterministic program drives the session. Good for multi-phase processes, optimization loops, coordinated multi-session work. The LLM calls an `ouija.workflow()` tool; the program controls state, verification, and progression.
 
 Simple loops restart with clean context each iteration:
 
 ```
-session_start(
+ouija.start(
   name: "migrator",
   prompt: "Find the next .js file in src/ not yet converted to .ts. Convert it, run tests, commit.",
-  reminder: "Call loop_next('converted X.js'). If no .js files remain, session_send(done=true)."
+  reminder: "Call ouija.loop-next('converted X.js'). If no .js files remain, ouija.send(done=true)."
 )
 ```
 
-**Workflow actors** attach an external executable (Python, bash, anything) to a session. The program manages state, runs verification, and tells the LLM what to do — one step at a time. The LLM doesn't see the full process; each `workflow()` response reveals only the current step and what to call next, like [HATEOAS](https://en.wikipedia.org/wiki/HATEOAS) for an LLM:
+**Workflow actors** attach an external executable (Python, bash, anything) to a session. The program manages state, runs verification, and tells the LLM what to do — one step at a time. The LLM doesn't see the full process; each `ouija.workflow()` response reveals only the current step and what to call next, like [HATEOAS](https://en.wikipedia.org/wiki/HATEOAS) for an LLM:
 
 ```
-session_start(
+ouija.start(
   name: "optimizer",
   workflow: "examples/autoresearch-workflow.py",
   workflow_params: {"max_iterations": 30},
@@ -64,21 +64,21 @@ session_start(
 )
 ```
 
-The workflow handles [autoresearch-style](https://github.com/karpathy/autoresearch) optimization: the LLM makes one change, measures, calls `workflow('result', {score, description})`, and the workflow commits improvements, reverts regressions, tracks history in a TSV, and accumulates findings that survive context restarts. The daemon enforces call budgets and detects stalls.
+The workflow handles [autoresearch-style](https://github.com/karpathy/autoresearch) optimization: the LLM makes one change, measures, calls `ouija.workflow('result', {score, description})`, and the workflow commits improvements, reverts regressions, tracks history in a TSV, and accumulates findings that survive context restarts. The daemon enforces call budgets and detects stalls.
 
 The prompt doesn't describe the process — the workflow discloses it incrementally:
 
 ```
-LLM: workflow('init')
-  → "Iteration 3/30. Best: 0.89. Make one change, measure, call workflow('result', {score, description})."
+LLM: ouija.workflow('init')
+  → "Iteration 3/30. Best: 0.89. Make one change, measure, call ouija.workflow('result', {score, description})."
 
-LLM: workflow('result', {score: 0.91, description: "batched queries"})
-  → "New best! Committed. 27 remaining. Call workflow('init') for next iteration."
+LLM: ouija.workflow('result', {score: 0.91, description: "batched queries"})
+  → "New best! Committed. 27 remaining. Call ouija.workflow('init') for next iteration."
 ```
 
 Workflows can coordinate multiple sessions — spawning workers and reviewers via the REST API, gating progress on test results, replacing an entire coordinator LLM with deterministic code. See the [workflow docs](docs/workflows.md) for the full architecture and [`examples/`](examples/) for a reference implementation.
 
-**Peer-to-peer collaboration.** No hierarchy. Two long-running sessions can message each other directly — one optimizing a skill while the other evaluates results, or one migrating files while the other reviews the diffs. They coordinate through `session_send`, not through a central orchestrator.
+**Peer-to-peer collaboration.** No hierarchy. Two long-running sessions can message each other directly — one optimizing a skill while the other evaluates results, or one migrating files while the other reviews the diffs. They coordinate through `ouija.send`, not through a central orchestrator.
 
 **Always interactive.** Every session runs in a tmux pane. You can jump into any session at any time — watch it work, type a correction, answer a question, or take over. The session doesn't know or care whether the next input comes from a peer session or from you at the keyboard.
 
@@ -116,7 +116,7 @@ Messages can reference earlier ones for conversation threading:
 - `re="47"` — progress update on task 47
 - `re="47" done="true"` — task 47 is complete
 
-The daemon assigns unique IDs to every message, tracks pending replies, and nudges sessions that haven't responded. Sessions interact with the protocol through MCP tools (`session_send`, `session_list`, etc.) — the XML is handled automatically.
+The daemon assigns unique IDs to every message, tracks pending replies, and nudges sessions that haven't responded. Sessions interact with the protocol through MCP tools (`ouija.send`, `ouija.list`, etc.) -- the XML is handled automatically.
 
 ## How it works
 

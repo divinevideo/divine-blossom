@@ -213,11 +213,11 @@ async fn prompt_submit_inner(
         let bulletin = stale_info["bulletin"].as_str().unwrap_or("");
         if !bulletin.is_empty() {
             output_parts.push(format!(
-                "<ouija-status type=\"stale\">Your metadata is stale. Current: role=\"{role}\" | bulletin=\"{bulletin}\". Call session_update(id=\"{id}\", role=\"&lt;what you're doing now&gt;\", bulletin=\"&lt;what you can help with or need&gt;\") if these are outdated.</ouija-status>"
+                "<ouija-status type=\"stale\">Your metadata is stale. Current: role=\"{role}\" | bulletin=\"{bulletin}\". Call ouija.update(id=\"{id}\", role=\"&lt;what you're doing now&gt;\", bulletin=\"&lt;what you can help with or need&gt;\") if these are outdated.</ouija-status>"
             ));
         } else {
             output_parts.push(format!(
-                "<ouija-status type=\"stale\">Your metadata is stale (role: \"{role}\", no bulletin). Call session_update(id=\"{id}\", role=\"&lt;what you're doing now&gt;\", bulletin=\"&lt;what you can help with or need&gt;\") to stay discoverable.</ouija-status>"
+                "<ouija-status type=\"stale\">Your metadata is stale (role: \"{role}\", no bulletin). Call ouija.update(id=\"{id}\", role=\"&lt;what you're doing now&gt;\", bulletin=\"&lt;what you can help with or need&gt;\") to stay discoverable.</ouija-status>"
             ));
         }
     }

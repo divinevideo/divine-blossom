@@ -6,7 +6,7 @@ Two states: Running and Done. The LLM iterates: make one change, measure, report
 The workflow commits improvements and reverts regressions.
 
 Launch:
-    session_start(
+    ouija.start(
         name="optimizer",
         workflow="examples/simple-loop-workflow.py",
         workflow_params={"max_iterations": 10},
@@ -17,35 +17,35 @@ Launch:
 ── LLM conversation trace ──────────────────────────────────────────────
 
   System prompt (from registration):
-    "You are running an optimization loop. workflow('init') gets your task.
-     workflow('result', {score, description}) reports each attempt. One
+    "You are running an optimization loop. ouija.workflow('init') gets your task.
+     ouija.workflow('result', {score, description}) reports each attempt. One
      change per iteration. Never skip measuring."
 
-  Daemon injects: "Call workflow('init') to begin."
+  Daemon injects: "Call ouija.workflow('init') to begin."
 
-  LLM → workflow('init')
+  LLM → ouija.workflow('init')
     ← "## Iteration 1/10
         Read INSTRUCTIONS.md, make ONE change, measure.
-        Call workflow('result', {score: <number>, description: '<what>'})."
+        Call ouija.workflow('result', {score: <number>, description: '<what>'})."
 
   LLM reads INSTRUCTIONS.md, edits code, runs benchmark...
 
-  LLM → workflow('result', {score: 42.5, description: "added connection pooling"})
+  LLM → ouija.workflow('result', {score: 42.5, description: "added connection pooling"})
     ← "## Iteration 1: improved
         Score: 42.5. Baseline recorded.
-        9 iterations remaining. Call workflow('init')."
+        9 iterations remaining. Call ouija.workflow('init')."
 
-  LLM → workflow('init')
+  LLM → ouija.workflow('init')
     ← "## Iteration 2/10
         Best so far: 42.5 (added connection pooling)
         Make ONE change, measure, report."
 
   ...several iterations later...
 
-  LLM → workflow('result', {score: 38.0, description: "tried batch inserts"})
+  LLM → ouija.workflow('result', {score: 38.0, description: "tried batch inserts"})
     ← "## Iteration 6: regressed
         Score 38.0 < best 47.2. Changes reverted.
-        4 iterations remaining. Call workflow('init')."
+        4 iterations remaining. Call ouija.workflow('init')."
 
   Note: the LLM never knew about revert-on-regression until it happened.
   Note: the LLM never knew the total iteration count until init told it.
@@ -73,7 +73,7 @@ class Running(State):
             parts.append(f"Best so far: {ctx.data['best_score']} ({ctx.data['best_desc']})")
         parts.append(
             "\nMake ONE change, measure, then call "
-            "workflow('result', {score: <number>, description: '<what you changed>'})."
+            "ouija.workflow('result', {score: <number>, description: '<what you changed>'})."
         )
         return self.respond("\n".join(parts))
 
@@ -114,7 +114,7 @@ class Running(State):
         remaining = max_i - i
         if remaining <= 0:
             return self.transition_to(Done, msg)
-        msg += f"\n\n{remaining} remaining. Call workflow('init')."
+        msg += f"\n\n{remaining} remaining. Call ouija.workflow('init')."
         return self.respond(msg)
 
 
@@ -122,7 +122,7 @@ class Done(State):
     terminal = True
 
     def on_enter(self, ctx):
-        return "Call session_send(done=true)."
+        return "Call ouija.send(done=true)."
 
 
 Workflow(
@@ -130,8 +130,8 @@ Workflow(
     states=[Running, Done],
     instructions=(
         "You are running an optimization loop. "
-        "workflow('init') gets your task. "
-        "workflow('result', {score, description}) reports each attempt. "
+        "ouija.workflow('init') gets your task. "
+        "ouija.workflow('result', {score, description}) reports each attempt. "
         "One change per iteration. Never skip measuring."
     ),
     max_calls=120,
