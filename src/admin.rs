@@ -257,7 +257,7 @@ pub fn handle_google_auth(mut req: Request) -> Result<Response> {
     let hd = token_info["hd"].as_str().unwrap_or("");
 
     if hd != allowed_domain {
-        eprintln!(
+        log::warn!(
             "[AUTH] Google login rejected: domain '{}' not allowed (expected '{}')",
             hd, allowed_domain
         );
@@ -276,7 +276,7 @@ pub fn handle_google_auth(mut req: Request) -> Result<Response> {
     }
 
     let email = token_info["email"].as_str().unwrap_or("unknown");
-    eprintln!("[AUTH] Google login success: {}", email);
+    log::info!("[AUTH] Google login success: {}", email);
 
     // Create session
     let token = create_session("google", email)?;
@@ -464,7 +464,7 @@ pub fn handle_github_callback(req: Request) -> Result<Response> {
             .any(|o| o["login"].as_str().unwrap_or("") == org.as_str());
 
         if !is_member {
-            eprintln!(
+            log::warn!(
                 "[AUTH] GitHub login rejected: user '{}' not in org '{}'",
                 username, org
             );
@@ -475,7 +475,7 @@ pub fn handle_github_callback(req: Request) -> Result<Response> {
         }
     }
 
-    eprintln!("[AUTH] GitHub login success: {}", username);
+    log::info!("[AUTH] GitHub login success: {}", username);
 
     // Create session
     let session_token = create_session("github", username)?;
@@ -848,7 +848,7 @@ pub fn handle_admin_bulk_approve(mut req: Request) -> Result<Response> {
         }
     }
 
-    eprintln!(
+    log::error!(
         "[ADMIN] Bulk approve: {} approved, {} already_ok, {} not_found, {} errors (of {} hashes)",
         approved, already_ok, not_found, errors, hashes.len()
     );
@@ -963,7 +963,7 @@ pub fn handle_admin_backfill(req: Request) -> Result<Response> {
     let end = std::cmp::min(offset + limit, total_users);
     let pubkeys_to_process: Vec<_> = user_index.pubkeys[offset..end].to_vec();
 
-    eprintln!(
+    log::info!(
         "[BACKFILL] Processing users {}-{} of {} (batch size {})",
         offset,
         end,
@@ -1028,7 +1028,7 @@ pub fn handle_admin_backfill(req: Request) -> Result<Response> {
     // Set unique uploaders count
     stats.unique_uploaders = total_users as u64;
 
-    eprintln!(
+    log::info!(
         "[BACKFILL] Processed {} blobs from {} users (batch {}-{})",
         blobs_processed,
         pubkeys_to_process.len(),

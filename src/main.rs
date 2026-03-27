@@ -81,7 +81,7 @@ fn handle_request(req: Request) -> Result<Response> {
     let path = req.get_path().to_string();
     let host = req.get_header_str("host").unwrap_or("unknown");
 
-    eprintln!(
+    log::info!(
         "[BLOSSOM ROUTE] method={} path={} host={}",
         method, path, host
     );
@@ -485,7 +485,7 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
             // HLS exists in GCS — serve it and fix metadata if needed
             let meta = metadata.as_ref().unwrap();
             if meta.transcode_status != Some(TranscodeStatus::Complete) {
-                eprintln!(
+                log::info!(
                     "[HLS] Fixing metadata: {} has HLS in GCS but status was {:?}",
                     hash, meta.transcode_status
                 );
@@ -533,7 +533,7 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
                     // Pending, Failed, Complete-but-missing, or None — trigger transcoding
                     use crate::metadata::update_transcode_status;
                     if let Err(e) = update_transcode_status(&hash, TranscodeStatus::Processing) {
-                        eprintln!("[HLS] Failed to update transcode status: {}", e);
+                        log::error!("[HLS] Failed to update transcode status: {}", e);
                     }
                     let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
 
@@ -670,7 +670,7 @@ fn handle_get_hls_content(req: Request, path: &str) -> Result<Response> {
                 match meta.transcode_status {
                     Some(TranscodeStatus::Complete) => {
                         // Metadata says complete but file not in GCS - re-trigger
-                        eprintln!("[HLS] master.m3u8 not found in GCS for {} despite Complete status, re-triggering", hash);
+                        log::info!("[HLS] master.m3u8 not found in GCS for {} despite Complete status, re-triggering", hash);
                         use crate::metadata::update_transcode_status;
                         let _ = update_transcode_status(&hash, TranscodeStatus::Processing);
                         let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
@@ -696,7 +696,7 @@ fn handle_get_hls_content(req: Request, path: &str) -> Result<Response> {
                     }
                     Some(TranscodeStatus::Failed) => {
                         // Failed previously - re-trigger
-                        eprintln!("[HLS] Re-triggering failed transcode for {}", hash);
+                        log::error!("[HLS] Re-triggering failed transcode for {}", hash);
                         use crate::metadata::update_transcode_status;
                         let _ = update_transcode_status(&hash, TranscodeStatus::Processing);
                         let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
@@ -714,7 +714,7 @@ fn handle_get_hls_content(req: Request, path: &str) -> Result<Response> {
                         use crate::metadata::update_transcode_status;
                         if let Err(e) = update_transcode_status(&hash, TranscodeStatus::Processing)
                         {
-                            eprintln!("[HLS] Failed to update transcode status: {}", e);
+                            log::error!("[HLS] Failed to update transcode status: {}", e);
                         }
                         let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
 
@@ -1500,7 +1500,7 @@ fn handle_get_audio(_req: Request, path: &str) -> Result<Response> {
     let allowed = match check_funnelcake_audio_reuse(&hash) {
         Ok(allowed) => allowed,
         Err(e) => {
-            eprintln!("[AUDIO] Funnelcake unavailable for {}: {}", hash, e);
+            log::warn!("[AUDIO] Funnelcake unavailable for {}: {}", hash, e);
             // 503 Service Unavailable
             let mut resp = Response::from_status(StatusCode::SERVICE_UNAVAILABLE);
             resp.set_header("Content-Type", "application/json");
@@ -1812,7 +1812,7 @@ const CLOUD_RUN_TRANSCODER_HOST: &str = "divine-transcoder-149672065768.us-centr
 /// Generate thumbnail on-demand by proxying to Cloud Run
 fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
     if crate::storage::is_local_mode() {
-        eprintln!("[THUMB][LOCAL] Returning placeholder thumbnail for {}", hash);
+        log::info!("[THUMB][LOCAL] Returning placeholder thumbnail for {}", hash);
         // Minimal valid JPEG (smallest possible)
         let jpeg: Vec<u8> = vec![
             0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01,
@@ -1837,7 +1837,7 @@ fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
             jpeg.len() as u64,
             "",
         ) {
-            eprintln!("[THUMB][LOCAL] Failed to store placeholder: {}", e);
+            log::error!("[THUMB][LOCAL] Failed to store placeholder: {}", e);
         }
         let mut resp = Response::from_status(StatusCode::OK);
         resp.set_header("Content-Type", "image/jpeg");
@@ -1870,7 +1870,7 @@ fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
 /// This is fire-and-forget - we update metadata to Processing and return immediately
 fn trigger_on_demand_transcoding(hash: &str, owner: &str) -> Result<()> {
     if crate::storage::is_local_mode() {
-        eprintln!("[HLS][LOCAL] Stubbing transcode for {}", hash);
+        log::info!("[HLS][LOCAL] Stubbing transcode for {}", hash);
 
         // Master playlist — matches production transcoder output (two variants)
         let manifest = format!(
@@ -1942,7 +1942,7 @@ fn trigger_on_demand_transcoding(hash: &str, owner: &str) -> Result<()> {
                 }
             }
             Err(e) => {
-                eprintln!("[HLS][LOCAL] Could not copy blob as .ts/.mp4 stubs: {}", e);
+                log::info!("[HLS][LOCAL] Could not copy blob as .ts/.mp4 stubs: {}", e);
             }
         }
 
@@ -1964,11 +1964,11 @@ fn trigger_on_demand_transcoding(hash: &str, owner: &str) -> Result<()> {
     // The transcoder will callback via webhook when done
     match proxy_req.send_async(CLOUD_RUN_BACKEND) {
         Ok(_) => {
-            eprintln!("[HLS] Triggered on-demand transcoding for {}", hash);
+            log::info!("[HLS] Triggered on-demand transcoding for {}", hash);
             Ok(())
         }
         Err(e) => {
-            eprintln!("[HLS] Failed to trigger transcoding for {}: {}", hash, e);
+            log::error!("[HLS] Failed to trigger transcoding for {}: {}", hash, e);
             Err(BlossomError::Internal(format!(
                 "Failed to trigger transcoding: {}",
                 e
@@ -1980,7 +1980,7 @@ fn trigger_on_demand_transcoding(hash: &str, owner: &str) -> Result<()> {
 /// Trigger fMP4 backfill via Cloud Run transcoder — remuxes existing .ts to .mp4
 fn trigger_fmp4_backfill(hash: &str) -> Result<()> {
     if crate::storage::is_local_mode() {
-        eprintln!("[HLS][LOCAL] Stubbing fMP4 backfill for {}", hash);
+        log::info!("[HLS][LOCAL] Stubbing fMP4 backfill for {}", hash);
         return Ok(());
     }
 
@@ -1994,11 +1994,11 @@ fn trigger_fmp4_backfill(hash: &str) -> Result<()> {
 
     match proxy_req.send_async(CLOUD_RUN_BACKEND) {
         Ok(_) => {
-            eprintln!("[HLS] Triggered fMP4 backfill for {}", hash);
+            log::info!("[HLS] Triggered fMP4 backfill for {}", hash);
             Ok(())
         }
         Err(e) => {
-            eprintln!("[HLS] Failed to trigger fMP4 backfill for {}: {}", hash, e);
+            log::error!("[HLS] Failed to trigger fMP4 backfill for {}: {}", hash, e);
             Err(BlossomError::Internal(format!(
                 "Failed to trigger fMP4 backfill: {}",
                 e
@@ -2015,7 +2015,7 @@ fn trigger_on_demand_transcription(
     lang: Option<&str>,
 ) -> Result<()> {
     if crate::storage::is_local_mode() {
-        eprintln!("[VTT][LOCAL] Stubbing transcription for {}", hash);
+        log::info!("[VTT][LOCAL] Stubbing transcription for {}", hash);
         let vtt = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n[local mode stub transcript]\n";
         let vtt_key = format!("{}/vtt/main.vtt", hash);
         crate::storage::upload_blob(
@@ -2058,11 +2058,11 @@ fn trigger_on_demand_transcription(
 
     match proxy_req.send_async(CLOUD_RUN_BACKEND) {
         Ok(_) => {
-            eprintln!("[VTT] Triggered on-demand transcription for {}", hash);
+            log::info!("[VTT] Triggered on-demand transcription for {}", hash);
             Ok(())
         }
         Err(e) => {
-            eprintln!("[VTT] Failed to trigger transcription for {}: {}", hash, e);
+            log::error!("[VTT] Failed to trigger transcription for {}: {}", hash, e);
             Err(BlossomError::Internal(format!(
                 "Failed to trigger transcription: {}",
                 e
@@ -2078,7 +2078,7 @@ const MODERATION_API_BACKEND: &str = "moderation_api";
 /// Fire-and-forget — upload should never fail because moderation is down.
 fn trigger_moderation_scan(sha256: &str, pubkey: &str) {
     if crate::storage::is_local_mode() {
-        eprintln!("[MODERATION][LOCAL] Auto-approving {} for {}", sha256, pubkey);
+        log::info!("[MODERATION][LOCAL] Auto-approving {} for {}", sha256, pubkey);
         let _ = crate::metadata::update_blob_status(sha256, crate::blossom::BlobStatus::Active);
         return;
     }
@@ -2090,7 +2090,7 @@ fn trigger_moderation_scan(sha256: &str, pubkey: &str) {
     {
         Some(t) if !t.is_empty() => t,
         _ => {
-            eprintln!("[MODERATION] moderation_api_token not configured, skipping scan");
+            log::warn!("[MODERATION] moderation_api_token not configured, skipping scan");
             return;
         }
     };
@@ -2111,10 +2111,10 @@ fn trigger_moderation_scan(sha256: &str, pubkey: &str) {
 
     match req.send_async(MODERATION_API_BACKEND) {
         Ok(_) => {
-            eprintln!("[MODERATION] Queued scan for {}", sha256);
+            log::info!("[MODERATION] Queued scan for {}", sha256);
         }
         Err(e) => {
-            eprintln!("[MODERATION] Failed to queue scan for {}: {}", sha256, e);
+            log::error!("[MODERATION] Failed to queue scan for {}: {}", sha256, e);
             // Don't fail the upload — moderation is best-effort
         }
     }
@@ -2642,7 +2642,7 @@ fn handle_delete(req: Request, path: &str) -> Result<Response> {
             // Purge VCL cache
             purge_vcl_cache(&hash);
 
-            eprintln!("[DELETE] Full delete of {} by owner {}", hash, auth.pubkey);
+            log::info!("[DELETE] Full delete of {} by owner {}", hash, auth.pubkey);
         } else {
             // Shared content: transfer ownership to next ref
             let new_owner = other_refs[0].clone();
@@ -2650,14 +2650,14 @@ fn handle_delete(req: Request, path: &str) -> Result<Response> {
             updated_meta.owner = new_owner.clone();
             let _ = put_blob_metadata(&updated_meta);
 
-            eprintln!(
+            log::info!(
                 "[DELETE] Ownership of {} transferred from {} to {}",
                 hash, auth.pubkey, new_owner
             );
         }
     } else {
         // Non-owner ref: just unlinked above, nothing else to do
-        eprintln!("[DELETE] Unlinked ref {} from blob {}", auth.pubkey, hash);
+        log::info!("[DELETE] Unlinked ref {} from blob {}", auth.pubkey, hash);
     }
 
     let mut resp = Response::from_status(StatusCode::OK);
@@ -2794,7 +2794,7 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
     // Purge VCL cache
     purge_vcl_cache(&hash);
 
-    eprintln!(
+    log::info!(
         "[ADMIN DELETE] hash={} reason={} legal_hold={}",
         hash, reason, legal_hold
     );
@@ -2824,7 +2824,7 @@ fn execute_vanish(pubkey: &str) -> (u32, u32, u32) {
     let hashes = match get_user_blobs(pubkey) {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("[VANISH] Failed to get user blobs for {}: {}", pubkey, e);
+            log::error!("[VANISH] Failed to get user blobs for {}: {}", pubkey, e);
             return (0, 0, 1);
         }
     };
@@ -2841,7 +2841,7 @@ fn execute_vanish(pubkey: &str) -> (u32, u32, u32) {
                 continue;
             }
             Err(e) => {
-                eprintln!("[VANISH] Failed to get metadata for {}: {}", hash, e);
+                log::error!("[VANISH] Failed to get metadata for {}: {}", hash, e);
                 errors += 1;
                 continue;
             }
@@ -2890,7 +2890,7 @@ fn execute_vanish(pubkey: &str) -> (u32, u32, u32) {
     // Trigger audit anonymization
     trigger_audit_anonymize(pubkey);
 
-    eprintln!(
+    log::error!(
         "[VANISH] pubkey={} fully_deleted={} unlinked={} errors={}",
         pubkey, fully_deleted, unlinked, errors
     );
@@ -3065,7 +3065,7 @@ fn handle_report(mut req: Request) -> Result<Response> {
 
     // Log the report for operator review
     // In production, this would be stored in a database or sent to a moderation queue
-    eprintln!(
+    log::info!(
         "BUD-09 REPORT: reporter={}, hashes={:?}, type={:?}, content={}",
         reporter, reported_hashes, report_type, content
     );
@@ -3512,18 +3512,18 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
             Some(ref header) if header.starts_with("Bearer ") => {
                 let provided = header.strip_prefix("Bearer ").unwrap_or("");
                 if provided != expected.trim() {
-                    eprintln!("[ADMIN] Invalid webhook secret");
+                    log::warn!("[ADMIN] Invalid webhook secret");
                     return Err(BlossomError::Forbidden("Invalid webhook secret".into()));
                 }
             }
             _ => {
-                eprintln!("[ADMIN] Missing or invalid Authorization header");
+                log::warn!("[ADMIN] Missing or invalid Authorization header");
                 return Err(BlossomError::AuthRequired("Webhook secret required".into()));
             }
         }
     } else {
         // Fail closed: reject requests if webhook_secret is not configured
-        eprintln!("[ADMIN] webhook_secret not configured, rejecting request");
+        log::warn!("[ADMIN] webhook_secret not configured, rejecting request");
         return Err(BlossomError::Forbidden(
             "Webhook secret not configured".into(),
         ));
@@ -3542,7 +3542,7 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
         .as_str()
         .ok_or_else(|| BlossomError::BadRequest("Missing 'action' field".into()))?;
 
-    eprintln!(
+    log::info!(
         "[ADMIN] Moderation webhook: sha256={}, action={}",
         sha256, action
     );
@@ -3568,7 +3568,7 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
     // Update blob status
     match update_blob_status(sha256, new_status) {
         Ok(()) => {
-            eprintln!("[ADMIN] Updated blob {} to status {:?}", sha256, new_status);
+            log::info!("[ADMIN] Updated blob {} to status {:?}", sha256, new_status);
 
             // Purge VCL cache so the new status takes effect immediately.
             // Banned/restricted content will 404 on next request; approved content will 200.
@@ -3585,7 +3585,7 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
             Ok(resp)
         }
         Err(BlossomError::NotFound(_)) => {
-            eprintln!("[ADMIN] Blob {} not found", sha256);
+            log::info!("[ADMIN] Blob {} not found", sha256);
             let response = serde_json::json!({
                 "success": false,
                 "sha256": sha256,
@@ -3596,7 +3596,7 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
             Ok(resp)
         }
         Err(e) => {
-            eprintln!("[ADMIN] Failed to update blob {}: {:?}", sha256, e);
+            log::error!("[ADMIN] Failed to update blob {}: {:?}", sha256, e);
             Err(e)
         }
     }
@@ -3624,18 +3624,18 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
             Some(ref header) if header.starts_with("Bearer ") => {
                 let provided = header.strip_prefix("Bearer ").unwrap_or("");
                 if provided != expected.trim() {
-                    eprintln!("[TRANSCODE] Invalid webhook secret");
+                    log::warn!("[TRANSCODE] Invalid webhook secret");
                     return Err(BlossomError::Forbidden("Invalid webhook secret".into()));
                 }
             }
             _ => {
-                eprintln!("[TRANSCODE] Missing or invalid Authorization header");
+                log::warn!("[TRANSCODE] Missing or invalid Authorization header");
                 return Err(BlossomError::AuthRequired("Webhook secret required".into()));
             }
         }
     } else {
         // Fail closed: reject requests if webhook_secret is not configured
-        eprintln!("[TRANSCODE] webhook_secret not configured, rejecting request");
+        log::warn!("[TRANSCODE] webhook_secret not configured, rejecting request");
         return Err(BlossomError::Forbidden(
             "Webhook secret not configured".into(),
         ));
@@ -3665,7 +3665,7 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
         _ => None,
     };
 
-    eprintln!(
+    log::info!(
         "[TRANSCODE] Status webhook: sha256={}, status={}, new_size={:?}, dim={:?}",
         sha256, status_str, new_size, dim
     );
@@ -3694,17 +3694,17 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
     match update_transcode_status_with_size(sha256, new_status, new_size, dim.clone()) {
         Ok(()) => {
             if let Some(ref d) = dim {
-                eprintln!(
+                log::info!(
                     "[TRANSCODE] Updated blob {} to transcode status {:?} with dim {}",
                     sha256, new_status, d
                 );
             } else if let Some(size) = new_size {
-                eprintln!(
+                log::info!(
                     "[TRANSCODE] Updated blob {} to transcode status {:?} with new size {}",
                     sha256, new_status, size
                 );
             } else {
-                eprintln!(
+                log::info!(
                     "[TRANSCODE] Updated blob {} to transcode status {:?}",
                     sha256, new_status
                 );
@@ -3730,7 +3730,7 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
             Ok(resp)
         }
         Err(BlossomError::NotFound(_)) => {
-            eprintln!("[TRANSCODE] Blob {} not found", sha256);
+            log::info!("[TRANSCODE] Blob {} not found", sha256);
             let response = serde_json::json!({
                 "success": false,
                 "sha256": sha256,
@@ -3741,7 +3741,7 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
             Ok(resp)
         }
         Err(e) => {
-            eprintln!("[TRANSCODE] Failed to update blob {}: {:?}", sha256, e);
+            log::error!("[TRANSCODE] Failed to update blob {}: {:?}", sha256, e);
             Err(e)
         }
     }
@@ -3769,18 +3769,18 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
             Some(ref header) if header.starts_with("Bearer ") => {
                 let provided = header.strip_prefix("Bearer ").unwrap_or("");
                 if provided != expected.trim() {
-                    eprintln!("[TRANSCRIPT] Invalid webhook secret");
+                    log::warn!("[TRANSCRIPT] Invalid webhook secret");
                     return Err(BlossomError::Forbidden("Invalid webhook secret".into()));
                 }
             }
             _ => {
-                eprintln!("[TRANSCRIPT] Missing or invalid Authorization header");
+                log::warn!("[TRANSCRIPT] Missing or invalid Authorization header");
                 return Err(BlossomError::AuthRequired("Webhook secret required".into()));
             }
         }
     } else {
         // Fail closed: reject requests if webhook_secret is not configured
-        eprintln!("[TRANSCRIPT] webhook_secret not configured, rejecting request");
+        log::warn!("[TRANSCRIPT] webhook_secret not configured, rejecting request");
         return Err(BlossomError::Forbidden(
             "Webhook secret not configured".into(),
         ));
@@ -3794,7 +3794,7 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
     let parsed = parse_transcript_status_webhook_payload(&payload, unix_timestamp_secs())?;
     let sha256 = parsed.sha256.as_str();
 
-    eprintln!(
+    log::info!(
         "[TRANSCRIPT] Status webhook: sha256={}, status={:?}, job_id={:?}",
         sha256, parsed.status, parsed.job_id
     );
@@ -3816,7 +3816,7 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
         },
     ) {
         Ok(()) => {
-            eprintln!(
+            log::info!(
                 "[TRANSCRIPT] Updated blob {} to transcript status {:?}",
                 sha256, parsed.status
             );
@@ -3888,7 +3888,7 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
             Ok(resp)
         }
         Err(BlossomError::NotFound(_)) => {
-            eprintln!(
+            log::error!(
                 "[TRANSCRIPT] Reconciliation pending for missing blob {} status={:?} error_code={:?} retry_after={:?}",
                 sha256,
                 parsed.status,
@@ -3906,7 +3906,7 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
             Ok(resp)
         }
         Err(e) => {
-            eprintln!("[TRANSCRIPT] Failed to update blob {}: {:?}", sha256, e);
+            log::error!("[TRANSCRIPT] Failed to update blob {}: {:?}", sha256, e);
             Err(e)
         }
     }
@@ -4295,7 +4295,7 @@ pub(crate) fn purge_vcl_cache(surrogate_key: &str) {
     {
         Some(token) if !token.is_empty() => token,
         _ => {
-            eprintln!("[PURGE] fastly_api_token not configured, skipping VCL cache purge");
+            log::warn!("[PURGE] fastly_api_token not configured, skipping VCL cache purge");
             return;
         }
     };
@@ -4316,9 +4316,9 @@ pub(crate) fn purge_vcl_cache(surrogate_key: &str) {
         Ok(resp) => {
             let status = resp.get_status();
             if status.is_success() {
-                eprintln!("[PURGE] VCL cache purged for key={}", surrogate_key);
+                log::info!("[PURGE] VCL cache purged for key={}", surrogate_key);
             } else {
-                eprintln!(
+                log::error!(
                     "[PURGE] VCL purge failed for key={}: HTTP {}",
                     surrogate_key,
                     status.as_u16()
@@ -4326,7 +4326,7 @@ pub(crate) fn purge_vcl_cache(surrogate_key: &str) {
             }
         }
         Err(e) => {
-            eprintln!(
+            log::error!(
                 "[PURGE] VCL purge request failed for key={}: {}",
                 surrogate_key, e
             );

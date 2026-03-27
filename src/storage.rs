@@ -1205,13 +1205,13 @@ pub fn write_audit_log(
 
     match req.send_async(CLOUD_RUN_BACKEND) {
         Ok(_) => {
-            eprintln!(
+            log::info!(
                 "[AUDIT] {} sha256={} actor={}",
                 action, sha256, actor_pubkey
             );
         }
         Err(e) => {
-            eprintln!("[AUDIT] Failed to send audit log: {}", e);
+            log::error!("[AUDIT] Failed to send audit log: {}", e);
         }
     }
 }
@@ -1223,7 +1223,7 @@ pub fn trigger_cloud_run_delete_blob(hash: &str) {
     let webhook_secret = match get_secret("webhook_secret") {
         Ok(s) => s,
         Err(_) => {
-            eprintln!("[DELETE] webhook_secret not configured, skipping Cloud Run delete");
+            log::warn!("[DELETE] webhook_secret not configured, skipping Cloud Run delete");
             return;
         }
     };
@@ -1242,10 +1242,10 @@ pub fn trigger_cloud_run_delete_blob(hash: &str) {
 
     match req.send_async(CLOUD_RUN_BACKEND) {
         Ok(_) => {
-            eprintln!("[DELETE] Triggered Cloud Run delete-blob for {}", hash);
+            log::info!("[DELETE] Triggered Cloud Run delete-blob for {}", hash);
         }
         Err(e) => {
-            eprintln!(
+            log::error!(
                 "[DELETE] Failed to trigger Cloud Run delete-blob for {}: {}",
                 hash, e
             );
@@ -1259,7 +1259,7 @@ pub fn trigger_cloud_run_bulk_delete(pubkey: &str, hashes: &[String]) {
     let webhook_secret = match get_secret("webhook_secret") {
         Ok(s) => s,
         Err(_) => {
-            eprintln!("[VANISH] webhook_secret not configured, skipping Cloud Run bulk delete");
+            log::warn!("[VANISH] webhook_secret not configured, skipping Cloud Run bulk delete");
             return;
         }
     };
@@ -1282,13 +1282,13 @@ pub fn trigger_cloud_run_bulk_delete(pubkey: &str, hashes: &[String]) {
 
     match req.send_async(CLOUD_RUN_BACKEND) {
         Ok(_) => {
-            eprintln!(
+            log::info!(
                 "[VANISH] Triggered Cloud Run bulk delete for pubkey={}",
                 pubkey
             );
         }
         Err(e) => {
-            eprintln!("[VANISH] Failed to trigger Cloud Run bulk delete: {}", e);
+            log::error!("[VANISH] Failed to trigger Cloud Run bulk delete: {}", e);
         }
     }
 }
@@ -1298,7 +1298,7 @@ pub fn trigger_audit_anonymize(pubkey: &str) {
     let webhook_secret = match get_secret("webhook_secret") {
         Ok(s) => s,
         Err(_) => {
-            eprintln!("[VANISH] webhook_secret not configured, skipping audit anonymize");
+            log::warn!("[VANISH] webhook_secret not configured, skipping audit anonymize");
             return;
         }
     };
@@ -1317,10 +1317,10 @@ pub fn trigger_audit_anonymize(pubkey: &str) {
 
     match req.send_async(CLOUD_RUN_BACKEND) {
         Ok(_) => {
-            eprintln!("[VANISH] Triggered audit anonymize for pubkey={}", pubkey);
+            log::info!("[VANISH] Triggered audit anonymize for pubkey={}", pubkey);
         }
         Err(e) => {
-            eprintln!("[VANISH] Failed to trigger audit anonymize: {}", e);
+            log::error!("[VANISH] Failed to trigger audit anonymize: {}", e);
         }
     }
 }
@@ -1366,12 +1366,12 @@ pub fn trigger_background_migration(hash: &str, source_backend: &str) -> Result<
         Ok(resp) => {
             let status = resp.get_status();
             if status.is_success() {
-                eprintln!(
+                log::info!(
                     "[MIGRATE] Successfully migrated {} from {}",
                     hash, source_backend
                 );
             } else {
-                eprintln!(
+                log::info!(
                     "[MIGRATE] Cloud Run returned {} for {} migration",
                     status, hash
                 );
@@ -1379,7 +1379,7 @@ pub fn trigger_background_migration(hash: &str, source_backend: &str) -> Result<
             Ok(())
         }
         Err(e) => {
-            eprintln!(
+            log::error!(
                 "[MIGRATE] Failed to migrate {} from {}: {}",
                 hash, source_backend, e
             );

@@ -184,7 +184,7 @@ pub fn add_to_user_list(pubkey: &str, hash: &str) -> Result<()> {
             Ok(()) => return Ok(()),
             Err(e) if attempt < 4 => {
                 // Log retry and continue
-                eprintln!("[KV] Retry {} for user list update: {}", attempt + 1, e);
+                log::info!("[KV] Retry {} for user list update: {}", attempt + 1, e);
                 // Small delay before retry (10ms, 20ms, 40ms, 80ms)
                 // Note: Fastly Compute doesn't have sleep, so we just retry immediately
                 // The re-read of the list should pick up concurrent writes
@@ -218,7 +218,7 @@ pub fn remove_from_user_list(pubkey: &str, hash: &str) -> Result<()> {
         match put_user_list(pubkey, &hashes) {
             Ok(()) => return Ok(()),
             Err(e) if attempt < 4 => {
-                eprintln!("[KV] Retry {} for user list removal: {}", attempt + 1, e);
+                log::info!("[KV] Retry {} for user list removal: {}", attempt + 1, e);
                 continue;
             }
             Err(e) => return Err(e),
@@ -474,7 +474,7 @@ pub fn update_stats_on_add(metadata: &BlobMetadata) -> Result<()> {
         match put_global_stats(&stats) {
             Ok(()) => return Ok(()),
             Err(e) if attempt < 4 => {
-                eprintln!("[KV] Retry {} for stats add: {}", attempt + 1, e);
+                log::info!("[KV] Retry {} for stats add: {}", attempt + 1, e);
                 continue;
             }
             Err(e) => return Err(e),
@@ -494,7 +494,7 @@ pub fn update_stats_on_remove(metadata: &BlobMetadata) -> Result<()> {
         match put_global_stats(&stats) {
             Ok(()) => return Ok(()),
             Err(e) if attempt < 4 => {
-                eprintln!("[KV] Retry {} for stats remove: {}", attempt + 1, e);
+                log::info!("[KV] Retry {} for stats remove: {}", attempt + 1, e);
                 continue;
             }
             Err(e) => return Err(e),
@@ -514,7 +514,7 @@ pub fn update_stats_on_status_change(old_status: BlobStatus, new_status: BlobSta
         match put_global_stats(&stats) {
             Ok(()) => return Ok(()),
             Err(e) if attempt < 4 => {
-                eprintln!("[KV] Retry {} for status change: {}", attempt + 1, e);
+                log::info!("[KV] Retry {} for status change: {}", attempt + 1, e);
                 continue;
             }
             Err(e) => return Err(e),
@@ -534,7 +534,7 @@ pub fn increment_unique_uploaders() -> Result<()> {
         match put_global_stats(&stats) {
             Ok(()) => return Ok(()),
             Err(e) if attempt < 4 => {
-                eprintln!("[KV] Retry {} for uploaders increment: {}", attempt + 1, e);
+                log::info!("[KV] Retry {} for uploaders increment: {}", attempt + 1, e);
                 continue;
             }
             Err(e) => return Err(e),
@@ -599,7 +599,7 @@ pub fn add_to_recent_index(hash: &str) -> Result<()> {
         match put_recent_index(&index) {
             Ok(()) => return Ok(()),
             Err(e) if attempt < 4 => {
-                eprintln!("[KV] Retry {} for recent index add: {}", attempt + 1, e);
+                log::info!("[KV] Retry {} for recent index add: {}", attempt + 1, e);
                 continue;
             }
             Err(e) => return Err(e),
@@ -621,7 +621,7 @@ pub fn remove_from_recent_index(hash: &str) -> Result<()> {
         match put_recent_index(&index) {
             Ok(()) => return Ok(()),
             Err(e) if attempt < 4 => {
-                eprintln!("[KV] Retry {} for recent index remove: {}", attempt + 1, e);
+                log::info!("[KV] Retry {} for recent index remove: {}", attempt + 1, e);
                 continue;
             }
             Err(e) => return Err(e),
@@ -693,7 +693,7 @@ pub fn add_to_user_index(pubkey: &str) -> Result<bool> {
         match put_user_index(&index) {
             Ok(()) => return Ok(true),
             Err(e) if attempt < 4 => {
-                eprintln!("[KV] Retry {} for user index add: {}", attempt + 1, e);
+                log::info!("[KV] Retry {} for user index add: {}", attempt + 1, e);
                 continue;
             }
             Err(e) => return Err(e),
@@ -829,7 +829,7 @@ pub fn remove_from_blob_refs(hash: &str, pubkey: &str) -> Result<Vec<String>> {
         match store.insert(&key, json) {
             Ok(()) => return Ok(refs),
             Err(e) if attempt < 4 => {
-                eprintln!("[KV] Retry {} for refs removal: {}", attempt + 1, e);
+                log::info!("[KV] Retry {} for refs removal: {}", attempt + 1, e);
                 continue;
             }
             Err(e) => {
@@ -872,7 +872,7 @@ pub fn delete_auth_events(hash: &str) -> Result<()> {
             Ok(()) => {}
             Err(KVStoreError::ItemNotFound) => {}
             Err(e) => {
-                eprintln!(
+                log::error!(
                     "[KV] Failed to delete auth event {}:{}: {}",
                     hash_lower, action, e
                 );
@@ -897,7 +897,7 @@ pub fn delete_subtitle_data(hash: &str) -> Result<()> {
             Ok(()) => {}
             Err(KVStoreError::ItemNotFound) => {}
             Err(e) => {
-                eprintln!("[KV] Failed to delete subtitle job {}: {}", job_id, e);
+                log::error!("[KV] Failed to delete subtitle job {}: {}", job_id, e);
             }
         }
 
@@ -907,7 +907,7 @@ pub fn delete_subtitle_data(hash: &str) -> Result<()> {
             Ok(()) => {}
             Err(KVStoreError::ItemNotFound) => {}
             Err(e) => {
-                eprintln!(
+                log::error!(
                     "[KV] Failed to delete subtitle hash mapping {}: {}",
                     hash_lower, e
                 );
@@ -949,7 +949,7 @@ pub fn remove_from_user_index(pubkey: &str) -> Result<()> {
         match put_user_index(&index) {
             Ok(()) => return Ok(()),
             Err(e) if attempt < 4 => {
-                eprintln!("[KV] Retry {} for user index removal: {}", attempt + 1, e);
+                log::info!("[KV] Retry {} for user index removal: {}", attempt + 1, e);
                 continue;
             }
             Err(e) => return Err(e),
@@ -982,7 +982,7 @@ pub fn add_to_blob_refs(hash: &str, pubkey: &str) -> Result<()> {
         match store.insert(&key, json) {
             Ok(()) => return Ok(()),
             Err(e) if attempt < 4 => {
-                eprintln!("[KV] Retry {} for refs update: {}", attempt + 1, e);
+                log::info!("[KV] Retry {} for refs update: {}", attempt + 1, e);
                 continue;
             }
             Err(e) => {
