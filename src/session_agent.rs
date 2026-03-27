@@ -442,7 +442,7 @@ impl SessionAgent {
             };
             if let Some((origin_pane, origin_vim)) = origin_info {
                 let notify_msg = format!(
-                    "<ouija-status type=\"loop-stall\">session '{}' appears stalled (no ouija.loop-next for 3x its average interval)</ouija-status>",
+                    "<ouija-status type=\"loop-stall\">session '{}' appears stalled (no progress for 3x its average interval)</ouija-status>",
                     state.session_id
                 );
                 let _ = crate::tmux::locked_inject(

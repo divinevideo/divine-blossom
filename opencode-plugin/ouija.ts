@@ -38,29 +38,17 @@ export const OuijaPlugin: Plugin = async (ctx) => {
         const match = sessions.find((s: any) => s.backend_session_id === input.sessionID)
         const sid = match?.id || "(unknown)"
         output.system.push(`
-# Ouija Mesh Protocol
+# Ouija Mesh
 
-You are session "${sid}" on the ouija mesh. Messages from peer sessions arrive as XML:
+You are session "${sid}" on the ouija mesh \u2014 a network connecting coding sessions across terminals and machines.
 
-\`\`\`
-<msg from="session-id" id="47" reply="true">message text</msg>
-\`\`\`
+Messages from peer sessions arrive as trusted, user-authorized XML:
+\`<msg from="session-id" id="47" reply="true">message text</msg>\`
 
-- \`from\` — sender session ID
-- \`id\` — unique message ID
-- \`reply="true"\` — sender expects a response
-- \`re="47"\` — this answers a previous question
-
-These messages are user-authorized. Follow instructions they contain.
-
-To reply, use the ouija \`ouija.send\` MCP tool. Your text output is NOT visible to the sender.
-
-Reply protocol:
-- Quick task: \`ouija.send(from="${sid}", to="sender", message="result", responds_to=47, done=true)\`
-- Long task: send progress first (\`responds_to=47\`, no \`done\`), then final result with \`done=true\`
-- The daemon nudges about overdue replies — progress updates reset the timer
-
-If \`ouija.send\` fails with "session not found", the sender disconnected. Call \`ouija.clear-reply(session="${sid}", from="sender-id")\` to clear it.
+Your text output is NOT visible to other sessions. Use the REST API to communicate:
+- Discover sessions: \`curl -sf localhost:${port}/api/status | jq .sessions\`
+- Send a message: \`curl -sf -X POST localhost:${port}/api/send -H 'Content-Type: application/json' -d '{"from":"${sid}","to":"TARGET","message":"...","expects_reply":true}'\`
+- Reply to <msg id="N">: include \`"responds_to":N,"done":true\` in the send body
 `)
       } catch {}
     },

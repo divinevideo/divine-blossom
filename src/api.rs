@@ -595,10 +595,10 @@ pub async fn send_msg(
             .map(|k| k.as_str())
             .collect();
         let hint = if suggestions.is_empty() {
-            "If you meant a remote session, use the full node-prefixed name (e.g. 'node/session'). Run ouija.list to see all available targets.".to_string()
+            "If you meant a remote session, use the full node-prefixed name (e.g. 'node/session'). GET /api/status to see all available targets.".to_string()
         } else {
             format!(
-                "Did you mean one of these remote sessions? {} — use ouija.list to check.",
+                "Did you mean one of these remote sessions? {} — GET /api/status to check.",
                 suggestions.join(", ")
             )
         };
@@ -626,7 +626,12 @@ pub async fn send_msg(
     }) {
         (
             StatusCode::OK,
-            Json(json!({ "status": "delivered", "method": method, "msg_id": msg_id })),
+            Json(json!({
+                "status": "delivered",
+                "method": method,
+                "msg_id": msg_id,
+                "hint": format!("To reply to this message, use responds_to={msg_id}")
+            })),
         )
     } else if let Some((reason, renamed_to)) = effects.iter().find_map(|e| match e {
         crate::daemon_protocol::Effect::SendFailed {
@@ -1804,6 +1809,36 @@ pub async fn list_projects(
     let mut projects: Vec<_> = index.values().cloned().collect();
     projects.sort_by(|a, b| a.name.cmp(&b.name));
     axum::Json(projects)
+}
+
+// ── Clear reminder (REST equivalent of removed MCP tool) ─────────────
+
+#[derive(Deserialize)]
+pub struct ClearReminderBody {
+    pub from: String,
+    pub clearing_id: u64,
+}
+
+pub async fn clear_reminder(
+    State(state): State<SharedState>,
+    Json(body): Json<ClearReminderBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    state
+        .notify_agent(
+            &body.from,
+            crate::session_agent::SessionMsg::ClearReminder {
+                clearing_id: body.clearing_id,
+            },
+        )
+        .await;
+    (
+        StatusCode::OK,
+        Json(json!({
+            "cleared": body.clearing_id,
+            "session": body.from,
+            "hint": "Reminder paused. It will resume after new activity (incoming message, hook fire, etc.)."
+        })),
+    )
 }
 
 #[cfg(test)]

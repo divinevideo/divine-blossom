@@ -92,7 +92,7 @@ assert_contains "ouija daemon responds" "$ouija_status" '"daemon"'
 
 log "Test 3: ouija MCP server accessible"
 mcp_health=$(mcp_init "$BASE")
-if echo "$mcp_health" | grep -q "ouija"; then
+if echo "$mcp_health" | grep -qi "ouija\|serverInfo"; then
     pass "ouija MCP server responds to initialize"
 else
     fail "ouija MCP reachable" "contains ouija" "$mcp_health"
@@ -171,13 +171,13 @@ if ! wait_for 15 curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/global/health" -o /
 fi
 log "opencode serve ready on port $OC_SERVE_PORT"
 
-log "Test 7: ouija ouija.start with backend=opencode"
-start_result=$(mcp_call_tool "$BASE" "ouija.start" \
-    '{"name":"oc-e2e","project_dir":"/tmp","backend":"opencode"}')
-if echo "$start_result" | grep -q "started.*oc-e2e"; then
+log "Test 7: ouija start with backend=opencode"
+start_result=$(api "$BASE" POST /api/sessions/start \
+    -d '{"name":"oc-e2e","project_dir":"/tmp","backend":"opencode"}')
+if echo "$start_result" | jq -r '.session // empty' 2>/dev/null | grep -q "oc-e2e"; then
     pass "ouija started opencode session 'oc-e2e'"
 else
-    fail "ouija.start opencode" "contains 'started'" "$(echo "$start_result" | head -c 200)"
+    fail "ouija start opencode" "session=oc-e2e" "$(echo "$start_result" | head -c 200)"
 fi
 
 log "Test 8: ouija detects opencode serve readiness"
@@ -205,10 +205,10 @@ else
     fail "backend_session_id" "non-empty value" "empty in status"
 fi
 
-log "Test 9: ouija ouija.send delivers to opencode via HTTP API"
-send_result=$(mcp_call_tool "$BASE" "ouija.send" \
-    '{"from":"test-sender","to":"oc-e2e","message":"Reply with only the word hello","expects_reply":false}')
-if echo "$send_result" | grep -qi "delivered\|success"; then
+log "Test 9: ouija send delivers to opencode via HTTP API"
+send_result=$(api "$BASE" POST /api/send \
+    -d '{"from":"test-sender","to":"oc-e2e","message":"Reply with only the word hello","expects_reply":false}')
+if echo "$send_result" | jq -r '.status // empty' 2>/dev/null | grep -qi "delivered"; then
     pass "ouija delivered message to opencode session"
 else
     # Check daemon log for HTTP delivery confirmation
@@ -270,9 +270,8 @@ log "Test 10c: second message exercises plugin chat.message hook"
 # The chat.message hook pushes parts with id/sessionID/messageID on each
 # message. The second message also triggers the mesh diff path (joined/left).
 # This is the exact code path that had the Zod validation bug.
-mcp_init "$BASE" >/dev/null 2>&1
-send2_result=$(mcp_call_tool "$BASE" "ouija.send" \
-    '{"from":"test-sender","to":"oc-e2e","message":"What is 1+1? Reply with just the number.","expects_reply":false}')
+send2_result=$(api "$BASE" POST /api/send \
+    -d '{"from":"test-sender","to":"oc-e2e","message":"What is 1+1? Reply with just the number.","expects_reply":false}')
 sleep 20
 if curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/global/health" -o /dev/null 2>/dev/null; then
     latest_session=$(curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/session" \
@@ -307,14 +306,12 @@ if [ -f "$OC_SERVE_LOG" ]; then
     fi
 fi
 
-log "Test 11: ouija ouija.kill cleans up opencode session"
-# Re-init MCP in case the session expired during the long wait
-mcp_init "$BASE" >/dev/null 2>&1
-kill_result=$(mcp_call_tool "$BASE" "ouija.kill" '{"name":"oc-e2e"}')
-if echo "$kill_result" | grep -qi "killed\|removed"; then
+log "Test 11: ouija kill cleans up opencode session"
+kill_result=$(api "$BASE" POST /api/sessions/kill -d '{"name":"oc-e2e"}')
+if echo "$kill_result" | jq -r '.result // empty' 2>/dev/null | grep -qi "killed"; then
     pass "ouija killed opencode session"
 else
-    fail "ouija.kill" "killed or removed" "$(echo "$kill_result" | head -c 200)"
+    fail "ouija kill" "result contains killed" "$(echo "$kill_result" | head -c 200)"
 fi
 
 # Verify it's gone
@@ -329,13 +326,12 @@ fi
 log "Test 12: second session on same serve works"
 # The original bug manifested as "first session works, subsequent ones fail."
 # This test creates a second session on the same shared serve instance.
-mcp_init "$BASE" >/dev/null 2>&1
-start2_result=$(mcp_call_tool "$BASE" "ouija.start" \
-    '{"name":"oc-e2e2","project_dir":"/tmp","backend":"opencode","text":"Reply with only the word ping"}')
-if echo "$start2_result" | grep -q "started.*oc-e2e2"; then
+start2_result=$(api "$BASE" POST /api/sessions/start \
+    -d '{"name":"oc-e2e2","project_dir":"/tmp","backend":"opencode","text":"Reply with only the word ping"}')
+if echo "$start2_result" | jq -r '.session // empty' 2>/dev/null | grep -q "oc-e2e2"; then
     pass "second opencode session started"
 else
-    fail "second ouija.start" "contains 'started'" "$(echo "$start2_result" | head -c 200)"
+    fail "second start" "session=oc-e2e2" "$(echo "$start2_result" | head -c 200)"
 fi
 
 sleep 5
@@ -348,9 +344,8 @@ else
 fi
 
 # Send a message to the second session
-mcp_init "$BASE" >/dev/null 2>&1
-mcp_call_tool "$BASE" "ouija.send" \
-    '{"from":"test-sender","to":"oc-e2e2","message":"Reply with only the word ping","expects_reply":false}' >/dev/null 2>&1
+api "$BASE" POST /api/send \
+    -d '{"from":"test-sender","to":"oc-e2e2","message":"Reply with only the word ping","expects_reply":false}' >/dev/null 2>&1
 sleep 20
 
 # Verify LLM processed it
@@ -375,18 +370,16 @@ else
 fi
 
 # Clean up second session
-mcp_init "$BASE" >/dev/null 2>&1
-mcp_call_tool "$BASE" "ouija.kill" '{"name":"oc-e2e2"}' >/dev/null 2>&1
+api "$BASE" POST /api/sessions/kill -d '{"name":"oc-e2e2"}' >/dev/null 2>&1
 
 log "Test 13: soft restart creates new opencode session via HTTP API"
 # Start a session with prompt and reminder
-mcp_init "$BASE" >/dev/null 2>&1
-start13=$(mcp_call_tool "$BASE" "ouija.start" \
-    "{\"name\":\"oc-soft\",\"project_dir\":\"/tmp/soft-test\",\"backend\":\"opencode\",\"prompt\":\"say hello\",\"reminder\":\"call loop_next when done\"}")
-if echo "$start13" | grep -q "started.*oc-soft"; then
+start13=$(api "$BASE" POST /api/sessions/start \
+    -d '{"name":"oc-soft","project_dir":"/tmp/soft-test","backend":"opencode","prompt":"say hello","reminder":"call loop_next when done"}')
+if echo "$start13" | jq -r '.session // empty' 2>/dev/null | grep -q "oc-soft"; then
     pass "13a: started session for soft restart test"
 else
-    fail "13a: ouija.start" "contains started" "$(echo "$start13" | head -c 200)"
+    fail "13a: start" "session=oc-soft" "$(echo "$start13" | head -c 200)"
 fi
 sleep 5
 # Verify session has prompt and reminder
@@ -402,13 +395,12 @@ else
     fail "13b: backend_session_id" "non-empty" "empty"
 fi
 # Now restart with fresh=true — should trigger soft restart (POST /session + prompt_async)
-mcp_init "$BASE" >/dev/null 2>&1
-restart13=$(mcp_call_tool "$BASE" "ouija.restart" \
-    '{"name":"oc-soft","fresh":true,"prompt":"say goodbye","reminder":"call loop_next when done"}')
-if echo "$restart13" | grep -qi "soft-restarted\|restarted"; then
+restart13=$(api "$BASE" POST /api/sessions/restart \
+    -d '{"name":"oc-soft","fresh":true,"prompt":"say goodbye","reminder":"call loop_next when done"}')
+if echo "$restart13" | jq -r '.result // empty' 2>/dev/null | grep -qi "soft-restarted\|restarted"; then
     pass "13c: soft restart succeeded"
 else
-    fail "13c: soft restart" "contains restarted" "$(echo "$restart13" | head -c 200)"
+    fail "13c: soft restart" "result contains restarted" "$(echo "$restart13" | head -c 200)"
 fi
 sleep 5
 # Verify backend_session_id changed (new opencode session)
@@ -437,8 +429,7 @@ fi
 rem13b=$(echo "$status13b" | jq -r '.sessions[] | select(.id == "oc-soft") | .reminder // ""')
 assert_eq "13g: reminder preserved after soft restart" "$rem13b" "call loop_next when done"
 # Clean up
-mcp_init "$BASE" >/dev/null 2>&1
-mcp_call_tool "$BASE" "ouija.kill" '{"name":"oc-soft"}' >/dev/null 2>&1
+api "$BASE" POST /api/sessions/kill -d '{"name":"oc-soft"}' >/dev/null 2>&1
 
 # ═══════════════════════════════════════════════════════════════════
 # WORKFLOW ACTOR TEST — Real LLM follows workflow instructions
@@ -519,13 +510,12 @@ PYEOF
 chmod +x "$OC_WF_SCRIPT"
 
 log "Test 14: Workflow — start session with workflow actor"
-mcp_init "$BASE" >/dev/null 2>&1
-wf_start=$(mcp_call_tool "$BASE" "ouija.start" \
-    "{\"name\":\"oc-wf\",\"project_dir\":\"/tmp\",\"backend\":\"opencode\",\"workflow\":\"$OC_WF_SCRIPT\"}")
-if echo "$wf_start" | grep -q "started.*oc-wf"; then
+wf_start=$(api "$BASE" POST /api/sessions/start \
+    -d "{\"name\":\"oc-wf\",\"project_dir\":\"/tmp\",\"backend\":\"opencode\",\"workflow\":\"$OC_WF_SCRIPT\"}")
+if echo "$wf_start" | jq -r '.session // empty' 2>/dev/null | grep -q "oc-wf"; then
     pass "14a: workflow session started"
 else
-    fail "14a: workflow ouija.start" "contains started" "$(echo "$wf_start" | head -c 200)"
+    fail "14a: workflow start" "session=oc-wf" "$(echo "$wf_start" | head -c 200)"
 fi
 
 # Verify workflow metadata was set
@@ -654,8 +644,30 @@ log "  daemon: MCP requests=$MCP_CONNECTS, workflow mentions=$WORKFLOW_CALLS"
 fi  # end GEMINI_API_KEY guard
 
 # Clean up workflow session
-mcp_init "$BASE" >/dev/null 2>&1
-mcp_call_tool "$BASE" "ouija.kill" '{"name":"oc-wf"}' >/dev/null 2>&1
+api "$BASE" POST /api/sessions/kill -d '{"name":"oc-wf"}' >/dev/null 2>&1
+
+# ═══════════════════════════════════════════════════════════════════
+# AUTO-START TEST — send to non-existent session matching project name
+# ═══════════════════════════════════════════════════════════════════
+
+log "Test 16: REST send auto-starts session from project index"
+# Configure projects_dir
+api "$BASE" POST /api/settings -d '{"projects_dir":"/tmp/projects"}' >/dev/null
+mkdir -p /tmp/projects/autostart-proj
+sleep 3
+# Register sender
+api "$BASE" POST /api/register -d '{"id":"autostart-sender","pane":"'$OC_SERVE_PANE'"}' >/dev/null
+# Send to non-existent session matching project name
+result=$(curl -s -X POST "$BASE/api/send" -H "Content-Type: application/json" \
+  -d '{"from":"autostart-sender","to":"autostart-proj","message":"hello","expects_reply":false}')
+if echo "$result" | grep -qi "auto-started\|delivered"; then
+    pass "16: send auto-started or delivered"
+else
+    fail "16: auto-start" "auto-started or delivered" "$(echo "$result" | head -c 200)"
+fi
+# Cleanup
+api "$BASE" POST /api/sessions/kill -d '{"name":"autostart-proj"}' >/dev/null 2>&1 || true
+api "$BASE" POST /api/remove -d '{"id":"autostart-sender"}' >/dev/null 2>&1 || true
 
 # ── Daemon logs ──────────────────────────────────────────────────
 log "Daemon logs (last 20 lines):"

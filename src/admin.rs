@@ -261,7 +261,7 @@ pub async fn dashboard(State(state): State<SharedState>) -> Html<String> {
     }
     if sorted_tasks.is_empty() {
         tasks_html.push_str(
-            r#"<tr><td colspan="10" class="empty">No scheduled tasks.<br>CLI: <b>ouija task add "check-logs" "0 9 * * *" "check the error logs"</b><br>MCP: use the <b>ouija.task-create</b> tool from any coding session</td></tr>"#,
+            r#"<tr><td colspan="10" class="empty">No scheduled tasks.<br>CLI: <b>ouija task add "check-logs" "0 9 * * *" "check the error logs"</b><br>API: <b>POST /api/tasks</b></td></tr>"#,
         );
     }
 
