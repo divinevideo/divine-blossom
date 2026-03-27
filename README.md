@@ -27,6 +27,7 @@ Client → Fastly Compute (Rust WASM) → GCS (blobs) + Fastly KV (metadata)
 - **Range requests**: Native video seeking support
 - **HLS transcoding**: Multi-quality adaptive streaming (1080p, 720p, 480p, 360p)
 - **WebVTT transcripts**: Stable transcript URL at `/<sha256>.vtt` with async generation
+- **Audio extraction**: Stable audio-only URL at `/<sha256>.audio.m4a` with Funnelcake permission gating
 - **Provenance & audit**: Cryptographic proof of upload/delete authorship with Cloud Logging audit trail
 - **Tombstones**: Legal hold prevents re-upload of removed content
 - **Admin soft-delete**: DMCA/legal removal with full audit trail while preserving recoverable storage
@@ -63,6 +64,8 @@ fastly config-store create --name blossom_config
 fastly secret-store create --name blossom_secrets
 ```
 
+If you want audio extraction enabled in production, add `funnelcake_api_url` to `blossom_config`. The example `fastly.toml.example` points it at `https://relay.divine.video`, which serves the public audio-reuse lookup used by the edge service.
+
 ### Local development
 
 ```bash
@@ -93,6 +96,8 @@ fastly compute publish
 | `GET` | `/<sha256>.vtt` | Retrieve WebVTT transcript (on-demand generation) |
 | `HEAD` | `/<sha256>.vtt` | Check transcript status/existence |
 | `GET` | `/<sha256>/VTT` | Alias for transcript retrieval |
+| `GET` | `/<sha256>.audio.m4a` | Extract and serve audio-only M4A for eligible videos |
+| `HEAD` | `/<sha256>.audio.m4a` | Check audio extraction availability |
 
 `GET /<sha256>.vtt` returns `202 Accepted` with `Retry-After` while transcription is still running or cooling down after a retryable provider failure. Clients should poll again instead of treating that response as "no subtitles".
 

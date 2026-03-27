@@ -17,14 +17,16 @@ use crate::blossom::{
 };
 use crate::error::{BlossomError, Result};
 use crate::metadata::{
-    add_to_blob_refs, add_to_recent_index, add_to_user_index, add_to_user_list, check_ownership,
-    delete_auth_events, delete_blob_metadata, delete_blob_refs, delete_subtitle_data,
-    delete_user_list, get_audio_mapping, get_auth_event, get_blob_metadata, get_blob_refs,
-    get_subtitle_job, get_subtitle_job_by_hash, get_tombstone, get_user_blobs,
-    list_blobs_with_metadata, put_audio_mapping, put_auth_event, put_blob_metadata,
-    put_subtitle_job, put_tombstone, remove_from_blob_refs, remove_from_recent_index,
-    remove_from_user_index, remove_from_user_list, set_subtitle_job_id_for_hash,
-    update_blob_status, update_stats_on_add, update_stats_on_remove, TranscriptMetadataUpdate,
+    add_to_audio_source_refs, add_to_blob_refs, add_to_recent_index, add_to_user_index,
+    add_to_user_list, delete_audio_mapping, delete_audio_source_refs, delete_auth_events,
+    delete_blob_metadata, delete_blob_refs, delete_subtitle_data, delete_user_list,
+    get_audio_mapping, get_audio_source_refs, get_auth_event, get_blob_metadata,
+    get_blob_refs, get_subtitle_job, get_subtitle_job_by_hash, get_tombstone,
+    get_user_blobs, list_blobs_with_metadata, put_audio_mapping, put_auth_event,
+    put_blob_metadata, put_subtitle_job, put_tombstone, remove_from_audio_source_refs,
+    remove_from_blob_refs, remove_from_recent_index, remove_from_user_index,
+    remove_from_user_list, set_subtitle_job_id_for_hash, update_blob_status,
+    update_stats_on_add, update_stats_on_remove, TranscriptMetadataUpdate,
 };
 use crate::storage::{
     blob_exists, check_funnelcake_audio_reuse, current_timestamp,
@@ -189,6 +191,157 @@ fn handle_request(req: Request) -> Result<Response> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioReuseAvailability {
+    Allowed,
+    Denied,
+    LookupUnavailable,
+}
+
+fn classify_audio_reuse_availability(result: &Result<bool>) -> AudioReuseAvailability {
+    match result {
+        Ok(true) => AudioReuseAvailability::Allowed,
+        Ok(false) => AudioReuseAvailability::Denied,
+        Err(_) => AudioReuseAvailability::LookupUnavailable,
+    }
+}
+
+fn is_alias_only_audio_blob(has_audio_sources: bool, blob_refs: &[String]) -> bool {
+    has_audio_sources && blob_refs.is_empty()
+}
+
+fn should_delete_derived_audio_blob(
+    remaining_audio_sources: &[String],
+    blob_refs: &[String],
+) -> bool {
+    remaining_audio_sources.is_empty() && blob_refs.is_empty()
+}
+
+fn should_hide_direct_blob(hash: &str, is_admin: bool) -> Result<bool> {
+    if is_admin {
+        return Ok(false);
+    }
+
+    let audio_sources = get_audio_source_refs(hash)?;
+    if audio_sources.is_empty() {
+        return Ok(false);
+    }
+
+    let blob_refs = get_blob_refs(hash)?;
+    Ok(is_alias_only_audio_blob(true, &blob_refs))
+}
+
+fn audio_lookup_unavailable_response() -> Response {
+    let mut resp = Response::from_status(StatusCode::SERVICE_UNAVAILABLE);
+    resp.set_header("Content-Type", "application/json");
+    resp.set_header("Retry-After", "30");
+    resp.set_body(r#"{"error":"permission_lookup_unavailable"}"#);
+    add_no_cache_headers(&mut resp);
+    add_cors_headers(&mut resp);
+    resp
+}
+
+fn audio_reuse_denied_response() -> Response {
+    let mut resp = Response::from_status(StatusCode::FORBIDDEN);
+    resp.set_header("Content-Type", "application/json");
+    resp.set_body(r#"{"error":"audio_reuse_not_allowed"}"#);
+    add_no_cache_headers(&mut resp);
+    add_cors_headers(&mut resp);
+    resp
+}
+
+fn add_audio_response_headers(
+    resp: &mut Response,
+    source_hash: &str,
+    mime_type: &str,
+    size_bytes: u64,
+    duration_seconds: f64,
+) {
+    let set_full_content_length = should_set_audio_content_length(resp.get_status());
+    resp.set_header("Content-Type", mime_type);
+    if set_full_content_length {
+        resp.set_header("Content-Length", size_bytes.to_string());
+    }
+    resp.set_header("X-Audio-Duration", format!("{}", duration_seconds));
+    resp.set_header("X-Audio-Size", size_bytes.to_string());
+    resp.set_header("Accept-Ranges", "bytes");
+    add_cache_headers(resp, source_hash);
+    add_cors_headers(resp);
+}
+
+fn should_set_audio_content_length(status: StatusCode) -> bool {
+    status != StatusCode::PARTIAL_CONTENT
+}
+
+fn clear_stale_audio_mapping(source_hash: &str, audio_hash: &str) {
+    let _ = delete_audio_mapping(source_hash);
+    match remove_from_audio_source_refs(audio_hash, source_hash) {
+        Ok(remaining_sources) if remaining_sources.is_empty() => {
+            let _ = delete_audio_source_refs(audio_hash);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!(
+                "[AUDIO] Failed to remove stale audio ref {} <- {}: {}",
+                audio_hash, source_hash, e
+            );
+        }
+    }
+}
+
+fn cleanup_derived_audio_for_source(source_hash: &str) {
+    let mapping = match get_audio_mapping(source_hash) {
+        Ok(Some(mapping)) => mapping,
+        Ok(None) => return,
+        Err(e) => {
+            eprintln!(
+                "[AUDIO] Failed to load audio mapping for cleanup {}: {}",
+                source_hash, e
+            );
+            return;
+        }
+    };
+
+    let remaining_audio_sources =
+        match remove_from_audio_source_refs(&mapping.audio_sha256, source_hash) {
+            Ok(remaining) => remaining,
+            Err(e) => {
+                eprintln!(
+                    "[AUDIO] Failed to remove audio ref {} <- {}: {}",
+                    mapping.audio_sha256, source_hash, e
+                );
+                let _ = delete_audio_mapping(source_hash);
+                return;
+            }
+        };
+
+    let _ = delete_audio_mapping(source_hash);
+
+    if !remaining_audio_sources.is_empty() {
+        return;
+    }
+
+    let blob_refs = match get_blob_refs(&mapping.audio_sha256) {
+        Ok(refs) => refs,
+        Err(e) => {
+            eprintln!(
+                "[AUDIO] Failed to load blob refs for derived audio {}: {}",
+                mapping.audio_sha256, e
+            );
+            return;
+        }
+    };
+
+    if should_delete_derived_audio_blob(&remaining_audio_sources, &blob_refs) {
+        let _ = storage_delete(&mapping.audio_sha256);
+        let _ = delete_blob_metadata(&mapping.audio_sha256);
+        let _ = delete_audio_source_refs(&mapping.audio_sha256);
+        purge_vcl_cache(&mapping.audio_sha256);
+    } else {
+        let _ = delete_audio_source_refs(&mapping.audio_sha256);
+    }
+}
+
 /// GET /<sha256>[.ext] - Retrieve blob
 fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
     // Check if this is a thumbnail request ({hash}.jpg)
@@ -260,6 +413,10 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
 
     // Admin Bearer token bypasses moderation checks (used by moderation service proxy)
     let is_admin = admin::validate_bearer_token(&req).is_ok();
+
+    if should_hide_direct_blob(&hash, is_admin)? {
+        return Err(BlossomError::NotFound("Blob not found".into()));
+    }
 
     if let Some(ref meta) = metadata {
         if !is_admin {
@@ -395,6 +552,10 @@ fn handle_head_blob(path: &str) -> Result<Response> {
 
     let hash = parse_hash_from_path(path)
         .ok_or_else(|| BlossomError::BadRequest("Invalid hash in path".into()))?;
+
+    if should_hide_direct_blob(&hash, false)? {
+        return Err(BlossomError::NotFound("Blob not found".into()));
+    }
 
     // Check metadata
     let metadata =
@@ -1491,7 +1652,7 @@ const QUALITY_VARIANTS: &[(&str, &str, &str)] = &[
 /// Permission is hash-level: if ANY public current video event for this sha256
 /// opts into audio reuse via Funnelcake, extraction is allowed. This collapses
 /// event-level permission to hash-level because Blossom is content-addressed.
-fn handle_get_audio(_req: Request, path: &str) -> Result<Response> {
+fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
     let hash = parse_audio_path(path)
         .ok_or_else(|| BlossomError::BadRequest("Invalid hash in audio path".into()))?;
 
@@ -1509,26 +1670,18 @@ fn handle_get_audio(_req: Request, path: &str) -> Result<Response> {
     }
 
     // 3. Check Funnelcake permission
-    let allowed = match check_funnelcake_audio_reuse(&hash) {
-        Ok(allowed) => allowed,
+    let permission = match check_funnelcake_audio_reuse(&hash) {
+        ok @ Ok(_) => classify_audio_reuse_availability(&ok),
         Err(e) => {
             eprintln!("[AUDIO] Funnelcake unavailable for {}: {}", hash, e);
-            // 503 Service Unavailable
-            let mut resp = Response::from_status(StatusCode::SERVICE_UNAVAILABLE);
-            resp.set_header("Content-Type", "application/json");
-            resp.set_body(r#"{"error":"permission_lookup_unavailable"}"#);
-            resp.set_header("Retry-After", "30");
-            add_cors_headers(&mut resp);
-            return Ok(resp);
+            AudioReuseAvailability::LookupUnavailable
         }
     };
 
-    if !allowed {
-        let mut resp = Response::from_status(StatusCode::FORBIDDEN);
-        resp.set_header("Content-Type", "application/json");
-        resp.set_body(r#"{"error":"audio_reuse_not_allowed"}"#);
-        add_cors_headers(&mut resp);
-        return Ok(resp);
+    match permission {
+        AudioReuseAvailability::Allowed => {}
+        AudioReuseAvailability::Denied => return Ok(audio_reuse_denied_response()),
+        AudioReuseAvailability::LookupUnavailable => return Ok(audio_lookup_unavailable_response()),
     }
 
     // 4. Must be a video source
@@ -1540,23 +1693,32 @@ fn handle_get_audio(_req: Request, path: &str) -> Result<Response> {
         return Ok(resp);
     }
 
+    let range = req
+        .get_header(header::RANGE)
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
     // 5. Check cache: source->audio mapping
     if let Some(mapping) = get_audio_mapping(&hash)? {
         // Verify the audio blob still exists in GCS
         if blob_exists(&mapping.audio_sha256)? {
+            add_to_audio_source_refs(&mapping.audio_sha256, &hash).map_err(|e| {
+                BlossomError::Internal(format!("Failed to persist audio source refs: {}", e))
+            })?;
             // Serve cached audio via redirect or proxy
-            let result = download_blob_with_fallback(&mapping.audio_sha256, None)?;
+            let result = download_blob_with_fallback(&mapping.audio_sha256, range.as_deref())?;
             let mut resp = result.response;
-            resp.set_header("Content-Type", &mapping.mime_type);
-            resp.set_header("Content-Length", mapping.size_bytes.to_string());
-            resp.set_header("X-Content-SHA256", &mapping.audio_sha256);
-            resp.set_header("X-Audio-Duration", format!("{}", mapping.duration_seconds));
-            resp.set_header("X-Audio-Size", mapping.size_bytes.to_string());
-            add_cache_headers(&mut resp, &hash);
-            add_cors_headers(&mut resp);
+            add_audio_response_headers(
+                &mut resp,
+                &hash,
+                &mapping.mime_type,
+                mapping.size_bytes,
+                mapping.duration_seconds,
+            );
             return Ok(resp);
         }
         // Audio blob gone, fall through to re-extract
+        clear_stale_audio_mapping(&hash, &mapping.audio_sha256);
     }
 
     // 6. Trigger Cloud Run audio extraction (synchronous)
@@ -1586,28 +1748,7 @@ fn handle_get_audio(_req: Request, path: &str) -> Result<Response> {
         .mime_type
         .unwrap_or_else(|| "audio/mp4".to_string());
 
-    // 7. Store audio blob metadata (so /{audio_sha256} works as normal Blossom blob)
-    // Do NOT add to user lists or recent indexes for derived blobs.
-    let audio_metadata = BlobMetadata {
-        sha256: audio_sha256.clone(),
-        size,
-        mime_type: mime_type.clone(),
-        uploaded: current_timestamp(),
-        owner: metadata.owner.clone(),
-        status: BlobStatus::Active,
-        thumbnail: None,
-        moderation: None,
-        transcode_status: None,
-        dim: None,
-        transcript_status: None,
-        transcript_error_code: None,
-        transcript_error_message: None,
-        transcript_last_attempt_at: None,
-        transcript_retry_after: None,
-    };
-    let _ = put_blob_metadata(&audio_metadata);
-
-    // 8. Store source->audio mapping
+    // 7. Store source->audio mapping and reverse refs.
     let mapping = AudioMapping {
         source_sha256: hash.clone(),
         audio_sha256: audio_sha256.clone(),
@@ -1615,18 +1756,15 @@ fn handle_get_audio(_req: Request, path: &str) -> Result<Response> {
         size_bytes: size,
         mime_type: mime_type.clone(),
     };
-    let _ = put_audio_mapping(&mapping);
+    put_audio_mapping(&mapping)?;
+    add_to_audio_source_refs(&audio_sha256, &hash).map_err(|e| {
+        BlossomError::Internal(format!("Failed to persist audio source refs: {}", e))
+    })?;
 
-    // 9. Download and serve the audio
-    let result = download_blob_with_fallback(&audio_sha256, None)?;
+    // 8. Download and serve the audio
+    let result = download_blob_with_fallback(&audio_sha256, range.as_deref())?;
     let mut resp = result.response;
-    resp.set_header("Content-Type", &mime_type);
-    resp.set_header("Content-Length", size.to_string());
-    resp.set_header("X-Content-SHA256", &audio_sha256);
-    resp.set_header("X-Audio-Duration", format!("{}", duration));
-    resp.set_header("X-Audio-Size", size.to_string());
-    add_cache_headers(&mut resp, &hash);
-    add_cors_headers(&mut resp);
+    add_audio_response_headers(&mut resp, &hash, &mime_type, size, duration);
     Ok(resp)
 }
 
@@ -1642,17 +1780,39 @@ fn handle_head_audio(path: &str) -> Result<Response> {
         return Err(BlossomError::NotFound("Blob not found".into()));
     }
 
-    // Check if audio mapping exists
-    if let Some(mapping) = get_audio_mapping(&hash)? {
-        let mut resp = Response::from_status(StatusCode::OK);
-        resp.set_header("Content-Type", &mapping.mime_type);
-        resp.set_header("Content-Length", mapping.size_bytes.to_string());
-        resp.set_header("X-Content-SHA256", &mapping.audio_sha256);
-        resp.set_header("X-Audio-Duration", format!("{}", mapping.duration_seconds));
-        resp.set_header("X-Audio-Size", mapping.size_bytes.to_string());
-        add_cache_headers(&mut resp, &hash);
+    let permission = classify_audio_reuse_availability(&check_funnelcake_audio_reuse(&hash));
+    match permission {
+        AudioReuseAvailability::Allowed => {}
+        AudioReuseAvailability::Denied => return Ok(audio_reuse_denied_response()),
+        AudioReuseAvailability::LookupUnavailable => return Ok(audio_lookup_unavailable_response()),
+    }
+
+    if !is_video_mime_type(&metadata.mime_type) {
+        let mut resp = Response::from_status(StatusCode::UNPROCESSABLE_ENTITY);
+        resp.set_header("Content-Type", "application/json");
+        resp.set_body(r#"{"error":"not_a_video"}"#);
+        add_no_cache_headers(&mut resp);
         add_cors_headers(&mut resp);
         return Ok(resp);
+    }
+
+    // Check if audio mapping exists
+    if let Some(mapping) = get_audio_mapping(&hash)? {
+        if blob_exists(&mapping.audio_sha256)? {
+            add_to_audio_source_refs(&mapping.audio_sha256, &hash).map_err(|e| {
+                BlossomError::Internal(format!("Failed to persist audio source refs: {}", e))
+            })?;
+            let mut resp = Response::from_status(StatusCode::OK);
+            add_audio_response_headers(
+                &mut resp,
+                &hash,
+                &mapping.mime_type,
+                mapping.size_bytes,
+                mapping.duration_seconds,
+            );
+            return Ok(resp);
+        }
+        clear_stale_audio_mapping(&hash, &mapping.audio_sha256);
     }
 
     // No audio extracted yet
@@ -2642,6 +2802,7 @@ fn handle_delete(req: Request, path: &str) -> Result<Response> {
 
         if other_refs.is_empty() {
             // Sole owner: full delete
+            cleanup_derived_audio_for_source(&hash);
             storage_delete(&hash)?;
             delete_blob_gcs_artifacts(&hash);
             delete_blob_metadata(&hash)?;
@@ -2773,6 +2934,7 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
     );
 
     // Delete from GCS (main blob + all artifacts)
+    cleanup_derived_audio_for_source(&hash);
     let _ = storage_delete(&hash);
     delete_blob_gcs_artifacts(&hash);
 
@@ -2871,6 +3033,7 @@ fn execute_vanish(pubkey: &str) -> (u32, u32, u32) {
 
         if is_owner && other_refs.is_empty() {
             // Sole owner: full delete
+            cleanup_derived_audio_for_source(hash);
             let _ = storage_delete(hash);
             delete_blob_gcs_artifacts(hash);
             let _ = delete_blob_metadata(hash);
@@ -4358,7 +4521,7 @@ fn add_cors_headers(resp: &mut Response) {
     );
     resp.set_header(
         "Access-Control-Expose-Headers",
-        "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256, X-Content-SHA256, X-Audio-Duration, X-Audio-Size",
+        "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256, X-Audio-Duration, X-Audio-Size",
     );
 }
 
@@ -4450,10 +4613,15 @@ fn infer_mime_from_path(path: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decide_transcript_fetch_action, is_quality_variant_path, parse_quality_variant_path,
-        parse_transcript_status_webhook_payload, TranscriptFetchAction, TranscriptPendingState,
+        classify_audio_reuse_availability, decide_transcript_fetch_action,
+        is_alias_only_audio_blob, is_quality_variant_path, parse_quality_variant_path,
+        parse_transcript_status_webhook_payload, should_delete_derived_audio_blob,
+        should_set_audio_content_length, AudioReuseAvailability, TranscriptFetchAction,
+        TranscriptPendingState,
     };
     use crate::blossom::TranscriptStatus;
+    use crate::error::{BlossomError, Result as BlossomResult};
+    use fastly::http::StatusCode;
 
     #[test]
     fn quality_variant_path_valid() {
@@ -4602,5 +4770,59 @@ mod tests {
                 should_repair: true,
             }
         );
+    }
+
+    #[test]
+    fn audio_reuse_availability_classifies_lookup_outcomes() {
+        let allowed: BlossomResult<bool> = Ok(true);
+        let denied: BlossomResult<bool> = Ok(false);
+        let unavailable: BlossomResult<bool> = Err(BlossomError::Internal("down".into()));
+
+        assert_eq!(
+            classify_audio_reuse_availability(&allowed),
+            AudioReuseAvailability::Allowed
+        );
+        assert_eq!(
+            classify_audio_reuse_availability(&denied),
+            AudioReuseAvailability::Denied
+        );
+        assert_eq!(
+            classify_audio_reuse_availability(&unavailable),
+            AudioReuseAvailability::LookupUnavailable
+        );
+    }
+
+    #[test]
+    fn alias_only_audio_blob_requires_reverse_refs_without_public_blob_refs() {
+        assert!(is_alias_only_audio_blob(true, &[]));
+        assert!(!is_alias_only_audio_blob(false, &[]));
+        assert!(!is_alias_only_audio_blob(
+            true,
+            &[String::from("pubkey"), String::from("another")]
+        ));
+    }
+
+    #[test]
+    fn derived_audio_cleanup_only_deletes_when_no_sources_or_blob_refs_remain() {
+        assert!(should_delete_derived_audio_blob(&[], &[]));
+        assert!(!should_delete_derived_audio_blob(
+            &[String::from("source")],
+            &[]
+        ));
+        assert!(!should_delete_derived_audio_blob(
+            &[],
+            &[String::from("pubkey")]
+        ));
+    }
+
+    #[test]
+    fn audio_response_headers_keep_partial_content_length_from_storage() {
+        assert!(!should_set_audio_content_length(StatusCode::PARTIAL_CONTENT));
+    }
+
+    #[test]
+    fn audio_response_headers_set_full_content_length_for_complete_responses() {
+        assert!(should_set_audio_content_length(StatusCode::OK));
+        assert!(should_set_audio_content_length(StatusCode::CREATED));
     }
 }

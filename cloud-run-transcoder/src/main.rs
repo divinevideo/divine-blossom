@@ -182,6 +182,23 @@ struct AudioExtractResponse {
     mime_type: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioExtractErrorKind {
+    NotAVideo,
+    NoAudioTrack,
+    Other,
+}
+
+fn classify_audio_extract_error(message: &str) -> AudioExtractErrorKind {
+    if message.contains("not_a_video") {
+        AudioExtractErrorKind::NotAVideo
+    } else if message.contains("no_audio_track") {
+        AudioExtractErrorKind::NoAudioTrack
+    } else {
+        AudioExtractErrorKind::Other
+    }
+}
+
 // Transcode response
 #[derive(Serialize)]
 struct TranscodeResponse {
@@ -661,31 +678,31 @@ async fn handle_audio_extract(
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => {
             let msg = e.to_string();
-            if msg.contains("not_a_video") {
-                (
+            match classify_audio_extract_error(&msg) {
+                AudioExtractErrorKind::NotAVideo => (
                     StatusCode::UNPROCESSABLE_ENTITY,
                     Json(ErrorResponse {
                         error: "not_a_video".to_string(),
                     }),
                 )
-                    .into_response()
-            } else if msg.contains("no_audio_track") {
-                (
+                    .into_response(),
+                AudioExtractErrorKind::NoAudioTrack => (
                     StatusCode::UNPROCESSABLE_ENTITY,
                     Json(ErrorResponse {
                         error: "no_audio_track".to_string(),
                     }),
                 )
-                    .into_response()
-            } else {
-                error!("Audio extract error: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: e.to_string(),
-                    }),
-                )
-                    .into_response()
+                    .into_response(),
+                AudioExtractErrorKind::Other => {
+                    error!("Audio extract error: {}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: e.to_string(),
+                        }),
+                    )
+                        .into_response()
+                }
             }
         }
     }
@@ -2267,11 +2284,12 @@ async fn finalize_transcript(
 #[cfg(test)]
 mod tests {
     use super::{
-        decide_transcript_lock_action, is_retryable_provider_failure, normalize_transcript_to_vtt,
-        parse_audio_analysis_output, parse_provider_status, retry_delay_for_attempt,
-        should_drop_low_signal_transcript, transcript_drop_reason, transcription_response_format,
-        AudioAnalysis, Config, ParsedVtt, TranscriptConfidence, TranscriptDropReason,
-        TranscriptLockAction, TranscriptLockState, TranscriptLockStatus,
+        classify_audio_extract_error, decide_transcript_lock_action, is_retryable_provider_failure,
+        normalize_transcript_to_vtt, parse_audio_analysis_output, parse_provider_status,
+        retry_delay_for_attempt, should_drop_low_signal_transcript, transcript_drop_reason,
+        transcription_response_format, AudioAnalysis, AudioExtractErrorKind, Config, ParsedVtt,
+        TranscriptConfidence, TranscriptDropReason, TranscriptLockAction, TranscriptLockState,
+        TranscriptLockStatus,
     };
     use std::time::Duration;
 
@@ -2287,6 +2305,22 @@ mod tests {
     #[test]
     fn whisper_uses_vtt_response_format() {
         assert_eq!(transcription_response_format("whisper-1"), "vtt");
+    }
+
+    #[test]
+    fn classifies_audio_extract_errors() {
+        assert_eq!(
+            classify_audio_extract_error("not_a_video"),
+            AudioExtractErrorKind::NotAVideo
+        );
+        assert_eq!(
+            classify_audio_extract_error("no_audio_track"),
+            AudioExtractErrorKind::NoAudioTrack
+        );
+        assert_eq!(
+            classify_audio_extract_error("ffmpeg exploded"),
+            AudioExtractErrorKind::Other
+        );
     }
 
     #[test]
