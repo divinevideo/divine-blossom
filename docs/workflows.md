@@ -424,7 +424,7 @@ ouija.start(
 
 ### With the State Pattern
 
-The [`ouija_workflow`](../examples/ouija_workflow.py) module provides building blocks: `State`, `Context`, and `Workflow`. States are plain classes with `handle_*` methods. Transitions are explicit. No DSL — guards are plain `if/else`.
+The [`ouija_workflow`](../examples/ouija_workflow.py) module provides building blocks: `State`, `Context`, and `Workflow`. `State` extends [`state_pattern.State`](https://github.com/dcadenas/state-pattern-py) with ouija protocol dispatch — `handle_*` methods, `respond()`, `transition_to()`. Transitions are explicit. No DSL — guards are plain `if/else`.
 
 ```python
 from ouija_workflow import Workflow, State
@@ -459,4 +459,4 @@ See [`examples/`](../examples/) for runnable implementations of each pattern.
 
 A workflow can be written in any language. It reads one JSON object from stdin, writes one JSON object to stdout, and exits. State goes in files. The daemon handles everything else. See [`autoresearch-workflow.py`](../examples/autoresearch-workflow.py) for a procedural example.
 
-Inspired by the Ruby [state_pattern](https://github.com/dcadenas/state_pattern) gem and its Python port [state-pattern-py](https://github.com/dcadenas/state-pattern-py).
+Built on the Python [state-pattern-py](https://github.com/dcadenas/state-pattern-py) library, itself a port of the Ruby [state_pattern](https://github.com/dcadenas/state_pattern) gem.

@@ -1,14 +1,15 @@
 # Workflow Examples
 
-## ouija_workflow.py — State Pattern building blocks
+## ouija_workflow.py — Protocol adapter for ouija workflow actors
 
-The shared library that the examples below import. Three primitives:
+Built on [state-pattern-py](https://github.com/dcadenas/state-pattern-py), a Python port
+of the Ruby [state_pattern](https://github.com/dcadenas/state_pattern) gem. The library
+provides the pure state machine primitives (`State`, `Stateful`, transitions, hooks). This
+module adds the ouija protocol layer:
 
-- **State** — subclass, add `handle_*` methods, call `respond()` or `transition_to()`
+- **State** — extends `state_pattern.State` with `handle_*` dispatch, `respond()`, `transition_to()`
 - **Context** — persistent data dict + ouija REST API client
-- **Workflow** — protocol handler, per-session state dispatch, registration
-
-Inspired by the Ruby [state_pattern](https://github.com/dcadenas/state_pattern) gem and its Python port [state-pattern-py](https://github.com/dcadenas/state-pattern-py). Same philosophy: states are plain classes, transitions are explicit, guards are plain conditionals. No DSL.
+- **Workflow** — protocol handler (stdin/stdout JSON), per-session state dispatch, registration
 
 ## Examples
 

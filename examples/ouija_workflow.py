@@ -1,18 +1,22 @@
 """
-ouija_workflow — State Pattern building blocks for ouija workflow actors.
+ouija_workflow — Protocol adapter for ouija workflow actors.
 
 Three primitives:
-  State    — subclass, add handle_* methods, call respond() or transition_to()
+  State    — extends state_pattern.State with ouija protocol dispatch
   Context  — shared persistent data + ouija API client
   Workflow — protocol handler, per-session state dispatch, registration
 
-Inspired by the Ruby state_pattern gem (https://github.com/dcadenas/state_pattern).
-Same philosophy: states are plain classes, transitions are explicit, guards are
-plain conditionals. No DSL.
+Built on state-pattern-py (https://github.com/dcadenas/state-pattern-py),
+a Python port of the Ruby state_pattern gem. Same philosophy: states are
+plain classes, transitions are explicit, guards are plain conditionals. No DSL.
 
-The key difference from the Ruby gem: workflow actors are stateless processes
-(spawned per call, state on disk). States are reconstituted from a JSON file on
-each invocation. The API looks similar but the mechanics differ.
+The state_pattern library provides the pure state machine primitives (State,
+Stateful, transitions, hooks). This module adds the ouija protocol layer:
+stdin/stdout JSON, registration, action dispatch, persistent context.
+
+The key difference from the library's normal usage: workflow actors are
+stateless processes (spawned per call, state on disk). States are reconstituted
+via Stateful.restore_state() from a JSON file on each invocation.
 
 Usage:
     from ouija_workflow import Workflow, State
@@ -43,6 +47,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+from state_pattern import State as _BaseState, Stateful as _Stateful
 
 try:
     import requests
@@ -157,15 +163,22 @@ class Context:
 # ── State ─────────────────────────────────────────────────────────────
 
 
-class State:
-    """Base class for workflow states. Subclass and add handle_* methods.
+class State(_BaseState):
+    """Ouija workflow state — extends state_pattern.State with protocol dispatch.
 
-    The LLM calls workflow(action, params). The daemon dispatches to the
-    current state's handle_{action}(ctx, params) method. The handler returns
-    either a Response (stay in state) or a Transition (move to another state).
+    The state_pattern library provides the state machine primitives (terminal
+    flag, stateful reference, subclass discovery). This class adds the ouija
+    protocol layer: action dispatch, response types, context-aware lifecycle.
     """
 
-    terminal = False
+    def enter(self):
+        # state_pattern calls this on instantiation; ouija manages lifecycle
+        # explicitly via on_enter(ctx) so this is a no-op.
+        pass
+
+    def exit(self):
+        # Same — ouija calls on_exit(ctx) explicitly during transition processing.
+        pass
 
     def on_enter(self, ctx):
         """Called once when entering this state. Return a message or None."""
@@ -226,7 +239,7 @@ class Workflow:
         state_file="workflow-state.json",
     ):
         self.initial = initial
-        self.state_map = {s.__name__: s() for s in states}
+        self._states = states  # restore_state discovers via subclass tree
         self.instructions = instructions
         self.inject_on_start = inject_on_start
         self.max_calls = max_calls
@@ -283,17 +296,21 @@ class Workflow:
             state_path=Path(self.state_file),
         )
 
-        # Look up this session's current state, or resolve initial
+        # Create a Stateful machine and restore the current state from disk
+        machine = _Stateful()
+
         state_name = ctx._state_for(ctx.session_id)
         if not state_name:
             initial_cls = self._resolve_initial(ctx)
             state_name = initial_cls.__name__
 
-        state = self.state_map.get(state_name)
-        if not state:
+        try:
+            machine.restore_state(state_name)
+        except ValueError:
             ctx._save()
             return {"error": f"Unknown state: {state_name}"}
 
+        state = machine.current_state_instance
         action = envelope.get("action", "init")
         params = envelope.get("params") or {}
         result = state.handle(ctx, action, params)
@@ -302,12 +319,14 @@ class Workflow:
         if isinstance(result, Transition):
             state.on_exit(ctx)
             new_name = result.to.__name__
-            new_state = self.state_map.get(new_name)
-            if not new_state:
+            try:
+                machine.restore_state(new_name)
+            except ValueError:
                 ctx._save()
                 return {"error": f"Bad transition target: {new_name}"}
 
-            ctx._set_state(ctx.session_id, new_name)
+            new_state = machine.current_state_instance
+            ctx._set_state(ctx.session_id, machine.state_name)
             enter_msg = new_state.on_enter(ctx)
 
             msg = result.message
