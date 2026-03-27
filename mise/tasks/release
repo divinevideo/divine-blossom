@@ -2,11 +2,14 @@
 # Bump alpha version, commit, push, publish to crates.io, then ouija update
 set -euo pipefail
 
+# All operations scoped to the ouija repo root — prevents CWD drift pushing to wrong repos
+REPO_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+
 PORT="${OUIJA_PORT:-7880}"
 BASE="http://localhost:${PORT}"
 
 # Read current version
-CURRENT=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+CURRENT=$(grep '^version' "$REPO_DIR/Cargo.toml" | head -1 | sed 's/.*"\(.*\)"/\1/')
 echo "Current version: $CURRENT"
 
 # Bump alpha number: 0.1.0-alpha.65 -> 0.1.0-alpha.66
@@ -16,22 +19,21 @@ NEXT="$PREFIX.$((NUM + 1))"
 echo "Next version: $NEXT"
 
 # Update Cargo.toml and regenerate Cargo.lock
-# macOS sed -i requires '' arg, GNU sed does not
 if [[ "$(uname)" == "Darwin" ]]; then
-  sed -i '' "s/^version = \"$CURRENT\"/version = \"$NEXT\"/" Cargo.toml
+  sed -i '' "s/^version = \"$CURRENT\"/version = \"$NEXT\"/" "$REPO_DIR/Cargo.toml"
 else
-  sed -i "s/^version = \"$CURRENT\"/version = \"$NEXT\"/" Cargo.toml
+  sed -i "s/^version = \"$CURRENT\"/version = \"$NEXT\"/" "$REPO_DIR/Cargo.toml"
 fi
-cargo check --quiet 2>/dev/null || true
+cargo check --quiet --manifest-path "$REPO_DIR/Cargo.toml" 2>/dev/null || true
 
 # Commit, tag, and push
-git add Cargo.toml Cargo.lock
-git commit -m "v$NEXT"
-git tag "v$NEXT"
-git push && git push origin "v$NEXT"
+git -C "$REPO_DIR" add Cargo.toml Cargo.lock
+git -C "$REPO_DIR" commit -m "v$NEXT"
+git -C "$REPO_DIR" tag "v$NEXT"
+git -C "$REPO_DIR" push && git -C "$REPO_DIR" push origin "v$NEXT"
 
 # Publish
-cargo publish
+cargo publish --manifest-path "$REPO_DIR/Cargo.toml"
 
 # Update local daemon
 ouija update
