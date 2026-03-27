@@ -123,6 +123,15 @@ pub struct ClearPendingReplyParams {
     pub from: String,
 }
 
+/// Parameters for the `clear_reminder` MCP tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ClearReminderParams {
+    /// Your session ID
+    pub from: String,
+    /// The clearing_id from the reminder's clearing_id attribute
+    pub clearing_id: u64,
+}
+
 /// Parameters for the `task_create` MCP tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TaskCreateParams {
@@ -661,6 +670,29 @@ impl OuijaMcp {
         ))]))
     }
 
+    /// Acknowledge an idle reminder so it stops re-firing until new activity occurs.
+    #[tool(
+        name = "ouija.clear-reminder",
+        description = "Acknowledge an idle reminder to stop it re-firing. Pass the clearing_id from the reminder XML. The reminder resumes after new activity (incoming message, hook, etc)."
+    )]
+    async fn clear_reminder(
+        &self,
+        Parameters(params): Parameters<ClearReminderParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.state
+            .notify_agent(
+                &params.from,
+                crate::session_agent::SessionMsg::ClearReminder {
+                    clearing_id: params.clearing_id,
+                },
+            )
+            .await;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "cleared reminder {} for '{}'",
+            params.clearing_id, params.from
+        ))]))
+    }
+
     /// List all scheduled tasks with their status, next/last run times, and run counts.
     #[tool(name = "ouija.task-list", description = "List all scheduled tasks with status and run info")]
     async fn task_list(&self) -> Result<CallToolResult, rmcp::ErrorData> {
@@ -1127,7 +1159,7 @@ impl OuijaMcp {
             });
 
             Ok(CallToolResult::success(vec![Content::text(format!(
-                "loop_next: restarting session '{}' (iteration {})",
+                "restarting session '{}' (iteration {})",
                 session_id, iteration
             ))]))
         } else {
@@ -1143,7 +1175,7 @@ impl OuijaMcp {
             self.state.persist_protocol_state(&proto);
 
             // Build response — include reminder every 10th iteration
-            let response = if iteration % 10 == 0 {
+            let loop_xml = if iteration % 10 == 0 {
                 if let Some(ref reminder_text) = reminder {
                     format!("<loop iteration=\"{iteration}\">{reminder_text}</loop>")
                 } else {
@@ -1153,7 +1185,7 @@ impl OuijaMcp {
                 format!("<loop iteration=\"{iteration}\" />")
             };
 
-            Ok(CallToolResult::success(vec![Content::text(response)]))
+            Ok(CallToolResult::success(vec![Content::text(loop_xml)]))
         }
     }
 
@@ -1331,6 +1363,17 @@ This keeps your session discoverable without re-registering.
 - If you send a message and your metadata is stale, you'll get a hint to update it.
 </metadata>
 
+<idle-reminders>\n\
+When idle, the daemon injects `<ouija-status type=\"reminder\" clearing_id=\"N\">...</ouija-status>` \
+into your pane. If you have nothing to do, call `ouija.clear-reminder(from, clearing_id)` with the \
+`clearing_id` value from the reminder. This stops the reminder from re-firing until new activity \
+(incoming message, hook fire, etc.) resets it.\n\
+\n\
+Sessions without a configured reminder get a default nudge once per idle period. \
+If you are done, call `ouija.send(done=true)` to signal completion. The default nudge \
+does not repeat — it fires once and auto-clears.\n\
+</idle-reminders>
+
 <messaging>
 1. Call `ouija.list` to discover available sessions before sending.
 2. Use `ouija.send(from, to, message)` to reach any session. Keep messages concise and actionable.
@@ -1373,7 +1416,7 @@ to start a new conversation each fire while keeping the worktree
 
 Tasks and loops are the same recurring session primitive with different triggers: \
 tasks use cron (passive, scheduled), loops use ouija.loop-next (active, self-driven). \
-Both rely on prompt + reminder for session bootstrap and continuity.
+Both rely on prompt + reminder for session bootstrap and continuity. \
 </tasks>
 
 <loops>

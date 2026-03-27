@@ -46,6 +46,8 @@ pub enum SessionMsg {
     LoopMildStall,
     /// Internal: hard stall timer expired (10x average interval or 30min cap).
     LoopHardStall,
+    /// MCP tool called: session acknowledged the reminder.
+    ClearReminder { clearing_id: u64 },
 }
 
 /// Per-session behavioral state owned by the agent.
@@ -60,6 +62,10 @@ pub struct SessionAgentState {
     loop_mild_timer: Option<JoinHandle<Result<(), MessagingErr<SessionMsg>>>>,
     /// Timer for hard loop stall (10x average interval or 30min cap).
     loop_hard_timer: Option<JoinHandle<Result<(), MessagingErr<SessionMsg>>>>,
+    /// True when the session has acknowledged the current reminder via ouija.clear-reminder.
+    pub reminder_cleared: bool,
+    /// Monotonic counter for clearing_id stamped on each reminder injection.
+    next_clearing_id: u64,
 }
 
 impl std::fmt::Debug for SessionAgentState {
@@ -84,6 +90,8 @@ impl SessionAgentState {
             idle_timer: None,
             loop_mild_timer: None,
             loop_hard_timer: None,
+            reminder_cleared: false,
+            next_clearing_id: 0,
         }
     }
 }
@@ -159,6 +167,7 @@ impl Actor for SessionAgent {
             }
             SessionMsg::Active => {
                 state.idle = false;
+                state.reminder_cleared = false;
                 state.last_active_at = Some(Utc::now());
                 if let Some(h) = state.idle_timer.take() {
                     h.abort();
@@ -249,65 +258,104 @@ impl Actor for SessionAgent {
 
                 self.handle_hard_stall(state).await;
             }
+            SessionMsg::ClearReminder { clearing_id } => {
+                if clearing_id == state.next_clearing_id {
+                    state.reminder_cleared = true;
+                    tracing::debug!(
+                        session = %state.session_id,
+                        clearing_id,
+                        "reminder cleared by session"
+                    );
+                }
+            }
             SessionMsg::IdleTimeout => {
                 state.idle_timer = None;
                 state.idle = true;
 
-                // Read session metadata in one lock
-                let (reminder, vim_mode, pending) = {
-                    let proto = self.app_state.protocol.read().await;
-                    let session = proto.sessions.get(&state.session_id);
-                    let reminder = session.and_then(|s| s.metadata.reminder.clone());
-                    let vim_mode = session.map(|s| s.metadata.vim_mode).unwrap_or(false);
-                    let pending = proto
-                        .pending_replies
-                        .get(&state.session_id)
-                        .cloned()
-                        .unwrap_or_default();
-                    (reminder, vim_mode, pending)
-                };
-
-                tracing::debug!(
-                    session = %state.session_id,
-                    pending = pending.len(),
-                    has_reminder = reminder.is_some(),
-                    "idle timeout fired"
-                );
-
-                // Inject reminder text if present (fires even without pending replies)
-                if let Some(ref reminder_text) = reminder {
-                    let wrapped =
-                        format!("<ouija-status type=\"reminder\">{reminder_text}</ouija-status>");
-                    let _ = crate::tmux::locked_inject(
-                        &self.app_state,
-                        &state.session_id,
-                        &state.pane,
-                        &wrapped,
-                        vim_mode,
-                    )
-                    .await;
-                }
-
-                // Append pending reply info with per-message format
-                if !pending.is_empty() {
-                    tracing::info!(
+                if state.reminder_cleared {
+                    tracing::debug!(
                         session = %state.session_id,
-                        count = pending.len(),
-                        "reminding about unanswered pending replies"
+                        "idle timeout fired but reminder was cleared — skipping injection"
                     );
-                    for p in &pending {
-                        let msg = format!(
-                            "<ouija-status type=\"reminder\">Pending reply owed: msg #{} from {}</ouija-status>",
-                            p.msg_id, p.from
+                } else {
+                    state.next_clearing_id += 1;
+                    let clearing_id = state.next_clearing_id;
+
+                    // Read session metadata in one lock
+                    let (reminder, vim_mode, pending) = {
+                        let proto = self.app_state.protocol.read().await;
+                        let session = proto.sessions.get(&state.session_id);
+                        let reminder = session.and_then(|s| s.metadata.reminder.clone());
+                        let vim_mode =
+                            session.map(|s| s.metadata.vim_mode).unwrap_or(false);
+                        let pending = proto
+                            .pending_replies
+                            .get(&state.session_id)
+                            .cloned()
+                            .unwrap_or_default();
+                        (reminder, vim_mode, pending)
+                    };
+
+                    tracing::debug!(
+                        session = %state.session_id,
+                        clearing_id,
+                        pending = pending.len(),
+                        has_reminder = reminder.is_some(),
+                        "idle timeout fired"
+                    );
+
+                    // Inject reminder text if present, otherwise a default nudge (once)
+                    if let Some(ref reminder_text) = reminder {
+                        let wrapped = format!(
+                            "<ouija-status type=\"reminder\" clearing_id=\"{clearing_id}\">{reminder_text}</ouija-status>"
                         );
                         let _ = crate::tmux::locked_inject(
                             &self.app_state,
                             &state.session_id,
                             &state.pane,
-                            &msg,
+                            &wrapped,
                             vim_mode,
                         )
                         .await;
+                    } else {
+                        // Default nudge for sessions with no configured reminder.
+                        // Auto-clears so it fires exactly once per idle period.
+                        // The nudge text teaches the LLM the clearing mechanism (HATEOAS).
+                        let nudge = format!(
+                            "<ouija-status type=\"idle-check\" clearing_id=\"{clearing_id}\">You appear idle. If you are done, call ouija.clear-reminder({clearing_id}) to confirm completion. If you have pending work, continue — this nudge will not repeat until your next idle period.</ouija-status>"
+                        );
+                        let _ = crate::tmux::locked_inject(
+                            &self.app_state,
+                            &state.session_id,
+                            &state.pane,
+                            &nudge,
+                            vim_mode,
+                        )
+                        .await;
+                        state.reminder_cleared = true;
+                    }
+
+                    // Append pending reply info with per-message format
+                    if !pending.is_empty() {
+                        tracing::info!(
+                            session = %state.session_id,
+                            count = pending.len(),
+                            "reminding about unanswered pending replies"
+                        );
+                        for p in &pending {
+                            let msg = format!(
+                                "<ouija-status type=\"reminder\" clearing_id=\"{clearing_id}\">Pending reply owed: msg #{} from {}</ouija-status>",
+                                p.msg_id, p.from
+                            );
+                            let _ = crate::tmux::locked_inject(
+                                &self.app_state,
+                                &state.session_id,
+                                &state.pane,
+                                &msg,
+                                vim_mode,
+                            )
+                            .await;
+                        }
                     }
                 }
             }
@@ -605,6 +653,67 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
         assert!(!handle.is_finished());
+        actor.stop(None);
+        handle.await.expect("actor failed");
+    }
+
+    #[test]
+    fn agent_state_starts_reminder_not_cleared() {
+        let state = SessionAgentState::new("test-sess".into(), "%1".into());
+        assert!(!state.reminder_cleared);
+        assert_eq!(state.next_clearing_id, 0);
+    }
+
+    #[tokio::test]
+    async fn active_resets_reminder_cleared() {
+        let state = crate::state::AppState::new_for_test();
+        let agent = SessionAgent {
+            app_state: state.clone(),
+        };
+        let args = SessionAgentArgs {
+            session_id: "test-clear".into(),
+            pane: "%99".into(),
+        };
+        state.settings.write().await.idle_timeout_secs = 60;
+
+        let (actor, handle) = Actor::spawn(None, agent, args).await.expect("spawn failed");
+
+        actor
+            .cast(SessionMsg::ClearReminder { clearing_id: 1 })
+            .expect("send");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        actor.cast(SessionMsg::Active).expect("send");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(!handle.is_finished());
+
+        actor.stop(None);
+        handle.await.expect("actor failed");
+    }
+
+    #[tokio::test]
+    async fn clear_reminder_wrong_id_ignored() {
+        let state = crate::state::AppState::new_for_test();
+        let agent = SessionAgent {
+            app_state: state.clone(),
+        };
+        let args = SessionAgentArgs {
+            session_id: "test-wrong-id".into(),
+            pane: "%99".into(),
+        };
+        state.settings.write().await.idle_timeout_secs = 60;
+
+        let (actor, handle) = Actor::spawn(None, agent, args).await.expect("spawn failed");
+
+        // clearing_id 999 doesn't match next_clearing_id (0), should be ignored
+        actor
+            .cast(SessionMsg::ClearReminder { clearing_id: 999 })
+            .expect("send");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(!handle.is_finished());
+
         actor.stop(None);
         handle.await.expect("actor failed");
     }

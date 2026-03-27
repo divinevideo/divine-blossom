@@ -58,6 +58,24 @@ Information reaches the LLM at three levels:
 
 Level 1 helps recognize. Level 2 orients. Level 3 directs. Don't bleed between levels — if you're putting step-specific detail in registration instructions, move it to a runtime response.
 
+### What belongs in registration instructions (Level 2)
+
+Registration instructions orient the LLM to the workflow rhythm. They should contain:
+
+- **How to interact** — call `ouija.workflow()`, follow what it says, call `ouija.workflow('init')` after any restart
+- **Constraints** — what NOT to do (don't push to origin, don't create PRs manually, don't modify labels)
+- **Identity** — your role, what you're here to do
+
+They should NOT contain:
+
+- **Tool usage** — how to use git, how to run tests, what commands to type. The workflow response provides exact commands when needed (Level 3). If the LLM needs to run `git -C /path checkout -b branch`, the workflow tells it at the right moment with the right paths.
+- **Process steps** — what happens after planning, what the review flow looks like. Progressive disclosure handles this — the LLM doesn't need a process map.
+- **Conventions** — branch naming, commit message format, PR templates. The workflow embeds these in its responses.
+
+The reason: the workflow is deterministic code. Determinism belongs in code, not in prompts. When you put `git push forgejo {branch}` in registration instructions, the LLM memorizes it and may use it at the wrong time, with the wrong branch, or after CWD drift changes its working directory. When the workflow response says `git -C /exact/path push forgejo exact-branch`, there's no ambiguity.
+
+This also keeps registration instructions small. A 5-line instruction set that says "call `ouija.workflow('init')`, do what it says, here's what NOT to do" consumes less context than a 50-line manual that duplicates what the workflow already controls.
+
 ## How it works
 
 ### Protocol
@@ -242,6 +260,24 @@ The LLM calls `ouija.workflow('complete')` twice. First call does the fast part 
 
 If a workflow returns the wrong response (e.g. reviewer instructions to a worker), the LLM will often "work around it" — using other tools like `ouija.send` instead of workflow actions, or interpreting instructions creatively. This makes bugs hard to detect. Always verify the state file during testing to confirm sessions are in the expected states, not just that the end result looks correct.
 
+### Use explicit paths in all commands (CWD drift)
+
+After context compaction, the LLM's working directory can silently shift — from a git worktree back to the main repo, for example. If your workflow response says "run `git push forgejo branch`", the LLM runs it in whatever directory it thinks it's in, which may be wrong.
+
+Fix: embed explicit paths in every command your workflow returns. The workflow knows `project_dir` from registration params — use it:
+
+```python
+def handle_init(self, ctx, params):
+    project_dir = ctx.session_params[ctx.session_id]["project_dir"]
+    branch = f"{ctx.data['task_branch']}-work-1"
+    return self.respond(
+        f"Create your branch:\n"
+        f"```\ngit -C {project_dir} checkout -b {branch} {ctx.data['task_branch']}\n```"
+    )
+```
+
+This applies to git, cargo, npm, file reads — anything that depends on CWD. The cost is slightly longer responses; the benefit is commands that work regardless of LLM state.
+
 ### Expand tilde paths before sending to the REST API
 
 `project_dir: "~/code/foo"` fails silently — the daemon passes the literal `~` to the OS. Always expand paths:
@@ -298,6 +334,91 @@ Asking the LLM to kill its own session is unreliable. It sometimes ignores `keep
 ### Synchronous spawning from a workflow call will timeout
 
 `ouija.start` is async (returns 202). If a workflow action tries to spawn a session and wait for it to be ready in the same call, it will hit the daemon's tool timeout. Always spawn-and-continue: spawn in one action, check readiness in the next. The retry-after pattern handles this naturally.
+
+## Migrating from loop_next
+
+`ouija.loop-next` is deprecated. Workflows provide the same iteration capability with added
+structure: state management, verification criteria, effort budgets, and multi-session coordination.
+
+### Before (loop_next)
+
+```
+ouija.start(
+  name: "migrator",
+  prompt: "Find the next .js file in src/ not yet converted to .ts. Convert it, run tests, commit.",
+  reminder: "Call ouija.loop-next('converted X.js'). If no .js files remain, ouija.send(done=true)."
+)
+```
+
+The LLM manages its own state, decides when to stop, and has no verification step.
+
+### After (workflow)
+
+```python
+#!/usr/bin/env python3
+# migrate-workflow.py
+import json, sys, glob, os
+
+STATE_FILE = "/tmp/migrate-state.json"
+
+def load_state():
+    if os.path.exists(STATE_FILE):
+        return json.load(open(STATE_FILE))
+    return {"converted": []}
+
+def save_state(state):
+    json.dump(state, open(STATE_FILE, "w"))
+
+req = json.load(sys.stdin)
+
+if req.get("event") == "register":
+    json.dump({
+        "instructions": "You convert .js files to .ts. Follow the workflow for each file.",
+        "max_calls": 200,
+    }, sys.stdout)
+    sys.exit(0)
+
+state = load_state()
+action = req.get("action", "init")
+js_files = sorted(set(glob.glob("src/**/*.js", recursive=True)) - set(state["converted"]))
+
+if action == "init":
+    if not js_files:
+        json.dump({"message": "All files converted! Call ouija.send(done=true)."}, sys.stdout)
+    else:
+        json.dump({
+            "message": f"Convert `{js_files[0]}` to TypeScript. Run tests. Then call ouija.workflow('done', {{file: '{js_files[0]}'}}).",
+            "verify": "Tests pass and the .js file has been replaced with .ts",
+        }, sys.stdout)
+elif action == "done":
+    converted = req.get("params", {}).get("file")
+    if converted:
+        state["converted"].append(converted)
+        save_state(state)
+    remaining = len(js_files) - (1 if converted in js_files else 0)
+    json.dump({"message": f"Recorded. {remaining} files remain. Call ouija.workflow('init') for the next file."}, sys.stdout)
+
+sys.exit(0)
+```
+
+```
+ouija.start(
+  name: "migrator",
+  workflow: "migrate-workflow.py",
+  project_dir: "/code/my-project"
+)
+```
+
+### Key differences
+
+| | loop_next | workflow |
+|---|---|---|
+| State management | LLM remembers (or doesn't) | External file, survives restarts |
+| Verification | None | `verify` field with criteria |
+| Effort budget | Unbounded | `max_calls` limit |
+| Coordination | Single session only | Can spawn/manage multiple sessions |
+| Context resets | Manual `clean_context=true` | Workflow handles via `init` action |
+| Progress tracking | Iteration counter only | Arbitrary state in workflow |
 
 ## Writing workflows
 

@@ -39,7 +39,7 @@ Sessions auto-register using the working directory name (e.g. `/code/api` become
 
 **Long-running work.** Three mechanisms for recurring work, from simple to structured:
 
-- **Loops** (`ouija.loop-next`) -- the session drives itself. Good for migrations, simple iteration. Each call logs an iteration; `clean_context=true` restarts with a fresh conversation seeded by the same prompt.
+- **Loops** (`ouija.loop-next`, legacy) -- the session drives itself. Simple but limited — no state management, verification, or coordination. Still works for quick one-off migrations; prefer **workflows** for new work.
 - **Tasks** (cron) -- the daemon drives the session. Good for periodic checks, daily reports, scheduled maintenance. If the target session is dead, the daemon revives it with the task's prompt + reminder.
 - **Workflows** -- a deterministic program drives the session. Good for multi-phase processes, optimization loops, coordinated multi-session work. The LLM calls an `ouija.workflow()` tool; the program controls state, verification, and progression.
 
@@ -52,6 +52,8 @@ ouija.start(
   reminder: "Call ouija.loop-next('converted X.js'). If no .js files remain, ouija.send(done=true)."
 )
 ```
+
+> **Note:** Loops are the legacy approach. For new long-running work, use workflows — they provide state management, verification criteria, effort budgets, and multi-session coordination. See [migrating from loops](docs/workflows.md#migrating-from-loopnext) below.
 
 **Workflow actors** attach an external executable (Python, bash, anything) to a session. The program manages state, runs verification, and tells the LLM what to do — one step at a time. The LLM doesn't see the full process; each `ouija.workflow()` response reveals only the current step and what to call next, like [HATEOAS](https://en.wikipedia.org/wiki/HATEOAS) for an LLM:
 
