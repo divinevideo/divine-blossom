@@ -31,6 +31,9 @@ wasip2 = "=1.0.1"
 # Cryptography - AWS v4 signing for GCS
 hmac = "0.12"
 
+# Logging - structured log facade
+log = "0.4"
+
 # Encoding
 hex = "0.4"
 base64 = "0.22"

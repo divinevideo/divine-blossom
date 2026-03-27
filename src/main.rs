@@ -5,6 +5,7 @@ mod admin;
 mod auth;
 mod blossom;
 mod error;
+mod logging;
 mod metadata;
 mod storage;
 
@@ -53,10 +54,25 @@ const SUBTITLE_MAX_ATTEMPTS: u32 = 3;
 /// Entry point
 #[fastly::main]
 fn main(req: Request) -> std::result::Result<Response, Error> {
-    match handle_request(req) {
-        Ok(resp) => Ok(resp),
-        Err(e) => Ok(error_response(&e)),
-    }
+    logging::init();
+
+    let method = req.get_method().to_string();
+    let path = req.get_path().to_string();
+    let start = SystemTime::now();
+
+    let (resp, error_msg) = match handle_request(req) {
+        Ok(resp) => (resp, None),
+        Err(e) => {
+            let msg = e.message().to_string();
+            (error_response(&e), Some(msg))
+        }
+    };
+
+    let status = resp.get_status().as_u16();
+    let duration_ms = start.elapsed().map(|d| d.as_millis()).unwrap_or(0);
+    logging::log_request(&method, &path, status, duration_ms, error_msg.as_deref());
+
+    Ok(resp)
 }
 
 /// Route and handle the request
