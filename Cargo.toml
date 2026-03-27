@@ -7,7 +7,7 @@ description = "Cross-machine AI session daemon — bridges Claude Code sessions 
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/dcadenas/ouija"
-keywords = ["claude", "mcp", "tmux", "nostr", "ai"]
+keywords = ["claude", "tmux", "nostr", "ai", "workflow"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = [
     ".claude/",
@@ -23,7 +23,6 @@ exclude = [
 ]
 
 [dependencies]
-rmcp = { version = "0.16", features = ["server", "macros", "transport-streamable-http-server"] }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }

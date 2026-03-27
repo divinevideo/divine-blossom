@@ -1,31 +1,16 @@
 use axum::Router;
 use axum::routing::{delete, get, post};
-use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
-};
 use tokio::net::TcpListener;
 
-use crate::mcp::OuijaMcp;
 use crate::state::SharedState;
 use crate::{admin, api, hooks};
 
-/// Start the HTTP/MCP server on the configured port.
+/// Start the HTTP server on the configured port.
 pub async fn run(state: SharedState) -> anyhow::Result<()> {
     let port = state.config.port;
     let name = state.config.name.clone();
 
-    let mcp_state = state.clone();
-    let mcp_service = StreamableHttpService::new(
-        move || Ok(OuijaMcp::new(mcp_state.clone())),
-        LocalSessionManager::default().into(),
-        StreamableHttpServerConfig {
-            stateful_mode: false,
-            ..Default::default()
-        },
-    );
-
     let app = Router::new()
-        .nest_service("/mcp", mcp_service)
         .route("/", get(admin::dashboard))
         .route("/admin", get(admin::dashboard))
         .route("/api/status", get(api::status))
@@ -99,7 +84,6 @@ pub async fn run(state: SharedState) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     println!("ouija daemon '{name}' listening on http://localhost:{port}");
     tracing::info!("ouija daemon '{name}' listening on {addr}");
-    tracing::info!("  MCP: http://localhost:{port}/mcp");
     axum::serve(listener, app).await?;
 
     Ok(())
