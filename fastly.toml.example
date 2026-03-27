@@ -36,6 +36,10 @@ language = "rust"
     [local_server.backends.funnelcake_api]
     url = "https://relay.divine.video"
 
+  # Log endpoint for persistent application logs (writes to stderr in local dev)
+  [local_server.log_endpoints]
+    app_logs = "%h %l %u %t \"%r\" %>s %b"
+
   [local_server.kv_stores]
 
     [local_server.kv_stores.blossom_metadata]
@@ -110,6 +114,16 @@ language = "rust"
     description = "Funnelcake permission API"
     address = "relay.divine.video"
     port = 443
+
+  [setup.log_endpoints]
+
+    # GCS logging endpoint — configure via Fastly dashboard or API:
+    #   fastly logging gcs create --name app_logs --bucket divine-blossom-logs \
+    #     --user <service-account-email> --secret-key <JSON key> \
+    #     --path "/logs/" --period 60 --gzip-level 9 \
+    #     --message-type blank --service-id $FASTLY_SERVICE_ID --version latest
+    [setup.log_endpoints.app_logs]
+    description = "Persistent application logs (GCS)"
 
   [setup.kv_stores]
 

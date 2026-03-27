@@ -40,6 +40,9 @@ language = "rust"
     [local_server.backends.funnelcake_api]
     url = "http://localhost:9000"
 
+  [local_server.log_endpoints]
+    app_logs = "%h %l %u %t \"%r\" %>s %b"
+
   [local_server.kv_stores]
 
     [local_server.kv_stores.blossom_metadata]
