@@ -54,6 +54,8 @@ thiserror = "1"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sentry = { version = "0.31.8", features = ["tracing"] }
+uuid = "=1.12.1"
 
 [profile.release]
 lto = true

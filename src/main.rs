@@ -27,9 +27,10 @@ use crate::metadata::{
     get_audio_mapping, get_audio_source_refs, get_auth_event, get_blob_metadata, get_blob_refs,
     get_subtitle_job, get_subtitle_job_by_hash, get_tombstone, get_user_blobs,
     list_blobs_with_metadata, put_audio_mapping, put_auth_event, put_blob_metadata,
-    put_subtitle_job, remove_from_audio_source_refs, remove_from_blob_refs,
+    put_subtitle_job, put_tombstone, remove_from_audio_source_refs, remove_from_blob_refs,
     remove_from_recent_index, remove_from_user_index, remove_from_user_list,
     set_subtitle_job_id_for_hash, update_blob_status, update_stats_on_add, update_stats_on_remove,
+    TranscodeMetadataUpdate,
     TranscriptMetadataUpdate,
 };
 use crate::storage::{
@@ -58,6 +59,8 @@ const MAX_UPLOAD_SIZE: u64 = 50 * 1024 * 1024 * 1024;
 const DIVINE_UPLOAD_EXTENSION_RESUMABLE: &str = "resumable-sessions";
 /// Max automatic subtitle transcription attempts before poison state.
 const SUBTITLE_MAX_ATTEMPTS: u32 = 3;
+/// Max derivative failures before public endpoints stop re-triggering work.
+const DERIVATIVE_MAX_ATTEMPTS: u32 = 3;
 
 /// Entry point
 #[fastly::main]
@@ -675,22 +678,40 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
 
             Ok(resp)
         }
-        Err(_) => {
+        Err(BlossomError::NotFound(_)) => {
             // HLS not in GCS — check metadata and trigger transcoding if needed
             let meta = metadata.as_ref().unwrap();
-            match meta.transcode_status {
-                Some(TranscodeStatus::Processing) => {
+            match decide_transcode_fetch_action(
+                meta.transcode_status,
+                meta.transcode_retry_after,
+                meta.transcode_attempt_count,
+                meta.transcode_terminal,
+                unix_timestamp_secs(),
+            ) {
+                TranscodeFetchAction::Accepted {
+                    state,
+                    retry_after_secs,
+                } => {
                     let mut resp = Response::from_status(StatusCode::ACCEPTED);
-                    resp.set_header("Retry-After", "5");
+                    resp.set_header("Retry-After", retry_after_secs.to_string());
                     resp.set_header("Content-Type", "application/json");
-                    resp.set_body(
-                        r#"{"status":"processing","message":"HLS transcoding in progress"}"#,
-                    );
+                    let body = match state {
+                        TranscriptPendingState::InProgress => {
+                            r#"{"status":"processing","message":"HLS transcoding in progress"}"#
+                        }
+                        TranscriptPendingState::CoolingDown => {
+                            r#"{"status":"cooling_down","message":"HLS transcoding cooling down before retry"}"#
+                        }
+                    };
+                    resp.set_body(body);
                     add_no_cache_headers(&mut resp);
                     add_cors_headers(&mut resp);
                     Ok(resp)
                 }
-                _ => {
+                TranscodeFetchAction::Trigger {
+                    retry_after_secs,
+                    should_repair,
+                } => {
                     // Pending, Failed, Complete-but-missing, or None — trigger transcoding
                     use crate::metadata::update_transcode_status;
                     if let Err(e) = update_transcode_status(&hash, TranscodeStatus::Processing) {
@@ -699,15 +720,29 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
                     let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
 
                     let mut resp = Response::from_status(StatusCode::ACCEPTED);
-                    resp.set_header("Retry-After", "10");
+                    resp.set_header("Retry-After", retry_after_secs.to_string());
                     resp.set_header("Content-Type", "application/json");
-                    resp.set_body(r#"{"status":"processing","message":"HLS transcoding started, please retry in 10 seconds"}"#);
+                    if should_repair {
+                        resp.set_body(
+                            r#"{"status":"repairing","message":"HLS transcoding repair started, please retry soon"}"#,
+                        );
+                    } else {
+                        resp.set_body(
+                            r#"{"status":"processing","message":"HLS transcoding started, please retry soon"}"#,
+                        );
+                    }
                     add_no_cache_headers(&mut resp);
                     add_cors_headers(&mut resp);
                     Ok(resp)
                 }
+                TranscodeFetchAction::Terminal => Ok(derivative_failure_response(
+                    meta.transcode_error_code.as_deref(),
+                    meta.transcode_error_message.as_deref(),
+                    "HLS generation failed for this blob",
+                )),
             }
         }
+        Err(e) => Err(e),
     }
 }
 
@@ -750,16 +785,32 @@ fn handle_head_hls_master(path: &str) -> Result<Response> {
             add_cors_headers(&mut resp);
             Ok(resp)
         }
-        Err(_) => match metadata.transcode_status {
-            Some(TranscodeStatus::Processing) => {
+        Err(BlossomError::NotFound(_)) => match decide_transcode_fetch_action(
+            metadata.transcode_status,
+            metadata.transcode_retry_after,
+            metadata.transcode_attempt_count,
+            metadata.transcode_terminal,
+            unix_timestamp_secs(),
+        ) {
+            TranscodeFetchAction::Accepted {
+                retry_after_secs, ..
+            }
+            | TranscodeFetchAction::Trigger {
+                retry_after_secs, ..
+            } => {
                 let mut resp = Response::from_status(StatusCode::ACCEPTED);
-                resp.set_header("Retry-After", "5");
+                resp.set_header("Retry-After", retry_after_secs.to_string());
                 add_no_cache_headers(&mut resp);
                 add_cors_headers(&mut resp);
                 Ok(resp)
             }
-            _ => Err(BlossomError::NotFound("HLS not available".into())),
+            TranscodeFetchAction::Terminal => Ok(derivative_failure_head_response(
+                &hash,
+                metadata.transcode_error_code.as_deref(),
+                "application/vnd.apple.mpegurl",
+            )),
         },
+        Err(e) => Err(e),
     }
 }
 
@@ -848,65 +899,62 @@ fn handle_get_hls_content(req: Request, path: &str) -> Result<Response> {
             let metadata = get_blob_metadata(&hash)?;
 
             if let Some(ref meta) = metadata {
-                match meta.transcode_status {
-                    Some(TranscodeStatus::Complete) => {
-                        // Metadata says complete but file not in GCS - re-trigger
-                        eprintln!("[HLS] master.m3u8 not found in GCS for {} despite Complete status, re-triggering", hash);
+                match decide_transcode_fetch_action(
+                    meta.transcode_status,
+                    meta.transcode_retry_after,
+                    meta.transcode_attempt_count,
+                    meta.transcode_terminal,
+                    unix_timestamp_secs(),
+                ) {
+                    TranscodeFetchAction::Accepted {
+                        state,
+                        retry_after_secs,
+                    } => {
+                        let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                        resp.set_header("Retry-After", retry_after_secs.to_string());
+                        resp.set_header("Content-Type", "application/json");
+                        let body = match state {
+                            TranscriptPendingState::InProgress => {
+                                r#"{"status":"processing","message":"HLS transcoding in progress"}"#
+                            }
+                            TranscriptPendingState::CoolingDown => {
+                                r#"{"status":"cooling_down","message":"HLS transcoding cooling down before retry"}"#
+                            }
+                        };
+                        resp.set_body(body);
+                        add_no_cache_headers(&mut resp);
+                        add_cors_headers(&mut resp);
+                        Ok(resp)
+                    }
+                    TranscodeFetchAction::Trigger {
+                        retry_after_secs,
+                        should_repair,
+                    } => {
                         use crate::metadata::update_transcode_status;
                         let _ = update_transcode_status(&hash, TranscodeStatus::Processing);
                         let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
 
                         let mut resp = Response::from_status(StatusCode::ACCEPTED);
-                        resp.set_header("Retry-After", "10");
+                        resp.set_header("Retry-After", retry_after_secs.to_string());
                         resp.set_header("Content-Type", "application/json");
-                        resp.set_body(r#"{"status":"processing","message":"HLS transcoding re-triggered, please retry"}"#);
-                        add_no_cache_headers(&mut resp);
-                        add_cors_headers(&mut resp);
-                        Ok(resp)
-                    }
-                    Some(TranscodeStatus::Processing) => {
-                        let mut resp = Response::from_status(StatusCode::ACCEPTED);
-                        resp.set_header("Retry-After", "5");
-                        resp.set_header("Content-Type", "application/json");
-                        resp.set_body(
-                            r#"{"status":"processing","message":"HLS transcoding in progress"}"#,
-                        );
-                        add_no_cache_headers(&mut resp);
-                        add_cors_headers(&mut resp);
-                        Ok(resp)
-                    }
-                    Some(TranscodeStatus::Failed) => {
-                        // Failed previously - re-trigger
-                        eprintln!("[HLS] Re-triggering failed transcode for {}", hash);
-                        use crate::metadata::update_transcode_status;
-                        let _ = update_transcode_status(&hash, TranscodeStatus::Processing);
-                        let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
-
-                        let mut resp = Response::from_status(StatusCode::ACCEPTED);
-                        resp.set_header("Retry-After", "10");
-                        resp.set_header("Content-Type", "application/json");
-                        resp.set_body(r#"{"status":"processing","message":"HLS transcoding re-started, please retry"}"#);
-                        add_no_cache_headers(&mut resp);
-                        add_cors_headers(&mut resp);
-                        Ok(resp)
-                    }
-                    Some(TranscodeStatus::Pending) | None => {
-                        // Not yet started - trigger on-demand transcoding
-                        use crate::metadata::update_transcode_status;
-                        if let Err(e) = update_transcode_status(&hash, TranscodeStatus::Processing)
-                        {
-                            eprintln!("[HLS] Failed to update transcode status: {}", e);
+                        if should_repair {
+                            resp.set_body(
+                                r#"{"status":"repairing","message":"HLS transcoding repair started, please retry soon"}"#,
+                            );
+                        } else {
+                            resp.set_body(
+                                r#"{"status":"processing","message":"HLS transcoding started, please retry soon"}"#,
+                            );
                         }
-                        let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
-
-                        let mut resp = Response::from_status(StatusCode::ACCEPTED);
-                        resp.set_header("Retry-After", "10");
-                        resp.set_header("Content-Type", "application/json");
-                        resp.set_body(r#"{"status":"processing","message":"HLS transcoding started, please retry in 10 seconds"}"#);
                         add_no_cache_headers(&mut resp);
                         add_cors_headers(&mut resp);
                         Ok(resp)
                     }
+                    TranscodeFetchAction::Terminal => Ok(derivative_failure_response(
+                        meta.transcode_error_code.as_deref(),
+                        meta.transcode_error_message.as_deref(),
+                        "HLS generation failed for this blob",
+                    )),
                 }
             } else {
                 Err(BlossomError::NotFound("Content not found".into()))
@@ -937,7 +985,8 @@ fn handle_head_hls_content(path: &str) -> Result<Response> {
     let hash_lower = hash.to_lowercase();
 
     // Check moderation status — HEAD has no auth, so block both banned and restricted
-    if let Ok(Some(ref meta)) = get_blob_metadata(&hash_lower) {
+    let metadata = get_blob_metadata(&hash_lower)?;
+    if let Some(ref meta) = metadata {
         if meta.status == BlobStatus::Banned || meta.status == BlobStatus::Restricted {
             return Err(BlossomError::NotFound("Content not found".into()));
         }
@@ -946,9 +995,6 @@ fn handle_head_hls_content(path: &str) -> Result<Response> {
     // Check if file exists in GCS
     let gcs_path = format!("{}/hls/{}", hash_lower, filename);
 
-    // Try to get the content (HEAD-like check)
-    download_hls_content(&gcs_path, None)?;
-
     let content_type = if filename.ends_with(".m3u8") {
         "application/vnd.apple.mpegurl"
     } else if filename.ends_with(".ts") {
@@ -956,14 +1002,47 @@ fn handle_head_hls_content(path: &str) -> Result<Response> {
     } else {
         "application/octet-stream"
     };
-
-    let mut resp = Response::from_status(StatusCode::OK);
-    resp.set_header("Content-Type", content_type);
-    add_cache_headers(&mut resp, &hash_lower);
-    resp.set_header("X-Sha256", &hash_lower);
-    add_cors_headers(&mut resp);
-
-    Ok(resp)
+    match download_hls_content(&gcs_path, None) {
+        Ok(_) => {
+            let mut resp = Response::from_status(StatusCode::OK);
+            resp.set_header("Content-Type", content_type);
+            add_cache_headers(&mut resp, &hash_lower);
+            resp.set_header("X-Sha256", &hash_lower);
+            add_cors_headers(&mut resp);
+            Ok(resp)
+        }
+        Err(BlossomError::NotFound(_)) if filename == "master.m3u8" => {
+            let meta = metadata
+                .as_ref()
+                .ok_or_else(|| BlossomError::NotFound("Content not found".into()))?;
+            match decide_transcode_fetch_action(
+                meta.transcode_status,
+                meta.transcode_retry_after,
+                meta.transcode_attempt_count,
+                meta.transcode_terminal,
+                unix_timestamp_secs(),
+            ) {
+                TranscodeFetchAction::Accepted {
+                    retry_after_secs, ..
+                }
+                | TranscodeFetchAction::Trigger {
+                    retry_after_secs, ..
+                } => {
+                    let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                    resp.set_header("Retry-After", retry_after_secs.to_string());
+                    add_no_cache_headers(&mut resp);
+                    add_cors_headers(&mut resp);
+                    Ok(resp)
+                }
+                TranscodeFetchAction::Terminal => Ok(derivative_failure_head_response(
+                    &hash_lower,
+                    meta.transcode_error_code.as_deref(),
+                    content_type,
+                )),
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Download HLS content from GCS (with POP-local Simple Cache for non-range requests)
@@ -1094,6 +1173,18 @@ fn purge_transcript_content_cache(hash: &str) {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedTranscodeStatusWebhook {
+    sha256: String,
+    status: TranscodeStatus,
+    new_size: Option<u64>,
+    dim: Option<String>,
+    error_code: Option<String>,
+    error_message: Option<String>,
+    retry_after_epoch_secs: Option<u64>,
+    terminal: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedTranscriptStatusWebhook {
     sha256: String,
     status: TranscriptStatus,
@@ -1104,6 +1195,7 @@ struct ParsedTranscriptStatusWebhook {
     error_code: Option<String>,
     error_message: Option<String>,
     retry_after_epoch_secs: Option<u64>,
+    terminal: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1122,6 +1214,20 @@ enum TranscriptFetchAction {
         retry_after_secs: u64,
         should_repair: bool,
     },
+    Terminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscodeFetchAction {
+    Accepted {
+        state: TranscriptPendingState,
+        retry_after_secs: u64,
+    },
+    Trigger {
+        retry_after_secs: u64,
+        should_repair: bool,
+    },
+    Terminal,
 }
 
 fn parse_optional_retry_after_epoch(
@@ -1134,6 +1240,57 @@ fn parse_optional_retry_after_epoch(
             .and_then(|value| value.parse().ok())
     })?;
     Some(now_epoch_secs.saturating_add(retry_after_secs))
+}
+
+fn parse_optional_bool(payload: &serde_json::Value, field: &str) -> Option<bool> {
+    payload[field]
+        .as_bool()
+        .or_else(|| payload[field].as_str().and_then(|value| value.parse().ok()))
+}
+
+fn parse_transcode_status_webhook_payload(
+    payload: &serde_json::Value,
+    now_epoch_secs: u64,
+) -> Result<ParsedTranscodeStatusWebhook> {
+    let sha256 = payload["sha256"]
+        .as_str()
+        .ok_or_else(|| BlossomError::BadRequest("Missing 'sha256' field".into()))?
+        .to_string();
+
+    let status_str = payload["status"]
+        .as_str()
+        .ok_or_else(|| BlossomError::BadRequest("Missing 'status' field".into()))?;
+
+    let status = match status_str.to_lowercase().as_str() {
+        "pending" => TranscodeStatus::Pending,
+        "processing" => TranscodeStatus::Processing,
+        "complete" | "completed" => TranscodeStatus::Complete,
+        "failed" | "error" => TranscodeStatus::Failed,
+        _ => {
+            return Err(BlossomError::BadRequest(format!(
+                "Unknown status: {}. Expected pending, processing, complete, or failed",
+                status_str
+            )));
+        }
+    };
+
+    let display_width = payload["display_width"].as_u64().map(|v| v as u32);
+    let display_height = payload["display_height"].as_u64().map(|v| v as u32);
+    let dim = match (display_width, display_height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => Some(format!("{}x{}", w, h)),
+        _ => None,
+    };
+
+    Ok(ParsedTranscodeStatusWebhook {
+        sha256,
+        status,
+        new_size: payload["new_size"].as_u64(),
+        dim,
+        error_code: payload["error_code"].as_str().map(|s| s.to_string()),
+        error_message: payload["error_message"].as_str().map(|s| s.to_string()),
+        retry_after_epoch_secs: parse_optional_retry_after_epoch(payload, now_epoch_secs),
+        terminal: parse_optional_bool(payload, "terminal").unwrap_or(false),
+    })
 }
 
 fn parse_transcript_status_webhook_payload(
@@ -1172,14 +1329,24 @@ fn parse_transcript_status_webhook_payload(
         error_code: payload["error_code"].as_str().map(|s| s.to_string()),
         error_message: payload["error_message"].as_str().map(|s| s.to_string()),
         retry_after_epoch_secs: parse_optional_retry_after_epoch(payload, now_epoch_secs),
+        terminal: parse_optional_bool(payload, "terminal").unwrap_or(false),
     })
 }
 
 fn decide_transcript_fetch_action(
     status: Option<TranscriptStatus>,
     retry_after_epoch_secs: Option<u64>,
+    attempt_count: u32,
+    terminal: bool,
     now_epoch_secs: u64,
 ) -> TranscriptFetchAction {
+    if terminal
+        || (matches!(status, Some(TranscriptStatus::Failed))
+            && attempt_count >= DERIVATIVE_MAX_ATTEMPTS)
+    {
+        return TranscriptFetchAction::Terminal;
+    }
+
     if matches!(status, Some(TranscriptStatus::Processing)) {
         return TranscriptFetchAction::Accepted {
             state: TranscriptPendingState::InProgress,
@@ -1200,6 +1367,75 @@ fn decide_transcript_fetch_action(
         retry_after_secs: 10,
         should_repair: matches!(status, Some(TranscriptStatus::Complete)),
     }
+}
+
+fn decide_transcode_fetch_action(
+    status: Option<TranscodeStatus>,
+    retry_after_epoch_secs: Option<u64>,
+    attempt_count: u32,
+    terminal: bool,
+    now_epoch_secs: u64,
+) -> TranscodeFetchAction {
+    if terminal
+        || (matches!(status, Some(TranscodeStatus::Failed))
+            && attempt_count >= DERIVATIVE_MAX_ATTEMPTS)
+    {
+        return TranscodeFetchAction::Terminal;
+    }
+
+    if matches!(status, Some(TranscodeStatus::Processing)) {
+        return TranscodeFetchAction::Accepted {
+            state: TranscriptPendingState::InProgress,
+            retry_after_secs: 5,
+        };
+    }
+
+    if let Some(retry_after_epoch_secs) = retry_after_epoch_secs {
+        if retry_after_epoch_secs > now_epoch_secs {
+            return TranscodeFetchAction::Accepted {
+                state: TranscriptPendingState::CoolingDown,
+                retry_after_secs: retry_after_epoch_secs.saturating_sub(now_epoch_secs).max(1),
+            };
+        }
+    }
+
+    TranscodeFetchAction::Trigger {
+        retry_after_secs: 10,
+        should_repair: matches!(status, Some(TranscodeStatus::Complete)),
+    }
+}
+
+fn derivative_failure_response(
+    error_code: Option<&str>,
+    error_message: Option<&str>,
+    default_message: &str,
+) -> Response {
+    let body = serde_json::json!({
+        "status": "failed",
+        "error_code": error_code.unwrap_or("derivative_failed"),
+        "message": error_message.unwrap_or(default_message),
+        "retryable": false
+    });
+    let mut resp = json_response(StatusCode::UNPROCESSABLE_ENTITY, &body);
+    add_no_cache_headers(&mut resp);
+    add_cors_headers(&mut resp);
+    resp
+}
+
+fn derivative_failure_head_response(
+    hash: &str,
+    error_code: Option<&str>,
+    content_type: &str,
+) -> Response {
+    let mut resp = Response::from_status(StatusCode::UNPROCESSABLE_ENTITY);
+    resp.set_header("Content-Type", content_type);
+    resp.set_header("X-Sha256", hash);
+    if let Some(error_code) = error_code {
+        resp.set_header("X-Error-Code", error_code);
+    }
+    add_no_cache_headers(&mut resp);
+    add_cors_headers(&mut resp);
+    resp
 }
 
 fn serve_transcript_by_hash(
@@ -1245,6 +1481,17 @@ fn serve_transcript_by_hash(
 
     match download_transcript_content(&gcs_path) {
         Ok(mut resp) => {
+            if metadata.transcript_status != Some(TranscriptStatus::Complete) {
+                use crate::metadata::update_transcript_status;
+                let _ = update_transcript_status(
+                    hash,
+                    TranscriptStatus::Complete,
+                    TranscriptMetadataUpdate {
+                        last_attempt_at: Some(current_timestamp()),
+                        ..Default::default()
+                    },
+                );
+            }
             resp.set_header("Content-Type", "text/vtt; charset=utf-8");
             add_cache_headers(&mut resp, &hash);
             add_cors_headers(&mut resp);
@@ -1255,6 +1502,8 @@ fn serve_transcript_by_hash(
             match decide_transcript_fetch_action(
                 metadata.transcript_status,
                 metadata.transcript_retry_after,
+                metadata.transcript_attempt_count,
+                metadata.transcript_terminal,
                 unix_timestamp_secs(),
             ) {
                 TranscriptFetchAction::Accepted {
@@ -1308,6 +1557,11 @@ fn serve_transcript_by_hash(
                     add_cors_headers(&mut resp);
                     Ok(resp)
                 }
+                TranscriptFetchAction::Terminal => Ok(derivative_failure_response(
+                    metadata.transcript_error_code.as_deref(),
+                    metadata.transcript_error_message.as_deref(),
+                    "Transcript generation failed for this blob",
+                )),
             }
         }
         Err(e) => Err(e),
@@ -1356,29 +1610,52 @@ fn handle_head_transcript_by_hash(hash: &str) -> Result<Response> {
         ));
     }
 
-    match metadata.transcript_status {
-        Some(TranscriptStatus::Complete) => {
+    let gcs_path = format!("{}/vtt/main.vtt", hash);
+    match download_transcript_content(&gcs_path) {
+        Ok(_) => {
+            if metadata.transcript_status != Some(TranscriptStatus::Complete) {
+                use crate::metadata::update_transcript_status;
+                let _ = update_transcript_status(
+                    hash,
+                    TranscriptStatus::Complete,
+                    TranscriptMetadataUpdate {
+                        last_attempt_at: Some(current_timestamp()),
+                        ..Default::default()
+                    },
+                );
+            }
             let mut resp = Response::from_status(StatusCode::OK);
             resp.set_header("Content-Type", "text/vtt; charset=utf-8");
             add_cache_headers(&mut resp, hash);
             add_cors_headers(&mut resp);
             Ok(resp)
         }
-        Some(TranscriptStatus::Processing) => {
-            let mut resp = Response::from_status(StatusCode::ACCEPTED);
-            resp.set_header("Retry-After", "5");
-            add_no_cache_headers(&mut resp);
-            add_cors_headers(&mut resp);
-            Ok(resp)
-        }
-        Some(TranscriptStatus::Pending) => {
-            let mut resp = Response::from_status(StatusCode::ACCEPTED);
-            resp.set_header("Retry-After", "10");
-            add_no_cache_headers(&mut resp);
-            add_cors_headers(&mut resp);
-            Ok(resp)
-        }
-        _ => Err(BlossomError::NotFound("Transcript not available".into())),
+        Err(BlossomError::NotFound(_)) => match decide_transcript_fetch_action(
+            metadata.transcript_status,
+            metadata.transcript_retry_after,
+            metadata.transcript_attempt_count,
+            metadata.transcript_terminal,
+            unix_timestamp_secs(),
+        ) {
+            TranscriptFetchAction::Accepted {
+                retry_after_secs, ..
+            }
+            | TranscriptFetchAction::Trigger {
+                retry_after_secs, ..
+            } => {
+                let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                resp.set_header("Retry-After", retry_after_secs.to_string());
+                add_no_cache_headers(&mut resp);
+                add_cors_headers(&mut resp);
+                Ok(resp)
+            }
+            TranscriptFetchAction::Terminal => Ok(derivative_failure_head_response(
+                hash,
+                metadata.transcript_error_code.as_deref(),
+                "text/vtt; charset=utf-8",
+            )),
+        },
+        Err(e) => Err(e),
     }
 }
 
@@ -1765,7 +2042,36 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
         .mime_type
         .unwrap_or_else(|| "audio/mp4".to_string());
 
-    // 7. Store source->audio mapping and reverse refs.
+    // 7. Store audio blob metadata (so /{audio_sha256} works as normal Blossom blob)
+    // Do NOT add to user lists or recent indexes for derived blobs.
+    let audio_metadata = BlobMetadata {
+        sha256: audio_sha256.clone(),
+        size,
+        mime_type: mime_type.clone(),
+        uploaded: current_timestamp(),
+        owner: metadata.owner.clone(),
+        status: BlobStatus::Active,
+        thumbnail: None,
+        moderation: None,
+        transcode_status: None,
+        transcode_error_code: None,
+        transcode_error_message: None,
+        transcode_last_attempt_at: None,
+        transcode_retry_after: None,
+        transcode_attempt_count: 0,
+        transcode_terminal: false,
+        dim: None,
+        transcript_status: None,
+        transcript_error_code: None,
+        transcript_error_message: None,
+        transcript_last_attempt_at: None,
+        transcript_retry_after: None,
+        transcript_attempt_count: 0,
+        transcript_terminal: false,
+    };
+    let _ = put_blob_metadata(&audio_metadata);
+
+    // 8. Store source->audio mapping and reverse refs.
     let mapping = AudioMapping {
         source_sha256: hash.clone(),
         audio_sha256: audio_sha256.clone(),
@@ -2438,6 +2744,12 @@ fn handle_upload(mut req: Request) -> Result<Response> {
         } else {
             None
         },
+        transcode_error_code: None,
+        transcode_error_message: None,
+        transcode_last_attempt_at: None,
+        transcode_retry_after: None,
+        transcode_attempt_count: 0,
+        transcode_terminal: false,
         dim: None, // Set by transcoder webhook when transcoding completes
         transcript_status: if is_transcribable_mime_type(&content_type) {
             Some(TranscriptStatus::Pending)
@@ -2448,6 +2760,8 @@ fn handle_upload(mut req: Request) -> Result<Response> {
         transcript_error_message: None,
         transcript_last_attempt_at: None,
         transcript_retry_after: None,
+        transcript_attempt_count: 0,
+        transcript_terminal: false,
     };
 
     put_blob_metadata(&metadata)?;
@@ -2557,17 +2871,55 @@ fn publish_upload_service_upload(
 
     let auth_event_json = serde_json::to_string(&auth).unwrap_or_default();
 
+    // Derivative failure fields — populated when the upload service detects
+    // invalid media (corrupt container, missing moov atom, etc.) during
+    // sanitization/probing. Currently defaults to None/false since the typed
+    // upload response struct doesn't carry these yet; once the upload service
+    // is updated to return them, wire them through here.
+    let transcode_error_code: Option<String> = None;
+    let transcode_error_message: Option<String> = None;
+    let transcode_terminal = false;
+    let transcript_error_code: Option<String> = None;
+    let transcript_error_message: Option<String> = None;
+    let transcript_terminal = false;
+    let has_transcode_error = transcode_error_code.is_some();
+    let has_transcript_error = transcript_error_code.is_some();
+    let derivative_failure_recorded_at: Option<String> = None;
+
+    // Check if metadata already exists (dedupe/re-upload case)
     if let Some(mut metadata) = get_blob_metadata(&hash)? {
         let _ = add_to_user_list(&auth.pubkey, &hash);
         let _ = add_to_blob_refs(&hash, &auth.pubkey);
 
         if thumbnail_url.is_some() && metadata.thumbnail.is_none() {
-            metadata.thumbnail = thumbnail_url;
+            metadata.thumbnail = thumbnail_url.clone();
         }
+        // Even for dedupe, update dim if we got it and it wasn't set before
         if dim.is_some() && metadata.dim.is_none() {
-            metadata.dim = dim;
+            metadata.dim = dim.clone();
         }
-        if is_transcribable_mime_type(&metadata.mime_type) && metadata.transcript_status.is_none() {
+        if let Some(ref error_code) = transcode_error_code {
+            metadata.transcode_status = Some(TranscodeStatus::Failed);
+            metadata.transcode_error_code = Some(error_code.clone());
+            metadata.transcode_error_message = transcode_error_message.clone();
+            metadata.transcode_last_attempt_at = derivative_failure_recorded_at.clone();
+            metadata.transcode_retry_after = None;
+            metadata.transcode_attempt_count = metadata.transcode_attempt_count.max(1);
+            metadata.transcode_terminal = transcode_terminal;
+        } else if is_video_mime_type(&metadata.mime_type) && metadata.transcode_status.is_none() {
+            metadata.transcode_status = Some(TranscodeStatus::Pending);
+        }
+        if let Some(ref error_code) = transcript_error_code {
+            metadata.transcript_status = Some(TranscriptStatus::Failed);
+            metadata.transcript_error_code = Some(error_code.clone());
+            metadata.transcript_error_message = transcript_error_message.clone();
+            metadata.transcript_last_attempt_at = derivative_failure_recorded_at.clone();
+            metadata.transcript_retry_after = None;
+            metadata.transcript_attempt_count = metadata.transcript_attempt_count.max(1);
+            metadata.transcript_terminal = transcript_terminal;
+        } else if is_transcribable_mime_type(&metadata.mime_type)
+            && metadata.transcript_status.is_none()
+        {
             metadata.transcript_status = Some(TranscriptStatus::Pending);
         }
         let _ = put_blob_metadata(&metadata);
@@ -2587,20 +2939,46 @@ fn publish_upload_service_upload(
         thumbnail: thumbnail_url,
         moderation: None,
         transcode_status: if is_video_mime_type(&content_type) {
-            Some(TranscodeStatus::Pending)
+            if transcode_error_code.is_some() {
+                Some(TranscodeStatus::Failed)
+            } else {
+                Some(TranscodeStatus::Pending)
+            }
         } else {
             None
         },
-        dim,
+        transcode_error_code,
+        transcode_error_message,
+        transcode_last_attempt_at: derivative_failure_recorded_at.clone(),
+        transcode_retry_after: None,
+        transcode_attempt_count: if is_video_mime_type(&content_type) && has_transcode_error {
+            1
+        } else {
+            0
+        },
+        transcode_terminal,
+        dim: dim.clone(),
         transcript_status: if is_transcribable_mime_type(&content_type) {
-            Some(TranscriptStatus::Pending)
+            if transcript_error_code.is_some() {
+                Some(TranscriptStatus::Failed)
+            } else {
+                Some(TranscriptStatus::Pending)
+            }
         } else {
             None
         },
-        transcript_error_code: None,
-        transcript_error_message: None,
-        transcript_last_attempt_at: None,
+        transcript_error_code,
+        transcript_error_message,
+        transcript_last_attempt_at: derivative_failure_recorded_at,
         transcript_retry_after: None,
+        transcript_attempt_count: if is_transcribable_mime_type(&content_type)
+            && has_transcript_error
+        {
+            1
+        } else {
+            0
+        },
+        transcript_terminal,
     };
 
     put_blob_metadata(&metadata)?;
@@ -3568,6 +3946,12 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
         } else {
             None
         },
+        transcode_error_code: None,
+        transcode_error_message: None,
+        transcode_last_attempt_at: None,
+        transcode_retry_after: None,
+        transcode_attempt_count: 0,
+        transcode_terminal: false,
         dim: None, // Set by transcoder webhook when transcoding completes
         transcript_status: if is_transcribable_mime_type(&content_type) {
             Some(TranscriptStatus::Pending)
@@ -3578,6 +3962,8 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
         transcript_error_message: None,
         transcript_last_attempt_at: None,
         transcript_retry_after: None,
+        transcript_attempt_count: 0,
+        transcript_terminal: false,
     };
 
     put_blob_metadata(&metadata)?;
@@ -4007,28 +4393,17 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
     let payload: serde_json::Value = serde_json::from_str(&body)
         .map_err(|e| BlossomError::BadRequest(format!("Invalid JSON: {}", e)))?;
 
-    let sha256 = payload["sha256"]
-        .as_str()
-        .ok_or_else(|| BlossomError::BadRequest("Missing 'sha256' field".into()))?;
-
-    let status_str = payload["status"]
-        .as_str()
-        .ok_or_else(|| BlossomError::BadRequest("Missing 'status' field".into()))?;
-
-    // Optional new_size field - provided when faststart optimization replaces the original file
-    let new_size = payload["new_size"].as_u64();
-
-    // Optional display dimensions from transcoder's ffprobe
-    let display_width = payload["display_width"].as_u64().map(|v| v as u32);
-    let display_height = payload["display_height"].as_u64().map(|v| v as u32);
-    let dim = match (display_width, display_height) {
-        (Some(w), Some(h)) if w > 0 && h > 0 => Some(format!("{}x{}", w, h)),
-        _ => None,
-    };
+    let parsed = parse_transcode_status_webhook_payload(&payload, unix_timestamp_secs())?;
+    let sha256 = parsed.sha256.as_str();
 
     eprintln!(
-        "[TRANSCODE] Status webhook: sha256={}, status={}, new_size={:?}, dim={:?}",
-        sha256, status_str, new_size, dim
+        "[TRANSCODE] Status webhook: sha256={}, status={:?}, new_size={:?}, dim={:?}, error_code={:?}, terminal={}",
+        sha256,
+        parsed.status,
+        parsed.new_size,
+        parsed.dim,
+        parsed.error_code,
+        parsed.terminal
     );
 
     // Validate sha256 format
@@ -4036,45 +4411,44 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
         return Err(BlossomError::BadRequest("Invalid sha256 format".into()));
     }
 
-    // Map status string to TranscodeStatus
-    let new_status = match status_str.to_lowercase().as_str() {
-        "pending" => TranscodeStatus::Pending,
-        "processing" => TranscodeStatus::Processing,
-        "complete" | "completed" => TranscodeStatus::Complete,
-        "failed" | "error" => TranscodeStatus::Failed,
-        _ => {
-            return Err(BlossomError::BadRequest(format!(
-                "Unknown status: {}. Expected pending, processing, complete, or failed",
-                status_str
-            )));
-        }
-    };
-
     // Update transcode status (and optionally file size and dimensions if provided)
-    use crate::metadata::update_transcode_status_with_size;
-    match update_transcode_status_with_size(sha256, new_status, new_size, dim.clone()) {
+    use crate::metadata::update_transcode_status_with_metadata;
+    match update_transcode_status_with_metadata(
+        sha256,
+        parsed.status,
+        parsed.new_size,
+        parsed.dim.clone(),
+        TranscodeMetadataUpdate {
+            error_code: parsed.error_code.clone(),
+            error_message: parsed.error_message.clone(),
+            last_attempt_at: Some(current_timestamp()),
+            retry_after: parsed.retry_after_epoch_secs,
+            terminal: Some(parsed.terminal),
+            increment_attempt_count: matches!(parsed.status, TranscodeStatus::Failed),
+        },
+    ) {
         Ok(()) => {
-            if let Some(ref d) = dim {
+            if let Some(ref d) = parsed.dim {
                 eprintln!(
                     "[TRANSCODE] Updated blob {} to transcode status {:?} with dim {}",
-                    sha256, new_status, d
+                    sha256, parsed.status, d
                 );
-            } else if let Some(size) = new_size {
+            } else if let Some(size) = parsed.new_size {
                 eprintln!(
                     "[TRANSCODE] Updated blob {} to transcode status {:?} with new size {}",
-                    sha256, new_status, size
+                    sha256, parsed.status, size
                 );
             } else {
                 eprintln!(
                     "[TRANSCODE] Updated blob {} to transcode status {:?}",
-                    sha256, new_status
+                    sha256, parsed.status
                 );
             }
 
             // Purge VCL cache on transcode completion so any cached 202 is evicted
             // and clients get the actual content on next request.
             if matches!(
-                new_status,
+                parsed.status,
                 TranscodeStatus::Complete | TranscodeStatus::Failed
             ) {
                 purge_vcl_cache(sha256);
@@ -4083,7 +4457,7 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
             let response = serde_json::json!({
                 "success": true,
                 "sha256": sha256,
-                "transcode_status": format!("{:?}", new_status).to_lowercase(),
+                "transcode_status": format!("{:?}", parsed.status).to_lowercase(),
                 "message": "Transcode status updated"
             });
             let mut resp = json_response(StatusCode::OK, &response);
@@ -4174,6 +4548,8 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
             error_message: parsed.error_message.clone(),
             last_attempt_at: Some(current_timestamp()),
             retry_after: parsed.retry_after_epoch_secs,
+            terminal: Some(parsed.terminal),
+            increment_attempt_count: matches!(parsed.status, TranscriptStatus::Failed),
         },
     ) {
         Ok(()) => {
@@ -4832,14 +5208,15 @@ fn infer_mime_from_path(path: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_audio_reuse_availability, decide_transcript_fetch_action, error_response,
-        is_alias_only_audio_blob, is_quality_variant_path, parse_quality_variant_path,
+        classify_audio_reuse_availability, decide_transcode_fetch_action,
+        decide_transcript_fetch_action, error_response, is_alias_only_audio_blob,
+        is_quality_variant_path, parse_quality_variant_path,
         parse_transcript_status_webhook_payload, should_delete_derived_audio_blob,
         should_set_audio_content_length, upload_capability_headers, upload_control_host,
-        upload_exposed_headers, AudioReuseAvailability, TranscriptFetchAction,
-        TranscriptPendingState,
+        upload_exposed_headers, AudioReuseAvailability, TranscodeFetchAction,
+        TranscriptFetchAction, TranscriptPendingState,
     };
-    use crate::blossom::TranscriptStatus;
+    use crate::blossom::{TranscodeStatus, TranscriptStatus};
     use crate::error::{BlossomError, Result as BlossomResult};
     use fastly::http::StatusCode;
 
@@ -4933,7 +5310,13 @@ mod tests {
     #[test]
     fn transcript_fetch_action_cools_down_when_retry_after_is_in_future() {
         assert_eq!(
-            decide_transcript_fetch_action(Some(TranscriptStatus::Failed), Some(1_030), 1_000,),
+            decide_transcript_fetch_action(
+                Some(TranscriptStatus::Failed),
+                Some(1_030),
+                1,
+                false,
+                1_000,
+            ),
             TranscriptFetchAction::Accepted {
                 state: TranscriptPendingState::CoolingDown,
                 retry_after_secs: 30,
@@ -4944,7 +5327,13 @@ mod tests {
     #[test]
     fn transcript_fetch_action_keeps_processing_items_in_progress() {
         assert_eq!(
-            decide_transcript_fetch_action(Some(TranscriptStatus::Processing), None, 1_000,),
+            decide_transcript_fetch_action(
+                Some(TranscriptStatus::Processing),
+                None,
+                0,
+                false,
+                1_000,
+            ),
             TranscriptFetchAction::Accepted {
                 state: TranscriptPendingState::InProgress,
                 retry_after_secs: 5,
@@ -4955,7 +5344,7 @@ mod tests {
     #[test]
     fn transcript_fetch_action_triggers_pending_items_without_cooldown() {
         assert_eq!(
-            decide_transcript_fetch_action(Some(TranscriptStatus::Pending), None, 1_000,),
+            decide_transcript_fetch_action(Some(TranscriptStatus::Pending), None, 0, false, 1_000,),
             TranscriptFetchAction::Trigger {
                 retry_after_secs: 10,
                 should_repair: false,
@@ -4966,8 +5355,65 @@ mod tests {
     #[test]
     fn transcript_fetch_action_repairs_missing_vtt_for_complete_status() {
         assert_eq!(
-            decide_transcript_fetch_action(Some(TranscriptStatus::Complete), None, 1_000,),
+            decide_transcript_fetch_action(Some(TranscriptStatus::Complete), None, 0, false, 1_000,),
             TranscriptFetchAction::Trigger {
+                retry_after_secs: 10,
+                should_repair: true,
+            }
+        );
+    }
+
+    #[test]
+    fn transcript_fetch_action_retries_failed_items_under_cap() {
+        assert_eq!(
+            decide_transcript_fetch_action(Some(TranscriptStatus::Failed), None, 2, false, 1_000,),
+            TranscriptFetchAction::Trigger {
+                retry_after_secs: 10,
+                should_repair: false,
+            }
+        );
+    }
+
+    #[test]
+    fn transcript_fetch_action_stops_retrying_at_cap() {
+        assert_eq!(
+            decide_transcript_fetch_action(Some(TranscriptStatus::Failed), None, 3, false, 1_000,),
+            TranscriptFetchAction::Terminal
+        );
+    }
+
+    #[test]
+    fn transcript_fetch_action_honors_terminal_failure() {
+        assert_eq!(
+            decide_transcript_fetch_action(Some(TranscriptStatus::Failed), None, 1, true, 1_000,),
+            TranscriptFetchAction::Terminal
+        );
+    }
+
+    #[test]
+    fn transcode_fetch_action_retries_failed_items_under_cap() {
+        assert_eq!(
+            decide_transcode_fetch_action(Some(TranscodeStatus::Failed), None, 2, false, 1_000,),
+            TranscodeFetchAction::Trigger {
+                retry_after_secs: 10,
+                should_repair: false,
+            }
+        );
+    }
+
+    #[test]
+    fn transcode_fetch_action_stops_retrying_at_cap() {
+        assert_eq!(
+            decide_transcode_fetch_action(Some(TranscodeStatus::Failed), None, 3, false, 1_000,),
+            TranscodeFetchAction::Terminal
+        );
+    }
+
+    #[test]
+    fn transcode_fetch_action_repairs_missing_manifest_for_complete_status() {
+        assert_eq!(
+            decide_transcode_fetch_action(Some(TranscodeStatus::Complete), None, 0, false, 1_000,),
+            TranscodeFetchAction::Trigger {
                 retry_after_secs: 10,
                 should_repair: true,
             }

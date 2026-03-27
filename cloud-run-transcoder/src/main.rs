@@ -141,6 +141,64 @@ impl Config {
     }
 }
 
+fn init_sentry(service_name: &str) -> sentry::ClientInitGuard {
+    let environment = env::var("SENTRY_ENVIRONMENT")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let server_name = env::var("SENTRY_SERVER_NAME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| service_name.to_string());
+
+    sentry::init(sentry::ClientOptions {
+        dsn: env::var("SENTRY_DSN")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .and_then(|value| value.parse().ok()),
+        environment: environment.map(Into::into),
+        server_name: Some(server_name.into()),
+        release: sentry::release_name!(),
+        ..Default::default()
+    })
+}
+
+fn report_derivative_failure_to_sentry(
+    service: &'static str,
+    derivative: &'static str,
+    hash: &str,
+    error_code: &str,
+    error_message: &str,
+    terminal: bool,
+    content_type: Option<&str>,
+    owner: Option<&str>,
+    attempt_count: Option<u32>,
+) {
+    let fingerprint = [service, derivative, error_code];
+    sentry::with_scope(
+        |scope| {
+            scope.set_level(Some(sentry::Level::Error));
+            scope.set_fingerprint(Some(fingerprint.as_ref()));
+            scope.set_tag("service", service);
+            scope.set_tag("derivative", derivative);
+            scope.set_tag("error_code", error_code);
+            scope.set_tag("terminal", terminal.to_string());
+            if let Some(content_type) = content_type {
+                scope.set_tag("content_type", content_type);
+            }
+            scope.set_extra("sha256", serde_json::json!(hash));
+            if let Some(owner) = owner {
+                scope.set_extra("owner", serde_json::json!(owner));
+            }
+            if let Some(attempt_count) = attempt_count {
+                scope.set_extra("attempt_count", serde_json::json!(attempt_count));
+            }
+        },
+        || {
+            sentry::capture_message(error_message, sentry::Level::Error);
+        },
+    );
+}
+
 // App state shared across handlers
 struct AppState {
     gcs_client: GcsClient,
@@ -476,6 +534,8 @@ struct HealthResponse {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _sentry_guard = init_sentry("divine-transcoder");
+
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -745,8 +805,8 @@ async fn process_audio_extract(
         .output()
         .await?;
 
-    let probe_json: serde_json::Value = serde_json::from_slice(&probe_output.stdout)
-        .map_err(|_| anyhow!("not_a_video"))?;
+    let probe_json: serde_json::Value =
+        serde_json::from_slice(&probe_output.stdout).map_err(|_| anyhow!("not_a_video"))?;
 
     let streams = probe_json
         .get("streams")
@@ -884,7 +944,18 @@ async fn process_transcode(
     if check_gcs_exists(&state.gcs_client, &state.config.gcs_bucket, &master_path).await? {
         info!("HLS already exists for {}, skipping transcode", hash);
         // Still update status to complete in case it was pending (no size change for already-transcoded)
-        send_status_webhook(&state.config, &hash, "complete", None, None).await;
+        send_status_webhook(
+            &state.config,
+            &hash,
+            "complete",
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await;
         return Ok(TranscodeResponse {
             hash: hash.clone(),
             status: "already_exists".to_string(),
@@ -907,7 +978,18 @@ async fn process_transcode(
     }
 
     // Update status to processing
-    send_status_webhook(&state.config, &hash, "processing", None, None).await;
+    send_status_webhook(
+        &state.config,
+        &hash,
+        "processing",
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+    )
+    .await;
 
     // Create temp directory for processing
     let temp_dir = TempDir::new()?;
@@ -924,7 +1006,18 @@ async fn process_transcode(
     .await;
 
     if let Err(e) = download_result {
-        send_status_webhook(&state.config, &hash, "failed", None, None).await;
+        send_status_webhook(
+            &state.config,
+            &hash,
+            "failed",
+            None,
+            None,
+            Some("download_failed"),
+            Some(&e.to_string()),
+            None,
+            false,
+        )
+        .await;
         return Err(e);
     }
 
@@ -985,7 +1078,34 @@ async fn process_transcode(
     let variants = match ffmpeg_result {
         Ok(v) => v,
         Err(e) => {
-            send_status_webhook(&state.config, &hash, "failed", None, Some(&video_info)).await;
+            let error_message = e.to_string();
+            let (error_code, terminal) =
+                classify_invalid_media_error(&error_message, "transcode_failed");
+            if terminal {
+                report_derivative_failure_to_sentry(
+                    "divine-transcoder",
+                    "hls",
+                    &hash,
+                    error_code,
+                    &error_message,
+                    true,
+                    Some("video/mp4"),
+                    request.owner.as_deref(),
+                    Some(1),
+                );
+            }
+            send_status_webhook(
+                &state.config,
+                &hash,
+                "failed",
+                None,
+                Some(&video_info),
+                Some(error_code),
+                Some(&error_message),
+                None,
+                terminal,
+            )
+            .await;
             return Err(e);
         }
     };
@@ -1007,14 +1127,36 @@ async fn process_transcode(
     .await;
 
     if let Err(e) = upload_result {
-        send_status_webhook(&state.config, &hash, "failed", None, Some(&video_info)).await;
+        send_status_webhook(
+            &state.config,
+            &hash,
+            "failed",
+            None,
+            Some(&video_info),
+            Some("upload_failed"),
+            Some(&e.to_string()),
+            None,
+            false,
+        )
+        .await;
         return Err(e);
     }
 
     info!("Uploaded HLS files for {}", hash);
 
     // Update status to complete with video dimensions for the edge service
-    send_status_webhook(&state.config, &hash, "complete", None, Some(&video_info)).await;
+    send_status_webhook(
+        &state.config,
+        &hash,
+        "complete",
+        None,
+        Some(&video_info),
+        None,
+        None,
+        None,
+        false,
+    )
+    .await;
 
     Ok(TranscodeResponse {
         hash: hash.clone(),
@@ -1059,6 +1201,7 @@ async fn process_transcribe(
             None,
             None,
             None,
+            false,
         )
         .await;
         return Ok(TranscribeResponse {
@@ -1069,37 +1212,39 @@ async fn process_transcribe(
         });
     }
 
-    let transcript_lock = match acquire_transcript_lock(
-        &state.gcs_client,
-        &state.config.gcs_bucket,
-        &hash,
-        900,
-    )
-    .await?
-    {
-        Ok(handle) => handle,
-        Err(TranscriptLockAction::AlreadyProcessing) => {
-            info!("Transcript already processing for {}, skipping duplicate request", hash);
-            return Ok(TranscribeResponse {
-                hash,
-                status: "already_processing".to_string(),
-                vtt_path,
-                transcript_confidence: None,
-            });
-        }
-        Err(TranscriptLockAction::CoolingDown) => {
-            info!("Transcript cooldown active for {}, skipping duplicate request", hash);
-            return Ok(TranscribeResponse {
-                hash,
-                status: "cooling_down".to_string(),
-                vtt_path,
-                transcript_confidence: None,
-            });
-        }
-        Err(TranscriptLockAction::StartWork | TranscriptLockAction::ReclaimStaleLock) => {
-            unreachable!("acquire_transcript_lock resolves start/reclaim internally")
-        }
-    };
+    let transcript_lock =
+        match acquire_transcript_lock(&state.gcs_client, &state.config.gcs_bucket, &hash, 900)
+            .await?
+        {
+            Ok(handle) => handle,
+            Err(TranscriptLockAction::AlreadyProcessing) => {
+                info!(
+                    "Transcript already processing for {}, skipping duplicate request",
+                    hash
+                );
+                return Ok(TranscribeResponse {
+                    hash,
+                    status: "already_processing".to_string(),
+                    vtt_path,
+                    transcript_confidence: None,
+                });
+            }
+            Err(TranscriptLockAction::CoolingDown) => {
+                info!(
+                    "Transcript cooldown active for {}, skipping duplicate request",
+                    hash
+                );
+                return Ok(TranscribeResponse {
+                    hash,
+                    status: "cooling_down".to_string(),
+                    vtt_path,
+                    transcript_confidence: None,
+                });
+            }
+            Err(TranscriptLockAction::StartWork | TranscriptLockAction::ReclaimStaleLock) => {
+                unreachable!("acquire_transcript_lock resolves start/reclaim internally")
+            }
+        };
 
     send_transcript_status_webhook(
         &state.config,
@@ -1113,6 +1258,7 @@ async fn process_transcribe(
         None,
         None,
         None,
+        false,
     )
     .await;
 
@@ -1125,14 +1271,20 @@ async fn process_transcribe(
         &state.config.gcs_bucket,
         &hash,
         &input_path,
+    )
+    .await
+    {
+        if let Err(lock_error) = delete_transcript_lock(
+            &state.gcs_client,
+            &state.config.gcs_bucket,
+            &transcript_lock,
         )
         .await
-    {
-        if let Err(lock_error) =
-            delete_transcript_lock(&state.gcs_client, &state.config.gcs_bucket, &transcript_lock)
-                .await
         {
-            warn!("Failed to release transcript lock for {}: {}", hash, lock_error);
+            warn!(
+                "Failed to release transcript lock for {}: {}",
+                hash, lock_error
+            );
         }
         send_transcript_status_webhook(
             &state.config,
@@ -1146,6 +1298,7 @@ async fn process_transcribe(
             None,
             Some("download_failed"),
             Some(&e.to_string()),
+            false,
         )
         .await;
         return Err(e);
@@ -1166,22 +1319,50 @@ async fn process_transcribe(
             &vtt_path,
         )
         .await;
-        if let Err(lock_error) =
-            delete_transcript_lock(&state.gcs_client, &state.config.gcs_bucket, &transcript_lock)
-                .await
+        if let Err(lock_error) = delete_transcript_lock(
+            &state.gcs_client,
+            &state.config.gcs_bucket,
+            &transcript_lock,
+        )
+        .await
         {
-            warn!("Failed to release transcript lock for {}: {}", hash, lock_error);
+            warn!(
+                "Failed to release transcript lock for {}: {}",
+                hash, lock_error
+            );
         }
         return result;
     }
 
     let audio_path = temp_path.join("transcribe.wav");
     if let Err(e) = extract_audio_for_transcription(&input_path, &audio_path).await {
-        if let Err(lock_error) =
-            delete_transcript_lock(&state.gcs_client, &state.config.gcs_bucket, &transcript_lock)
-                .await
+        let error_message = e.to_string();
+        let (error_code, terminal) =
+            classify_invalid_media_error(&error_message, "audio_extract_failed");
+        if terminal {
+            report_derivative_failure_to_sentry(
+                "divine-transcoder",
+                "transcript",
+                &hash,
+                error_code,
+                &error_message,
+                true,
+                Some("video/mp4"),
+                request.owner.as_deref(),
+                Some(1),
+            );
+        }
+        if let Err(lock_error) = delete_transcript_lock(
+            &state.gcs_client,
+            &state.config.gcs_bucket,
+            &transcript_lock,
+        )
+        .await
         {
-            warn!("Failed to release transcript lock for {}: {}", hash, lock_error);
+            warn!(
+                "Failed to release transcript lock for {}: {}",
+                hash, lock_error
+            );
         }
         send_transcript_status_webhook(
             &state.config,
@@ -1193,8 +1374,9 @@ async fn process_transcribe(
             None,
             None,
             None,
-            Some("audio_extract_failed"),
-            Some(&e.to_string()),
+            Some(error_code),
+            Some(&error_message),
+            terminal,
         )
         .await;
         return Err(e);
@@ -1232,11 +1414,17 @@ async fn process_transcribe(
             &vtt_path,
         )
         .await;
-        if let Err(lock_error) =
-            delete_transcript_lock(&state.gcs_client, &state.config.gcs_bucket, &transcript_lock)
-                .await
+        if let Err(lock_error) = delete_transcript_lock(
+            &state.gcs_client,
+            &state.config.gcs_bucket,
+            &transcript_lock,
+        )
+        .await
         {
-            warn!("Failed to release transcript lock for {}: {}", hash, lock_error);
+            warn!(
+                "Failed to release transcript lock for {}: {}",
+                hash, lock_error
+            );
         }
         return result;
     }
@@ -1258,73 +1446,94 @@ async fn process_transcribe(
         .saturating_sub(state.provider_semaphore.available_permits());
     info!(
         hash,
-        in_flight,
-        provider_wait_ms,
-        "Acquired transcription provider permit"
+        in_flight, provider_wait_ms, "Acquired transcription provider permit"
     );
 
-    let raw_output = match transcribe_audio_via_provider(
-        &state.config,
-        &audio_path,
-        requested_lang.as_deref(),
-    )
-    .await
-    {
-        Ok(output) => output,
-        Err(e) => {
-            drop(provider_permit);
-            if e.exhausted_retryable {
-                let retry_after = e
-                    .retry_after()
-                    .unwrap_or_else(|| Duration::from_millis(state.config.transcription_retry_max_ms));
-                if let Err(lock_error) = write_transcript_cooldown(
+    let raw_output =
+        match transcribe_audio_via_provider(&state.config, &audio_path, requested_lang.as_deref())
+            .await
+        {
+            Ok(output) => output,
+            Err(e) => {
+                drop(provider_permit);
+                if e.exhausted_retryable {
+                    report_derivative_failure_to_sentry(
+                        "divine-transcoder",
+                        "transcript",
+                        &hash,
+                        e.error_code(),
+                        &e.to_string(),
+                        false,
+                        None,
+                        request.owner.as_deref(),
+                        Some(e.attempts),
+                    );
+                }
+                if e.exhausted_retryable {
+                    let retry_after = e.retry_after().unwrap_or_else(|| {
+                        Duration::from_millis(state.config.transcription_retry_max_ms)
+                    });
+                    if let Err(lock_error) = write_transcript_cooldown(
+                        &state.gcs_client,
+                        &state.config.gcs_bucket,
+                        &hash,
+                        &transcript_lock,
+                        retry_after,
+                        e.error_code(),
+                    )
+                    .await
+                    {
+                        warn!(
+                            "Failed to persist transcript cooldown for {}: {}",
+                            hash, lock_error
+                        );
+                    }
+                } else if let Err(lock_error) = delete_transcript_lock(
                     &state.gcs_client,
                     &state.config.gcs_bucket,
-                    &hash,
                     &transcript_lock,
-                    retry_after,
-                    e.error_code(),
                 )
                 .await
                 {
-                    warn!("Failed to persist transcript cooldown for {}: {}", hash, lock_error);
+                    warn!(
+                        "Failed to release transcript lock for {}: {}",
+                        hash, lock_error
+                    );
                 }
-            } else if let Err(lock_error) = delete_transcript_lock(
+                send_transcript_status_webhook(
+                    &state.config,
+                    &hash,
+                    "failed",
+                    job_id.as_deref(),
+                    requested_lang.as_deref(),
+                    None,
+                    None,
+                    None,
+                    e.retry_after().map(|duration| duration.as_secs().max(1)),
+                    Some(e.error_code()),
+                    Some(&e.to_string()),
+                    false,
+                )
+                .await;
+                return Err(e.into());
+            }
+        };
+    drop(provider_permit);
+
+    let parsed_vtt = match normalize_transcript_to_vtt(&raw_output) {
+        Ok(vtt) => vtt,
+        Err(e) => {
+            if let Err(lock_error) = delete_transcript_lock(
                 &state.gcs_client,
                 &state.config.gcs_bucket,
                 &transcript_lock,
             )
             .await
             {
-                warn!("Failed to release transcript lock for {}: {}", hash, lock_error);
-            }
-            send_transcript_status_webhook(
-                &state.config,
-                &hash,
-                "failed",
-                job_id.as_deref(),
-                requested_lang.as_deref(),
-                None,
-                None,
-                None,
-                e.retry_after().map(|duration| duration.as_secs().max(1)),
-                Some(e.error_code()),
-                Some(&e.to_string()),
-            )
-            .await;
-            return Err(e.into());
-        }
-    };
-    drop(provider_permit);
-
-    let parsed_vtt = match normalize_transcript_to_vtt(&raw_output) {
-        Ok(vtt) => vtt,
-        Err(e) => {
-            if let Err(lock_error) =
-                delete_transcript_lock(&state.gcs_client, &state.config.gcs_bucket, &transcript_lock)
-                    .await
-            {
-                warn!("Failed to release transcript lock for {}: {}", hash, lock_error);
+                warn!(
+                    "Failed to release transcript lock for {}: {}",
+                    hash, lock_error
+                );
             }
             send_transcript_status_webhook(
                 &state.config,
@@ -1338,6 +1547,7 @@ async fn process_transcribe(
                 None,
                 Some("normalize_failed"),
                 Some(&e.to_string()),
+                false,
             )
             .await;
             return Err(e);
@@ -1386,10 +1596,17 @@ async fn process_transcribe(
         &vtt_path,
     )
     .await;
-    if let Err(lock_error) =
-        delete_transcript_lock(&state.gcs_client, &state.config.gcs_bucket, &transcript_lock).await
+    if let Err(lock_error) = delete_transcript_lock(
+        &state.gcs_client,
+        &state.config.gcs_bucket,
+        &transcript_lock,
+    )
+    .await
     {
-        warn!("Failed to release transcript lock for {}: {}", hash, lock_error);
+        warn!(
+            "Failed to release transcript lock for {}: {}",
+            hash, lock_error
+        );
     }
     result
 }
@@ -1594,8 +1811,7 @@ fn parse_provider_status(
 }
 
 fn is_retryable_provider_failure(failure: &ProviderFailure) -> bool {
-    failure.timed_out
-        || matches!(failure.status_code, Some(429 | 500 | 502 | 503 | 504))
+    failure.timed_out || matches!(failure.status_code, Some(429 | 500 | 502 | 503 | 504))
 }
 
 fn retry_delay_for_attempt(
@@ -1796,17 +2012,9 @@ async fn transcribe_audio_via_provider_once(
     audio_path: &Path,
     language: Option<&str>,
 ) -> std::result::Result<String, ProviderFailure> {
-    let api_url = config
-        .transcription_api_url
-        .as_ref()
-        .ok_or_else(|| {
-            parse_provider_status(
-                None,
-                None,
-                "TRANSCRIPTION_API_URL is not configured",
-                false,
-            )
-        })?;
+    let api_url = config.transcription_api_url.as_ref().ok_or_else(|| {
+        parse_provider_status(None, None, "TRANSCRIPTION_API_URL is not configured", false)
+    })?;
 
     let audio_bytes = tokio::fs::read(audio_path).await.map_err(|e| {
         parse_provider_status(
@@ -2253,6 +2461,7 @@ async fn finalize_transcript(
             None,
             Some("upload_failed"),
             Some(&e.to_string()),
+            false,
         )
         .await;
         return Err(e);
@@ -2270,6 +2479,7 @@ async fn finalize_transcript(
         None,
         None,
         None,
+        false,
     )
     .await;
 
@@ -2284,12 +2494,13 @@ async fn finalize_transcript(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_audio_extract_error, decide_transcript_lock_action, is_retryable_provider_failure,
-        normalize_transcript_to_vtt, parse_audio_analysis_output, parse_provider_status,
-        retry_delay_for_attempt, should_drop_low_signal_transcript, transcript_drop_reason,
-        transcription_response_format, AudioAnalysis, AudioExtractErrorKind, Config, ParsedVtt,
-        TranscriptConfidence, TranscriptDropReason, TranscriptLockAction, TranscriptLockState,
-        TranscriptLockStatus,
+        build_transcode_status_webhook_payload, classify_audio_extract_error,
+        decide_transcript_lock_action, is_retryable_provider_failure, normalize_transcript_to_vtt,
+        parse_audio_analysis_output, parse_provider_status, retry_delay_for_attempt,
+        should_drop_low_signal_transcript, transcript_drop_reason, transcription_response_format,
+        AudioAnalysis, AudioExtractErrorKind, Config, ParsedVtt, TranscriptConfidence,
+        TranscriptDropReason, TranscriptLockAction, TranscriptLockState, TranscriptLockStatus,
+        VideoInfo,
     };
     use std::time::Duration;
 
@@ -2321,6 +2532,63 @@ mod tests {
             classify_audio_extract_error("ffmpeg exploded"),
             AudioExtractErrorKind::Other
         );
+    }
+
+    #[test]
+    fn transcode_webhook_payload_includes_failure_fields() {
+        let video_info = VideoInfo {
+            width: 1920,
+            height: 1080,
+            rotation: 0,
+            display_width: 1080,
+            display_height: 1920,
+            has_audio: true,
+        };
+
+        let payload = build_transcode_status_webhook_payload(
+            "abc123",
+            "failed",
+            Some(42),
+            Some(&video_info),
+            Some("invalid_media"),
+            Some("moov atom not found"),
+            Some(30),
+            true,
+        );
+
+        assert_eq!(payload["sha256"], "abc123");
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["new_size"], 42);
+        assert_eq!(payload["display_width"], 1080);
+        assert_eq!(payload["display_height"], 1920);
+        assert_eq!(payload["error_code"], "invalid_media");
+        assert_eq!(payload["error_message"], "moov atom not found");
+        assert_eq!(payload["retry_after"], 30);
+        assert_eq!(payload["terminal"], true);
+    }
+
+    #[test]
+    fn transcode_webhook_payload_omits_optional_failure_fields_when_absent() {
+        let payload = build_transcode_status_webhook_payload(
+            "abc123",
+            "processing",
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+
+        assert_eq!(payload["sha256"], "abc123");
+        assert_eq!(payload["status"], "processing");
+        assert!(payload.get("new_size").is_none());
+        assert!(payload.get("display_width").is_none());
+        assert!(payload.get("display_height").is_none());
+        assert!(payload.get("error_code").is_none());
+        assert!(payload.get("error_message").is_none());
+        assert!(payload.get("retry_after").is_none());
+        assert!(payload.get("terminal").is_none());
     }
 
     #[test]
@@ -2464,12 +2732,7 @@ mod tests {
 
     #[test]
     fn classifies_rate_limited_provider_responses_as_retryable() {
-        let failure = parse_provider_status(
-            Some(429),
-            Some("12"),
-            "rate limit exceeded",
-            false,
-        );
+        let failure = parse_provider_status(Some(429), Some("12"), "rate limit exceeded", false);
 
         assert_eq!(failure.status_code, Some(429));
         assert_eq!(failure.retry_after, Some(Duration::from_secs(12)));
@@ -2588,25 +2851,22 @@ mod tests {
     #[test]
     fn empty_segments_json_response_is_rejected() {
         // gpt-4o-transcribe with no speech: segments array present but empty
-        let result = normalize_transcript_to_vtt(
-            r#"{"text":"","language":"en","segments":[]}"#,
-        );
+        let result = normalize_transcript_to_vtt(r#"{"text":"","language":"en","segments":[]}"#);
         assert!(result.is_err(), "empty-segments JSON should be rejected");
     }
 
     #[test]
     fn json_with_only_whitespace_text_is_rejected() {
-        let result = normalize_transcript_to_vtt(
-            r#"{"text":"   \n  "}"#,
+        let result = normalize_transcript_to_vtt(r#"{"text":"   \n  "}"#);
+        assert!(
+            result.is_err(),
+            "whitespace-only text JSON should be rejected"
         );
-        assert!(result.is_err(), "whitespace-only text JSON should be rejected");
     }
 
     #[test]
     fn json_with_null_text_is_rejected() {
-        let result = normalize_transcript_to_vtt(
-            r#"{"text":null,"language":"en"}"#,
-        );
+        let result = normalize_transcript_to_vtt(r#"{"text":null,"language":"en"}"#);
         assert!(result.is_err(), "null-text JSON should be rejected");
     }
 
@@ -2621,10 +2881,8 @@ mod tests {
 
     #[test]
     fn json_with_text_is_still_accepted() {
-        let parsed = normalize_transcript_to_vtt(
-            r#"{"text":"hello world"}"#,
-        )
-        .expect("json with text should parse");
+        let parsed = normalize_transcript_to_vtt(r#"{"text":"hello world"}"#)
+            .expect("json with text should parse");
         assert!(parsed.content.starts_with("WEBVTT"));
         assert_eq!(parsed.text, "hello world");
     }
@@ -2643,8 +2901,7 @@ mod tests {
     #[test]
     fn valid_vtt_passthrough_still_works() {
         let vtt = "WEBVTT\n\n1\n00:00:00.000 --> 00:00:02.000\nHello\n";
-        let parsed = normalize_transcript_to_vtt(vtt)
-            .expect("valid VTT should pass through");
+        let parsed = normalize_transcript_to_vtt(vtt).expect("valid VTT should pass through");
         assert!(parsed.content.starts_with("WEBVTT"));
         assert_eq!(parsed.text, "Hello");
     }
@@ -3145,12 +3402,18 @@ async fn remux_ts_to_fmp4(hls_dir: &Path) -> Result<()> {
         let output = tokio::process::Command::new("ffmpeg")
             .args([
                 "-y",
-                "-v", "warning",
-                "-i", &ts_path.to_string_lossy(),
-                "-c:v", "copy",
-                "-c:a", "aac",
-                "-b:a", "128k",
-                "-movflags", "+faststart",
+                "-v",
+                "warning",
+                "-i",
+                &ts_path.to_string_lossy(),
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-movflags",
+                "+faststart",
                 &mp4_path.to_string_lossy(),
             ])
             .output()
@@ -3274,6 +3537,10 @@ async fn send_status_webhook(
     status: &str,
     new_size: Option<u64>,
     video_info: Option<&VideoInfo>,
+    error_code: Option<&str>,
+    error_message: Option<&str>,
+    retry_after_secs: Option<u64>,
+    terminal: bool,
 ) {
     let webhook_url = match &config.webhook_url {
         Some(url) => url,
@@ -3287,21 +3554,22 @@ async fn send_status_webhook(
     };
 
     let client = reqwest::Client::new();
-    let mut payload = serde_json::json!({
-        "sha256": hash,
-        "status": status
-    });
+    let payload = build_transcode_status_webhook_payload(
+        hash,
+        status,
+        new_size,
+        video_info,
+        error_code,
+        error_message,
+        retry_after_secs,
+        terminal,
+    );
 
-    // Include new_size if the original file was replaced (faststart optimization)
     if let Some(size) = new_size {
-        payload["new_size"] = serde_json::json!(size);
         info!("Including new_size {} in webhook for {}", size, hash);
     }
 
-    // Include display dimensions so the edge can store them for the `dim` tag
     if let Some(info) = video_info {
-        payload["display_width"] = serde_json::json!(info.display_width);
-        payload["display_height"] = serde_json::json!(info.display_height);
         info!(
             "Including dimensions {}x{} in webhook for {}",
             info.display_width, info.display_height, hash
@@ -3348,6 +3616,66 @@ fn resolve_transcript_webhook_url(config: &Config) -> Option<String> {
     None
 }
 
+fn build_transcode_status_webhook_payload(
+    hash: &str,
+    status: &str,
+    new_size: Option<u64>,
+    video_info: Option<&VideoInfo>,
+    error_code: Option<&str>,
+    error_message: Option<&str>,
+    retry_after_secs: Option<u64>,
+    terminal: bool,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "sha256": hash,
+        "status": status
+    });
+
+    if let Some(size) = new_size {
+        payload["new_size"] = serde_json::json!(size);
+    }
+
+    if let Some(info) = video_info {
+        payload["display_width"] = serde_json::json!(info.display_width);
+        payload["display_height"] = serde_json::json!(info.display_height);
+    }
+
+    if let Some(code) = error_code {
+        payload["error_code"] = serde_json::json!(code);
+    }
+
+    if let Some(message) = error_message {
+        payload["error_message"] = serde_json::json!(message);
+    }
+
+    if let Some(retry_after_secs) = retry_after_secs {
+        payload["retry_after"] = serde_json::json!(retry_after_secs);
+    }
+
+    if terminal {
+        payload["terminal"] = serde_json::json!(true);
+    }
+
+    payload
+}
+
+fn classify_invalid_media_error(
+    message: &str,
+    fallback_code: &'static str,
+) -> (&'static str, bool) {
+    let message = message.to_ascii_lowercase();
+    if message.contains("moov atom not found")
+        || message.contains("invalid data found when processing input")
+        || message.contains("not_a_video")
+        || message.contains("error reading header")
+        || message.contains("could not find codec parameters")
+    {
+        ("invalid_media", true)
+    } else {
+        (fallback_code, false)
+    }
+}
+
 /// Send transcript status update to the Fastly edge webhook.
 async fn send_transcript_status_webhook(
     config: &Config,
@@ -3361,6 +3689,7 @@ async fn send_transcript_status_webhook(
     retry_after_secs: Option<u64>,
     error_code: Option<&str>,
     error_message: Option<&str>,
+    terminal: bool,
 ) {
     let webhook_url = match resolve_transcript_webhook_url(config) {
         Some(url) => url,
@@ -3401,6 +3730,9 @@ async fn send_transcript_status_webhook(
     }
     if let Some(msg) = error_message {
         payload["error_message"] = serde_json::json!(msg);
+    }
+    if terminal {
+        payload["terminal"] = serde_json::json!(true);
     }
 
     let mut request = client.post(webhook_url).json(&payload);

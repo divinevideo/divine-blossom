@@ -87,6 +87,60 @@ impl Config {
     }
 }
 
+fn init_sentry(service_name: &str) -> sentry::ClientInitGuard {
+    let environment = env::var("SENTRY_ENVIRONMENT")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let server_name = env::var("SENTRY_SERVER_NAME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| service_name.to_string());
+
+    sentry::init(sentry::ClientOptions {
+        dsn: env::var("SENTRY_DSN")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .and_then(|value| value.parse().ok()),
+        environment: environment.map(Into::into),
+        server_name: Some(server_name.into()),
+        release: sentry::release_name!(),
+        ..Default::default()
+    })
+}
+
+fn report_derivative_failure_to_sentry(
+    service: &'static str,
+    derivative: &'static str,
+    hash: &str,
+    error_code: &str,
+    error_message: &str,
+    terminal: bool,
+    content_type: Option<&str>,
+    owner: Option<&str>,
+) {
+    let fingerprint = [service, derivative, error_code];
+    sentry::with_scope(
+        |scope| {
+            scope.set_level(Some(sentry::Level::Error));
+            scope.set_fingerprint(Some(fingerprint.as_ref()));
+            scope.set_tag("service", service);
+            scope.set_tag("derivative", derivative);
+            scope.set_tag("error_code", error_code);
+            scope.set_tag("terminal", terminal.to_string());
+            if let Some(content_type) = content_type {
+                scope.set_tag("content_type", content_type);
+            }
+            scope.set_extra("sha256", serde_json::json!(hash));
+            if let Some(owner) = owner {
+                scope.set_extra("owner", serde_json::json!(owner));
+            }
+        },
+        || {
+            sentry::capture_message(error_message, sentry::Level::Error);
+        },
+    );
+}
+
 // App state shared across handlers
 struct AppState {
     gcs_client: GcsClient,
@@ -119,6 +173,18 @@ struct UploadResponse {
     /// Video dimensions as "WIDTHxHEIGHT" (display dimensions after rotation)
     #[serde(skip_serializing_if = "Option::is_none")]
     dim: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transcode_error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transcode_error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    transcode_terminal: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transcript_error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transcript_error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    transcript_terminal: bool,
 }
 
 // Migration request
@@ -146,10 +212,23 @@ struct ErrorResponse {
     error: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DerivativeFailureSignal {
+    error_code: String,
+    error_message: String,
+    terminal: bool,
+}
+
 const BLOSSOM_AUTH_KIND: u32 = 24242;
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _sentry_guard = init_sentry("divine-upload");
+
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -548,7 +627,7 @@ async fn process_upload(
         .to_string();
 
     // Stream body while hashing (with owner metadata for durability)
-    let (sha256_hash, size, all_bytes) = stream_to_gcs_with_hash(
+    let (sha256_hash, size, all_bytes, sanitize_error) = stream_to_gcs_with_hash(
         &state.gcs_client,
         &state.config.gcs_bucket,
         &content_type,
@@ -557,6 +636,7 @@ async fn process_upload(
     )
     .await?;
 
+    let mut thumbnail_error: Option<String> = None;
     // Extract thumbnail for videos (non-blocking - failures don't fail the upload)
     let thumbnail_url = if thumbnail::is_video_type(&content_type) {
         match extract_and_upload_thumbnail(
@@ -574,6 +654,7 @@ async fn process_upload(
             }
             Err(e) => {
                 error!("Thumbnail extraction failed for {}: {}", sha256_hash, e);
+                thumbnail_error = Some(e.to_string());
                 None
             }
         }
@@ -581,6 +662,7 @@ async fn process_upload(
         None
     };
 
+    let mut probe_error: Option<String> = None;
     // Probe video dimensions (non-blocking - failures don't fail the upload)
     let dim = if thumbnail::is_video_type(&content_type) {
         match probe_video_dimensions(&all_bytes).await {
@@ -590,6 +672,7 @@ async fn process_upload(
             }
             Err(e) => {
                 error!("Video probe failed for {}: {}", sha256_hash, e);
+                probe_error = Some(e.to_string());
                 None
             }
         }
@@ -597,8 +680,28 @@ async fn process_upload(
         None
     };
 
+    let derivative_failure = classify_invalid_media_signal(
+        &content_type,
+        sanitize_error.as_deref(),
+        thumbnail_error.as_deref(),
+        probe_error.as_deref(),
+    );
+
+    if let Some(signal) = derivative_failure.as_ref() {
+        report_derivative_failure_to_sentry(
+            "divine-upload",
+            "derivative-validation",
+            &sha256_hash,
+            &signal.error_code,
+            &signal.error_message,
+            signal.terminal,
+            Some(&content_type),
+            Some(&auth_event.pubkey),
+        );
+    }
+
     // Trigger HLS transcoding for videos (fire-and-forget)
-    if thumbnail::is_video_type(&content_type) {
+    if thumbnail::is_video_type(&content_type) && derivative_failure.is_none() {
         if let Some(ref transcoder_url) = state.config.transcoder_url {
             // Spawn background task to trigger transcoder - don't block upload response
             let transcoder_url = transcoder_url.clone();
@@ -615,10 +718,15 @@ async fn process_upload(
                 sha256_hash
             );
         }
+    } else if let Some(signal) = derivative_failure.as_ref() {
+        warn!(
+            "Skipping HLS transcoding for {} due to terminal derivative validation failure {}",
+            sha256_hash, signal.error_code
+        );
     }
 
     // Trigger transcript generation for transcribable media (audio/video)
-    if is_transcribable_type(&content_type) {
+    if is_transcribable_type(&content_type) && derivative_failure.is_none() {
         if let Some(ref transcriber_url) = state.config.transcriber_url {
             let transcriber_url = transcriber_url.clone();
             let hash = sha256_hash.clone();
@@ -634,6 +742,11 @@ async fn process_upload(
                 sha256_hash
             );
         }
+    } else if let Some(signal) = derivative_failure.as_ref() {
+        warn!(
+            "Skipping transcript generation for {} due to terminal derivative validation failure {}",
+            sha256_hash, signal.error_code
+        );
     }
 
     // Build response
@@ -642,6 +755,28 @@ async fn process_upload(
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
+
+    let transcode_error_code = derivative_failure
+        .as_ref()
+        .map(|signal| signal.error_code.clone());
+    let transcode_error_message = derivative_failure
+        .as_ref()
+        .map(|signal| signal.error_message.clone());
+    let transcode_terminal = derivative_failure
+        .as_ref()
+        .map(|signal| signal.terminal)
+        .unwrap_or(false);
+
+    let transcript_error_code = derivative_failure
+        .as_ref()
+        .map(|signal| signal.error_code.clone());
+    let transcript_error_message = derivative_failure
+        .as_ref()
+        .map(|signal| signal.error_message.clone());
+    let transcript_terminal = derivative_failure
+        .as_ref()
+        .map(|signal| signal.terminal)
+        .unwrap_or(false);
 
     Ok(UploadResponse {
         sha256: sha256_hash.clone(),
@@ -654,6 +789,12 @@ async fn process_upload(
         ),
         thumbnail_url,
         dim,
+        transcode_error_code,
+        transcode_error_message,
+        transcode_terminal,
+        transcript_error_code,
+        transcript_error_message,
+        transcript_terminal,
     })
 }
 
@@ -663,7 +804,7 @@ async fn stream_to_gcs_with_hash(
     content_type: &str,
     body: Body,
     owner: &str,
-) -> Result<(String, u64, Vec<u8>)> {
+) -> Result<(String, u64, Vec<u8>, Option<String>)> {
     let mut original_bytes = Vec::new();
 
     // Collect body stream first; original bytes remain the source of truth for hashing/storage.
@@ -676,6 +817,7 @@ async fn stream_to_gcs_with_hash(
     // Keep original bytes immutable for hash/storage integrity.
     // Derivative generation (thumbnail/probe/transcode) can use sanitized bytes.
     let mut derivative_bytes = original_bytes.clone();
+    let mut sanitize_error = None;
 
     // Sanitize video bytes for derivative processing only.
     if thumbnail::is_video_type(content_type) {
@@ -695,6 +837,7 @@ async fn stream_to_gcs_with_hash(
                     "Video sanitization failed for derivatives, using original: {}",
                     e
                 );
+                sanitize_error = Some(e.to_string());
             }
         }
     }
@@ -719,7 +862,7 @@ async fn stream_to_gcs_with_hash(
 
     if exists {
         info!("Blob {} already exists, skipping upload", sha256_hash);
-        return Ok((sha256_hash, total_size, derivative_bytes));
+        return Ok((sha256_hash, total_size, derivative_bytes, sanitize_error));
     }
 
     // Upload to GCS
@@ -754,7 +897,7 @@ async fn stream_to_gcs_with_hash(
         "Uploaded {} bytes as {} (owner: {})",
         total_size, sha256_hash, owner
     );
-    Ok((sha256_hash, total_size, derivative_bytes))
+    Ok((sha256_hash, total_size, derivative_bytes, sanitize_error))
 }
 
 /// Extract thumbnail from video and upload to GCS
@@ -1119,7 +1262,7 @@ async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{media_source_candidates, new_temp_media_path};
+    use super::{classify_invalid_media_signal, media_source_candidates, new_temp_media_path};
 
     #[test]
     fn temp_media_paths_are_unique_per_request() {
@@ -1141,6 +1284,50 @@ mod tests {
         assert_eq!(candidates[0], hash);
         assert_eq!(candidates[1], format!("{}/hls/stream_720p.ts", hash));
         assert_eq!(candidates[2], format!("{}/hls/stream_480p.ts", hash));
+    }
+
+    #[test]
+    fn invalid_media_classification_marks_sanitize_failure_terminal() {
+        let signal = classify_invalid_media_signal(
+            "video/mp4",
+            Some("ffmpeg sanitize failed: moov atom not found"),
+            None,
+            None,
+        )
+        .expect("sanitize failure should mark invalid media");
+
+        assert_eq!(signal.error_code, "invalid_media");
+        assert!(signal.terminal);
+        assert!(signal.error_message.contains("moov atom not found"));
+    }
+
+    #[test]
+    fn invalid_media_classification_marks_probe_failure_terminal() {
+        let signal = classify_invalid_media_signal(
+            "video/mp4",
+            None,
+            None,
+            Some("ffprobe failed: Invalid data found when processing input"),
+        )
+        .expect("probe failure should mark invalid media");
+
+        assert_eq!(signal.error_code, "invalid_media");
+        assert!(signal.terminal);
+        assert!(signal
+            .error_message
+            .contains("Invalid data found when processing input"));
+    }
+
+    #[test]
+    fn invalid_media_classification_ignores_thumbnail_only_failures() {
+        let signal = classify_invalid_media_signal(
+            "video/mp4",
+            None,
+            Some("thumbnail extraction failed"),
+            None,
+        );
+
+        assert!(signal.is_none());
     }
 }
 
@@ -1534,6 +1721,39 @@ async fn maybe_trigger_derivatives(
             );
         }
     }
+}
+
+/// Classify whether the upload produced signals indicating the media is
+/// fundamentally invalid (corrupt container, missing moov atom, etc.).
+/// Returns a terminal failure signal that the edge can record to avoid
+/// retrying derivatives on media that will never transcode.
+fn classify_invalid_media_signal(
+    content_type: &str,
+    sanitize_error: Option<&str>,
+    _thumbnail_error: Option<&str>,
+    probe_error: Option<&str>,
+) -> Option<DerivativeFailureSignal> {
+    if !thumbnail::is_video_type(content_type) {
+        return None;
+    }
+
+    if let Some(message) = sanitize_error {
+        return Some(DerivativeFailureSignal {
+            error_code: "invalid_media".to_string(),
+            error_message: message.to_string(),
+            terminal: true,
+        });
+    }
+
+    if let Some(message) = probe_error {
+        return Some(DerivativeFailureSignal {
+            error_code: "invalid_media".to_string(),
+            error_message: message.to_string(),
+            terminal: true,
+        });
+    }
+
+    None
 }
 
 /// Trigger HLS transcoding for a video (fire-and-forget)

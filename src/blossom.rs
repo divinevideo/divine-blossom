@@ -58,6 +58,24 @@ pub struct BlobMetadata {
     /// Transcode status for video HLS generation
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transcode_status: Option<TranscodeStatus>,
+    /// Stable error code from the last transcode attempt
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcode_error_code: Option<String>,
+    /// Human-readable error message from the last transcode attempt
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcode_error_message: Option<String>,
+    /// ISO timestamp for the most recent transcode attempt
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcode_last_attempt_at: Option<String>,
+    /// UNIX timestamp after which HLS generation may be retried
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcode_retry_after: Option<u64>,
+    /// Number of failed transcode attempts recorded for this blob
+    #[serde(default)]
+    pub transcode_attempt_count: u32,
+    /// Whether HLS generation has reached a terminal failure state
+    #[serde(default)]
+    pub transcode_terminal: bool,
     /// Video dimensions as "WIDTHxHEIGHT" (display dimensions after rotation)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dim: Option<String>,
@@ -76,6 +94,12 @@ pub struct BlobMetadata {
     /// UNIX timestamp after which transcript generation may be retried
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transcript_retry_after: Option<u64>,
+    /// Number of failed transcript attempts recorded for this blob
+    #[serde(default)]
+    pub transcript_attempt_count: u32,
+    /// Whether transcript generation has reached a terminal failure state
+    #[serde(default)]
+    pub transcript_terminal: bool,
 }
 
 /// Moderation status for blobs
@@ -707,12 +731,20 @@ mod tests {
             thumbnail: None,
             moderation: None,
             transcode_status: None,
+            transcode_error_code: None,
+            transcode_error_message: None,
+            transcode_last_attempt_at: None,
+            transcode_retry_after: None,
+            transcode_attempt_count: 0,
+            transcode_terminal: false,
             dim: None,
             transcript_status: None,
             transcript_error_code: None,
             transcript_error_message: None,
             transcript_last_attempt_at: None,
             transcript_retry_after: None,
+            transcript_attempt_count: 0,
+            transcript_terminal: false,
         }
     }
 

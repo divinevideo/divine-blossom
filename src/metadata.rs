@@ -1,7 +1,9 @@
 // ABOUTME: Fastly KV store operations for blob metadata
 // ABOUTME: Handles blob metadata and per-user blob lists
 
-use crate::blossom::{AudioMapping, BlobMetadata, BlobStatus, GlobalStats, RecentIndex, SubtitleJob, UserIndex};
+use crate::blossom::{
+    AudioMapping, BlobMetadata, BlobStatus, GlobalStats, RecentIndex, SubtitleJob, UserIndex,
+};
 use crate::error::{BlossomError, Result};
 use fastly::cache::simple as simple_cache;
 use fastly::kv_store::{KVStore, KVStoreError};
@@ -261,10 +263,75 @@ pub fn update_blob_status(hash: &str, status: BlobStatus) -> Result<()> {
 
 /// Update transcode status for a video blob
 pub fn update_transcode_status(hash: &str, status: crate::blossom::TranscodeStatus) -> Result<()> {
+    update_transcode_status_with_metadata(
+        hash,
+        status,
+        None,
+        None,
+        TranscodeMetadataUpdate::default(),
+    )
+}
+
+/// Additional metadata recorded alongside transcode status updates.
+#[derive(Debug, Clone, Default)]
+pub struct TranscodeMetadataUpdate {
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub last_attempt_at: Option<String>,
+    pub retry_after: Option<u64>,
+    pub terminal: Option<bool>,
+    pub increment_attempt_count: bool,
+}
+
+/// Update transcode status and associated failure metadata for a video blob.
+pub fn update_transcode_status_with_metadata(
+    hash: &str,
+    status: crate::blossom::TranscodeStatus,
+    new_size: Option<u64>,
+    dim: Option<String>,
+    update: TranscodeMetadataUpdate,
+) -> Result<()> {
     let mut metadata =
         get_blob_metadata(hash)?.ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
 
     metadata.transcode_status = Some(status);
+    match status {
+        crate::blossom::TranscodeStatus::Failed => {
+            if update.increment_attempt_count {
+                metadata.transcode_attempt_count =
+                    metadata.transcode_attempt_count.saturating_add(1);
+            }
+            metadata.transcode_error_code = update.error_code;
+            metadata.transcode_error_message = update.error_message;
+            metadata.transcode_last_attempt_at = update.last_attempt_at;
+            metadata.transcode_retry_after = update.retry_after;
+            metadata.transcode_terminal = update.terminal.unwrap_or(false);
+        }
+        crate::blossom::TranscodeStatus::Complete => {
+            metadata.transcode_error_code = None;
+            metadata.transcode_error_message = None;
+            metadata.transcode_last_attempt_at = update.last_attempt_at;
+            metadata.transcode_retry_after = None;
+            metadata.transcode_attempt_count = 0;
+            metadata.transcode_terminal = false;
+        }
+        crate::blossom::TranscodeStatus::Processing | crate::blossom::TranscodeStatus::Pending => {
+            metadata.transcode_error_code = update.error_code;
+            metadata.transcode_error_message = update.error_message;
+            metadata.transcode_last_attempt_at = update.last_attempt_at;
+            metadata.transcode_retry_after = update.retry_after;
+            metadata.transcode_terminal = update.terminal.unwrap_or(false);
+        }
+    }
+
+    if let Some(size) = new_size {
+        metadata.size = size;
+    }
+
+    if let Some(d) = dim {
+        metadata.dim = Some(d);
+    }
+
     put_blob_metadata(&metadata)?;
 
     Ok(())
@@ -277,6 +344,8 @@ pub struct TranscriptMetadataUpdate {
     pub error_message: Option<String>,
     pub last_attempt_at: Option<String>,
     pub retry_after: Option<u64>,
+    pub terminal: Option<bool>,
+    pub increment_attempt_count: bool,
 }
 
 pub fn update_transcript_status(
@@ -288,10 +357,35 @@ pub fn update_transcript_status(
         get_blob_metadata(hash)?.ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
 
     metadata.transcript_status = Some(status);
-    metadata.transcript_error_code = update.error_code;
-    metadata.transcript_error_message = update.error_message;
-    metadata.transcript_last_attempt_at = update.last_attempt_at;
-    metadata.transcript_retry_after = update.retry_after;
+    match status {
+        crate::blossom::TranscriptStatus::Failed => {
+            if update.increment_attempt_count {
+                metadata.transcript_attempt_count =
+                    metadata.transcript_attempt_count.saturating_add(1);
+            }
+            metadata.transcript_error_code = update.error_code;
+            metadata.transcript_error_message = update.error_message;
+            metadata.transcript_last_attempt_at = update.last_attempt_at;
+            metadata.transcript_retry_after = update.retry_after;
+            metadata.transcript_terminal = update.terminal.unwrap_or(false);
+        }
+        crate::blossom::TranscriptStatus::Complete => {
+            metadata.transcript_error_code = None;
+            metadata.transcript_error_message = None;
+            metadata.transcript_last_attempt_at = update.last_attempt_at;
+            metadata.transcript_retry_after = None;
+            metadata.transcript_attempt_count = 0;
+            metadata.transcript_terminal = false;
+        }
+        crate::blossom::TranscriptStatus::Processing
+        | crate::blossom::TranscriptStatus::Pending => {
+            metadata.transcript_error_code = update.error_code;
+            metadata.transcript_error_message = update.error_message;
+            metadata.transcript_last_attempt_at = update.last_attempt_at;
+            metadata.transcript_retry_after = update.retry_after;
+            metadata.transcript_terminal = update.terminal.unwrap_or(false);
+        }
+    }
     put_blob_metadata(&metadata)?;
 
     Ok(())
@@ -383,24 +477,13 @@ pub fn update_transcode_status_with_size(
     new_size: Option<u64>,
     dim: Option<String>,
 ) -> Result<()> {
-    let mut metadata =
-        get_blob_metadata(hash)?.ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
-
-    metadata.transcode_status = Some(status);
-
-    // Update size if provided (faststart optimization replaced the original file)
-    if let Some(size) = new_size {
-        metadata.size = size;
-    }
-
-    // Update display dimensions if provided by transcoder
-    if let Some(d) = dim {
-        metadata.dim = Some(d);
-    }
-
-    put_blob_metadata(&metadata)?;
-
-    Ok(())
+    update_transcode_status_with_metadata(
+        hash,
+        status,
+        new_size,
+        dim,
+        TranscodeMetadataUpdate::default(),
+    )
 }
 
 /// Check if user owns the blob
@@ -1031,11 +1114,12 @@ pub fn put_audio_mapping(mapping: &AudioMapping) -> Result<()> {
         AUDIO_MAP_PREFIX,
         mapping.source_sha256.to_lowercase()
     );
-    let json = serde_json::to_string(mapping)
-        .map_err(|e| BlossomError::MetadataError(format!("Failed to serialize audio mapping: {}", e)))?;
-    store
-        .insert(&key, json)
-        .map_err(|e| BlossomError::MetadataError(format!("Failed to store audio mapping: {}", e)))?;
+    let json = serde_json::to_string(mapping).map_err(|e| {
+        BlossomError::MetadataError(format!("Failed to serialize audio mapping: {}", e))
+    })?;
+    store.insert(&key, json).map_err(|e| {
+        BlossomError::MetadataError(format!("Failed to store audio mapping: {}", e))
+    })?;
     Ok(())
 }
 
