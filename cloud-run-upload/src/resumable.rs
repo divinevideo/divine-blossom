@@ -10,6 +10,7 @@ use google_cloud_storage::{
             delete::DeleteObjectRequest,
             download::Range as DownloadRange,
             get::GetObjectRequest,
+            patch::PatchObjectRequest,
             upload::{Media, UploadObjectRequest, UploadType},
             Object,
         },
@@ -724,26 +725,24 @@ impl ResumableBackend for GcsResumableBackend {
         content_type: &str,
         owner: &str,
     ) -> Result<()> {
-        let mut metadata_map = HashMap::new();
-        metadata_map.insert("owner".to_string(), owner.to_string());
-
         self.client
-            .copy_object(&CopyObjectRequest {
-                source_bucket: self.bucket.clone(),
-                source_object: source_key.to_string(),
-                destination_bucket: self.bucket.clone(),
-                destination_object: destination_key.to_string(),
-                if_generation_match: Some(0),
-                metadata: Some(Object {
-                    name: destination_key.to_string(),
-                    content_type: Some(content_type.to_string()),
-                    metadata: Some(metadata_map),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            })
+            .copy_object(&build_copy_to_final_request(
+                &self.bucket,
+                source_key,
+                destination_key,
+            ))
             .await
             .map_err(|error| anyhow!("Failed to copy final object: {}", error))?;
+
+        self.client
+            .patch_object(&build_finalize_metadata_patch_request(
+                &self.bucket,
+                destination_key,
+                content_type,
+                owner,
+            ))
+            .await
+            .map_err(|error| anyhow!("Failed to patch final object metadata: {}", error))?;
 
         Ok(())
     }
@@ -851,6 +850,42 @@ fn internal_error(error: anyhow::Error) -> ResumableError {
 fn is_not_found_error(error: &impl std::fmt::Display) -> bool {
     let message = error.to_string();
     message.contains("404") || message.contains("Not Found") || message.contains("No such object")
+}
+
+fn build_copy_to_final_request(
+    bucket: &str,
+    source_key: &str,
+    destination_key: &str,
+) -> CopyObjectRequest {
+    CopyObjectRequest {
+        source_bucket: bucket.to_string(),
+        source_object: source_key.to_string(),
+        destination_bucket: bucket.to_string(),
+        destination_object: destination_key.to_string(),
+        if_generation_match: Some(0),
+        ..Default::default()
+    }
+}
+
+fn build_finalize_metadata_patch_request(
+    bucket: &str,
+    object_key: &str,
+    content_type: &str,
+    owner: &str,
+) -> PatchObjectRequest {
+    let mut metadata_map = HashMap::new();
+    metadata_map.insert("owner".to_string(), owner.to_string());
+
+    PatchObjectRequest {
+        bucket: bucket.to_string(),
+        object: object_key.to_string(),
+        metadata: Some(Object {
+            content_type: Some(content_type.to_string()),
+            metadata: Some(metadata_map),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]
@@ -989,6 +1024,59 @@ mod tests {
             DEFAULT_RESUMABLE_CHUNK_SIZE,
             DEFAULT_RESUMABLE_SESSION_TTL_SECS,
         )
+    }
+
+    #[test]
+    fn build_copy_to_final_request_omits_metadata_body() {
+        let request = build_copy_to_final_request(
+            "divine-blossom-media",
+            "__resumable/uploads/up_123/blob",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        );
+
+        assert_eq!(request.source_bucket, "divine-blossom-media");
+        assert_eq!(request.source_object, "__resumable/uploads/up_123/blob");
+        assert_eq!(
+            request.destination_bucket,
+            "divine-blossom-media"
+        );
+        assert_eq!(
+            request.destination_object,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(request.if_generation_match, Some(0));
+        assert!(request.metadata.is_none());
+    }
+
+    #[test]
+    fn build_finalize_metadata_patch_request_sets_owner_and_content_type() {
+        let request = build_finalize_metadata_patch_request(
+            "divine-blossom-media",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "application/octet-stream",
+            "owner_pubkey",
+        );
+
+        assert_eq!(request.bucket, "divine-blossom-media");
+        assert_eq!(
+            request.object,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
+
+        let metadata = request.metadata.expect("patch metadata");
+        assert_eq!(
+            metadata.content_type.as_deref(),
+            Some("application/octet-stream")
+        );
+        assert_eq!(
+            metadata
+                .metadata
+                .as_ref()
+                .and_then(|values| values.get("owner"))
+                .map(String::as_str),
+            Some("owner_pubkey")
+        );
+        assert!(metadata.name.is_empty());
     }
 
     #[tokio::test]
