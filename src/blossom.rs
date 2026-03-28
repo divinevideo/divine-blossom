@@ -189,16 +189,20 @@ pub struct UploadRequirements {
 
 /// Request payload for initializing a resumable upload session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ResumableUploadInitRequest {
     pub sha256: String,
     pub size: u64,
+    #[serde(alias = "content_type")]
     pub content_type: String,
+    #[serde(alias = "file_name")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_name: Option<String>,
 }
 
 /// Response payload returned after creating a resumable upload session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ResumableUploadInitResponse {
     pub upload_id: String,
     pub upload_url: String,
@@ -217,10 +221,13 @@ pub struct ResumableUploadCompleteRequest {
 
 /// Response payload returned when a resumable upload session finishes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ResumableUploadCompleteResponse {
     pub sha256: String,
     pub size: u64,
+    #[serde(alias = "content_type")]
     pub content_type: String,
+    #[serde(alias = "thumbnail_url")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumbnail_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

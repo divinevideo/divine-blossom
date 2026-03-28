@@ -51,7 +51,7 @@ const TRANSCRIPT_CACHE_TTL: Duration = Duration::from_secs(3600);
 /// Maximum upload size (50 GB) - Cloud Run with HTTP/2 has no size limit
 const MAX_UPLOAD_SIZE: u64 = 50 * 1024 * 1024 * 1024;
 /// Divine upload extension name for resumable session support.
-const DIVINE_UPLOAD_EXTENSION_RESUMABLE: &str = "resumable";
+const DIVINE_UPLOAD_EXTENSION_RESUMABLE: &str = "resumable-sessions";
 /// Max automatic subtitle transcription attempts before poison state.
 const SUBTITLE_MAX_ATTEMPTS: u32 = 3;
 
@@ -5077,7 +5077,7 @@ mod tests {
         assert_eq!(resp.get_status(), StatusCode::OK);
         assert_eq!(
             resp.get_header_str("X-Divine-Upload-Extensions"),
-            Some("resumable")
+            Some("resumable-sessions")
         );
     }
 

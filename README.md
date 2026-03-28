@@ -131,23 +131,32 @@ fastly compute publish
 | `PUT` | `/upload` | Required | Upload blob |
 | `HEAD` | `/upload` | None | Get upload requirements |
 | `POST` | `/upload/init` | Required | Create a Divine resumable upload session |
-| `POST` | `/upload/<upload_id>/complete` | Required | Publish a completed resumable upload into canonical metadata |
+| `POST` | `/upload/<uploadId>/complete` | Required | Publish a completed resumable upload into canonical metadata |
 | `DELETE` | `/<sha256>` | Required | Permanently delete your own blob |
 | `GET` | `/list/<pubkey>` | Optional | List user's blobs |
 
 When resumable support is available, `HEAD /upload` includes these discovery headers:
 
-- `X-Divine-Upload-Extensions: resumable`
+- `X-Divine-Upload-Extensions: resumable-sessions`
 - `X-Divine-Upload-Control-Host: <public Blossom host>`
 - `X-Divine-Upload-Data-Host: upload.divine.video`
+
+`POST /upload/init` returns camelCase fields for the mobile client contract:
+
+- `uploadId`
+- `uploadUrl`
+- `expiresAt`
+- `chunkSize`
+- `nextOffset`
+- `requiredHeaders`
 
 The session byte stream itself is served from `upload.divine.video`:
 
 | Method | Host | Path | Auth | Description |
 |--------|------|------|------|-------------|
-| `HEAD` | `upload.divine.video` | `/sessions/<upload_id>` | Session bearer token | Query the committed offset |
-| `PUT` | `upload.divine.video` | `/sessions/<upload_id>` | Session bearer token | Upload a contiguous chunk with `Content-Range` |
-| `DELETE` | `upload.divine.video` | `/upload/<upload_id>` | Session bearer token | Abort a resumable upload session |
+| `HEAD` | `upload.divine.video` | `/sessions/<uploadId>` | Session bearer token | Query the committed offset |
+| `PUT` | `upload.divine.video` | `/sessions/<uploadId>` | Session bearer token | Upload a contiguous chunk with `Content-Range` |
+| `DELETE` | `upload.divine.video` | `/upload/<uploadId>` | Session bearer token | Abort a resumable upload session |
 
 ### Provenance & Admin
 

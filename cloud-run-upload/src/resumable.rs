@@ -32,15 +32,19 @@ pub const SESSION_EXPIRES_HEADER: &str = "Upload-Expires";
 pub const SESSION_CHUNK_SIZE_HEADER: &str = "X-Divine-Chunk-Size";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ResumableUploadInitRequest {
     pub sha256: String,
     pub size: u64,
+    #[serde(alias = "content_type")]
     pub content_type: String,
+    #[serde(alias = "file_name")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ResumableUploadInitResponse {
     pub upload_id: String,
     pub upload_url: String,
@@ -52,10 +56,13 @@ pub struct ResumableUploadInitResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CompleteUploadResponse {
     pub sha256: String,
     pub size: u64,
+    #[serde(alias = "content_type")]
     pub content_type: String,
+    #[serde(alias = "thumbnail_url")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumbnail_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1013,6 +1020,58 @@ mod tests {
         assert_eq!(response.next_offset, 0);
         assert_eq!(response.chunk_size, DEFAULT_RESUMABLE_CHUNK_SIZE);
         assert!(response.required_headers.contains_key("Authorization"));
+    }
+
+    #[test]
+    fn init_request_accepts_camel_case_and_legacy_snake_case_fields() {
+        let camel_case: ResumableUploadInitRequest = serde_json::from_value(serde_json::json!({
+            "sha256": "5b48aa1fcf30af61243ac9307eb98b7fa22df1c58573c3ca5d1b14fc30099929",
+            "size": 1024,
+            "contentType": "video/mp4",
+            "fileName": "video.mp4"
+        }))
+        .expect("camelCase init request");
+        assert_eq!(camel_case.content_type, "video/mp4");
+        assert_eq!(camel_case.file_name.as_deref(), Some("video.mp4"));
+
+        let snake_case: ResumableUploadInitRequest = serde_json::from_value(serde_json::json!({
+            "sha256": "5b48aa1fcf30af61243ac9307eb98b7fa22df1c58573c3ca5d1b14fc30099929",
+            "size": 1024,
+            "content_type": "video/mp4",
+            "file_name": "video.mp4"
+        }))
+        .expect("snake_case init request");
+        assert_eq!(snake_case.content_type, "video/mp4");
+        assert_eq!(snake_case.file_name.as_deref(), Some("video.mp4"));
+    }
+
+    #[test]
+    fn init_response_serializes_mobile_contract_field_names() {
+        let response = ResumableUploadInitResponse {
+            upload_id: "up_123".to_string(),
+            upload_url: "https://upload.divine.video/sessions/up_123".to_string(),
+            expires_at: "1234567890".to_string(),
+            chunk_size: DEFAULT_RESUMABLE_CHUNK_SIZE,
+            next_offset: 0,
+            required_headers: HashMap::from([(
+                "Authorization".to_string(),
+                "Bearer token".to_string(),
+            )]),
+        };
+
+        let json = serde_json::to_value(&response).expect("serialize init response");
+
+        assert_eq!(json["uploadId"], "up_123");
+        assert_eq!(
+            json["uploadUrl"],
+            "https://upload.divine.video/sessions/up_123"
+        );
+        assert_eq!(json["expiresAt"], "1234567890");
+        assert_eq!(json["chunkSize"], DEFAULT_RESUMABLE_CHUNK_SIZE);
+        assert_eq!(json["nextOffset"], 0);
+        assert_eq!(json["requiredHeaders"]["Authorization"], "Bearer token");
+        assert!(json.get("upload_id").is_none());
+        assert!(json.get("required_headers").is_none());
     }
 
     #[tokio::test]
