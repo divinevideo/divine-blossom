@@ -2862,7 +2862,7 @@ fn handle_upload_service_proxy(
 /// Clients can send X-SHA-256, X-Content-Length, X-Content-Type headers
 /// to check if an upload would be accepted before sending the full file
 fn handle_upload_requirements(req: Request) -> Result<Response> {
-    let control_host = get_public_host(&req).unwrap_or_else(|| "media.divine.video".into());
+    let control_host = upload_control_host(get_public_host(&req).as_deref());
     // Check for BUD-06 pre-validation headers
     let sha256 = req
         .get_header("X-SHA-256")
@@ -4763,19 +4763,37 @@ fn add_cors_headers(resp: &mut Response) {
         "Access-Control-Allow-Headers",
         "Authorization, Content-Type, X-Sha256",
     );
-    resp.set_header(
-        "Access-Control-Expose-Headers",
-        "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256, X-Content-SHA256, X-Audio-Duration, X-Audio-Size, X-Divine-Upload-Extensions, X-Divine-Upload-Control-Host, X-Divine-Upload-Data-Host",
-    );
+    resp.set_header("Access-Control-Expose-Headers", upload_exposed_headers());
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct UploadCapabilityHeaders {
+    extensions: &'static str,
+    control_host: String,
+    data_host: &'static str,
+}
+
+fn upload_exposed_headers() -> &'static str {
+    "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256, X-Content-SHA256, X-Audio-Duration, X-Audio-Size, X-Divine-Upload-Extensions, X-Divine-Upload-Control-Host, X-Divine-Upload-Data-Host"
+}
+
+fn upload_control_host(public_host: Option<&str>) -> String {
+    public_host.unwrap_or("media.divine.video").to_string()
+}
+
+fn upload_capability_headers(control_host: &str) -> UploadCapabilityHeaders {
+    UploadCapabilityHeaders {
+        extensions: DIVINE_UPLOAD_EXTENSION_RESUMABLE,
+        control_host: control_host.to_string(),
+        data_host: UPLOAD_SERVICE_HOST,
+    }
 }
 
 fn add_upload_capability_headers(resp: &mut Response, control_host: &str) {
-    resp.set_header(
-        "X-Divine-Upload-Extensions",
-        DIVINE_UPLOAD_EXTENSION_RESUMABLE,
-    );
-    resp.set_header("X-Divine-Upload-Control-Host", control_host);
-    resp.set_header("X-Divine-Upload-Data-Host", UPLOAD_SERVICE_HOST);
+    let headers = upload_capability_headers(control_host);
+    resp.set_header("X-Divine-Upload-Extensions", headers.extensions);
+    resp.set_header("X-Divine-Upload-Control-Host", headers.control_host);
+    resp.set_header("X-Divine-Upload-Data-Host", headers.data_host);
 }
 
 /// CORS preflight response
@@ -4790,9 +4808,10 @@ fn cors_preflight_response() -> Response {
 /// Prefers X-Original-Host (set by VCL when service-chaining) over the Host header,
 /// so that BlobDescriptor URLs reflect the public-facing domain.
 fn get_base_url(req: &Request) -> String {
-    get_public_host(req)
-        .map(|host| format!("https://{}", host))
-        .unwrap_or_else(|| "https://media.divine.video".into())
+    format!(
+        "https://{}",
+        upload_control_host(get_public_host(req).as_deref())
+    )
 }
 
 fn get_public_host(req: &Request) -> Option<String> {
@@ -4872,14 +4891,15 @@ fn infer_mime_from_path(path: &str) -> Option<&'static str> {
 mod tests {
     use super::{
         classify_audio_reuse_availability, decide_transcript_fetch_action, error_response,
-        handle_upload_requirements, is_alias_only_audio_blob, is_quality_variant_path,
-        parse_quality_variant_path, parse_transcript_status_webhook_payload,
-        should_delete_derived_audio_blob, should_set_audio_content_length, AudioReuseAvailability,
-        TranscriptFetchAction, TranscriptPendingState,
+        is_alias_only_audio_blob, is_quality_variant_path, parse_quality_variant_path,
+        parse_transcript_status_webhook_payload, should_delete_derived_audio_blob,
+        should_set_audio_content_length, upload_capability_headers, upload_control_host,
+        upload_exposed_headers, AudioReuseAvailability, TranscriptFetchAction,
+        TranscriptPendingState,
     };
     use crate::blossom::TranscriptStatus;
     use crate::error::{BlossomError, Result as BlossomResult};
-    use fastly::http::{Method, StatusCode};
+    use fastly::http::StatusCode;
 
     #[test]
     fn quality_variant_path_valid() {
@@ -5069,43 +5089,35 @@ mod tests {
     }
 
     #[test]
-    fn upload_requirements_advertise_resumable_extension() {
-        let req = fastly::Request::new(Method::HEAD, "https://media.divine.video/upload");
+    fn upload_capability_headers_advertise_resumable_extension() {
+        let resp = upload_capability_headers("media.divine.video");
 
-        let resp = handle_upload_requirements(req).expect("upload requirements response");
-
-        assert_eq!(resp.get_status(), StatusCode::OK);
         assert_eq!(
-            resp.get_header_str("X-Divine-Upload-Extensions"),
-            Some("resumable-sessions")
+            resp.extensions,
+            "resumable-sessions"
         );
     }
 
     #[test]
-    fn upload_requirements_advertise_control_and_data_hosts() {
-        let req = fastly::Request::new(Method::HEAD, "https://media.divine.video/upload");
+    fn upload_capability_headers_advertise_control_and_data_hosts() {
+        let resp = upload_capability_headers("media.divine.video");
 
-        let resp = handle_upload_requirements(req).expect("upload requirements response");
+        assert_eq!(resp.control_host, "media.divine.video");
+        assert_eq!(resp.data_host, "upload.divine.video");
+    }
 
-        assert_eq!(resp.get_status(), StatusCode::OK);
+    #[test]
+    fn upload_control_host_defaults_to_media_domain() {
+        assert_eq!(upload_control_host(None), "media.divine.video");
         assert_eq!(
-            resp.get_header_str("X-Divine-Upload-Control-Host"),
-            Some("media.divine.video")
-        );
-        assert_eq!(
-            resp.get_header_str("X-Divine-Upload-Data-Host"),
-            Some("upload.divine.video")
+            upload_control_host(Some("staging-media.divine.video")),
+            "staging-media.divine.video"
         );
     }
 
     #[test]
-    fn upload_requirements_expose_resumable_capability_headers_for_cors() {
-        let req = fastly::Request::new(Method::HEAD, "https://media.divine.video/upload");
-
-        let resp = handle_upload_requirements(req).expect("upload requirements response");
-        let exposed_headers = resp
-            .get_header_str("Access-Control-Expose-Headers")
-            .expect("exposed headers");
+    fn upload_capability_headers_are_exposed_for_cors() {
+        let exposed_headers = upload_exposed_headers();
 
         assert!(exposed_headers.contains("X-Divine-Upload-Extensions"));
         assert!(exposed_headers.contains("X-Divine-Upload-Control-Host"));

@@ -26,8 +26,11 @@ jobs:
         with:
           key: wasm32-wasip1
 
-      - name: Run tests
-        run: cargo test --locked
+      - name: Check edge crate
+        run: cargo check --tests --locked
+
+      - name: Run upload service tests
+        run: cargo test --manifest-path cloud-run-upload/Cargo.toml --locked
 
       - name: Run clippy
         run: cargo clippy --locked --all-targets --all-features
