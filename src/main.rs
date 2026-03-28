@@ -10,9 +10,10 @@ mod storage;
 
 use crate::auth::{optional_auth, validate_auth, validate_hash_match};
 use crate::blossom::{
-    is_audio_path, is_hash_path, is_transcribable_mime_type, is_video_mime_type,
-    parse_audio_path, parse_hash_from_path, parse_thumbnail_path, AudioMapping, AuthAction,
-    BlobDescriptor, BlobMetadata, BlobStatus, SubtitleJob, SubtitleJobCreateRequest,
+    is_audio_path, is_hash_path, is_transcribable_mime_type, is_video_mime_type, parse_audio_path,
+    parse_hash_from_path, parse_thumbnail_path, AudioMapping, AuthAction, BlobDescriptor,
+    BlobMetadata, BlobStatus, ResumableUploadCompleteRequest, ResumableUploadCompleteResponse,
+    ResumableUploadInitRequest, ResumableUploadInitResponse, SubtitleJob, SubtitleJobCreateRequest,
     SubtitleJobStatus, TranscodeStatus, TranscriptStatus, UploadRequirements,
 };
 use crate::error::{BlossomError, Result};
@@ -20,19 +21,19 @@ use crate::metadata::{
     add_to_audio_source_refs, add_to_blob_refs, add_to_recent_index, add_to_user_index,
     add_to_user_list, delete_audio_mapping, delete_audio_source_refs, delete_auth_events,
     delete_blob_metadata, delete_blob_refs, delete_subtitle_data, delete_user_list,
-    get_audio_mapping, get_audio_source_refs, get_auth_event, get_blob_metadata,
-    get_blob_refs, get_subtitle_job, get_subtitle_job_by_hash, get_tombstone,
-    get_user_blobs, list_blobs_with_metadata, put_audio_mapping, put_auth_event,
-    put_blob_metadata, put_subtitle_job, put_tombstone, remove_from_audio_source_refs,
-    remove_from_blob_refs, remove_from_recent_index, remove_from_user_index,
-    remove_from_user_list, set_subtitle_job_id_for_hash, update_blob_status,
-    update_stats_on_add, update_stats_on_remove, TranscriptMetadataUpdate,
+    get_audio_mapping, get_audio_source_refs, get_auth_event, get_blob_metadata, get_blob_refs,
+    get_subtitle_job, get_subtitle_job_by_hash, get_tombstone, get_user_blobs,
+    list_blobs_with_metadata, put_audio_mapping, put_auth_event, put_blob_metadata,
+    put_subtitle_job, put_tombstone, remove_from_audio_source_refs, remove_from_blob_refs,
+    remove_from_recent_index, remove_from_user_index, remove_from_user_list,
+    set_subtitle_job_id_for_hash, update_blob_status, update_stats_on_add, update_stats_on_remove,
+    TranscriptMetadataUpdate,
 };
 use crate::storage::{
-    blob_exists, check_funnelcake_audio_reuse, current_timestamp,
-    delete_blob as storage_delete, download_blob_with_fallback, download_thumbnail,
-    trigger_audio_extraction, trigger_audit_anonymize, trigger_cloud_run_bulk_delete,
-    trigger_cloud_run_delete_blob, upload_blob, write_audit_log,
+    blob_exists, check_funnelcake_audio_reuse, current_timestamp, delete_blob as storage_delete,
+    download_blob_with_fallback, download_thumbnail, trigger_audio_extraction,
+    trigger_audit_anonymize, trigger_cloud_run_bulk_delete, trigger_cloud_run_delete_blob,
+    upload_blob, write_audit_log,
 };
 
 use fastly::cache::simple as simple_cache;
@@ -49,6 +50,8 @@ const TRANSCRIPT_CACHE_TTL: Duration = Duration::from_secs(3600);
 
 /// Maximum upload size (50 GB) - Cloud Run with HTTP/2 has no size limit
 const MAX_UPLOAD_SIZE: u64 = 50 * 1024 * 1024 * 1024;
+/// Divine upload extension name for resumable session support.
+const DIVINE_UPLOAD_EXTENSION_RESUMABLE: &str = "resumable";
 /// Max automatic subtitle transcription attempts before poison state.
 const SUBTITLE_MAX_ATTEMPTS: u32 = 3;
 
@@ -123,6 +126,11 @@ fn handle_request(req: Request) -> Result<Response> {
         (Method::PUT, "/upload") => handle_upload(req),
         // BUD-06: Upload requirements/pre-validation
         (Method::HEAD, "/upload") => handle_upload_requirements(req),
+        // Divine resumable control plane
+        (Method::POST, "/upload/init") => handle_upload_init(req),
+        (Method::POST, p) if p.starts_with("/upload/") && p.ends_with("/complete") => {
+            handle_upload_complete(req, p)
+        }
 
         // BUD-02: Delete
         (Method::DELETE, p) if is_hash_path(p) => handle_delete(req, p),
@@ -1112,9 +1120,11 @@ fn parse_optional_retry_after_epoch(
     payload: &serde_json::Value,
     now_epoch_secs: u64,
 ) -> Option<u64> {
-    let retry_after_secs = payload["retry_after"]
-        .as_u64()
-        .or_else(|| payload["retry_after"].as_str().and_then(|value| value.parse().ok()))?;
+    let retry_after_secs = payload["retry_after"].as_u64().or_else(|| {
+        payload["retry_after"]
+            .as_str()
+            .and_then(|value| value.parse().ok())
+    })?;
     Some(now_epoch_secs.saturating_add(retry_after_secs))
 }
 
@@ -1423,15 +1433,14 @@ fn dispatch_subtitle_job(job: &mut SubtitleJob, owner: &str) -> Result<()> {
     job.error_code = None;
     job.error_message = None;
     put_subtitle_job(job)?;
-    let _ =
-        crate::metadata::update_transcript_status(
-            &job.video_sha256,
-            TranscriptStatus::Processing,
-            TranscriptMetadataUpdate {
-                last_attempt_at: Some(current_timestamp()),
-                ..Default::default()
-            },
-        );
+    let _ = crate::metadata::update_transcript_status(
+        &job.video_sha256,
+        TranscriptStatus::Processing,
+        TranscriptMetadataUpdate {
+            last_attempt_at: Some(current_timestamp()),
+            ..Default::default()
+        },
+    );
 
     let lang_for_provider = job
         .language
@@ -1657,8 +1666,8 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
         .ok_or_else(|| BlossomError::BadRequest("Invalid hash in audio path".into()))?;
 
     // 1. Look up source blob metadata
-    let metadata = get_blob_metadata(&hash)?
-        .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
+    let metadata =
+        get_blob_metadata(&hash)?.ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
 
     // 2. Access control: banned/deleted content is not served
     if metadata.status.blocks_public_access() {
@@ -1739,9 +1748,9 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
         )));
     }
 
-    let audio_sha256 = extraction.audio_sha256.ok_or_else(|| {
-        BlossomError::Internal("Audio extraction returned no hash".into())
-    })?;
+    let audio_sha256 = extraction
+        .audio_sha256
+        .ok_or_else(|| BlossomError::Internal("Audio extraction returned no hash".into()))?;
     let duration = extraction.duration.unwrap_or(0.0);
     let size = extraction.size.unwrap_or(0);
     let mime_type = extraction
@@ -1773,8 +1782,8 @@ fn handle_head_audio(path: &str) -> Result<Response> {
     let hash = parse_audio_path(path)
         .ok_or_else(|| BlossomError::BadRequest("Invalid hash in audio path".into()))?;
 
-    let metadata = get_blob_metadata(&hash)?
-        .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
+    let metadata =
+        get_blob_metadata(&hash)?.ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
 
     if metadata.status.blocks_public_access() || metadata.status.requires_owner_auth() {
         return Err(BlossomError::NotFound("Blob not found".into()));
@@ -1969,14 +1978,16 @@ fn handle_head_quality_variant(path: &str) -> Result<Response> {
     Ok(resp)
 }
 
-/// Maximum size for in-process upload (500KB) - larger files proxy to Cloud Run
-const CLOUD_RUN_THRESHOLD: u64 = 500 * 1024;
+/// Maximum size for in-process upload (500KB) - larger files proxy to the upload service
+const UPLOAD_SERVICE_THRESHOLD: u64 = 500 * 1024;
 
-/// Cloud Run upload backend name (must match fastly.toml)
-const CLOUD_RUN_BACKEND: &str = "cloud_run_upload";
+/// Upload service backend name (must match fastly.toml)
+const UPLOAD_SERVICE_BACKEND: &str = "upload_service";
+/// Public hostname for the upload service.
+const UPLOAD_SERVICE_HOST: &str = "upload.divine.video";
 
-/// Cloud Run host for on-demand thumbnail generation
-const CLOUD_RUN_THUMBNAIL_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
+/// Upload service host for on-demand thumbnail generation
+const UPLOAD_SERVICE_THUMBNAIL_HOST: &str = UPLOAD_SERVICE_HOST;
 
 /// Cloud Run host for on-demand transcoding
 const CLOUD_RUN_TRANSCODER_HOST: &str = "divine-transcoder-149672065768.us-central1.run.app";
@@ -1984,22 +1995,23 @@ const CLOUD_RUN_TRANSCODER_HOST: &str = "divine-transcoder-149672065768.us-centr
 /// Generate thumbnail on-demand by proxying to Cloud Run
 fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
     if crate::storage::is_local_mode() {
-        eprintln!("[THUMB][LOCAL] Returning placeholder thumbnail for {}", hash);
+        eprintln!(
+            "[THUMB][LOCAL] Returning placeholder thumbnail for {}",
+            hash
+        );
         // Minimal valid JPEG (smallest possible)
         let jpeg: Vec<u8> = vec![
-            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01,
-            0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43,
-            0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08, 0x07, 0x07, 0x07, 0x09,
-            0x09, 0x08, 0x0A, 0x0C, 0x14, 0x0D, 0x0C, 0x0B, 0x0B, 0x0C, 0x19, 0x12,
-            0x13, 0x0F, 0x14, 0x1D, 0x1A, 0x1F, 0x1E, 0x1D, 0x1A, 0x1C, 0x1C, 0x20,
-            0x24, 0x2E, 0x27, 0x20, 0x22, 0x2C, 0x23, 0x1C, 0x1C, 0x28, 0x37, 0x29,
-            0x2C, 0x30, 0x31, 0x34, 0x34, 0x34, 0x1F, 0x27, 0x39, 0x3D, 0x38, 0x32,
-            0x3C, 0x2E, 0x33, 0x34, 0x32, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01,
-            0x00, 0x01, 0x01, 0x01, 0x11, 0x00, 0xFF, 0xC4, 0x00, 0x1F, 0x00, 0x00,
-            0x01, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-            0x09, 0x0A, 0x0B, 0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F,
-            0x00, 0x7B, 0x94, 0x11, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xD9,
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
+            0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06,
+            0x07, 0x06, 0x05, 0x08, 0x07, 0x07, 0x07, 0x09, 0x09, 0x08, 0x0A, 0x0C, 0x14, 0x0D,
+            0x0C, 0x0B, 0x0B, 0x0C, 0x19, 0x12, 0x13, 0x0F, 0x14, 0x1D, 0x1A, 0x1F, 0x1E, 0x1D,
+            0x1A, 0x1C, 0x1C, 0x20, 0x24, 0x2E, 0x27, 0x20, 0x22, 0x2C, 0x23, 0x1C, 0x1C, 0x28,
+            0x37, 0x29, 0x2C, 0x30, 0x31, 0x34, 0x34, 0x34, 0x1F, 0x27, 0x39, 0x3D, 0x38, 0x32,
+            0x3C, 0x2E, 0x33, 0x34, 0x32, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01,
+            0x01, 0x01, 0x11, 0x00, 0xFF, 0xC4, 0x00, 0x1F, 0x00, 0x00, 0x01, 0x05, 0x01, 0x01,
+            0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02,
+            0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0xFF, 0xDA, 0x00, 0x08, 0x01,
+            0x01, 0x00, 0x00, 0x3F, 0x00, 0x7B, 0x94, 0x11, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xD9,
         ];
         let thumb_key = format!("{}.jpg", hash);
         if let Err(e) = crate::storage::upload_blob(
@@ -2017,12 +2029,15 @@ fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
         return Ok(resp);
     }
 
-    let url = format!("https://{}/thumbnail/{}", CLOUD_RUN_THUMBNAIL_HOST, hash);
+    let url = format!(
+        "https://{}/thumbnail/{}",
+        UPLOAD_SERVICE_THUMBNAIL_HOST, hash
+    );
 
     let mut proxy_req = Request::new(Method::GET, &url);
-    proxy_req.set_header("Host", CLOUD_RUN_THUMBNAIL_HOST);
+    proxy_req.set_header("Host", UPLOAD_SERVICE_THUMBNAIL_HOST);
 
-    let resp = proxy_req.send(CLOUD_RUN_BACKEND).map_err(|e| {
+    let resp = proxy_req.send(UPLOAD_SERVICE_BACKEND).map_err(|e| {
         BlossomError::StorageError(format!("Cloud Run thumbnail request failed: {}", e))
     })?;
 
@@ -2134,7 +2149,7 @@ fn trigger_on_demand_transcoding(hash: &str, owner: &str) -> Result<()> {
 
     // Fire and forget - we don't wait for transcoding to complete
     // The transcoder will callback via webhook when done
-    match proxy_req.send_async(CLOUD_RUN_BACKEND) {
+    match proxy_req.send_async(UPLOAD_SERVICE_BACKEND) {
         Ok(_) => {
             eprintln!("[HLS] Triggered on-demand transcoding for {}", hash);
             Ok(())
@@ -2164,7 +2179,7 @@ fn trigger_fmp4_backfill(hash: &str) -> Result<()> {
     proxy_req.set_header("Content-Type", "application/json");
     proxy_req.set_body(body);
 
-    match proxy_req.send_async(CLOUD_RUN_BACKEND) {
+    match proxy_req.send_async(UPLOAD_SERVICE_BACKEND) {
         Ok(_) => {
             eprintln!("[HLS] Triggered fMP4 backfill for {}", hash);
             Ok(())
@@ -2198,7 +2213,11 @@ fn trigger_on_demand_transcription(
             owner,
         )?;
         use crate::metadata::{update_transcript_status, TranscriptMetadataUpdate};
-        update_transcript_status(hash, crate::blossom::TranscriptStatus::Complete, TranscriptMetadataUpdate::default())?;
+        update_transcript_status(
+            hash,
+            crate::blossom::TranscriptStatus::Complete,
+            TranscriptMetadataUpdate::default(),
+        )?;
         if let Some(id) = job_id {
             if let Ok(Some(mut job)) = crate::metadata::get_subtitle_job(id) {
                 job.status = crate::blossom::SubtitleJobStatus::Ready;
@@ -2228,7 +2247,7 @@ fn trigger_on_demand_transcription(
     proxy_req.set_header("Content-Type", "application/json");
     proxy_req.set_body(body);
 
-    match proxy_req.send_async(CLOUD_RUN_BACKEND) {
+    match proxy_req.send_async(UPLOAD_SERVICE_BACKEND) {
         Ok(_) => {
             eprintln!("[VTT] Triggered on-demand transcription for {}", hash);
             Ok(())
@@ -2250,7 +2269,10 @@ const MODERATION_API_BACKEND: &str = "moderation_api";
 /// Fire-and-forget — upload should never fail because moderation is down.
 fn trigger_moderation_scan(sha256: &str, pubkey: &str) {
     if crate::storage::is_local_mode() {
-        eprintln!("[MODERATION][LOCAL] Auto-approving {} for {}", sha256, pubkey);
+        eprintln!(
+            "[MODERATION][LOCAL] Auto-approving {} for {}",
+            sha256, pubkey
+        );
         let _ = crate::metadata::update_blob_status(sha256, crate::blossom::BlobStatus::Active);
         return;
     }
@@ -2329,9 +2351,9 @@ fn handle_upload(mut req: Request) -> Result<Response> {
     // In local mode, handle all uploads inline (no Cloud Run available).
     // Viceroy doesn't have WASM heap limits, but very large files (>50MB) may be slow.
     if !crate::storage::is_local_mode()
-        && (content_length > CLOUD_RUN_THRESHOLD || is_video_mime_type(&content_type))
+        && (content_length > UPLOAD_SERVICE_THRESHOLD || is_video_mime_type(&content_type))
     {
-        return handle_cloud_run_proxy(req, auth, content_type, content_length, base_url);
+        return handle_upload_service_proxy(req, auth, content_type, content_length, base_url);
     }
 
     // For small files (or all files in local mode), buffer in memory
@@ -2454,92 +2476,77 @@ fn handle_upload(mut req: Request) -> Result<Response> {
     Ok(resp)
 }
 
-/// Handle large uploads by proxying to Cloud Run
-/// Fastly Compute has WASM memory limits (~5MB), so large files must be proxied
-fn handle_cloud_run_proxy(
-    mut req: Request,
-    auth: crate::blossom::BlossomAuthEvent,
+#[derive(Debug, Clone)]
+struct UploadServicePublishedUpload {
+    sha256: String,
+    size: u64,
     content_type: String,
-    content_length: u64,
-    base_url: String,
-) -> Result<Response> {
-    // Get the original Authorization header to forward
-    let auth_header = req
-        .get_header(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string())
-        .ok_or_else(|| BlossomError::AuthRequired("Missing authorization header".into()))?;
+    thumbnail_url: Option<String>,
+    dim: Option<String>,
+}
 
-    // Get the body to forward
-    let body = req.take_body();
+fn extract_authorization_header(req: &Request) -> Result<String> {
+    req.get_header(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string())
+        .ok_or_else(|| BlossomError::AuthRequired("Missing authorization header".into()))
+}
 
-    // Build request to Cloud Run
-    // NOTE: Use the actual Cloud Run hostname as the Host header, not the custom domain
-    // Cloud Run uses the Host header for routing - if the custom domain isn't configured,
-    // Cloud Run returns 404
-    const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
-    let mut proxy_req = Request::new(
-        fastly::http::Method::PUT,
-        format!("https://{}/upload", CLOUD_RUN_HOST),
-    );
-    proxy_req.set_header("Host", CLOUD_RUN_HOST);
-    proxy_req.set_header(header::AUTHORIZATION, &auth_header);
-    proxy_req.set_header(header::CONTENT_TYPE, &content_type);
-    proxy_req.set_header(header::CONTENT_LENGTH, content_length.to_string());
-    proxy_req.set_body(body);
+fn extract_upload_service_error_message(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value["error"].as_str().map(|error| error.to_string()))
+        .filter(|message| !message.is_empty())
+        .unwrap_or_else(|| body.trim().to_string())
+}
 
-    // Send to Cloud Run
-    let mut proxy_resp = proxy_req
-        .send(CLOUD_RUN_BACKEND)
-        .map_err(|e| BlossomError::Internal(format!("Failed to proxy to Cloud Run: {}", e)))?;
-
-    // Check for errors from Cloud Run
-    if !proxy_resp.get_status().is_success() {
-        let status = proxy_resp.get_status();
-        let body = proxy_resp.take_body().into_string();
-        return Err(BlossomError::Internal(format!(
-            "Cloud Run upload failed ({}): {}",
-            status, body
-        )));
+fn map_upload_service_error(status: StatusCode, body: &str) -> BlossomError {
+    let message = extract_upload_service_error_message(body);
+    match status {
+        StatusCode::BAD_REQUEST => BlossomError::BadRequest(message),
+        StatusCode::UNAUTHORIZED => BlossomError::AuthInvalid(message),
+        StatusCode::FORBIDDEN => BlossomError::Forbidden(message),
+        StatusCode::NOT_FOUND => BlossomError::NotFound(message),
+        StatusCode::CONFLICT => BlossomError::Conflict(message),
+        StatusCode::GONE => BlossomError::Gone(message),
+        s if s == StatusCode::from_u16(416).unwrap() => BlossomError::RangeNotSatisfiable(message),
+        s if s == StatusCode::from_u16(422).unwrap() => BlossomError::UnprocessableEntity(message),
+        StatusCode::INTERNAL_SERVER_ERROR | StatusCode::BAD_GATEWAY => {
+            BlossomError::Internal(message)
+        }
+        _ => BlossomError::StorageError(format!(
+            "Cloud Run request failed ({}): {}",
+            status, message
+        )),
     }
+}
 
-    // Parse Cloud Run response to get the hash
-    let resp_body = proxy_resp.take_body().into_string();
-    let cloud_run_resp: serde_json::Value = serde_json::from_str(&resp_body)
-        .map_err(|e| BlossomError::Internal(format!("Invalid Cloud Run response: {}", e)))?;
+fn publish_upload_service_upload(
+    auth: crate::blossom::BlossomAuthEvent,
+    base_url: String,
+    upload: UploadServicePublishedUpload,
+) -> Result<Response> {
+    let hash = upload.sha256;
+    let size = upload.size;
+    let content_type = upload.content_type;
+    let thumbnail_url = upload.thumbnail_url;
+    let dim = upload.dim;
 
-    let hash = cloud_run_resp["sha256"]
-        .as_str()
-        .ok_or_else(|| BlossomError::Internal("Missing sha256 in Cloud Run response".into()))?
-        .to_string();
-
-    // Check for tombstone (legally removed content cannot be re-uploaded)
     if let Ok(Some(_tombstone)) = get_tombstone(&hash) {
         return Err(BlossomError::Forbidden(
             "This content has been removed and cannot be re-uploaded".into(),
         ));
     }
 
-    let size = cloud_run_resp["size"].as_u64().unwrap_or(content_length);
-
-    // Serialize auth event for provenance
     let auth_event_json = serde_json::to_string(&auth).unwrap_or_default();
 
-    // Parse thumbnail URL if present (for video uploads)
-    let thumbnail_url = cloud_run_resp["thumbnail_url"]
-        .as_str()
-        .map(|s| s.to_string());
-
-    // Parse video dimensions if present (from ffprobe in upload service)
-    let dim = cloud_run_resp["dim"].as_str().map(|s| s.to_string());
-
-    // Check if metadata already exists (dedupe/re-upload case)
     if let Some(mut metadata) = get_blob_metadata(&hash)? {
-        // Track re-uploader in refs and their list
         let _ = add_to_user_list(&auth.pubkey, &hash);
         let _ = add_to_blob_refs(&hash, &auth.pubkey);
 
-        // Even for dedupe, update dim if we got it and it wasn't set before
+        if thumbnail_url.is_some() && metadata.thumbnail.is_none() {
+            metadata.thumbnail = thumbnail_url;
+        }
         if dim.is_some() && metadata.dim.is_none() {
             metadata.dim = dim;
         }
@@ -2553,8 +2560,6 @@ fn handle_cloud_run_proxy(
         return Ok(resp);
     }
 
-    // Store metadata in Fastly's KV store
-    // For video uploads, transcode_status starts as Pending (Cloud Run upload service triggers transcoder)
     let metadata = BlobMetadata {
         sha256: hash.clone(),
         size,
@@ -2569,7 +2574,7 @@ fn handle_cloud_run_proxy(
         } else {
             None
         },
-        dim: dim.clone(), // From ffprobe in upload service; updated by transcoder webhook
+        dim,
         transcript_status: if is_transcribable_mime_type(&content_type) {
             Some(TranscriptStatus::Pending)
         } else {
@@ -2582,15 +2587,10 @@ fn handle_cloud_run_proxy(
     };
 
     put_blob_metadata(&metadata)?;
-
-    // Add to user's list and refs
     add_to_user_list(&auth.pubkey, &hash)?;
     let _ = add_to_blob_refs(&hash, &auth.pubkey);
-
-    // Store provenance: signed auth event as cryptographic proof of upload
     let _ = put_auth_event(&hash, "upload", &auth_event_json);
 
-    // Write audit log to GCS (best effort)
     let meta_json = serde_json::to_string(&metadata).ok();
     write_audit_log(
         &hash,
@@ -2601,22 +2601,18 @@ fn handle_cloud_run_proxy(
         None,
     );
 
-    // Update admin indices (best effort - don't fail upload if these fail)
     let _ = update_stats_on_add(&metadata);
     let _ = add_to_recent_index(&hash);
-    // Add user to index if new, increment unique_uploaders count
     if let Ok(is_new) = add_to_user_index(&auth.pubkey) {
         if is_new {
             let _ = crate::metadata::increment_unique_uploaders();
         }
     }
 
-    // Trigger content moderation for video uploads (fire-and-forget)
     if is_video_mime_type(&content_type) {
         trigger_moderation_scan(&hash, &auth.pubkey);
     }
 
-    // Return blob descriptor with Fastly's CDN URL
     let descriptor = metadata.to_descriptor(&base_url);
     let mut resp = json_response(StatusCode::OK, &descriptor);
     add_cors_headers(&mut resp);
@@ -2624,10 +2620,249 @@ fn handle_cloud_run_proxy(
     Ok(resp)
 }
 
+fn handle_upload_init(mut req: Request) -> Result<Response> {
+    let auth = validate_auth(&req, AuthAction::Upload)?;
+    let auth_header = extract_authorization_header(&req)?;
+    let base_url = get_base_url(&req);
+    let control_host = get_public_host(&req).unwrap_or_else(|| "media.divine.video".into());
+    let body = req.take_body().into_string();
+    if body.is_empty() {
+        return Err(BlossomError::BadRequest("Request body required".into()));
+    }
+
+    let init_request: ResumableUploadInitRequest = serde_json::from_str(&body)
+        .map_err(|e| BlossomError::BadRequest(format!("Invalid JSON: {}", e)))?;
+
+    if init_request.size == 0 {
+        return Err(BlossomError::BadRequest(
+            "Upload size must be greater than zero".into(),
+        ));
+    }
+    if init_request.size > MAX_UPLOAD_SIZE {
+        return Err(BlossomError::BadRequest(format!(
+            "File too large. Maximum size is {} bytes",
+            MAX_UPLOAD_SIZE
+        )));
+    }
+    if init_request.sha256.len() != 64
+        || !init_request
+            .sha256
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Err(BlossomError::BadRequest(
+            "sha256 must be a 64-character hexadecimal string".into(),
+        ));
+    }
+    if init_request.content_type.trim().is_empty() {
+        return Err(BlossomError::BadRequest("Content type is required".into()));
+    }
+
+    if let Some(expected_hash) = auth.get_hash() {
+        if expected_hash.to_lowercase() != init_request.sha256.to_lowercase() {
+            return Err(BlossomError::AuthInvalid(
+                "Hash in auth event doesn't match init request".into(),
+            ));
+        }
+    }
+
+    if let Ok(Some(_tombstone)) = get_tombstone(&init_request.sha256) {
+        return Err(BlossomError::Forbidden(
+            "This content has been removed and cannot be re-uploaded".into(),
+        ));
+    }
+
+    if blob_exists(&init_request.sha256)? {
+        let payload = if let Some(metadata) = get_blob_metadata(&init_request.sha256)? {
+            serde_json::json!({
+                "error": "Blob already exists",
+                "descriptor": metadata.to_descriptor(&base_url),
+            })
+        } else {
+            serde_json::json!({
+                "error": "Blob already exists",
+                "sha256": init_request.sha256,
+            })
+        };
+        let mut resp = json_response(StatusCode::CONFLICT, &payload);
+        add_upload_capability_headers(&mut resp, &control_host);
+        add_cors_headers(&mut resp);
+        return Ok(resp);
+    }
+
+    let mut proxy_req = Request::new(
+        fastly::http::Method::POST,
+        format!("https://{}/upload/init", UPLOAD_SERVICE_HOST),
+    );
+    proxy_req.set_header("Host", UPLOAD_SERVICE_HOST);
+    proxy_req.set_header(header::AUTHORIZATION, &auth_header);
+    proxy_req.set_header(header::CONTENT_TYPE, "application/json");
+    proxy_req.set_header(header::CONTENT_LENGTH, body.len().to_string());
+    proxy_req.set_body(body);
+
+    let mut proxy_resp = proxy_req
+        .send(UPLOAD_SERVICE_BACKEND)
+        .map_err(|e| BlossomError::Internal(format!("Failed to proxy to Cloud Run: {}", e)))?;
+    if !proxy_resp.get_status().is_success() {
+        let status = proxy_resp.get_status();
+        let body = proxy_resp.take_body().into_string();
+        return Err(map_upload_service_error(status, &body));
+    }
+
+    let response_body = proxy_resp.take_body().into_string();
+    let init_response: ResumableUploadInitResponse = serde_json::from_str(&response_body)
+        .map_err(|e| BlossomError::Internal(format!("Invalid Cloud Run init response: {}", e)))?;
+
+    let mut resp = json_response(StatusCode::OK, &init_response);
+    add_upload_capability_headers(&mut resp, &control_host);
+    add_cors_headers(&mut resp);
+    Ok(resp)
+}
+
+fn handle_upload_complete(mut req: Request, path: &str) -> Result<Response> {
+    let auth = validate_auth(&req, AuthAction::Upload)?;
+    let auth_header = extract_authorization_header(&req)?;
+    let base_url = get_base_url(&req);
+    let upload_id = path
+        .strip_prefix("/upload/")
+        .and_then(|suffix| suffix.strip_suffix("/complete"))
+        .ok_or_else(|| BlossomError::BadRequest("Invalid upload complete path".into()))?;
+    let request_body = req.take_body().into_string();
+
+    let expected_request_hash = if request_body.trim().is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::from_str::<ResumableUploadCompleteRequest>(&request_body)
+                .map_err(|e| BlossomError::BadRequest(format!("Invalid completion JSON: {}", e)))?,
+        )
+    };
+
+    if let Some(expected_hash) = auth.get_hash() {
+        if let Some(ref request) = expected_request_hash {
+            if expected_hash.to_lowercase() != request.sha256.to_lowercase() {
+                return Err(BlossomError::AuthInvalid(
+                    "Hash in auth event doesn't match completion request".into(),
+                ));
+            }
+        }
+    }
+
+    let mut proxy_req = Request::new(
+        fastly::http::Method::POST,
+        format!(
+            "https://{}/upload/{}/complete",
+            UPLOAD_SERVICE_HOST, upload_id
+        ),
+    );
+    proxy_req.set_header("Host", UPLOAD_SERVICE_HOST);
+    proxy_req.set_header(header::AUTHORIZATION, &auth_header);
+    if !request_body.trim().is_empty() {
+        proxy_req.set_header(header::CONTENT_TYPE, "application/json");
+        proxy_req.set_header(header::CONTENT_LENGTH, request_body.len().to_string());
+        proxy_req.set_body(request_body);
+    }
+
+    let mut proxy_resp = proxy_req
+        .send(UPLOAD_SERVICE_BACKEND)
+        .map_err(|e| BlossomError::Internal(format!("Failed to proxy to Cloud Run: {}", e)))?;
+    if !proxy_resp.get_status().is_success() {
+        let status = proxy_resp.get_status();
+        let body = proxy_resp.take_body().into_string();
+        return Err(map_upload_service_error(status, &body));
+    }
+
+    let response_body = proxy_resp.take_body().into_string();
+    let complete_response: ResumableUploadCompleteResponse = serde_json::from_str(&response_body)
+        .map_err(|e| {
+        BlossomError::Internal(format!("Invalid Cloud Run completion response: {}", e))
+    })?;
+
+    if let Some(ref request) = expected_request_hash {
+        if request.sha256.to_lowercase() != complete_response.sha256.to_lowercase() {
+            return Err(BlossomError::Conflict(
+                "Completion response hash did not match requested hash".into(),
+            ));
+        }
+    }
+
+    publish_upload_service_upload(
+        auth,
+        base_url,
+        UploadServicePublishedUpload {
+            sha256: complete_response.sha256,
+            size: complete_response.size,
+            content_type: complete_response.content_type,
+            thumbnail_url: complete_response.thumbnail_url,
+            dim: complete_response.dim,
+        },
+    )
+}
+
+/// Handle large uploads by proxying to the upload service
+/// Fastly Compute has WASM memory limits (~5MB), so large files must be proxied
+fn handle_upload_service_proxy(
+    mut req: Request,
+    auth: crate::blossom::BlossomAuthEvent,
+    content_type: String,
+    content_length: u64,
+    base_url: String,
+) -> Result<Response> {
+    let auth_header = extract_authorization_header(&req)?;
+
+    // Get the body to forward
+    let body = req.take_body();
+
+    // Build request to the upload service.
+    let mut proxy_req = Request::new(
+        fastly::http::Method::PUT,
+        format!("https://{}/upload", UPLOAD_SERVICE_HOST),
+    );
+    proxy_req.set_header("Host", UPLOAD_SERVICE_HOST);
+    proxy_req.set_header(header::AUTHORIZATION, &auth_header);
+    proxy_req.set_header(header::CONTENT_TYPE, &content_type);
+    proxy_req.set_header(header::CONTENT_LENGTH, content_length.to_string());
+    proxy_req.set_body(body);
+
+    // Send to Cloud Run
+    let mut proxy_resp = proxy_req
+        .send(UPLOAD_SERVICE_BACKEND)
+        .map_err(|e| BlossomError::Internal(format!("Failed to proxy to Cloud Run: {}", e)))?;
+
+    // Check for errors from Cloud Run
+    if !proxy_resp.get_status().is_success() {
+        let status = proxy_resp.get_status();
+        let body = proxy_resp.take_body().into_string();
+        return Err(map_upload_service_error(status, &body));
+    }
+
+    // Parse Cloud Run response to get the hash
+    let resp_body = proxy_resp.take_body().into_string();
+    let cloud_run_resp: serde_json::Value = serde_json::from_str(&resp_body)
+        .map_err(|e| BlossomError::Internal(format!("Invalid Cloud Run response: {}", e)))?;
+    let upload = UploadServicePublishedUpload {
+        sha256: cloud_run_resp["sha256"]
+            .as_str()
+            .ok_or_else(|| BlossomError::Internal("Missing sha256 in Cloud Run response".into()))?
+            .to_string(),
+        size: cloud_run_resp["size"].as_u64().unwrap_or(content_length),
+        content_type: content_type.clone(),
+        thumbnail_url: cloud_run_resp["thumbnail_url"]
+            .as_str()
+            .map(|value| value.to_string()),
+        dim: cloud_run_resp["dim"]
+            .as_str()
+            .map(|value| value.to_string()),
+    };
+
+    publish_upload_service_upload(auth, base_url, upload)
+}
+
 /// HEAD /upload - BUD-06 upload pre-validation
 /// Clients can send X-SHA-256, X-Content-Length, X-Content-Type headers
 /// to check if an upload would be accepted before sending the full file
 fn handle_upload_requirements(req: Request) -> Result<Response> {
+    let control_host = get_public_host(&req).unwrap_or_else(|| "media.divine.video".into());
     // Check for BUD-06 pre-validation headers
     let sha256 = req
         .get_header("X-SHA-256")
@@ -2652,6 +2887,7 @@ fn handle_upload_requirements(req: Request) -> Result<Response> {
                     "X-Reason",
                     "Invalid X-SHA-256 format (must be 64 hex characters)",
                 );
+                add_upload_capability_headers(&mut resp, &control_host);
                 add_cors_headers(&mut resp);
                 return Ok(resp);
             }
@@ -2661,6 +2897,7 @@ fn handle_upload_requirements(req: Request) -> Result<Response> {
                 let mut resp = Response::from_status(StatusCode::OK);
                 resp.set_header("X-Reason", "Blob already exists");
                 resp.set_header("X-Exists", "true");
+                add_upload_capability_headers(&mut resp, &control_host);
                 add_cors_headers(&mut resp);
                 return Ok(resp);
             }
@@ -2674,12 +2911,14 @@ fn handle_upload_requirements(req: Request) -> Result<Response> {
                     "X-Reason",
                     &format!("File too large. Maximum size is {} bytes", MAX_UPLOAD_SIZE),
                 );
+                add_upload_capability_headers(&mut resp, &control_host);
                 add_cors_headers(&mut resp);
                 return Ok(resp);
             }
             if size == 0 {
                 let mut resp = Response::from_status(StatusCode::BAD_REQUEST);
                 resp.set_header("X-Reason", "File cannot be empty");
+                add_upload_capability_headers(&mut resp, &control_host);
                 add_cors_headers(&mut resp);
                 return Ok(resp);
             }
@@ -2691,6 +2930,7 @@ fn handle_upload_requirements(req: Request) -> Result<Response> {
         // All validations passed
         let mut resp = Response::from_status(StatusCode::OK);
         resp.set_header("X-Reason", "Upload would be accepted");
+        add_upload_capability_headers(&mut resp, &control_host);
         add_cors_headers(&mut resp);
         return Ok(resp);
     }
@@ -2699,9 +2939,11 @@ fn handle_upload_requirements(req: Request) -> Result<Response> {
     let requirements = UploadRequirements {
         max_size: Some(MAX_UPLOAD_SIZE),
         allowed_types: None, // Accept all types
+        extensions: Some(vec![DIVINE_UPLOAD_EXTENSION_RESUMABLE.to_string()]),
     };
 
     let mut resp = json_response(StatusCode::OK, &requirements);
+    add_upload_capability_headers(&mut resp, &control_host);
     add_cors_headers(&mut resp);
 
     Ok(resp)
@@ -3319,19 +3561,17 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
     let migrate_json = serde_json::to_string(&migrate_body)
         .map_err(|e| BlossomError::Internal(format!("JSON error: {}", e)))?;
 
-    // Use actual Cloud Run hostname - see handle_cloud_run_proxy comment
-    const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
     let mut proxy_req = Request::new(
         fastly::http::Method::POST,
-        format!("https://{}/migrate", CLOUD_RUN_HOST),
+        format!("https://{}/migrate", UPLOAD_SERVICE_HOST),
     );
-    proxy_req.set_header("Host", CLOUD_RUN_HOST);
+    proxy_req.set_header("Host", UPLOAD_SERVICE_HOST);
     proxy_req.set_header("Content-Type", "application/json");
     proxy_req.set_header("Content-Length", migrate_json.len().to_string());
     proxy_req.set_body(migrate_json);
 
     let mut proxy_resp = proxy_req
-        .send(CLOUD_RUN_BACKEND)
+        .send(UPLOAD_SERVICE_BACKEND)
         .map_err(|e| BlossomError::Internal(format!("Failed to proxy to Cloud Run: {}", e)))?;
 
     if !proxy_resp.get_status().is_success() {
@@ -3600,7 +3840,11 @@ fn handle_admin_backfill_vtt(req: Request) -> Result<Response> {
             }
         }
 
-        (end < total_hashes, if end < total_hashes { Some(end) } else { None }, None)
+        (
+            end < total_hashes,
+            if end < total_hashes { Some(end) } else { None },
+            None,
+        )
     } else {
         let user_index = crate::metadata::get_user_index()?;
         let total_users = user_index.pubkeys.len();
@@ -4521,8 +4765,17 @@ fn add_cors_headers(resp: &mut Response) {
     );
     resp.set_header(
         "Access-Control-Expose-Headers",
-        "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256, X-Audio-Duration, X-Audio-Size",
+        "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256, X-Content-SHA256, X-Audio-Duration, X-Audio-Size, X-Divine-Upload-Extensions, X-Divine-Upload-Control-Host, X-Divine-Upload-Data-Host",
     );
+}
+
+fn add_upload_capability_headers(resp: &mut Response, control_host: &str) {
+    resp.set_header(
+        "X-Divine-Upload-Extensions",
+        DIVINE_UPLOAD_EXTENSION_RESUMABLE,
+    );
+    resp.set_header("X-Divine-Upload-Control-Host", control_host);
+    resp.set_header("X-Divine-Upload-Data-Host", UPLOAD_SERVICE_HOST);
 }
 
 /// CORS preflight response
@@ -4537,10 +4790,15 @@ fn cors_preflight_response() -> Response {
 /// Prefers X-Original-Host (set by VCL when service-chaining) over the Host header,
 /// so that BlobDescriptor URLs reflect the public-facing domain.
 fn get_base_url(req: &Request) -> String {
-    req.get_header_str("X-Original-Host")
-        .or_else(|| req.get_header(header::HOST).and_then(|h| h.to_str().ok()))
+    get_public_host(req)
         .map(|host| format!("https://{}", host))
         .unwrap_or_else(|| "https://media.divine.video".into())
+}
+
+fn get_public_host(req: &Request) -> Option<String> {
+    req.get_header_str("X-Original-Host")
+        .or_else(|| req.get_header(header::HOST).and_then(|h| h.to_str().ok()))
+        .map(str::to_string)
 }
 
 /// Infer MIME type from file extension in path
@@ -4613,15 +4871,15 @@ fn infer_mime_from_path(path: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_audio_reuse_availability, decide_transcript_fetch_action,
-        is_alias_only_audio_blob, is_quality_variant_path, parse_quality_variant_path,
-        parse_transcript_status_webhook_payload, should_delete_derived_audio_blob,
-        should_set_audio_content_length, AudioReuseAvailability, TranscriptFetchAction,
-        TranscriptPendingState,
+        classify_audio_reuse_availability, decide_transcript_fetch_action, error_response,
+        handle_upload_requirements, is_alias_only_audio_blob, is_quality_variant_path,
+        parse_quality_variant_path, parse_transcript_status_webhook_payload,
+        should_delete_derived_audio_blob, should_set_audio_content_length, AudioReuseAvailability,
+        TranscriptFetchAction, TranscriptPendingState,
     };
     use crate::blossom::TranscriptStatus;
     use crate::error::{BlossomError, Result as BlossomResult};
-    use fastly::http::StatusCode;
+    use fastly::http::{Method, StatusCode};
 
     #[test]
     fn quality_variant_path_valid() {
@@ -4665,14 +4923,12 @@ mod tests {
         let hash = "a".repeat(64);
 
         // 720p.mp4 derives correct .ts counterpart for backfill check
-        let (_, filename, ct) =
-            parse_quality_variant_path(&format!("/{}/720p.mp4", hash)).unwrap();
+        let (_, filename, ct) = parse_quality_variant_path(&format!("/{}/720p.mp4", hash)).unwrap();
         assert_eq!(ct, "video/mp4");
         assert_eq!(filename.replace(".mp4", ".ts"), "stream_720p.ts");
 
         // 480p.mp4 likewise
-        let (_, filename, ct) =
-            parse_quality_variant_path(&format!("/{}/480p.mp4", hash)).unwrap();
+        let (_, filename, ct) = parse_quality_variant_path(&format!("/{}/480p.mp4", hash)).unwrap();
         assert_eq!(ct, "video/mp4");
         assert_eq!(filename.replace(".mp4", ".ts"), "stream_480p.ts");
 
@@ -4715,11 +4971,7 @@ mod tests {
     #[test]
     fn transcript_fetch_action_cools_down_when_retry_after_is_in_future() {
         assert_eq!(
-            decide_transcript_fetch_action(
-                Some(TranscriptStatus::Failed),
-                Some(1_030),
-                1_000,
-            ),
+            decide_transcript_fetch_action(Some(TranscriptStatus::Failed), Some(1_030), 1_000,),
             TranscriptFetchAction::Accepted {
                 state: TranscriptPendingState::CoolingDown,
                 retry_after_secs: 30,
@@ -4730,11 +4982,7 @@ mod tests {
     #[test]
     fn transcript_fetch_action_keeps_processing_items_in_progress() {
         assert_eq!(
-            decide_transcript_fetch_action(
-                Some(TranscriptStatus::Processing),
-                None,
-                1_000,
-            ),
+            decide_transcript_fetch_action(Some(TranscriptStatus::Processing), None, 1_000,),
             TranscriptFetchAction::Accepted {
                 state: TranscriptPendingState::InProgress,
                 retry_after_secs: 5,
@@ -4745,11 +4993,7 @@ mod tests {
     #[test]
     fn transcript_fetch_action_triggers_pending_items_without_cooldown() {
         assert_eq!(
-            decide_transcript_fetch_action(
-                Some(TranscriptStatus::Pending),
-                None,
-                1_000,
-            ),
+            decide_transcript_fetch_action(Some(TranscriptStatus::Pending), None, 1_000,),
             TranscriptFetchAction::Trigger {
                 retry_after_secs: 10,
                 should_repair: false,
@@ -4760,11 +5004,7 @@ mod tests {
     #[test]
     fn transcript_fetch_action_repairs_missing_vtt_for_complete_status() {
         assert_eq!(
-            decide_transcript_fetch_action(
-                Some(TranscriptStatus::Complete),
-                None,
-                1_000,
-            ),
+            decide_transcript_fetch_action(Some(TranscriptStatus::Complete), None, 1_000,),
             TranscriptFetchAction::Trigger {
                 retry_after_secs: 10,
                 should_repair: true,
@@ -4817,12 +5057,65 @@ mod tests {
 
     #[test]
     fn audio_response_headers_keep_partial_content_length_from_storage() {
-        assert!(!should_set_audio_content_length(StatusCode::PARTIAL_CONTENT));
+        assert!(!should_set_audio_content_length(
+            StatusCode::PARTIAL_CONTENT
+        ));
     }
 
     #[test]
     fn audio_response_headers_set_full_content_length_for_complete_responses() {
         assert!(should_set_audio_content_length(StatusCode::OK));
         assert!(should_set_audio_content_length(StatusCode::CREATED));
+    }
+
+    #[test]
+    fn upload_requirements_advertise_resumable_extension() {
+        let req = fastly::Request::new(Method::HEAD, "https://media.divine.video/upload");
+
+        let resp = handle_upload_requirements(req).expect("upload requirements response");
+
+        assert_eq!(resp.get_status(), StatusCode::OK);
+        assert_eq!(
+            resp.get_header_str("X-Divine-Upload-Extensions"),
+            Some("resumable")
+        );
+    }
+
+    #[test]
+    fn upload_requirements_advertise_control_and_data_hosts() {
+        let req = fastly::Request::new(Method::HEAD, "https://media.divine.video/upload");
+
+        let resp = handle_upload_requirements(req).expect("upload requirements response");
+
+        assert_eq!(resp.get_status(), StatusCode::OK);
+        assert_eq!(
+            resp.get_header_str("X-Divine-Upload-Control-Host"),
+            Some("media.divine.video")
+        );
+        assert_eq!(
+            resp.get_header_str("X-Divine-Upload-Data-Host"),
+            Some("upload.divine.video")
+        );
+    }
+
+    #[test]
+    fn upload_requirements_expose_resumable_capability_headers_for_cors() {
+        let req = fastly::Request::new(Method::HEAD, "https://media.divine.video/upload");
+
+        let resp = handle_upload_requirements(req).expect("upload requirements response");
+        let exposed_headers = resp
+            .get_header_str("Access-Control-Expose-Headers")
+            .expect("exposed headers");
+
+        assert!(exposed_headers.contains("X-Divine-Upload-Extensions"));
+        assert!(exposed_headers.contains("X-Divine-Upload-Control-Host"));
+        assert!(exposed_headers.contains("X-Divine-Upload-Data-Host"));
+    }
+
+    #[test]
+    fn complete_rejects_unknown_upload_session_with_404() {
+        let resp = error_response(&BlossomError::NotFound("Upload session not found".into()));
+
+        assert_eq!(resp.get_status(), StatusCode::NOT_FOUND);
     }
 }

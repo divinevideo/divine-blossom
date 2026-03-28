@@ -12,10 +12,11 @@ Client → Fastly Compute (Rust WASM) → GCS (blobs) + Fastly KV (metadata)
 ```
 
 - **Fastly Compute Edge** (`src/`) - Rust WASM service on Fastly. Handles uploads, metadata KV, HLS proxying, admin, provenance
-- **Cloud Run Upload** (`cloud-run-upload/`) - Rust service on GCP. Receives video bytes, sanitizes (ffmpeg -c copy), hashes, uploads to GCS, triggers transcoder, receives audit logs
+- **Cloud Run Upload** (`cloud-run-upload/`) - Rust service on GCP. Receives legacy `PUT /upload` bytes, owns resumable upload sessions, writes temp/final objects in GCS, triggers transcoder, receives audit logs
 - **Cloud Run Transcoder** (`cloud-run-transcoder/`) - Rust service on GCP with NVIDIA GPU. Downloads from GCS, transcodes to HLS via FFmpeg NVENC, uploads segments back
 - **GCS bucket**: `divine-blossom-media`
-- **CDN**: `media.divine.video` (Fastly)
+- **Control plane**: `media.divine.video` (Fastly)
+- **Data plane**: `upload.divine.video` (GKE-hosted resumable `HEAD`/`PUT`/`DELETE` service)
 
 ## Features
 
@@ -79,6 +80,20 @@ fastly compute serve
 
 **Note**: `fastly.toml` is gitignored to prevent accidentally committing secrets. The `[local_server.secret_stores]` section is only used for local testing.
 
+### Cloud Run upload service configuration
+
+`cloud-run-upload` now expects these runtime values in addition to the existing bucket and transcoder settings:
+
+- `UPLOAD_BASE_URL=https://upload.divine.video`
+- `RESUMABLE_SESSION_TTL_SECS=86400`
+- `RESUMABLE_CHUNK_SIZE=8388608`
+
+For browser/web clients, the `upload.divine.video` service must allow:
+
+- Methods: `HEAD`, `PUT`, `POST`, `DELETE`, `OPTIONS`
+- Request headers: `Authorization`, `Content-Type`, `Content-Range`
+- Exposed response headers: `Upload-Offset`, `Upload-Length`, `Upload-Expires`, `X-Divine-Chunk-Size`
+
 ### Deploy
 
 ```bash
@@ -115,8 +130,24 @@ fastly compute publish
 |--------|------|------|-------------|
 | `PUT` | `/upload` | Required | Upload blob |
 | `HEAD` | `/upload` | None | Get upload requirements |
+| `POST` | `/upload/init` | Required | Create a Divine resumable upload session |
+| `POST` | `/upload/<upload_id>/complete` | Required | Publish a completed resumable upload into canonical metadata |
 | `DELETE` | `/<sha256>` | Required | Permanently delete your own blob |
 | `GET` | `/list/<pubkey>` | Optional | List user's blobs |
+
+When resumable support is available, `HEAD /upload` includes these discovery headers:
+
+- `X-Divine-Upload-Extensions: resumable`
+- `X-Divine-Upload-Control-Host: <public Blossom host>`
+- `X-Divine-Upload-Data-Host: upload.divine.video`
+
+The session byte stream itself is served from `upload.divine.video`:
+
+| Method | Host | Path | Auth | Description |
+|--------|------|------|------|-------------|
+| `HEAD` | `upload.divine.video` | `/sessions/<upload_id>` | Session bearer token | Query the committed offset |
+| `PUT` | `upload.divine.video` | `/sessions/<upload_id>` | Session bearer token | Upload a contiguous chunk with `Content-Range` |
+| `DELETE` | `upload.divine.video` | `/upload/<upload_id>` | Session bearer token | Abort a resumable upload session |
 
 ### Provenance & Admin
 
