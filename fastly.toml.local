@@ -31,7 +31,8 @@ language = "rust"
     [local_server.backends.nostr_build]
     url = "http://localhost:9000"
 
-    [local_server.backends.cloud_run_upload]
+    [local_server.backends.upload_service]
+    # Local stub for the upload/resumable session service.
     url = "http://localhost:9000"
 
     [local_server.backends.moderation_api]

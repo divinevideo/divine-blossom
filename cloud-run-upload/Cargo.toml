@@ -48,6 +48,8 @@ url = "2"
 # Error handling
 anyhow = "1"
 thiserror = "1"
+async-trait = "0.1"
+rand = "0.8"
 
 # Temp files for thumbnail extraction
 tempfile = "3"

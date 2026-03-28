@@ -182,6 +182,49 @@ pub struct UploadRequirements {
     /// Allowed MIME types (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_types: Option<Vec<String>>,
+    /// Supported Divine upload extensions (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Vec<String>>,
+}
+
+/// Request payload for initializing a resumable upload session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumableUploadInitRequest {
+    pub sha256: String,
+    pub size: u64,
+    pub content_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+}
+
+/// Response payload returned after creating a resumable upload session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumableUploadInitResponse {
+    pub upload_id: String,
+    pub upload_url: String,
+    pub expires_at: String,
+    pub chunk_size: u64,
+    pub next_offset: u64,
+    #[serde(default)]
+    pub required_headers: HashMap<String, String>,
+}
+
+/// Request payload for completing a resumable upload session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumableUploadCompleteRequest {
+    pub sha256: String,
+}
+
+/// Response payload returned when a resumable upload session finishes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumableUploadCompleteResponse {
+    pub sha256: String,
+    pub size: u64,
+    pub content_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbnail_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dim: Option<String>,
 }
 
 /// Subtitle job status returned by /v1/subtitles APIs.
@@ -683,10 +726,7 @@ mod tests {
         // HLS URL present when complete
         meta.transcode_status = Some(TranscodeStatus::Complete);
         let desc = meta.to_descriptor(base);
-        assert_eq!(
-            desc.hls,
-            Some(format!("{}/{}.hls", base, meta.sha256))
-        );
+        assert_eq!(desc.hls, Some(format!("{}/{}.hls", base, meta.sha256)));
     }
 
     #[test]
@@ -701,10 +741,7 @@ mod tests {
         // VTT URL present when complete
         meta.transcript_status = Some(TranscriptStatus::Complete);
         let desc = meta.to_descriptor(base);
-        assert_eq!(
-            desc.vtt,
-            Some(format!("{}/{}.vtt", base, meta.sha256))
-        );
+        assert_eq!(desc.vtt, Some(format!("{}/{}.vtt", base, meta.sha256)));
     }
 
     #[test]

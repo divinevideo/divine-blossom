@@ -1,15 +1,16 @@
 // ABOUTME: Rust Cloud Run service for Blossom blob uploads
 // ABOUTME: Handles Nostr auth validation, streaming upload to GCS, and SHA-256 hashing
 
+mod resumable;
 mod thumbnail;
 
 use anyhow::{anyhow, Result};
 use axum::{
     body::Body,
     extract::{Path, State},
-    http::{header, Method, StatusCode},
+    http::{header, HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Json, Response},
-    routing::{get, options, post, put},
+    routing::{delete, get, head, options, post, put},
     Router,
 };
 use bytes::Bytes;
@@ -41,13 +42,17 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
 // Configuration
+#[derive(Clone)]
 struct Config {
     gcs_bucket: String,
     cdn_base_url: String,
+    upload_base_url: String,
     port: u16,
     migration_nsec: Option<String>,
     transcoder_url: Option<String>,
     transcriber_url: Option<String>,
+    resumable_session_ttl_secs: u64,
+    resumable_chunk_size: u64,
 }
 
 impl Config {
@@ -57,6 +62,8 @@ impl Config {
                 .unwrap_or_else(|_| "divine-blossom-media".to_string()),
             cdn_base_url: env::var("CDN_BASE_URL")
                 .unwrap_or_else(|_| "https://media.divine.video".to_string()),
+            upload_base_url: env::var("UPLOAD_BASE_URL")
+                .unwrap_or_else(|_| "https://upload.divine.video".to_string()),
             port: env::var("PORT")
                 .unwrap_or_else(|_| "8080".to_string())
                 .parse()
@@ -68,6 +75,14 @@ impl Config {
             transcriber_url: env::var("TRANSCRIBER_URL")
                 .ok()
                 .or_else(|| env::var("TRANSCODER_URL").ok()),
+            resumable_session_ttl_secs: env::var("RESUMABLE_SESSION_TTL_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(resumable::DEFAULT_RESUMABLE_SESSION_TTL_SECS),
+            resumable_chunk_size: env::var("RESUMABLE_CHUNK_SIZE")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(resumable::DEFAULT_RESUMABLE_CHUNK_SIZE),
         }
     }
 }
@@ -155,14 +170,46 @@ async fn main() -> Result<()> {
     // CORS configuration
     let cors = CorsLayer::new()
         .allow_origin(Any)
-        .allow_methods([Method::GET, Method::PUT, Method::POST, Method::OPTIONS])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        .allow_methods([
+            Method::GET,
+            Method::HEAD,
+            Method::PUT,
+            Method::POST,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::CONTENT_RANGE,
+        ])
+        .expose_headers([
+            HeaderName::from_static("upload-offset"),
+            HeaderName::from_static("upload-length"),
+            HeaderName::from_static("upload-expires"),
+            HeaderName::from_static("x-divine-chunk-size"),
+        ])
         .max_age(std::time::Duration::from_secs(86400));
 
     // Build router
     let app = Router::new()
         .route("/upload", put(handle_upload))
         .route("/upload", options(handle_cors_preflight))
+        .route("/upload/init", post(handle_resumable_init))
+        .route("/upload/init", options(handle_cors_preflight))
+        .route(
+            "/upload/:upload_id/complete",
+            post(handle_resumable_complete),
+        )
+        .route(
+            "/upload/:upload_id/complete",
+            options(handle_cors_preflight),
+        )
+        .route("/upload/:upload_id", delete(handle_resumable_abort))
+        .route("/upload/:upload_id", options(handle_cors_preflight))
+        .route("/sessions/:upload_id", put(handle_session_chunk))
+        .route("/sessions/:upload_id", head(handle_session_head))
+        .route("/sessions/:upload_id", options(handle_cors_preflight))
         .route("/migrate", post(handle_migrate))
         .route("/migrate", options(handle_cors_preflight))
         .route("/audit", post(handle_audit_log))
@@ -204,6 +251,39 @@ async fn main() -> Result<()> {
 
 async fn handle_cors_preflight() -> impl IntoResponse {
     StatusCode::NO_CONTENT
+}
+
+fn auth_error_response(error: anyhow::Error) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(ErrorResponse {
+            error: error.to_string(),
+        }),
+    )
+        .into_response()
+}
+
+fn resumable_error_response(error: resumable::ResumableError) -> Response {
+    (
+        error.status_code(),
+        Json(ErrorResponse {
+            error: error.to_string(),
+        }),
+    )
+        .into_response()
+}
+
+async fn collect_body_bytes(body: Body) -> Result<Bytes> {
+    let mut stream = body.into_data_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        bytes.extend_from_slice(&chunk.map_err(|error| anyhow!("Stream error: {}", error))?);
+    }
+    Ok(Bytes::from(bytes))
+}
+
+fn header_value(value: u64) -> HeaderValue {
+    HeaderValue::from_str(&value.to_string()).expect("numeric header values must be valid")
 }
 
 /// POST /audit - Receive audit log entries from Fastly edge and write as structured logs.
@@ -252,6 +332,193 @@ async fn handle_upload(
             )
                 .into_response()
         }
+    }
+}
+
+fn resumable_manager(
+    state: &AppState,
+) -> resumable::ResumableManager<resumable::GcsResumableBackend, resumable::GcsSessionStore> {
+    resumable::ResumableManager::new(
+        resumable::GcsResumableBackend::new(
+            state.gcs_client.clone(),
+            state.config.gcs_bucket.clone(),
+        ),
+        resumable::GcsSessionStore::new(state.gcs_client.clone(), state.config.gcs_bucket.clone()),
+        state.config.upload_base_url.clone(),
+        state.config.resumable_chunk_size,
+        state.config.resumable_session_ttl_secs,
+    )
+}
+
+async fn handle_resumable_init(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<resumable::ResumableUploadInitRequest>,
+) -> Response {
+    let auth_event = match validate_auth(&headers, "upload") {
+        Ok(event) => event,
+        Err(error) => return auth_error_response(error),
+    };
+
+    if let Some(expected_hash) = get_tag_value(&auth_event.tags, "x") {
+        if expected_hash.to_lowercase() != request.sha256.to_lowercase() {
+            return resumable_error_response(resumable::ResumableError::BadRequest(
+                "Declared sha256 does not match Blossom auth hash tag".to_string(),
+            ));
+        }
+    }
+
+    let manager = resumable_manager(state.as_ref());
+    match manager.init_session(&auth_event.pubkey, request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => resumable_error_response(error),
+    }
+}
+
+async fn handle_session_head(
+    State(state): State<Arc<AppState>>,
+    Path(upload_id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let manager = resumable_manager(state.as_ref());
+    match manager
+        .head_session(
+            &upload_id,
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+        )
+        .await
+    {
+        Ok(status) => {
+            let mut response = Response::new(Body::empty());
+            *response.status_mut() = StatusCode::NO_CONTENT;
+            response.headers_mut().insert(
+                resumable::SESSION_OFFSET_HEADER,
+                header_value(status.next_offset),
+            );
+            response.headers_mut().insert(
+                resumable::SESSION_LENGTH_HEADER,
+                header_value(status.declared_size),
+            );
+            response.headers_mut().insert(
+                resumable::SESSION_EXPIRES_HEADER,
+                HeaderValue::from_str(&status.expires_at)
+                    .expect("session expiry header must be valid ASCII"),
+            );
+            response.headers_mut().insert(
+                resumable::SESSION_CHUNK_SIZE_HEADER,
+                header_value(status.chunk_size),
+            );
+            response
+        }
+        Err(error) => resumable_error_response(error),
+    }
+}
+
+async fn handle_session_chunk(
+    State(state): State<Arc<AppState>>,
+    Path(upload_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: Body,
+) -> Response {
+    let content_range = match headers
+        .get(header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(value) => value.to_string(),
+        None => {
+            return resumable_error_response(resumable::ResumableError::BadRequest(
+                "Content-Range header required".to_string(),
+            ))
+        }
+    };
+
+    let chunk = match collect_body_bytes(body).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return resumable_error_response(resumable::ResumableError::BadRequest(format!(
+                "Failed to read request body: {}",
+                error
+            )))
+        }
+    };
+
+    let manager = resumable_manager(state.as_ref());
+    match manager
+        .upload_chunk(
+            &upload_id,
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            &content_range,
+            chunk,
+        )
+        .await
+    {
+        Ok(status) => {
+            let mut response = Response::new(Body::empty());
+            *response.status_mut() = StatusCode::NO_CONTENT;
+            response.headers_mut().insert(
+                resumable::SESSION_OFFSET_HEADER,
+                header_value(status.next_offset),
+            );
+            response.headers_mut().insert(
+                resumable::SESSION_LENGTH_HEADER,
+                header_value(status.declared_size),
+            );
+            response.headers_mut().insert(
+                resumable::SESSION_EXPIRES_HEADER,
+                HeaderValue::from_str(&status.expires_at)
+                    .expect("session expiry header must be valid ASCII"),
+            );
+            response.headers_mut().insert(
+                resumable::SESSION_CHUNK_SIZE_HEADER,
+                header_value(status.chunk_size),
+            );
+            response
+        }
+        Err(error) => resumable_error_response(error),
+    }
+}
+
+async fn handle_resumable_complete(
+    State(state): State<Arc<AppState>>,
+    Path(upload_id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let auth_event = match validate_auth(&headers, "upload") {
+        Ok(event) => event,
+        Err(error) => return auth_error_response(error),
+    };
+
+    let manager = resumable_manager(state.as_ref());
+    match manager
+        .complete_session(&upload_id, &auth_event.pubkey)
+        .await
+    {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => resumable_error_response(error),
+    }
+}
+
+async fn handle_resumable_abort(
+    State(state): State<Arc<AppState>>,
+    Path(upload_id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let manager = resumable_manager(state.as_ref());
+    match manager
+        .abort_session(
+            &upload_id,
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+        )
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => resumable_error_response(error),
     }
 }
 
@@ -413,7 +680,10 @@ async fn stream_to_gcs_with_hash(
             }
             Err(e) => {
                 // Non-fatal: keep original bytes for derivative processing if sanitization fails
-                error!("Video sanitization failed for derivatives, using original: {}", e);
+                error!(
+                    "Video sanitization failed for derivatives, using original: {}",
+                    e
+                );
             }
         }
     }
@@ -469,7 +739,10 @@ async fn stream_to_gcs_with_hash(
     };
     let _ = client.patch_object(&update_req).await;
 
-    info!("Uploaded {} bytes as {} (owner: {})", total_size, sha256_hash, owner);
+    info!(
+        "Uploaded {} bytes as {} (owner: {})",
+        total_size, sha256_hash, owner
+    );
     Ok((sha256_hash, total_size, derivative_bytes))
 }
 
@@ -851,8 +1124,7 @@ mod tests {
 
     #[test]
     fn media_source_candidates_prefer_original_then_hls_variants() {
-        let hash =
-            "5b48aa1fcf30af61243ac9307eb98b7fa22df1c58573c3ca5d1b14fc30099929";
+        let hash = "5b48aa1fcf30af61243ac9307eb98b7fa22df1c58573c3ca5d1b14fc30099929";
         let candidates = media_source_candidates(hash);
 
         assert_eq!(candidates[0], hash);

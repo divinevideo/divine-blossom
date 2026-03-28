@@ -27,8 +27,10 @@ language = "rust"
     [local_server.backends.nostr_build]
     url = "https://image.nostr.build"
 
-    [local_server.backends.cloud_run_upload]
-    url = "https://blossom-upload-rust-149672065768.us-central1.run.app"
+    [local_server.backends.upload_service]
+    # Fastly control-plane proxy target. In production this should point at
+    # the GKE upload service on upload.divine.video.
+    url = "https://upload.divine.video"
 
     [local_server.backends.moderation_api]
     url = "https://moderation-api.divine.video"
@@ -96,9 +98,9 @@ language = "rust"
     address = "image.nostr.build"
     port = 443
 
-    [setup.backends.cloud_run_upload]
-    description = "Cloud Run upload/migration service"
-    address = "blossom-upload-rust-149672065768.us-central1.run.app"
+    [setup.backends.upload_service]
+    description = "GKE upload/migration/resumable session service"
+    address = "upload.divine.video"
     port = 443
 
     [setup.backends.moderation_api]

@@ -15,8 +15,16 @@ pub enum BlossomError {
     Forbidden(String),
     /// Blob not found
     NotFound(String),
+    /// Conflict with existing state
+    Conflict(String),
     /// Bad request - malformed input
     BadRequest(String),
+    /// Upload session or resource expired
+    Gone(String),
+    /// Requested byte range is invalid for the current upload state
+    RangeNotSatisfiable(String),
+    /// Entity is well-formed but semantically invalid
+    UnprocessableEntity(String),
     /// Storage backend error
     StorageError(String),
     /// Metadata store error
@@ -33,7 +41,15 @@ impl BlossomError {
             BlossomError::AuthInvalid(_) => StatusCode::UNAUTHORIZED,
             BlossomError::Forbidden(_) => StatusCode::FORBIDDEN,
             BlossomError::NotFound(_) => StatusCode::NOT_FOUND,
+            BlossomError::Conflict(_) => StatusCode::CONFLICT,
             BlossomError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            BlossomError::Gone(_) => StatusCode::GONE,
+            BlossomError::RangeNotSatisfiable(_) => {
+                StatusCode::from_u16(416).expect("416 is a valid HTTP status code")
+            }
+            BlossomError::UnprocessableEntity(_) => {
+                StatusCode::from_u16(422).expect("422 is a valid HTTP status code")
+            }
             BlossomError::StorageError(_) => StatusCode::BAD_GATEWAY,
             BlossomError::MetadataError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             BlossomError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -47,7 +63,11 @@ impl BlossomError {
             BlossomError::AuthInvalid(msg) => msg,
             BlossomError::Forbidden(msg) => msg,
             BlossomError::NotFound(msg) => msg,
+            BlossomError::Conflict(msg) => msg,
             BlossomError::BadRequest(msg) => msg,
+            BlossomError::Gone(msg) => msg,
+            BlossomError::RangeNotSatisfiable(msg) => msg,
+            BlossomError::UnprocessableEntity(msg) => msg,
             BlossomError::StorageError(msg) => msg,
             BlossomError::MetadataError(msg) => msg,
             BlossomError::Internal(msg) => msg,
@@ -89,8 +109,24 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert_eq!(
+            BlossomError::Conflict("".into()).status_code(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
             BlossomError::BadRequest("".into()).status_code(),
             StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            BlossomError::Gone("".into()).status_code(),
+            StatusCode::GONE
+        );
+        assert_eq!(
+            BlossomError::RangeNotSatisfiable("".into()).status_code(),
+            StatusCode::from_u16(416).unwrap()
+        );
+        assert_eq!(
+            BlossomError::UnprocessableEntity("".into()).status_code(),
+            StatusCode::from_u16(422).unwrap()
         );
         assert_eq!(
             BlossomError::StorageError("".into()).status_code(),
