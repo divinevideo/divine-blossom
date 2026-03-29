@@ -836,21 +836,29 @@ mod tests {
     fn test_every_status_is_classified() {
         // Ensure no status variant is silently servable — every non-Active,
         // non-Pending status must trigger at least one access check.
-        let must_block = [BlobStatus::Banned, BlobStatus::Deleted];
-        let must_auth = [BlobStatus::Restricted];
-        let open = [BlobStatus::Active, BlobStatus::Pending];
-
-        for s in must_block {
-            assert!(s.blocks_public_access(), "{:?} should block public access", s);
-            assert!(!s.requires_owner_auth(), "{:?} should not allow owner auth", s);
-        }
-        for s in must_auth {
-            assert!(!s.blocks_public_access(), "{:?} should not block public access", s);
-            assert!(s.requires_owner_auth(), "{:?} should require owner auth", s);
-        }
-        for s in open {
-            assert!(!s.blocks_public_access(), "{:?} should not block public access", s);
-            assert!(!s.requires_owner_auth(), "{:?} should not require owner auth", s);
+        // Uses match for compiler-enforced exhaustiveness: adding a new
+        // BlobStatus variant will fail to compile until classified here.
+        for s in [
+            BlobStatus::Active,
+            BlobStatus::Restricted,
+            BlobStatus::Pending,
+            BlobStatus::Banned,
+            BlobStatus::Deleted,
+        ] {
+            match s {
+                BlobStatus::Banned | BlobStatus::Deleted => {
+                    assert!(s.blocks_public_access(), "{:?} should block public access", s);
+                    assert!(!s.requires_owner_auth(), "{:?} should not require owner auth", s);
+                }
+                BlobStatus::Restricted => {
+                    assert!(!s.blocks_public_access(), "{:?} should not block public access", s);
+                    assert!(s.requires_owner_auth(), "{:?} should require owner auth", s);
+                }
+                BlobStatus::Active | BlobStatus::Pending => {
+                    assert!(!s.blocks_public_access(), "{:?} should not block public access", s);
+                    assert!(!s.requires_owner_auth(), "{:?} should not require owner auth", s);
+                }
+            }
         }
     }
 

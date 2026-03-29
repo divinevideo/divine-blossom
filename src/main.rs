@@ -1898,8 +1898,9 @@ fn handle_get_subtitle_by_hash(req: Request, path: &str) -> Result<Response> {
     }
 
     // Don't leak subtitle info for moderated content
+    let is_admin = admin::validate_bearer_token(&req).is_ok();
     if let Some(meta) = get_blob_metadata(&hash)? {
-        if meta.status.requires_owner_auth() || meta.status.blocks_public_access() {
+        if !is_admin && (meta.status.requires_owner_auth() || meta.status.blocks_public_access()) {
             return Err(BlossomError::NotFound("Video hash not found".into()));
         }
     }
