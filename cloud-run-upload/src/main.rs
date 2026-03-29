@@ -679,8 +679,9 @@ async fn stream_to_gcs_with_hash(
                 derivative_bytes = sanitized;
             }
             Err(e) => {
-                // Non-fatal: keep original bytes for derivative processing if sanitization fails
-                error!(
+                // Non-fatal: user-caused (corrupt upload, missing moov atom, etc.)
+                // Keep original bytes for derivative processing if sanitization fails
+                warn!(
                     "Video sanitization failed for derivatives, using original: {}",
                     e
                 );
