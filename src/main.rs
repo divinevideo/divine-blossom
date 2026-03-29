@@ -12,9 +12,9 @@ use crate::auth::{optional_auth, validate_auth, validate_hash_match};
 use crate::blossom::{
     is_audio_path, is_hash_path, is_transcribable_mime_type, is_video_mime_type, parse_audio_path,
     parse_hash_from_path, parse_thumbnail_path, AudioMapping, AuthAction, BlobDescriptor,
-    BlobMetadata, BlobStatus, ResumableUploadCompleteRequest, ResumableUploadCompleteResponse,
-    ResumableUploadInitRequest, ResumableUploadInitResponse, SubtitleJob, SubtitleJobCreateRequest,
-    SubtitleJobStatus, TranscodeStatus, TranscriptStatus, UploadRequirements,
+    BlobMetadata, BlobStatus, ResumableUploadCompleteResponse, ResumableUploadInitRequest,
+    ResumableUploadInitResponse, SubtitleJob, SubtitleJobCreateRequest, SubtitleJobStatus,
+    TranscodeStatus, TranscriptStatus, UploadRequirements,
 };
 use crate::error::{BlossomError, Result};
 use crate::metadata::{
@@ -35,6 +35,7 @@ use crate::storage::{
     trigger_audit_anonymize, trigger_cloud_run_bulk_delete, trigger_cloud_run_delete_blob,
     upload_blob, write_audit_log,
 };
+use fastly_blossom::resumable_complete::parse_resumable_complete_request_body;
 
 use fastly::cache::simple as simple_cache;
 use fastly::http::{header, Method, StatusCode};
@@ -2728,19 +2729,12 @@ fn handle_upload_complete(mut req: Request, path: &str) -> Result<Response> {
         .and_then(|suffix| suffix.strip_suffix("/complete"))
         .ok_or_else(|| BlossomError::BadRequest("Invalid upload complete path".into()))?;
     let request_body = req.take_body().into_string();
-
-    let expected_request_hash = if request_body.trim().is_empty() {
-        None
-    } else {
-        Some(
-            serde_json::from_str::<ResumableUploadCompleteRequest>(&request_body)
-                .map_err(|e| BlossomError::BadRequest(format!("Invalid completion JSON: {}", e)))?,
-        )
-    };
+    let expected_request_hash =
+        parse_resumable_complete_request_body(&request_body).map_err(BlossomError::BadRequest)?;
 
     if let Some(expected_hash) = auth.get_hash() {
-        if let Some(ref request) = expected_request_hash {
-            if expected_hash.to_lowercase() != request.sha256.to_lowercase() {
+        if let Some(ref request_hash) = expected_request_hash {
+            if expected_hash.to_lowercase() != request_hash.to_lowercase() {
                 return Err(BlossomError::AuthInvalid(
                     "Hash in auth event doesn't match completion request".into(),
                 ));
@@ -2757,7 +2751,7 @@ fn handle_upload_complete(mut req: Request, path: &str) -> Result<Response> {
     );
     proxy_req.set_header("Host", UPLOAD_SERVICE_HOST);
     proxy_req.set_header(header::AUTHORIZATION, &auth_header);
-    if !request_body.trim().is_empty() {
+    if expected_request_hash.is_some() {
         proxy_req.set_header(header::CONTENT_TYPE, "application/json");
         proxy_req.set_header(header::CONTENT_LENGTH, request_body.len().to_string());
         proxy_req.set_body(request_body);
@@ -2778,8 +2772,8 @@ fn handle_upload_complete(mut req: Request, path: &str) -> Result<Response> {
         BlossomError::Internal(format!("Invalid Cloud Run completion response: {}", e))
     })?;
 
-    if let Some(ref request) = expected_request_hash {
-        if request.sha256.to_lowercase() != complete_response.sha256.to_lowercase() {
+    if let Some(ref request_hash) = expected_request_hash {
+        if request_hash.to_lowercase() != complete_response.sha256.to_lowercase() {
             return Err(BlossomError::Conflict(
                 "Completion response hash did not match requested hash".into(),
             ));
