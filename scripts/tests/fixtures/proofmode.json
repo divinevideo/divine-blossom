@@ -1,0 +1,7 @@
+{
+  "pgpSignature": "proof-signature",
+  "deviceAttestation": {
+    "nonce": "abc123"
+  },
+  "c2paManifestId": "urn:c2pa:manifest"
+}
