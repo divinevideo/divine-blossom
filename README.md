@@ -236,6 +236,45 @@ Notes:
 - Use `--scope users` for a full corpus sweep when the recent window is not enough.
 - `--reset-processing` requeues blobs stuck in `processing`, and `--force-retranscribe` reruns blobs marked `complete`.
 
+## Debug Upload Harness
+
+Use the upload harness to replay the upload control plane with a full HTTP transcript. The first version stops at upload completion and does not create the publish event.
+
+Resumable upload example:
+
+```bash
+python3 scripts/debug_upload_harness.py \
+  --server https://media.divine.video \
+  --file /absolute/path/to/video.mp4 \
+  --mode resumable \
+  --auth-header 'Nostr <signed-event>'
+```
+
+ProofMode completion example:
+
+```bash
+python3 scripts/debug_upload_harness.py \
+  --server https://media.divine.video \
+  --file /absolute/path/to/video.mp4 \
+  --mode resumable \
+  --auth-header 'Nostr <signed-event>' \
+  --proof-json /absolute/path/to/proofmode.json \
+  --dump-json /tmp/upload-transcript.json
+```
+
+Replay only the completion request for an existing session:
+
+```bash
+python3 scripts/debug_upload_harness.py \
+  --server https://media.divine.video \
+  --mode resumable \
+  --auth-header 'Nostr <signed-event>' \
+  --complete-only \
+  --upload-id up_example123 \
+  --file-hash 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --file-size 1234567
+```
+
 ## Authentication
 
 Uses Nostr kind 24242 events:
