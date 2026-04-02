@@ -1,0 +1,119 @@
+use crate::blossom::BlobStatus;
+use crate::error::{BlossomError, Result};
+use crate::metadata::{
+    add_to_recent_index, add_to_user_list, get_blob_refs, put_tombstone, remove_from_recent_index,
+    remove_from_user_list, update_blob_status, update_stats_on_status_change,
+};
+use crate::blossom::BlobMetadata;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletePlan {
+    SoftDelete,
+    UnlinkOnly,
+}
+
+pub fn plan_user_delete(is_owner: bool) -> DeletePlan {
+    if is_owner {
+        DeletePlan::SoftDelete
+    } else {
+        DeletePlan::UnlinkOnly
+    }
+}
+
+pub fn parse_restore_status(status: Option<&str>) -> Result<BlobStatus> {
+    match status.unwrap_or("active").to_uppercase().as_str() {
+        "APPROVE" | "ACTIVE" => Ok(BlobStatus::Active),
+        "PENDING" => Ok(BlobStatus::Pending),
+        "RESTRICT" | "RESTRICTED" => Ok(BlobStatus::Restricted),
+        "DELETED" => Err(BlossomError::BadRequest(
+            "Restore target status cannot be deleted".into(),
+        )),
+        other => Err(BlossomError::BadRequest(format!(
+            "Unknown restore status: {}",
+            other
+        ))),
+    }
+}
+
+pub fn soft_delete_blob(
+    hash: &str,
+    metadata: &BlobMetadata,
+    reason: &str,
+    legal_hold: bool,
+) -> Result<()> {
+    if metadata.status != BlobStatus::Deleted {
+        update_blob_status(hash, BlobStatus::Deleted)?;
+        let _ = update_stats_on_status_change(metadata.status, BlobStatus::Deleted);
+    }
+
+    let _ = remove_from_user_list(&metadata.owner, hash);
+    if let Ok(refs) = get_blob_refs(hash) {
+        for pubkey in &refs {
+            let _ = remove_from_user_list(pubkey, hash);
+        }
+    }
+    let _ = remove_from_recent_index(hash);
+
+    if legal_hold {
+        let _ = put_tombstone(hash, reason);
+    }
+
+    crate::purge_vcl_cache(hash);
+    Ok(())
+}
+
+pub fn restore_soft_deleted_blob(
+    hash: &str,
+    metadata: &BlobMetadata,
+    new_status: BlobStatus,
+) -> Result<()> {
+    if new_status == BlobStatus::Deleted {
+        return Err(BlossomError::BadRequest(
+            "Restore target status cannot be deleted".into(),
+        ));
+    }
+
+    update_blob_status(hash, new_status)?;
+    let _ = update_stats_on_status_change(metadata.status, new_status);
+
+    let _ = add_to_user_list(&metadata.owner, hash);
+    if let Ok(refs) = get_blob_refs(hash) {
+        for pubkey in &refs {
+            let _ = add_to_user_list(pubkey, hash);
+        }
+    }
+    let _ = add_to_recent_index(hash);
+    crate::purge_vcl_cache(hash);
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owner_delete_plan_is_soft_delete_not_hard_delete() {
+        assert_eq!(plan_user_delete(true), DeletePlan::SoftDelete);
+    }
+
+    #[test]
+    fn non_owner_delete_plan_unlinks_only() {
+        assert_eq!(plan_user_delete(false), DeletePlan::UnlinkOnly);
+    }
+
+    #[test]
+    fn restore_target_rejects_deleted_status() {
+        assert!(parse_restore_status(Some("deleted")).is_err());
+    }
+
+    #[test]
+    fn restore_from_deleted_allows_active_pending_or_restricted() {
+        assert_eq!(parse_restore_status(None).unwrap(), BlobStatus::Active);
+        assert_eq!(parse_restore_status(Some("pending")).unwrap(), BlobStatus::Pending);
+        assert_eq!(
+            parse_restore_status(Some("restricted")).unwrap(),
+            BlobStatus::Restricted
+        );
+    }
+}

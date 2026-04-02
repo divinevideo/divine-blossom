@@ -1,12 +1,12 @@
 // ABOUTME: Admin dashboard for Divine Blossom server
 // ABOUTME: Provides stats, recent uploads, user lists, OAuth login, and moderation controls
 
-use crate::blossom::{BlobMetadata, BlobStatus, GlobalStats, RecentIndex, UserIndex};
+use crate::blossom::{BlobMetadata, BlobStatus, GlobalStats, RecentIndex};
+use crate::delete_policy::{parse_restore_status, restore_soft_deleted_blob};
 use crate::error::{BlossomError, Result};
 use crate::metadata::{
     get_blob_metadata, get_global_stats, get_recent_index, get_user_blobs, get_user_index,
-    replace_global_stats, replace_recent_index, replace_user_index, update_blob_status,
-    update_stats_on_status_change,
+    replace_global_stats, replace_recent_index, update_blob_status, update_stats_on_status_change,
 };
 use crate::storage::download_blob_with_fallback;
 use fastly::http::{header, Method, StatusCode};
@@ -731,6 +731,13 @@ struct ModerateRequest {
     action: String,
 }
 
+#[derive(Deserialize)]
+struct RestoreRequest {
+    sha256: String,
+    #[serde(default)]
+    status: Option<String>,
+}
+
 pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
     validate_admin_auth(&req)?;
 
@@ -764,22 +771,54 @@ pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
         }
     };
 
-    // Update blob status
-    update_blob_status(&moderate_req.sha256, new_status)?;
-
-    // Purge VCL cache so moderation takes effect immediately
     if old_status != new_status {
-        crate::purge_vcl_cache(&moderate_req.sha256);
-    }
-
-    // Update global stats for the status change
-    if old_status != new_status {
-        let _ = update_stats_on_status_change(old_status, new_status);
+        if old_status == BlobStatus::Deleted {
+            restore_soft_deleted_blob(&moderate_req.sha256, &metadata, new_status)?;
+        } else {
+            update_blob_status(&moderate_req.sha256, new_status)?;
+            crate::purge_vcl_cache(&moderate_req.sha256);
+            let _ = update_stats_on_status_change(old_status, new_status);
+        }
     }
 
     let response = serde_json::json!({
         "success": true,
         "sha256": moderate_req.sha256,
+        "old_status": format!("{:?}", old_status).to_lowercase(),
+        "new_status": format!("{:?}", new_status).to_lowercase()
+    });
+
+    json_response(StatusCode::OK, &response)
+}
+
+/// POST /admin/api/restore - Restore a previously soft-deleted blob
+pub fn handle_admin_restore_action(mut req: Request) -> Result<Response> {
+    validate_admin_auth(&req)?;
+
+    let body = req.take_body().into_string();
+    let restore_req: RestoreRequest = serde_json::from_str(&body)
+        .map_err(|e| BlossomError::BadRequest(format!("Invalid JSON: {}", e)))?;
+
+    if restore_req.sha256.len() != 64 || !restore_req.sha256.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err(BlossomError::BadRequest("Invalid sha256 format".into()));
+    }
+
+    let metadata = get_blob_metadata(&restore_req.sha256)?
+        .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
+    let old_status = metadata.status;
+
+    if old_status != BlobStatus::Deleted {
+        return Err(BlossomError::BadRequest("Blob is not soft-deleted".into()));
+    }
+
+    let new_status = parse_restore_status(restore_req.status.as_deref())?;
+    restore_soft_deleted_blob(&restore_req.sha256, &metadata, new_status)?;
+
+    let response = serde_json::json!({
+        "success": true,
+        "restored": true,
+        "sha256": restore_req.sha256,
         "old_status": format!("{:?}", old_status).to_lowercase(),
         "new_status": format!("{:?}", new_status).to_lowercase()
     });

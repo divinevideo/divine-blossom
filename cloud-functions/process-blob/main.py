@@ -129,26 +129,9 @@ def extract_video_thumbnail(bucket_name: str, blob_name: str) -> str:
 
 
 def handle_moderation_result(bucket_name: str, blob_name: str, result: dict, thumbnail_path: str = None):
-    """Handle the moderation result - delete if flagged, update metadata."""
-    storage_client = storage.Client()
-    bucket = storage_client.bucket(bucket_name)
-
+    """Handle the moderation result by updating moderation metadata only."""
     if result['is_flagged']:
         print(f"Content flagged: {result['reason']}")
-
-        # Delete the blob
-        blob = bucket.blob(blob_name)
-        blob.delete()
-        print(f"Deleted: {blob_name}")
-
-        # Delete thumbnail if exists
-        if thumbnail_path:
-            thumb_blob = bucket.blob(thumbnail_path)
-            try:
-                thumb_blob.delete()
-                print(f"Deleted thumbnail: {thumbnail_path}")
-            except Exception:
-                pass
 
         # Update metadata to restricted/deleted
         update_metadata(blob_name, 'restricted', thumbnail_path,

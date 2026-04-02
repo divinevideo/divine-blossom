@@ -132,7 +132,7 @@ fastly compute publish
 | `HEAD` | `/upload` | None | Get upload requirements |
 | `POST` | `/upload/init` | Required | Create a Divine resumable upload session |
 | `POST` | `/upload/<uploadId>/complete` | Required | Publish a completed resumable upload into canonical metadata |
-| `DELETE` | `/<sha256>` | Required | Permanently delete your own blob |
+| `DELETE` | `/<sha256>` | Required | Soft-delete your own blob and stop serving it publicly |
 | `GET` | `/list/<pubkey>` | Optional | List user's blobs |
 
 When resumable support is available, `HEAD /upload` includes these discovery headers:
@@ -187,9 +187,10 @@ All uploads and deletes are logged to Google Cloud Logging via the Cloud Run upl
 
 ### Delete Semantics
 
-- `DELETE /<sha256>` is a direct user delete and permanently removes the canonical blob.
+- `DELETE /<sha256>` is a direct user soft-delete. It marks the blob as `deleted`, stops public serving, removes it from user/recent indexes, and preserves stored media plus derivatives for possible restoration.
 - `POST /admin/api/delete` is an admin soft-delete. It marks the blob as `deleted`, stops all public serving, removes it from user/recent indexes, and preserves the stored blob so it can be recovered later.
 - `POST /admin/api/restore` restores a soft-deleted blob and re-indexes it.
+- `DELETE /vanish` remains the explicit erasure path for authenticated right-to-erasure requests.
 - `legal_hold: true` sets a tombstone that prevents re-upload of the same hash even if the stored blob is preserved.
 
 ### Admin Soft-Delete
