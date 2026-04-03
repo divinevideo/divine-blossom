@@ -713,12 +713,10 @@ pub fn handle_admin_blob_content(req: Request, hash: &str) -> Result<Response> {
     resp.set_header("Cache-Control", "private, no-store");
     resp.set_header("Accept-Ranges", "bytes");
 
-    // Inline CORS headers (add_cors_headers is private to main.rs)
-    resp.set_header("Access-Control-Allow-Origin", "*");
     resp.set_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
     resp.set_header(
         "Access-Control-Allow-Headers",
-        "Authorization, Content-Type, Range",
+        "Authorization, Content-Type, Range, X-Requested-With",
     );
 
     Ok(resp)
@@ -1068,10 +1066,9 @@ fn json_response<T: serde::Serialize>(status: StatusCode, body: &T) -> Result<Re
         .map_err(|e| BlossomError::Internal(format!("JSON serialization error: {}", e)))?;
     let mut resp = Response::from_status(status);
     resp.set_header(header::CONTENT_TYPE, "application/json");
-    resp.set_header("Access-Control-Allow-Origin", "*");
     resp.set_header(
         "Access-Control-Allow-Headers",
-        "Authorization, Content-Type",
+        "Authorization, Content-Type, X-Requested-With",
     );
     resp.set_body(json);
     Ok(resp)

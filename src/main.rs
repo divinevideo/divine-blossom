@@ -52,6 +52,8 @@ const MAX_UPLOAD_SIZE: u64 = 50 * 1024 * 1024 * 1024;
 const SUBTITLE_MAX_ATTEMPTS: u32 = 3;
 /// Max derivative failures before public endpoints stop re-triggering work.
 const DERIVATIVE_MAX_ATTEMPTS: u32 = 3;
+const APP_ORIGIN: &str = "https://app.divine.video";
+const PREVIEW_ORIGIN_SUFFIX: &str = ".openvine-app.pages.dev";
 
 /// Entry point
 #[fastly::main]
@@ -185,7 +187,7 @@ fn handle_request(req: Request) -> Result<Response> {
         (Method::POST, "/admin/api/backfill-vtt") => handle_admin_backfill_vtt(req),
 
         // CORS preflight
-        (Method::OPTIONS, _) => Ok(cors_preflight_response()),
+        (Method::OPTIONS, _) => Ok(cors_preflight_response(req.get_header_str("Origin"))),
 
         // Not found
         _ => Err(BlossomError::NotFound("Not found".into())),
@@ -4724,15 +4726,27 @@ pub(crate) fn purge_vcl_cache(surrogate_key: &str) {
     }
 }
 
+fn origin_matches_rule(origin: &str) -> bool {
+    origin == APP_ORIGIN
+        || origin
+            .strip_prefix("https://")
+            .and_then(|host| host.strip_suffix(PREVIEW_ORIGIN_SUFFIX))
+            .is_some_and(|prefix| !prefix.is_empty())
+}
+
+fn resolve_cors_origin(request_origin: Option<&str>) -> Option<String> {
+    let origin = request_origin?.trim();
+    origin_matches_rule(origin).then(|| origin.to_string())
+}
+
 fn add_cors_headers(resp: &mut Response) {
-    resp.set_header("Access-Control-Allow-Origin", "*");
     resp.set_header(
         "Access-Control-Allow-Methods",
         "GET, HEAD, PUT, POST, DELETE, OPTIONS",
     );
     resp.set_header(
         "Access-Control-Allow-Headers",
-        "Authorization, Content-Type, X-Sha256",
+        "Authorization, Content-Type, Range, X-Requested-With, X-Sha256",
     );
     resp.set_header(
         "Access-Control-Expose-Headers",
@@ -4741,9 +4755,13 @@ fn add_cors_headers(resp: &mut Response) {
 }
 
 /// CORS preflight response
-fn cors_preflight_response() -> Response {
+fn cors_preflight_response(request_origin: Option<&str>) -> Response {
     let mut resp = Response::from_status(StatusCode::NO_CONTENT);
     add_cors_headers(&mut resp);
+    if let Some(origin) = resolve_cors_origin(request_origin) {
+        resp.set_header("Access-Control-Allow-Origin", origin.as_str());
+        resp.set_header("Vary", "Origin");
+    }
     resp.set_header("Access-Control-Max-Age", "86400");
     resp
 }
@@ -4829,8 +4847,8 @@ fn infer_mime_from_path(path: &str) -> Option<&'static str> {
 mod tests {
     use super::{
         decide_transcode_fetch_action, decide_transcript_fetch_action, is_quality_variant_path,
-        parse_quality_variant_path, parse_transcript_status_webhook_payload, TranscodeFetchAction,
-        TranscriptFetchAction, TranscriptPendingState,
+        parse_quality_variant_path, parse_transcript_status_webhook_payload, resolve_cors_origin,
+        TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState,
     };
     use crate::blossom::{TranscodeStatus, TranscriptStatus};
 
@@ -5032,5 +5050,34 @@ mod tests {
                 should_repair: true,
             }
         );
+    }
+
+    #[test]
+    fn cors_allows_app_origin() {
+        assert_eq!(
+            resolve_cors_origin(Some("https://app.divine.video")),
+            Some("https://app.divine.video".into())
+        );
+    }
+
+    #[test]
+    fn cors_allows_preview_origin() {
+        assert_eq!(
+            resolve_cors_origin(Some("https://pr-123.openvine-app.pages.dev")),
+            Some("https://pr-123.openvine-app.pages.dev".into())
+        );
+    }
+
+    #[test]
+    fn cors_rejects_apex_preview_domain() {
+        assert_eq!(
+            resolve_cors_origin(Some("https://openvine-app.pages.dev")),
+            None
+        );
+    }
+
+    #[test]
+    fn cors_rejects_unknown_origin() {
+        assert_eq!(resolve_cors_origin(Some("https://evil.example")), None);
     }
 }
