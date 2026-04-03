@@ -25,21 +25,7 @@ if (obj.hits > 0) {
   set resp.http.X-Cache = "MISS";
 }
 
-# Preserve wildcard CORS for public media/read responses. Sanitize everything
-# else to the approved browser origins only.
-if (resp.http.Access-Control-Allow-Origin == "*") {
-  unset resp.http.Vary;
-} else {
-  unset resp.http.Access-Control-Allow-Origin;
-  if (req.http.Origin == "https://app.divine.video" ||
-      req.http.Origin ~ "^https://[^.]+\\.openvine-app\\.pages\\.dev$") {
-    set resp.http.Access-Control-Allow-Origin = req.http.Origin;
-    if (resp.http.Vary) {
-      if (resp.http.Vary !~ "(?i)\\bOrigin\\b") {
-        set resp.http.Vary = resp.http.Vary ", Origin";
-      }
-    } else {
-      set resp.http.Vary = "Origin";
-    }
-  }
+# Ensure CORS headers are present (Compute sets them, but belt-and-suspenders)
+if (!resp.http.Access-Control-Allow-Origin) {
+  set resp.http.Access-Control-Allow-Origin = "*";
 }
