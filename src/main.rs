@@ -58,9 +58,20 @@ const PREVIEW_ORIGIN_SUFFIX: &str = ".openvine-app.pages.dev";
 /// Entry point
 #[fastly::main]
 fn main(req: Request) -> std::result::Result<Response, Error> {
+    let method = req.get_method().clone();
+    let path = req.get_path().to_string();
+    let request_origin = req.get_header_str("Origin").map(str::to_string);
+
     match handle_request(req) {
-        Ok(resp) => Ok(resp),
-        Err(e) => Ok(error_response(&e)),
+        Ok(mut resp) => {
+            apply_response_cors(&method, &path, request_origin.as_deref(), &mut resp);
+            Ok(resp)
+        }
+        Err(e) => {
+            let mut resp = error_response(&e);
+            apply_response_cors(&method, &path, request_origin.as_deref(), &mut resp);
+            Ok(resp)
+        }
     }
 }
 
@@ -187,7 +198,10 @@ fn handle_request(req: Request) -> Result<Response> {
         (Method::POST, "/admin/api/backfill-vtt") => handle_admin_backfill_vtt(req),
 
         // CORS preflight
-        (Method::OPTIONS, _) => Ok(cors_preflight_response(req.get_header_str("Origin"))),
+        (Method::OPTIONS, _) => Ok(cors_preflight_response(
+            req.get_path(),
+            req.get_header_str("Origin"),
+        )),
 
         // Not found
         _ => Err(BlossomError::NotFound("Not found".into())),
@@ -4739,6 +4753,45 @@ fn resolve_cors_origin(request_origin: Option<&str>) -> Option<String> {
     origin_matches_rule(origin).then(|| origin.to_string())
 }
 
+fn is_public_media_cors_path(path: &str) -> bool {
+    is_hash_path(path)
+        || path.ends_with(".hls")
+        || path.contains("/hls/")
+        || is_vtt_file_path(path)
+        || is_transcript_path(path)
+        || is_audio_path(path)
+        || is_quality_variant_path(path)
+}
+
+fn resolve_response_cors_origin(
+    method: &Method,
+    path: &str,
+    request_origin: Option<&str>,
+) -> Option<String> {
+    if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+        && is_public_media_cors_path(path)
+    {
+        Some("*".into())
+    } else {
+        resolve_cors_origin(request_origin)
+    }
+}
+
+fn apply_response_cors(
+    method: &Method,
+    path: &str,
+    request_origin: Option<&str>,
+    resp: &mut Response,
+) {
+    add_cors_headers(resp);
+    if let Some(origin) = resolve_response_cors_origin(method, path, request_origin) {
+        resp.set_header("Access-Control-Allow-Origin", origin.as_str());
+        if origin != "*" {
+            resp.set_header("Vary", "Origin");
+        }
+    }
+}
+
 fn add_cors_headers(resp: &mut Response) {
     resp.set_header(
         "Access-Control-Allow-Methods",
@@ -4755,13 +4808,9 @@ fn add_cors_headers(resp: &mut Response) {
 }
 
 /// CORS preflight response
-fn cors_preflight_response(request_origin: Option<&str>) -> Response {
+fn cors_preflight_response(path: &str, request_origin: Option<&str>) -> Response {
     let mut resp = Response::from_status(StatusCode::NO_CONTENT);
-    add_cors_headers(&mut resp);
-    if let Some(origin) = resolve_cors_origin(request_origin) {
-        resp.set_header("Access-Control-Allow-Origin", origin.as_str());
-        resp.set_header("Vary", "Origin");
-    }
+    apply_response_cors(&Method::OPTIONS, path, request_origin, &mut resp);
     resp.set_header("Access-Control-Max-Age", "86400");
     resp
 }
@@ -4846,11 +4895,13 @@ fn infer_mime_from_path(path: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decide_transcode_fetch_action, decide_transcript_fetch_action, is_quality_variant_path,
-        parse_quality_variant_path, parse_transcript_status_webhook_payload, resolve_cors_origin,
-        TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState,
+        decide_transcode_fetch_action, decide_transcript_fetch_action,
+        resolve_response_cors_origin, is_quality_variant_path, parse_quality_variant_path,
+        parse_transcript_status_webhook_payload, resolve_cors_origin, TranscodeFetchAction,
+        TranscriptFetchAction, TranscriptPendingState,
     };
     use crate::blossom::{TranscodeStatus, TranscriptStatus};
+    use fastly::http::Method;
 
     #[test]
     fn quality_variant_path_valid() {
@@ -5079,5 +5130,47 @@ mod tests {
     #[test]
     fn cors_rejects_unknown_origin() {
         assert_eq!(resolve_cors_origin(Some("https://evil.example")), None);
+    }
+
+    #[test]
+    fn cors_uses_wildcard_for_public_blob_reads() {
+        let hash = "a".repeat(64);
+        assert_eq!(
+            resolve_response_cors_origin(&Method::GET, &format!("/{}", hash), None),
+            Some("*".into())
+        );
+    }
+
+    #[test]
+    fn cors_uses_wildcard_for_public_media_preflight() {
+        let hash = "a".repeat(64);
+        assert_eq!(
+            resolve_response_cors_origin(
+                &Method::OPTIONS,
+                &format!("/{}/hls/master.m3u8", hash),
+                Some("https://evil.example"),
+            ),
+            Some("*".into())
+        );
+    }
+
+    #[test]
+    fn cors_keeps_uploads_on_allowlist() {
+        assert_eq!(
+            resolve_response_cors_origin(
+                &Method::POST,
+                "/upload",
+                Some("https://app.divine.video"),
+            ),
+            Some("https://app.divine.video".into())
+        );
+        assert_eq!(
+            resolve_response_cors_origin(
+                &Method::POST,
+                "/upload",
+                Some("https://evil.example"),
+            ),
+            None
+        );
     }
 }
