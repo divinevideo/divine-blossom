@@ -4,6 +4,7 @@
 mod admin;
 mod auth;
 mod blossom;
+mod delete_policy;
 mod error;
 mod metadata;
 mod storage;
@@ -16,6 +17,7 @@ use crate::blossom::{
     ResumableUploadInitResponse, SubtitleJob, SubtitleJobCreateRequest, SubtitleJobStatus,
     TranscodeStatus, TranscriptStatus, UploadRequirements,
 };
+use crate::delete_policy::{plan_user_delete, soft_delete_blob, DeletePlan};
 use crate::error::{BlossomError, Result};
 use crate::metadata::{
     add_to_audio_source_refs, add_to_blob_refs, add_to_recent_index, add_to_user_index,
@@ -24,7 +26,7 @@ use crate::metadata::{
     get_audio_mapping, get_audio_source_refs, get_auth_event, get_blob_metadata, get_blob_refs,
     get_subtitle_job, get_subtitle_job_by_hash, get_tombstone, get_user_blobs,
     list_blobs_with_metadata, put_audio_mapping, put_auth_event, put_blob_metadata,
-    put_subtitle_job, put_tombstone, remove_from_audio_source_refs, remove_from_blob_refs,
+    put_subtitle_job, remove_from_audio_source_refs, remove_from_blob_refs,
     remove_from_recent_index, remove_from_user_index, remove_from_user_list,
     set_subtitle_job_id_for_hash, update_blob_status, update_stats_on_add, update_stats_on_remove,
     TranscriptMetadataUpdate,
@@ -188,6 +190,7 @@ fn handle_request(req: Request) -> Result<Response> {
         (Method::POST, "/admin/api/bulk-approve") => admin::handle_admin_bulk_approve(req),
         (Method::POST, "/admin/api/scan-flagged") => admin::handle_admin_scan_flagged(req),
         (Method::POST, "/admin/api/delete") => handle_admin_force_delete(req),
+        (Method::POST, "/admin/api/restore") => admin::handle_admin_restore_action(req),
         (Method::POST, "/admin/api/vanish") => handle_admin_vanish(req),
         (Method::POST, "/admin/api/backfill") => admin::handle_admin_backfill(req),
         (Method::POST, "/admin/api/backfill-vtt") => handle_admin_backfill_vtt(req),
@@ -2989,11 +2992,7 @@ fn delete_blob_kv_artifacts(hash: &str) {
     let _ = delete_subtitle_data(hash);
 }
 
-/// DELETE /<sha256> - Delete blob with ref-counting
-///
-/// - Sole owner (no other refs): full delete of blob, all GCS artifacts, all KV data
-/// - Owner but shared (other refs exist): transfer ownership to next ref, remove self
-/// - Non-owner ref: just unlink (remove from own list + refs)
+/// DELETE /<sha256> - Preserve-first delete with ref unlinking for non-owners
 fn handle_delete(req: Request, path: &str) -> Result<Response> {
     let hash = parse_hash_from_path(path)
         .ok_or_else(|| BlossomError::BadRequest("Invalid hash in path".into()))?;
@@ -3033,49 +3032,19 @@ fn handle_delete(req: Request, path: &str) -> Result<Response> {
         None,
     );
 
-    // Remove self from user list and refs
-    let _ = remove_from_user_list(&auth.pubkey, &hash);
-    let remaining_refs = remove_from_blob_refs(&hash, &auth.pubkey).unwrap_or_default();
-
-    if is_owner {
-        // Check if there are other refs who can take ownership
-        let other_refs: Vec<String> = remaining_refs
-            .iter()
-            .filter(|r| r.to_lowercase() != auth.pubkey.to_lowercase())
-            .cloned()
-            .collect();
-
-        if other_refs.is_empty() {
-            // Sole owner: full delete
-            cleanup_derived_audio_for_source(&hash);
-            storage_delete(&hash)?;
-            delete_blob_gcs_artifacts(&hash);
-            delete_blob_metadata(&hash)?;
-            delete_blob_kv_artifacts(&hash);
-
-            // Update admin indices
-            let _ = update_stats_on_remove(&metadata);
-            let _ = remove_from_recent_index(&hash);
-
-            // Purge VCL cache
-            purge_vcl_cache(&hash);
-
-            eprintln!("[DELETE] Full delete of {} by owner {}", hash, auth.pubkey);
-        } else {
-            // Shared content: transfer ownership to next ref
-            let new_owner = other_refs[0].clone();
-            let mut updated_meta = metadata.clone();
-            updated_meta.owner = new_owner.clone();
-            let _ = put_blob_metadata(&updated_meta);
-
+    match plan_user_delete(is_owner) {
+        DeletePlan::SoftDelete => {
+            soft_delete_blob(&hash, &metadata, "Owner delete", false)?;
             eprintln!(
-                "[DELETE] Ownership of {} transferred from {} to {}",
-                hash, auth.pubkey, new_owner
+                "[DELETE] Soft-deleted {} by owner {}",
+                hash, auth.pubkey
             );
         }
-    } else {
-        // Non-owner ref: just unlinked above, nothing else to do
-        eprintln!("[DELETE] Unlinked ref {} from blob {}", auth.pubkey, hash);
+        DeletePlan::UnlinkOnly => {
+            let _ = remove_from_user_list(&auth.pubkey, &hash);
+            let _ = remove_from_blob_refs(&hash, &auth.pubkey);
+            eprintln!("[DELETE] Unlinked ref {} from blob {}", auth.pubkey, hash);
+        }
     }
 
     let mut resp = Response::from_status(StatusCode::OK);
@@ -3137,8 +3106,7 @@ fn handle_get_provenance(path: &str) -> Result<Response> {
     Ok(resp)
 }
 
-/// POST /admin/api/delete - Admin force-delete for legal/DMCA compliance
-/// Full cleanup: main blob + thumbnail + HLS + VTT + all KV artifacts + VCL cache purge
+/// POST /admin/api/delete - Admin soft-delete with optional legal hold
 fn handle_admin_force_delete(req: Request) -> Result<Response> {
     // Validate admin auth
     admin::validate_admin_auth(&req)?;
@@ -3163,10 +3131,9 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
     }
 
     // Get metadata before deletion for audit
-    let metadata = get_blob_metadata(&hash)?;
-    let meta_json = metadata
-        .as_ref()
-        .and_then(|m| serde_json::to_string(m).ok());
+    let metadata =
+        get_blob_metadata(&hash)?.ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
+    let meta_json = serde_json::to_string(&metadata).ok();
 
     // Write audit log BEFORE deletion
     write_audit_log(
@@ -3178,40 +3145,7 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
         Some(reason),
     );
 
-    // Delete from GCS (main blob + all artifacts)
-    cleanup_derived_audio_for_source(&hash);
-    let _ = storage_delete(&hash);
-    delete_blob_gcs_artifacts(&hash);
-
-    // Delete KV metadata
-    let _ = delete_blob_metadata(&hash);
-
-    // Remove from ALL users' lists (owner + all refs)
-    if let Some(ref meta) = metadata {
-        let _ = remove_from_user_list(&meta.owner, &hash);
-    }
-    if let Ok(refs) = get_blob_refs(&hash) {
-        for pubkey in &refs {
-            let _ = remove_from_user_list(pubkey, &hash);
-        }
-    }
-
-    // Delete all KV artifacts (refs, auth events, subtitle data)
-    delete_blob_kv_artifacts(&hash);
-
-    // Update stats
-    if let Some(meta) = metadata {
-        let _ = update_stats_on_remove(&meta);
-    }
-    let _ = remove_from_recent_index(&hash);
-
-    // Set tombstone if legal hold requested
-    if legal_hold {
-        let _ = put_tombstone(&hash, reason);
-    }
-
-    // Purge VCL cache
-    purge_vcl_cache(&hash);
+    soft_delete_blob(&hash, &metadata, reason, legal_hold)?;
 
     eprintln!(
         "[ADMIN DELETE] hash={} reason={} legal_hold={}",
@@ -3220,6 +3154,7 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
 
     let result = serde_json::json!({
         "deleted": true,
+        "preserved": true,
         "sha256": hash,
         "legal_hold": legal_hold,
     });
@@ -4577,7 +4512,7 @@ fn handle_landing_page() -> Response {
                 <span class="method method-delete">DELETE</span>
                 <div class="endpoint-info">
                     <span class="endpoint-path">/&lt;sha256&gt;</span>
-                    <p class="endpoint-desc">Delete a blob with ref-counting. Sole owner: full delete. Shared: transfers ownership. Non-owner ref: unlinks. Requires Nostr authentication. <em>(BUD-02)</em></p>
+                    <p class="endpoint-desc">Soft-delete a blob you own so it stops serving publicly while remaining recoverable. Non-owner refs only unlink themselves. Requires Nostr authentication. <em>(BUD-02)</em></p>
                 </div>
             </div>
             <div class="endpoint">

@@ -1,42 +1,52 @@
 #!/bin/bash
-# ABOUTME: Deploy divine-transcoder to Cloud Run with GPU support
-# ABOUTME: Requires L4 GPU quota to be approved in your GCP project
+# ABOUTME: Deploy divine-transcoder to Cloud Run with the current production runtime settings
+# ABOUTME: Builds in Cloud Build, then deploys with webhook, transcription, and Sentry secrets wired
 
-set -e
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project)}"
 REGION="${REGION:-us-central1}"
-SERVICE_NAME="divine-transcoder"
-IMAGE="gcr.io/${PROJECT_ID}/${SERVICE_NAME}"
+SERVICE_NAME="${SERVICE_NAME:-divine-transcoder}"
+SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-149672065768-compute@developer.gserviceaccount.com}"
+IMAGE_TAG="${IMAGE_TAG:-$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M%S)}"
+IMAGE="gcr.io/${PROJECT_ID}/${SERVICE_NAME}:${IMAGE_TAG}"
 
-echo "Building and pushing Docker image..."
-docker build --platform linux/amd64 -t "${IMAGE}" .
-docker push "${IMAGE}"
+GCS_BUCKET="${GCS_BUCKET:-divine-blossom-media}"
+WEBHOOK_URL="${WEBHOOK_URL:-https://media.divine.video/admin/transcode-status}"
+TRANSCRIPT_WEBHOOK_URL="${TRANSCRIPT_WEBHOOK_URL:-https://media.divine.video/admin/transcript-status}"
+TRANSCRIPTION_API_URL="${TRANSCRIPTION_API_URL:-https://api.openai.com/v1/audio/transcriptions}"
+TRANSCRIPTION_MODEL="${TRANSCRIPTION_MODEL:-gpt-4o-mini-transcribe}"
+USE_GPU="${USE_GPU:-false}"
+SENTRY_ENVIRONMENT="${SENTRY_ENVIRONMENT:-production}"
+SENTRY_SECRET="${SENTRY_SECRET:-sentry_dsn}"
 
-echo "Deploying to Cloud Run with GPU..."
-gcloud run deploy "${SERVICE_NAME}" \
-  --image "${IMAGE}" \
+echo "Building ${IMAGE} in Cloud Build..."
+gcloud builds submit "${SCRIPT_DIR}" \
+  --project "${PROJECT_ID}" \
   --region "${REGION}" \
-  --gpu 1 \
-  --gpu-type nvidia-l4 \
+  --tag "${IMAGE}"
+
+echo "Deploying ${SERVICE_NAME} to Cloud Run..."
+gcloud run deploy "${SERVICE_NAME}" \
+  --project "${PROJECT_ID}" \
+  --region "${REGION}" \
+  --image "${IMAGE}" \
+  --allow-unauthenticated \
+  --service-account "${SERVICE_ACCOUNT}" \
   --cpu 4 \
-  --memory 16Gi \
-  --concurrency 8 \
-  --min-instances 1 \
+  --memory 8Gi \
+  --concurrency 320 \
+  --timeout 900 \
   --max-instances 10 \
   --no-cpu-throttling \
-  --set-env-vars "GCS_BUCKET=divine-blossom-media" \
-  --set-env-vars "WEBHOOK_URL=https://media.divine.video/admin/transcode-status" \
-  --set-env-vars "TRANSCRIPT_WEBHOOK_URL=https://media.divine.video/admin/transcript-status" \
-  --set-env-vars "TRANSCRIPTION_API_URL=https://api.openai.com/v1/audio/transcriptions" \
-  --set-env-vars "TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe" \
-  --set-env-vars "TRANSCRIPTION_MAX_IN_FLIGHT=4" \
-  --set-env-vars "TRANSCRIPTION_MAX_RETRIES=3" \
-  --set-env-vars "TRANSCRIPTION_RETRY_BASE_MS=1000" \
-  --set-env-vars "TRANSCRIPTION_RETRY_MAX_MS=15000" \
-  --set-env-vars "TRANSCRIPTION_RETRY_TOTAL_MS=30000" \
-  --set-secrets "WEBHOOK_SECRET=webhook_secret:latest,TRANSCRIPTION_API_KEY=openai_api_key:latest" \
-  --allow-unauthenticated
+  --set-env-vars "GCS_BUCKET=${GCS_BUCKET},WEBHOOK_URL=${WEBHOOK_URL},TRANSCRIPT_WEBHOOK_URL=${TRANSCRIPT_WEBHOOK_URL},TRANSCRIPTION_API_URL=${TRANSCRIPTION_API_URL},TRANSCRIPTION_MODEL=${TRANSCRIPTION_MODEL},USE_GPU=${USE_GPU},SENTRY_ENVIRONMENT=${SENTRY_ENVIRONMENT}" \
+  --set-secrets "WEBHOOK_SECRET=webhook_secret:latest,TRANSCRIPTION_API_KEY=openai_api_key:latest,SENTRY_DSN=${SENTRY_SECRET}:latest"
 
 echo "Done! Service URL:"
-gcloud run services describe "${SERVICE_NAME}" --region "${REGION}" --format='value(status.url)'
+gcloud run services describe "${SERVICE_NAME}" \
+  --project "${PROJECT_ID}" \
+  --region "${REGION}" \
+  --format='value(status.url)'
