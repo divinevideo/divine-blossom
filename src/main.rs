@@ -1982,7 +1982,8 @@ fn handle_head_quality_variant(path: &str) -> Result<Response> {
 /// Maximum size for in-process upload (500KB) - larger files proxy to the upload service
 const UPLOAD_SERVICE_THRESHOLD: u64 = 500 * 1024;
 
-/// Upload service backend name (must match fastly.toml)
+/// Upload service backend name (must match a backend configured in the
+/// Fastly dashboard whose address is `upload.divine.video`).
 const UPLOAD_SERVICE_BACKEND: &str = "upload_service";
 /// Public hostname for the upload service.
 const UPLOAD_SERVICE_HOST: &str = "upload.divine.video";
@@ -1992,6 +1993,14 @@ const UPLOAD_SERVICE_THUMBNAIL_HOST: &str = UPLOAD_SERVICE_HOST;
 
 /// Cloud Run host for on-demand transcoding
 const CLOUD_RUN_TRANSCODER_HOST: &str = "divine-transcoder-149672065768.us-central1.run.app";
+
+/// Backend name for the Cloud Run transcoder. MUST be configured in the
+/// Fastly dashboard as a separate backend pointing at CLOUD_RUN_TRANSCODER_HOST
+/// (address: divine-transcoder-149672065768.us-central1.run.app, port 443,
+/// SSL on, SNI = host, override_host = host). Without this, calls to
+/// /transcode, /backfill-fmp4, /transcribe silently misroute to the upload
+/// service and 404, leaving videos stuck in `Processing` forever.
+const TRANSCODER_BACKEND: &str = "cloud_run_transcoder";
 
 /// Generate thumbnail on-demand by proxying to Cloud Run
 fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
@@ -2150,7 +2159,7 @@ fn trigger_on_demand_transcoding(hash: &str, owner: &str) -> Result<()> {
 
     // Fire and forget - we don't wait for transcoding to complete
     // The transcoder will callback via webhook when done
-    match proxy_req.send_async(UPLOAD_SERVICE_BACKEND) {
+    match proxy_req.send_async(TRANSCODER_BACKEND) {
         Ok(_) => {
             eprintln!("[HLS] Triggered on-demand transcoding for {}", hash);
             Ok(())
@@ -2180,7 +2189,7 @@ fn trigger_fmp4_backfill(hash: &str) -> Result<()> {
     proxy_req.set_header("Content-Type", "application/json");
     proxy_req.set_body(body);
 
-    match proxy_req.send_async(UPLOAD_SERVICE_BACKEND) {
+    match proxy_req.send_async(TRANSCODER_BACKEND) {
         Ok(_) => {
             eprintln!("[HLS] Triggered fMP4 backfill for {}", hash);
             Ok(())
@@ -2248,7 +2257,7 @@ fn trigger_on_demand_transcription(
     proxy_req.set_header("Content-Type", "application/json");
     proxy_req.set_body(body);
 
-    match proxy_req.send_async(UPLOAD_SERVICE_BACKEND) {
+    match proxy_req.send_async(TRANSCODER_BACKEND) {
         Ok(_) => {
             eprintln!("[VTT] Triggered on-demand transcription for {}", hash);
             Ok(())
