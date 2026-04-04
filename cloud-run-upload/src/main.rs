@@ -497,7 +497,51 @@ async fn handle_resumable_complete(
         .complete_session(&upload_id, &auth_event.pubkey)
         .await
     {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => {
+            // Trigger HLS transcoding for videos (fire-and-forget).
+            // Without this, resumable uploads never reach the transcoder and
+            // /{hash}/720p.mp4 stays in "Processing" forever. See the
+            // 2026-04-05 720p-mp4-stuck investigation.
+            if thumbnail::is_video_type(&response.content_type) {
+                if let Some(ref transcoder_url) = state.config.transcoder_url {
+                    let transcoder_url = transcoder_url.clone();
+                    let hash = response.sha256.clone();
+                    let owner = auth_event.pubkey.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = trigger_transcoding(&transcoder_url, &hash, &owner).await {
+                            error!("Failed to trigger transcoding for {}: {}", hash, e);
+                        }
+                    });
+                } else {
+                    info!(
+                        "TRANSCODER_URL not configured, skipping HLS transcoding for {}",
+                        response.sha256
+                    );
+                }
+            }
+
+            // Trigger transcript generation for transcribable media (audio/video).
+            if is_transcribable_type(&response.content_type) {
+                if let Some(ref transcriber_url) = state.config.transcriber_url {
+                    let transcriber_url = transcriber_url.clone();
+                    let hash = response.sha256.clone();
+                    let owner = auth_event.pubkey.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = trigger_transcription(&transcriber_url, &hash, &owner).await
+                        {
+                            error!("Failed to trigger transcription for {}: {}", hash, e);
+                        }
+                    });
+                } else {
+                    info!(
+                        "TRANSCRIBER_URL not configured, skipping transcript generation for {}",
+                        response.sha256
+                    );
+                }
+            }
+
+            (StatusCode::OK, Json(response)).into_response()
+        }
         Err(error) => resumable_error_response(error),
     }
 }
