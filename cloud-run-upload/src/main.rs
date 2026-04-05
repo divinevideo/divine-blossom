@@ -498,47 +498,13 @@ async fn handle_resumable_complete(
         .await
     {
         Ok(response) => {
-            // Trigger HLS transcoding for videos (fire-and-forget).
-            // Without this, resumable uploads never reach the transcoder and
-            // /{hash}/720p.mp4 stays in "Processing" forever. See the
-            // 2026-04-05 720p-mp4-stuck investigation.
-            if thumbnail::is_video_type(&response.content_type) {
-                if let Some(ref transcoder_url) = state.config.transcoder_url {
-                    let transcoder_url = transcoder_url.clone();
-                    let hash = response.sha256.clone();
-                    let owner = auth_event.pubkey.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = trigger_transcoding(&transcoder_url, &hash, &owner).await {
-                            error!("Failed to trigger transcoding for {}: {}", hash, e);
-                        }
-                    });
-                } else {
-                    info!(
-                        "TRANSCODER_URL not configured, skipping HLS transcoding for {}",
-                        response.sha256
-                    );
-                }
-            }
-
-            // Trigger transcript generation for transcribable media (audio/video).
-            if is_transcribable_type(&response.content_type) {
-                if let Some(ref transcriber_url) = state.config.transcriber_url {
-                    let transcriber_url = transcriber_url.clone();
-                    let hash = response.sha256.clone();
-                    let owner = auth_event.pubkey.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = trigger_transcription(&transcriber_url, &hash, &owner).await
-                        {
-                            error!("Failed to trigger transcription for {}: {}", hash, e);
-                        }
-                    });
-                } else {
-                    info!(
-                        "TRANSCRIBER_URL not configured, skipping transcript generation for {}",
-                        response.sha256
-                    );
-                }
-            }
+            maybe_trigger_derivatives(
+                state.config.transcoder_url.as_deref(),
+                state.config.transcriber_url.as_deref(),
+                &response,
+                &auth_event.pubkey,
+            )
+            .await;
 
             (StatusCode::OK, Json(response)).into_response()
         }
@@ -1178,6 +1144,210 @@ mod tests {
     }
 }
 
+/// Regression tests for `maybe_trigger_derivatives`.
+///
+/// These tests guard against the regression reported in PR #59, where
+/// `handle_resumable_complete` did not call `trigger_transcoding` or
+/// `trigger_transcription` after a successful session completion.  Any future
+/// refactor that removes or misconditions those calls will cause at least one
+/// of these tests to fail.
+///
+/// Each test spins up a `wiremock` mock HTTP server in-process, points
+/// `maybe_trigger_derivatives` at it, and asserts on which mock endpoints were
+/// (or were not) reached.  The spawned tasks are fire-and-forget, so we give
+/// them a short yield before asserting received requests.
+#[cfg(test)]
+mod derivative_trigger_tests {
+    use super::{maybe_trigger_derivatives, resumable::CompleteUploadResponse};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Build a minimal `CompleteUploadResponse` for the given content type.
+    fn fake_response(content_type: &str) -> CompleteUploadResponse {
+        CompleteUploadResponse {
+            sha256: "abc123".to_string(),
+            size: 1024,
+            content_type: content_type.to_string(),
+            thumbnail_url: None,
+            dim: None,
+        }
+    }
+
+    /// Wait long enough for fire-and-forget spawned tasks to complete their
+    /// HTTP round-trip against the in-process wiremock server. Tests run on a
+    /// multi_thread runtime so the spawned tasks can make real localhost
+    /// requests concurrently with this sleep. 200ms is ample for a loopback
+    /// POST to a mock server; tune upward only if you see CI flakes.
+    async fn drain_spawned_tasks() {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    /// video/mp4 → transcoder /transcode should be called.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawns_transcoder_for_video() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/transcode"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Transcriber also responds (video is transcribable too).
+        Mock::given(method("POST"))
+            .and(path("/transcribe"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let response = fake_response("video/mp4");
+        maybe_trigger_derivatives(
+            Some(&server.uri()),
+            Some(&server.uri()),
+            &response,
+            "pubkey_abc",
+        )
+        .await;
+
+        drain_spawned_tasks().await;
+
+        // wiremock verifies the `expect(1)` on drop.
+        server.verify().await;
+    }
+
+    /// audio/mpeg → transcriber /transcribe should be called; transcoder should NOT.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawns_transcriber_for_audio_not_transcoder() {
+        let server = MockServer::start().await;
+
+        // /transcode must NOT be called for audio.
+        Mock::given(method("POST"))
+            .and(path("/transcode"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/transcribe"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let response = fake_response("audio/mpeg");
+        maybe_trigger_derivatives(
+            Some(&server.uri()),
+            Some(&server.uri()),
+            &response,
+            "pubkey_abc",
+        )
+        .await;
+
+        drain_spawned_tasks().await;
+
+        server.verify().await;
+    }
+
+    /// image/jpeg → neither transcoder nor transcriber should be called.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn noop_for_image() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/transcode"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/transcribe"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let response = fake_response("image/jpeg");
+        maybe_trigger_derivatives(
+            Some(&server.uri()),
+            Some(&server.uri()),
+            &response,
+            "pubkey_abc",
+        )
+        .await;
+
+        drain_spawned_tasks().await;
+
+        server.verify().await;
+    }
+
+    /// video/mp4 with TRANSCODER_URL=None → no HTTP calls, no panic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn skips_when_transcoder_url_missing() {
+        let server = MockServer::start().await;
+
+        // Nothing should be called on the transcoder endpoint.
+        Mock::given(method("POST"))
+            .and(path("/transcode"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        // Transcription may still be called when a transcriber_url is provided.
+        Mock::given(method("POST"))
+            .and(path("/transcribe"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let response = fake_response("video/mp4");
+        // transcoder_url = None, transcriber_url = Some
+        maybe_trigger_derivatives(None, Some(&server.uri()), &response, "pubkey_abc").await;
+
+        drain_spawned_tasks().await;
+
+        server.verify().await;
+    }
+
+    /// video/mp4, transcoder returns HTTP 500 → spawn completes without propagating the error
+    /// (fire-and-forget contract is preserved; the handler still returns 200 to the client).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handles_transcoder_errors_gracefully() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/transcode"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/transcribe"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+            .mount(&server)
+            .await;
+
+        let response = fake_response("video/mp4");
+        // This must not panic even though the transcoder returns 500.
+        maybe_trigger_derivatives(
+            Some(&server.uri()),
+            Some(&server.uri()),
+            &response,
+            "pubkey_abc",
+        )
+        .await;
+
+        drain_spawned_tasks().await;
+
+        // The requests were sent (transcoder was hit), just with an error response.
+        server.verify().await;
+    }
+}
+
 fn validate_auth(headers: &axum::http::HeaderMap, required_action: &str) -> Result<NostrEvent> {
     let auth_header = headers
         .get(header::AUTHORIZATION)
@@ -1311,6 +1481,59 @@ fn get_extension(content_type: &str) -> &'static str {
 
 fn is_transcribable_type(content_type: &str) -> bool {
     content_type.starts_with("video/") || content_type.starts_with("audio/")
+}
+
+/// Spawn derivative-generation tasks (transcoding + transcription) for a newly completed upload.
+///
+/// This is the authoritative branching point: video → transcode + transcribe, audio → transcribe
+/// only, image → neither. Extracted from `handle_resumable_complete` so it can be unit-tested in
+/// isolation. See PR #59 for the regression where resumable uploads skipped these triggers.
+async fn maybe_trigger_derivatives(
+    transcoder_url: Option<&str>,
+    transcriber_url: Option<&str>,
+    response: &resumable::CompleteUploadResponse,
+    pubkey: &str,
+) {
+    // Trigger HLS transcoding for videos (fire-and-forget).
+    // Without this, resumable uploads never reach the transcoder and
+    // /{hash}/720p.mp4 stays in "Processing" forever. See the
+    // 2026-04-05 720p-mp4-stuck investigation.
+    if thumbnail::is_video_type(&response.content_type) {
+        if let Some(url) = transcoder_url {
+            let transcoder_url = url.to_owned();
+            let hash = response.sha256.clone();
+            let owner = pubkey.to_owned();
+            tokio::spawn(async move {
+                if let Err(e) = trigger_transcoding(&transcoder_url, &hash, &owner).await {
+                    error!("Failed to trigger transcoding for {}: {}", hash, e);
+                }
+            });
+        } else {
+            info!(
+                "TRANSCODER_URL not configured, skipping HLS transcoding for {}",
+                response.sha256
+            );
+        }
+    }
+
+    // Trigger transcript generation for transcribable media (audio/video).
+    if is_transcribable_type(&response.content_type) {
+        if let Some(url) = transcriber_url {
+            let transcriber_url = url.to_owned();
+            let hash = response.sha256.clone();
+            let owner = pubkey.to_owned();
+            tokio::spawn(async move {
+                if let Err(e) = trigger_transcription(&transcriber_url, &hash, &owner).await {
+                    error!("Failed to trigger transcription for {}: {}", hash, e);
+                }
+            });
+        } else {
+            info!(
+                "TRANSCRIBER_URL not configured, skipping transcript generation for {}",
+                response.sha256
+            );
+        }
+    }
 }
 
 /// Trigger HLS transcoding for a video (fire-and-forget)

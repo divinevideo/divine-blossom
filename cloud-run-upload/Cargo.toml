@@ -58,6 +58,10 @@ tempfile = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[dev-dependencies]
+# HTTP mock server for testing derivative trigger calls (transcoder/transcriber)
+wiremock = "0.5"
+
 [profile.release]
 lto = true
 opt-level = 3
