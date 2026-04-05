@@ -1101,6 +1101,222 @@ pub fn handle_admin_backfill(req: Request) -> Result<Response> {
     json_response(StatusCode::OK, &response)
 }
 
+/// `POST /admin/api/reset-stuck-transcodes`
+///
+/// Sweeps `BlobMetadata` records with `transcode_status = Processing` that have
+/// been in that state for longer than `older_than_secs`, and either marks them
+/// `Complete` (if HLS already exists in GCS — lost webhook) or resets them to
+/// `Pending` (so the next client request to `/{hash}/720p.mp4` re-triggers
+/// transcoding).
+///
+/// Enumerates blobs via `get_user_index() -> for each pubkey: get_user_blobs`.
+/// There is no KV-native list, so user-index iteration is the only full-coverage
+/// enumeration available. Callers should shard via `hex_prefix` and paginate
+/// via `user_offset` / `user_limit` for large deployments.
+///
+/// Request body (all fields optional):
+/// ```json
+/// {
+///   "older_than_secs": 3600,
+///   "dry_run": true,
+///   "user_offset": 0,
+///   "user_limit": 100,
+///   "hex_prefix": "a"
+/// }
+/// ```
+///
+/// Response:
+/// ```json
+/// {
+///   "dry_run": true,
+///   "users_scanned": N,
+///   "blobs_scanned": N,
+///   "candidates": N,
+///   "marked_complete": N,
+///   "reset_pending": N,
+///   "skipped_not_stuck": N,
+///   "skipped_too_recent": N,
+///   "next_user_offset": N | null
+/// }
+/// ```
+pub fn handle_admin_reset_stuck_transcodes(mut req: Request) -> Result<Response> {
+    use crate::admin_sweep::{classify_stuck_record, iso_timestamp_seconds_ago, StuckAction};
+
+    validate_admin_auth(&req)?;
+
+    let body = req.take_body().into_string();
+    let payload: serde_json::Value = if body.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(&body)
+            .map_err(|e| BlossomError::BadRequest(format!("Invalid JSON: {}", e)))?
+    };
+
+    let older_than_secs = payload
+        .get("older_than_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(3600);
+    let dry_run = payload
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let user_offset = payload
+        .get("user_offset")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let user_limit = payload
+        .get("user_limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(100) as usize;
+    let hex_prefix = payload
+        .get("hex_prefix")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_lowercase());
+
+    let threshold_iso = iso_timestamp_seconds_ago(older_than_secs);
+    eprintln!(
+        "[UNSTICK] sweep start dry_run={} older_than_secs={} threshold={} user_offset={} user_limit={} hex_prefix={:?}",
+        dry_run, older_than_secs, threshold_iso, user_offset, user_limit, hex_prefix
+    );
+
+    let user_index = get_user_index()?;
+    let total_users = user_index.pubkeys.len();
+    let end = std::cmp::min(user_offset + user_limit, total_users);
+    let pubkeys_to_process: &[String] = if user_offset < total_users {
+        &user_index.pubkeys[user_offset..end]
+    } else {
+        &[]
+    };
+
+    let mut blobs_scanned: u64 = 0;
+    let mut candidates: u64 = 0;
+    let mut marked_complete: u64 = 0;
+    let mut reset_pending: u64 = 0;
+    let mut skipped_not_stuck: u64 = 0;
+    let mut skipped_too_recent: u64 = 0;
+
+    for pubkey in pubkeys_to_process {
+        let hashes = match get_user_blobs(pubkey) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("[UNSTICK] get_user_blobs failed for {}: {}", pubkey, e);
+                continue;
+            }
+        };
+        for hash in hashes {
+            if let Some(prefix) = &hex_prefix {
+                if !hash.to_lowercase().starts_with(prefix.as_str()) {
+                    continue;
+                }
+            }
+            blobs_scanned += 1;
+
+            let meta = match get_blob_metadata(&hash) {
+                Ok(Some(m)) => m,
+                Ok(None) => continue,
+                Err(e) => {
+                    eprintln!("[UNSTICK] get_blob_metadata failed for {}: {}", hash, e);
+                    continue;
+                }
+            };
+
+            // Pre-filter cheaply before probing GCS.
+            if meta.transcode_status
+                != Some(crate::blossom::TranscodeStatus::Processing)
+            {
+                skipped_not_stuck += 1;
+                continue;
+            }
+            if meta.uploaded.as_str() >= threshold_iso.as_str() {
+                skipped_too_recent += 1;
+                continue;
+            }
+            candidates += 1;
+
+            // Probe GCS for {hash}/hls/master.m3u8. Treat any error other than
+            // an explicit 200 as "not present" — we'd rather reset a record to
+            // Pending and re-trigger than incorrectly mark it Complete.
+            let hls_path = format!("{}/hls/master.m3u8", hash);
+            let hls_present = crate::storage::download_hls_from_gcs(&hls_path, Some("bytes=0-0"))
+                .map(|resp| {
+                    let status = resp.get_status().as_u16();
+                    status == 200 || status == 206
+                })
+                .unwrap_or(false);
+
+            let is_processing = meta.transcode_status
+                == Some(crate::blossom::TranscodeStatus::Processing);
+            let action = classify_stuck_record(
+                is_processing,
+                &meta.uploaded,
+                &threshold_iso,
+                hls_present,
+            );
+            eprintln!(
+                "[UNSTICK] hash={} uploaded={} hls_present={} action={:?} dry_run={}",
+                hash, meta.uploaded, hls_present, action, dry_run
+            );
+
+            match action {
+                StuckAction::MarkComplete => {
+                    marked_complete += 1;
+                    if !dry_run {
+                        if let Err(e) = crate::metadata::update_transcode_status(
+                            &hash,
+                            crate::blossom::TranscodeStatus::Complete,
+                        ) {
+                            eprintln!(
+                                "[UNSTICK] update_transcode_status(Complete) failed for {}: {}",
+                                hash, e
+                            );
+                        }
+                    }
+                }
+                StuckAction::ResetPending => {
+                    reset_pending += 1;
+                    if !dry_run {
+                        if let Err(e) = crate::metadata::update_transcode_status(
+                            &hash,
+                            crate::blossom::TranscodeStatus::Pending,
+                        ) {
+                            eprintln!(
+                                "[UNSTICK] update_transcode_status(Pending) failed for {}: {}",
+                                hash, e
+                            );
+                        }
+                    }
+                }
+                // Already filtered above — unreachable but handled for completeness.
+                StuckAction::SkipNotStuck => skipped_not_stuck += 1,
+                StuckAction::SkipTooRecent => skipped_too_recent += 1,
+            }
+        }
+    }
+
+    let has_more = end < total_users;
+    let response = serde_json::json!({
+        "dry_run": dry_run,
+        "older_than_secs": older_than_secs,
+        "threshold": threshold_iso,
+        "hex_prefix": hex_prefix,
+        "users_scanned": pubkeys_to_process.len(),
+        "blobs_scanned": blobs_scanned,
+        "candidates": candidates,
+        "marked_complete": marked_complete,
+        "reset_pending": reset_pending,
+        "skipped_not_stuck": skipped_not_stuck,
+        "skipped_too_recent": skipped_too_recent,
+        "next_user_offset": if has_more { Some(end) } else { None },
+        "total_users": total_users,
+    });
+    eprintln!("[UNSTICK] sweep done: {}", response);
+    json_response(StatusCode::OK, &response)
+}
+
+// Tests for the sweep's pure classifier and timestamp helpers live in
+// `src/admin_sweep.rs` so they can run via `cargo test --lib` without
+// linking the binary (which requires Fastly SDK host symbols).
+
 /// Create JSON response
 fn json_response<T: serde::Serialize>(status: StatusCode, body: &T) -> Result<Response> {
     let json = serde_json::to_string(body)

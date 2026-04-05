@@ -2,6 +2,7 @@
 // ABOUTME: Routes requests to appropriate handlers for BUD-01 and BUD-02
 
 mod admin;
+mod admin_sweep;
 mod auth;
 mod blossom;
 mod delete_policy;
@@ -194,6 +195,9 @@ fn handle_request(req: Request) -> Result<Response> {
         (Method::POST, "/admin/api/vanish") => handle_admin_vanish(req),
         (Method::POST, "/admin/api/backfill") => admin::handle_admin_backfill(req),
         (Method::POST, "/admin/api/backfill-vtt") => handle_admin_backfill_vtt(req),
+        (Method::POST, "/admin/api/reset-stuck-transcodes") => {
+            admin::handle_admin_reset_stuck_transcodes(req)
+        }
 
         // CORS preflight
         (Method::OPTIONS, _) => Ok(cors_preflight_response()),

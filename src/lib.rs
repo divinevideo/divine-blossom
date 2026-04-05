@@ -1,3 +1,4 @@
+pub mod admin_sweep;
 pub mod resumable_complete;
 
 #[cfg(test)]
