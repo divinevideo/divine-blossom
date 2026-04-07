@@ -118,10 +118,17 @@ fn report_derivative_failure_to_sentry(
     content_type: Option<&str>,
     owner: Option<&str>,
 ) {
+    // User-caused invalid media (corrupt uploads, missing moov atom, etc.) are warnings,
+    // not errors — they don't indicate system failures.
+    let level = if error_code == "invalid_media" {
+        sentry::Level::Warning
+    } else {
+        sentry::Level::Error
+    };
     let fingerprint = [service, derivative, error_code];
     sentry::with_scope(
         |scope| {
-            scope.set_level(Some(sentry::Level::Error));
+            scope.set_level(Some(level));
             scope.set_fingerprint(Some(fingerprint.as_ref()));
             scope.set_tag("service", service);
             scope.set_tag("derivative", derivative);
@@ -136,7 +143,7 @@ fn report_derivative_failure_to_sentry(
             }
         },
         || {
-            sentry::capture_message(error_message, sentry::Level::Error);
+            sentry::capture_message(error_message, level);
         },
     );
 }
