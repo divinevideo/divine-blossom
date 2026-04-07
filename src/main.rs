@@ -990,7 +990,8 @@ fn handle_head_hls_content(path: &str) -> Result<Response> {
     let hash_lower = hash.to_lowercase();
 
     // Don't reveal restricted/banned/deleted content (HEAD has no req, no admin bypass)
-    if let Ok(Some(meta)) = get_blob_metadata(&hash_lower) {
+    let metadata = get_blob_metadata(&hash_lower)?;
+    if let Some(ref meta) = metadata {
         if meta.status.requires_owner_auth() || meta.status.blocks_public_access() {
             return Err(BlossomError::NotFound("Content not found".into()));
         }
