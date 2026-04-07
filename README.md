@@ -135,11 +135,18 @@ fastly compute publish
 | `DELETE` | `/<sha256>` | Required | Soft-delete your own blob and stop serving it publicly |
 | `GET` | `/list/<pubkey>` | Optional | List user's blobs |
 
+On production Fastly Compute, **video** uploads (`video/*` Content-Type) must use the **resumable** flow below. A single `PUT /upload` with a video type returns **422** with `code: video_requires_resumable` and hints (`initUrl`, `dataHost`). Non-video blobs may still use `PUT /upload` for small files or resumable for large ones. Video sent as `application/octet-stream` is not treated as video for this rule.
+
 When resumable support is available, `HEAD /upload` includes these discovery headers:
 
 - `X-Divine-Upload-Extensions: resumable-sessions`
 - `X-Divine-Upload-Control-Host: <public Blossom host>`
 - `X-Divine-Upload-Data-Host: upload.divine.video`
+- `X-Divine-Video-Upload-Method: resumable`
+
+The JSON body from `HEAD /upload` (without BUD-06 pre-check headers) includes `videoUploadMethod: "resumable"`.
+
+Use `python3 scripts/debug_upload_harness.py --mode resumable` to exercise the full flow.
 
 `POST /upload/init` returns camelCase fields for the mobile client contract:
 

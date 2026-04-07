@@ -209,6 +209,10 @@ pub struct UploadRequirements {
     /// Supported Divine upload extensions (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extensions: Option<Vec<String>>,
+    /// Video uploads must use the resumable protocol (`POST /upload/init`, chunk `uploadUrl`, `POST .../complete`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "videoUploadMethod")]
+    pub video_upload_method: Option<String>,
 }
 
 /// Request payload for initializing a resumable upload session.

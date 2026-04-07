@@ -2679,14 +2679,13 @@ fn handle_upload(mut req: Request) -> Result<Response> {
 
     let base_url = get_base_url(&req);
 
-    // Proxy to Cloud Run for:
-    // 1. Large uploads (> 500KB) to avoid WASM memory limits
-    // 2. Video uploads (any size) for thumbnail generation
-    // In local mode, handle all uploads inline (no Cloud Run available).
-    // Viceroy doesn't have WASM heap limits, but very large files (>50MB) may be slow.
-    if !crate::storage::is_local_mode()
-        && (content_length > UPLOAD_SERVICE_THRESHOLD || is_video_mime_type(&content_type))
-    {
+    if !crate::storage::is_local_mode() && is_video_mime_type(&content_type) {
+        return respond_video_requires_resumable(req);
+    }
+
+    // Proxy to Cloud Run for large non-video uploads (> 500KB) to avoid WASM memory limits.
+    // Video uses resumable uploads (see above). In local mode, handle all uploads inline.
+    if !crate::storage::is_local_mode() && content_length > UPLOAD_SERVICE_THRESHOLD {
         return handle_upload_service_proxy(req, auth, content_type, content_length, base_url);
     }
 
@@ -3200,6 +3199,35 @@ fn handle_upload_complete(mut req: Request, path: &str) -> Result<Response> {
 
 /// Handle large uploads by proxying to the upload service
 /// Fastly Compute has WASM memory limits (~5MB), so large files must be proxied
+/// Production: single `PUT /upload` cannot stream video through the edge within time limits.
+/// Clients must use `POST /upload/init`, chunk to `uploadUrl`, then `POST /upload/{id}/complete`.
+fn respond_video_requires_resumable(mut req: Request) -> Result<Response> {
+    let base_url = get_base_url(&req);
+    let control_host = upload_control_host(get_public_host(&req).as_deref());
+    let _ = req.take_body();
+    let init_url = upload_init_control_plane_url(&base_url);
+    let payload = serde_json::json!({
+        "error": "Video uploads must use the resumable upload protocol",
+        "code": "video_requires_resumable",
+        "dataHost": UPLOAD_SERVICE_HOST,
+        "initMethod": "POST",
+        "initPath": "/upload/init",
+        "initUrl": init_url,
+        "hint": "POST /upload/init with sha256, size, and contentType; PUT chunks to uploadUrl from the response; POST /upload/{uploadId}/complete."
+    });
+    let mut resp = json_response(
+        StatusCode::from_u16(422).expect("422 is valid"),
+        &payload,
+    );
+    add_upload_capability_headers(&mut resp, &control_host);
+    add_cors_headers(&mut resp);
+    Ok(resp)
+}
+
+fn upload_init_control_plane_url(base_url: &str) -> String {
+    format!("{}/upload/init", base_url.trim_end_matches('/'))
+}
+
 fn handle_upload_service_proxy(
     mut req: Request,
     auth: crate::blossom::BlossomAuthEvent,
@@ -3339,6 +3367,7 @@ fn handle_upload_requirements(req: Request) -> Result<Response> {
         max_size: Some(MAX_UPLOAD_SIZE),
         allowed_types: None, // Accept all types
         extensions: Some(vec![DIVINE_UPLOAD_EXTENSION_RESUMABLE.to_string()]),
+        video_upload_method: Some("resumable".to_string()),
     };
 
     let mut resp = json_response(StatusCode::OK, &requirements);
@@ -5103,7 +5132,7 @@ struct UploadCapabilityHeaders {
 }
 
 fn upload_exposed_headers() -> &'static str {
-    "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256, X-Content-SHA256, X-Audio-Duration, X-Audio-Size, X-Divine-Upload-Extensions, X-Divine-Upload-Control-Host, X-Divine-Upload-Data-Host"
+    "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256, X-Content-SHA256, X-Audio-Duration, X-Audio-Size, X-Divine-Upload-Extensions, X-Divine-Upload-Control-Host, X-Divine-Upload-Data-Host, X-Divine-Video-Upload-Method"
 }
 
 fn upload_control_host(public_host: Option<&str>) -> String {
@@ -5123,6 +5152,7 @@ fn add_upload_capability_headers(resp: &mut Response, control_host: &str) {
     resp.set_header("X-Divine-Upload-Extensions", headers.extensions);
     resp.set_header("X-Divine-Upload-Control-Host", headers.control_host);
     resp.set_header("X-Divine-Upload-Data-Host", headers.data_host);
+    resp.set_header("X-Divine-Video-Upload-Method", "resumable");
 }
 
 /// CORS preflight response
@@ -5224,8 +5254,8 @@ mod tests {
         is_quality_variant_path, parse_quality_variant_path,
         parse_transcript_status_webhook_payload, should_delete_derived_audio_blob,
         should_set_audio_content_length, upload_capability_headers, upload_control_host,
-        upload_exposed_headers, AudioReuseAvailability, TranscodeFetchAction,
-        TranscriptFetchAction, TranscriptPendingState,
+        upload_exposed_headers, upload_init_control_plane_url, AudioReuseAvailability,
+        TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState,
     };
     use crate::blossom::{TranscodeStatus, TranscriptStatus};
     use crate::error::{BlossomError, Result as BlossomResult};
@@ -5521,6 +5551,19 @@ mod tests {
         assert!(exposed_headers.contains("X-Divine-Upload-Extensions"));
         assert!(exposed_headers.contains("X-Divine-Upload-Control-Host"));
         assert!(exposed_headers.contains("X-Divine-Upload-Data-Host"));
+        assert!(exposed_headers.contains("X-Divine-Video-Upload-Method"));
+    }
+
+    #[test]
+    fn upload_init_control_plane_url_trims_trailing_slash() {
+        assert_eq!(
+            upload_init_control_plane_url("https://media.divine.video"),
+            "https://media.divine.video/upload/init"
+        );
+        assert_eq!(
+            upload_init_control_plane_url("https://media.divine.video/"),
+            "https://media.divine.video/upload/init"
+        );
     }
 
     #[test]

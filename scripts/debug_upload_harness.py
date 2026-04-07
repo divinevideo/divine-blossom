@@ -554,7 +554,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--mode",
         choices=("resumable", "legacy"),
         default="resumable",
-        help="Upload mode to exercise",
+        help="resumable: init + chunk PUTs + complete (required for video on production). "
+        "legacy: single PUT /upload — for non-video only; video returns 422.",
     )
     parser.add_argument(
         "--auth-header",
