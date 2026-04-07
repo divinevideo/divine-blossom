@@ -815,6 +815,54 @@ mod tests {
     }
 
     #[test]
+    fn test_deleted_status_blocks_like_banned() {
+        // Deleted must behave identically to Banned for access control.
+        // The serving code uses these helpers instead of matching on individual
+        // variants, so any status that blocks_public_access() will 404.
+        assert_eq!(
+            BlobStatus::Deleted.blocks_public_access(),
+            BlobStatus::Banned.blocks_public_access(),
+        );
+        assert_eq!(
+            BlobStatus::Deleted.requires_owner_auth(),
+            BlobStatus::Banned.requires_owner_auth(),
+        );
+        // Neither should allow owner access
+        assert!(!BlobStatus::Deleted.requires_owner_auth());
+        assert!(!BlobStatus::Banned.requires_owner_auth());
+    }
+
+    #[test]
+    fn test_every_status_is_classified() {
+        // Ensure no status variant is silently servable — every non-Active,
+        // non-Pending status must trigger at least one access check.
+        // Uses match for compiler-enforced exhaustiveness: adding a new
+        // BlobStatus variant will fail to compile until classified here.
+        for s in [
+            BlobStatus::Active,
+            BlobStatus::Restricted,
+            BlobStatus::Pending,
+            BlobStatus::Banned,
+            BlobStatus::Deleted,
+        ] {
+            match s {
+                BlobStatus::Banned | BlobStatus::Deleted => {
+                    assert!(s.blocks_public_access(), "{:?} should block public access", s);
+                    assert!(!s.requires_owner_auth(), "{:?} should not require owner auth", s);
+                }
+                BlobStatus::Restricted => {
+                    assert!(!s.blocks_public_access(), "{:?} should not block public access", s);
+                    assert!(s.requires_owner_auth(), "{:?} should require owner auth", s);
+                }
+                BlobStatus::Active | BlobStatus::Pending => {
+                    assert!(!s.blocks_public_access(), "{:?} should not block public access", s);
+                    assert!(!s.requires_owner_auth(), "{:?} should not require owner auth", s);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_local_mode_stub_hls_manifest_format() {
         let hash = "a".repeat(64);
         let manifest = format!(
