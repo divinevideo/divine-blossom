@@ -2237,29 +2237,40 @@ fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
                 }
             }
 
-            // HLS not ready - trigger on-demand transcoding
-            match meta.transcode_status {
-                Some(TranscodeStatus::Processing) => {
+            // HLS not ready — use the bounding classifier to decide whether to
+            // trigger, return "in progress", or declare terminal failure.
+            match decide_transcode_fetch_action(
+                meta.transcode_status,
+                meta.transcode_retry_after,
+                meta.transcode_attempt_count,
+                meta.transcode_terminal,
+                unix_timestamp_secs(),
+            ) {
+                TranscodeFetchAction::Terminal => {
+                    Ok(derivative_failure_response(
+                        meta.transcode_error_code.as_deref(),
+                        meta.transcode_error_message.as_deref(),
+                        "Video transcoding permanently failed",
+                    ))
+                }
+                TranscodeFetchAction::Accepted { retry_after_secs, .. } => {
                     let mut resp = Response::from_status(StatusCode::ACCEPTED);
-                    resp.set_header("Retry-After", "5");
+                    resp.set_header("Retry-After", retry_after_secs.to_string());
                     resp.set_header("Content-Type", "application/json");
                     resp.set_body(r#"{"status":"processing","message":"Video is being transcoded, please retry"}"#);
                     add_no_cache_headers(&mut resp);
                     add_cors_headers(&mut resp);
                     Ok(resp)
                 }
-                Some(TranscodeStatus::Complete)
-                | Some(TranscodeStatus::Failed)
-                | Some(TranscodeStatus::Pending)
-                | None => {
+                TranscodeFetchAction::Trigger { retry_after_secs, .. } => {
                     use crate::metadata::update_transcode_status;
                     let _ = update_transcode_status(&hash, TranscodeStatus::Processing);
                     let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
 
                     let mut resp = Response::from_status(StatusCode::ACCEPTED);
-                    resp.set_header("Retry-After", "10");
+                    resp.set_header("Retry-After", retry_after_secs.to_string());
                     resp.set_header("Content-Type", "application/json");
-                    resp.set_body(r#"{"status":"processing","message":"Transcoding started, please retry in 10 seconds"}"#);
+                    resp.set_body(r#"{"status":"processing","message":"Transcoding started, please retry"}"#);
                     add_no_cache_headers(&mut resp);
                     add_cors_headers(&mut resp);
                     Ok(resp)
