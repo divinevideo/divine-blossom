@@ -4100,6 +4100,23 @@ struct TranscriptBackfillCandidate {
     cooldown_remaining_secs: Option<u64>,
 }
 
+fn backfill_batch_cursor(
+    offset: usize,
+    end: usize,
+    total: usize,
+    hit_trigger_limit: bool,
+) -> (bool, Option<usize>) {
+    if hit_trigger_limit && offset < total {
+        return (true, Some(offset));
+    }
+
+    if end < total {
+        return (true, Some(end));
+    }
+
+    (false, None)
+}
+
 fn handle_admin_backfill_vtt(req: Request) -> Result<Response> {
     // Accept webhook secret (same as transcoder uses) OR admin session
     let webhook_ok = fastly::secret_store::SecretStore::open("blossom_secrets")
@@ -4268,11 +4285,9 @@ fn handle_admin_backfill_vtt(req: Request) -> Result<Response> {
             }
         }
 
-        (
-            end < total_hashes,
-            if end < total_hashes { Some(end) } else { None },
-            None,
-        )
+        let (has_more, next_offset) = backfill_batch_cursor(offset, end, total_hashes, hit_limit);
+
+        (has_more, next_offset, None)
     } else {
         let user_index = crate::metadata::get_user_index()?;
         let total_users = user_index.pubkeys.len();
@@ -4300,11 +4315,9 @@ fn handle_admin_backfill_vtt(req: Request) -> Result<Response> {
             }
         }
 
-        (
-            end < total_users,
-            if end < total_users { Some(end) } else { None },
-            Some(pubkeys_to_process.len()),
-        )
+        let (has_more, next_offset) = backfill_batch_cursor(offset, end, total_users, hit_limit);
+
+        (has_more, next_offset, Some(pubkeys_to_process.len()))
     };
 
     let response = serde_json::json!({
@@ -5308,7 +5321,7 @@ fn infer_mime_from_path(path: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_audio_reuse_availability, decide_transcode_fetch_action,
+        backfill_batch_cursor, classify_audio_reuse_availability, decide_transcode_fetch_action,
         decide_transcript_fetch_action, error_response, is_alias_only_audio_blob,
         is_quality_variant_path, parse_quality_variant_path,
         parse_transcript_status_webhook_payload, should_delete_derived_audio_blob,
@@ -5515,6 +5528,24 @@ mod tests {
             "video/mp4",
             Some(TranscriptStatus::Failed)
         ));
+    }
+
+    #[test]
+    fn backfill_cursor_retries_same_window_after_hitting_trigger_limit() {
+        assert_eq!(backfill_batch_cursor(50, 100, 250, true), (true, Some(50)));
+    }
+
+    #[test]
+    fn backfill_cursor_advances_when_batch_completes_without_hitting_limit() {
+        assert_eq!(
+            backfill_batch_cursor(50, 100, 250, false),
+            (true, Some(100))
+        );
+    }
+
+    #[test]
+    fn backfill_cursor_finishes_on_last_page_without_hitting_limit() {
+        assert_eq!(backfill_batch_cursor(200, 250, 250, false), (false, None));
     }
 
     #[test]

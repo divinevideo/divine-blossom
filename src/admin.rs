@@ -103,6 +103,29 @@ fn get_session_cookie(req: &Request) -> Option<String> {
         })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::get_session_cookie;
+    use fastly::http::header;
+    use fastly::Request;
+
+    #[test]
+    fn extracts_admin_session_cookie_from_cookie_header() {
+        let mut req = Request::get("https://media.divine.video/admin");
+        req.set_header(header::COOKIE, "foo=bar; admin_session=abc123; theme=dark");
+
+        assert_eq!(get_session_cookie(&req).as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn ignores_legacy_session_cookie_name() {
+        let mut req = Request::get("https://media.divine.video/admin");
+        req.set_header(header::COOKIE, "session=abc123");
+
+        assert_eq!(get_session_cookie(&req), None);
+    }
+}
+
 /// Validate session cookie against KV store
 fn validate_session(req: &Request) -> Result<()> {
     let token = get_session_cookie(req)
@@ -1574,6 +1597,13 @@ const ADMIN_HTML: &str = r#"<!DOCTYPE html>
             </div>
         </div>
 
+        <div style="display:flex;align-items:center;gap:0.75rem;margin:1rem 0;flex-wrap:wrap">
+            <button id="backfillTranscriptsBtn" class="btn btn-approve" onclick="backfillPendingTranscripts()">
+                Backfill Pending Transcripts
+            </button>
+            <span id="backfillTranscriptsStatus" style="color:#888;font-size:0.9rem"></span>
+        </div>
+
         <div class="tabs">
             <button class="tab active" data-tab="recent">Recent Uploads</button>
             <button class="tab" data-tab="users">Users</button>
@@ -1694,6 +1724,85 @@ const ADMIN_HTML: &str = r#"<!DOCTYPE html>
                 document.getElementById('statusBreakdown').innerHTML = statusHtml;
             } catch (e) {
                 showError(e.message);
+            }
+        }
+
+        function setTranscriptBackfillStatus(message, isError = false) {
+            const status = document.getElementById('backfillTranscriptsStatus');
+            status.textContent = message || '';
+            status.style.color = isError ? '#ff8a80' : '#888';
+        }
+
+        async function backfillPendingTranscripts() {
+            if (!confirm('Queue transcript generation for pending media across all users?')) {
+                return;
+            }
+
+            const button = document.getElementById('backfillTranscriptsBtn');
+            const originalLabel = button.textContent;
+            const totals = {
+                triggered: 0,
+                already_processing: 0,
+                already_complete: 0,
+                cooling_down: 0,
+                errors: 0
+            };
+            let offset = 0;
+            let batchCount = 0;
+
+            button.disabled = true;
+            button.style.opacity = '0.6';
+            button.textContent = 'Backfilling...';
+
+            try {
+                while (batchCount < 250) {
+                    setTranscriptBackfillStatus(`Scanning transcript backlog... batch ${batchCount + 1}`);
+
+                    const resp = await fetch(`/admin/api/backfill-vtt?offset=${offset}&limit=50&scope=users&max_triggers=10`, {
+                        method: 'POST',
+                        headers: authHeaders()
+                    });
+                    const data = await resp.json().catch(() => ({}));
+                    if (!resp.ok) throw new Error(data.error || 'Failed to backfill transcripts');
+
+                    const results = data.results || {};
+                    const batch = data.batch || {};
+                    totals.triggered += results.triggered || 0;
+                    totals.already_processing += results.already_processing || 0;
+                    totals.already_complete += results.already_complete || 0;
+                    totals.cooling_down += results.cooling_down || 0;
+                    totals.errors += results.errors || 0;
+                    batchCount += 1;
+
+                    setTranscriptBackfillStatus(
+                        `Queued ${totals.triggered}, processing ${totals.already_processing}, complete ${totals.already_complete}, cooldown ${totals.cooling_down}, errors ${totals.errors}`
+                    );
+
+                    if (!batch.has_more || batch.next_offset === null || batch.next_offset === undefined) {
+                        break;
+                    }
+
+                    offset = Number(batch.next_offset);
+                    await new Promise(resolve => setTimeout(resolve, 250));
+                }
+
+                if (batchCount >= 250) {
+                    setTranscriptBackfillStatus(
+                        'Transcript backfill paused after 250 batches. Run it again to continue.',
+                        true
+                    );
+                } else {
+                    setTranscriptBackfillStatus(
+                        `Transcript backfill queued ${totals.triggered} blobs. Processing ${totals.already_processing}, complete ${totals.already_complete}, cooldown ${totals.cooling_down}, errors ${totals.errors}.`
+                    );
+                }
+            } catch (e) {
+                setTranscriptBackfillStatus('', false);
+                showError(e.message);
+            } finally {
+                button.disabled = false;
+                button.style.opacity = '';
+                button.textContent = originalLabel;
             }
         }
 
@@ -1855,12 +1964,20 @@ const ADMIN_HTML: &str = r#"<!DOCTYPE html>
                 const blob = await resp.json();
 
                 const isVideo = blob.type?.startsWith('video');
+                const isAudio = blob.type?.startsWith('audio');
                 const isImage = blob.type?.startsWith('image');
+                const isTranscribable = isVideo || isAudio;
                 const thumbUrl = blob.thumbnail || (isVideo ? '/' + blob.sha256 + '.jpg' : null);
                 const previewUrl = isImage ? '/' + blob.sha256 : thumbUrl;
+                const transcriptStatus = blob.transcript_status || 'missing';
+                const transcriptRetryAfter = blob.transcript_retry_after
+                    ? new Date(blob.transcript_retry_after * 1000).toLocaleString()
+                    : null;
 
                 content.innerHTML = `
-                    ${isVideo ? `<video src="/${blob.sha256}" class="detail-preview" controls poster="${thumbUrl}" style="max-width:100%"></video>` : (previewUrl ? `<img src="${previewUrl}" class="detail-preview">` : '')}
+                    ${isVideo ? `<video src="/${blob.sha256}" class="detail-preview" controls poster="${thumbUrl}" style="max-width:100%"></video>` : ''}
+                    ${isAudio ? `<audio src="/${blob.sha256}" class="detail-preview" controls style="width:100%"></audio>` : ''}
+                    ${!isVideo && !isAudio && previewUrl ? `<img src="${previewUrl}" class="detail-preview">` : ''}
                     <div class="detail-section">
                         <div class="detail-label">SHA256</div>
                         <div class="detail-value hash">${blob.sha256}</div>
@@ -1891,10 +2008,29 @@ const ADMIN_HTML: &str = r#"<!DOCTYPE html>
                         <div class="detail-value">${blob.transcode_status}</div>
                     </div>
                     ` : ''}
+                    ${isTranscribable ? `
+                    <div class="detail-section">
+                        <div class="detail-label">Transcript</div>
+                        <div class="detail-value">${transcriptStatus}${blob.transcript_terminal ? ' (terminal)' : ''}</div>
+                    </div>
+                    ` : ''}
+                    ${isTranscribable && blob.transcript_error_code ? `
+                    <div class="detail-section">
+                        <div class="detail-label">Transcript Error</div>
+                        <div class="detail-value">${blob.transcript_error_code}${blob.transcript_error_message ? `: ${blob.transcript_error_message}` : ''}</div>
+                    </div>
+                    ` : ''}
+                    ${isTranscribable && transcriptRetryAfter ? `
+                    <div class="detail-section">
+                        <div class="detail-label">Retry After</div>
+                        <div class="detail-value">${transcriptRetryAfter}</div>
+                    </div>
+                    ` : ''}
                     <div class="actions" style="margin-top:1rem">
                         <button class="btn btn-approve" onclick="moderate('${blob.sha256}','approve');closeDetail()">Approve</button>
                         <button class="btn btn-restrict" onclick="moderate('${blob.sha256}','restrict');closeDetail()">Restrict</button>
                         <button class="btn btn-ban" onclick="moderate('${blob.sha256}','ban');closeDetail()">Ban</button>
+                        ${isTranscribable ? `<button class="btn btn-approve" onclick="retriggerTranscript('${blob.sha256}')">Regenerate Transcript</button>` : ''}
                     </div>
                     <div style="margin-top:1rem">
                         <a href="/${blob.sha256}" target="_blank" class="btn btn-approve">View File</a>
@@ -1904,6 +2040,23 @@ const ADMIN_HTML: &str = r#"<!DOCTYPE html>
             } catch (e) {
                 content.innerHTML = `<div class="error">${e.message}</div>`;
                 panel.classList.add('open');
+            }
+        }
+
+        async function retriggerTranscript(hash) {
+            try {
+                const resp = await fetch('/v1/subtitles/jobs', {
+                    method: 'POST',
+                    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ video_sha256: hash, force: true })
+                });
+                const data = await resp.json().catch(() => ({}));
+                if (!resp.ok) throw new Error(data.error || data.message || 'Failed to regenerate transcript');
+
+                setTranscriptBackfillStatus(`Queued transcript regeneration for ${hash.substring(0, 12)}...`);
+                await showBlobDetail(hash);
+            } catch (e) {
+                showError(e.message);
             }
         }
 
