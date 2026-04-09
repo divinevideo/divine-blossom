@@ -2734,6 +2734,32 @@ mod tests {
     }
 
     #[test]
+    fn gemini_structured_output_normalizes_to_vtt() {
+        let gemini_json = r#"{
+            "language": "en",
+            "segments": [
+                {"start": 0.0, "end": 2.5, "text": "Hello world"},
+                {"start": 2.5, "end": 5.0, "text": "Testing one two three"}
+            ]
+        }"#;
+        let parsed = normalize_transcript_to_vtt(gemini_json).unwrap();
+        assert!(parsed.content.starts_with("WEBVTT"));
+        assert_eq!(parsed.cue_count, 2);
+        assert_eq!(parsed.language.as_deref(), Some("en"));
+        assert!(parsed.content.contains("Hello world"));
+        assert!(parsed.content.contains("Testing one two three"));
+        assert!(parsed.content.contains("00:00:00.000 --> 00:00:02.500"));
+    }
+
+    #[test]
+    fn gemini_config_defaults_to_gemini_provider() {
+        let config = Config::from_lookup(|_| None);
+        assert_eq!(config.transcription_provider, "gemini");
+        assert_eq!(config.gcp_project_id, "rich-compiler-479518-d2");
+        assert_eq!(config.gcp_region, "us-central1");
+    }
+
+    #[test]
     fn classifies_audio_extract_errors() {
         assert_eq!(
             classify_audio_extract_error("not_a_video"),
