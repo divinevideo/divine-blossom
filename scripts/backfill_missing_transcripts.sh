@@ -32,6 +32,7 @@ Options:
 
 Authentication:
   Set either ADMIN_BEARER_TOKEN or ADMIN_COOKIE.
+  ADMIN_COOKIE should be the value of the admin_session cookie from /admin.
 
 Examples:
   ADMIN_BEARER_TOKEN=... bash scripts/backfill_missing_transcripts.sh --dry-run --limit 20
@@ -111,7 +112,7 @@ request_backfill() {
     if [[ -n "${ADMIN_BEARER_TOKEN:-}" ]]; then
         curl_args+=(-H "Authorization: Bearer ${ADMIN_BEARER_TOKEN}")
     else
-        curl_args+=(-H "Cookie: session=${ADMIN_COOKIE}")
+        curl_args+=(-H "Cookie: admin_session=${ADMIN_COOKIE}")
     fi
 
     curl "${curl_args[@]}"
