@@ -2032,6 +2032,11 @@ async fn transcribe_audio_via_provider_once(
     audio_path: &Path,
     language: Option<&str>,
 ) -> std::result::Result<String, ProviderFailure> {
+    if config.transcription_provider == "gemini" {
+        return transcribe_via_gemini(config, audio_path, language).await;
+    }
+
+    // --- OpenAI path (original) ---
     let api_url = config.transcription_api_url.as_ref().ok_or_else(|| {
         parse_provider_status(None, None, "TRANSCRIPTION_API_URL is not configured", false)
     })?;
@@ -2194,6 +2199,196 @@ fn transcription_response_format(model: &str) -> &'static str {
     } else {
         "vtt"
     }
+}
+
+/// Fetch a GCP access token from the metadata server (works on Cloud Run)
+/// or fall back to `gcloud auth print-access-token` locally.
+async fn fetch_gcp_access_token() -> std::result::Result<String, ProviderFailure> {
+    let metadata_url =
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(metadata_url)
+        .header("Metadata-Flavor", "Google")
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            let body = r.text().await.map_err(|e| {
+                parse_provider_status(
+                    None,
+                    None,
+                    &format!("Failed to read metadata token: {}", e),
+                    false,
+                )
+            })?;
+            let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+                parse_provider_status(
+                    None,
+                    None,
+                    &format!("Failed to parse metadata token: {}", e),
+                    false,
+                )
+            })?;
+            json["access_token"]
+                .as_str()
+                .map(|s| s.to_string())
+                .ok_or_else(|| {
+                    parse_provider_status(
+                        None,
+                        None,
+                        "No access_token in metadata response",
+                        false,
+                    )
+                })
+        }
+        _ => {
+            // Fallback: try gcloud CLI for local development
+            let output = tokio::process::Command::new("gcloud")
+                .args(["auth", "print-access-token"])
+                .output()
+                .await
+                .map_err(|e| {
+                    parse_provider_status(
+                        None,
+                        None,
+                        &format!("gcloud auth failed: {}", e),
+                        false,
+                    )
+                })?;
+            if output.status.success() {
+                Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            } else {
+                Err(parse_provider_status(
+                    None,
+                    None,
+                    "Failed to get GCP access token (no metadata server, gcloud failed)",
+                    false,
+                ))
+            }
+        }
+    }
+}
+
+/// Transcribe audio using Gemini via Vertex AI generateContent.
+/// Returns raw JSON text with segments and timestamps.
+async fn transcribe_via_gemini(
+    config: &Config,
+    audio_path: &Path,
+    _language: Option<&str>,
+) -> std::result::Result<String, ProviderFailure> {
+    let audio_bytes = tokio::fs::read(audio_path).await.map_err(|e| {
+        parse_provider_status(
+            None,
+            None,
+            &format!("Failed to read audio: {}", e),
+            false,
+        )
+    })?;
+    let audio_b64 = base64::engine::general_purpose::STANDARD.encode(&audio_bytes);
+
+    let access_token = fetch_gcp_access_token().await?;
+
+    let url = format!(
+        "https://{}-aiplatform.googleapis.com/v1/projects/{}/locations/{}/publishers/google/models/{}:generateContent",
+        config.gcp_region, config.gcp_project_id, config.gcp_region, config.transcription_model,
+    );
+
+    let body = serde_json::json!({
+        "contents": [{
+            "role": "user",
+            "parts": [
+                {"text": "Transcribe this audio. Return every spoken segment with start and end timestamps in seconds and the text. If there is no speech, return an empty segments array."},
+                {"inlineData": {"mimeType": "audio/wav", "data": audio_b64}}
+            ]
+        }],
+        "generationConfig": {
+            "audioTimestamp": true,
+            "responseMimeType": "application/json",
+            "responseSchema": {
+                "type": "object",
+                "properties": {
+                    "language": {"type": "string"},
+                    "segments": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "start": {"type": "number"},
+                                "end": {"type": "number"},
+                                "text": {"type": "string"}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&url)
+        .bearer_auth(&access_token)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| {
+            parse_provider_status(
+                None,
+                None,
+                &format!("Failed to call Vertex AI: {}", e),
+                e.is_timeout(),
+            )
+        })?;
+
+    let status = response.status();
+    let retry_after_header = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
+    let resp_body = response.text().await.map_err(|e| {
+        parse_provider_status(
+            Some(status.as_u16()),
+            retry_after_header.as_deref(),
+            &format!("Failed to read Vertex AI response: {}", e),
+            e.is_timeout(),
+        )
+    })?;
+
+    if !status.is_success() {
+        return Err(parse_provider_status(
+            Some(status.as_u16()),
+            retry_after_header.as_deref(),
+            &resp_body,
+            false,
+        ));
+    }
+
+    // Extract text from Vertex AI response: candidates[0].content.parts[0].text
+    let resp_json: serde_json::Value = serde_json::from_str(&resp_body).map_err(|e| {
+        parse_provider_status(
+            None,
+            None,
+            &format!("Invalid Vertex AI JSON: {}", e),
+            false,
+        )
+    })?;
+
+    resp_json["candidates"][0]["content"]["parts"][0]["text"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            parse_provider_status(
+                None,
+                None,
+                &format!("No text in Vertex AI response: {}", resp_body),
+                false,
+            )
+        })
 }
 
 /// Normalize transcription output to WebVTT and collect summary metadata.
