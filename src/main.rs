@@ -30,8 +30,7 @@ use crate::metadata::{
     put_subtitle_job, put_tombstone, remove_from_audio_source_refs, remove_from_blob_refs,
     remove_from_recent_index, remove_from_user_index, remove_from_user_list,
     set_subtitle_job_id_for_hash, update_blob_status, update_stats_on_add, update_stats_on_remove,
-    TranscodeMetadataUpdate,
-    TranscriptMetadataUpdate,
+    TranscodeMetadataUpdate, TranscriptMetadataUpdate,
 };
 use crate::storage::{
     blob_exists, check_funnelcake_audio_reuse, current_timestamp, delete_blob as storage_delete,
@@ -2259,14 +2258,14 @@ fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
                 meta.transcode_terminal,
                 unix_timestamp_secs(),
             ) {
-                TranscodeFetchAction::Terminal => {
-                    Ok(derivative_failure_response(
-                        meta.transcode_error_code.as_deref(),
-                        meta.transcode_error_message.as_deref(),
-                        "Video transcoding permanently failed",
-                    ))
-                }
-                TranscodeFetchAction::Accepted { retry_after_secs, .. } => {
+                TranscodeFetchAction::Terminal => Ok(derivative_failure_response(
+                    meta.transcode_error_code.as_deref(),
+                    meta.transcode_error_message.as_deref(),
+                    "Video transcoding permanently failed",
+                )),
+                TranscodeFetchAction::Accepted {
+                    retry_after_secs, ..
+                } => {
                     let mut resp = Response::from_status(StatusCode::ACCEPTED);
                     resp.set_header("Retry-After", retry_after_secs.to_string());
                     resp.set_header("Content-Type", "application/json");
@@ -2275,7 +2274,9 @@ fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
                     add_cors_headers(&mut resp);
                     Ok(resp)
                 }
-                TranscodeFetchAction::Trigger { retry_after_secs, .. } => {
+                TranscodeFetchAction::Trigger {
+                    retry_after_secs, ..
+                } => {
                     use crate::metadata::update_transcode_status;
                     let _ = update_transcode_status(&hash, TranscodeStatus::Processing);
                     let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
@@ -2283,7 +2284,9 @@ fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
                     let mut resp = Response::from_status(StatusCode::ACCEPTED);
                     resp.set_header("Retry-After", retry_after_secs.to_string());
                     resp.set_header("Content-Type", "application/json");
-                    resp.set_body(r#"{"status":"processing","message":"Transcoding started, please retry"}"#);
+                    resp.set_body(
+                        r#"{"status":"processing","message":"Transcoding started, please retry"}"#,
+                    );
                     add_no_cache_headers(&mut resp);
                     add_cors_headers(&mut resp);
                     Ok(resp)
@@ -2609,6 +2612,46 @@ fn trigger_on_demand_transcription(
     }
 }
 
+fn should_eagerly_trigger_transcription(
+    mime_type: &str,
+    transcript_status: Option<TranscriptStatus>,
+) -> bool {
+    is_transcribable_mime_type(mime_type)
+        && matches!(transcript_status, None | Some(TranscriptStatus::Pending))
+}
+
+fn eagerly_trigger_transcription_if_needed(
+    hash: &str,
+    owner: &str,
+    mime_type: &str,
+    transcript_status: Option<TranscriptStatus>,
+) {
+    if !should_eagerly_trigger_transcription(mime_type, transcript_status) {
+        return;
+    }
+
+    match trigger_on_demand_transcription(hash, owner, None, None) {
+        Ok(()) => {
+            if !crate::storage::is_local_mode() {
+                let _ = crate::metadata::update_transcript_status(
+                    hash,
+                    TranscriptStatus::Processing,
+                    TranscriptMetadataUpdate {
+                        last_attempt_at: Some(current_timestamp()),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        Err(error) => {
+            eprintln!(
+                "[VTT] Failed to eagerly trigger transcription for {}: {}",
+                hash, error
+            );
+        }
+    }
+}
+
 /// Moderation API backend name (must match fastly.toml)
 const MODERATION_API_BACKEND: &str = "moderation_api";
 
@@ -2739,6 +2782,12 @@ fn handle_upload(mut req: Request) -> Result<Response> {
                 metadata.transcript_status = Some(TranscriptStatus::Pending);
                 let _ = put_blob_metadata(&metadata);
             }
+            eagerly_trigger_transcription_if_needed(
+                &hash,
+                &auth.pubkey,
+                &metadata.mime_type,
+                metadata.transcript_status,
+            );
             let descriptor = metadata.to_descriptor(&base_url);
             return Ok(json_response(StatusCode::OK, &descriptor));
         }
@@ -2822,6 +2871,12 @@ fn handle_upload(mut req: Request) -> Result<Response> {
     if is_video_mime_type(&content_type) {
         trigger_moderation_scan(&hash, &auth.pubkey);
     }
+    eagerly_trigger_transcription_if_needed(
+        &hash,
+        &auth.pubkey,
+        &content_type,
+        metadata.transcript_status,
+    );
 
     // Return blob descriptor
     let descriptor = metadata.to_descriptor(&base_url);
@@ -2947,6 +3002,12 @@ fn publish_upload_service_upload(
             metadata.transcript_status = Some(TranscriptStatus::Pending);
         }
         let _ = put_blob_metadata(&metadata);
+        eagerly_trigger_transcription_if_needed(
+            &hash,
+            &auth.pubkey,
+            &metadata.mime_type,
+            metadata.transcript_status,
+        );
         let descriptor = metadata.to_descriptor(&base_url);
         let mut resp = json_response(StatusCode::OK, &descriptor);
         add_cors_headers(&mut resp);
@@ -3031,6 +3092,12 @@ fn publish_upload_service_upload(
     if is_video_mime_type(&content_type) {
         trigger_moderation_scan(&hash, &auth.pubkey);
     }
+    eagerly_trigger_transcription_if_needed(
+        &hash,
+        &auth.pubkey,
+        &content_type,
+        metadata.transcript_status,
+    );
 
     let descriptor = metadata.to_descriptor(&base_url);
     let mut resp = json_response(StatusCode::OK, &descriptor);
@@ -3441,10 +3508,7 @@ fn handle_delete(req: Request, path: &str) -> Result<Response> {
     match plan_user_delete(is_owner) {
         DeletePlan::SoftDelete => {
             soft_delete_blob(&hash, &metadata, "Owner delete", false)?;
-            eprintln!(
-                "[DELETE] Soft-deleted {} by owner {}",
-                hash, auth.pubkey
-            );
+            eprintln!("[DELETE] Soft-deleted {} by owner {}", hash, auth.pubkey);
         }
         DeletePlan::UnlinkOnly => {
             let _ = remove_from_user_list(&auth.pubkey, &hash);
@@ -3949,6 +4013,12 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
             metadata.transcript_status = Some(TranscriptStatus::Pending);
             let _ = put_blob_metadata(&metadata);
         }
+        eagerly_trigger_transcription_if_needed(
+            &hash,
+            &auth.pubkey,
+            &metadata.mime_type,
+            metadata.transcript_status,
+        );
         let descriptor = metadata.to_descriptor(&base_url);
         let mut resp = json_response(StatusCode::OK, &descriptor);
         add_cors_headers(&mut resp);
@@ -4002,6 +4072,12 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
             let _ = crate::metadata::increment_unique_uploaders();
         }
     }
+    eagerly_trigger_transcription_if_needed(
+        &hash,
+        &auth.pubkey,
+        &content_type,
+        metadata.transcript_status,
+    );
 
     // Return blob descriptor per BUD-04
     let descriptor = metadata.to_descriptor(&base_url);
@@ -5236,9 +5312,10 @@ mod tests {
         decide_transcript_fetch_action, error_response, is_alias_only_audio_blob,
         is_quality_variant_path, parse_quality_variant_path,
         parse_transcript_status_webhook_payload, should_delete_derived_audio_blob,
-        should_set_audio_content_length, upload_capability_headers, upload_control_host,
-        upload_exposed_headers, AudioReuseAvailability, TranscodeFetchAction,
-        TranscriptFetchAction, TranscriptPendingState,
+        should_eagerly_trigger_transcription, should_set_audio_content_length,
+        upload_capability_headers, upload_control_host, upload_exposed_headers,
+        AudioReuseAvailability, TranscodeFetchAction, TranscriptFetchAction,
+        TranscriptPendingState,
     };
     use crate::blossom::{TranscodeStatus, TranscriptStatus};
     use crate::error::{BlossomError, Result as BlossomResult};
@@ -5415,6 +5492,32 @@ mod tests {
     }
 
     #[test]
+    fn eagerly_triggers_transcription_for_pending_transcribable_media() {
+        assert!(should_eagerly_trigger_transcription(
+            "video/mp4",
+            Some(TranscriptStatus::Pending)
+        ));
+        assert!(should_eagerly_trigger_transcription("audio/mp4", None));
+    }
+
+    #[test]
+    fn does_not_eagerly_trigger_transcription_for_non_pending_or_non_transcribable_media() {
+        assert!(!should_eagerly_trigger_transcription("image/jpeg", None));
+        assert!(!should_eagerly_trigger_transcription(
+            "video/mp4",
+            Some(TranscriptStatus::Processing)
+        ));
+        assert!(!should_eagerly_trigger_transcription(
+            "video/mp4",
+            Some(TranscriptStatus::Complete)
+        ));
+        assert!(!should_eagerly_trigger_transcription(
+            "video/mp4",
+            Some(TranscriptStatus::Failed)
+        ));
+    }
+
+    #[test]
     fn transcode_fetch_action_retries_failed_items_under_cap() {
         assert_eq!(
             decide_transcode_fetch_action(Some(TranscodeStatus::Failed), None, 2, false, 1_000,),
@@ -5504,10 +5607,7 @@ mod tests {
     fn upload_capability_headers_advertise_resumable_extension() {
         let resp = upload_capability_headers("media.divine.video");
 
-        assert_eq!(
-            resp.extensions,
-            "resumable-sessions"
-        );
+        assert_eq!(resp.extensions, "resumable-sessions");
     }
 
     #[test]
