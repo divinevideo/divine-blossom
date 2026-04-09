@@ -54,6 +54,9 @@ migration_progress.json
 scripts/backfill-fmp4-all-hashes.txt
 scripts/backfill-fmp4-done.txt
 scripts/backfill-fmp4-failed.txt
+scripts/backfill-orientation-done.txt
+scripts/backfill-orientation-affected.txt
+scripts/backfill-orientation-failed.txt
 
 # Local/ephemeral
 .claude/
