@@ -2,6 +2,7 @@
 // ABOUTME: Downloads video from GCS, transcodes to HLS with NVENC, uploads segments
 
 use anyhow::{anyhow, Result};
+use base64::Engine as _;
 use axum::{
     extract::State,
     http::{header, Method, StatusCode},
@@ -53,6 +54,12 @@ struct Config {
     transcription_api_key: Option<String>,
     /// Model name for transcription API requests
     transcription_model: String,
+    /// Transcription provider: "gemini" or "openai"
+    transcription_provider: String,
+    /// GCP project ID for Vertex AI (required for Gemini provider)
+    gcp_project_id: String,
+    /// GCP region for Vertex AI
+    gcp_region: String,
     /// URL of the Fastly edge service for transcript status webhook callbacks
     transcript_webhook_url: Option<String>,
     transcription_max_in_flight: usize,
@@ -114,6 +121,12 @@ impl Config {
             transcription_model: lookup("TRANSCRIPTION_MODEL")
                 .or_else(|| lookup("OPENAI_MODEL"))
                 .unwrap_or_else(|| "whisper-1".to_string()),
+            transcription_provider: lookup("TRANSCRIPTION_PROVIDER")
+                .unwrap_or_else(|| "gemini".to_string()),
+            gcp_project_id: lookup("GCP_PROJECT_ID")
+                .unwrap_or_else(|| "rich-compiler-479518-d2".to_string()),
+            gcp_region: lookup("GCP_REGION")
+                .unwrap_or_else(|| "us-central1".to_string()),
             // Transcript webhook URL (defaults to same host + /admin/transcript-status)
             transcript_webhook_url: lookup("TRANSCRIPT_WEBHOOK_URL"),
             transcription_max_in_flight: parse_value(&mut lookup, "TRANSCRIPTION_MAX_IN_FLIGHT", 4)
