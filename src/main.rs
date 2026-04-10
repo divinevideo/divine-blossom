@@ -13,10 +13,11 @@ mod storage;
 use crate::auth::{optional_auth, validate_auth, validate_hash_match};
 use crate::blossom::{
     is_audio_path, is_hash_path, is_transcribable_mime_type, is_video_mime_type, parse_audio_path,
-    parse_hash_from_path, parse_thumbnail_path, AudioMapping, AuthAction, BlobDescriptor,
-    BlobMetadata, BlobStatus, ResumableUploadCompleteResponse, ResumableUploadInitRequest,
-    ResumableUploadInitResponse, SubtitleJob, SubtitleJobCreateRequest, SubtitleJobStatus,
-    TranscodeStatus, TranscriptStatus, UploadRequirements,
+    parse_hash_from_path, parse_thumbnail_path, AudioMapping, AuthAction, BlobAccess,
+    BlobDescriptor, BlobMetadata, BlobStatus, ResumableUploadCompleteResponse,
+    ResumableUploadInitRequest, ResumableUploadInitResponse, SubtitleJob,
+    SubtitleJobCreateRequest, SubtitleJobStatus, TranscodeStatus, TranscriptStatus,
+    UploadRequirements,
 };
 use crate::delete_policy::{plan_user_delete, soft_delete_blob, DeletePlan};
 use crate::error::{BlossomError, Result};
@@ -372,20 +373,23 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         // Check parent video's moderation status - thumbnails inherit video access rules
         let mut is_restricted = false;
         if let Ok(Some(meta)) = get_blob_metadata(video_hash) {
-            if !is_admin {
-                if meta.status.blocks_public_access() {
+            let requester_pk = optional_auth(&req, AuthAction::List)
+                .ok()
+                .flatten()
+                .map(|auth| auth.pubkey);
+            match meta.access_for(requester_pk.as_deref(), is_admin) {
+                BlobAccess::Allowed => {
+                    // Owner viewing their own restricted/age-restricted thumb —
+                    // mark so cache headers stay private below.
+                    if meta.status.requires_owner_auth() {
+                        is_restricted = true;
+                    }
+                }
+                BlobAccess::NotFound => {
                     return Err(BlossomError::NotFound("Blob not found".into()));
                 }
-                if meta.status.requires_owner_auth() {
-                    // Check if requester is owner
-                    if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
-                        if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
-                            return Err(BlossomError::NotFound("Blob not found".into()));
-                        }
-                    } else {
-                        return Err(BlossomError::NotFound("Blob not found".into()));
-                    }
-                    is_restricted = true;
+                BlobAccess::AgeGated => {
+                    return Err(BlossomError::AuthRequired("age_restricted".into()));
                 }
             }
         }
@@ -437,22 +441,17 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
     }
 
     if let Some(ref meta) = metadata {
-        if !is_admin {
-            // Handle banned/deleted content - no access for anyone
-            if meta.status.blocks_public_access() {
+        let requester_pk = optional_auth(&req, AuthAction::List)
+            .ok()
+            .flatten()
+            .map(|auth| auth.pubkey);
+        match meta.access_for(requester_pk.as_deref(), is_admin) {
+            BlobAccess::Allowed => {}
+            BlobAccess::NotFound => {
                 return Err(BlossomError::NotFound("Blob not found".into()));
             }
-
-            // Handle restricted content - owner can still access
-            if meta.status.requires_owner_auth() {
-                // Check if requester is owner
-                if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
-                    if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
-                        return Err(BlossomError::NotFound("Blob not found".into()));
-                    }
-                } else {
-                    return Err(BlossomError::NotFound("Blob not found".into()));
-                }
+            BlobAccess::AgeGated => {
+                return Err(BlossomError::AuthRequired("age_restricted".into()));
             }
         }
     }
@@ -579,9 +578,12 @@ fn handle_head_blob(path: &str) -> Result<Response> {
     let metadata =
         get_blob_metadata(&hash)?.ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
 
-    // Don't reveal restricted, banned, or deleted content exists
-    if metadata.status.requires_owner_auth() || metadata.status.blocks_public_access() {
-        return Err(BlossomError::NotFound("Blob not found".into()));
+    // HEAD has no auth context, so non-owner gating applies. Banned/Deleted/Restricted
+    // collapse to 404; AgeRestricted surfaces as 401 so the client knows to age-gate.
+    match metadata.access_for(None, false) {
+        BlobAccess::Allowed => {}
+        BlobAccess::NotFound => return Err(BlossomError::NotFound("Blob not found".into())),
+        BlobAccess::AgeGated => return Err(BlossomError::AuthRequired("age_restricted".into())),
     }
 
     let mut resp = Response::from_status(StatusCode::OK);
@@ -619,21 +621,17 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
     let is_admin = admin::validate_bearer_token(&req).is_ok();
 
     if let Some(ref meta) = metadata {
-        if !is_admin {
-            // Handle banned/deleted content
-            if meta.status.blocks_public_access() {
+        let requester_pk = optional_auth(&req, AuthAction::List)
+            .ok()
+            .flatten()
+            .map(|auth| auth.pubkey);
+        match meta.access_for(requester_pk.as_deref(), is_admin) {
+            BlobAccess::Allowed => {}
+            BlobAccess::NotFound => {
                 return Err(BlossomError::NotFound("Content not found".into()));
             }
-
-            // Handle restricted content - owner can still access
-            if meta.status.requires_owner_auth() {
-                if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
-                    if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
-                        return Err(BlossomError::NotFound("Content not found".into()));
-                    }
-                } else {
-                    return Err(BlossomError::NotFound("Content not found".into()));
-                }
+            BlobAccess::AgeGated => {
+                return Err(BlossomError::AuthRequired("age_restricted".into()));
             }
         }
     } else {
@@ -763,9 +761,12 @@ fn handle_head_hls_master(path: &str) -> Result<Response> {
     let metadata = get_blob_metadata(&hash)?
         .ok_or_else(|| BlossomError::NotFound("Content not found".into()))?;
 
-    // Don't reveal restricted/banned/deleted content (HEAD has no req, no admin bypass)
-    if metadata.status.requires_owner_auth() || metadata.status.blocks_public_access() {
-        return Err(BlossomError::NotFound("Content not found".into()));
+    // HEAD has no req/admin context. Banned/Restricted collapse to 404; AgeRestricted
+    // surfaces as 401 so the client knows to age-gate.
+    match metadata.access_for(None, false) {
+        BlobAccess::Allowed => {}
+        BlobAccess::NotFound => return Err(BlossomError::NotFound("Content not found".into())),
+        BlobAccess::AgeGated => return Err(BlossomError::AuthRequired("age_restricted".into())),
     }
 
     // Check GCS first (source of truth), then fall back to metadata status
@@ -838,19 +839,21 @@ fn handle_get_hls_content(req: Request, path: &str) -> Result<Response> {
     let mut is_restricted = false;
 
     if let Ok(Some(ref meta)) = get_blob_metadata(&hash) {
-        if !is_admin {
-            if meta.status == BlobStatus::Banned {
+        let requester_pk = optional_auth(&req, AuthAction::List)
+            .ok()
+            .flatten()
+            .map(|auth| auth.pubkey);
+        match meta.access_for(requester_pk.as_deref(), is_admin) {
+            BlobAccess::Allowed => {
+                if meta.status.requires_owner_auth() {
+                    is_restricted = true;
+                }
+            }
+            BlobAccess::NotFound => {
                 return Err(BlossomError::NotFound("Blob not found".into()));
             }
-            if meta.status == BlobStatus::Restricted {
-                if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
-                    if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
-                        return Err(BlossomError::NotFound("Blob not found".into()));
-                    }
-                } else {
-                    return Err(BlossomError::NotFound("Blob not found".into()));
-                }
-                is_restricted = true;
+            BlobAccess::AgeGated => {
+                return Err(BlossomError::AuthRequired("age_restricted".into()));
             }
         }
     }
@@ -988,11 +991,18 @@ fn handle_head_hls_content(path: &str) -> Result<Response> {
 
     let hash_lower = hash.to_lowercase();
 
-    // Don't reveal restricted/banned/deleted content (HEAD has no req, no admin bypass)
+    // HEAD has no req/admin context. Banned/Restricted collapse to 404; AgeRestricted
+    // surfaces as 401 so the client knows to age-gate.
     let metadata = get_blob_metadata(&hash_lower)?;
     if let Some(ref meta) = metadata {
-        if meta.status.requires_owner_auth() || meta.status.blocks_public_access() {
-            return Err(BlossomError::NotFound("Content not found".into()));
+        match meta.access_for(None, false) {
+            BlobAccess::Allowed => {}
+            BlobAccess::NotFound => {
+                return Err(BlossomError::NotFound("Content not found".into()));
+            }
+            BlobAccess::AgeGated => {
+                return Err(BlossomError::AuthRequired("age_restricted".into()));
+            }
         }
     }
 
@@ -1455,24 +1465,13 @@ fn serve_transcript_by_hash(
         .map(|r| admin::validate_bearer_token(r).is_ok())
         .unwrap_or(false);
 
-    if !is_admin {
-        if metadata.status.blocks_public_access() {
-            return Err(BlossomError::NotFound("Content not found".into()));
-        }
-
-        if metadata.status.requires_owner_auth() {
-            if let Some(request) = req {
-                if let Ok(Some(auth)) = optional_auth(request, AuthAction::List) {
-                    if auth.pubkey.to_lowercase() != metadata.owner.to_lowercase() {
-                        return Err(BlossomError::NotFound("Content not found".into()));
-                    }
-                } else {
-                    return Err(BlossomError::NotFound("Content not found".into()));
-                }
-            } else {
-                return Err(BlossomError::NotFound("Content not found".into()));
-            }
-        }
+    let requester_pk = req
+        .and_then(|r| optional_auth(r, AuthAction::List).ok().flatten())
+        .map(|auth| auth.pubkey);
+    match metadata.access_for(requester_pk.as_deref(), is_admin) {
+        BlobAccess::Allowed => {}
+        BlobAccess::NotFound => return Err(BlossomError::NotFound("Content not found".into())),
+        BlobAccess::AgeGated => return Err(BlossomError::AuthRequired("age_restricted".into())),
     }
 
     if !is_transcribable_mime_type(&metadata.mime_type) {
@@ -1604,8 +1603,12 @@ fn handle_head_transcript_by_hash(hash: &str) -> Result<Response> {
     let metadata = get_blob_metadata(hash)?
         .ok_or_else(|| BlossomError::NotFound("Content not found".into()))?;
 
-    if metadata.status.requires_owner_auth() || metadata.status.blocks_public_access() {
-        return Err(BlossomError::NotFound("Content not found".into()));
+    // HEAD has no req/admin context. Banned/Restricted collapse to 404; AgeRestricted
+    // surfaces as 401 so the client knows to age-gate.
+    match metadata.access_for(None, false) {
+        BlobAccess::Allowed => {}
+        BlobAccess::NotFound => return Err(BlossomError::NotFound("Content not found".into())),
+        BlobAccess::AgeGated => return Err(BlossomError::AuthRequired("age_restricted".into())),
     }
 
     if !is_transcribable_mime_type(&metadata.mime_type) {
@@ -1897,11 +1900,22 @@ fn handle_get_subtitle_by_hash(req: Request, path: &str) -> Result<Response> {
         return Err(BlossomError::BadRequest("Invalid sha256 format".into()));
     }
 
-    // Don't leak subtitle info for moderated content
+    // Don't leak subtitle info for moderated content. Use the blob's access_for so
+    // age-restricted videos surface as 401 (age gate) instead of 404.
     let is_admin = admin::validate_bearer_token(&req).is_ok();
     if let Some(meta) = get_blob_metadata(&hash)? {
-        if !is_admin && (meta.status.requires_owner_auth() || meta.status.blocks_public_access()) {
-            return Err(BlossomError::NotFound("Video hash not found".into()));
+        let requester_pk = optional_auth(&req, AuthAction::List)
+            .ok()
+            .flatten()
+            .map(|auth| auth.pubkey);
+        match meta.access_for(requester_pk.as_deref(), is_admin) {
+            BlobAccess::Allowed => {}
+            BlobAccess::NotFound => {
+                return Err(BlossomError::NotFound("Video hash not found".into()));
+            }
+            BlobAccess::AgeGated => {
+                return Err(BlossomError::AuthRequired("age_restricted".into()));
+            }
         }
     }
 
@@ -1966,13 +1980,20 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
     let metadata =
         get_blob_metadata(&hash)?.ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
 
-    // 2. Access control: banned/deleted content is not served
-    if metadata.status.blocks_public_access() {
-        return Err(BlossomError::NotFound("Blob not found".into()));
-    }
-    // Restricted content requires owner auth - not supported for audio extraction
-    if metadata.status.requires_owner_auth() {
-        return Err(BlossomError::NotFound("Blob not found".into()));
+    // 2. Access control. Audio extraction requires the source video to be accessible to
+    //    the caller — banned/deleted/shadow-restricted source -> 404; age-restricted
+    //    source -> 401 (age gate). Owner of restricted/age-restricted source is allowed
+    //    by access_for, but the audio handler currently does not implement owner-only
+    //    extraction, so we still gate non-owners on the source's status.
+    let requester_pk = optional_auth(&req, AuthAction::List)
+        .ok()
+        .flatten()
+        .map(|auth| auth.pubkey);
+    let is_admin = admin::validate_bearer_token(&req).is_ok();
+    match metadata.access_for(requester_pk.as_deref(), is_admin) {
+        BlobAccess::Allowed => {}
+        BlobAccess::NotFound => return Err(BlossomError::NotFound("Blob not found".into())),
+        BlobAccess::AgeGated => return Err(BlossomError::AuthRequired("age_restricted".into())),
     }
 
     // 3. Check Funnelcake permission
@@ -2111,8 +2132,12 @@ fn handle_head_audio(path: &str) -> Result<Response> {
     let metadata =
         get_blob_metadata(&hash)?.ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
 
-    if metadata.status.blocks_public_access() || metadata.status.requires_owner_auth() {
-        return Err(BlossomError::NotFound("Blob not found".into()));
+    // HEAD has no req/admin context. Banned/Restricted collapse to 404; AgeRestricted
+    // surfaces as 401 so the client knows to age-gate.
+    match metadata.access_for(None, false) {
+        BlobAccess::Allowed => {}
+        BlobAccess::NotFound => return Err(BlossomError::NotFound("Blob not found".into())),
+        BlobAccess::AgeGated => return Err(BlossomError::AuthRequired("age_restricted".into())),
     }
 
     let permission = classify_audio_reuse_availability(&check_funnelcake_audio_reuse(&hash));
@@ -2194,18 +2219,17 @@ fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
     let is_admin = admin::validate_bearer_token(&req).is_ok();
     let metadata = get_blob_metadata(&hash)?;
     if let Some(ref meta) = metadata {
-        if !is_admin {
-            if meta.status.blocks_public_access() {
+        let requester_pk = optional_auth(&req, AuthAction::List)
+            .ok()
+            .flatten()
+            .map(|auth| auth.pubkey);
+        match meta.access_for(requester_pk.as_deref(), is_admin) {
+            BlobAccess::Allowed => {}
+            BlobAccess::NotFound => {
                 return Err(BlossomError::NotFound("Content not found".into()));
             }
-            if meta.status.requires_owner_auth() {
-                if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
-                    if auth.pubkey.to_lowercase() != meta.owner.to_lowercase() {
-                        return Err(BlossomError::NotFound("Content not found".into()));
-                    }
-                } else {
-                    return Err(BlossomError::NotFound("Content not found".into()));
-                }
+            BlobAccess::AgeGated => {
+                return Err(BlossomError::AuthRequired("age_restricted".into()));
             }
         }
     } else {
@@ -2305,8 +2329,12 @@ fn handle_head_quality_variant(path: &str) -> Result<Response> {
     let metadata = get_blob_metadata(&hash)?
         .ok_or_else(|| BlossomError::NotFound("Content not found".into()))?;
 
-    if metadata.status.blocks_public_access() || metadata.status.requires_owner_auth() {
-        return Err(BlossomError::NotFound("Content not found".into()));
+    // HEAD has no req/admin context. Banned/Restricted collapse to 404; AgeRestricted
+    // surfaces as 401 so the client knows to age-gate.
+    match metadata.access_for(None, false) {
+        BlobAccess::Allowed => {}
+        BlobAccess::NotFound => return Err(BlossomError::NotFound("Content not found".into())),
+        BlobAccess::AgeGated => return Err(BlossomError::AuthRequired("age_restricted".into())),
     }
 
     let gcs_path = format!("{}/hls/{}", hash, ts_filename);
