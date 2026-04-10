@@ -15,9 +15,8 @@ use crate::blossom::{
     is_audio_path, is_hash_path, is_transcribable_mime_type, is_video_mime_type, parse_audio_path,
     parse_hash_from_path, parse_thumbnail_path, AudioMapping, AuthAction, BlobAccess,
     BlobDescriptor, BlobMetadata, BlobStatus, ResumableUploadCompleteResponse,
-    ResumableUploadInitRequest, ResumableUploadInitResponse, SubtitleJob,
-    SubtitleJobCreateRequest, SubtitleJobStatus, TranscodeStatus, TranscriptStatus,
-    UploadRequirements,
+    ResumableUploadInitRequest, ResumableUploadInitResponse, SubtitleJob, SubtitleJobCreateRequest,
+    SubtitleJobStatus, TranscodeStatus, TranscriptStatus, UploadRequirements,
 };
 use crate::delete_policy::{plan_user_delete, soft_delete_blob, DeletePlan};
 use crate::error::{BlossomError, Result};
@@ -4440,14 +4439,19 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
         return Err(BlossomError::BadRequest("Invalid sha256 format".into()));
     }
 
-    // Map action to BlobStatus
+    // Map action to BlobStatus.
+    //
+    // AGE_RESTRICTED is intentionally split out from RESTRICT/QUARANTINE: it lands on
+    // BlobStatus::AgeRestricted, which serves as 401 (age gate) to non-owners instead of
+    // the 404 shadow-ban that RESTRICT/QUARANTINE produce.
     let new_status = match action.to_uppercase().as_str() {
         "BLOCK" | "BAN" | "PERMANENT_BAN" => BlobStatus::Banned,
-        "RESTRICT" | "AGE_RESTRICTED" | "QUARANTINE" => BlobStatus::Restricted,
+        "AGE_RESTRICTED" | "AGE_RESTRICT" => BlobStatus::AgeRestricted,
+        "RESTRICT" | "QUARANTINE" => BlobStatus::Restricted,
         "APPROVE" | "SAFE" => BlobStatus::Active,
         _ => {
             return Err(BlossomError::BadRequest(format!(
-                "Unknown action: {}. Expected BLOCK, RESTRICT, QUARANTINE, or APPROVE",
+                "Unknown action: {}. Expected BLOCK, RESTRICT, QUARANTINE, AGE_RESTRICTED, or APPROVE",
                 action
             )));
         }

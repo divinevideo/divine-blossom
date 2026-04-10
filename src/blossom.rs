@@ -908,16 +908,36 @@ mod tests {
         ] {
             match s {
                 BlobStatus::Banned | BlobStatus::Deleted => {
-                    assert!(s.blocks_public_access(), "{:?} should block public access", s);
-                    assert!(!s.requires_owner_auth(), "{:?} should not require owner auth", s);
+                    assert!(
+                        s.blocks_public_access(),
+                        "{:?} should block public access",
+                        s
+                    );
+                    assert!(
+                        !s.requires_owner_auth(),
+                        "{:?} should not require owner auth",
+                        s
+                    );
                 }
                 BlobStatus::Restricted | BlobStatus::AgeRestricted => {
-                    assert!(!s.blocks_public_access(), "{:?} should not block public access", s);
+                    assert!(
+                        !s.blocks_public_access(),
+                        "{:?} should not block public access",
+                        s
+                    );
                     assert!(s.requires_owner_auth(), "{:?} should require owner auth", s);
                 }
                 BlobStatus::Active | BlobStatus::Pending => {
-                    assert!(!s.blocks_public_access(), "{:?} should not block public access", s);
-                    assert!(!s.requires_owner_auth(), "{:?} should not require owner auth", s);
+                    assert!(
+                        !s.blocks_public_access(),
+                        "{:?} should not block public access",
+                        s
+                    );
+                    assert!(
+                        !s.requires_owner_auth(),
+                        "{:?} should not require owner auth",
+                        s
+                    );
                 }
             }
         }

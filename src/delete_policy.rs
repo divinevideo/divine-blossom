@@ -1,10 +1,10 @@
+use crate::blossom::BlobMetadata;
 use crate::blossom::BlobStatus;
 use crate::error::{BlossomError, Result};
 use crate::metadata::{
     add_to_recent_index, add_to_user_list, get_blob_refs, put_tombstone, remove_from_recent_index,
     remove_from_user_list, update_blob_status, update_stats_on_status_change,
 };
-use crate::blossom::BlobMetadata;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeletePlan {
@@ -25,6 +25,7 @@ pub fn parse_restore_status(status: Option<&str>) -> Result<BlobStatus> {
         "APPROVE" | "ACTIVE" => Ok(BlobStatus::Active),
         "PENDING" => Ok(BlobStatus::Pending),
         "RESTRICT" | "RESTRICTED" => Ok(BlobStatus::Restricted),
+        "AGE_RESTRICT" | "AGE_RESTRICTED" => Ok(BlobStatus::AgeRestricted),
         "DELETED" => Err(BlossomError::BadRequest(
             "Restore target status cannot be deleted".into(),
         )),
@@ -110,10 +111,29 @@ mod tests {
     #[test]
     fn restore_from_deleted_allows_active_pending_or_restricted() {
         assert_eq!(parse_restore_status(None).unwrap(), BlobStatus::Active);
-        assert_eq!(parse_restore_status(Some("pending")).unwrap(), BlobStatus::Pending);
+        assert_eq!(
+            parse_restore_status(Some("pending")).unwrap(),
+            BlobStatus::Pending
+        );
         assert_eq!(
             parse_restore_status(Some("restricted")).unwrap(),
             BlobStatus::Restricted
+        );
+    }
+
+    #[test]
+    fn restore_target_accepts_age_restricted() {
+        assert_eq!(
+            parse_restore_status(Some("age_restricted")).unwrap(),
+            BlobStatus::AgeRestricted
+        );
+        assert_eq!(
+            parse_restore_status(Some("AGE_RESTRICTED")).unwrap(),
+            BlobStatus::AgeRestricted
+        );
+        assert_eq!(
+            parse_restore_status(Some("age_restrict")).unwrap(),
+            BlobStatus::AgeRestricted
         );
     }
 }
