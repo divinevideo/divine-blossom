@@ -1,4 +1,5 @@
 pub mod admin_sweep;
+pub mod blossom;
 pub mod resumable_complete;
 
 #[cfg(test)]

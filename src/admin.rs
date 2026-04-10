@@ -949,6 +949,7 @@ pub fn handle_admin_scan_flagged(mut req: Request) -> Result<Response> {
 
     let mut banned: Vec<String> = Vec::new();
     let mut restricted: Vec<String> = Vec::new();
+    let mut age_restricted: Vec<String> = Vec::new();
     let mut active = 0u32;
     let mut pending = 0u32;
     let mut not_found = 0u32;
@@ -961,6 +962,7 @@ pub fn handle_admin_scan_flagged(mut req: Request) -> Result<Response> {
             Ok(Some(meta)) => match meta.status {
                 BlobStatus::Banned => banned.push(hash.clone()),
                 BlobStatus::Restricted => restricted.push(hash.clone()),
+                BlobStatus::AgeRestricted => age_restricted.push(hash.clone()),
                 BlobStatus::Active => active += 1,
                 BlobStatus::Pending => pending += 1,
                 BlobStatus::Deleted => not_found += 1,
@@ -974,6 +976,7 @@ pub fn handle_admin_scan_flagged(mut req: Request) -> Result<Response> {
         "total_scanned": hashes.len(),
         "banned": banned,
         "restricted": restricted,
+        "age_restricted": age_restricted,
         "active": active,
         "pending": pending,
         "not_found": not_found,

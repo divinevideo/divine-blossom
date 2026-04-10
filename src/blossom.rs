@@ -108,7 +108,7 @@ pub struct BlobMetadata {
 pub enum BlobStatus {
     /// Normal, publicly accessible
     Active,
-    /// Shadow restricted - only owner can access
+    /// Shadow restricted - only owner can access (renders as 404 to non-owners)
     Restricted,
     /// Awaiting moderation review
     Pending,
@@ -116,6 +116,11 @@ pub enum BlobStatus {
     Banned,
     /// Soft-deleted internally; preserved in storage but never served publicly
     Deleted,
+    /// Age-gated content. Non-owners receive 401 (auth_required) so the
+    /// client can present an age-verification UI. Distinct from `Restricted`,
+    /// which is shadow-banned and 404s to non-owners.
+    #[serde(rename = "age_restricted")]
+    AgeRestricted,
 }
 
 impl BlobStatus {
@@ -124,7 +129,62 @@ impl BlobStatus {
     }
 
     pub fn requires_owner_auth(self) -> bool {
-        matches!(self, BlobStatus::Restricted)
+        matches!(self, BlobStatus::Restricted | BlobStatus::AgeRestricted)
+    }
+}
+
+/// Result of evaluating whether a viewer is allowed to fetch a blob.
+///
+/// All blob-serving endpoints should derive their HTTP response from this
+/// enum (via [`BlobMetadata::access_for`]) instead of inspecting
+/// [`BlobStatus`] directly. This guarantees consistent behavior across
+/// `GET`/`HEAD` for blobs, thumbnails, HLS manifests, HLS segments,
+/// transcripts, and quality variants — and makes adding a new moderation
+/// outcome a single-file change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobAccess {
+    /// Viewer may fetch the content.
+    Allowed,
+    /// Hide the existence of the blob (Banned / Deleted / shadow-Restricted to
+    /// non-owners). Maps to HTTP 404.
+    NotFound,
+    /// Age-gated content. Maps to HTTP 401 with body `age_restricted` so the
+    /// client can present an age-verification UI.
+    AgeGated,
+}
+
+impl BlobMetadata {
+    /// Decide whether a viewer is allowed to access this blob.
+    ///
+    /// `requester_pubkey` is the authenticated viewer's pubkey, if any.
+    /// `is_admin` is true when the request carries a valid admin Bearer token.
+    pub fn access_for(&self, requester_pubkey: Option<&str>, is_admin: bool) -> BlobAccess {
+        if is_admin {
+            return BlobAccess::Allowed;
+        }
+
+        let is_owner = requester_pubkey
+            .map(|p| p.eq_ignore_ascii_case(&self.owner))
+            .unwrap_or(false);
+
+        match self.status {
+            BlobStatus::Active | BlobStatus::Pending => BlobAccess::Allowed,
+            BlobStatus::Banned | BlobStatus::Deleted => BlobAccess::NotFound,
+            BlobStatus::Restricted => {
+                if is_owner {
+                    BlobAccess::Allowed
+                } else {
+                    BlobAccess::NotFound
+                }
+            }
+            BlobStatus::AgeRestricted => {
+                if is_owner {
+                    BlobAccess::Allowed
+                } else {
+                    BlobAccess::AgeGated
+                }
+            }
+        }
     }
 }
 
@@ -844,13 +904,14 @@ mod tests {
             BlobStatus::Pending,
             BlobStatus::Banned,
             BlobStatus::Deleted,
+            BlobStatus::AgeRestricted,
         ] {
             match s {
                 BlobStatus::Banned | BlobStatus::Deleted => {
                     assert!(s.blocks_public_access(), "{:?} should block public access", s);
                     assert!(!s.requires_owner_auth(), "{:?} should not require owner auth", s);
                 }
-                BlobStatus::Restricted => {
+                BlobStatus::Restricted | BlobStatus::AgeRestricted => {
                     assert!(!s.blocks_public_access(), "{:?} should not block public access", s);
                     assert!(s.requires_owner_auth(), "{:?} should require owner auth", s);
                 }
@@ -860,6 +921,126 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn fixture_metadata(status: BlobStatus, owner: &str) -> BlobMetadata {
+        BlobMetadata {
+            sha256: "x".into(),
+            size: 1,
+            mime_type: "video/mp4".into(),
+            uploaded: "2026-04-10T00:00:00Z".into(),
+            owner: owner.into(),
+            status,
+            thumbnail: None,
+            moderation: None,
+            transcode_status: None,
+            transcode_error_code: None,
+            transcode_error_message: None,
+            transcode_last_attempt_at: None,
+            transcode_retry_after: None,
+            transcode_attempt_count: 0,
+            transcode_terminal: false,
+            dim: None,
+            transcript_status: None,
+            transcript_error_code: None,
+            transcript_error_message: None,
+            transcript_last_attempt_at: None,
+            transcript_retry_after: None,
+            transcript_attempt_count: 0,
+            transcript_terminal: false,
+        }
+    }
+
+    #[test]
+    fn blob_status_serializes_age_restricted_with_underscore() {
+        let json = serde_json::to_string(&BlobStatus::AgeRestricted).unwrap();
+        assert_eq!(json, "\"age_restricted\"");
+    }
+
+    #[test]
+    fn blob_status_deserializes_age_restricted() {
+        let parsed: BlobStatus = serde_json::from_str("\"age_restricted\"").unwrap();
+        assert_eq!(parsed, BlobStatus::AgeRestricted);
+    }
+
+    #[test]
+    fn blob_status_age_restricted_does_not_block_public_access() {
+        // AgeRestricted should NOT be in blocks_public_access (that returns 404).
+        // It instead surfaces as an age-gate via access_for.
+        assert!(!BlobStatus::AgeRestricted.blocks_public_access());
+    }
+
+    #[test]
+    fn blob_status_age_restricted_requires_owner_auth() {
+        assert!(BlobStatus::AgeRestricted.requires_owner_auth());
+    }
+
+    #[test]
+    fn access_for_admin_always_allowed() {
+        let m = fixture_metadata(BlobStatus::Banned, "owner");
+        assert_eq!(m.access_for(None, true), BlobAccess::Allowed);
+        let m = fixture_metadata(BlobStatus::AgeRestricted, "owner");
+        assert_eq!(m.access_for(None, true), BlobAccess::Allowed);
+    }
+
+    #[test]
+    fn access_for_active_allowed_for_anyone() {
+        let m = fixture_metadata(BlobStatus::Active, "owner");
+        assert_eq!(m.access_for(None, false), BlobAccess::Allowed);
+        assert_eq!(m.access_for(Some("stranger"), false), BlobAccess::Allowed);
+        assert_eq!(m.access_for(Some("owner"), false), BlobAccess::Allowed);
+    }
+
+    #[test]
+    fn access_for_pending_allowed() {
+        // Existing behavior: Pending blobs are publicly served while waiting
+        // for moderation. Don't change that here.
+        let m = fixture_metadata(BlobStatus::Pending, "owner");
+        assert_eq!(m.access_for(None, false), BlobAccess::Allowed);
+    }
+
+    #[test]
+    fn access_for_banned_is_notfound_to_everyone_non_admin() {
+        let m = fixture_metadata(BlobStatus::Banned, "owner");
+        assert_eq!(m.access_for(Some("owner"), false), BlobAccess::NotFound);
+        assert_eq!(m.access_for(None, false), BlobAccess::NotFound);
+    }
+
+    #[test]
+    fn access_for_deleted_is_notfound_to_everyone_non_admin() {
+        let m = fixture_metadata(BlobStatus::Deleted, "owner");
+        assert_eq!(m.access_for(Some("owner"), false), BlobAccess::NotFound);
+        assert_eq!(m.access_for(None, false), BlobAccess::NotFound);
+    }
+
+    #[test]
+    fn access_for_restricted_is_notfound_to_non_owner_and_anonymous() {
+        let m = fixture_metadata(BlobStatus::Restricted, "owner");
+        assert_eq!(m.access_for(None, false), BlobAccess::NotFound);
+        assert_eq!(m.access_for(Some("stranger"), false), BlobAccess::NotFound);
+    }
+
+    #[test]
+    fn access_for_restricted_is_allowed_to_owner() {
+        let m = fixture_metadata(BlobStatus::Restricted, "owner");
+        assert_eq!(m.access_for(Some("owner"), false), BlobAccess::Allowed);
+        // Case-insensitive comparison
+        assert_eq!(m.access_for(Some("OWNER"), false), BlobAccess::Allowed);
+    }
+
+    #[test]
+    fn access_for_age_restricted_is_age_gated_to_non_owner_and_anonymous() {
+        let m = fixture_metadata(BlobStatus::AgeRestricted, "owner");
+        assert_eq!(m.access_for(None, false), BlobAccess::AgeGated);
+        assert_eq!(m.access_for(Some("stranger"), false), BlobAccess::AgeGated);
+    }
+
+    #[test]
+    fn access_for_age_restricted_is_allowed_to_owner() {
+        let m = fixture_metadata(BlobStatus::AgeRestricted, "owner");
+        assert_eq!(m.access_for(Some("owner"), false), BlobAccess::Allowed);
+        // Case-insensitive comparison
+        assert_eq!(m.access_for(Some("OWNER"), false), BlobAccess::Allowed);
     }
 
     #[test]
