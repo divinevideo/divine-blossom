@@ -186,6 +186,14 @@ fn handle_request(req: Request) -> Result<Response> {
                 .unwrap_or("");
             admin::handle_admin_blob_content(req, hash)
         }
+        // Admin bypass for transcoded quality variants (720p.mp4, 480p.mp4, etc.)
+        (Method::GET, p) if p.starts_with("/admin/api/blob/") && is_admin_quality_variant_path(p) => {
+            handle_admin_quality_variant(req, p)
+        }
+        // Admin bypass for HLS content (master.m3u8, segments, etc.)
+        (Method::GET, p) if p.starts_with("/admin/api/blob/") && p.contains("/hls/") => {
+            handle_admin_hls_content(req, p)
+        }
         (Method::GET, p) if p.starts_with("/admin/api/blob/") => {
             let hash = p.strip_prefix("/admin/api/blob/").unwrap_or("");
             admin::handle_admin_blob_detail(req, hash)
@@ -2301,6 +2309,216 @@ fn handle_head_quality_variant(path: &str) -> Result<Response> {
     resp.set_header("Accept-Ranges", "bytes");
     add_cors_headers(&mut resp);
     Ok(resp)
+}
+
+/// Check if an admin API path contains a quality variant suffix
+/// e.g. /admin/api/blob/{hash}/720p.mp4
+fn is_admin_quality_variant_path(path: &str) -> bool {
+    let rest = path.strip_prefix("/admin/api/blob/").unwrap_or("");
+    for (suffix, _, _) in QUALITY_VARIANTS {
+        let suffix = suffix.trim_start_matches('/');
+        if rest.ends_with(suffix) && rest.len() > suffix.len() + 1 {
+            let hash_part = &rest[..rest.len() - suffix.len() - 1];
+            if hash_part.len() == 64 && hash_part.chars().all(|c| c.is_ascii_hexdigit()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Parse admin quality variant path into (hash, gcs_filename, content_type)
+fn parse_admin_quality_variant_path(path: &str) -> Option<(String, &'static str, &'static str)> {
+    let rest = path.strip_prefix("/admin/api/blob/").unwrap_or("");
+    for (suffix, filename, content_type) in QUALITY_VARIANTS {
+        let suffix = suffix.trim_start_matches('/');
+        if rest.ends_with(suffix) && rest.len() > suffix.len() + 1 {
+            let hash_part = &rest[..rest.len() - suffix.len() - 1];
+            if hash_part.len() == 64 && hash_part.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Some((hash_part.to_lowercase(), filename, content_type));
+            }
+        }
+    }
+    None
+}
+
+/// GET /admin/api/blob/{hash}/720p.mp4 (etc.) - Serve transcoded variant regardless of moderation status
+/// Used by divine-moderation-service admin proxy for moderator review of flagged content
+fn handle_admin_quality_variant(req: Request, path: &str) -> Result<Response> {
+    admin::validate_admin_auth(&req)?;
+
+    let (hash, ts_filename, content_type) = parse_admin_quality_variant_path(path)
+        .ok_or_else(|| BlossomError::BadRequest("Invalid admin quality variant path".into()))?;
+
+    // Verify blob exists (but don't check moderation status)
+    let meta = get_blob_metadata(&hash)?
+        .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
+
+    let gcs_path = format!("{}/hls/{}", hash, ts_filename);
+
+    let range = req
+        .get_header(header::RANGE)
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
+    match download_hls_content(&gcs_path, range.as_deref()) {
+        Ok(mut resp) => {
+            resp.set_header("Content-Type", content_type);
+            resp.set_header("X-Sha256", &hash);
+            resp.set_header("X-Moderation-Status", &format!("{:?}", meta.status));
+            resp.set_header("Accept-Ranges", "bytes");
+            resp.set_header("Cache-Control", "private, no-store");
+            add_cors_headers(&mut resp);
+            Ok(resp)
+        }
+        Err(BlossomError::NotFound(_)) => {
+            // For .mp4 requests, check if .ts counterpart exists for lazy remux
+            if content_type == "video/mp4" {
+                let ts_name = ts_filename.replace(".mp4", ".ts");
+                let ts_gcs_path = format!("{}/hls/{}", hash, ts_name);
+                if download_hls_content(&ts_gcs_path, Some("bytes=0-0")).is_ok() {
+                    let _ = trigger_fmp4_backfill(&hash);
+
+                    let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                    resp.set_header("Retry-After", "3");
+                    resp.set_header("Content-Type", "application/json");
+                    resp.set_body(
+                        r#"{"status":"processing","message":"Remuxing to fMP4, please retry"}"#,
+                    );
+                    add_no_cache_headers(&mut resp);
+                    add_cors_headers(&mut resp);
+                    return Ok(resp);
+                }
+            }
+
+            // Not transcoded yet — trigger on-demand transcoding
+            match decide_transcode_fetch_action(
+                meta.transcode_status,
+                meta.transcode_retry_after,
+                meta.transcode_attempt_count,
+                meta.transcode_terminal,
+                unix_timestamp_secs(),
+            ) {
+                TranscodeFetchAction::Terminal => {
+                    Ok(derivative_failure_response(
+                        meta.transcode_error_code.as_deref(),
+                        meta.transcode_error_message.as_deref(),
+                        "Video transcoding permanently failed",
+                    ))
+                }
+                TranscodeFetchAction::Accepted { retry_after_secs, .. } => {
+                    let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                    resp.set_header("Retry-After", retry_after_secs.to_string());
+                    resp.set_header("Content-Type", "application/json");
+                    resp.set_body(r#"{"status":"processing","message":"Video is being transcoded, please retry"}"#);
+                    add_no_cache_headers(&mut resp);
+                    add_cors_headers(&mut resp);
+                    Ok(resp)
+                }
+                TranscodeFetchAction::Trigger { retry_after_secs, .. } => {
+                    use crate::metadata::update_transcode_status;
+                    let _ = update_transcode_status(&hash, TranscodeStatus::Processing);
+                    let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
+
+                    let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                    resp.set_header("Retry-After", retry_after_secs.to_string());
+                    resp.set_header("Content-Type", "application/json");
+                    resp.set_body(r#"{"status":"processing","message":"Transcoding started, please retry"}"#);
+                    add_no_cache_headers(&mut resp);
+                    add_cors_headers(&mut resp);
+                    Ok(resp)
+                }
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// GET /admin/api/blob/{hash}/hls/{filename} - Serve HLS content regardless of moderation status
+/// Used by divine-moderation-service admin proxy for moderator review of flagged content
+fn handle_admin_hls_content(req: Request, path: &str) -> Result<Response> {
+    admin::validate_admin_auth(&req)?;
+
+    // Parse: /admin/api/blob/{hash}/hls/{filename}
+    let rest = path
+        .strip_prefix("/admin/api/blob/")
+        .ok_or_else(|| BlossomError::BadRequest("Invalid admin HLS path".into()))?;
+    let parts: Vec<&str> = rest.splitn(3, '/').collect();
+    if parts.len() < 3 || parts[1] != "hls" {
+        return Err(BlossomError::BadRequest("Invalid admin HLS path format".into()));
+    }
+
+    let hash = parts[0];
+    let filename = parts[2];
+
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(BlossomError::BadRequest("Invalid hash in path".into()));
+    }
+    let hash = hash.to_lowercase();
+
+    // Verify blob exists (but don't check moderation status)
+    let meta = get_blob_metadata(&hash)?
+        .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
+
+    let gcs_path = format!("{}/hls/{}", hash, filename);
+
+    match download_hls_content(&gcs_path, None) {
+        Ok(mut resp) => {
+            let content_type = if filename.ends_with(".m3u8") {
+                "application/vnd.apple.mpegurl"
+            } else if filename.ends_with(".ts") {
+                "video/mp2t"
+            } else {
+                "application/octet-stream"
+            };
+
+            resp.set_header("Content-Type", content_type);
+            resp.set_header("X-Sha256", &hash);
+            resp.set_header("X-Moderation-Status", &format!("{:?}", meta.status));
+            resp.set_header("Cache-Control", "private, no-store");
+            add_cors_headers(&mut resp);
+            Ok(resp)
+        }
+        Err(BlossomError::NotFound(_)) if filename == "master.m3u8" => {
+            // HLS not ready — trigger on-demand transcoding
+            match decide_transcode_fetch_action(
+                meta.transcode_status,
+                meta.transcode_retry_after,
+                meta.transcode_attempt_count,
+                meta.transcode_terminal,
+                unix_timestamp_secs(),
+            ) {
+                TranscodeFetchAction::Terminal => Ok(derivative_failure_response(
+                    meta.transcode_error_code.as_deref(),
+                    meta.transcode_error_message.as_deref(),
+                    "HLS generation failed for this blob",
+                )),
+                TranscodeFetchAction::Accepted { retry_after_secs, .. } => {
+                    let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                    resp.set_header("Retry-After", retry_after_secs.to_string());
+                    resp.set_header("Content-Type", "application/json");
+                    resp.set_body(r#"{"status":"processing","message":"HLS transcoding in progress"}"#);
+                    add_no_cache_headers(&mut resp);
+                    add_cors_headers(&mut resp);
+                    Ok(resp)
+                }
+                TranscodeFetchAction::Trigger { retry_after_secs, .. } => {
+                    use crate::metadata::update_transcode_status;
+                    let _ = update_transcode_status(&hash, TranscodeStatus::Processing);
+                    let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
+
+                    let mut resp = Response::from_status(StatusCode::ACCEPTED);
+                    resp.set_header("Retry-After", retry_after_secs.to_string());
+                    resp.set_header("Content-Type", "application/json");
+                    resp.set_body(r#"{"status":"processing","message":"HLS transcoding started, please retry soon"}"#);
+                    add_no_cache_headers(&mut resp);
+                    add_cors_headers(&mut resp);
+                    Ok(resp)
+                }
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Maximum size for in-process upload (500KB) - larger files proxy to the upload service
