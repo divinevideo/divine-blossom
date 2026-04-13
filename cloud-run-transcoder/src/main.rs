@@ -147,7 +147,7 @@ impl Config {
             transcription_retry_total_ms: parse_value(
                 &mut lookup,
                 "TRANSCRIPTION_RETRY_TOTAL_MS",
-                30_000,
+                180_000,
             )
             .max(1_000),
         }
@@ -2332,7 +2332,7 @@ async fn transcribe_via_gemini(
         .post(&url)
         .bearer_auth(&access_token)
         .json(&body)
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(120))
         .send()
         .await
         .map_err(|e| {
