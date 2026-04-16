@@ -9,8 +9,9 @@ mod delete_policy;
 mod error;
 mod metadata;
 mod storage;
+mod viewer_auth;
 
-use crate::auth::{optional_auth, validate_auth, validate_hash_match};
+use crate::auth::{validate_auth, validate_hash_match, viewer_pubkey};
 use crate::blossom::{
     is_audio_path, is_hash_path, is_transcribable_mime_type, is_video_mime_type, parse_audio_path,
     parse_hash_from_path, parse_thumbnail_path, AudioMapping, AuthAction, BlobAccess,
@@ -27,7 +28,7 @@ use crate::metadata::{
     get_audio_mapping, get_audio_source_refs, get_auth_event, get_blob_metadata, get_blob_refs,
     get_subtitle_job, get_subtitle_job_by_hash, get_tombstone, get_user_blobs,
     list_blobs_with_metadata, put_audio_mapping, put_auth_event, put_blob_metadata,
-    put_subtitle_job, put_tombstone, remove_from_audio_source_refs, remove_from_blob_refs,
+    put_subtitle_job, remove_from_audio_source_refs, remove_from_blob_refs,
     remove_from_recent_index, remove_from_user_index, remove_from_user_list,
     set_subtitle_job_id_for_hash, update_blob_status, update_stats_on_add, update_stats_on_remove,
     TranscodeMetadataUpdate, TranscriptMetadataUpdate,
@@ -271,6 +272,7 @@ fn audio_reuse_denied_response() -> Response {
 fn add_audio_response_headers(
     resp: &mut Response,
     source_hash: &str,
+    private_cache: bool,
     mime_type: &str,
     size_bytes: u64,
     duration_seconds: f64,
@@ -283,7 +285,11 @@ fn add_audio_response_headers(
     resp.set_header("X-Audio-Duration", format!("{}", duration_seconds));
     resp.set_header("X-Audio-Size", size_bytes.to_string());
     resp.set_header("Accept-Ranges", "bytes");
-    add_cache_headers(resp, source_hash);
+    if private_cache {
+        add_private_cache_headers(resp, source_hash);
+    } else {
+        add_cache_headers(resp, source_hash);
+    }
     add_cors_headers(resp);
 }
 
@@ -372,15 +378,12 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         // Check parent video's moderation status - thumbnails inherit video access rules
         let mut is_restricted = false;
         if let Ok(Some(meta)) = get_blob_metadata(video_hash) {
-            let requester_pk = optional_auth(&req, AuthAction::List)
-                .ok()
-                .flatten()
-                .map(|auth| auth.pubkey);
+            let requester_pk = viewer_pubkey(&req)?;
             match meta.access_for(requester_pk.as_deref(), is_admin) {
                 BlobAccess::Allowed => {
-                    // Owner viewing their own restricted/age-restricted thumb —
-                    // mark so cache headers stay private below.
-                    if meta.status.requires_owner_auth() {
+                    // Authenticated access to restricted/age-restricted thumbnails
+                    // must stay private in cache below.
+                    if meta.status.requires_private_cache() {
                         is_restricted = true;
                     }
                 }
@@ -440,10 +443,7 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
     }
 
     if let Some(ref meta) = metadata {
-        let requester_pk = optional_auth(&req, AuthAction::List)
-            .ok()
-            .flatten()
-            .map(|auth| auth.pubkey);
+        let requester_pk = viewer_pubkey(&req)?;
         match meta.access_for(requester_pk.as_deref(), is_admin) {
             BlobAccess::Allowed => {}
             BlobAccess::NotFound => {
@@ -620,10 +620,7 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
     let is_admin = admin::validate_bearer_token(&req).is_ok();
 
     if let Some(ref meta) = metadata {
-        let requester_pk = optional_auth(&req, AuthAction::List)
-            .ok()
-            .flatten()
-            .map(|auth| auth.pubkey);
+        let requester_pk = viewer_pubkey(&req)?;
         match meta.access_for(requester_pk.as_deref(), is_admin) {
             BlobAccess::Allowed => {}
             BlobAccess::NotFound => {
@@ -662,7 +659,11 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
                 .map(|s| s.to_string());
 
             resp.set_header("Content-Type", "application/vnd.apple.mpegurl");
-            add_cache_headers(&mut resp, &hash);
+            if is_admin || meta.status.requires_private_cache() {
+                add_private_cache_headers(&mut resp, &hash);
+            } else {
+                add_cache_headers(&mut resp, &hash);
+            }
             resp.set_header("X-Sha256", &hash);
             if let Some(c2pa) = c2pa_manifest_id {
                 resp.set_header("X-C2PA-Manifest-Id", &c2pa);
@@ -838,13 +839,10 @@ fn handle_get_hls_content(req: Request, path: &str) -> Result<Response> {
     let mut is_restricted = false;
 
     if let Ok(Some(ref meta)) = get_blob_metadata(&hash) {
-        let requester_pk = optional_auth(&req, AuthAction::List)
-            .ok()
-            .flatten()
-            .map(|auth| auth.pubkey);
+        let requester_pk = viewer_pubkey(&req)?;
         match meta.access_for(requester_pk.as_deref(), is_admin) {
             BlobAccess::Allowed => {
-                if meta.status.requires_owner_auth() {
+                if meta.status.requires_private_cache() {
                     is_restricted = true;
                 }
             }
@@ -1464,9 +1462,10 @@ fn serve_transcript_by_hash(
         .map(|r| admin::validate_bearer_token(r).is_ok())
         .unwrap_or(false);
 
-    let requester_pk = req
-        .and_then(|r| optional_auth(r, AuthAction::List).ok().flatten())
-        .map(|auth| auth.pubkey);
+    let requester_pk = match req {
+        Some(request) => viewer_pubkey(request)?,
+        None => None,
+    };
     match metadata.access_for(requester_pk.as_deref(), is_admin) {
         BlobAccess::Allowed => {}
         BlobAccess::NotFound => return Err(BlossomError::NotFound("Content not found".into())),
@@ -1495,7 +1494,11 @@ fn serve_transcript_by_hash(
                 );
             }
             resp.set_header("Content-Type", "text/vtt; charset=utf-8");
-            add_cache_headers(&mut resp, &hash);
+            if is_admin || metadata.status.requires_private_cache() {
+                add_private_cache_headers(&mut resp, &hash);
+            } else {
+                add_cache_headers(&mut resp, &hash);
+            }
             add_cors_headers(&mut resp);
             Ok(resp)
         }
@@ -1903,10 +1906,7 @@ fn handle_get_subtitle_by_hash(req: Request, path: &str) -> Result<Response> {
     // age-restricted videos surface as 401 (age gate) instead of 404.
     let is_admin = admin::validate_bearer_token(&req).is_ok();
     if let Some(meta) = get_blob_metadata(&hash)? {
-        let requester_pk = optional_auth(&req, AuthAction::List)
-            .ok()
-            .flatten()
-            .map(|auth| auth.pubkey);
+        let requester_pk = viewer_pubkey(&req)?;
         match meta.access_for(requester_pk.as_deref(), is_admin) {
             BlobAccess::Allowed => {}
             BlobAccess::NotFound => {
@@ -1980,14 +1980,10 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
         get_blob_metadata(&hash)?.ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
 
     // 2. Access control. Audio extraction requires the source video to be accessible to
-    //    the caller — banned/deleted/shadow-restricted source -> 404; age-restricted
-    //    source -> 401 (age gate). Owner of restricted/age-restricted source is allowed
-    //    by access_for, but the audio handler currently does not implement owner-only
-    //    extraction, so we still gate non-owners on the source's status.
-    let requester_pk = optional_auth(&req, AuthAction::List)
-        .ok()
-        .flatten()
-        .map(|auth| auth.pubkey);
+    //    the caller — banned/deleted/shadow-restricted source -> 404; anonymous
+    //    age-restricted source -> 401 (age gate). Any authenticated viewer may access
+    //    age-restricted content, while shadow-restricted content stays owner/admin only.
+    let requester_pk = viewer_pubkey(&req)?;
     let is_admin = admin::validate_bearer_token(&req).is_ok();
     match metadata.access_for(requester_pk.as_deref(), is_admin) {
         BlobAccess::Allowed => {}
@@ -2009,6 +2005,8 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
         AudioReuseAvailability::Denied => return Ok(audio_reuse_denied_response()),
         AudioReuseAvailability::LookupUnavailable => return Ok(audio_lookup_unavailable_response()),
     }
+
+    let private_cache = is_admin || metadata.status.requires_private_cache();
 
     // 4. Must be a video source
     if !is_video_mime_type(&metadata.mime_type) {
@@ -2037,6 +2035,7 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
             add_audio_response_headers(
                 &mut resp,
                 &hash,
+                private_cache,
                 &mapping.mime_type,
                 mapping.size_bytes,
                 mapping.duration_seconds,
@@ -2119,7 +2118,7 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
     // 8. Download and serve the audio
     let result = download_blob_with_fallback(&audio_sha256, range.as_deref())?;
     let mut resp = result.response;
-    add_audio_response_headers(&mut resp, &hash, &mime_type, size, duration);
+    add_audio_response_headers(&mut resp, &hash, private_cache, &mime_type, size, duration);
     Ok(resp)
 }
 
@@ -2165,6 +2164,7 @@ fn handle_head_audio(path: &str) -> Result<Response> {
             add_audio_response_headers(
                 &mut resp,
                 &hash,
+                metadata.status.requires_private_cache(),
                 &mapping.mime_type,
                 mapping.size_bytes,
                 mapping.duration_seconds,
@@ -2218,10 +2218,7 @@ fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
     let is_admin = admin::validate_bearer_token(&req).is_ok();
     let metadata = get_blob_metadata(&hash)?;
     if let Some(ref meta) = metadata {
-        let requester_pk = optional_auth(&req, AuthAction::List)
-            .ok()
-            .flatten()
-            .map(|auth| auth.pubkey);
+        let requester_pk = viewer_pubkey(&req)?;
         match meta.access_for(requester_pk.as_deref(), is_admin) {
             BlobAccess::Allowed => {}
             BlobAccess::NotFound => {
@@ -2247,7 +2244,11 @@ fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
     match download_hls_content(&gcs_path, range.as_deref()) {
         Ok(mut resp) => {
             resp.set_header("Content-Type", content_type);
-            add_cache_headers(&mut resp, &hash);
+            if is_admin || meta.status.requires_private_cache() {
+                add_private_cache_headers(&mut resp, &hash);
+            } else {
+                add_cache_headers(&mut resp, &hash);
+            }
             resp.set_header("Accept-Ranges", "bytes");
             add_cors_headers(&mut resp);
             Ok(resp)
@@ -3752,7 +3753,7 @@ fn execute_vanish(pubkey: &str) -> (u32, u32, u32) {
 
 /// DELETE /vanish - User-initiated GDPR right to erasure
 fn handle_vanish(req: Request) -> Result<Response> {
-    // Validate auth (NIP-98/Blossom)
+    // Validate Blossom delete auth.
     let auth = validate_auth(&req, AuthAction::Delete)?;
     let auth_event_json = serde_json::to_string(&auth).unwrap_or_default();
 
@@ -3831,11 +3832,9 @@ fn handle_list(req: Request, path: &str) -> Result<Response> {
         .ok_or_else(|| BlossomError::BadRequest("Invalid list path".into()))?;
 
     // Check if authenticated as the owner (to include restricted blobs)
-    let is_owner = if let Ok(Some(auth)) = optional_auth(&req, AuthAction::List) {
-        auth.pubkey.to_lowercase() == pubkey.to_lowercase()
-    } else {
-        false
-    };
+    let is_owner = viewer_pubkey(&req)?
+        .map(|viewer| viewer.eq_ignore_ascii_case(pubkey))
+        .unwrap_or(false);
 
     // Get blobs with metadata
     let blobs = list_blobs_with_metadata(pubkey, is_owner)?;
@@ -4442,8 +4441,8 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
     // Map action to BlobStatus.
     //
     // AGE_RESTRICTED is intentionally split out from RESTRICT/QUARANTINE: it lands on
-    // BlobStatus::AgeRestricted, which serves as 401 (age gate) to non-owners instead of
-    // the 404 shadow-ban that RESTRICT/QUARANTINE produce.
+    // BlobStatus::AgeRestricted, which serves as a 401 age gate to anonymous viewers
+    // instead of the 404 shadow-ban that RESTRICT/QUARANTINE produce.
     let new_status = match action.to_uppercase().as_str() {
         "BLOCK" | "BAN" | "PERMANENT_BAN" => BlobStatus::Banned,
         "AGE_RESTRICTED" | "AGE_RESTRICT" => BlobStatus::AgeRestricted,
@@ -5068,7 +5067,7 @@ fn handle_landing_page() -> Response {
             <div class="features">
                 <div class="feature">
                     <h3>Nostr Authentication</h3>
-                    <p>Secure uploads using NIP-98 HTTP Auth with Schnorr signatures.</p>
+                    <p>Viewer requests accept Blossom list auth or NIP-98 HTTP auth. Upload and delete operations require signed Blossom events (kind <code>24242</code>).</p>
                 </div>
                 <div class="feature">
                     <h3>Content Moderation</h3>
@@ -5151,8 +5150,8 @@ fn add_cache_headers(resp: &mut Response, hash: &str) {
     resp.set_header("Surrogate-Key", hash);
 }
 
-/// Like add_cache_headers but for restricted content served only to the owner.
-/// Uses private/no-store so VCL doesn't cache it, but still sets Surrogate-Key for purging.
+/// Like add_cache_headers but for authenticated or admin-only content that must
+/// not be stored in shared caches.
 fn add_private_cache_headers(resp: &mut Response, hash: &str) {
     resp.set_header("Cache-Control", "private, no-store");
     resp.set_header("Surrogate-Control", "no-store");

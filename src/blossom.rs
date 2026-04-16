@@ -116,7 +116,7 @@ pub enum BlobStatus {
     Banned,
     /// Soft-deleted internally; preserved in storage but never served publicly
     Deleted,
-    /// Age-gated content. Non-owners receive 401 (auth_required) so the
+    /// Age-gated content. Anonymous viewers receive 401 (auth_required) so the
     /// client can present an age-verification UI. Distinct from `Restricted`,
     /// which is shadow-banned and 404s to non-owners.
     #[serde(rename = "age_restricted")]
@@ -128,7 +128,7 @@ impl BlobStatus {
         matches!(self, BlobStatus::Banned | BlobStatus::Deleted)
     }
 
-    pub fn requires_owner_auth(self) -> bool {
+    pub fn requires_private_cache(self) -> bool {
         matches!(self, BlobStatus::Restricted | BlobStatus::AgeRestricted)
     }
 }
@@ -178,7 +178,7 @@ impl BlobMetadata {
                 }
             }
             BlobStatus::AgeRestricted => {
-                if is_owner {
+                if requester_pubkey.is_some() {
                     BlobAccess::Allowed
                 } else {
                     BlobAccess::AgeGated
@@ -862,7 +862,7 @@ mod tests {
     #[test]
     fn test_active_status_allows_public_access() {
         assert!(!BlobStatus::Active.blocks_public_access());
-        assert!(!BlobStatus::Active.requires_owner_auth());
+        assert!(!BlobStatus::Active.requires_private_cache());
     }
 
     #[test]
@@ -870,7 +870,8 @@ mod tests {
         assert!(BlobStatus::Banned.blocks_public_access());
         assert!(BlobStatus::Deleted.blocks_public_access());
         assert!(!BlobStatus::Restricted.blocks_public_access());
-        assert!(BlobStatus::Restricted.requires_owner_auth());
+        assert!(BlobStatus::Restricted.requires_private_cache());
+        assert!(BlobStatus::AgeRestricted.requires_private_cache());
         assert!(!BlobStatus::Pending.blocks_public_access());
     }
 
@@ -884,12 +885,11 @@ mod tests {
             BlobStatus::Banned.blocks_public_access(),
         );
         assert_eq!(
-            BlobStatus::Deleted.requires_owner_auth(),
-            BlobStatus::Banned.requires_owner_auth(),
+            BlobStatus::Deleted.requires_private_cache(),
+            BlobStatus::Banned.requires_private_cache(),
         );
-        // Neither should allow owner access
-        assert!(!BlobStatus::Deleted.requires_owner_auth());
-        assert!(!BlobStatus::Banned.requires_owner_auth());
+        assert!(!BlobStatus::Deleted.requires_private_cache());
+        assert!(!BlobStatus::Banned.requires_private_cache());
     }
 
     #[test]
@@ -914,18 +914,34 @@ mod tests {
                         s
                     );
                     assert!(
-                        !s.requires_owner_auth(),
-                        "{:?} should not require owner auth",
+                        !s.requires_private_cache(),
+                        "{:?} should not require private cache",
                         s
                     );
                 }
-                BlobStatus::Restricted | BlobStatus::AgeRestricted => {
+                BlobStatus::Restricted => {
                     assert!(
                         !s.blocks_public_access(),
                         "{:?} should not block public access",
                         s
                     );
-                    assert!(s.requires_owner_auth(), "{:?} should require owner auth", s);
+                    assert!(
+                        s.requires_private_cache(),
+                        "{:?} should require private cache",
+                        s
+                    );
+                }
+                BlobStatus::AgeRestricted => {
+                    assert!(
+                        !s.blocks_public_access(),
+                        "{:?} should not block public access",
+                        s
+                    );
+                    assert!(
+                        s.requires_private_cache(),
+                        "{:?} should require private cache",
+                        s
+                    );
                 }
                 BlobStatus::Active | BlobStatus::Pending => {
                     assert!(
@@ -934,8 +950,8 @@ mod tests {
                         s
                     );
                     assert!(
-                        !s.requires_owner_auth(),
-                        "{:?} should not require owner auth",
+                        !s.requires_private_cache(),
+                        "{:?} should not require private cache",
                         s
                     );
                 }
@@ -991,8 +1007,8 @@ mod tests {
     }
 
     #[test]
-    fn blob_status_age_restricted_requires_owner_auth() {
-        assert!(BlobStatus::AgeRestricted.requires_owner_auth());
+    fn blob_status_age_restricted_requires_private_cache_not_owner_auth() {
+        assert!(BlobStatus::AgeRestricted.requires_private_cache());
     }
 
     #[test]
@@ -1049,10 +1065,15 @@ mod tests {
     }
 
     #[test]
-    fn access_for_age_restricted_is_age_gated_to_non_owner_and_anonymous() {
+    fn access_for_age_restricted_is_age_gated_to_anonymous_only() {
         let m = fixture_metadata(BlobStatus::AgeRestricted, "owner");
         assert_eq!(m.access_for(None, false), BlobAccess::AgeGated);
-        assert_eq!(m.access_for(Some("stranger"), false), BlobAccess::AgeGated);
+    }
+
+    #[test]
+    fn access_for_age_restricted_is_allowed_to_any_authenticated_viewer() {
+        let m = fixture_metadata(BlobStatus::AgeRestricted, "owner");
+        assert_eq!(m.access_for(Some("stranger"), false), BlobAccess::Allowed);
     }
 
     #[test]
@@ -1462,6 +1483,6 @@ mod tests {
         assert!(desc.hls.is_some());
         assert!(desc.vtt.is_some());
         assert!(!meta.status.blocks_public_access());
-        assert!(!meta.status.requires_owner_auth());
+        assert!(!meta.status.requires_private_cache());
     }
 }

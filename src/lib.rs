@@ -1,6 +1,8 @@
 pub mod admin_sweep;
 pub mod blossom;
+pub mod error;
 pub mod resumable_complete;
+pub mod viewer_auth;
 
 #[cfg(test)]
 mod tests {

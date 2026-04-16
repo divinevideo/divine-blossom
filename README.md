@@ -209,7 +209,8 @@ The module runs on Cloud Run as a Flask/gunicorn service. The Dockerfile install
 
 ## Authentication
 
-Uses Nostr kind 24242 events:
+Management operations (`PUT /upload`, `DELETE /<sha256>`, GDPR vanish) use
+Blossom auth events (`kind 24242`):
 
 ```json
 {
@@ -224,6 +225,14 @@ Uses Nostr kind 24242 events:
 ```
 
 Send as: `Authorization: Nostr <base64_encoded_signed_event>`
+
+Viewer/list requests additionally accept valid NIP-98 HTTP auth (`kind 27235`)
+for the exact request URL and method. This is used to identify the caller's
+pubkey on media routes. `age_restricted` blobs are served to any authenticated
+viewer and return `401 {"error":"age_restricted"}` to anonymous requests.
+`restricted` blobs remain shadow-banned and only serve to the owner or an admin.
+Blossom does not currently read any hosted-session age-verification claim or
+external viewer adult-verification service when serving media.
 
 ## License
 
