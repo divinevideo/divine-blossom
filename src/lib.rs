@@ -1,6 +1,7 @@
 pub mod admin_sweep;
 pub mod blossom;
 pub mod error;
+pub mod media_auth_log;
 pub mod resumable_complete;
 pub mod viewer_auth;
 

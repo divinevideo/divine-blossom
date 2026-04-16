@@ -4,7 +4,8 @@
 use crate::blossom::{AuthAction, BlossomAuthEvent};
 use crate::error::{BlossomError, Result};
 use crate::viewer_auth::{
-    parse_auth_header, public_request_url, validate_blossom_event, validate_viewer_event,
+    diagnose_viewer_auth_request, parse_auth_header, validate_blossom_event, ViewerAuthDiagnostics,
+    ViewerAuthState,
 };
 use fastly::http::header::{AUTHORIZATION, HOST};
 use fastly::Request;
@@ -23,22 +24,31 @@ pub fn validate_auth(req: &Request, required_action: AuthAction) -> Result<Bloss
 /// (kind 27235). If an auth header is present but invalid, this returns an
 /// error instead of silently treating the request as anonymous.
 pub fn viewer_pubkey(req: &Request) -> Result<Option<String>> {
-    if req.get_header(AUTHORIZATION).is_none() {
-        return Ok(None);
-    }
+    let diagnostics = diagnose_viewer_auth(req)?;
 
-    let event = parse_request_auth_event(req)?;
-    let request_url = public_request_url(
-        &req.get_url().to_string(),
-        req.get_header(HOST).and_then(|h| h.to_str().ok()),
-    )?;
-    validate_viewer_event(
-        &event,
+    match diagnostics.auth_state {
+        ViewerAuthState::Missing => Ok(None),
+        ViewerAuthState::Valid => Ok(diagnostics.viewer_pubkey),
+        ViewerAuthState::InvalidScheme
+        | ViewerAuthState::ParseFailed
+        | ViewerAuthState::RequestUrlInvalid
+        | ViewerAuthState::ValidationFailed => Err(BlossomError::AuthInvalid(
+            diagnostics
+                .auth_error
+                .unwrap_or_else(|| "Invalid viewer authorization".into()),
+        )),
+    }
+}
+
+pub fn diagnose_viewer_auth(req: &Request) -> Result<ViewerAuthDiagnostics> {
+    Ok(diagnose_viewer_auth_request(
         req.get_method().as_str(),
-        &request_url,
+        req.get_path(),
+        req.get_header(HOST).and_then(|h| h.to_str().ok()),
+        &req.get_url().to_string(),
+        req.get_header(AUTHORIZATION).and_then(|h| h.to_str().ok()),
         unix_now(),
-    )?;
-    Ok(Some(event.pubkey))
+    ))
 }
 
 fn parse_request_auth_event(req: &Request) -> Result<BlossomAuthEvent> {
