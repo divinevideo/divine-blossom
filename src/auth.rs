@@ -3,8 +3,10 @@
 
 use crate::blossom::{AuthAction, BlossomAuthEvent};
 use crate::error::{BlossomError, Result};
-use crate::viewer_auth::{parse_auth_header, validate_blossom_event, validate_viewer_event};
-use fastly::http::header::AUTHORIZATION;
+use crate::viewer_auth::{
+    parse_auth_header, public_request_url, validate_blossom_event, validate_viewer_event,
+};
+use fastly::http::header::{AUTHORIZATION, HOST};
 use fastly::Request;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,10 +28,14 @@ pub fn viewer_pubkey(req: &Request) -> Result<Option<String>> {
     }
 
     let event = parse_request_auth_event(req)?;
+    let request_url = public_request_url(
+        &req.get_url().to_string(),
+        req.get_header(HOST).and_then(|h| h.to_str().ok()),
+    )?;
     validate_viewer_event(
         &event,
         req.get_method().as_str(),
-        &req.get_url().to_string(),
+        &request_url,
         unix_now(),
     )?;
     Ok(Some(event.pubkey))
