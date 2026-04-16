@@ -13,6 +13,8 @@ pub const BLOSSOM_AUTH_KIND: u32 = 24242;
 pub const NIP98_AUTH_KIND: u32 = 27235;
 /// Suggested freshness window from NIP-98.
 pub const NIP98_MAX_AGE_SECS: u64 = 60;
+/// Public hostname clients use for media viewer requests.
+pub const PUBLIC_MEDIA_HOST: &str = "media.divine.video";
 
 pub fn parse_auth_header(auth_header: &str) -> Result<BlossomAuthEvent> {
     let base64_event = auth_header.strip_prefix("Nostr ").ok_or_else(|| {
@@ -114,6 +116,34 @@ pub fn validate_viewer_event(
             BLOSSOM_AUTH_KIND, NIP98_AUTH_KIND, kind
         ))),
     }
+}
+
+pub fn public_request_url(request_url: &str, host_override: Option<&str>) -> Result<String> {
+    let scheme_end = request_url
+        .find("://")
+        .ok_or_else(|| BlossomError::AuthInvalid("Invalid request URL: missing scheme".into()))?;
+    let authority_start = scheme_end + 3;
+    let path_start = request_url[authority_start..]
+        .find(['/', '?', '#'])
+        .map(|offset| authority_start + offset)
+        .unwrap_or(request_url.len());
+
+    let scheme = &request_url[..authority_start];
+    let authority = &request_url[authority_start..path_start];
+    let suffix = &request_url[path_start..];
+    let host_override = host_override.map(str::trim).filter(|host| !host.is_empty());
+
+    let effective_authority = match host_override {
+        Some(host) if !is_internal_edge_host(host) => host,
+        _ if is_internal_edge_host(authority) => PUBLIC_MEDIA_HOST,
+        _ => authority,
+    };
+
+    Ok(format!("{}{}{}", scheme, effective_authority, suffix))
+}
+
+fn is_internal_edge_host(authority: &str) -> bool {
+    authority.ends_with(".edgecompute.app")
 }
 
 fn get_tag_value<'a>(event: &'a BlossomAuthEvent, tag_name: &str) -> Option<&'a str> {
@@ -303,6 +333,35 @@ mod tests {
     fn parse_auth_header_rejects_wrong_scheme() {
         let error = parse_auth_header("Bearer nope").expect_err("wrong scheme should fail");
         assert_eq!(error.message(), "Authorization must start with 'Nostr '");
+    }
+
+    #[test]
+    fn public_request_url_rewrites_internal_edge_host_to_public_host() {
+        let internal =
+            "https://separately-robust-roughy.edgecompute.app/4a31d696c2275e60dbfe2359e6ff006f78a30f5df11c7290233a7860c4e8c31e";
+        let public = public_request_url(internal, None)
+            .expect("public host rewrite should succeed");
+
+        assert_eq!(public, TEST_URL);
+    }
+
+    #[test]
+    fn public_request_url_preserves_query_and_port_override() {
+        let internal = "https://edgecompute.app/path/to/blob?foo=bar";
+        let public = public_request_url(internal, Some("media.divine.video:8443"))
+            .expect("public host rewrite should succeed");
+
+        assert_eq!(public, "https://media.divine.video:8443/path/to/blob?foo=bar");
+    }
+
+    #[test]
+    fn public_request_url_ignores_edge_host_override() {
+        let internal =
+            "https://separately-robust-roughy.edgecompute.app/4a31d696c2275e60dbfe2359e6ff006f78a30f5df11c7290233a7860c4e8c31e";
+        let public = public_request_url(internal, Some("separately-robust-roughy.edgecompute.app"))
+            .expect("edge host override should fall back to public media host");
+
+        assert_eq!(public, TEST_URL);
     }
 
     fn signed_event(kind: u32, tags: Vec<Vec<String>>, created_at: u64) -> BlossomAuthEvent {
