@@ -50,7 +50,7 @@ Client → Fastly Compute (Rust WASM) → GCS (blobs) + Fastly KV (metadata)
 rustup target add wasm32-wasi
 ```
 
-### Configure secrets
+### Configure secrets and config
 
 1. Create a GCS bucket with HMAC credentials
 2. Set up Fastly stores:
@@ -65,6 +65,12 @@ fastly config-store create --name blossom_config
 # Create secret store with GCS HMAC credentials
 fastly secret-store create --name blossom_secrets
 ```
+
+**Config store flags:**
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `ENABLE_PHYSICAL_DELETE` | When `"true"`, creator-delete actions via `/admin/api/moderate` physically remove bytes from GCS and purge edge caches. When `"false"`, status flip only (bytes preserved). Admin DMCA via `/admin/api/delete` is unconditionally soft-delete regardless of this flag. | `"false"` |
 
 ### Local development
 

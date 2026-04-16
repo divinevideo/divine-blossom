@@ -1,5 +1,6 @@
 {
   "gcs_bucket": "divine-blossom-local",
   "gcs_project_id": "local",
-  "local_mode": "true"
+  "local_mode": "true",
+  "ENABLE_PHYSICAL_DELETE": "false"
 }
