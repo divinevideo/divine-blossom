@@ -1,175 +1,112 @@
-# Blossom `DELETE` Action Implementation Plan
+# Blossom `DELETE` Action Implementation Plan (revised)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Wire a `DELETE` action into Blossom's `/admin/api/moderate` endpoint that dispatches to a shared physical-delete helper extracted from the existing admin DMCA cascade. Gate the destructive step on a new `ENABLE_PHYSICAL_DELETE` config flag (default off) so the first production deploy is inert.
+**Goal:** Wire a `DELETE` action into Blossom's `/admin/api/moderate` endpoint that composes `soft_delete_blob` (stops serving) with physical GCS byte removal (when the `ENABLE_PHYSICAL_DELETE` flag is on). New helper lives in `delete_policy.rs` alongside the existing soft-delete helper.
 
-**Architecture:** Extract `perform_physical_delete(hash, actor, reason, legal_hold)` from `handle_admin_force_delete` into a shared helper. Both admin DMCA (unconditional) and creator-delete (flag-gated) call it. Creator-delete ingress stays on the existing `/admin/api/moderate` endpoint so moderation-service's single call pattern is preserved.
+**Architecture:** `perform_physical_delete` = `soft_delete_blob` + byte destruction. DELETE handled as a special-case branch in `handle_admin_moderate_action` (not a new arm in the bare-status-flip match). Admin DMCA endpoint and GDPR vanish are untouched.
 
-**Tech Stack:** Rust on Fastly Compute (WASM), `fastly` crate, `serde_json`. Tests via inline `#[cfg(test)] mod tests` — standard Rust pattern. Local dev via MinIO + `fastly compute serve`.
+**Tech Stack:** Rust on Fastly Compute (WASM target `wasm32-wasip1`), `fastly` crate, `serde_json`. Tests via `cargo check --tests --locked` (the edge crate's FFI symbols don't link for `cargo test` on host). Local e2e via MinIO + `fastly compute serve`.
 
-**Spec:** `docs/superpowers/specs/2026-04-16-creator-delete-action-design.md` on this branch.
+**Spec:** `docs/superpowers/specs/2026-04-16-creator-delete-action-design.md` (revised).
 
 ---
 
 ## File Structure
 
 **Files to modify:**
-- `src/main.rs` — extract `perform_physical_delete` helper (~55 lines moved from `handle_admin_force_delete`), update `handle_admin_force_delete` to call it.
-- `src/admin.rs` — add `reason` field to `ModerateRequest` struct, wire `DELETE` action dispatch with `ENABLE_PHYSICAL_DELETE` flag check.
-- `config-store-data.json` — add `ENABLE_PHYSICAL_DELETE = "false"` for local dev.
+- `src/delete_policy.rs` — add `perform_physical_delete` (new public function, ~20 lines)
+- `src/admin.rs` — add `reason` field to `ModerateRequest`; add DELETE special-case branch in `handle_admin_moderate_action` (~40 lines)
+- `config-store-data.json` — add `ENABLE_PHYSICAL_DELETE = "false"` for local dev
+- `README.md` — document the flag
 
-**Files to create:**
-- None. Tests live alongside production code in `#[cfg(test)]` modules within the modified files.
+**Files NOT modified:**
+- `src/main.rs` — no changes. `handle_admin_force_delete` stays soft-delete. `execute_vanish` stays inline.
 
 ---
 
-## Guardrails — do not do these without checkpointing with Matt first
-
-### Scope
+## Guardrails
 
 - Do not add new dependencies in `Cargo.toml`.
-- Do not refactor any file not listed above.
-- Do not modify `handle_admin_force_delete`'s behavior — only its internals (extract to helper; caller is equivalent).
-- Do not change the auth path on `/admin/api/moderate`. Existing Bearer auth (admin_token OR webhook_secret) remains.
-- Do not modify `BlobStatus` enum. `Deleted` already exists.
-- Do not change any existing tests. Add new tests; don't reshape existing.
-- Do not change the Fastly Purge logic (`purge_vcl_cache`). Reuse it verbatim.
-- Do not add new logging beyond the eprintln lines specified in the spec.
-
-### Safety measures — DO NOT REMOVE OR SIMPLIFY
-
-These are required by the spec:
-
-- `ENABLE_PHYSICAL_DELETE` flag check in the creator-delete DELETE branch. Flag off → status flip only, return `physical_delete_skipped: true`.
-- `actor: "creator_delete"` passed to `perform_physical_delete` (and `"admin"` from the force-delete endpoint). This is the audit-log distinguisher.
-- `legal_hold: false` on the creator-delete ingress (creator re-upload is not blocked).
-- Failure of `perform_physical_delete` is logged but does NOT block the 200 response — the status flip is the load-bearing compliance guarantee.
-- `get_config("ENABLE_PHYSICAL_DELETE")` comparison uses `eq_ignore_ascii_case` on the value OR exact `== Some("true")`; pick ONE and be consistent. The spec uses `as_deref() == Some("true")` — follow it.
-
-### When in doubt
-
-Stop and ask. A checkpoint question is cheaper than reverting a commit.
-
----
-
-## Per-task review checklist (orchestrator uses this on every subagent output)
-
-- [ ] Tests written before implementation (visible in git history or commit body).
-- [ ] `cargo test` passes all tests (existing + new).
-- [ ] `cargo build --target wasm32-wasi --release` succeeds (or the repo's documented build command).
-- [ ] No new dependencies in `Cargo.toml`.
-- [ ] No files touched outside the task's "Files" list.
-- [ ] Safety measures from Guardrails present and unaltered.
-- [ ] Existing `handle_admin_force_delete` test (if any) still passes after the refactor — behavior equivalence.
-- [ ] Commit message follows existing Blossom convention (check `git log --oneline -10` on main for style; no Claude attribution).
-- [ ] Rust doc comments on new public/pub(crate) functions.
-
-### Red flags to escalate
-
-- Subagent adds a dependency, refactors an unrelated file, or changes `BlobStatus`.
-- `handle_admin_force_delete`'s tests or behavior change beyond the extraction.
-- The DELETE branch returns anything other than 200 on status-flip-only or full-cascade success.
-- The flag check is bypassed, inverted, or gated on the wrong value.
+- Do not modify `handle_admin_force_delete` or `execute_vanish`.
+- Do not modify any existing tests.
+- Do not delete the metadata row via `delete_blob_metadata`. Metadata stays with `status: Deleted` for audit.
+- Do not delete KV artifacts via `delete_blob_kv_artifacts`. Same reason.
+- `ENABLE_PHYSICAL_DELETE` flag check uses `get_config("ENABLE_PHYSICAL_DELETE").as_deref() == Some("true")`.
+- `write_audit_log` call: action = `"creator_delete"`, actor_pubkey = `&metadata.owner`. Do NOT pass actor into the action slot.
+- `legal_hold: false` on all creator-delete calls. Tombstone is a legal mechanism.
+- Failure of `perform_physical_delete` is logged but does NOT block the 200 response.
+- Build target: `wasm32-wasip1` (NOT `wasm32-wasi`).
+- Verification: `cargo check --tests --locked` (NOT `cargo test`).
 
 ---
 
 ## Staging Preflight
 
-- [ ] **Build works at baseline.** `cargo build --target wasm32-wasi --release` on the current branch (before any changes) succeeds. Note the current Fastly CLI version (`fastly version`) — the local dev loop wants ≥14.0.4.
-
-- [ ] **Local dev loop operational.** `docker compose -f docker-compose.local.yml up minio minio-init -d` starts MinIO on :9000. `cp fastly.toml.local fastly.toml` then `fastly compute serve` brings Blossom up on :7676. `curl http://localhost:7676/admin/api/stats -H 'Authorization: Bearer <admin_token>'` returns 200 (admin auth configured for local).
-
-- [ ] **Existing DELETE action confirms baseline.** `curl -X POST http://localhost:7676/admin/api/moderate -H 'Content-Type: application/json' -H 'Authorization: Bearer <admin_token>' -d '{"sha256":"aaaa...","action":"DELETE"}'` returns `400 Unknown action: DELETE`. This is the state this PR changes.
-
-- [ ] **Existing `handle_admin_force_delete` works.** `curl -X POST http://localhost:7676/admin/api/delete -d '{"sha256":"...","reason":"preflight"}'` against a test blob shows the existing cascade. Record the response shape so the refactor in Task 1 can be verified equivalent.
-
-Any preflight failure is a redirect signal.
+- [ ] `cargo build --target wasm32-wasip1 --release` succeeds on the current branch (baseline).
+- [ ] `cargo check --tests --locked` succeeds (baseline).
+- [ ] Local dev: `docker compose -f docker-compose.local.yml up minio minio-init -d` + `cp fastly.toml.local fastly.toml` + `fastly compute serve` starts Blossom on :7676.
+- [ ] `POST /admin/api/moderate` with `action: "DELETE"` returns `400 Unknown action: DELETE` (pre-change baseline).
 
 ---
 
-## Task 1: Extract `perform_physical_delete` helper
+## Task 1: Add `perform_physical_delete` to `delete_policy.rs`
 
-**Files:**
-- Modify: `src/main.rs`
+**Files:** Modify `src/delete_policy.rs`
 
-Refactor `handle_admin_force_delete` (currently ~89 lines, `main.rs:3152-3240`) so its cascade body lives in a new `pub(crate) fn perform_physical_delete(...)` called by the handler. Behavior must be equivalent.
+- [ ] **Step 1: Read the existing helpers.** `soft_delete_blob` is at line 39. Understand its signature, what it does, what it imports. Read the module's `use crate::...` block at the top — you'll need additional imports for the byte-destruction functions.
 
-- [ ] **Step 1: Locate the current function**
+- [ ] **Step 2: Add imports for byte-destruction helpers.** At the top of `delete_policy.rs`, the existing imports include `update_blob_status`, `remove_from_user_list`, etc. Add the functions `perform_physical_delete` will call that aren't already imported. These live in `crate` (main.rs) and will need `pub(crate)` visibility there:
+    - `crate::cleanup_derived_audio_for_source`
+    - `crate::storage_delete`
+    - `crate::delete_blob_gcs_artifacts`
+    - `crate::purge_vcl_cache`
 
-    ```bash
-    grep -n "^fn handle_admin_force_delete\|^pub fn handle_admin_force_delete" src/main.rs
-    ```
+    Check whether these are already `pub(crate)` in main.rs. If they're private (`fn` without `pub`), add `pub(crate)` to each. Do NOT change their signatures or behavior; only their visibility.
 
-    Confirm the line range (should be roughly 3152-3240). Read it top-to-bottom to understand the flow.
-
-- [ ] **Step 2: Add `perform_physical_delete` above `handle_admin_force_delete`**
-
-    Insert the helper verbatim from the spec (Component 1 code block). Signature:
+- [ ] **Step 3: Add `perform_physical_delete` below `soft_delete_blob`.**
 
     ```rust
-    pub(crate) fn perform_physical_delete(
+    /// Physical deletion: soft-delete (stops serving) + GCS byte removal.
+    /// Metadata row is preserved (status=Deleted) for audit/support visibility.
+    pub fn perform_physical_delete(
         hash: &str,
-        actor: &str,
+        metadata: &BlobMetadata,
         reason: &str,
         legal_hold: bool,
-    ) -> Result<()> { /* body */ }
+    ) -> Result<()> {
+        soft_delete_blob(hash, metadata, reason, legal_hold)?;
+        crate::cleanup_derived_audio_for_source(hash);
+        let _ = crate::storage_delete(hash);
+        crate::delete_blob_gcs_artifacts(hash);
+        crate::purge_vcl_cache(hash);
+        Ok(())
+    }
     ```
 
-    The body mirrors `handle_admin_force_delete`'s cascade exactly (from "Get metadata before deletion for audit" through "Purge VCL cache"), with `actor` parameterized (was hardcoded `"admin_delete"` / `"admin"`).
-
-- [ ] **Step 3: Update `handle_admin_force_delete` to call the helper**
-
-    Replace the extracted body (between "Get metadata before deletion for audit" and "Purge VCL cache" inclusive) with a single call:
-
-    ```rust
-    perform_physical_delete(&hash, "admin", reason, legal_hold)?;
-    ```
-
-    The surrounding code (hash validation, response construction) stays as-is.
-
-- [ ] **Step 4: Build and verify existing tests pass**
+- [ ] **Step 4: Build.**
 
     ```bash
-    cargo build --target wasm32-wasi --release
-    cargo test
+    cargo build --target wasm32-wasip1 --release
+    cargo check --tests --locked
     ```
+    Expected: success (new function is defined but not yet called — dead code warning is OK).
 
-    Expected: build succeeds, all existing tests pass. The refactor is behavior-equivalent — any test failure here indicates we dropped something in the move.
-
-- [ ] **Step 5: Manual equivalence check against preflight baseline**
-
-    If you captured a response shape from the preflight `handle_admin_force_delete` call, compare the post-refactor response. Should match field-for-field.
-
-- [ ] **Step 6: Commit**
-
-    ```bash
-    git add src/main.rs
-    git commit -m "refactor: extract perform_physical_delete helper from handle_admin_force_delete"
-    ```
+- [ ] **Step 5: Commit.** (Matt commits from his shell.)
 
 ---
 
 ## Task 2: Add optional `reason` to `ModerateRequest`
 
-**Files:**
-- Modify: `src/admin.rs`
+**Files:** Modify `src/admin.rs`
 
-The creator-delete ingress will eventually want to pass a reason for audit purposes. Struct extension is minimal and safe — existing callers that omit `reason` continue to work via `Option<String>`.
+- [ ] **Step 1: Find the struct.**
 
-- [ ] **Step 1: Update the struct**
-
-    Find `struct ModerateRequest` in `src/admin.rs` (around line 728-732). Change from:
-
-    ```rust
-    #[derive(Deserialize)]
-    struct ModerateRequest {
-        sha256: String,
-        action: String,
-    }
+    ```bash
+    grep -n "struct ModerateRequest" src/admin.rs
     ```
 
-    to:
+- [ ] **Step 2: Add the field.**
 
     ```rust
     #[derive(Deserialize)]
@@ -181,271 +118,187 @@ The creator-delete ingress will eventually want to pass a reason for audit purpo
     }
     ```
 
-- [ ] **Step 2: Build**
+- [ ] **Step 3: Build.** `cargo build --target wasm32-wasip1 --release`. Expected: succeeds. No callers changed.
 
-    ```bash
-    cargo build --target wasm32-wasi --release
-    ```
-    Expected: succeeds. No callers changed; `reason` defaults to `None`.
-
-- [ ] **Step 3: Commit**
-
-    ```bash
-    git add src/admin.rs
-    git commit -m "feat(admin): accept optional reason field in ModerateRequest"
-    ```
+- [ ] **Step 4: Commit.** (Matt commits.)
 
 ---
 
-## Task 3: Wire DELETE action with `ENABLE_PHYSICAL_DELETE` flag check
+## Task 3: Wire DELETE special-case in `handle_admin_moderate_action`
 
-**Files:**
-- Modify: `src/admin.rs`
+**Files:** Modify `src/admin.rs`
 
-Add the new action to `BLOSSOM_ACTION_MAP` (implicit via the match in `handle_admin_moderate_action`) and dispatch to `perform_physical_delete` when the flag is on.
+This is the core wiring task. DELETE is a special-case branch BEFORE the existing action-map match.
 
-- [ ] **Step 1: Write the failing test first**
+- [ ] **Step 1: Read the current handler.** Find `handle_admin_moderate_action` (around line 848). Read the full function to understand the flow: auth, parse, validate sha256, fetch metadata, action match, status flip, response.
 
-    Add to `src/admin.rs` inside the existing `#[cfg(test)] mod tests` block:
-
-    ```rust
-    #[test]
-    fn test_delete_action_with_flag_off_returns_physical_delete_skipped() {
-        // Build a ModerateRequest with action "DELETE"
-        // Mock get_config to return None for ENABLE_PHYSICAL_DELETE
-        // Call handle_admin_moderate_action
-        // Assert: 200 status, body contains physical_delete_skipped: true,
-        //         blob status updated to Deleted.
-        todo!("build minimal viceroy mocks or use real local fastly dev harness");
-    }
-
-    #[test]
-    fn test_delete_action_with_flag_on_invokes_physical_delete() {
-        // Mock get_config to return Some("true") for ENABLE_PHYSICAL_DELETE
-        // Call handle_admin_moderate_action with action "DELETE"
-        // Assert: 200 status, body contains physical_deleted: true
-        // Assert: audit log written with actor="creator_delete"
-        todo!("same mocking as above");
-    }
-    ```
-
-    These are marked `todo!()` to serve as failing-test stubs. If the repo has a mocking harness for `get_config` + storage, expand them. Otherwise, replace `todo!()` with integration tests via local `fastly compute serve` driven by a test script.
-
-    **Fallback if Viceroy/Rust mocking is too heavy:** run the test cases manually via `curl` in the preflight loop and document results in the commit body. Rust mocks for `fastly::config_store` are non-trivial; pragmatic manual verification is acceptable for this narrowly-scoped behavior.
-
-- [ ] **Step 2: Run tests — confirm they're marked todo / fail as expected**
-
-    ```bash
-    cargo test
-    ```
-
-- [ ] **Step 3: Implement the DELETE branch**
-
-    Find `handle_admin_moderate_action` in `src/admin.rs` (around line 734). After the existing `update_blob_status` + `update_stats_on_status_change` + `purge_vcl_cache` calls, AND BEFORE the existing `json_response(StatusCode::OK, &response)` return, insert the DELETE dispatch per the spec Component 2 code block:
+- [ ] **Step 2: Add necessary imports at the top of `admin.rs`.**
 
     ```rust
+    use crate::delete_policy::{perform_physical_delete, soft_delete_blob};
+    use crate::storage::write_audit_log;
+    ```
+
+    Check whether these are already imported. Add only what's missing.
+
+- [ ] **Step 3: Insert the DELETE branch.** After the `metadata` fetch and BEFORE the `let new_status = match ...` block, add:
+
+    ```rust
+    // Creator-delete: special-case because DELETE needs soft_delete_blob's full
+    // index/user-list cleanup, not the bare update_blob_status the action-map
+    // match provides for BAN/RESTRICT/etc.
     if moderate_req.action.eq_ignore_ascii_case("DELETE") {
+        let reason = moderate_req
+            .reason
+            .as_deref()
+            .unwrap_or("Creator-initiated deletion via kind 5");
+
+        let meta_json = serde_json::to_string(&metadata).ok();
+        crate::write_audit_log(
+            &moderate_req.sha256,
+            "creator_delete",
+            &metadata.owner,
+            None,
+            meta_json.as_deref(),
+            Some(reason),
+        );
+
         let physical_delete_enabled = get_config("ENABLE_PHYSICAL_DELETE")
             .as_deref()
             == Some("true");
 
         if physical_delete_enabled {
-            let reason = moderate_req
-                .reason
-                .as_deref()
-                .unwrap_or("Creator-initiated deletion via kind 5");
-
-            if let Err(e) = crate::perform_physical_delete(
+            if let Err(e) = perform_physical_delete(
                 &moderate_req.sha256,
-                "creator_delete",
+                &metadata,
                 reason,
                 false,
             ) {
                 eprintln!(
-                    "[CREATOR-DELETE] perform_physical_delete failed for {}: {}. \
-                     Status is still Deleted; bytes may remain. Operator follow-up required.",
+                    "[CREATOR-DELETE] perform_physical_delete failed for {}: {}",
                     moderate_req.sha256, e
                 );
             }
-
-            let response = serde_json::json!({
-                "success": true,
-                "sha256": moderate_req.sha256,
-                "old_status": format!("{:?}", old_status).to_lowercase(),
-                "new_status": format!("{:?}", new_status).to_lowercase(),
-                "physical_deleted": true
-            });
-            return json_response(StatusCode::OK, &response);
         } else {
-            let response = serde_json::json!({
-                "success": true,
-                "sha256": moderate_req.sha256,
-                "old_status": format!("{:?}", old_status).to_lowercase(),
-                "new_status": format!("{:?}", new_status).to_lowercase(),
-                "physical_delete_skipped": true
-            });
-            return json_response(StatusCode::OK, &response);
+            if let Err(e) = soft_delete_blob(
+                &moderate_req.sha256,
+                &metadata,
+                reason,
+                false,
+            ) {
+                eprintln!(
+                    "[CREATOR-DELETE] soft_delete_blob failed for {}: {}",
+                    moderate_req.sha256, e
+                );
+                return Err(e);
+            }
         }
+
+        let response = serde_json::json!({
+            "success": true,
+            "sha256": moderate_req.sha256,
+            "old_status": format!("{:?}", old_status).to_lowercase(),
+            "new_status": "deleted",
+            "physical_deleted": physical_delete_enabled,
+            "physical_delete_skipped": !physical_delete_enabled
+        });
+        return json_response(StatusCode::OK, &response);
     }
     ```
 
-    The existing action-map match in `handle_admin_moderate_action` handles `DELETE` by mapping to `BlobStatus::Deleted` (once the arm is added). Find the match that sets `new_status` from the action string and add a `"DELETE" | "delete"` arm:
-
-    ```rust
-    let new_status = match moderate_req.action.to_uppercase().as_str() {
-        "BAN" | "BLOCK" => BlobStatus::Banned,
-        "RESTRICT" => BlobStatus::Restricted,
-        "APPROVE" | "ACTIVE" => BlobStatus::Active,
-        "PENDING" => BlobStatus::Pending,
-        "AGE_RESTRICTED" | "AGERESTRICTED" => BlobStatus::AgeRestricted,
-        "DELETE" => BlobStatus::Deleted,  // NEW
-        _ => {
-            return Err(BlossomError::BadRequest(format!(
-                "Unknown action: {}",
-                moderate_req.action
-            )))
-        }
-    };
-    ```
-
-    (The exact existing match arms may vary; confirm against the current file and add `"DELETE" => BlobStatus::Deleted` consistent with the style.)
-
-- [ ] **Step 4: Build**
+- [ ] **Step 4: Build.**
 
     ```bash
-    cargo build --target wasm32-wasi --release
+    cargo build --target wasm32-wasip1 --release
+    cargo check --tests --locked
     ```
-    Expected: succeeds.
+    Expected: success. The dead-code warning on `perform_physical_delete` should be gone (it's now called).
 
-- [ ] **Step 5: Local e2e validation (manual)**
+- [ ] **Step 5: Local e2e test — flag off.**
 
-    Start the local dev stack (per preflight). Then:
+    Start local dev stack (MinIO + `fastly compute serve`). Upload a test blob if one doesn't exist. Then:
 
     ```bash
-    # Flag off (default): expect physical_delete_skipped=true, blob still in GCS
     curl -X POST http://localhost:7676/admin/api/moderate \
       -H 'Content-Type: application/json' \
-      -H "Authorization: Bearer $ADMIN_TOKEN" \
+      -H "Authorization: Bearer <admin_token_from_secret_store_data>" \
       -d '{"sha256":"<test_blob_hash>","action":"DELETE"}'
-    # Expect: 200 {..., "physical_delete_skipped": true}
-    # Verify: minio bucket still has the blob (mc ls local/divine-blossom-local)
-    # Verify: Blossom serves 404 on the blob URL (status = Deleted)
+    ```
 
-    # Flag on: expect physical_deleted=true, blob gone from GCS
-    # Set ENABLE_PHYSICAL_DELETE=true in config-store-data.json (see Task 4)
-    # Restart fastly compute serve
+    Expected: 200 with `"physical_delete_skipped": true`, `"new_status": "deleted"`. Blob serves 404 on `http://localhost:7676/<hash>`. MinIO bucket still has the bytes.
+
+- [ ] **Step 6: Local e2e test — flag on.**
+
+    Edit `config-store-data.json` to set `"ENABLE_PHYSICAL_DELETE": "true"`. Restart `fastly compute serve`. Upload a NEW test blob (different hash since the first is now `Deleted`).
+
+    ```bash
     curl -X POST http://localhost:7676/admin/api/moderate \
       -H 'Content-Type: application/json' \
-      -H "Authorization: Bearer $ADMIN_TOKEN" \
-      -d '{"sha256":"<different_test_blob>","action":"DELETE"}'
-    # Expect: 200 {..., "physical_deleted": true}
-    # Verify: minio bucket no longer has the blob
+      -H "Authorization: Bearer <admin_token>" \
+      -d '{"sha256":"<new_test_blob_hash>","action":"DELETE"}'
     ```
 
-    Record both results in the commit body.
+    Expected: 200 with `"physical_deleted": true`. MinIO bucket no longer has the blob bytes. Thumbnail and VTT also gone (verify via `mc ls`).
 
-- [ ] **Step 6: Run cargo test**
+- [ ] **Step 7: Verify existing actions still work.**
 
     ```bash
-    cargo test
+    # BAN should still work as before
+    curl -X POST http://localhost:7676/admin/api/moderate \
+      -H 'Content-Type: application/json' \
+      -H "Authorization: Bearer <admin_token>" \
+      -d '{"sha256":"<another_hash>","action":"BAN"}'
     ```
-    Existing tests must still pass. If the `todo!()` tests from Step 1 are still stubs, they'll panic and fail — expected; remove them or replace with real assertions as a follow-up if you can build a mocking harness, OR delete them in favor of the manual local-e2e approach (note in commit body either way).
+    Expected: 200 with `"new_status": "banned"`. No `physical_deleted` or `physical_delete_skipped` fields.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Verify admin DMCA endpoint unchanged.**
 
     ```bash
-    git add src/admin.rs
-    git commit -m "feat(admin): add DELETE action dispatching to perform_physical_delete
-
-    Wires DELETE into /admin/api/moderate's BLOSSOM_ACTION_MAP (new arm:
-    DELETE → BlobStatus::Deleted) and, after the status flip + VCL purge,
-    dispatches to the extracted perform_physical_delete helper when
-    ENABLE_PHYSICAL_DELETE config flag is 'true'. Flag off returns
-    {physical_delete_skipped: true} — first-prod deploy is inert.
-
-    Admin DMCA path (/admin/api/delete) unchanged — always destructive.
-    Shared helper distinguishes callers via audit-log actor field
-    ('admin' vs 'creator_delete').
-
-    Caller: divinevideo/divine-moderation-service#92.
-    "
+    curl -X POST http://localhost:7676/admin/api/delete \
+      -H 'Content-Type: application/json' \
+      -H "Authorization: Bearer <admin_token>" \
+      -d '{"sha256":"<another_hash>","reason":"test"}'
     ```
+    Expected: 200 with `"preserved": true`. Bytes still on MinIO. Unchanged behavior.
+
+- [ ] **Step 9: Commit.** (Matt commits.)
 
 ---
 
 ## Task 4: Local dev config
 
-**Files:**
-- Modify: `config-store-data.json`
+**Files:** Modify `config-store-data.json`
 
-- [ ] **Step 1: Add the flag**
-
-    Open `config-store-data.json` in the repo root. Add `"ENABLE_PHYSICAL_DELETE": "false"` alongside other config keys. Keep it as a string (Fastly config store semantic).
-
-- [ ] **Step 2: Verify local dev picks it up**
-
-    Restart `fastly compute serve`. Confirm via a Task-3-style curl that `physical_delete_skipped: true` is returned.
-
-- [ ] **Step 3: Commit**
-
-    ```bash
-    git add config-store-data.json
-    git commit -m "config: add ENABLE_PHYSICAL_DELETE=false for local dev"
-    ```
+- [ ] **Step 1: Add the flag.** `"ENABLE_PHYSICAL_DELETE": "false"` alongside other config keys.
+- [ ] **Step 2: Commit.** (Matt commits.)
 
 ---
 
-## Task 5: Documentation + PR polish
+## Task 5: Documentation
 
-**Files:**
-- Modify: `README.md` (if the "Configure secrets" section mentions all config keys — add the flag alongside existing `google_allowed_domain`, `gcs_bucket`, etc.).
-- Optionally: `CHANGELOG.md` if the repo maintains one.
+**Files:** Modify `README.md`
 
-- [ ] **Step 1: Document the flag in README**
+- [ ] **Step 1: Document the flag.** In the Configuration or Environment section, add:
 
-    Find the "Configure secrets" or "Configuration" section. Add:
+    `ENABLE_PHYSICAL_DELETE` (config store `blossom_config`): when `"true"`, creator-delete actions via `/admin/api/moderate` physically remove bytes from GCS and purge edge caches. Default `"false"` (status flip only). Flip to `"true"` after end-to-end validation in the creator-delete rollout. Admin DMCA via `/admin/api/delete` is unconditionally soft-delete regardless of this flag.
 
-    ```markdown
-    - `ENABLE_PHYSICAL_DELETE` (config store `blossom_config`): when `"true"`, creator-delete actions via `/admin/api/moderate` physically remove bytes from GCS and purge edge caches. Default `"false"` — status flip only. Flip to `"true"` after end-to-end validation in the creator-delete rollout. Admin DMCA via `/admin/api/delete` is unconditionally destructive regardless of this flag.
-    ```
-
-- [ ] **Step 2: Commit**
-
-    ```bash
-    git add README.md
-    git commit -m "docs(readme): document ENABLE_PHYSICAL_DELETE config flag"
-    ```
+- [ ] **Step 2: Commit.** (Matt commits.)
 
 ---
+
+## Execution order
+
+Task 1 → Task 2 → Task 3 → Task 4 → Task 5
+
+Tasks 1-2 can run in either order. Task 3 depends on both (imports `perform_physical_delete` + uses `moderate_req.reason`). Tasks 4-5 are independent cleanups.
 
 ## Self-Review checklist
 
-After writing the plan, check:
-
-**Spec coverage:**
-- [x] `perform_physical_delete` helper extraction — Task 1
-- [x] `reason` field on `ModerateRequest` — Task 2
-- [x] `DELETE` action dispatch with flag check — Task 3
-- [x] `ENABLE_PHYSICAL_DELETE` config store entry — Task 4
-- [x] Documentation — Task 5
-- [x] Failure handling matrix — covered in Task 3's implementation (eprintln on helper failure, 200 still returned)
-- [x] Observability — existing `[PURGE]` and new `[CREATOR-DELETE]` / `[PHYSICAL-DELETE]` logs
-- [x] Tests — Task 3 with fallback to local e2e if Viceroy mocking is too heavy
-- [x] Dependencies and sequencing — spec section is authoritative
-- [x] Local dev loop — preflight + Task 3 Step 5
-
-**Placeholder scan:** The `todo!()` in Task 3 Step 1 is an acknowledged stub with a fallback — manual local e2e driven by the Step 5 curl commands. This is pragmatic for Rust + Fastly Compute where mocking `fastly::config_store` is non-trivial.
-
-**Type consistency:** `perform_physical_delete(hash: &str, actor: &str, reason: &str, legal_hold: bool) -> Result<()>` — signature consistent across Tasks 1 and 3.
-
----
-
-## Execution handoff
-
-Plan complete and committed to `docs/superpowers/plans/2026-04-16-creator-delete-action-plan.md` on branch `feat/creator-delete-action`. Two execution options:
-
-**1. Subagent-Driven (recommended)** — dispatch a fresh subagent per task, review between tasks, fast iteration.
-
-**2. Inline Execution** — execute in this session using executing-plans, batch execution with checkpoints.
-
-For this PR's scope (5 small tasks, mostly file edits in two files), either approach works. Subagent-driven preserves the per-task review rhythm we've established on the moderation-service side.
+- [x] Spec coverage: `perform_physical_delete` (Task 1), DELETE wiring + flag (Task 3), reason field (Task 2), config (Task 4), docs (Task 5)
+- [x] Existing endpoints untouched: `handle_admin_force_delete` and `execute_vanish` have no changes in any task
+- [x] Build target correct: `wasm32-wasip1` everywhere
+- [x] Test command correct: `cargo check --tests --locked` (not `cargo test`)
+- [x] `write_audit_log` call: action=`"creator_delete"`, actor=`&metadata.owner` (not `actor` in both slots)
+- [x] DELETE is a special-case branch, not an action-map arm (so `soft_delete_blob` runs, not bare `update_blob_status`)
+- [x] `perform_physical_delete` composes `soft_delete_blob` + byte destruction, preserves metadata row
+- [x] Guardrails documented for subagents
