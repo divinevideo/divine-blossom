@@ -105,9 +105,11 @@ fn get_session_cookie(req: &Request) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::get_session_cookie;
+    use super::{get_session_cookie, set_admin_blob_response_headers};
+    use crate::blossom::{BlobMetadata, BlobStatus};
     use fastly::http::header;
-    use fastly::Request;
+    use fastly::http::StatusCode;
+    use fastly::{Request, Response};
 
     #[test]
     fn extracts_admin_session_cookie_from_cookie_header() {
@@ -123,6 +125,65 @@ mod tests {
         req.set_header(header::COOKIE, "session=abc123");
 
         assert_eq!(get_session_cookie(&req), None);
+    }
+
+    #[test]
+    fn admin_blob_headers_allow_storage_backfill_without_metadata() {
+        let hash = "a".repeat(64);
+        let mut resp = Response::from_status(StatusCode::OK);
+        resp.set_header("Content-Type", "video/mp4");
+        resp.set_header("x-goog-stored-content-length", "75492");
+
+        set_admin_blob_response_headers(&mut resp, None, &hash);
+
+        assert_eq!(resp.get_header_str("Content-Type"), Some("video/mp4"));
+        assert_eq!(resp.get_header_str("Content-Length"), Some("75492"));
+        assert_eq!(resp.get_header_str("X-Sha256"), Some(hash.as_str()));
+        assert_eq!(
+            resp.get_header_str("Cache-Control"),
+            Some("private, no-store")
+        );
+        assert_eq!(resp.get_header_str("Accept-Ranges"), Some("bytes"));
+    }
+
+    #[test]
+    fn admin_blob_headers_expose_moderation_status_when_metadata_exists() {
+        let hash = "b".repeat(64);
+        let metadata = BlobMetadata {
+            sha256: hash.clone(),
+            size: 1234,
+            mime_type: "video/mp4".to_string(),
+            uploaded: "2026-04-14T00:00:00Z".to_string(),
+            owner: "c".repeat(64),
+            status: BlobStatus::AgeRestricted,
+            thumbnail: None,
+            moderation: None,
+            transcode_status: None,
+            transcode_error_code: None,
+            transcode_error_message: None,
+            transcode_last_attempt_at: None,
+            transcode_retry_after: None,
+            transcode_attempt_count: 0,
+            transcode_terminal: false,
+            dim: None,
+            transcript_status: None,
+            transcript_error_code: None,
+            transcript_error_message: None,
+            transcript_last_attempt_at: None,
+            transcript_retry_after: None,
+            transcript_attempt_count: 0,
+            transcript_terminal: false,
+        };
+        let mut resp = Response::from_status(StatusCode::OK);
+
+        set_admin_blob_response_headers(&mut resp, Some(&metadata), &hash);
+
+        assert_eq!(resp.get_header_str("Content-Type"), Some("video/mp4"));
+        assert_eq!(resp.get_header_str("Content-Length"), Some("1234"));
+        assert_eq!(
+            resp.get_header_str("X-Moderation-Status"),
+            Some("AgeRestricted")
+        );
     }
 }
 
@@ -705,34 +766,36 @@ pub fn handle_admin_blob_detail(req: Request, hash: &str) -> Result<Response> {
     json_response(StatusCode::OK, &metadata)
 }
 
-/// GET /admin/api/blob/{hash}/content - Serve blob content regardless of moderation status
-/// Used by divine-moderation-service admin proxy for moderator review of flagged content
-pub fn handle_admin_blob_content(req: Request, hash: &str) -> Result<Response> {
-    validate_admin_auth(&req)?;
-
-    // Verify blob exists in metadata (but don't check moderation status)
-    let metadata =
-        get_blob_metadata(hash)?.ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
-
-    // Get Range header for partial content support
-    let range = req
-        .get_header(header::RANGE)
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string());
-
-    // Download from storage (GCS with CDN fallback) — no moderation gating
-    let result = download_blob_with_fallback(hash, range.as_deref())?;
-    let mut resp = result.response;
-
-    // Don't overwrite Content-Length for 206 Partial Content (backend sets it)
+fn set_admin_blob_response_headers(
+    resp: &mut Response,
+    metadata: Option<&BlobMetadata>,
+    hash: &str,
+) {
     let is_partial = resp.get_status() == StatusCode::PARTIAL_CONTENT;
 
-    resp.set_header("Content-Type", &metadata.mime_type);
-    resp.set_header("X-Sha256", &metadata.sha256);
-    resp.set_header("X-Moderation-Status", &format!("{:?}", metadata.status));
-    if !is_partial {
-        resp.set_header("Content-Length", metadata.size.to_string());
+    if let Some(metadata) = metadata {
+        resp.set_header("Content-Type", &metadata.mime_type);
+        resp.set_header("X-Sha256", &metadata.sha256);
+        resp.set_header("X-Moderation-Status", &format!("{:?}", metadata.status));
+        if !is_partial {
+            resp.set_header("Content-Length", metadata.size.to_string());
+        }
+    } else {
+        if !is_partial {
+            let content_length = resp
+                .get_header_str("content-length")
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    resp.get_header_str("x-goog-stored-content-length")
+                        .map(|s| s.to_string())
+                });
+            if let Some(content_length) = content_length {
+                resp.set_header("Content-Length", &content_length);
+            }
+        }
+        resp.set_header("X-Sha256", hash);
     }
+
     resp.set_header("Cache-Control", "private, no-store");
     resp.set_header("Accept-Ranges", "bytes");
 
@@ -743,6 +806,27 @@ pub fn handle_admin_blob_content(req: Request, hash: &str) -> Result<Response> {
         "Access-Control-Allow-Headers",
         "Authorization, Content-Type, Range",
     );
+}
+
+/// GET /admin/api/blob/{hash}/content - Serve blob content regardless of moderation status
+/// Used by divine-moderation-service admin proxy for moderator review of flagged content
+pub fn handle_admin_blob_content(req: Request, hash: &str) -> Result<Response> {
+    validate_admin_auth(&req)?;
+
+    // Metadata is preferred for headers/status, but storage remains the source of truth
+    // for older blobs that were preserved in GCS without a surviving KV row.
+    let metadata = get_blob_metadata(hash)?;
+
+    // Get Range header for partial content support
+    let range = req
+        .get_header(header::RANGE)
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
+    // Download from storage (GCS with CDN fallback) — no moderation gating
+    let result = download_blob_with_fallback(hash, range.as_deref())?;
+    let mut resp = result.response;
+    set_admin_blob_response_headers(&mut resp, metadata.as_ref(), hash);
 
     Ok(resp)
 }
