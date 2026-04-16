@@ -16,6 +16,28 @@ pub const NIP98_MAX_AGE_SECS: u64 = 60;
 /// Public hostname clients use for media viewer requests.
 pub const PUBLIC_MEDIA_HOST: &str = "media.divine.video";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewerAuthState {
+    Missing,
+    InvalidScheme,
+    ParseFailed,
+    RequestUrlInvalid,
+    ValidationFailed,
+    Valid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewerAuthDiagnostics {
+    pub method: String,
+    pub path: String,
+    pub host: Option<String>,
+    pub auth_present: bool,
+    pub auth_state: ViewerAuthState,
+    pub normalized_request_url: Option<String>,
+    pub viewer_pubkey: Option<String>,
+    pub auth_error: Option<String>,
+}
+
 pub fn parse_auth_header(auth_header: &str) -> Result<BlossomAuthEvent> {
     let base64_event = auth_header.strip_prefix("Nostr ").ok_or_else(|| {
         BlossomError::AuthInvalid("Authorization must start with 'Nostr '".into())
@@ -142,8 +164,75 @@ pub fn public_request_url(request_url: &str, host_override: Option<&str>) -> Res
     Ok(format!("{}{}{}", scheme, effective_authority, suffix))
 }
 
+pub fn diagnose_viewer_auth_request(
+    method: &str,
+    path: &str,
+    host: Option<&str>,
+    request_url: &str,
+    auth_header: Option<&str>,
+    now: u64,
+) -> ViewerAuthDiagnostics {
+    let host = host.map(|s| s.to_string());
+    let mut diagnostics = ViewerAuthDiagnostics {
+        method: method.to_string(),
+        path: path.to_string(),
+        host: host.clone(),
+        auth_present: auth_header.is_some(),
+        auth_state: ViewerAuthState::Missing,
+        normalized_request_url: None,
+        viewer_pubkey: None,
+        auth_error: None,
+    };
+
+    let Some(auth_header) = auth_header else {
+        return diagnostics;
+    };
+
+    let event = match parse_auth_header(auth_header) {
+        Ok(event) => event,
+        Err(err) => {
+            diagnostics.auth_state = classify_parse_error(err.message());
+            diagnostics.auth_error = Some(err.message().to_string());
+            return diagnostics;
+        }
+    };
+
+    let request_url = match public_request_url(request_url, host.as_deref()) {
+        Ok(url) => {
+            diagnostics.normalized_request_url = Some(url.clone());
+            url
+        }
+        Err(err) => {
+            diagnostics.auth_state = ViewerAuthState::RequestUrlInvalid;
+            diagnostics.auth_error = Some(err.message().to_string());
+            return diagnostics;
+        }
+    };
+
+    match validate_viewer_event(&event, method, &request_url, now) {
+        Ok(()) => {
+            diagnostics.auth_state = ViewerAuthState::Valid;
+            diagnostics.viewer_pubkey = Some(event.pubkey);
+        }
+        Err(err) => {
+            diagnostics.auth_state = ViewerAuthState::ValidationFailed;
+            diagnostics.auth_error = Some(err.message().to_string());
+        }
+    }
+
+    diagnostics
+}
+
 fn is_internal_edge_host(authority: &str) -> bool {
     authority.ends_with(".edgecompute.app")
+}
+
+fn classify_parse_error(error_message: &str) -> ViewerAuthState {
+    if error_message == "Authorization must start with 'Nostr '" {
+        ViewerAuthState::InvalidScheme
+    } else {
+        ViewerAuthState::ParseFailed
+    }
 }
 
 fn get_tag_value<'a>(event: &'a BlossomAuthEvent, tag_name: &str) -> Option<&'a str> {
@@ -339,8 +428,8 @@ mod tests {
     fn public_request_url_rewrites_internal_edge_host_to_public_host() {
         let internal =
             "https://separately-robust-roughy.edgecompute.app/4a31d696c2275e60dbfe2359e6ff006f78a30f5df11c7290233a7860c4e8c31e";
-        let public = public_request_url(internal, None)
-            .expect("public host rewrite should succeed");
+        let public =
+            public_request_url(internal, None).expect("public host rewrite should succeed");
 
         assert_eq!(public, TEST_URL);
     }
@@ -351,7 +440,10 @@ mod tests {
         let public = public_request_url(internal, Some("media.divine.video:8443"))
             .expect("public host rewrite should succeed");
 
-        assert_eq!(public, "https://media.divine.video:8443/path/to/blob?foo=bar");
+        assert_eq!(
+            public,
+            "https://media.divine.video:8443/path/to/blob?foo=bar"
+        );
     }
 
     #[test]
@@ -362,6 +454,106 @@ mod tests {
             .expect("edge host override should fall back to public media host");
 
         assert_eq!(public, TEST_URL);
+    }
+
+    #[test]
+    fn viewer_auth_diagnostics_reports_missing_authorization() {
+        let diagnostics = diagnose_viewer_auth_request(
+            "GET",
+            "/blob",
+            Some("media.divine.video"),
+            TEST_URL,
+            None,
+            1_000,
+        );
+
+        assert!(!diagnostics.auth_present);
+        assert_eq!(diagnostics.auth_state, ViewerAuthState::Missing);
+        assert_eq!(diagnostics.viewer_pubkey.as_deref(), None);
+    }
+
+    #[test]
+    fn viewer_auth_diagnostics_reports_invalid_scheme() {
+        let diagnostics = diagnose_viewer_auth_request(
+            "GET",
+            "/blob",
+            Some("media.divine.video"),
+            TEST_URL,
+            Some("Bearer nope"),
+            1_000,
+        );
+
+        assert!(diagnostics.auth_present);
+        assert_eq!(diagnostics.auth_state, ViewerAuthState::InvalidScheme);
+        assert_eq!(
+            diagnostics.auth_error.as_deref(),
+            Some("Authorization must start with 'Nostr '")
+        );
+    }
+
+    #[test]
+    fn viewer_auth_diagnostics_reports_valid_nip98_request() {
+        let event = signed_event(
+            NIP98_AUTH_KIND,
+            vec![
+                vec!["u".into(), TEST_URL.into()],
+                vec!["method".into(), "GET".into()],
+            ],
+            1_000,
+        );
+        let auth_header = format!(
+            "Nostr {}",
+            BASE64.encode(serde_json::to_vec(&event).expect("serialize auth event"))
+        );
+
+        let diagnostics = diagnose_viewer_auth_request(
+            "GET",
+            "/blob",
+            Some("media.divine.video"),
+            TEST_URL,
+            Some(&auth_header),
+            1_000,
+        );
+
+        assert!(diagnostics.auth_present);
+        assert_eq!(diagnostics.auth_state, ViewerAuthState::Valid);
+        assert!(diagnostics.viewer_pubkey.is_some());
+        assert_eq!(
+            diagnostics.normalized_request_url.as_deref(),
+            Some(TEST_URL)
+        );
+    }
+
+    #[test]
+    fn viewer_auth_diagnostics_reports_validation_failure() {
+        let event = signed_event(
+            NIP98_AUTH_KIND,
+            vec![
+                vec!["u".into(), TEST_URL.into()],
+                vec!["method".into(), "HEAD".into()],
+            ],
+            1_000,
+        );
+        let auth_header = format!(
+            "Nostr {}",
+            BASE64.encode(serde_json::to_vec(&event).expect("serialize auth event"))
+        );
+
+        let diagnostics = diagnose_viewer_auth_request(
+            "GET",
+            "/blob",
+            Some("media.divine.video"),
+            TEST_URL,
+            Some(&auth_header),
+            1_000,
+        );
+
+        assert!(diagnostics.auth_present);
+        assert_eq!(diagnostics.auth_state, ViewerAuthState::ValidationFailed);
+        assert_eq!(
+            diagnostics.auth_error.as_deref(),
+            Some("Method mismatch: expected GET, got HEAD")
+        );
     }
 
     fn signed_event(kind: u32, tags: Vec<Vec<String>>, created_at: u64) -> BlossomAuthEvent {

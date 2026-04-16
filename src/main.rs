@@ -7,11 +7,12 @@ mod auth;
 mod blossom;
 mod delete_policy;
 mod error;
+mod media_auth_log;
 mod metadata;
 mod storage;
 mod viewer_auth;
 
-use crate::auth::{validate_auth, validate_hash_match, viewer_pubkey};
+use crate::auth::{diagnose_viewer_auth, validate_auth, validate_hash_match, viewer_pubkey};
 use crate::blossom::{
     is_audio_path, is_hash_path, is_transcribable_mime_type, is_video_mime_type, parse_audio_path,
     parse_hash_from_path, parse_thumbnail_path, AudioMapping, AuthAction, BlobAccess,
@@ -21,6 +22,7 @@ use crate::blossom::{
 };
 use crate::delete_policy::{plan_user_delete, soft_delete_blob, DeletePlan};
 use crate::error::{BlossomError, Result};
+use crate::media_auth_log::format_media_auth_log;
 use crate::metadata::{
     add_to_audio_source_refs, add_to_blob_refs, add_to_recent_index, add_to_user_index,
     add_to_user_list, delete_audio_mapping, delete_audio_source_refs, delete_auth_events,
@@ -39,6 +41,7 @@ use crate::storage::{
     trigger_audit_anonymize, trigger_cloud_run_bulk_delete, trigger_cloud_run_delete_blob,
     upload_blob, write_audit_log,
 };
+use crate::viewer_auth::{ViewerAuthDiagnostics, ViewerAuthState};
 use fastly_blossom::resumable_complete::parse_resumable_complete_request_body;
 
 use fastly::cache::simple as simple_cache;
@@ -187,7 +190,9 @@ fn handle_request(req: Request) -> Result<Response> {
             admin::handle_admin_blob_content(req, hash)
         }
         // Admin bypass for transcoded quality variants (720p.mp4, 480p.mp4, etc.)
-        (Method::GET, p) if p.starts_with("/admin/api/blob/") && is_admin_quality_variant_path(p) => {
+        (Method::GET, p)
+            if p.starts_with("/admin/api/blob/") && is_admin_quality_variant_path(p) =>
+        {
             handle_admin_quality_variant(req, p)
         }
         // Admin bypass for HLS content (master.m3u8, segments, etc.)
@@ -223,6 +228,34 @@ enum AudioReuseAvailability {
     Allowed,
     Denied,
     LookupUnavailable,
+}
+
+fn media_viewer_context(
+    req: &Request,
+    route: &str,
+) -> Result<(Option<String>, ViewerAuthDiagnostics)> {
+    let diagnostics = diagnose_viewer_auth(req)?;
+
+    match diagnostics.auth_state {
+        ViewerAuthState::Missing => Ok((None, diagnostics)),
+        ViewerAuthState::Valid => Ok((diagnostics.viewer_pubkey.clone(), diagnostics)),
+        _ => {
+            eprintln!(
+                "{}",
+                format_media_auth_log(route, &diagnostics, "auth_invalid")
+            );
+            Err(BlossomError::AuthInvalid(
+                diagnostics
+                    .auth_error
+                    .clone()
+                    .unwrap_or_else(|| "Invalid viewer authorization".into()),
+            ))
+        }
+    }
+}
+
+fn log_media_outcome(route: &str, diagnostics: &ViewerAuthDiagnostics, outcome: &str) {
+    eprintln!("{}", format_media_auth_log(route, diagnostics, outcome));
 }
 
 fn classify_audio_reuse_availability(result: &Result<bool>) -> AudioReuseAvailability {
@@ -386,9 +419,10 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         // Check parent video's moderation status - thumbnails inherit video access rules
         let mut is_restricted = false;
         if let Ok(Some(meta)) = get_blob_metadata(video_hash) {
-            let requester_pk = viewer_pubkey(&req)?;
+            let (requester_pk, auth_diagnostics) = media_viewer_context(&req, "thumbnail")?;
             match meta.access_for(requester_pk.as_deref(), is_admin) {
                 BlobAccess::Allowed => {
+                    log_media_outcome("thumbnail", &auth_diagnostics, "allowed");
                     // Authenticated access to restricted/age-restricted thumbnails
                     // must stay private in cache below.
                     if meta.status.requires_private_cache() {
@@ -396,9 +430,11 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
                     }
                 }
                 BlobAccess::NotFound => {
+                    log_media_outcome("thumbnail", &auth_diagnostics, "not_found");
                     return Err(BlossomError::NotFound("Blob not found".into()));
                 }
                 BlobAccess::AgeGated => {
+                    log_media_outcome("thumbnail", &auth_diagnostics, "age_gated");
                     return Err(BlossomError::AuthRequired("age_restricted".into()));
                 }
             }
@@ -451,13 +487,15 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
     }
 
     if let Some(ref meta) = metadata {
-        let requester_pk = viewer_pubkey(&req)?;
+        let (requester_pk, auth_diagnostics) = media_viewer_context(&req, "blob")?;
         match meta.access_for(requester_pk.as_deref(), is_admin) {
-            BlobAccess::Allowed => {}
+            BlobAccess::Allowed => log_media_outcome("blob", &auth_diagnostics, "allowed"),
             BlobAccess::NotFound => {
+                log_media_outcome("blob", &auth_diagnostics, "not_found");
                 return Err(BlossomError::NotFound("Blob not found".into()));
             }
             BlobAccess::AgeGated => {
+                log_media_outcome("blob", &auth_diagnostics, "age_gated");
                 return Err(BlossomError::AuthRequired("age_restricted".into()));
             }
         }
@@ -628,13 +666,15 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
     let is_admin = admin::validate_bearer_token(&req).is_ok();
 
     if let Some(ref meta) = metadata {
-        let requester_pk = viewer_pubkey(&req)?;
+        let (requester_pk, auth_diagnostics) = media_viewer_context(&req, "hls_master")?;
         match meta.access_for(requester_pk.as_deref(), is_admin) {
-            BlobAccess::Allowed => {}
+            BlobAccess::Allowed => log_media_outcome("hls_master", &auth_diagnostics, "allowed"),
             BlobAccess::NotFound => {
+                log_media_outcome("hls_master", &auth_diagnostics, "not_found");
                 return Err(BlossomError::NotFound("Content not found".into()));
             }
             BlobAccess::AgeGated => {
+                log_media_outcome("hls_master", &auth_diagnostics, "age_gated");
                 return Err(BlossomError::AuthRequired("age_restricted".into()));
             }
         }
@@ -847,17 +887,20 @@ fn handle_get_hls_content(req: Request, path: &str) -> Result<Response> {
     let mut is_restricted = false;
 
     if let Ok(Some(ref meta)) = get_blob_metadata(&hash) {
-        let requester_pk = viewer_pubkey(&req)?;
+        let (requester_pk, auth_diagnostics) = media_viewer_context(&req, "hls_content")?;
         match meta.access_for(requester_pk.as_deref(), is_admin) {
             BlobAccess::Allowed => {
+                log_media_outcome("hls_content", &auth_diagnostics, "allowed");
                 if meta.status.requires_private_cache() {
                     is_restricted = true;
                 }
             }
             BlobAccess::NotFound => {
+                log_media_outcome("hls_content", &auth_diagnostics, "not_found");
                 return Err(BlossomError::NotFound("Blob not found".into()));
             }
             BlobAccess::AgeGated => {
+                log_media_outcome("hls_content", &auth_diagnostics, "age_gated");
                 return Err(BlossomError::AuthRequired("age_restricted".into()));
             }
         }
@@ -1459,6 +1502,7 @@ fn derivative_failure_head_response(
 
 fn serve_transcript_by_hash(
     req: Option<&Request>,
+    route: &str,
     hash: &str,
     can_trigger: bool,
 ) -> Result<Response> {
@@ -1470,14 +1514,31 @@ fn serve_transcript_by_hash(
         .map(|r| admin::validate_bearer_token(r).is_ok())
         .unwrap_or(false);
 
-    let requester_pk = match req {
-        Some(request) => viewer_pubkey(request)?,
-        None => None,
+    let (requester_pk, auth_diagnostics) = match req {
+        Some(request) => {
+            let (requester_pk, diagnostics) = media_viewer_context(request, route)?;
+            (requester_pk, Some(diagnostics))
+        }
+        None => (None, None),
     };
     match metadata.access_for(requester_pk.as_deref(), is_admin) {
-        BlobAccess::Allowed => {}
-        BlobAccess::NotFound => return Err(BlossomError::NotFound("Content not found".into())),
-        BlobAccess::AgeGated => return Err(BlossomError::AuthRequired("age_restricted".into())),
+        BlobAccess::Allowed => {
+            if let Some(ref diagnostics) = auth_diagnostics {
+                log_media_outcome(route, diagnostics, "allowed");
+            }
+        }
+        BlobAccess::NotFound => {
+            if let Some(ref diagnostics) = auth_diagnostics {
+                log_media_outcome(route, diagnostics, "not_found");
+            }
+            return Err(BlossomError::NotFound("Content not found".into()));
+        }
+        BlobAccess::AgeGated => {
+            if let Some(ref diagnostics) = auth_diagnostics {
+                log_media_outcome(route, diagnostics, "age_gated");
+            }
+            return Err(BlossomError::AuthRequired("age_restricted".into()));
+        }
     }
 
     if !is_transcribable_mime_type(&metadata.mime_type) {
@@ -1585,7 +1646,7 @@ fn serve_transcript_by_hash(
 fn handle_get_transcript(req: Request, path: &str) -> Result<Response> {
     let hash = parse_transcript_path(path)
         .ok_or_else(|| BlossomError::BadRequest("Invalid transcript path".into()))?;
-    serve_transcript_by_hash(Some(&req), &hash, true)
+    serve_transcript_by_hash(Some(&req), "transcript_file", &hash, true)
 }
 
 /// HEAD /<sha256>/VTT - Check transcript existence/status
@@ -1599,7 +1660,7 @@ fn handle_head_transcript(path: &str) -> Result<Response> {
 fn handle_get_transcript_file(req: Request, path: &str) -> Result<Response> {
     let hash = parse_vtt_file_path(path)
         .ok_or_else(|| BlossomError::BadRequest("Invalid VTT path".into()))?;
-    serve_transcript_by_hash(Some(&req), &hash, true)
+    serve_transcript_by_hash(Some(&req), "transcript", &hash, true)
 }
 
 /// HEAD /<sha256>.vtt - Check transcript file URL status
@@ -1914,13 +1975,17 @@ fn handle_get_subtitle_by_hash(req: Request, path: &str) -> Result<Response> {
     // age-restricted videos surface as 401 (age gate) instead of 404.
     let is_admin = admin::validate_bearer_token(&req).is_ok();
     if let Some(meta) = get_blob_metadata(&hash)? {
-        let requester_pk = viewer_pubkey(&req)?;
+        let (requester_pk, auth_diagnostics) = media_viewer_context(&req, "subtitle_by_hash")?;
         match meta.access_for(requester_pk.as_deref(), is_admin) {
-            BlobAccess::Allowed => {}
+            BlobAccess::Allowed => {
+                log_media_outcome("subtitle_by_hash", &auth_diagnostics, "allowed")
+            }
             BlobAccess::NotFound => {
+                log_media_outcome("subtitle_by_hash", &auth_diagnostics, "not_found");
                 return Err(BlossomError::NotFound("Video hash not found".into()));
             }
             BlobAccess::AgeGated => {
+                log_media_outcome("subtitle_by_hash", &auth_diagnostics, "age_gated");
                 return Err(BlossomError::AuthRequired("age_restricted".into()));
             }
         }
@@ -1991,12 +2056,18 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
     //    the caller — banned/deleted/shadow-restricted source -> 404; anonymous
     //    age-restricted source -> 401 (age gate). Any authenticated viewer may access
     //    age-restricted content, while shadow-restricted content stays owner/admin only.
-    let requester_pk = viewer_pubkey(&req)?;
+    let (requester_pk, auth_diagnostics) = media_viewer_context(&req, "audio")?;
     let is_admin = admin::validate_bearer_token(&req).is_ok();
     match metadata.access_for(requester_pk.as_deref(), is_admin) {
-        BlobAccess::Allowed => {}
-        BlobAccess::NotFound => return Err(BlossomError::NotFound("Blob not found".into())),
-        BlobAccess::AgeGated => return Err(BlossomError::AuthRequired("age_restricted".into())),
+        BlobAccess::Allowed => log_media_outcome("audio", &auth_diagnostics, "allowed"),
+        BlobAccess::NotFound => {
+            log_media_outcome("audio", &auth_diagnostics, "not_found");
+            return Err(BlossomError::NotFound("Blob not found".into()));
+        }
+        BlobAccess::AgeGated => {
+            log_media_outcome("audio", &auth_diagnostics, "age_gated");
+            return Err(BlossomError::AuthRequired("age_restricted".into()));
+        }
     }
 
     // 3. Check Funnelcake permission
@@ -2226,13 +2297,17 @@ fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
     let is_admin = admin::validate_bearer_token(&req).is_ok();
     let metadata = get_blob_metadata(&hash)?;
     if let Some(ref meta) = metadata {
-        let requester_pk = viewer_pubkey(&req)?;
+        let (requester_pk, auth_diagnostics) = media_viewer_context(&req, "quality_variant")?;
         match meta.access_for(requester_pk.as_deref(), is_admin) {
-            BlobAccess::Allowed => {}
+            BlobAccess::Allowed => {
+                log_media_outcome("quality_variant", &auth_diagnostics, "allowed")
+            }
             BlobAccess::NotFound => {
+                log_media_outcome("quality_variant", &auth_diagnostics, "not_found");
                 return Err(BlossomError::NotFound("Content not found".into()));
             }
             BlobAccess::AgeGated => {
+                log_media_outcome("quality_variant", &auth_diagnostics, "age_gated");
                 return Err(BlossomError::AuthRequired("age_restricted".into()));
             }
         }
@@ -2395,8 +2470,8 @@ fn handle_admin_quality_variant(req: Request, path: &str) -> Result<Response> {
         .ok_or_else(|| BlossomError::BadRequest("Invalid admin quality variant path".into()))?;
 
     // Verify blob exists (but don't check moderation status)
-    let meta = get_blob_metadata(&hash)?
-        .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
+    let meta =
+        get_blob_metadata(&hash)?.ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
 
     let gcs_path = format!("{}/hls/{}", hash, ts_filename);
 
@@ -2443,14 +2518,14 @@ fn handle_admin_quality_variant(req: Request, path: &str) -> Result<Response> {
                 meta.transcode_terminal,
                 unix_timestamp_secs(),
             ) {
-                TranscodeFetchAction::Terminal => {
-                    Ok(derivative_failure_response(
-                        meta.transcode_error_code.as_deref(),
-                        meta.transcode_error_message.as_deref(),
-                        "Video transcoding permanently failed",
-                    ))
-                }
-                TranscodeFetchAction::Accepted { retry_after_secs, .. } => {
+                TranscodeFetchAction::Terminal => Ok(derivative_failure_response(
+                    meta.transcode_error_code.as_deref(),
+                    meta.transcode_error_message.as_deref(),
+                    "Video transcoding permanently failed",
+                )),
+                TranscodeFetchAction::Accepted {
+                    retry_after_secs, ..
+                } => {
                     let mut resp = Response::from_status(StatusCode::ACCEPTED);
                     resp.set_header("Retry-After", retry_after_secs.to_string());
                     resp.set_header("Content-Type", "application/json");
@@ -2459,7 +2534,9 @@ fn handle_admin_quality_variant(req: Request, path: &str) -> Result<Response> {
                     add_cors_headers(&mut resp);
                     Ok(resp)
                 }
-                TranscodeFetchAction::Trigger { retry_after_secs, .. } => {
+                TranscodeFetchAction::Trigger {
+                    retry_after_secs, ..
+                } => {
                     use crate::metadata::update_transcode_status;
                     let _ = update_transcode_status(&hash, TranscodeStatus::Processing);
                     let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
@@ -2467,7 +2544,9 @@ fn handle_admin_quality_variant(req: Request, path: &str) -> Result<Response> {
                     let mut resp = Response::from_status(StatusCode::ACCEPTED);
                     resp.set_header("Retry-After", retry_after_secs.to_string());
                     resp.set_header("Content-Type", "application/json");
-                    resp.set_body(r#"{"status":"processing","message":"Transcoding started, please retry"}"#);
+                    resp.set_body(
+                        r#"{"status":"processing","message":"Transcoding started, please retry"}"#,
+                    );
                     add_no_cache_headers(&mut resp);
                     add_cors_headers(&mut resp);
                     Ok(resp)
@@ -2489,7 +2568,9 @@ fn handle_admin_hls_content(req: Request, path: &str) -> Result<Response> {
         .ok_or_else(|| BlossomError::BadRequest("Invalid admin HLS path".into()))?;
     let parts: Vec<&str> = rest.splitn(3, '/').collect();
     if parts.len() < 3 || parts[1] != "hls" {
-        return Err(BlossomError::BadRequest("Invalid admin HLS path format".into()));
+        return Err(BlossomError::BadRequest(
+            "Invalid admin HLS path format".into(),
+        ));
     }
 
     let hash = parts[0];
@@ -2501,8 +2582,8 @@ fn handle_admin_hls_content(req: Request, path: &str) -> Result<Response> {
     let hash = hash.to_lowercase();
 
     // Verify blob exists (but don't check moderation status)
-    let meta = get_blob_metadata(&hash)?
-        .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
+    let meta =
+        get_blob_metadata(&hash)?.ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
 
     let gcs_path = format!("{}/hls/{}", hash, filename);
 
@@ -2537,16 +2618,22 @@ fn handle_admin_hls_content(req: Request, path: &str) -> Result<Response> {
                     meta.transcode_error_message.as_deref(),
                     "HLS generation failed for this blob",
                 )),
-                TranscodeFetchAction::Accepted { retry_after_secs, .. } => {
+                TranscodeFetchAction::Accepted {
+                    retry_after_secs, ..
+                } => {
                     let mut resp = Response::from_status(StatusCode::ACCEPTED);
                     resp.set_header("Retry-After", retry_after_secs.to_string());
                     resp.set_header("Content-Type", "application/json");
-                    resp.set_body(r#"{"status":"processing","message":"HLS transcoding in progress"}"#);
+                    resp.set_body(
+                        r#"{"status":"processing","message":"HLS transcoding in progress"}"#,
+                    );
                     add_no_cache_headers(&mut resp);
                     add_cors_headers(&mut resp);
                     Ok(resp)
                 }
-                TranscodeFetchAction::Trigger { retry_after_secs, .. } => {
+                TranscodeFetchAction::Trigger {
+                    retry_after_secs, ..
+                } => {
                     use crate::metadata::update_transcode_status;
                     let _ = update_transcode_status(&hash, TranscodeStatus::Processing);
                     let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
