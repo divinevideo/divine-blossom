@@ -20,7 +20,7 @@ use crate::blossom::{
     ResumableUploadInitRequest, ResumableUploadInitResponse, SubtitleJob, SubtitleJobCreateRequest,
     SubtitleJobStatus, TranscodeStatus, TranscriptStatus, UploadRequirements,
 };
-use crate::delete_policy::{plan_user_delete, soft_delete_blob, DeletePlan};
+use crate::delete_policy::{perform_physical_delete, plan_user_delete, soft_delete_blob, DeletePlan};
 use crate::error::{BlossomError, Result};
 use crate::media_auth_log::format_media_auth_log;
 use crate::metadata::{
@@ -4741,6 +4741,62 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
     // Validate sha256 format
     if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(BlossomError::BadRequest("Invalid sha256 format".into()));
+    }
+
+    // Creator-delete: special-case because DELETE needs soft_delete_blob's full
+    // index/user-list cleanup, not the bare update_blob_status the action-map
+    // match below provides for BAN/RESTRICT/etc.
+    if action.eq_ignore_ascii_case("DELETE") {
+        let metadata = get_blob_metadata(sha256)?
+            .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
+
+        let reason = payload["reason"]
+            .as_str()
+            .unwrap_or("Creator-initiated deletion via kind 5");
+
+        let meta_json = serde_json::to_string(&metadata).ok();
+        write_audit_log(
+            sha256,
+            "creator_delete",
+            &metadata.owner,
+            None,
+            meta_json.as_deref(),
+            Some(reason),
+        );
+
+        let physical_delete_enabled = fastly::config_store::ConfigStore::open("blossom_config")
+            .get("ENABLE_PHYSICAL_DELETE")
+            .as_deref()
+            == Some("true");
+
+        if physical_delete_enabled {
+            if let Err(e) = perform_physical_delete(sha256, &metadata, reason, false) {
+                eprintln!(
+                    "[CREATOR-DELETE] perform_physical_delete failed for {}: {}",
+                    sha256, e
+                );
+            }
+        } else {
+            if let Err(e) = soft_delete_blob(sha256, &metadata, reason, false) {
+                eprintln!(
+                    "[CREATOR-DELETE] soft_delete_blob failed for {}: {}",
+                    sha256, e
+                );
+                return Err(e);
+            }
+        }
+
+        let response = serde_json::json!({
+            "success": true,
+            "sha256": sha256,
+            "status": "deleted",
+            "physical_deleted": physical_delete_enabled,
+            "physical_delete_skipped": !physical_delete_enabled,
+            "message": "Creator-delete processed"
+        });
+        let mut resp = json_response(StatusCode::OK, &response);
+        add_cors_headers(&mut resp);
+        return Ok(resp);
     }
 
     // Map action to BlobStatus.
