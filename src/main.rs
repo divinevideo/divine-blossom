@@ -354,7 +354,7 @@ fn clear_stale_audio_mapping(source_hash: &str, audio_hash: &str) {
     }
 }
 
-fn cleanup_derived_audio_for_source(source_hash: &str) {
+pub(crate) fn cleanup_derived_audio_for_source(source_hash: &str) {
     let mapping = match get_audio_mapping(source_hash) {
         Ok(Some(mapping)) => mapping,
         Ok(None) => return,
@@ -3764,7 +3764,7 @@ fn handle_upload_requirements(req: Request) -> Result<Response> {
 /// Delete all GCS artifacts for a blob (thumbnail, HLS, VTT).
 /// The main blob itself is NOT deleted here (caller handles that).
 /// Best-effort: logs errors but never fails.
-fn delete_blob_gcs_artifacts(hash: &str) {
+pub(crate) fn delete_blob_gcs_artifacts(hash: &str) {
     // Thumbnail
     let _ = storage_delete(&format!("{}.jpg", hash));
 

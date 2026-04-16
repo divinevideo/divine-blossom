@@ -63,6 +63,22 @@ pub fn soft_delete_blob(
     Ok(())
 }
 
+/// Physical deletion: soft-delete (stops serving) + GCS byte removal.
+/// Metadata row is preserved (status=Deleted) for audit/support visibility.
+pub fn perform_physical_delete(
+    hash: &str,
+    metadata: &BlobMetadata,
+    reason: &str,
+    legal_hold: bool,
+) -> Result<()> {
+    soft_delete_blob(hash, metadata, reason, legal_hold)?;
+    crate::cleanup_derived_audio_for_source(hash);
+    let _ = crate::storage::delete_blob(hash);
+    crate::delete_blob_gcs_artifacts(hash);
+    crate::purge_vcl_cache(hash);
+    Ok(())
+}
+
 pub fn restore_soft_deleted_blob(
     hash: &str,
     metadata: &BlobMetadata,
