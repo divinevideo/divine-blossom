@@ -836,6 +836,8 @@ pub fn handle_admin_blob_content(req: Request, hash: &str) -> Result<Response> {
 struct ModerateRequest {
     sha256: String,
     action: String,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Deserialize)]
