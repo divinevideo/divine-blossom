@@ -2,13 +2,15 @@
 // ABOUTME: Provides stats, recent uploads, user lists, OAuth login, and moderation controls
 
 use crate::blossom::{BlobMetadata, BlobStatus, GlobalStats, RecentIndex};
-use crate::delete_policy::{parse_restore_status, restore_soft_deleted_blob};
+use crate::delete_policy::{
+    parse_restore_status, perform_physical_delete, restore_soft_deleted_blob, soft_delete_blob,
+};
 use crate::error::{BlossomError, Result};
 use crate::metadata::{
     get_blob_metadata, get_global_stats, get_recent_index, get_user_blobs, get_user_index,
     replace_global_stats, replace_recent_index, update_blob_status, update_stats_on_status_change,
 };
-use crate::storage::download_blob_with_fallback;
+use crate::storage::{download_blob_with_fallback, write_audit_log};
 use fastly::http::{header, Method, StatusCode};
 use fastly::kv_store::KVStore;
 use fastly::{Request, Response};
@@ -865,6 +867,69 @@ pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
     let metadata = get_blob_metadata(&moderate_req.sha256)?
         .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
     let old_status = metadata.status;
+
+    // Creator-delete: special-case because DELETE needs soft_delete_blob's full
+    // index/user-list cleanup, not the bare update_blob_status the action-map
+    // match provides for BAN/RESTRICT/etc.
+    if moderate_req.action.eq_ignore_ascii_case("DELETE") {
+        let reason = moderate_req
+            .reason
+            .as_deref()
+            .unwrap_or("Creator-initiated deletion via kind 5");
+
+        // Audit BEFORE destruction
+        let meta_json = serde_json::to_string(&metadata).ok();
+        write_audit_log(
+            &moderate_req.sha256,
+            "creator_delete",
+            &metadata.owner,
+            None,
+            meta_json.as_deref(),
+            Some(reason),
+        );
+
+        let physical_delete_enabled =
+            get_config("ENABLE_PHYSICAL_DELETE").as_deref() == Some("true");
+
+        if physical_delete_enabled {
+            if let Err(e) = perform_physical_delete(
+                &moderate_req.sha256,
+                &metadata,
+                reason,
+                false, // no legal hold for creator-delete
+            ) {
+                eprintln!(
+                    "[CREATOR-DELETE] perform_physical_delete failed for {}: {}. \
+                     Status may still be flipped to Deleted; bytes may remain.",
+                    moderate_req.sha256, e
+                );
+            }
+        } else {
+            // Flag off: soft-delete only
+            if let Err(e) = soft_delete_blob(
+                &moderate_req.sha256,
+                &metadata,
+                reason,
+                false,
+            ) {
+                eprintln!(
+                    "[CREATOR-DELETE] soft_delete_blob failed for {}: {}",
+                    moderate_req.sha256, e
+                );
+                return Err(e);
+            }
+        }
+
+        let response = serde_json::json!({
+            "success": true,
+            "sha256": moderate_req.sha256,
+            "old_status": format!("{:?}", old_status).to_lowercase(),
+            "new_status": "deleted",
+            "physical_deleted": physical_delete_enabled,
+            "physical_delete_skipped": !physical_delete_enabled
+        });
+        return json_response(StatusCode::OK, &response);
+    }
 
     // Map action to BlobStatus.
     //
