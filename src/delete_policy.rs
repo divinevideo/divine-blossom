@@ -266,4 +266,24 @@ mod tests {
         assert_eq!(body["old_status"], serde_json::json!("active"));
         assert_eq!(body["new_status"], serde_json::json!("deleted"));
     }
+
+    #[test]
+    fn response_builder_already_deleted_blob_idempotent_retry() {
+        // Scenario: caller retries DELETE on a blob that was already soft-deleted.
+        // handle_creator_delete returned Ok with old_status=Deleted (no change).
+        // physical_deleted reflects the retry's byte-delete outcome.
+        let outcome = CreatorDeleteOutcome {
+            old_status: BlobStatus::Deleted,
+            physical_delete_enabled: true,
+            physical_deleted: true,
+        };
+        let body = build_creator_delete_response(
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            &outcome,
+        );
+        assert_eq!(body["old_status"], serde_json::json!("deleted"));
+        assert_eq!(body["new_status"], serde_json::json!("deleted"));
+        assert_eq!(body["physical_deleted"], serde_json::json!(true));
+        assert_eq!(body["physical_delete_skipped"], serde_json::json!(false));
+    }
 }
