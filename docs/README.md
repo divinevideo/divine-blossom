@@ -8,6 +8,7 @@ This directory is the index for repository documentation. Current docs first, hi
 - [CLAUDE.md](../CLAUDE.md) — working notes for AI-assisted development
 - [OAUTH_SETUP.md](../OAUTH_SETUP.md) — OAuth configuration for admin UI
 - [CHANGELOG.md](../CHANGELOG.md) — release history
+- [docs/api/](api/) — cross-service API contracts (creator-delete, etc.)
 - [docs/runbooks/](runbooks/) — operational runbooks
 
 ## Historical
