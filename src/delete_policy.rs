@@ -320,29 +320,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn outcome_truth_table_matches_contract() {
-        // Pins the two reachable success outcomes the contract doc describes.
-        // Used as a readable enumeration of what downstream callers can expect.
-        let flag_off = CreatorDeleteOutcome {
-            old_status: BlobStatus::Active,
-            physical_delete_enabled: false,
-            physical_deleted: false,
-        };
-        assert!(!flag_off.physical_delete_enabled);
-        assert!(!flag_off.physical_deleted);
-
-        let flag_on_success = CreatorDeleteOutcome {
-            old_status: BlobStatus::Active,
-            physical_delete_enabled: true,
-            physical_deleted: true,
-        };
-        assert!(flag_on_success.physical_delete_enabled);
-        assert!(flag_on_success.physical_deleted);
-
-        // The (physical_delete_enabled=true, physical_deleted=false)
-        // combination is unreachable via handle_creator_delete's Ok path —
-        // byte-delete failure returns Err. No test case for it because it
-        // cannot be produced by the helper.
-    }
 }
