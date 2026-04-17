@@ -233,12 +233,27 @@ Blossom auth events (`kind 24242`):
 Send as: `Authorization: Nostr <base64_encoded_signed_event>`
 
 Viewer/list requests additionally accept valid NIP-98 HTTP auth (`kind 27235`)
-for the exact request URL and method. This is used to identify the caller's
-pubkey on media routes. `age_restricted` blobs are served to any authenticated
-viewer and return `401 {"error":"age_restricted"}` to anonymous requests.
-`restricted` blobs remain shadow-banned and only serve to the owner or an admin.
-Blossom does not currently read any hosted-session age-verification claim or
-external viewer adult-verification service when serving media.
+for the exact request URL and method. Protected blob/media GET routes also
+accept Blossom GET auth (`kind 24242`) with:
+
+```json
+{
+  "kind": 24242,
+  "tags": [
+    ["t", "get"],
+    ["x", "<sha256>"],
+    ["expiration", "<unix_timestamp>"]
+  ]
+}
+```
+
+If multiple `Authorization` headers are present, viewer auth succeeds when any
+valid NIP-98 or Blossom GET header matches the request. `age_restricted` blobs
+are served to any authenticated viewer and return `401 {"error":"age_restricted"}`
+to anonymous requests. `restricted` blobs remain shadow-banned and only serve
+to the owner or an admin. Blossom does not currently read any hosted-session
+age-verification claim or external viewer adult-verification service when
+serving media.
 
 ## License
 

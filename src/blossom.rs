@@ -420,6 +420,7 @@ pub struct BlossomAuthEvent {
 /// Blossom authorization action types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthAction {
+    Get,
     Upload,
     Delete,
     List,
@@ -431,6 +432,7 @@ impl BlossomAuthEvent {
         for tag in &self.tags {
             if tag.len() >= 2 && tag[0] == "t" {
                 return match tag[1].as_str() {
+                    "get" => Some(AuthAction::Get),
                     "upload" => Some(AuthAction::Upload),
                     "delete" => Some(AuthAction::Delete),
                     "list" => Some(AuthAction::List),
@@ -1242,11 +1244,17 @@ mod tests {
             pubkey: "a".repeat(64),
             created_at: 0,
             kind: 24242,
-            tags: vec![vec!["t".into(), "upload".into()]],
+            tags: vec![vec!["t".into(), "get".into()]],
             content: String::new(),
             sig: "b".repeat(128),
         };
-        assert_eq!(event.get_action(), Some(AuthAction::Upload));
+        assert_eq!(event.get_action(), Some(AuthAction::Get));
+
+        let upload_event = BlossomAuthEvent {
+            tags: vec![vec!["t".into(), "upload".into()]],
+            ..event.clone()
+        };
+        assert_eq!(upload_event.get_action(), Some(AuthAction::Upload));
 
         let delete_event = BlossomAuthEvent {
             tags: vec![vec!["t".into(), "delete".into()]],

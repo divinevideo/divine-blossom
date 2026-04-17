@@ -82,6 +82,25 @@ pub fn validate_blossom_event(
     validate_event_integrity(event)
 }
 
+pub fn validate_blossom_get_event(
+    event: &BlossomAuthEvent,
+    expected_hash: &str,
+    now: u64,
+) -> Result<()> {
+    validate_blossom_event(event, AuthAction::Get, now)?;
+
+    let event_hash = get_tag_value(event, "x")
+        .ok_or_else(|| BlossomError::AuthInvalid("Missing x tag".into()))?;
+    if !event_hash.eq_ignore_ascii_case(expected_hash) {
+        return Err(BlossomError::AuthInvalid(format!(
+            "Hash mismatch: expected {}, got {}",
+            expected_hash, event_hash
+        )));
+    }
+
+    Ok(())
+}
+
 pub fn validate_nip98_event(
     event: &BlossomAuthEvent,
     request_method: &str,
@@ -138,6 +157,46 @@ pub fn validate_viewer_event(
             BLOSSOM_AUTH_KIND, NIP98_AUTH_KIND, kind
         ))),
     }
+}
+
+pub fn validate_blob_viewer_event(
+    event: &BlossomAuthEvent,
+    request_method: &str,
+    request_url: &str,
+    expected_hash: &str,
+    now: u64,
+) -> Result<()> {
+    match event.kind {
+        BLOSSOM_AUTH_KIND => validate_blossom_get_event(event, expected_hash, now),
+        NIP98_AUTH_KIND => validate_nip98_event(event, request_method, request_url, now),
+        kind => Err(BlossomError::AuthInvalid(format!(
+            "Invalid event kind: expected {} or {}, got {}",
+            BLOSSOM_AUTH_KIND, NIP98_AUTH_KIND, kind
+        ))),
+    }
+}
+
+pub fn authenticate_generic_viewer(
+    auth_headers: &[&str],
+    request_method: &str,
+    request_url: &str,
+    now: u64,
+) -> Result<BlossomAuthEvent> {
+    authenticate_viewer(auth_headers, |event| {
+        validate_viewer_event(event, request_method, request_url, now)
+    })
+}
+
+pub fn authenticate_blob_viewer(
+    auth_headers: &[&str],
+    request_method: &str,
+    request_url: &str,
+    expected_hash: &str,
+    now: u64,
+) -> Result<BlossomAuthEvent> {
+    authenticate_viewer(auth_headers, |event| {
+        validate_blob_viewer_event(event, request_method, request_url, expected_hash, now)
+    })
 }
 
 pub fn public_request_url(request_url: &str, host_override: Option<&str>) -> Result<String> {
@@ -245,6 +304,38 @@ fn get_tag_value<'a>(event: &'a BlossomAuthEvent, tag_name: &str) -> Option<&'a 
     })
 }
 
+fn authenticate_viewer<F>(auth_headers: &[&str], validator: F) -> Result<BlossomAuthEvent>
+where
+    F: Fn(&BlossomAuthEvent) -> Result<()>,
+{
+    let mut parsed_events = Vec::new();
+    let mut first_error: Option<BlossomError> = None;
+
+    for auth_header in auth_headers {
+        match parse_auth_header(auth_header) {
+            Ok(event) => parsed_events.push(event),
+            Err(err) if first_error.is_none() => first_error = Some(err),
+            Err(_) => {}
+        }
+    }
+
+    for preferred_kind in [NIP98_AUTH_KIND, BLOSSOM_AUTH_KIND] {
+        for event in parsed_events
+            .iter()
+            .filter(|event| event.kind == preferred_kind)
+        {
+            match validator(event) {
+                Ok(()) => return Ok(event.clone()),
+                Err(err) if first_error.is_none() => first_error = Some(err),
+                Err(_) => {}
+            }
+        }
+    }
+
+    Err(first_error
+        .unwrap_or_else(|| BlossomError::AuthInvalid("Authorization header required".into())))
+}
+
 fn validate_event_integrity(event: &BlossomAuthEvent) -> Result<()> {
     let computed_id = compute_event_id(event)?;
     if computed_id != event.id {
@@ -329,6 +420,250 @@ mod tests {
         );
 
         assert!(validate_viewer_event(&event, "GET", TEST_URL, 1_100).is_ok());
+    }
+
+    #[test]
+    fn blossom_get_auth_is_valid_for_blob_viewer_requests() {
+        let event = signed_event(
+            BLOSSOM_AUTH_KIND,
+            vec![
+                vec!["t".into(), "get".into()],
+                vec![
+                    "x".into(),
+                    "4a31d696c2275e60dbfe2359e6ff006f78a30f5df11c7290233a7860c4e8c31e".into(),
+                ],
+                vec!["expiration".into(), "1300".into()],
+            ],
+            1_000,
+        );
+
+        assert!(validate_blob_viewer_event(
+            &event,
+            "GET",
+            TEST_URL,
+            "4a31d696c2275e60dbfe2359e6ff006f78a30f5df11c7290233a7860c4e8c31e",
+            1_100,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn blossom_get_auth_rejects_missing_hash() {
+        let event = signed_event(
+            BLOSSOM_AUTH_KIND,
+            vec![
+                vec!["t".into(), "get".into()],
+                vec!["expiration".into(), "1300".into()],
+            ],
+            1_000,
+        );
+
+        let error = validate_blob_viewer_event(
+            &event,
+            "GET",
+            TEST_URL,
+            "4a31d696c2275e60dbfe2359e6ff006f78a30f5df11c7290233a7860c4e8c31e",
+            1_100,
+        )
+        .expect_err("missing x tag should fail");
+        assert_eq!(error.message(), "Missing x tag");
+    }
+
+    #[test]
+    fn blossom_get_auth_rejects_hash_mismatch() {
+        let event = signed_event(
+            BLOSSOM_AUTH_KIND,
+            vec![
+                vec!["t".into(), "get".into()],
+                vec![
+                    "x".into(),
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                ],
+                vec!["expiration".into(), "1300".into()],
+            ],
+            1_000,
+        );
+
+        let error = validate_blob_viewer_event(
+            &event,
+            "GET",
+            TEST_URL,
+            "4a31d696c2275e60dbfe2359e6ff006f78a30f5df11c7290233a7860c4e8c31e",
+            1_100,
+        )
+        .expect_err("hash mismatch should fail");
+        assert_eq!(
+            error.message(),
+            "Hash mismatch: expected 4a31d696c2275e60dbfe2359e6ff006f78a30f5df11c7290233a7860c4e8c31e, got aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+    }
+
+    #[test]
+    fn blossom_get_auth_rejects_wrong_action() {
+        let event = signed_event(
+            BLOSSOM_AUTH_KIND,
+            vec![
+                vec!["t".into(), "list".into()],
+                vec![
+                    "x".into(),
+                    "4a31d696c2275e60dbfe2359e6ff006f78a30f5df11c7290233a7860c4e8c31e".into(),
+                ],
+                vec!["expiration".into(), "1300".into()],
+            ],
+            1_000,
+        );
+
+        let error = validate_blob_viewer_event(
+            &event,
+            "GET",
+            TEST_URL,
+            "4a31d696c2275e60dbfe2359e6ff006f78a30f5df11c7290233a7860c4e8c31e",
+            1_100,
+        )
+        .expect_err("wrong action should fail");
+        assert_eq!(error.message(), "Action mismatch: expected Get, got List");
+    }
+
+    #[test]
+    fn blob_viewer_auth_accepts_valid_nip98_only() {
+        let header = encoded_event(signed_event(
+            NIP98_AUTH_KIND,
+            vec![
+                vec!["u".into(), TEST_URL.into()],
+                vec!["method".into(), "GET".into()],
+            ],
+            1_000,
+        ));
+
+        let event = authenticate_blob_viewer(
+            &[header.as_str()],
+            "GET",
+            TEST_URL,
+            "4a31d696c2275e60dbfe2359e6ff006f78a30f5df11c7290233a7860c4e8c31e",
+            1_000,
+        )
+        .expect("NIP-98 auth should succeed");
+
+        assert_eq!(event.kind, NIP98_AUTH_KIND);
+    }
+
+    #[test]
+    fn blob_viewer_auth_accepts_valid_bud01_only() {
+        let header = encoded_event(signed_event(
+            BLOSSOM_AUTH_KIND,
+            vec![
+                vec!["t".into(), "get".into()],
+                vec![
+                    "x".into(),
+                    "4a31d696c2275e60dbfe2359e6ff006f78a30f5df11c7290233a7860c4e8c31e".into(),
+                ],
+                vec!["expiration".into(), "1300".into()],
+            ],
+            1_000,
+        ));
+
+        let event = authenticate_blob_viewer(
+            &[header.as_str()],
+            "GET",
+            TEST_URL,
+            "4a31d696c2275e60dbfe2359e6ff006f78a30f5df11c7290233a7860c4e8c31e",
+            1_100,
+        )
+        .expect("BUD-01 auth should succeed");
+
+        assert_eq!(event.kind, BLOSSOM_AUTH_KIND);
+    }
+
+    #[test]
+    fn blob_viewer_auth_accepts_second_header_when_first_is_invalid() {
+        let bud01 = encoded_event(signed_event(
+            BLOSSOM_AUTH_KIND,
+            vec![
+                vec!["t".into(), "get".into()],
+                vec![
+                    "x".into(),
+                    "4a31d696c2275e60dbfe2359e6ff006f78a30f5df11c7290233a7860c4e8c31e".into(),
+                ],
+                vec!["expiration".into(), "1300".into()],
+            ],
+            1_000,
+        ));
+
+        let event = authenticate_blob_viewer(
+            &["Nostr definitely-not-base64", bud01.as_str()],
+            "GET",
+            TEST_URL,
+            "4a31d696c2275e60dbfe2359e6ff006f78a30f5df11c7290233a7860c4e8c31e",
+            1_100,
+        )
+        .expect("later valid header should succeed");
+
+        assert_eq!(event.kind, BLOSSOM_AUTH_KIND);
+    }
+
+    #[test]
+    fn blob_viewer_auth_prefers_valid_nip98_over_invalid_bud01() {
+        let invalid_bud01 = encoded_event(signed_event(
+            BLOSSOM_AUTH_KIND,
+            vec![
+                vec!["t".into(), "get".into()],
+                vec![
+                    "x".into(),
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                ],
+                vec!["expiration".into(), "1300".into()],
+            ],
+            1_000,
+        ));
+        let nip98 = encoded_event(signed_event(
+            NIP98_AUTH_KIND,
+            vec![
+                vec!["u".into(), TEST_URL.into()],
+                vec!["method".into(), "GET".into()],
+            ],
+            1_000,
+        ));
+
+        let event = authenticate_blob_viewer(
+            &[invalid_bud01.as_str(), nip98.as_str()],
+            "GET",
+            TEST_URL,
+            "4a31d696c2275e60dbfe2359e6ff006f78a30f5df11c7290233a7860c4e8c31e",
+            1_000,
+        )
+        .expect("valid NIP-98 should win");
+
+        assert_eq!(event.kind, NIP98_AUTH_KIND);
+    }
+
+    #[test]
+    fn blob_viewer_auth_rejects_when_all_headers_fail() {
+        let invalid_bud01 = encoded_event(signed_event(
+            BLOSSOM_AUTH_KIND,
+            vec![
+                vec!["t".into(), "get".into()],
+                vec![
+                    "x".into(),
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                ],
+                vec!["expiration".into(), "1300".into()],
+            ],
+            1_000,
+        ));
+
+        let error = authenticate_blob_viewer(
+            &[invalid_bud01.as_str()],
+            "GET",
+            TEST_URL,
+            "4a31d696c2275e60dbfe2359e6ff006f78a30f5df11c7290233a7860c4e8c31e",
+            1_100,
+        )
+        .expect_err("invalid auth should fail");
+
+        assert_eq!(
+            error.message(),
+            "Hash mismatch: expected 4a31d696c2275e60dbfe2359e6ff006f78a30f5df11c7290233a7860c4e8c31e, got aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
     }
 
     #[test]
@@ -575,5 +910,10 @@ mod tests {
             .expect("event id prehash should sign");
         event.sig = hex::encode(signature.to_bytes());
         event
+    }
+
+    fn encoded_event(event: BlossomAuthEvent) -> String {
+        let json = serde_json::to_vec(&event).expect("event should serialize");
+        format!("Nostr {}", BASE64.encode(json))
     }
 }
