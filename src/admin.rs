@@ -869,9 +869,14 @@ pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
     let old_status = metadata.status;
 
     // Creator-delete: thin adapter over handle_creator_delete so /admin/moderate
-    // and /admin/api/moderate produce the same response contract. Audit fires
-    // on every attempted delete, with outcome encoded in the action string so
-    // operators can distinguish full success, partial (soft-only), and failure.
+    // and /admin/api/moderate produce the same response contract.
+    //
+    // Audit strategy: write `creator_delete_attempt` before the helper call and
+    // `creator_delete` after success. A failure path leaves an attempt entry
+    // without a paired success, which operators can query for directly. This
+    // closes the audit gap that would otherwise exist if a soft-delete
+    // succeeded but the physical byte delete failed (soft-delete is durable
+    // even though we propagate the error to the caller).
     if moderate_req.action.eq_ignore_ascii_case("DELETE") {
         let reason = moderate_req
             .reason
@@ -883,38 +888,32 @@ pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
 
         let meta_json = serde_json::to_string(&metadata).ok();
 
-        let outcome = match handle_creator_delete(
+        write_audit_log(
+            &moderate_req.sha256,
+            "creator_delete_attempt",
+            &metadata.owner,
+            None,
+            meta_json.as_deref(),
+            Some(reason),
+        );
+
+        let outcome = handle_creator_delete(
             &moderate_req.sha256,
             &metadata,
             reason,
             physical_delete_enabled,
-        ) {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                eprintln!(
-                    "[CREATOR-DELETE] soft_delete_blob failed for {}: {}",
-                    moderate_req.sha256, e
-                );
-                write_audit_log(
-                    &moderate_req.sha256,
-                    "creator_delete_failed",
-                    &metadata.owner,
-                    None,
-                    meta_json.as_deref(),
-                    Some(reason),
-                );
-                return Err(e);
-            }
-        };
+        )
+        .map_err(|e| {
+            eprintln!(
+                "[CREATOR-DELETE] handle_creator_delete failed for {}: {}",
+                moderate_req.sha256, e
+            );
+            e
+        })?;
 
-        let audit_action = if outcome.physical_delete_enabled && !outcome.physical_deleted {
-            "creator_delete_partial"
-        } else {
-            "creator_delete"
-        };
         write_audit_log(
             &moderate_req.sha256,
-            audit_action,
+            "creator_delete",
             &metadata.owner,
             None,
             meta_json.as_deref(),
@@ -926,7 +925,6 @@ pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
             "sha256": moderate_req.sha256,
             "old_status": format!("{:?}", outcome.old_status).to_lowercase(),
             "new_status": "deleted",
-            "soft_deleted": outcome.soft_deleted,
             "physical_deleted": outcome.physical_deleted,
             "physical_delete_skipped": !outcome.physical_delete_enabled,
         });

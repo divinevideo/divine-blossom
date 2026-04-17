@@ -63,18 +63,18 @@ pub fn soft_delete_blob(
     Ok(())
 }
 
-/// Outcome of a creator-initiated delete. Spans the full truth table:
-/// - Both false: nothing happened (`handle_creator_delete` returned `Err`).
-/// - `soft_deleted=true, physical_deleted=false`: content stopped serving,
-///   metadata is in `Deleted` status, but bytes may remain on GCS. This is
-///   either the expected flag-off state, or a partial flag-on outcome where
-///   the GCS byte delete failed.
-/// - Both true: full delete; content stopped serving and main blob bytes
-///   removed. Artifact cleanup is best-effort and may have left stragglers.
+/// Outcome of a successful creator-initiated delete. Returned only when the
+/// full requested operation completed: soft-delete always, and main GCS byte
+/// removal when `physical_delete_enabled`.
+///
+/// Partial states (soft ok, bytes failed) are not represented here. They
+/// surface as `Err` from `handle_creator_delete` so callers get a loud
+/// failure signal instead of a silent partial success. The validation-window
+/// sweep (blossom#90) is the operational safety net for bytes that remain
+/// after a soft-delete when retries do not converge.
 #[derive(Debug, Clone)]
 pub struct CreatorDeleteOutcome {
     pub old_status: BlobStatus,
-    pub soft_deleted: bool,
     pub physical_delete_enabled: bool,
     pub physical_deleted: bool,
 }
@@ -82,13 +82,15 @@ pub struct CreatorDeleteOutcome {
 /// Shared creator-delete policy. Callers (`/admin/moderate` and
 /// `/admin/api/moderate`) are thin adapters over this function.
 ///
-/// Contract:
-/// - Returns `Err` only when soft-delete itself fails. In that case no state
-///   mutated and both `soft_deleted` and `physical_deleted` would be false.
-/// - Returns `Ok(outcome)` in all other cases, including the partial-success
-///   state where soft-delete applied but the main GCS byte delete failed.
-///   Callers get `soft_deleted=true, physical_deleted=false` so they can
-///   distinguish "retry byte delete only" from "retry the whole operation."
+/// Returns `Err` on any failure, including:
+/// - soft-delete failure (no state mutated)
+/// - main GCS byte delete failure when `physical_delete_enabled` (soft-delete
+///   already applied; content stopped serving; bytes may remain on GCS)
+///
+/// On `Err` from byte-delete failure, the status flip to `Deleted` is already
+/// durable. A retry by the caller converges: `soft_delete_blob` is a no-op on
+/// already-`Deleted` state, and `storage::delete_blob` treats a missing
+/// object as success.
 pub fn handle_creator_delete(
     hash: &str,
     metadata: &BlobMetadata,
@@ -101,28 +103,23 @@ pub fn handle_creator_delete(
 
     let physical_deleted = if physical_delete_enabled {
         crate::cleanup_derived_audio_for_source(hash);
-        match crate::storage::delete_blob(hash) {
-            Ok(()) => {
-                crate::delete_blob_gcs_artifacts(hash);
-                crate::purge_vcl_cache(hash);
-                true
-            }
-            Err(e) => {
-                eprintln!(
-                    "[CREATOR-DELETE] storage::delete_blob failed for {}: {}. \
-                     Soft delete applied; bytes may remain on GCS.",
-                    hash, e
-                );
-                false
-            }
-        }
+        crate::storage::delete_blob(hash).map_err(|e| {
+            eprintln!(
+                "[CREATOR-DELETE] storage::delete_blob failed for {}: {}. \
+                 Soft delete applied; bytes may remain on GCS.",
+                hash, e
+            );
+            e
+        })?;
+        crate::delete_blob_gcs_artifacts(hash);
+        crate::purge_vcl_cache(hash);
+        true
     } else {
         false
     };
 
     Ok(CreatorDeleteOutcome {
         old_status,
-        soft_deleted: true,
         physical_delete_enabled,
         physical_deleted,
     })
