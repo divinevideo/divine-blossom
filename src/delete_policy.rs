@@ -63,47 +63,32 @@ pub fn soft_delete_blob(
     Ok(())
 }
 
-/// Physical deletion: soft-delete (stops serving) + GCS byte removal.
-/// Metadata row is preserved (status=Deleted) for audit/support visibility.
-///
-/// Returns Err if the main GCS blob delete fails. Soft-delete may have already
-/// applied in that case (status=Deleted, content stops serving), but bytes may
-/// remain on GCS. Artifact cleanup is best-effort and runs only after the main
-/// blob is confirmed deleted.
-pub fn perform_physical_delete(
-    hash: &str,
-    metadata: &BlobMetadata,
-    reason: &str,
-    legal_hold: bool,
-) -> Result<()> {
-    soft_delete_blob(hash, metadata, reason, legal_hold)?;
-    crate::cleanup_derived_audio_for_source(hash);
-    if let Err(e) = crate::storage::delete_blob(hash) {
-        eprintln!(
-            "[PHYSICAL-DELETE] storage::delete_blob failed for {}: {}. \
-             Bytes may remain on GCS; blob remains in Deleted status.",
-            hash, e
-        );
-        return Err(e);
-    }
-    crate::delete_blob_gcs_artifacts(hash);
-    crate::purge_vcl_cache(hash);
-    Ok(())
-}
-
-/// Outcome of a creator-initiated delete, used to serialize a consistent
-/// response shape across `/admin/moderate` and `/admin/api/moderate`.
+/// Outcome of a creator-initiated delete. Spans the full truth table:
+/// - Both false: nothing happened (`handle_creator_delete` returned `Err`).
+/// - `soft_deleted=true, physical_deleted=false`: content stopped serving,
+///   metadata is in `Deleted` status, but bytes may remain on GCS. This is
+///   either the expected flag-off state, or a partial flag-on outcome where
+///   the GCS byte delete failed.
+/// - Both true: full delete; content stopped serving and main blob bytes
+///   removed. Artifact cleanup is best-effort and may have left stragglers.
 #[derive(Debug, Clone)]
 pub struct CreatorDeleteOutcome {
     pub old_status: BlobStatus,
+    pub soft_deleted: bool,
     pub physical_delete_enabled: bool,
     pub physical_deleted: bool,
 }
 
-/// Shared creator-delete policy. Flips status to Deleted via soft_delete_blob,
-/// and when `physical_delete_enabled` is true also removes GCS bytes via
-/// perform_physical_delete. Returns Err if any step fails so callers never
-/// report success for a delete that did not complete.
+/// Shared creator-delete policy. Callers (`/admin/moderate` and
+/// `/admin/api/moderate`) are thin adapters over this function.
+///
+/// Contract:
+/// - Returns `Err` only when soft-delete itself fails. In that case no state
+///   mutated and both `soft_deleted` and `physical_deleted` would be false.
+/// - Returns `Ok(outcome)` in all other cases, including the partial-success
+///   state where soft-delete applied but the main GCS byte delete failed.
+///   Callers get `soft_deleted=true, physical_deleted=false` so they can
+///   distinguish "retry byte delete only" from "retry the whole operation."
 pub fn handle_creator_delete(
     hash: &str,
     metadata: &BlobMetadata,
@@ -111,15 +96,33 @@ pub fn handle_creator_delete(
     physical_delete_enabled: bool,
 ) -> Result<CreatorDeleteOutcome> {
     let old_status = metadata.status;
+
+    soft_delete_blob(hash, metadata, reason, false)?;
+
     let physical_deleted = if physical_delete_enabled {
-        perform_physical_delete(hash, metadata, reason, false)?;
-        true
+        crate::cleanup_derived_audio_for_source(hash);
+        match crate::storage::delete_blob(hash) {
+            Ok(()) => {
+                crate::delete_blob_gcs_artifacts(hash);
+                crate::purge_vcl_cache(hash);
+                true
+            }
+            Err(e) => {
+                eprintln!(
+                    "[CREATOR-DELETE] storage::delete_blob failed for {}: {}. \
+                     Soft delete applied; bytes may remain on GCS.",
+                    hash, e
+                );
+                false
+            }
+        }
     } else {
-        soft_delete_blob(hash, metadata, reason, false)?;
         false
     };
+
     Ok(CreatorDeleteOutcome {
         old_status,
+        soft_deleted: true,
         physical_delete_enabled,
         physical_deleted,
     })

@@ -4744,7 +4744,9 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
     }
 
     // Creator-delete: thin adapter over handle_creator_delete so /admin/moderate
-    // and /admin/api/moderate produce the same response contract.
+    // and /admin/api/moderate produce the same response contract. Audit fires
+    // on every attempted delete, with outcome encoded in the action string so
+    // operators can distinguish full success, partial (soft-only), and failure.
     if action.eq_ignore_ascii_case("DELETE") {
         let metadata = get_blob_metadata(sha256)?
             .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
@@ -4756,23 +4758,35 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
         let physical_delete_enabled =
             crate::admin::get_config("ENABLE_PHYSICAL_DELETE").as_deref() == Some("true");
 
+        let meta_json = serde_json::to_string(&metadata).ok();
+
         let outcome = match handle_creator_delete(sha256, &metadata, reason, physical_delete_enabled) {
             Ok(outcome) => outcome,
             Err(e) => {
                 eprintln!(
-                    "[CREATOR-DELETE] handle_creator_delete failed for {}: {}",
+                    "[CREATOR-DELETE] soft_delete_blob failed for {}: {}",
                     sha256, e
+                );
+                write_audit_log(
+                    sha256,
+                    "creator_delete_failed",
+                    &metadata.owner,
+                    None,
+                    meta_json.as_deref(),
+                    Some(reason),
                 );
                 return Err(e);
             }
         };
 
-        // Audit AFTER the status flip succeeds so the trail does not imply
-        // a delete that did not happen.
-        let meta_json = serde_json::to_string(&metadata).ok();
+        let audit_action = if outcome.physical_delete_enabled && !outcome.physical_deleted {
+            "creator_delete_partial"
+        } else {
+            "creator_delete"
+        };
         write_audit_log(
             sha256,
-            "creator_delete",
+            audit_action,
             &metadata.owner,
             None,
             meta_json.as_deref(),
@@ -4784,6 +4798,7 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
             "sha256": sha256,
             "old_status": format!("{:?}", outcome.old_status).to_lowercase(),
             "new_status": "deleted",
+            "soft_deleted": outcome.soft_deleted,
             "physical_deleted": outcome.physical_deleted,
             "physical_delete_skipped": !outcome.physical_delete_enabled,
         });
