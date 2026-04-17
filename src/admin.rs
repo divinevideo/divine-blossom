@@ -3,7 +3,7 @@
 
 use crate::blossom::{BlobMetadata, BlobStatus, GlobalStats, RecentIndex};
 use crate::delete_policy::{
-    parse_restore_status, perform_physical_delete, restore_soft_deleted_blob, soft_delete_blob,
+    handle_creator_delete, parse_restore_status, restore_soft_deleted_blob,
 };
 use crate::error::{BlossomError, Result};
 use crate::metadata::{
@@ -286,7 +286,7 @@ fn create_session(provider: &str, identity: &str) -> Result<String> {
 }
 
 /// Get config value from Fastly config store
-fn get_config(key: &str) -> Option<String> {
+pub(crate) fn get_config(key: &str) -> Option<String> {
     fastly::config_store::ConfigStore::open("blossom_config").get(key)
 }
 
@@ -868,16 +868,35 @@ pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
         .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
     let old_status = metadata.status;
 
-    // Creator-delete: special-case because DELETE needs soft_delete_blob's full
-    // index/user-list cleanup, not the bare update_blob_status the action-map
-    // match provides for BAN/RESTRICT/etc.
+    // Creator-delete: thin adapter over handle_creator_delete so /admin/moderate
+    // and /admin/api/moderate produce the same response contract.
     if moderate_req.action.eq_ignore_ascii_case("DELETE") {
         let reason = moderate_req
             .reason
             .as_deref()
             .unwrap_or("Creator-initiated deletion via kind 5");
 
-        // Audit BEFORE destruction
+        let physical_delete_enabled =
+            get_config("ENABLE_PHYSICAL_DELETE").as_deref() == Some("true");
+
+        let outcome = match handle_creator_delete(
+            &moderate_req.sha256,
+            &metadata,
+            reason,
+            physical_delete_enabled,
+        ) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                eprintln!(
+                    "[CREATOR-DELETE] handle_creator_delete failed for {}: {}",
+                    moderate_req.sha256, e
+                );
+                return Err(e);
+            }
+        };
+
+        // Audit AFTER the status flip succeeds so the trail does not imply
+        // a delete that did not happen.
         let meta_json = serde_json::to_string(&metadata).ok();
         write_audit_log(
             &moderate_req.sha256,
@@ -888,52 +907,13 @@ pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
             Some(reason),
         );
 
-        let physical_delete_enabled =
-            get_config("ENABLE_PHYSICAL_DELETE").as_deref() == Some("true");
-
-        let mut physical_deleted = false;
-        if physical_delete_enabled {
-            match perform_physical_delete(
-                &moderate_req.sha256,
-                &metadata,
-                reason,
-                false,
-            ) {
-                Ok(()) => {
-                    physical_deleted = true;
-                }
-                Err(e) => {
-                    // soft_delete_blob failed inside the helper — blob is NOT deleted.
-                    eprintln!(
-                        "[CREATOR-DELETE] perform_physical_delete failed for {}: {}. \
-                         Blob status was NOT changed.",
-                        moderate_req.sha256, e
-                    );
-                    return Err(e);
-                }
-            }
-        } else {
-            if let Err(e) = soft_delete_blob(
-                &moderate_req.sha256,
-                &metadata,
-                reason,
-                false,
-            ) {
-                eprintln!(
-                    "[CREATOR-DELETE] soft_delete_blob failed for {}: {}",
-                    moderate_req.sha256, e
-                );
-                return Err(e);
-            }
-        }
-
         let response = serde_json::json!({
             "success": true,
             "sha256": moderate_req.sha256,
-            "old_status": format!("{:?}", old_status).to_lowercase(),
+            "old_status": format!("{:?}", outcome.old_status).to_lowercase(),
             "new_status": "deleted",
-            "physical_deleted": physical_deleted,
-            "physical_delete_skipped": !physical_delete_enabled
+            "physical_deleted": outcome.physical_deleted,
+            "physical_delete_skipped": !outcome.physical_delete_enabled,
         });
         return json_response(StatusCode::OK, &response);
     }

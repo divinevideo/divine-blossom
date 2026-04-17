@@ -65,6 +65,11 @@ pub fn soft_delete_blob(
 
 /// Physical deletion: soft-delete (stops serving) + GCS byte removal.
 /// Metadata row is preserved (status=Deleted) for audit/support visibility.
+///
+/// Returns Err if the main GCS blob delete fails. Soft-delete may have already
+/// applied in that case (status=Deleted, content stops serving), but bytes may
+/// remain on GCS. Artifact cleanup is best-effort and runs only after the main
+/// blob is confirmed deleted.
 pub fn perform_physical_delete(
     hash: &str,
     metadata: &BlobMetadata,
@@ -74,11 +79,50 @@ pub fn perform_physical_delete(
     soft_delete_blob(hash, metadata, reason, legal_hold)?;
     crate::cleanup_derived_audio_for_source(hash);
     if let Err(e) = crate::storage::delete_blob(hash) {
-        eprintln!("[PHYSICAL-DELETE] storage::delete_blob failed for {}: {}. Bytes may remain on GCS.", hash, e);
+        eprintln!(
+            "[PHYSICAL-DELETE] storage::delete_blob failed for {}: {}. \
+             Bytes may remain on GCS; blob remains in Deleted status.",
+            hash, e
+        );
+        return Err(e);
     }
     crate::delete_blob_gcs_artifacts(hash);
     crate::purge_vcl_cache(hash);
     Ok(())
+}
+
+/// Outcome of a creator-initiated delete, used to serialize a consistent
+/// response shape across `/admin/moderate` and `/admin/api/moderate`.
+#[derive(Debug, Clone)]
+pub struct CreatorDeleteOutcome {
+    pub old_status: BlobStatus,
+    pub physical_delete_enabled: bool,
+    pub physical_deleted: bool,
+}
+
+/// Shared creator-delete policy. Flips status to Deleted via soft_delete_blob,
+/// and when `physical_delete_enabled` is true also removes GCS bytes via
+/// perform_physical_delete. Returns Err if any step fails so callers never
+/// report success for a delete that did not complete.
+pub fn handle_creator_delete(
+    hash: &str,
+    metadata: &BlobMetadata,
+    reason: &str,
+    physical_delete_enabled: bool,
+) -> Result<CreatorDeleteOutcome> {
+    let old_status = metadata.status;
+    let physical_deleted = if physical_delete_enabled {
+        perform_physical_delete(hash, metadata, reason, false)?;
+        true
+    } else {
+        soft_delete_blob(hash, metadata, reason, false)?;
+        false
+    };
+    Ok(CreatorDeleteOutcome {
+        old_status,
+        physical_delete_enabled,
+        physical_deleted,
+    })
 }
 
 pub fn restore_soft_deleted_blob(

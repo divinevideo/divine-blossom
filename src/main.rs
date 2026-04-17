@@ -20,7 +20,7 @@ use crate::blossom::{
     ResumableUploadInitRequest, ResumableUploadInitResponse, SubtitleJob, SubtitleJobCreateRequest,
     SubtitleJobStatus, TranscodeStatus, TranscriptStatus, UploadRequirements,
 };
-use crate::delete_policy::{perform_physical_delete, plan_user_delete, soft_delete_blob, DeletePlan};
+use crate::delete_policy::{handle_creator_delete, plan_user_delete, soft_delete_blob, DeletePlan};
 use crate::error::{BlossomError, Result};
 use crate::media_auth_log::format_media_auth_log;
 use crate::metadata::{
@@ -4743,9 +4743,8 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
         return Err(BlossomError::BadRequest("Invalid sha256 format".into()));
     }
 
-    // Creator-delete: special-case because DELETE needs soft_delete_blob's full
-    // index/user-list cleanup, not the bare update_blob_status the action-map
-    // match below provides for BAN/RESTRICT/etc.
+    // Creator-delete: thin adapter over handle_creator_delete so /admin/moderate
+    // and /admin/api/moderate produce the same response contract.
     if action.eq_ignore_ascii_case("DELETE") {
         let metadata = get_blob_metadata(sha256)?
             .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
@@ -4754,6 +4753,22 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
             .as_str()
             .unwrap_or("Creator-initiated deletion via kind 5");
 
+        let physical_delete_enabled =
+            crate::admin::get_config("ENABLE_PHYSICAL_DELETE").as_deref() == Some("true");
+
+        let outcome = match handle_creator_delete(sha256, &metadata, reason, physical_delete_enabled) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                eprintln!(
+                    "[CREATOR-DELETE] handle_creator_delete failed for {}: {}",
+                    sha256, e
+                );
+                return Err(e);
+            }
+        };
+
+        // Audit AFTER the status flip succeeds so the trail does not imply
+        // a delete that did not happen.
         let meta_json = serde_json::to_string(&metadata).ok();
         write_audit_log(
             sha256,
@@ -4764,46 +4779,13 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
             Some(reason),
         );
 
-        // Canonical pattern: admin.rs get_config() (private to that module).
-        // Inlined here because get_config is not pub(crate).
-        let physical_delete_enabled = fastly::config_store::ConfigStore::open("blossom_config")
-            .get("ENABLE_PHYSICAL_DELETE")
-            .as_deref()
-            == Some("true");
-
-        let mut physical_deleted = false;
-        if physical_delete_enabled {
-            match perform_physical_delete(sha256, &metadata, reason, false) {
-                Ok(()) => {
-                    physical_deleted = true;
-                }
-                Err(e) => {
-                    // soft_delete_blob failed inside the helper — blob is NOT deleted.
-                    eprintln!(
-                        "[CREATOR-DELETE] perform_physical_delete failed for {}: {}. \
-                         Blob status was NOT changed.",
-                        sha256, e
-                    );
-                    return Err(e);
-                }
-            }
-        } else {
-            if let Err(e) = soft_delete_blob(sha256, &metadata, reason, false) {
-                eprintln!(
-                    "[CREATOR-DELETE] soft_delete_blob failed for {}: {}",
-                    sha256, e
-                );
-                return Err(e);
-            }
-        }
-
         let response = serde_json::json!({
             "success": true,
             "sha256": sha256,
-            "status": "deleted",
-            "physical_deleted": physical_deleted,
-            "physical_delete_skipped": !physical_delete_enabled,
-            "message": "Creator-delete processed"
+            "old_status": format!("{:?}", outcome.old_status).to_lowercase(),
+            "new_status": "deleted",
+            "physical_deleted": outcome.physical_deleted,
+            "physical_delete_skipped": !outcome.physical_delete_enabled,
         });
         let mut resp = json_response(StatusCode::OK, &response);
         add_cors_headers(&mut resp);
