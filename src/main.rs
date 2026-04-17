@@ -4764,17 +4764,27 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
             Some(reason),
         );
 
+        // Canonical pattern: admin.rs get_config() (private to that module).
+        // Inlined here because get_config is not pub(crate).
         let physical_delete_enabled = fastly::config_store::ConfigStore::open("blossom_config")
             .get("ENABLE_PHYSICAL_DELETE")
             .as_deref()
             == Some("true");
 
+        let mut physical_deleted = false;
         if physical_delete_enabled {
-            if let Err(e) = perform_physical_delete(sha256, &metadata, reason, false) {
-                eprintln!(
-                    "[CREATOR-DELETE] perform_physical_delete failed for {}: {}",
-                    sha256, e
-                );
+            match perform_physical_delete(sha256, &metadata, reason, false) {
+                Ok(()) => {
+                    physical_deleted = true;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[CREATOR-DELETE] perform_physical_delete failed for {}: {}. \
+                         Status is Deleted (serving stopped); bytes may remain on GCS.",
+                        sha256, e
+                    );
+                    // physical_deleted stays false — response is honest
+                }
             }
         } else {
             if let Err(e) = soft_delete_blob(sha256, &metadata, reason, false) {
@@ -4790,7 +4800,7 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
             "success": true,
             "sha256": sha256,
             "status": "deleted",
-            "physical_deleted": physical_delete_enabled,
+            "physical_deleted": physical_deleted,
             "physical_delete_skipped": !physical_delete_enabled,
             "message": "Creator-delete processed"
         });

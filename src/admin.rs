@@ -891,21 +891,26 @@ pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
         let physical_delete_enabled =
             get_config("ENABLE_PHYSICAL_DELETE").as_deref() == Some("true");
 
+        let mut physical_deleted = false;
         if physical_delete_enabled {
-            if let Err(e) = perform_physical_delete(
+            match perform_physical_delete(
                 &moderate_req.sha256,
                 &metadata,
                 reason,
-                false, // no legal hold for creator-delete
+                false,
             ) {
-                eprintln!(
-                    "[CREATOR-DELETE] perform_physical_delete failed for {}: {}. \
-                     Status may still be flipped to Deleted; bytes may remain.",
-                    moderate_req.sha256, e
-                );
+                Ok(()) => {
+                    physical_deleted = true;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[CREATOR-DELETE] perform_physical_delete failed for {}: {}. \
+                         Status is Deleted (serving stopped); bytes may remain on GCS.",
+                        moderate_req.sha256, e
+                    );
+                }
             }
         } else {
-            // Flag off: soft-delete only
             if let Err(e) = soft_delete_blob(
                 &moderate_req.sha256,
                 &metadata,
@@ -925,7 +930,7 @@ pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
             "sha256": moderate_req.sha256,
             "old_status": format!("{:?}", old_status).to_lowercase(),
             "new_status": "deleted",
-            "physical_deleted": physical_delete_enabled,
+            "physical_deleted": physical_deleted,
             "physical_delete_skipped": !physical_delete_enabled
         });
         return json_response(StatusCode::OK, &response);
