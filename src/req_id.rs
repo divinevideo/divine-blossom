@@ -24,24 +24,31 @@ const MAX_LEN: usize = 16;
 /// 3. Generated short hex ID derived from the current nanosecond clock.
 pub(crate) fn for_request(req: &Request) -> String {
     if let Some(v) = req.get_header_str(REQUEST_ID_HEADER) {
-        let trimmed = v.trim();
-        if !trimmed.is_empty() {
-            return truncate(trimmed);
+        let sanitized = sanitize(v);
+        if !sanitized.is_empty() {
+            return sanitized;
         }
     }
     if let Some(v) = req.get_header_str(CF_RAY_HEADER) {
         if let Some(left) = v.split('-').next() {
-            let trimmed = left.trim();
-            if !trimmed.is_empty() {
-                return truncate(trimmed);
+            let sanitized = sanitize(left);
+            if !sanitized.is_empty() {
+                return sanitized;
             }
         }
     }
     generate()
 }
 
-fn truncate(s: &str) -> String {
-    s.chars().take(MAX_LEN).collect()
+/// Restrict correlation IDs to a safe log charset. Header values are
+/// attacker-controllable; without filtering, an `X-Request-Id` containing
+/// newlines or ANSI escapes would be echoed verbatim into stderr and could
+/// forge log lines or corrupt terminal output for operators tailing logs.
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(MAX_LEN)
+        .collect()
 }
 
 fn generate() -> String {
@@ -57,14 +64,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn truncate_limits_length() {
+    fn sanitize_limits_length() {
         let long = "a".repeat(32);
-        assert_eq!(truncate(&long).len(), MAX_LEN);
+        assert_eq!(sanitize(&long).len(), MAX_LEN);
     }
 
     #[test]
-    fn truncate_preserves_short() {
-        assert_eq!(truncate("abc123"), "abc123");
+    fn sanitize_preserves_short_alnum() {
+        assert_eq!(sanitize("abc123-_"), "abc123-_");
+    }
+
+    #[test]
+    fn sanitize_strips_log_injection_chars() {
+        assert_eq!(sanitize("abc\n[ADMIN] fake"), "abcADMINfake");
+        assert_eq!(sanitize("\x1b[31mred\x1b[0m"), "31mred0m");
+        assert_eq!(sanitize("a b\tc\rd"), "abcd");
+    }
+
+    #[test]
+    fn sanitize_empty_when_all_filtered() {
+        assert_eq!(sanitize("\n\r\t "), "");
+        assert_eq!(sanitize(""), "");
     }
 
     #[test]
