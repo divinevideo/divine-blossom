@@ -130,6 +130,30 @@ pub fn handle_creator_delete(
     })
 }
 
+/// Build the JSON response body for a successful creator-delete. Both the
+/// `/admin/moderate` and `/admin/api/moderate` handlers delegate to this so
+/// their response contracts stay identical.
+///
+/// The `old_status` field is rendered via `format!("{:?}", ...).to_lowercase()`
+/// which produces `"agerestricted"` for `BlobStatus::AgeRestricted` rather than
+/// the serde-canonical `"age_restricted"`. This mismatch is documented in
+/// `docs/api/creator-delete-contract.md` and tracked for fix in
+/// divinevideo/divine-blossom#95. Tests in this module pin the current
+/// behavior; they will need updating when #95 lands.
+pub fn build_creator_delete_response(
+    sha256: &str,
+    outcome: &CreatorDeleteOutcome,
+) -> serde_json::Value {
+    serde_json::json!({
+        "success": true,
+        "sha256": sha256,
+        "old_status": format!("{:?}", outcome.old_status).to_lowercase(),
+        "new_status": "deleted",
+        "physical_deleted": outcome.physical_deleted,
+        "physical_delete_skipped": !outcome.physical_delete_enabled,
+    })
+}
+
 pub fn restore_soft_deleted_blob(
     hash: &str,
     metadata: &BlobMetadata,
@@ -202,5 +226,27 @@ mod tests {
             parse_restore_status(Some("age_restrict")).unwrap(),
             BlobStatus::AgeRestricted
         );
+    }
+
+    #[test]
+    fn response_builder_active_blob_flag_off() {
+        let outcome = CreatorDeleteOutcome {
+            old_status: BlobStatus::Active,
+            physical_delete_enabled: false,
+            physical_deleted: false,
+        };
+        let body = build_creator_delete_response(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &outcome,
+        );
+        assert_eq!(body["success"], serde_json::json!(true));
+        assert_eq!(
+            body["sha256"],
+            serde_json::json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(body["old_status"], serde_json::json!("active"));
+        assert_eq!(body["new_status"], serde_json::json!("deleted"));
+        assert_eq!(body["physical_deleted"], serde_json::json!(false));
+        assert_eq!(body["physical_delete_skipped"], serde_json::json!(true));
     }
 }
