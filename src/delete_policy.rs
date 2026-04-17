@@ -82,6 +82,10 @@ pub struct CreatorDeleteOutcome {
 /// Shared creator-delete policy. Callers (`/admin/moderate` and
 /// `/admin/api/moderate`) are thin adapters over this function.
 ///
+/// `req_id` is a correlation ID extracted or generated at the HTTP entry
+/// point; it is included in every log line so retries and partial failures
+/// can be traced across stderr. See `crate::req_id` for the contract.
+///
 /// Returns `Err` on any failure, including:
 /// - soft-delete failure (no state mutated)
 /// - main GCS byte delete failure when `physical_delete_enabled` (soft-delete
@@ -96,6 +100,7 @@ pub fn handle_creator_delete(
     metadata: &BlobMetadata,
     reason: &str,
     physical_delete_enabled: bool,
+    req_id: &str,
 ) -> Result<CreatorDeleteOutcome> {
     let old_status = metadata.status;
 
@@ -105,9 +110,9 @@ pub fn handle_creator_delete(
         crate::cleanup_derived_audio_for_source(hash);
         crate::storage::delete_blob(hash).map_err(|e| {
             eprintln!(
-                "[CREATOR-DELETE] storage::delete_blob failed for {}: {}. \
+                "[req={}] [CREATOR-DELETE] storage::delete_blob failed for {}: {}. \
                  Soft delete applied; bytes may remain on GCS.",
-                hash, e
+                req_id, hash, e
             );
             e
         })?;

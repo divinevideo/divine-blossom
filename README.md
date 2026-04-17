@@ -255,6 +255,26 @@ to the owner or an admin. Blossom does not currently read any hosted-session
 age-verification claim or external viewer adult-verification service when
 serving media.
 
+## Request correlation
+
+Admin and moderation endpoints accept an `X-Request-Id` header and include
+its value in related log lines so retries and partial failures can be traced
+across stderr.
+
+- If the caller sends `X-Request-Id`, its first 16 characters are used.
+- If absent, the leading segment of the Cloudflare-provided `cf-ray`
+  header is used (free correlation with Cloudflare edge logs).
+- If neither is present, a short hex ID is generated from the nanosecond
+  clock.
+
+Upstream services integrating with Blossom (e.g. `divine-moderation-service`
+for creator-delete) are encouraged to forward a stable `X-Request-Id`
+across their retry loops so both sides share the same correlation token.
+Log lines are prefixed with `[req=<id>]`; the `[PURGE]` logs emitted by
+the Fastly cache-purge path include the blob `sha256` as their surrogate
+key, which serves as the cross-reference when purging is triggered from
+a moderate/delete request.
+
 ## License
 
 MIT

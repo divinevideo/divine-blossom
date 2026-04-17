@@ -9,6 +9,7 @@ mod delete_policy;
 mod error;
 mod media_auth_log;
 mod metadata;
+mod req_id;
 mod storage;
 mod viewer_auth;
 
@@ -4684,6 +4685,8 @@ fn handle_admin_backfill_vtt(req: Request) -> Result<Response> {
 /// POST /admin/moderate - Webhook from divine-moderation-service
 /// Receives moderation decisions and updates blob status
 fn handle_admin_moderate(mut req: Request) -> Result<Response> {
+    let req_id = crate::req_id::for_request(&req);
+
     // Try to get webhook secret from secret store (optional)
     let expected_secret: Option<String> =
         fastly::secret_store::SecretStore::open("blossom_secrets")
@@ -4703,18 +4706,24 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
             Some(ref header) if header.starts_with("Bearer ") => {
                 let provided = header.strip_prefix("Bearer ").unwrap_or("");
                 if provided != expected.trim() {
-                    eprintln!("[ADMIN] Invalid webhook secret");
+                    eprintln!("[req={}] [ADMIN] Invalid webhook secret", req_id);
                     return Err(BlossomError::Forbidden("Invalid webhook secret".into()));
                 }
             }
             _ => {
-                eprintln!("[ADMIN] Missing or invalid Authorization header");
+                eprintln!(
+                    "[req={}] [ADMIN] Missing or invalid Authorization header",
+                    req_id
+                );
                 return Err(BlossomError::AuthRequired("Webhook secret required".into()));
             }
         }
     } else {
         // Fail closed: reject requests if webhook_secret is not configured
-        eprintln!("[ADMIN] webhook_secret not configured, rejecting request");
+        eprintln!(
+            "[req={}] [ADMIN] webhook_secret not configured, rejecting request",
+            req_id
+        );
         return Err(BlossomError::Forbidden(
             "Webhook secret not configured".into(),
         ));
@@ -4734,8 +4743,8 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
         .ok_or_else(|| BlossomError::BadRequest("Missing 'action' field".into()))?;
 
     eprintln!(
-        "[ADMIN] Moderation webhook: sha256={}, action={}",
-        sha256, action
+        "[req={}] [ADMIN] Moderation webhook: sha256={}, action={}",
+        req_id, sha256, action
     );
 
     // Validate sha256 format
@@ -4774,14 +4783,20 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
             Some(reason),
         );
 
-        let outcome = handle_creator_delete(sha256, &metadata, reason, physical_delete_enabled)
-            .map_err(|e| {
-                eprintln!(
-                    "[CREATOR-DELETE] handle_creator_delete failed for {}: {}",
-                    sha256, e
-                );
-                e
-            })?;
+        let outcome = handle_creator_delete(
+            sha256,
+            &metadata,
+            reason,
+            physical_delete_enabled,
+            &req_id,
+        )
+        .map_err(|e| {
+            eprintln!(
+                "[req={}] [CREATOR-DELETE] handle_creator_delete failed for {}: {}",
+                req_id, sha256, e
+            );
+            e
+        })?;
 
         write_audit_log(
             sha256,
@@ -5590,7 +5605,7 @@ fn add_cors_headers(resp: &mut Response) {
     );
     resp.set_header(
         "Access-Control-Allow-Headers",
-        "Authorization, Content-Type, X-Sha256",
+        "Authorization, Content-Type, X-Sha256, X-Request-Id",
     );
     resp.set_header("Access-Control-Expose-Headers", upload_exposed_headers());
 }

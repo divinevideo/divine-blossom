@@ -806,7 +806,7 @@ fn set_admin_blob_response_headers(
     resp.set_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
     resp.set_header(
         "Access-Control-Allow-Headers",
-        "Authorization, Content-Type, Range",
+        "Authorization, Content-Type, Range, X-Request-Id",
     );
 }
 
@@ -851,6 +851,8 @@ struct RestoreRequest {
 
 pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
     validate_admin_auth(&req)?;
+
+    let req_id = crate::req_id::for_request(&req);
 
     let body = req.take_body().into_string();
     let moderate_req: ModerateRequest = serde_json::from_str(&body)
@@ -902,11 +904,12 @@ pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
             &metadata,
             reason,
             physical_delete_enabled,
+            &req_id,
         )
         .map_err(|e| {
             eprintln!(
-                "[CREATOR-DELETE] handle_creator_delete failed for {}: {}",
-                moderate_req.sha256, e
+                "[req={}] [CREATOR-DELETE] handle_creator_delete failed for {}: {}",
+                req_id, moderate_req.sha256, e
             );
             e
         })?;
@@ -1509,7 +1512,7 @@ fn json_response<T: serde::Serialize>(status: StatusCode, body: &T) -> Result<Re
     resp.set_header("Access-Control-Allow-Origin", "*");
     resp.set_header(
         "Access-Control-Allow-Headers",
-        "Authorization, Content-Type",
+        "Authorization, Content-Type, X-Request-Id",
     );
     resp.set_body(json);
     Ok(resp)
