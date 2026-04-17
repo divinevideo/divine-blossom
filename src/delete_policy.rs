@@ -249,4 +249,21 @@ mod tests {
         assert_eq!(body["physical_deleted"], serde_json::json!(false));
         assert_eq!(body["physical_delete_skipped"], serde_json::json!(true));
     }
+
+    #[test]
+    fn response_builder_active_blob_flag_on_physical_success() {
+        let outcome = CreatorDeleteOutcome {
+            old_status: BlobStatus::Active,
+            physical_delete_enabled: true,
+            physical_deleted: true,
+        };
+        let body = build_creator_delete_response(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &outcome,
+        );
+        assert_eq!(body["physical_deleted"], serde_json::json!(true));
+        assert_eq!(body["physical_delete_skipped"], serde_json::json!(false));
+        assert_eq!(body["old_status"], serde_json::json!("active"));
+        assert_eq!(body["new_status"], serde_json::json!("deleted"));
+    }
 }
