@@ -44,12 +44,18 @@ Field semantics:
 |---|---|---|
 | `success` | bool | Always `true` when HTTP 200. |
 | `sha256` | string | Echoes the request blob hash. |
-| `old_status` | string | Lowercase `BlobStatus` the blob was in before this call (`active`, `restricted`, `age_restricted`, `pending`, `banned`, `deleted`). |
+| `old_status` | string | Lowercase `BlobStatus` the blob was in before this call. Current values: `active`, `restricted`, `agerestricted`, `pending`, `banned`, `deleted`. See [note on status rendering](#note-status-string-rendering). |
 | `new_status` | string | Always `"deleted"` on success. |
 | `physical_deleted` | bool | `true` only when the main GCS blob delete succeeded. `false` when the flag is off *or* when physical delete wasn't attempted. |
 | `physical_delete_skipped` | bool | `true` when `ENABLE_PHYSICAL_DELETE` was off; `false` when it was on. |
 
 Callers can rely on these fields without reading Blossom source. Additional fields may be added; clients must ignore unknown fields.
+
+#### Note: status string rendering
+
+The response currently renders `BlobStatus` via `format!("{:?}", status).to_lowercase()`, which bypasses serde's `#[serde(rename = "age_restricted")]` attribute on `BlobStatus::AgeRestricted`. As a result, `old_status` emits `"agerestricted"` (no underscore) on this path, while serde-serialized status strings elsewhere in the API render as `"age_restricted"`.
+
+Tracked as [blossom#95](https://github.com/divinevideo/divine-blossom/issues/95). Until that lands, callers matching on `old_status` should accept `"agerestricted"` for the age-gated variant on creator-delete/moderate/restore responses specifically. Other status variants are unaffected because their `Debug` form lowercases cleanly to the same string serde produces.
 
 ### Mapping between outcomes and response
 
