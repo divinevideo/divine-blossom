@@ -286,4 +286,37 @@ mod tests {
         assert_eq!(body["physical_deleted"], serde_json::json!(true));
         assert_eq!(body["physical_delete_skipped"], serde_json::json!(false));
     }
+
+    #[test]
+    fn response_builder_old_status_covers_every_blob_status_variant() {
+        // Pins the current Debug-to-lowercase rendering. When #95 switches
+        // to serde-aware rendering, AgeRestricted's expected string flips to
+        // "age_restricted" and this test needs updating to match.
+        let cases: &[(BlobStatus, &str)] = &[
+            (BlobStatus::Active, "active"),
+            (BlobStatus::Restricted, "restricted"),
+            (BlobStatus::Pending, "pending"),
+            (BlobStatus::Banned, "banned"),
+            (BlobStatus::Deleted, "deleted"),
+            (BlobStatus::AgeRestricted, "agerestricted"),
+        ];
+        for (status, expected) in cases {
+            let outcome = CreatorDeleteOutcome {
+                old_status: *status,
+                physical_delete_enabled: false,
+                physical_deleted: false,
+            };
+            let body = build_creator_delete_response(
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                &outcome,
+            );
+            assert_eq!(
+                body["old_status"],
+                serde_json::json!(expected),
+                "BlobStatus::{:?} should render as {:?}",
+                status,
+                expected
+            );
+        }
+    }
 }
