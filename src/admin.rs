@@ -850,9 +850,9 @@ struct RestoreRequest {
 }
 
 pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
-    validate_admin_auth(&req)?;
-
     let req_id = crate::req_id::for_request(&req);
+
+    validate_admin_auth(&req)?;
 
     let body = req.take_body().into_string();
     let moderate_req: ModerateRequest = serde_json::from_str(&body)
