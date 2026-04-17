@@ -4778,12 +4778,13 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
                     physical_deleted = true;
                 }
                 Err(e) => {
+                    // soft_delete_blob failed inside the helper — blob is NOT deleted.
                     eprintln!(
                         "[CREATOR-DELETE] perform_physical_delete failed for {}: {}. \
-                         Status is Deleted (serving stopped); bytes may remain on GCS.",
+                         Blob status was NOT changed.",
                         sha256, e
                     );
-                    // physical_deleted stays false — response is honest
+                    return Err(e);
                 }
             }
         } else {

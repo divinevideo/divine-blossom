@@ -73,7 +73,9 @@ pub fn perform_physical_delete(
 ) -> Result<()> {
     soft_delete_blob(hash, metadata, reason, legal_hold)?;
     crate::cleanup_derived_audio_for_source(hash);
-    let _ = crate::storage::delete_blob(hash);
+    if let Err(e) = crate::storage::delete_blob(hash) {
+        eprintln!("[PHYSICAL-DELETE] storage::delete_blob failed for {}: {}. Bytes may remain on GCS.", hash, e);
+    }
     crate::delete_blob_gcs_artifacts(hash);
     crate::purge_vcl_cache(hash);
     Ok(())
