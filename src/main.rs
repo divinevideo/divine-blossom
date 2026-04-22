@@ -21,7 +21,10 @@ use crate::blossom::{
     ResumableUploadInitRequest, ResumableUploadInitResponse, SubtitleJob, SubtitleJobCreateRequest,
     SubtitleJobStatus, TranscodeStatus, TranscriptStatus, UploadRequirements,
 };
-use crate::delete_policy::{handle_creator_delete, plan_user_delete, soft_delete_blob, DeletePlan};
+use crate::delete_policy::{
+    build_creator_delete_response, handle_creator_delete, plan_user_delete, soft_delete_blob,
+    DeletePlan,
+};
 use crate::error::{BlossomError, Result};
 use crate::media_auth_log::format_media_auth_log;
 use crate::metadata::{
@@ -4807,14 +4810,7 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
             Some(reason),
         );
 
-        let response = serde_json::json!({
-            "success": true,
-            "sha256": sha256,
-            "old_status": format!("{:?}", outcome.old_status).to_lowercase(),
-            "new_status": "deleted",
-            "physical_deleted": outcome.physical_deleted,
-            "physical_delete_skipped": !outcome.physical_delete_enabled,
-        });
+        let response = build_creator_delete_response(sha256, &outcome);
         let mut resp = json_response(StatusCode::OK, &response);
         add_cors_headers(&mut resp);
         return Ok(resp);

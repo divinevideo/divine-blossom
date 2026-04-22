@@ -130,6 +130,30 @@ pub fn handle_creator_delete(
     })
 }
 
+/// Build the JSON response body for a successful creator-delete. Both the
+/// `/admin/moderate` and `/admin/api/moderate` handlers delegate to this so
+/// their response contracts stay identical.
+///
+/// The `old_status` field is rendered via `format!("{:?}", ...).to_lowercase()`
+/// which produces `"agerestricted"` for `BlobStatus::AgeRestricted` rather than
+/// the serde-canonical `"age_restricted"`. This mismatch is documented in
+/// `docs/api/creator-delete-contract.md` and tracked for fix in
+/// divinevideo/divine-blossom#95. Tests in this module pin the current
+/// behavior; they will need updating when #95 lands.
+pub fn build_creator_delete_response(
+    sha256: &str,
+    outcome: &CreatorDeleteOutcome,
+) -> serde_json::Value {
+    serde_json::json!({
+        "success": true,
+        "sha256": sha256,
+        "old_status": format!("{:?}", outcome.old_status).to_lowercase(),
+        "new_status": "deleted",
+        "physical_deleted": outcome.physical_deleted,
+        "physical_delete_skipped": !outcome.physical_delete_enabled,
+    })
+}
+
 pub fn restore_soft_deleted_blob(
     hash: &str,
     metadata: &BlobMetadata,
@@ -203,4 +227,97 @@ mod tests {
             BlobStatus::AgeRestricted
         );
     }
+
+    #[test]
+    fn response_builder_active_blob_flag_off() {
+        let outcome = CreatorDeleteOutcome {
+            old_status: BlobStatus::Active,
+            physical_delete_enabled: false,
+            physical_deleted: false,
+        };
+        let body = build_creator_delete_response(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &outcome,
+        );
+        assert_eq!(body["success"], serde_json::json!(true));
+        assert_eq!(
+            body["sha256"],
+            serde_json::json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(body["old_status"], serde_json::json!("active"));
+        assert_eq!(body["new_status"], serde_json::json!("deleted"));
+        assert_eq!(body["physical_deleted"], serde_json::json!(false));
+        assert_eq!(body["physical_delete_skipped"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn response_builder_active_blob_flag_on_physical_success() {
+        let outcome = CreatorDeleteOutcome {
+            old_status: BlobStatus::Active,
+            physical_delete_enabled: true,
+            physical_deleted: true,
+        };
+        let body = build_creator_delete_response(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &outcome,
+        );
+        assert_eq!(body["physical_deleted"], serde_json::json!(true));
+        assert_eq!(body["physical_delete_skipped"], serde_json::json!(false));
+        assert_eq!(body["old_status"], serde_json::json!("active"));
+        assert_eq!(body["new_status"], serde_json::json!("deleted"));
+    }
+
+    #[test]
+    fn response_builder_already_deleted_blob_idempotent_retry() {
+        // Scenario: caller retries DELETE on a blob that was already soft-deleted.
+        // handle_creator_delete returned Ok with old_status=Deleted (no change).
+        // physical_deleted reflects the retry's byte-delete outcome.
+        let outcome = CreatorDeleteOutcome {
+            old_status: BlobStatus::Deleted,
+            physical_delete_enabled: true,
+            physical_deleted: true,
+        };
+        let body = build_creator_delete_response(
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            &outcome,
+        );
+        assert_eq!(body["old_status"], serde_json::json!("deleted"));
+        assert_eq!(body["new_status"], serde_json::json!("deleted"));
+        assert_eq!(body["physical_deleted"], serde_json::json!(true));
+        assert_eq!(body["physical_delete_skipped"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn response_builder_old_status_covers_every_blob_status_variant() {
+        // Pins the current Debug-to-lowercase rendering. When #95 switches
+        // to serde-aware rendering, AgeRestricted's expected string flips to
+        // "age_restricted" and this test needs updating to match.
+        let cases: &[(BlobStatus, &str)] = &[
+            (BlobStatus::Active, "active"),
+            (BlobStatus::Restricted, "restricted"),
+            (BlobStatus::Pending, "pending"),
+            (BlobStatus::Banned, "banned"),
+            (BlobStatus::Deleted, "deleted"),
+            (BlobStatus::AgeRestricted, "agerestricted"),
+        ];
+        for (status, expected) in cases {
+            let outcome = CreatorDeleteOutcome {
+                old_status: *status,
+                physical_delete_enabled: false,
+                physical_deleted: false,
+            };
+            let body = build_creator_delete_response(
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                &outcome,
+            );
+            assert_eq!(
+                body["old_status"],
+                serde_json::json!(expected),
+                "BlobStatus::{:?} should render as {:?}",
+                status,
+                expected
+            );
+        }
+    }
+
 }

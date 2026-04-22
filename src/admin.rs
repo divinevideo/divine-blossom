@@ -3,7 +3,8 @@
 
 use crate::blossom::{BlobMetadata, BlobStatus, GlobalStats, RecentIndex};
 use crate::delete_policy::{
-    handle_creator_delete, parse_restore_status, restore_soft_deleted_blob,
+    build_creator_delete_response, handle_creator_delete, parse_restore_status,
+    restore_soft_deleted_blob,
 };
 use crate::error::{BlossomError, Result};
 use crate::metadata::{
@@ -923,14 +924,7 @@ pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
             Some(reason),
         );
 
-        let response = serde_json::json!({
-            "success": true,
-            "sha256": moderate_req.sha256,
-            "old_status": format!("{:?}", outcome.old_status).to_lowercase(),
-            "new_status": "deleted",
-            "physical_deleted": outcome.physical_deleted,
-            "physical_delete_skipped": !outcome.physical_delete_enabled,
-        });
+        let response = build_creator_delete_response(&moderate_req.sha256, &outcome);
         return json_response(StatusCode::OK, &response);
     }
 
