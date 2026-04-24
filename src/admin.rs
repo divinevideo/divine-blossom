@@ -959,8 +959,8 @@ pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
     let response = serde_json::json!({
         "success": true,
         "sha256": moderate_req.sha256,
-        "old_status": format!("{:?}", old_status).to_lowercase(),
-        "new_status": format!("{:?}", new_status).to_lowercase()
+        "old_status": old_status.as_api_str(),
+        "new_status": new_status.as_api_str()
     });
 
     json_response(StatusCode::OK, &response)
@@ -994,8 +994,8 @@ pub fn handle_admin_restore_action(mut req: Request) -> Result<Response> {
         "success": true,
         "restored": true,
         "sha256": restore_req.sha256,
-        "old_status": format!("{:?}", old_status).to_lowercase(),
-        "new_status": format!("{:?}", new_status).to_lowercase()
+        "old_status": old_status.as_api_str(),
+        "new_status": new_status.as_api_str()
     });
 
     json_response(StatusCode::OK, &response)

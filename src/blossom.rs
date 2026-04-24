@@ -124,6 +124,17 @@ pub enum BlobStatus {
 }
 
 impl BlobStatus {
+    pub fn as_api_str(self) -> &'static str {
+        match self {
+            BlobStatus::Active => "active",
+            BlobStatus::Restricted => "restricted",
+            BlobStatus::Pending => "pending",
+            BlobStatus::Banned => "banned",
+            BlobStatus::Deleted => "deleted",
+            BlobStatus::AgeRestricted => "age_restricted",
+        }
+    }
+
     pub fn blocks_public_access(self) -> bool {
         matches!(self, BlobStatus::Banned | BlobStatus::Deleted)
     }
@@ -999,6 +1010,22 @@ mod tests {
     fn blob_status_deserializes_age_restricted() {
         let parsed: BlobStatus = serde_json::from_str("\"age_restricted\"").unwrap();
         assert_eq!(parsed, BlobStatus::AgeRestricted);
+    }
+
+    #[test]
+    fn blob_status_api_string_covers_every_variant() {
+        let cases = [
+            (BlobStatus::Active, "active"),
+            (BlobStatus::Restricted, "restricted"),
+            (BlobStatus::Pending, "pending"),
+            (BlobStatus::Banned, "banned"),
+            (BlobStatus::Deleted, "deleted"),
+            (BlobStatus::AgeRestricted, "age_restricted"),
+        ];
+
+        for (status, expected) in cases {
+            assert_eq!(status.as_api_str(), expected);
+        }
     }
 
     #[test]
