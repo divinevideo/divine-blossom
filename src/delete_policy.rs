@@ -83,7 +83,7 @@ pub struct CreatorDeleteOutcome {
 /// (`DefaultCreatorDeleteOps`) forwards to the crate-level functions that
 /// talk to Fastly KV, GCS, and the VCL cache. Tests substitute a mock so
 /// `handle_creator_delete` can be exercised natively without Viceroy.
-pub trait CreatorDeleteOps {
+pub(crate) trait CreatorDeleteOps {
     fn soft_delete(&self, hash: &str, metadata: &BlobMetadata, reason: &str) -> Result<()>;
     fn cleanup_derived_audio(&self, hash: &str);
     fn delete_blob(&self, hash: &str) -> Result<()>;
@@ -93,7 +93,7 @@ pub trait CreatorDeleteOps {
 
 /// Production-side implementation. Forwards to the real Fastly-backed
 /// functions. Only used inside `handle_creator_delete`'s default path.
-pub struct DefaultCreatorDeleteOps;
+pub(crate) struct DefaultCreatorDeleteOps;
 
 impl CreatorDeleteOps for DefaultCreatorDeleteOps {
     fn soft_delete(&self, hash: &str, metadata: &BlobMetadata, reason: &str) -> Result<()> {
