@@ -79,6 +79,40 @@ pub struct CreatorDeleteOutcome {
     pub physical_deleted: bool,
 }
 
+/// Side-effects used by `handle_creator_delete`. The default impl
+/// (`DefaultCreatorDeleteOps`) forwards to the crate-level functions that
+/// talk to Fastly KV, GCS, and the VCL cache. Tests substitute a mock so
+/// `handle_creator_delete` can be exercised natively without Viceroy.
+pub(crate) trait CreatorDeleteOps {
+    fn soft_delete(&self, hash: &str, metadata: &BlobMetadata, reason: &str) -> Result<()>;
+    fn cleanup_derived_audio(&self, hash: &str);
+    fn delete_blob(&self, hash: &str) -> Result<()>;
+    fn delete_blob_gcs_artifacts(&self, hash: &str);
+    fn purge_vcl_cache(&self, hash: &str);
+}
+
+/// Production-side implementation. Forwards to the real Fastly-backed
+/// functions. Only used inside `handle_creator_delete`'s default path.
+pub(crate) struct DefaultCreatorDeleteOps;
+
+impl CreatorDeleteOps for DefaultCreatorDeleteOps {
+    fn soft_delete(&self, hash: &str, metadata: &BlobMetadata, reason: &str) -> Result<()> {
+        soft_delete_blob(hash, metadata, reason, false)
+    }
+    fn cleanup_derived_audio(&self, hash: &str) {
+        crate::cleanup_derived_audio_for_source(hash);
+    }
+    fn delete_blob(&self, hash: &str) -> Result<()> {
+        crate::storage::delete_blob(hash)
+    }
+    fn delete_blob_gcs_artifacts(&self, hash: &str) {
+        crate::delete_blob_gcs_artifacts(hash);
+    }
+    fn purge_vcl_cache(&self, hash: &str) {
+        crate::purge_vcl_cache(hash);
+    }
+}
+
 /// Shared creator-delete policy. Callers (`/admin/moderate` and
 /// `/admin/api/moderate`) are thin adapters over this function.
 ///
@@ -102,13 +136,35 @@ pub fn handle_creator_delete(
     physical_delete_enabled: bool,
     req_id: &str,
 ) -> Result<CreatorDeleteOutcome> {
+    handle_creator_delete_with_ops(
+        hash,
+        metadata,
+        reason,
+        physical_delete_enabled,
+        req_id,
+        &DefaultCreatorDeleteOps,
+    )
+}
+
+/// Internal core: runs the creator-delete steps against an injectable
+/// `CreatorDeleteOps`. The public `handle_creator_delete` is a thin wrapper
+/// that picks `DefaultCreatorDeleteOps`. Visible only to this crate so tests
+/// can drive it with a mock.
+pub(crate) fn handle_creator_delete_with_ops<O: CreatorDeleteOps>(
+    hash: &str,
+    metadata: &BlobMetadata,
+    reason: &str,
+    physical_delete_enabled: bool,
+    req_id: &str,
+    ops: &O,
+) -> Result<CreatorDeleteOutcome> {
     let old_status = metadata.status;
 
-    soft_delete_blob(hash, metadata, reason, false)?;
+    ops.soft_delete(hash, metadata, reason)?;
 
     let physical_deleted = if physical_delete_enabled {
-        crate::cleanup_derived_audio_for_source(hash);
-        crate::storage::delete_blob(hash).map_err(|e| {
+        ops.cleanup_derived_audio(hash);
+        ops.delete_blob(hash).map_err(|e| {
             eprintln!(
                 "[req={}] [CREATOR-DELETE] storage::delete_blob failed for {}: {}. \
                  Soft delete applied; bytes may remain on GCS.",
@@ -116,8 +172,8 @@ pub fn handle_creator_delete(
             );
             e
         })?;
-        crate::delete_blob_gcs_artifacts(hash);
-        crate::purge_vcl_cache(hash);
+        ops.delete_blob_gcs_artifacts(hash);
+        ops.purge_vcl_cache(hash);
         true
     } else {
         false
@@ -176,6 +232,199 @@ pub fn restore_soft_deleted_blob(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blossom::ModerationResult;
+    use std::cell::RefCell;
+
+    /// In-memory `CreatorDeleteOps` for unit tests. Records the sequence of
+    /// calls so ordering can be asserted, and lets tests preset the
+    /// fallible operations' outcomes.
+    #[derive(Default)]
+    struct MockOps {
+        soft_delete_err: Option<BlossomError>,
+        delete_blob_err: Option<BlossomError>,
+        calls: RefCell<Vec<&'static str>>,
+    }
+
+    impl CreatorDeleteOps for MockOps {
+        fn soft_delete(&self, _hash: &str, _metadata: &BlobMetadata, _reason: &str) -> Result<()> {
+            self.calls.borrow_mut().push("soft_delete");
+            match &self.soft_delete_err {
+                Some(e) => Err(clone_error(e)),
+                None => Ok(()),
+            }
+        }
+        fn cleanup_derived_audio(&self, _hash: &str) {
+            self.calls.borrow_mut().push("cleanup_derived_audio");
+        }
+        fn delete_blob(&self, _hash: &str) -> Result<()> {
+            self.calls.borrow_mut().push("delete_blob");
+            match &self.delete_blob_err {
+                Some(e) => Err(clone_error(e)),
+                None => Ok(()),
+            }
+        }
+        fn delete_blob_gcs_artifacts(&self, _hash: &str) {
+            self.calls.borrow_mut().push("delete_blob_gcs_artifacts");
+        }
+        fn purge_vcl_cache(&self, _hash: &str) {
+            self.calls.borrow_mut().push("purge_vcl_cache");
+        }
+    }
+
+    /// `BlossomError` doesn't implement `Clone`, so reconstruct the relevant
+    /// variants by name+message for the test fixtures.
+    fn clone_error(e: &BlossomError) -> BlossomError {
+        match e {
+            BlossomError::StorageError(m) => BlossomError::StorageError(m.clone()),
+            BlossomError::MetadataError(m) => BlossomError::MetadataError(m.clone()),
+            BlossomError::Internal(m) => BlossomError::Internal(m.clone()),
+            other => BlossomError::Internal(format!("cloned: {:?}", other)),
+        }
+    }
+
+    fn sample_metadata(status: BlobStatus) -> BlobMetadata {
+        BlobMetadata {
+            sha256: "0".repeat(64),
+            size: 123,
+            mime_type: "video/mp4".into(),
+            uploaded: "2026-04-22T00:00:00Z".into(),
+            owner: "1".repeat(64),
+            status,
+            thumbnail: None,
+            moderation: None::<ModerationResult>,
+            transcode_status: None,
+            transcode_error_code: None,
+            transcode_error_message: None,
+            transcode_last_attempt_at: None,
+            transcode_retry_after: None,
+            transcode_attempt_count: 0,
+            transcode_terminal: false,
+            dim: None,
+            transcript_status: None,
+            transcript_error_code: None,
+            transcript_error_message: None,
+            transcript_last_attempt_at: None,
+            transcript_retry_after: None,
+            transcript_attempt_count: 0,
+            transcript_terminal: false,
+        }
+    }
+
+    const HASH: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    const REQ_ID: &str = "test-req-id";
+
+    #[test]
+    fn creator_delete_flag_off_does_soft_delete_only_and_reports_physical_deleted_false() {
+        let metadata = sample_metadata(BlobStatus::Active);
+        let ops = MockOps::default();
+
+        let outcome = handle_creator_delete_with_ops(HASH, &metadata, "user", false, REQ_ID, &ops)
+            .expect("flag-off path should succeed");
+
+        assert_eq!(outcome.old_status, BlobStatus::Active);
+        assert!(!outcome.physical_delete_enabled);
+        assert!(!outcome.physical_deleted);
+        // Only soft_delete is called when the flag is off. No physical-delete
+        // ops, no GCS artifact cleanup, no VCL purge.
+        assert_eq!(*ops.calls.borrow(), vec!["soft_delete"]);
+    }
+
+    #[test]
+    fn creator_delete_flag_on_success_does_full_sequence_in_order() {
+        let metadata = sample_metadata(BlobStatus::Active);
+        let ops = MockOps::default();
+
+        let outcome = handle_creator_delete_with_ops(HASH, &metadata, "user", true, REQ_ID, &ops)
+            .expect("flag-on success path should succeed");
+
+        assert_eq!(outcome.old_status, BlobStatus::Active);
+        assert!(outcome.physical_delete_enabled);
+        assert!(outcome.physical_deleted);
+        // Order matters: soft-delete first (so serving stops even if the
+        // byte-delete fails later), then the physical-delete cleanup
+        // sequence. GCS artifact cleanup and VCL purge run last, after the
+        // main blob byte-delete succeeded.
+        assert_eq!(
+            *ops.calls.borrow(),
+            vec![
+                "soft_delete",
+                "cleanup_derived_audio",
+                "delete_blob",
+                "delete_blob_gcs_artifacts",
+                "purge_vcl_cache",
+            ]
+        );
+    }
+
+    #[test]
+    fn creator_delete_flag_on_byte_delete_failure_returns_err_after_soft_delete_already_applied() {
+        // This is the partial-state invariant the issue and helper docstring
+        // call out: when main-blob byte-delete fails, the soft-delete call
+        // already happened (content stopped serving, status flip durable),
+        // and the caller gets a loud `Err` rather than a silent partial
+        // success.
+        let metadata = sample_metadata(BlobStatus::Active);
+        let ops = MockOps {
+            delete_blob_err: Some(BlossomError::StorageError("simulated GCS 500".into())),
+            ..Default::default()
+        };
+
+        let result =
+            handle_creator_delete_with_ops(HASH, &metadata, "user", true, REQ_ID, &ops);
+
+        assert!(
+            matches!(result, Err(BlossomError::StorageError(ref m)) if m.contains("simulated GCS 500")),
+            "expected StorageError propagated from delete_blob, got {:?}",
+            result,
+        );
+        // soft_delete and cleanup_derived_audio ran before delete_blob
+        // failed; the cleanup ops that come after delete_blob did NOT run.
+        assert_eq!(
+            *ops.calls.borrow(),
+            vec!["soft_delete", "cleanup_derived_audio", "delete_blob"]
+        );
+    }
+
+    #[test]
+    fn creator_delete_soft_delete_failure_short_circuits_before_any_physical_ops() {
+        let metadata = sample_metadata(BlobStatus::Active);
+        let ops = MockOps {
+            soft_delete_err: Some(BlossomError::MetadataError("simulated KV failure".into())),
+            ..Default::default()
+        };
+
+        let result = handle_creator_delete_with_ops(HASH, &metadata, "user", true, REQ_ID, &ops);
+
+        assert!(
+            matches!(result, Err(BlossomError::MetadataError(ref m)) if m.contains("simulated KV failure")),
+            "expected MetadataError propagated from soft_delete, got {:?}",
+            result,
+        );
+        // No physical-delete ops should run when soft-delete failed.
+        assert_eq!(*ops.calls.borrow(), vec!["soft_delete"]);
+    }
+
+    #[test]
+    fn creator_delete_captures_old_status_from_metadata_not_post_soft_delete_state() {
+        // `old_status` in the outcome is the status AT ENTRY — this is what
+        // the response builder surfaces to callers as the pre-delete state.
+        // The mock doesn't mutate metadata, so we can exercise each variant.
+        for (status, expected) in &[
+            (BlobStatus::Active, BlobStatus::Active),
+            (BlobStatus::Restricted, BlobStatus::Restricted),
+            (BlobStatus::AgeRestricted, BlobStatus::AgeRestricted),
+            (BlobStatus::Pending, BlobStatus::Pending),
+            (BlobStatus::Banned, BlobStatus::Banned),
+            (BlobStatus::Deleted, BlobStatus::Deleted),
+        ] {
+            let metadata = sample_metadata(*status);
+            let ops = MockOps::default();
+            let outcome =
+                handle_creator_delete_with_ops(HASH, &metadata, "user", false, REQ_ID, &ops)
+                    .expect("metadata-only path should succeed");
+            assert_eq!(outcome.old_status, *expected);
+        }
+    }
 
     #[test]
     fn owner_delete_plan_is_soft_delete_not_hard_delete() {
