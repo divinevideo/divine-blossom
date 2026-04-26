@@ -4,7 +4,7 @@
 
 **Goal:** Allow the original uploader of a video to overwrite its WebVTT transcript with a manually edited version, and protect manual edits from being clobbered by later transcoder webhook callbacks.
 
-**Architecture:** Add a `PUT /<sha256>/vtt` (and twin `PUT /<sha256>.vtt`) route on the Fastly Compute service. Auth reuses Blossom kind 24242 with `t=upload` plus an `x=<hash>` tag binding (same shape as delete auth, just with an upload action). The handler enforces sole-owner access, validates the body, writes `{hash}/vtt/main.vtt` to GCS, and stamps `transcript_source = Manual` on `BlobMetadata`. The transcoder webhook learns to refuse transcript writes when `transcript_source = Manual`.
+**Architecture:** Add a `PUT /<sha256>/vtt` (and twin `PUT /<sha256>.vtt`) route on the Fastly Compute service. Auth reuses Blossom kind 24242 with `t=upload` plus an `x=<hash>` tag binding (same shape as delete auth, just with an upload action). The handler enforces sole-owner access, validates the body, writes `{hash}/vtt/main.vtt` to GCS, stamps `transcript_source = Manual` on `BlobMetadata`, and records the signed manual-edit auth event in provenance/audit. The metadata write helper becomes the authoritative guard that refuses auto transcript-status writes when `transcript_source = Manual`.
 
 **Tech Stack:** Rust, Fastly Compute, existing Blossom auth (`crate::auth`), GCS S3-compat upload (`crate::storage`), KV metadata (`crate::metadata`), Simple Cache + VCL purge.
 
@@ -16,10 +16,11 @@
 
 - Modify: `src/blossom.rs` — add `TranscriptSource` enum + `transcript_source` field on `BlobMetadata`; getter helpers if needed.
 - Modify: `src/storage.rs` — add `upload_transcript_to_gcs(hash, body, size)` (small-PUT only — VTTs are < 1MB).
-- Modify: `src/main.rs` — add `validate_vtt_body`, `handle_put_transcript`, route dispatch, and Manual-source guard inside `handle_transcript_status`.
-- Modify: `src/main.rs` (tests) — pure-function unit tests for body validation + the Manual-source webhook guard.
+- Modify: `src/main.rs` — add `validate_vtt_body`, `handle_put_transcript`, route dispatch, provenance response wiring, and skipped-webhook response handling.
+- Modify: `src/metadata.rs` — make `update_transcript_status` read uncached metadata and skip auto writes when `transcript_source = Manual`.
+- Modify: `src/main.rs` / `src/metadata.rs` (tests) — pure-function unit tests for body validation + Manual-source update guard.
 
-No new files. Total surface ~150 LOC.
+No new files. Total surface ~200 LOC.
 
 ---
 
@@ -27,11 +28,11 @@ No new files. Total surface ~150 LOC.
 
 - **Auth shape:** Blossom kind 24242 with `t=upload` and `x=<hash>` (NOT NIP-98). Matches every other write endpoint in this service. Using `AuthAction::Upload` plus `validate_hash_match` rejects replay against another blob.
 - **Owner gating:** Sole-owner only. `auth.pubkey == metadata.owner` (case-insensitive). Re-uploaders in `refs:<hash>` are rejected. Mirrors creator-delete semantics.
-- **Race protection:** `transcript_source` field on `BlobMetadata`. `Auto` is implicit for `None` (backward-compat for existing rows). Manual writes set `Manual`. Transcoder webhook refuses to mutate transcript fields when current value is `Manual`.
+- **Race protection:** `transcript_source` field on `BlobMetadata`. `Auto` is implicit for `None` (backward-compat for existing rows). Manual writes set `Manual`. `metadata::update_transcript_status` reads uncached metadata and refuses to mutate transcript fields when current value is `Manual`; webhook-level checks are response shaping only, not the race guard.
 - **Body validation:** Must start with `WEBVTT` magic line; size cap 512 KB (matches "small file" threshold and is comfortably above any real-world transcript). Bodies that look like JSON (start with `{` or `[`, ignoring BOM and whitespace) are rejected up front with an explicit "this looks like a transcription API response, send the WebVTT text instead" error — defends against the same LLM-output-mishandled-as-VTT class of bug that produced 27,726 corrupted VTTs in the 2026-03-09 cleanup. Yes, the `WEBVTT` magic check already rejects these; the JSON-shape branch exists purely for a debuggable error message.
 - **Status side effects:** Manual write sets `transcript_status = Complete`, clears `transcript_error_code/message/retry_after/terminal`, resets `transcript_attempt_count = 0`, sets `transcript_last_attempt_at = now`.
 - **Cache:** Invalidate metadata Simple Cache (`meta:<hash>`), transcript Simple Cache (`vtt:<hash>/vtt/main.vtt`), and VCL surrogate-key `<hash>` after a successful write.
-- **Out of scope:** Versioning / history of edits (provenance system already records the signed auth event), language metadata (today's transcoder writes one VTT; multi-lang is a separate effort), client tooling (mobile/web update happens in their repos).
+- **Out of scope:** Full versioning / history of every edit (this plan stores the latest manual-update auth event plus an audit-log entry, not every overwritten VTT body), language metadata (today's transcoder writes one VTT; multi-lang is a separate effort), client tooling (mobile/web update happens in their repos).
 
 ---
 
@@ -110,7 +111,7 @@ In the `BlobMetadata` struct (`src/blossom.rs:38-103`), add this field at the en
 
 ```rust
     /// Origin of the current transcript (auto vs manual). When `Some(Manual)`
-    /// the transcoder webhook refuses to overwrite transcript fields.
+    /// auto transcript-status writers refuse to overwrite transcript fields.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub transcript_source: Option<TranscriptSource>,
 ```
@@ -268,7 +269,7 @@ fn validate_vtt_body(body: &[u8]) -> Result<()> {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --lib validate_vtt_body -v`
-Expected: PASS (5 new).
+Expected: PASS (8 new).
 
 - [ ] **Step 5: Commit**
 
@@ -319,8 +320,8 @@ In `src/storage.rs`, add (model on `upload_blob` at line 102):
 /// Upload a manually edited transcript to GCS at `{hash}/vtt/main.vtt`.
 ///
 /// VTTs are small (< 512 KB), so this always uses a single signed PUT —
-/// no multipart path needed. The owner is recorded in `x-amz-meta-owner`
-/// for the same provenance reasons as `upload_blob`.
+/// no multipart path needed. Provenance for the edit lives in KV/audit;
+/// this derived object does not need its own `x-amz-meta-owner` header.
 pub fn upload_transcript_to_gcs(hash: &str, body: Body, size: u64) -> Result<()> {
     let config = GCSConfig::load()?;
     let object_path = format!("{}/vtt/main.vtt", hash);
@@ -413,9 +414,9 @@ fn handle_put_transcript(mut req: Request, path: &str) -> Result<Response> {
     use crate::auth::{validate_auth, validate_hash_match};
     use crate::blossom::{AuthAction, TranscriptSource, TranscriptStatus};
     use crate::metadata::{
-        get_blob_metadata_uncached, invalidate_metadata_cache, put_blob_metadata,
+        get_blob_metadata_uncached, invalidate_metadata_cache, put_auth_event, put_blob_metadata,
     };
-    use crate::storage::upload_transcript_to_gcs;
+    use crate::storage::{upload_transcript_to_gcs, write_audit_log};
 
     let hash = parse_transcript_path(path)
         .or_else(|| parse_vtt_file_path(path))
@@ -424,6 +425,7 @@ fn handle_put_transcript(mut req: Request, path: &str) -> Result<Response> {
     // Auth: signed Blossom upload event bound to this hash.
     let auth = validate_auth(&req, AuthAction::Upload)?;
     validate_hash_match(&auth, &hash)?;
+    let auth_event_json = serde_json::to_string(&auth).unwrap_or_default();
 
     // Sole-owner check. Read uncached so we don't trust a 5-min stale cache for an auth gate.
     let mut metadata = get_blob_metadata_uncached(&hash)?
@@ -484,6 +486,20 @@ fn handle_put_transcript(mut req: Request, path: &str) -> Result<Response> {
     metadata.transcript_terminal = false;
     put_blob_metadata(&metadata)?;
 
+    // Store provenance and audit for the manual edit. This is best-effort like
+    // upload/delete provenance: failure to record audit data must not roll back
+    // the already-written VTT and metadata.
+    let _ = put_auth_event(&hash, "transcript_update", &auth_event_json);
+    let meta_json = serde_json::to_string(&metadata).ok();
+    write_audit_log(
+        &hash,
+        "transcript_update",
+        &auth.pubkey,
+        Some(&auth_event_json),
+        meta_json.as_deref(),
+        None,
+    );
+
     // Cache invalidation: metadata cache (already done by put_blob_metadata),
     // transcript content cache, and VCL surrogate-key.
     invalidate_metadata_cache(&hash);
@@ -513,12 +529,30 @@ In `src/main.rs` `handle_request` (~line 105-115), add two route arms next to th
 
 Place them above the GET arms (route order doesn't matter functionally — `match` is exhaustive — but reads better grouped by path).
 
-- [ ] **Step 5: Run all tests**
+- [ ] **Step 5: Surface manual-edit provenance**
+
+Update `handle_get_provenance` to load and return the latest signed manual edit auth event:
+
+```rust
+    let transcript_update_auth = get_auth_event(&hash, "transcript_update")?;
+
+    // ...
+
+    if let Some(auth) = transcript_update_auth {
+        if let Ok(event) = serde_json::from_str::<serde_json::Value>(&auth) {
+            provenance["transcript_update_auth_event"] = event;
+        }
+    }
+```
+
+This is intentionally the latest edit event only. Full edit history/versioning is out of scope for this endpoint.
+
+- [ ] **Step 6: Run all tests**
 
 Run: `cargo test --lib`
 Expected: PASS — handler unit tests pass, nothing else regressed.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src/main.rs
@@ -527,62 +561,93 @@ git commit -m "feat(blossom): add PUT /<hash>/vtt for owner transcript edits"
 
 ---
 
-### Task 5: Transcoder webhook respects `Manual` source
+### Task 5: Transcript status updates respect `Manual` source
 
 **Files:**
-- Modify: `src/main.rs` `handle_transcript_status` (around line 5050-5080) and `crate::metadata::update_transcript_status`.
+- Modify: `src/metadata.rs` `update_transcript_status`
+- Modify: `src/main.rs` `handle_transcript_status` (around line 5050-5080)
 
 - [ ] **Step 1: Inspect current update path**
 
-Run: `grep -n "fn update_transcript_status\|TranscriptMetadataUpdate" src/metadata.rs`
+Run:
 
-Confirm where the webhook applies updates. The guard MUST live close to the KV write to be race-safe; the call-site check in `handle_transcript_status` is also fine since the webhook is the only Auto writer.
+```bash
+grep -n "fn update_transcript_status\|TranscriptMetadataUpdate" src/metadata.rs
+grep -n "update_transcript_status(" src/main.rs src/metadata.rs
+grep -n "transcript_status = Some" src/main.rs src/metadata.rs
+```
+
+Confirm every automatic transcript-status writer. The guard MUST live inside `metadata::update_transcript_status`, close to the KV write, and it MUST use `get_blob_metadata_uncached`; a webhook-only pre-check is not race-safe because other callers and POP-local metadata cache can otherwise erase `transcript_source = Manual`.
 
 - [ ] **Step 2: Write the failing test**
 
-Add to the test module nearest `update_transcript_status` (in `src/metadata.rs` if there are unit tests there, otherwise inline in main.rs as a behavioral test on the public helper):
+Add to the test module nearest `update_transcript_status` in `src/metadata.rs`:
 
 ```rust
 #[test]
-fn webhook_skip_when_manual_source_present() {
-    // Pure decision helper — extract the conditional out of the webhook handler
-    // so it's testable without KV.
+fn transcript_status_update_skips_when_manual_source_present() {
+    // Pure decision helper — the KV-writing function calls this after an
+    // uncached metadata read, before mutating transcript fields.
     use crate::blossom::TranscriptSource;
 
-    assert!(should_skip_transcript_webhook_write(Some(TranscriptSource::Manual)));
-    assert!(!should_skip_transcript_webhook_write(Some(TranscriptSource::Auto)));
-    assert!(!should_skip_transcript_webhook_write(None));
+    assert!(should_skip_auto_transcript_status_update(Some(
+        TranscriptSource::Manual
+    )));
+    assert!(!should_skip_auto_transcript_status_update(Some(
+        TranscriptSource::Auto
+    )));
+    assert!(!should_skip_auto_transcript_status_update(None));
 }
 ```
 
 - [ ] **Step 3: Run test to verify it fails**
 
-Run: `cargo test --lib webhook_skip_when_manual_source_present -v`
+Run: `cargo test --lib transcript_status_update_skips_when_manual_source_present -v`
 Expected: FAIL — helper undefined.
 
-- [ ] **Step 4: Add the decision helper and use it in the webhook**
+- [ ] **Step 4: Add the decision helper inside the metadata module**
 
-In `src/main.rs`, near `handle_transcript_status` (~line 5000), add:
+In `src/metadata.rs`, import `TranscriptSource` alongside the other blossom types and add this helper near `update_transcript_status`:
 
 ```rust
-/// Webhook write-guard: refuse to mutate transcript fields if the current
-/// source is `Manual`. Owner-edited VTTs must not be clobbered by a
-/// late/retried machine transcription job.
-fn should_skip_transcript_webhook_write(current: Option<TranscriptSource>) -> bool {
+/// Auto transcript writers must not mutate transcript fields after the owner
+/// uploads a manual VTT. This protects against late/retried machine
+/// transcription jobs and other auto repair paths.
+fn should_skip_auto_transcript_status_update(current: Option<TranscriptSource>) -> bool {
     matches!(current, Some(TranscriptSource::Manual))
 }
 ```
 
-Then in `handle_transcript_status`, immediately before the call to `update_transcript_status` (~line 5069), add:
+Change `update_transcript_status` to return `Result<bool>` where `true` means "metadata updated" and `false` means "skipped because source is Manual". Existing `let _ = update_transcript_status(...)` and `update_transcript_status(...)?;` callers can ignore the boolean, but any explicit `Ok(())` match must be updated.
 
 ```rust
-    // Race guard: if the owner has uploaded a manual VTT, the transcoder
-    // callback must not overwrite it. We re-read uncached because the 5-min
-    // metadata cache could otherwise hide a recent manual write.
-    if let Some(existing) = crate::metadata::get_blob_metadata_uncached(sha256)? {
-        if should_skip_transcript_webhook_write(existing.transcript_source) {
+pub fn update_transcript_status(
+    hash: &str,
+    status: crate::blossom::TranscriptStatus,
+    update: TranscriptMetadataUpdate,
+) -> Result<bool> {
+    let mut metadata = get_blob_metadata_uncached(hash)?
+        .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
+
+    if should_skip_auto_transcript_status_update(metadata.transcript_source) {
+        return Ok(false);
+    }
+
+    metadata.transcript_status = Some(status);
+    // existing status match body stays here
+    put_blob_metadata(&metadata)?;
+    Ok(true)
+}
+```
+
+- [ ] **Step 5: Update webhook response handling**
+
+In `handle_transcript_status`, update the `match update_transcript_status(...)` arms:
+
+```rust
+        Ok(false) => {
             eprintln!(
-                "[TRANSCRIPT] Skipping webhook write for {} — transcript_source=manual",
+                "[TRANSCRIPT] Skipping webhook write for {} - transcript_source=manual",
                 sha256
             );
             let response = serde_json::json!({
@@ -593,21 +658,21 @@ Then in `handle_transcript_status`, immediately before the call to `update_trans
             });
             let mut resp = json_response(StatusCode::OK, &response);
             add_cors_headers(&mut resp);
-            return Ok(resp);
+            Ok(resp)
         }
-    }
+        Ok(true) => {
+            // existing success path
+        }
 ```
-
-Place this **after** the webhook secret check (so unauth'd callers still get 403) and **before** the `update_transcript_status` call.
 
 Also update the GCS-deletion path in `handle_transcript_status` if any: currently the webhook does not delete VTTs, so no further changes — but verify by grepping `delete_transcript` and `vtt/main.vtt` in `src/main.rs`.
 
-- [ ] **Step 5: Run all tests**
+- [ ] **Step 6: Run all tests**
 
 Run: `cargo test --lib`
 Expected: PASS — all old tests green, new test green.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src/main.rs
@@ -674,7 +739,7 @@ curl -sS -X PUT "http://localhost:7676/${HASH}/vtt" \
 ```bash
 # After a successful manual write, fire a fake transcoder webhook for the same hash.
 curl -sS -X POST "http://localhost:7676/admin/transcript-status" \
-  -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
+  -H "Authorization: Bearer $WEBHOOK_SECRET" \
   -H "Content-Type: application/json" \
   -d "{\"sha256\":\"${HASH}\",\"status\":\"complete\"}" \
   | jq .
@@ -682,7 +747,8 @@ curl -sS -X POST "http://localhost:7676/admin/transcript-status" \
 
 # Confirm metadata still says manual:
 curl -sS "http://localhost:7676/${HASH}" -I
-# Then read the KV (or call /provenance) to verify transcript_source=manual.
+# Then read metadata/KV to verify transcript_source=manual, and call
+# /${HASH}/provenance to verify transcript_update_auth_event is present.
 ```
 
 - [ ] **Step 4: Deploy + production purge**
@@ -715,7 +781,7 @@ All three must pass. Record output in the PR description.
 ## What This Plan Deliberately Does NOT Do
 
 - **Multi-language VTTs.** Today the schema is `{hash}/vtt/main.vtt` — single track. If multi-language is needed later, that is a separate plan with a `lang` query param and a different GCS path layout.
-- **Versioning / rollback.** The signed Blossom event is stored in the existing provenance KV; the VTT itself is overwritten in place. If audit-grade history is required, route the write through Cloud Run with the existing audit-log endpoint.
+- **Versioning / rollback.** The latest signed Blossom manual-edit event is stored in the existing provenance KV and the edit is audit-logged, but the VTT itself is overwritten in place. If audit-grade body history is required, route the write through Cloud Run with append-only object versioning.
 - **NIP-98 auth on this route.** Rejected in favor of Blossom kind 24242 for consistency with `PUT /upload` and `DELETE /<hash>`. If a NIP-98 path is later wanted (e.g. for clients that don't speak Blossom auth), add it as an *additional* accepted scheme inside `validate_auth`, not as a route-specific exception.
 - **Re-uploader edits.** Refs (`refs:<hash>`) cannot edit. If the product later wants shared edit rights, the auth check moves to "is in refs OR is owner" — explicit decision needed.
 - **Client-side wiring.** divine-mobile and divine-web changes ship in their own PRs. This plan only delivers the server endpoint.
