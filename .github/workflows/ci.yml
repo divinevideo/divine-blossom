@@ -29,6 +29,9 @@ jobs:
       - name: Check edge crate
         run: cargo check --tests --locked
 
+      - name: Run blossom-core tests
+        run: cargo test -p blossom-core --locked
+
       - name: Run upload service tests
         run: cargo test --manifest-path cloud-run-upload/Cargo.toml --locked
 
