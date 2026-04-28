@@ -3,7 +3,7 @@
 
 use crate::blossom::{BlobMetadata, BlobStatus, GlobalStats, RecentIndex};
 use crate::delete_policy::{
-    build_creator_delete_response, handle_creator_delete, map_moderate_action,
+    build_creator_delete_response, handle_creator_delete, map_admin_api_action,
     parse_restore_status, restore_soft_deleted_blob, validate_sha256_format,
 };
 use crate::error::{BlossomError, Result};
@@ -923,7 +923,7 @@ pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
         return json_response(StatusCode::OK, &response);
     }
 
-    let new_status = map_moderate_action(&moderate_req.action)?;
+    let new_status = map_admin_api_action(&moderate_req.action)?;
 
     if old_status != new_status {
         if old_status == BlobStatus::Deleted {

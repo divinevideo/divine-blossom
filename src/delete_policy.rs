@@ -22,22 +22,35 @@ pub fn validate_sha256_format(sha256: &str) -> Result<()> {
     Ok(())
 }
 
-/// Maps an action string from a moderation request to a `BlobStatus`.
-/// Returns `Err(BadRequest)` for unknown actions. The DELETE action is
-/// handled separately by callers before reaching this function.
-///
-/// Both `/admin/moderate` and `/admin/api/moderate` accept slightly
-/// different action aliases. This function covers the union so both
-/// endpoints can share validation.
-pub fn map_moderate_action(action: &str) -> Result<BlobStatus> {
+/// Maps an action string from `/admin/api/moderate` to a `BlobStatus`.
+/// Accepts: BAN, BLOCK, RESTRICT, AGE_RESTRICT, AGE_RESTRICTED, APPROVE,
+/// ACTIVE, PENDING. DELETE is handled by callers before reaching this.
+pub fn map_admin_api_action(action: &str) -> Result<BlobStatus> {
     match action.to_uppercase().as_str() {
-        "BAN" | "BLOCK" | "PERMANENT_BAN" => Ok(BlobStatus::Banned),
-        "RESTRICT" | "QUARANTINE" => Ok(BlobStatus::Restricted),
+        "BAN" | "BLOCK" => Ok(BlobStatus::Banned),
+        "RESTRICT" => Ok(BlobStatus::Restricted),
         "AGE_RESTRICT" | "AGE_RESTRICTED" => Ok(BlobStatus::AgeRestricted),
-        "APPROVE" | "ACTIVE" | "SAFE" => Ok(BlobStatus::Active),
+        "APPROVE" | "ACTIVE" => Ok(BlobStatus::Active),
         "PENDING" => Ok(BlobStatus::Pending),
         _ => Err(BlossomError::BadRequest(format!(
             "Unknown action: {}",
+            action
+        ))),
+    }
+}
+
+/// Maps an action string from `/admin/moderate` (webhook) to a `BlobStatus`.
+/// Accepts: BLOCK, BAN, PERMANENT_BAN, AGE_RESTRICTED, AGE_RESTRICT,
+/// RESTRICT, QUARANTINE, APPROVE, SAFE. DELETE is handled by callers
+/// before reaching this.
+pub fn map_webhook_moderate_action(action: &str) -> Result<BlobStatus> {
+    match action.to_uppercase().as_str() {
+        "BLOCK" | "BAN" | "PERMANENT_BAN" => Ok(BlobStatus::Banned),
+        "AGE_RESTRICTED" | "AGE_RESTRICT" => Ok(BlobStatus::AgeRestricted),
+        "RESTRICT" | "QUARANTINE" => Ok(BlobStatus::Restricted),
+        "APPROVE" | "SAFE" => Ok(BlobStatus::Active),
+        _ => Err(BlossomError::BadRequest(format!(
+            "Unknown action: {}. Expected BLOCK, RESTRICT, QUARANTINE, AGE_RESTRICTED, or APPROVE",
             action
         ))),
     }
@@ -400,8 +413,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result =
-            handle_creator_delete_with_ops(HASH, &metadata, "user", true, REQ_ID, &ops);
+        let result = handle_creator_delete_with_ops(HASH, &metadata, "user", true, REQ_ID, &ops);
 
         assert!(
             matches!(result, Err(BlossomError::StorageError(ref m)) if m.contains("simulated GCS 500")),
@@ -574,7 +586,8 @@ mod tests {
 
     #[test]
     fn sha256_valid_mixed_case_passes() {
-        validate_sha256_format("aAbBcCdDeEfF0011223344556677889900112233445566778899aAbBcCdDeEfF").unwrap();
+        validate_sha256_format("aAbBcCdDeEfF0011223344556677889900112233445566778899aAbBcCdDeEfF")
+            .unwrap();
     }
 
     #[test]
@@ -609,13 +622,13 @@ mod tests {
         assert!(matches!(result, Err(BlossomError::BadRequest(_))));
     }
 
-    // ── map_moderate_action ─────────────────────────────────────────
+    // ── map_admin_api_action (/admin/api/moderate) ──────────────────
 
     #[test]
-    fn action_ban_aliases_all_map_to_banned() {
-        for action in &["BAN", "BLOCK", "PERMANENT_BAN", "ban", "Block", "permanent_ban"] {
+    fn admin_api_ban_aliases_map_to_banned() {
+        for action in &["BAN", "BLOCK", "ban", "Block"] {
             assert_eq!(
-                map_moderate_action(action).unwrap(),
+                map_admin_api_action(action).unwrap(),
                 BlobStatus::Banned,
                 "{action} should map to Banned"
             );
@@ -623,21 +636,46 @@ mod tests {
     }
 
     #[test]
-    fn action_restrict_aliases_map_to_restricted() {
-        for action in &["RESTRICT", "QUARANTINE", "restrict", "Quarantine"] {
-            assert_eq!(
-                map_moderate_action(action).unwrap(),
-                BlobStatus::Restricted,
-                "{action} should map to Restricted"
-            );
-        }
+    fn admin_api_restrict_maps_to_restricted() {
+        assert_eq!(
+            map_admin_api_action("RESTRICT").unwrap(),
+            BlobStatus::Restricted
+        );
+        assert_eq!(
+            map_admin_api_action("restrict").unwrap(),
+            BlobStatus::Restricted
+        );
     }
 
     #[test]
-    fn action_age_restrict_aliases_map_to_age_restricted() {
-        for action in &["AGE_RESTRICT", "AGE_RESTRICTED", "age_restrict", "Age_Restricted"] {
+    fn admin_api_does_not_accept_quarantine() {
+        assert!(matches!(
+            map_admin_api_action("QUARANTINE"),
+            Err(BlossomError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn admin_api_does_not_accept_permanent_ban() {
+        assert!(matches!(
+            map_admin_api_action("PERMANENT_BAN"),
+            Err(BlossomError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn admin_api_does_not_accept_safe() {
+        assert!(matches!(
+            map_admin_api_action("SAFE"),
+            Err(BlossomError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn admin_api_age_restrict_aliases_map_to_age_restricted() {
+        for action in &["AGE_RESTRICT", "AGE_RESTRICTED", "age_restrict"] {
             assert_eq!(
-                map_moderate_action(action).unwrap(),
+                map_admin_api_action(action).unwrap(),
                 BlobStatus::AgeRestricted,
                 "{action} should map to AgeRestricted"
             );
@@ -645,10 +683,10 @@ mod tests {
     }
 
     #[test]
-    fn action_approve_aliases_map_to_active() {
-        for action in &["APPROVE", "ACTIVE", "SAFE", "approve", "Active", "safe"] {
+    fn admin_api_approve_aliases_map_to_active() {
+        for action in &["APPROVE", "ACTIVE", "approve", "Active"] {
             assert_eq!(
-                map_moderate_action(action).unwrap(),
+                map_admin_api_action(action).unwrap(),
                 BlobStatus::Active,
                 "{action} should map to Active"
             );
@@ -656,14 +694,20 @@ mod tests {
     }
 
     #[test]
-    fn action_pending_maps_to_pending() {
-        assert_eq!(map_moderate_action("PENDING").unwrap(), BlobStatus::Pending);
-        assert_eq!(map_moderate_action("pending").unwrap(), BlobStatus::Pending);
+    fn admin_api_pending_maps_to_pending() {
+        assert_eq!(
+            map_admin_api_action("PENDING").unwrap(),
+            BlobStatus::Pending
+        );
+        assert_eq!(
+            map_admin_api_action("pending").unwrap(),
+            BlobStatus::Pending
+        );
     }
 
     #[test]
-    fn action_unknown_returns_bad_request_with_action_name() {
-        let result = map_moderate_action("OBLITERATE");
+    fn admin_api_unknown_returns_bad_request() {
+        let result = map_admin_api_action("OBLITERATE");
         match result {
             Err(BlossomError::BadRequest(msg)) => assert!(
                 msg.contains("OBLITERATE"),
@@ -674,19 +718,111 @@ mod tests {
     }
 
     #[test]
-    fn action_empty_string_returns_bad_request() {
+    fn admin_api_delete_is_not_handled() {
         assert!(matches!(
-            map_moderate_action(""),
+            map_admin_api_action("DELETE"),
+            Err(BlossomError::BadRequest(_))
+        ));
+    }
+
+    // ── map_webhook_moderate_action (/admin/moderate) ─────────────────
+
+    #[test]
+    fn webhook_ban_aliases_map_to_banned() {
+        for action in &["BLOCK", "BAN", "PERMANENT_BAN", "block", "permanent_ban"] {
+            assert_eq!(
+                map_webhook_moderate_action(action).unwrap(),
+                BlobStatus::Banned,
+                "{action} should map to Banned"
+            );
+        }
+    }
+
+    #[test]
+    fn webhook_restrict_aliases_map_to_restricted() {
+        for action in &["RESTRICT", "QUARANTINE", "restrict", "Quarantine"] {
+            assert_eq!(
+                map_webhook_moderate_action(action).unwrap(),
+                BlobStatus::Restricted,
+                "{action} should map to Restricted"
+            );
+        }
+    }
+
+    #[test]
+    fn webhook_age_restrict_aliases_map_to_age_restricted() {
+        for action in &["AGE_RESTRICTED", "AGE_RESTRICT", "age_restricted"] {
+            assert_eq!(
+                map_webhook_moderate_action(action).unwrap(),
+                BlobStatus::AgeRestricted,
+                "{action} should map to AgeRestricted"
+            );
+        }
+    }
+
+    #[test]
+    fn webhook_approve_aliases_map_to_active() {
+        for action in &["APPROVE", "SAFE", "approve", "safe"] {
+            assert_eq!(
+                map_webhook_moderate_action(action).unwrap(),
+                BlobStatus::Active,
+                "{action} should map to Active"
+            );
+        }
+    }
+
+    #[test]
+    fn webhook_does_not_accept_active() {
+        assert!(matches!(
+            map_webhook_moderate_action("ACTIVE"),
             Err(BlossomError::BadRequest(_))
         ));
     }
 
     #[test]
-    fn action_delete_is_not_handled_by_map_moderate_action() {
-        // DELETE is handled by callers before reaching map_moderate_action.
-        // If someone passes it here, it's an unknown action.
+    fn webhook_does_not_accept_pending() {
         assert!(matches!(
-            map_moderate_action("DELETE"),
+            map_webhook_moderate_action("PENDING"),
+            Err(BlossomError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn webhook_unknown_returns_specific_error_message() {
+        let result = map_webhook_moderate_action("OBLITERATE");
+        match result {
+            Err(BlossomError::BadRequest(msg)) => {
+                assert!(
+                    msg.contains("OBLITERATE"),
+                    "error should include the unknown action name, got: {msg}"
+                );
+                assert!(
+                    msg.contains(
+                        "Expected BLOCK, RESTRICT, QUARANTINE, AGE_RESTRICTED, or APPROVE"
+                    ),
+                    "webhook error should list expected actions, got: {msg}"
+                );
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn webhook_delete_is_not_handled() {
+        assert!(matches!(
+            map_webhook_moderate_action("DELETE"),
+            Err(BlossomError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn admin_api_and_webhook_empty_string_returns_bad_request() {
+        assert!(matches!(
+            map_admin_api_action(""),
+            Err(BlossomError::BadRequest(_))
+        ));
+        assert!(matches!(
+            map_webhook_moderate_action(""),
             Err(BlossomError::BadRequest(_))
         ));
     }

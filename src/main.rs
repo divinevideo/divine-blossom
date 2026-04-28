@@ -22,8 +22,8 @@ use crate::blossom::{
     SubtitleJobStatus, TranscodeStatus, TranscriptStatus, UploadRequirements,
 };
 use crate::delete_policy::{
-    build_creator_delete_response, handle_creator_delete, map_moderate_action, plan_user_delete,
-    soft_delete_blob, validate_sha256_format, DeletePlan,
+    build_creator_delete_response, handle_creator_delete, map_webhook_moderate_action,
+    plan_user_delete, soft_delete_blob, validate_sha256_format, DeletePlan,
 };
 use crate::error::{BlossomError, Result};
 use crate::media_auth_log::format_media_auth_log;
@@ -4783,20 +4783,15 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
             Some(reason),
         );
 
-        let outcome = handle_creator_delete(
-            sha256,
-            &metadata,
-            reason,
-            physical_delete_enabled,
-            &req_id,
-        )
-        .map_err(|e| {
-            eprintln!(
-                "[req={}] [CREATOR-DELETE] handle_creator_delete failed for {}: {}",
-                req_id, sha256, e
-            );
-            e
-        })?;
+        let outcome =
+            handle_creator_delete(sha256, &metadata, reason, physical_delete_enabled, &req_id)
+                .map_err(|e| {
+                    eprintln!(
+                        "[req={}] [CREATOR-DELETE] handle_creator_delete failed for {}: {}",
+                        req_id, sha256, e
+                    );
+                    e
+                })?;
 
         write_audit_log(
             sha256,
@@ -4813,7 +4808,7 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
         return Ok(resp);
     }
 
-    let new_status = map_moderate_action(action)?;
+    let new_status = map_webhook_moderate_action(action)?;
 
     // Update blob status
     match update_blob_status(sha256, new_status) {
