@@ -22,8 +22,8 @@ use crate::blossom::{
     SubtitleJobStatus, TranscodeStatus, TranscriptStatus, UploadRequirements,
 };
 use crate::delete_policy::{
-    build_creator_delete_response, handle_creator_delete, plan_user_delete, soft_delete_blob,
-    DeletePlan,
+    build_creator_delete_response, handle_creator_delete, map_moderate_action, plan_user_delete,
+    soft_delete_blob, validate_sha256_format, DeletePlan,
 };
 use crate::error::{BlossomError, Result};
 use crate::media_auth_log::format_media_auth_log;
@@ -4750,10 +4750,7 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
         req_id, sha256, action
     );
 
-    // Validate sha256 format
-    if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(BlossomError::BadRequest("Invalid sha256 format".into()));
-    }
+    validate_sha256_format(sha256)?;
 
     // Creator-delete: thin adapter over handle_creator_delete so /admin/moderate
     // and /admin/api/moderate produce the same response contract.
@@ -4816,23 +4813,7 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
         return Ok(resp);
     }
 
-    // Map action to BlobStatus.
-    //
-    // AGE_RESTRICTED is intentionally split out from RESTRICT/QUARANTINE: it lands on
-    // BlobStatus::AgeRestricted, which serves as a 401 age gate to anonymous viewers
-    // instead of the 404 shadow-ban that RESTRICT/QUARANTINE produce.
-    let new_status = match action.to_uppercase().as_str() {
-        "BLOCK" | "BAN" | "PERMANENT_BAN" => BlobStatus::Banned,
-        "AGE_RESTRICTED" | "AGE_RESTRICT" => BlobStatus::AgeRestricted,
-        "RESTRICT" | "QUARANTINE" => BlobStatus::Restricted,
-        "APPROVE" | "SAFE" => BlobStatus::Active,
-        _ => {
-            return Err(BlossomError::BadRequest(format!(
-                "Unknown action: {}. Expected BLOCK, RESTRICT, QUARANTINE, AGE_RESTRICTED, or APPROVE",
-                action
-            )));
-        }
-    };
+    let new_status = map_moderate_action(action)?;
 
     // Update blob status
     match update_blob_status(sha256, new_status) {
@@ -4928,10 +4909,7 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
         parsed.terminal
     );
 
-    // Validate sha256 format
-    if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(BlossomError::BadRequest("Invalid sha256 format".into()));
-    }
+    validate_sha256_format(sha256)?;
 
     // Update transcode status (and optionally file size and dimensions if provided)
     use crate::metadata::update_transcode_status_with_metadata;
@@ -5056,10 +5034,7 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
         sha256, parsed.status, parsed.job_id
     );
 
-    // Validate sha256 format
-    if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(BlossomError::BadRequest("Invalid sha256 format".into()));
-    }
+    validate_sha256_format(sha256)?;
 
     use crate::metadata::update_transcript_status;
     match update_transcript_status(
