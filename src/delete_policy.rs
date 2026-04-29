@@ -31,7 +31,7 @@ pub fn soft_delete_blob(
         let _ = put_tombstone(hash, reason);
     }
 
-    crate::purge_vcl_cache(hash);
+    crate::purge_edge_cache(hash);
     Ok(())
 }
 
@@ -51,7 +51,7 @@ impl CreatorDeleteOps for DefaultCreatorDeleteOps {
         crate::delete_blob_gcs_artifacts(hash);
     }
     fn purge_vcl_cache(&self, hash: &str) {
-        crate::purge_vcl_cache(hash);
+        crate::purge_edge_cache(hash);
     }
 }
 
@@ -93,7 +93,7 @@ pub fn restore_soft_deleted_blob(
         }
     }
     let _ = add_to_recent_index(hash);
-    crate::purge_vcl_cache(hash);
+    crate::purge_edge_cache(hash);
 
     Ok(())
 }

@@ -405,7 +405,7 @@ pub(crate) fn cleanup_derived_audio_for_source(source_hash: &str) {
         let _ = storage_delete(&mapping.audio_sha256);
         let _ = delete_blob_metadata(&mapping.audio_sha256);
         let _ = delete_audio_source_refs(&mapping.audio_sha256);
-        purge_vcl_cache(&mapping.audio_sha256);
+        purge_edge_cache(&mapping.audio_sha256);
     } else {
         let _ = delete_audio_source_refs(&mapping.audio_sha256);
     }
@@ -4048,7 +4048,7 @@ fn execute_vanish(pubkey: &str) -> (u32, u32, u32) {
             delete_blob_kv_artifacts(hash);
             let _ = update_stats_on_remove(&metadata);
             let _ = remove_from_recent_index(hash);
-            purge_vcl_cache(hash);
+            purge_edge_cache(hash);
             fully_deleted += 1;
         } else if is_owner {
             // Transfer ownership to next ref
@@ -4838,7 +4838,7 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
 
             // Purge VCL cache so the new status takes effect immediately.
             // Banned/restricted content will 404 on next request; approved content will 200.
-            purge_vcl_cache(sha256);
+            purge_edge_cache(sha256);
 
             let response = serde_json::json!({
                 "success": true,
@@ -4967,7 +4967,7 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
                 parsed.status,
                 TranscodeStatus::Complete | TranscodeStatus::Failed
             ) {
-                purge_vcl_cache(sha256);
+                purge_edge_cache(sha256);
             }
 
             let response = serde_json::json!({
@@ -5124,7 +5124,7 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
                 TranscriptStatus::Complete | TranscriptStatus::Failed
             ) {
                 purge_transcript_content_cache(sha256);
-                purge_vcl_cache(sha256);
+                purge_edge_cache(sha256);
             }
 
             let response = serde_json::json!({
@@ -5505,6 +5505,14 @@ fn error_response(error: &BlossomError) -> Response {
     resp.set_body(body.to_string());
     add_cors_headers(&mut resp);
 
+    // Cap how long CDN caches 404s from access-controlled blobs.
+    // Without this, moderation status changes (e.g. Restricted -> Active)
+    // stay invisible at the edge until Fastly's default TTL expires.
+    if error.status_code() == StatusCode::NOT_FOUND {
+        resp.set_header("Cache-Control", "no-store");
+        resp.set_header("Surrogate-Control", "max-age=60");
+    }
+
     resp
 }
 
@@ -5534,10 +5542,10 @@ fn add_no_cache_headers(resp: &mut Response) {
     resp.set_header("Surrogate-Control", "no-store");
 }
 
-/// Purge content from the VCL caching layer by Surrogate-Key.
-/// Calls POST /service/{service_id}/purge/{key} on api.fastly.com.
-/// Best-effort: logs errors but never fails the calling request.
-pub(crate) fn purge_vcl_cache(surrogate_key: &str) {
+/// Purge content from both the VCL website cache and the Compute media cache
+/// by Surrogate-Key. Calls POST /service/{id}/purge/{key} on api.fastly.com
+/// for each service. Best-effort: logs errors but never fails the calling request.
+pub(crate) fn purge_edge_cache(surrogate_key: &str) {
     let api_token = match fastly::secret_store::SecretStore::open("blossom_secrets")
         .ok()
         .and_then(|store| store.get("fastly_api_token"))
@@ -5545,41 +5553,45 @@ pub(crate) fn purge_vcl_cache(surrogate_key: &str) {
     {
         Some(token) if !token.is_empty() => token,
         _ => {
-            eprintln!("[PURGE] fastly_api_token not configured, skipping VCL cache purge");
+            eprintln!("[PURGE] fastly_api_token not configured, skipping cache purge");
             return;
         }
     };
 
-    // VCL service ID for the caching layer (Divine.Video's website)
-    let vcl_service_id = "ML7R82HKfmTaqTpHExIDVN";
-    let url = format!(
-        "https://api.fastly.com/service/{}/purge/{}",
-        vcl_service_id, surrogate_key
-    );
+    let services: &[(&str, &str)] = &[
+        ("ML7R82HKfmTaqTpHExIDVN", "VCL"),     // divine.video website
+        ("pOvEEWykEbpnylqst1KTrR", "Compute"),  // media.divine.video (Blossom)
+    ];
 
-    let mut purge_req = Request::new(Method::POST, &url);
-    purge_req.set_header("Host", "api.fastly.com");
-    purge_req.set_header("Fastly-Key", &api_token);
-    purge_req.set_header("Accept", "application/json");
+    for &(service_id, label) in services {
+        let url = format!(
+            "https://api.fastly.com/service/{}/purge/{}",
+            service_id, surrogate_key
+        );
 
-    match purge_req.send("fastly_api") {
-        Ok(resp) => {
-            let status = resp.get_status();
-            if status.is_success() {
-                eprintln!("[PURGE] VCL cache purged for key={}", surrogate_key);
-            } else {
+        let mut purge_req = Request::new(Method::POST, &url);
+        purge_req.set_header("Host", "api.fastly.com");
+        purge_req.set_header("Fastly-Key", &api_token);
+        purge_req.set_header("Accept", "application/json");
+
+        match purge_req.send("fastly_api") {
+            Ok(resp) => {
+                let status = resp.get_status();
+                if status.is_success() {
+                    eprintln!("[PURGE] {} cache purged for key={}", label, surrogate_key);
+                } else {
+                    eprintln!(
+                        "[PURGE] {} purge failed for key={}: HTTP {}",
+                        label, surrogate_key, status.as_u16()
+                    );
+                }
+            }
+            Err(e) => {
                 eprintln!(
-                    "[PURGE] VCL purge failed for key={}: HTTP {}",
-                    surrogate_key,
-                    status.as_u16()
+                    "[PURGE] {} purge request failed for key={}: {}",
+                    label, surrogate_key, e
                 );
             }
-        }
-        Err(e) => {
-            eprintln!(
-                "[PURGE] VCL purge request failed for key={}: {}",
-                surrogate_key, e
-            );
         }
     }
 }
@@ -6072,5 +6084,29 @@ mod tests {
         let resp = error_response(&BlossomError::NotFound("Upload session not found".into()));
 
         assert_eq!(resp.get_status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn error_response_404_has_short_cdn_ttl() {
+        let resp = error_response(&BlossomError::NotFound("Blob not found".into()));
+
+        assert_eq!(resp.get_status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            resp.get_header_str("Cache-Control"),
+            Some("no-store"),
+        );
+        assert_eq!(
+            resp.get_header_str("Surrogate-Control"),
+            Some("max-age=60"),
+        );
+    }
+
+    #[test]
+    fn error_response_non_404_has_no_cdn_cache_headers() {
+        let resp = error_response(&BlossomError::BadRequest("bad input".into()));
+
+        assert_eq!(resp.get_status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.get_header_str("Cache-Control"), None);
+        assert_eq!(resp.get_header_str("Surrogate-Control"), None);
     }
 }
