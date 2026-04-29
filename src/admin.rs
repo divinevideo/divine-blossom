@@ -3,8 +3,8 @@
 
 use crate::blossom::{BlobMetadata, BlobStatus, GlobalStats, RecentIndex};
 use crate::delete_policy::{
-    build_creator_delete_response, handle_creator_delete, parse_restore_status,
-    restore_soft_deleted_blob,
+    build_creator_delete_response, handle_creator_delete, map_admin_api_action,
+    parse_restore_status, restore_soft_deleted_blob, validate_sha256_format,
 };
 use crate::error::{BlossomError, Result};
 use crate::metadata::{
@@ -859,12 +859,7 @@ pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
     let moderate_req: ModerateRequest = serde_json::from_str(&body)
         .map_err(|e| BlossomError::BadRequest(format!("Invalid JSON: {}", e)))?;
 
-    // Validate sha256 format
-    if moderate_req.sha256.len() != 64
-        || !moderate_req.sha256.chars().all(|c| c.is_ascii_hexdigit())
-    {
-        return Err(BlossomError::BadRequest("Invalid sha256 format".into()));
-    }
+    validate_sha256_format(&moderate_req.sha256)?;
 
     // Get current metadata to track status change
     let metadata = get_blob_metadata(&moderate_req.sha256)?
@@ -928,23 +923,7 @@ pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
         return json_response(StatusCode::OK, &response);
     }
 
-    // Map action to BlobStatus.
-    //
-    // AGE_RESTRICT lands on BlobStatus::AgeRestricted, which serves 401 (age gate)
-    // to non-owners. RESTRICT continues to mean the existing 404 shadow-ban.
-    let new_status = match moderate_req.action.to_uppercase().as_str() {
-        "BAN" | "BLOCK" => BlobStatus::Banned,
-        "RESTRICT" => BlobStatus::Restricted,
-        "AGE_RESTRICT" | "AGE_RESTRICTED" => BlobStatus::AgeRestricted,
-        "APPROVE" | "ACTIVE" => BlobStatus::Active,
-        "PENDING" => BlobStatus::Pending,
-        _ => {
-            return Err(BlossomError::BadRequest(format!(
-                "Unknown action: {}",
-                moderate_req.action
-            )))
-        }
-    };
+    let new_status = map_admin_api_action(&moderate_req.action)?;
 
     if old_status != new_status {
         if old_status == BlobStatus::Deleted {
@@ -974,10 +953,7 @@ pub fn handle_admin_restore_action(mut req: Request) -> Result<Response> {
     let restore_req: RestoreRequest = serde_json::from_str(&body)
         .map_err(|e| BlossomError::BadRequest(format!("Invalid JSON: {}", e)))?;
 
-    if restore_req.sha256.len() != 64 || !restore_req.sha256.chars().all(|c| c.is_ascii_hexdigit())
-    {
-        return Err(BlossomError::BadRequest("Invalid sha256 format".into()));
-    }
+    validate_sha256_format(&restore_req.sha256)?;
 
     let metadata = get_blob_metadata(&restore_req.sha256)?
         .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;

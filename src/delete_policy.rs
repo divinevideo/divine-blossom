@@ -12,6 +12,50 @@ pub enum DeletePlan {
     UnlinkOnly,
 }
 
+/// Validates that a SHA-256 string is exactly 64 hex characters.
+/// Used by both `/admin/moderate` and `/admin/api/moderate` before any
+/// metadata lookup.
+pub fn validate_sha256_format(sha256: &str) -> Result<()> {
+    if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(BlossomError::BadRequest("Invalid sha256 format".into()));
+    }
+    Ok(())
+}
+
+/// Maps an action string from `/admin/api/moderate` to a `BlobStatus`.
+/// Accepts: BAN, BLOCK, RESTRICT, AGE_RESTRICT, AGE_RESTRICTED, APPROVE,
+/// ACTIVE, PENDING. DELETE is handled by callers before reaching this.
+pub fn map_admin_api_action(action: &str) -> Result<BlobStatus> {
+    match action.to_uppercase().as_str() {
+        "BAN" | "BLOCK" => Ok(BlobStatus::Banned),
+        "RESTRICT" => Ok(BlobStatus::Restricted),
+        "AGE_RESTRICT" | "AGE_RESTRICTED" => Ok(BlobStatus::AgeRestricted),
+        "APPROVE" | "ACTIVE" => Ok(BlobStatus::Active),
+        "PENDING" => Ok(BlobStatus::Pending),
+        _ => Err(BlossomError::BadRequest(format!(
+            "Unknown action: {}",
+            action
+        ))),
+    }
+}
+
+/// Maps an action string from `/admin/moderate` (webhook) to a `BlobStatus`.
+/// Accepts: BLOCK, BAN, PERMANENT_BAN, AGE_RESTRICTED, AGE_RESTRICT,
+/// RESTRICT, QUARANTINE, APPROVE, SAFE. DELETE is handled by callers
+/// before reaching this.
+pub fn map_webhook_moderate_action(action: &str) -> Result<BlobStatus> {
+    match action.to_uppercase().as_str() {
+        "BLOCK" | "BAN" | "PERMANENT_BAN" => Ok(BlobStatus::Banned),
+        "AGE_RESTRICTED" | "AGE_RESTRICT" => Ok(BlobStatus::AgeRestricted),
+        "RESTRICT" | "QUARANTINE" => Ok(BlobStatus::Restricted),
+        "APPROVE" | "SAFE" => Ok(BlobStatus::Active),
+        _ => Err(BlossomError::BadRequest(format!(
+            "Unknown action: {}. Expected BLOCK, RESTRICT, QUARANTINE, AGE_RESTRICTED, or APPROVE",
+            action
+        ))),
+    }
+}
+
 pub fn plan_user_delete(is_owner: bool) -> DeletePlan {
     if is_owner {
         DeletePlan::SoftDelete
@@ -369,8 +413,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result =
-            handle_creator_delete_with_ops(HASH, &metadata, "user", true, REQ_ID, &ops);
+        let result = handle_creator_delete_with_ops(HASH, &metadata, "user", true, REQ_ID, &ops);
 
         assert!(
             matches!(result, Err(BlossomError::StorageError(ref m)) if m.contains("simulated GCS 500")),
@@ -528,6 +571,276 @@ mod tests {
         assert_eq!(body["physical_deleted"], serde_json::json!(true));
         assert_eq!(body["physical_delete_skipped"], serde_json::json!(false));
     }
+
+    // ── validate_sha256_format ────────────────────────────────────────
+
+    #[test]
+    fn sha256_valid_lowercase_hex_passes() {
+        validate_sha256_format(&"a".repeat(64)).unwrap();
+    }
+
+    #[test]
+    fn sha256_valid_uppercase_hex_passes() {
+        validate_sha256_format(&"A".repeat(64)).unwrap();
+    }
+
+    #[test]
+    fn sha256_valid_mixed_case_passes() {
+        validate_sha256_format("aAbBcCdDeEfF0011223344556677889900112233445566778899aAbBcCdDeEfF")
+            .unwrap();
+    }
+
+    #[test]
+    fn sha256_too_short_returns_bad_request() {
+        let result = validate_sha256_format(&"a".repeat(63));
+        assert!(matches!(result, Err(BlossomError::BadRequest(_))));
+    }
+
+    #[test]
+    fn sha256_too_long_returns_bad_request() {
+        let result = validate_sha256_format(&"a".repeat(65));
+        assert!(matches!(result, Err(BlossomError::BadRequest(_))));
+    }
+
+    #[test]
+    fn sha256_empty_returns_bad_request() {
+        let result = validate_sha256_format("");
+        assert!(matches!(result, Err(BlossomError::BadRequest(_))));
+    }
+
+    #[test]
+    fn sha256_non_hex_chars_return_bad_request() {
+        let mut bad = "a".repeat(62);
+        bad.push_str("zz");
+        let result = validate_sha256_format(&bad);
+        assert!(matches!(result, Err(BlossomError::BadRequest(_))));
+    }
+
+    #[test]
+    fn sha256_with_spaces_returns_bad_request() {
+        let result = validate_sha256_format(&format!("{} {}", "a".repeat(32), "b".repeat(31)));
+        assert!(matches!(result, Err(BlossomError::BadRequest(_))));
+    }
+
+    // ── map_admin_api_action (/admin/api/moderate) ──────────────────
+
+    #[test]
+    fn admin_api_ban_aliases_map_to_banned() {
+        for action in &["BAN", "BLOCK", "ban", "Block"] {
+            assert_eq!(
+                map_admin_api_action(action).unwrap(),
+                BlobStatus::Banned,
+                "{action} should map to Banned"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_api_restrict_maps_to_restricted() {
+        assert_eq!(
+            map_admin_api_action("RESTRICT").unwrap(),
+            BlobStatus::Restricted
+        );
+        assert_eq!(
+            map_admin_api_action("restrict").unwrap(),
+            BlobStatus::Restricted
+        );
+    }
+
+    #[test]
+    fn admin_api_does_not_accept_quarantine() {
+        assert!(matches!(
+            map_admin_api_action("QUARANTINE"),
+            Err(BlossomError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn admin_api_does_not_accept_permanent_ban() {
+        assert!(matches!(
+            map_admin_api_action("PERMANENT_BAN"),
+            Err(BlossomError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn admin_api_does_not_accept_safe() {
+        assert!(matches!(
+            map_admin_api_action("SAFE"),
+            Err(BlossomError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn admin_api_age_restrict_aliases_map_to_age_restricted() {
+        for action in &["AGE_RESTRICT", "AGE_RESTRICTED", "age_restrict"] {
+            assert_eq!(
+                map_admin_api_action(action).unwrap(),
+                BlobStatus::AgeRestricted,
+                "{action} should map to AgeRestricted"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_api_approve_aliases_map_to_active() {
+        for action in &["APPROVE", "ACTIVE", "approve", "Active"] {
+            assert_eq!(
+                map_admin_api_action(action).unwrap(),
+                BlobStatus::Active,
+                "{action} should map to Active"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_api_pending_maps_to_pending() {
+        assert_eq!(
+            map_admin_api_action("PENDING").unwrap(),
+            BlobStatus::Pending
+        );
+        assert_eq!(
+            map_admin_api_action("pending").unwrap(),
+            BlobStatus::Pending
+        );
+    }
+
+    #[test]
+    fn admin_api_unknown_returns_bad_request() {
+        let result = map_admin_api_action("OBLITERATE");
+        match result {
+            Err(BlossomError::BadRequest(msg)) => assert!(
+                msg.contains("OBLITERATE"),
+                "error should include the unknown action name, got: {msg}"
+            ),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn admin_api_delete_is_not_handled() {
+        assert!(matches!(
+            map_admin_api_action("DELETE"),
+            Err(BlossomError::BadRequest(_))
+        ));
+    }
+
+    // ── map_webhook_moderate_action (/admin/moderate) ─────────────────
+
+    #[test]
+    fn webhook_ban_aliases_map_to_banned() {
+        for action in &["BLOCK", "BAN", "PERMANENT_BAN", "block", "permanent_ban"] {
+            assert_eq!(
+                map_webhook_moderate_action(action).unwrap(),
+                BlobStatus::Banned,
+                "{action} should map to Banned"
+            );
+        }
+    }
+
+    #[test]
+    fn webhook_restrict_aliases_map_to_restricted() {
+        for action in &["RESTRICT", "QUARANTINE", "restrict", "Quarantine"] {
+            assert_eq!(
+                map_webhook_moderate_action(action).unwrap(),
+                BlobStatus::Restricted,
+                "{action} should map to Restricted"
+            );
+        }
+    }
+
+    #[test]
+    fn webhook_age_restrict_aliases_map_to_age_restricted() {
+        for action in &["AGE_RESTRICTED", "AGE_RESTRICT", "age_restricted"] {
+            assert_eq!(
+                map_webhook_moderate_action(action).unwrap(),
+                BlobStatus::AgeRestricted,
+                "{action} should map to AgeRestricted"
+            );
+        }
+    }
+
+    #[test]
+    fn webhook_approve_aliases_map_to_active() {
+        for action in &["APPROVE", "SAFE", "approve", "safe"] {
+            assert_eq!(
+                map_webhook_moderate_action(action).unwrap(),
+                BlobStatus::Active,
+                "{action} should map to Active"
+            );
+        }
+    }
+
+    #[test]
+    fn webhook_does_not_accept_active() {
+        assert!(matches!(
+            map_webhook_moderate_action("ACTIVE"),
+            Err(BlossomError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn webhook_does_not_accept_pending() {
+        assert!(matches!(
+            map_webhook_moderate_action("PENDING"),
+            Err(BlossomError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn webhook_unknown_returns_specific_error_message() {
+        let result = map_webhook_moderate_action("OBLITERATE");
+        match result {
+            Err(BlossomError::BadRequest(msg)) => {
+                assert!(
+                    msg.contains("OBLITERATE"),
+                    "error should include the unknown action name, got: {msg}"
+                );
+                assert!(
+                    msg.contains(
+                        "Expected BLOCK, RESTRICT, QUARANTINE, AGE_RESTRICTED, or APPROVE"
+                    ),
+                    "webhook error should list expected actions, got: {msg}"
+                );
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn webhook_delete_is_not_handled() {
+        assert!(matches!(
+            map_webhook_moderate_action("DELETE"),
+            Err(BlossomError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn admin_api_and_webhook_empty_string_returns_bad_request() {
+        assert!(matches!(
+            map_admin_api_action(""),
+            Err(BlossomError::BadRequest(_))
+        ));
+        assert!(matches!(
+            map_webhook_moderate_action(""),
+            Err(BlossomError::BadRequest(_))
+        ));
+    }
+
+    // ── Coverage gaps documented (require Viceroy integration tests) ─
+    //
+    // The following #87 checklist items cannot be tested as pure functions
+    // because they depend on Fastly KV metadata lookups inside the HTTP
+    // handler:
+    //
+    //   4. Missing blob returns 404 — requires metadata::get_metadata()
+    //      to return None, which only happens inside the handler path that
+    //      reads from Fastly KV (needs Viceroy).
+    //
+    // The response contract divergence between /admin/moderate and
+    // /admin/api/moderate for non-DELETE actions is documented in
+    // docs/api/creator-delete-contract.md. DELETE responses are unified
+    // through build_creator_delete_response (tested above).
 
     #[test]
     fn response_builder_old_status_covers_every_blob_status_variant() {
