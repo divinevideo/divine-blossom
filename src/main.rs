@@ -890,23 +890,44 @@ fn handle_get_hls_content(req: Request, path: &str) -> Result<Response> {
     let is_admin = admin::validate_bearer_token(&req).is_ok();
     let mut is_restricted = false;
 
-    if let Ok(Some(ref meta)) = get_blob_metadata(&hash) {
-        let (requester_pk, auth_diagnostics) = media_viewer_context(&req, "hls_content")?;
-        match meta.access_for(requester_pk.as_deref(), is_admin) {
-            BlobAccess::Allowed => {
-                log_media_outcome("hls_content", &auth_diagnostics, "allowed");
-                if meta.status.requires_private_cache() {
-                    is_restricted = true;
+    // Propagate KV errors instead of swallowing them as "no metadata, allow":
+    // a transient KV failure must fail closed so we don't leak HLS variants
+    // for moderated/vanished blobs.
+    match get_blob_metadata(&hash)? {
+        Some(ref meta) => {
+            let (requester_pk, auth_diagnostics) = media_viewer_context(&req, "hls_content")?;
+            match meta.access_for(requester_pk.as_deref(), is_admin) {
+                BlobAccess::Allowed => {
+                    log_media_outcome("hls_content", &auth_diagnostics, "allowed");
+                    if meta.status.requires_private_cache() {
+                        is_restricted = true;
+                    }
+                }
+                BlobAccess::NotFound => {
+                    log_media_outcome("hls_content", &auth_diagnostics, "not_found");
+                    return Err(BlossomError::NotFound("Blob not found".into()));
+                }
+                BlobAccess::AgeGated => {
+                    log_media_outcome("hls_content", &auth_diagnostics, "age_gated");
+                    return Err(BlossomError::AuthRequired("age_restricted".into()));
                 }
             }
-            BlobAccess::NotFound => {
-                log_media_outcome("hls_content", &auth_diagnostics, "not_found");
-                return Err(BlossomError::NotFound("Blob not found".into()));
+        }
+        None => {
+            // Metadata may be missing because vanish/soft-delete removed it while
+            // GCS bytes survive. Mirror handle_get_blob: 404 for non-admin, log
+            // and allow admin so the moderation proxy can preview orphaned bytes.
+            if !is_admin {
+                eprintln!(
+                    "[ACCESS] hash={} metadata=None denied (no metadata, non-admin, hls_content)",
+                    hash
+                );
+                return Err(BlossomError::NotFound("Content not found".into()));
             }
-            BlobAccess::AgeGated => {
-                log_media_outcome("hls_content", &auth_diagnostics, "age_gated");
-                return Err(BlossomError::AuthRequired("age_restricted".into()));
-            }
+            eprintln!(
+                "[ACCESS] hash={} metadata=None allowed (admin bypass, hls_content)",
+                hash
+            );
         }
     }
 
