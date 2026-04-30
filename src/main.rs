@@ -422,25 +422,32 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
 
         // Check parent video's moderation status - thumbnails inherit video access rules
         let mut is_restricted = false;
-        if let Ok(Some(meta)) = get_blob_metadata(video_hash) {
-            let (requester_pk, auth_diagnostics) = media_viewer_context(&req, "thumbnail")?;
-            match meta.access_for(requester_pk.as_deref(), is_admin) {
-                BlobAccess::Allowed => {
-                    log_media_outcome("thumbnail", &auth_diagnostics, "allowed");
-                    // Authenticated access to restricted/age-restricted thumbnails
-                    // must stay private in cache below.
-                    if meta.status.requires_private_cache() {
-                        is_restricted = true;
+        match get_blob_metadata(video_hash)? {
+            Some(meta) => {
+                let (requester_pk, auth_diagnostics) = media_viewer_context(&req, "thumbnail")?;
+                match meta.access_for(requester_pk.as_deref(), is_admin) {
+                    BlobAccess::Allowed => {
+                        log_media_outcome("thumbnail", &auth_diagnostics, "allowed");
+                        if meta.status.requires_private_cache() {
+                            is_restricted = true;
+                        }
+                    }
+                    BlobAccess::NotFound => {
+                        log_media_outcome("thumbnail", &auth_diagnostics, "not_found");
+                        return Err(BlossomError::NotFound("Blob not found".into()));
+                    }
+                    BlobAccess::AgeGated => {
+                        log_media_outcome("thumbnail", &auth_diagnostics, "age_gated");
+                        return Err(BlossomError::AuthRequired("age_restricted".into()));
                     }
                 }
-                BlobAccess::NotFound => {
-                    log_media_outcome("thumbnail", &auth_diagnostics, "not_found");
+            }
+            None => {
+                if !is_admin {
+                    eprintln!("[ACCESS] thumbnail hash={} metadata=None denied (non-admin)", video_hash);
                     return Err(BlossomError::NotFound("Blob not found".into()));
                 }
-                BlobAccess::AgeGated => {
-                    log_media_outcome("thumbnail", &auth_diagnostics, "age_gated");
-                    return Err(BlossomError::AuthRequired("age_restricted".into()));
-                }
+                eprintln!("[ACCESS] thumbnail hash={} metadata=None allowed (admin bypass)", video_hash);
             }
         }
 
@@ -609,6 +616,24 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
 fn handle_head_blob(path: &str) -> Result<Response> {
     // Check if this is a thumbnail request ({hash}.jpg)
     if let Some(thumbnail_key) = parse_thumbnail_path(path) {
+        let thumb_hash = thumbnail_key.trim_end_matches(".jpg");
+
+        // HEAD has no auth context — apply non-owner access rules.
+        match get_blob_metadata(thumb_hash)? {
+            Some(meta) => match meta.access_for(None, false) {
+                BlobAccess::Allowed => {}
+                BlobAccess::NotFound => {
+                    return Err(BlossomError::NotFound("Blob not found".into()));
+                }
+                BlobAccess::AgeGated => {
+                    return Err(BlossomError::AuthRequired("age_restricted".into()));
+                }
+            },
+            None => {
+                return Err(BlossomError::NotFound("Blob not found".into()));
+            }
+        }
+
         let resp = download_thumbnail(&thumbnail_key)?;
         let content_length = resp
             .get_header_str("x-goog-stored-content-length")
@@ -618,7 +643,6 @@ fn handle_head_blob(path: &str) -> Result<Response> {
         let mut head_resp = Response::from_status(StatusCode::OK);
         head_resp.set_header("Content-Type", "image/jpeg");
         head_resp.set_header("Content-Length", &content_length);
-        let thumb_hash = thumbnail_key.trim_end_matches(".jpg");
         add_cache_headers(&mut head_resp, thumb_hash);
         head_resp.set_header("Accept-Ranges", "bytes");
         add_cors_headers(&mut head_resp);
@@ -2004,20 +2028,29 @@ fn handle_get_subtitle_by_hash(req: Request, path: &str) -> Result<Response> {
     // Don't leak subtitle info for moderated content. Use the blob's access_for so
     // age-restricted videos surface as 401 (age gate) instead of 404.
     let is_admin = admin::validate_bearer_token(&req).is_ok();
-    if let Some(meta) = get_blob_metadata(&hash)? {
-        let (requester_pk, auth_diagnostics) = media_viewer_context(&req, "subtitle_by_hash")?;
-        match meta.access_for(requester_pk.as_deref(), is_admin) {
-            BlobAccess::Allowed => {
-                log_media_outcome("subtitle_by_hash", &auth_diagnostics, "allowed")
+    match get_blob_metadata(&hash)? {
+        Some(meta) => {
+            let (requester_pk, auth_diagnostics) = media_viewer_context(&req, "subtitle_by_hash")?;
+            match meta.access_for(requester_pk.as_deref(), is_admin) {
+                BlobAccess::Allowed => {
+                    log_media_outcome("subtitle_by_hash", &auth_diagnostics, "allowed")
+                }
+                BlobAccess::NotFound => {
+                    log_media_outcome("subtitle_by_hash", &auth_diagnostics, "not_found");
+                    return Err(BlossomError::NotFound("Video hash not found".into()));
+                }
+                BlobAccess::AgeGated => {
+                    log_media_outcome("subtitle_by_hash", &auth_diagnostics, "age_gated");
+                    return Err(BlossomError::AuthRequired("age_restricted".into()));
+                }
             }
-            BlobAccess::NotFound => {
-                log_media_outcome("subtitle_by_hash", &auth_diagnostics, "not_found");
+        }
+        None => {
+            if !is_admin {
+                eprintln!("[ACCESS] subtitle hash={} metadata=None denied (non-admin)", hash);
                 return Err(BlossomError::NotFound("Video hash not found".into()));
             }
-            BlobAccess::AgeGated => {
-                log_media_outcome("subtitle_by_hash", &auth_diagnostics, "age_gated");
-                return Err(BlossomError::AuthRequired("age_restricted".into()));
-            }
+            eprintln!("[ACCESS] subtitle hash={} metadata=None allowed (admin bypass)", hash);
         }
     }
 
