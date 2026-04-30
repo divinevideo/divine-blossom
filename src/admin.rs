@@ -930,7 +930,7 @@ pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
             restore_soft_deleted_blob(&moderate_req.sha256, &metadata, new_status)?;
         } else {
             update_blob_status(&moderate_req.sha256, new_status)?;
-            crate::purge_vcl_cache(&moderate_req.sha256);
+            crate::purge_edge_cache(&moderate_req.sha256);
             let _ = update_stats_on_status_change(old_status, new_status);
         }
     }
@@ -1026,7 +1026,7 @@ pub fn handle_admin_bulk_approve(mut req: Request) -> Result<Response> {
                             if !skip_purge {
                                 let _ =
                                     update_stats_on_status_change(meta.status, BlobStatus::Active);
-                                crate::purge_vcl_cache(hash);
+                                crate::purge_edge_cache(hash);
                             }
                             approved += 1;
                             approved_hashes.push(hash.clone());
