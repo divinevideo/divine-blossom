@@ -1,6 +1,10 @@
 # ABOUTME: Cargo manifest for Fastly Blossom server
 # ABOUTME: Defines dependencies for Nostr auth, S3 signing, and Fastly Compute
 
+[workspace]
+members = ["blossom-core"]
+exclude = ["cloud-run-upload"]
+
 [package]
 name = "fastly-blossom"
 version = "0.1.0"
@@ -34,6 +38,9 @@ hmac = "0.12"
 # Encoding
 hex = "0.4"
 base64 = "0.22"
+
+# Pure-logic types and policy (testable without Viceroy)
+blossom-core = { path = "blossom-core" }
 
 [profile.release]
 lto = true
