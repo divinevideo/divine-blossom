@@ -490,18 +490,27 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         return Err(BlossomError::NotFound("Blob not found".into()));
     }
 
-    if let Some(ref meta) = metadata {
-        let (requester_pk, auth_diagnostics) = media_viewer_context(&req, "blob")?;
-        match meta.access_for(requester_pk.as_deref(), is_admin) {
-            BlobAccess::Allowed => log_media_outcome("blob", &auth_diagnostics, "allowed"),
-            BlobAccess::NotFound => {
-                log_media_outcome("blob", &auth_diagnostics, "not_found");
+    match metadata {
+        Some(ref meta) => {
+            let (requester_pk, auth_diagnostics) = media_viewer_context(&req, "blob")?;
+            match meta.access_for(requester_pk.as_deref(), is_admin) {
+                BlobAccess::Allowed => log_media_outcome("blob", &auth_diagnostics, "allowed"),
+                BlobAccess::NotFound => {
+                    log_media_outcome("blob", &auth_diagnostics, "not_found");
+                    return Err(BlossomError::NotFound("Blob not found".into()));
+                }
+                BlobAccess::AgeGated => {
+                    log_media_outcome("blob", &auth_diagnostics, "age_gated");
+                    return Err(BlossomError::AuthRequired("age_restricted".into()));
+                }
+            }
+        }
+        None => {
+            if !is_admin {
+                eprintln!("[ACCESS] hash={} metadata=None denied (no metadata, non-admin)", hash);
                 return Err(BlossomError::NotFound("Blob not found".into()));
             }
-            BlobAccess::AgeGated => {
-                log_media_outcome("blob", &auth_diagnostics, "age_gated");
-                return Err(BlossomError::AuthRequired("age_restricted".into()));
-            }
+            eprintln!("[ACCESS] hash={} metadata=None allowed (admin bypass)", hash);
         }
     }
 
@@ -1066,16 +1075,15 @@ fn handle_head_hls_content(path: &str) -> Result<Response> {
 
     // HEAD has no req/admin context. Banned/Restricted collapse to 404; AgeRestricted
     // surfaces as 401 so the client knows to age-gate.
-    let metadata = get_blob_metadata(&hash_lower)?;
-    if let Some(ref meta) = metadata {
-        match meta.access_for(None, false) {
-            BlobAccess::Allowed => {}
-            BlobAccess::NotFound => {
-                return Err(BlossomError::NotFound("Content not found".into()));
-            }
-            BlobAccess::AgeGated => {
-                return Err(BlossomError::AuthRequired("age_restricted".into()));
-            }
+    let metadata = get_blob_metadata(&hash_lower)?
+        .ok_or_else(|| BlossomError::NotFound("Content not found".into()))?;
+    match metadata.access_for(None, false) {
+        BlobAccess::Allowed => {}
+        BlobAccess::NotFound => {
+            return Err(BlossomError::NotFound("Content not found".into()));
+        }
+        BlobAccess::AgeGated => {
+            return Err(BlossomError::AuthRequired("age_restricted".into()));
         }
     }
 
@@ -1099,14 +1107,11 @@ fn handle_head_hls_content(path: &str) -> Result<Response> {
             Ok(resp)
         }
         Err(BlossomError::NotFound(_)) if filename == "master.m3u8" => {
-            let meta = metadata
-                .as_ref()
-                .ok_or_else(|| BlossomError::NotFound("Content not found".into()))?;
             match decide_transcode_fetch_action(
-                meta.transcode_status,
-                meta.transcode_retry_after,
-                meta.transcode_attempt_count,
-                meta.transcode_terminal,
+                metadata.transcode_status,
+                metadata.transcode_retry_after,
+                metadata.transcode_attempt_count,
+                metadata.transcode_terminal,
                 unix_timestamp_secs(),
             ) {
                 TranscodeFetchAction::Accepted {
@@ -1123,7 +1128,7 @@ fn handle_head_hls_content(path: &str) -> Result<Response> {
                 }
                 TranscodeFetchAction::Terminal => Ok(derivative_failure_head_response(
                     &hash_lower,
-                    meta.transcode_error_code.as_deref(),
+                    metadata.transcode_error_code.as_deref(),
                     content_type,
                 )),
             }
