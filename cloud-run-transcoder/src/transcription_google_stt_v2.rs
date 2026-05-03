@@ -142,6 +142,40 @@ pub(crate) fn group_words_into_cues(words: &[SttWord]) -> Vec<Cue> {
     cues
 }
 
+pub(crate) fn cues_to_parsed_vtt(cues: &[Cue], language: Option<String>) -> ParsedVtt {
+    if cues.is_empty() {
+        return ParsedVtt {
+            content: "WEBVTT\n\n".to_string(),
+            text: String::new(),
+            language,
+            duration_ms: 0,
+            cue_count: 0,
+            confidence: None,
+        };
+    }
+    let mut content = String::from("WEBVTT\n\n");
+    let mut text_parts: Vec<&str> = Vec::with_capacity(cues.len());
+    for (i, cue) in cues.iter().enumerate() {
+        content.push_str(&format!(
+            "{}\n{} --> {}\n{}\n\n",
+            i + 1,
+            crate::format_vtt_timestamp(cue.start_ms as f64 / 1000.0),
+            crate::format_vtt_timestamp(cue.end_ms as f64 / 1000.0),
+            cue.text,
+        ));
+        text_parts.push(cue.text.as_str());
+    }
+    let duration_ms = cues.last().map(|c| c.end_ms).unwrap_or(0);
+    ParsedVtt {
+        content,
+        text: text_parts.join(" "),
+        language,
+        duration_ms,
+        cue_count: cues.len() as u32,
+        confidence: None,
+    }
+}
+
 pub(crate) fn parse_stt_v2_response(
     raw: &str,
 ) -> std::result::Result<Vec<SttResult>, anyhow::Error> {
@@ -434,5 +468,29 @@ mod tests {
         assert_eq!(cues.len(), 2);
         assert_eq!(cues[0].text, "Hello world");
         assert_eq!(cues[1].text, "later");
+    }
+
+    #[test]
+    fn cues_to_parsed_vtt_emits_valid_webvtt() {
+        let cues = vec![
+            Cue { start_ms: 0,    end_ms: 1500, text: "Hello world".into() },
+            Cue { start_ms: 2000, end_ms: 3000, text: "second cue".into() },
+        ];
+        let parsed = cues_to_parsed_vtt(&cues, Some("en-US".to_string()));
+        assert!(parsed.content.starts_with("WEBVTT"));
+        assert_eq!(parsed.cue_count, 2);
+        assert_eq!(parsed.duration_ms, 3000);
+        assert_eq!(parsed.language.as_deref(), Some("en-US"));
+        assert!(parsed.content.contains("00:00:00.000 --> 00:00:01.500"));
+        assert!(parsed.content.contains("00:00:02.000 --> 00:00:03.000"));
+        assert!(parsed.text.contains("Hello world"));
+    }
+
+    #[test]
+    fn empty_cues_return_empty_vtt() {
+        let parsed = cues_to_parsed_vtt(&[], None);
+        assert_eq!(parsed.content, "WEBVTT\n\n");
+        assert_eq!(parsed.cue_count, 0);
+        assert!(parsed.text.is_empty());
     }
 }
