@@ -229,6 +229,13 @@ impl Config {
             ),
         }
     }
+
+    pub(crate) fn transcription_model_for_log(&self) -> String {
+        match self.transcription_provider.as_str() {
+            "google_stt_v2" => self.google_stt_model.clone(),
+            _ => self.transcription_model.clone(),
+        }
+    }
 }
 
 fn init_sentry(service_name: &str) -> sentry::ClientInitGuard {
@@ -1549,6 +1556,22 @@ async fn process_transcribe(
         in_flight, provider_wait_ms, "Acquired transcription provider permit"
     );
 
+    let wav_bytes = tokio::fs::metadata(&audio_path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+    info!(
+        hash,
+        provider = %state.config.transcription_provider,
+        model = %state.config.transcription_model_for_log(),
+        wav_bytes,
+        duration_ms = audio_analysis.duration_ms,
+        silence_ratio = format!("{:.3}", audio_analysis.silence_ratio()),
+        mean_volume_db = ?audio_analysis.mean_volume_db,
+        max_volume_db = ?audio_analysis.max_volume_db,
+        "Calling transcription provider",
+    );
+
     let (raw_output, used_provider) =
         match transcribe_with_fallback(&state, &audio_path, requested_lang.as_deref()).await {
             Ok(pair) => pair,
@@ -1749,6 +1772,32 @@ async fn process_transcribe(
     } else {
         parsed_vtt
     };
+
+    info!(
+        hash,
+        used_provider = %used_provider,
+        cue_count = parsed_vtt.cue_count,
+        duration_ms = parsed_vtt.duration_ms,
+        language = ?parsed_vtt.language,
+        text_chars = parsed_vtt.text.chars().count(),
+        timing_mode = match used_provider.as_str() {
+            "google_stt_v2" => "word-level-or-degraded",
+            _ => "segment-level",
+        },
+        fallback_used = used_provider != state.config.transcription_provider,
+        "Transcript ready for upload",
+    );
+
+    if std::env::var("TRANSCRIPTION_LOG_PREVIEW")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+    {
+        info!(
+            hash,
+            preview = %first_chars(&parsed_vtt.text, 80),
+            "Transcript preview (debug)",
+        );
+    }
 
     let result = finalize_transcript(
         &state,
@@ -2937,6 +2986,25 @@ mod tests {
         assert_eq!(config.transcription_fallback_provider, None);
         assert!(!config.transcription_fallback_on_empty);
         assert!(config.transcription_fallback_on_provider_error);
+    }
+
+    #[test]
+    fn transcription_model_for_log_uses_stt_model_for_google() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("TRANSCRIPTION_PROVIDER", "google_stt_v2");
+        env.insert("GOOGLE_STT_MODEL", "chirp_3");
+        env.insert("TRANSCRIPTION_MODEL", "gemini-1.5-flash");
+        let cfg = Config::from_lookup(|k| env.get(k).map(|v| v.to_string()));
+        assert_eq!(cfg.transcription_model_for_log(), "chirp_3");
+    }
+
+    #[test]
+    fn transcription_model_for_log_uses_transcription_model_otherwise() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("TRANSCRIPTION_PROVIDER", "openai");
+        env.insert("TRANSCRIPTION_MODEL", "whisper-1");
+        let cfg = Config::from_lookup(|k| env.get(k).map(|v| v.to_string()));
+        assert_eq!(cfg.transcription_model_for_log(), "whisper-1");
     }
 
     #[test]
