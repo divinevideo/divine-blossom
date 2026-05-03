@@ -15,6 +15,19 @@ pub(crate) const SYNC_RECOGNIZE_MAX_BYTES: usize = 9 * 1024 * 1024;
 /// error out as non-retryable so the caller can decide whether to fall back.
 pub(crate) const SYNC_RECOGNIZE_MAX_DURATION_MS: u64 = 5 * 60 * 1000;
 
+pub(crate) fn recognize_url(config: &Config) -> String {
+    let recognizer = config.google_stt_recognizer.trim();
+    if recognizer.starts_with("projects/") {
+        return format!("https://speech.googleapis.com/v2/{}:recognize", recognizer);
+    }
+    format!(
+        "https://speech.googleapis.com/v2/projects/{}/locations/{}/recognizers/{}:recognize",
+        config.gcp_project_id,
+        config.google_stt_location,
+        recognizer,
+    )
+}
+
 pub(crate) fn build_recognize_request(config: &Config, audio_bytes: &[u8]) -> String {
     let audio_b64 = base64::engine::general_purpose::STANDARD.encode(audio_bytes);
     let body = serde_json::json!({
@@ -74,6 +87,31 @@ mod tests {
         assert_eq!(v["config"]["features"]["enableWordTimeOffsets"], true);
         assert!(v["config"]["autoDecodingConfig"].is_object());
         assert!(v["content"].is_string(), "audio bytes must be base64-encoded `content`");
+    }
+
+    #[test]
+    fn recognize_url_uses_project_location_recognizer() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("GCP_PROJECT_ID", "test-proj");
+        env.insert("GOOGLE_CLOUD_LOCATION", "global");
+        let cfg = crate::Config::from_lookup(|k| env.get(k).map(|v| v.to_string()));
+        let url = recognize_url(&cfg);
+        assert_eq!(
+            url,
+            "https://speech.googleapis.com/v2/projects/test-proj/locations/global/recognizers/_:recognize"
+        );
+    }
+
+    #[test]
+    fn recognize_url_passes_through_full_recognizer_path() {
+        let mut env = std::collections::HashMap::new();
+        env.insert(
+            "GOOGLE_STT_RECOGNIZER",
+            "projects/p/locations/global/recognizers/my-rec",
+        );
+        let cfg = crate::Config::from_lookup(|k| env.get(k).map(|v| v.to_string()));
+        let url = recognize_url(&cfg);
+        assert!(url.ends_with("/projects/p/locations/global/recognizers/my-rec:recognize"));
     }
 
     #[cfg(test)]
