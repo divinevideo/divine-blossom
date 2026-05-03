@@ -1,22 +1,16 @@
 // ABOUTME: Google Cloud Speech-to-Text V2 (Chirp 3) provider.
 // ABOUTME: Sync `recognize` REST API → ParsedVtt with word-grouped cues.
 
-#![allow(dead_code)] // wired up incrementally in subsequent tasks
-
 use std::path::Path;
 
 use base64::Engine as _;
-use crate::{AudioAnalysis, Config, ParsedVtt, ProviderFailure, parse_provider_status};
+use crate::{Config, ParsedVtt, ProviderFailure, parse_provider_status};
 
 /// STT V2 sync `recognize` accepts up to 10 MB inline audio per the
 /// public docs; we cap at 9 MB to leave headroom for JSON envelope.
+/// The byte cap also effectively bounds duration: 16kHz mono PCM = 32 KB/s,
+/// so 9 MB ≈ 281 s — well within the 5-minute sync recognize limit.
 pub(crate) const SYNC_RECOGNIZE_MAX_BYTES: usize = 9 * 1024 * 1024;
-/// Sync recognize duration cap (milliseconds; 5 minutes). Past this we
-/// error out as non-retryable so the caller can decide whether to fall back.
-// TODO(chunk-5): enforce this duration cap once AudioAnalysis is plumbed
-// through the dispatch path. Today only the byte-size cap is checked in
-// `transcribe`; this constant is reserved for the duration check.
-pub(crate) const SYNC_RECOGNIZE_MAX_DURATION_MS: u64 = 5 * 60 * 1000;
 
 pub(crate) fn recognize_url(config: &Config) -> String {
     let recognizer = config.google_stt_recognizer.trim();
@@ -47,13 +41,6 @@ pub(crate) fn build_recognize_request(config: &Config, audio_bytes: &[u8]) -> St
         "content": audio_b64,
     });
     body.to_string()
-}
-
-/// Convenience constructor used by the dispatch path when the audio
-/// signal is already known to be silent — keeps the call site shape
-/// identical to the OpenAI / Gemini paths.
-pub(crate) fn empty_for_audio(audio: &AudioAnalysis) -> ParsedVtt {
-    ParsedVtt::empty(audio.duration_ms)
 }
 
 /// Parse a protobuf Duration string (e.g. "1.5s", "500ms", bare float) to
@@ -500,7 +487,6 @@ mod tests {
     #[test]
     fn limits_are_sane() {
         assert!(SYNC_RECOGNIZE_MAX_BYTES > 1_000_000);
-        assert!(SYNC_RECOGNIZE_MAX_DURATION_MS >= 60_000);
     }
 
     #[test]
@@ -808,5 +794,24 @@ mod tests {
         assert_eq!(mode, ParseTimingMode::Empty);
         assert_eq!(parsed.content, "WEBVTT\n\n");
         assert_eq!(parsed.cue_count, 0);
+    }
+
+    #[test]
+    fn fallback_selection_on_provider_error() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("TRANSCRIPTION_PROVIDER", "google_stt_v2");
+        env.insert("TRANSCRIPTION_FALLBACK_PROVIDER", "openai");
+        let cfg = crate::Config::from_lookup(|k| env.get(k).map(|v| v.to_string()));
+        assert_eq!(cfg.transcription_fallback_provider.as_deref(), Some("openai"));
+        assert!(cfg.transcription_fallback_on_provider_error);
+    }
+
+    #[test]
+    fn no_fallback_when_disabled() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("TRANSCRIPTION_FALLBACK_PROVIDER", "openai");
+        env.insert("TRANSCRIPTION_FALLBACK_ON_PROVIDER_ERROR", "false");
+        let cfg = crate::Config::from_lookup(|k| env.get(k).map(|v| v.to_string()));
+        assert!(!cfg.transcription_fallback_on_provider_error);
     }
 }
