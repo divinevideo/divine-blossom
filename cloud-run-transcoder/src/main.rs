@@ -39,6 +39,8 @@ use tower::Service;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
+mod transcription_google_stt_v2;
+
 // Configuration
 struct Config {
     gcs_bucket: String,
