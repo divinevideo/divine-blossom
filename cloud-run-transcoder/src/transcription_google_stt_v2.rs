@@ -13,6 +13,9 @@ use crate::{AudioAnalysis, Config, ParsedVtt, ProviderFailure, parse_provider_st
 pub(crate) const SYNC_RECOGNIZE_MAX_BYTES: usize = 9 * 1024 * 1024;
 /// Sync recognize duration cap (milliseconds; 5 minutes). Past this we
 /// error out as non-retryable so the caller can decide whether to fall back.
+// TODO(chunk-5): enforce this duration cap once AudioAnalysis is plumbed
+// through the dispatch path. Today only the byte-size cap is checked in
+// `transcribe`; this constant is reserved for the duration check.
 pub(crate) const SYNC_RECOGNIZE_MAX_DURATION_MS: u64 = 5 * 60 * 1000;
 
 pub(crate) fn recognize_url(config: &Config) -> String {
@@ -146,6 +149,10 @@ mod tests {
         assert_eq!(v["config"]["features"]["enableWordTimeOffsets"], true);
         assert!(v["config"]["autoDecodingConfig"].is_object());
         assert!(v["content"].is_string(), "audio bytes must be base64-encoded `content`");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(v["content"].as_str().unwrap())
+            .expect("content is valid base64");
+        assert_eq!(decoded, b"FAKE_WAV_BYTES");
     }
 
     #[test]
@@ -173,7 +180,6 @@ mod tests {
         assert!(url.ends_with("/projects/p/locations/global/recognizers/my-rec:recognize"));
     }
 
-    #[cfg(test)]
     fn test_config() -> crate::Config {
         crate::Config::from_lookup(|_| None)
     }
