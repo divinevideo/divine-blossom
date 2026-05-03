@@ -3,8 +3,8 @@
 
 use std::path::Path;
 
+use crate::{parse_provider_status, Config, ParsedVtt, ProviderFailure};
 use base64::Engine as _;
-use crate::{Config, ParsedVtt, ProviderFailure, parse_provider_status};
 
 /// STT V2 sync `recognize` accepts up to 10 MB inline audio per the
 /// public docs; we cap at 9 MB to leave headroom for JSON envelope.
@@ -19,9 +19,7 @@ pub(crate) fn recognize_url(config: &Config) -> String {
     }
     format!(
         "https://speech.googleapis.com/v2/projects/{}/locations/{}/recognizers/{}:recognize",
-        config.gcp_project_id,
-        config.google_stt_location,
-        recognizer,
+        config.gcp_project_id, config.google_stt_location, recognizer,
     )
 }
 
@@ -48,7 +46,11 @@ pub(crate) fn build_recognize_request(config: &Config, audio_bytes: &[u8]) -> St
 pub(crate) fn parse_offset_to_ms(value: &str) -> Option<u64> {
     let trimmed = value.trim();
     if let Some(stripped) = trimmed.strip_suffix("ms") {
-        return stripped.trim().parse::<f64>().ok().map(|n| n.round() as u64);
+        return stripped
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|n| n.round() as u64);
     }
     if let Some(stripped) = trimmed.strip_suffix('s') {
         return stripped
@@ -81,7 +83,7 @@ pub(crate) struct SttResult {
 const CUE_MIN_SPAN_MS: u64 = 1_500;
 const CUE_MAX_SPAN_MS: u64 = 3_000;
 const CUE_MAX_LINE_CHARS: usize = 84; // two ~42-char lines tolerated by most players
-const CUE_BREAK_GAP_MS: u64 = 800;    // gap between words that forces a cue break
+const CUE_BREAK_GAP_MS: u64 = 800; // gap between words that forces a cue break
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Cue {
@@ -102,7 +104,11 @@ pub(crate) fn group_words_into_cues(words: &[SttWord]) -> Vec<Cue> {
             .map(|w| w.text.as_str())
             .collect::<Vec<_>>()
             .join(" ");
-        cues.push(Cue { start_ms, end_ms, text });
+        cues.push(Cue {
+            start_ms,
+            end_ms,
+            text,
+        });
         buf.clear();
     }
 
@@ -205,8 +211,8 @@ pub(crate) fn cues_to_parsed_vtt(cues: &[Cue], language: Option<String>) -> Pars
 pub(crate) fn parse_stt_v2_response(
     raw: &str,
 ) -> std::result::Result<Vec<SttResult>, anyhow::Error> {
-    let v: serde_json::Value = serde_json::from_str(raw)
-        .map_err(|e| anyhow::anyhow!("Invalid STT V2 JSON: {}", e))?;
+    let v: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| anyhow::anyhow!("Invalid STT V2 JSON: {}", e))?;
     let results = match v.get("results").and_then(|r| r.as_array()) {
         Some(arr) => arr,
         None => return Ok(Vec::new()),
@@ -254,12 +260,20 @@ pub(crate) fn parse_stt_v2_response(
                             .and_then(|v| v.as_str())
                             .and_then(parse_offset_to_ms)
                             .unwrap_or(start_ms.saturating_add(1));
-                        Some(SttWord { text, start_ms, end_ms })
+                        Some(SttWord {
+                            text,
+                            start_ms,
+                            end_ms,
+                        })
                     })
                     .collect()
             })
             .unwrap_or_default();
-        out.push(SttResult { transcript, language, words });
+        out.push(SttResult {
+            transcript,
+            language,
+            words,
+        });
     }
     Ok(out)
 }
@@ -374,8 +388,7 @@ pub(crate) fn is_repeated_phrase_hallucination(text: &str) -> bool {
         if tokens.len() < gram_size * 2 {
             return false;
         }
-        let mut counts: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         let total = tokens.len() + 1 - gram_size;
         for i in 0..total {
             if let Some(g) = gram_at(tokens, i) {
@@ -499,7 +512,10 @@ mod tests {
         assert_eq!(v["config"]["features"]["enableAutomaticPunctuation"], true);
         assert_eq!(v["config"]["features"]["enableWordTimeOffsets"], true);
         assert!(v["config"]["autoDecodingConfig"].is_object());
-        assert!(v["content"].is_string(), "audio bytes must be base64-encoded `content`");
+        assert!(
+            v["content"].is_string(),
+            "audio bytes must be base64-encoded `content`"
+        );
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(v["content"].as_str().unwrap())
             .expect("content is valid base64");
@@ -603,15 +619,51 @@ mod tests {
     #[test]
     fn groups_words_into_short_cues() {
         let words = vec![
-            SttWord { text: "Hello".into(),   start_ms: 0,    end_ms: 400 },
-            SttWord { text: "world".into(),   start_ms: 400,  end_ms: 900 },
-            SttWord { text: "this".into(),    start_ms: 1000, end_ms: 1200 },
-            SttWord { text: "is".into(),      start_ms: 1200, end_ms: 1400 },
-            SttWord { text: "a".into(),       start_ms: 1400, end_ms: 1500 },
-            SttWord { text: "test".into(),    start_ms: 1500, end_ms: 2100 },
-            SttWord { text: "of".into(),      start_ms: 2200, end_ms: 2400 },
-            SttWord { text: "grouping".into(),start_ms: 2400, end_ms: 3100 },
-            SttWord { text: "cues".into(),    start_ms: 3100, end_ms: 3700 },
+            SttWord {
+                text: "Hello".into(),
+                start_ms: 0,
+                end_ms: 400,
+            },
+            SttWord {
+                text: "world".into(),
+                start_ms: 400,
+                end_ms: 900,
+            },
+            SttWord {
+                text: "this".into(),
+                start_ms: 1000,
+                end_ms: 1200,
+            },
+            SttWord {
+                text: "is".into(),
+                start_ms: 1200,
+                end_ms: 1400,
+            },
+            SttWord {
+                text: "a".into(),
+                start_ms: 1400,
+                end_ms: 1500,
+            },
+            SttWord {
+                text: "test".into(),
+                start_ms: 1500,
+                end_ms: 2100,
+            },
+            SttWord {
+                text: "of".into(),
+                start_ms: 2200,
+                end_ms: 2400,
+            },
+            SttWord {
+                text: "grouping".into(),
+                start_ms: 2400,
+                end_ms: 3100,
+            },
+            SttWord {
+                text: "cues".into(),
+                start_ms: 3100,
+                end_ms: 3700,
+            },
         ];
         let cues = group_words_into_cues(&words);
         assert!(cues.len() >= 2, "should split into multiple cues");
@@ -620,7 +672,11 @@ mod tests {
             assert!(span_ms <= 3500, "cue too long: {}ms", span_ms);
             assert!(!cue.text.trim().is_empty());
         }
-        let stitched = cues.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join(" ");
+        let stitched = cues
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(stitched.contains("Hello world"));
         assert!(stitched.contains("grouping cues"));
     }
@@ -633,9 +689,21 @@ mod tests {
     #[test]
     fn group_words_breaks_on_long_silence_gap() {
         let words = vec![
-            SttWord { text: "Hello".into(), start_ms: 0,     end_ms: 400 },
-            SttWord { text: "world".into(), start_ms: 400,   end_ms: 900 },
-            SttWord { text: "later".into(), start_ms: 5_000, end_ms: 5_400 },
+            SttWord {
+                text: "Hello".into(),
+                start_ms: 0,
+                end_ms: 400,
+            },
+            SttWord {
+                text: "world".into(),
+                start_ms: 400,
+                end_ms: 900,
+            },
+            SttWord {
+                text: "later".into(),
+                start_ms: 5_000,
+                end_ms: 5_400,
+            },
         ];
         let cues = group_words_into_cues(&words);
         assert_eq!(cues.len(), 2);
@@ -646,8 +714,16 @@ mod tests {
     #[test]
     fn cues_to_parsed_vtt_emits_valid_webvtt() {
         let cues = vec![
-            Cue { start_ms: 0,    end_ms: 1500, text: "Hello world".into() },
-            Cue { start_ms: 2000, end_ms: 3000, text: "second cue".into() },
+            Cue {
+                start_ms: 0,
+                end_ms: 1500,
+                text: "Hello world".into(),
+            },
+            Cue {
+                start_ms: 2000,
+                end_ms: 3000,
+                text: "second cue".into(),
+            },
         ];
         let parsed = cues_to_parsed_vtt(&cues, Some("en-US".to_string()));
         assert!(parsed.content.starts_with("WEBVTT"));
@@ -740,7 +816,10 @@ mod tests {
             cue_count: 1,
             confidence: None,
         };
-        assert_eq!(google_drop_reason(&parsed), Some(GoogleDropReason::JsonArtifact));
+        assert_eq!(
+            google_drop_reason(&parsed),
+            Some(GoogleDropReason::JsonArtifact)
+        );
     }
 
     #[test]
@@ -753,7 +832,10 @@ mod tests {
             cue_count: 1,
             confidence: None,
         };
-        assert_eq!(google_drop_reason(&parsed), Some(GoogleDropReason::RepeatedPhrase));
+        assert_eq!(
+            google_drop_reason(&parsed),
+            Some(GoogleDropReason::RepeatedPhrase)
+        );
     }
 
     #[test]
@@ -802,7 +884,10 @@ mod tests {
         env.insert("TRANSCRIPTION_PROVIDER", "google_stt_v2");
         env.insert("TRANSCRIPTION_FALLBACK_PROVIDER", "openai");
         let cfg = crate::Config::from_lookup(|k| env.get(k).map(|v| v.to_string()));
-        assert_eq!(cfg.transcription_fallback_provider.as_deref(), Some("openai"));
+        assert_eq!(
+            cfg.transcription_fallback_provider.as_deref(),
+            Some("openai")
+        );
         assert!(cfg.transcription_fallback_on_provider_error);
     }
 

@@ -2,7 +2,6 @@
 // ABOUTME: Downloads video from GCS, transcodes to HLS with NVENC, uploads segments
 
 use anyhow::{anyhow, Result};
-use base64::Engine as _;
 use axum::{
     extract::State,
     http::{header, Method, StatusCode},
@@ -10,6 +9,7 @@ use axum::{
     routing::{get, options, post},
     Router,
 };
+use base64::Engine as _;
 use bytes::Bytes;
 use google_cloud_storage::{
     client::{Client as GcsClient, ClientConfig},
@@ -89,6 +89,12 @@ struct Config {
     /// transcript. Default false because empty is often the correct answer
     /// (silent media). Has no effect on guards (silence/repeat/json-artifact),
     /// which always remain non-fallback.
+    ///
+    /// Reserved: parsed and tested today, but not yet wired into
+    /// `transcribe_with_fallback`. The empty-output fallback path will
+    /// land alongside production canary evidence that primary providers
+    /// are returning silent transcripts on non-silent media.
+    #[allow(dead_code)]
     transcription_fallback_on_empty: bool,
     /// If true, fall back when primary returns a `ProviderError`. Default true.
     transcription_fallback_on_provider_error: bool,
@@ -150,8 +156,7 @@ impl Config {
                 .unwrap_or_else(|| "gemini".to_string()),
             gcp_project_id: lookup("GCP_PROJECT_ID")
                 .unwrap_or_else(|| "rich-compiler-479518-d2".to_string()),
-            gcp_region: lookup("GCP_REGION")
-                .unwrap_or_else(|| "us-central1".to_string()),
+            gcp_region: lookup("GCP_REGION").unwrap_or_else(|| "us-central1".to_string()),
             // Transcript webhook URL (defaults to same host + /admin/transcript-status)
             transcript_webhook_url: lookup("TRANSCRIPT_WEBHOOK_URL"),
             transcription_max_in_flight: parse_value(&mut lookup, "TRANSCRIPTION_MAX_IN_FLIGHT", 4)
@@ -1544,16 +1549,11 @@ async fn process_transcribe(
         in_flight, provider_wait_ms, "Acquired transcription provider permit"
     );
 
-    let (raw_output, used_provider) = match transcribe_with_fallback(
-        &state,
-        &audio_path,
-        requested_lang.as_deref(),
-    )
-    .await
-    {
-        Ok(pair) => pair,
-        Err(e) => {
-            drop(provider_permit);
+    let (raw_output, used_provider) =
+        match transcribe_with_fallback(&state, &audio_path, requested_lang.as_deref()).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                drop(provider_permit);
                 if e.exhausted_retryable {
                     report_derivative_failure_to_sentry(
                         "divine-transcoder",
@@ -1641,7 +1641,10 @@ async fn process_transcribe(
                 )
                 .await
                 {
-                    warn!("Failed to release transcript lock for {}: {}", hash, lock_error);
+                    warn!(
+                        "Failed to release transcript lock for {}: {}",
+                        hash, lock_error
+                    );
                 }
                 send_transcript_status_webhook(
                     &state.config,
@@ -2281,14 +2284,7 @@ async fn transcribe_with_fallback(
     language: Option<&str>,
 ) -> std::result::Result<(String, String), ProviderError> {
     let primary = state.config.transcription_provider.clone();
-    match transcribe_audio_via_provider(
-        &state.config,
-        audio_path,
-        language,
-        None,
-    )
-    .await
-    {
+    match transcribe_audio_via_provider(&state.config, audio_path, language, None).await {
         Ok(output) => Ok((output, primary)),
         Err(err) => {
             let Some(fallback) = state.config.transcription_fallback_provider.as_deref() else {
@@ -2303,14 +2299,9 @@ async fn transcribe_with_fallback(
                 error = %err,
                 "Primary provider failed; attempting fallback provider",
             );
-            transcribe_audio_via_provider(
-                &state.config,
-                audio_path,
-                language,
-                Some(fallback),
-            )
-            .await
-            .map(|out| (out, fallback.to_string()))
+            transcribe_audio_via_provider(&state.config, audio_path, language, Some(fallback))
+                .await
+                .map(|out| (out, fallback.to_string()))
         }
     }
 }
@@ -2326,7 +2317,9 @@ async fn transcribe_audio_via_provider(
     let mut attempt: u32 = 0;
 
     loop {
-        match transcribe_audio_via_provider_once(config, audio_path, language, provider_override).await {
+        match transcribe_audio_via_provider_once(config, audio_path, language, provider_override)
+            .await
+        {
             Ok(body) => return Ok(body),
             Err(failure) if !is_retryable_provider_failure(&failure) => {
                 return Err(ProviderError {
@@ -2428,12 +2421,7 @@ async fn fetch_gcp_access_token() -> std::result::Result<String, ProviderFailure
                 .as_str()
                 .map(|s| s.to_string())
                 .ok_or_else(|| {
-                    parse_provider_status(
-                        None,
-                        None,
-                        "No access_token in metadata response",
-                        false,
-                    )
+                    parse_provider_status(None, None, "No access_token in metadata response", false)
                 })
         }
         _ => {
@@ -2443,12 +2431,7 @@ async fn fetch_gcp_access_token() -> std::result::Result<String, ProviderFailure
                 .output()
                 .await
                 .map_err(|e| {
-                    parse_provider_status(
-                        None,
-                        None,
-                        &format!("gcloud auth failed: {}", e),
-                        false,
-                    )
+                    parse_provider_status(None, None, &format!("gcloud auth failed: {}", e), false)
                 })?;
             if output.status.success() {
                 Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -2472,12 +2455,7 @@ async fn transcribe_via_gemini(
     _language: Option<&str>,
 ) -> std::result::Result<String, ProviderFailure> {
     let audio_bytes = tokio::fs::read(audio_path).await.map_err(|e| {
-        parse_provider_status(
-            None,
-            None,
-            &format!("Failed to read audio: {}", e),
-            false,
-        )
+        parse_provider_status(None, None, &format!("Failed to read audio: {}", e), false)
     })?;
     let audio_b64 = base64::engine::general_purpose::STANDARD.encode(&audio_bytes);
 
@@ -2562,12 +2540,7 @@ async fn transcribe_via_gemini(
 
     // Extract text from Vertex AI response: candidates[0].content.parts[0].text
     let resp_json: serde_json::Value = serde_json::from_str(&resp_body).map_err(|e| {
-        parse_provider_status(
-            None,
-            None,
-            &format!("Invalid Vertex AI JSON: {}", e),
-            false,
-        )
+        parse_provider_status(None, None, &format!("Invalid Vertex AI JSON: {}", e), false)
     })?;
 
     resp_json["candidates"][0]["content"]["parts"][0]["text"]
@@ -2970,7 +2943,10 @@ mod tests {
     fn google_stt_v2_config_parses_overrides() {
         let env_map: std::collections::HashMap<&str, &str> = [
             ("GOOGLE_CLOUD_LOCATION", "us-central1"),
-            ("GOOGLE_STT_RECOGNIZER", "projects/p/locations/global/recognizers/r"),
+            (
+                "GOOGLE_STT_RECOGNIZER",
+                "projects/p/locations/global/recognizers/r",
+            ),
             ("GOOGLE_STT_MODEL", "chirp_3"),
             ("GOOGLE_STT_LANGUAGE_CODES", "en-US, es-ES,  ja-JP"),
             ("GOOGLE_STT_ENABLE_AUTOMATIC_PUNCTUATION", "false"),
@@ -2979,18 +2955,30 @@ mod tests {
             ("TRANSCRIPTION_FALLBACK_PROVIDER", "openai"),
             ("TRANSCRIPTION_FALLBACK_ON_EMPTY", "true"),
             ("TRANSCRIPTION_FALLBACK_ON_PROVIDER_ERROR", "false"),
-        ].into_iter().collect();
+        ]
+        .into_iter()
+        .collect();
         let config = Config::from_lookup(|k| env_map.get(k).map(|v| v.to_string()));
         assert_eq!(config.google_stt_location, "us-central1");
-        assert_eq!(config.google_stt_recognizer, "projects/p/locations/global/recognizers/r");
+        assert_eq!(
+            config.google_stt_recognizer,
+            "projects/p/locations/global/recognizers/r"
+        );
         assert_eq!(
             config.google_stt_language_codes,
-            vec!["en-US".to_string(), "es-ES".to_string(), "ja-JP".to_string()]
+            vec![
+                "en-US".to_string(),
+                "es-ES".to_string(),
+                "ja-JP".to_string()
+            ]
         );
         assert!(!config.google_stt_enable_automatic_punctuation);
         assert!(!config.google_stt_enable_word_time_offsets);
         assert_eq!(config.google_stt_max_alternatives, 3);
-        assert_eq!(config.transcription_fallback_provider.as_deref(), Some("openai"));
+        assert_eq!(
+            config.transcription_fallback_provider.as_deref(),
+            Some("openai")
+        );
         assert!(config.transcription_fallback_on_empty);
         assert!(!config.transcription_fallback_on_provider_error);
     }
