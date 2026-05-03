@@ -10,8 +10,8 @@ use crate::{AudioAnalysis, Config, ParsedVtt, ProviderFailure, parse_provider_st
 /// STT V2 sync `recognize` accepts up to 10 MB inline audio per the
 /// public docs; we cap at 9 MB to leave headroom for JSON envelope.
 pub(crate) const SYNC_RECOGNIZE_MAX_BYTES: usize = 9 * 1024 * 1024;
-/// Sync recognize duration cap (seconds). Past this we error out as
-/// non-retryable so the caller can decide whether to fall back.
+/// Sync recognize duration cap (milliseconds; 5 minutes). Past this we
+/// error out as non-retryable so the caller can decide whether to fall back.
 pub(crate) const SYNC_RECOGNIZE_MAX_DURATION_MS: u64 = 5 * 60 * 1000;
 
 /// Convenience constructor used by the dispatch path when the audio
