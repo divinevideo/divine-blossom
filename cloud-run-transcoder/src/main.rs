@@ -1757,6 +1757,15 @@ async fn process_transcribe(
             );
             ParsedVtt::empty(audio_analysis.duration_ms)
         }
+        Some(TranscriptDropReason::LoopHallucination) => {
+            warn!(
+                hash,
+                text_chars = parsed_vtt.text.chars().count(),
+                preview = %first_chars(&parsed_vtt.text, 80),
+                "Dropping loop-hallucinated transcript (provider repeated a phrase verbatim)"
+            );
+            ParsedVtt::empty(audio_analysis.duration_ms)
+        }
         None => parsed_vtt,
     };
 
@@ -2839,6 +2848,7 @@ fn should_drop_low_signal_transcript(audio: &AudioAnalysis, parsed_vtt: &ParsedV
 enum TranscriptDropReason {
     LowProviderConfidence,
     LowSignalHeuristic,
+    LoopHallucination,
 }
 
 fn transcript_drop_reason(
@@ -2857,11 +2867,56 @@ fn transcript_drop_reason(
         return Some(TranscriptDropReason::LowProviderConfidence);
     }
 
+    // Catch sentence-level autoregressive loops (the failure mode where a
+    // model emits the same long phrase 50 times in a single cue). The
+    // 1/2/3-gram dominance check in google_drop_reason misses these
+    // because each n-gram only covers a small fraction of total tokens.
+    if is_loop_hallucination(&parsed_vtt.text) {
+        return Some(TranscriptDropReason::LoopHallucination);
+    }
+
     if should_drop_low_signal_transcript(audio, parsed_vtt) {
         return Some(TranscriptDropReason::LowSignalHeuristic);
     }
 
     None
+}
+
+/// Detect autoregressive-loop hallucinations where a long substring is
+/// repeated verbatim ≥ 3 times. Catches model outputs that get stuck in a
+/// sentence-level loop (e.g. Gemini emitting the same 25-word sentence 50
+/// times in one cue), which slip past 1/2/3-gram dominance because each
+/// individual gram covers only a small fraction of total tokens.
+///
+/// Heuristic: collapse whitespace, then take the first ~60-char prefix and
+/// count its non-overlapping occurrences in the full text. Three or more
+/// = a loop. Texts under 250 chars are exempt to avoid false positives on
+/// legitimately short transcripts that happen to repeat a courtesy phrase.
+fn is_loop_hallucination(text: &str) -> bool {
+    let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let len = collapsed.chars().count();
+    if len < 250 {
+        return false;
+    }
+    // Probe must be long enough to be unlikely-by-chance in normal speech
+    // (~60 chars ≈ 10-12 words) but short enough to fit inside a typical
+    // looping unit (a sentence). Cap at len/4 so we never exceed ¼ of the
+    // text — guarantees room for 3+ occurrences before we even count.
+    let probe_len = 60.min(len / 4);
+    let probe: String = collapsed.chars().take(probe_len).collect();
+    if probe.is_empty() {
+        return false;
+    }
+    let mut count = 0usize;
+    let mut cursor = 0usize;
+    while let Some(pos) = collapsed[cursor..].find(probe.as_str()) {
+        count += 1;
+        cursor += pos + probe.len();
+        if count >= 3 {
+            return true;
+        }
+    }
+    false
 }
 
 async fn finalize_transcript(
@@ -2926,12 +2981,12 @@ async fn finalize_transcript(
 mod tests {
     use super::{
         build_transcode_status_webhook_payload, classify_audio_extract_error,
-        decide_transcript_lock_action, is_retryable_provider_failure, normalize_transcript_to_vtt,
-        parse_audio_analysis_output, parse_provider_status, retry_delay_for_attempt,
-        should_drop_low_signal_transcript, transcript_drop_reason, transcription_response_format,
-        AudioAnalysis, AudioExtractErrorKind, Config, ParsedVtt, TranscriptConfidence,
-        TranscriptDropReason, TranscriptLockAction, TranscriptLockState, TranscriptLockStatus,
-        VideoInfo,
+        decide_transcript_lock_action, is_loop_hallucination, is_retryable_provider_failure,
+        normalize_transcript_to_vtt, parse_audio_analysis_output, parse_provider_status,
+        retry_delay_for_attempt, should_drop_low_signal_transcript, transcript_drop_reason,
+        transcription_response_format, AudioAnalysis, AudioExtractErrorKind, Config, ParsedVtt,
+        TranscriptConfidence, TranscriptDropReason, TranscriptLockAction, TranscriptLockState,
+        TranscriptLockStatus, VideoInfo,
     };
     use std::time::Duration;
 
@@ -3448,6 +3503,89 @@ mod tests {
             .expect("plain text should still work");
         assert!(parsed.content.starts_with("WEBVTT"));
         assert_eq!(parsed.text, "This is spoken text from the video");
+    }
+
+    // ---- loop-hallucination guard tests ----
+
+    /// Sanity: short transcripts (under the safe length cutoff) never trip
+    /// the loop guard, even if they technically contain repetition. The
+    /// 1/2/3-gram repeat-phrase guard handles those.
+    #[test]
+    fn loop_guard_does_not_fire_on_short_text() {
+        assert!(!is_loop_hallucination(""));
+        assert!(!is_loop_hallucination("Hello world"));
+        assert!(!is_loop_hallucination(
+            "Welcome to my Divine channel. Follow me on YouTube and X for updates."
+        ));
+    }
+
+    /// Sanity: a long but non-repeating transcript should not be flagged.
+    #[test]
+    fn loop_guard_passes_long_unique_text() {
+        let mut s = String::new();
+        for word in [
+            "The", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "near", "the",
+            "river", "where", "the", "old", "mill", "stood", "for", "centuries", "until", "the",
+            "great", "flood", "carried", "it", "downstream", "into", "the", "harbor", "where",
+            "fishermen", "still", "remember", "its", "broken", "wheel", "rotting", "in", "the",
+            "salt", "spray",
+        ]
+        .iter()
+        .cycle()
+        .take(60)
+        {
+            s.push_str(word);
+            s.push(' ');
+        }
+        // Only catches loops, not legitimately long monologues that happen
+        // to reuse common words.
+        assert!(s.len() > 250);
+        assert!(!is_loop_hallucination(&s));
+    }
+
+    /// Real-world failure from production: a 6-second clip Gemini transcribed
+    /// by repeating the same 25-word sentence ~50 times. Captured at
+    /// tests/fixtures/loop_hallucination_real_gemini.txt.
+    ///
+    /// This is precisely what the existing 1/2/3-gram dominance guard misses:
+    /// each n-gram only covers ~12% of total tokens, well below the 60%
+    /// threshold. The loop guard catches it via verbatim-substring repetition.
+    #[test]
+    fn loop_guard_flags_real_gemini_loop_hallucination() {
+        let bad = include_str!("../tests/fixtures/loop_hallucination_real_gemini.txt");
+        assert!(
+            is_loop_hallucination(bad),
+            "loop guard should flag the production Gemini loop sample"
+        );
+    }
+
+    /// The same sample must be wired through the unified `transcript_drop_reason`
+    /// so any provider's loop hallucination is dropped, not just Google's.
+    #[test]
+    fn transcript_drop_reason_flags_loop_hallucination() {
+        use super::TranscriptDropReason;
+        let bad = include_str!("../tests/fixtures/loop_hallucination_real_gemini.txt");
+        let parsed = ParsedVtt {
+            content: format!("WEBVTT\n\n1\n00:00:00.000 --> 00:00:06.000\n{}\n\n", bad),
+            text: bad.to_string(),
+            language: None,
+            duration_ms: 6_000,
+            cue_count: 1,
+            confidence: None,
+        };
+        // Audio analysis with normal speech levels (the real clip was not
+        // silent — Gemini just looped). Confirms the loop guard fires
+        // independent of the silence / low-signal heuristic.
+        let analysis = AudioAnalysis {
+            duration_ms: 6_000,
+            silent_duration_ms: 0,
+            mean_volume_db: Some(-22.0),
+            max_volume_db: Some(-3.0),
+        };
+        assert_eq!(
+            transcript_drop_reason(&analysis, &parsed),
+            Some(TranscriptDropReason::LoopHallucination)
+        );
     }
 }
 
