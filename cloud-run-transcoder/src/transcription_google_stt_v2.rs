@@ -91,6 +91,57 @@ pub(crate) struct SttResult {
     pub(crate) words: Vec<SttWord>,
 }
 
+const CUE_MIN_SPAN_MS: u64 = 1_500;
+const CUE_MAX_SPAN_MS: u64 = 3_000;
+const CUE_MAX_LINE_CHARS: usize = 84; // two ~42-char lines tolerated by most players
+const CUE_BREAK_GAP_MS: u64 = 800;    // gap between words that forces a cue break
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Cue {
+    pub(crate) start_ms: u64,
+    pub(crate) end_ms: u64,
+    pub(crate) text: String,
+}
+
+pub(crate) fn group_words_into_cues(words: &[SttWord]) -> Vec<Cue> {
+    let mut cues: Vec<Cue> = Vec::new();
+    let mut buf: Vec<&SttWord> = Vec::new();
+
+    macro_rules! flush {
+        ($buf:expr, $cues:expr) => {
+            if !$buf.is_empty() {
+                let start_ms = $buf.first().unwrap().start_ms;
+                let end_ms = $buf.last().unwrap().end_ms.max(start_ms + 1);
+                let text = $buf
+                    .iter()
+                    .map(|w| w.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                $cues.push(Cue { start_ms, end_ms, text });
+                $buf.clear();
+            }
+        };
+    }
+
+    for word in words {
+        if let Some(last) = buf.last() {
+            let gap = word.start_ms.saturating_sub(last.end_ms);
+            let span = word.end_ms.saturating_sub(buf.first().unwrap().start_ms);
+            let pending_text_len: usize =
+                buf.iter().map(|w| w.text.len() + 1).sum::<usize>() + word.text.len();
+            let too_long = span > CUE_MAX_SPAN_MS && span >= CUE_MIN_SPAN_MS;
+            let big_gap = gap >= CUE_BREAK_GAP_MS;
+            let too_wide = pending_text_len > CUE_MAX_LINE_CHARS && span >= CUE_MIN_SPAN_MS;
+            if too_long || big_gap || too_wide {
+                flush!(buf, cues);
+            }
+        }
+        buf.push(word);
+    }
+    flush!(buf, cues);
+    cues
+}
+
 pub(crate) fn parse_stt_v2_response(
     raw: &str,
 ) -> std::result::Result<Vec<SttResult>, anyhow::Error> {
@@ -340,5 +391,48 @@ mod tests {
         let raw = r#"{ "results": [] }"#;
         let parsed = parse_stt_v2_response(raw).expect("parses");
         assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn groups_words_into_short_cues() {
+        let words = vec![
+            SttWord { text: "Hello".into(),   start_ms: 0,    end_ms: 400 },
+            SttWord { text: "world".into(),   start_ms: 400,  end_ms: 900 },
+            SttWord { text: "this".into(),    start_ms: 1000, end_ms: 1200 },
+            SttWord { text: "is".into(),      start_ms: 1200, end_ms: 1400 },
+            SttWord { text: "a".into(),       start_ms: 1400, end_ms: 1500 },
+            SttWord { text: "test".into(),    start_ms: 1500, end_ms: 2100 },
+            SttWord { text: "of".into(),      start_ms: 2200, end_ms: 2400 },
+            SttWord { text: "grouping".into(),start_ms: 2400, end_ms: 3100 },
+            SttWord { text: "cues".into(),    start_ms: 3100, end_ms: 3700 },
+        ];
+        let cues = group_words_into_cues(&words);
+        assert!(cues.len() >= 2, "should split into multiple cues");
+        for cue in &cues {
+            let span_ms = cue.end_ms - cue.start_ms;
+            assert!(span_ms <= 3500, "cue too long: {}ms", span_ms);
+            assert!(!cue.text.trim().is_empty());
+        }
+        let stitched = cues.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join(" ");
+        assert!(stitched.contains("Hello world"));
+        assert!(stitched.contains("grouping cues"));
+    }
+
+    #[test]
+    fn group_words_into_cues_handles_empty() {
+        assert!(group_words_into_cues(&[]).is_empty());
+    }
+
+    #[test]
+    fn group_words_breaks_on_long_silence_gap() {
+        let words = vec![
+            SttWord { text: "Hello".into(), start_ms: 0,     end_ms: 400 },
+            SttWord { text: "world".into(), start_ms: 400,   end_ms: 900 },
+            SttWord { text: "later".into(), start_ms: 5_000, end_ms: 5_400 },
+        ];
+        let cues = group_words_into_cues(&words);
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[0].text, "Hello world");
+        assert_eq!(cues[1].text, "later");
     }
 }
