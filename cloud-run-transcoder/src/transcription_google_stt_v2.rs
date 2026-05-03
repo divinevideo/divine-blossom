@@ -6,20 +6,45 @@ use std::path::Path;
 use crate::{parse_provider_status, Config, ParsedVtt, ProviderFailure};
 use base64::Engine as _;
 
-/// STT V2 sync `recognize` accepts up to 10 MB inline audio per the
-/// public docs; we cap at 9 MB to leave headroom for JSON envelope.
-/// The byte cap also effectively bounds duration: 16kHz mono PCM = 32 KB/s,
-/// so 9 MB ≈ 281 s — well within the 5-minute sync recognize limit.
-pub(crate) const SYNC_RECOGNIZE_MAX_BYTES: usize = 9 * 1024 * 1024;
+/// STT V2 sync `recognize` is limited to **10 MB OR 1 minute, whichever
+/// comes first** (per Google quota docs). Our ffmpeg extraction always
+/// emits 16 kHz mono PCM s16le (32 KB/s), so 60 s = 1,920,000 bytes plus
+/// the 44-byte WAV header. We cap a touch under that for safety. The byte
+/// cap therefore implicitly enforces the duration cap because the encoding
+/// is fixed.
+pub(crate) const SYNC_RECOGNIZE_MAX_BYTES: usize = 1_900_000;
+
+/// Build the regional STT V2 endpoint host. Chirp 3 is currently only
+/// served by the `us` and `eu` multi-region endpoints (and specific
+/// regional ones); the `global` host does not serve `chirp_3`. Callers
+/// that explicitly opt into `global` (for non-Chirp models) get the
+/// unprefixed host.
+fn endpoint_host(location: &str) -> String {
+    if location == "global" {
+        "speech.googleapis.com".to_string()
+    } else {
+        format!("{}-speech.googleapis.com", location)
+    }
+}
 
 pub(crate) fn recognize_url(config: &Config) -> String {
     let recognizer = config.google_stt_recognizer.trim();
     if recognizer.starts_with("projects/") {
-        return format!("https://speech.googleapis.com/v2/{}:recognize", recognizer);
+        // Extract the location from the recognizer path so the host
+        // matches the recognizer's region (Google routes per-region).
+        // Falls back to config.google_stt_location if the path is malformed.
+        let location = recognizer
+            .split('/')
+            .nth(3)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(config.google_stt_location.as_str());
+        let host = endpoint_host(location);
+        return format!("https://{}/v2/{}:recognize", host, recognizer);
     }
+    let host = endpoint_host(&config.google_stt_location);
     format!(
-        "https://speech.googleapis.com/v2/projects/{}/locations/{}/recognizers/{}:recognize",
-        config.gcp_project_id, config.google_stt_location, recognizer,
+        "https://{}/v2/projects/{}/locations/{}/recognizers/{}:recognize",
+        host, config.gcp_project_id, config.google_stt_location, recognizer,
     )
 }
 
@@ -506,7 +531,11 @@ mod tests {
 
     #[test]
     fn limits_are_sane() {
-        assert!(SYNC_RECOGNIZE_MAX_BYTES > 1_000_000);
+        // Must allow at least ~1 MB of audio (≈30 s of 16 kHz mono PCM) so
+        // typical short clips fit, and must stay under Google's 10 MB hard
+        // cap with margin.
+        assert!(SYNC_RECOGNIZE_MAX_BYTES >= 1_000_000);
+        assert!(SYNC_RECOGNIZE_MAX_BYTES <= 10 * 1024 * 1024);
     }
 
     #[test]
@@ -552,6 +581,36 @@ mod tests {
         let cfg = crate::Config::from_lookup(|k| env.get(k).map(|v| v.to_string()));
         let url = recognize_url(&cfg);
         assert!(url.ends_with("/projects/p/locations/global/recognizers/my-rec:recognize"));
+    }
+
+    #[test]
+    fn recognize_url_uses_regional_endpoint_for_us() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("GCP_PROJECT_ID", "test-proj");
+        env.insert("GOOGLE_CLOUD_LOCATION", "us");
+        let cfg = crate::Config::from_lookup(|k| env.get(k).map(|v| v.to_string()));
+        let url = recognize_url(&cfg);
+        // Chirp 3 lives on regional hosts only — `us-speech.googleapis.com`,
+        // not `speech.googleapis.com`.
+        assert_eq!(
+            url,
+            "https://us-speech.googleapis.com/v2/projects/test-proj/locations/us/recognizers/_:recognize"
+        );
+    }
+
+    #[test]
+    fn recognize_url_full_path_derives_host_from_path_location() {
+        // Even if config.google_stt_location says `us`, a fully-qualified
+        // recognizer in `eu` must hit `eu-speech.googleapis.com`.
+        let mut env = std::collections::HashMap::new();
+        env.insert("GOOGLE_CLOUD_LOCATION", "us");
+        env.insert(
+            "GOOGLE_STT_RECOGNIZER",
+            "projects/p/locations/eu/recognizers/my-rec",
+        );
+        let cfg = crate::Config::from_lookup(|k| env.get(k).map(|v| v.to_string()));
+        let url = recognize_url(&cfg);
+        assert!(url.starts_with("https://eu-speech.googleapis.com/v2/"));
     }
 
     fn test_config() -> crate::Config {

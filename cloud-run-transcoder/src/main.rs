@@ -182,7 +182,9 @@ impl Config {
             .max(1_000),
             google_stt_location: lookup("GOOGLE_CLOUD_LOCATION")
                 .filter(|v| !v.trim().is_empty())
-                .unwrap_or_else(|| "global".to_string()),
+                // Chirp 3 is served by `us` and `eu` multi-regions only;
+                // `global` does NOT serve `chirp_3`. Default to `us`.
+                .unwrap_or_else(|| "us".to_string()),
             google_stt_recognizer: lookup("GOOGLE_STT_RECOGNIZER")
                 .filter(|v| !v.trim().is_empty())
                 .unwrap_or_else(|| "_".to_string()),
@@ -2976,7 +2978,8 @@ mod tests {
     #[test]
     fn google_stt_v2_config_defaults() {
         let config = Config::from_lookup(|_| None);
-        assert_eq!(config.google_stt_location, "global");
+        // Chirp 3 only runs on `us`/`eu` multi-regions, not `global`.
+        assert_eq!(config.google_stt_location, "us");
         assert_eq!(config.google_stt_recognizer, "_");
         assert_eq!(config.google_stt_model, "chirp_3");
         assert_eq!(config.google_stt_language_codes, vec!["en-US".to_string()]);
