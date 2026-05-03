@@ -1,0 +1,24 @@
+{
+  "results": [
+    {
+      "alternatives": [
+        {
+          "transcript": "Hello world this is a test of grouping cues",
+          "confidence": 0.92,
+          "words": [
+            {"startOffset":"0s",   "endOffset":"0.4s","word":"Hello"},
+            {"startOffset":"0.4s", "endOffset":"0.9s","word":"world"},
+            {"startOffset":"1.0s", "endOffset":"1.2s","word":"this"},
+            {"startOffset":"1.2s", "endOffset":"1.4s","word":"is"},
+            {"startOffset":"1.4s", "endOffset":"1.5s","word":"a"},
+            {"startOffset":"1.5s", "endOffset":"2.1s","word":"test"},
+            {"startOffset":"2.2s", "endOffset":"2.4s","word":"of"},
+            {"startOffset":"2.4s", "endOffset":"3.1s","word":"grouping"},
+            {"startOffset":"3.1s", "endOffset":"3.7s","word":"cues"}
+          ]
+        }
+      ],
+      "languageCode": "en-us"
+    }
+  ]
+}

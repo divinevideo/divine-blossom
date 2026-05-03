@@ -443,6 +443,56 @@ pub(crate) fn google_drop_reason(parsed: &ParsedVtt) -> Option<GoogleDropReason>
     None
 }
 
+/// Whether word-level timestamps, degraded single-cue, or empty output was
+/// produced by `parse_response_to_parsed_vtt`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParseTimingMode {
+    WordLevel,
+    Degraded,
+    Empty,
+}
+
+/// Parse an STT V2 response body into a ParsedVtt, applying the
+/// word-grouping or single-cue fallback as appropriate. Does NOT apply
+/// the silence/repeat/json guards — the caller decides those (so they
+/// can branch on whether to fall back to another provider).
+pub(crate) fn parse_response_to_parsed_vtt(
+    raw: &str,
+    audio_duration_ms: u64,
+) -> std::result::Result<(ParsedVtt, ParseTimingMode), anyhow::Error> {
+    let results = parse_stt_v2_response(raw)?;
+    if results.is_empty() {
+        return Ok((
+            ParsedVtt {
+                content: "WEBVTT\n\n".to_string(),
+                text: String::new(),
+                language: None,
+                duration_ms: audio_duration_ms,
+                cue_count: 0,
+                confidence: None,
+            },
+            ParseTimingMode::Empty,
+        ));
+    }
+    let language = results.iter().find_map(|r| r.language.clone());
+    let mut all_words: Vec<SttWord> = Vec::new();
+    let mut all_text: Vec<String> = Vec::new();
+    for r in &results {
+        all_words.extend(r.words.iter().cloned());
+        all_text.push(r.transcript.clone());
+    }
+    if all_words.is_empty() {
+        let combined = all_text.join(" ");
+        return Ok((
+            transcript_only_to_parsed_vtt(&combined, language, audio_duration_ms),
+            ParseTimingMode::Degraded,
+        ));
+    }
+    let cues = group_words_into_cues(&all_words);
+    let parsed = cues_to_parsed_vtt(&cues, language);
+    Ok((parsed, ParseTimingMode::WordLevel))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -731,5 +781,32 @@ mod tests {
             confidence: None,
         };
         assert_eq!(google_drop_reason(&parsed), None);
+    }
+
+    #[test]
+    fn end_to_end_word_level_parse() {
+        let raw = include_str!("../tests/fixtures/stt_v2_with_words.json");
+        let (parsed, mode) = parse_response_to_parsed_vtt(raw, 6_000).unwrap();
+        assert_eq!(mode, ParseTimingMode::WordLevel);
+        assert!(parsed.cue_count >= 1);
+        assert!(parsed.content.starts_with("WEBVTT"));
+    }
+
+    #[test]
+    fn end_to_end_degraded_parse_when_no_offsets() {
+        let raw = r#"{ "results": [ { "alternatives": [ { "transcript": "no times here" } ] } ] }"#;
+        let (parsed, mode) = parse_response_to_parsed_vtt(raw, 4_000).unwrap();
+        assert_eq!(mode, ParseTimingMode::Degraded);
+        assert_eq!(parsed.cue_count, 1);
+        assert_eq!(parsed.duration_ms, 4_000);
+    }
+
+    #[test]
+    fn end_to_end_empty_results_yields_empty_vtt() {
+        let raw = r#"{ "results": [] }"#;
+        let (parsed, mode) = parse_response_to_parsed_vtt(raw, 2_000).unwrap();
+        assert_eq!(mode, ParseTimingMode::Empty);
+        assert_eq!(parsed.content, "WEBVTT\n\n");
+        assert_eq!(parsed.cue_count, 0);
     }
 }
