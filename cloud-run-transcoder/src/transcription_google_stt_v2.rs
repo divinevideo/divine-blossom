@@ -104,24 +104,23 @@ pub(crate) struct Cue {
 }
 
 pub(crate) fn group_words_into_cues(words: &[SttWord]) -> Vec<Cue> {
+    fn flush_buf(buf: &mut Vec<&SttWord>, cues: &mut Vec<Cue>) {
+        if buf.is_empty() {
+            return;
+        }
+        let start_ms = buf.first().unwrap().start_ms;
+        let end_ms = buf.last().unwrap().end_ms.max(start_ms + 1);
+        let text = buf
+            .iter()
+            .map(|w| w.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        cues.push(Cue { start_ms, end_ms, text });
+        buf.clear();
+    }
+
     let mut cues: Vec<Cue> = Vec::new();
     let mut buf: Vec<&SttWord> = Vec::new();
-
-    macro_rules! flush {
-        ($buf:expr, $cues:expr) => {
-            if !$buf.is_empty() {
-                let start_ms = $buf.first().unwrap().start_ms;
-                let end_ms = $buf.last().unwrap().end_ms.max(start_ms + 1);
-                let text = $buf
-                    .iter()
-                    .map(|w| w.text.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                $cues.push(Cue { start_ms, end_ms, text });
-                $buf.clear();
-            }
-        };
-    }
 
     for word in words {
         if let Some(last) = buf.last() {
@@ -129,16 +128,16 @@ pub(crate) fn group_words_into_cues(words: &[SttWord]) -> Vec<Cue> {
             let span = word.end_ms.saturating_sub(buf.first().unwrap().start_ms);
             let pending_text_len: usize =
                 buf.iter().map(|w| w.text.len() + 1).sum::<usize>() + word.text.len();
-            let too_long = span > CUE_MAX_SPAN_MS && span >= CUE_MIN_SPAN_MS;
+            let too_long = span > CUE_MAX_SPAN_MS;
             let big_gap = gap >= CUE_BREAK_GAP_MS;
             let too_wide = pending_text_len > CUE_MAX_LINE_CHARS && span >= CUE_MIN_SPAN_MS;
             if too_long || big_gap || too_wide {
-                flush!(buf, cues);
+                flush_buf(&mut buf, &mut cues);
             }
         }
         buf.push(word);
     }
-    flush!(buf, cues);
+    flush_buf(&mut buf, &mut cues);
     cues
 }
 
@@ -159,7 +158,9 @@ pub(crate) fn transcript_only_to_parsed_vtt(
         };
     }
     let end_secs = if audio_duration_ms == 0 {
-        // Same sentinel that `normalize_transcript_to_vtt` uses.
+        // 24h ceiling — caller never knew the duration here. Distinct from the
+        // 99:59:59.000 sentinel `normalize_transcript_to_vtt` uses; both are
+        // valid WebVTT but this one stays under the standard 24h horizon.
         86_400.0
     } else {
         audio_duration_ms as f64 / 1000.0
@@ -410,6 +411,10 @@ mod tests {
         assert_eq!(parse_offset_to_ms("1.5s"), Some(1500));
         assert_eq!(parse_offset_to_ms("12.345s"), Some(12_345));
         assert_eq!(parse_offset_to_ms("500ms"), Some(500));
+        // Bare-number branch: treat as seconds.
+        assert_eq!(parse_offset_to_ms("1.5"), Some(1500));
+        // Empty / unparseable inputs return None, not Some(0).
+        assert_eq!(parse_offset_to_ms(""), None);
         assert_eq!(parse_offset_to_ms("garbage"), None);
     }
 
