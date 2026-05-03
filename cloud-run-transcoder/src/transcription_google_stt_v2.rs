@@ -393,8 +393,11 @@ pub(crate) fn contains_provider_json_artifact(text: &str) -> bool {
 }
 
 /// Drop the transcript if a single token, bigram, or trigram dominates
-/// it (≥ 60% of tokens). Avoids the "thanks thanks thanks ..." failure
-/// mode without hurting legitimate short utterances.
+/// it (≥ 80% of tokens). Avoids the "thanks thanks thanks ..." failure
+/// mode without hurting legitimate short utterances. Threshold raised
+/// from 0.60 → 0.80 after the bigram/trigram paths mis-flagged real
+/// onomatopoeic speech in production (sports/hype clips with "go go go
+/// go" + "eh eh eh eh eh eh" pushed trigram coverage to exactly 0.75).
 pub(crate) fn is_repeated_phrase_hallucination(text: &str) -> bool {
     let tokens: Vec<String> = text
         .split_whitespace()
@@ -441,11 +444,11 @@ pub(crate) fn is_repeated_phrase_hallucination(text: &str) -> bool {
             .unwrap_or(false)
     }
 
-    dominates(&tokens, 1, 0.6, |t, i| Some(t[i].clone()))
-        || dominates(&tokens, 2, 0.6, |t, i| {
+    dominates(&tokens, 1, 0.80, |t, i| Some(t[i].clone()))
+        || dominates(&tokens, 2, 0.80, |t, i| {
             Some(format!("{} {}", t[i], t[i + 1]))
         })
-        || dominates(&tokens, 3, 0.6, |t, i| {
+        || dominates(&tokens, 3, 0.80, |t, i| {
             Some(format!("{} {} {}", t[i], t[i + 1], t[i + 2]))
         })
 }
@@ -859,17 +862,27 @@ mod tests {
 
     #[test]
     fn repeated_trigram_is_flagged() {
-        // 12 tokens, structure "abc abc abc xyz". No unigram or bigram
-        // dominates by ≥60% (each unigram = 25%, "alpha bravo" bigram
-        // covers 6/12 = 50%), but the trigram "alpha bravo charlie"
-        // repeats three times → covers 9/12 = 75% and trips the guard.
-        let text = "alpha bravo charlie alpha bravo charlie alpha bravo charlie xray yankee zulu";
+        // 15 tokens, structure "abc abc abc abc xyz". The trigram
+        // "alpha bravo charlie" repeats four times → covers 12/15 = 80%
+        // and trips the guard at the 0.80 threshold.
+        let text = "alpha bravo charlie alpha bravo charlie alpha bravo charlie alpha bravo charlie xray yankee zulu";
         assert!(is_repeated_phrase_hallucination(text));
     }
 
     #[test]
     fn empty_transcript_is_not_flagged_by_repeat_guard() {
         assert!(!is_repeated_phrase_hallucination(""));
+    }
+
+    #[test]
+    fn onomatopoeic_short_clip_is_not_flagged() {
+        // Real production transcript (sha256 5ed3d748...) where Chirp 3
+        // correctly captured a hype clip's speech. 16 tokens, with bigram
+        // (eh, eh) covering 10/16 = 62.5% and trigram (eh, eh, eh)
+        // covering 12/16 = 75%. Both stay under the 0.80 threshold so
+        // legitimate sports/kids/music transcripts are not dropped.
+        let text = "She's going to do a gritty. Go, go, go, go. Eh eh eh eh eh eh.";
+        assert!(!is_repeated_phrase_hallucination(text));
     }
 
     #[test]
