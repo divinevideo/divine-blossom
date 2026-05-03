@@ -160,10 +160,19 @@ def collect_popular_hashes(
     min_views: int,
     timeout: int,
     verbose: bool,
+    max_empty_pages: int = 5,
 ) -> list[str]:
+    """Walk relay.sort=popular until limit reached or pagination exhausted.
+
+    The relay's `sort=popular` is ordered by `trending_score`, not `views`,
+    so a sparse page mid-stream (all videos below `min_views`) doesn't prove
+    we've hit the tail. Tolerate up to `max_empty_pages` consecutive empty
+    pages before giving up.
+    """
     out: list[str] = []
     seen: set[str] = set()
     offset = 0
+    empty_streak = 0
     while len(out) < limit:
         page = fetch_videos_page(relay_api, "popular", page_size, offset, timeout)
         if not page:
@@ -182,9 +191,16 @@ def collect_popular_hashes(
             if len(out) >= limit:
                 break
         if verbose:
-            print(f"  popular offset={offset} added={new_in_page} total={len(out)}")
+            print(
+                f"  popular offset={offset} added={new_in_page} "
+                f"total={len(out)} empty_streak={empty_streak}"
+            )
         if new_in_page == 0:
-            break
+            empty_streak += 1
+            if empty_streak >= max_empty_pages:
+                break
+        else:
+            empty_streak = 0
         offset += page_size
     return out
 
@@ -414,11 +430,12 @@ def parse_args() -> argparse.Namespace:
         help="Suppress before/after transcript preview and video link.",
     )
     parser.add_argument(
-        "--no-wait",
+        "--wait",
         action="store_true",
         help=(
-            "Skip polling for the new VTT after retranscribe. Use for bulk "
-            "runs where you don't need the after-text inline (faster)."
+            "After triggering each retranscribe, poll until the new VTT "
+            "lands and print the after-text inline. Slow on bulk runs "
+            "(~10-30 s per video); recommended only for inspection."
         ),
     )
     parser.add_argument("--poll-interval", type=float, default=4.0)
@@ -535,7 +552,7 @@ def main() -> int:
         job_status = payload.get("status", "unknown")
         print(f"  job:    {job_id} ({job_status})")
 
-        if not args.no_wait and not args.no_show:
+        if args.wait and not args.no_show:
             label, after_text = wait_for_new_vtt(
                 args.media_url,
                 sha,
