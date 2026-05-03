@@ -142,6 +142,44 @@ pub(crate) fn group_words_into_cues(words: &[SttWord]) -> Vec<Cue> {
     cues
 }
 
+pub(crate) fn transcript_only_to_parsed_vtt(
+    transcript: &str,
+    language: Option<String>,
+    audio_duration_ms: u64,
+) -> ParsedVtt {
+    let trimmed = transcript.trim();
+    if trimmed.is_empty() {
+        return ParsedVtt {
+            content: "WEBVTT\n\n".to_string(),
+            text: String::new(),
+            language,
+            duration_ms: audio_duration_ms,
+            cue_count: 0,
+            confidence: None,
+        };
+    }
+    let end_secs = if audio_duration_ms == 0 {
+        // Same sentinel that `normalize_transcript_to_vtt` uses.
+        86_400.0
+    } else {
+        audio_duration_ms as f64 / 1000.0
+    };
+    let content = format!(
+        "WEBVTT\n\n1\n{} --> {}\n{}\n\n",
+        crate::format_vtt_timestamp(0.0),
+        crate::format_vtt_timestamp(end_secs),
+        trimmed,
+    );
+    ParsedVtt {
+        content,
+        text: trimmed.to_string(),
+        language,
+        duration_ms: audio_duration_ms,
+        cue_count: 1,
+        confidence: None,
+    }
+}
+
 pub(crate) fn cues_to_parsed_vtt(cues: &[Cue], language: Option<String>) -> ParsedVtt {
     if cues.is_empty() {
         return ParsedVtt {
@@ -492,5 +530,25 @@ mod tests {
         assert_eq!(parsed.content, "WEBVTT\n\n");
         assert_eq!(parsed.cue_count, 0);
         assert!(parsed.text.is_empty());
+    }
+
+    #[test]
+    fn single_cue_fallback_when_no_word_offsets() {
+        let parsed = transcript_only_to_parsed_vtt(
+            "Hello world without timing",
+            Some("en-US".into()),
+            6_000,
+        );
+        assert_eq!(parsed.cue_count, 1);
+        assert_eq!(parsed.duration_ms, 6_000);
+        assert!(parsed.content.contains("00:00:00.000 --> 00:00:06.000"));
+        assert!(parsed.content.contains("Hello world without timing"));
+    }
+
+    #[test]
+    fn single_cue_fallback_uses_24h_when_duration_unknown() {
+        let parsed = transcript_only_to_parsed_vtt("text", None, 0);
+        assert!(parsed.content.contains("--> "));
+        assert!(parsed.cue_count == 1);
     }
 }
