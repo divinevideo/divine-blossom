@@ -349,6 +349,72 @@ pub(crate) async fn transcribe(
     Ok(resp_body)
 }
 
+pub(crate) fn contains_provider_json_artifact(text: &str) -> bool {
+    let needles = [
+        "\"total_tokens\"",
+        "\"usage\":{",
+        "\"results\":[",
+        "\"alternatives\":[",
+    ];
+    needles.iter().any(|n| text.contains(n))
+}
+
+/// Drop the transcript if a single token, bigram, or trigram dominates
+/// it (≥ 60% of tokens). Avoids the "thanks thanks thanks ..." failure
+/// mode without hurting legitimate short utterances.
+pub(crate) fn is_repeated_phrase_hallucination(text: &str) -> bool {
+    let tokens: Vec<String> = text
+        .split_whitespace()
+        .map(|t| {
+            t.chars()
+                .filter(|c| c.is_alphanumeric())
+                .flat_map(|c| c.to_lowercase())
+                .collect::<String>()
+        })
+        .filter(|t| !t.is_empty())
+        .collect();
+    let n = tokens.len();
+    if n < 6 {
+        return false;
+    }
+
+    fn dominates<F: Fn(&[String], usize) -> Option<String>>(
+        tokens: &[String],
+        gram_size: usize,
+        threshold_ratio: f64,
+        gram_at: F,
+    ) -> bool {
+        if tokens.len() < gram_size * 2 {
+            return false;
+        }
+        let mut counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let total = tokens.len() + 1 - gram_size;
+        for i in 0..total {
+            if let Some(g) = gram_at(tokens, i) {
+                *counts.entry(g).or_insert(0) += 1;
+            }
+        }
+        // Compare coverage as fraction of total tokens rather than gram
+        // positions so that bigram/trigram dominance is measured on the
+        // same scale as unigram dominance.
+        counts
+            .values()
+            .max()
+            .copied()
+            .map(|m| (m * gram_size) as f64 / tokens.len() as f64 >= threshold_ratio)
+            .unwrap_or(false)
+    }
+
+    dominates(&tokens, 1, 0.6, |t, i| Some(t[i].clone()))
+        || dominates(&tokens, 2, 0.6, |t, i| {
+            Some(format!("{} {}", t[i], t[i + 1]))
+        })
+        || dominates(&tokens, 3, 0.6, |t, i| {
+            Some(format!("{} {} {}", t[i], t[i + 1], t[i + 2]))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,5 +621,38 @@ mod tests {
         let parsed = transcript_only_to_parsed_vtt("text", None, 0);
         assert!(parsed.content.contains("--> "));
         assert!(parsed.cue_count == 1);
+    }
+
+    #[test]
+    fn detects_json_artifacts_in_transcript_text() {
+        assert!(contains_provider_json_artifact("\"total_tokens\": 42"));
+        assert!(contains_provider_json_artifact("foo \"usage\":{ bar"));
+        assert!(contains_provider_json_artifact("\"results\":[ ..."));
+        assert!(contains_provider_json_artifact("\"alternatives\":["));
+        assert!(!contains_provider_json_artifact("Hello world"));
+    }
+
+    #[test]
+    fn repeated_word_dominance_is_flagged() {
+        // 6 of 7 tokens are the same word -> dropped.
+        let text = "thanks thanks thanks thanks thanks thanks bye";
+        assert!(is_repeated_phrase_hallucination(text));
+    }
+
+    #[test]
+    fn repeated_short_phrase_is_flagged() {
+        let text = "you know you know you know you know you know really";
+        assert!(is_repeated_phrase_hallucination(text));
+    }
+
+    #[test]
+    fn normal_transcripts_are_not_flagged() {
+        let text = "Hello world this is a perfectly normal sentence about cats";
+        assert!(!is_repeated_phrase_hallucination(text));
+    }
+
+    #[test]
+    fn empty_transcript_is_not_flagged_by_repeat_guard() {
+        assert!(!is_repeated_phrase_hallucination(""));
     }
 }
