@@ -395,14 +395,17 @@ pub(crate) fn is_repeated_phrase_hallucination(text: &str) -> bool {
                 *counts.entry(g).or_insert(0) += 1;
             }
         }
-        // Compare coverage as fraction of total tokens rather than gram
-        // positions so that bigram/trigram dominance is measured on the
-        // same scale as unigram dominance.
+        // Approximate coverage as fraction of total tokens. Cap at the
+        // total so the ratio stays in [0, 1] for fully-repeated input
+        // (overlapping windows would otherwise push it above 1.0).
         counts
             .values()
             .max()
             .copied()
-            .map(|m| (m * gram_size) as f64 / tokens.len() as f64 >= threshold_ratio)
+            .map(|m| {
+                let covered = (m * gram_size).min(tokens.len());
+                covered as f64 / tokens.len() as f64 >= threshold_ratio
+            })
             .unwrap_or(false)
     }
 
@@ -425,6 +428,10 @@ pub(crate) fn google_drop_reason(parsed: &ParsedVtt) -> Option<GoogleDropReason>
     if parsed.text.trim().is_empty() {
         return None; // already empty — nothing to drop further
     }
+    // Check parsed.content (the rendered WebVTT) as well as parsed.text
+    // because malformed STT responses sometimes leak the JSON envelope into
+    // cue bodies. False-positive risk: tech-podcast transcripts that
+    // literally pronounce JSON syntax ('"results":[' etc.); deemed acceptable.
     if contains_provider_json_artifact(&parsed.text)
         || contains_provider_json_artifact(&parsed.content)
     {
@@ -670,6 +677,16 @@ mod tests {
     fn normal_transcripts_are_not_flagged() {
         let text = "Hello world this is a perfectly normal sentence about cats";
         assert!(!is_repeated_phrase_hallucination(text));
+    }
+
+    #[test]
+    fn repeated_trigram_is_flagged() {
+        // 12 tokens, structure "abc abc abc xyz". No unigram or bigram
+        // dominates by ≥60% (each unigram = 25%, "alpha bravo" bigram
+        // covers 6/12 = 50%), but the trigram "alpha bravo charlie"
+        // repeats three times → covers 9/12 = 75% and trips the guard.
+        let text = "alpha bravo charlie alpha bravo charlie alpha bravo charlie xray yankee zulu";
+        assert!(is_repeated_phrase_hallucination(text));
     }
 
     #[test]
