@@ -119,8 +119,13 @@ pub(crate) fn group_words_into_cues(words: &[SttWord]) -> Vec<Cue> {
         if let Some(last) = buf.last() {
             let gap = word.start_ms.saturating_sub(last.end_ms);
             let span = word.end_ms.saturating_sub(buf.first().unwrap().start_ms);
-            let pending_text_len: usize =
-                buf.iter().map(|w| w.text.len() + 1).sum::<usize>() + word.text.len();
+            // Count characters not bytes so CJK transcripts get the same
+            // cue-density budget as Latin text.
+            let pending_text_len: usize = buf
+                .iter()
+                .map(|w| w.text.chars().count() + 1)
+                .sum::<usize>()
+                + word.text.chars().count();
             let too_long = span > CUE_MAX_SPAN_MS;
             let big_gap = gap >= CUE_BREAK_GAP_MS;
             let too_wide = pending_text_len > CUE_MAX_LINE_CHARS && span >= CUE_MIN_SPAN_MS;
@@ -151,10 +156,12 @@ pub(crate) fn transcript_only_to_parsed_vtt(
         };
     }
     let end_secs = if audio_duration_ms == 0 {
-        // 24h ceiling — caller never knew the duration here. Distinct from the
-        // 99:59:59.000 sentinel `normalize_transcript_to_vtt` uses; both are
-        // valid WebVTT but this one stays under the standard 24h horizon.
-        86_400.0
+        // Just-under-24h sentinel — caller never knew the duration here.
+        // Renders as 23:59:59.999, which keeps the cue strictly inside
+        // the WebVTT 24h horizon (some parsers, notably older Safari,
+        // are strict about HH < 24). Distinct from the 99:59:59.000
+        // sentinel `normalize_transcript_to_vtt` uses.
+        86_399.999
     } else {
         audio_duration_ms as f64 / 1000.0
     };
