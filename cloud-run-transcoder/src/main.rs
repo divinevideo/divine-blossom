@@ -1641,15 +1641,17 @@ async fn process_transcribe(
         };
     drop(provider_permit);
 
+    let mut stt_v2_timing_mode: Option<transcription_google_stt_v2::ParseTimingMode> = None;
     let parsed_vtt = if used_provider == "google_stt_v2" {
         match transcription_google_stt_v2::parse_response_to_parsed_vtt(
             &raw_output,
             audio_analysis.duration_ms,
         ) {
             Ok((parsed, mode)) => {
+                stt_v2_timing_mode = Some(mode);
                 info!(
                     hash,
-                    timing_mode = ?mode,
+                    parser_mode = ?mode,
                     cue_count = parsed.cue_count,
                     duration_ms = parsed.duration_ms,
                     "STT V2 response parsed",
@@ -1775,16 +1777,14 @@ async fn process_transcribe(
 
     info!(
         hash,
+        primary_provider = %state.config.transcription_provider,
         used_provider = %used_provider,
+        fallback_used = used_provider != state.config.transcription_provider,
         cue_count = parsed_vtt.cue_count,
         duration_ms = parsed_vtt.duration_ms,
         language = ?parsed_vtt.language,
         text_chars = parsed_vtt.text.chars().count(),
-        timing_mode = match used_provider.as_str() {
-            "google_stt_v2" => "word-level-or-degraded",
-            _ => "segment-level",
-        },
-        fallback_used = used_provider != state.config.transcription_provider,
+        timing_mode = ?stt_v2_timing_mode,
         "Transcript ready for upload",
     );
 
