@@ -2104,8 +2104,12 @@ async fn transcribe_audio_via_provider_once(
     audio_path: &Path,
     language: Option<&str>,
 ) -> std::result::Result<String, ProviderFailure> {
-    if config.transcription_provider == "gemini" {
-        return transcribe_via_gemini(config, audio_path, language).await;
+    match config.transcription_provider.as_str() {
+        "gemini" => return transcribe_via_gemini(config, audio_path, language).await,
+        "google_stt_v2" => {
+            return transcription_google_stt_v2::transcribe(config, audio_path, language).await
+        }
+        _ => {} // fall through to OpenAI multipart path below
     }
 
     // --- OpenAI path (original) ---
