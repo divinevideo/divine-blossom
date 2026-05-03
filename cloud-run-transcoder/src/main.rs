@@ -67,6 +67,29 @@ struct Config {
     transcription_retry_base_ms: u64,
     transcription_retry_max_ms: u64,
     transcription_retry_total_ms: u64,
+    /// GCP location for STT V2 (default "global"). Distinct from `gcp_region`,
+    /// which Vertex AI uses.
+    google_stt_location: String,
+    /// Recognizer identifier. Either short id ("_") or full path
+    /// `projects/{project}/locations/{location}/recognizers/{id}`.
+    google_stt_recognizer: String,
+    /// STT model name (e.g. "chirp_3").
+    google_stt_model: String,
+    /// Comma-separated language hints, parsed into Vec.
+    google_stt_language_codes: Vec<String>,
+    google_stt_enable_automatic_punctuation: bool,
+    google_stt_enable_word_time_offsets: bool,
+    google_stt_max_alternatives: u32,
+    /// If set and the primary provider returns a `ProviderError`, retry once
+    /// with this provider (subject to `transcription_fallback_on_provider_error`).
+    transcription_fallback_provider: Option<String>,
+    /// If true, fall back even when the primary returned a successful but empty
+    /// transcript. Default false because empty is often the correct answer
+    /// (silent media). Has no effect on guards (silence/repeat/json-artifact),
+    /// which always remain non-fallback.
+    transcription_fallback_on_empty: bool,
+    /// If true, fall back when primary returns a `ProviderError`. Default true.
+    transcription_fallback_on_provider_error: bool,
 }
 
 impl Config {
@@ -150,6 +173,53 @@ impl Config {
                 180_000,
             )
             .max(1_000),
+            google_stt_location: lookup("GOOGLE_CLOUD_LOCATION")
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "global".to_string()),
+            google_stt_recognizer: lookup("GOOGLE_STT_RECOGNIZER")
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "_".to_string()),
+            google_stt_model: lookup("GOOGLE_STT_MODEL")
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "chirp_3".to_string()),
+            google_stt_language_codes: lookup("GOOGLE_STT_LANGUAGE_CODES")
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_else(|| vec!["en-US".to_string()]),
+            google_stt_enable_automatic_punctuation: parse_bool(
+                &mut lookup,
+                "GOOGLE_STT_ENABLE_AUTOMATIC_PUNCTUATION",
+                true,
+            ),
+            google_stt_enable_word_time_offsets: parse_bool(
+                &mut lookup,
+                "GOOGLE_STT_ENABLE_WORD_TIME_OFFSETS",
+                true,
+            ),
+            google_stt_max_alternatives: parse_value(
+                &mut lookup,
+                "GOOGLE_STT_MAX_ALTERNATIVES",
+                1u32,
+            )
+            .max(1),
+            transcription_fallback_provider: lookup("TRANSCRIPTION_FALLBACK_PROVIDER")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
+            transcription_fallback_on_empty: parse_bool(
+                &mut lookup,
+                "TRANSCRIPTION_FALLBACK_ON_EMPTY",
+                false,
+            ),
+            transcription_fallback_on_provider_error: parse_bool(
+                &mut lookup,
+                "TRANSCRIPTION_FALLBACK_ON_PROVIDER_ERROR",
+                true,
+            ),
         }
     }
 }
@@ -2757,6 +2827,50 @@ mod tests {
         assert_eq!(config.transcription_provider, "gemini");
         assert_eq!(config.gcp_project_id, "rich-compiler-479518-d2");
         assert_eq!(config.gcp_region, "us-central1");
+    }
+
+    #[test]
+    fn google_stt_v2_config_defaults() {
+        let config = Config::from_lookup(|_| None);
+        assert_eq!(config.google_stt_location, "global");
+        assert_eq!(config.google_stt_recognizer, "_");
+        assert_eq!(config.google_stt_model, "chirp_3");
+        assert_eq!(config.google_stt_language_codes, vec!["en-US".to_string()]);
+        assert!(config.google_stt_enable_automatic_punctuation);
+        assert!(config.google_stt_enable_word_time_offsets);
+        assert_eq!(config.google_stt_max_alternatives, 1);
+        assert_eq!(config.transcription_fallback_provider, None);
+        assert!(!config.transcription_fallback_on_empty);
+        assert!(config.transcription_fallback_on_provider_error);
+    }
+
+    #[test]
+    fn google_stt_v2_config_parses_overrides() {
+        let env_map: std::collections::HashMap<&str, &str> = [
+            ("GOOGLE_CLOUD_LOCATION", "us-central1"),
+            ("GOOGLE_STT_RECOGNIZER", "projects/p/locations/global/recognizers/r"),
+            ("GOOGLE_STT_MODEL", "chirp_3"),
+            ("GOOGLE_STT_LANGUAGE_CODES", "en-US, es-ES,  ja-JP"),
+            ("GOOGLE_STT_ENABLE_AUTOMATIC_PUNCTUATION", "false"),
+            ("GOOGLE_STT_ENABLE_WORD_TIME_OFFSETS", "false"),
+            ("GOOGLE_STT_MAX_ALTERNATIVES", "3"),
+            ("TRANSCRIPTION_FALLBACK_PROVIDER", "openai"),
+            ("TRANSCRIPTION_FALLBACK_ON_EMPTY", "true"),
+            ("TRANSCRIPTION_FALLBACK_ON_PROVIDER_ERROR", "false"),
+        ].into_iter().collect();
+        let config = Config::from_lookup(|k| env_map.get(k).map(|v| v.to_string()));
+        assert_eq!(config.google_stt_location, "us-central1");
+        assert_eq!(config.google_stt_recognizer, "projects/p/locations/global/recognizers/r");
+        assert_eq!(
+            config.google_stt_language_codes,
+            vec!["en-US".to_string(), "es-ES".to_string(), "ja-JP".to_string()]
+        );
+        assert!(!config.google_stt_enable_automatic_punctuation);
+        assert!(!config.google_stt_enable_word_time_offsets);
+        assert_eq!(config.google_stt_max_alternatives, 3);
+        assert_eq!(config.transcription_fallback_provider.as_deref(), Some("openai"));
+        assert!(config.transcription_fallback_on_empty);
+        assert!(!config.transcription_fallback_on_provider_error);
     }
 
     #[test]
