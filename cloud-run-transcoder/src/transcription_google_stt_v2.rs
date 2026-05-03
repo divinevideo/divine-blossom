@@ -54,16 +54,75 @@ pub(crate) fn empty_for_audio(audio: &AudioAnalysis) -> ParsedVtt {
 }
 
 pub(crate) async fn transcribe(
-    _config: &Config,
-    _audio_path: &Path,
+    config: &Config,
+    audio_path: &Path,
     _language: Option<&str>,
 ) -> std::result::Result<String, ProviderFailure> {
-    Err(parse_provider_status(
-        None,
-        None,
-        "google_stt_v2 transcribe is not yet implemented",
-        false,
-    ))
+    let audio_bytes = tokio::fs::read(audio_path).await.map_err(|e| {
+        parse_provider_status(None, None, &format!("Failed to read audio: {}", e), false)
+    })?;
+
+    if audio_bytes.len() > SYNC_RECOGNIZE_MAX_BYTES {
+        // Non-retryable: caller may choose fallback.
+        return Err(parse_provider_status(
+            Some(413),
+            None,
+            &format!(
+                "audio_too_large_for_sync_recognize: {} bytes > {}",
+                audio_bytes.len(),
+                SYNC_RECOGNIZE_MAX_BYTES
+            ),
+            false,
+        ));
+    }
+
+    let access_token = crate::fetch_gcp_access_token().await?;
+    let url = recognize_url(config);
+    let body = build_recognize_request(config, &audio_bytes);
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&url)
+        .bearer_auth(&access_token)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .await
+        .map_err(|e| {
+            parse_provider_status(
+                None,
+                None,
+                &format!("Failed to call STT V2: {}", e),
+                e.is_timeout(),
+            )
+        })?;
+
+    let status = response.status();
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
+    let resp_body = response.text().await.map_err(|e| {
+        parse_provider_status(
+            Some(status.as_u16()),
+            retry_after.as_deref(),
+            &format!("Failed to read STT V2 response: {}", e),
+            e.is_timeout(),
+        )
+    })?;
+
+    if !status.is_success() {
+        return Err(parse_provider_status(
+            Some(status.as_u16()),
+            retry_after.as_deref(),
+            &resp_body,
+            false,
+        ));
+    }
+
+    Ok(resp_body)
 }
 
 #[cfg(test)]
