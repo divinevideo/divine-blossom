@@ -1496,6 +1496,9 @@ async fn process_transcribe(
             audio_analysis.mean_volume_db,
             audio_analysis.max_volume_db
         );
+        // NOTE: Silence guard is intentional dead-end for fallback. We never
+        // call another provider for clearly-silent audio, even if a fallback
+        // is configured.
         let parsed_vtt = ParsedVtt::empty(audio_analysis.duration_ms);
         let result = finalize_transcript(
             &state,
@@ -1541,13 +1544,16 @@ async fn process_transcribe(
         in_flight, provider_wait_ms, "Acquired transcription provider permit"
     );
 
-    let raw_output =
-        match transcribe_audio_via_provider(&state.config, &audio_path, requested_lang.as_deref())
-            .await
-        {
-            Ok(output) => output,
-            Err(e) => {
-                drop(provider_permit);
+    let (raw_output, used_provider) = match transcribe_with_fallback(
+        &state,
+        &audio_path,
+        requested_lang.as_deref(),
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(e) => {
+            drop(provider_permit);
                 if e.exhausted_retryable {
                     report_derivative_failure_to_sentry(
                         "divine-transcoder",
@@ -1612,37 +1618,82 @@ async fn process_transcribe(
         };
     drop(provider_permit);
 
-    let parsed_vtt = match normalize_transcript_to_vtt(&raw_output) {
-        Ok(vtt) => vtt,
-        Err(e) => {
-            if let Err(lock_error) = delete_transcript_lock(
-                &state.gcs_client,
-                &state.config.gcs_bucket,
-                &transcript_lock,
-            )
-            .await
-            {
-                warn!(
-                    "Failed to release transcript lock for {}: {}",
-                    hash, lock_error
+    let parsed_vtt = if used_provider == "google_stt_v2" {
+        match transcription_google_stt_v2::parse_response_to_parsed_vtt(
+            &raw_output,
+            audio_analysis.duration_ms,
+        ) {
+            Ok((parsed, mode)) => {
+                info!(
+                    hash,
+                    timing_mode = ?mode,
+                    cue_count = parsed.cue_count,
+                    duration_ms = parsed.duration_ms,
+                    "STT V2 response parsed",
                 );
+                parsed
             }
-            send_transcript_status_webhook(
-                &state.config,
-                &hash,
-                "failed",
-                job_id.as_deref(),
-                requested_lang.as_deref(),
-                None,
-                None,
-                None,
-                None,
-                Some("normalize_failed"),
-                Some(&e.to_string()),
-                false,
-            )
-            .await;
-            return Err(e);
+            Err(e) => {
+                if let Err(lock_error) = delete_transcript_lock(
+                    &state.gcs_client,
+                    &state.config.gcs_bucket,
+                    &transcript_lock,
+                )
+                .await
+                {
+                    warn!("Failed to release transcript lock for {}: {}", hash, lock_error);
+                }
+                send_transcript_status_webhook(
+                    &state.config,
+                    &hash,
+                    "failed",
+                    job_id.as_deref(),
+                    requested_lang.as_deref(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("normalize_failed"),
+                    Some(&e.to_string()),
+                    false,
+                )
+                .await;
+                return Err(e);
+            }
+        }
+    } else {
+        match normalize_transcript_to_vtt(&raw_output) {
+            Ok(vtt) => vtt,
+            Err(e) => {
+                if let Err(lock_error) = delete_transcript_lock(
+                    &state.gcs_client,
+                    &state.config.gcs_bucket,
+                    &transcript_lock,
+                )
+                .await
+                {
+                    warn!(
+                        "Failed to release transcript lock for {}: {}",
+                        hash, lock_error
+                    );
+                }
+                send_transcript_status_webhook(
+                    &state.config,
+                    &hash,
+                    "failed",
+                    job_id.as_deref(),
+                    requested_lang.as_deref(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("normalize_failed"),
+                    Some(&e.to_string()),
+                    false,
+                )
+                .await;
+                return Err(e);
+            }
         }
     };
 
@@ -1677,6 +1728,23 @@ async fn process_transcribe(
             ParsedVtt::empty(audio_analysis.duration_ms)
         }
         None => parsed_vtt,
+    };
+
+    let parsed_vtt = if used_provider == "google_stt_v2" {
+        match transcription_google_stt_v2::google_drop_reason(&parsed_vtt) {
+            Some(reason) => {
+                warn!(
+                    hash,
+                    drop_reason = ?reason,
+                    text_preview = %first_chars(&parsed_vtt.text, 80),
+                    "Dropping STT V2 transcript due to Google-specific guard"
+                );
+                ParsedVtt::empty(audio_analysis.duration_ms)
+            }
+            None => parsed_vtt,
+        }
+    } else {
+        parsed_vtt
     };
 
     let result = finalize_transcript(
@@ -2103,8 +2171,10 @@ async fn transcribe_audio_via_provider_once(
     config: &Config,
     audio_path: &Path,
     language: Option<&str>,
+    provider_override: Option<&str>,
 ) -> std::result::Result<String, ProviderFailure> {
-    match config.transcription_provider.as_str() {
+    let provider = provider_override.unwrap_or(config.transcription_provider.as_str());
+    match provider {
         "gemini" => return transcribe_via_gemini(config, audio_path, language).await,
         "google_stt_v2" => {
             return transcription_google_stt_v2::transcribe(config, audio_path, language).await
@@ -2200,17 +2270,63 @@ async fn transcribe_audio_via_provider_once(
     Ok(body)
 }
 
+/// Try the configured provider; on a non-silence ProviderError, fall back
+/// to `transcription_fallback_provider` once if configured. Returns
+/// `(raw_output, used_provider_name)` so the caller can pick the right
+/// downstream parser (STT V2 needs the structured parser, others go
+/// through normalize_transcript_to_vtt).
+async fn transcribe_with_fallback(
+    state: &AppState,
+    audio_path: &Path,
+    language: Option<&str>,
+) -> std::result::Result<(String, String), ProviderError> {
+    let primary = state.config.transcription_provider.clone();
+    match transcribe_audio_via_provider(
+        &state.config,
+        audio_path,
+        language,
+        None,
+    )
+    .await
+    {
+        Ok(output) => Ok((output, primary)),
+        Err(err) => {
+            let Some(fallback) = state.config.transcription_fallback_provider.as_deref() else {
+                return Err(err);
+            };
+            if !state.config.transcription_fallback_on_provider_error {
+                return Err(err);
+            }
+            warn!(
+                primary = %primary,
+                fallback = %fallback,
+                error = %err,
+                "Primary provider failed; attempting fallback provider",
+            );
+            transcribe_audio_via_provider(
+                &state.config,
+                audio_path,
+                language,
+                Some(fallback),
+            )
+            .await
+            .map(|out| (out, fallback.to_string()))
+        }
+    }
+}
+
 /// Call a configured transcription provider and return raw response text.
 async fn transcribe_audio_via_provider(
     config: &Config,
     audio_path: &Path,
     language: Option<&str>,
+    provider_override: Option<&str>,
 ) -> std::result::Result<String, ProviderError> {
     let started = Instant::now();
     let mut attempt: u32 = 0;
 
     loop {
-        match transcribe_audio_via_provider_once(config, audio_path, language).await {
+        match transcribe_audio_via_provider_once(config, audio_path, language, provider_override).await {
             Ok(body) => return Ok(body),
             Err(failure) if !is_retryable_provider_failure(&failure) => {
                 return Err(ProviderError {
@@ -3322,6 +3438,10 @@ fn format_vtt_timestamp(seconds: f64) -> String {
     let m = total_minutes % 60;
     let h = total_minutes / 60;
     format!("{:02}:{:02}:{:02}.{:03}", h, m, s, ms)
+}
+
+fn first_chars(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
 }
 
 async fn upload_transcript_to_gcs(
