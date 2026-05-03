@@ -415,6 +415,27 @@ pub(crate) fn is_repeated_phrase_hallucination(text: &str) -> bool {
         })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GoogleDropReason {
+    JsonArtifact,
+    RepeatedPhrase,
+}
+
+pub(crate) fn google_drop_reason(parsed: &ParsedVtt) -> Option<GoogleDropReason> {
+    if parsed.text.trim().is_empty() {
+        return None; // already empty — nothing to drop further
+    }
+    if contains_provider_json_artifact(&parsed.text)
+        || contains_provider_json_artifact(&parsed.content)
+    {
+        return Some(GoogleDropReason::JsonArtifact);
+    }
+    if is_repeated_phrase_hallucination(&parsed.text) {
+        return Some(GoogleDropReason::RepeatedPhrase);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,5 +675,44 @@ mod tests {
     #[test]
     fn empty_transcript_is_not_flagged_by_repeat_guard() {
         assert!(!is_repeated_phrase_hallucination(""));
+    }
+
+    #[test]
+    fn google_guard_drops_json_artifact_text() {
+        let parsed = ParsedVtt {
+            content: "WEBVTT\n\n1\n00:00:00.000 --> 00:00:01.000\n\"total_tokens\": 5\n\n".into(),
+            text: "\"total_tokens\": 5".into(),
+            language: None,
+            duration_ms: 1000,
+            cue_count: 1,
+            confidence: None,
+        };
+        assert_eq!(google_drop_reason(&parsed), Some(GoogleDropReason::JsonArtifact));
+    }
+
+    #[test]
+    fn google_guard_drops_repeated_phrase() {
+        let parsed = ParsedVtt {
+            content: String::new(),
+            text: "thanks thanks thanks thanks thanks thanks ok".into(),
+            language: None,
+            duration_ms: 5000,
+            cue_count: 1,
+            confidence: None,
+        };
+        assert_eq!(google_drop_reason(&parsed), Some(GoogleDropReason::RepeatedPhrase));
+    }
+
+    #[test]
+    fn google_guard_keeps_normal_transcript() {
+        let parsed = ParsedVtt {
+            content: String::new(),
+            text: "Hello world this is fine".into(),
+            language: None,
+            duration_ms: 2000,
+            cue_count: 1,
+            confidence: None,
+        };
+        assert_eq!(google_drop_reason(&parsed), None);
     }
 }
