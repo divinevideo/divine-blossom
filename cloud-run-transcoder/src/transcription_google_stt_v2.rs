@@ -457,6 +457,7 @@ pub(crate) fn is_repeated_phrase_hallucination(text: &str) -> bool {
 pub(crate) enum GoogleDropReason {
     JsonArtifact,
     RepeatedPhrase,
+    NonSpeechGarbage,
 }
 
 pub(crate) fn google_drop_reason(parsed: &ParsedVtt) -> Option<GoogleDropReason> {
@@ -475,7 +476,41 @@ pub(crate) fn google_drop_reason(parsed: &ParsedVtt) -> Option<GoogleDropReason>
     if is_repeated_phrase_hallucination(&parsed.text) {
         return Some(GoogleDropReason::RepeatedPhrase);
     }
+    if is_non_speech_garbage(&parsed.text) {
+        return Some(GoogleDropReason::NonSpeechGarbage);
+    }
     None
+}
+
+/// Drop the transcript when Chirp 3 returns mostly punctuation/dash tokens
+/// or one-character "words" — the failure mode it exhibits when fed
+/// non-speech audio (music, ambient noise, sound effects). Real production
+/// case sha256 d8cae7fd...: cue body had alphanum_ratio=0.005,
+/// dash_token_ratio=0.995, then 20 more cues each one character long.
+///
+/// Triggers when the transcript is at least 60 chars AND any of:
+///   - Less than 35% of characters are alphanumeric
+///   - More than 30% of whitespace-separated tokens are pure dashes
+pub(crate) fn is_non_speech_garbage(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.chars().count() < 60 {
+        return false;
+    }
+    let total = trimmed.chars().count();
+    let alpha = trimmed.chars().filter(|c| c.is_alphanumeric()).count();
+    let alpha_ratio = alpha as f64 / total as f64;
+    if alpha_ratio < 0.35 {
+        return true;
+    }
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    if tokens.is_empty() {
+        return false;
+    }
+    let dash_only = tokens
+        .iter()
+        .filter(|t| t.chars().all(|c| c == '-'))
+        .count();
+    (dash_only as f64) / (tokens.len() as f64) > 0.30
 }
 
 /// Whether word-level timestamps, degraded single-cue, or empty output was
@@ -898,6 +933,47 @@ mod tests {
         assert_eq!(
             google_drop_reason(&parsed),
             Some(GoogleDropReason::JsonArtifact)
+        );
+    }
+
+    #[test]
+    fn non_speech_garbage_is_flagged_dash_spam() {
+        // Real production case (sha256 d8cae7fd...) where Chirp 3 fed
+        // music/non-speech audio emitted a token cloud of single dashes.
+        let text = "Ever heard of a sweetie-holic?!-! --- --- --- --- --- --- -- --- -- --- -- - - - --- -- - --- --- - --- - -- - -- --- --- -- - - - -- - - -- -- - -- - - - -- -- - - -- -- --- -- - - - - -- --- -- - - - - - - --- --- ---";
+        assert!(is_non_speech_garbage(text));
+    }
+
+    #[test]
+    fn non_speech_garbage_short_text_is_not_flagged() {
+        // Below the 60-char floor — legitimate punctuation-heavy short
+        // utterances ("Wait... what?!") shouldn't trip the guard.
+        assert!(!is_non_speech_garbage("Wait... what?!"));
+        assert!(!is_non_speech_garbage("--- ok"));
+    }
+
+    #[test]
+    fn non_speech_garbage_normal_text_is_not_flagged() {
+        // Long real-speech transcript (200+ chars, normal punctuation
+        // density) must stay under both thresholds.
+        let text = "Hello and welcome to the show today, where we discuss the latest in technology, business, and culture. Today we have a special guest joining us to talk about their recent project.";
+        assert!(!is_non_speech_garbage(text));
+    }
+
+    #[test]
+    fn google_guard_drops_non_speech_garbage() {
+        let dash_body = "Ever heard of a sweetie-holic?!-! --- --- --- --- --- --- -- --- -- --- -- - - - --- -- - --- --- - --- - -- - -- --- --- -- - - - -- - - -- -- - -- - - - -- -- - - -- -- --- -- - - - - -- --- -- - - - - - - --- --- ---";
+        let parsed = ParsedVtt {
+            content: String::new(),
+            text: dash_body.into(),
+            language: None,
+            duration_ms: 1000,
+            cue_count: 1,
+            confidence: None,
+        };
+        assert_eq!(
+            google_drop_reason(&parsed),
+            Some(GoogleDropReason::NonSpeechGarbage)
         );
     }
 

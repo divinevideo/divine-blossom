@@ -268,6 +268,29 @@ def is_loop_hallucination(text: str) -> bool:
             return True
 
 
+def is_non_speech_garbage(text: str) -> bool:
+    """Mirror of `is_non_speech_garbage` in transcription_google_stt_v2.rs.
+
+    Catches Chirp 3's failure mode on music/non-speech audio where the
+    response is mostly dashes or single-character tokens. Fires when the
+    transcript is at least 60 chars AND either:
+      - alphanum chars cover < 35% of total, or
+      - dash-only tokens are > 30% of whitespace-separated tokens.
+    """
+    trimmed = text.strip()
+    if len(trimmed) < 60:
+        return False
+    total = len(trimmed)
+    alpha = sum(1 for c in trimmed if c.isalnum())
+    if alpha / total < 0.35:
+        return True
+    tokens = trimmed.split()
+    if not tokens:
+        return False
+    dash_only = sum(1 for t in tokens if all(c == "-" for c in t))
+    return dash_only / len(tokens) > 0.30
+
+
 def is_repeated_phrase_hallucination(text: str) -> bool:
     """Token-level n-gram dominance guard.
 
@@ -307,6 +330,8 @@ def classify_vtt(body: str, *, check_empty: bool) -> str | None:
     text = vtt_spoken_text(body)
     if check_empty and is_empty_text(text):
         return "empty"
+    if is_non_speech_garbage(text):
+        return "non_speech_garbage"
     if is_loop_hallucination(text):
         return "loop_hallucination"
     if is_repeated_phrase_hallucination(text):
