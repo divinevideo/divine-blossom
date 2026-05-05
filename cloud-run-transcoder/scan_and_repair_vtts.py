@@ -282,27 +282,60 @@ def is_implausible_text_density(text: str, duration_seconds: float | None) -> bo
 def is_loop_hallucination(text: str) -> bool:
     """Sentence-level autoregressive loop guard.
 
-    Mirrors `is_loop_hallucination` in cloud-run-transcoder/src/main.rs:
-    take a ~60-char prefix of the whitespace-collapsed text and count its
-    non-overlapping occurrences. >=3 hits flags the cue.
+    Mirrors `is_loop_hallucination` in cloud-run-transcoder/src/main.rs.
+    Probes at four positions (0%, 25%, 50%, 75%) and flags if any probe's
+    ~60-char window appears non-overlapping >= 3 times in the full text.
+    Multi-position probing catches loops that don't begin at position 0
+    (e.g. a 1-2 sentence preamble before the loop).
     """
     collapsed = " ".join(text.split())
-    if len(collapsed) < LOOP_PROBE_MIN_CHARS:
+    length = len(collapsed)
+    if length < LOOP_PROBE_MIN_CHARS:
         return False
-    probe_len = min(LOOP_PROBE_MAX_LEN, len(collapsed) // 4)
-    probe = collapsed[:probe_len]
-    if not probe:
+    probe_len = min(LOOP_PROBE_MAX_LEN, length // 4)
+    if probe_len < 30:
         return False
-    count = 0
-    cursor = 0
-    while True:
-        pos = collapsed.find(probe, cursor)
-        if pos == -1:
-            return False
-        count += 1
-        cursor = pos + len(probe)
-        if count >= LOOP_PROBE_MIN_HITS:
-            return True
+    for start_pct in (0, 25, 50, 75):
+        start_idx = (length * start_pct) // 100
+        if start_idx + probe_len > length:
+            continue
+        probe = collapsed[start_idx : start_idx + probe_len]
+        if not probe.strip():
+            continue
+        count = 0
+        cursor = 0
+        while True:
+            pos = collapsed.find(probe, cursor)
+            if pos == -1:
+                break
+            count += 1
+            cursor = pos + len(probe)
+            if count >= LOOP_PROBE_MIN_HITS:
+                return True
+    return False
+
+
+def is_non_speech_garbage(text: str) -> bool:
+    """Mirror of `is_non_speech_garbage` in transcription_google_stt_v2.rs.
+
+    Catches Chirp 3's failure mode on music/non-speech audio where the
+    response is mostly dashes or single-character tokens. Fires when the
+    transcript is at least 60 chars AND either:
+      - alphanum chars cover < 35% of total, or
+      - dash-only tokens are > 30% of whitespace-separated tokens.
+    """
+    trimmed = text.strip()
+    if len(trimmed) < 60:
+        return False
+    total = len(trimmed)
+    alpha = sum(1 for c in trimmed if c.isalnum())
+    if alpha / total < 0.35:
+        return True
+    tokens = trimmed.split()
+    if not tokens:
+        return False
+    dash_only = sum(1 for t in tokens if all(c == "-" for c in t))
+    return dash_only / len(tokens) > 0.30
 
 
 def is_repeated_phrase_hallucination(text: str) -> bool:
@@ -347,6 +380,8 @@ def classify_vtt(body: str, *, check_empty: bool) -> str | None:
     duration_seconds = vtt_max_end_seconds(body)
     if is_implausible_text_density(text, duration_seconds):
         return "implausible_density"
+    if is_non_speech_garbage(text):
+        return "non_speech_garbage"
     if is_loop_hallucination(text):
         return "loop_hallucination"
     if is_repeated_phrase_hallucination(text):
