@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import string
 import sys
@@ -350,6 +351,90 @@ def wait_for_new_vtt(
     return label, vtt_spoken_text(last_body)
 
 
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+DEFAULT_LLM_MODEL = "claude-haiku-4-5-20251001"
+
+LLM_JUDGE_PROMPT = """You are a quality reviewer for short video transcripts.
+
+The video is approximately {duration_seconds:.1f} seconds long. Here is the transcript:
+
+\"\"\"
+{transcript}
+\"\"\"
+
+Decide if this transcript is plausible — i.e. it could plausibly be what someone actually said in that duration. Common bad patterns to flag:
+- The same phrase or sentence repeated many times (autoregressive loop)
+- Garbage characters (long runs of dashes, random punctuation)
+- Text volume far exceeding what could be uttered in the duration
+- Model meta-commentary ("Segment starts at...", "This transcript contains...")
+- Single-character or one-letter "words" forming nonsense
+
+Reply with exactly ONE LINE in this format:
+- "OK" if the transcript looks plausible
+- "BAD: <short reason>" if it does not
+
+Do not include any other text, reasoning, or explanation."""
+
+
+def llm_judge_transcript(
+    text: str,
+    duration_seconds: float,
+    api_key: str,
+    model: str = DEFAULT_LLM_MODEL,
+    timeout: int = REQUEST_TIMEOUT,
+) -> tuple[str, str]:
+    """Ask a fast LLM whether the transcript is plausibly N seconds of speech.
+
+    Returns (verdict, reason) where verdict is "OK", "BAD", or "ERROR".
+    """
+    body = json.dumps(
+        {
+            "model": model,
+            "max_tokens": 64,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": LLM_JUDGE_PROMPT.format(
+                        duration_seconds=duration_seconds,
+                        transcript=text[:6000],
+                    ),
+                }
+            ],
+        }
+    ).encode("utf-8")
+    req = request.Request(
+        ANTHROPIC_API_URL,
+        data=body,
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except (error.HTTPError, error.URLError, json.JSONDecodeError) as exc:
+        return ("ERROR", f"api error: {exc}")
+
+    blocks = payload.get("content", [])
+    text_out = ""
+    for block in blocks:
+        if block.get("type") == "text":
+            text_out = (block.get("text") or "").strip()
+            break
+    if not text_out:
+        return ("ERROR", "empty response")
+    upper = text_out.upper()
+    if upper.startswith("OK"):
+        return ("OK", text_out)
+    if upper.startswith("BAD"):
+        reason = text_out.split(":", 1)[1].strip() if ":" in text_out else text_out
+        return ("BAD", reason)
+    return ("ERROR", f"unparseable: {text_out[:80]}")
+
+
 def trigger_retranscription(
     media_url: str, sha: str, timeout: int
 ) -> tuple[int, dict[str, Any]]:
@@ -407,6 +492,28 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=100,
         help="Skip popular videos below this view count.",
+    )
+
+    parser.add_argument(
+        "--llm-check",
+        action="store_true",
+        help=(
+            "After deterministic guards, run a fast LLM (Haiku by default) "
+            "to judge whether each transcript is plausible for the clip's "
+            "duration. Catches subtle hallucinations the rules miss. "
+            "Requires ANTHROPIC_API_KEY (or --llm-api-key-env) to be set. "
+            "Adds ~1s and a fraction of a cent per transcript."
+        ),
+    )
+    parser.add_argument(
+        "--llm-model",
+        default=DEFAULT_LLM_MODEL,
+        help="Anthropic model id for --llm-check.",
+    )
+    parser.add_argument(
+        "--llm-api-key-env",
+        default="ANTHROPIC_API_KEY",
+        help="Env var holding the Anthropic API key.",
     )
 
     parser.add_argument("--page-size", type=int, default=100)
@@ -497,6 +604,17 @@ def main() -> int:
         )
         print(f"  -> {len(popular)} unique popular hashes")
 
+    llm_api_key: str | None = None
+    if args.llm_check:
+        llm_api_key = os.environ.get(args.llm_api_key_env, "").strip() or None
+        if not llm_api_key:
+            print(
+                f"--llm-check requires {args.llm_api_key_env} in env",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"LLM judge: enabled (model={args.llm_model})")
+
     hashes = merged_unique(recent, popular)
     summary = ScanSummary(seen_hashes=len(hashes))
     print(f"\nUnique hashes to inspect: {summary.seen_hashes}\n")
@@ -524,6 +642,22 @@ def main() -> int:
                 continue
             old_body = cur_body
             reason = classify_vtt(old_body, check_empty=args.check_empty)
+            if reason is None and llm_api_key:
+                # Deterministic guards passed; ask the LLM for a second opinion.
+                spoken = vtt_spoken_text(old_body)
+                duration = vtt_max_end_seconds(old_body) or 6.0
+                if spoken.strip():
+                    verdict, explanation = llm_judge_transcript(
+                        spoken,
+                        duration,
+                        llm_api_key,
+                        model=args.llm_model,
+                        timeout=args.timeout,
+                    )
+                    if verdict == "BAD":
+                        reason = f"llm_judge:{explanation[:60]}"
+                    elif args.verbose and verdict == "ERROR":
+                        print(f"  llm_judge ERROR for {sha}: {explanation[:80]}")
             if reason is None:
                 summary.clean += 1
                 if args.verbose:
