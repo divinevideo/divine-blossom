@@ -48,7 +48,12 @@ SENTRY_ENVIRONMENT="${SENTRY_ENVIRONMENT:-production}"
 GOOGLE_CLOUD_LOCATION="${GOOGLE_CLOUD_LOCATION:-us}"
 GOOGLE_STT_RECOGNIZER="${GOOGLE_STT_RECOGNIZER:-_}"
 GOOGLE_STT_MODEL="${GOOGLE_STT_MODEL:-chirp_3}"
-GOOGLE_STT_LANGUAGE_CODES="${GOOGLE_STT_LANGUAGE_CODES:-en-US}"
+# Multi-language detection default. Chirp 3's `languageCodes` accepts a
+# comma list and the model picks per-clip. Without this, every transcription
+# is forced to English and non-English audio is mis-transcribed. Override
+# at deploy time if a stricter single-language policy is wanted (e.g.
+# GOOGLE_STT_LANGUAGE_CODES=en-US for English-only).
+GOOGLE_STT_LANGUAGE_CODES="${GOOGLE_STT_LANGUAGE_CODES:-en-US,es-US,es-ES,pt-BR,fr-FR,de-DE,it-IT,ja-JP,ko-KR,zh-CN}"
 TRANSCRIPTION_FALLBACK_PROVIDER="${TRANSCRIPTION_FALLBACK_PROVIDER:-}"
 TRANSCRIPTION_FALLBACK_ON_PROVIDER_ERROR="${TRANSCRIPTION_FALLBACK_ON_PROVIDER_ERROR:-true}"
 SENTRY_SECRET="${SENTRY_SECRET:-sentry_dsn}"
