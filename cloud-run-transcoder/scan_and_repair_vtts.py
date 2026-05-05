@@ -33,6 +33,20 @@ JSON_CORRUPTION_MARKERS = (
     '"finish_reason"',
 )
 
+# Distinct STT-response key names. >=2 of these together signal a leaked
+# JSON envelope (Gemini sometimes emits one instead of plain transcript).
+JSON_ENVELOPE_KEYS = (
+    '"language"',
+    '"segments"',
+    '"transcript"',
+    '"start":',
+    '"end":',
+    '"text":',
+    '"words":',
+    '"alternatives":',
+    '"results":',
+)
+
 # Mirrors cloud-run-transcoder/src/main.rs `is_loop_hallucination` and
 # `is_repeated_phrase_hallucination`. Keep parameters in lockstep so the
 # scanner flags exactly what the deployed service would reject.
@@ -277,6 +291,14 @@ def is_implausible_text_density(text: str, duration_seconds: float | None) -> bo
     if chars < 100:
         return False
     return chars / duration_seconds > 40.0
+def has_json_envelope_leak(text: str) -> bool:
+    """True if the text contains >=2 distinct STT-response JSON keys.
+
+    Catches Gemini's "I returned an envelope instead of plain text" mode.
+    Conservative: a transcript that legitimately mentions one technical
+    term won't fire (needs at least two co-occurring quoted keys).
+    """
+    return sum(1 for k in JSON_ENVELOPE_KEYS if k in text) >= 2
 
 
 def is_loop_hallucination(text: str) -> bool:
@@ -375,6 +397,8 @@ def classify_vtt(body: str, *, check_empty: bool) -> str | None:
     if has_json_artifact(body):
         return "json_artifact"
     text = vtt_spoken_text(body)
+    if has_json_envelope_leak(text):
+        return "json_envelope_leak"
     if check_empty and is_empty_text(text):
         return "empty"
     duration_seconds = vtt_max_end_seconds(body)

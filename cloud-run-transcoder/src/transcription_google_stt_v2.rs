@@ -164,12 +164,164 @@ pub(crate) fn group_words_into_cues(words: &[SttWord]) -> Vec<Cue> {
     cues
 }
 
+/// Try to extract spoken text when the model returned a JSON envelope
+/// instead of plain text (e.g. Gemini emitting
+/// `{"language":"en","segments":[{"start":0.4,"text":"Hey guys..."}]}`).
+///
+/// Returns `Some(extracted_text)` if the input was JSON-shaped AND yielded
+/// useful text. Returns `None` for plain text (caller uses original) or
+/// when extraction yields nothing.
+///
+/// Handles three shapes:
+/// 1. Clean JSON via serde — walks `text`, `transcript`, `segments[].text`,
+///    or `results[].alternatives[0].transcript` fields.
+/// 2. Truncated/malformed JSON via byte-walking: scans for `"text":"..."`
+///    occurrences and joins them, accepting a missing closing quote at the
+///    end of the input (the most common truncation pattern).
+pub(crate) fn unwrap_json_envelope(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
+        return None;
+    }
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(out) = extract_text_from_json_value(&value) {
+            let cleaned = out.trim().to_string();
+            if !cleaned.is_empty() {
+                return Some(cleaned);
+            }
+        }
+    }
+
+    // Truncated or malformed — best-effort regex-equivalent scan.
+    let parts = scan_text_fields(trimmed);
+    if parts.is_empty() {
+        return None;
+    }
+    let joined = parts.join(" ").trim().to_string();
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
+}
+
+fn extract_text_from_json_value(v: &serde_json::Value) -> Option<String> {
+    // Top-level transcript / text (Whisper verbose, OpenAI, generic).
+    for key in &["transcript", "text"] {
+        if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
+            return Some(s.to_string());
+        }
+    }
+    // Gemini-style: { segments: [{ text: "..." }, ...] }
+    if let Some(segments) = v.get("segments").and_then(|x| x.as_array()) {
+        let parts: Vec<String> = segments
+            .iter()
+            .filter_map(|s| s.get("text").and_then(|t| t.as_str()).map(str::to_string))
+            .collect();
+        if !parts.is_empty() {
+            return Some(parts.join(" "));
+        }
+    }
+    // Google STT V2: { results: [{ alternatives: [{ transcript: "..." }] }] }
+    if let Some(results) = v.get("results").and_then(|x| x.as_array()) {
+        let parts: Vec<String> = results
+            .iter()
+            .filter_map(|r| {
+                r.get("alternatives")
+                    .and_then(|a| a.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|alt| alt.get("transcript"))
+                    .and_then(|t| t.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        if !parts.is_empty() {
+            return Some(parts.join(" "));
+        }
+    }
+    None
+}
+
+/// Permissive byte-walker: scans for `"text"` keys followed by `:` and a
+/// quoted string value. Used when serde_json fails (truncated input).
+/// Accepts a missing closing quote at the very end of input as the value
+/// running to end-of-input.
+fn scan_text_fields(input: &str) -> Vec<String> {
+    let bytes = input.as_bytes();
+    let needle = b"\"text\"";
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i + needle.len() <= bytes.len() {
+        if &bytes[i..i + needle.len()] != needle {
+            i += 1;
+            continue;
+        }
+        let mut j = i + needle.len();
+        // Skip whitespace then expect ':'.
+        while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n') {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b':' {
+            i += 1;
+            continue;
+        }
+        j += 1;
+        while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n') {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b'"' {
+            i += 1;
+            continue;
+        }
+        j += 1;
+        let value_start = j;
+        // Walk until unescaped `"` or end of input.
+        let mut value_end_excl = bytes.len();
+        while j < bytes.len() {
+            match bytes[j] {
+                b'\\' if j + 1 < bytes.len() => j += 2,
+                b'"' => {
+                    value_end_excl = j;
+                    break;
+                }
+                _ => j += 1,
+            }
+        }
+        // Slice safely on UTF-8 boundary by snapping to a known char start.
+        let raw = std::str::from_utf8(&bytes[value_start..value_end_excl]).unwrap_or("");
+        let unescaped = raw
+            .replace("\\\"", "\"")
+            .replace("\\n", "\n")
+            .replace("\\t", "\t")
+            .replace("\\\\", "\\");
+        let cleaned = unescaped.trim().to_string();
+        if !cleaned.is_empty() {
+            out.push(cleaned);
+        }
+        i = value_end_excl + 1;
+    }
+    out
+}
+
 pub(crate) fn transcript_only_to_parsed_vtt(
     transcript: &str,
     language: Option<String>,
     audio_duration_ms: u64,
 ) -> ParsedVtt {
-    let trimmed = transcript.trim();
+    // First, try to unwrap a JSON envelope. Some providers (notably
+    // Gemini) sometimes emit `{"language":"en","segments":[{"text":"..."}]}`
+    // instead of plain text. When that happens we want to preserve the
+    // real transcript inside the envelope rather than render the JSON
+    // syntax to viewers.
+    let unwrapped: String;
+    let trimmed: &str = match unwrap_json_envelope(transcript) {
+        Some(extracted) => {
+            unwrapped = extracted;
+            unwrapped.as_str()
+        }
+        None => transcript.trim(),
+    };
     if trimmed.is_empty() {
         return ParsedVtt {
             content: "WEBVTT\n\n".to_string(),
@@ -566,6 +718,60 @@ pub(crate) fn parse_response_to_parsed_vtt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unwrap_envelope_handles_clean_gemini_segments() {
+        let json = r#"{"language":"en","segments":[{"start":0.4,"text":"Hey guys"},{"start":1.2,"text":"my name's Tristan"}]}"#;
+        assert_eq!(
+            unwrap_json_envelope(json).as_deref(),
+            Some("Hey guys my name's Tristan")
+        );
+    }
+
+    #[test]
+    fn unwrap_envelope_handles_top_level_text() {
+        let json = r#"{"text":"Hello world","language":"en"}"#;
+        assert_eq!(unwrap_json_envelope(json).as_deref(), Some("Hello world"));
+    }
+
+    #[test]
+    fn unwrap_envelope_handles_truncated_envelope() {
+        // Real production case sha256 26e4bece...: Gemini emitted a
+        // structurally-broken envelope (no closing quote/brackets) with
+        // the actual transcript inside the first text field.
+        let bad = "{ \"language\": \"en\", \"segments\": [ { \"start\": 0.403, \"text\": \"Hey guys, my name's Tristan. I'm just trying to use this platform to make y'all laugh and be happy. Thank you all.  Here is the JSON requested:";
+        let extracted = unwrap_json_envelope(bad)
+            .expect("scan_text_fields should recover the transcript from truncated JSON");
+        assert!(
+            extracted.starts_with("Hey guys, my name's Tristan."),
+            "extracted = {extracted:?}"
+        );
+        assert!(
+            extracted.contains("happy. Thank you all."),
+            "extracted = {extracted:?}"
+        );
+    }
+
+    #[test]
+    fn unwrap_envelope_returns_none_for_plain_text() {
+        assert_eq!(unwrap_json_envelope("Hello world this is a normal sentence"), None);
+    }
+
+    #[test]
+    fn unwrap_envelope_returns_none_for_empty_json() {
+        // Pure JSON with no extractable text — caller should fall back.
+        assert_eq!(unwrap_json_envelope("{}"), None);
+        assert_eq!(unwrap_json_envelope("[]"), None);
+    }
+
+    #[test]
+    fn transcript_only_unwraps_envelope_in_pipeline() {
+        let bad = r#"{"language":"en","segments":[{"text":"Hello there"}]}"#;
+        let parsed = transcript_only_to_parsed_vtt(bad, Some("en".into()), 5_000);
+        assert_eq!(parsed.text, "Hello there");
+        assert!(parsed.content.contains("Hello there"));
+        assert!(!parsed.content.contains("\"language\""));
+    }
 
     #[test]
     fn limits_are_sane() {
