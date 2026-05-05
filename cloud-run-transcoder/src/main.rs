@@ -2507,12 +2507,32 @@ async fn fetch_gcp_access_token() -> std::result::Result<String, ProviderFailure
     }
 }
 
+/// Build the Gemini transcription prompt, optionally biased to a specific
+/// language. Empty/auto/und sentinels fall through to the generic prompt
+/// so the model is free to detect the language itself.
+fn build_gemini_prompt(language: Option<&str>) -> String {
+    let base = "Transcribe this audio. Return every spoken segment with start and end timestamps in seconds and the text. If there is no speech, return an empty segments array.";
+    match language {
+        Some(lang)
+            if !lang.trim().is_empty()
+                && !lang.eq_ignore_ascii_case("auto")
+                && !lang.eq_ignore_ascii_case("und") =>
+        {
+            format!(
+                "Transcribe this audio in {}. Return every spoken segment with start and end timestamps in seconds and the text. If there is no speech, return an empty segments array.",
+                lang.trim()
+            )
+        }
+        _ => base.to_string(),
+    }
+}
+
 /// Transcribe audio using Gemini via Vertex AI generateContent.
 /// Returns raw JSON text with segments and timestamps.
 async fn transcribe_via_gemini(
     config: &Config,
     audio_path: &Path,
-    _language: Option<&str>,
+    language: Option<&str>,
 ) -> std::result::Result<String, ProviderFailure> {
     let audio_bytes = tokio::fs::read(audio_path).await.map_err(|e| {
         parse_provider_status(None, None, &format!("Failed to read audio: {}", e), false)
@@ -2526,11 +2546,13 @@ async fn transcribe_via_gemini(
         config.gcp_region, config.gcp_project_id, config.gcp_region, config.transcription_model,
     );
 
+    let prompt = build_gemini_prompt(language);
+
     let body = serde_json::json!({
         "contents": [{
             "role": "user",
             "parts": [
-                {"text": "Transcribe this audio. Return every spoken segment with start and end timestamps in seconds and the text. If there is no speech, return an empty segments array."},
+                {"text": prompt},
                 {"inlineData": {"mimeType": "audio/wav", "data": audio_b64}}
             ]
         }],
@@ -3503,6 +3525,28 @@ mod tests {
             .expect("plain text should still work");
         assert!(parsed.content.starts_with("WEBVTT"));
         assert_eq!(parsed.text, "This is spoken text from the video");
+    }
+
+    // ---- gemini prompt tests ----
+
+    #[test]
+    fn gemini_prompt_uses_language_when_provided() {
+        let prompt = super::build_gemini_prompt(Some("Spanish"));
+        assert!(prompt.contains("in Spanish"));
+        let prompt_es = super::build_gemini_prompt(Some("es-ES"));
+        assert!(prompt_es.contains("in es-ES"));
+    }
+
+    #[test]
+    fn gemini_prompt_omits_language_for_sentinels() {
+        let generic = super::build_gemini_prompt(None);
+        for sentinel in &["", "  ", "auto", "AUTO", "und"] {
+            let prompt = super::build_gemini_prompt(Some(*sentinel));
+            assert_eq!(
+                prompt, generic,
+                "sentinel `{sentinel}` should produce generic prompt"
+            );
+        }
     }
 
     // ---- loop-hallucination guard tests ----

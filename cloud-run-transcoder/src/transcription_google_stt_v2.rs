@@ -48,12 +48,27 @@ pub(crate) fn recognize_url(config: &Config) -> String {
     )
 }
 
-pub(crate) fn build_recognize_request(config: &Config, audio_bytes: &[u8]) -> String {
+pub(crate) fn build_recognize_request(
+    config: &Config,
+    audio_bytes: &[u8],
+    language: Option<&str>,
+) -> String {
     let audio_b64 = base64::engine::general_purpose::STANDARD.encode(audio_bytes);
+    // Per-request language wins over the env-default. Empty / "auto" / "und"
+    // fall through to the configured codes (multi-language detection).
+    let language_codes: Vec<String> = match language {
+        Some(lang) if !lang.trim().is_empty()
+            && !lang.eq_ignore_ascii_case("auto")
+            && !lang.eq_ignore_ascii_case("und") =>
+        {
+            vec![lang.trim().to_string()]
+        }
+        _ => config.google_stt_language_codes.clone(),
+    };
     let body = serde_json::json!({
         "config": {
             "model": config.google_stt_model,
-            "languageCodes": config.google_stt_language_codes,
+            "languageCodes": language_codes,
             "features": {
                 "enableAutomaticPunctuation": config.google_stt_enable_automatic_punctuation,
                 "enableWordTimeOffsets": config.google_stt_enable_word_time_offsets,
@@ -313,7 +328,7 @@ pub(crate) fn parse_stt_v2_response(
 pub(crate) async fn transcribe(
     config: &Config,
     audio_path: &Path,
-    _language: Option<&str>,
+    language: Option<&str>,
 ) -> std::result::Result<String, ProviderFailure> {
     let audio_bytes = tokio::fs::read(audio_path).await.map_err(|e| {
         parse_provider_status(None, None, &format!("Failed to read audio: {}", e), false)
@@ -335,7 +350,7 @@ pub(crate) async fn transcribe(
 
     let access_token = crate::fetch_gcp_access_token().await?;
     let url = recognize_url(config);
-    let body = build_recognize_request(config, &audio_bytes);
+    let body = build_recognize_request(config, &audio_bytes, language);
 
     let client = reqwest::Client::new();
     let response = client
@@ -544,7 +559,7 @@ mod tests {
     #[test]
     fn builds_recognize_request_body_with_word_offsets() {
         let cfg = test_config();
-        let body = build_recognize_request(&cfg, &b"FAKE_WAV_BYTES"[..]);
+        let body = build_recognize_request(&cfg, &b"FAKE_WAV_BYTES"[..], None);
         let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
         assert_eq!(v["config"]["model"], "chirp_3");
         assert_eq!(v["config"]["languageCodes"][0], "en-US");
@@ -559,6 +574,32 @@ mod tests {
             .decode(v["content"].as_str().unwrap())
             .expect("content is valid base64");
         assert_eq!(decoded, b"FAKE_WAV_BYTES");
+    }
+
+    #[test]
+    fn build_recognize_uses_per_request_language_when_provided() {
+        let cfg = test_config();
+        let body = build_recognize_request(&cfg, &b"x"[..], Some("es-ES"));
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["config"]["languageCodes"][0], "es-ES");
+        assert_eq!(
+            v["config"]["languageCodes"].as_array().unwrap().len(),
+            1,
+            "explicit language overrides multi-code default"
+        );
+    }
+
+    #[test]
+    fn build_recognize_falls_back_to_config_for_auto_or_empty_language() {
+        let cfg = test_config();
+        for sentinel in &["", "  ", "auto", "AUTO", "und"] {
+            let body = build_recognize_request(&cfg, &b"x"[..], Some(*sentinel));
+            let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+            assert_eq!(
+                v["config"]["languageCodes"][0], "en-US",
+                "sentinel `{sentinel}` should fall back to config default"
+            );
+        }
     }
 
     #[test]
