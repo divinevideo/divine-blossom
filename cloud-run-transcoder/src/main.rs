@@ -1766,6 +1766,19 @@ async fn process_transcribe(
             );
             ParsedVtt::empty(audio_analysis.duration_ms)
         }
+        Some(TranscriptDropReason::ImplausibleTextDensity) => {
+            let chars = parsed_vtt.text.chars().count();
+            let seconds = (audio_analysis.duration_ms as f64) / 1000.0;
+            warn!(
+                hash,
+                text_chars = chars,
+                duration_ms = audio_analysis.duration_ms,
+                chars_per_sec = (chars as f64) / seconds.max(0.001),
+                preview = %first_chars(&parsed_vtt.text, 80),
+                "Dropping transcript with implausible text density (more chars than physically utterable in audio duration)"
+            );
+            ParsedVtt::empty(audio_analysis.duration_ms)
+        }
         None => parsed_vtt,
     };
 
@@ -2849,6 +2862,7 @@ enum TranscriptDropReason {
     LowProviderConfidence,
     LowSignalHeuristic,
     LoopHallucination,
+    ImplausibleTextDensity,
 }
 
 fn transcript_drop_reason(
@@ -2867,6 +2881,14 @@ fn transcript_drop_reason(
         return Some(TranscriptDropReason::LowProviderConfidence);
     }
 
+    // Cheap deterministic catch: drop when the transcript is so much text
+    // that it could not physically be uttered in the clip's audio duration.
+    // Catches sentence-level loops and dash-spam tails before the more
+    // expensive content-shape guards run.
+    if is_implausible_text_density(&parsed_vtt.text, audio.duration_ms) {
+        return Some(TranscriptDropReason::ImplausibleTextDensity);
+    }
+
     // Catch sentence-level autoregressive loops (the failure mode where a
     // model emits the same long phrase 50 times in a single cue). The
     // 1/2/3-gram dominance check in google_drop_reason misses these
@@ -2880,6 +2902,29 @@ fn transcript_drop_reason(
     }
 
     None
+}
+
+/// Drop when the transcript contains more text than is physically utterable
+/// in the clip's duration. Normal speech is ~12-15 chars/sec; even very fast
+/// speech tops out near 25. Anything above 40 chars/sec is a hallucination
+/// (typically a sentence-level loop). Universal across providers.
+///
+/// Bypassed when audio_duration_ms is 0 (caller didn't probe the duration)
+/// and for transcripts under 100 chars (avoid false positives on tiny clips
+/// where measurement granularity dominates).
+fn is_implausible_text_density(text: &str, audio_duration_ms: u64) -> bool {
+    if audio_duration_ms == 0 {
+        return false;
+    }
+    let chars = text.chars().count();
+    if chars < 100 {
+        return false;
+    }
+    let seconds = audio_duration_ms as f64 / 1000.0;
+    if seconds <= 0.0 {
+        return false;
+    }
+    (chars as f64) / seconds > 40.0
 }
 
 /// Detect autoregressive-loop hallucinations where a long substring is
@@ -2981,7 +3026,8 @@ async fn finalize_transcript(
 mod tests {
     use super::{
         build_transcode_status_webhook_payload, classify_audio_extract_error,
-        decide_transcript_lock_action, is_loop_hallucination, is_retryable_provider_failure,
+        decide_transcript_lock_action, is_implausible_text_density, is_loop_hallucination,
+        is_retryable_provider_failure,
         normalize_transcript_to_vtt, parse_audio_analysis_output, parse_provider_status,
         retry_delay_for_attempt, should_drop_low_signal_transcript, transcript_drop_reason,
         transcription_response_format, AudioAnalysis, AudioExtractErrorKind, Config, ParsedVtt,
@@ -3543,6 +3589,47 @@ mod tests {
         assert!(!is_loop_hallucination(&s));
     }
 
+    // ---- text-density guard tests ----
+
+    #[test]
+    fn text_density_guard_flags_impossible_speech_rate() {
+        // Production case sha256 820cc60c...: ~35,580 chars in a 6s clip
+        // = 5,930 chars/sec, ~400× faster than human speech.
+        let text = "But we need to get a line. ".repeat(1300);
+        assert!(is_implausible_text_density(&text, 6_000));
+    }
+
+    #[test]
+    fn text_density_guard_passes_normal_speech() {
+        // ~6 seconds of natural speech at ~14 chars/sec = ~84 chars.
+        let text = "Hello and welcome, this is a normal sentence okay";
+        assert!(!is_implausible_text_density(text, 6_000));
+    }
+
+    #[test]
+    fn text_density_guard_passes_fast_dense_speech() {
+        // Auctioneer/rapper edge case: 25 chars/sec for 4s = 100 chars.
+        // Stays under the 40 chars/sec ceiling.
+        let text = "a".repeat(100);
+        assert!(!is_implausible_text_density(&text, 4_000));
+    }
+
+    #[test]
+    fn text_density_guard_skips_zero_duration() {
+        // When audio_duration_ms is unknown, never flag — the caller may
+        // not have probed duration for non-Google providers.
+        let text = "x".repeat(10_000);
+        assert!(!is_implausible_text_density(&text, 0));
+    }
+
+    #[test]
+    fn text_density_guard_skips_tiny_text() {
+        // 99 chars in a 1ms duration would be 99,000 chars/sec by math
+        // but the floor avoids false positives on tiny clips.
+        let text = "x".repeat(99);
+        assert!(!is_implausible_text_density(&text, 1));
+    }
+
     /// Real-world failure from production: a 6-second clip Gemini transcribed
     /// by repeating the same 25-word sentence ~50 times. Captured at
     /// tests/fixtures/loop_hallucination_real_gemini.txt.
@@ -3561,6 +3648,10 @@ mod tests {
 
     /// The same sample must be wired through the unified `transcript_drop_reason`
     /// so any provider's loop hallucination is dropped, not just Google's.
+    /// The fixture represents a 6s clip but ~600s of "spoken" text — for
+    /// this test we set duration_ms high so the new ImplausibleTextDensity
+    /// guard doesn't shadow the loop guard. Density guard coverage is in
+    /// `text_density_guard_flags_impossible_speech_rate`.
     #[test]
     fn transcript_drop_reason_flags_loop_hallucination() {
         use super::TranscriptDropReason;
@@ -3569,7 +3660,7 @@ mod tests {
             content: format!("WEBVTT\n\n1\n00:00:00.000 --> 00:00:06.000\n{}\n\n", bad),
             text: bad.to_string(),
             language: None,
-            duration_ms: 6_000,
+            duration_ms: 600_000,
             cue_count: 1,
             confidence: None,
         };
@@ -3577,7 +3668,7 @@ mod tests {
         // silent — Gemini just looped). Confirms the loop guard fires
         // independent of the silence / low-signal heuristic.
         let analysis = AudioAnalysis {
-            duration_ms: 6_000,
+            duration_ms: 600_000,
             silent_duration_ms: 0,
             mean_volume_db: Some(-22.0),
             max_volume_db: Some(-3.0),

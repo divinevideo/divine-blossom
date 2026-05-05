@@ -217,6 +217,28 @@ def fetch_vtt(media_url: str, sha: str, timeout: int) -> tuple[int, str]:
     )
 
 
+CUE_TIMING_RE = re.compile(
+    r"(\d{2}):(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})\.(\d{3})"
+)
+
+
+def vtt_max_end_seconds(body: str) -> float | None:
+    """Approximate audio duration from the highest cue end-timestamp.
+
+    Not authoritative (real duration may exceed the last cue) but good
+    enough for the chars/sec sanity check — what we need is "the model
+    claimed it transcribed N seconds". Returns None if no cue timings
+    parse cleanly.
+    """
+    best = 0.0
+    for match in CUE_TIMING_RE.findall(body):
+        h, m, s, ms = (int(x) for x in match[4:8])
+        end = h * 3600 + m * 60 + s + ms / 1000.0
+        if end > best:
+            best = end
+    return best if best > 0 else None
+
+
 def vtt_spoken_text(body: str) -> str:
     """Return only the spoken transcript lines from a VTT body."""
     lines: list[str] = []
@@ -240,6 +262,21 @@ def is_empty_text(text: str) -> bool:
 
 def has_json_artifact(body: str) -> bool:
     return any(marker in body for marker in JSON_CORRUPTION_MARKERS)
+
+
+def is_implausible_text_density(text: str, duration_seconds: float | None) -> bool:
+    """Mirror of `is_implausible_text_density` in main.rs.
+
+    Drop when the transcript could not physically be uttered in the clip's
+    duration (>40 chars/sec). Skipped when duration is unknown or text is
+    under 100 chars.
+    """
+    if not duration_seconds or duration_seconds <= 0:
+        return False
+    chars = len(text)
+    if chars < 100:
+        return False
+    return chars / duration_seconds > 40.0
 
 
 def is_loop_hallucination(text: str) -> bool:
@@ -307,6 +344,9 @@ def classify_vtt(body: str, *, check_empty: bool) -> str | None:
     text = vtt_spoken_text(body)
     if check_empty and is_empty_text(text):
         return "empty"
+    duration_seconds = vtt_max_end_seconds(body)
+    if is_implausible_text_density(text, duration_seconds):
+        return "implausible_density"
     if is_loop_hallucination(text):
         return "loop_hallucination"
     if is_repeated_phrase_hallucination(text):
