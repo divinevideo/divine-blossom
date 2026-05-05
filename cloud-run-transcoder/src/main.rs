@@ -2888,13 +2888,20 @@ fn transcript_drop_reason(
 /// times in one cue), which slip past 1/2/3-gram dominance because each
 /// individual gram covers only a small fraction of total tokens.
 ///
-/// Heuristic: collapse whitespace, then take the first ~60-char prefix and
-/// count its non-overlapping occurrences in the full text. Three or more
-/// = a loop. Texts under 250 chars are exempt to avoid false positives on
-/// legitimately short transcripts that happen to repeat a courtesy phrase.
+/// Heuristic: collapse whitespace, then probe at four positions across the
+/// text (start, ¼, ½, ¾). For each probe, take a ~60-char window and count
+/// its non-overlapping occurrences in the full text. Three or more in any
+/// probe = a loop. Texts under 250 chars are exempt to avoid false positives
+/// on legitimately short transcripts that happen to repeat a courtesy
+/// phrase.
+///
+/// Multi-position probing is required because a transcript with a 1-2
+/// sentence preamble before falling into a loop has a unique opening 60
+/// chars, but a probe taken from any point inside the loop will match.
 fn is_loop_hallucination(text: &str) -> bool {
     let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let len = collapsed.chars().count();
+    let chars: Vec<char> = collapsed.chars().collect();
+    let len = chars.len();
     if len < 250 {
         return false;
     }
@@ -2903,17 +2910,26 @@ fn is_loop_hallucination(text: &str) -> bool {
     // looping unit (a sentence). Cap at len/4 so we never exceed ¼ of the
     // text — guarantees room for 3+ occurrences before we even count.
     let probe_len = 60.min(len / 4);
-    let probe: String = collapsed.chars().take(probe_len).collect();
-    if probe.is_empty() {
+    if probe_len < 30 {
         return false;
     }
-    let mut count = 0usize;
-    let mut cursor = 0usize;
-    while let Some(pos) = collapsed[cursor..].find(probe.as_str()) {
-        count += 1;
-        cursor += pos + probe.len();
-        if count >= 3 {
-            return true;
+    for &start_pct in &[0usize, 25, 50, 75] {
+        let start_idx = (len * start_pct) / 100;
+        if start_idx + probe_len > len {
+            continue;
+        }
+        let probe: String = chars[start_idx..start_idx + probe_len].iter().collect();
+        if probe.trim().is_empty() {
+            continue;
+        }
+        let mut count = 0usize;
+        let mut cursor = 0usize;
+        while let Some(pos) = collapsed[cursor..].find(probe.as_str()) {
+            count += 1;
+            cursor += pos + probe.len();
+            if count >= 3 {
+                return true;
+            }
         }
     }
     false
@@ -3556,6 +3572,20 @@ mod tests {
         assert!(
             is_loop_hallucination(bad),
             "loop guard should flag the production Gemini loop sample"
+        );
+    }
+
+    /// Real-world failure (sha256 820cc60c...): a 6-second clip where Chirp 3
+    /// emitted a 1-2 sentence preamble ("All right guys, I know a kid just
+    /// passed out") and then looped "But we need to get a line." 1000+ times.
+    /// The original prefix-only probe missed this because the 60-char prefix
+    /// captured the unique preamble; multi-position probes catch the loop.
+    #[test]
+    fn loop_guard_flags_loop_with_preamble() {
+        let bad = include_str!("../tests/fixtures/loop_hallucination_with_preamble.txt");
+        assert!(
+            is_loop_hallucination(bad),
+            "loop guard must catch loops that don't begin at position 0"
         );
     }
 

@@ -245,27 +245,37 @@ def has_json_artifact(body: str) -> bool:
 def is_loop_hallucination(text: str) -> bool:
     """Sentence-level autoregressive loop guard.
 
-    Mirrors `is_loop_hallucination` in cloud-run-transcoder/src/main.rs:
-    take a ~60-char prefix of the whitespace-collapsed text and count its
-    non-overlapping occurrences. >=3 hits flags the cue.
+    Mirrors `is_loop_hallucination` in cloud-run-transcoder/src/main.rs.
+    Probes at four positions (0%, 25%, 50%, 75%) and flags if any probe's
+    ~60-char window appears non-overlapping >= 3 times in the full text.
+    Multi-position probing catches loops that don't begin at position 0
+    (e.g. a 1-2 sentence preamble before the loop).
     """
     collapsed = " ".join(text.split())
-    if len(collapsed) < LOOP_PROBE_MIN_CHARS:
+    length = len(collapsed)
+    if length < LOOP_PROBE_MIN_CHARS:
         return False
-    probe_len = min(LOOP_PROBE_MAX_LEN, len(collapsed) // 4)
-    probe = collapsed[:probe_len]
-    if not probe:
+    probe_len = min(LOOP_PROBE_MAX_LEN, length // 4)
+    if probe_len < 30:
         return False
-    count = 0
-    cursor = 0
-    while True:
-        pos = collapsed.find(probe, cursor)
-        if pos == -1:
-            return False
-        count += 1
-        cursor = pos + len(probe)
-        if count >= LOOP_PROBE_MIN_HITS:
-            return True
+    for start_pct in (0, 25, 50, 75):
+        start_idx = (length * start_pct) // 100
+        if start_idx + probe_len > length:
+            continue
+        probe = collapsed[start_idx : start_idx + probe_len]
+        if not probe.strip():
+            continue
+        count = 0
+        cursor = 0
+        while True:
+            pos = collapsed.find(probe, cursor)
+            if pos == -1:
+                break
+            count += 1
+            cursor = pos + len(probe)
+            if count >= LOOP_PROBE_MIN_HITS:
+                return True
+    return False
 
 
 def is_repeated_phrase_hallucination(text: str) -> bool:
