@@ -1,0 +1,10 @@
+# Local-dev dependencies for the Parakeet sidecar.
+# Production uses nvcr.io/nvidia/nemo:25.07 as a base image, which already
+# bundles version-matched torch / cuDNN / NeMo. This file is only useful
+# if you want to run the unit tests or develop locally without that base.
+
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+nemo_toolkit[asr]>=2.4.0
+huggingface_hub>=0.30.0
+soundfile==0.12.1
