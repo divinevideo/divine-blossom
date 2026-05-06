@@ -40,7 +40,10 @@ GCS_BUCKET="${GCS_BUCKET:-divine-blossom-media}"
 WEBHOOK_URL="${WEBHOOK_URL:-https://media.divine.video/admin/transcode-status}"
 TRANSCRIPT_WEBHOOK_URL="${TRANSCRIPT_WEBHOOK_URL:-https://media.divine.video/admin/transcript-status}"
 TRANSCRIPTION_PROVIDER="${TRANSCRIPTION_PROVIDER:-gemini}"
-TRANSCRIPTION_MODEL="${TRANSCRIPTION_MODEL:-gemini-2.5-pro}"
+# Default to Gemini Flash: ~10-15× cheaper than gemini-2.5-pro for audio
+# input and adequate for transcription. Pro can be opted into per-deploy
+# by setting TRANSCRIPTION_MODEL=gemini-2.5-pro.
+TRANSCRIPTION_MODEL="${TRANSCRIPTION_MODEL:-gemini-2.5-flash}"
 # OpenAI fallback (only used when TRANSCRIPTION_PROVIDER=openai)
 TRANSCRIPTION_API_URL="${TRANSCRIPTION_API_URL:-https://api.openai.com/v1/audio/transcriptions}"
 USE_GPU="${USE_GPU:-false}"

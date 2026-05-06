@@ -98,6 +98,10 @@ struct Config {
     transcription_fallback_on_empty: bool,
     /// If true, fall back when primary returns a `ProviderError`. Default true.
     transcription_fallback_on_provider_error: bool,
+    /// Base URL of the Parakeet ASR sidecar (Cloud Run, GPU). Required when
+    /// `transcription_provider == "parakeet"`. Audience for the
+    /// Cloud Run identity token is the same URL.
+    parakeet_asr_url: Option<String>,
 }
 
 impl Config {
@@ -229,12 +233,16 @@ impl Config {
                 "TRANSCRIPTION_FALLBACK_ON_PROVIDER_ERROR",
                 true,
             ),
+            parakeet_asr_url: lookup("PARAKEET_ASR_URL")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
         }
     }
 
     pub(crate) fn transcription_model_for_log(&self) -> String {
         match self.transcription_provider.as_str() {
             "google_stt_v2" => self.google_stt_model.clone(),
+            "parakeet" => "parakeet-tdt".to_string(),
             _ => self.transcription_model.clone(),
         }
     }
@@ -2255,6 +2263,7 @@ async fn transcribe_audio_via_provider_once(
         "google_stt_v2" => {
             return transcription_google_stt_v2::transcribe(config, audio_path, language).await
         }
+        "parakeet" => return transcribe_via_parakeet(config, audio_path, language).await,
         _ => {} // fall through to OpenAI multipart path below
     }
 
@@ -2459,65 +2468,164 @@ fn transcription_response_format(model: &str) -> &'static str {
     }
 }
 
+/// Process-global cache for GCP access tokens. Tokens issued by the
+/// metadata server are valid for ~60 minutes; we cache for less so a
+/// callsite never hands a near-expired token to a long upstream call.
+struct AccessTokenCache {
+    inner: std::sync::Mutex<Option<CachedAccessToken>>,
+}
+
+struct CachedAccessToken {
+    token: String,
+    expires_at: Instant,
+}
+
+impl AccessTokenCache {
+    fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn get(&self, now: Instant) -> Option<String> {
+        let guard = self.inner.lock().ok()?;
+        let cached = guard.as_ref()?;
+        if cached.expires_at > now {
+            Some(cached.token.clone())
+        } else {
+            None
+        }
+    }
+
+    fn set(&self, token: String, ttl: Duration, now: Instant) {
+        if let Ok(mut guard) = self.inner.lock() {
+            *guard = Some(CachedAccessToken {
+                token,
+                expires_at: now + ttl,
+            });
+        }
+    }
+}
+
+static ACCESS_TOKEN_CACHE: std::sync::OnceLock<AccessTokenCache> = std::sync::OnceLock::new();
+
+fn access_token_cache() -> &'static AccessTokenCache {
+    ACCESS_TOKEN_CACHE.get_or_init(AccessTokenCache::new)
+}
+
+/// Cache fresh tokens for slightly less than the metadata-server TTL so
+/// a request that uses the cached token cannot exceed the actual token
+/// expiry mid-flight.
+const ACCESS_TOKEN_CACHE_TTL: Duration = Duration::from_secs(50 * 60);
+
+const METADATA_FETCH_MAX_ATTEMPTS: u32 = 3;
+
+/// Backoff for sequential metadata-server attempts. Kept short because
+/// each fetch already has a 5s socket timeout — the goal is to ride
+/// through brief Cloud Run metadata-server hiccups, not long outages.
+fn token_fetch_retry_delay(attempt: u32) -> Duration {
+    match attempt {
+        0 => Duration::from_millis(200),
+        1 => Duration::from_millis(400),
+        _ => Duration::from_millis(800),
+    }
+}
+
 /// Fetch a GCP access token from the metadata server (works on Cloud Run)
 /// or fall back to `gcloud auth print-access-token` locally.
+///
+/// Tokens are cached process-wide for `ACCESS_TOKEN_CACHE_TTL`. On a cache
+/// miss, the metadata server is retried `METADATA_FETCH_MAX_ATTEMPTS`
+/// times before giving up — a transient hiccup used to fall straight
+/// through to a `gcloud` exec that doesn't exist in the container, which
+/// in turn triggered an expensive Vertex AI Gemini fallback.
 async fn fetch_gcp_access_token() -> std::result::Result<String, ProviderFailure> {
+    if let Some(token) = access_token_cache().get(Instant::now()) {
+        return Ok(token);
+    }
+
+    let mut last_metadata_error: Option<String> = None;
+
+    for attempt in 0..METADATA_FETCH_MAX_ATTEMPTS {
+        match fetch_token_from_metadata_server().await {
+            Ok(token) => {
+                access_token_cache().set(token.clone(), ACCESS_TOKEN_CACHE_TTL, Instant::now());
+                return Ok(token);
+            }
+            Err(err) => {
+                last_metadata_error = Some(err);
+                if attempt + 1 < METADATA_FETCH_MAX_ATTEMPTS {
+                    tokio::time::sleep(token_fetch_retry_delay(attempt)).await;
+                }
+            }
+        }
+    }
+
+    // Metadata path exhausted. Try `gcloud` for local dev. If both fail,
+    // surface a `timed_out=true` failure so the per-provider retry loop
+    // in `transcribe_audio_via_provider` treats it as transient — a
+    // metadata blip should not collapse straight into the Gemini fallback.
+    let metadata_summary = last_metadata_error
+        .unwrap_or_else(|| "metadata server unreachable".to_string());
+
+    match tokio::process::Command::new("gcloud")
+        .args(["auth", "print-access-token"])
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => Ok(String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .to_string()),
+        Ok(_) => Err(parse_provider_status(
+            None,
+            None,
+            &format!(
+                "Failed to get GCP access token: metadata exhausted ({}); gcloud returned non-zero",
+                metadata_summary
+            ),
+            true,
+        )),
+        Err(e) => Err(parse_provider_status(
+            None,
+            None,
+            &format!(
+                "Failed to get GCP access token: metadata exhausted ({}); gcloud unavailable: {}",
+                metadata_summary, e
+            ),
+            true,
+        )),
+    }
+}
+
+/// One round-trip to the GCE/Cloud Run metadata server. Returns the raw
+/// access token on success, or a short human-readable error on failure.
+async fn fetch_token_from_metadata_server() -> std::result::Result<String, String> {
     let metadata_url =
         "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
     let client = reqwest::Client::new();
     let resp = client
         .get(metadata_url)
         .header("Metadata-Flavor", "Google")
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(Duration::from_secs(5))
         .send()
-        .await;
+        .await
+        .map_err(|e| format!("metadata request failed: {}", e))?;
 
-    match resp {
-        Ok(r) if r.status().is_success() => {
-            let body = r.text().await.map_err(|e| {
-                parse_provider_status(
-                    None,
-                    None,
-                    &format!("Failed to read metadata token: {}", e),
-                    false,
-                )
-            })?;
-            let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
-                parse_provider_status(
-                    None,
-                    None,
-                    &format!("Failed to parse metadata token: {}", e),
-                    false,
-                )
-            })?;
-            json["access_token"]
-                .as_str()
-                .map(|s| s.to_string())
-                .ok_or_else(|| {
-                    parse_provider_status(None, None, "No access_token in metadata response", false)
-                })
-        }
-        _ => {
-            // Fallback: try gcloud CLI for local development
-            let output = tokio::process::Command::new("gcloud")
-                .args(["auth", "print-access-token"])
-                .output()
-                .await
-                .map_err(|e| {
-                    parse_provider_status(None, None, &format!("gcloud auth failed: {}", e), false)
-                })?;
-            if output.status.success() {
-                Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-            } else {
-                Err(parse_provider_status(
-                    None,
-                    None,
-                    "Failed to get GCP access token (no metadata server, gcloud failed)",
-                    false,
-                ))
-            }
-        }
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("metadata returned status {}", status.as_u16()));
     }
+
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("failed to read metadata body: {}", e))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("failed to parse metadata json: {}", e))?;
+    json["access_token"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "no access_token in metadata response".to_string())
 }
 
 /// Build the Gemini transcription prompt, optionally biased to a specific
@@ -2676,6 +2784,191 @@ async fn transcribe_via_gemini(
                 false,
             )
         })
+}
+
+/// Build the Parakeet sidecar transcribe URL from a configured base URL.
+/// Accepts the bare service URL or a URL that already includes the path.
+pub(crate) fn parakeet_request_url(base: &str) -> String {
+    let trimmed = base.trim().trim_end_matches('/');
+    if trimmed.ends_with("/v1/transcribe") {
+        trimmed.to_string()
+    } else {
+        format!("{}/v1/transcribe", trimmed)
+    }
+}
+
+/// Per-audience cache for Cloud Run service-to-service identity tokens.
+/// Service-to-service auth signs an OIDC token with `aud=<sidecar URL>`,
+/// so two different sidecars must NEVER share a cache entry.
+static IDENTITY_TOKEN_CACHES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, &'static AccessTokenCache>>,
+> = std::sync::OnceLock::new();
+
+pub(crate) fn identity_token_cache_for_audience(audience: &str) -> &'static AccessTokenCache {
+    let map_lock = IDENTITY_TOKEN_CACHES
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut map = map_lock.lock().expect("identity token cache map poisoned");
+    if let Some(existing) = map.get(audience) {
+        return existing;
+    }
+    // Leak a fresh cache so we can hand out a `'static` reference. There
+    // is one cache per audience (sidecar URL) for the lifetime of the
+    // process — bounded and tiny.
+    let leaked: &'static AccessTokenCache = Box::leak(Box::new(AccessTokenCache::new()));
+    map.insert(audience.to_string(), leaked);
+    leaked
+}
+
+/// Fetch a Cloud Run identity token (OIDC) for `audience`. Cached per
+/// audience for 50 minutes. On metadata-server failure we apply the same
+/// 3-attempt retry as `fetch_gcp_access_token`.
+async fn fetch_gcp_identity_token(
+    audience: &str,
+) -> std::result::Result<String, ProviderFailure> {
+    let cache = identity_token_cache_for_audience(audience);
+    if let Some(token) = cache.get(Instant::now()) {
+        return Ok(token);
+    }
+
+    let mut last_metadata_error: Option<String> = None;
+    for attempt in 0..METADATA_FETCH_MAX_ATTEMPTS {
+        match fetch_identity_token_from_metadata_server(audience).await {
+            Ok(token) => {
+                cache.set(token.clone(), ACCESS_TOKEN_CACHE_TTL, Instant::now());
+                return Ok(token);
+            }
+            Err(err) => {
+                last_metadata_error = Some(err);
+                if attempt + 1 < METADATA_FETCH_MAX_ATTEMPTS {
+                    tokio::time::sleep(token_fetch_retry_delay(attempt)).await;
+                }
+            }
+        }
+    }
+
+    Err(parse_provider_status(
+        None,
+        None,
+        &format!(
+            "Failed to get GCP identity token (audience={}): {}",
+            audience,
+            last_metadata_error.unwrap_or_else(|| "metadata server unreachable".to_string())
+        ),
+        true,
+    ))
+}
+
+/// One round-trip to the metadata server's identity-token endpoint.
+async fn fetch_identity_token_from_metadata_server(
+    audience: &str,
+) -> std::result::Result<String, String> {
+    // Identity tokens are plain JWT strings (no JSON wrapper) when fetched
+    // with `format=full`, so we treat the body as the token directly.
+    // The metadata server accepts the audience URL un-percent-encoded;
+    // Cloud Run service URLs never contain reserved characters (`&`/`=`)
+    // that would break query parsing.
+    let url = format!(
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience={}&format=full",
+        audience
+    );
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .header("Metadata-Flavor", "Google")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| format!("metadata identity request failed: {}", e))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!(
+            "metadata identity returned status {}",
+            status.as_u16()
+        ));
+    }
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("failed to read identity body: {}", e))?;
+    let token = body.trim();
+    if token.is_empty() {
+        return Err("metadata identity returned empty body".to_string());
+    }
+    Ok(token.to_string())
+}
+
+/// Transcribe audio by POSTing the WAV bytes to the Parakeet sidecar.
+/// Returns the sidecar's JSON body verbatim so the caller can run it
+/// through `normalize_transcript_to_vtt` (the sidecar's wire format is
+/// the same `{language, segments[]}` shape).
+async fn transcribe_via_parakeet(
+    config: &Config,
+    audio_path: &Path,
+    language: Option<&str>,
+) -> std::result::Result<String, ProviderFailure> {
+    let base_url = config.parakeet_asr_url.as_deref().ok_or_else(|| {
+        parse_provider_status(None, None, "PARAKEET_ASR_URL is not configured", false)
+    })?;
+
+    let audio_bytes = tokio::fs::read(audio_path).await.map_err(|e| {
+        parse_provider_status(None, None, &format!("Failed to read audio: {}", e), false)
+    })?;
+
+    // Audience for the OIDC token is the sidecar's base URL (no path).
+    let audience = base_url.trim_end_matches('/').to_string();
+    let identity_token = fetch_gcp_identity_token(&audience).await?;
+
+    let mut url = parakeet_request_url(base_url);
+    // BCP-47 language tags are alphanumeric + `-` only; safe in a query.
+    if let Some(lang) = language.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        url.push_str("?language=");
+        url.push_str(lang);
+    }
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&url)
+        .bearer_auth(&identity_token)
+        .header(reqwest::header::CONTENT_TYPE, "audio/wav")
+        .body(audio_bytes)
+        .timeout(Duration::from_secs(300))
+        .send()
+        .await
+        .map_err(|e| {
+            parse_provider_status(
+                None,
+                None,
+                &format!("Failed to call Parakeet sidecar: {}", e),
+                e.is_timeout(),
+            )
+        })?;
+
+    let status = response.status();
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
+    let body = response.text().await.map_err(|e| {
+        parse_provider_status(
+            Some(status.as_u16()),
+            retry_after.as_deref(),
+            &format!("Failed to read Parakeet response: {}", e),
+            e.is_timeout(),
+        )
+    })?;
+
+    if !status.is_success() {
+        return Err(parse_provider_status(
+            Some(status.as_u16()),
+            retry_after.as_deref(),
+            &body,
+            false,
+        ));
+    }
+
+    Ok(body)
 }
 
 /// Normalize transcription output to WebVTT and collect summary metadata.
@@ -3101,15 +3394,16 @@ async fn finalize_transcript(
 mod tests {
     use super::{
         build_transcode_status_webhook_payload, classify_audio_extract_error,
-        decide_transcript_lock_action, is_implausible_text_density, is_loop_hallucination,
-        is_retryable_provider_failure,
-        normalize_transcript_to_vtt, parse_audio_analysis_output, parse_provider_status,
-        retry_delay_for_attempt, should_drop_low_signal_transcript, transcript_drop_reason,
-        transcription_response_format, AudioAnalysis, AudioExtractErrorKind, Config, ParsedVtt,
+        decide_transcript_lock_action, identity_token_cache_for_audience,
+        is_implausible_text_density, is_loop_hallucination, is_retryable_provider_failure,
+        normalize_transcript_to_vtt, parakeet_request_url, parse_audio_analysis_output,
+        parse_provider_status, retry_delay_for_attempt, should_drop_low_signal_transcript,
+        token_fetch_retry_delay, transcript_drop_reason, transcription_response_format,
+        AccessTokenCache, AudioAnalysis, AudioExtractErrorKind, Config, ParsedVtt,
         TranscriptConfidence, TranscriptDropReason, TranscriptLockAction, TranscriptLockState,
         TranscriptLockStatus, VideoInfo,
     };
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn gpt_transcribe_uses_json_response_format() {
@@ -3788,6 +4082,148 @@ mod tests {
             transcript_drop_reason(&analysis, &parsed),
             Some(TranscriptDropReason::LoopHallucination)
         );
+    }
+    // --- Access-token cache & metadata-fetch retry policy ---
+    //
+    // These regression tests guard the behaviour added to stop a flaky
+    // metadata-server response from instantly triggering an expensive
+    // Vertex AI Gemini fallback. See deploy.sh + fetch_gcp_access_token.
+
+    #[test]
+    fn access_token_cache_returns_none_when_empty() {
+        let cache = AccessTokenCache::new();
+        let now = Instant::now();
+        assert_eq!(cache.get(now), None);
+    }
+
+    #[test]
+    fn access_token_cache_returns_value_within_ttl() {
+        let cache = AccessTokenCache::new();
+        let now = Instant::now();
+        cache.set("token-abc".to_string(), Duration::from_secs(3000), now);
+        assert_eq!(
+            cache.get(now + Duration::from_secs(2999)),
+            Some("token-abc".to_string())
+        );
+    }
+
+    #[test]
+    fn access_token_cache_returns_none_after_ttl() {
+        let cache = AccessTokenCache::new();
+        let now = Instant::now();
+        cache.set("token-abc".to_string(), Duration::from_secs(3000), now);
+        assert_eq!(cache.get(now + Duration::from_secs(3001)), None);
+    }
+
+    #[test]
+    fn access_token_cache_overwrites_on_set() {
+        let cache = AccessTokenCache::new();
+        let now = Instant::now();
+        cache.set("first".to_string(), Duration::from_secs(60), now);
+        cache.set(
+            "second".to_string(),
+            Duration::from_secs(60),
+            now + Duration::from_secs(10),
+        );
+        assert_eq!(
+            cache.get(now + Duration::from_secs(20)),
+            Some("second".to_string())
+        );
+    }
+
+    #[test]
+    fn token_fetch_retry_delay_grows_then_caps() {
+        assert_eq!(token_fetch_retry_delay(0), Duration::from_millis(200));
+        assert_eq!(token_fetch_retry_delay(1), Duration::from_millis(400));
+        assert_eq!(token_fetch_retry_delay(2), Duration::from_millis(800));
+        assert_eq!(token_fetch_retry_delay(5), Duration::from_millis(800));
+    }
+
+    #[test]
+    fn token_fetch_failures_are_retryable_for_provider_loop() {
+        // The token-fetch path now flags failures as `timed_out=true` so
+        // the per-provider retry loop treats them as transient. Without
+        // this, a single metadata-server hiccup falls straight through to
+        // the Gemini fallback.
+        let failure = parse_provider_status(None, None, "metadata server unavailable", true);
+        assert!(is_retryable_provider_failure(&failure));
+    }
+
+    // --- Parakeet sidecar provider ---
+
+    #[test]
+    fn parakeet_request_url_appends_endpoint() {
+        assert_eq!(
+            parakeet_request_url("https://asr.example.com"),
+            "https://asr.example.com/v1/transcribe"
+        );
+        assert_eq!(
+            parakeet_request_url("https://asr.example.com/"),
+            "https://asr.example.com/v1/transcribe"
+        );
+        assert_eq!(
+            parakeet_request_url("https://asr.example.com/v1/transcribe"),
+            "https://asr.example.com/v1/transcribe"
+        );
+        assert_eq!(
+            parakeet_request_url("https://asr.example.com/v1/transcribe/"),
+            "https://asr.example.com/v1/transcribe"
+        );
+    }
+
+    #[test]
+    fn parakeet_response_normalises_to_vtt() {
+        let parakeet_json = r#"{
+            "language": "en",
+            "segments": [
+                {"start": 0.0, "end": 1.0, "text": "hello world",
+                 "words": [
+                    {"word": "hello", "start": 0.0, "end": 0.5},
+                    {"word": "world", "start": 0.6, "end": 1.0}
+                 ]}
+            ]
+        }"#;
+        // Parakeet's wire format intentionally matches Gemini's: a top-level
+        // `language` and an array of `segments` with `start`/`end`/`text`,
+        // so the existing normaliser handles it without a special parser.
+        let parsed = normalize_transcript_to_vtt(parakeet_json).expect("parakeet JSON valid");
+        assert!(parsed.content.starts_with("WEBVTT"));
+        assert_eq!(parsed.cue_count, 1);
+        assert_eq!(parsed.language.as_deref(), Some("en"));
+        assert!(parsed.content.contains("hello world"));
+        assert!(parsed.content.contains("00:00:00.000 --> 00:00:01.000"));
+    }
+
+    #[test]
+    fn parakeet_config_defaults_url_to_none() {
+        let config = Config::from_lookup(|_| None);
+        assert!(config.parakeet_asr_url.is_none());
+    }
+
+    #[test]
+    fn parakeet_config_reads_url_when_set() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("PARAKEET_ASR_URL", "https://asr.example.com");
+        let config = Config::from_lookup(|k| env.get(k).map(|v| v.to_string()));
+        assert_eq!(
+            config.parakeet_asr_url.as_deref(),
+            Some("https://asr.example.com")
+        );
+    }
+
+    #[test]
+    fn identity_token_cache_is_keyed_by_audience() {
+        // Two different audiences must not share cache entries — otherwise
+        // a token signed for sidecar A would be sent to sidecar B and
+        // rejected by IAM with a confusing 401.
+        let cache_a = identity_token_cache_for_audience("https://a.example.com");
+        let cache_b = identity_token_cache_for_audience("https://b.example.com");
+        let now = Instant::now();
+        cache_a.set("token-a".to_string(), Duration::from_secs(60), now);
+        cache_b.set("token-b".to_string(), Duration::from_secs(60), now);
+        assert_eq!(cache_a.get(now), Some("token-a".to_string()));
+        assert_eq!(cache_b.get(now), Some("token-b".to_string()));
+        assert_ne!(cache_a.get(now), cache_b.get(now));
     }
 }
 
