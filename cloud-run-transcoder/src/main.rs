@@ -2523,21 +2523,38 @@ async fn fetch_gcp_access_token() -> std::result::Result<String, ProviderFailure
 /// Build the Gemini transcription prompt, optionally biased to a specific
 /// language. Empty/auto/und sentinels fall through to the generic prompt
 /// so the model is free to detect the language itself.
+///
+/// The prompt is intentionally strict about output shape: response is JSON
+/// only (enforced by `responseMimeType` too, but belt-and-suspenders), and
+/// each segment's `text` field must contain ONLY the spoken words —
+/// no markdown fences, no explanatory prose, no JSON fragments. We've
+/// observed Gemini occasionally appending "Here is the JSON requested:"
+/// followed by another JSON envelope into a segment text; the
+/// instructions below try to pre-empt that.
 fn build_gemini_prompt(language: Option<&str>) -> String {
-    let base = "Transcribe this audio. Return every spoken segment with start and end timestamps in seconds and the text. If there is no speech, return an empty segments array.";
-    match language {
+    let lang_clause = match language {
         Some(lang)
             if !lang.trim().is_empty()
                 && !lang.eq_ignore_ascii_case("auto")
                 && !lang.eq_ignore_ascii_case("und") =>
         {
-            format!(
-                "Transcribe this audio in {}. Return every spoken segment with start and end timestamps in seconds and the text. If there is no speech, return an empty segments array.",
-                lang.trim()
-            )
+            format!(" The audio is spoken in {}.", lang.trim())
         }
-        _ => base.to_string(),
-    }
+        _ => String::new(),
+    };
+    format!(
+        "Transcribe the speech in this audio.{lang_clause}\n\
+         \n\
+         Output requirements (STRICT):\n\
+         - Return ONLY a JSON object with this exact shape: \
+         {{\"language\": \"<bcp47>\", \"segments\": [{{\"start\": <seconds>, \"end\": <seconds>, \"text\": \"<spoken words>\"}}]}}.\n\
+         - The `text` field of every segment MUST contain ONLY the spoken words \
+         transcribed verbatim. Do NOT include markdown, code fences, JSON \
+         fragments, headers, summaries, explanations, or any commentary.\n\
+         - Do NOT prefix or suffix the JSON with any text, markdown, or \
+         explanation. No \"Here is the JSON\" preamble. No ``` fences.\n\
+         - If there is no speech, return {{\"segments\": []}}.\n",
+    )
 }
 
 /// Transcribe audio using Gemini via Vertex AI generateContent.
@@ -2694,7 +2711,7 @@ fn normalize_transcript_to_vtt(raw: &str) -> Result<ParsedVtt> {
                     .as_f64()
                     .or_else(|| segment["end"].as_str().and_then(|s| s.parse::<f64>().ok()))
                     .unwrap_or(start + 1.0);
-                let text = segment["text"]
+                let raw_text = segment["text"]
                     .as_str()
                     .or_else(|| segment["transcript"].as_str())
                     .unwrap_or("")
@@ -2703,6 +2720,14 @@ fn normalize_transcript_to_vtt(raw: &str) -> Result<ParsedVtt> {
                     parsed_language = segment["language"].as_str().map(|s| s.to_string());
                 }
 
+                // Defense-in-depth: even though Gemini emits per-segment
+                // text fields, we've seen cases where a segment's text
+                // contains a model "explanation tail" (e.g. real speech
+                // followed by markdown-fenced JSON). Strip any structured-
+                // data tail before storing.
+                let cleaned =
+                    transcription_google_stt_v2::strip_envelope_explanation_tail(raw_text);
+                let text = cleaned.trim();
                 if text.is_empty() {
                     continue;
                 }
@@ -2734,7 +2759,8 @@ fn normalize_transcript_to_vtt(raw: &str) -> Result<ParsedVtt> {
         }
 
         if let Some(text) = json["text"].as_str() {
-            let merged = text
+            let cleaned = transcription_google_stt_v2::strip_envelope_explanation_tail(text);
+            let merged = cleaned
                 .split('\n')
                 .map(|line| line.trim())
                 .filter(|line| !line.is_empty())
@@ -2762,7 +2788,8 @@ fn normalize_transcript_to_vtt(raw: &str) -> Result<ParsedVtt> {
     }
 
     // Plain text fallback when the provider does not return timestamps.
-    let merged = trimmed
+    let cleaned = transcription_google_stt_v2::strip_envelope_explanation_tail(trimmed);
+    let merged = cleaned
         .split('\n')
         .map(|line| line.trim())
         .filter(|line| !line.is_empty())

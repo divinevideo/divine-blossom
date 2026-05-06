@@ -319,38 +319,128 @@ fn scan_text_fields(input: &str) -> Vec<String> {
     out
 }
 
-/// Strip "explanation tails" the model sometimes appends after the real
-/// transcript. Real production cases:
-///   - "...his ass? He is the JSON requested: ```json\n{...}\n```"
-///   - "...launch Divine tomorrow. Here is the JSON requested: {...}"
-///   - "...Thank you all. Here is the requested JSON: ..."
-/// Returns the text with the earliest matching tail (and everything after)
-/// removed. Trims trailing whitespace from the result. The match is
-/// case-insensitive.
-pub(crate) fn strip_envelope_explanation_tail(text: &str) -> String {
-    let lower = text.to_lowercase();
-    const MARKERS: &[&str] = &[
-        "```json",
-        "```\n",
+/// Find the earliest byte position of a JSON-like opener (`{` or `[`
+/// followed by whitespace and then a structural character — `"`, `{`, `[`,
+/// `}`, or `]`). Plain `{some text}` in prose won't match because the next
+/// char would be a letter; only structured-data shapes do.
+fn find_structured_data_start(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'{' || b == b'[' {
+            let mut j = i + 1;
+            while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() {
+                let next = bytes[j];
+                if matches!(next, b'"' | b'{' | b'[' | b'}' | b']') {
+                    return Some(i);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Strip trailing "preamble" prose after the head has been cut. Removes
+/// phrases like "Here is the JSON requested:" or "as requested, here's the
+/// JSON:" that sit between real speech and the structured data.
+fn strip_trailing_preamble(head: &str) -> &str {
+    let trimmed = head.trim_end();
+    let lower = trimmed.to_lowercase();
+    // Markers that, when found near the end, indicate the model started its
+    // "explanation" before emitting structured output. Cut the head back to
+    // the position of the earliest such marker if it sits in the last ~80
+    // chars (i.e. it's the final clause, not earlier prose).
+    const TAIL_MARKERS: &[&str] = &[
         "here is the json",
         "here's the json",
         "he is the json",
-        "here is the requested json",
-        "here's the requested json",
+        "here is the requested",
+        "here's the requested",
         "as requested, here",
         "as requested here",
-        "json requested:",
+        "the requested json",
+        "json requested",
+        "the json:",
+        "the response:",
+        "the output:",
     ];
+    let len = lower.len();
     let mut earliest: Option<usize> = None;
-    for marker in MARKERS {
-        if let Some(pos) = lower.find(marker) {
-            earliest = Some(earliest.map_or(pos, |p| p.min(pos)));
+    for marker in TAIL_MARKERS {
+        if let Some(pos) = lower.rfind(marker) {
+            // Must be in the tail region (last 120 chars) to count as a
+            // preamble — earlier matches are likely real speech.
+            if len.saturating_sub(pos) <= 120 {
+                earliest = Some(earliest.map_or(pos, |p| p.min(pos)));
+            }
         }
     }
     match earliest {
-        Some(pos) => text[..pos].trim_end().to_string(),
-        None => text.to_string(),
+        Some(pos) => trimmed[..pos].trim_end_matches(|c: char| {
+            c.is_whitespace() || c == ',' || c == ':' || c == '-'
+        }),
+        None => trimmed,
     }
+}
+
+/// Strip "explanation tails" the model sometimes appends after real
+/// speech. The detection is structural rather than phrase-based: we cut at
+/// the earliest occurrence of either a markdown code fence or a JSON-like
+/// opener, then walk back through any preamble prose. Real production
+/// cases:
+///   - "...his ass? He is the JSON requested: ```json\n{...}\n```"
+///   - "...launch Divine tomorrow. Here is the JSON: {...}"
+///   - "...the show. \n```\n{...}\n```"
+///   - "...Thank you. {\"language\":\"en\",\"segments\":[...]}"
+pub(crate) fn strip_envelope_explanation_tail(text: &str) -> String {
+    let mut earliest: Option<usize> = None;
+    let mut consider = |pos: usize| {
+        earliest = Some(earliest.map_or(pos, |p| p.min(pos)));
+    };
+
+    // Structural artifacts: markdown fences and JSON-like openers.
+    if let Some(pos) = text.find("```") {
+        consider(pos);
+    }
+    if let Some(pos) = find_structured_data_start(text) {
+        consider(pos);
+    }
+    // XML/HTML-style tags (Gemini has been observed emitting <response> wrappers).
+    if let Some(pos) = text.find("<response") {
+        consider(pos);
+    }
+
+    // Preamble phrases that introduce structured output, even when the
+    // structured part itself doesn't trigger the heuristic above.
+    let lower = text.to_lowercase();
+    const PREAMBLES: &[&str] = &[
+        "here is the json",
+        "here's the json",
+        "he is the json",
+        "here is the requested",
+        "here's the requested",
+        "as requested, here",
+        "as requested here",
+        "the requested json",
+        "json requested:",
+    ];
+    for marker in PREAMBLES {
+        if let Some(pos) = lower.find(marker) {
+            consider(pos);
+        }
+    }
+
+    let cut = match earliest {
+        Some(p) => p,
+        None => return text.to_string(),
+    };
+    let head = &text[..cut];
+    strip_trailing_preamble(head).to_string()
 }
 
 pub(crate) fn transcript_only_to_parsed_vtt(
@@ -849,6 +939,37 @@ mod tests {
     fn strip_tail_passes_plain_speech_unchanged() {
         let good = "Hello and welcome to the show today.";
         assert_eq!(strip_envelope_explanation_tail(good), good);
+    }
+
+    #[test]
+    fn strip_tail_catches_bare_json_object_no_preamble() {
+        // Detection is structural: any JSON-like opener gets cut even
+        // without a known preamble phrase.
+        let bad = "Real speech here. {\"language\":\"en\",\"segments\":[]}";
+        let cleaned = strip_envelope_explanation_tail(bad);
+        assert_eq!(cleaned, "Real speech here.");
+    }
+
+    #[test]
+    fn strip_tail_catches_bare_json_array_no_preamble() {
+        let bad = "Some words. [{\"text\":\"foo\"}]";
+        let cleaned = strip_envelope_explanation_tail(bad);
+        assert_eq!(cleaned, "Some words.");
+    }
+
+    #[test]
+    fn strip_tail_catches_xml_response_wrapper() {
+        let bad = "Real speech. <response><text>foo</text></response>";
+        let cleaned = strip_envelope_explanation_tail(bad);
+        assert_eq!(cleaned, "Real speech.");
+    }
+
+    #[test]
+    fn strip_tail_does_not_cut_curly_braces_in_prose() {
+        // `{some text}` in real prose has letters after `{`, not JSON
+        // structural chars — should NOT be cut.
+        let prose = "He shouted {wow} loudly and that was the end.";
+        assert_eq!(strip_envelope_explanation_tail(prose), prose);
     }
 
     #[test]
