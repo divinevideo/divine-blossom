@@ -2545,6 +2545,16 @@ fn build_gemini_prompt(language: Option<&str>) -> String {
     format!(
         "Transcribe the speech in this audio.{lang_clause}\n\
          \n\
+         Why this matters: this transcript is consumed by an automated \
+         caption pipeline that can ONLY parse the exact JSON shape below. \
+         It has no ability to parse markdown, prose preambles, code \
+         fences, or alternative JSON shapes. If you deviate from the \
+         format, the pipeline cannot recover the captions: real users \
+         watching videos in the Divine app will see broken or missing \
+         subtitles, lose trust in the product, and stop using it. Please \
+         help us keep the captions working — strict adherence to the \
+         format below is what makes that possible.\n\
+         \n\
          Output requirements (STRICT):\n\
          - Return ONLY a JSON object with this exact shape: \
          {{\"language\": \"<bcp47>\", \"segments\": [{{\"start\": <seconds>, \"end\": <seconds>, \"text\": \"<spoken words>\"}}]}}.\n\
