@@ -319,24 +319,57 @@ fn scan_text_fields(input: &str) -> Vec<String> {
     out
 }
 
+/// Strip "explanation tails" the model sometimes appends after the real
+/// transcript. Real production cases:
+///   - "...his ass? He is the JSON requested: ```json\n{...}\n```"
+///   - "...launch Divine tomorrow. Here is the JSON requested: {...}"
+///   - "...Thank you all. Here is the requested JSON: ..."
+/// Returns the text with the earliest matching tail (and everything after)
+/// removed. Trims trailing whitespace from the result. The match is
+/// case-insensitive.
+pub(crate) fn strip_envelope_explanation_tail(text: &str) -> String {
+    let lower = text.to_lowercase();
+    const MARKERS: &[&str] = &[
+        "```json",
+        "```\n",
+        "here is the json",
+        "here's the json",
+        "he is the json",
+        "here is the requested json",
+        "here's the requested json",
+        "as requested, here",
+        "as requested here",
+        "json requested:",
+    ];
+    let mut earliest: Option<usize> = None;
+    for marker in MARKERS {
+        if let Some(pos) = lower.find(marker) {
+            earliest = Some(earliest.map_or(pos, |p| p.min(pos)));
+        }
+    }
+    match earliest {
+        Some(pos) => text[..pos].trim_end().to_string(),
+        None => text.to_string(),
+    }
+}
+
 pub(crate) fn transcript_only_to_parsed_vtt(
     transcript: &str,
     language: Option<String>,
     audio_duration_ms: u64,
 ) -> ParsedVtt {
-    // First, try to unwrap a JSON envelope. Some providers (notably
-    // Gemini) sometimes emit `{"language":"en","segments":[{"text":"..."}]}`
-    // instead of plain text. When that happens we want to preserve the
-    // real transcript inside the envelope rather than render the JSON
-    // syntax to viewers.
-    let unwrapped: String;
-    let trimmed: &str = match unwrap_json_envelope(transcript) {
-        Some(extracted) => {
-            unwrapped = extracted;
-            unwrapped.as_str()
-        }
-        None => transcript.trim(),
+    // First, try to unwrap a JSON envelope (text is pure JSON — the model
+    // returned its full structured response instead of plain text).
+    let unwrap_step: String = match unwrap_json_envelope(transcript) {
+        Some(extracted) => extracted,
+        None => transcript.to_string(),
     };
+    // Then, strip "Here is the JSON requested: ```json {...}``` " style
+    // explanation tails the model sometimes appends after real speech.
+    // This catches cases where the prefix is real prose (so unwrap doesn't
+    // fire) but the model still leaked a JSON tail.
+    let cleaned: String = strip_envelope_explanation_tail(&unwrap_step);
+    let trimmed: &str = cleaned.trim();
     if trimmed.is_empty() {
         return ParsedVtt {
             content: "WEBVTT\n\n".to_string(),
@@ -785,6 +818,54 @@ mod tests {
         let parsed = transcript_only_to_parsed_vtt(bad, Some("en".into()), 5_000);
         assert_eq!(parsed.text, "Hello there");
         assert!(parsed.content.contains("Hello there"));
+        assert!(!parsed.content.contains("\"language\""));
+    }
+
+    #[test]
+    fn strip_tail_handles_markdown_fenced_json_with_he_is_typo() {
+        // Production case: sha c60a0373f9121df3e7c01b0c19464b22931c5a149b9417f6c60dd9a56419b85b
+        // Gemini occasionally appends a JSON envelope after the real speech with
+        // a typo'd preamble ("He is" instead of "Here is").
+        let bad = "Hey man, why'd you put the crutch on his ass? He is the JSON requested: ```json\n{\n  \"language\": \"en\"\n}\n```";
+        let cleaned = strip_envelope_explanation_tail(bad);
+        assert_eq!(cleaned, "Hey man, why'd you put the crutch on his ass?");
+    }
+
+    #[test]
+    fn strip_tail_handles_here_is_the_json_variant() {
+        let bad = "Welcome to the show. Here is the JSON: {\"segments\": []}";
+        let cleaned = strip_envelope_explanation_tail(bad);
+        assert_eq!(cleaned, "Welcome to the show.");
+    }
+
+    #[test]
+    fn strip_tail_handles_bare_markdown_fence() {
+        let bad = "Real speech here.\n```json\n{\"x\":1}\n```";
+        let cleaned = strip_envelope_explanation_tail(bad);
+        assert_eq!(cleaned, "Real speech here.");
+    }
+
+    #[test]
+    fn strip_tail_passes_plain_speech_unchanged() {
+        let good = "Hello and welcome to the show today.";
+        assert_eq!(strip_envelope_explanation_tail(good), good);
+    }
+
+    #[test]
+    fn strip_tail_is_case_insensitive() {
+        let bad = "Speech text. HERE IS THE JSON requested: {}";
+        let cleaned = strip_envelope_explanation_tail(bad);
+        assert_eq!(cleaned, "Speech text.");
+    }
+
+    #[test]
+    fn transcript_only_strips_prose_then_json_tail() {
+        // End-to-end: parsed VTT should contain only the real speech.
+        let bad = "Hey man, why'd you put the crutch on his ass? He is the JSON requested: ```json\n{\n  \"language\": \"en\"\n}\n```";
+        let parsed = transcript_only_to_parsed_vtt(bad, Some("en".into()), 5_000);
+        assert_eq!(parsed.text, "Hey man, why'd you put the crutch on his ass?");
+        assert!(!parsed.content.contains("```"));
+        assert!(!parsed.content.contains("JSON"));
         assert!(!parsed.content.contains("\"language\""));
     }
 
