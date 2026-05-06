@@ -1702,6 +1702,18 @@ async fn process_transcribe(
     } else {
         match normalize_transcript_to_vtt(&raw_output) {
             Ok(vtt) => vtt,
+            Err(e) if is_empty_transcript_normalize_error(&e) => {
+                // The provider answered, but the audio had no transcribable
+                // speech (silent video, music-only, noise). This is a
+                // SUCCESSFUL transcription with empty content — write an
+                // empty VTT stub so the edge serves 200 with no cues
+                // instead of 202 "in_progress" forever.
+                info!(
+                    "Empty transcript for {} ({}); writing empty VTT stub",
+                    hash, e
+                );
+                ParsedVtt::empty(audio_analysis.duration_ms)
+            }
             Err(e) => {
                 if let Err(lock_error) = delete_transcript_lock(
                     &state.gcs_client,
@@ -3113,6 +3125,19 @@ fn normalize_transcript_to_vtt(raw: &str) -> Result<ParsedVtt> {
     })
 }
 
+/// True when an error from `normalize_transcript_to_vtt` indicates that the
+/// provider replied successfully with no transcribable speech (silent video,
+/// music-only audio, etc.). The caller should treat this as a successful
+/// empty transcription — write an empty VTT stub and return `complete` —
+/// rather than a failure. Real provider failures (network errors, 5xx, JSON
+/// parse failures) are NOT classified as empty.
+fn is_empty_transcript_normalize_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    msg == "Transcription output is empty"
+        || msg == "Transcription response contained no usable text"
+        || msg == "Transcription output had no usable text"
+}
+
 fn extract_transcript_confidence(json: &serde_json::Value) -> Option<TranscriptConfidence> {
     let mut logprobs = Vec::new();
     collect_logprob_values(json, &mut logprobs);
@@ -3395,13 +3420,13 @@ mod tests {
     use super::{
         build_transcode_status_webhook_payload, classify_audio_extract_error,
         decide_transcript_lock_action, identity_token_cache_for_audience,
-        is_implausible_text_density, is_loop_hallucination, is_retryable_provider_failure,
-        normalize_transcript_to_vtt, parakeet_request_url, parse_audio_analysis_output,
-        parse_provider_status, retry_delay_for_attempt, should_drop_low_signal_transcript,
-        token_fetch_retry_delay, transcript_drop_reason, transcription_response_format,
-        AccessTokenCache, AudioAnalysis, AudioExtractErrorKind, Config, ParsedVtt,
-        TranscriptConfidence, TranscriptDropReason, TranscriptLockAction, TranscriptLockState,
-        TranscriptLockStatus, VideoInfo,
+        is_empty_transcript_normalize_error, is_implausible_text_density, is_loop_hallucination,
+        is_retryable_provider_failure, normalize_transcript_to_vtt, parakeet_request_url,
+        parse_audio_analysis_output, parse_provider_status, retry_delay_for_attempt,
+        should_drop_low_signal_transcript, token_fetch_retry_delay, transcript_drop_reason,
+        transcription_response_format, AccessTokenCache, AudioAnalysis, AudioExtractErrorKind,
+        Config, ParsedVtt, TranscriptConfidence, TranscriptDropReason, TranscriptLockAction,
+        TranscriptLockState, TranscriptLockStatus, VideoInfo,
     };
     use std::time::{Duration, Instant};
 
@@ -4224,6 +4249,51 @@ mod tests {
         assert_eq!(cache_a.get(now), Some("token-a".to_string()));
         assert_eq!(cache_b.get(now), Some("token-b".to_string()));
         assert_ne!(cache_a.get(now), cache_b.get(now));
+    }
+
+    // --- empty-transcript classifier ---
+    //
+    // process_transcribe used to surface "no usable text" / "Transcription
+    // output is empty" errors as HTTP 500, leaving no VTT in GCS at all.
+    // The edge then served `GET /{hash}/vtt` as 202 in_progress forever,
+    // even though transcription was complete and there simply was no
+    // speech in the audio. is_empty_transcript_normalize_error lets the
+    // caller distinguish "no content" from a real failure, so it can
+    // substitute an empty VTT stub instead of erroring.
+
+    #[test]
+    fn empty_transcript_classifier_matches_no_usable_text_errors() {
+        let err = anyhow::anyhow!("Transcription response contained no usable text");
+        assert!(is_empty_transcript_normalize_error(&err));
+        let err = anyhow::anyhow!("Transcription output had no usable text");
+        assert!(is_empty_transcript_normalize_error(&err));
+    }
+
+    #[test]
+    fn empty_transcript_classifier_matches_explicit_empty_output() {
+        // normalize_transcript_to_vtt's first-line guard for an empty body.
+        let err = anyhow::anyhow!("Transcription output is empty");
+        assert!(is_empty_transcript_normalize_error(&err));
+    }
+
+    #[test]
+    fn empty_transcript_classifier_rejects_real_failures() {
+        // Genuine errors must NOT be reclassified as empty. Otherwise we'd
+        // silently swallow real provider issues as "no transcription
+        // available."
+        for msg in [
+            "Failed to read provider response: connection reset",
+            "Transcription provider returned 503: try again",
+            "Failed to parse Vertex AI JSON: expected value at line 1 column 1",
+            "TRANSCRIPTION_API_URL is not configured",
+            "",
+        ] {
+            let err = anyhow::anyhow!("{}", msg);
+            assert!(
+                !is_empty_transcript_normalize_error(&err),
+                "{msg:?} should NOT be treated as an empty-transcript signal",
+            );
+        }
     }
 }
 
