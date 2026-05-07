@@ -906,6 +906,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn viewer_auth_diagnostics_accepts_bud01_get_on_blob_path() {
+        let hash = "4a31d696c2275e60dbfe2359e6ff006f78a30f5df11c7290233a7860c4e8c31e";
+        let event = signed_event(
+            BLOSSOM_AUTH_KIND,
+            vec![
+                vec!["t".into(), "get".into()],
+                vec!["x".into(), hash.into()],
+                vec!["expiration".into(), "1300".into()],
+            ],
+            1_000,
+        );
+        let auth_header = encoded_event(event);
+        let path = format!("/{}.mp4", hash);
+
+        let diagnostics = diagnose_viewer_auth_request(
+            "GET",
+            &path,
+            Some("media.divine.video"),
+            TEST_URL,
+            Some(&auth_header),
+            1_100,
+        );
+
+        assert_eq!(diagnostics.auth_state, ViewerAuthState::Valid);
+        assert!(diagnostics.viewer_pubkey.is_some());
+    }
+
+    #[test]
+    fn viewer_auth_diagnostics_rejects_bud01_list_on_blob_path() {
+        let hash = "4a31d696c2275e60dbfe2359e6ff006f78a30f5df11c7290233a7860c4e8c31e";
+        let event = signed_event(
+            BLOSSOM_AUTH_KIND,
+            vec![
+                vec!["t".into(), "list".into()],
+                vec!["expiration".into(), "1300".into()],
+            ],
+            1_000,
+        );
+        let auth_header = encoded_event(event);
+        let path = format!("/{}.mp4", hash);
+
+        let diagnostics = diagnose_viewer_auth_request(
+            "GET",
+            &path,
+            Some("media.divine.video"),
+            TEST_URL,
+            Some(&auth_header),
+            1_100,
+        );
+
+        assert_eq!(diagnostics.auth_state, ViewerAuthState::ValidationFailed);
+        assert!(diagnostics.auth_error.is_some());
+    }
+
     fn signed_event(kind: u32, tags: Vec<Vec<String>>, created_at: u64) -> BlossomAuthEvent {
         let signing_key = SigningKey::from_bytes(&[7u8; 32]).expect("test key should be valid");
         let mut event = BlossomAuthEvent {
