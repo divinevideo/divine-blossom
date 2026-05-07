@@ -268,7 +268,11 @@ pub fn diagnose_viewer_auth_request(
         }
     };
 
-    match validate_viewer_event(&event, method, &request_url, now) {
+    let validation = match blob_hash_from_path(path) {
+        Some(hash) => validate_blob_viewer_event(&event, method, &request_url, &hash, now),
+        None => validate_viewer_event(&event, method, &request_url, now),
+    };
+    match validation {
         Ok(()) => {
             diagnostics.auth_state = ViewerAuthState::Valid;
             diagnostics.viewer_pubkey = Some(event.pubkey);
@@ -291,6 +295,17 @@ fn classify_parse_error(error_message: &str) -> ViewerAuthState {
         ViewerAuthState::InvalidScheme
     } else {
         ViewerAuthState::ParseFailed
+    }
+}
+
+pub(crate) fn blob_hash_from_path(path: &str) -> Option<String> {
+    let first_segment = path.trim_start_matches('/').split('/').next()?;
+    let candidate = first_segment.split('.').next().unwrap_or(first_segment);
+
+    if candidate.len() == 64 && candidate.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(candidate.to_lowercase())
+    } else {
+        None
     }
 }
 

@@ -4,8 +4,9 @@
 use crate::blossom::{AuthAction, BlossomAuthEvent};
 use crate::error::{BlossomError, Result};
 use crate::viewer_auth::{
-    authenticate_blob_viewer, authenticate_generic_viewer, diagnose_viewer_auth_request,
-    parse_auth_header, public_request_url, validate_blossom_event, ViewerAuthDiagnostics,
+    authenticate_blob_viewer, authenticate_generic_viewer, blob_hash_from_path,
+    diagnose_viewer_auth_request, parse_auth_header, public_request_url, validate_blossom_event,
+    ViewerAuthDiagnostics,
 };
 use fastly::http::header::{AUTHORIZATION, HOST};
 use fastly::Request;
@@ -97,17 +98,6 @@ fn request_auth_headers(req: &Request) -> Result<Vec<&str>> {
 enum ViewerScope {
     Generic,
     Blob(String),
-}
-
-fn blob_hash_from_path(path: &str) -> Option<String> {
-    let first_segment = path.trim_start_matches('/').split('/').next()?;
-    let candidate = first_segment.split('.').next().unwrap_or(first_segment);
-
-    if candidate.len() == 64 && candidate.chars().all(|c| c.is_ascii_hexdigit()) {
-        Some(candidate.to_lowercase())
-    } else {
-        None
-    }
 }
 
 fn unix_now() -> u64 {
