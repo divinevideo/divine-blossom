@@ -39,9 +39,20 @@ pub struct ViewerAuthDiagnostics {
 }
 
 pub fn parse_auth_header(auth_header: &str) -> Result<BlossomAuthEvent> {
-    let base64_event = auth_header.strip_prefix("Nostr ").ok_or_else(|| {
+    // Postel's law: accept any case for the scheme name (e.g. `Nostr `,
+    // `nostr `, `NOSTR `). RFC 7235 says auth-scheme is case-insensitive,
+    // and some clients have shipped lowercase variants.
+    let trimmed = auth_header.trim_start();
+    let scheme_end = trimmed.find(' ').ok_or_else(|| {
         BlossomError::AuthInvalid("Authorization must start with 'Nostr '".into())
     })?;
+    let (scheme, rest) = trimmed.split_at(scheme_end);
+    if !scheme.eq_ignore_ascii_case("Nostr") {
+        return Err(BlossomError::AuthInvalid(
+            "Authorization must start with 'Nostr '".into(),
+        ));
+    }
+    let base64_event = rest.trim_start();
 
     let event_json = BASE64
         .decode(base64_event)
@@ -89,16 +100,30 @@ pub fn validate_blossom_get_event(
 ) -> Result<()> {
     validate_blossom_event(event, AuthAction::Get, now)?;
 
-    let event_hash = get_tag_value(event, "x")
-        .ok_or_else(|| BlossomError::AuthInvalid("Missing x tag".into()))?;
-    if !event_hash.eq_ignore_ascii_case(expected_hash) {
-        return Err(BlossomError::AuthInvalid(format!(
-            "Hash mismatch: expected {}, got {}",
-            expected_hash, event_hash
-        )));
+    // Postel's law: BUD-01 allows authorizing multiple blobs in one event by
+    // including multiple `x` tags. Previously this only checked the first x
+    // tag, rejecting otherwise-valid multi-blob auth events. Iterate every
+    // x tag and accept if any matches the requested hash.
+    let mut saw_any_x = false;
+    let mut last_seen_hash: Option<&str> = None;
+    for tag in &event.tags {
+        if tag.len() >= 2 && tag[0] == "x" {
+            saw_any_x = true;
+            let candidate = tag[1].as_str();
+            if candidate.eq_ignore_ascii_case(expected_hash) {
+                return Ok(());
+            }
+            last_seen_hash = Some(candidate);
+        }
     }
-
-    Ok(())
+    if !saw_any_x {
+        return Err(BlossomError::AuthInvalid("Missing x tag".into()));
+    }
+    Err(BlossomError::AuthInvalid(format!(
+        "Hash mismatch: expected {}, got {}",
+        expected_hash,
+        last_seen_hash.unwrap_or("")
+    )))
 }
 
 pub fn validate_nip98_event(
@@ -959,6 +984,97 @@ mod tests {
 
         assert_eq!(diagnostics.auth_state, ViewerAuthState::ValidationFailed);
         assert!(diagnostics.auth_error.is_some());
+    }
+
+    // ---- Postel's law relaxations ----
+
+    const TEST_HASH: &str =
+        "4a31d696c2275e60dbfe2359e6ff006f78a30f5df11c7290233a7860c4e8c31e";
+
+    #[test]
+    fn parse_auth_header_accepts_lowercase_nostr_scheme() {
+        // RFC 7235 says auth-scheme is case-insensitive. Some clients have
+        // shipped lowercase `nostr `; we should accept any case.
+        let event = signed_event(
+            BLOSSOM_AUTH_KIND,
+            vec![vec!["t".into(), "get".into()]],
+            1_000,
+        );
+        let json = serde_json::to_string(&event).expect("event serialises");
+        let b64 = BASE64.encode(json.as_bytes());
+        for scheme in ["Nostr ", "nostr ", "NOSTR ", "NoStR "] {
+            let header = format!("{scheme}{b64}");
+            parse_auth_header(&header).unwrap_or_else(|e| {
+                panic!("scheme {scheme:?} should parse, got {}", e.message())
+            });
+        }
+    }
+
+    #[test]
+    fn blossom_get_event_accepts_uppercase_action_tag() {
+        // Same kindness for the `t` tag value — some clients ship `Get` /
+        // `GET` rather than the spec's lowercase `get`.
+        for action in ["get", "Get", "GET", "gEt"] {
+            let event = signed_event(
+                BLOSSOM_AUTH_KIND,
+                vec![
+                    vec!["t".into(), action.into()],
+                    vec!["x".into(), TEST_HASH.into()],
+                ],
+                1_000,
+            );
+            validate_blossom_get_event(&event, TEST_HASH, 1_000)
+                .unwrap_or_else(|e| panic!("action `{action}` should be valid, got {}", e.message()));
+        }
+    }
+
+    #[test]
+    fn blossom_get_event_accepts_multiple_x_tags_when_one_matches() {
+        // BUD-01 allows authorising several blobs in a single event by
+        // attaching multiple `x` tags. Accept if any one matches.
+        let other_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        let event = signed_event(
+            BLOSSOM_AUTH_KIND,
+            vec![
+                vec!["t".into(), "get".into()],
+                vec!["x".into(), other_hash.into()],
+                vec!["x".into(), TEST_HASH.into()],
+            ],
+            1_000,
+        );
+        validate_blossom_get_event(&event, TEST_HASH, 1_000)
+            .expect("multi-x event should accept request for any listed hash");
+    }
+
+    #[test]
+    fn blossom_get_event_still_rejects_when_no_x_tag_matches() {
+        let other_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        let event = signed_event(
+            BLOSSOM_AUTH_KIND,
+            vec![
+                vec!["t".into(), "get".into()],
+                vec!["x".into(), other_hash.into()],
+            ],
+            1_000,
+        );
+        let err = validate_blossom_get_event(&event, TEST_HASH, 1_000)
+            .expect_err("non-matching x tag must still be rejected");
+        assert!(err.message().contains("Hash mismatch"), "got: {}", err.message());
+    }
+
+    #[test]
+    fn blossom_get_event_still_requires_some_x_tag() {
+        // Postel relaxation: if no x tag at all, that's still wrong per
+        // spec — keep the explicit "Missing x tag" rejection so clients
+        // get a clear diagnostic.
+        let event = signed_event(
+            BLOSSOM_AUTH_KIND,
+            vec![vec!["t".into(), "get".into()]],
+            1_000,
+        );
+        let err = validate_blossom_get_event(&event, TEST_HASH, 1_000)
+            .expect_err("no x tag should still error");
+        assert_eq!(err.message(), "Missing x tag");
     }
 
     fn signed_event(kind: u32, tags: Vec<Vec<String>>, created_at: u64) -> BlossomAuthEvent {
