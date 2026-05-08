@@ -438,11 +438,14 @@ pub enum AuthAction {
 }
 
 impl BlossomAuthEvent {
-    /// Get the action type from tags
+    /// Get the action type from tags. Action value is matched
+    /// case-insensitively per Postel's law — some clients have shipped
+    /// `Get`, `GET`, etc. and the spec doesn't mandate case.
     pub fn get_action(&self) -> Option<AuthAction> {
         for tag in &self.tags {
             if tag.len() >= 2 && tag[0] == "t" {
-                return match tag[1].as_str() {
+                let action = tag[1].to_ascii_lowercase();
+                return match action.as_str() {
                     "get" => Some(AuthAction::Get),
                     "upload" => Some(AuthAction::Upload),
                     "delete" => Some(AuthAction::Delete),
