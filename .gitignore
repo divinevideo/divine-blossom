@@ -60,5 +60,6 @@ scripts/backfill-orientation-failed.txt
 
 # Local/ephemeral
 .claude/
+.superpowers/
 __pycache__/
 *.log
