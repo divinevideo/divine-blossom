@@ -1367,13 +1367,31 @@ mod derivative_trigger_tests {
         }
     }
 
-    /// Wait long enough for fire-and-forget spawned tasks to complete their
-    /// HTTP round-trip against the in-process wiremock server. Tests run on a
-    /// multi_thread runtime so the spawned tasks can make real localhost
-    /// requests concurrently with this sleep. 200ms is ample for a loopback
-    /// POST to a mock server; tune upward only if you see CI flakes.
-    async fn drain_spawned_tasks() {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    /// Poll the mock server until it has received at least `expected` requests
+    /// or the timeout elapses. For `expected == 0`, we sleep a bounded amount
+    /// to give any (incorrectly) spawned task a chance to misfire so the
+    /// subsequent `verify()` can catch it. Replaces the previous flat 200ms
+    /// sleep which races under CI load.
+    async fn wait_for_n_requests(server: &MockServer, expected: usize) {
+        if expected == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            return;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let count = server
+                .received_requests()
+                .await
+                .map(|v| v.len())
+                .unwrap_or(0);
+            if count >= expected {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     /// video/mp4 → transcoder /transcode should be called.
@@ -1404,7 +1422,8 @@ mod derivative_trigger_tests {
         )
         .await;
 
-        drain_spawned_tasks().await;
+        // Video fires both /transcode and /transcribe — wait for both.
+        wait_for_n_requests(&server, 2).await;
 
         // wiremock verifies the `expect(1)` on drop.
         server.verify().await;
@@ -1439,7 +1458,8 @@ mod derivative_trigger_tests {
         )
         .await;
 
-        drain_spawned_tasks().await;
+        // Audio fires only /transcribe.
+        wait_for_n_requests(&server, 1).await;
 
         server.verify().await;
     }
@@ -1472,7 +1492,8 @@ mod derivative_trigger_tests {
         )
         .await;
 
-        drain_spawned_tasks().await;
+        // Images should produce zero requests; sleep to catch any misfire.
+        wait_for_n_requests(&server, 0).await;
 
         server.verify().await;
     }
@@ -1501,7 +1522,8 @@ mod derivative_trigger_tests {
         // transcoder_url = None, transcriber_url = Some
         maybe_trigger_derivatives(None, Some(&server.uri()), &response, "pubkey_abc").await;
 
-        drain_spawned_tasks().await;
+        // Only /transcribe fires (transcoder_url is None).
+        wait_for_n_requests(&server, 1).await;
 
         server.verify().await;
     }
@@ -1535,7 +1557,9 @@ mod derivative_trigger_tests {
         )
         .await;
 
-        drain_spawned_tasks().await;
+        // Both /transcode and /transcribe fire; both return 500 but the spawned
+        // tasks swallow the error rather than panicking.
+        wait_for_n_requests(&server, 2).await;
 
         // The requests were sent (transcoder was hit), just with an error response.
         server.verify().await;
