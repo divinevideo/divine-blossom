@@ -243,17 +243,16 @@ fn media_viewer_context(
     match diagnostics.auth_state {
         ViewerAuthState::Missing => Ok((None, diagnostics)),
         ViewerAuthState::Valid => Ok((diagnostics.viewer_pubkey.clone(), diagnostics)),
+        // Postel: a malformed/invalid viewer auth header degrades to anonymous.
+        // `BlobMetadata::access_for(None, ...)` is the single source of truth on
+        // whether the blob requires auth — public blobs serve, restricted blobs
+        // 401 the same way they would for a request with no header at all.
         _ => {
             eprintln!(
                 "{}",
-                format_media_auth_log(route, &diagnostics, "auth_invalid")
+                format_media_auth_log(route, &diagnostics, "auth_invalid_degraded_to_anonymous")
             );
-            Err(BlossomError::AuthInvalid(
-                diagnostics
-                    .auth_error
-                    .clone()
-                    .unwrap_or_else(|| "Invalid viewer authorization".into()),
-            ))
+            Ok((None, diagnostics))
         }
     }
 }
