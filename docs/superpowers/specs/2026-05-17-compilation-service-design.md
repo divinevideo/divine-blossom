@@ -74,6 +74,12 @@ Response (immediate):
       { "event_id": "...", "pubkey": "...", "nip05": "alice@example.com", "display_name": "Alice" }
     ]
   },
+  "callback_delivery": {
+    "attempts": 1,
+    "last_attempt_at": "2026-05-17T18:42:11Z",
+    "last_status_code": 200,
+    "delivered": true
+  },
   "error": null
 }
 ```
@@ -89,7 +95,7 @@ Callback delivery is recorded on the job doc as `callback_delivery: { attempts: 
 Either of these is sufficient on `POST /compile` and `GET /compile/:job_id`:
 
 - **NIP-98** — preferred. Caller's pubkey is extracted and logged on the job. Tenant id is `pubkey:<hex>`.
-- **Webhook shared-secret** (`Authorization: Bearer <secret>`) — for trusted internal callers (funnelcake, etc.). Each secret is bound to a fixed tenant name in service config (env `COMPILER_WEBHOOK_SECRETS=funnelcake:abc...,janitor:xyz...`). The tenant name comes from the secret, **not** from a client-supplied header — that prevents tenants from spoofing each other's identity or rate-limit bucket. Tenant id is `secret:<name>`.
+- **Webhook shared-secret** (`Authorization: Bearer <secret>`) — for trusted internal callers (funnelcake, etc.). Each secret is bound to a fixed tenant name in service config (env `COMPILER_WEBHOOK_SECRETS=funnelcake:abc...,janitor:xyz...`). The tenant name comes from the secret, **not** from a client-supplied header — that prevents tenants from spoofing each other's identity or rate-limit bucket. Secret values must be hex or base64 (URL-safe) — no `,` or `:` allowed, since those are the env-format separators. Tenant id is `secret:<name>`.
 
 If both are present, NIP-98 wins. If neither is present, 401.
 
@@ -116,8 +122,11 @@ These all become accepted in v2+ per the deferred list below.
 1. Validate request, persist job to Firestore (`compilation_jobs/<job_id>`), return job_id.
 2. Worker picks up job:
    a. Resolve source → list of event refs (e/a tags from naddr in their literal
-      tag order, or `event_ids`/`nevents` in the order the caller supplied).
+      tag order, or `event_ids` in the order the caller supplied).
       No sort, no shuffle — render order is whatever the input gave us.
+      **Assumption:** `api.divine.video` returns list-event tags in their original
+      event order (not re-sorted). Verify during implementation; if it sorts, fetch
+      the raw list event JSON and parse tags ourselves.
    b. Fetch each event (kind 34235/34236) + each author's kind 0 profile via
       `https://api.divine.video` REST API. No relay WebSocket — REST is simpler,
       no reconnects, no subscription management. **Caveat:** REST responses can
@@ -181,7 +190,7 @@ v2+ fields/values present in a v1 request → `400 Bad Request` with the unsuppo
 ## Constraints
 
 - **Max clips per job: 500.** For `event_ids` input, enforced synchronously at `POST /compile` (returns 400 immediately). For `naddr` input the cap can only be checked after resolution, so it's enforced asynchronously in the worker — job transitions to `failed` with `error: "too_many_clips"`.
-- **Max total source bytes downloaded: 20 GB.** Always enforced asynchronously in the worker (requires HEAD on every blob first, which is too slow for sync request validation). Job fails with `error: "source_too_large"` if exceeded.
+- **Max total source bytes downloaded: 20 GB.** Always enforced asynchronously in the worker (requires HEAD on every blob first, which is too slow for sync request validation). Job fails with `error: "source_too_large"` if exceeded. Any partially-downloaded bytes in `/tmp/job_<id>/` are cleaned up by the same teardown path as a successful job (also handles SIGTERM during eviction).
 - **Output duration:** whatever the caller requests via `max_duration_sec` (default 600 if unspecified). No hard ceiling.
 - **Empty resolved clip list** (zero usable clips after fetch/probe/moderation) → job fails with `error: "no_usable_clips"`. Don't render an empty MP4.
 - **No request dedup.** Two identical `POST /compile` payloads create two independent jobs. Caller is responsible for not double-submitting.
@@ -206,7 +215,7 @@ Every job event emits a structured JSON log line picked up by Cloud Logging:
   "job_id": "cmp_01HXY...",
   "event": "queued | started | clip_fetched | clip_dropped | aspect_rendered | uploaded | done | failed",
   "caller": { "kind": "nip98", "pubkey": "..." } | { "kind": "webhook", "tenant": "funnelcake" },
-  "source_kind": "naddr | event_ids | nevents",
+  "source_kind": "naddr | event_ids",
   "clip_count": 23, "clips_dropped": 2,
   "aspects": ["9:16","1:1","16:9"],
   "duration_sec": 487, "render_time_sec": 142, "gpu_seconds": 89,
@@ -245,7 +254,7 @@ If the request includes `"dry_run": true`, the job:
 5. Returns `result.credits` and `result.clips_dropped` populated; `result.outputs` is `[]`.
 6. Marks job `done` with `dry_run: true` in the result.
 
-Lets a caller preview what a comp would contain before spending GPU time on it.
+Lets a caller preview what a comp would contain before spending GPU time on it. Dry-run requests count against the tenant's rate-limit bucket the same as full runs — cheap-but-not-free, to prevent the obvious "I'll just dry-run 10,000 times" abuse.
 
 ## Output encoding
 
