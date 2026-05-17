@@ -123,5 +123,36 @@ class TestHypothesisMapping(unittest.TestCase):
         )
 
 
+class TestTimestampsFallback(unittest.TestCase):
+    def test_timestamps_crash_falls_back_to_no_timestamps(self):
+        from app.transcribe import ParakeetTranscriber
+
+        calls: list[bool] = []
+
+        class FakeModel:
+            def transcribe(self, _files, timestamps):
+                calls.append(timestamps)
+                if timestamps:
+                    raise IndexError("simulated NeMo get_words_offsets crash")
+                return [FakeHypothesis(text="degenerate", timestamp={})]
+
+            def to(self, _device):
+                return self
+
+            def eval(self):
+                return self
+
+        transcriber = ParakeetTranscriber.__new__(ParakeetTranscriber)
+        transcriber._model = FakeModel()
+        transcriber._device = "cpu"
+        transcriber._model_name = "test"
+
+        result = transcriber.transcribe(b"RIFF....fake-wav", language="en")
+
+        self.assertEqual(calls, [True, False])
+        self.assertEqual(len(result.segments), 1)
+        self.assertEqual(result.segments[0].text, "degenerate")
+
+
 if __name__ == "__main__":
     unittest.main()
