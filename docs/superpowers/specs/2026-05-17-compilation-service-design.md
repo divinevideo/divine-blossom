@@ -78,16 +78,37 @@ Response (immediate):
 }
 ```
 
-When `status` transitions to `done` or `failed`, the service POSTs the same body to `callback_url` (fire-and-forget, 3 retries with exponential backoff). The POST carries `X-Compiler-Signature: sha256=<hex>` where the hex is `HMAC_SHA256(COMPILER_WEBHOOK_SECRET, raw_body)`. Caller verifies before trusting the payload.
+`GET /compile/:job_id` on an unknown id returns `404 Not Found` with `{"error": "job_not_found", "job_id": "..."}`.
+
+When `status` transitions to `done` or `failed`, the service POSTs the same body to `callback_url` (3 retries with exponential backoff: 1s, 5s, 25s). The POST carries `X-Compiler-Signature: sha256=<hex>` where the hex is `HMAC_SHA256(COMPILER_WEBHOOK_SECRET, raw_body)`. Caller verifies before trusting the payload.
+
+Callback delivery is recorded on the job doc as `callback_delivery: { attempts: N, last_attempt_at, last_status_code, delivered: bool }`. If all 3 retries fail, the job stays in its terminal status (`done` / `failed`) with `callback_delivery.delivered: false`; admin can see undelivered callbacks via `GET /admin/jobs?callback_delivered=false`.
 
 ### Auth
 
 Either of these is sufficient on `POST /compile` and `GET /compile/:job_id`:
 
-- **NIP-98** — preferred. Caller's pubkey is extracted and logged on the job for audit/abuse.
-- **Webhook shared-secret** (`Authorization: Bearer $COMPILER_WEBHOOK_SECRET`) — fallback for trusted internal callers (funnelcake, etc.). No pubkey logged; `requested_by` is set to the calling service's name from a header.
+- **NIP-98** — preferred. Caller's pubkey is extracted and logged on the job. Tenant id is `pubkey:<hex>`.
+- **Webhook shared-secret** (`Authorization: Bearer <secret>`) — for trusted internal callers (funnelcake, etc.). Each secret is bound to a fixed tenant name in service config (env `COMPILER_WEBHOOK_SECRETS=funnelcake:abc...,janitor:xyz...`). The tenant name comes from the secret, **not** from a client-supplied header — that prevents tenants from spoofing each other's identity or rate-limit bucket. Tenant id is `secret:<name>`.
 
 If both are present, NIP-98 wins. If neither is present, 401.
+
+### V1 request validation matrix
+
+The API schema is forward-compatible; v1 implements a subset. A v1 service returns `400 Bad Request` with `{"error": "unsupported_field", "field": "...", "value": "..."}` on:
+
+| Field | v1-rejected values |
+|-------|---------------------|
+| `source.nevents` | any (use `event_ids` after hex-decoding, or `naddr`) |
+| `credit.mode` | `always-on`, `corner-pill` |
+| `transition` | `crossfade`, `dip-to-black` |
+| `transition_ms` | any non-zero value |
+| `audio.mode` | `ducked-under-music` |
+| `audio.bgm_url` | non-null |
+| `intro_card` | non-null |
+| `outro_card` | non-null |
+
+These all become accepted in v2+ per the deferred list below.
 
 ## Pipeline
 
@@ -159,22 +180,20 @@ v2+ fields/values present in a v1 request → `400 Bad Request` with the unsuppo
 
 ## Constraints
 
-- Max clips per job: 500 (enforced via 400). Sanity cap, not a cost ceiling.
-- Max total source bytes downloaded: 20 GB (enforced via 400 if estimate exceeds; estimate from blossom `Content-Length` HEAD).
-- Output duration: whatever the caller requests via `max_duration_sec` (default 600 if unspecified). No hard ceiling.
-- Empty resolved clip list (zero usable clips after fetch/probe/moderation) → job fails with `error: "no_usable_clips"`. Don't render an empty MP4.
+- **Max clips per job: 500.** For `event_ids` input, enforced synchronously at `POST /compile` (returns 400 immediately). For `naddr` input the cap can only be checked after resolution, so it's enforced asynchronously in the worker — job transitions to `failed` with `error: "too_many_clips"`.
+- **Max total source bytes downloaded: 20 GB.** Always enforced asynchronously in the worker (requires HEAD on every blob first, which is too slow for sync request validation). Job fails with `error: "source_too_large"` if exceeded.
+- **Output duration:** whatever the caller requests via `max_duration_sec` (default 600 if unspecified). No hard ceiling.
+- **Empty resolved clip list** (zero usable clips after fetch/probe/moderation) → job fails with `error: "no_usable_clips"`. Don't render an empty MP4.
+- **No request dedup.** Two identical `POST /compile` payloads create two independent jobs. Caller is responsible for not double-submitting.
 - Service does **not** sign or publish anything to Nostr. Caller signs whatever kind 34235 they want with the returned blob descriptors.
 
 ## Text rendering
 
-Credits and any future text overlays use the Noto Sans family bundled in the Docker image: Noto Sans (Latin), Noto Sans CJK (Chinese/Japanese/Korean), Noto Sans Arabic. fontconfig routes per glyph run. ~30 MB image cost, covers everything we'll realistically see.
+Credits and any future text overlays use the Noto Sans family bundled in the Docker image via Debian packages pinned in the Dockerfile: `fonts-noto-core`, `fonts-noto-cjk`, `fonts-noto-extra` (Arabic ships in the extras). Pin to a specific Debian apt snapshot date so rebuilds are reproducible. fontconfig routes per glyph run. ~30 MB image cost, covers everything we'll realistically see.
 
 ## Rate limiting
 
-Per-tenant. Tenant id is:
-
-- `pubkey:<hex>` for NIP-98 callers
-- `secret:<name>` for webhook-secret callers (name comes from a request header set by the caller, e.g. `X-Caller-Service: funnelcake`)
+Per-tenant. Tenant id is derived from auth (see Auth section above): `pubkey:<hex>` for NIP-98, `secret:<name>` for webhook secrets where the name comes from the service's env config (not a client-supplied header).
 
 Defaults: **20 jobs/hr, 100 jobs/day** per tenant. Overrides live in Firestore at `rate_limits/<tenant_id>`. Counters are Firestore atomic increments with field-level TTL. Exceeded → `429 Too Many Requests` with `Retry-After` header.
 
@@ -211,7 +230,7 @@ Auth: admin pubkey allowlist (`COMPILER_ADMIN_PUBKEYS` env, comma-separated hex)
 - `GET /admin/jobs/:job_id` — full detail: caller, source event ids, all credits, all output URLs, all `clips_dropped` reasons.
 - `GET /admin/tenants` — tenants with job counts, GPU minutes used, rate-limit overrides.
 - `POST /admin/jobs/:job_id/cancel` — kill an in-flight job.
-- `POST /admin/jobs/:job_id/requeue` — re-run a failed job with the original input.
+- `POST /admin/jobs/:job_id/requeue` — re-run a failed (or stuck) job using the original input. Creates a **new** `job_id`; the new job doc carries `requeued_from: <original_job_id>` and the original carries `requeued_as: <new_job_id>`. Callbacks fire fresh against the original `callback_url`. This preserves audit trail and avoids mutating completed jobs.
 
 Admin endpoints are for operator visibility ("see what people are making") and incident response. A future public "recently rendered comps" feed is explicitly **not** in v1 — that's a product surface, not the service's job.
 
@@ -228,26 +247,31 @@ If the request includes `"dry_run": true`, the job:
 
 Lets a caller preview what a comp would contain before spending GPU time on it.
 
+## Output encoding
+
+- **Codec:** H.264 + AAC in MP4 with `+faststart`. yuv420p.
+- **Single bitrate per aspect:** 9:16 ≈ 6 Mbps @ 1080×1920, 1:1 ≈ 5 Mbps @ 1080×1080, 16:9 ≈ 6 Mbps @ 1920×1080. AAC 128 kbps stereo.
+- **NVENC params** are lifted from the transcoder's existing pipeline.
+- **Audio loudness:** single-pass `loudnorm` filter targeting `target_lufs` (default -14). Single-pass is good enough for short comps and avoids the two-pass measure-then-encode dance; the transcoder also uses single-pass.
+
+## Concurrency and lifecycle
+
+- Each Cloud Run instance processes up to 4 jobs in parallel (FFmpeg/NVENC slots shared).
+- `max_instances` on the Cloud Run service starts at 5; tune from real traffic.
+- Each job uses its own temp working dir under `/tmp/job_<id>/` and cleans up on completion (or on instance shutdown via SIGTERM handler).
+- Comp MP4s are regular blossom blobs with no special TTL. Caller can `DELETE` if they want them gone. No GC job in v1.
+
 ## What's reused from cloud-run-transcoder
 
 - `Dockerfile` GPU base image, NVENC build flags.
 - `deploy.sh` shape and Artifact Registry repo pattern.
 - ffprobe / GPU-encode-with-CPU-fallback logic.
 - Webhook callback retry shape.
-- Loudnorm two-pass pattern (if transcoder already does this — otherwise lift from FFmpeg docs).
-
-## Behavior
-
-- **Render order:** literal input order (list-tag order or caller-supplied array order). No sort, no shuffle.
-- **Per-clip failure:** drop-and-continue. Failures recorded in `clips_dropped`. Job only fails if zero clips usable.
-- **Dedup:** none. Two identical requests = two jobs.
-- **Output lifetime:** comp MP4s are regular blossom blobs with no special TTL. Caller can `DELETE` if they want them gone. No GC job in v1.
-- **Concurrency:** each Cloud Run instance processes up to 4 jobs in parallel (FFmpeg/NVENC slots shared). `max_instances` on the Cloud Run service starts at 5; tune from real traffic. Each job uses its own temp working dir under `/tmp/job_<id>/` and cleans up on completion.
-- **Output codec:** H.264 + AAC in MP4 with `+faststart`. yuv420p. Single bitrate per aspect (9:16 ≈ 6 Mbps @ 1080×1920, 1:1 ≈ 5 Mbps @ 1080×1080, 16:9 ≈ 6 Mbps @ 1920×1080). AAC 128 kbps stereo. Lifts the transcoder's existing NVENC params.
+- Single-pass loudnorm pattern.
 
 ## Decisions locked
 
-- **Job state:** Firestore (collection `compilation_jobs`, doc id = job_id). Falls back to GCS JSON file if Firestore setup is more work than expected during implementation.
+- **Job state:** Firestore (collection `compilation_jobs`, doc id = job_id). No fallback. Rate-limit counters live in `rate_limits/<tenant_id>` and depend on Firestore atomic increments. Job docs are retained indefinitely in v1 (jobs are small JSON; a TTL/GC is a future operational tune, not v1 scope).
 - **Logo:** fetched at worker startup from `https://media.divine.video/divine-logo.png` (CDN-served, single source of truth, no rebuild needed to refresh the logo). Cached on local disk for the worker's lifetime.
 - **Event/profile fetch:** `https://api.divine.video` REST API. No relay WebSocket.
 - **Moderation:** `Restricted` and `AgeRestricted` source blobs are silently skipped in v1 and surfaced in `clips_dropped`. Per-user age-gate (caller opts in, request carries their auth, service fetches with that auth) is **v2+** — too much complexity for v1.
