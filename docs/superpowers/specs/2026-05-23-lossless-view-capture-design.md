@@ -81,8 +81,7 @@ Included:
 - `/{sha}/hls/stream_480p.ts`
 - `/{sha}/hls/stream_720p.mp4`
 - `/{sha}/hls/stream_480p.mp4`
-- `200` responses
-- `206` responses when `resp.body_bytes_written` is large enough to be plausible playback
+- successful 2xx responses that delivered video bytes
 
 Excluded from display candidates by default:
 
@@ -91,10 +90,9 @@ Excluded from display candidates by default:
 - VTT
 - audio extraction routes
 - HLS manifests and variant playlists
-- very small byte probes
 - non-video content types
 
-Optional debug capture can be added later for manifests and tiny probes, but it should not feed display counts.
+Optional debug capture can be added later for manifests, but it should not feed display counts.
 
 Proposed response condition:
 
@@ -102,7 +100,9 @@ Proposed response condition:
 req.method == "GET"
 && req.url ~ "^/[0-9a-fA-F]{64}($|\\?|\\.mp4(\\?|$)|/(720p|480p)(\\.mp4)?(\\?|$)|/hls/stream_(720p|480p)\\.(ts|mp4)(\\?|$))"
 && resp.http.Content-Type ~ "^video/"
-&& (resp.status == 200 || (resp.status == 206 && resp.body_bytes_written > 100000))
+&& resp.status >= 200
+&& resp.status < 300
+&& resp.body_bytes_written > 0
 ```
 
 Proposed log payload:
@@ -174,8 +174,8 @@ Create derived read models in `divine-funnelcake`.
 
 A view candidate is a raw CDN media delivery that likely represents playback. Initial policy:
 
-- `http_status = 200`, or
-- `http_status = 206 AND bytes_sent > 100000`
+- `http_status >= 200 AND http_status < 300`
+- `bytes_sent > 0`
 - `media_path_type IN ('original', 'original_mp4', 'quality_mp4', 'quality_ts', 'quality_progressive')`
 
 This policy intentionally still overcounts. It is a display candidate filter, not an anti-fraud system.
