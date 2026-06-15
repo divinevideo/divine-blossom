@@ -1367,18 +1367,16 @@ mod derivative_trigger_tests {
         }
     }
 
-    /// Poll the mock server until it has received at least `expected` requests
-    /// or the timeout elapses. For `expected == 0`, we sleep a bounded amount
-    /// to give any (incorrectly) spawned task a chance to misfire so the
-    /// subsequent `verify()` can catch it. Replaces the previous flat 200ms
-    /// sleep which races under CI load.
+    /// Poll the mock server until it has received at least `expected` requests.
+    /// For `expected == 0`, sleep a bounded amount to give any incorrectly
+    /// spawned task a chance to misfire before `verify()` catches it.
     async fn wait_for_n_requests(server: &MockServer, expected: usize) {
         if expected == 0 {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             return;
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
+        let count = loop {
             let count = server
                 .received_requests()
                 .await
@@ -1388,10 +1386,11 @@ mod derivative_trigger_tests {
                 return;
             }
             if std::time::Instant::now() >= deadline {
-                return;
+                break count;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        };
+        panic!("timed out waiting for {expected} requests; received {count}");
     }
 
     /// video/mp4 → transcoder /transcode should be called.
@@ -1544,6 +1543,7 @@ mod derivative_trigger_tests {
         Mock::given(method("POST"))
             .and(path("/transcribe"))
             .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+            .expect(1)
             .mount(&server)
             .await;
 
