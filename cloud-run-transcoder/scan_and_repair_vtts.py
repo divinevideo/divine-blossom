@@ -48,6 +48,35 @@ JSON_ENVELOPE_KEYS = (
     '"results":',
 )
 
+# Mirrors cloud-run-transcoder/src/main.rs `contains_instruction_echo`.
+# Keep these markers conservative: common technical speech about JSON should
+# not trigger a repair unless prompt/schema-specific phrasing also leaked.
+INSTRUCTION_ECHO_STRONG_MARKERS = (
+    "<bcp47>",
+    "<seconds>",
+    "<spoken words>",
+    "output requirements",
+    "follow the schema",
+    "provided in the context",
+    "extra text outside",
+    "outside of the json",
+    "do not include any extra text",
+    "return only a json",
+    "only a json object",
+    "single json array",
+    "spoken words transcribed verbatim",
+    "text field of every segment",
+)
+INSTRUCTION_ECHO_WEAK_MARKERS = (
+    "valid json",
+    "json array",
+    "json object",
+    "json string",
+    "markdown",
+    "code fences",
+    "response schema",
+)
+
 # Mirrors cloud-run-transcoder/src/main.rs `is_loop_hallucination` and
 # `is_repeated_phrase_hallucination`. Keep parameters in lockstep so the
 # scanner flags exactly what the deployed service would reject.
@@ -292,6 +321,8 @@ def is_implausible_text_density(text: str, duration_seconds: float | None) -> bo
     if chars < 100:
         return False
     return chars / duration_seconds > 40.0
+
+
 def has_json_envelope_leak(text: str) -> bool:
     """True if the text contains >=2 distinct STT-response JSON keys.
 
@@ -300,6 +331,20 @@ def has_json_envelope_leak(text: str) -> bool:
     term won't fire (needs at least two co-occurring quoted keys).
     """
     return sum(1 for k in JSON_ENVELOPE_KEYS if k in text) >= 2
+
+
+def has_instruction_echo(text: str) -> bool:
+    """Mirror of `contains_instruction_echo` in main.rs."""
+    normalized = " ".join(text.split()).lower()
+    strong_count = sum(
+        1 for marker in INSTRUCTION_ECHO_STRONG_MARKERS if marker in normalized
+    )
+    if strong_count >= 2:
+        return True
+    weak_count = sum(
+        1 for marker in INSTRUCTION_ECHO_WEAK_MARKERS if marker in normalized
+    )
+    return strong_count >= 1 and weak_count >= 2
 
 
 def is_loop_hallucination(text: str) -> bool:
@@ -400,6 +445,8 @@ def classify_vtt(body: str, *, check_empty: bool) -> str | None:
     text = vtt_spoken_text(body)
     if has_json_envelope_leak(text):
         return "json_envelope_leak"
+    if has_instruction_echo(text):
+        return "instruction_echo"
     if check_empty and is_empty_text(text):
         return "empty"
     duration_seconds = vtt_max_end_seconds(body)

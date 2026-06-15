@@ -47,6 +47,46 @@ class RepairRecentBadVttsTests(unittest.TestCase):
 
         self.assertFalse(detector(body))
 
+    def test_detects_instruction_echo_vtt_body(self):
+        module = load_script_module(self)
+        detector = getattr(module, "is_bad_vtt_body", None)
+        self.assertIsNotNone(detector, "is_bad_vtt_body should exist")
+
+        body = (
+            "WEBVTT\n\n1\n00:00:00.000 --> 00:00:07.000\n"
+            "Well, that's not really freedom now, is it? a single JSON array. "
+            "Do not include any extra text outside of the JSON string. "
+            "When producing JSON you must follow the schema provided in the context.\n"
+        )
+
+        self.assertTrue(detector(body))
+
+    def test_ignores_technical_json_speech(self):
+        module = load_script_module(self)
+        detector = getattr(module, "is_bad_vtt_body", None)
+        self.assertIsNotNone(detector, "is_bad_vtt_body should exist")
+
+        body = (
+            "WEBVTT\n\n1\n00:00:00.000 --> 00:00:08.000\n"
+            "Today we're comparing a JSON array with a JSON object and explaining "
+            "why valid JSON matters for API compatibility.\n"
+        )
+
+        self.assertFalse(detector(body))
+
+    def test_ignores_overlapping_schema_speech(self):
+        module = load_script_module(self)
+        detector = getattr(module, "is_bad_vtt_body", None)
+        self.assertIsNotNone(detector, "is_bad_vtt_body should exist")
+
+        body = (
+            "WEBVTT\n\n1\n00:00:00.000 --> 00:00:08.000\n"
+            "In our API docs, follow the schema provided for each endpoint "
+            "before sending the request body.\n"
+        )
+
+        self.assertFalse(detector(body))
+
     def test_collects_recent_media_hashes_with_age_filter_and_dedupe(self):
         module = load_script_module(self)
         collector = getattr(module, "collect_recent_media_hashes", None)

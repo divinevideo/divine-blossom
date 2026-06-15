@@ -1799,6 +1799,14 @@ async fn process_transcribe(
             );
             ParsedVtt::empty(audio_analysis.duration_ms)
         }
+        Some(TranscriptDropReason::InstructionEcho) => {
+            warn!(
+                hash,
+                text_preview = %first_chars(&parsed_vtt.text, 120),
+                "Dropping transcript with leaked output-format instructions"
+            );
+            ParsedVtt::empty(audio_analysis.duration_ms)
+        }
         None => parsed_vtt,
     };
 
@@ -3240,6 +3248,7 @@ enum TranscriptDropReason {
     LowSignalHeuristic,
     LoopHallucination,
     ImplausibleTextDensity,
+    InstructionEcho,
 }
 
 fn transcript_drop_reason(
@@ -3274,11 +3283,68 @@ fn transcript_drop_reason(
         return Some(TranscriptDropReason::LoopHallucination);
     }
 
+    if contains_instruction_echo(&parsed_vtt.text) {
+        return Some(TranscriptDropReason::InstructionEcho);
+    }
+
     if should_drop_low_signal_transcript(audio, parsed_vtt) {
         return Some(TranscriptDropReason::LowSignalHeuristic);
     }
 
     None
+}
+
+/// Detect model output-format instructions that leaked into caption text.
+///
+/// This intentionally requires multiple prompt/schema-derived phrases. Common
+/// technical speech such as "valid JSON" or "JSON array" alone must not trip a
+/// universal provider guard.
+fn contains_instruction_echo(text: &str) -> bool {
+    let normalized = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+
+    const STRONG_MARKERS: &[&str] = &[
+        "<bcp47>",
+        "<seconds>",
+        "<spoken words>",
+        "output requirements",
+        "follow the schema",
+        "provided in the context",
+        "extra text outside",
+        "outside of the json",
+        "do not include any extra text",
+        "return only a json",
+        "only a json object",
+        "single json array",
+        "spoken words transcribed verbatim",
+        "text field of every segment",
+    ];
+    const WEAK_MARKERS: &[&str] = &[
+        "valid json",
+        "json array",
+        "json object",
+        "json string",
+        "markdown",
+        "code fences",
+        "response schema",
+    ];
+
+    let strong_count = STRONG_MARKERS
+        .iter()
+        .filter(|marker| normalized.contains(**marker))
+        .count();
+    if strong_count >= 2 {
+        return true;
+    }
+
+    let weak_count = WEAK_MARKERS
+        .iter()
+        .filter(|marker| normalized.contains(**marker))
+        .count();
+    strong_count >= 1 && weak_count >= 2
 }
 
 /// Drop when the transcript contains more text than is physically utterable
@@ -3419,7 +3485,7 @@ async fn finalize_transcript(
 mod tests {
     use super::{
         build_transcode_status_webhook_payload, classify_audio_extract_error,
-        decide_transcript_lock_action, identity_token_cache_for_audience,
+        contains_instruction_echo, decide_transcript_lock_action, identity_token_cache_for_audience,
         is_empty_transcript_normalize_error, is_implausible_text_density, is_loop_hallucination,
         is_retryable_provider_failure, normalize_transcript_to_vtt, parakeet_request_url,
         parse_audio_analysis_output, parse_provider_status, retry_delay_for_attempt,
@@ -4044,6 +4110,59 @@ mod tests {
         // but the floor avoids false positives on tiny clips.
         let text = "x".repeat(99);
         assert!(!is_implausible_text_density(&text, 1));
+    }
+
+    #[test]
+    fn instruction_echo_guard_flags_prompt_schema_leak() {
+        let bad = "Well, that's not really freedom now, is it, you freaking idiot? \
+            a single JSON array. Do not include any extra text outside of the JSON string. \
+            When producing JSON you must follow the schema provided in the context.";
+        assert!(contains_instruction_echo(bad));
+    }
+
+    #[test]
+    fn instruction_echo_guard_passes_single_technical_marker() {
+        let tech_talk = "Today we're comparing a JSON array with a JSON object and explaining \
+            why valid JSON matters for API compatibility.";
+        assert!(!contains_instruction_echo(tech_talk));
+    }
+
+    #[test]
+    fn instruction_echo_guard_passes_overlapping_schema_speech() {
+        let tech_talk = "In our API docs, follow the schema provided for each endpoint \
+            before sending the request body.";
+        assert!(!contains_instruction_echo(tech_talk));
+    }
+
+    #[test]
+    fn instruction_echo_guard_passes_normal_speech() {
+        assert!(!contains_instruction_echo(
+            "Well, that's not really freedom now, is it? I think people deserve better."
+        ));
+    }
+
+    #[test]
+    fn transcript_drop_reason_flags_instruction_echo() {
+        let text = "Return only a JSON object. The text field of every segment must contain \
+            only the spoken words transcribed verbatim.";
+        let parsed = ParsedVtt {
+            content: format!("WEBVTT\n\n1\n00:00:00.000 --> 00:00:08.000\n{}\n\n", text),
+            text: text.to_string(),
+            language: None,
+            duration_ms: 8_000,
+            cue_count: 1,
+            confidence: None,
+        };
+        let analysis = AudioAnalysis {
+            duration_ms: 8_000,
+            silent_duration_ms: 0,
+            mean_volume_db: Some(-20.0),
+            max_volume_db: Some(-4.0),
+        };
+        assert_eq!(
+            transcript_drop_reason(&analysis, &parsed),
+            Some(TranscriptDropReason::InstructionEcho)
+        );
     }
 
     /// Real-world failure from production: a 6-second clip Gemini transcribed
