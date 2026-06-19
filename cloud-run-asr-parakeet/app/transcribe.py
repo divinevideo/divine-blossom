@@ -83,7 +83,19 @@ class ParakeetTranscriber:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
             f.write(audio_bytes)
             f.flush()
-            hyps = self._model.transcribe([f.name], timestamps=True)
+            try:
+                hyps = self._model.transcribe([f.name], timestamps=True)
+            except Exception as exc:
+                # NeMo's compute_rnnt_timestamps → get_words_offsets crashes on
+                # degenerate TDT hypotheses (silent / music / non-speech audio).
+                # Retry without word timestamps so we still return any text the
+                # decoder produced; downstream emits an empty VTT stub if blank.
+                logger.warning(
+                    "Parakeet timestamped transcribe failed (%s: %s); retrying without timestamps",
+                    type(exc).__name__,
+                    exc,
+                )
+                hyps = self._model.transcribe([f.name], timestamps=False)
 
         if not hyps:
             return TranscriptionResult(language=language, segments=[])
