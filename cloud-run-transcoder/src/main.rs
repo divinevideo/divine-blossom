@@ -3338,8 +3338,8 @@ fn distinct_marker_phrases(normalized: &str, markers: &[&str]) -> usize {
 ///
 /// This intentionally requires multiple *distinct* prompt/schema-derived
 /// phrases (see `distinct_marker_phrases`). Common technical speech such as
-/// "valid JSON" or "JSON array" alone — or a single contiguous instruction
-/// sentence — must not trip a universal provider guard.
+/// "valid JSON", "JSON array", or "response schema" — or a single contiguous
+/// instruction sentence — must not trip a universal provider guard.
 fn contains_instruction_echo(text: &str) -> bool {
     let normalized = text
         .split_whitespace()
@@ -3363,23 +3363,7 @@ fn contains_instruction_echo(text: &str) -> bool {
         "spoken words transcribed verbatim",
         "text field of every segment",
     ];
-    const WEAK_MARKERS: &[&str] = &[
-        "valid json",
-        "json array",
-        "json object",
-        "json string",
-        "markdown",
-        "code fences",
-        "response schema",
-    ];
-
-    let strong_count = distinct_marker_phrases(&normalized, STRONG_MARKERS);
-    if strong_count >= 2 {
-        return true;
-    }
-
-    let weak_count = distinct_marker_phrases(&normalized, WEAK_MARKERS);
-    strong_count >= 1 && weak_count >= 2
+    distinct_marker_phrases(&normalized, STRONG_MARKERS) >= 2
 }
 
 /// Drop when the transcript contains more text than is physically utterable
@@ -4166,6 +4150,13 @@ mod tests {
     fn instruction_echo_guard_passes_overlapping_schema_speech() {
         let tech_talk = "In our API docs, follow the schema provided for each endpoint \
             before sending the request body.";
+        assert!(!contains_instruction_echo(tech_talk));
+    }
+
+    #[test]
+    fn instruction_echo_guard_passes_one_strong_with_weak_json_terms() {
+        let tech_talk = "Follow the schema for this endpoint: it returns a JSON array, \
+            accepts a JSON object, and the docs call this the response schema.";
         assert!(!contains_instruction_echo(tech_talk));
     }
 

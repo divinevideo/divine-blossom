@@ -87,6 +87,19 @@ class RepairRecentBadVttsTests(unittest.TestCase):
 
         self.assertFalse(detector(body))
 
+    def test_ignores_one_strong_with_weak_json_terms(self):
+        module = load_script_module(self)
+        detector = getattr(module, "is_bad_vtt_body", None)
+        self.assertIsNotNone(detector, "is_bad_vtt_body should exist")
+
+        body = (
+            "WEBVTT\n\n1\n00:00:00.000 --> 00:00:08.000\n"
+            "Follow the schema for this endpoint: it returns a JSON array, "
+            "accepts a JSON object, and the docs call this the response schema.\n"
+        )
+
+        self.assertFalse(detector(body))
+
     def test_ignores_overlapping_strong_markers(self):
         # Ordinary speech where several STRONG markers overlap inside one
         # contiguous clause must not trip the gate (cluster counting).

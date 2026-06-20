@@ -50,7 +50,7 @@ JSON_ENVELOPE_KEYS = (
 
 # Mirrors cloud-run-transcoder/src/main.rs `contains_instruction_echo`.
 # Keep these markers conservative: common technical speech about JSON should
-# not trigger a repair unless prompt/schema-specific phrasing also leaked.
+# not trigger a repair unless multiple prompt/schema-specific phrases leaked.
 INSTRUCTION_ECHO_STRONG_MARKERS = (
     "<bcp47>",
     "<seconds>",
@@ -66,15 +66,6 @@ INSTRUCTION_ECHO_STRONG_MARKERS = (
     "single json array",
     "spoken words transcribed verbatim",
     "text field of every segment",
-)
-INSTRUCTION_ECHO_WEAK_MARKERS = (
-    "valid json",
-    "json array",
-    "json object",
-    "json string",
-    "markdown",
-    "code fences",
-    "response schema",
 )
 
 # Mirrors cloud-run-transcoder/src/main.rs `is_loop_hallucination` and
@@ -364,11 +355,7 @@ def distinct_marker_phrases(normalized: str, markers: Iterable[str]) -> int:
 def has_instruction_echo(text: str) -> bool:
     """Mirror of `contains_instruction_echo` in main.rs."""
     normalized = " ".join(text.split()).lower()
-    strong_count = distinct_marker_phrases(normalized, INSTRUCTION_ECHO_STRONG_MARKERS)
-    if strong_count >= 2:
-        return True
-    weak_count = distinct_marker_phrases(normalized, INSTRUCTION_ECHO_WEAK_MARKERS)
-    return strong_count >= 1 and weak_count >= 2
+    return distinct_marker_phrases(normalized, INSTRUCTION_ECHO_STRONG_MARKERS) >= 2
 
 
 def is_loop_hallucination(text: str) -> bool:
