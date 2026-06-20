@@ -48,6 +48,26 @@ JSON_ENVELOPE_KEYS = (
     '"results":',
 )
 
+# Mirrors cloud-run-transcoder/src/main.rs `contains_instruction_echo`.
+# Keep this list byte-identical with the Rust STRONG_MARKERS (CI asserts parity).
+# Every marker is high-specificity: a literal template token or a verbatim
+# prompt/responseSchema clause that does not occur in ordinary speech. Generic
+# English fragments that were merely substrings of a leaked clause were removed
+# so legitimate developer/API speech is never dropped (a drop is terminal —
+# empty VTT, status=complete, edge-cached, no auto-retranscribe).
+INSTRUCTION_ECHO_STRONG_MARKERS = (
+    "<bcp47>",
+    "<seconds>",
+    "<spoken words>",
+    "do not include any extra text",
+    "extra text outside",
+    "outside of the json",
+    "single json array",
+    "follow the schema provided in the context",
+    "spoken words transcribed verbatim",
+    "text field of every segment",
+)
+
 # Mirrors cloud-run-transcoder/src/main.rs `is_loop_hallucination` and
 # `is_repeated_phrase_hallucination`. Keep parameters in lockstep so the
 # scanner flags exactly what the deployed service would reject.
@@ -292,6 +312,8 @@ def is_implausible_text_density(text: str, duration_seconds: float | None) -> bo
     if chars < 100:
         return False
     return chars / duration_seconds > 40.0
+
+
 def has_json_envelope_leak(text: str) -> bool:
     """True if the text contains >=2 distinct STT-response JSON keys.
 
@@ -300,6 +322,51 @@ def has_json_envelope_leak(text: str) -> bool:
     term won't fire (needs at least two co-occurring quoted keys).
     """
     return sum(1 for k in JSON_ENVELOPE_KEYS if k in text) >= 2
+
+
+def distinct_marker_phrases(normalized: str, markers: Iterable[str]) -> int:
+    """Mirror of `distinct_marker_phrases` in main.rs.
+
+    Collect every marker match span, then merge spans that overlap or are
+    separated only by whitespace, so one contiguous instruction sentence
+    counts as a single phrase. This keeps the threshold meaning "multiple
+    distinct phrases" instead of inflating on overlapping markers.
+    """
+    spans: list[tuple[int, int]] = []
+    for marker in markers:
+        start = normalized.find(marker)
+        while start != -1:
+            spans.append((start, start + len(marker)))
+            start = normalized.find(marker, start + 1)
+    if not spans:
+        return 0
+    spans.sort()
+    clusters = 1
+    cluster_end = spans[0][1]
+    for start, end in spans[1:]:
+        if start <= cluster_end or not normalized[cluster_end:start].strip():
+            cluster_end = max(cluster_end, end)
+        else:
+            clusters += 1
+            cluster_end = end
+    return clusters
+
+
+def normalize_for_marker_scan(text: str) -> str:
+    """Mirror of `normalize_for_marker_scan` in main.rs.
+
+    Map every C0 control char (U+0000-U+001F) to a space before collapsing
+    whitespace so this matches Rust's `split_whitespace` (Unicode White_Space,
+    which excludes U+001C-U+001F) byte-for-byte.
+    """
+    cleaned = "".join(" " if ord(ch) < 0x20 else ch for ch in text)
+    return " ".join(cleaned.split()).lower()
+
+
+def has_instruction_echo(text: str) -> bool:
+    """Mirror of `contains_instruction_echo` in main.rs."""
+    normalized = normalize_for_marker_scan(text)
+    return distinct_marker_phrases(normalized, INSTRUCTION_ECHO_STRONG_MARKERS) >= 2
 
 
 def is_loop_hallucination(text: str) -> bool:
@@ -400,6 +467,8 @@ def classify_vtt(body: str, *, check_empty: bool) -> str | None:
     text = vtt_spoken_text(body)
     if has_json_envelope_leak(text):
         return "json_envelope_leak"
+    if has_instruction_echo(text):
+        return "instruction_echo"
     if check_empty and is_empty_text(text):
         return "empty"
     duration_seconds = vtt_max_end_seconds(body)
