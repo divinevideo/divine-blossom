@@ -89,6 +89,63 @@ class ScanAndRepairVttsTests(unittest.TestCase):
 
         self.assertIsNone(classifier(body, check_empty=False))
 
+    def test_ignores_split_generic_schema_speech(self):
+        # Generic fragments that were once markers ("output requirements",
+        # "follow the schema", "provided in the context") must not drop a
+        # legitimate transcript when ordinary words separate them.
+        module = load_script_module(self)
+        classifier = getattr(module, "classify_vtt", None)
+        self.assertIsNotNone(classifier, "classify_vtt should exist")
+
+        for spoken in (
+            "Our API output requirements changed, so please follow the schema "
+            "in the new docs.",
+            "You should follow the schema that was provided in the context of "
+            "the previous lesson.",
+            "Our output requirements say to return only a JSON object for each "
+            "user record.",
+        ):
+            body = f"WEBVTT\n\n1\n00:00:00.000 --> 00:00:08.000\n{spoken}\n"
+            self.assertIsNone(
+                classifier(body, check_empty=False),
+                f"legitimate speech must not classify as bad: {spoken!r}",
+            )
+
+    def test_marker_scan_normalizes_c0_controls(self):
+        # A single contiguous instruction split only by a C0 control char is
+        # one phrase, matching the Rust gate's control normalization.
+        module = load_script_module(self)
+        has_echo = getattr(module, "has_instruction_echo", None)
+        self.assertIsNotNone(has_echo, "has_instruction_echo should exist")
+        self.assertFalse(
+            has_echo("do not include any extra text\x1coutside of the json")
+        )
+
+
+class MarkerParityTests(unittest.TestCase):
+    """The Rust gate and the Python scanner must use the same marker list."""
+
+    def test_rust_and_python_strong_markers_match(self):
+        module = load_script_module(self)
+        python_markers = tuple(module.INSTRUCTION_ECHO_STRONG_MARKERS)
+
+        rust_path = SCRIPT_PATH.parent / "src" / "main.rs"
+        source = rust_path.read_text(encoding="utf-8")
+        marker = "const STRONG_MARKERS: &[&str] = &["
+        start = source.index(marker) + len(marker)
+        end = source.index("];", start)
+        rust_markers = tuple(
+            line.strip().strip(",").strip('"')
+            for line in source[start:end].splitlines()
+            if line.strip()
+        )
+
+        self.assertEqual(
+            rust_markers,
+            python_markers,
+            "STRONG_MARKERS drifted between main.rs and scan_and_repair_vtts.py",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

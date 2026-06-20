@@ -35,6 +35,13 @@ jobs:
       - name: Run upload service tests
         run: cargo test --manifest-path cloud-run-upload/Cargo.toml --locked
 
+      - name: Run transcoder service tests
+        run: cargo test --manifest-path cloud-run-transcoder/Cargo.toml --locked
+
+      - name: Run transcoder Python tests
+        working-directory: cloud-run-transcoder
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
+
       - name: Run clippy
         run: cargo clippy --locked --all-targets --all-features
 

@@ -49,21 +49,21 @@ JSON_ENVELOPE_KEYS = (
 )
 
 # Mirrors cloud-run-transcoder/src/main.rs `contains_instruction_echo`.
-# Keep these markers conservative: common technical speech about JSON should
-# not trigger a repair unless multiple prompt/schema-specific phrases leaked.
+# Keep this list byte-identical with the Rust STRONG_MARKERS (CI asserts parity).
+# Every marker is high-specificity: a literal template token or a verbatim
+# prompt/responseSchema clause that does not occur in ordinary speech. Generic
+# English fragments that were merely substrings of a leaked clause were removed
+# so legitimate developer/API speech is never dropped (a drop is terminal —
+# empty VTT, status=complete, edge-cached, no auto-retranscribe).
 INSTRUCTION_ECHO_STRONG_MARKERS = (
     "<bcp47>",
     "<seconds>",
     "<spoken words>",
-    "output requirements",
-    "follow the schema",
-    "provided in the context",
+    "do not include any extra text",
     "extra text outside",
     "outside of the json",
-    "do not include any extra text",
-    "return only a json",
-    "only a json object",
     "single json array",
+    "follow the schema provided in the context",
     "spoken words transcribed verbatim",
     "text field of every segment",
 )
@@ -352,9 +352,20 @@ def distinct_marker_phrases(normalized: str, markers: Iterable[str]) -> int:
     return clusters
 
 
+def normalize_for_marker_scan(text: str) -> str:
+    """Mirror of `normalize_for_marker_scan` in main.rs.
+
+    Map every C0 control char (U+0000-U+001F) to a space before collapsing
+    whitespace so this matches Rust's `split_whitespace` (Unicode White_Space,
+    which excludes U+001C-U+001F) byte-for-byte.
+    """
+    cleaned = "".join(" " if ord(ch) < 0x20 else ch for ch in text)
+    return " ".join(cleaned.split()).lower()
+
+
 def has_instruction_echo(text: str) -> bool:
     """Mirror of `contains_instruction_echo` in main.rs."""
-    normalized = " ".join(text.split()).lower()
+    normalized = normalize_for_marker_scan(text)
     return distinct_marker_phrases(normalized, INSTRUCTION_ECHO_STRONG_MARKERS) >= 2
 
 

@@ -133,6 +133,28 @@ class RepairRecentBadVttsTests(unittest.TestCase):
 
         self.assertTrue(detector(body))
 
+    def test_ignores_split_generic_schema_speech(self):
+        # Generic fragments that were once markers must not flag a legitimate
+        # transcript for repair when ordinary words separate them. A false
+        # positive here force-retranscribes a good caption.
+        module = load_script_module(self)
+        detector = getattr(module, "is_bad_vtt_body", None)
+        self.assertIsNotNone(detector, "is_bad_vtt_body should exist")
+
+        for spoken in (
+            "Our API output requirements changed, so please follow the schema "
+            "in the new docs.",
+            "You should follow the schema that was provided in the context of "
+            "the previous lesson.",
+            "Our output requirements say to return only a JSON object for each "
+            "user record.",
+        ):
+            body = f"WEBVTT\n\n1\n00:00:00.000 --> 00:00:08.000\n{spoken}\n"
+            self.assertFalse(
+                detector(body),
+                f"legitimate speech must not be flagged: {spoken!r}",
+            )
+
     def test_collects_recent_media_hashes_with_age_filter_and_dedupe(self):
         module = load_script_module(self)
         collector = getattr(module, "collect_recent_media_hashes", None)

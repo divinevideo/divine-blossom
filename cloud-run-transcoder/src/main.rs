@@ -3340,30 +3340,52 @@ fn distinct_marker_phrases(normalized: &str, markers: &[&str]) -> usize {
 /// phrases (see `distinct_marker_phrases`). Common technical speech such as
 /// "valid JSON", "JSON array", or "response schema" — or a single contiguous
 /// instruction sentence — must not trip a universal provider guard.
+///
+/// Every marker below is high-specificity: a literal template token
+/// (`<bcp47>`), or a verbatim prompt/`responseSchema` clause that does not
+/// occur in ordinary speech. Generic English fragments that happened to be
+/// substrings of a leaked clause ("output requirements", "follow the schema",
+/// "provided in the context", "return only a json", "only a json object")
+/// were deliberately removed: split out of their leaked sentence they fire on
+/// legitimate developer/API speech ("our output requirements changed, follow
+/// the schema in the docs"), and because a drop is terminal (empty VTT →
+/// status=complete → edge-cached, no auto-retranscribe) a false positive is
+/// permanent caption loss. The real #134 leak still carries several of the
+/// retained phrases, so detection is unaffected.
 fn contains_instruction_echo(text: &str) -> bool {
-    let normalized = text
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase();
+    let normalized = normalize_for_marker_scan(text);
 
     const STRONG_MARKERS: &[&str] = &[
         "<bcp47>",
         "<seconds>",
         "<spoken words>",
-        "output requirements",
-        "follow the schema",
-        "provided in the context",
+        "do not include any extra text",
         "extra text outside",
         "outside of the json",
-        "do not include any extra text",
-        "return only a json",
-        "only a json object",
         "single json array",
+        "follow the schema provided in the context",
         "spoken words transcribed verbatim",
         "text field of every segment",
     ];
     distinct_marker_phrases(&normalized, STRONG_MARKERS) >= 2
+}
+
+/// Collapse whitespace and lowercase for marker scanning, mapping every C0
+/// control char (U+0000–U+001F) to a space first. Python's `str.split()`
+/// treats U+001C–U+001F as whitespace but Rust's `split_whitespace()` (Unicode
+/// White_Space) does not, so without this the Rust gate and the Python scanner
+/// would cluster the same bytes differently. Normalizing controls up front
+/// keeps the two implementations byte-for-byte identical.
+fn normalize_for_marker_scan(text: &str) -> String {
+    let cleaned: String = text
+        .chars()
+        .map(|c| if (c as u32) < 0x20 { ' ' } else { c })
+        .collect();
+    cleaned
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 /// Drop when the transcript contains more text than is physically utterable
@@ -4172,6 +4194,34 @@ mod tests {
         // is one phrase, not three — needs a second distinct phrase to fire.
         assert!(!contains_instruction_echo(
             "Do not include any extra text outside of the JSON string."
+        ));
+    }
+
+    #[test]
+    fn instruction_echo_guard_passes_split_generic_schema_speech() {
+        // Generic English fragments ("output requirements", "follow the
+        // schema", "provided in the context") that were once markers fire on
+        // legitimate developer/API speech when ordinary words separate them.
+        // Pruning them to the contiguous leaked clause keeps these transcripts.
+        for legit in [
+            "Our API output requirements changed, so please follow the schema in the new docs.",
+            "You should follow the schema that was provided in the context of the previous lesson.",
+            "Our output requirements say to return only a JSON object for each user record.",
+        ] {
+            assert!(
+                !contains_instruction_echo(legit),
+                "legitimate speech must not drop: {legit}"
+            );
+        }
+    }
+
+    #[test]
+    fn instruction_echo_guard_normalizes_c0_controls() {
+        // C0 control chars between two markers must be treated as whitespace so
+        // the Rust gate and the Python scanner cluster identically. A single
+        // contiguous instruction split only by a control char is one phrase.
+        assert!(!contains_instruction_echo(
+            "do not include any extra text\u{1c}outside of the json"
         ));
     }
 
