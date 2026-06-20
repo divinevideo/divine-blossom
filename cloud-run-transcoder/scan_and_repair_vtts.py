@@ -333,17 +333,41 @@ def has_json_envelope_leak(text: str) -> bool:
     return sum(1 for k in JSON_ENVELOPE_KEYS if k in text) >= 2
 
 
+def distinct_marker_phrases(normalized: str, markers: Iterable[str]) -> int:
+    """Mirror of `distinct_marker_phrases` in main.rs.
+
+    Collect every marker match span, then merge spans that overlap or are
+    separated only by whitespace, so one contiguous instruction sentence
+    counts as a single phrase. This keeps the threshold meaning "multiple
+    distinct phrases" instead of inflating on overlapping markers.
+    """
+    spans: list[tuple[int, int]] = []
+    for marker in markers:
+        start = normalized.find(marker)
+        while start != -1:
+            spans.append((start, start + len(marker)))
+            start = normalized.find(marker, start + 1)
+    if not spans:
+        return 0
+    spans.sort()
+    clusters = 1
+    cluster_end = spans[0][1]
+    for start, end in spans[1:]:
+        if start <= cluster_end or not normalized[cluster_end:start].strip():
+            cluster_end = max(cluster_end, end)
+        else:
+            clusters += 1
+            cluster_end = end
+    return clusters
+
+
 def has_instruction_echo(text: str) -> bool:
     """Mirror of `contains_instruction_echo` in main.rs."""
     normalized = " ".join(text.split()).lower()
-    strong_count = sum(
-        1 for marker in INSTRUCTION_ECHO_STRONG_MARKERS if marker in normalized
-    )
+    strong_count = distinct_marker_phrases(normalized, INSTRUCTION_ECHO_STRONG_MARKERS)
     if strong_count >= 2:
         return True
-    weak_count = sum(
-        1 for marker in INSTRUCTION_ECHO_WEAK_MARKERS if marker in normalized
-    )
+    weak_count = distinct_marker_phrases(normalized, INSTRUCTION_ECHO_WEAK_MARKERS)
     return strong_count >= 1 and weak_count >= 2
 
 

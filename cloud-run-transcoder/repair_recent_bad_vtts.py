@@ -11,45 +11,25 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from urllib import error, parse, request
+
+# Share one definition of the quality heuristics with the scanner so the two
+# operator tools (and their marker lists) cannot drift apart. The scan module
+# is a sibling script with no import-time side effects.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from scan_and_repair_vtts import (  # noqa: E402
+    has_instruction_echo,
+    has_json_artifact,
+    has_json_envelope_leak,
+    vtt_spoken_text,
+)
 
 
 RELAY_API = "https://relay.divine.video/api"
 MEDIA_URL = "https://media.divine.video"
 REQUEST_TIMEOUT = 30
-JSON_CORRUPTION_MARKERS = (
-    '"total_tokens"',
-    '"usage":{',
-    '"prompt_tokens"',
-    '"completion_tokens"',
-    '"finish_reason"',
-)
-INSTRUCTION_ECHO_STRONG_MARKERS = (
-    "<bcp47>",
-    "<seconds>",
-    "<spoken words>",
-    "output requirements",
-    "follow the schema",
-    "provided in the context",
-    "extra text outside",
-    "outside of the json",
-    "do not include any extra text",
-    "return only a json",
-    "only a json object",
-    "single json array",
-    "spoken words transcribed verbatim",
-    "text field of every segment",
-)
-INSTRUCTION_ECHO_WEAK_MARKERS = (
-    "valid json",
-    "json array",
-    "json object",
-    "json string",
-    "markdown",
-    "code fences",
-    "response schema",
-)
 USER_AGENT = "divine-blossom/repair_recent_bad_vtts"
 
 
@@ -111,26 +91,26 @@ def collect_recent_media_hashes(
     return hashes
 
 
+def bad_vtt_reason(body: str) -> str | None:
+    """Classify a VTT body the same way the deployed gate and scanner do.
+
+    Detectors run on the *spoken* text (not the raw body) so a leaked
+    instruction split across cue boundaries — the normal one-cue-per-segment
+    shape — is still seen as a contiguous phrase. Returns a short reason
+    string for the operator log, or None when the body looks clean.
+    """
+    if has_json_artifact(body):
+        return "json_artifact"
+    spoken = vtt_spoken_text(body)
+    if has_json_envelope_leak(spoken):
+        return "json_envelope_leak"
+    if has_instruction_echo(spoken):
+        return "instruction_echo"
+    return None
+
+
 def is_bad_vtt_body(body: str) -> bool:
-    return has_json_artifact(body) or has_instruction_echo(body)
-
-
-def has_json_artifact(body: str) -> bool:
-    return any(marker in body for marker in JSON_CORRUPTION_MARKERS)
-
-
-def has_instruction_echo(text: str) -> bool:
-    """Mirror of cloud-run-transcoder/src/main.rs `contains_instruction_echo`."""
-    normalized = " ".join(text.split()).lower()
-    strong_count = sum(
-        1 for marker in INSTRUCTION_ECHO_STRONG_MARKERS if marker in normalized
-    )
-    if strong_count >= 2:
-        return True
-    weak_count = sum(
-        1 for marker in INSTRUCTION_ECHO_WEAK_MARKERS if marker in normalized
-    )
-    return strong_count >= 1 and weak_count >= 2
+    return bad_vtt_reason(body) is not None
 
 
 def is_empty_vtt_body(body: str) -> bool:
@@ -342,16 +322,16 @@ def main() -> int:
                 print(f"SKIP {media_hash}: vtt status={status}")
             continue
 
-        bad_vtt = is_bad_vtt_body(body)
+        reason = bad_vtt_reason(body)
         empty_vtt = args.check_empty and is_empty_vtt_body(body)
-        if not bad_vtt and not empty_vtt:
+        if reason is None and not empty_vtt:
             summary.clean_vtts += 1
             if args.verbose:
                 print(f"CLEAN {media_hash}")
             continue
 
         summary.bad_vtts += 1
-        reason = "json" if bad_vtt else "empty"
+        reason = reason or "empty"
         print(f"BAD {media_hash}: {reason}")
 
         if args.dry_run:

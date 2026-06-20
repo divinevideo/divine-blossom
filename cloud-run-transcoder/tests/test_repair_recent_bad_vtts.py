@@ -87,6 +87,39 @@ class RepairRecentBadVttsTests(unittest.TestCase):
 
         self.assertFalse(detector(body))
 
+    def test_ignores_overlapping_strong_markers(self):
+        # Ordinary speech where several STRONG markers overlap inside one
+        # contiguous clause must not trip the gate (cluster counting).
+        module = load_script_module(self)
+        detector = getattr(module, "is_bad_vtt_body", None)
+        self.assertIsNotNone(detector, "is_bad_vtt_body should exist")
+
+        body = (
+            "WEBVTT\n\n1\n00:00:00.000 --> 00:00:08.000\n"
+            "The endpoint should return only a JSON object with the user's data.\n"
+        )
+
+        self.assertFalse(detector(body))
+
+    def test_detects_instruction_echo_split_across_cues(self):
+        # The normal Gemini path emits one cue per segment, so a leaked
+        # instruction is split across cue boundaries. Detecting on spoken
+        # text (not the raw body) keeps the phrases contiguous.
+        module = load_script_module(self)
+        detector = getattr(module, "is_bad_vtt_body", None)
+        self.assertIsNotNone(detector, "is_bad_vtt_body should exist")
+
+        body = (
+            "WEBVTT\n\n"
+            "1\n00:00:00.000 --> 00:00:03.000\na single JSON array.\n\n"
+            "2\n00:00:03.000 --> 00:00:06.000\n"
+            "Do not include any extra text outside of the JSON string.\n\n"
+            "3\n00:00:06.000 --> 00:00:09.000\n"
+            "Follow the schema provided in the context.\n"
+        )
+
+        self.assertTrue(detector(body))
+
     def test_collects_recent_media_hashes_with_age_filter_and_dedupe(self):
         module = load_script_module(self)
         collector = getattr(module, "collect_recent_media_hashes", None)

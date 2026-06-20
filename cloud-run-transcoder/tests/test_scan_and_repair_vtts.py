@@ -62,6 +62,20 @@ class ScanAndRepairVttsTests(unittest.TestCase):
 
         self.assertIsNone(classifier(body, check_empty=False))
 
+    def test_ignores_overlapping_strong_markers(self):
+        # Several STRONG markers overlapping inside one contiguous clause must
+        # not reach the >=2 threshold (cluster counting, not raw substring hits).
+        module = load_script_module(self)
+        classifier = getattr(module, "classify_vtt", None)
+        self.assertIsNotNone(classifier, "classify_vtt should exist")
+
+        body = (
+            "WEBVTT\n\n1\n00:00:00.000 --> 00:00:08.000\n"
+            "The endpoint should return only a JSON object with the user's data.\n"
+        )
+
+        self.assertIsNone(classifier(body, check_empty=False))
+
 
 if __name__ == "__main__":
     unittest.main()

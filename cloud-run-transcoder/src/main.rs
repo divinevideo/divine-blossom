@@ -3294,11 +3294,52 @@ fn transcript_drop_reason(
     None
 }
 
+/// Count distinct instruction-phrase clusters in `normalized`.
+///
+/// Collects every marker match span, then merges spans that overlap *or* are
+/// separated only by whitespace, so one contiguous instruction sentence counts
+/// as a single phrase rather than several. This is what makes the threshold in
+/// `contains_instruction_echo` mean "multiple distinct phrases": redundant,
+/// overlapping markers (e.g. "return only a json" + "only a json object" inside
+/// "return only a JSON object") collapse to one cluster instead of inflating the
+/// count and tripping the gate on ordinary speech.
+fn distinct_marker_phrases(normalized: &str, markers: &[&str]) -> usize {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for marker in markers {
+        let mut from = 0;
+        while let Some(rel) = normalized[from..].find(marker) {
+            let start = from + rel;
+            spans.push((start, start + marker.len()));
+            from = start + 1;
+        }
+    }
+    if spans.is_empty() {
+        return 0;
+    }
+    spans.sort_unstable();
+
+    let mut clusters = 1;
+    let mut cluster_end = spans[0].1;
+    for &(start, end) in &spans[1..] {
+        // Same cluster when overlapping, or separated only by whitespace
+        // (one contiguous instruction). A non-whitespace gap means another
+        // distinct phrase.
+        if start <= cluster_end || normalized[cluster_end..start].trim().is_empty() {
+            cluster_end = cluster_end.max(end);
+        } else {
+            clusters += 1;
+            cluster_end = end;
+        }
+    }
+    clusters
+}
+
 /// Detect model output-format instructions that leaked into caption text.
 ///
-/// This intentionally requires multiple prompt/schema-derived phrases. Common
-/// technical speech such as "valid JSON" or "JSON array" alone must not trip a
-/// universal provider guard.
+/// This intentionally requires multiple *distinct* prompt/schema-derived
+/// phrases (see `distinct_marker_phrases`). Common technical speech such as
+/// "valid JSON" or "JSON array" alone — or a single contiguous instruction
+/// sentence — must not trip a universal provider guard.
 fn contains_instruction_echo(text: &str) -> bool {
     let normalized = text
         .split_whitespace()
@@ -3332,18 +3373,12 @@ fn contains_instruction_echo(text: &str) -> bool {
         "response schema",
     ];
 
-    let strong_count = STRONG_MARKERS
-        .iter()
-        .filter(|marker| normalized.contains(**marker))
-        .count();
+    let strong_count = distinct_marker_phrases(&normalized, STRONG_MARKERS);
     if strong_count >= 2 {
         return true;
     }
 
-    let weak_count = WEAK_MARKERS
-        .iter()
-        .filter(|marker| normalized.contains(**marker))
-        .count();
+    let weak_count = distinct_marker_phrases(&normalized, WEAK_MARKERS);
     strong_count >= 1 && weak_count >= 2
 }
 
@@ -4132,6 +4167,21 @@ mod tests {
         let tech_talk = "In our API docs, follow the schema provided for each endpoint \
             before sending the request body.";
         assert!(!contains_instruction_echo(tech_talk));
+    }
+
+    #[test]
+    fn instruction_echo_guard_passes_overlapping_strong_markers() {
+        // Ordinary speech where several STRONG markers overlap inside one
+        // contiguous clause must not reach the >=2 threshold. Before the
+        // cluster fix this dropped a whole transcript on a single sentence.
+        assert!(!contains_instruction_echo(
+            "The endpoint should return only a JSON object with the user's data."
+        ));
+        // A single contiguous instruction phrase (three overlapping markers)
+        // is one phrase, not three — needs a second distinct phrase to fire.
+        assert!(!contains_instruction_echo(
+            "Do not include any extra text outside of the JSON string."
+        ));
     }
 
     #[test]
