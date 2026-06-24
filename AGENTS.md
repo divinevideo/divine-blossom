@@ -24,6 +24,23 @@
 - Public issues, PRs, branch names, screenshots, and descriptions must not mention corporate partners, customers, brands, campaign names, or other sensitive external identities unless a maintainer explicitly approves it. Use generic descriptors instead.
 - Respect the existing deployment rule: use `fastly compute publish` for Fastly deploys, not separate build and deploy commands.
 
+## Fastly Compute Deployment Rules
+
+**ALWAYS use `fastly compute publish` instead of `fastly compute build` + `fastly compute deploy`.** The `publish` command does build+deploy in a single atomic operation.
+
+### Deployment Workflow
+```bash
+fastly compute publish --comment "description" && fastly purge --all --service-id pOvEEWykEbpnylqst1KTrR
+```
+
+### Key Lessons
+- `fastly compute publish --comment "description"` is the correct way to deploy.
+- Do NOT use `fastly compute deploy` separately.
+- Local testing with `fastly compute serve` works correctly for verification.
+- **CRITICAL: Always purge after deploy!** Run `fastly purge --all --service-id pOvEEWykEbpnylqst1KTrR` after publishing.
+- **Propagation can be SLOW** — even after purge, Compute package propagation to all POPs can take several minutes. The version may show as "active" in the API but edge POPs may still serve old code. Be patient.
+- Remember it takes a few minutes for Fastly deploys to roll out; relax and let it happen.
+
 ## Pull Request Guardrails
 - PR titles must use Conventional Commit format: `type(scope): summary` or `type: summary`.
 - Set the correct PR title when opening the PR. Do not rely on fixing it later.
