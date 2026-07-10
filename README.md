@@ -278,3 +278,7 @@ a moderate/delete request.
 ## License
 
 MIT
+
+---
+
+Part of [Divine](https://divine.video) — your playground for human creativity · [Brand guidelines](https://github.com/divinevideo/brand-guidelines)
