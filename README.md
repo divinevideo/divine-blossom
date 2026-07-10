@@ -1,160 +1,193 @@
-# Fastly Blossom Server
+# Divine Blossom
 
-A [Blossom](https://github.com/hzrd149/blossom) media server for Nostr running on Fastly Compute, optimized for video content.
-
-## Architecture
-
-```
-Client → Fastly Compute (Rust WASM) → GCS (blobs) + Fastly KV (metadata)
-           ├── Cloud Run Upload (Rust) → GCS + Transcoder trigger
-           ├── Cloud Run Transcoder (Rust, NVIDIA GPU) → HLS segments to GCS
-           ├── Cloud Run Process-Blob (Python) → C2PA validation + SafeSearch moderation
-           └── Cloud Logging (audit trail)
-```
-
-- **Fastly Compute Edge** (`src/`) - Rust WASM service on Fastly. Handles uploads, metadata KV, HLS proxying, admin, provenance
-- **Cloud Run Upload** (`cloud-run-upload/`) - Rust service on GCP. Receives video bytes, sanitizes (ffmpeg -c copy), hashes, uploads to GCS, triggers transcoder, receives audit logs
-- **Cloud Run Transcoder** (`cloud-run-transcoder/`) - Rust service on GCP with NVIDIA GPU. Downloads from GCS, transcodes to HLS via FFmpeg NVENC, uploads segments back
-- **Cloud Run Process-Blob** (`cloud-functions/process-blob/`) - Python/Flask service on GCP. Triggered by GCS object finalization via Eventarc. Validates C2PA Content Credentials (c2patool) and runs SafeSearch moderation (Vision API), then updates Fastly KV metadata via webhook
-- **GCS bucket**: `divine-blossom-media`
-- **CDN**: `media.divine.video` (Fastly)
+Content-addressed media storage for the [Divine](https://divine.video) platform, implementing the [Blossom](https://github.com/hzrd149/blossom) protocol for Nostr on [Fastly Compute](https://www.fastly.com/products/edge-compute). Divine Blossom serves media at `media.divine.video`: blobs are addressed by their SHA-256 hash, uploads are authorized with signed Nostr events, and video is transcoded to adaptive HLS with generated transcripts. The Fastly edge service handles retrieval, auth, and admin; heavier work (large uploads, transcoding, speech-to-text, moderation) runs in companion Cloud Run services on GCP.
 
 ## Features
 
-- **BUD-01**: Blob retrieval (GET/HEAD)
-- **BUD-02**: Upload/delete/list management
-- **BUD-03**: User server list support
-- **Nostr auth**: Kind 24242 signature validation (Schnorr signatures)
-- **Shadow restriction**: Moderated content only visible to owner
-- **Range requests**: Native video seeking support
-- **HLS transcoding**: Multi-quality adaptive streaming (1080p, 720p, 480p, 360p)
-- **WebVTT transcripts**: Stable transcript URL at `/<sha256>.vtt` with async generation
-- **Provenance & audit**: Cryptographic proof of upload/delete authorship with Cloud Logging audit trail
-- **Tombstones**: Legal hold prevents re-upload of removed content
-- **Admin soft-delete**: DMCA/legal removal with full audit trail while preserving recoverable storage
-- **Admin restore**: Re-index and restore previously soft-deleted blobs
-- **C2PA trust checking**: Validates Content Credentials (C2PA) manifests and signer trust chains on uploaded media
+- **Content-addressed storage** — blobs stored and retrieved by SHA-256 hash, backed by Google Cloud Storage
+- **Nostr auth** — Blossom auth events (kind 24242, Schnorr signatures) for uploads and deletes; NIP-98 HTTP auth (kind 27235) for viewer/list requests
+- **HLS transcoding** — multi-quality adaptive streaming (1080p, 720p, 480p, 360p) generated on GPU-backed Cloud Run
+- **WebVTT transcripts** — automatic speech-to-text with a stable transcript URL at `/<sha256>.vtt` and an on-demand subtitle jobs API
+- **Range requests** — native video seeking with `206 Partial Content` on blobs, quality variants, and audio
+- **Provenance & audit** — every upload and delete stores its signed auth event as cryptographic proof; actions are logged to Google Cloud Logging
+- **Moderation** — SafeSearch (Vision API) screening plus shadow restriction, so restricted content is visible only to its owner or an admin
+- **Age restriction** — `age_restricted` blobs serve to any authenticated viewer and return `401` to anonymous requests
+- **Admin soft-delete & restore** — DMCA/legal removal with a full audit trail while preserving recoverable storage, plus re-index/restore
+- **Tombstones & legal hold** — legally removed content is blocked from re-upload (returns 403)
+- **GDPR vanish** — user- and admin-initiated erasure of a pubkey's content
+- **C2PA trust checking** — validates Content Credentials manifests and signer trust chains on uploaded media
+- **CDN fallback** — missing blobs are fetched from a fallback chain (`cdn.divine.video`, `blossom.divine.video`, `cdn.satellite.earth`, `image.nostr.build`)
 
-## Setup
+### Supported Blossom endpoints (BUDs)
+
+| BUD | Capability |
+|-----|------------|
+| BUD-01 | Blob retrieval (`GET`/`HEAD /<sha256>`) |
+| BUD-02 | Upload, list, and delete management |
+| BUD-04 | Mirroring — pull a blob from another server by URL |
+| BUD-06 | Upload pre-validation (`HEAD /upload`) |
+| BUD-09 | Reporting — accept NIP-56 report events (kind 1984) |
+
+Maximum upload size is 50 GB. Files above the in-process limit are streamed through the Cloud Run upload service.
+
+## Architecture
+
+Divine Blossom is a Fastly Compute edge service plus a set of GCP Cloud Run companions. The edge service is the front door for all media traffic; it stores small blobs directly and delegates large uploads, transcoding, speech-to-text, and moderation.
+
+```
+Client → Fastly Compute (Rust WASM) → GCS (blobs) + Fastly KV (metadata)
+           ├── Cloud Run Upload (Rust) → GCS + transcoder trigger
+           ├── Cloud Run Transcoder (Rust, NVIDIA GPU) → HLS segments to GCS
+           ├── Cloud Run ASR / Parakeet (Python) → speech-to-text for transcripts
+           └── Cloud Run Process-Blob (Python) → C2PA validation + SafeSearch moderation
+```
+
+- **Fastly Compute edge** (`src/`) — Rust WASM service. Handles blob retrieval, uploads, metadata in Fastly KV, HLS proxying, transcripts, admin, provenance, and auth. Pure-logic types and delete/moderation policy live in the `blossom-core` library crate so they can be unit-tested natively (outside the WASM runtime).
+- **Cloud Run Upload** (`cloud-run-upload/`) — Rust service on GCP. Receives large uploads over HTTP/2 (bypassing the Fastly body-size limit), sanitizes with `ffmpeg -c copy`, hashes, uploads to GCS, triggers the transcoder, and emits audit logs.
+- **Cloud Run Transcoder** (`cloud-run-transcoder/`) — Rust service on GCP with an NVIDIA GPU. Downloads source from GCS, transcodes to HLS via FFmpeg NVENC, and uploads segments back.
+- **Cloud Run ASR / Parakeet** (`cloud-run-asr-parakeet/`) — Python service. Runs speech-to-text (Parakeet TDT) as a sidecar to the transcoder for WebVTT transcript generation.
+- **Cloud Run Process-Blob** (`cloud-functions/process-blob/`) — Python/Flask service triggered by GCS object finalization via Eventarc. Validates C2PA Content Credentials (`c2patool`) and runs SafeSearch moderation (Vision API), then updates Fastly KV metadata through a webhook.
+
+**Platform details**
+
+- GCS bucket: `divine-blossom-media`
+- CDN / public host: `media.divine.video` (Fastly)
+- Fastly stores: KV store `blossom_metadata`, config store `blossom_config`, secret store `blossom_secrets`
+
+## Getting started
 
 ### Prerequisites
 
 - [Fastly CLI](https://developer.fastly.com/learning/tools/cli/)
-- [Rust](https://rustup.rs/) with wasm32-wasi target
-- GCP project with GCS bucket and Cloud Run
-- Fastly account with Compute enabled
+- [Rust](https://rustup.rs/) — the toolchain is pinned by `rust-toolchain.toml` (stable 1.83.0, target `wasm32-wasip1`)
+- A GCP project with a GCS bucket and Cloud Run
+- A Fastly account with Compute enabled
 
-### Install Rust target
+### Install the WASM target
 
 ```bash
-rustup target add wasm32-wasi
+rustup target add wasm32-wasip1
 ```
 
-### Configure secrets and config
-
-1. Create a GCS bucket with HMAC credentials
-2. Set up Fastly stores:
+### Create the Fastly stores
 
 ```bash
-# Create KV store
+# KV store for blob metadata
 fastly kv-store create --name blossom_metadata
 
-# Create config store
+# Config store for non-secret settings
 fastly config-store create --name blossom_config
 
-# Create secret store with GCS HMAC credentials
+# Secret store for GCS HMAC credentials and tokens
 fastly secret-store create --name blossom_secrets
 ```
-
-**Config store flags:**
-
-| Key | Description | Default |
-|-----|-------------|---------|
-| `ENABLE_PHYSICAL_DELETE` | When `"true"`, creator-delete actions via `/admin/api/moderate` physically remove bytes from GCS and purge edge caches. When `"false"`, status flip only (bytes preserved). Admin DMCA via `/admin/api/delete` is unconditionally soft-delete regardless of this flag. | `"false"` |
 
 ### Local development
 
 ```bash
-# Copy the example config and fill in your credentials
+# Copy the example manifest and fill in credentials (gitignored)
 cp fastly.toml.example fastly.toml
 
-# Edit fastly.toml with your GCS credentials (this file is gitignored)
-# Then run:
+# Run the local Compute test server
 fastly compute serve
 ```
 
-**Note**: `fastly.toml` is gitignored to prevent accidentally committing secrets. The `[local_server.secret_stores]` section is only used for local testing.
+`fastly.toml` is gitignored so secrets are never committed. The `[local_server]` section (backends, KV, config, and secret stores) is used only for local testing; in production these bindings are managed in the Fastly dashboard.
 
-### Deploy
+### Tests
 
 ```bash
-fastly compute publish
+cargo check --tests --locked                                  # edge crate
+cargo test -p blossom-core --locked                           # pure-logic core
+cargo test --manifest-path cloud-run-upload/Cargo.toml --locked
+cargo clippy --locked --all-targets --all-features            # lint gate used in CI
 ```
 
-## API Endpoints
+## Configuration
 
-### BUD-01: Retrieval
+Configuration is split across the Fastly config store (non-secret) and secret store (credentials). The `fastly.toml.example` manifest documents the full set of backends and store bindings.
+
+### Config store (`blossom_config`)
+
+| Key | Description |
+|-----|-------------|
+| `gcs_bucket` | GCS bucket name (`divine-blossom-media`) |
+| `gcs_project_id` | GCP project ID |
+| `funnelcake_api_url` | Funnelcake permission API base URL |
+| `ENABLE_PHYSICAL_DELETE` | When `"true"`, creator-delete via `/admin/api/moderate` physically removes bytes from GCS and purges edge caches; when `"false"` (default), it flips status only. Admin DMCA via `/admin/api/delete` is always a soft-delete regardless of this flag. |
+
+### Secret store (`blossom_secrets`)
+
+| Key | Description |
+|-----|-------------|
+| `gcs_access_key` | GCS HMAC access key |
+| `gcs_secret_key` | GCS HMAC secret key |
+| `moderation_api_token` | Bearer token for the Divine moderation API |
+
+### Backends
+
+Registered in Fastly and mirrored in `fastly.toml.example`: `gcs_storage` (GCS), the CDN fallback chain (`cdn_divine`, `blossom_divine`, `cdn_satellite`, `nostr_build`), `upload_service` (large-upload/resumable control plane), `moderation_api`, and `funnelcake_api`.
+
+### Process-Blob (Cloud Run) environment
+
+C2PA validation in `cloud-functions/process-blob` is controlled by environment variables:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `C2PA_MODE` | `off`, `log`, or `enforce` | `off` |
+| `C2PA_TRUST_ANCHORS` | Path to trusted CA certificates (PEM) | `/app/trust_anchors.pem` |
+| `C2PA_CHECK_IMAGES` | Also validate image uploads | `false` |
+| `C2PA_MAX_FILE_SIZE` | Skip C2PA above this size (bytes) | `2147483648` |
+| `C2PA_WARN_FILE_SIZE` | Warn above this size (bytes) | `268435456` |
+
+In `enforce` mode, unsigned or untrusted content is rejected (status set to `restricted`). C2PA runs before SafeSearch to short-circuit untrusted content and save Vision API cost.
+
+## API
+
+### Retrieval (BUD-01)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/<sha256>[.ext]` | Retrieve blob |
-| `HEAD` | `/<sha256>[.ext]` | Check blob exists |
-| `GET` | `/<sha256>.vtt` | Retrieve WebVTT transcript (on-demand generation) |
-| `HEAD` | `/<sha256>.vtt` | Check transcript status/existence |
-| `GET` | `/<sha256>/VTT` | Alias for transcript retrieval |
+| `GET` / `HEAD` | `/<sha256>[.ext]` | Retrieve blob / check existence |
+| `GET` / `HEAD` | `/<sha256>.hls` | HLS master manifest |
+| `GET` / `HEAD` | `/<sha256>/<quality>` | Quality variant (e.g. `720p`, `480p`) |
+| `GET` / `HEAD` | `/<sha256>.vtt`, `/<sha256>/VTT` | WebVTT transcript (on-demand generation) |
+| `GET` | `/<sha256>/provenance` | Provenance info (owner, uploaders, auth events) |
 
-### Subtitle Jobs API
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/v1/subtitles/jobs` | Create subtitle job (`video_sha256`, optional `lang`, optional `force`) |
-| `GET` | `/v1/subtitles/jobs/<job_id>` | Get subtitle job status (`queued`, `processing`, `ready`, `failed`) |
-| `GET` | `/v1/subtitles/by-hash/<sha256>` | Idempotent hash lookup for existing subtitle job |
-
-### BUD-02: Management
+### Management (BUD-02)
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | `PUT` | `/upload` | Required | Upload blob |
-| `HEAD` | `/upload` | None | Get upload requirements |
+| `HEAD` | `/upload` | None | Upload requirements (BUD-06) |
 | `DELETE` | `/<sha256>` | Required | Permanently delete your own blob |
-| `GET` | `/list/<pubkey>` | Optional | List user's blobs |
+| `DELETE` | `/vanish` | Required | GDPR erasure of your content |
+| `GET` | `/list/<pubkey>` | Optional | List a user's blobs |
+| `PUT` | `/mirror` | Required | Mirror a blob from another server (BUD-04) |
+| `PUT` | `/report` | None | Report content via a NIP-56 event (BUD-09) |
 
-### Provenance & Admin
+The resumable-upload control plane (`POST /upload/init`, `POST /upload/<id>/complete`) proxies large sessions to the upload service.
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| `GET` | `/<sha256>/provenance` | None | Get provenance info (owner, uploaders, auth events) |
-| `POST` | `/admin/api/delete` | Admin | Soft-delete blob, remove it from public serving/indexes, and optionally set legal hold |
-| `POST` | `/admin/api/restore` | Admin | Restore a soft-deleted blob to `active`, `pending`, or `restricted` |
+### Subtitle jobs
 
-### Provenance
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/v1/subtitles/jobs` | Create a subtitle job (`video_sha256`, optional `lang`, `force`) |
+| `GET` | `/v1/subtitles/jobs/<job_id>` | Job status (`queued`, `processing`, `ready`, `failed`) |
+| `GET` | `/v1/subtitles/by-hash/<sha256>` | Idempotent lookup of an existing job by hash |
 
-Every upload and delete stores the signed Nostr auth event (kind 24242) in KV as cryptographic proof of who authorized the action. The `/provenance` endpoint returns:
+### Admin
 
-```json
-{
-  "sha256": "abc123...",
-  "owner": "<nostr_pubkey>",
-  "uploaders": ["<pubkey1>", "<pubkey2>"],
-  "upload_auth_event": { ... },
-  "delete_auth_event": null,
-  "tombstone": null
-}
-```
+Admin routes require an admin session (Google or GitHub OAuth; see `OAUTH_SETUP.md`). Highlights:
 
-### Audit Logging
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/admin/api/delete` | Soft-delete a blob, remove it from public serving/indexes, optionally set legal hold |
+| `POST` | `/admin/api/restore` | Restore a soft-deleted blob to `active`, `pending`, or `restricted` |
+| `POST` | `/admin/api/moderate` | Creator/moderation action (respects `ENABLE_PHYSICAL_DELETE`) |
+| `GET` | `/admin/api/stats`, `/admin/api/recent`, `/admin/api/users` | Dashboard data |
 
-All uploads and deletes are logged to Google Cloud Logging via the Cloud Run upload service. Each audit entry includes: action, SHA-256, actor pubkey, timestamp, the signed auth event, and a metadata snapshot. Logs are queryable via Cloud Logging with labels `service=divine-blossom, component=audit`.
-
-### Delete Semantics
-
-- `DELETE /<sha256>` is a direct user delete and permanently removes the canonical blob.
-- `POST /admin/api/delete` is an admin soft-delete. It marks the blob as `deleted`, stops all public serving, removes it from user/recent indexes, and preserves the stored blob so it can be recovered later.
-- `POST /admin/api/restore` restores a soft-deleted blob and re-indexes it.
-- `legal_hold: true` sets a tombstone that prevents re-upload of the same hash even if the stored blob is preserved.
-
-### Admin Soft-Delete
+Example soft-delete:
 
 ```bash
 curl -X POST https://media.divine.video/admin/api/delete \
@@ -163,60 +196,11 @@ curl -X POST https://media.divine.video/admin/api/delete \
   -d '{"sha256": "abc123...", "reason": "DMCA #1234", "legal_hold": true}'
 ```
 
-### Admin Restore
+When `legal_hold: true`, a tombstone is set that blocks re-upload of the same hash (returns 403).
 
-```bash
-curl -X POST https://media.divine.video/admin/api/restore \
-  -H "Authorization: Bearer <admin_token>" \
-  -H "Content-Type: application/json" \
-  -d '{"sha256": "abc123...", "status": "active"}'
-```
+### Authentication
 
-When `legal_hold: true`, a tombstone is set preventing re-upload of the removed content (returns 403).
-
-## C2PA Trust Checking
-
-The `cloud-functions/process-blob` module validates [C2PA](https://c2pa.org/) Content Credentials on uploaded media using [c2patool](https://github.com/contentauth/c2patool).
-
-### How it works
-
-1. **Manifest extraction** — runs `c2patool --detailed <file>` to read the embedded C2PA manifest
-2. **Trust chain validation** — runs `c2patool --detailed <file> trust --trust_anchors <trust_anchors.pem>` to verify the signer against trusted certificate authorities
-
-Validation results (manifest presence, trust status, claim generator, issuer) are attached to the blob's metadata via the Fastly KV webhook.
-
-### Modes
-
-Controlled by the `C2PA_MODE` environment variable:
-
-| Mode | Behavior |
-|------|----------|
-| `off` (default) | No C2PA validation |
-| `log` | Validates and logs results but does not block content |
-| `enforce` | Rejects unsigned or untrusted content (sets status to `restricted`) |
-
-### Configuration
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `C2PA_MODE` | Validation mode (`off`, `log`, `enforce`) | `off` |
-| `C2PA_TRUST_ANCHORS` | Path to trusted CA certificates (PEM) | `/app/trust_anchors.pem` |
-| `C2PA_CHECK_IMAGES` | Also validate image uploads (`true`/`false`) | `false` |
-| `C2PA_MAX_FILE_SIZE` | Skip C2PA validation for files above this size (bytes) | `2147483648` (500MB) |
-| `C2PA_WARN_FILE_SIZE` | Log a warning for files above this size (bytes) | `268435456` (256MB) |
-
-### Trust anchors
-
-The bundled `trust_anchors.pem` contains ProofSign CA certificates (ECDSA P-256) for verifying C2PA manifests signed by [ProofMode](https://proofmode.org/) on Android and iOS. Replace or extend this file with additional CA certificates as needed.
-
-### Container
-
-The module runs on Cloud Run as a Flask/gunicorn service. The Dockerfile installs c2patool v0.26.33 from GitHub releases. C2PA validation runs before SafeSearch moderation to short-circuit untrusted content early and save Vision API costs.
-
-## Authentication
-
-Management operations (`PUT /upload`, `DELETE /<sha256>`, GDPR vanish) use
-Blossom auth events (`kind 24242`):
+Management operations (`PUT /upload`, `DELETE /<sha256>`, vanish) use Blossom auth events (kind 24242):
 
 ```json
 {
@@ -230,50 +214,26 @@ Blossom auth events (`kind 24242`):
 }
 ```
 
-Send as: `Authorization: Nostr <base64_encoded_signed_event>`
+Send as `Authorization: Nostr <base64_encoded_signed_event>`.
 
-Viewer/list requests additionally accept valid NIP-98 HTTP auth (`kind 27235`)
-for the exact request URL and method. Protected blob/media GET routes also
-accept Blossom GET auth (`kind 24242`) with:
+Viewer/list requests also accept NIP-98 HTTP auth (kind 27235) for the exact request URL and method. Protected media GET routes additionally accept Blossom GET auth (kind 24242 with `["t","get"]`). When multiple `Authorization` headers are present, viewer auth succeeds if any valid NIP-98 or Blossom GET header matches. `age_restricted` blobs serve to any authenticated viewer and return `401 {"error":"age_restricted"}` to anonymous requests; `restricted` blobs remain shadow-banned and serve only to the owner or an admin.
 
-```json
-{
-  "kind": 24242,
-  "tags": [
-    ["t", "get"],
-    ["x", "<sha256>"],
-    ["expiration", "<unix_timestamp>"]
-  ]
-}
+### Request correlation
+
+Admin and moderation endpoints accept an `X-Request-Id` header and echo it into related log lines (`[req=<id>]`) so retries and partial failures can be traced. If absent, the leading segment of the Cloudflare `cf-ray` header is used; failing that, a short hex ID is generated. Upstream services (e.g. the moderation service driving creator-delete) should forward a stable `X-Request-Id` across retries. `[PURGE]` logs carry the blob `sha256` as the surrogate key for cross-referencing cache purges.
+
+## Deployment
+
+Deploys go to Fastly Compute with a single atomic command, followed by a cache purge:
+
+```bash
+fastly compute publish --comment "description"
+fastly purge --all --service-id <service-id>
 ```
 
-If multiple `Authorization` headers are present, viewer auth succeeds when any
-valid NIP-98 or Blossom GET header matches the request. `age_restricted` blobs
-are served to any authenticated viewer and return `401 {"error":"age_restricted"}`
-to anonymous requests. `restricted` blobs remain shadow-banned and only serve
-to the owner or an admin. Blossom does not currently read any hosted-session
-age-verification claim or external viewer adult-verification service when
-serving media.
+Always use `fastly compute publish` (build + deploy in one step), never separate `build` and `deploy`. Package propagation to all POPs can take several minutes even after a purge.
 
-## Request correlation
-
-Admin and moderation endpoints accept an `X-Request-Id` header and include
-its value in related log lines so retries and partial failures can be traced
-across stderr.
-
-- If the caller sends `X-Request-Id`, its first 16 characters are used.
-- If absent, the leading segment of the Cloudflare-provided `cf-ray`
-  header is used (free correlation with Cloudflare edge logs).
-- If neither is present, a short hex ID is generated from the nanosecond
-  clock.
-
-Upstream services integrating with Blossom (e.g. `divine-moderation-service`
-for creator-delete) are encouraged to forward a stable `X-Request-Id`
-across their retry loops so both sides share the same correlation token.
-Log lines are prefixed with `[req=<id>]`; the `[PURGE]` logs emitted by
-the Fastly cache-purge path include the blob `sha256` as their surrogate
-key, which serves as the cross-reference when purging is triggered from
-a moderate/delete request.
+CI (`.github/workflows/ci.yml`) runs the edge, core, upload, transcoder, and Python test suites plus clippy on every push and PR. On a push to `main` it then, in parallel: publishes the edge service to Fastly and purges the CDN, builds and pushes the container image to GHCR, and deploys `process-blob` to Cloud Run (`us-central1`).
 
 ## License
 
