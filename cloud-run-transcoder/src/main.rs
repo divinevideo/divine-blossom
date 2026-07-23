@@ -3,7 +3,7 @@
 
 use anyhow::{anyhow, Result};
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, Query, State},
     http::{header, Method, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, options, post},
@@ -695,6 +695,11 @@ async fn main() -> Result<()> {
         .route("/transcode", options(handle_cors_preflight))
         .route("/transcribe", post(handle_transcribe))
         .route("/transcribe", options(handle_cors_preflight))
+        .route(
+            "/transcribe/audio",
+            post(handle_transcribe_audio).layer(DefaultBodyLimit::max(MAX_TRANSCRIBE_AUDIO_BYTES)),
+        )
+        .route("/transcribe/audio", options(handle_cors_preflight))
         .route("/backfill-fmp4", post(handle_backfill_fmp4))
         .route("/audio/extract", post(handle_audio_extract))
         .route("/audio/extract", options(handle_cors_preflight))
@@ -779,6 +784,102 @@ async fn handle_transcribe(
                 .into_response()
         }
     }
+}
+
+/// Max audio body accepted by `POST /transcribe/audio`. ffmpeg-normalized
+/// 16 kHz mono PCM is ~32 KB/s, so 100 MB is ~50 min of audio — far above any
+/// editor clip while still bounding request memory. The Parakeet sidecar caps
+/// at 200 MB; we stay under that.
+const MAX_TRANSCRIBE_AUDIO_BYTES: usize = 100 * 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+struct TranscribeAudioParams {
+    /// Optional BCP-47 recognition-language hint (e.g. `en`, `de-CH`).
+    language: Option<String>,
+}
+
+/// Synchronous "raw audio bytes -> WebVTT" transcription.
+///
+/// Unlike [`handle_transcribe`] (by-hash: reads a stored blob, writes the VTT
+/// back to GCS, holds a lock), this transcribes the audio in the request body
+/// inline via the configured provider and returns the WebVTT directly — no GCS
+/// read/write, no lock, no idempotency cache. It exists for the editor's
+/// pre-publish caption generation, reached through the upload-server's
+/// authenticated proxy.
+///
+/// This service is private (Cloud Run IAM), so per-caller rate limiting lives
+/// at the public proxy, not here. Every call is an uncached, billable provider
+/// request; an optional audio-hash result cache (reusing the by-hash GCS cache)
+/// could dedupe repeat audio, but that is a cost optimization, not a blocker.
+async fn handle_transcribe_audio(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<TranscribeAudioParams>,
+    body: Bytes,
+) -> Response {
+    match process_transcribe_audio(&state, params.language.as_deref(), &body).await {
+        Ok(vtt) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/vtt; charset=utf-8")],
+            vtt,
+        )
+            .into_response(),
+        Err(e) => {
+            error!("Transcribe-audio error: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Rejects an empty body or one past [`MAX_TRANSCRIBE_AUDIO_BYTES`].
+fn ensure_transcribe_audio_size(len: usize) -> Result<()> {
+    if len == 0 {
+        return Err(anyhow!("empty audio body"));
+    }
+    if len > MAX_TRANSCRIBE_AUDIO_BYTES {
+        return Err(anyhow!(
+            "audio too large: {} bytes > {}",
+            len,
+            MAX_TRANSCRIBE_AUDIO_BYTES
+        ));
+    }
+    Ok(())
+}
+
+async fn process_transcribe_audio(
+    state: &Arc<AppState>,
+    language: Option<&str>,
+    body: &[u8],
+) -> Result<String> {
+    ensure_transcribe_audio_size(body.len())?;
+
+    let temp_dir = TempDir::new()?;
+    let input_path = temp_dir.path().join("input");
+    tokio::fs::write(&input_path, body).await?;
+
+    // Normalize whatever container/codec was posted to the 16 kHz mono PCM WAV
+    // every provider path expects (same step the by-hash flow runs).
+    let audio_path = temp_dir.path().join("transcribe.wav");
+    extract_audio_for_transcription(&input_path, &audio_path).await?;
+
+    let language = language.map(str::trim).filter(|lang| !lang.is_empty());
+    let raw_output =
+        transcribe_audio_via_provider(&state.config, &audio_path, language, None).await?;
+
+    // Empty speech (silence/music) is a successful transcription: hand back an
+    // empty WebVTT so the caller renders "no captions", not an error.
+    let parsed = match normalize_transcript_to_vtt(&raw_output) {
+        Ok(vtt) => vtt,
+        Err(e) if is_empty_transcript_normalize_error(&e) => ParsedVtt::empty(0),
+        Err(e) => return Err(e),
+    };
+
+    Ok(parsed.content)
 }
 
 async fn handle_backfill_fmp4(
@@ -2585,17 +2686,17 @@ async fn fetch_gcp_access_token() -> std::result::Result<String, ProviderFailure
     // surface a `timed_out=true` failure so the per-provider retry loop
     // in `transcribe_audio_via_provider` treats it as transient — a
     // metadata blip should not collapse straight into the Gemini fallback.
-    let metadata_summary = last_metadata_error
-        .unwrap_or_else(|| "metadata server unreachable".to_string());
+    let metadata_summary =
+        last_metadata_error.unwrap_or_else(|| "metadata server unreachable".to_string());
 
     match tokio::process::Command::new("gcloud")
         .args(["auth", "print-access-token"])
         .output()
         .await
     {
-        Ok(output) if output.status.success() => Ok(String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .to_string()),
+        Ok(output) if output.status.success() => {
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        }
         Ok(_) => Err(parse_provider_status(
             None,
             None,
@@ -2842,9 +2943,7 @@ pub(crate) fn identity_token_cache_for_audience(audience: &str) -> &'static Acce
 /// Fetch a Cloud Run identity token (OIDC) for `audience`. Cached per
 /// audience for 50 minutes. On metadata-server failure we apply the same
 /// 3-attempt retry as `fetch_gcp_access_token`.
-async fn fetch_gcp_identity_token(
-    audience: &str,
-) -> std::result::Result<String, ProviderFailure> {
+async fn fetch_gcp_identity_token(audience: &str) -> std::result::Result<String, ProviderFailure> {
     let cache = identity_token_cache_for_audience(audience);
     if let Some(token) = cache.get(Instant::now()) {
         return Ok(token);
@@ -3526,16 +3625,25 @@ async fn finalize_transcript(
 mod tests {
     use super::{
         build_transcode_status_webhook_payload, classify_audio_extract_error,
-        contains_instruction_echo, decide_transcript_lock_action, identity_token_cache_for_audience,
-        is_empty_transcript_normalize_error, is_implausible_text_density, is_loop_hallucination,
-        is_retryable_provider_failure, normalize_transcript_to_vtt, parakeet_request_url,
-        parse_audio_analysis_output, parse_provider_status, retry_delay_for_attempt,
-        should_drop_low_signal_transcript, token_fetch_retry_delay, transcript_drop_reason,
-        transcription_response_format, AccessTokenCache, AudioAnalysis, AudioExtractErrorKind,
-        Config, ParsedVtt, TranscriptConfidence, TranscriptDropReason, TranscriptLockAction,
-        TranscriptLockState, TranscriptLockStatus, VideoInfo,
+        contains_instruction_echo, decide_transcript_lock_action, ensure_transcribe_audio_size,
+        identity_token_cache_for_audience, is_empty_transcript_normalize_error,
+        is_implausible_text_density, is_loop_hallucination, is_retryable_provider_failure,
+        normalize_transcript_to_vtt, parakeet_request_url, parse_audio_analysis_output,
+        parse_provider_status, retry_delay_for_attempt, should_drop_low_signal_transcript,
+        token_fetch_retry_delay, transcript_drop_reason, transcription_response_format,
+        AccessTokenCache, AudioAnalysis, AudioExtractErrorKind, Config, ParsedVtt,
+        TranscriptConfidence, TranscriptDropReason, TranscriptLockAction, TranscriptLockState,
+        TranscriptLockStatus, VideoInfo, MAX_TRANSCRIBE_AUDIO_BYTES,
     };
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn transcribe_audio_size_guard_rejects_empty_and_oversize() {
+        assert!(ensure_transcribe_audio_size(0).is_err());
+        assert!(ensure_transcribe_audio_size(1).is_ok());
+        assert!(ensure_transcribe_audio_size(MAX_TRANSCRIBE_AUDIO_BYTES).is_ok());
+        assert!(ensure_transcribe_audio_size(MAX_TRANSCRIBE_AUDIO_BYTES + 1).is_err());
+    }
 
     #[test]
     fn gpt_transcribe_uses_json_response_format() {
@@ -4093,11 +4201,47 @@ mod tests {
     fn loop_guard_passes_long_unique_text() {
         let mut s = String::new();
         for word in [
-            "The", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "near", "the",
-            "river", "where", "the", "old", "mill", "stood", "for", "centuries", "until", "the",
-            "great", "flood", "carried", "it", "downstream", "into", "the", "harbor", "where",
-            "fishermen", "still", "remember", "its", "broken", "wheel", "rotting", "in", "the",
-            "salt", "spray",
+            "The",
+            "quick",
+            "brown",
+            "fox",
+            "jumps",
+            "over",
+            "the",
+            "lazy",
+            "dog",
+            "near",
+            "the",
+            "river",
+            "where",
+            "the",
+            "old",
+            "mill",
+            "stood",
+            "for",
+            "centuries",
+            "until",
+            "the",
+            "great",
+            "flood",
+            "carried",
+            "it",
+            "downstream",
+            "into",
+            "the",
+            "harbor",
+            "where",
+            "fishermen",
+            "still",
+            "remember",
+            "its",
+            "broken",
+            "wheel",
+            "rotting",
+            "in",
+            "the",
+            "salt",
+            "spray",
         ]
         .iter()
         .cycle()
