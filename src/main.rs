@@ -3710,16 +3710,11 @@ fn handle_transcribe_proxy(mut req: Request) -> Result<Response> {
         .send(UPLOAD_SERVICE_BACKEND)
         .map_err(|e| BlossomError::Internal(format!("Failed to proxy transcription: {}", e)))?;
 
-    // Pass the upload service's response (WebVTT or its error) straight back.
-    let status = proxy_resp.get_status();
-    let resp_content_type = proxy_resp
-        .get_header(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("text/vtt; charset=utf-8")
-        .to_string();
-    Ok(Response::from_status(status)
-        .with_header(header::CONTENT_TYPE, resp_content_type)
-        .with_body(proxy_resp.take_body()))
+    // Return the upstream response as-is — its status and every header
+    // (Content-Type, and a future 429's `Retry-After`) — then add CORS.
+    // Reconstructing the response would silently drop those headers.
+    add_cors_headers(&mut proxy_resp);
+    Ok(proxy_resp)
 }
 
 /// Handle large uploads by proxying to the upload service
