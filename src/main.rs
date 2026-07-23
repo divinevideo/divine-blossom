@@ -140,6 +140,9 @@ fn handle_request(req: Request) -> Result<Response> {
         (Method::PUT, "/upload") => handle_upload(req),
         // BUD-06: Upload requirements/pre-validation
         (Method::HEAD, "/upload") => handle_upload_requirements(req),
+        // Synchronous audio transcription — thin forward to the upload service's
+        // authenticated /transcribe proxy (which calls the transcoder).
+        (Method::POST, "/transcribe") => handle_transcribe_proxy(req),
         // Divine resumable control plane
         (Method::POST, "/upload/init") => handle_upload_init(req),
         (Method::POST, p) if p.starts_with("/upload/") && p.ends_with("/complete") => {
@@ -3671,6 +3674,52 @@ fn handle_upload_complete(mut req: Request, path: &str) -> Result<Response> {
             dim: complete_response.dim,
         },
     )
+}
+
+/// POST /transcribe — thin forward to the upload service's authenticated
+/// transcription proxy (`upload.divine.video/transcribe`), which validates the
+/// Blossom auth and calls the transcoder. The mobile editor only addresses this
+/// edge host, so transcription has to enter here.
+///
+/// The body (audio) is streamed straight through — Fastly Compute has a ~5 MB
+/// WASM memory limit, so we never buffer it. Auth is passed through unchanged;
+/// the upload service is the authority that validates it (`t=media`).
+fn handle_transcribe_proxy(mut req: Request) -> Result<Response> {
+    let auth_header = extract_authorization_header(&req)?;
+    let content_type = req
+        .get_header(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("audio/wav")
+        .to_string();
+    let query = req.get_query_str().map(str::to_string);
+    let body = req.take_body();
+
+    let mut url = format!("https://{}/transcribe", UPLOAD_SERVICE_HOST);
+    if let Some(query) = query.filter(|q| !q.is_empty()) {
+        url.push('?');
+        url.push_str(&query);
+    }
+
+    let mut proxy_req = Request::new(Method::POST, &url);
+    proxy_req.set_header("Host", UPLOAD_SERVICE_HOST);
+    proxy_req.set_header(header::AUTHORIZATION, &auth_header);
+    proxy_req.set_header(header::CONTENT_TYPE, &content_type);
+    proxy_req.set_body(body);
+
+    let mut proxy_resp = proxy_req
+        .send(UPLOAD_SERVICE_BACKEND)
+        .map_err(|e| BlossomError::Internal(format!("Failed to proxy transcription: {}", e)))?;
+
+    // Pass the upload service's response (WebVTT or its error) straight back.
+    let status = proxy_resp.get_status();
+    let resp_content_type = proxy_resp
+        .get_header(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("text/vtt; charset=utf-8")
+        .to_string();
+    Ok(Response::from_status(status)
+        .with_header(header::CONTENT_TYPE, resp_content_type)
+        .with_body(proxy_resp.take_body()))
 }
 
 /// Handle large uploads by proxying to the upload service
