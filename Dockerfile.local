@@ -9,6 +9,7 @@ RUN rustup target add wasm32-wasip1
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
+COPY blossom-core/ blossom-core/
 
 # Build the WASM binary
 RUN cargo build --locked --target wasm32-wasip1 --release
