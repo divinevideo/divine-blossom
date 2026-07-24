@@ -9,10 +9,10 @@ use std::time::Duration;
 ///
 /// Transcription is expensive (ffmpeg extraction + a paid ASR provider call per
 /// request), so the limits are deliberately low. Tune them here.
-pub const PUBKEY_LIMIT: u32 = 20;
-pub const PUBKEY_WINDOW_SECS: u64 = 60;
-pub const IP_LIMIT: u32 = 40;
-pub const IP_WINDOW_SECS: u64 = 60;
+pub const PUBKEY_LIMIT: u32 = 10;
+pub const PUBKEY_WINDOW_SECS: u64 = 3600;
+pub const IP_LIMIT: u32 = 20;
+pub const IP_WINDOW_SECS: u64 = 3600;
 
 /// Key prefix so rate-limit counters never collide with the metadata keys that
 /// share the `blossom_metadata` KV store.
