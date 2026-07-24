@@ -3702,21 +3702,18 @@ fn enforce_transcribe_rate_limit(req: &Request, auth_header: &str) -> Option<Res
         }
     }
 
-    // Pubkey only after the event validates against the transcription
-    // authorization contract (kind 24242, `t=media`, unexpired, valid
-    // signature) — the same contract the upload service enforces. A
-    // signature-only check would let a replayed authentic event for another
-    // action (a captured `t=get` token, say) burn a victim's hourly budget
-    // before the upload service rejects it. `parse_auth_header` decodes
-    // attacker-controlled JSON, so the pubkey is untrusted until then.
-    if let Ok(event) = crate::viewer_auth::parse_auth_header(auth_header) {
-        if crate::viewer_auth::validate_transcribe_event(&event, now).is_ok() {
-            let pubkey = event.pubkey.to_lowercase();
-            let cfg =
-                rate_limit::RateLimit::new(rate_limit::PUBKEY_LIMIT, rate_limit::PUBKEY_WINDOW_SECS);
-            if let Some(retry_after) = rate_limit::enforce(&counter, "pk", &pubkey, cfg, now) {
-                return Some(too_many_requests(retry_after));
-            }
+    // Pubkey only after the event satisfies the transcription authorization
+    // contract (kind 24242, exact `t=media`, required unexpired expiration,
+    // Divine-scoped `server` tag, valid signature) — the same contract the
+    // upload service enforces. Charging an event it would reject burns a
+    // signer's budget on a doomed request, and a signature-only check would
+    // even let a replayed `t=get` token charge a victim. `parse_auth_header`
+    // decodes attacker-controlled JSON, so the pubkey is untrusted until then.
+    if let Some(pubkey) = crate::viewer_auth::transcribe_charge_pubkey(auth_header, now) {
+        let cfg =
+            rate_limit::RateLimit::new(rate_limit::PUBKEY_LIMIT, rate_limit::PUBKEY_WINDOW_SECS);
+        if let Some(retry_after) = rate_limit::enforce(&counter, "pk", &pubkey, cfg, now) {
+            return Some(too_many_requests(retry_after));
         }
     }
 

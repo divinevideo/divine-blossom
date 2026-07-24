@@ -4,6 +4,7 @@
 use crate::blossom::{AuthAction, BlossomAuthEvent};
 use crate::error::{BlossomError, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use blossom_core::transcribe;
 use k256::schnorr::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 
@@ -62,25 +63,21 @@ pub fn parse_auth_header(auth_header: &str) -> Result<BlossomAuthEvent> {
         .map_err(|e| BlossomError::AuthInvalid(format!("Invalid event JSON: {}", e)))
 }
 
-/// The action tag a transcription authorization must carry. Divine scopes
-/// transcription tokens with `t=media` rather than a standard Blossom verb, so
-/// `AuthAction` doesn't model it and we match the tag value directly.
-pub const TRANSCRIBE_ACTION: &str = "media";
-
 /// Verifies a parsed auth event authorizes *this* transcription request — the
-/// same contract the upload service enforces on `/transcribe`: kind 24242, a
-/// `t=media` action tag, a present and unexpired `expiration` tag, and a valid
-/// id + signature.
+/// exact contract the upload service enforces on `/transcribe`: kind 24242, an
+/// exact `t=media` action tag, a required unexpired `expiration` tag, any
+/// present `server` tag scoped to a Divine host, and a valid id + signature.
 ///
 /// The edge uses this to bind a per-pubkey rate-limit charge to the pubkey that
 /// actually authorized transcription. Authenticity alone is not enough:
 /// `parse_auth_header` decodes attacker-controlled JSON, and a *replayed*
 /// authentic event signed for some other action (a captured `t=get` blob-view
 /// token, say) would pass a signature-only check and burn the victim's hourly
-/// transcription budget before the upload service rejects it. Requiring the
-/// transcription contract here means any event the upload service would reject
-/// also fails at the edge, charging no quota. Server-tag scoping and the rest
-/// of the contract remain the upload service's job.
+/// transcription budget before the upload service rejects it. Matching the
+/// upload service's contract exactly — down to case-sensitive `media` and the
+/// `server`-tag allow-list — means any request it would reject charges no quota
+/// here either, so no uppercase-`MEDIA` or foreign-`server` token can spend a
+/// signer's budget on a request that is doomed downstream.
 pub fn validate_transcribe_event(event: &BlossomAuthEvent, now: u64) -> Result<()> {
     if event.kind != BLOSSOM_AUTH_KIND {
         return Err(BlossomError::AuthInvalid(format!(
@@ -91,10 +88,10 @@ pub fn validate_transcribe_event(event: &BlossomAuthEvent, now: u64) -> Result<(
 
     let action = get_tag_value(event, "t")
         .ok_or_else(|| BlossomError::AuthInvalid("Missing action tag".into()))?;
-    if !action.eq_ignore_ascii_case(TRANSCRIBE_ACTION) {
+    if !transcribe::action_allowed(action) {
         return Err(BlossomError::AuthInvalid(format!(
             "Action mismatch: expected {}, got {}",
-            TRANSCRIBE_ACTION, action
+            transcribe::TRANSCRIBE_ACTION, action
         )));
     }
 
@@ -105,7 +102,31 @@ pub fn validate_transcribe_event(event: &BlossomAuthEvent, now: u64) -> Result<(
         return Err(BlossomError::AuthInvalid("Authorization expired".into()));
     }
 
+    // BUD-11 `server` scope: a token explicitly bound to another host is being
+    // replayed here. The upload service rejects it, so the edge must too or it
+    // charges quota for a request doomed downstream. Absent tag = unscoped = ok.
+    if let Some(server) = get_tag_value(event, "server") {
+        if !transcribe::server_tag_allowed(server) {
+            return Err(BlossomError::AuthInvalid(
+                "Authorization server tag does not match this host".into(),
+            ));
+        }
+    }
+
     validate_event_integrity(event)
+}
+
+/// The pubkey a transcription request should be charged against, or `None` when
+/// the auth header fails the transcription contract ([`validate_transcribe_event`]).
+///
+/// Returning `None` means no per-pubkey quota is spent on a request the upload
+/// service will reject. The pubkey is lowercased so rate-limit counter keys are
+/// canonical. `parse_auth_header` decodes attacker-controlled JSON, so the
+/// pubkey is untrusted until the contract (including the signature) validates.
+pub fn transcribe_charge_pubkey(auth_header: &str, now: u64) -> Option<String> {
+    let event = parse_auth_header(auth_header).ok()?;
+    validate_transcribe_event(&event, now).ok()?;
+    Some(event.pubkey.to_lowercase())
 }
 
 pub fn validate_blossom_event(
@@ -1144,9 +1165,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_transcribe_event_accepts_uppercase_action() {
-        // Postel's law: the rest of this module matches the `t` value
-        // case-insensitively, so `MEDIA` must be accepted too.
+    fn validate_transcribe_event_rejects_uppercase_action() {
+        // The upload service matches `t` exactly (`== "media"`), so the edge
+        // must too. Accepting `MEDIA` here would charge the signer's quota for a
+        // request the upload service then rejects.
         let event = signed_event(
             BLOSSOM_AUTH_KIND,
             vec![
@@ -1155,7 +1177,143 @@ mod tests {
             ],
             1_000,
         );
-        validate_transcribe_event(&event, 1_100).expect("uppercase MEDIA action should validate");
+        let err = validate_transcribe_event(&event, 1_100)
+            .expect_err("uppercase MEDIA must be rejected to match the upload contract");
+        assert_eq!(err.message(), "Action mismatch: expected media, got MEDIA");
+    }
+
+    #[test]
+    fn validate_transcribe_event_accepts_divine_server_tag() {
+        let event = signed_event(
+            BLOSSOM_AUTH_KIND,
+            vec![
+                vec!["t".into(), "media".into()],
+                vec!["expiration".into(), "1300".into()],
+                vec!["server".into(), "https://media.divine.video".into()],
+            ],
+            1_000,
+        );
+        validate_transcribe_event(&event, 1_100)
+            .expect("a Divine-scoped server tag should validate");
+    }
+
+    #[test]
+    fn validate_transcribe_event_rejects_foreign_server_tag() {
+        // A token scoped to another host is a replay from elsewhere; it must not
+        // charge quota here even though it is authentic.
+        let event = signed_event(
+            BLOSSOM_AUTH_KIND,
+            vec![
+                vec!["t".into(), "media".into()],
+                vec!["expiration".into(), "1300".into()],
+                vec!["server".into(), "https://evil.example".into()],
+            ],
+            1_000,
+        );
+        let err = validate_transcribe_event(&event, 1_100)
+            .expect_err("a foreign server scope must be rejected");
+        assert_eq!(
+            err.message(),
+            "Authorization server tag does not match this host"
+        );
+    }
+
+    #[test]
+    fn rejected_transcribe_tokens_never_charge_pubkey_quota() {
+        // Counter-level regression: an uppercase-action or foreign-server token
+        // — both rejected downstream — must not increment the pubkey counter,
+        // while a valid token does and is limited after its budget.
+        use blossom_core::rate_limit::{
+            bucket_for, counter_key, enforce, CasResult, CounterStore, RateLimit,
+        };
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        struct FakeCounter {
+            map: RefCell<HashMap<String, (u32, u64)>>,
+        }
+        impl FakeCounter {
+            fn new() -> Self {
+                Self {
+                    map: RefCell::new(HashMap::new()),
+                }
+            }
+            fn count(&self, key: &str) -> u32 {
+                self.map.borrow().get(key).map(|&(c, _)| c).unwrap_or(0)
+            }
+        }
+        impl CounterStore for FakeCounter {
+            fn read(&self, key: &str) -> Option<(u32, u64)> {
+                self.map.borrow().get(key).copied()
+            }
+            fn create(&self, key: &str, value: u32, _ttl: Duration) -> CasResult {
+                let mut map = self.map.borrow_mut();
+                if map.contains_key(key) {
+                    return CasResult::Conflict;
+                }
+                map.insert(key.to_string(), (value, 1));
+                CasResult::Committed
+            }
+            fn update(
+                &self,
+                key: &str,
+                value: u32,
+                _ttl: Duration,
+                expected: u64,
+            ) -> CasResult {
+                let mut map = self.map.borrow_mut();
+                match map.get(key) {
+                    Some(&(_, generation)) if generation == expected => {
+                        map.insert(key.to_string(), (value, generation + 1));
+                        CasResult::Committed
+                    }
+                    _ => CasResult::Conflict,
+                }
+            }
+        }
+
+        let store = FakeCounter::new();
+        let cfg = RateLimit::new(2, 60);
+        let now = 1_100;
+        let pubkey = media_event(1_000, 1_300).pubkey;
+        let key = counter_key("pk", &pubkey, bucket_for(now, cfg.window_secs));
+
+        // Mirror the edge charge path: charge iff the contract passes.
+        let charge = |header: &str| {
+            transcribe_charge_pubkey(header, now)
+                .and_then(|pk| enforce(&store, "pk", &pk, cfg, now))
+        };
+
+        let uppercase = encoded_event(signed_event(
+            BLOSSOM_AUTH_KIND,
+            vec![
+                vec!["t".into(), "MEDIA".into()],
+                vec!["expiration".into(), "1300".into()],
+            ],
+            1_000,
+        ));
+        let foreign_server = encoded_event(signed_event(
+            BLOSSOM_AUTH_KIND,
+            vec![
+                vec!["t".into(), "media".into()],
+                vec!["expiration".into(), "1300".into()],
+                vec!["server".into(), "https://evil.example".into()],
+            ],
+            1_000,
+        ));
+
+        // Rejected tokens: no charge, and the counter is never written.
+        assert_eq!(charge(&uppercase), None);
+        assert_eq!(charge(&foreign_server), None);
+        assert_eq!(store.count(&key), 0);
+
+        // A valid media token charges; the third within the window is limited.
+        let valid = encoded_event(media_event(1_000, 1_300));
+        assert_eq!(charge(&valid), None);
+        assert_eq!(charge(&valid), None);
+        assert!(charge(&valid).is_some());
+        assert_eq!(store.count(&key), 2);
     }
 
     #[test]
