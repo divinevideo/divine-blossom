@@ -62,19 +62,49 @@ pub fn parse_auth_header(auth_header: &str) -> Result<BlossomAuthEvent> {
         .map_err(|e| BlossomError::AuthInvalid(format!("Invalid event JSON: {}", e)))
 }
 
-/// Verifies a parsed auth event is authentic — its id matches its contents and
-/// its signature is valid — and is not expired, without binding it to a
-/// specific action or kind. The edge uses this to safely attribute a
-/// rate-limit charge to a pubkey it otherwise can't trust: `parse_auth_header`
-/// alone decodes attacker-controlled JSON, so any pubkey could be forged.
+/// The action tag a transcription authorization must carry. Divine scopes
+/// transcription tokens with `t=media` rather than a standard Blossom verb, so
+/// `AuthAction` doesn't model it and we match the tag value directly.
+pub const TRANSCRIBE_ACTION: &str = "media";
+
+/// Verifies a parsed auth event authorizes *this* transcription request — the
+/// same contract the upload service enforces on `/transcribe`: kind 24242, a
+/// `t=media` action tag, a present and unexpired `expiration` tag, and a valid
+/// id + signature.
 ///
-/// Full action/kind/hash validation remains the upload service's job.
-pub fn verify_event_authenticity(event: &BlossomAuthEvent, now: u64) -> Result<()> {
-    if let Some(expiration) = event.get_expiration() {
-        if now > expiration {
-            return Err(BlossomError::AuthInvalid("Authorization expired".into()));
-        }
+/// The edge uses this to bind a per-pubkey rate-limit charge to the pubkey that
+/// actually authorized transcription. Authenticity alone is not enough:
+/// `parse_auth_header` decodes attacker-controlled JSON, and a *replayed*
+/// authentic event signed for some other action (a captured `t=get` blob-view
+/// token, say) would pass a signature-only check and burn the victim's hourly
+/// transcription budget before the upload service rejects it. Requiring the
+/// transcription contract here means any event the upload service would reject
+/// also fails at the edge, charging no quota. Server-tag scoping and the rest
+/// of the contract remain the upload service's job.
+pub fn validate_transcribe_event(event: &BlossomAuthEvent, now: u64) -> Result<()> {
+    if event.kind != BLOSSOM_AUTH_KIND {
+        return Err(BlossomError::AuthInvalid(format!(
+            "Invalid event kind: expected {}, got {}",
+            BLOSSOM_AUTH_KIND, event.kind
+        )));
     }
+
+    let action = get_tag_value(event, "t")
+        .ok_or_else(|| BlossomError::AuthInvalid("Missing action tag".into()))?;
+    if !action.eq_ignore_ascii_case(TRANSCRIBE_ACTION) {
+        return Err(BlossomError::AuthInvalid(format!(
+            "Action mismatch: expected {}, got {}",
+            TRANSCRIBE_ACTION, action
+        )));
+    }
+
+    let expiration = event
+        .get_expiration()
+        .ok_or_else(|| BlossomError::AuthInvalid("Missing expiration tag".into()))?;
+    if now > expiration {
+        return Err(BlossomError::AuthInvalid("Authorization expired".into()));
+    }
+
     validate_event_integrity(event)
 }
 
@@ -1091,6 +1121,122 @@ mod tests {
         let err = validate_blossom_get_event(&event, TEST_HASH, 1_000)
             .expect_err("no x tag should still error");
         assert_eq!(err.message(), "Missing x tag");
+    }
+
+    // ---- Transcription authorization contract (edge rate-limit gate) ----
+
+    fn media_event(created_at: u64, expiration: u64) -> BlossomAuthEvent {
+        signed_event(
+            BLOSSOM_AUTH_KIND,
+            vec![
+                vec!["t".into(), "media".into()],
+                vec!["expiration".into(), expiration.to_string()],
+            ],
+            created_at,
+        )
+    }
+
+    #[test]
+    fn validate_transcribe_event_accepts_valid_media_token() {
+        let event = media_event(1_000, 1_300);
+        validate_transcribe_event(&event, 1_100)
+            .expect("a signed t=media token with a future expiration should validate");
+    }
+
+    #[test]
+    fn validate_transcribe_event_accepts_uppercase_action() {
+        // Postel's law: the rest of this module matches the `t` value
+        // case-insensitively, so `MEDIA` must be accepted too.
+        let event = signed_event(
+            BLOSSOM_AUTH_KIND,
+            vec![
+                vec!["t".into(), "MEDIA".into()],
+                vec!["expiration".into(), "1300".into()],
+            ],
+            1_000,
+        );
+        validate_transcribe_event(&event, 1_100).expect("uppercase MEDIA action should validate");
+    }
+
+    #[test]
+    fn validate_transcribe_event_rejects_other_action() {
+        // The replay vector: a captured, authentic `t=get` token must not
+        // charge the victim's transcription quota at the edge.
+        let event = signed_event(
+            BLOSSOM_AUTH_KIND,
+            vec![
+                vec!["t".into(), "get".into()],
+                vec!["expiration".into(), "1300".into()],
+            ],
+            1_000,
+        );
+        let err = validate_transcribe_event(&event, 1_100)
+            .expect_err("a non-media action must be rejected");
+        assert_eq!(err.message(), "Action mismatch: expected media, got get");
+    }
+
+    #[test]
+    fn validate_transcribe_event_rejects_missing_action_tag() {
+        let event = signed_event(
+            BLOSSOM_AUTH_KIND,
+            vec![vec!["expiration".into(), "1300".into()]],
+            1_000,
+        );
+        let err = validate_transcribe_event(&event, 1_100)
+            .expect_err("a token with no action tag must be rejected");
+        assert_eq!(err.message(), "Missing action tag");
+    }
+
+    #[test]
+    fn validate_transcribe_event_requires_expiration_tag() {
+        // The upload service rejects a media token without an expiration; the
+        // edge must too, or a never-expiring replay would burn quota
+        // indefinitely before the upload service rejects it.
+        let event = signed_event(
+            BLOSSOM_AUTH_KIND,
+            vec![vec!["t".into(), "media".into()]],
+            1_000,
+        );
+        let err = validate_transcribe_event(&event, 1_100)
+            .expect_err("a media token without an expiration must be rejected");
+        assert_eq!(err.message(), "Missing expiration tag");
+    }
+
+    #[test]
+    fn validate_transcribe_event_rejects_expired_token() {
+        let event = media_event(1_000, 1_200);
+        let err = validate_transcribe_event(&event, 1_300)
+            .expect_err("an expired media token must be rejected");
+        assert_eq!(err.message(), "Authorization expired");
+    }
+
+    #[test]
+    fn validate_transcribe_event_rejects_wrong_kind() {
+        // A NIP-98 (27235) token is not a Blossom transcription authorization.
+        let event = signed_event(
+            NIP98_AUTH_KIND,
+            vec![
+                vec!["t".into(), "media".into()],
+                vec!["expiration".into(), "1300".into()],
+            ],
+            1_000,
+        );
+        let err = validate_transcribe_event(&event, 1_100)
+            .expect_err("a non-24242 kind must be rejected");
+        assert_eq!(err.message(), "Invalid event kind: expected 24242, got 27235");
+    }
+
+    #[test]
+    fn validate_transcribe_event_rejects_forged_pubkey() {
+        // The forge vector: swap in a victim's pubkey without re-signing. The
+        // id no longer matches the contents, so integrity validation fails and
+        // no quota is charged to the victim.
+        let mut event = media_event(1_000, 1_300);
+        event.pubkey =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
+        let err = validate_transcribe_event(&event, 1_100)
+            .expect_err("a forged pubkey must fail integrity validation");
+        assert_eq!(err.message(), "Invalid event ID");
     }
 
     fn signed_event(kind: u32, tags: Vec<Vec<String>>, created_at: u64) -> BlossomAuthEvent {

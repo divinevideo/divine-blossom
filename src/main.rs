@@ -3682,9 +3682,11 @@ fn handle_upload_complete(mut req: Request, path: &str) -> Result<Response> {
 ///
 /// Returns `Some(429)` when either limit is exceeded, `None` to let the request
 /// through. Best-effort: if the KV store is unavailable the request is allowed
-/// — the transcoder's in-flight semaphore is the hard backstop. The pubkey is
-/// parsed cheaply (base64 + JSON, no signature check); the upload service still
-/// does full auth validation downstream.
+/// — the transcoder's in-flight semaphore is the hard backstop. The per-pubkey
+/// charge is applied only after the event validates against the transcription
+/// authorization contract (`validate_transcribe_event`), so a forged or
+/// replayed token can't burn a victim's budget; the upload service still does
+/// full validation downstream.
 fn enforce_transcribe_rate_limit(req: &Request, auth_header: &str) -> Option<Response> {
     let store = KVStore::open("blossom_metadata").ok().flatten()?;
     let counter = rate_limit::KvCounterStore(&store);
@@ -3700,12 +3702,15 @@ fn enforce_transcribe_rate_limit(req: &Request, auth_header: &str) -> Option<Res
         }
     }
 
-    // Pubkey only after verifying the event's signature. `parse_auth_header`
-    // decodes attacker-controlled JSON, so charging an unverified pubkey would
-    // let anyone forge a victim's pubkey and burn their hourly budget. The
-    // upload service still does full action/kind validation downstream.
+    // Pubkey only after the event validates against the transcription
+    // authorization contract (kind 24242, `t=media`, unexpired, valid
+    // signature) — the same contract the upload service enforces. A
+    // signature-only check would let a replayed authentic event for another
+    // action (a captured `t=get` token, say) burn a victim's hourly budget
+    // before the upload service rejects it. `parse_auth_header` decodes
+    // attacker-controlled JSON, so the pubkey is untrusted until then.
     if let Ok(event) = crate::viewer_auth::parse_auth_header(auth_header) {
-        if crate::viewer_auth::verify_event_authenticity(&event, now).is_ok() {
+        if crate::viewer_auth::validate_transcribe_event(&event, now).is_ok() {
             let pubkey = event.pubkey.to_lowercase();
             let cfg =
                 rate_limit::RateLimit::new(rate_limit::PUBKEY_LIMIT, rate_limit::PUBKEY_WINDOW_SECS);
