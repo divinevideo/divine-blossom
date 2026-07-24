@@ -19,31 +19,26 @@ pub fn action_allowed(action: &str) -> bool {
 }
 
 /// Reduces a BUD-11 `server` tag value to a bare lowercase host, dropping any
-/// scheme, userinfo, port, and path. Mirrors the upload service's `url::Url`
-/// based parser without pulling a URL dependency into the WASM edge: the
-/// authority ends at the first `/`, `?`, or `#`; userinfo before an `@` is
-/// stripped; a port after `:` is dropped. This defeats crafted values such as
-/// `https://evil.example/x://media.divine.video` (host is `evil.example`) and
-/// `https://media.divine.video:x@evil.com` (host is `evil.com`).
+/// scheme, userinfo, port, and path. Parses with `url::Url` — the exact parser
+/// the upload service uses — so the authority is extracted with full URL
+/// semantics rather than a hand-rolled split. That matters for parity: a
+/// hand-rolled split truncates `https://media.divine.video:abc` to the allowed
+/// `media.divine.video`, but `url::Url` rejects the non-numeric port, so the
+/// value falls through to the whole trimmed string and fails the allow-list —
+/// exactly as the upload service rejects it. Bare hosts (no scheme) get an
+/// `https://` prefix before parsing. An unparseable value returns the whole
+/// trimmed string, which never matches the allow-list (fail closed).
 pub fn server_tag_host(value: &str) -> String {
     let trimmed = value.trim();
-    let after_scheme = match trimmed.find("://") {
-        Some(index) => &trimmed[index + 3..],
-        None => trimmed,
+    let candidate = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
     };
-    let authority_end = after_scheme
-        .find(['/', '?', '#'])
-        .unwrap_or(after_scheme.len());
-    let authority = &after_scheme[..authority_end];
-    let host_port = match authority.rfind('@') {
-        Some(index) => &authority[index + 1..],
-        None => authority,
-    };
-    let host = match host_port.find(':') {
-        Some(index) => &host_port[..index],
-        None => host_port,
-    };
-    host.to_ascii_lowercase()
+    url::Url::parse(&candidate)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_else(|| trimmed.to_ascii_lowercase())
 }
 
 /// Whether a `server` tag value targets a Divine transcription host.
@@ -93,15 +88,25 @@ mod tests {
             server_tag_host("https://media.divine.video:x@evil.com"),
             "evil.com"
         );
+        // A non-numeric port makes the authority unparseable; it must fall
+        // through to the whole value, not be truncated to the allowed host.
+        assert_eq!(
+            server_tag_host("https://media.divine.video:abc"),
+            "https://media.divine.video:abc"
+        );
     }
 
     #[test]
     fn server_tag_allowed_accepts_only_divine_hosts() {
         assert!(server_tag_allowed("https://media.divine.video"));
         assert!(server_tag_allowed("upload.divine.video"));
+        // A valid explicit port still resolves to the allowed host.
+        assert!(server_tag_allowed("https://media.divine.video:443"));
         assert!(!server_tag_allowed("https://evil.example.com"));
         assert!(!server_tag_allowed("cdn.divine.video"));
         assert!(!server_tag_allowed("https://evil.example/x://media.divine.video"));
         assert!(!server_tag_allowed("https://media.divine.video:x@evil.com"));
+        // Malformed port: rejected here just as the upload proxy rejects it.
+        assert!(!server_tag_allowed("https://media.divine.video:abc"));
     }
 }

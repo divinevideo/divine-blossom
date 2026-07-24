@@ -1302,10 +1302,22 @@ mod tests {
             ],
             1_000,
         ));
+        // A non-numeric port is unparseable to the upload proxy; the edge must
+        // not truncate it to the allowed host and charge quota.
+        let malformed_server = encoded_event(signed_event(
+            BLOSSOM_AUTH_KIND,
+            vec![
+                vec!["t".into(), "media".into()],
+                vec!["expiration".into(), "1300".into()],
+                vec!["server".into(), "https://media.divine.video:abc".into()],
+            ],
+            1_000,
+        ));
 
         // Rejected tokens: no charge, and the counter is never written.
         assert_eq!(charge(&uppercase), None);
         assert_eq!(charge(&foreign_server), None);
+        assert_eq!(charge(&malformed_server), None);
         assert_eq!(store.count(&key), 0);
 
         // A valid media token charges; the third within the window is limited.
