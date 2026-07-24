@@ -62,6 +62,22 @@ pub fn parse_auth_header(auth_header: &str) -> Result<BlossomAuthEvent> {
         .map_err(|e| BlossomError::AuthInvalid(format!("Invalid event JSON: {}", e)))
 }
 
+/// Verifies a parsed auth event is authentic — its id matches its contents and
+/// its signature is valid — and is not expired, without binding it to a
+/// specific action or kind. The edge uses this to safely attribute a
+/// rate-limit charge to a pubkey it otherwise can't trust: `parse_auth_header`
+/// alone decodes attacker-controlled JSON, so any pubkey could be forged.
+///
+/// Full action/kind/hash validation remains the upload service's job.
+pub fn verify_event_authenticity(event: &BlossomAuthEvent, now: u64) -> Result<()> {
+    if let Some(expiration) = event.get_expiration() {
+        if now > expiration {
+            return Err(BlossomError::AuthInvalid("Authorization expired".into()));
+        }
+    }
+    validate_event_integrity(event)
+}
+
 pub fn validate_blossom_event(
     event: &BlossomAuthEvent,
     required_action: AuthAction,

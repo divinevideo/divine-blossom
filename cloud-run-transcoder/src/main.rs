@@ -3,8 +3,9 @@
 
 use anyhow::{anyhow, Result};
 use axum::{
-    extract::{DefaultBodyLimit, Query, State},
+    extract::{DefaultBodyLimit, Query, Request, State},
     http::{header, Method, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Json, Response},
     routing::{get, options, post},
     Router,
@@ -704,7 +705,12 @@ async fn main() -> Result<()> {
         .route("/transcribe", options(handle_cors_preflight))
         .route(
             "/transcribe/audio",
-            post(handle_transcribe_audio).layer(DefaultBodyLimit::max(MAX_TRANSCRIBE_AUDIO_BYTES)),
+            post(handle_transcribe_audio)
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    require_transcribe_secret,
+                ))
+                .layer(DefaultBodyLimit::max(MAX_TRANSCRIBE_AUDIO_BYTES)),
         )
         .route("/transcribe/audio", options(handle_cors_preflight))
         .route("/backfill-fmp4", post(handle_backfill_fmp4))
@@ -829,13 +835,11 @@ struct TranscribeAudioParams {
 /// audio-hash result cache could dedupe repeat audio as a cost optimization.
 async fn handle_transcribe_audio(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
     Query(params): Query<TranscribeAudioParams>,
     body: Bytes,
 ) -> Response {
-    if let Err(rejection) = authorize_transcribe_audio(&state.config, &headers) {
-        return rejection;
-    }
+    // Auth is enforced by `require_transcribe_secret` on this route, before the
+    // `Bytes` body is buffered — see the router. Reaching here means authorized.
     match process_transcribe_audio(&state, params.language.as_deref(), &body).await {
         Ok(vtt) => (
             StatusCode::OK,
@@ -869,6 +873,23 @@ fn ensure_transcribe_audio_size(len: usize) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Rejects unauthenticated `/transcribe/audio` requests *before* the body is
+/// buffered. The secret check has to run in middleware, not the handler: Axum's
+/// `Bytes` extractor materializes the entire body — up to
+/// `MAX_TRANSCRIBE_AUDIO_BYTES` — before handler code runs, so an
+/// unauthenticated flood on this `--allow-unauthenticated` service could
+/// otherwise exhaust instance memory.
+async fn require_transcribe_secret(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if let Err(rejection) = authorize_transcribe_audio(&state.config, request.headers()) {
+        return rejection;
+    }
+    next.run(request).await
 }
 
 /// Header carrying the shared secret that authorizes `POST /transcribe/audio`.

@@ -3687,31 +3687,31 @@ fn handle_upload_complete(mut req: Request, path: &str) -> Result<Response> {
 /// does full auth validation downstream.
 fn enforce_transcribe_rate_limit(req: &Request, auth_header: &str) -> Option<Response> {
     let store = KVStore::open("blossom_metadata").ok().flatten()?;
+    let counter = rate_limit::KvCounterStore(&store);
     let now = unix_timestamp_secs();
 
-    let pubkey = crate::viewer_auth::parse_auth_header(auth_header)
-        .ok()
-        .map(|event| event.pubkey.to_lowercase());
-    let client_ip = req.get_client_ip_addr().map(|ip| ip.to_string());
-
-    let checks = [
-        (
-            "pk",
-            pubkey.as_deref(),
-            rate_limit::RateLimit::new(rate_limit::PUBKEY_LIMIT, rate_limit::PUBKEY_WINDOW_SECS),
-        ),
-        (
-            "ip",
-            client_ip.as_deref(),
-            rate_limit::RateLimit::new(rate_limit::IP_LIMIT, rate_limit::IP_WINDOW_SECS),
-        ),
-    ];
-
-    let counter = rate_limit::KvCounterStore(&store);
-    for (scope, id, cfg) in checks {
-        let Some(id) = id else { continue };
-        if let Some(retry_after) = rate_limit::enforce(&counter, scope, id, cfg, now) {
+    // IP first: always trustworthy (it's the connection source) and cheap, so a
+    // flood is throttled before we spend a signature verification on the
+    // forgeable pubkey below.
+    if let Some(ip) = req.get_client_ip_addr().map(|ip| ip.to_string()) {
+        let cfg = rate_limit::RateLimit::new(rate_limit::IP_LIMIT, rate_limit::IP_WINDOW_SECS);
+        if let Some(retry_after) = rate_limit::enforce(&counter, "ip", &ip, cfg, now) {
             return Some(too_many_requests(retry_after));
+        }
+    }
+
+    // Pubkey only after verifying the event's signature. `parse_auth_header`
+    // decodes attacker-controlled JSON, so charging an unverified pubkey would
+    // let anyone forge a victim's pubkey and burn their hourly budget. The
+    // upload service still does full action/kind validation downstream.
+    if let Ok(event) = crate::viewer_auth::parse_auth_header(auth_header) {
+        if crate::viewer_auth::verify_event_authenticity(&event, now).is_ok() {
+            let pubkey = event.pubkey.to_lowercase();
+            let cfg =
+                rate_limit::RateLimit::new(rate_limit::PUBKEY_LIMIT, rate_limit::PUBKEY_WINDOW_SECS);
+            if let Some(retry_after) = rate_limit::enforce(&counter, "pk", &pubkey, cfg, now) {
+                return Some(too_many_requests(retry_after));
+            }
         }
     }
 
@@ -5756,7 +5756,8 @@ struct UploadCapabilityHeaders {
 }
 
 fn upload_exposed_headers() -> &'static str {
-    "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256, X-Content-SHA256, X-Audio-Duration, X-Audio-Size, X-Divine-Upload-Extensions, X-Divine-Upload-Control-Host, X-Divine-Upload-Data-Host"
+    // Retry-After lets a browser client read the throttle backoff on a 429.
+    "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256, X-Content-SHA256, X-Audio-Duration, X-Audio-Size, X-Divine-Upload-Extensions, X-Divine-Upload-Control-Host, X-Divine-Upload-Data-Host, Retry-After"
 }
 
 fn upload_control_host(public_host: Option<&str>) -> String {
@@ -6216,6 +6217,8 @@ mod tests {
         assert!(exposed_headers.contains("X-Divine-Upload-Extensions"));
         assert!(exposed_headers.contains("X-Divine-Upload-Control-Host"));
         assert!(exposed_headers.contains("X-Divine-Upload-Data-Host"));
+        // Browser clients must be able to read the 429 throttle backoff.
+        assert!(exposed_headers.contains("Retry-After"));
     }
 
     #[test]
