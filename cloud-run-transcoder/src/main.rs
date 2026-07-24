@@ -1475,8 +1475,9 @@ enum TranscribeError {
     Normalize(anyhow::Error),
 }
 
-/// The hardened "audio file -> validated WebVTT" core, shared by the by-hash
-/// [`process_transcribe`] and the raw-audio `process_transcribe_audio`.
+/// The hardened "audio file -> validated WebVTT" core used by the raw-audio
+/// `process_transcribe_audio`. The by-hash [`process_transcribe`] still carries
+/// its own inline copy; folding it onto this core is a deferred follow-up.
 ///
 /// Runs silence analysis (short-circuiting silent audio to an empty VTT),
 /// acquires the instance-wide provider permit ([`AppState::provider_semaphore`]
