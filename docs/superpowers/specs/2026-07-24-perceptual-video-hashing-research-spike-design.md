@@ -165,20 +165,26 @@ directory:
 ./benchmark preflight --manifest <file> --input-root <dir> --runs-root <dir>
 ./benchmark smoke --runs-root <dir>
 ./benchmark pilot --manifest <file> --input-root <dir> --runs-root <dir>
+./benchmark accept-pilot --runs-root <dir> --run <run-id>
 ./benchmark tune --runs-root <dir> --run <run-id>
 ./benchmark test --runs-root <dir> --run <run-id> \
   --freeze <frozen-operating-points.json>
 ./benchmark report --runs-root <dir> --run <run-id>
+./benchmark accept --runs-root <dir> --run <run-id> --conclusion <value>
 ./benchmark cleanup --runs-root <dir> --run <run-id>
-./benchmark full --manifest <file> --input-root <dir> --runs-root <dir>
+./benchmark full --manifest <file> --input-root <dir> --runs-root <dir> \
+  [--run <run-id>]
 ```
 
-`full` is the one-command happy path and invokes the same visible phases in
-order, prints its allocated run ID, and passes the same explicit runs root and
-run ID to every internal phase. Follow-up commands never discover runs through
-global state. Each phase is independently rerunnable when its recorded inputs
-and digests match. Help text documents required mounts and emits the exact
-container command rather than relying on shell aliases or operator memory.
+`full` is the one-command computational path and invokes the same visible
+phases in order, prints its allocated run ID, and passes the same explicit
+runs root and run ID to every internal phase. A real-media run pauses for
+pilot acceptance before full-corpus work and ends pending final human
+acceptance; it never cleans restricted evidence before acceptance. Follow-up
+commands never discover runs through global state. Each phase is independently
+rerunnable when its recorded inputs and digests match. Help text documents
+required mounts and emits the exact container command rather than relying on
+shell aliases or operator memory.
 
 `preflight` is read-only. It validates the manifest and runtime isolation,
 probes inputs inside the sandbox, calculates the expected source/variant/query
@@ -209,8 +215,11 @@ rejected. Its top-level fields are:
 
 - `schema_version`, exactly `1`;
 - `corpus_id`, an opaque identifier;
-- `attestation`, with literal booleans `authorized_for_local_research` and
-  `non_sensitive`, both true, plus an opaque approver role;
+- `attestation`, with literal booleans `authorized_for_local_research`,
+  `non_sensitive`, and `perceptually_distinct_distractors`, all true, plus
+  opaque aliases for the corpus approver, benchmark operator, safety reviewer,
+  and decision owner, and literal confirmation that the corpus approver and
+  decision owner are human;
 - `items`, a nonempty array.
 
 Each item contains:
@@ -237,7 +246,13 @@ A minimal valid shape is:
   "attestation": {
     "authorized_for_local_research": true,
     "non_sensitive": true,
-    "approver_role": "corpus-approver"
+    "perceptually_distinct_distractors": true,
+    "corpus_approver_human": true,
+    "decision_owner_human": true,
+    "corpus_approver_role": "corpus-approver",
+    "benchmark_operator_role": "benchmark-operator",
+    "safety_reviewer_role": "safety-reviewer",
+    "decision_owner_role": "decision-owner"
   },
   "items": [
     {
@@ -625,6 +640,8 @@ runs/<run-id>/
   metrics.json
   report.md
   failures.jsonl
+  pilot-acceptance.json
+  decision-acceptance.json
 ```
 
 The entire `runs/` tree, local inputs, generated variants, and fingerprints
