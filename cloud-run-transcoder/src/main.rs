@@ -1477,7 +1477,10 @@ enum TranscribeError {
 
 /// The hardened "audio file -> validated WebVTT" core used by the raw-audio
 /// `process_transcribe_audio`. The by-hash [`process_transcribe`] still carries
-/// its own inline copy; folding it onto this core is a deferred follow-up.
+/// its own inline copy.
+///
+/// TODO(#147): Fold the by-hash path onto this core after staging validates its
+/// GCS lock, cooldown, webhook, and upload side effects.
 ///
 /// Runs silence analysis (short-circuiting silent audio to an empty VTT),
 /// acquires the instance-wide provider permit ([`AppState::provider_semaphore`]
@@ -2933,8 +2936,8 @@ async fn fetch_gcp_access_token() -> std::result::Result<String, ProviderFailure
     // surface a `timed_out=true` failure so the per-provider retry loop
     // in `transcribe_audio_via_provider` treats it as transient — a
     // metadata blip should not collapse straight into the Gemini fallback.
-    let metadata_summary =
-        last_metadata_error.unwrap_or_else(|| "metadata server unreachable".to_string());
+    let metadata_summary = last_metadata_error
+        .unwrap_or_else(|| "metadata server unreachable".to_string());
 
     match tokio::process::Command::new("gcloud")
         .args(["auth", "print-access-token"])
@@ -3190,7 +3193,9 @@ pub(crate) fn identity_token_cache_for_audience(audience: &str) -> &'static Acce
 /// Fetch a Cloud Run identity token (OIDC) for `audience`. Cached per
 /// audience for 50 minutes. On metadata-server failure we apply the same
 /// 3-attempt retry as `fetch_gcp_access_token`.
-async fn fetch_gcp_identity_token(audience: &str) -> std::result::Result<String, ProviderFailure> {
+async fn fetch_gcp_identity_token(
+    audience: &str,
+) -> std::result::Result<String, ProviderFailure> {
     let cache = identity_token_cache_for_audience(audience);
     if let Some(token) = cache.get(Instant::now()) {
         return Ok(token);
@@ -4458,47 +4463,11 @@ mod tests {
     fn loop_guard_passes_long_unique_text() {
         let mut s = String::new();
         for word in [
-            "The",
-            "quick",
-            "brown",
-            "fox",
-            "jumps",
-            "over",
-            "the",
-            "lazy",
-            "dog",
-            "near",
-            "the",
-            "river",
-            "where",
-            "the",
-            "old",
-            "mill",
-            "stood",
-            "for",
-            "centuries",
-            "until",
-            "the",
-            "great",
-            "flood",
-            "carried",
-            "it",
-            "downstream",
-            "into",
-            "the",
-            "harbor",
-            "where",
-            "fishermen",
-            "still",
-            "remember",
-            "its",
-            "broken",
-            "wheel",
-            "rotting",
-            "in",
-            "the",
-            "salt",
-            "spray",
+            "The", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "near", "the",
+            "river", "where", "the", "old", "mill", "stood", "for", "centuries", "until", "the",
+            "great", "flood", "carried", "it", "downstream", "into", "the", "harbor", "where",
+            "fishermen", "still", "remember", "its", "broken", "wheel", "rotting", "in", "the",
+            "salt", "spray",
         ]
         .iter()
         .cycle()
