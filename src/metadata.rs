@@ -281,6 +281,10 @@ pub struct TranscodeMetadataUpdate {
     pub retry_after: Option<u64>,
     pub terminal: Option<bool>,
     pub increment_attempt_count: bool,
+    /// Monotonic ordering token from the sender. When present it is persisted so
+    /// later callbacks can be ordered against it. `None` (internal callers)
+    /// leaves any stored generation untouched.
+    pub generation: Option<u64>,
 }
 
 /// Update transcode status and associated failure metadata for a video blob.
@@ -332,6 +336,10 @@ pub fn update_transcode_status_with_metadata(
         metadata.dim = Some(d);
     }
 
+    // Persist the ordering token when the sender provided one; otherwise keep
+    // whatever is already stored (internal callers pass None).
+    metadata.transcode_generation = update.generation.or(metadata.transcode_generation);
+
     put_blob_metadata(&metadata)?;
 
     Ok(())
@@ -346,6 +354,8 @@ pub struct TranscriptMetadataUpdate {
     pub retry_after: Option<u64>,
     pub terminal: Option<bool>,
     pub increment_attempt_count: bool,
+    /// Monotonic ordering token from the sender; see `TranscodeMetadataUpdate`.
+    pub generation: Option<u64>,
 }
 
 pub fn update_transcript_status(
@@ -386,6 +396,7 @@ pub fn update_transcript_status(
             metadata.transcript_terminal = update.terminal.unwrap_or(false);
         }
     }
+    metadata.transcript_generation = update.generation.or(metadata.transcript_generation);
     put_blob_metadata(&metadata)?;
 
     Ok(())

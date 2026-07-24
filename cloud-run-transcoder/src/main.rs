@@ -102,6 +102,14 @@ struct Config {
     /// `transcription_provider == "parakeet"`. Audience for the
     /// Cloud Run identity token is the same URL.
     parakeet_asr_url: Option<String>,
+    /// When true, status callbacks are enqueued to Cloud Tasks (durable, retried)
+    /// instead of POSTed directly to Fastly. Default false — the direct POST is
+    /// the rollback path. See docs/superpowers/plans/2026-07-24-derivative-status-queue-simple.md
+    status_queue_enabled: bool,
+    /// Cloud Tasks location for the status queue (e.g. "us-central1").
+    status_queue_location: String,
+    /// Cloud Tasks queue id for status callbacks.
+    status_queue_name: String,
 }
 
 impl Config {
@@ -236,6 +244,13 @@ impl Config {
             parakeet_asr_url: lookup("PARAKEET_ASR_URL")
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty()),
+            status_queue_enabled: parse_bool(&mut lookup, "STATUS_QUEUE_ENABLED", false),
+            status_queue_location: lookup("STATUS_QUEUE_LOCATION")
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "us-central1".to_string()),
+            status_queue_name: lookup("STATUS_QUEUE_NAME")
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "derivative-status".to_string()),
         }
     }
 
@@ -3525,7 +3540,8 @@ async fn finalize_transcript(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_transcode_status_webhook_payload, classify_audio_extract_error,
+        attach_generation, build_cloud_tasks_task_body, build_transcode_status_webhook_payload,
+        classify_audio_extract_error,
         contains_instruction_echo, decide_transcript_lock_action, identity_token_cache_for_audience,
         is_empty_transcript_normalize_error, is_implausible_text_density, is_loop_hallucination,
         is_retryable_provider_failure, normalize_transcript_to_vtt, parakeet_request_url,
@@ -3727,6 +3743,62 @@ mod tests {
         assert!(payload.get("error_message").is_none());
         assert!(payload.get("retry_after").is_none());
         assert!(payload.get("terminal").is_none());
+    }
+
+    #[test]
+    fn attach_generation_adds_monotonic_field() {
+        let mut payload = serde_json::json!({"sha256": "abc123", "status": "complete"});
+        attach_generation(&mut payload, 1_700_000_000_123);
+        assert_eq!(payload["generation"], 1_700_000_000_123_u64);
+        // Original fields survive.
+        assert_eq!(payload["sha256"], "abc123");
+        assert_eq!(payload["status"], "complete");
+    }
+
+    #[test]
+    fn cloud_tasks_body_wraps_payload_as_base64_http_request() {
+        let payload = serde_json::json!({
+            "sha256": "abc123",
+            "status": "complete",
+            "generation": 1_700_000_000_123_u64
+        });
+        let body = build_cloud_tasks_task_body(
+            "https://edge.example/admin/transcode-status",
+            Some("s3cr3t"),
+            &payload,
+        );
+
+        let http = &body["task"]["httpRequest"];
+        assert_eq!(http["url"], "https://edge.example/admin/transcode-status");
+        assert_eq!(http["httpMethod"], "POST");
+        assert_eq!(http["headers"]["Content-Type"], "application/json");
+        assert_eq!(http["headers"]["Authorization"], "Bearer s3cr3t");
+
+        // The task body is base64-encoded JSON; decode and confirm it round-trips
+        // the payload including the generation field.
+        use base64::Engine as _;
+        let b64 = http["body"].as_str().expect("body should be a string");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("body should be valid base64");
+        let round: serde_json::Value =
+            serde_json::from_slice(&decoded).expect("decoded body should be JSON");
+        assert_eq!(round["sha256"], "abc123");
+        assert_eq!(round["status"], "complete");
+        assert_eq!(round["generation"], 1_700_000_000_123_u64);
+    }
+
+    #[test]
+    fn cloud_tasks_body_omits_authorization_when_no_secret() {
+        let payload = serde_json::json!({"sha256": "x", "status": "pending"});
+        let body = build_cloud_tasks_task_body(
+            "https://edge.example/admin/transcode-status",
+            None,
+            &payload,
+        );
+        assert!(body["task"]["httpRequest"]["headers"]
+            .get("Authorization")
+            .is_none());
     }
 
     #[test]
@@ -5149,7 +5221,6 @@ async fn send_status_webhook(
         }
     };
 
-    let client = reqwest::Client::new();
     let payload = build_transcode_status_webhook_payload(
         hash,
         status,
@@ -5172,30 +5243,8 @@ async fn send_status_webhook(
         );
     }
 
-    let mut request = client.post(webhook_url).json(&payload);
-
-    // Add auth header if secret is configured
-    if let Some(secret) = &config.webhook_secret {
-        request = request.header("Authorization", format!("Bearer {}", secret));
-    }
-
-    match request.send().await {
-        Ok(response) => {
-            if response.status().is_success() {
-                info!("Status webhook sent for {}: {}", hash, status);
-            } else {
-                error!(
-                    "Status webhook failed for {}: {} - {}",
-                    hash,
-                    response.status(),
-                    response.text().await.unwrap_or_default()
-                );
-            }
-        }
-        Err(e) => {
-            error!("Status webhook request failed for {}: {}", hash, e);
-        }
-    }
+    let target = webhook_url.clone();
+    deliver_status_payload(config, hash, "transcode", &target, payload).await;
 }
 
 fn resolve_transcript_webhook_url(config: &Config) -> Option<String> {
@@ -5255,6 +5304,145 @@ fn build_transcode_status_webhook_payload(
     payload
 }
 
+/// Monotonically increasing per-sha ordering token, sourced from wall-clock
+/// milliseconds at send time. Later callbacks carry a larger value, so the
+/// receiver can drop a stale update that arrives after a newer one. A clock
+/// that never goes backwards is all this needs; it is not a global sequence.
+fn current_generation_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Stamp a `generation` onto an existing status payload in place.
+fn attach_generation(payload: &mut serde_json::Value, generation: u64) {
+    payload["generation"] = serde_json::json!(generation);
+}
+
+/// Build the Cloud Tasks `CreateTask` request body that will deliver `payload`
+/// to `target_url` as a POST. The status payload is base64-encoded per the
+/// Cloud Tasks HTTP-target contract. Auth to Fastly rides in the task's own
+/// headers (the same bearer secret the direct POST used), so a redelivery
+/// authenticates exactly like the original.
+fn build_cloud_tasks_task_body(
+    target_url: &str,
+    webhook_secret: Option<&str>,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    use base64::Engine as _;
+    let body_b64 = base64::engine::general_purpose::STANDARD
+        .encode(serde_json::to_vec(payload).unwrap_or_default());
+
+    let mut headers = serde_json::json!({ "Content-Type": "application/json" });
+    if let Some(secret) = webhook_secret {
+        headers["Authorization"] = serde_json::json!(format!("Bearer {}", secret));
+    }
+
+    serde_json::json!({
+        "task": {
+            "httpRequest": {
+                "url": target_url,
+                "httpMethod": "POST",
+                "headers": headers,
+                "body": body_b64,
+            }
+        }
+    })
+}
+
+/// Deliver a status payload either by enqueuing to Cloud Tasks (durable, when
+/// `status_queue_enabled`) or by POSTing directly to Fastly (the rollback
+/// path). Fire-and-forget in both cases: a failure is logged, never fatal to
+/// the transcode. The queue path is what makes a lost callback recoverable —
+/// Cloud Tasks retries with backoff and dead-letters on exhaustion.
+async fn deliver_status_payload(
+    config: &Config,
+    hash: &str,
+    label: &str,
+    target_url: &str,
+    mut payload: serde_json::Value,
+) {
+    attach_generation(&mut payload, current_generation_ms());
+
+    if config.status_queue_enabled {
+        if let Err(e) = enqueue_status_task(config, target_url, &payload).await {
+            error!(
+                "Failed to enqueue {} status task for {}: {} — NOT falling back to direct POST (Cloud Tasks owns durability)",
+                label, hash, e
+            );
+        } else {
+            info!("{} status enqueued for {}", label, hash);
+        }
+        return;
+    }
+
+    // Direct POST rollback path.
+    let client = reqwest::Client::new();
+    let mut request = client.post(target_url).json(&payload);
+    if let Some(secret) = &config.webhook_secret {
+        request = request.header("Authorization", format!("Bearer {}", secret));
+    }
+    match request.send().await {
+        Ok(response) if response.status().is_success() => {
+            info!("{} status webhook sent for {}", label, hash);
+        }
+        Ok(response) => {
+            error!(
+                "{} status webhook failed for {}: {} - {}",
+                label,
+                hash,
+                response.status(),
+                response.text().await.unwrap_or_default()
+            );
+        }
+        Err(e) => {
+            error!("{} status webhook request failed for {}: {}", label, hash, e);
+        }
+    }
+}
+
+/// POST a `CreateTask` to the Cloud Tasks REST API using the instance's GCP
+/// access token. Returns Err on any non-2xx so the caller can log it; the task
+/// itself, once created, is retried by Cloud Tasks independently.
+async fn enqueue_status_task(
+    config: &Config,
+    target_url: &str,
+    payload: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let token = fetch_gcp_access_token()
+        .await
+        .map_err(|e| anyhow!("access token: {:?}", e))?;
+
+    let queue_path = format!(
+        "projects/{}/locations/{}/queues/{}",
+        config.gcp_project_id, config.status_queue_location, config.status_queue_name
+    );
+    let create_url = format!(
+        "https://cloudtasks.googleapis.com/v2/{}/tasks",
+        queue_path
+    );
+
+    let body = build_cloud_tasks_task_body(target_url, config.webhook_secret.as_deref(), payload);
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&create_url)
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow!("create task request failed: {}", e))?;
+
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        let code = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        Err(anyhow!("create task returned {}: {}", code, text))
+    }
+}
+
 fn classify_invalid_media_error(
     message: &str,
     fallback_code: &'static str,
@@ -5298,7 +5486,6 @@ async fn send_transcript_status_webhook(
         }
     };
 
-    let client = reqwest::Client::new();
     let mut payload = serde_json::json!({
         "sha256": hash,
         "status": status
@@ -5331,29 +5518,5 @@ async fn send_transcript_status_webhook(
         payload["terminal"] = serde_json::json!(true);
     }
 
-    let mut request = client.post(webhook_url).json(&payload);
-    if let Some(secret) = &config.webhook_secret {
-        request = request.header("Authorization", format!("Bearer {}", secret));
-    }
-
-    match request.send().await {
-        Ok(response) => {
-            if response.status().is_success() {
-                info!("Transcript status webhook sent for {}: {}", hash, status);
-            } else {
-                error!(
-                    "Transcript status webhook failed for {}: {} - {}",
-                    hash,
-                    response.status(),
-                    response.text().await.unwrap_or_default()
-                );
-            }
-        }
-        Err(e) => {
-            error!(
-                "Transcript status webhook request failed for {}: {}",
-                hash, e
-            );
-        }
-    }
+    deliver_status_payload(config, hash, "transcript", &webhook_url, payload).await;
 }

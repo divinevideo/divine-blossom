@@ -76,6 +76,11 @@ pub struct BlobMetadata {
     /// Whether HLS generation has reached a terminal failure state
     #[serde(default)]
     pub transcode_terminal: bool,
+    /// Monotonic ordering token from the last applied transcode status callback.
+    /// A callback carrying a smaller generation is stale (superseded) and is
+    /// dropped by the receiver. Sourced from the transcoder's send-time clock.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcode_generation: Option<u64>,
     /// Video dimensions as "WIDTHxHEIGHT" (display dimensions after rotation)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dim: Option<String>,
@@ -100,6 +105,10 @@ pub struct BlobMetadata {
     /// Whether transcript generation has reached a terminal failure state
     #[serde(default)]
     pub transcript_terminal: bool,
+    /// Monotonic ordering token from the last applied transcript status
+    /// callback. A callback carrying a smaller generation is stale and dropped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript_generation: Option<u64>,
 }
 
 /// Moderation status for blobs
@@ -821,6 +830,8 @@ mod tests {
             transcript_retry_after: None,
             transcript_attempt_count: 0,
             transcript_terminal: false,
+            transcode_generation: None,
+            transcript_generation: None,
         }
     }
 
@@ -1000,6 +1011,8 @@ mod tests {
             transcript_retry_after: None,
             transcript_attempt_count: 0,
             transcript_terminal: false,
+            transcode_generation: None,
+            transcript_generation: None,
         }
     }
 

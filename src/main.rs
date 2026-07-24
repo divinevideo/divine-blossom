@@ -1297,6 +1297,9 @@ struct ParsedTranscodeStatusWebhook {
     error_message: Option<String>,
     retry_after_epoch_secs: Option<u64>,
     terminal: bool,
+    /// Monotonic ordering token from the sender. `None` for legacy senders that
+    /// predate the queue; those are always applied (no ordering info to act on).
+    generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1311,6 +1314,8 @@ struct ParsedTranscriptStatusWebhook {
     error_message: Option<String>,
     retry_after_epoch_secs: Option<u64>,
     terminal: bool,
+    /// Monotonic ordering token from the sender. `None` for legacy senders.
+    generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1405,7 +1410,20 @@ fn parse_transcode_status_webhook_payload(
         error_message: payload["error_message"].as_str().map(|s| s.to_string()),
         retry_after_epoch_secs: parse_optional_retry_after_epoch(payload, now_epoch_secs),
         terminal: parse_optional_bool(payload, "terminal").unwrap_or(false),
+        generation: payload["generation"].as_u64(),
     })
+}
+
+/// Decide whether an incoming status callback is stale relative to what is
+/// already stored. Returns true when the incoming generation is strictly less
+/// than the stored one — i.e. a superseded duplicate that must not be applied.
+/// A missing generation on either side means "no ordering info", so never
+/// stale: legacy senders and first-ever updates always apply.
+fn is_stale_generation(incoming: Option<u64>, stored: Option<u64>) -> bool {
+    match (incoming, stored) {
+        (Some(inc), Some(cur)) => inc < cur,
+        _ => false,
+    }
 }
 
 fn parse_transcript_status_webhook_payload(
@@ -1445,6 +1463,7 @@ fn parse_transcript_status_webhook_payload(
         error_message: payload["error_message"].as_str().map(|s| s.to_string()),
         retry_after_epoch_secs: parse_optional_retry_after_epoch(payload, now_epoch_secs),
         terminal: parse_optional_bool(payload, "terminal").unwrap_or(false),
+        generation: payload["generation"].as_u64(),
     })
 }
 
@@ -2240,6 +2259,8 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
         transcript_retry_after: None,
         transcript_attempt_count: 0,
         transcript_terminal: false,
+        transcode_generation: None,
+        transcript_generation: None,
     };
     let _ = put_blob_metadata(&audio_metadata);
 
@@ -3230,6 +3251,8 @@ fn handle_upload(mut req: Request) -> Result<Response> {
         transcript_retry_after: None,
         transcript_attempt_count: 0,
         transcript_terminal: false,
+        transcode_generation: None,
+        transcript_generation: None,
     };
 
     put_blob_metadata(&metadata)?;
@@ -3459,6 +3482,8 @@ fn publish_upload_service_upload(
             0
         },
         transcript_terminal,
+        transcode_generation: None,
+        transcript_generation: None,
     };
 
     put_blob_metadata(&metadata)?;
@@ -4451,6 +4476,8 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
         transcript_retry_after: None,
         transcript_attempt_count: 0,
         transcript_terminal: false,
+        transcode_generation: None,
+        transcript_generation: None,
     };
 
     put_blob_metadata(&metadata)?;
@@ -4905,44 +4932,57 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
     }
 }
 
-/// POST /admin/transcode-status - Webhook from divine-transcoder service
-/// Updates transcode status for a blob after HLS generation
-fn handle_transcode_status(mut req: Request) -> Result<Response> {
-    // Try to get webhook secret from secret store (same as moderation webhook)
-    let expected_secret: Option<String> =
-        fastly::secret_store::SecretStore::open("blossom_secrets")
-            .ok()
-            .and_then(|store| store.get("webhook_secret"))
-            .map(|secret| String::from_utf8(secret.plaintext().to_vec()).unwrap_or_default());
+/// Validate a transcoder status callback's bearer token.
+///
+/// Accepts EITHER the shared `webhook_secret` (also used by
+/// divine-moderation-service) OR a dedicated `transcoder_webhook_secret`. The
+/// second key lets the transcoder authenticate with its own credential without
+/// sharing moderation's secret — so the transcoder can be re-keyed
+/// independently. Fail-closed if neither key is configured.
+fn validate_transcoder_webhook(req: &Request, label: &str) -> Result<()> {
+    let store = fastly::secret_store::SecretStore::open("blossom_secrets")
+        .map_err(|_| BlossomError::Forbidden("Secret store not available".into()))?;
 
-    // Get Authorization header
-    let auth_header = req
+    let provided = req
         .get_header(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string());
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|s| s.trim().to_string());
 
-    // Validate secret if configured
-    if let Some(ref expected) = expected_secret {
-        match auth_header {
-            Some(ref header) if header.starts_with("Bearer ") => {
-                let provided = header.strip_prefix("Bearer ").unwrap_or("");
-                if provided != expected.trim() {
-                    eprintln!("[TRANSCODE] Invalid webhook secret");
-                    return Err(BlossomError::Forbidden("Invalid webhook secret".into()));
-                }
+    let mut any_configured = false;
+    for key in ["webhook_secret", "transcoder_webhook_secret"] {
+        if let Some(secret) = store.get(key) {
+            let expected = String::from_utf8(secret.plaintext().to_vec()).unwrap_or_default();
+            let expected = expected.trim().to_string();
+            if expected.is_empty() {
+                continue;
             }
-            _ => {
-                eprintln!("[TRANSCODE] Missing or invalid Authorization header");
-                return Err(BlossomError::AuthRequired("Webhook secret required".into()));
+            any_configured = true;
+            if provided.as_deref() == Some(expected.as_str()) {
+                return Ok(());
             }
         }
-    } else {
-        // Fail closed: reject requests if webhook_secret is not configured
-        eprintln!("[TRANSCODE] webhook_secret not configured, rejecting request");
+    }
+
+    if !any_configured {
+        // Fail closed: reject if no webhook secret is configured at all.
+        eprintln!("[{}] no webhook secret configured, rejecting request", label);
         return Err(BlossomError::Forbidden(
             "Webhook secret not configured".into(),
         ));
     }
+    if provided.is_none() {
+        eprintln!("[{}] Missing or invalid Authorization header", label);
+        return Err(BlossomError::AuthRequired("Webhook secret required".into()));
+    }
+    eprintln!("[{}] Invalid webhook secret", label);
+    Err(BlossomError::Forbidden("Invalid webhook secret".into()))
+}
+
+/// POST /admin/transcode-status - Webhook from divine-transcoder service
+/// Updates transcode status for a blob after HLS generation
+fn handle_transcode_status(mut req: Request) -> Result<Response> {
+    validate_transcoder_webhook(&req, "TRANSCODE")?;
 
     // Parse JSON body
     let body = req.take_body().into_string();
@@ -4964,6 +5004,26 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
 
     validate_sha256_format(sha256)?;
 
+    // Drop stale/duplicate callbacks: if the incoming generation is older than
+    // what we already applied, this is a superseded redelivery. Return 200 so
+    // Cloud Tasks stops retrying it, but do not apply or purge.
+    if let Some(existing) = crate::metadata::get_blob_metadata(sha256)? {
+        if is_stale_generation(parsed.generation, existing.transcode_generation) {
+            eprintln!(
+                "[TRANSCODE] Ignoring stale callback for {}: incoming gen {:?} < stored {:?}",
+                sha256, parsed.generation, existing.transcode_generation
+            );
+            let response = serde_json::json!({
+                "success": true,
+                "sha256": sha256,
+                "ignored": "stale_generation"
+            });
+            let mut resp = json_response(StatusCode::OK, &response);
+            add_cors_headers(&mut resp);
+            return Ok(resp);
+        }
+    }
+
     // Update transcode status (and optionally file size and dimensions if provided)
     use crate::metadata::update_transcode_status_with_metadata;
     match update_transcode_status_with_metadata(
@@ -4978,6 +5038,7 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
             retry_after: parsed.retry_after_epoch_secs,
             terminal: Some(parsed.terminal),
             increment_attempt_count: matches!(parsed.status, TranscodeStatus::Failed),
+            generation: parsed.generation,
         },
     ) {
         Ok(()) => {
@@ -5038,41 +5099,7 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
 /// POST /admin/transcript-status - Webhook from divine-transcoder service
 /// Updates transcript status for a blob after VTT generation
 fn handle_transcript_status(mut req: Request) -> Result<Response> {
-    // Try to get webhook secret from secret store (same as moderation/transcode webhook)
-    let expected_secret: Option<String> =
-        fastly::secret_store::SecretStore::open("blossom_secrets")
-            .ok()
-            .and_then(|store| store.get("webhook_secret"))
-            .map(|secret| String::from_utf8(secret.plaintext().to_vec()).unwrap_or_default());
-
-    // Get Authorization header
-    let auth_header = req
-        .get_header(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string());
-
-    // Validate secret if configured
-    if let Some(ref expected) = expected_secret {
-        match auth_header {
-            Some(ref header) if header.starts_with("Bearer ") => {
-                let provided = header.strip_prefix("Bearer ").unwrap_or("");
-                if provided != expected.trim() {
-                    eprintln!("[TRANSCRIPT] Invalid webhook secret");
-                    return Err(BlossomError::Forbidden("Invalid webhook secret".into()));
-                }
-            }
-            _ => {
-                eprintln!("[TRANSCRIPT] Missing or invalid Authorization header");
-                return Err(BlossomError::AuthRequired("Webhook secret required".into()));
-            }
-        }
-    } else {
-        // Fail closed: reject requests if webhook_secret is not configured
-        eprintln!("[TRANSCRIPT] webhook_secret not configured, rejecting request");
-        return Err(BlossomError::Forbidden(
-            "Webhook secret not configured".into(),
-        ));
-    }
+    validate_transcoder_webhook(&req, "TRANSCRIPT")?;
 
     // Parse JSON body
     let body = req.take_body().into_string();
@@ -5089,6 +5116,24 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
 
     validate_sha256_format(sha256)?;
 
+    // Drop stale/duplicate callbacks (see handle_transcode_status).
+    if let Some(existing) = crate::metadata::get_blob_metadata(sha256)? {
+        if is_stale_generation(parsed.generation, existing.transcript_generation) {
+            eprintln!(
+                "[TRANSCRIPT] Ignoring stale callback for {}: incoming gen {:?} < stored {:?}",
+                sha256, parsed.generation, existing.transcript_generation
+            );
+            let response = serde_json::json!({
+                "success": true,
+                "sha256": sha256,
+                "ignored": "stale_generation"
+            });
+            let mut resp = json_response(StatusCode::OK, &response);
+            add_cors_headers(&mut resp);
+            return Ok(resp);
+        }
+    }
+
     use crate::metadata::update_transcript_status;
     match update_transcript_status(
         sha256,
@@ -5100,6 +5145,7 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
             retry_after: parsed.retry_after_epoch_secs,
             terminal: Some(parsed.terminal),
             increment_attempt_count: matches!(parsed.status, TranscriptStatus::Failed),
+            generation: parsed.generation,
         },
     ) {
         Ok(()) => {
@@ -5772,16 +5818,62 @@ mod tests {
     use super::{
         backfill_batch_cursor, classify_audio_reuse_availability, decide_transcode_fetch_action,
         decide_transcript_fetch_action, error_response, is_alias_only_audio_blob,
-        is_quality_variant_path, parse_quality_variant_path,
-        parse_transcript_status_webhook_payload, should_delete_derived_audio_blob,
-        should_eagerly_trigger_transcription, should_set_audio_content_length,
-        upload_capability_headers, upload_control_host, upload_exposed_headers,
-        AudioReuseAvailability, TranscodeFetchAction, TranscriptFetchAction,
+        is_quality_variant_path, is_stale_generation, parse_quality_variant_path,
+        parse_transcode_status_webhook_payload, parse_transcript_status_webhook_payload,
+        should_delete_derived_audio_blob, should_eagerly_trigger_transcription,
+        should_set_audio_content_length, upload_capability_headers, upload_control_host,
+        upload_exposed_headers, AudioReuseAvailability, TranscodeFetchAction, TranscriptFetchAction,
         TranscriptPendingState,
     };
     use crate::blossom::{TranscodeStatus, TranscriptStatus};
     use crate::error::{BlossomError, Result as BlossomResult};
     use fastly::http::StatusCode;
+
+    #[test]
+    fn stale_generation_ordering() {
+        // Newer supersedes older -> older is stale.
+        assert!(is_stale_generation(Some(3), Some(5)));
+        // Equal is not stale (idempotent redelivery still applies once; the
+        // no-op write is harmless and status is unchanged).
+        assert!(!is_stale_generation(Some(5), Some(5)));
+        // Newer than stored -> apply.
+        assert!(!is_stale_generation(Some(6), Some(5)));
+        // Missing info on either side -> never stale (legacy sender / first update).
+        assert!(!is_stale_generation(None, Some(5)));
+        assert!(!is_stale_generation(Some(3), None));
+        assert!(!is_stale_generation(None, None));
+    }
+
+    #[test]
+    fn transcode_payload_parses_generation() {
+        let payload = serde_json::json!({
+            "sha256": "a".repeat(64),
+            "status": "complete",
+            "generation": 1_700_000_000_123_u64
+        });
+        let parsed = parse_transcode_status_webhook_payload(&payload, 0).unwrap();
+        assert_eq!(parsed.generation, Some(1_700_000_000_123));
+
+        // A legacy payload with no generation parses as None (always applied).
+        let legacy = serde_json::json!({ "sha256": "a".repeat(64), "status": "complete" });
+        assert_eq!(
+            parse_transcode_status_webhook_payload(&legacy, 0)
+                .unwrap()
+                .generation,
+            None
+        );
+    }
+
+    #[test]
+    fn transcript_payload_parses_generation() {
+        let payload = serde_json::json!({
+            "sha256": "b".repeat(64),
+            "status": "processing",
+            "generation": 42_u64
+        });
+        let parsed = parse_transcript_status_webhook_payload(&payload, 0).unwrap();
+        assert_eq!(parsed.generation, Some(42));
+    }
 
     #[test]
     fn quality_variant_path_valid() {

@@ -223,6 +223,8 @@ mod tests {
             transcript_retry_after: None,
             transcript_attempt_count: 0,
             transcript_terminal: false,
+            transcode_generation: None,
+            transcript_generation: None,
         }
     }
 
