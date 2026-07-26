@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@divinevideo/login": "^1.1.0",
+    "@fontsource-variable/bricolage-grotesque": "^5.2.8",
     "@fontsource-variable/inter": "^5.2.8",
     "@phosphor-icons/react": "^2.1.10",
     "nostr-tools": "^2.15.1",
