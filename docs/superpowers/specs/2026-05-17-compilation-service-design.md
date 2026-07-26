@@ -6,7 +6,7 @@ A backend service that takes a Nostr list of video events and produces a single 
 
 ## Solution
 
-New Cloud Run service `cloud-run-compiler/`, parallel to `cloud-run-transcoder/`. Same stack: Rust + FFmpeg + NVIDIA NVENC. Reuses transcoder patterns for deploy, auth, GCS layout, webhook callbacks.
+New Cloud Run service `cloud-run-compiler/`, parallel to `cloud-run-transcoder/`. Same stack: Rust + FFmpeg + NVIDIA NVENC. Reuses transcoder patterns for deploy, auth, FFmpeg/NVENC execution, and webhook callbacks.
 
 ## API
 
@@ -79,7 +79,7 @@ Response (immediate):
 
 `GET /compile/:job_id` on an unknown id returns `404 Not Found` with `{"error": "job_not_found", "job_id": "..."}`.
 
-When `status` transitions to `done` or `failed`, the service POSTs the same body to `callback_url` (3 retries with exponential backoff: 1s, 5s, 25s). The POST carries `X-Compiler-Signature: sha256=<hex>` where the hex is `HMAC_SHA256(COMPILER_WEBHOOK_SECRET, raw_body)`. Caller verifies before trusting the payload.
+When `status` transitions to `done` or `failed`, the service POSTs the same body to `callback_url` (3 retries with exponential backoff: 1s, 5s, 25s). The POST always carries `X-Compiler-Signature: sha256=<hex>` where the hex is `HMAC_SHA256(COMPILER_CALLBACK_SECRET, raw_body)`. This is one service-wide callback signing secret, not the caller auth secret; NIP-98 and webhook-secret callers get the same signed callback behavior.
 
 Callback delivery is recorded on the job doc as `callback_delivery: { attempts: N, last_attempt_at, last_status_code, delivered: bool }`. If all 3 retries fail, the job stays in its terminal status (`done` / `failed`) with `callback_delivery.delivered: false`; operators inspect via `GET /admin/jobs/:job_id`. (A `callback_delivered=false` query filter on `GET /admin/jobs` is v2+.)
 
@@ -93,6 +93,12 @@ Either of these is sufficient on `POST /compile` and `GET /compile/:job_id`:
 If both are present, NIP-98 wins. If neither is present, 401.
 
 V1 request validation is done by serde with `deny_unknown_fields` on `CompileRequest` and all nested structs — any field outside the schema above returns 400. No separate validation matrix needed.
+
+Business validation after serde:
+
+- `aspects` must contain at least one entry.
+- `aspects` may only contain `9:16`, `1:1`, and `16:9` values.
+- `callback_url`, when present, must be `https://`.
 
 ## Pipeline
 
@@ -115,15 +121,15 @@ V1 request validation is done by serde with `deny_unknown_fields` on `CompileReq
       `https://media.divine.video/<sha256>` (bounded concurrency). HLS
       renditions are not used as input — comp re-encodes anyway, so we go straight
       from the original. No pre-check; if a blob is Restricted/AgeRestricted/missing
-      the download returns 403/404 and the worker records `clips_dropped` with the
+      the download returns 401/403/404 and the worker records `clips_dropped` with the
       mapped reason.
    d. ffprobe each downloaded file: duration, dim, codec, rotation.
    e. Build clip list, drop anything past max_duration_sec (tail-drop).
    f. For each requested aspect ratio, generate one concat plan and run FFmpeg.
       - GPU NVENC encode (CPU fallback for rotated/oddball inputs, same as transcoder).
-      - Overlay: divine logo (static PNG bundled), per-clip credit text via drawtext.
+      - Overlay: divine logo (static PNG bundled), per-clip credit text via drawtext after concat so credit windows use final-timeline timestamps.
       - Audio: loudnorm filter targeting target_lufs.
-   g. Upload each output MP4 to blossom (GCS bucket divine-blossom-media), get sha256.
+   g. Upload each output MP4 to the `cloud-run-upload` service via a Blossom-signed `PUT`. The upload service handles GCS storage and Fastly KV registration; the compiler treats it as a black-box bytes → BlobDescriptor operation.
    h. Mark job done, persist result, POST callback_url.
 3. On any failure: persist error, mark failed, POST callback_url.
 
@@ -141,7 +147,7 @@ GPU error, blossom upload fails).
 - Multi-aspect render (any combo of 9:16 / 1:1 / 16:9 in one job).
 - All three fit modes globally (`blur-pad` / `center-crop` / `letterbox`).
 - Static-corner watermark + lower-third-fade credit (no other modes).
-- Passthrough audio + single-pass loudnorm.
+- Source audio concat + single-pass loudnorm.
 - Hard cut transitions only.
 - Webhook callback with HMAC signature.
 - NIP-98 auth **and** webhook shared-secret auth (either sufficient).
@@ -180,6 +186,15 @@ These are NOT in v1. Schema rejects them with 400 (unknown field) until implemen
 - **No request dedup.** Two identical `POST /compile` payloads create two independent jobs. Caller is responsible for not double-submitting.
 - **Job working dir** is `/tmp/job_<id>/`, removed when the worker finishes regardless of outcome.
 - Service does **not** sign or publish anything to Nostr. Caller signs whatever kind 34235 they want with the returned blob descriptors.
+- Output blobs are service-owned in v1 by the pubkey derived from `COMPILER_OUTPUT_OWNER_NSEC`. Direct caller delete of compiled outputs is v2+; v1 operator removal goes through existing admin delete/restore tooling.
+
+## Runtime config
+
+Required env/secrets: `FIRESTORE_PROJECT`, `COMPILER_CALLBACK_SECRET`, `COMPILER_OUTPUT_OWNER_NSEC`. `COMPILER_OUTPUT_OWNER_NSEC` is a bech32 `nsec` or 32-byte hex secret; the derived pubkey owns compiler output blobs.
+
+Defaults: `API_DIVINE_VIDEO_URL=https://api.divine.video`, `MEDIA_DIVINE_VIDEO_URL=https://media.divine.video`, `UPLOAD_SERVICE_URL=https://upload.divine.video`, `MAX_CONCURRENT_JOBS=4`, `RATE_LIMIT_PER_HOUR=20`, `RATE_LIMIT_PER_DAY=100`.
+
+Optional auth/admin config: `COMPILER_WEBHOOK_SECRETS=name:secret,...`, `COMPILER_ADMIN_TOKEN`.
 
 ## Text rendering
 
@@ -189,7 +204,9 @@ Credits and any future text overlays use the Noto Sans family bundled in the Doc
 
 Per-tenant. Tenant id is derived from auth (see Auth section above): `pubkey:<hex>` for NIP-98, `secret:<name>` for webhook secrets where the name comes from the service's env config (not a client-supplied header).
 
-Defaults: **20 jobs/hr, 100 jobs/day** per tenant. Overrides live in Firestore at `rate_limits/<tenant_id>`. Counters are Firestore atomic increments with field-level TTL. Exceeded → `429 Too Many Requests` with `Retry-After` header.
+Defaults: **20 jobs/hr, 100 jobs/day** per tenant. Overrides live in Firestore at `rate_limits/<tenant_id>`. Counter check + increment happens in one Firestore transaction per tenant doc; no read-modify-write outside a transaction. Exceeded → `429 Too Many Requests` with `Retry-After` header.
+
+`GET /compile/:job_id` is tenant-scoped: the authenticated caller must match `job.tenant_id`, or the service returns `404` so job ids are not enumerable across tenants. Admin endpoints remain bearer-token-only.
 
 ## Observability
 
@@ -222,7 +239,7 @@ Admin endpoints are for operator visibility ("see what people are making") and i
 - Each Cloud Run instance processes up to 4 jobs in parallel (FFmpeg/NVENC slots shared).
 - `max_instances` on the Cloud Run service starts at 5; tune from real traffic.
 - Each job uses its own temp working dir under `/tmp/job_<id>/` and cleans up on completion (or on instance shutdown via SIGTERM handler).
-- Comp MP4s are regular blossom blobs with no special TTL. Caller can `DELETE` if they want them gone. No GC job in v1.
+- Comp MP4s are regular blossom blobs with no special TTL. They are service-owned in v1 by the compiler output key; caller-owned output/delete semantics are v2+. No GC job in v1.
 
 ## What's reused from cloud-run-transcoder
 
@@ -231,10 +248,11 @@ Admin endpoints are for operator visibility ("see what people are making") and i
 - ffprobe / GPU-encode-with-CPU-fallback logic.
 - Webhook callback retry shape.
 - Single-pass loudnorm pattern.
+- `cloud-run-upload` service for output publishing, so compiler outputs use the same GCS + Fastly KV registration path as normal uploads.
 
 ## Decisions locked
 
-- **Job state:** Firestore (collection `compilation_jobs`, doc id = job_id). No fallback. Rate-limit counters live in `rate_limits/<tenant_id>` and depend on Firestore atomic increments. Job docs are retained indefinitely in v1 (jobs are small JSON; a TTL/GC is a future operational tune, not v1 scope).
+- **Job state:** Firestore (collection `compilation_jobs`, doc id = job_id). No fallback. Rate-limit counters live in `rate_limits/<tenant_id>` and depend on Firestore transactional check+increment. Job docs are retained indefinitely in v1 (jobs are small JSON; a TTL/GC is a future operational tune, not v1 scope).
 - **Logo:** fetched at worker startup from `https://media.divine.video/divine-logo.png` (CDN-served, single source of truth, no rebuild needed to refresh the logo). Cached on local disk for the worker's lifetime.
 - **Event/profile fetch:** `https://api.divine.video` REST API. No relay WebSocket.
-- **Moderation:** `Restricted` and `AgeRestricted` source blobs are silently skipped in v1 and surfaced in `clips_dropped`. Per-user age-gate (caller opts in, request carries their auth, service fetches with that auth) is **v2+** — too much complexity for v1.
+- **Moderation:** `Restricted` and `AgeRestricted` source blobs are silently skipped in v1 and surfaced in `clips_dropped` (`401`/`403`/`404` from media fetch). Per-user age-gate (caller opts in, request carries their auth, service fetches with that auth) is **v2+** — too much complexity for v1.

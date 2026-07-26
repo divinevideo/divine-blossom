@@ -4,9 +4,9 @@
 
 **Goal:** New Cloud Run GPU service `cloud-run-compiler/` (parallel to `cloud-run-transcoder/`) that takes a Nostr list of video events, downloads source MP4s from blossom, and produces concatenated MP4s in three aspect ratios (9:16, 1:1, 16:9) with a Divine logo watermark and per-clip nip05 credits burned in. Async jobs, HMAC-signed webhook callback. NIP-98 or webhook-secret auth.
 
-**Architecture:** Single Rust crate. axum HTTP server on Cloud Run GPU (NVIDIA L4), NVENC encoding via system FFmpeg. Firestore for job state at `compilation_jobs/<job_id>`. Source events via `https://api.divine.video` REST. Source blobs via `https://media.divine.video/<sha256>`. Outputs uploaded to GCS bucket `divine-blossom-media`. Concurrency cap of 4 jobs per Cloud Run instance.
+**Architecture:** Single Rust crate. axum HTTP server on Cloud Run GPU (NVIDIA L4), NVENC encoding via system FFmpeg. Firestore for job state at `compilation_jobs/<job_id>`. Source events via `https://api.divine.video` REST. Source blobs via `https://media.divine.video/<sha256>`. Outputs uploaded to `cloud-run-upload` with a Blossom-signed `PUT`; that service stores bytes and registers Fastly KV metadata. Concurrency cap of 4 jobs per Cloud Run instance.
 
-**Tech Stack:** Rust 1.83, axum 0.7, tokio, reqwest, `firestore` crate, `nostr` crate (for NIP-19 decode + NIP-98 verification — do NOT hand-roll), `google-cloud-storage`, system FFmpeg + NVENC + Noto Sans fonts.
+**Tech Stack:** Rust 1.83, axum 0.7, tokio, reqwest, `firestore` crate, `nostr` crate (for NIP-19 decode, NIP-98 verification, and Blossom auth signing — do NOT hand-roll), system FFmpeg + NVENC + Noto Sans fonts.
 
 **Spec:** `docs/superpowers/specs/2026-05-17-compilation-service-design.md`
 
@@ -35,7 +35,7 @@ cloud-run-compiler/
 │   ├── auth.rs         # Tenant extractor (NIP-98 via `nostr` crate + webhook secret)
 │   ├── rate_limit.rs   # Firestore counter w/ hourly+daily buckets
 │   ├── nostr_api.rs    # api.divine.video REST client + imeta parse
-│   ├── blossom.rs      # download + GCS upload
+│   ├── blossom.rs      # source download + output publish via cloud-run-upload
 │   ├── render.rs       # probe + filtergraph builders + ffmpeg exec
 │   ├── webhook.rs      # HMAC sign + deliver with retry
 │   ├── handlers.rs     # axum router + POST /compile + GET /compile/:id + admin
@@ -60,12 +60,12 @@ cloud-run-compiler/
 | File | Responsibility |
 |---|---|
 | `main.rs` | wire config → state → axum router → spawn worker, bind PORT |
-| `config.rs` | `Config { firestore_project, gcs_bucket, api_url, media_url, webhook_secrets, admin_token, ... }` |
+| `config.rs` | `Config { firestore_project, api_url, media_url, upload_service_url, webhook_secrets, admin_token, ... }` |
 | `job.rs` | `Job`, `JobStatus`, `JobResult`, `CompileRequest` types + `JobStore` (Firestore CRUD) — one cohesive module |
 | `auth.rs` | `Tenant` enum + axum extractor that runs NIP-98 (via `nostr::nips::nip98`) then webhook secret |
 | `rate_limit.rs` | `RateLimiter::check_and_increment(tenant_id, now)` |
 | `nostr_api.rs` | `ApiClient::{fetch_event, fetch_profile, fetch_list_event}` + `Imeta::first_in(event)` |
-| `blossom.rs` | `DownloadClient::download(sha256, dest)` + `GcsUploader::upload_file(path)` |
+| `blossom.rs` | `DownloadClient::download(sha256, dest)` + `BlossomPublisher::publish_file(path)` |
 | `render.rs` | `probe(file)`, `build_command(AspectJob)`, `run_render(AspectJob)` (GPU→CPU fallback), `render_aspect(...)` |
 | `webhook.rs` | `sign(secret, body)`, `verify(...)`, `deliver(url, body, secret) -> CallbackDelivery` |
 | `handlers.rs` | axum `Router` building, all HTTP handlers (POST /compile, GET /compile/:id, GET /admin/jobs, GET /admin/jobs/:id, /health) |
@@ -105,13 +105,6 @@ axum = { version = "0.7", features = ["http2"] }
 tokio = { version = "1", features = ["full", "process"] }
 tower-http = { version = "0.5", features = ["trace"] }
 hyper = { version = "1", features = ["http2", "server"] }
-
-# Pinned to match cloud-run-transcoder (edition2024 workarounds)
-google-cloud-storage = "=0.17.0"
-google-cloud-auth = "=0.12.0"
-home = "=0.5.9"
-base64ct = "=1.6.0"
-time = "=0.3.36"
 
 firestore = "0.43"  # verify latest 0.4x at impl time, pin to whatever resolves
 
@@ -299,6 +292,8 @@ git commit -m "feat(compiler): Dockerfile with NVIDIA CUDA + ffmpeg + Noto fonts
 use divine_compiler::config::Config;
 use std::collections::HashMap;
 
+const NSEC_HEX: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
 fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
     pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
 }
@@ -307,12 +302,14 @@ fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
 fn loads_defaults_with_only_required_vars() {
     let cfg = Config::from_env(&env(&[
         ("FIRESTORE_PROJECT", "p"),
-        ("GCS_BUCKET", "b"),
+        ("COMPILER_CALLBACK_SECRET", "callback-secret"),
+        ("COMPILER_OUTPUT_OWNER_NSEC", NSEC_HEX),
     ])).unwrap();
     assert_eq!(cfg.firestore_project, "p");
-    assert_eq!(cfg.gcs_bucket, "b");
     assert_eq!(cfg.api_url, "https://api.divine.video");
     assert_eq!(cfg.media_url, "https://media.divine.video");
+    assert_eq!(cfg.upload_service_url, "https://upload.divine.video");
+    assert_eq!(cfg.output_owner_nsec, NSEC_HEX);
     assert_eq!(cfg.max_concurrent_jobs, 4);
     assert!(cfg.webhook_secrets.is_empty());
 }
@@ -320,7 +317,9 @@ fn loads_defaults_with_only_required_vars() {
 #[test]
 fn parses_webhook_secrets_env() {
     let cfg = Config::from_env(&env(&[
-        ("FIRESTORE_PROJECT", "p"), ("GCS_BUCKET", "b"),
+        ("FIRESTORE_PROJECT", "p"),
+        ("COMPILER_CALLBACK_SECRET", "callback-secret"),
+        ("COMPILER_OUTPUT_OWNER_NSEC", NSEC_HEX),
         ("COMPILER_WEBHOOK_SECRETS", "funnelcake:abc,janitor:def"),
     ])).unwrap();
     assert_eq!(cfg.webhook_secrets.get("abc"), Some(&"funnelcake".into()));
@@ -330,15 +329,30 @@ fn parses_webhook_secrets_env() {
 #[test]
 fn rejects_malformed_secrets() {
     let res = Config::from_env(&env(&[
-        ("FIRESTORE_PROJECT", "p"), ("GCS_BUCKET", "b"),
+        ("FIRESTORE_PROJECT", "p"),
+        ("COMPILER_CALLBACK_SECRET", "callback-secret"),
+        ("COMPILER_OUTPUT_OWNER_NSEC", NSEC_HEX),
         ("COMPILER_WEBHOOK_SECRETS", "bad:abc,123"),
     ]));
     assert!(res.is_err());
 }
 
 #[test]
+fn rejects_malformed_output_owner_nsec() {
+    let res = Config::from_env(&env(&[
+        ("FIRESTORE_PROJECT", "p"),
+        ("COMPILER_CALLBACK_SECRET", "callback-secret"),
+        ("COMPILER_OUTPUT_OWNER_NSEC", "not-a-key"),
+    ]));
+    assert!(matches!(
+        res,
+        Err(divine_compiler::config::ConfigError::Invalid { var: "COMPILER_OUTPUT_OWNER_NSEC", .. })
+    ));
+}
+
+#[test]
 fn errors_on_missing_required() {
-    assert!(Config::from_env(&env(&[("GCS_BUCKET", "b")])).is_err());
+    assert!(Config::from_env(&env(&[("FIRESTORE_PROJECT", "p")])).is_err());
 }
 ```
 
@@ -346,16 +360,19 @@ fn errors_on_missing_required() {
 
 ```rust
 // src/config.rs
-// ABOUTME: Config loaded from env at startup. Required: FIRESTORE_PROJECT, GCS_BUCKET.
+// ABOUTME: Config loaded from env at startup. Required vars are explicit so deploy fails closed.
 
+use nostr::prelude::Keys;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub firestore_project: String,
-    pub gcs_bucket: String,
     pub api_url: String,
     pub media_url: String,
+    pub upload_service_url: String,
+    pub callback_secret: String,
+    pub output_owner_nsec: String,
     pub webhook_secrets: HashMap<String, String>, // secret_value -> tenant_name
     pub admin_token: Option<String>,
     pub max_concurrent_jobs: usize,
@@ -374,15 +391,21 @@ pub enum ConfigError {
 impl Config {
     pub fn from_env(env: &HashMap<String, String>) -> Result<Self, ConfigError> {
         let firestore_project = env.get("FIRESTORE_PROJECT").ok_or(ConfigError::Missing("FIRESTORE_PROJECT"))?.clone();
-        let gcs_bucket = env.get("GCS_BUCKET").ok_or(ConfigError::Missing("GCS_BUCKET"))?.clone();
+        let callback_secret = env.get("COMPILER_CALLBACK_SECRET").ok_or(ConfigError::Missing("COMPILER_CALLBACK_SECRET"))?.clone();
+        let output_owner_nsec = env.get("COMPILER_OUTPUT_OWNER_NSEC").ok_or(ConfigError::Missing("COMPILER_OUTPUT_OWNER_NSEC"))?.clone();
+        Keys::parse(&output_owner_nsec).map_err(|e| ConfigError::Invalid {
+            var: "COMPILER_OUTPUT_OWNER_NSEC",
+            detail: e.to_string(),
+        })?;
         let api_url = env.get("API_DIVINE_VIDEO_URL").cloned().unwrap_or_else(|| "https://api.divine.video".into());
         let media_url = env.get("MEDIA_DIVINE_VIDEO_URL").cloned().unwrap_or_else(|| "https://media.divine.video".into());
+        let upload_service_url = env.get("UPLOAD_SERVICE_URL").cloned().unwrap_or_else(|| "https://upload.divine.video".into());
         let webhook_secrets = parse_webhook_secrets(env.get("COMPILER_WEBHOOK_SECRETS"))?;
         let admin_token = env.get("COMPILER_ADMIN_TOKEN").cloned();
         let max_concurrent_jobs = env.get("MAX_CONCURRENT_JOBS").and_then(|s| s.parse().ok()).unwrap_or(4);
         let rate_limit_per_hour = env.get("RATE_LIMIT_PER_HOUR").and_then(|s| s.parse().ok()).unwrap_or(20);
         let rate_limit_per_day = env.get("RATE_LIMIT_PER_DAY").and_then(|s| s.parse().ok()).unwrap_or(100);
-        Ok(Config { firestore_project, gcs_bucket, api_url, media_url, webhook_secrets, admin_token, max_concurrent_jobs, rate_limit_per_hour, rate_limit_per_day })
+        Ok(Config { firestore_project, api_url, media_url, upload_service_url, callback_secret, output_owner_nsec, webhook_secrets, admin_token, max_concurrent_jobs, rate_limit_per_hour, rate_limit_per_day })
     }
     pub fn from_process_env() -> Result<Self, ConfigError> {
         Self::from_env(&std::env::vars().collect())
@@ -442,9 +465,11 @@ git commit -m "feat(compiler): Config struct with env parsing + webhook secret m
 #     --enable-ttl --project="${PROJECT_ID}"
 #   gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
 #     --member="serviceAccount:${SERVICE_ACCOUNT}" --role="roles/datastore.user"
-#   gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-#     --member="serviceAccount:${SERVICE_ACCOUNT}" --role="roles/storage.objectAdmin"
 #   echo -n "name1:secret1,name2:secret2" | gcloud secrets create compiler_webhook_secrets \
+#     --data-file=- --project="${PROJECT_ID}"
+#   echo -n "callback-signing-secret" | gcloud secrets create compiler_callback_secret \
+#     --data-file=- --project="${PROJECT_ID}"
+#   echo -n "nsec1..." | gcloud secrets create compiler_output_owner_nsec \
 #     --data-file=- --project="${PROJECT_ID}"
 #   echo -n "your-admin-bearer-token" | gcloud secrets create compiler_admin_token \
 #     --data-file=- --project="${PROJECT_ID}"
@@ -461,10 +486,10 @@ SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-149672065768-compute@developer.gserviceaccou
 IMAGE_TAG="${IMAGE_TAG:-$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M%S)}"
 IMAGE="gcr.io/${PROJECT_ID}/${SERVICE_NAME}:${IMAGE_TAG}"
 
-GCS_BUCKET="${GCS_BUCKET:-divine-blossom-media}"
 FIRESTORE_PROJECT="${FIRESTORE_PROJECT:-${PROJECT_ID}}"
 API_DIVINE_VIDEO_URL="${API_DIVINE_VIDEO_URL:-https://api.divine.video}"
 MEDIA_DIVINE_VIDEO_URL="${MEDIA_DIVINE_VIDEO_URL:-https://media.divine.video}"
+UPLOAD_SERVICE_URL="${UPLOAD_SERVICE_URL:-https://upload.divine.video}"
 MAX_CONCURRENT_JOBS="${MAX_CONCURRENT_JOBS:-4}"
 RATE_LIMIT_PER_HOUR="${RATE_LIMIT_PER_HOUR:-20}"
 RATE_LIMIT_PER_DAY="${RATE_LIMIT_PER_DAY:-100}"
@@ -488,8 +513,8 @@ gcloud run deploy "${SERVICE_NAME}" \
   --timeout 1800 \
   --max-instances 5 \
   --no-cpu-throttling \
-  --set-env-vars "^@@^GCS_BUCKET=${GCS_BUCKET}@@FIRESTORE_PROJECT=${FIRESTORE_PROJECT}@@API_DIVINE_VIDEO_URL=${API_DIVINE_VIDEO_URL}@@MEDIA_DIVINE_VIDEO_URL=${MEDIA_DIVINE_VIDEO_URL}@@MAX_CONCURRENT_JOBS=${MAX_CONCURRENT_JOBS}@@RATE_LIMIT_PER_HOUR=${RATE_LIMIT_PER_HOUR}@@RATE_LIMIT_PER_DAY=${RATE_LIMIT_PER_DAY}" \
-  --set-secrets "COMPILER_WEBHOOK_SECRETS=compiler_webhook_secrets:latest,COMPILER_ADMIN_TOKEN=compiler_admin_token:latest"
+  --set-env-vars "^@@^FIRESTORE_PROJECT=${FIRESTORE_PROJECT}@@API_DIVINE_VIDEO_URL=${API_DIVINE_VIDEO_URL}@@MEDIA_DIVINE_VIDEO_URL=${MEDIA_DIVINE_VIDEO_URL}@@UPLOAD_SERVICE_URL=${UPLOAD_SERVICE_URL}@@MAX_CONCURRENT_JOBS=${MAX_CONCURRENT_JOBS}@@RATE_LIMIT_PER_HOUR=${RATE_LIMIT_PER_HOUR}@@RATE_LIMIT_PER_DAY=${RATE_LIMIT_PER_DAY}" \
+  --set-secrets "COMPILER_WEBHOOK_SECRETS=compiler_webhook_secrets:latest,COMPILER_CALLBACK_SECRET=compiler_callback_secret:latest,COMPILER_OUTPUT_OWNER_NSEC=compiler_output_owner_nsec:latest,COMPILER_ADMIN_TOKEN=compiler_admin_token:latest"
 
 SERVICE_URL=$(gcloud run services describe "${SERVICE_NAME}" --project "${PROJECT_ID}" --region "${REGION}" --format='value(status.url)')
 echo "Service URL: ${SERVICE_URL}"
@@ -570,6 +595,22 @@ fn rejects_unsupported_aspect() {
 }
 
 #[test]
+fn validates_non_empty_aspects() {
+    let r: CompileRequest = serde_json::from_value(json!({
+        "source": { "naddr": "n" }, "aspects": []
+    })).unwrap();
+    assert!(r.validate().is_err());
+}
+
+#[test]
+fn validates_https_callback() {
+    let r: CompileRequest = serde_json::from_value(json!({
+        "source": { "naddr": "n" }, "callback_url": "http://example.com/hook"
+    })).unwrap();
+    assert!(r.validate().is_err());
+}
+
+#[test]
 fn job_round_trips_through_json() {
     let req: CompileRequest = serde_json::from_value(json!({ "source": { "naddr": "n" } })).unwrap();
     let job = Job {
@@ -615,6 +656,20 @@ pub struct CompileRequest {
 
 fn default_aspects() -> Vec<Aspect> { vec![Aspect::Vertical] }
 fn default_max_duration_sec() -> u32 { 600 }
+
+impl CompileRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.aspects.is_empty() {
+            return Err("aspects must contain at least one entry".into());
+        }
+        if let Some(url) = self.callback_url.as_deref() {
+            if !url.starts_with("https://") {
+                return Err("callback_url must be https://".into());
+            }
+        }
+        Ok(())
+    }
+}
 
 /// V1: only `naddr` or `event_ids`. `nevents` is not exposed — callers
 /// hex-decode if they have nevent strings.
@@ -729,7 +784,7 @@ pub struct CallbackDelivery {
 }
 ```
 
-- [ ] **Step 3: Run** `cargo test --test job_types_serde`. Expected: 5 pass.
+- [ ] **Step 3: Run** `cargo test --test job_types_serde`. Expected: 7 pass.
 
 - [ ] **Step 4: Commit**
 
@@ -1114,6 +1169,7 @@ git commit -m "feat(compiler): Tenant extractor (NIP-98 via nostr crate + webhoo
 
 ```rust
 // ABOUTME: Per-tenant rate limit. Firestore doc per tenant with hourly + daily counters.
+// ABOUTME: Check+increment is transactional; no cross-instance read/modify/write race.
 // ABOUTME: TTL via `expires_at` field (operator enables Firestore TTL policy in deploy.sh).
 
 use anyhow::{Context, Result};
@@ -1160,54 +1216,44 @@ impl RateLimiter {
         let hour_bucket = format!("{:04}{:02}{:02}{:02}", now.year(), now.month(), now.day(), now.hour());
         let day_bucket  = format!("{:04}{:02}{:02}",      now.year(), now.month(), now.day());
 
-        let existing: Option<CounterDoc> = self.db.fluent().select().by_id_in(COLLECTION)
-            .obj().one(tenant_id).await.context("read rate_limits doc")?;
-        let doc_exists = existing.is_some();
-        let mut doc = existing.unwrap_or_else(|| CounterDoc {
-            hour_bucket: hour_bucket.clone(), hour_count: 0,
-            day_bucket: day_bucket.clone(),  day_count: 0,
-            overrides: None,
-            expires_at: now + Duration::hours(TTL_HOURS),
-        });
+        // Use the Firestore crate's transaction API here. Exact method names
+        // vary by crate version; keep this invariant: read the tenant doc,
+        // decide, and write the incremented doc inside one transaction.
+        self.db.run_transaction(|tx| async move {
+            let existing: Option<CounterDoc> = tx.get_by_id(COLLECTION, tenant_id).await?;
+            let mut doc = existing.unwrap_or_else(|| CounterDoc {
+                hour_bucket: hour_bucket.clone(), hour_count: 0,
+                day_bucket: day_bucket.clone(),  day_count: 0,
+                overrides: None,
+                expires_at: now + Duration::hours(TTL_HOURS),
+            });
 
-        if doc.hour_bucket != hour_bucket { doc.hour_bucket = hour_bucket; doc.hour_count = 0; }
-        if doc.day_bucket  != day_bucket  { doc.day_bucket  = day_bucket;  doc.day_count  = 0; }
+            if doc.hour_bucket != hour_bucket { doc.hour_bucket = hour_bucket; doc.hour_count = 0; }
+            if doc.day_bucket  != day_bucket  { doc.day_bucket  = day_bucket;  doc.day_count  = 0; }
 
-        let per_hour = doc.overrides.as_ref().and_then(|o| o.per_hour).unwrap_or(self.default_per_hour);
-        let per_day  = doc.overrides.as_ref().and_then(|o| o.per_day).unwrap_or(self.default_per_day);
+            let per_hour = doc.overrides.as_ref().and_then(|o| o.per_hour).unwrap_or(self.default_per_hour);
+            let per_day  = doc.overrides.as_ref().and_then(|o| o.per_day).unwrap_or(self.default_per_day);
 
-        if doc.hour_count >= per_hour {
-            let secs = 3600 - (now.minute() as u64 * 60 + now.second() as u64);
-            return Ok(RateLimitOutcome::TooMany { retry_after_seconds: secs });
-        }
-        if doc.day_count >= per_day {
-            let secs = 86400 - (now.hour() as u64 * 3600 + now.minute() as u64 * 60 + now.second() as u64);
-            return Ok(RateLimitOutcome::TooMany { retry_after_seconds: secs });
-        }
-
-        doc.hour_count += 1;
-        doc.day_count += 1;
-        doc.expires_at = now + Duration::hours(TTL_HOURS);
-
-        let write = if doc_exists {
-            self.db.fluent().update().in_col(COLLECTION).document_id(tenant_id).object(&doc).execute::<()>().await
-        } else {
-            self.db.fluent().insert().into(COLLECTION).document_id(tenant_id).object(&doc).execute::<()>().await
-        };
-        // Race-loss safety: if we lost a CREATE race, retry as update.
-        if let Err(e) = write {
-            let msg = format!("{}", e);
-            if !doc_exists && msg.to_lowercase().contains("exists") {
-                self.db.fluent().update().in_col(COLLECTION).document_id(tenant_id)
-                    .object(&doc).execute::<()>().await.context("retry as update")?;
-            } else {
-                return Err(anyhow::Error::from(e).context("write rate_limits doc"));
+            if doc.hour_count >= per_hour {
+                let secs = 3600 - (now.minute() as u64 * 60 + now.second() as u64);
+                return Ok(RateLimitOutcome::TooMany { retry_after_seconds: secs });
             }
-        }
-        Ok(RateLimitOutcome::Allowed)
+            if doc.day_count >= per_day {
+                let secs = 86400 - (now.hour() as u64 * 3600 + now.minute() as u64 * 60 + now.second() as u64);
+                return Ok(RateLimitOutcome::TooMany { retry_after_seconds: secs });
+            }
+
+            doc.hour_count += 1;
+            doc.day_count += 1;
+            doc.expires_at = now + Duration::hours(TTL_HOURS);
+            tx.upsert(COLLECTION, tenant_id, &doc).await?;
+            Ok(RateLimitOutcome::Allowed)
+        }).await.context("transactional rate limit")
     }
 }
 ```
+
+> **Implementer note:** do not downgrade this to read-modify-write. Multiple Cloud Run instances can accept jobs for the same tenant at the same time; a non-transactional counter will over-admit and lose increments.
 
 - [ ] **Step 2: Tests** (`#[ignore]`d, emulator-backed)
 
@@ -1261,7 +1307,7 @@ git commit -m "feat(compiler): per-tenant Firestore rate limiter with hourly+dai
 
 ## Chunk 4: Nostr REST + Blossom IO
 
-Goal: `src/nostr_api.rs` (api.divine.video client + imeta parser; naddr decode via `nostr::nips::nip19`) and `src/blossom.rs` (download from `media.divine.video`, upload to GCS).
+Goal: `src/nostr_api.rs` (api.divine.video client + imeta parser; naddr decode via `nostr::nips::nip19`) and `src/blossom.rs` (download from `media.divine.video`, publish output blobs through `cloud-run-upload` with Blossom auth).
 
 ### Task 4.1: Nostr REST client + imeta
 
@@ -1495,16 +1541,19 @@ git commit -m "feat(compiler): api.divine.video REST client + imeta parser (nadd
 - [ ] **Step 1: Implement**
 
 ```rust
-// ABOUTME: Blossom IO — download source MP4s, upload finished comp MP4s to GCS
-// ABOUTME: No moderation pre-check; download errors (403/404) drop the clip via Worker
+// ABOUTME: Blossom IO — download source MP4s, publish finished comp MP4s.
+// ABOUTME: Publish sends bytes to cloud-run-upload with Blossom auth; upload owns storage metadata.
 
 use anyhow::{anyhow, Context, Result};
+use base64::Engine as _;
 use bytes::Bytes;
 use futures::stream::StreamExt;
+use nostr::prelude::*;
 use reqwest::Client;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
@@ -1525,8 +1574,8 @@ impl DownloadClient {
     }
 
     /// Download `sha256` → `dest`. Returns Err on any non-2xx (caller decides
-    /// drop-and-continue policy). Restricted/AgeRestricted blobs surface as
-    /// 403/404 here — we don't pre-check.
+    /// drop-and-continue policy). Restricted/AgeRestricted/deleted blobs surface
+    /// as 401/403/404 here — we don't pre-check.
     pub async fn download(&self, sha256: &str, dest: &Path) -> Result<Downloaded> {
         let url = format!("{}/{}", self.base.trim_end_matches('/'), sha256);
         let resp = self.http.get(&url).send().await.context("GET blob")?;
@@ -1548,54 +1597,90 @@ impl DownloadClient {
 
 // --- Upload ---
 
-use google_cloud_storage::client::{Client as GcsClient, ClientConfig};
-use google_cloud_storage::http::objects::upload::{Media, UploadObjectRequest, UploadType};
-use google_cloud_storage::http::objects::Object;
-
-pub struct GcsUploader {
-    client: GcsClient,
-    bucket: String,
-    public_base: String,
+pub struct BlossomPublisher {
+    http: Client,
+    upload_service_url: String,
+    keys: Keys,
 }
 
 #[derive(Debug, Clone)]
 pub struct UploadResult { pub sha256: String, pub size: u64, pub url: String }
 
-impl GcsUploader {
-    pub async fn new(bucket: impl Into<String>, public_base: impl Into<String>) -> Result<Self> {
-        let cfg = ClientConfig::default().with_auth().await.context("gcs config (ADC)")?;
-        Ok(Self { client: GcsClient::new(cfg), bucket: bucket.into(), public_base: public_base.into() })
+#[derive(Debug, Deserialize)]
+struct UploadServiceBlobDescriptor {
+    url: String,
+    sha256: String,
+    size: u64,
+}
+
+impl BlossomPublisher {
+    pub fn new(upload_service_url: impl Into<String>, output_owner_nsec: &str) -> Result<Self> {
+        let keys = Keys::parse(output_owner_nsec).context("parse COMPILER_OUTPUT_OWNER_NSEC")?;
+        Ok(Self {
+            http: Client::builder().timeout(Duration::from_secs(120)).build().context("http client")?,
+            upload_service_url: upload_service_url.into(),
+            keys,
+        })
     }
 
-    pub async fn upload_file(&self, src: &Path, content_type: &str) -> Result<UploadResult> {
+    pub async fn publish_file(&self, src: &Path, content_type: &str) -> Result<UploadResult> {
         let bytes = fs::read(src).await.context("read upload src")?;
         let sha256 = hex::encode(Sha256::digest(&bytes));
         let size = bytes.len() as u64;
+        let auth = self.upload_auth_header(&sha256)?;
+        let url = format!("{}/upload", self.upload_service_url.trim_end_matches('/'));
+        let resp = self.http.put(&url)
+            .header("Authorization", auth)
+            .header("Content-Type", content_type)
+            .header("Content-Length", size.to_string())
+            .body(bytes)
+            .send().await.context("upload service PUT")?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("upload service PUT {} -> {}", url, resp.status()));
+        }
+        let descriptor: UploadServiceBlobDescriptor = resp.json().await.context("upload service JSON")?;
+        if descriptor.sha256 != sha256 {
+            return Err(anyhow!("upload service returned sha256 {}, expected {}", descriptor.sha256, sha256));
+        }
+        if descriptor.size != size {
+            return Err(anyhow!("upload service returned size {}, expected {}", descriptor.size, size));
+        }
+        Ok(UploadResult { sha256: descriptor.sha256, size: descriptor.size, url: descriptor.url })
+    }
 
-        // Multipart upload carries the content type inline.
-        let mut obj = Object::default();
-        obj.name = sha256.clone();
-        obj.content_type = Some(content_type.into());
-        let upload = UploadType::Multipart(Box::new(obj));
-        let req = UploadObjectRequest { bucket: self.bucket.clone(), ..Default::default() };
-
-        self.client.upload_object(&req, bytes, &upload).await.context("gcs upload")?;
-        let url = format!("{}/{}", self.public_base.trim_end_matches('/'), sha256);
-        Ok(UploadResult { sha256, size, url })
+    fn upload_auth_header(&self, sha256: &str) -> Result<String> {
+        let expiration = (SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock before unix epoch")?
+            .as_secs()
+            + 300)
+            .to_string();
+        let event = EventBuilder::new(Kind::Custom(24242), "")
+            .tags([
+                Tag::parse(["t", "upload"])?,
+                Tag::parse(["x", sha256])?,
+                Tag::parse(["expiration", expiration.as_str()])?,
+            ])
+            .to_event(&self.keys)?;
+        let json = serde_json::to_string(&event)?;
+        Ok(format!("Nostr {}", base64::engine::general_purpose::STANDARD.encode(json)))
     }
 }
 ```
 
-> **Implementer note:** verify the `google-cloud-storage = "=0.17.0"` Multipart API at impl time. If `Object::default()` + Multipart doesn't compile against the pinned version, fall back to Simple upload + a follow-up `patch_object` to set content type. Either way, `upload_file` returns `{sha256, size, url}`.
+> **Serving invariant:** never synthesize `media.divine.video/<sha256>` in the compiler. Return the URL from the upload service's BlobDescriptor only after the upload service accepts the bytes.
 
-- [ ] **Step 2: Tests** (downloads only — GCS upload is exercised by Chunk 6 smoke test)
+- [ ] **Step 2: Tests** (download tests stay simple; publish gets one wiremock contract test)
 
 ```rust
-use divine_compiler::blossom::DownloadClient;
+use base64::Engine as _;
+use divine_compiler::blossom::{BlossomPublisher, DownloadClient};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::fs;
 use tempfile::tempdir;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::matchers::{body_bytes, header_exists, method, path};
+use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 
 #[tokio::test]
 async fn download_writes_bytes() {
@@ -1623,7 +1708,7 @@ async fn download_404_is_err() {
 
 #[tokio::test]
 async fn download_403_restricted_is_err() {
-    // Restricted/AgeRestricted blobs return 403 from the moderation layer.
+    // Restricted blobs return 403 from the moderation layer.
     // We don't pre-check; the worker classifies via clips_dropped.
     let s = MockServer::start().await;
     Mock::given(method("GET")).and(path("/restricted"))
@@ -1633,15 +1718,92 @@ async fn download_403_restricted_is_err() {
         .download("restricted", &dir.path().join("x")).await;
     assert!(r.is_err());
 }
+
+#[tokio::test]
+async fn download_401_age_restricted_is_err() {
+    let s = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/age"))
+        .respond_with(ResponseTemplate::new(401)).mount(&s).await;
+    let dir = tempdir().unwrap();
+    let r = DownloadClient::new(s.uri()).unwrap()
+        .download("age", &dir.path().join("x")).await;
+    assert!(r.is_err());
+}
+
+struct BlossomUploadAuthMatchesBodySha;
+
+impl Match for BlossomUploadAuthMatchesBodySha {
+    fn matches(&self, req: &Request) -> bool {
+        let Some(auth) = req.headers.get("authorization").and_then(|v| v.to_str().ok()) else {
+            return false;
+        };
+        let Some(encoded) = auth.strip_prefix("Nostr ") else { return false; };
+        let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+            return false;
+        };
+        let Ok(event) = serde_json::from_slice::<Value>(&decoded) else { return false; };
+        if event.get("kind").and_then(|v| v.as_u64()) != Some(24242) {
+            return false;
+        }
+        let body_sha = hex::encode(Sha256::digest(&req.body));
+        let tags = event.get("tags").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let has_upload = tags.iter().any(|tag| {
+            tag.as_array().is_some_and(|parts| {
+                parts.get(0).and_then(|v| v.as_str()) == Some("t")
+                    && parts.get(1).and_then(|v| v.as_str()) == Some("upload")
+            })
+        });
+        let has_hash = tags.iter().any(|tag| {
+            tag.as_array().is_some_and(|parts| {
+                parts.get(0).and_then(|v| v.as_str()) == Some("x")
+                    && parts.get(1).and_then(|v| v.as_str()) == Some(body_sha.as_str())
+            })
+        });
+        has_upload && has_hash
+    }
+}
+
+#[tokio::test]
+async fn publish_puts_to_upload_service_with_blossom_auth() {
+    let s = MockServer::start().await;
+    let bytes = b"compiled mp4 bytes".to_vec();
+    let sha256 = hex::encode(Sha256::digest(&bytes));
+    let response = serde_json::json!({
+        "url": format!("https://media.divine.video/{}", sha256),
+        "sha256": sha256,
+        "size": bytes.len(),
+        "type": "video/mp4",
+        "uploaded": 1
+    });
+    Mock::given(method("PUT"))
+        .and(path("/upload"))
+        .and(header_exists("authorization"))
+        .and(body_bytes(bytes.clone()))
+        .and(BlossomUploadAuthMatchesBodySha)
+        .respond_with(ResponseTemplate::new(200).set_body_json(response))
+        .expect(1)
+        .mount(&s).await;
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("out.mp4");
+    fs::write(&src, &bytes).unwrap();
+    let nsec_hex = "1111111111111111111111111111111111111111111111111111111111111111";
+    let result = BlossomPublisher::new(s.uri(), nsec_hex).unwrap()
+        .publish_file(&src, "video/mp4").await.unwrap();
+
+    assert_eq!(result.sha256, hex::encode(Sha256::digest(&bytes)));
+    assert_eq!(result.size, bytes.len() as u64);
+    assert!(result.url.starts_with("https://media.divine.video/"));
+}
 ```
 
-- [ ] **Step 3: Run** `cargo test --test blossom`. Expected: 3 pass.
+- [ ] **Step 3: Run** `cargo test --test blossom`. Expected: 5 pass.
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add cloud-run-compiler/
-git commit -m "feat(compiler): blossom download (no pre-check) + GCS multipart upload"
+git commit -m "feat(compiler): blossom download + public output publishing"
 ```
 
 **End of Chunk 4.**
@@ -1662,7 +1824,7 @@ Goal: one file `src/render.rs` containing probe, fit/overlay filtergraph builder
 // ABOUTME: Render pipeline — probe, fit/overlay filtergraph, ffmpeg command + exec
 // ABOUTME: Pure builders are unit-tested; executor needs ffmpeg on PATH
 
-use crate::job::{Aspect, Credit, Fit, Watermark, WatermarkPosition};
+use crate::job::{Aspect, Audio, Credit, Fit, Watermark, WatermarkPosition};
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -1797,7 +1959,7 @@ pub fn format_credit_text(display_name: Option<&str>, nip05: Option<&str>, pubke
         (Some(d), Some(n)) => format!("{} • {}", d, n),
         (Some(d), None)    => d.to_string(),
         (None, Some(n))    => n.to_string(),
-        (None, None)       => format!("npub: {}…", &pubkey[..8.min(pubkey.len())]),
+        (None, None)       => format!("pubkey: {}", pubkey),
     }
 }
 
@@ -1814,6 +1976,7 @@ pub struct AspectJob {
     pub logo_path: PathBuf,
     pub watermark: Watermark,
     pub credit: Credit,
+    pub audio: Audio,
     pub output_path: PathBuf,
     pub bitrate_kbps: u32,
     pub use_gpu: bool,
@@ -1855,22 +2018,33 @@ pub fn build_command(job: &AspectJob) -> Vec<String> {
 
 fn build_filter_complex(job: &AspectJob, logo_idx: usize) -> String {
     let mut parts: Vec<String> = vec![];
-    let mut start = 0.0_f64;
     let mut v: Vec<String> = vec![];
     let mut a: Vec<String> = vec![];
     for (i, c) in job.clips.iter().enumerate() {
         let fit_l = format!("vfit_{}", i);
         parts.push(fit_filter(&format!("{}:v:0", i), &fit_l, job.fit, job.target));
-        let cr_l = format!("vcr_{}", i);
-        parts.push(credit_drawtext(&fit_l, &cr_l, &job.credit, &c.credit_text, start, job.target.height));
-        v.push(format!("[{}]", cr_l));
+        v.push(format!("[{}]", fit_l));
         a.push(format!("[{}:a:0]", i));
-        start += c.duration_sec;
     }
     // V1 LIMITATION: assumes every clip has [N:a:0]. Audio-less clips fail.
     let concat_inputs: String = v.iter().zip(a.iter()).map(|(vv, aa)| format!("{}{}", vv, aa)).collect();
-    parts.push(format!("{}concat=n={}:v=1:a=1[v_cat][a_final]", concat_inputs, job.clips.len()));
-    parts.push(logo_overlay("v_cat", &format!("{}:v:0", logo_idx), "v_final", job.target.width, &job.watermark));
+    parts.push(format!("{}concat=n={}:v=1:a=1[v_cat][a_cat]", concat_inputs, job.clips.len()));
+
+    // Credits are drawn after concat so their timestamps are on the final
+    // output timeline. Drawing them per input clip with global timestamps means
+    // later clips never hit their enable window because each input starts at t=0.
+    let mut current_label = "v_cat".to_string();
+    let mut credit_start = 0.0_f64;
+    for (i, c) in job.clips.iter().enumerate() {
+        let next = format!("vcred_{}", i);
+        parts.push(credit_drawtext(&current_label, &next, &job.credit, &c.credit_text, credit_start, job.target.height));
+        current_label = next;
+        credit_start += c.duration_sec;
+    }
+    parts.push(logo_overlay(&current_label, &format!("{}:v:0", logo_idx), "v_final", job.target.width, &job.watermark));
+
+    let lufs = job.audio.target_lufs;
+    parts.push(format!("[a_cat]loudnorm=I={:.1}:TP=-1.5:LRA=11[a_final]", lufs));
     parts.join(";")
 }
 
@@ -1919,6 +2093,7 @@ pub async fn render_aspect(
     fit: Fit,
     watermark: Watermark,
     credit: Credit,
+    audio: Audio,
     logo_path: &Path,
     job_dir: &Path,
     use_gpu: bool,
@@ -1931,7 +2106,7 @@ pub async fn render_aspect(
     let aj = AspectJob {
         clips: clips.iter().map(|c| ClipInput { path: c.path.clone(), credit_text: c.credit_text.clone(), duration_sec: c.duration_sec }).collect(),
         target, fit, logo_path: logo_path.into(),
-        watermark, credit,
+        watermark, credit, audio,
         output_path: output_path.clone(), bitrate_kbps, use_gpu,
     };
     run_render(&aj).await?;
@@ -1943,7 +2118,7 @@ pub async fn render_aspect(
 
 ```rust
 // tests/render_filters.rs
-use divine_compiler::job::{Credit, Fit, Watermark, WatermarkPosition, Aspect};
+use divine_compiler::job::{Aspect, Credit, Fit, Watermark, WatermarkPosition};
 use divine_compiler::render::{fit_filter, logo_overlay, credit_drawtext, format_credit_text, TargetDim};
 
 const T: TargetDim = TargetDim { width: 1080, height: 1920 };
@@ -2013,7 +2188,7 @@ fn credit_escapes_user_input() {
 #[test]
 fn format_credit_text_prefers_full() {
     assert_eq!(format_credit_text(Some("A"), Some("a@x"), "deadbeefcafe"), "A • a@x");
-    assert_eq!(format_credit_text(None, None, "deadbeefcafe"), "npub: deadbeef…");
+    assert_eq!(format_credit_text(None, None, "deadbeefcafe"), "pubkey: deadbeefcafe");
 }
 ```
 
@@ -2021,7 +2196,7 @@ fn format_credit_text_prefers_full() {
 
 ```rust
 // tests/render_ffmpeg_args.rs
-use divine_compiler::job::{Credit, Fit, Watermark, WatermarkPosition};
+use divine_compiler::job::{Audio, Credit, Fit, Watermark, WatermarkPosition};
 use divine_compiler::render::{build_command, AspectJob, ClipInput, TargetDim};
 use std::path::PathBuf;
 
@@ -2037,6 +2212,7 @@ fn fixture(use_gpu: bool, n: usize) -> AspectJob {
         logo_path: PathBuf::from("/tmp/logo.png"),
         watermark: Watermark { enabled: true, position: WatermarkPosition::BottomRight, opacity: 0.3 },
         credit: Credit { duration_ms: 2500, show_display_name: true, show_nip05: true },
+        audio: Audio { target_lufs: -14.0 },
         output_path: PathBuf::from("/tmp/out.mp4"),
         bitrate_kbps: 6000,
         use_gpu,
@@ -2061,10 +2237,11 @@ fn cpu_uses_libx264_no_hwaccel() {
 fn filter_complex_concats_n_clips_and_advances_credit_start() {
     let cmd = build_command(&fixture(true, 3));
     let fc = &cmd[cmd.iter().position(|s| s == "-filter_complex").unwrap() + 1];
-    assert!(fc.contains("concat=n=3:v=1:a=1[v_cat][a_final]"));
+    assert!(fc.contains("concat=n=3:v=1:a=1[v_cat][a_cat]"));
     assert!(fc.contains("between(t,0.000,2.500)"));
     assert!(fc.contains("between(t,6.000,8.500)"));
     assert!(fc.contains("between(t,12.000,14.500)"));
+    assert!(fc.contains("loudnorm=I=-14.0:TP=-1.5:LRA=11[a_final]"));
 }
 
 #[test]
@@ -2080,7 +2257,7 @@ fn output_is_final_and_faststart_set() {
 
 ```rust
 // tests/render_smoke.rs
-use divine_compiler::job::{Credit, Fit, Watermark, WatermarkPosition};
+use divine_compiler::job::{Audio, Credit, Fit, Watermark, WatermarkPosition};
 use divine_compiler::render::{run_render, AspectJob, ClipInput, TargetDim};
 use std::path::PathBuf;
 use tempfile::tempdir;
@@ -2121,6 +2298,7 @@ async fn renders_two_clip_comp_cpu() {
         logo_path: logo,
         watermark: Watermark { enabled: true, position: WatermarkPosition::BottomRight, opacity: 0.4 },
         credit: Credit { duration_ms: 800, show_display_name: true, show_nip05: false },
+        audio: Audio { target_lufs: -14.0 },
         output_path: out.clone(),
         bitrate_kbps: 1500,
         use_gpu: false,
@@ -2178,15 +2356,17 @@ pub fn verify(secret: &str, body: &[u8], header_value: &str) -> bool {
 
 const BACKOFF_SECS: [u64; 3] = [1, 5, 25];
 
-pub async fn deliver(url: &str, body: &[u8], secret: Option<&str>) -> CallbackDelivery {
+pub async fn deliver(url: &str, body: &[u8], secret: &str) -> CallbackDelivery {
     let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().expect("client");
     let mut attempts = 0;
     let mut last = 0u16;
     for delay in BACKOFF_SECS.iter() {
         attempts += 1;
         if attempts > 1 { tokio::time::sleep(Duration::from_secs(*delay)).await; }
-        let mut req = client.post(url).body(body.to_vec()).header("content-type", "application/json");
-        if let Some(s) = secret { req = req.header("X-Compiler-Signature", sign(s, body)); }
+        let req = client.post(url)
+            .body(body.to_vec())
+            .header("content-type", "application/json")
+            .header("X-Compiler-Signature", sign(secret, body));
         match req.send().await {
             Ok(r) => {
                 last = r.status().as_u16();
@@ -2221,7 +2401,7 @@ fn sign_and_verify_round_trip() {
 async fn delivers_first_2xx() {
     let s = MockServer::start().await;
     Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).expect(1).mount(&s).await;
-    let r = deliver(&s.uri(), b"{}", Some("shh")).await;
+    let r = deliver(&s.uri(), b"{}", "shh").await;
     assert!(r.delivered); assert_eq!(r.attempts, 1);
 }
 
@@ -2231,7 +2411,7 @@ async fn sends_signature_header() {
     Mock::given(method("POST"))
         .and(header("X-Compiler-Signature", sign("shh", b"{}").as_str()))
         .respond_with(ResponseTemplate::new(200)).expect(1).mount(&s).await;
-    let r = deliver(&s.uri(), b"{}", Some("shh")).await;
+    let r = deliver(&s.uri(), b"{}", "shh").await;
     assert!(r.delivered);
 }
 
@@ -2240,7 +2420,7 @@ async fn sends_signature_header() {
 async fn retries_on_5xx() {
     let s = MockServer::start().await;
     Mock::given(method("POST")).respond_with(ResponseTemplate::new(503)).expect(3).mount(&s).await;
-    let r = deliver(&s.uri(), b"{}", None).await;
+    let r = deliver(&s.uri(), b"{}", "shh").await;
     assert!(!r.delivered); assert_eq!(r.attempts, 3);
 }
 ```
@@ -2300,6 +2480,10 @@ async fn post_compile(
     tenant: Tenant,
     Json(req): Json<CompileRequest>,
 ) -> Result<Json<CompileResponse>, Response> {
+    if let Err(e) = req.validate() {
+        return Err(err(StatusCode::BAD_REQUEST, json!({"error":"invalid_request","detail":e}), vec![]));
+    }
+
     let tenant_id = tenant.id();
     match state.rate_limiter.check_and_increment(&tenant_id, chrono::Utc::now()).await {
         Ok(RateLimitOutcome::Allowed) => {}
@@ -2334,11 +2518,12 @@ async fn post_compile(
 
 async fn get_status(
     State(state): State<AppState>,
-    _tenant: Tenant,
+    tenant: Tenant,
     Path(job_id): Path<String>,
 ) -> Result<Json<Value>, Response> {
     match state.job_store.get_job(&job_id).await {
-        Ok(Some(j)) => Ok(Json(serde_json::to_value(&j).unwrap())),
+        Ok(Some(j)) if j.tenant_id == tenant.id() => Ok(Json(serde_json::to_value(&j).unwrap())),
+        Ok(Some(_)) => Err(err(StatusCode::NOT_FOUND, json!({"error":"job_not_found","job_id":job_id}), vec![])),
         Ok(None) => Err(err(StatusCode::NOT_FOUND, json!({"error":"job_not_found","job_id":job_id}), vec![])),
         Err(e) => {
             tracing::error!(?e, "get_job failed");
@@ -2393,7 +2578,7 @@ async fn admin_get(
 ```rust
 // ABOUTME: Background worker — polls Firestore for queued jobs, runs them concurrently
 use crate::auth::AppState;
-use crate::blossom::{DownloadClient, GcsUploader};
+use crate::blossom::{BlossomPublisher, DownloadClient};
 use crate::job::*;
 use crate::nostr_api::{ApiClient, FetchError, Imeta};
 use crate::render::{format_credit_text, render_aspect, probe, ProbedClip};
@@ -2408,13 +2593,13 @@ pub struct Worker {
     state: AppState,
     api: Arc<ApiClient>,
     download: Arc<DownloadClient>,
-    upload: Arc<GcsUploader>,
+    upload: Arc<BlossomPublisher>,
     logo_path: PathBuf,
     sem: Arc<Semaphore>,
 }
 
 impl Worker {
-    pub fn new(state: AppState, api: ApiClient, download: DownloadClient, upload: GcsUploader, logo_path: PathBuf) -> Self {
+    pub fn new(state: AppState, api: ApiClient, download: DownloadClient, upload: BlossomPublisher, logo_path: PathBuf) -> Self {
         let limit = state.config.max_concurrent_jobs;
         Self { state, api: Arc::new(api), download: Arc::new(download), upload: Arc::new(upload), logo_path, sem: Arc::new(Semaphore::new(limit)) }
     }
@@ -2463,12 +2648,7 @@ impl Worker {
 
         if let Some(url) = job.request.callback_url.clone() {
             let body = serde_json::to_vec(&job).unwrap_or_default();
-            // Pick the matching webhook secret for signing (if caller is a webhook tenant).
-            let secret = job.tenant_id.strip_prefix("secret:").and_then(|name| {
-                self.state.config.webhook_secrets.iter()
-                    .find_map(|(sec, n)| if n == name { Some(sec.clone()) } else { None })
-            });
-            let delivery = webhook::deliver(&url, &body, secret.as_deref()).await;
+            let delivery = webhook::deliver(&url, &body, &self.state.config.callback_secret).await;
             job.callback_delivery = Some(delivery);
             let _ = self.state.job_store.update_job(&job).await;
         }
@@ -2497,7 +2677,8 @@ impl Worker {
                 Ok(d) => d,
                 Err(e) => {
                     let s = format!("{:#}", e);
-                    let reason = if s.contains("403") { "moderation_restricted" }
+                    let reason = if s.contains("401") { "age_restricted_auth_required" }
+                                 else if s.contains("403") { "moderation_restricted" }
                                  else if s.contains("404") { "blob_not_found" }
                                  else { "download_err" };
                     clips_dropped.push(ClipDropped { event_id: ev.id.clone(), reason: format!("{}: {}", reason, s) });
@@ -2536,9 +2717,10 @@ impl Worker {
             let r = render_aspect(
                 *aspect, &kept, job.request.fit,
                 job.request.watermark.clone(), job.request.credit.clone(),
+                job.request.audio.clone(),
                 &self.logo_path, work_dir, true,
             ).await.with_context(|| format!("render {:?}", aspect))?;
-            let up = self.upload.upload_file(&r.output_path, "video/mp4").await
+            let up = self.upload.publish_file(&r.output_path, "video/mp4").await
                 .with_context(|| format!("upload {:?}", aspect))?;
             outputs.push(BlobDescriptor {
                 aspect: *aspect, url: up.url, sha256: up.sha256, size: up.size,
@@ -2580,7 +2762,7 @@ impl Worker {
 use anyhow::Context;
 use divine_compiler::{
     auth::AppState,
-    blossom::{DownloadClient, GcsUploader},
+    blossom::{BlossomPublisher, DownloadClient},
     config::Config,
     handlers::build_router,
     job::JobStore,
@@ -2600,7 +2782,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = Arc::new(Config::from_process_env()?);
     tracing::info!(
-        firestore_project = %cfg.firestore_project, gcs_bucket = %cfg.gcs_bucket,
+        firestore_project = %cfg.firestore_project, upload_service_url = %cfg.upload_service_url,
         webhook_tenants = cfg.webhook_secrets.len(), max_concurrent_jobs = cfg.max_concurrent_jobs,
         "compiler starting"
     );
@@ -2613,7 +2795,7 @@ async fn main() -> anyhow::Result<()> {
 
     let api = ApiClient::new(&cfg.api_url)?;
     let download = DownloadClient::new(&cfg.media_url)?;
-    let upload = GcsUploader::new(&cfg.gcs_bucket, &cfg.media_url).await?;
+    let upload = BlossomPublisher::new(&cfg.upload_service_url, &cfg.output_owner_nsec)?;
 
     // Fetch logo once at startup; cache on disk for the worker's lifetime.
     let logo_path = fetch_logo(&cfg.media_url).await?;
@@ -2758,12 +2940,13 @@ These are explicitly NOT in v1; ship them when there's real demand:
 - **nevents source variant** — caller hex-decodes.
 - **Admin cancel/requeue** — only list + get for v1.
 - **Atomic job-claim** — best-effort update; duplicate-claim window is tiny at low concurrency.
-- **Streaming GCS upload** — `fs::read` whole file is fine for v1 sizes.
+- **Streaming upload to cloud-run-upload** — `fs::read` whole file is fine for v1 sizes.
 - **Crossfade/dip-to-black transitions, intro/outro cards, always-on credit modes, BGM mixing, animated watermark** — schema doesn't accept these fields.
 - **Public "recently rendered comps" feed** — admin-only in v1.
 - **Per-tenant idempotency keys** — none.
+- **Caller-owned output/delete semantics** — v1 output blobs are owned by the pubkey derived from `COMPILER_OUTPUT_OWNER_NSEC`; operator delete/restore uses existing admin tooling.
 - **naddr `a`-tag (addressable refs)** — surfaced in `clips_dropped` with `addressable_ref_not_supported_v1`.
-- **Pre-checking moderation** — we let downloads fail (403 = restricted, 404 = deleted/missing) and surface in `clips_dropped`.
+- **Pre-checking moderation** — we let downloads fail (401 = age-gated, 403 = restricted, 404 = deleted/missing) and surface in `clips_dropped`.
 
 ## Known v1 limitations (documented in source)
 
@@ -2771,4 +2954,4 @@ These are explicitly NOT in v1; ship them when there's real demand:
 - **NIP-01 canonicalization via `nostr` crate.** Should be interop-safe with other Rust signers; verify cross-client interop in staging.
 - **`firestore` crate version drift.** API surface may shift between minor versions; verify against the pinned version at impl time.
 - **`api.divine.video` endpoint paths.** `/api/event/<hex>`, `/api/profile/<hex>`, `/api/addressable?author&kind&d` are best-guesses; verify against actual OpenAPI before deploy.
-- **`google-cloud-storage` Multipart vs Simple upload.** Verify Multipart works against the pinned 0.17 version; fall back to Simple + `patch_object` if not.
+- **Upload service availability.** If `cloud-run-upload` integration is blocked by service shape or sunset, fallback is a direct write with only the six non-default blob metadata fields (`sha256`, `size`, `mime_type`, `uploaded`, `owner`, `status`) while keeping the compiler decoupled from future `BlobMetadata` additions.
