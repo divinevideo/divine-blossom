@@ -1799,6 +1799,14 @@ async fn process_transcribe(
             );
             ParsedVtt::empty(audio_analysis.duration_ms)
         }
+        Some(TranscriptDropReason::InstructionEcho) => {
+            warn!(
+                hash,
+                text_preview = %first_chars(&parsed_vtt.text, 120),
+                "Dropping transcript with leaked output-format instructions"
+            );
+            ParsedVtt::empty(audio_analysis.duration_ms)
+        }
         None => parsed_vtt,
     };
 
@@ -3240,6 +3248,7 @@ enum TranscriptDropReason {
     LowSignalHeuristic,
     LoopHallucination,
     ImplausibleTextDensity,
+    InstructionEcho,
 }
 
 fn transcript_drop_reason(
@@ -3274,11 +3283,109 @@ fn transcript_drop_reason(
         return Some(TranscriptDropReason::LoopHallucination);
     }
 
+    if contains_instruction_echo(&parsed_vtt.text) {
+        return Some(TranscriptDropReason::InstructionEcho);
+    }
+
     if should_drop_low_signal_transcript(audio, parsed_vtt) {
         return Some(TranscriptDropReason::LowSignalHeuristic);
     }
 
     None
+}
+
+/// Count distinct instruction-phrase clusters in `normalized`.
+///
+/// Collects every marker match span, then merges spans that overlap *or* are
+/// separated only by whitespace, so one contiguous instruction sentence counts
+/// as a single phrase rather than several. This is what makes the threshold in
+/// `contains_instruction_echo` mean "multiple distinct phrases": redundant,
+/// overlapping markers (e.g. "return only a json" + "only a json object" inside
+/// "return only a JSON object") collapse to one cluster instead of inflating the
+/// count and tripping the gate on ordinary speech.
+fn distinct_marker_phrases(normalized: &str, markers: &[&str]) -> usize {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for marker in markers {
+        let mut from = 0;
+        while let Some(rel) = normalized[from..].find(marker) {
+            let start = from + rel;
+            spans.push((start, start + marker.len()));
+            from = start + 1;
+        }
+    }
+    if spans.is_empty() {
+        return 0;
+    }
+    spans.sort_unstable();
+
+    let mut clusters = 1;
+    let mut cluster_end = spans[0].1;
+    for &(start, end) in &spans[1..] {
+        // Same cluster when overlapping, or separated only by whitespace
+        // (one contiguous instruction). A non-whitespace gap means another
+        // distinct phrase.
+        if start <= cluster_end || normalized[cluster_end..start].trim().is_empty() {
+            cluster_end = cluster_end.max(end);
+        } else {
+            clusters += 1;
+            cluster_end = end;
+        }
+    }
+    clusters
+}
+
+/// Detect model output-format instructions that leaked into caption text.
+///
+/// This intentionally requires multiple *distinct* prompt/schema-derived
+/// phrases (see `distinct_marker_phrases`). Common technical speech such as
+/// "valid JSON", "JSON array", or "response schema" — or a single contiguous
+/// instruction sentence — must not trip a universal provider guard.
+///
+/// Every marker below is high-specificity: a literal template token
+/// (`<bcp47>`), or a verbatim prompt/`responseSchema` clause that does not
+/// occur in ordinary speech. Generic English fragments that happened to be
+/// substrings of a leaked clause ("output requirements", "follow the schema",
+/// "provided in the context", "return only a json", "only a json object")
+/// were deliberately removed: split out of their leaked sentence they fire on
+/// legitimate developer/API speech ("our output requirements changed, follow
+/// the schema in the docs"), and because a drop is terminal (empty VTT →
+/// status=complete → edge-cached, no auto-retranscribe) a false positive is
+/// permanent caption loss. The real #134 leak still carries several of the
+/// retained phrases, so detection is unaffected.
+fn contains_instruction_echo(text: &str) -> bool {
+    let normalized = normalize_for_marker_scan(text);
+
+    const STRONG_MARKERS: &[&str] = &[
+        "<bcp47>",
+        "<seconds>",
+        "<spoken words>",
+        "do not include any extra text",
+        "extra text outside",
+        "outside of the json",
+        "single json array",
+        "follow the schema provided in the context",
+        "spoken words transcribed verbatim",
+        "text field of every segment",
+    ];
+    distinct_marker_phrases(&normalized, STRONG_MARKERS) >= 2
+}
+
+/// Collapse whitespace and lowercase for marker scanning, mapping every C0
+/// control char (U+0000–U+001F) to a space first. Python's `str.split()`
+/// treats U+001C–U+001F as whitespace but Rust's `split_whitespace()` (Unicode
+/// White_Space) does not, so without this the Rust gate and the Python scanner
+/// would cluster the same bytes differently. Normalizing controls up front
+/// keeps the two implementations byte-for-byte identical.
+fn normalize_for_marker_scan(text: &str) -> String {
+    let cleaned: String = text
+        .chars()
+        .map(|c| if (c as u32) < 0x20 { ' ' } else { c })
+        .collect();
+    cleaned
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 /// Drop when the transcript contains more text than is physically utterable
@@ -3419,7 +3526,7 @@ async fn finalize_transcript(
 mod tests {
     use super::{
         build_transcode_status_webhook_payload, classify_audio_extract_error,
-        decide_transcript_lock_action, identity_token_cache_for_audience,
+        contains_instruction_echo, decide_transcript_lock_action, identity_token_cache_for_audience,
         is_empty_transcript_normalize_error, is_implausible_text_density, is_loop_hallucination,
         is_retryable_provider_failure, normalize_transcript_to_vtt, parakeet_request_url,
         parse_audio_analysis_output, parse_provider_status, retry_delay_for_attempt,
@@ -4044,6 +4151,109 @@ mod tests {
         // but the floor avoids false positives on tiny clips.
         let text = "x".repeat(99);
         assert!(!is_implausible_text_density(&text, 1));
+    }
+
+    #[test]
+    fn instruction_echo_guard_flags_prompt_schema_leak() {
+        let bad = "Well, that's not really freedom now, is it, you freaking idiot? \
+            a single JSON array. Do not include any extra text outside of the JSON string. \
+            When producing JSON you must follow the schema provided in the context.";
+        assert!(contains_instruction_echo(bad));
+    }
+
+    #[test]
+    fn instruction_echo_guard_passes_single_technical_marker() {
+        let tech_talk = "Today we're comparing a JSON array with a JSON object and explaining \
+            why valid JSON matters for API compatibility.";
+        assert!(!contains_instruction_echo(tech_talk));
+    }
+
+    #[test]
+    fn instruction_echo_guard_passes_overlapping_schema_speech() {
+        let tech_talk = "In our API docs, follow the schema provided for each endpoint \
+            before sending the request body.";
+        assert!(!contains_instruction_echo(tech_talk));
+    }
+
+    #[test]
+    fn instruction_echo_guard_passes_one_strong_with_weak_json_terms() {
+        let tech_talk = "Follow the schema for this endpoint: it returns a JSON array, \
+            accepts a JSON object, and the docs call this the response schema.";
+        assert!(!contains_instruction_echo(tech_talk));
+    }
+
+    #[test]
+    fn instruction_echo_guard_passes_overlapping_strong_markers() {
+        // Ordinary speech where several STRONG markers overlap inside one
+        // contiguous clause must not reach the >=2 threshold. Before the
+        // cluster fix this dropped a whole transcript on a single sentence.
+        assert!(!contains_instruction_echo(
+            "The endpoint should return only a JSON object with the user's data."
+        ));
+        // A single contiguous instruction phrase (three overlapping markers)
+        // is one phrase, not three — needs a second distinct phrase to fire.
+        assert!(!contains_instruction_echo(
+            "Do not include any extra text outside of the JSON string."
+        ));
+    }
+
+    #[test]
+    fn instruction_echo_guard_passes_split_generic_schema_speech() {
+        // Generic English fragments ("output requirements", "follow the
+        // schema", "provided in the context") that were once markers fire on
+        // legitimate developer/API speech when ordinary words separate them.
+        // Pruning them to the contiguous leaked clause keeps these transcripts.
+        for legit in [
+            "Our API output requirements changed, so please follow the schema in the new docs.",
+            "You should follow the schema that was provided in the context of the previous lesson.",
+            "Our output requirements say to return only a JSON object for each user record.",
+        ] {
+            assert!(
+                !contains_instruction_echo(legit),
+                "legitimate speech must not drop: {legit}"
+            );
+        }
+    }
+
+    #[test]
+    fn instruction_echo_guard_normalizes_c0_controls() {
+        // C0 control chars between two markers must be treated as whitespace so
+        // the Rust gate and the Python scanner cluster identically. A single
+        // contiguous instruction split only by a control char is one phrase.
+        assert!(!contains_instruction_echo(
+            "do not include any extra text\u{1c}outside of the json"
+        ));
+    }
+
+    #[test]
+    fn instruction_echo_guard_passes_normal_speech() {
+        assert!(!contains_instruction_echo(
+            "Well, that's not really freedom now, is it? I think people deserve better."
+        ));
+    }
+
+    #[test]
+    fn transcript_drop_reason_flags_instruction_echo() {
+        let text = "Return only a JSON object. The text field of every segment must contain \
+            only the spoken words transcribed verbatim.";
+        let parsed = ParsedVtt {
+            content: format!("WEBVTT\n\n1\n00:00:00.000 --> 00:00:08.000\n{}\n\n", text),
+            text: text.to_string(),
+            language: None,
+            duration_ms: 8_000,
+            cue_count: 1,
+            confidence: None,
+        };
+        let analysis = AudioAnalysis {
+            duration_ms: 8_000,
+            silent_duration_ms: 0,
+            mean_volume_db: Some(-20.0),
+            max_volume_db: Some(-4.0),
+        };
+        assert_eq!(
+            transcript_drop_reason(&analysis, &parsed),
+            Some(TranscriptDropReason::InstructionEcho)
+        );
     }
 
     /// Real-world failure from production: a 6-second clip Gemini transcribed
