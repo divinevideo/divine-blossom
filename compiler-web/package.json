@@ -1,0 +1,29 @@
+{
+  "name": "divine-compiler-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit && vite build",
+    "dev": "vite",
+    "test": "vitest"
+  },
+  "dependencies": {
+    "@divinevideo/login": "^1.1.0",
+    "@fontsource-variable/inter": "^5.2.8",
+    "@phosphor-icons/react": "^2.1.10",
+    "nostr-tools": "^2.15.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.24",
+    "@types/react-dom": "^18.3.7",
+    "@types/node": "^22.15.3",
+    "@vitejs/plugin-react": "^4.3.4",
+    "jsdom": "^26.1.0",
+    "typescript": "^5.9.2",
+    "vite": "^5.4.14",
+    "vitest": "^2.1.9"
+  }
+}
