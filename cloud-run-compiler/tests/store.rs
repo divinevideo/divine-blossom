@@ -3,7 +3,7 @@ use divine_compiler::{
         Aspect, AudioSettings, CompileRequest, CreditSettings, FitMode, Job, JobStatus, NostrEvent,
         RenderRequest, Source, Watermark,
     },
-    store::{JobStore, MemoryJobStore},
+    store::{FirestoreJobStore, JobStore, MemoryJobStore},
 };
 
 fn request() -> CompileRequest {
@@ -121,4 +121,19 @@ async fn create_rejects_duplicate_job_ids() {
         .unwrap_err();
 
     assert!(error.to_string().contains("already exists"));
+}
+
+#[tokio::test]
+async fn firestore_transaction_round_trip_when_emulator_is_available() {
+    if std::env::var("FIRESTORE_EMULATOR_HOST").is_err() {
+        return;
+    }
+    let store =
+        FirestoreJobStore::new("test-project", "compilation_jobs_test").expect("emulator store");
+    let id = format!("job_{}", uuid::Uuid::new_v4().simple());
+    let fixture = job(&id, "firestore@example.com", 10);
+
+    assert!(store.create_limited(&fixture, 0, 10).await.unwrap());
+    assert_eq!(store.get(&id).await.unwrap().unwrap(), fixture);
+    assert_eq!(store.claim_next().await.unwrap().unwrap().id, id);
 }
