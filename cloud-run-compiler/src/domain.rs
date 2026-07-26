@@ -303,6 +303,7 @@ pub struct AspectFailure {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClipDrop {
+    pub source_index: usize,
     pub coordinate: String,
     pub reason: String,
 }
