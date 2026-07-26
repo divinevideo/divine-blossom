@@ -4,5 +4,7 @@
 pub mod auth;
 pub mod config;
 pub mod domain;
+pub mod render;
 pub mod source;
 pub mod store;
+pub mod upload;
