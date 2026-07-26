@@ -6,9 +6,10 @@ use divine_compiler::{
         JobResult, JobStatus, NostrEvent, Output, RenderRequest, Source, Watermark,
     },
     store::{JobStore, MemoryJobStore},
-    worker::{run_next_job, JobExecutor},
+    worker::{run_next_job, run_worker, JobExecutor},
 };
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
+use tokio::sync::Notify;
 
 fn queued_job() -> Job {
     Job {
@@ -112,4 +113,36 @@ async fn pipeline_error_marks_claimed_job_failed() {
 
     assert_eq!(job.status, JobStatus::Failed);
     assert_eq!(job.error.unwrap().code, "compilation-failed");
+}
+
+#[tokio::test]
+async fn worker_polls_for_jobs_created_without_a_local_notification() {
+    let store = Arc::new(MemoryJobStore::default());
+    let worker = tokio::spawn(run_worker(
+        store.clone(),
+        Arc::new(PartialExecutor),
+        Arc::new(Notify::new()),
+        Duration::from_millis(10),
+    ));
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    store.create(&queued_job()).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if store
+                .get("job-1")
+                .await
+                .unwrap()
+                .is_some_and(|job| job.status == JobStatus::Done)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("worker should discover an unnotified queued job");
+
+    worker.abort();
 }
