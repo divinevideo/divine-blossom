@@ -3,7 +3,7 @@
 
 [workspace]
 members = ["blossom-core"]
-exclude = ["cloud-run-upload", "cloud-run-transcoder"]
+exclude = ["cloud-run-upload", "cloud-run-transcoder", "cloud-run-compiler"]
 
 [package]
 name = "fastly-blossom"
