@@ -1,0 +1,25 @@
+# ABOUTME: Cargo manifest for the Divine compilation service
+# ABOUTME: Builds ordered Nostr lists into branded multi-aspect MP4 files
+
+[package]
+name = "divine-compiler"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "divine_compiler"
+path = "src/lib.rs"
+
+[[bin]]
+name = "divine-compiler"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[profile.release]
+lto = true
+opt-level = 3
+strip = true
