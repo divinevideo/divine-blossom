@@ -2,11 +2,34 @@
 
 ## Goal
 
-A backend service that takes a Nostr list of video events and produces a single concatenated MP4 compilation, with the Divine logo watermark and per-clip nip05 credits burned in, ready for upload to TikTok / Reels / YouTube. No UI — HTTP API only.
+A backend service that takes a Nostr list of video events and produces a single concatenated MP4 compilation, with the Divine logo watermark and per-clip nip05 credits burned in, ready for upload to TikTok / Reels / YouTube. The rendering service remains an HTTP API; its companion internal editor is specified in [Internal Compilation Editor: Design Spec](./2026-07-26-compilation-editor-design.md).
 
 ## Solution
 
 New Cloud Run service `cloud-run-compiler/`, parallel to `cloud-run-transcoder/`. Same stack: Rust + FFmpeg + NVIDIA NVENC. Reuses transcoder patterns for deploy, auth, FFmpeg/NVENC execution, and webhook callbacks.
+
+### Companion editor and v1 supersession
+
+The approved editor at `compiler.divine.video` adds a Cloudflare
+Access-protected UI and same-origin edge proxy while keeping this Cloud Run
+service private. For editor-originated jobs, the July editor design supersedes
+conflicting v1 statements in this document:
+
+- The source is the exact signed kind `30005` list event, not a list pointer
+  that the worker resolves later.
+- Ordered kind `34235` and `34236` `a` coordinates must resolve in v1.
+- Render settings are per aspect, with an optional per-clip fit override.
+- At least one successful aspect yields `done`; failed aspects are retained
+  explicitly in the result.
+- Output upload uses the upload service's resumable session flow, streams from
+  disk, and suppresses redundant transcoding and transcription through a
+  trusted compiler-only option.
+- The editor does not expose callbacks and never publishes an output to Nostr
+  or Divine.
+
+The original API shapes below remain the basis for trusted programmatic callers
+until the implementation plan reconciles them with the editor contract. Do not
+execute the May implementation plan unchanged.
 
 ## API
 

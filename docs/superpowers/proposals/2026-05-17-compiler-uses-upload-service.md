@@ -4,6 +4,23 @@
 **Targets:** `docs/superpowers/plans/2026-05-17-compilation-service.md`, `docs/superpowers/specs/2026-05-17-compilation-service-design.md`
 **Audience:** whoever picks up the next plan revision (codex or human)
 
+## July 2026 transport update
+
+The architectural direction in this proposal remains accepted: compiler outputs
+go through `cloud-run-upload`, not direct GCS or Fastly KV writes. The approved
+[Internal Compilation Editor design](../specs/2026-07-26-compilation-editor-design.md)
+supersedes the one-shot upload mechanics below:
+
+- Stream the output file through the resumable `/upload/init`, session, and
+  `/upload/:upload_id/complete` flow instead of reading the complete MP4 into
+  memory for one `PUT`.
+- Add a trusted compiler-only completion option that suppresses HLS transcoding
+  and transcription for these already-final distribution MP4s.
+- Preserve the normal derivative behavior for every ordinary upload client.
+
+The May implementation steps below are historical context and must not be
+implemented unchanged.
+
 ## Context
 
 The earlier plan revision added a direct Fastly KV metadata write inside `BlossomPublisher::put_metadata`. The bug fixes bundled with that pass — credit drawtext after concat, loudnorm in filtergraph, transactional rate limit, tenant-scoped GET, single signed callback secret, 401 in drop reasons — are all correct and should stay. The KV write itself is the only piece that's worth reworking before we ship.
