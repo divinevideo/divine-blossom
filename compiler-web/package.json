@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc --noEmit && vite build",
     "dev": "vite",
-    "test": "vitest"
+    "test": "vitest",
+    "deploy": "npm run build && wrangler deploy"
   },
   "dependencies": {
     "@divinevideo/login": "^1.1.0",
@@ -25,6 +26,7 @@
     "jsdom": "^26.1.0",
     "typescript": "^5.9.2",
     "vite": "^5.4.14",
-    "vitest": "^2.1.9"
+    "vitest": "^2.1.9",
+    "wrangler": "^4.26.1"
   }
 }

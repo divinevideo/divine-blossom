@@ -9,7 +9,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::{
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Notify;
 
@@ -53,10 +53,23 @@ pub async fn run_worker(
     store: Arc<dyn JobStore>,
     executor: Arc<dyn JobExecutor>,
     notify: Arc<Notify>,
+    poll_interval: Duration,
 ) -> Result<()> {
     loop {
-        while run_next_job(store.clone(), executor.as_ref()).await? {}
-        notify.notified().await;
+        loop {
+            match run_next_job(store.clone(), executor.as_ref()).await {
+                Ok(true) => continue,
+                Ok(false) => break,
+                Err(error) => {
+                    tracing::warn!(%error, "compiler worker could not read or save the queue");
+                    break;
+                }
+            }
+        }
+        tokio::select! {
+            () = notify.notified() => {}
+            () = tokio::time::sleep(poll_interval) => {}
+        }
     }
 }
 

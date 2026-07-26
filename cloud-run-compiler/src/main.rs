@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
         let pipeline = pipeline.clone();
         let notify = state.worker_notify.clone();
         tokio::spawn(async move {
-            if let Err(error) = run_worker(store, pipeline, notify).await {
+            if let Err(error) = run_worker(store, pipeline, notify, Duration::from_secs(15)).await {
                 tracing::error!(worker_index, %error, "compiler worker stopped");
             }
         });
