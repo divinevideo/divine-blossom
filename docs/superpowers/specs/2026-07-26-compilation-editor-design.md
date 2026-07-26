@@ -1,11 +1,12 @@
 # Internal Compilation Editor: Design Spec
 
-**Status:** Approved design, awaiting written-spec review
+**Status:** Approved
 **Date:** 2026-07-26
 **Site:** `https://compiler.divine.video`
 **Related backend design:** [Compilation Service: Design Spec](./2026-05-17-compilation-service-design.md)
 **Related implementation plan:** [Compilation Service](../plans/2026-05-17-compilation-service.md)
 **Related upload proposal:** [Compiler Uses Upload Service](../proposals/2026-05-17-compiler-uses-upload-service.md)
+**Deployment design:** [Compilation Service Deployment](./2026-07-26-compilation-deployment-design.md)
 
 ## Goal
 
