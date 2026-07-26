@@ -1,0 +1,189 @@
+name: Compiler Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      promote_image:
+        description: Build the compiler image and open a coreconfig promotion PR
+        required: true
+        default: true
+        type: boolean
+      deploy_worker:
+        description: Deploy the protected editor Worker after Cloud Run exists
+        required: true
+        default: false
+        type: boolean
+
+env:
+  COMPILER_IMAGE: us-central1-docker.pkg.dev/dv-platform-prod/containers-production/divine-compiler
+
+jobs:
+  verify:
+    name: Verify compiler and editor
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate release mode
+        if: inputs.promote_image && inputs.deploy_worker
+        run: |
+          echo "::error::Promote the image first, then deploy the Worker after coreconfig has applied."
+          exit 1
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup component add clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cloud-run-compiler
+
+      - name: Test compiler
+        run: cargo test --manifest-path cloud-run-compiler/Cargo.toml --locked
+
+      - name: Lint compiler
+        run: cargo clippy --manifest-path cloud-run-compiler/Cargo.toml --locked --all-targets -- -D warnings
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: compiler-web/package-lock.json
+
+      - name: Install editor dependencies
+        working-directory: compiler-web
+        run: npm ci
+
+      - name: Test editor
+        working-directory: compiler-web
+        run: npm test -- --run
+
+      - name: Build editor
+        working-directory: compiler-web
+        run: npm run build
+
+  publish-image:
+    name: Publish immutable compiler image
+    needs: verify
+    if: inputs.promote_image
+    runs-on: ubuntu-24.04
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      digest: ${{ steps.compiler-image.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER_PRODUCTION }}
+          service_account: ${{ vars.SERVICE_ACCOUNT_PRODUCTION }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Authenticate Docker to Artifact Registry
+        run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push compiler
+        id: compiler-image
+        uses: docker/build-push-action@v6
+        with:
+          context: cloud-run-compiler
+          file: cloud-run-compiler/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ env.COMPILER_IMAGE }}:${{ github.sha }}
+          cache-from: type=gha,scope=compiler
+          cache-to: type=gha,mode=max,scope=compiler
+
+  promote-image:
+    name: Propose compiler image in coreconfig
+    needs: publish-image
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Generate coreconfig token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CORECONFIG_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.CORECONFIG_DISPATCH_APP_PRIVATE_KEY }}
+          owner: divinevideo
+          repositories: divine-iac-coreconfig
+
+      - name: Dispatch immutable image digest
+        uses: actions/github-script@v7
+        env:
+          COMPILER_DIGEST: ${{ needs.publish-image.outputs.digest }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const payload = {
+              application: 'divine-compiler',
+              environments: ['production'],
+              images: [{
+                name: 'divine-compiler',
+                tag: context.sha,
+                digest: process.env.COMPILER_DIGEST,
+              }],
+              source_repo: context.repo.owner + '/' + context.repo.repo,
+              source_sha: context.sha,
+              source_ref: context.ref,
+              internal: true,
+            };
+
+            await github.rest.repos.createDispatchEvent({
+              owner: 'divinevideo',
+              repo: 'divine-iac-coreconfig',
+              event_type: 'image-deploy',
+              client_payload: payload,
+            });
+
+  deploy-worker:
+    name: Deploy protected compiler editor
+    needs: verify
+    if: inputs.deploy_worker
+    runs-on: ubuntu-24.04
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: compiler-web/package-lock.json
+
+      - name: Install and build editor
+        working-directory: compiler-web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Deploy Worker code and managed variables
+        working-directory: compiler-web
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          COMPILER_SERVICE_URL: ${{ vars.COMPILER_SERVICE_URL }}
+          GOOGLE_SERVICE_ACCOUNT_EMAIL: ${{ vars.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+        run: |
+          npx wrangler deploy \
+            --var "COMPILER_SERVICE_URL:${COMPILER_SERVICE_URL}" \
+            --var "GOOGLE_SERVICE_ACCOUNT_EMAIL:${GOOGLE_SERVICE_ACCOUNT_EMAIL}"
+
+      - name: Load edge credential into Worker secret
+        working-directory: compiler-web
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY }}
+        run: |
+          printf '%s' "$GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY" \
+            | npx wrangler secret put GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY

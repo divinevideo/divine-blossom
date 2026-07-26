@@ -45,7 +45,6 @@ async function serviceAccountAssertion(
   const header = encodeJson({ alg: 'RS256', typ: 'JWT' })
   const claims = encodeJson({
     iss: environment.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-    sub: environment.GOOGLE_SERVICE_ACCOUNT_EMAIL,
     aud: 'https://oauth2.googleapis.com/token',
     iat: now,
     exp: now + 3600,

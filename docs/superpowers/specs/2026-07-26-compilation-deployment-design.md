@@ -121,8 +121,10 @@ reach it; the application repository supplies the code served there.
 3. CI resolves the pushed image digest.
 4. CI dispatches a compiler image promotion to `divine-iac-coreconfig`.
 5. Coreconfig opens a conventional-commit PR updating the production digest.
-6. Review and merge run the Terragrunt infrastructure workflow.
-7. The web artifact is deployed with Wrangler after application checks pass.
+6. Coreconfig runs a non-applying production plan; review and merge the PR.
+7. Run the protected production Terragrunt workflow for `compiler-service`;
+   production is intentionally not applied automatically on merge.
+8. The web artifact is deployed with Wrangler after application checks pass.
 
 The old `cloud-run-compiler/deploy.sh` is not an authoritative deployment path
 and is removed once the managed flow is present.
