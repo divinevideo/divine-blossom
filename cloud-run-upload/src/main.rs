@@ -53,6 +53,28 @@ struct Config {
     transcriber_url: Option<String>,
     resumable_session_ttl_secs: u64,
     resumable_chunk_size: u64,
+    compiler_output_owner_pubkeys: Vec<String>,
+}
+
+fn parse_compiler_output_owner_pubkeys(value: &str) -> std::result::Result<Vec<String>, String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            if value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                Ok(value.to_string())
+            } else {
+                Err(format!(
+                    "COMPILER_OUTPUT_OWNER_PUBKEYS entry must be a 64-character lowercase hex pubkey: {value}"
+                ))
+            }
+        })
+        .collect()
 }
 
 impl Config {
@@ -83,6 +105,10 @@ impl Config {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(resumable::DEFAULT_RESUMABLE_CHUNK_SIZE),
+            compiler_output_owner_pubkeys: parse_compiler_output_owner_pubkeys(
+                &env::var("COMPILER_OUTPUT_OWNER_PUBKEYS").unwrap_or_default(),
+            )
+            .unwrap_or_else(|error| panic!("{error}")),
         }
     }
 }
@@ -584,13 +610,19 @@ async fn handle_resumable_complete(
         .await
     {
         Ok(response) => {
-            maybe_trigger_derivatives(
-                state.config.transcoder_url.as_deref(),
-                state.config.transcriber_url.as_deref(),
-                &response,
+            if should_generate_derivatives(
+                response.generate_derivatives,
                 &auth_event.pubkey,
-            )
-            .await;
+                &state.config.compiler_output_owner_pubkeys,
+            ) {
+                maybe_trigger_derivatives(
+                    state.config.transcoder_url.as_deref(),
+                    state.config.transcriber_url.as_deref(),
+                    &response,
+                    &auth_event.pubkey,
+                )
+                .await;
+            }
 
             (StatusCode::OK, Json(response)).into_response()
         }
@@ -1352,7 +1384,10 @@ mod tests {
 /// them a short yield before asserting received requests.
 #[cfg(test)]
 mod derivative_trigger_tests {
-    use super::{maybe_trigger_derivatives, resumable::CompleteUploadResponse};
+    use super::{
+        maybe_trigger_derivatives, parse_compiler_output_owner_pubkeys,
+        resumable::CompleteUploadResponse, should_generate_derivatives,
+    };
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1364,6 +1399,7 @@ mod derivative_trigger_tests {
             content_type: content_type.to_string(),
             thumbnail_url: None,
             dim: None,
+            generate_derivatives: true,
         }
     }
 
@@ -1374,6 +1410,32 @@ mod derivative_trigger_tests {
     /// POST to a mock server; tune upward only if you see CI flakes.
     async fn drain_spawned_tasks() {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    #[test]
+    fn compiler_owner_can_suppress_derivatives() {
+        let compiler_owner = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        assert!(!should_generate_derivatives(
+            false,
+            compiler_owner,
+            &[compiler_owner.to_string()],
+        ));
+    }
+
+    #[test]
+    fn ordinary_owner_cannot_suppress_derivatives() {
+        assert!(should_generate_derivatives(
+            false,
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            &["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()],
+        ));
+    }
+
+    #[test]
+    fn compiler_owner_config_requires_full_hex_pubkeys() {
+        let error = parse_compiler_output_owner_pubkeys("abc").unwrap_err();
+        assert!(error.contains("64-character lowercase hex"));
     }
 
     /// video/mp4 → transcoder /transcode should be called.
@@ -1675,6 +1737,10 @@ fn get_extension(content_type: &str) -> &'static str {
 
 fn is_transcribable_type(content_type: &str) -> bool {
     content_type.starts_with("video/") || content_type.starts_with("audio/")
+}
+
+fn should_generate_derivatives(requested: bool, owner: &str, compiler_owners: &[String]) -> bool {
+    requested || !compiler_owners.iter().any(|candidate| candidate == owner)
 }
 
 /// Spawn derivative-generation tasks (transcoding + transcription) for a newly completed upload.

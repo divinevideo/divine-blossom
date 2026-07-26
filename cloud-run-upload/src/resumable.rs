@@ -32,6 +32,10 @@ pub const SESSION_LENGTH_HEADER: &str = "Upload-Length";
 pub const SESSION_EXPIRES_HEADER: &str = "Upload-Expires";
 pub const SESSION_CHUNK_SIZE_HEADER: &str = "X-Divine-Chunk-Size";
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResumableUploadInitRequest {
@@ -42,6 +46,8 @@ pub struct ResumableUploadInitRequest {
     #[serde(alias = "file_name")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_name: Option<String>,
+    #[serde(default = "default_true")]
+    pub generate_derivatives: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +74,8 @@ pub struct CompleteUploadResponse {
     pub thumbnail_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dim: Option<String>,
+    #[serde(default = "default_true", skip_serializing)]
+    pub generate_derivatives: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +94,8 @@ pub struct UploadSession {
     pub declared_size: u64,
     pub content_type: String,
     pub file_name: Option<String>,
+    #[serde(default = "default_true")]
+    pub generate_derivatives: bool,
     pub expires_at_epoch_secs: u64,
     pub next_offset: u64,
     pub session_url: String,
@@ -249,6 +259,7 @@ where
             declared_size: request.size,
             content_type: request.content_type.clone(),
             file_name: request.file_name.clone(),
+            generate_derivatives: request.generate_derivatives,
             expires_at_epoch_secs,
             next_offset: 0,
             session_url: backend_session.session_url,
@@ -387,6 +398,7 @@ where
                 content_type: session.content_type.clone(),
                 thumbnail_url: None,
                 dim: None,
+                generate_derivatives: session.generate_derivatives,
             });
         }
 
@@ -437,6 +449,7 @@ where
             content_type: session.content_type.clone(),
             thumbnail_url: None,
             dim: None,
+            generate_derivatives: session.generate_derivatives,
         })
     }
 
@@ -1036,10 +1049,7 @@ mod tests {
 
         assert_eq!(request.source_bucket, "divine-blossom-media");
         assert_eq!(request.source_object, "__resumable/uploads/up_123/blob");
-        assert_eq!(
-            request.destination_bucket,
-            "divine-blossom-media"
-        );
+        assert_eq!(request.destination_bucket, "divine-blossom-media");
         assert_eq!(
             request.destination_object,
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -1092,6 +1102,7 @@ mod tests {
                     size: 1024,
                     content_type: "video/mp4".to_string(),
                     file_name: Some("video.mp4".to_string()),
+                    generate_derivatives: true,
                 },
             )
             .await
@@ -1131,6 +1142,19 @@ mod tests {
         .expect("snake_case init request");
         assert_eq!(snake_case.content_type, "video/mp4");
         assert_eq!(snake_case.file_name.as_deref(), Some("video.mp4"));
+    }
+
+    #[test]
+    fn init_request_accepts_generate_derivatives_false() {
+        let request: ResumableUploadInitRequest = serde_json::from_value(serde_json::json!({
+            "sha256": "5b48aa1fcf30af61243ac9307eb98b7fa22df1c58573c3ca5d1b14fc30099929",
+            "size": 1024,
+            "contentType": "video/mp4",
+            "generateDerivatives": false
+        }))
+        .expect("compiler init request");
+
+        assert!(!request.generate_derivatives);
     }
 
     #[test]
@@ -1174,6 +1198,7 @@ mod tests {
                     size: 1024 * 1024,
                     content_type: "video/mp4".to_string(),
                     file_name: None,
+                    generate_derivatives: true,
                 },
             )
             .await
@@ -1216,6 +1241,7 @@ mod tests {
                     size: 1024 * 1024,
                     content_type: "video/mp4".to_string(),
                     file_name: None,
+                    generate_derivatives: true,
                 },
             )
             .await
