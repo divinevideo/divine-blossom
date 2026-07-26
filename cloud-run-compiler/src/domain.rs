@@ -237,6 +237,28 @@ pub enum JobStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Job {
+    pub id: String,
+    pub status: JobStatus,
+    pub progress: f32,
+    pub request: CompileRequest,
+    pub signer_pubkey: String,
+    pub initiated_by: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    #[serde(default)]
+    pub result: Option<JobResult>,
+    #[serde(default)]
+    pub error: Option<JobError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobError {
+    pub code: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct JobResult {
     #[serde(default)]
