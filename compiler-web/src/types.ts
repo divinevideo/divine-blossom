@@ -31,3 +31,42 @@ export interface RenderRequest {
   default_fit: FitMode
   clip_overrides: Array<{ coordinate: string; fit: FitMode }>
 }
+
+export type JobStatus = 'queued' | 'running' | 'done' | 'failed'
+
+export interface CompilationOutput {
+  aspect: Aspect
+  url: string
+  sha256: string
+  size: number
+  dim: string
+}
+
+export interface CompilationJob {
+  id: string
+  status: JobStatus
+  progress: number
+  initiated_by: string
+  created_at: number
+  updated_at: number
+  result?: {
+    outputs: CompilationOutput[]
+    aspect_failures: Array<{ aspect: Aspect; code: string; message: string }>
+    duration_sec: number
+    clips_used: number
+    clips_dropped: Array<{
+      source_index: number
+      coordinate: string
+      reason: string
+    }>
+  }
+  error?: { code: string; message: string }
+}
+
+export interface VideoClip {
+  coordinate: string
+  event: NostrEvent
+  videoUrl?: string
+  title: string
+  creator: string
+}

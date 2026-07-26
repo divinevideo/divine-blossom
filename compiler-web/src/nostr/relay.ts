@@ -35,6 +35,29 @@ export class DivineListRelay implements ListRelay {
     await Promise.any(acknowledgements)
   }
 
+  async videoEvents(coordinates: string[]): Promise<Map<string, NostrEvent>> {
+    const pairs = await Promise.all(
+      coordinates.map(async (coordinate) => {
+        const [kindText, pubkey, ...identifierParts] = coordinate.split(':')
+        const identifier = identifierParts.join(':')
+        const event = await this.pool.get(
+          this.relays,
+          {
+            kinds: [Number(kindText)],
+            authors: [pubkey],
+            '#d': [identifier],
+            limit: 1,
+          },
+          { maxWait: 10_000 },
+        )
+        return [coordinate, event as NostrEvent | null] as const
+      }),
+    )
+    return new Map(
+      pairs.filter((pair): pair is readonly [string, NostrEvent] => pair[1] !== null),
+    )
+  }
+
   close(): void {
     this.pool.destroy()
   }
