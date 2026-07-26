@@ -16,8 +16,79 @@ Client → Fastly Compute (Rust WASM) → GCS (blobs) + Fastly KV (metadata)
 - **Cloud Run Upload** (`cloud-run-upload/`) - Rust service on GCP. Receives video bytes, sanitizes (ffmpeg -c copy), hashes, uploads to GCS, triggers transcoder, receives audit logs
 - **Cloud Run Transcoder** (`cloud-run-transcoder/`) - Rust service on GCP with NVIDIA GPU. Downloads from GCS, transcodes to HLS via FFmpeg NVENC, uploads segments back
 - **Cloud Run Process-Blob** (`cloud-functions/process-blob/`) - Python/Flask service on GCP. Triggered by GCS object finalization via Eventarc. Validates C2PA Content Credentials (c2patool) and runs SafeSearch moderation (Vision API), then updates Fastly KV metadata via webhook
+- **Compilation editor** (`compiler-web/`, `cloud-run-compiler/`) - Internal
+  list editor at `compiler.divine.video`. Reorders signed Nostr video lists and
+  renders 9:16, 1:1, and 16:9 MP4 compilations with creator credits and Divine
+  branding.
 - **GCS bucket**: `divine-blossom-media`
 - **CDN**: `media.divine.video` (Fastly)
+
+## Internal Compilation Editor
+
+The compilation editor is a standalone internal tool, not part of
+`divine.video`. It starts from an existing kind `30005` Nostr video list so the
+workflow encourages list making. Editors can reorder the list, choose
+aspect-specific fit modes, save the reordered signed list, and render external
+files for Reels, TikTok, and YouTube.
+
+Compilation output is stored as an ordinary Blossom blob for preview, download,
+and URL sharing. The compiler does **not** create a Divine video event and the
+editor has no “Publish to Divine” action: a multi-clip compilation is not a
+six-second Divine post.
+
+### Local verification
+
+```bash
+cargo test --manifest-path cloud-run-compiler/Cargo.toml --locked
+cargo clippy --manifest-path cloud-run-compiler/Cargo.toml \
+  --all-targets --all-features --locked -- -D warnings
+cloud-run-compiler/scripts/smoke-test.sh
+
+npm --prefix compiler-web ci
+npm --prefix compiler-web test -- --run
+npm --prefix compiler-web run build
+```
+
+The FFmpeg smoke renders two generated clips, including one without audio, into
+all three supported dimensions and checks each result with `ffprobe`.
+
+### Production configuration
+
+The private `cloud-run-compiler` service requires:
+
+- `FIRESTORE_PROJECT`; optional collection defaults to `compilation_jobs`
+- `SOURCE_RELAYS`, `UPLOAD_SERVICE_URL`, `MEDIA_ORIGIN`, and
+  `ALLOWED_MEDIA_HOSTS`
+- `PUBLIC_ORIGIN=https://compiler.divine.video`
+- Secret Manager secret `compiler_output_nsec`, exposed only as
+  `COMPILER_OUTPUT_NSEC`
+
+Apply the composite indexes in
+`cloud-run-compiler/firestore.indexes.json` before accepting jobs. The runtime
+service account needs Firestore access and Secret Manager access. Run
+`cloud-run-compiler/deploy.sh` with `EDGE_SERVICE_ACCOUNT` set to the dedicated
+Cloudflare Worker service account; the script keeps Cloud Run private and
+grants that account `roles/run.invoker`.
+
+Configure `cloud-run-upload` with
+`COMPILER_OUTPUT_OWNER_PUBKEYS=<full compiler pubkey>` before deploying it. Only
+that configured owner may request `generateDerivatives: false`, preventing
+compiled MP4s from entering the normal six-second derivative pipeline.
+
+The Cloudflare Worker needs non-secret variables `COMPILER_SERVICE_URL` and
+`GOOGLE_SERVICE_ACCOUNT_EMAIL`, plus the
+`GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY` Wrangler secret. Protect
+`compiler.divine.video` with Cloudflare Access and permit only the internal
+editor group. Register OAuth client `compiler-divine-video` with callback
+`https://compiler.divine.video/auth/callback`, then build or deploy with:
+
+```bash
+npm --prefix compiler-web run build
+npm --prefix compiler-web run deploy
+```
+
+Deployment scripts publish infrastructure and are intentionally not part of the
+local verification commands.
 
 ## Features
 

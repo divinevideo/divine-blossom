@@ -95,8 +95,6 @@ async fn cpu_render_smoke_handles_clips_with_and_without_audio() {
     std::fs::create_dir_all(&directory).unwrap();
     let with_audio = directory.join("with-audio.mp4");
     let silent = directory.join("silent.mp4");
-    let output = directory.join("output.mp4");
-
     assert!(Command::new("ffmpeg")
         .args([
             "-y",
@@ -131,30 +129,53 @@ async fn cpu_render_smoke_handles_clips_with_and_without_audio() {
         .unwrap()
         .success());
 
-    let job = AspectRenderJob {
-        aspect: Aspect::Square,
-        clips: vec![
-            ClipInput {
-                path: with_audio,
-                ..clip("with-audio", FitMode::BlurPad, 0.5, true)
+    for (aspect, dimensions) in [
+        (Aspect::Portrait, "1080x1920"),
+        (Aspect::Square, "1080x1080"),
+        (Aspect::Landscape, "1920x1080"),
+    ] {
+        let output = directory.join(format!("{aspect:?}.mp4"));
+        let job = AspectRenderJob {
+            aspect,
+            clips: vec![
+                ClipInput {
+                    path: with_audio.clone(),
+                    ..clip("with-audio", FitMode::BlurPad, 0.5, true)
+                },
+                ClipInput {
+                    path: silent.clone(),
+                    ..clip("silent", FitMode::Letterbox, 0.5, false)
+                },
+            ],
+            logo_path: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/divine-logo.png"),
+            output_path: output.clone(),
+            watermark: Watermark::default(),
+            credit: CreditSettings {
+                duration_ms: 0,
+                ..CreditSettings::default()
             },
-            ClipInput {
-                path: silent,
-                ..clip("silent", FitMode::Letterbox, 0.5, false)
-            },
-        ],
-        logo_path: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/divine-logo.png"),
-        output_path: output.clone(),
-        watermark: Watermark::default(),
-        credit: CreditSettings {
-            duration_ms: 0,
-            ..CreditSettings::default()
-        },
-        audio: AudioSettings::default(),
-        use_gpu: false,
-    };
+            audio: AudioSettings::default(),
+            use_gpu: false,
+        };
 
-    divine_compiler::render::render_aspect(&job).await.unwrap();
-    assert!(output.metadata().unwrap().len() > 0);
+        divine_compiler::render::render_aspect(&job).await.unwrap();
+        assert!(output.metadata().unwrap().len() > 0);
+        let probe = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=s=x:p=0",
+                output.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(probe.status.success());
+        assert_eq!(String::from_utf8_lossy(&probe.stdout).trim(), dimensions);
+    }
     std::fs::remove_dir_all(directory).unwrap();
 }
