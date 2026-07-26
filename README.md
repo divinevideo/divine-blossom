@@ -60,35 +60,31 @@ The private `cloud-run-compiler` service requires:
 - `SOURCE_RELAYS`, `UPLOAD_SERVICE_URL`, `MEDIA_ORIGIN`, and
   `ALLOWED_MEDIA_HOSTS`
 - `PUBLIC_ORIGIN=https://compiler.divine.video`
-- Secret Manager secret `compiler_output_nsec`, exposed only as
+- Secret Manager secret `compiler-output-nsec-production`, exposed only as
   `COMPILER_OUTPUT_NSEC`
 
-Apply the composite indexes in
-`cloud-run-compiler/firestore.indexes.json` before accepting jobs. The runtime
-service account needs Firestore access and Secret Manager access. Run
-`cloud-run-compiler/deploy.sh` with `EDGE_SERVICE_ACCOUNT` set to the dedicated
-Cloudflare Worker service account; the script keeps Cloud Run private and
-grants that account `roles/run.invoker`.
+These resources, both Firestore indexes, Cloud Run GPU sizing, service
+accounts, IAM, DNS, and Cloudflare Access are owned by the production
+`compiler-service` Terragrunt stack in `divine-iac-coreconfig`. Do not deploy
+Cloud Run imperatively from this repository.
 
-Configure `cloud-run-upload` with
-`COMPILER_OUTPUT_OWNER_PUBKEYS=<full compiler pubkey>` before deploying it. Only
-that configured owner may request `generateDerivatives: false`, preventing
-compiled MP4s from entering the normal six-second derivative pipeline.
+Production `upload.divine.video` is the GKE-hosted
+`divine-upload-server`. Its resumable completion path stores compiler outputs
+without starting the normal thumbnail, HLS, or transcription derivative work.
 
 The Cloudflare Worker needs non-secret variables `COMPILER_SERVICE_URL` and
 `GOOGLE_SERVICE_ACCOUNT_EMAIL`, plus the
 `GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY` Wrangler secret. Protect
 `compiler.divine.video` with Cloudflare Access and permit only the internal
-editor group. Register OAuth client `compiler-divine-video` with callback
-`https://compiler.divine.video/auth/callback`, then build or deploy with:
+staff domain. Register OAuth client `compiler-divine-video` with callback
+`https://compiler.divine.video/auth/callback`.
 
-```bash
-npm --prefix compiler-web run build
-npm --prefix compiler-web run deploy
-```
+Run the manual `Compiler Release` GitHub Actions workflow to test and publish an
+immutable image digest, propose it through a coreconfig PR, and deploy the
+Worker after the private service URL exists. See
+`docs/superpowers/specs/2026-07-26-compilation-deployment-design.md`.
 
-Deployment scripts publish infrastructure and are intentionally not part of the
-local verification commands.
+Deployment does not publish compilation files as Divine posts.
 
 ## Features
 
