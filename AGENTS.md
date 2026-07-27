@@ -45,6 +45,7 @@ If a Divine Brain search or ask tool is available, you may use it for company me
 ## Security & Operational Notes
 - Never commit secrets, API tokens, private keys, service credentials, or screenshots/logs containing sensitive values.
 - Public issues, PRs, branch names, screenshots, and descriptions must not mention corporate partners, customers, brands, campaign names, or other sensitive external identities unless a maintainer explicitly approves it. Use generic descriptors instead.
+- Before modifying or running `gcloud run deploy`, compare live environment-variable and secret-binding names with the command without reading values. `--set-env-vars` and `--set-secrets` replace all existing entries and may be used only when the script owns the complete configuration; otherwise use `--update-env-vars` and `--update-secrets`.
 - Respect the existing deployment rule: use `fastly compute publish` for Fastly deploys, not separate build and deploy commands.
 
 ## Fastly Compute Deployment Rules
