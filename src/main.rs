@@ -9,6 +9,7 @@ mod delete_policy;
 mod error;
 mod media_auth_log;
 mod metadata;
+mod rate_limit;
 mod req_id;
 mod storage;
 mod viewer_auth;
@@ -50,6 +51,7 @@ use fastly_blossom::resumable_complete::parse_resumable_complete_request_body;
 
 use fastly::cache::simple as simple_cache;
 use fastly::http::{header, Method, StatusCode};
+use fastly::kv_store::KVStore;
 use fastly::{Error, Request, Response};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -140,6 +142,9 @@ fn handle_request(req: Request) -> Result<Response> {
         (Method::PUT, "/upload") => handle_upload(req),
         // BUD-06: Upload requirements/pre-validation
         (Method::HEAD, "/upload") => handle_upload_requirements(req),
+        // Synchronous audio transcription — thin forward to the upload service's
+        // authenticated /transcribe proxy (which calls the transcoder).
+        (Method::POST, "/transcribe") => handle_transcribe_proxy(req),
         // Divine resumable control plane
         (Method::POST, "/upload/init") => handle_upload_init(req),
         (Method::POST, p) if p.starts_with("/upload/") && p.ends_with("/complete") => {
@@ -3673,6 +3678,105 @@ fn handle_upload_complete(mut req: Request, path: &str) -> Result<Response> {
     )
 }
 
+/// Per-pubkey and per-IP fixed-window throttle for the transcription proxy.
+///
+/// Returns `Some(429)` when either limit is exceeded, `None` to let the request
+/// through. Best-effort: if the KV store is unavailable the request is allowed
+/// — the transcoder's in-flight semaphore is the hard backstop. The per-pubkey
+/// charge is applied only after the event validates against the transcription
+/// authorization contract (`validate_transcribe_event`), so a forged or
+/// replayed token can't burn a victim's budget; the upload service still does
+/// full validation downstream.
+fn enforce_transcribe_rate_limit(req: &Request, auth_header: &str) -> Option<Response> {
+    let store = KVStore::open("blossom_metadata").ok().flatten()?;
+    let counter = rate_limit::KvCounterStore(&store);
+    let now = unix_timestamp_secs();
+
+    // IP first: always trustworthy (it's the connection source) and cheap, so a
+    // flood is throttled before we spend a signature verification on the
+    // forgeable pubkey below.
+    if let Some(ip) = req.get_client_ip_addr().map(|ip| ip.to_string()) {
+        let cfg = rate_limit::RateLimit::new(rate_limit::IP_LIMIT, rate_limit::IP_WINDOW_SECS);
+        if let Some(retry_after) = rate_limit::enforce(&counter, "ip", &ip, cfg, now) {
+            return Some(too_many_requests(retry_after));
+        }
+    }
+
+    // Pubkey only after the event satisfies the transcription authorization
+    // contract (kind 24242, exact `t=media`, required unexpired expiration,
+    // Divine-scoped `server` tag, valid signature) — the same contract the
+    // upload service enforces. Charging an event it would reject burns a
+    // signer's budget on a doomed request, and a signature-only check would
+    // even let a replayed `t=get` token charge a victim. `parse_auth_header`
+    // decodes attacker-controlled JSON, so the pubkey is untrusted until then.
+    if let Some(pubkey) = crate::viewer_auth::transcribe_charge_pubkey(auth_header, now) {
+        let cfg =
+            rate_limit::RateLimit::new(rate_limit::PUBKEY_LIMIT, rate_limit::PUBKEY_WINDOW_SECS);
+        if let Some(retry_after) = rate_limit::enforce(&counter, "pk", &pubkey, cfg, now) {
+            return Some(too_many_requests(retry_after));
+        }
+    }
+
+    None
+}
+
+fn too_many_requests(retry_after_secs: u64) -> Response {
+    let mut resp = Response::from_status(StatusCode::TOO_MANY_REQUESTS)
+        .with_header(header::RETRY_AFTER, retry_after_secs.to_string())
+        .with_header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .with_body("Rate limit exceeded for transcription. Try again shortly.\n");
+    add_cors_headers(&mut resp);
+    resp
+}
+
+/// POST /transcribe — thin forward to the upload service's authenticated
+/// transcription proxy (`upload.divine.video/transcribe`), which validates the
+/// Blossom auth and calls the transcoder. The mobile editor only addresses this
+/// edge host, so transcription has to enter here.
+///
+/// The body (audio) is streamed straight through — Fastly Compute has a ~5 MB
+/// WASM memory limit, so we never buffer it. Auth is passed through unchanged;
+/// the upload service is the authority that validates it (`t=media`). A
+/// per-pubkey and per-IP fixed-window rate limit is applied here first, since
+/// the edge sees the request before the expensive transcoder work begins.
+fn handle_transcribe_proxy(mut req: Request) -> Result<Response> {
+    let auth_header = extract_authorization_header(&req)?;
+
+    if let Some(limited) = enforce_transcribe_rate_limit(&req, &auth_header) {
+        return Ok(limited);
+    }
+
+    let content_type = req
+        .get_header(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("audio/wav")
+        .to_string();
+    let query = req.get_query_str().map(str::to_string);
+    let body = req.take_body();
+
+    let mut url = format!("https://{}/transcribe", UPLOAD_SERVICE_HOST);
+    if let Some(query) = query.filter(|q| !q.is_empty()) {
+        url.push('?');
+        url.push_str(&query);
+    }
+
+    let mut proxy_req = Request::new(Method::POST, &url);
+    proxy_req.set_header("Host", UPLOAD_SERVICE_HOST);
+    proxy_req.set_header(header::AUTHORIZATION, &auth_header);
+    proxy_req.set_header(header::CONTENT_TYPE, &content_type);
+    proxy_req.set_body(body);
+
+    let mut proxy_resp = proxy_req
+        .send(UPLOAD_SERVICE_BACKEND)
+        .map_err(|e| BlossomError::Internal(format!("Failed to proxy transcription: {}", e)))?;
+
+    // Return the upstream response as-is — its status and every header
+    // (Content-Type, and a future 429's `Retry-After`) — then add CORS.
+    // Reconstructing the response would silently drop those headers.
+    add_cors_headers(&mut proxy_resp);
+    Ok(proxy_resp)
+}
+
 /// Handle large uploads by proxying to the upload service
 /// Fastly Compute has WASM memory limits (~5MB), so large files must be proxied
 fn handle_upload_service_proxy(
@@ -5654,7 +5758,8 @@ struct UploadCapabilityHeaders {
 }
 
 fn upload_exposed_headers() -> &'static str {
-    "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256, X-Content-SHA256, X-Audio-Duration, X-Audio-Size, X-Divine-Upload-Extensions, X-Divine-Upload-Control-Host, X-Divine-Upload-Data-Host"
+    // Retry-After lets a browser client read the throttle backoff on a 429.
+    "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256, X-Content-SHA256, X-Audio-Duration, X-Audio-Size, X-Divine-Upload-Extensions, X-Divine-Upload-Control-Host, X-Divine-Upload-Data-Host, Retry-After"
 }
 
 fn upload_control_host(public_host: Option<&str>) -> String {
@@ -6114,6 +6219,8 @@ mod tests {
         assert!(exposed_headers.contains("X-Divine-Upload-Extensions"));
         assert!(exposed_headers.contains("X-Divine-Upload-Control-Host"));
         assert!(exposed_headers.contains("X-Divine-Upload-Data-Host"));
+        // Browser clients must be able to read the 429 throttle backoff.
+        assert!(exposed_headers.contains("Retry-After"));
     }
 
     #[test]

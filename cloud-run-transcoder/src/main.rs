@@ -3,8 +3,9 @@
 
 use anyhow::{anyhow, Result};
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, Query, Request, State},
     http::{header, Method, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Json, Response},
     routing::{get, options, post},
     Router,
@@ -102,6 +103,10 @@ struct Config {
     /// `transcription_provider == "parakeet"`. Audience for the
     /// Cloud Run identity token is the same URL.
     parakeet_asr_url: Option<String>,
+    /// Shared secret authorizing `POST /transcribe/audio`. The upload-service
+    /// proxy injects it; the service is `--allow-unauthenticated`, so when this
+    /// is unset the route fails closed (503).
+    transcribe_shared_secret: Option<String>,
 }
 
 impl Config {
@@ -234,6 +239,9 @@ impl Config {
                 true,
             ),
             parakeet_asr_url: lookup("PARAKEET_ASR_URL")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
+            transcribe_shared_secret: lookup("TRANSCRIBE_SHARED_SECRET")
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty()),
         }
@@ -695,6 +703,16 @@ async fn main() -> Result<()> {
         .route("/transcode", options(handle_cors_preflight))
         .route("/transcribe", post(handle_transcribe))
         .route("/transcribe", options(handle_cors_preflight))
+        .route(
+            "/transcribe/audio",
+            post(handle_transcribe_audio)
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    require_transcribe_secret,
+                ))
+                .layer(DefaultBodyLimit::max(MAX_TRANSCRIBE_AUDIO_BYTES)),
+        )
+        .route("/transcribe/audio", options(handle_cors_preflight))
         .route("/backfill-fmp4", post(handle_backfill_fmp4))
         .route("/audio/extract", post(handle_audio_extract))
         .route("/audio/extract", options(handle_cors_preflight))
@@ -778,6 +796,171 @@ async fn handle_transcribe(
             )
                 .into_response()
         }
+    }
+}
+
+/// Max audio body accepted by `POST /transcribe/audio`. ffmpeg-normalized
+/// 16 kHz mono PCM is ~32 KB/s, so 100 MB is ~50 min of audio — far above any
+/// editor clip while still bounding request memory. The Parakeet sidecar caps
+/// at 200 MB; we stay under that.
+const MAX_TRANSCRIBE_AUDIO_BYTES: usize = 100 * 1024 * 1024;
+
+/// Max decoded audio duration for `POST /transcribe/audio`. Caps the PCM ffmpeg
+/// writes so a highly compressed input cannot expand to gigabytes of raw audio
+/// (decompression-bomb guard). 10 min is well beyond any editor clip; at
+/// 16 kHz mono s16le it bounds the WAV to ~19 MB.
+const MAX_TRANSCRIBE_AUDIO_SECONDS: u64 = 600;
+
+#[derive(Debug, Deserialize)]
+struct TranscribeAudioParams {
+    /// Optional BCP-47 recognition-language hint (e.g. `en`, `de-CH`).
+    language: Option<String>,
+}
+
+/// Synchronous "raw audio bytes -> WebVTT" transcription.
+///
+/// Unlike [`handle_transcribe`] (by-hash: reads a stored blob, writes the VTT
+/// back to GCS, holds a lock), this transcribes the audio in the request body
+/// inline via the configured provider and returns the WebVTT directly — no GCS
+/// read/write, no lock, no idempotency cache. It exists for the editor's
+/// pre-publish caption generation, reached through the upload-server's
+/// authenticated proxy.
+///
+/// The transcoder is deployed `--allow-unauthenticated`, so this route guards
+/// itself with a shared secret (`X-Divine-Transcribe-Secret`) that only the
+/// upload-service proxy knows — without it, anyone could bypass the proxy's
+/// Nostr auth / rate limit and trigger billable transcription. Fail closed:
+/// when the secret is unconfigured the route returns 503. Per-caller rate
+/// limiting still lives at the proxy (it knows the pubkey); an optional
+/// audio-hash result cache could dedupe repeat audio as a cost optimization.
+async fn handle_transcribe_audio(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<TranscribeAudioParams>,
+    body: Bytes,
+) -> Response {
+    // Auth is enforced by `require_transcribe_secret` on this route, before the
+    // `Bytes` body is buffered — see the router. Reaching here means authorized.
+    match process_transcribe_audio(&state, params.language.as_deref(), &body).await {
+        Ok(vtt) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/vtt; charset=utf-8")],
+            vtt,
+        )
+            .into_response(),
+        Err(e) => {
+            error!("Transcribe-audio error: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Rejects an empty body or one past [`MAX_TRANSCRIBE_AUDIO_BYTES`].
+fn ensure_transcribe_audio_size(len: usize) -> Result<()> {
+    if len == 0 {
+        return Err(anyhow!("empty audio body"));
+    }
+    if len > MAX_TRANSCRIBE_AUDIO_BYTES {
+        return Err(anyhow!(
+            "audio too large: {} bytes > {}",
+            len,
+            MAX_TRANSCRIBE_AUDIO_BYTES
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects unauthenticated `/transcribe/audio` requests *before* the body is
+/// buffered. The secret check has to run in middleware, not the handler: Axum's
+/// `Bytes` extractor materializes the entire body — up to
+/// `MAX_TRANSCRIBE_AUDIO_BYTES` — before handler code runs, so an
+/// unauthenticated flood on this `--allow-unauthenticated` service could
+/// otherwise exhaust instance memory.
+async fn require_transcribe_secret(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if let Err(rejection) = authorize_transcribe_audio(&state.config, request.headers()) {
+        return rejection;
+    }
+    next.run(request).await
+}
+
+/// Header carrying the shared secret that authorizes `POST /transcribe/audio`.
+const TRANSCRIBE_SECRET_HEADER: &str = "x-divine-transcribe-secret";
+
+/// Guards `/transcribe/audio`. Returns `Err(response)` to short-circuit: 503
+/// when no secret is configured (fail closed), 401 on a missing/wrong secret.
+fn authorize_transcribe_audio(
+    config: &Config,
+    headers: &axum::http::HeaderMap,
+) -> std::result::Result<(), Response> {
+    let Some(expected) = config.transcribe_shared_secret.as_deref() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "transcribe-audio secret not configured",
+        )
+            .into_response());
+    };
+    let provided = headers
+        .get(TRANSCRIBE_SECRET_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+        Ok(())
+    } else {
+        Err((StatusCode::UNAUTHORIZED, "invalid transcribe-audio secret").into_response())
+    }
+}
+
+/// Length-then-content comparison that doesn't short-circuit on the first
+/// differing byte, so a matching secret can't be recovered by timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+async fn process_transcribe_audio(
+    state: &Arc<AppState>,
+    language: Option<&str>,
+    body: &[u8],
+) -> Result<String> {
+    ensure_transcribe_audio_size(body.len())?;
+
+    let temp_dir = TempDir::new()?;
+    let input_path = temp_dir.path().join("input");
+    tokio::fs::write(&input_path, body).await?;
+
+    // Normalize to the 16 kHz mono PCM WAV every provider expects, and cap the
+    // decoded duration: the 100 MB body limit bounds *compressed* input, but a
+    // highly compressed file can expand to gigabytes of raw PCM, which ffmpeg
+    // would then write and Gemini would base64-encode whole. `-t` bounds it.
+    let audio_path = temp_dir.path().join("transcribe.wav");
+    extract_bounded_audio_for_transcription(&input_path, &audio_path, MAX_TRANSCRIBE_AUDIO_SECONDS)
+        .await?;
+
+    let language = language.map(str::trim).filter(|lang| !lang.is_empty());
+
+    // Reuse the by-hash flow's hardened core: provider fallback,
+    // provider-specific parsing, the instance-wide provider permit
+    // (`TRANSCRIPTION_MAX_IN_FLIGHT`), and every caption-quality guard —
+    // instead of calling the low-level provider directly.
+    match transcribe_audio_file(state, &audio_path, language).await {
+        Ok((parsed, _provider)) => Ok(parsed.content),
+        Err(TranscribeError::Provider(e)) => Err(e.into()),
+        Err(TranscribeError::Normalize(e)) => Err(e),
     }
 }
 
@@ -1280,6 +1463,126 @@ async fn process_transcode(
         display_width: Some(video_info.display_width),
         display_height: Some(video_info.display_height),
     })
+}
+
+/// How [`transcribe_audio_file`] failed, so callers can map it to their own
+/// side effects (webhooks, cooldowns, error responses).
+enum TranscribeError {
+    /// The provider (and any configured fallback) failed. Carries retry and
+    /// attempt detail for cooldown/webhook decisions.
+    Provider(ProviderError),
+    /// The provider answered, but its output could not be parsed into VTT.
+    Normalize(anyhow::Error),
+}
+
+/// The hardened "audio file -> validated WebVTT" core used by the raw-audio
+/// `process_transcribe_audio`. The by-hash [`process_transcribe`] still carries
+/// its own inline copy.
+///
+/// TODO(#147): Fold the by-hash path onto this core after staging validates its
+/// GCS lock, cooldown, webhook, and upload side effects.
+///
+/// Runs silence analysis (short-circuiting silent audio to an empty VTT),
+/// acquires the instance-wide provider permit ([`AppState::provider_semaphore`]
+/// / `TRANSCRIPTION_MAX_IN_FLIGHT`), calls [`transcribe_with_fallback`]
+/// (provider selection + configured fallback), applies provider-specific
+/// parsing, and runs every caption-quality guard (low-confidence,
+/// hallucination, loop, text-density, instruction-echo, and Google-specific).
+/// Returns the validated VTT plus the provider that produced it.
+///
+/// No GCS, lock, or webhook side effects — the caller owns those.
+async fn transcribe_audio_file(
+    state: &Arc<AppState>,
+    audio_path: &Path,
+    language: Option<&str>,
+) -> std::result::Result<(ParsedVtt, String), TranscribeError> {
+    let audio_analysis = match analyze_audio_signal(audio_path).await {
+        Ok(analysis) => analysis,
+        Err(e) => {
+            warn!(
+                "Audio analysis failed; continuing without silence guardrails: {}",
+                e
+            );
+            AudioAnalysis {
+                duration_ms: audio_duration_ms(audio_path).await.unwrap_or(0),
+                ..AudioAnalysis::default()
+            }
+        }
+    };
+
+    if audio_analysis.is_effectively_silent() {
+        info!(
+            duration_ms = audio_analysis.duration_ms,
+            silence_ratio = format!("{:.3}", audio_analysis.silence_ratio()),
+            "Audio effectively silent; returning empty transcript (fallback intentionally skipped)",
+        );
+        return Ok((
+            ParsedVtt::empty(audio_analysis.duration_ms),
+            state.config.transcription_provider.clone(),
+        ));
+    }
+
+    let permit = state
+        .provider_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|e| TranscribeError::Normalize(anyhow!("Provider semaphore closed: {}", e)))?;
+
+    let (raw_output, used_provider) =
+        match transcribe_with_fallback(state, audio_path, language).await {
+            Ok(pair) => pair,
+            Err(e) => return Err(TranscribeError::Provider(e)),
+        };
+    drop(permit);
+
+    let parsed_vtt = if used_provider == "google_stt_v2" {
+        transcription_google_stt_v2::parse_response_to_parsed_vtt(
+            &raw_output,
+            audio_analysis.duration_ms,
+        )
+        .map(|(parsed, _mode)| parsed)
+        .map_err(TranscribeError::Normalize)?
+    } else {
+        match normalize_transcript_to_vtt(&raw_output) {
+            Ok(vtt) => vtt,
+            Err(e) if is_empty_transcript_normalize_error(&e) => {
+                ParsedVtt::empty(audio_analysis.duration_ms)
+            }
+            Err(e) => return Err(TranscribeError::Normalize(e)),
+        }
+    };
+
+    let parsed_vtt = match transcript_drop_reason(&audio_analysis, &parsed_vtt) {
+        Some(reason) => {
+            warn!(
+                drop_reason = ?reason,
+                silence_ratio = format!("{:.3}", audio_analysis.silence_ratio()),
+                text_preview = %first_chars(&parsed_vtt.text, 120),
+                "Dropping transcript flagged by a caption-quality guard",
+            );
+            ParsedVtt::empty(audio_analysis.duration_ms)
+        }
+        None => parsed_vtt,
+    };
+
+    let parsed_vtt = if used_provider == "google_stt_v2" {
+        match transcription_google_stt_v2::google_drop_reason(&parsed_vtt) {
+            Some(reason) => {
+                warn!(
+                    drop_reason = ?reason,
+                    text_preview = %first_chars(&parsed_vtt.text, 80),
+                    "Dropping STT V2 transcript due to Google-specific guard",
+                );
+                ParsedVtt::empty(audio_analysis.duration_ms)
+            }
+            None => parsed_vtt,
+        }
+    } else {
+        parsed_vtt
+    };
+
+    Ok((parsed_vtt, used_provider))
 }
 
 async fn process_transcribe(
@@ -1950,6 +2253,54 @@ async fn extract_audio_for_transcription(input_path: &Path, audio_path: &Path) -
     Ok(())
 }
 
+/// Like [`extract_audio_for_transcription`], but caps the output to
+/// [`max_seconds`] via ffmpeg `-t`. Used by the raw-audio endpoint, where the
+/// input is untrusted and could be a decompression bomb; the by-hash flow
+/// transcodes already-stored blobs and must not truncate them.
+async fn extract_bounded_audio_for_transcription(
+    input_path: &Path,
+    audio_path: &Path,
+    max_seconds: u64,
+) -> Result<()> {
+    let input_str = input_path.to_string_lossy();
+    let audio_str = audio_path.to_string_lossy();
+    let duration = max_seconds.to_string();
+
+    let output = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-i",
+            &input_str,
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            "-t",
+            &duration,
+            &audio_str,
+        ])
+        .output()
+        .await
+        .map_err(|e| anyhow!("Failed to run ffmpeg audio extraction: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("ffmpeg audio extraction failed: {}", stderr));
+    }
+
+    let metadata = tokio::fs::metadata(audio_path)
+        .await
+        .map_err(|e| anyhow!("Audio output missing after extraction: {}", e))?;
+    if metadata.len() == 0 {
+        return Err(anyhow!("Extracted audio is empty"));
+    }
+
+    Ok(())
+}
+
 async fn analyze_audio_signal(audio_path: &Path) -> Result<AudioAnalysis> {
     let duration_ms = audio_duration_ms(audio_path).await?;
     let audio_str = audio_path.to_string_lossy().to_string();
@@ -2593,9 +2944,9 @@ async fn fetch_gcp_access_token() -> std::result::Result<String, ProviderFailure
         .output()
         .await
     {
-        Ok(output) if output.status.success() => Ok(String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .to_string()),
+        Ok(output) if output.status.success() => {
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        }
         Ok(_) => Err(parse_provider_status(
             None,
             None,
@@ -3526,16 +3877,35 @@ async fn finalize_transcript(
 mod tests {
     use super::{
         build_transcode_status_webhook_payload, classify_audio_extract_error,
-        contains_instruction_echo, decide_transcript_lock_action, identity_token_cache_for_audience,
-        is_empty_transcript_normalize_error, is_implausible_text_density, is_loop_hallucination,
-        is_retryable_provider_failure, normalize_transcript_to_vtt, parakeet_request_url,
-        parse_audio_analysis_output, parse_provider_status, retry_delay_for_attempt,
-        should_drop_low_signal_transcript, token_fetch_retry_delay, transcript_drop_reason,
-        transcription_response_format, AccessTokenCache, AudioAnalysis, AudioExtractErrorKind,
-        Config, ParsedVtt, TranscriptConfidence, TranscriptDropReason, TranscriptLockAction,
-        TranscriptLockState, TranscriptLockStatus, VideoInfo,
+        constant_time_eq, contains_instruction_echo, decide_transcript_lock_action,
+        ensure_transcribe_audio_size,
+        identity_token_cache_for_audience, is_empty_transcript_normalize_error,
+        is_implausible_text_density, is_loop_hallucination, is_retryable_provider_failure,
+        normalize_transcript_to_vtt, parakeet_request_url, parse_audio_analysis_output,
+        parse_provider_status, retry_delay_for_attempt, should_drop_low_signal_transcript,
+        token_fetch_retry_delay, transcript_drop_reason, transcription_response_format,
+        AccessTokenCache, AudioAnalysis, AudioExtractErrorKind, Config, ParsedVtt,
+        TranscriptConfidence, TranscriptDropReason, TranscriptLockAction, TranscriptLockState,
+        TranscriptLockStatus, VideoInfo, MAX_TRANSCRIBE_AUDIO_BYTES,
     };
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn transcribe_audio_size_guard_rejects_empty_and_oversize() {
+        assert!(ensure_transcribe_audio_size(0).is_err());
+        assert!(ensure_transcribe_audio_size(1).is_ok());
+        assert!(ensure_transcribe_audio_size(MAX_TRANSCRIBE_AUDIO_BYTES).is_ok());
+        assert!(ensure_transcribe_audio_size(MAX_TRANSCRIBE_AUDIO_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_equal_secrets() {
+        assert!(constant_time_eq(b"s3cret", b"s3cret"));
+        assert!(!constant_time_eq(b"s3cret", b"s3creT"));
+        assert!(!constant_time_eq(b"s3cret", b"s3cre"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
+    }
 
     #[test]
     fn gpt_transcribe_uses_json_response_format() {
