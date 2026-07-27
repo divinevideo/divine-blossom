@@ -3288,6 +3288,47 @@ struct UploadServicePublishedUpload {
     content_type: String,
     thumbnail_url: Option<String>,
     dim: Option<String>,
+    transcode_error_code: Option<String>,
+    transcode_error_message: Option<String>,
+    transcode_terminal: bool,
+    transcript_error_code: Option<String>,
+    transcript_error_message: Option<String>,
+    transcript_terminal: bool,
+}
+
+/// Parse the upload service's JSON response into an UploadServicePublishedUpload.
+/// The upload service reports derivative validation failures (e.g. invalid_media
+/// for corrupt uploads / missing moov atom) so the edge can mark metadata
+/// terminal immediately instead of discovering it via transcode retries.
+fn parse_upload_service_response(
+    resp: &serde_json::Value,
+    content_type: &str,
+    fallback_size: u64,
+) -> Result<UploadServicePublishedUpload> {
+    Ok(UploadServicePublishedUpload {
+        sha256: resp["sha256"]
+            .as_str()
+            .ok_or_else(|| BlossomError::Internal("Missing sha256 in Cloud Run response".into()))?
+            .to_string(),
+        size: resp["size"].as_u64().unwrap_or(fallback_size),
+        content_type: content_type.to_string(),
+        thumbnail_url: resp["thumbnail_url"].as_str().map(|v| v.to_string()),
+        dim: resp["dim"].as_str().map(|v| v.to_string()),
+        transcode_error_code: resp["transcode_error_code"]
+            .as_str()
+            .map(|v| v.to_string()),
+        transcode_error_message: resp["transcode_error_message"]
+            .as_str()
+            .map(|v| v.to_string()),
+        transcode_terminal: resp["transcode_terminal"].as_bool().unwrap_or(false),
+        transcript_error_code: resp["transcript_error_code"]
+            .as_str()
+            .map(|v| v.to_string()),
+        transcript_error_message: resp["transcript_error_message"]
+            .as_str()
+            .map(|v| v.to_string()),
+        transcript_terminal: resp["transcript_terminal"].as_bool().unwrap_or(false),
+    })
 }
 
 fn extract_authorization_header(req: &Request) -> Result<String> {
@@ -3347,18 +3388,24 @@ fn publish_upload_service_upload(
 
     // Derivative failure fields — populated when the upload service detects
     // invalid media (corrupt container, missing moov atom, etc.) during
-    // sanitization/probing. Currently defaults to None/false since the typed
-    // upload response struct doesn't carry these yet; once the upload service
-    // is updated to return them, wire them through here.
-    let transcode_error_code: Option<String> = None;
-    let transcode_error_message: Option<String> = None;
-    let transcode_terminal = false;
-    let transcript_error_code: Option<String> = None;
-    let transcript_error_message: Option<String> = None;
-    let transcript_terminal = false;
+    // sanitization/probing. Wiring these through lets us mark the blob
+    // terminal immediately so playback does not trigger doomed transcode
+    // retries (the previous hardcoded None/false caused indefinite retry
+    // loops and Sentry noise for invalid uploads).
+    let transcode_error_code = upload.transcode_error_code.clone();
+    let transcode_error_message = upload.transcode_error_message.clone();
+    let transcode_terminal = upload.transcode_terminal;
+    let transcript_error_code = upload.transcript_error_code.clone();
+    let transcript_error_message = upload.transcript_error_message.clone();
+    let transcript_terminal = upload.transcript_terminal;
     let has_transcode_error = transcode_error_code.is_some();
     let has_transcript_error = transcript_error_code.is_some();
-    let derivative_failure_recorded_at: Option<String> = None;
+    let derivative_failure_recorded_at: Option<String> =
+        if has_transcode_error || has_transcript_error {
+            Some(current_timestamp())
+        } else {
+            None
+        };
 
     // Check if metadata already exists (dedupe/re-upload case)
     if let Some(mut metadata) = get_blob_metadata(&hash)? {
@@ -3669,6 +3716,14 @@ fn handle_upload_complete(mut req: Request, path: &str) -> Result<Response> {
             content_type: complete_response.content_type,
             thumbnail_url: complete_response.thumbnail_url,
             dim: complete_response.dim,
+            // TODO: resumable completion does not probe/classify invalid media
+            // yet, so no derivative failure fields are available here.
+            transcode_error_code: None,
+            transcode_error_message: None,
+            transcode_terminal: false,
+            transcript_error_code: None,
+            transcript_error_message: None,
+            transcript_terminal: false,
         },
     )
 }
@@ -3714,20 +3769,7 @@ fn handle_upload_service_proxy(
     let resp_body = proxy_resp.take_body().into_string();
     let cloud_run_resp: serde_json::Value = serde_json::from_str(&resp_body)
         .map_err(|e| BlossomError::Internal(format!("Invalid Cloud Run response: {}", e)))?;
-    let upload = UploadServicePublishedUpload {
-        sha256: cloud_run_resp["sha256"]
-            .as_str()
-            .ok_or_else(|| BlossomError::Internal("Missing sha256 in Cloud Run response".into()))?
-            .to_string(),
-        size: cloud_run_resp["size"].as_u64().unwrap_or(content_length),
-        content_type: content_type.clone(),
-        thumbnail_url: cloud_run_resp["thumbnail_url"]
-            .as_str()
-            .map(|value| value.to_string()),
-        dim: cloud_run_resp["dim"]
-            .as_str()
-            .map(|value| value.to_string()),
-    };
+    let upload = parse_upload_service_response(&cloud_run_resp, &content_type, content_length)?;
 
     publish_upload_service_upload(auth, base_url, upload)
 }
@@ -5772,7 +5814,7 @@ mod tests {
     use super::{
         backfill_batch_cursor, classify_audio_reuse_availability, decide_transcode_fetch_action,
         decide_transcript_fetch_action, error_response, is_alias_only_audio_blob,
-        is_quality_variant_path, parse_quality_variant_path,
+        is_quality_variant_path, parse_quality_variant_path, parse_upload_service_response,
         parse_transcript_status_webhook_payload, should_delete_derived_audio_blob,
         should_eagerly_trigger_transcription, should_set_audio_content_length,
         upload_capability_headers, upload_control_host, upload_exposed_headers,
@@ -5782,6 +5824,57 @@ mod tests {
     use crate::blossom::{TranscodeStatus, TranscriptStatus};
     use crate::error::{BlossomError, Result as BlossomResult};
     use fastly::http::StatusCode;
+
+    #[test]
+    fn upload_service_response_parses_derivative_failure_fields() {
+        let resp = serde_json::json!({
+            "sha256": "c".repeat(64),
+            "size": 5016_u64,
+            "thumbnail_url": null,
+            "dim": null,
+            "transcode_error_code": "invalid_media",
+            "transcode_error_message": "ffprobe failed: moov atom not found",
+            "transcode_terminal": true,
+            "transcript_error_code": "invalid_media",
+            "transcript_error_message": "ffprobe failed: moov atom not found",
+            "transcript_terminal": true
+        });
+        let upload = parse_upload_service_response(&resp, "video/mp4", 0).unwrap();
+        assert_eq!(upload.sha256, "c".repeat(64));
+        assert_eq!(upload.size, 5016);
+        assert_eq!(upload.transcode_error_code.as_deref(), Some("invalid_media"));
+        assert!(upload.transcode_terminal);
+        assert_eq!(upload.transcript_error_code.as_deref(), Some("invalid_media"));
+        assert!(upload.transcript_terminal);
+    }
+
+    #[test]
+    fn upload_service_response_defaults_when_derivative_fields_absent() {
+        let resp = serde_json::json!({
+            "sha256": "d".repeat(64),
+            "size": 1024_u64,
+            "thumbnail_url": "https://cdn.example.com/thumb.jpg",
+            "dim": "1920x1080"
+        });
+        let upload = parse_upload_service_response(&resp, "video/mp4", 512).unwrap();
+        assert_eq!(upload.size, 1024);
+        assert_eq!(upload.transcode_error_code, None);
+        assert_eq!(upload.transcode_error_message, None);
+        assert!(!upload.transcode_terminal);
+        assert_eq!(upload.transcript_error_code, None);
+        assert!(!upload.transcript_terminal);
+        assert_eq!(
+            upload.thumbnail_url.as_deref(),
+            Some("https://cdn.example.com/thumb.jpg")
+        );
+        assert_eq!(upload.dim.as_deref(), Some("1920x1080"));
+    }
+
+    #[test]
+    fn upload_service_response_requires_sha256() {
+        let resp = serde_json::json!({ "size": 10_u64 });
+        assert!(parse_upload_service_response(&resp, "video/mp4", 10).is_err());
+    }
 
     #[test]
     fn quality_variant_path_valid() {
