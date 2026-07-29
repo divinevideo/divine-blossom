@@ -182,6 +182,7 @@ mod tests {
             transcode_retry_after: None,
             transcode_attempt_count: 0,
             transcode_terminal: false,
+            transcode_generation: None,
             dim: None,
             transcript_status: None,
             transcript_error_code: None,
@@ -190,6 +191,7 @@ mod tests {
             transcript_retry_after: None,
             transcript_attempt_count: 0,
             transcript_terminal: false,
+            transcript_generation: None,
         };
         let mut resp = Response::from_status(StatusCode::OK);
 

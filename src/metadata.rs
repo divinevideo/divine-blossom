@@ -269,7 +269,8 @@ pub fn update_transcode_status(hash: &str, status: crate::blossom::TranscodeStat
         None,
         None,
         TranscodeMetadataUpdate::default(),
-    )
+    )?;
+    Ok(())
 }
 
 /// Additional metadata recorded alongside transcode status updates.
@@ -281,6 +282,33 @@ pub struct TranscodeMetadataUpdate {
     pub retry_after: Option<u64>,
     pub terminal: Option<bool>,
     pub increment_attempt_count: bool,
+    pub generation: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusUpdateOutcome {
+    Applied,
+    StaleGeneration {
+        incoming: Option<u64>,
+        stored: Option<u64>,
+    },
+    DuplicateGeneration {
+        incoming: Option<u64>,
+        stored: Option<u64>,
+    },
+}
+
+fn stale_generation(incoming: Option<u64>, stored: Option<u64>) -> bool {
+    matches!((incoming, stored), (Some(incoming), Some(stored)) if incoming < stored)
+}
+
+fn duplicate_failed_generation(
+    incoming: Option<u64>,
+    stored: Option<u64>,
+    increment_attempt_count: bool,
+) -> bool {
+    increment_attempt_count
+        && matches!((incoming, stored), (Some(incoming), Some(stored)) if incoming == stored)
 }
 
 /// Update transcode status and associated failure metadata for a video blob.
@@ -290,9 +318,26 @@ pub fn update_transcode_status_with_metadata(
     new_size: Option<u64>,
     dim: Option<String>,
     update: TranscodeMetadataUpdate,
-) -> Result<()> {
-    let mut metadata =
-        get_blob_metadata(hash)?.ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
+) -> Result<StatusUpdateOutcome> {
+    let mut metadata = get_blob_metadata_uncached(hash)?
+        .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
+
+    if stale_generation(update.generation, metadata.transcode_generation) {
+        return Ok(StatusUpdateOutcome::StaleGeneration {
+            incoming: update.generation,
+            stored: metadata.transcode_generation,
+        });
+    }
+    if duplicate_failed_generation(
+        update.generation,
+        metadata.transcode_generation,
+        update.increment_attempt_count,
+    ) {
+        return Ok(StatusUpdateOutcome::DuplicateGeneration {
+            incoming: update.generation,
+            stored: metadata.transcode_generation,
+        });
+    }
 
     metadata.transcode_status = Some(status);
     match status {
@@ -332,9 +377,13 @@ pub fn update_transcode_status_with_metadata(
         metadata.dim = Some(d);
     }
 
+    if let Some(generation) = update.generation {
+        metadata.transcode_generation = Some(generation);
+    }
+
     put_blob_metadata(&metadata)?;
 
-    Ok(())
+    Ok(StatusUpdateOutcome::Applied)
 }
 
 /// Update transcript status for an audio/video blob
@@ -346,15 +395,33 @@ pub struct TranscriptMetadataUpdate {
     pub retry_after: Option<u64>,
     pub terminal: Option<bool>,
     pub increment_attempt_count: bool,
+    pub generation: Option<u64>,
 }
 
 pub fn update_transcript_status(
     hash: &str,
     status: crate::blossom::TranscriptStatus,
     update: TranscriptMetadataUpdate,
-) -> Result<()> {
-    let mut metadata =
-        get_blob_metadata(hash)?.ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
+) -> Result<StatusUpdateOutcome> {
+    let mut metadata = get_blob_metadata_uncached(hash)?
+        .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
+
+    if stale_generation(update.generation, metadata.transcript_generation) {
+        return Ok(StatusUpdateOutcome::StaleGeneration {
+            incoming: update.generation,
+            stored: metadata.transcript_generation,
+        });
+    }
+    if duplicate_failed_generation(
+        update.generation,
+        metadata.transcript_generation,
+        update.increment_attempt_count,
+    ) {
+        return Ok(StatusUpdateOutcome::DuplicateGeneration {
+            incoming: update.generation,
+            stored: metadata.transcript_generation,
+        });
+    }
 
     metadata.transcript_status = Some(status);
     match status {
@@ -386,9 +453,12 @@ pub fn update_transcript_status(
             metadata.transcript_terminal = update.terminal.unwrap_or(false);
         }
     }
+    if let Some(generation) = update.generation {
+        metadata.transcript_generation = Some(generation);
+    }
     put_blob_metadata(&metadata)?;
 
-    Ok(())
+    Ok(StatusUpdateOutcome::Applied)
 }
 
 /// Get subtitle job by job id
@@ -483,7 +553,8 @@ pub fn update_transcode_status_with_size(
         new_size,
         dim,
         TranscodeMetadataUpdate::default(),
-    )
+    )?;
+    Ok(())
 }
 
 /// Check if user owns the blob
@@ -1247,5 +1318,30 @@ pub fn delete_audio_source_refs(audio_hash: &str) -> Result<()> {
             "Failed to delete audio refs: {}",
             e
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{duplicate_failed_generation, stale_generation};
+
+    #[test]
+    fn stale_generation_only_rejects_older_known_generations() {
+        assert!(stale_generation(Some(4), Some(5)));
+        assert!(!stale_generation(Some(5), Some(5)));
+        assert!(!stale_generation(Some(6), Some(5)));
+        assert!(!stale_generation(None, Some(5)));
+        assert!(!stale_generation(Some(5), None));
+        assert!(!stale_generation(None, None));
+    }
+
+    #[test]
+    fn duplicate_failed_generation_requires_equal_known_generation_and_increment() {
+        assert!(duplicate_failed_generation(Some(5), Some(5), true));
+        assert!(!duplicate_failed_generation(Some(4), Some(5), true));
+        assert!(!duplicate_failed_generation(Some(6), Some(5), true));
+        assert!(!duplicate_failed_generation(Some(5), Some(5), false));
+        assert!(!duplicate_failed_generation(None, Some(5), true));
+        assert!(!duplicate_failed_generation(Some(5), None, true));
     }
 }

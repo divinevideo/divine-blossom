@@ -38,7 +38,7 @@ use crate::metadata::{
     put_blob_metadata, put_subtitle_job, remove_from_audio_source_refs, remove_from_blob_refs,
     remove_from_recent_index, remove_from_user_index, remove_from_user_list,
     set_subtitle_job_id_for_hash, update_blob_status, update_stats_on_add, update_stats_on_remove,
-    TranscodeMetadataUpdate, TranscriptMetadataUpdate,
+    StatusUpdateOutcome, TranscodeMetadataUpdate, TranscriptMetadataUpdate,
 };
 use crate::storage::{
     blob_exists, check_funnelcake_audio_reuse, current_timestamp, delete_blob as storage_delete,
@@ -1306,6 +1306,7 @@ struct ParsedTranscodeStatusWebhook {
     error_message: Option<String>,
     retry_after_epoch_secs: Option<u64>,
     terminal: bool,
+    generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1320,6 +1321,7 @@ struct ParsedTranscriptStatusWebhook {
     error_message: Option<String>,
     retry_after_epoch_secs: Option<u64>,
     terminal: bool,
+    generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1414,6 +1416,7 @@ fn parse_transcode_status_webhook_payload(
         error_message: payload["error_message"].as_str().map(|s| s.to_string()),
         retry_after_epoch_secs: parse_optional_retry_after_epoch(payload, now_epoch_secs),
         terminal: parse_optional_bool(payload, "terminal").unwrap_or(false),
+        generation: payload["generation"].as_u64(),
     })
 }
 
@@ -1454,6 +1457,7 @@ fn parse_transcript_status_webhook_payload(
         error_message: payload["error_message"].as_str().map(|s| s.to_string()),
         retry_after_epoch_secs: parse_optional_retry_after_epoch(payload, now_epoch_secs),
         terminal: parse_optional_bool(payload, "terminal").unwrap_or(false),
+        generation: payload["generation"].as_u64(),
     })
 }
 
@@ -2241,6 +2245,7 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
         transcode_retry_after: None,
         transcode_attempt_count: 0,
         transcode_terminal: false,
+        transcode_generation: None,
         dim: None,
         transcript_status: None,
         transcript_error_code: None,
@@ -2249,6 +2254,7 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
         transcript_retry_after: None,
         transcript_attempt_count: 0,
         transcript_terminal: false,
+        transcript_generation: None,
     };
     let _ = put_blob_metadata(&audio_metadata);
 
@@ -3235,6 +3241,7 @@ fn handle_upload(mut req: Request) -> Result<Response> {
         transcode_retry_after: None,
         transcode_attempt_count: 0,
         transcode_terminal: false,
+        transcode_generation: None,
         dim: None, // Set by transcoder webhook when transcoding completes
         transcript_status: if is_transcribable_mime_type(&content_type) {
             Some(TranscriptStatus::Pending)
@@ -3247,6 +3254,7 @@ fn handle_upload(mut req: Request) -> Result<Response> {
         transcript_retry_after: None,
         transcript_attempt_count: 0,
         transcript_terminal: false,
+        transcript_generation: None,
     };
 
     put_blob_metadata(&metadata)?;
@@ -3615,6 +3623,7 @@ fn publish_upload_service_upload(
             0
         },
         transcode_terminal,
+        transcode_generation: None,
         dim: dim.clone(),
         transcript_status: if is_transcribable_mime_type(&content_type) {
             if transcript_error_code.is_some() {
@@ -3637,6 +3646,7 @@ fn publish_upload_service_upload(
             0
         },
         transcript_terminal,
+        transcript_generation: None,
     };
 
     put_blob_metadata(&metadata)?;
@@ -4719,6 +4729,7 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
         transcode_retry_after: None,
         transcode_attempt_count: 0,
         transcode_terminal: false,
+        transcode_generation: None,
         dim: None, // Set by transcoder webhook when transcoding completes
         transcript_status: if is_transcribable_mime_type(&content_type) {
             Some(TranscriptStatus::Pending)
@@ -4731,6 +4742,7 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
         transcript_retry_after: None,
         transcript_attempt_count: 0,
         transcript_terminal: false,
+        transcript_generation: None,
     };
 
     put_blob_metadata(&metadata)?;
@@ -5207,6 +5219,36 @@ fn validate_transcoder_webhook(req: &Request, label: &str) -> Result<()> {
     }
 }
 
+fn stale_generation_response(sha256: &str, incoming: Option<u64>, stored: Option<u64>) -> Response {
+    let response = serde_json::json!({
+        "success": true,
+        "sha256": sha256,
+        "ignored": "stale_generation",
+        "incoming_generation": incoming,
+        "stored_generation": stored
+    });
+    let mut resp = json_response(StatusCode::OK, &response);
+    add_cors_headers(&mut resp);
+    resp
+}
+
+fn duplicate_generation_response(
+    sha256: &str,
+    incoming: Option<u64>,
+    stored: Option<u64>,
+) -> Response {
+    let response = serde_json::json!({
+        "success": true,
+        "sha256": sha256,
+        "ignored": "duplicate_generation",
+        "incoming_generation": incoming,
+        "stored_generation": stored
+    });
+    let mut resp = json_response(StatusCode::OK, &response);
+    add_cors_headers(&mut resp);
+    resp
+}
+
 /// POST /admin/transcode-status - Webhook from divine-transcoder service
 /// Updates transcode status for a blob after HLS generation
 fn handle_transcode_status(mut req: Request) -> Result<Response> {
@@ -5246,9 +5288,24 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
             retry_after: parsed.retry_after_epoch_secs,
             terminal: Some(parsed.terminal),
             increment_attempt_count: matches!(parsed.status, TranscodeStatus::Failed),
+            generation: parsed.generation,
         },
     ) {
-        Ok(()) => {
+        Ok(StatusUpdateOutcome::StaleGeneration { incoming, stored }) => {
+            eprintln!(
+                "[TRANSCODE] Ignoring stale callback for {}: incoming gen {:?} < stored {:?}",
+                sha256, incoming, stored
+            );
+            Ok(stale_generation_response(sha256, incoming, stored))
+        }
+        Ok(StatusUpdateOutcome::DuplicateGeneration { incoming, stored }) => {
+            eprintln!(
+                "[TRANSCODE] Ignoring duplicate callback for {}: incoming gen {:?} == stored {:?}",
+                sha256, incoming, stored
+            );
+            Ok(duplicate_generation_response(sha256, incoming, stored))
+        }
+        Ok(StatusUpdateOutcome::Applied) => {
             if let Some(ref d) = parsed.dim {
                 eprintln!(
                     "[TRANSCODE] Updated blob {} to transcode status {:?} with dim {}",
@@ -5334,9 +5391,24 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
             retry_after: parsed.retry_after_epoch_secs,
             terminal: Some(parsed.terminal),
             increment_attempt_count: matches!(parsed.status, TranscriptStatus::Failed),
+            generation: parsed.generation,
         },
     ) {
-        Ok(()) => {
+        Ok(StatusUpdateOutcome::StaleGeneration { incoming, stored }) => {
+            eprintln!(
+                "[TRANSCRIPT] Ignoring stale callback for {}: incoming gen {:?} < stored {:?}",
+                sha256, incoming, stored
+            );
+            Ok(stale_generation_response(sha256, incoming, stored))
+        }
+        Ok(StatusUpdateOutcome::DuplicateGeneration { incoming, stored }) => {
+            eprintln!(
+                "[TRANSCRIPT] Ignoring duplicate callback for {}: incoming gen {:?} == stored {:?}",
+                sha256, incoming, stored
+            );
+            Ok(duplicate_generation_response(sha256, incoming, stored))
+        }
+        Ok(StatusUpdateOutcome::Applied) => {
             eprintln!(
                 "[TRANSCRIPT] Updated blob {} to transcript status {:?}",
                 sha256, parsed.status
@@ -6004,21 +6076,20 @@ fn infer_mime_from_path(path: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        backfill_batch_cursor, classify_audio_reuse_availability, decide_transcode_fetch_action,
-        decide_transcript_fetch_action, error_response, is_alias_only_audio_blob,
-        is_quality_variant_path, parse_quality_variant_path,
-        parse_transcript_status_webhook_payload, parse_upload_service_response,
-        should_delete_derived_audio_blob, should_eagerly_trigger_transcription,
-        should_record_upload_service_transcode_failure,
-        should_record_upload_service_transcript_failure,
-        should_reset_transcode_failure_on_clean_upload,
-        should_reset_transcript_failure_on_clean_upload, should_set_audio_content_length,
-        trusted_upload_service_terminal_derivative_error, upload_capability_headers,
-        upload_control_host, upload_exposed_headers, upload_from_resumable_completion,
-        AudioReuseAvailability, DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction,
-        TranscriptPendingState,
-    };
+	use super::{
+		backfill_batch_cursor, classify_audio_reuse_availability, decide_transcode_fetch_action,
+		decide_transcript_fetch_action, duplicate_generation_response, error_response,
+		is_alias_only_audio_blob, is_quality_variant_path, parse_quality_variant_path,
+		parse_transcode_status_webhook_payload, parse_transcript_status_webhook_payload,
+		parse_upload_service_response, should_delete_derived_audio_blob,
+		should_eagerly_trigger_transcription, should_record_upload_service_transcode_failure,
+		should_record_upload_service_transcript_failure, should_reset_transcode_failure_on_clean_upload,
+		should_reset_transcript_failure_on_clean_upload, should_set_audio_content_length,
+		stale_generation_response, trusted_upload_service_terminal_derivative_error,
+		upload_capability_headers, upload_control_host, upload_exposed_headers,
+		upload_from_resumable_completion, AudioReuseAvailability, DerivativeObservation,
+		TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState,
+	};
     use crate::blossom::{ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus};
     use crate::error::{BlossomError, Result as BlossomResult};
     use fastly::http::StatusCode;
@@ -6345,6 +6416,62 @@ mod tests {
 
         assert_eq!(parsed.error_code.as_deref(), Some("provider_rate_limited"));
         assert_eq!(parsed.retry_after_epoch_secs, Some(1_015));
+    }
+
+    #[test]
+    fn parses_transcode_webhook_generation() {
+        let payload = serde_json::json!({
+            "sha256": "50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a",
+            "status": "complete",
+            "generation": 1_700_000_000_123_u64
+        });
+
+        let parsed = parse_transcode_status_webhook_payload(&payload, 1_000).unwrap();
+
+        assert_eq!(parsed.generation, Some(1_700_000_000_123));
+    }
+
+    #[test]
+    fn parses_transcript_webhook_generation() {
+        let payload = serde_json::json!({
+            "sha256": "50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a",
+            "status": "processing",
+            "generation": 42_u64
+        });
+
+        let parsed = parse_transcript_status_webhook_payload(&payload, 1_000).unwrap();
+
+        assert_eq!(parsed.generation, Some(42));
+    }
+
+    #[test]
+    fn stale_generation_response_returns_successful_ignore() {
+        let hash = "50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a";
+        let resp = stale_generation_response(hash, Some(3), Some(5));
+
+        assert_eq!(resp.get_status(), StatusCode::OK);
+        assert_eq!(
+            resp.get_header_str("Access-Control-Allow-Origin"),
+            Some("*")
+        );
+        assert!(resp
+            .into_body_str()
+            .contains("\"ignored\":\"stale_generation\""));
+    }
+
+    #[test]
+    fn duplicate_generation_response_returns_successful_ignore() {
+        let hash = "50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a";
+        let resp = duplicate_generation_response(hash, Some(5), Some(5));
+
+        assert_eq!(resp.get_status(), StatusCode::OK);
+        assert_eq!(
+            resp.get_header_str("Access-Control-Allow-Origin"),
+            Some("*")
+        );
+        assert!(resp
+            .into_body_str()
+            .contains("\"ignored\":\"duplicate_generation\""));
     }
 
     #[test]
