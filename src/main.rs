@@ -346,6 +346,22 @@ fn should_set_audio_content_length(status: StatusCode) -> bool {
     status != StatusCode::PARTIAL_CONTENT
 }
 
+/// Decide which Range header, if any, to forward to origin storage.
+/// Publicly cacheable objects are always fetched whole: an origin 206 response
+/// cannot be stored by the edge cache, so forwarding client ranges for public
+/// media would send every play to origin. Private/admin responses are never
+/// cached, so their ranges pass through and avoid re-downloading whole objects.
+fn origin_range_for_request(
+    client_range: Option<&str>,
+    publicly_cacheable: bool,
+) -> Option<&str> {
+    if publicly_cacheable {
+        None
+    } else {
+        client_range
+    }
+}
+
 fn clear_stale_audio_mapping(source_hash: &str, audio_hash: &str) {
     let _ = delete_audio_mapping(source_hash);
     match remove_from_audio_source_refs(audio_hash, source_hash) {
@@ -531,8 +547,18 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
 
+    // Public blobs are fetched whole so the edge cache stores the full object;
+    // only private/admin traffic gets partial responses from origin. Keep this
+    // in sync with the cache-header decision below.
+    let publicly_cacheable = !is_admin
+        && metadata
+            .as_ref()
+            .map(|meta| meta.status == BlobStatus::Active)
+            .unwrap_or(false);
+    let upstream_range = origin_range_for_request(range.as_deref(), publicly_cacheable);
+
     // Download from GCS with fallback to CDNs
-    let result = download_blob_with_fallback(&hash, range.as_deref())?;
+    let result = download_blob_with_fallback(&hash, upstream_range)?;
     let mut resp = result.response;
 
     // Surface provenance metadata if present on the origin object.
@@ -2167,6 +2193,7 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
         .get_header(header::RANGE)
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
+    let upstream_range = origin_range_for_request(range.as_deref(), !private_cache);
 
     // 5. Check cache: source->audio mapping
     if let Some(mapping) = get_audio_mapping(&hash)? {
@@ -2176,7 +2203,7 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
                 BlossomError::Internal(format!("Failed to persist audio source refs: {}", e))
             })?;
             // Serve cached audio via redirect or proxy
-            let result = download_blob_with_fallback(&mapping.audio_sha256, range.as_deref())?;
+            let result = download_blob_with_fallback(&mapping.audio_sha256, upstream_range)?;
             let mut resp = result.response;
             add_audio_response_headers(
                 &mut resp,
@@ -2262,7 +2289,7 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
     })?;
 
     // 8. Download and serve the audio
-    let result = download_blob_with_fallback(&audio_sha256, range.as_deref())?;
+    let result = download_blob_with_fallback(&audio_sha256, upstream_range)?;
     let mut resp = result.response;
     add_audio_response_headers(&mut resp, &hash, private_cache, &mime_type, size, duration);
     Ok(resp)
@@ -5831,7 +5858,7 @@ mod tests {
     use super::{
         backfill_batch_cursor, classify_audio_reuse_availability, decide_transcode_fetch_action,
         decide_transcript_fetch_action, error_response, is_alias_only_audio_blob,
-        is_quality_variant_path, parse_quality_variant_path,
+        is_quality_variant_path, origin_range_for_request, parse_quality_variant_path,
         parse_transcript_status_webhook_payload, should_delete_derived_audio_blob,
         should_eagerly_trigger_transcription, should_set_audio_content_length,
         upload_capability_headers, upload_control_host, upload_exposed_headers,
@@ -6134,6 +6161,25 @@ mod tests {
         assert!(!should_set_audio_content_length(
             StatusCode::PARTIAL_CONTENT
         ));
+    }
+
+    #[test]
+    fn publicly_cacheable_media_drops_client_range_for_origin() {
+        assert_eq!(origin_range_for_request(Some("bytes=0-1023"), true), None);
+    }
+
+    #[test]
+    fn privately_cached_media_forwards_client_range_to_origin() {
+        assert_eq!(
+            origin_range_for_request(Some("bytes=0-1023"), false),
+            Some("bytes=0-1023")
+        );
+    }
+
+    #[test]
+    fn origin_range_absent_when_client_sent_no_range() {
+        assert_eq!(origin_range_for_request(None, true), None);
+        assert_eq!(origin_range_for_request(None, false), None);
     }
 
     #[test]
