@@ -32,10 +32,10 @@ use crate::metadata::{
     add_to_audio_source_refs, add_to_blob_refs, add_to_recent_index, add_to_user_index,
     add_to_user_list, delete_audio_mapping, delete_audio_source_refs, delete_auth_events,
     delete_blob_metadata, delete_blob_refs, delete_subtitle_data, delete_user_list,
-    get_audio_mapping, get_audio_source_refs, get_auth_event, get_blob_metadata, get_blob_refs,
-    get_subtitle_job, get_subtitle_job_by_hash, get_tombstone, get_user_blobs,
-    list_blobs_with_metadata, put_audio_mapping, put_auth_event, put_blob_metadata,
-    put_subtitle_job, remove_from_audio_source_refs, remove_from_blob_refs,
+    get_audio_mapping, get_audio_source_refs, get_auth_event, get_blob_metadata,
+    get_blob_metadata_uncached, get_blob_refs, get_subtitle_job, get_subtitle_job_by_hash,
+    get_tombstone, get_user_blobs, list_blobs_with_metadata, put_audio_mapping, put_auth_event,
+    put_blob_metadata, put_subtitle_job, remove_from_audio_source_refs, remove_from_blob_refs,
     remove_from_recent_index, remove_from_user_index, remove_from_user_list,
     set_subtitle_job_id_for_hash, update_blob_status, update_stats_on_add, update_stats_on_remove,
     TranscodeMetadataUpdate, TranscriptMetadataUpdate,
@@ -3286,6 +3286,12 @@ fn handle_upload(mut req: Request) -> Result<Response> {
     Ok(resp)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DerivativeObservation {
+    Unavailable,
+    Evaluated,
+}
+
 #[derive(Debug, Clone)]
 struct UploadServicePublishedUpload {
     sha256: String,
@@ -3293,9 +3299,11 @@ struct UploadServicePublishedUpload {
     content_type: String,
     thumbnail_url: Option<String>,
     dim: Option<String>,
+    transcode_observation: DerivativeObservation,
     transcode_error_code: Option<String>,
     transcode_error_message: Option<String>,
     transcode_terminal: bool,
+    transcript_observation: DerivativeObservation,
     transcript_error_code: Option<String>,
     transcript_error_message: Option<String>,
     transcript_terminal: bool,
@@ -3320,6 +3328,7 @@ fn parse_upload_service_response(
     content_type: &str,
     fallback_size: u64,
 ) -> Result<UploadServicePublishedUpload> {
+    let video_derivatives_evaluated = is_video_mime_type(content_type);
     let transcode_error_code = resp["transcode_error_code"].as_str().map(|v| v.to_string());
     let transcript_error_code = resp["transcript_error_code"]
         .as_str()
@@ -3342,11 +3351,21 @@ fn parse_upload_service_response(
         content_type: content_type.to_string(),
         thumbnail_url: resp["thumbnail_url"].as_str().map(|v| v.to_string()),
         dim: resp["dim"].as_str().map(|v| v.to_string()),
+        transcode_observation: if video_derivatives_evaluated {
+            DerivativeObservation::Evaluated
+        } else {
+            DerivativeObservation::Unavailable
+        },
         transcode_error_code,
         transcode_error_message: resp["transcode_error_message"]
             .as_str()
             .map(|v| v.to_string()),
         transcode_terminal,
+        transcript_observation: if video_derivatives_evaluated {
+            DerivativeObservation::Evaluated
+        } else {
+            DerivativeObservation::Unavailable
+        },
         transcript_error_code,
         transcript_error_message: resp["transcript_error_message"]
             .as_str()
@@ -3407,9 +3426,11 @@ fn should_record_upload_service_transcode_failure(
 fn should_reset_transcode_failure_on_clean_upload(
     mime_type: &str,
     current_status: Option<TranscodeStatus>,
+    observation: DerivativeObservation,
     incoming_error_code: Option<&str>,
 ) -> bool {
-    incoming_error_code.is_none()
+    observation == DerivativeObservation::Evaluated
+        && incoming_error_code.is_none()
         && is_video_mime_type(mime_type)
         && matches!(current_status, None | Some(TranscodeStatus::Failed))
 }
@@ -3430,9 +3451,11 @@ fn should_record_upload_service_transcript_failure(
 fn should_reset_transcript_failure_on_clean_upload(
     mime_type: &str,
     current_status: Option<TranscriptStatus>,
+    observation: DerivativeObservation,
     incoming_error_code: Option<&str>,
 ) -> bool {
-    incoming_error_code.is_none()
+    observation == DerivativeObservation::Evaluated
+        && incoming_error_code.is_none()
         && is_transcribable_mime_type(mime_type)
         && matches!(current_status, None | Some(TranscriptStatus::Failed))
 }
@@ -3471,8 +3494,8 @@ fn publish_upload_service_upload(
             None
         };
 
-    // Check if metadata already exists (dedupe/re-upload case)
-    if let Some(mut metadata) = get_blob_metadata(&hash)? {
+    // Read authoritative metadata before updating the full record.
+    if let Some(mut metadata) = get_blob_metadata_uncached(&hash)? {
         let _ = add_to_user_list(&auth.pubkey, &hash);
         let _ = add_to_blob_refs(&hash, &auth.pubkey);
 
@@ -3501,6 +3524,7 @@ fn publish_upload_service_upload(
         } else if should_reset_transcode_failure_on_clean_upload(
             &metadata.mime_type,
             metadata.transcode_status,
+            upload.transcode_observation,
             transcode_error_code.as_deref(),
         ) {
             metadata.transcode_status = Some(TranscodeStatus::Pending);
@@ -3527,6 +3551,7 @@ fn publish_upload_service_upload(
         } else if should_reset_transcript_failure_on_clean_upload(
             &metadata.mime_type,
             metadata.transcript_status,
+            upload.transcript_observation,
             transcript_error_code.as_deref(),
         ) {
             metadata.transcript_status = Some(TranscriptStatus::Pending);
@@ -3537,7 +3562,7 @@ fn publish_upload_service_upload(
             metadata.transcript_attempt_count = 0;
             metadata.transcript_terminal = false;
         }
-        let _ = put_blob_metadata(&metadata);
+        put_blob_metadata(&metadata)?;
         eagerly_trigger_transcription_if_needed(
             &hash,
             &auth.pubkey,
@@ -3741,6 +3766,28 @@ fn handle_upload_init(mut req: Request) -> Result<Response> {
     Ok(resp)
 }
 
+fn upload_from_resumable_completion(
+    response: ResumableUploadCompleteResponse,
+) -> UploadServicePublishedUpload {
+    UploadServicePublishedUpload {
+        sha256: response.sha256,
+        size: response.size,
+        content_type: response.content_type,
+        thumbnail_url: response.thumbnail_url,
+        dim: response.dim,
+        // TODO(#151): resumable completion does not probe/classify invalid media
+        // yet, so derivative observations and failure fields are unavailable.
+        transcode_observation: DerivativeObservation::Unavailable,
+        transcode_error_code: None,
+        transcode_error_message: None,
+        transcode_terminal: false,
+        transcript_observation: DerivativeObservation::Unavailable,
+        transcript_error_code: None,
+        transcript_error_message: None,
+        transcript_terminal: false,
+    }
+}
+
 fn handle_upload_complete(mut req: Request, path: &str) -> Result<Response> {
     let auth = validate_auth(&req, AuthAction::Upload)?;
     let auth_header = extract_authorization_header(&req)?;
@@ -3804,21 +3851,7 @@ fn handle_upload_complete(mut req: Request, path: &str) -> Result<Response> {
     publish_upload_service_upload(
         auth,
         base_url,
-        UploadServicePublishedUpload {
-            sha256: complete_response.sha256,
-            size: complete_response.size,
-            content_type: complete_response.content_type,
-            thumbnail_url: complete_response.thumbnail_url,
-            dim: complete_response.dim,
-            // TODO(#151): resumable completion does not probe/classify invalid media
-            // yet, so no derivative failure fields are available here.
-            transcode_error_code: None,
-            transcode_error_message: None,
-            transcode_terminal: false,
-            transcript_error_code: None,
-            transcript_error_message: None,
-            transcript_terminal: false,
-        },
+        upload_from_resumable_completion(complete_response),
     )
 }
 
@@ -6016,10 +6049,11 @@ mod tests {
         should_reset_transcode_failure_on_clean_upload,
         should_reset_transcript_failure_on_clean_upload, should_set_audio_content_length,
         trusted_upload_service_terminal_derivative_error, upload_capability_headers,
-        upload_control_host, upload_exposed_headers, AudioReuseAvailability, TranscodeFetchAction,
-        TranscriptFetchAction, TranscriptPendingState,
+        upload_control_host, upload_exposed_headers, upload_from_resumable_completion,
+        AudioReuseAvailability, DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction,
+        TranscriptPendingState,
     };
-    use crate::blossom::{TranscodeStatus, TranscriptStatus};
+    use crate::blossom::{ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus};
     use crate::error::{BlossomError, Result as BlossomResult};
     use fastly::http::StatusCode;
 
@@ -6093,6 +6127,14 @@ mod tests {
         assert_eq!(upload.transcript_error_code, None);
         assert!(!upload.transcript_terminal);
         assert_eq!(
+            upload.transcode_observation,
+            DerivativeObservation::Evaluated
+        );
+        assert_eq!(
+            upload.transcript_observation,
+            DerivativeObservation::Evaluated
+        );
+        assert_eq!(
             upload.thumbnail_url.as_deref(),
             Some("https://cdn.example.com/thumb.jpg")
         );
@@ -6104,6 +6146,25 @@ mod tests {
         let resp = serde_json::json!({ "size": 10_u64 });
 
         assert!(parse_upload_service_response(&resp, "video/mp4", 10).is_err());
+    }
+
+    #[test]
+    fn direct_audio_upload_leaves_derivative_observations_unavailable() {
+        let resp = serde_json::json!({
+            "sha256": "a".repeat(64),
+            "size": 2048_u64
+        });
+
+        let upload = parse_upload_service_response(&resp, "audio/mpeg", 0).unwrap();
+
+        assert_eq!(
+            upload.transcode_observation,
+            DerivativeObservation::Unavailable
+        );
+        assert_eq!(
+            upload.transcript_observation,
+            DerivativeObservation::Unavailable
+        );
     }
 
     #[test]
@@ -6158,35 +6219,77 @@ mod tests {
     }
 
     #[test]
-    fn clean_upload_resets_missing_or_failed_derivative_state_only() {
+    fn resumable_completion_leaves_derivative_observations_unavailable() {
+        let upload = upload_from_resumable_completion(ResumableUploadCompleteResponse {
+            sha256: "f".repeat(64),
+            size: 1024,
+            content_type: "video/mp4".to_string(),
+            thumbnail_url: None,
+            dim: None,
+        });
+
+        assert_eq!(
+            upload.transcode_observation,
+            DerivativeObservation::Unavailable
+        );
+        assert_eq!(
+            upload.transcript_observation,
+            DerivativeObservation::Unavailable
+        );
+    }
+
+    #[test]
+    fn evaluated_clean_upload_resets_missing_or_failed_derivative_state_only() {
         assert!(should_reset_transcode_failure_on_clean_upload(
             "video/mp4",
             Some(TranscodeStatus::Failed),
+            DerivativeObservation::Evaluated,
             None
         ));
         assert!(should_reset_transcode_failure_on_clean_upload(
             "video/mp4",
             None,
+            DerivativeObservation::Evaluated,
             None
         ));
         assert!(!should_reset_transcode_failure_on_clean_upload(
             "video/mp4",
             Some(TranscodeStatus::Complete),
+            DerivativeObservation::Evaluated,
             None
         ));
         assert!(!should_reset_transcode_failure_on_clean_upload(
             "image/jpeg",
             Some(TranscodeStatus::Failed),
+            DerivativeObservation::Evaluated,
             None
         ));
         assert!(should_reset_transcript_failure_on_clean_upload(
             "video/mp4",
             Some(TranscriptStatus::Failed),
+            DerivativeObservation::Evaluated,
             None
         ));
         assert!(!should_reset_transcript_failure_on_clean_upload(
             "video/mp4",
             Some(TranscriptStatus::Complete),
+            DerivativeObservation::Evaluated,
+            None
+        ));
+    }
+
+    #[test]
+    fn unavailable_upload_preserves_failed_derivative_state() {
+        assert!(!should_reset_transcode_failure_on_clean_upload(
+            "video/mp4",
+            Some(TranscodeStatus::Failed),
+            DerivativeObservation::Unavailable,
+            None
+        ));
+        assert!(!should_reset_transcript_failure_on_clean_upload(
+            "video/mp4",
+            Some(TranscriptStatus::Failed),
+            DerivativeObservation::Unavailable,
             None
         ));
     }
