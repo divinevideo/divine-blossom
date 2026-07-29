@@ -3293,6 +3293,66 @@ struct UploadServicePublishedUpload {
     content_type: String,
     thumbnail_url: Option<String>,
     dim: Option<String>,
+    transcode_error_code: Option<String>,
+    transcode_error_message: Option<String>,
+    transcode_terminal: bool,
+    transcript_error_code: Option<String>,
+    transcript_error_message: Option<String>,
+    transcript_terminal: bool,
+}
+
+fn trusted_upload_service_terminal_derivative_error(
+    error_code: Option<&str>,
+    upload_service_terminal: bool,
+) -> bool {
+    upload_service_terminal
+        && matches!(
+            error_code,
+            // Do not include invalid_media here. The upload service currently
+            // uses that broad code for sanitize/probe failures that can be
+            // recoverable by the transcoder's full re-encode path.
+            Some("unsupported_media_type")
+        )
+}
+
+fn parse_upload_service_response(
+    resp: &serde_json::Value,
+    content_type: &str,
+    fallback_size: u64,
+) -> Result<UploadServicePublishedUpload> {
+    let transcode_error_code = resp["transcode_error_code"].as_str().map(|v| v.to_string());
+    let transcript_error_code = resp["transcript_error_code"]
+        .as_str()
+        .map(|v| v.to_string());
+    let transcode_terminal = trusted_upload_service_terminal_derivative_error(
+        transcode_error_code.as_deref(),
+        resp["transcode_terminal"].as_bool().unwrap_or(false),
+    );
+    let transcript_terminal = trusted_upload_service_terminal_derivative_error(
+        transcript_error_code.as_deref(),
+        resp["transcript_terminal"].as_bool().unwrap_or(false),
+    );
+
+    Ok(UploadServicePublishedUpload {
+        sha256: resp["sha256"]
+            .as_str()
+            .ok_or_else(|| BlossomError::Internal("Missing sha256 in Cloud Run response".into()))?
+            .to_string(),
+        size: resp["size"].as_u64().unwrap_or(fallback_size),
+        content_type: content_type.to_string(),
+        thumbnail_url: resp["thumbnail_url"].as_str().map(|v| v.to_string()),
+        dim: resp["dim"].as_str().map(|v| v.to_string()),
+        transcode_error_code,
+        transcode_error_message: resp["transcode_error_message"]
+            .as_str()
+            .map(|v| v.to_string()),
+        transcode_terminal,
+        transcript_error_code,
+        transcript_error_message: resp["transcript_error_message"]
+            .as_str()
+            .map(|v| v.to_string()),
+        transcript_terminal,
+    })
 }
 
 fn extract_authorization_header(req: &Request) -> Result<String> {
@@ -3331,6 +3391,40 @@ fn map_upload_service_error(status: StatusCode, body: &str) -> BlossomError {
     }
 }
 
+fn should_record_upload_service_transcode_failure(
+    current_status: Option<TranscodeStatus>,
+    incoming_error_code: Option<&str>,
+) -> bool {
+    incoming_error_code.is_some() && current_status != Some(TranscodeStatus::Complete)
+}
+
+fn should_reset_transcode_failure_on_clean_upload(
+    mime_type: &str,
+    current_status: Option<TranscodeStatus>,
+    incoming_error_code: Option<&str>,
+) -> bool {
+    incoming_error_code.is_none()
+        && is_video_mime_type(mime_type)
+        && matches!(current_status, None | Some(TranscodeStatus::Failed))
+}
+
+fn should_record_upload_service_transcript_failure(
+    current_status: Option<TranscriptStatus>,
+    incoming_error_code: Option<&str>,
+) -> bool {
+    incoming_error_code.is_some() && current_status != Some(TranscriptStatus::Complete)
+}
+
+fn should_reset_transcript_failure_on_clean_upload(
+    mime_type: &str,
+    current_status: Option<TranscriptStatus>,
+    incoming_error_code: Option<&str>,
+) -> bool {
+    incoming_error_code.is_none()
+        && is_transcribable_mime_type(mime_type)
+        && matches!(current_status, None | Some(TranscriptStatus::Failed))
+}
+
 fn publish_upload_service_upload(
     auth: crate::blossom::BlossomAuthEvent,
     base_url: String,
@@ -3350,20 +3444,20 @@ fn publish_upload_service_upload(
 
     let auth_event_json = serde_json::to_string(&auth).unwrap_or_default();
 
-    // Derivative failure fields — populated when the upload service detects
-    // invalid media (corrupt container, missing moov atom, etc.) during
-    // sanitization/probing. Currently defaults to None/false since the typed
-    // upload response struct doesn't carry these yet; once the upload service
-    // is updated to return them, wire them through here.
-    let transcode_error_code: Option<String> = None;
-    let transcode_error_message: Option<String> = None;
-    let transcode_terminal = false;
-    let transcript_error_code: Option<String> = None;
-    let transcript_error_message: Option<String> = None;
-    let transcript_terminal = false;
+    let transcode_error_code = upload.transcode_error_code.clone();
+    let transcode_error_message = upload.transcode_error_message.clone();
+    let transcode_terminal = upload.transcode_terminal;
+    let transcript_error_code = upload.transcript_error_code.clone();
+    let transcript_error_message = upload.transcript_error_message.clone();
+    let transcript_terminal = upload.transcript_terminal;
     let has_transcode_error = transcode_error_code.is_some();
     let has_transcript_error = transcript_error_code.is_some();
-    let derivative_failure_recorded_at: Option<String> = None;
+    let derivative_failure_recorded_at: Option<String> =
+        if has_transcode_error || has_transcript_error {
+            Some(current_timestamp())
+        } else {
+            None
+        };
 
     // Check if metadata already exists (dedupe/re-upload case)
     if let Some(mut metadata) = get_blob_metadata(&hash)? {
@@ -3377,7 +3471,11 @@ fn publish_upload_service_upload(
         if dim.is_some() && metadata.dim.is_none() {
             metadata.dim = dim.clone();
         }
-        if let Some(ref error_code) = transcode_error_code {
+        if should_record_upload_service_transcode_failure(
+            metadata.transcode_status,
+            transcode_error_code.as_deref(),
+        ) {
+            let error_code = transcode_error_code.as_ref().unwrap();
             metadata.transcode_status = Some(TranscodeStatus::Failed);
             metadata.transcode_error_code = Some(error_code.clone());
             metadata.transcode_error_message = transcode_error_message.clone();
@@ -3385,10 +3483,24 @@ fn publish_upload_service_upload(
             metadata.transcode_retry_after = None;
             metadata.transcode_attempt_count = metadata.transcode_attempt_count.max(1);
             metadata.transcode_terminal = transcode_terminal;
-        } else if is_video_mime_type(&metadata.mime_type) && metadata.transcode_status.is_none() {
+        } else if should_reset_transcode_failure_on_clean_upload(
+            &metadata.mime_type,
+            metadata.transcode_status,
+            transcode_error_code.as_deref(),
+        ) {
             metadata.transcode_status = Some(TranscodeStatus::Pending);
+            metadata.transcode_error_code = None;
+            metadata.transcode_error_message = None;
+            metadata.transcode_last_attempt_at = None;
+            metadata.transcode_retry_after = None;
+            metadata.transcode_attempt_count = 0;
+            metadata.transcode_terminal = false;
         }
-        if let Some(ref error_code) = transcript_error_code {
+        if should_record_upload_service_transcript_failure(
+            metadata.transcript_status,
+            transcript_error_code.as_deref(),
+        ) {
+            let error_code = transcript_error_code.as_ref().unwrap();
             metadata.transcript_status = Some(TranscriptStatus::Failed);
             metadata.transcript_error_code = Some(error_code.clone());
             metadata.transcript_error_message = transcript_error_message.clone();
@@ -3396,10 +3508,18 @@ fn publish_upload_service_upload(
             metadata.transcript_retry_after = None;
             metadata.transcript_attempt_count = metadata.transcript_attempt_count.max(1);
             metadata.transcript_terminal = transcript_terminal;
-        } else if is_transcribable_mime_type(&metadata.mime_type)
-            && metadata.transcript_status.is_none()
-        {
+        } else if should_reset_transcript_failure_on_clean_upload(
+            &metadata.mime_type,
+            metadata.transcript_status,
+            transcript_error_code.as_deref(),
+        ) {
             metadata.transcript_status = Some(TranscriptStatus::Pending);
+            metadata.transcript_error_code = None;
+            metadata.transcript_error_message = None;
+            metadata.transcript_last_attempt_at = None;
+            metadata.transcript_retry_after = None;
+            metadata.transcript_attempt_count = 0;
+            metadata.transcript_terminal = false;
         }
         let _ = put_blob_metadata(&metadata);
         eagerly_trigger_transcription_if_needed(
@@ -3674,6 +3794,14 @@ fn handle_upload_complete(mut req: Request, path: &str) -> Result<Response> {
             content_type: complete_response.content_type,
             thumbnail_url: complete_response.thumbnail_url,
             dim: complete_response.dim,
+            // TODO(#151): resumable completion does not probe/classify invalid media
+            // yet, so no derivative failure fields are available here.
+            transcode_error_code: None,
+            transcode_error_message: None,
+            transcode_terminal: false,
+            transcript_error_code: None,
+            transcript_error_message: None,
+            transcript_terminal: false,
         },
     )
 }
@@ -3818,20 +3946,7 @@ fn handle_upload_service_proxy(
     let resp_body = proxy_resp.take_body().into_string();
     let cloud_run_resp: serde_json::Value = serde_json::from_str(&resp_body)
         .map_err(|e| BlossomError::Internal(format!("Invalid Cloud Run response: {}", e)))?;
-    let upload = UploadServicePublishedUpload {
-        sha256: cloud_run_resp["sha256"]
-            .as_str()
-            .ok_or_else(|| BlossomError::Internal("Missing sha256 in Cloud Run response".into()))?
-            .to_string(),
-        size: cloud_run_resp["size"].as_u64().unwrap_or(content_length),
-        content_type: content_type.clone(),
-        thumbnail_url: cloud_run_resp["thumbnail_url"]
-            .as_str()
-            .map(|value| value.to_string()),
-        dim: cloud_run_resp["dim"]
-            .as_str()
-            .map(|value| value.to_string()),
-    };
+    let upload = parse_upload_service_response(&cloud_run_resp, &content_type, content_length)?;
 
     publish_upload_service_upload(auth, base_url, upload)
 }
@@ -5878,15 +5993,175 @@ mod tests {
         backfill_batch_cursor, classify_audio_reuse_availability, decide_transcode_fetch_action,
         decide_transcript_fetch_action, error_response, is_alias_only_audio_blob,
         is_quality_variant_path, parse_quality_variant_path,
-        parse_transcript_status_webhook_payload, should_delete_derived_audio_blob,
-        should_eagerly_trigger_transcription, should_set_audio_content_length,
-        upload_capability_headers, upload_control_host, upload_exposed_headers,
-        AudioReuseAvailability, TranscodeFetchAction, TranscriptFetchAction,
-        TranscriptPendingState,
+        parse_transcript_status_webhook_payload, parse_upload_service_response,
+        should_delete_derived_audio_blob, should_eagerly_trigger_transcription,
+        should_record_upload_service_transcode_failure,
+        should_record_upload_service_transcript_failure,
+        should_reset_transcode_failure_on_clean_upload,
+        should_reset_transcript_failure_on_clean_upload, should_set_audio_content_length,
+        trusted_upload_service_terminal_derivative_error, upload_capability_headers,
+        upload_control_host, upload_exposed_headers, AudioReuseAvailability, TranscodeFetchAction,
+        TranscriptFetchAction, TranscriptPendingState,
     };
     use crate::blossom::{TranscodeStatus, TranscriptStatus};
     use crate::error::{BlossomError, Result as BlossomResult};
     use fastly::http::StatusCode;
+
+    #[test]
+    fn upload_service_response_records_failure_fields_but_clamps_broad_invalid_media_terminal() {
+        let resp = serde_json::json!({
+            "sha256": "c".repeat(64),
+            "size": 5016_u64,
+            "thumbnail_url": null,
+            "dim": null,
+            "transcode_error_code": "invalid_media",
+            "transcode_error_message": "ffprobe failed: moov atom not found",
+            "transcode_terminal": true,
+            "transcript_error_code": "invalid_media",
+            "transcript_error_message": "ffprobe failed: moov atom not found",
+            "transcript_terminal": true
+        });
+
+        let upload = parse_upload_service_response(&resp, "video/webm", 0).unwrap();
+
+        assert_eq!(upload.sha256, "c".repeat(64));
+        assert_eq!(upload.size, 5016);
+        assert_eq!(upload.content_type, "video/webm");
+        assert_eq!(
+            upload.transcode_error_code.as_deref(),
+            Some("invalid_media")
+        );
+        assert_eq!(
+            upload.transcode_error_message.as_deref(),
+            Some("ffprobe failed: moov atom not found")
+        );
+        assert!(!upload.transcode_terminal);
+        assert_eq!(
+            upload.transcript_error_code.as_deref(),
+            Some("invalid_media")
+        );
+        assert!(!upload.transcript_terminal);
+    }
+
+    #[test]
+    fn upload_service_response_honors_trusted_terminal_error_codes() {
+        let resp = serde_json::json!({
+            "sha256": "d".repeat(64),
+            "size": 10_u64,
+            "transcode_error_code": "unsupported_media_type",
+            "transcode_terminal": true,
+            "transcript_error_code": "unsupported_media_type",
+            "transcript_terminal": true
+        });
+
+        let upload = parse_upload_service_response(&resp, "video/example", 99).unwrap();
+
+        assert_eq!(upload.size, 10);
+        assert!(upload.transcode_terminal);
+        assert!(upload.transcript_terminal);
+    }
+
+    #[test]
+    fn upload_service_response_defaults_when_failure_fields_are_absent() {
+        let resp = serde_json::json!({
+            "sha256": "e".repeat(64),
+            "thumbnail_url": "https://cdn.example.com/thumb.jpg",
+            "dim": "1920x1080"
+        });
+
+        let upload = parse_upload_service_response(&resp, "video/mp4", 512).unwrap();
+
+        assert_eq!(upload.size, 512);
+        assert_eq!(upload.transcode_error_code, None);
+        assert!(!upload.transcode_terminal);
+        assert_eq!(upload.transcript_error_code, None);
+        assert!(!upload.transcript_terminal);
+        assert_eq!(
+            upload.thumbnail_url.as_deref(),
+            Some("https://cdn.example.com/thumb.jpg")
+        );
+        assert_eq!(upload.dim.as_deref(), Some("1920x1080"));
+    }
+
+    #[test]
+    fn upload_service_response_requires_sha256() {
+        let resp = serde_json::json!({ "size": 10_u64 });
+
+        assert!(parse_upload_service_response(&resp, "video/mp4", 10).is_err());
+    }
+
+    #[test]
+    fn upload_service_terminal_trust_requires_code_and_allowlist_match() {
+        assert!(trusted_upload_service_terminal_derivative_error(
+            Some("unsupported_media_type"),
+            true
+        ));
+        assert!(!trusted_upload_service_terminal_derivative_error(
+            Some("invalid_media"),
+            true
+        ));
+        assert!(!trusted_upload_service_terminal_derivative_error(
+            None, true
+        ));
+        assert!(!trusted_upload_service_terminal_derivative_error(
+            Some("unsupported_media_type"),
+            false
+        ));
+    }
+
+    #[test]
+    fn upload_service_dedupe_failure_decisions_preserve_complete_status() {
+        assert!(should_record_upload_service_transcode_failure(
+            Some(TranscodeStatus::Pending),
+            Some("invalid_media")
+        ));
+        assert!(!should_record_upload_service_transcode_failure(
+            Some(TranscodeStatus::Complete),
+            Some("invalid_media")
+        ));
+        assert!(should_record_upload_service_transcript_failure(
+            Some(TranscriptStatus::Failed),
+            Some("invalid_media")
+        ));
+        assert!(!should_record_upload_service_transcript_failure(
+            Some(TranscriptStatus::Complete),
+            Some("invalid_media")
+        ));
+    }
+
+    #[test]
+    fn clean_upload_resets_missing_or_failed_derivative_state_only() {
+        assert!(should_reset_transcode_failure_on_clean_upload(
+            "video/mp4",
+            Some(TranscodeStatus::Failed),
+            None
+        ));
+        assert!(should_reset_transcode_failure_on_clean_upload(
+            "video/mp4",
+            None,
+            None
+        ));
+        assert!(!should_reset_transcode_failure_on_clean_upload(
+            "video/mp4",
+            Some(TranscodeStatus::Complete),
+            None
+        ));
+        assert!(!should_reset_transcode_failure_on_clean_upload(
+            "image/jpeg",
+            Some(TranscodeStatus::Failed),
+            None
+        ));
+        assert!(should_reset_transcript_failure_on_clean_upload(
+            "video/mp4",
+            Some(TranscriptStatus::Failed),
+            None
+        ));
+        assert!(!should_reset_transcript_failure_on_clean_upload(
+            "video/mp4",
+            Some(TranscriptStatus::Complete),
+            None
+        ));
+    }
 
     #[test]
     fn quality_variant_path_valid() {
