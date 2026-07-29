@@ -5009,44 +5009,32 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
     }
 }
 
+fn validate_transcoder_webhook(req: &Request, label: &str) -> Result<()> {
+    let Some(provided) = admin::extract_bearer_token(req) else {
+        eprintln!("[{}] Missing or invalid Authorization header", label);
+        return Err(BlossomError::AuthRequired("Webhook secret required".into()));
+    };
+
+    match admin::validate_bearer_token_against_secret_keys(
+        &provided,
+        &["webhook_secret", "transcoder_webhook_secret"],
+    ) {
+        Ok(()) => Ok(()),
+        Err(BlossomError::Forbidden(message)) if message == "Secret store not available" => {
+            eprintln!("[{}] secret store not available, rejecting request", label);
+            Err(BlossomError::Forbidden("Secret store not available".into()))
+        }
+        Err(_) => {
+            eprintln!("[{}] Invalid webhook secret", label);
+            Err(BlossomError::Forbidden("Invalid webhook secret".into()))
+        }
+    }
+}
+
 /// POST /admin/transcode-status - Webhook from divine-transcoder service
 /// Updates transcode status for a blob after HLS generation
 fn handle_transcode_status(mut req: Request) -> Result<Response> {
-    // Try to get webhook secret from secret store (same as moderation webhook)
-    let expected_secret: Option<String> =
-        fastly::secret_store::SecretStore::open("blossom_secrets")
-            .ok()
-            .and_then(|store| store.get("webhook_secret"))
-            .map(|secret| String::from_utf8(secret.plaintext().to_vec()).unwrap_or_default());
-
-    // Get Authorization header
-    let auth_header = req
-        .get_header(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string());
-
-    // Validate secret if configured
-    if let Some(ref expected) = expected_secret {
-        match auth_header {
-            Some(ref header) if header.starts_with("Bearer ") => {
-                let provided = header.strip_prefix("Bearer ").unwrap_or("");
-                if provided != expected.trim() {
-                    eprintln!("[TRANSCODE] Invalid webhook secret");
-                    return Err(BlossomError::Forbidden("Invalid webhook secret".into()));
-                }
-            }
-            _ => {
-                eprintln!("[TRANSCODE] Missing or invalid Authorization header");
-                return Err(BlossomError::AuthRequired("Webhook secret required".into()));
-            }
-        }
-    } else {
-        // Fail closed: reject requests if webhook_secret is not configured
-        eprintln!("[TRANSCODE] webhook_secret not configured, rejecting request");
-        return Err(BlossomError::Forbidden(
-            "Webhook secret not configured".into(),
-        ));
-    }
+    validate_transcoder_webhook(&req, "TRANSCODE")?;
 
     // Parse JSON body
     let body = req.take_body().into_string();
@@ -5142,41 +5130,7 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
 /// POST /admin/transcript-status - Webhook from divine-transcoder service
 /// Updates transcript status for a blob after VTT generation
 fn handle_transcript_status(mut req: Request) -> Result<Response> {
-    // Try to get webhook secret from secret store (same as moderation/transcode webhook)
-    let expected_secret: Option<String> =
-        fastly::secret_store::SecretStore::open("blossom_secrets")
-            .ok()
-            .and_then(|store| store.get("webhook_secret"))
-            .map(|secret| String::from_utf8(secret.plaintext().to_vec()).unwrap_or_default());
-
-    // Get Authorization header
-    let auth_header = req
-        .get_header(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string());
-
-    // Validate secret if configured
-    if let Some(ref expected) = expected_secret {
-        match auth_header {
-            Some(ref header) if header.starts_with("Bearer ") => {
-                let provided = header.strip_prefix("Bearer ").unwrap_or("");
-                if provided != expected.trim() {
-                    eprintln!("[TRANSCRIPT] Invalid webhook secret");
-                    return Err(BlossomError::Forbidden("Invalid webhook secret".into()));
-                }
-            }
-            _ => {
-                eprintln!("[TRANSCRIPT] Missing or invalid Authorization header");
-                return Err(BlossomError::AuthRequired("Webhook secret required".into()));
-            }
-        }
-    } else {
-        // Fail closed: reject requests if webhook_secret is not configured
-        eprintln!("[TRANSCRIPT] webhook_secret not configured, rejecting request");
-        return Err(BlossomError::Forbidden(
-            "Webhook secret not configured".into(),
-        ));
-    }
+    validate_transcoder_webhook(&req, "TRANSCRIPT")?;
 
     // Parse JSON body
     let body = req.take_body().into_string();
