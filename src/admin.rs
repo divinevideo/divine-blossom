@@ -56,39 +56,37 @@ pub fn validate_admin_auth(req: &Request) -> Result<()> {
 /// Accepts either admin_token or webhook_secret from the Fastly Secret Store.
 /// Both are checked independently — webhook_secret is used by divine-moderation-service.
 pub fn validate_bearer_token(req: &Request) -> Result<()> {
-    let provided = req
-        .get_header(header::AUTHORIZATION)
+    let provided = extract_bearer_token(req)
+        .ok_or_else(|| BlossomError::AuthRequired("Admin authentication required".into()))?;
+
+    validate_bearer_token_against_secret_keys(&provided, &["admin_token", "webhook_secret"])
+        .map_err(|_| BlossomError::Forbidden("Invalid admin token".into()))
+}
+
+pub fn extract_bearer_token(req: &Request) -> Option<String> {
+    req.get_header(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(|s| s.trim().to_string())
-        .ok_or_else(|| BlossomError::AuthRequired("Admin authentication required".into()))?;
+}
 
+pub fn validate_bearer_token_against_secret_keys(provided: &str, keys: &[&str]) -> Result<()> {
     let store = fastly::secret_store::SecretStore::open("blossom_secrets")
         .map_err(|_| BlossomError::Forbidden("Secret store not available".into()))?;
 
-    // Accept admin_token
-    if let Some(secret) = store.get("admin_token") {
-        let token = String::from_utf8(secret.plaintext().to_vec())
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        if !token.is_empty() && provided == token {
-            return Ok(());
+    for key in keys {
+        if let Some(secret) = store.get(key) {
+            let token = String::from_utf8(secret.plaintext().to_vec())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if !token.is_empty() && provided == token {
+                return Ok(());
+            }
         }
     }
 
-    // Accept webhook_secret (used by divine-moderation-service)
-    if let Some(secret) = store.get("webhook_secret") {
-        let token = String::from_utf8(secret.plaintext().to_vec())
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        if !token.is_empty() && provided == token {
-            return Ok(());
-        }
-    }
-
-    Err(BlossomError::Forbidden("Invalid admin token".into()))
+    Err(BlossomError::Forbidden("Invalid bearer token".into()))
 }
 
 /// Extract session token from Cookie header
@@ -108,7 +106,7 @@ fn get_session_cookie(req: &Request) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_session_cookie, set_admin_blob_response_headers};
+    use super::{extract_bearer_token, get_session_cookie, set_admin_blob_response_headers};
     use crate::blossom::{BlobMetadata, BlobStatus};
     use fastly::http::header;
     use fastly::http::StatusCode;
@@ -128,6 +126,22 @@ mod tests {
         req.set_header(header::COOKIE, "session=abc123");
 
         assert_eq!(get_session_cookie(&req), None);
+    }
+
+    #[test]
+    fn extracts_trimmed_bearer_token() {
+        let mut req = Request::get("https://media.divine.video/admin");
+        req.set_header(header::AUTHORIZATION, "Bearer  s3cret  ");
+
+        assert_eq!(extract_bearer_token(&req).as_deref(), Some("s3cret"));
+    }
+
+    #[test]
+    fn bearer_token_requires_bearer_scheme() {
+        let mut req = Request::get("https://media.divine.video/admin");
+        req.set_header(header::AUTHORIZATION, "Basic s3cret");
+
+        assert_eq!(extract_bearer_token(&req), None);
     }
 
     #[test]
