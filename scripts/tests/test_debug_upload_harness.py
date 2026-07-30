@@ -6,6 +6,7 @@ import unittest
 import urllib.error
 
 from scripts.debug_upload_harness import (
+    MAX_PROOF_HEADER_BYTES,
     UploadHttpClient,
     build_complete_body,
     build_proof_headers,
@@ -62,6 +63,44 @@ class DebugUploadHarnessTests(unittest.TestCase):
             headers["X-ProofMode-C2PA"],
             base64.b64encode(b"urn:c2pa:manifest").decode("ascii"),
         )
+
+    def test_build_proof_headers_drops_bulk_over_budget(self) -> None:
+        # A real Android hardware attestation chain runs ~54 KB and lands in
+        # the manifest twice, which put the client past what
+        # media.divine.video accepts and turned every upload into a 502.
+        proof = {
+            "pgpSignature": "sig",
+            "deviceAttestation": "A" * 54000,
+            "c2paManifestId": "urn:c2pa:manifest",
+        }
+        warnings = io.StringIO()
+
+        headers = build_proof_headers(proof, warn=warnings)
+
+        self.assertIn("X-ProofMode-C2PA", headers)
+        self.assertIn("X-ProofMode-Signature", headers)
+        self.assertNotIn("X-ProofMode-Attestation", headers)
+        self.assertNotIn("X-ProofMode-Manifest", headers)
+        self.assertIn("over the 8192 byte budget", warnings.getvalue())
+
+    def test_build_proof_headers_stays_within_budget(self) -> None:
+        proof = {
+            "pgpSignature": "sig",
+            "deviceAttestation": "A" * 54000,
+            "c2paManifestId": "urn:c2pa:manifest",
+        }
+
+        headers = build_proof_headers(proof)
+
+        wire_bytes = sum(len(name) + len(value) + 4 for name, value in headers.items())
+        self.assertLessEqual(wire_bytes, MAX_PROOF_HEADER_BYTES)
+
+    def test_build_proof_headers_is_silent_within_budget(self) -> None:
+        warnings = io.StringIO()
+
+        build_proof_headers({"pgpSignature": "sig"}, warn=warnings)
+
+        self.assertEqual(warnings.getvalue(), "")
 
     def test_summarize_response_truncates_large_bodies(self) -> None:
         summary = summarize_response(
