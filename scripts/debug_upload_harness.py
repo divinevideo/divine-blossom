@@ -148,6 +148,12 @@ def build_proof_headers(
         candidates.append(
             ("X-ProofMode-Signature", _encode_proof_header_value(proof["pgpSignature"]))
         )
+    # Paired with the signature: without the key the signature cannot be
+    # verified from headers alone.
+    if "publicKey" in proof:
+        candidates.append(
+            ("X-ProofMode-PublicKey", _encode_proof_header_value(proof["publicKey"]))
+        )
     if "deviceAttestation" in proof:
         candidates.append(
             (

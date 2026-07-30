@@ -69,8 +69,9 @@ class DebugUploadHarnessTests(unittest.TestCase):
         # the manifest twice, which put the client past what
         # media.divine.video accepts and turned every upload into a 502.
         proof = {
-            "pgpSignature": "sig",
-            "deviceAttestation": "A" * 54000,
+            "pgpSignature": "S" * 821,
+            "publicKey": "K" * 2048,
+            "deviceAttestation": "A" * 53826,
             "c2paManifestId": "urn:c2pa:manifest",
         }
         warnings = io.StringIO()
@@ -78,10 +79,19 @@ class DebugUploadHarnessTests(unittest.TestCase):
         headers = build_proof_headers(proof, warn=warnings)
 
         self.assertIn("X-ProofMode-C2PA", headers)
-        self.assertIn("X-ProofMode-Signature", headers)
         self.assertNotIn("X-ProofMode-Attestation", headers)
         self.assertNotIn("X-ProofMode-Manifest", headers)
         self.assertIn("over the 8192 byte budget", warnings.getvalue())
+        # The signature and the key that verifies it survive intact; keeping a
+        # signature without its key would leave an uncheckable proof.
+        self.assertEqual(
+            base64.b64decode(headers["X-ProofMode-Signature"]).decode("utf-8"),
+            "S" * 821,
+        )
+        self.assertEqual(
+            base64.b64decode(headers["X-ProofMode-PublicKey"]).decode("utf-8"),
+            "K" * 2048,
+        )
 
     def test_build_proof_headers_stays_within_budget(self) -> None:
         proof = {
