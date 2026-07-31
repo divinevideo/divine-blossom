@@ -283,6 +283,8 @@ pub struct TranscodeMetadataUpdate {
     pub terminal: Option<bool>,
     pub increment_attempt_count: bool,
     pub generation: Option<u64>,
+    pub require_generation_after_versioned: bool,
+    pub malformed_generation: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,6 +296,12 @@ pub enum StatusUpdateOutcome {
     },
     DuplicateGeneration {
         incoming: Option<u64>,
+        stored: Option<u64>,
+    },
+    MissingGeneration {
+        stored: Option<u64>,
+    },
+    MalformedGeneration {
         stored: Option<u64>,
     },
 }
@@ -311,6 +319,28 @@ fn duplicate_failed_generation(
         && matches!((incoming, stored), (Some(incoming), Some(stored)) if incoming == stored)
 }
 
+fn generation_rejection(
+    incoming: Option<u64>,
+    stored: Option<u64>,
+    require_generation_after_versioned: bool,
+    malformed_generation: bool,
+    increment_attempt_count: bool,
+) -> Option<StatusUpdateOutcome> {
+    if malformed_generation {
+        return Some(StatusUpdateOutcome::MalformedGeneration { stored });
+    }
+    if require_generation_after_versioned && incoming.is_none() && stored.is_some() {
+        return Some(StatusUpdateOutcome::MissingGeneration { stored });
+    }
+    if stale_generation(incoming, stored) {
+        return Some(StatusUpdateOutcome::StaleGeneration { incoming, stored });
+    }
+    if duplicate_failed_generation(incoming, stored, increment_attempt_count) {
+        return Some(StatusUpdateOutcome::DuplicateGeneration { incoming, stored });
+    }
+    None
+}
+
 /// Update transcode status and associated failure metadata for a video blob.
 pub fn update_transcode_status_with_metadata(
     hash: &str,
@@ -322,21 +352,14 @@ pub fn update_transcode_status_with_metadata(
     let mut metadata = get_blob_metadata_uncached(hash)?
         .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
 
-    if stale_generation(update.generation, metadata.transcode_generation) {
-        return Ok(StatusUpdateOutcome::StaleGeneration {
-            incoming: update.generation,
-            stored: metadata.transcode_generation,
-        });
-    }
-    if duplicate_failed_generation(
+    if let Some(outcome) = generation_rejection(
         update.generation,
         metadata.transcode_generation,
+        update.require_generation_after_versioned,
+        update.malformed_generation,
         update.increment_attempt_count,
     ) {
-        return Ok(StatusUpdateOutcome::DuplicateGeneration {
-            incoming: update.generation,
-            stored: metadata.transcode_generation,
-        });
+        return Ok(outcome);
     }
 
     metadata.transcode_status = Some(status);
@@ -396,6 +419,8 @@ pub struct TranscriptMetadataUpdate {
     pub terminal: Option<bool>,
     pub increment_attempt_count: bool,
     pub generation: Option<u64>,
+    pub require_generation_after_versioned: bool,
+    pub malformed_generation: bool,
 }
 
 pub fn update_transcript_status(
@@ -406,21 +431,14 @@ pub fn update_transcript_status(
     let mut metadata = get_blob_metadata_uncached(hash)?
         .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
 
-    if stale_generation(update.generation, metadata.transcript_generation) {
-        return Ok(StatusUpdateOutcome::StaleGeneration {
-            incoming: update.generation,
-            stored: metadata.transcript_generation,
-        });
-    }
-    if duplicate_failed_generation(
+    if let Some(outcome) = generation_rejection(
         update.generation,
         metadata.transcript_generation,
+        update.require_generation_after_versioned,
+        update.malformed_generation,
         update.increment_attempt_count,
     ) {
-        return Ok(StatusUpdateOutcome::DuplicateGeneration {
-            incoming: update.generation,
-            stored: metadata.transcript_generation,
-        });
+        return Ok(outcome);
     }
 
     metadata.transcript_status = Some(status);
@@ -1323,7 +1341,9 @@ pub fn delete_audio_source_refs(audio_hash: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{duplicate_failed_generation, stale_generation};
+    use super::{
+        duplicate_failed_generation, generation_rejection, stale_generation, StatusUpdateOutcome,
+    };
 
     #[test]
     fn stale_generation_only_rejects_older_known_generations() {
@@ -1343,5 +1363,30 @@ mod tests {
         assert!(!duplicate_failed_generation(Some(5), Some(5), false));
         assert!(!duplicate_failed_generation(None, Some(5), true));
         assert!(!duplicate_failed_generation(Some(5), None, true));
+    }
+
+    #[test]
+    fn generation_rejection_blocks_missing_generation_after_versioned_state() {
+        assert_eq!(
+            generation_rejection(None, Some(5), true, false, false),
+            Some(StatusUpdateOutcome::MissingGeneration { stored: Some(5) })
+        );
+        assert_eq!(generation_rejection(None, None, true, false, false), None);
+        assert_eq!(
+            generation_rejection(None, Some(5), false, false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn generation_rejection_blocks_malformed_generation() {
+        assert_eq!(
+            generation_rejection(None, Some(5), true, true, false),
+            Some(StatusUpdateOutcome::MalformedGeneration { stored: Some(5) })
+        );
+        assert_eq!(
+            generation_rejection(None, None, true, true, false),
+            Some(StatusUpdateOutcome::MalformedGeneration { stored: None })
+        );
     }
 }

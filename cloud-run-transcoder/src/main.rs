@@ -2926,9 +2926,9 @@ const ACCESS_TOKEN_CACHE_TTL: Duration = Duration::from_secs(50 * 60);
 
 const METADATA_FETCH_MAX_ATTEMPTS: u32 = 3;
 
-/// Backoff for sequential metadata-server attempts. Kept short because
-/// each fetch already has a 5s socket timeout — the goal is to ride
-/// through brief Cloud Run metadata-server hiccups, not long outages.
+/// Backoff for short control-plane retries. Kept short because callers already
+/// bound each request with a timeout; the goal is to ride through brief Cloud
+/// Run or Google API hiccups, not long outages.
 fn token_fetch_retry_delay(attempt: u32) -> Duration {
     match attempt {
         0 => Duration::from_millis(200),
@@ -4034,6 +4034,21 @@ mod tests {
         let older_attempt = 1_700_000_000_123;
         let newer_attempt = older_attempt + 1;
 
+        assert!(
+            status_event_generation(older_attempt, STATUS_EVENT_TERMINAL)
+                < status_event_generation(newer_attempt, STATUS_EVENT_PROCESSING)
+        );
+    }
+
+    #[test]
+    fn status_event_generation_stays_ordered_past_2028() {
+        let older_attempt = 2_000_000_000_000;
+        let newer_attempt = older_attempt + 1;
+
+        assert!(
+            status_event_generation(older_attempt, STATUS_EVENT_PROCESSING)
+                < status_event_generation(older_attempt, STATUS_EVENT_TERMINAL)
+        );
         assert!(
             status_event_generation(older_attempt, STATUS_EVENT_TERMINAL)
                 < status_event_generation(newer_attempt, STATUS_EVENT_PROCESSING)
@@ -5768,7 +5783,7 @@ static LAST_STATUS_GENERATION: AtomicU64 = AtomicU64::new(0);
 fn next_status_generation() -> u64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos().min(u64::MAX as u128) as u64)
+        .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
         .unwrap_or(0);
 
     let mut previous = LAST_STATUS_GENERATION.load(Ordering::Relaxed);
@@ -5791,8 +5806,9 @@ const STATUS_EVENT_TERMINAL: u64 = 1;
 
 fn status_event_generation(attempt_generation: u64, event_sequence: u64) -> u64 {
     attempt_generation
-        .saturating_mul(10)
-        .saturating_add(event_sequence)
+        .checked_mul(10)
+        .and_then(|base| base.checked_add(event_sequence))
+        .unwrap_or(u64::MAX)
 }
 
 fn attach_generation(payload: &mut serde_json::Value, generation: u64) {
@@ -5807,7 +5823,7 @@ fn build_cloud_tasks_task_body(
     payload: &serde_json::Value,
 ) -> serde_json::Value {
     let body_b64 = base64::engine::general_purpose::STANDARD
-        .encode(serde_json::to_vec(payload).unwrap_or_default());
+        .encode(serde_json::to_vec(payload).expect("serializing JSON Value should not fail"));
 
     let mut headers = serde_json::json!({ "Content-Type": "application/json" });
     if let Some(secret) = webhook_secret {
@@ -5869,7 +5885,10 @@ async fn post_status_payload(
     status: &str,
     payload: &serde_json::Value,
 ) {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let mut request = client.post(target_url).json(&payload);
     if let Some(secret) = &config.webhook_secret {
         request = request.header("Authorization", format!("Bearer {}", secret));
@@ -5946,7 +5965,10 @@ async fn enqueue_status_task(
         payload,
     );
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let resp = client
         .post(&create_url)
         .header("Authorization", format!("Bearer {}", token))

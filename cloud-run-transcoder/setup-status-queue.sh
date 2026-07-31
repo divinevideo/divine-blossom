@@ -7,7 +7,8 @@ set -euo pipefail
 PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project)}"
 REGION="${REGION:-us-central1}"
 QUEUE_NAME="${QUEUE_NAME:-derivative-status}"
-SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-149672065768-compute@developer.gserviceaccount.com}"
+PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" --format="value(projectNumber)")"
+SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-${PROJECT_NUMBER}-compute@developer.gserviceaccount.com}"
 
 gcloud services enable cloudtasks.googleapis.com \
   --project "${PROJECT_ID}"
@@ -32,7 +33,28 @@ else
     --max-concurrent-dispatches=1
 fi
 
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+QUEUE_STATE="$(gcloud tasks queues describe "${QUEUE_NAME}" \
+  --project "${PROJECT_ID}" \
+  --location "${REGION}" \
+  --format="value(state)")"
+if [ "${QUEUE_STATE}" = "PAUSED" ]; then
+  gcloud tasks queues resume "${QUEUE_NAME}" \
+    --project "${PROJECT_ID}" \
+    --location "${REGION}"
+  QUEUE_STATE="$(gcloud tasks queues describe "${QUEUE_NAME}" \
+    --project "${PROJECT_ID}" \
+    --location "${REGION}" \
+    --format="value(state)")"
+fi
+
+if [ "${QUEUE_STATE}" != "RUNNING" ]; then
+  echo "Queue ${QUEUE_NAME} is ${QUEUE_STATE}, expected RUNNING" >&2
+  exit 1
+fi
+
+gcloud tasks queues add-iam-policy-binding "${QUEUE_NAME}" \
+  --project "${PROJECT_ID}" \
+  --location "${REGION}" \
   --member="serviceAccount:${SERVICE_ACCOUNT}" \
   --role=roles/cloudtasks.enqueuer \
   --condition=None

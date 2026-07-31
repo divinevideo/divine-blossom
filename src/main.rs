@@ -1307,6 +1307,7 @@ struct ParsedTranscodeStatusWebhook {
     retry_after_epoch_secs: Option<u64>,
     terminal: bool,
     generation: Option<u64>,
+    malformed_generation: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1322,6 +1323,7 @@ struct ParsedTranscriptStatusWebhook {
     retry_after_epoch_secs: Option<u64>,
     terminal: bool,
     generation: Option<u64>,
+    malformed_generation: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1374,6 +1376,16 @@ fn parse_optional_bool(payload: &serde_json::Value, field: &str) -> Option<bool>
         .or_else(|| payload[field].as_str().and_then(|value| value.parse().ok()))
 }
 
+fn parse_generation_field(payload: &serde_json::Value) -> (Option<u64>, bool) {
+    match payload.get("generation") {
+        None | Some(serde_json::Value::Null) => (None, false),
+        Some(value) => match value.as_u64() {
+            Some(generation) => (Some(generation), false),
+            None => (None, true),
+        },
+    }
+}
+
 fn parse_transcode_status_webhook_payload(
     payload: &serde_json::Value,
     now_epoch_secs: u64,
@@ -1407,6 +1419,8 @@ fn parse_transcode_status_webhook_payload(
         _ => None,
     };
 
+    let (generation, malformed_generation) = parse_generation_field(payload);
+
     Ok(ParsedTranscodeStatusWebhook {
         sha256,
         status,
@@ -1416,7 +1430,8 @@ fn parse_transcode_status_webhook_payload(
         error_message: payload["error_message"].as_str().map(|s| s.to_string()),
         retry_after_epoch_secs: parse_optional_retry_after_epoch(payload, now_epoch_secs),
         terminal: parse_optional_bool(payload, "terminal").unwrap_or(false),
-        generation: payload["generation"].as_u64(),
+        generation,
+        malformed_generation,
     })
 }
 
@@ -1446,6 +1461,8 @@ fn parse_transcript_status_webhook_payload(
         }
     };
 
+    let (generation, malformed_generation) = parse_generation_field(payload);
+
     Ok(ParsedTranscriptStatusWebhook {
         sha256,
         status,
@@ -1457,7 +1474,8 @@ fn parse_transcript_status_webhook_payload(
         error_message: payload["error_message"].as_str().map(|s| s.to_string()),
         retry_after_epoch_secs: parse_optional_retry_after_epoch(payload, now_epoch_secs),
         terminal: parse_optional_bool(payload, "terminal").unwrap_or(false),
-        generation: payload["generation"].as_u64(),
+        generation,
+        malformed_generation,
     })
 }
 
@@ -5249,6 +5267,30 @@ fn duplicate_generation_response(
     resp
 }
 
+fn missing_generation_response(sha256: &str, stored: Option<u64>) -> Response {
+    let response = serde_json::json!({
+        "success": true,
+        "sha256": sha256,
+        "ignored": "missing_generation",
+        "stored_generation": stored
+    });
+    let mut resp = json_response(StatusCode::OK, &response);
+    add_cors_headers(&mut resp);
+    resp
+}
+
+fn malformed_generation_response(sha256: &str, stored: Option<u64>) -> Response {
+    let response = serde_json::json!({
+        "success": true,
+        "sha256": sha256,
+        "ignored": "malformed_generation",
+        "stored_generation": stored
+    });
+    let mut resp = json_response(StatusCode::OK, &response);
+    add_cors_headers(&mut resp);
+    resp
+}
+
 /// POST /admin/transcode-status - Webhook from divine-transcoder service
 /// Updates transcode status for a blob after HLS generation
 fn handle_transcode_status(mut req: Request) -> Result<Response> {
@@ -5289,6 +5331,8 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
             terminal: Some(parsed.terminal),
             increment_attempt_count: matches!(parsed.status, TranscodeStatus::Failed),
             generation: parsed.generation,
+            require_generation_after_versioned: true,
+            malformed_generation: parsed.malformed_generation,
         },
     ) {
         Ok(StatusUpdateOutcome::StaleGeneration { incoming, stored }) => {
@@ -5304,6 +5348,20 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
                 sha256, incoming, stored
             );
             Ok(duplicate_generation_response(sha256, incoming, stored))
+        }
+        Ok(StatusUpdateOutcome::MissingGeneration { stored }) => {
+            eprintln!(
+                "[TRANSCODE] Ignoring missing-generation callback for {} after stored gen {:?}",
+                sha256, stored
+            );
+            Ok(missing_generation_response(sha256, stored))
+        }
+        Ok(StatusUpdateOutcome::MalformedGeneration { stored }) => {
+            eprintln!(
+                "[TRANSCODE] Ignoring malformed-generation callback for {} with stored gen {:?}",
+                sha256, stored
+            );
+            Ok(malformed_generation_response(sha256, stored))
         }
         Ok(StatusUpdateOutcome::Applied) => {
             if let Some(ref d) = parsed.dim {
@@ -5392,6 +5450,8 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
             terminal: Some(parsed.terminal),
             increment_attempt_count: matches!(parsed.status, TranscriptStatus::Failed),
             generation: parsed.generation,
+            require_generation_after_versioned: true,
+            malformed_generation: parsed.malformed_generation,
         },
     ) {
         Ok(StatusUpdateOutcome::StaleGeneration { incoming, stored }) => {
@@ -5407,6 +5467,20 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
                 sha256, incoming, stored
             );
             Ok(duplicate_generation_response(sha256, incoming, stored))
+        }
+        Ok(StatusUpdateOutcome::MissingGeneration { stored }) => {
+            eprintln!(
+                "[TRANSCRIPT] Ignoring missing-generation callback for {} after stored gen {:?}",
+                sha256, stored
+            );
+            Ok(missing_generation_response(sha256, stored))
+        }
+        Ok(StatusUpdateOutcome::MalformedGeneration { stored }) => {
+            eprintln!(
+                "[TRANSCRIPT] Ignoring malformed-generation callback for {} with stored gen {:?}",
+                sha256, stored
+            );
+            Ok(malformed_generation_response(sha256, stored))
         }
         Ok(StatusUpdateOutcome::Applied) => {
             eprintln!(
@@ -6079,20 +6153,22 @@ mod tests {
 	use super::{
 		backfill_batch_cursor, classify_audio_reuse_availability, decide_transcode_fetch_action,
 		decide_transcript_fetch_action, duplicate_generation_response, error_response,
-		is_alias_only_audio_blob, is_quality_variant_path, parse_quality_variant_path,
+		is_alias_only_audio_blob, is_quality_variant_path, malformed_generation_response,
+		missing_generation_response, parse_quality_variant_path,
 		parse_transcode_status_webhook_payload, parse_transcript_status_webhook_payload,
 		parse_upload_service_response, should_delete_derived_audio_blob,
 		should_eagerly_trigger_transcription, should_record_upload_service_transcode_failure,
-		should_record_upload_service_transcript_failure, should_reset_transcode_failure_on_clean_upload,
+		should_record_upload_service_transcript_failure,
+		should_reset_transcode_failure_on_clean_upload,
 		should_reset_transcript_failure_on_clean_upload, should_set_audio_content_length,
 		stale_generation_response, trusted_upload_service_terminal_derivative_error,
 		upload_capability_headers, upload_control_host, upload_exposed_headers,
 		upload_from_resumable_completion, AudioReuseAvailability, DerivativeObservation,
 		TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState,
 	};
-    use crate::blossom::{ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus};
-    use crate::error::{BlossomError, Result as BlossomResult};
-    use fastly::http::StatusCode;
+	use crate::blossom::{ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus};
+	use crate::error::{BlossomError, Result as BlossomResult};
+	use fastly::http::StatusCode;
 
     #[test]
     fn upload_service_response_records_failure_fields_but_clamps_broad_invalid_media_terminal() {
@@ -6429,6 +6505,7 @@ mod tests {
         let parsed = parse_transcode_status_webhook_payload(&payload, 1_000).unwrap();
 
         assert_eq!(parsed.generation, Some(1_700_000_000_123));
+        assert!(!parsed.malformed_generation);
     }
 
     #[test]
@@ -6442,6 +6519,34 @@ mod tests {
         let parsed = parse_transcript_status_webhook_payload(&payload, 1_000).unwrap();
 
         assert_eq!(parsed.generation, Some(42));
+        assert!(!parsed.malformed_generation);
+    }
+
+    #[test]
+    fn parses_missing_webhook_generation_as_legacy_absent() {
+        let payload = serde_json::json!({
+            "sha256": "50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a",
+            "status": "complete"
+        });
+
+        let parsed = parse_transcode_status_webhook_payload(&payload, 1_000).unwrap();
+
+        assert_eq!(parsed.generation, None);
+        assert!(!parsed.malformed_generation);
+    }
+
+    #[test]
+    fn parses_malformed_webhook_generation_distinctly() {
+        let payload = serde_json::json!({
+            "sha256": "50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a",
+            "status": "failed",
+            "generation": "123"
+        });
+
+        let parsed = parse_transcode_status_webhook_payload(&payload, 1_000).unwrap();
+
+        assert_eq!(parsed.generation, None);
+        assert!(parsed.malformed_generation);
     }
 
     #[test]
@@ -6472,6 +6577,28 @@ mod tests {
         assert!(resp
             .into_body_str()
             .contains("\"ignored\":\"duplicate_generation\""));
+    }
+
+    #[test]
+    fn missing_generation_response_returns_successful_ignore() {
+        let hash = "50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a";
+        let resp = missing_generation_response(hash, Some(5));
+
+        assert_eq!(resp.get_status(), StatusCode::OK);
+        assert!(resp
+            .into_body_str()
+            .contains("\"ignored\":\"missing_generation\""));
+    }
+
+    #[test]
+    fn malformed_generation_response_returns_successful_ignore() {
+        let hash = "50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a";
+        let resp = malformed_generation_response(hash, Some(5));
+
+        assert_eq!(resp.get_status(), StatusCode::OK);
+        assert!(resp
+            .into_body_str()
+            .contains("\"ignored\":\"malformed_generation\""));
     }
 
     #[test]
