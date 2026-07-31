@@ -24,10 +24,13 @@ SUCCESS_STATUSES = {200, 201, 204}
 #
 # media.divine.video rejects requests whose combined headers exceed 128 KiB
 # over HTTP/1.1 (with a 502) or 64 KiB over HTTP/2 (by closing the connection).
-# An Android hardware attestation chain is ~54 KB and lands in the manifest
-# twice — ~75 KB base64 in X-ProofMode-Manifest plus ~72 KB in
-# X-ProofMode-Attestation — so replaying a real proof through this harness
-# reproduced the client bug instead of diagnosing it.
+# A device attestation lands in the request twice — base64 in
+# X-ProofMode-Manifest and again in X-ProofMode-Attestation — so a raw
+# attestation over roughly 47.5 KB busts the limit and replaying such a proof
+# through this harness reproduced the client bug instead of diagnosing it.
+# Android attestation size is device-dependent (it is the
+# X509Certificate.toString() dump of the whole chain), which is why only some
+# devices were affected.
 #
 # No Blossom server reads these headers; the canonical manifest is the
 # proofmode tag on the kind 34236 event.
