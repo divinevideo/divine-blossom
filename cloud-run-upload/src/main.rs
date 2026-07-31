@@ -823,7 +823,9 @@ async fn stream_to_gcs_with_hash(
     // `Bytes` keeps the later clones refcount bumps instead of full copies.
     let original_bytes = Bytes::from(original_bytes);
 
-    // Derivative generation (probe/transcode) can use sanitized bytes.
+    // The remux output stays in-process: only ffprobe reads it, and it is never
+    // stored. The transcoder fetches the original blob from GCS itself, so a
+    // skipped remux changes nothing about what downstream services receive.
     let mut sanitize_error = None;
 
     let derivative_bytes = if needs_derivative_sanitize(content_type, &original_bytes) {
