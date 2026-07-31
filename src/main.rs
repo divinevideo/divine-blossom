@@ -328,7 +328,7 @@ fn add_audio_response_headers(
 ) {
     let set_full_content_length = should_set_audio_content_length(resp.get_status());
     resp.set_header("Content-Type", mime_type);
-    if set_full_content_length {
+    if set_full_content_length && size_bytes > 0 {
         resp.set_header("Content-Length", size_bytes.to_string());
     }
     resp.set_header("X-Audio-Duration", format!("{}", duration_seconds));
@@ -346,19 +346,28 @@ fn should_set_audio_content_length(status: StatusCode) -> bool {
     status != StatusCode::PARTIAL_CONTENT
 }
 
+fn blob_response_requires_private_cache(
+    is_admin: bool,
+    status: Option<BlobStatus>,
+    has_authorization_header: bool,
+) -> bool {
+    is_admin || has_authorization_header || status.map(|s| s != BlobStatus::Active).unwrap_or(true)
+}
+
 /// Decide which Range header, if any, to forward to origin storage.
-/// Publicly cacheable objects are always fetched whole: an origin 206 response
-/// cannot be stored by the edge cache, so forwarding client ranges for public
-/// media would send every play to origin. Private/admin responses are never
-/// cached, so their ranges pass through and avoid re-downloading whole objects.
+/// Edge-cacheable objects are fetched whole: an origin 206 response cannot be
+/// stored by the cache, so forwarding client ranges would send every play to
+/// origin. Responses that VCL passes or Compute marks private keep the range.
 fn origin_range_for_request(
     client_range: Option<&str>,
-    publicly_cacheable: bool,
+    is_admin: bool,
+    status: Option<BlobStatus>,
+    has_authorization_header: bool,
 ) -> Option<&str> {
-    if publicly_cacheable {
-        None
-    } else {
+    if blob_response_requires_private_cache(is_admin, status, has_authorization_header) {
         client_range
+    } else {
+        None
     }
 }
 
@@ -547,15 +556,18 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
 
-    // Public blobs are fetched whole so the edge cache stores the full object;
-    // only private/admin traffic gets partial responses from origin. Keep this
-    // in sync with the cache-header decision below.
-    let publicly_cacheable = !is_admin
-        && metadata
-            .as_ref()
-            .map(|meta| meta.status == BlobStatus::Active)
-            .unwrap_or(false);
-    let upstream_range = origin_range_for_request(range.as_deref(), publicly_cacheable);
+    let has_authorization_header = req.get_header(header::AUTHORIZATION).is_some();
+    let private_cache = blob_response_requires_private_cache(
+        is_admin,
+        metadata.as_ref().map(|meta| meta.status),
+        has_authorization_header,
+    );
+    let upstream_range = origin_range_for_request(
+        range.as_deref(),
+        is_admin,
+        metadata.as_ref().map(|meta| meta.status),
+        has_authorization_header,
+    );
 
     // Download from GCS with fallback to CDNs
     let result = download_blob_with_fallback(&hash, upstream_range)?;
@@ -614,21 +626,15 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
 
     // Content is addressed by SHA256 hash, so it's immutable - cache aggressively.
     // Exception: restricted/admin content must not be publicly cached.
-    if is_admin {
-        // Admin bypass: never cache, expose moderation status
-        resp.set_header("Cache-Control", "private, no-store");
-        if let Some(ref meta) = metadata {
-            resp.set_header("X-Moderation-Status", &format!("{:?}", meta.status));
-        }
+    if private_cache {
+        add_private_cache_headers(&mut resp, &hash);
     } else {
-        let is_restricted = metadata
-            .as_ref()
-            .map(|m| m.status != BlobStatus::Active)
-            .unwrap_or(false);
-        if is_restricted {
-            add_private_cache_headers(&mut resp, &hash);
-        } else {
-            add_cache_headers(&mut resp, &hash);
+        add_cache_headers(&mut resp, &hash);
+    }
+    if is_admin {
+        // Admin bypass exposes moderation status for tooling.
+        if let Some(ref meta) = metadata {
+            resp.set_header("X-Moderation-Status", format!("{:?}", meta.status));
         }
     }
 
@@ -2178,7 +2184,12 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
         AudioReuseAvailability::LookupUnavailable => return Ok(audio_lookup_unavailable_response()),
     }
 
-    let private_cache = is_admin || metadata.status.requires_private_cache();
+    let has_authorization_header = req.get_header(header::AUTHORIZATION).is_some();
+    let private_cache = blob_response_requires_private_cache(
+        is_admin,
+        Some(metadata.status),
+        has_authorization_header,
+    );
 
     // 4. Must be a video source
     if !is_video_mime_type(&metadata.mime_type) {
@@ -2193,7 +2204,12 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
         .get_header(header::RANGE)
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
-    let upstream_range = origin_range_for_request(range.as_deref(), !private_cache);
+    let upstream_range = origin_range_for_request(
+        range.as_deref(),
+        is_admin,
+        Some(metadata.status),
+        has_authorization_header,
+    );
 
     // 5. Check cache: source->audio mapping
     if let Some(mapping) = get_audio_mapping(&hash)? {
@@ -2241,7 +2257,9 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
         .audio_sha256
         .ok_or_else(|| BlossomError::Internal("Audio extraction returned no hash".into()))?;
     let duration = extraction.duration.unwrap_or(0.0);
-    let size = extraction.size.unwrap_or(0);
+    let size = extraction
+        .size
+        .ok_or_else(|| BlossomError::Internal("Audio extraction returned no size".into()))?;
     let mime_type = extraction
         .mime_type
         .unwrap_or_else(|| "audio/mp4".to_string());
@@ -5856,7 +5874,8 @@ fn infer_mime_from_path(path: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        backfill_batch_cursor, classify_audio_reuse_availability, decide_transcode_fetch_action,
+        backfill_batch_cursor, blob_response_requires_private_cache,
+        classify_audio_reuse_availability, decide_transcode_fetch_action,
         decide_transcript_fetch_action, error_response, is_alias_only_audio_blob,
         is_quality_variant_path, origin_range_for_request, parse_quality_variant_path,
         parse_transcript_status_webhook_payload, should_delete_derived_audio_blob,
@@ -5865,7 +5884,7 @@ mod tests {
         AudioReuseAvailability, TranscodeFetchAction, TranscriptFetchAction,
         TranscriptPendingState,
     };
-    use crate::blossom::{TranscodeStatus, TranscriptStatus};
+    use crate::blossom::{BlobStatus, TranscodeStatus, TranscriptStatus};
     use crate::error::{BlossomError, Result as BlossomResult};
     use fastly::http::StatusCode;
 
@@ -6164,22 +6183,57 @@ mod tests {
     }
 
     #[test]
-    fn publicly_cacheable_media_drops_client_range_for_origin() {
-        assert_eq!(origin_range_for_request(Some("bytes=0-1023"), true), None);
+    fn public_anonymous_active_media_drops_client_range_for_origin() {
+        assert_eq!(
+            origin_range_for_request(Some("bytes=0-1023"), false, Some(BlobStatus::Active), false),
+            None
+        );
     }
 
     #[test]
-    fn privately_cached_media_forwards_client_range_to_origin() {
+    fn authorized_public_media_forwards_client_range_to_origin() {
         assert_eq!(
-            origin_range_for_request(Some("bytes=0-1023"), false),
+            origin_range_for_request(Some("bytes=0-1023"), false, Some(BlobStatus::Active), true),
+            Some("bytes=0-1023")
+        );
+    }
+
+    #[test]
+    fn admin_media_forwards_client_range_to_origin() {
+        assert_eq!(
+            origin_range_for_request(Some("bytes=0-1023"), true, Some(BlobStatus::Active), false),
+            Some("bytes=0-1023")
+        );
+    }
+
+    #[test]
+    fn pending_media_uses_private_cache_policy_and_forwards_range() {
+        assert!(blob_response_requires_private_cache(
+            false,
+            Some(BlobStatus::Pending),
+            false
+        ));
+        assert_eq!(
+            origin_range_for_request(
+                Some("bytes=0-1023"),
+                false,
+                Some(BlobStatus::Pending),
+                false
+            ),
             Some("bytes=0-1023")
         );
     }
 
     #[test]
     fn origin_range_absent_when_client_sent_no_range() {
-        assert_eq!(origin_range_for_request(None, true), None);
-        assert_eq!(origin_range_for_request(None, false), None);
+        assert_eq!(
+            origin_range_for_request(None, false, Some(BlobStatus::Active), false),
+            None
+        );
+        assert_eq!(
+            origin_range_for_request(None, true, Some(BlobStatus::Active), false),
+            None
+        );
     }
 
     #[test]
