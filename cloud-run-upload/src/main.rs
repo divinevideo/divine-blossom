@@ -1,6 +1,7 @@
 // ABOUTME: Rust Cloud Run service for Blossom blob uploads
 // ABOUTME: Handles Nostr auth validation, streaming upload to GCS, and SHA-256 hashing
 
+mod mp4;
 mod resumable;
 mod thumbnail;
 
@@ -643,31 +644,14 @@ async fn process_upload(
     )
     .await?;
 
-    let mut thumbnail_error: Option<String> = None;
-    // Extract thumbnail for videos (non-blocking - failures don't fail the upload)
-    let thumbnail_url = if thumbnail::is_video_type(&content_type) {
-        match extract_and_upload_thumbnail(
-            &state.gcs_client,
-            &state.config.gcs_bucket,
-            &state.config.cdn_base_url,
-            &sha256_hash,
-            &all_bytes,
-        )
-        .await
-        {
-            Ok(url) => {
-                info!("Generated thumbnail for {}", sha256_hash);
-                Some(url)
-            }
-            Err(e) => {
-                error!("Thumbnail extraction failed for {}: {}", sha256_hash, e);
-                thumbnail_error = Some(e.to_string());
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // The poster is no longer extracted here. Clients supply their own cover
+    // (mobile uploads the frame the user picked and prefers it over ours), and
+    // a request for `{hash}.jpg` that finds nothing in GCS is served by
+    // `GET /thumbnail/:hash` via the edge. Returning the URL keeps it resolvable
+    // for callers that use it; it is generated on first request instead of on
+    // every upload.
+    let thumbnail_url = thumbnail::is_video_type(&content_type)
+        .then(|| format!("{}/{}.jpg", state.config.cdn_base_url, sha256_hash));
 
     let mut probe_error: Option<String> = None;
     // Probe video dimensions (non-blocking - failures don't fail the upload)
@@ -690,7 +674,6 @@ async fn process_upload(
     let derivative_failure = classify_invalid_media_signal(
         &content_type,
         sanitize_error.as_deref(),
-        thumbnail_error.as_deref(),
         probe_error.as_deref(),
     );
 
@@ -805,13 +788,28 @@ async fn process_upload(
     })
 }
 
+/// Whether the upload needs the ffmpeg remux before derivatives can use it.
+///
+/// A video that already carries moov before mdat is web-compatible as-is, so
+/// the remux would only rewrite it into the layout it already has. Clients that
+/// export with faststart — which divine-mobile does on every render path — land
+/// here and skip an ffmpeg process entirely.
+///
+/// Anything we cannot positively classify as faststart still gets sanitized,
+/// including non-MP4 containers and truncated files. That keeps the remux
+/// covering the case it was added for: iPhone captures, which carry moov at the
+/// end alongside the malformed atoms the remux strips.
+fn needs_derivative_sanitize(content_type: &str, bytes: &[u8]) -> bool {
+    thumbnail::is_video_type(content_type) && mp4::is_faststart(bytes) != Some(true)
+}
+
 async fn stream_to_gcs_with_hash(
     client: &GcsClient,
     bucket: &str,
     content_type: &str,
     body: Body,
     owner: &str,
-) -> Result<(String, u64, Vec<u8>, Option<String>)> {
+) -> Result<(String, u64, Bytes, Option<String>)> {
     let mut original_bytes = Vec::new();
 
     // Collect body stream first; original bytes remain the source of truth for hashing/storage.
@@ -821,21 +819,22 @@ async fn stream_to_gcs_with_hash(
         original_bytes.extend_from_slice(&chunk);
     }
 
-    // Keep original bytes immutable for hash/storage integrity.
-    // Derivative generation (thumbnail/probe/transcode) can use sanitized bytes.
-    let mut derivative_bytes = original_bytes.clone();
+    // Keep original bytes immutable for hash/storage integrity. Sharing them as
+    // `Bytes` keeps the later clones refcount bumps instead of full copies.
+    let original_bytes = Bytes::from(original_bytes);
+
+    // Derivative generation (probe/transcode) can use sanitized bytes.
     let mut sanitize_error = None;
 
-    // Sanitize video bytes for derivative processing only.
-    if thumbnail::is_video_type(content_type) {
-        match sanitize_video(&derivative_bytes).await {
+    let derivative_bytes = if needs_derivative_sanitize(content_type, &original_bytes) {
+        match sanitize_video(&original_bytes).await {
             Ok(sanitized) => {
                 info!(
                     "Prepared sanitized derivative bytes: {} -> {} bytes",
-                    derivative_bytes.len(),
+                    original_bytes.len(),
                     sanitized.len(),
                 );
-                derivative_bytes = sanitized;
+                Bytes::from(sanitized)
             }
             Err(e) => {
                 // Non-fatal: user-caused (corrupt upload, missing moov atom, etc.)
@@ -845,9 +844,15 @@ async fn stream_to_gcs_with_hash(
                     e
                 );
                 sanitize_error = Some(e.to_string());
+                original_bytes.clone()
             }
         }
-    }
+    } else {
+        if thumbnail::is_video_type(content_type) {
+            info!("Video is already faststart, skipping the derivative remux");
+        }
+        original_bytes.clone()
+    };
 
     // Hash and store the original uploaded bytes.
     let mut hasher = Sha256::new();
@@ -880,7 +885,7 @@ async fn stream_to_gcs_with_hash(
     };
 
     client
-        .upload_object(&req, Bytes::from(original_bytes.clone()), &upload_type)
+        .upload_object(&req, original_bytes.clone(), &upload_type)
         .await
         .map_err(|e| anyhow!("GCS upload failed: {}", e))?;
 
@@ -905,39 +910,6 @@ async fn stream_to_gcs_with_hash(
         total_size, sha256_hash, owner
     );
     Ok((sha256_hash, total_size, derivative_bytes, sanitize_error))
-}
-
-/// Extract thumbnail from video and upload to GCS
-/// Returns the thumbnail URL on success
-async fn extract_and_upload_thumbnail(
-    client: &GcsClient,
-    bucket: &str,
-    cdn_base_url: &str,
-    hash: &str,
-    video_data: &[u8],
-) -> Result<String> {
-    // Extract thumbnail using ffmpeg
-    let thumb_result = thumbnail::extract_thumbnail(video_data)?;
-
-    // Upload thumbnail to GCS with path: {hash}.jpg (same as video hash but with .jpg extension)
-    // This allows serving via CDN at media.divine.video/{hash}.jpg
-    let thumb_path = format!("{}.jpg", hash);
-
-    let mut media = Media::new(thumb_path.clone());
-    media.content_type = "image/jpeg".into();
-    let upload_type = UploadType::Simple(media);
-    let req = UploadObjectRequest {
-        bucket: bucket.to_string(),
-        ..Default::default()
-    };
-
-    client
-        .upload_object(&req, Bytes::from(thumb_result.data), &upload_type)
-        .await
-        .map_err(|e| anyhow!("GCS thumbnail upload failed: {}", e))?;
-
-    // Return CDN URL for thumbnail - stored at {hash}.jpg, served via CDN
-    Ok(format!("{}/{}.jpg", cdn_base_url, hash))
 }
 
 fn media_source_candidates(hash: &str) -> [String; 3] {
@@ -1076,8 +1048,15 @@ async fn handle_thumbnail_generate(
         );
     }
 
-    // Generate thumbnail
-    let thumb_result = match thumbnail::extract_thumbnail(&video_data) {
+    // Generate thumbnail. `extract_thumbnail` shells out with a synchronous
+    // `Command`, so it must not run on a runtime worker — a cold feed can ask
+    // for many posters at once and would otherwise stall unrelated requests.
+    let extraction = tokio::task::spawn_blocking(move || thumbnail::extract_thumbnail(&video_data))
+        .await
+        .map_err(|e| anyhow!("Thumbnail extraction task panicked: {}", e))
+        .and_then(|result| result);
+
+    let thumb_result = match extraction {
         Ok(result) => result,
         Err(e) => {
             error!("Failed to generate thumbnail for {}: {}", hash, e);
@@ -1096,7 +1075,7 @@ async fn handle_thumbnail_generate(
     // Upload thumbnail to GCS
     let thumb_path = format!("{}.jpg", hash);
     let mut media = Media::new(thumb_path.clone());
-    media.content_type = "image/jpeg".into();
+    media.content_type = thumb_result.content_type.clone().into();
     let upload_type = UploadType::Simple(media);
     let req = UploadObjectRequest {
         bucket: state.config.gcs_bucket.clone(),
@@ -1269,7 +1248,10 @@ async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_invalid_media_signal, media_source_candidates, new_temp_media_path};
+    use super::{
+        classify_invalid_media_signal, media_source_candidates, needs_derivative_sanitize,
+        new_temp_media_path,
+    };
 
     #[test]
     fn temp_media_paths_are_unique_per_request() {
@@ -1299,7 +1281,6 @@ mod tests {
             "video/mp4",
             Some("ffmpeg sanitize failed: moov atom not found"),
             None,
-            None,
         )
         .expect("sanitize failure should mark invalid media");
 
@@ -1313,7 +1294,6 @@ mod tests {
         let signal = classify_invalid_media_signal(
             "video/mp4",
             None,
-            None,
             Some("ffprobe failed: Invalid data found when processing input"),
         )
         .expect("probe failure should mark invalid media");
@@ -1326,15 +1306,64 @@ mod tests {
     }
 
     #[test]
-    fn invalid_media_classification_ignores_thumbnail_only_failures() {
+    fn invalid_media_classification_ignores_non_video_uploads() {
+        // Images never run the derivative pipeline, so a stray error string
+        // must not gate them out of anything.
         let signal = classify_invalid_media_signal(
-            "video/mp4",
-            None,
-            Some("thumbnail extraction failed"),
-            None,
+            "image/jpeg",
+            Some("ffmpeg sanitize failed: moov atom not found"),
+            Some("ffprobe failed: Invalid data found when processing input"),
         );
 
         assert!(signal.is_none());
+    }
+
+    #[test]
+    fn invalid_media_classification_passes_clean_videos() {
+        assert!(classify_invalid_media_signal("video/mp4", None, None).is_none());
+    }
+
+    /// Build a minimal top-level box sequence for the sanitize-gate tests.
+    fn mp4_with_box_order(order: [&[u8; 4]; 2]) -> Vec<u8> {
+        let mut data = Vec::new();
+        for box_type in [b"ftyp", order[0], order[1]] {
+            data.extend((16u32).to_be_bytes());
+            data.extend_from_slice(box_type);
+            data.extend(std::iter::repeat_n(0u8, 8));
+        }
+        data
+    }
+
+    #[test]
+    fn sanitize_gate_skips_videos_that_are_already_faststart() {
+        let faststart = mp4_with_box_order([b"moov", b"mdat"]);
+
+        assert!(!needs_derivative_sanitize("video/mp4", &faststart));
+    }
+
+    #[test]
+    fn sanitize_gate_remuxes_videos_with_trailing_moov() {
+        let trailing_moov = mp4_with_box_order([b"mdat", b"moov"]);
+
+        assert!(needs_derivative_sanitize("video/mp4", &trailing_moov));
+    }
+
+    #[test]
+    fn sanitize_gate_remuxes_videos_it_cannot_classify() {
+        // WebM and anything else we cannot parse must keep going through the
+        // remux — skipping on "unknown" would ship unsanitized bytes onward.
+        let webm = [0x1A, 0x45, 0xDF, 0xA3, 0x01, 0x00, 0x00, 0x00];
+
+        assert!(needs_derivative_sanitize("video/webm", &webm));
+        assert!(needs_derivative_sanitize("video/mp4", &[]));
+    }
+
+    #[test]
+    fn sanitize_gate_ignores_non_video_uploads() {
+        assert!(!needs_derivative_sanitize(
+            "image/jpeg",
+            &[0xFF, 0xD8, 0xFF, 0xE0]
+        ));
     }
 }
 
@@ -1761,7 +1790,6 @@ async fn maybe_trigger_derivatives(
 fn classify_invalid_media_signal(
     content_type: &str,
     sanitize_error: Option<&str>,
-    _thumbnail_error: Option<&str>,
     probe_error: Option<&str>,
 ) -> Option<DerivativeFailureSignal> {
     if !thumbnail::is_video_type(content_type) {
