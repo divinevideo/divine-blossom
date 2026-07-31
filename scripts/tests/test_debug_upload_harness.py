@@ -9,8 +9,10 @@ from scripts.debug_upload_harness import (
     MAX_PROOF_HEADER_BYTES,
     UploadHttpClient,
     build_complete_body,
+    build_parser,
     build_proof_headers,
     chunk_ranges,
+    load_proof_manifest,
     load_proof_json,
     normalize_server_url,
     should_use_resumable,
@@ -112,6 +114,29 @@ class DebugUploadHarnessTests(unittest.TestCase):
 
         self.assertEqual(warnings.getvalue(), "")
 
+    def test_build_proof_headers_uses_raw_manifest_json_when_provided(self) -> None:
+        manifest_json = '{\n  "pgpSignature": "sig",\n  "place": "München"\n}\n'
+        proof = json.loads(manifest_json)
+
+        headers = build_proof_headers(proof, manifest_json=manifest_json)
+
+        self.assertEqual(
+            headers["X-ProofMode-Manifest"],
+            base64.b64encode(manifest_json.encode("utf-8")).decode("ascii"),
+        )
+
+    def test_build_proof_headers_can_disable_budget(self) -> None:
+        proof = {
+            "pgpSignature": "sig",
+            "deviceAttestation": "A" * 54000,
+            "c2paManifestId": "urn:c2pa:manifest",
+        }
+
+        headers = build_proof_headers(proof, max_bytes=0)
+
+        self.assertIn("X-ProofMode-Attestation", headers)
+        self.assertIn("X-ProofMode-Manifest", headers)
+
     def test_summarize_response_truncates_large_bodies(self) -> None:
         summary = summarize_response(
             method="POST",
@@ -135,6 +160,28 @@ class DebugUploadHarnessTests(unittest.TestCase):
         proof = load_proof_json(fixture_path)
         self.assertEqual(proof["deviceAttestation"], {"nonce": "abc123"})
         self.assertEqual(proof["pgpSignature"], "proof-signature")
+
+    def test_load_proof_manifest_retains_raw_json(self) -> None:
+        fixture_path = (
+            Path(__file__).resolve().parent / "fixtures" / "proofmode.json"
+        )
+        proof, manifest_json = load_proof_manifest(fixture_path)
+        self.assertEqual(proof["pgpSignature"], "proof-signature")
+        self.assertEqual(manifest_json, fixture_path.read_text(encoding="utf-8"))
+
+    def test_parser_exposes_proof_header_budget_override(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "--server",
+                "https://media.divine.video",
+                "--auth-header",
+                "Nostr token",
+                "--max-proof-header-bytes",
+                "0",
+            ]
+        )
+
+        self.assertEqual(args.max_proof_header_bytes, 0)
 
     def test_summarize_request_body_hashes_binary_payloads(self) -> None:
         summary = summarize_request_body(
