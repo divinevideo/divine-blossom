@@ -34,10 +34,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     env,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tempfile::NamedTempFile;
+use tokio::sync::Semaphore;
 use tower::Service;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
@@ -965,6 +966,17 @@ async fn download_best_available_media_bytes(
 
 /// On-demand thumbnail generation endpoint
 /// Downloads video from GCS, generates thumbnail, stores it, returns the image
+/// Concurrent on-demand poster extractions allowed per instance.
+///
+/// Each extraction runs a whole ffmpeg process over a temp copy of the video.
+/// `spawn_blocking` alone would let a cold-feed burst launch one per request
+/// up to the blocking pool's size; this bound keeps such a burst from
+/// exhausting the instance's CPU and memory while queued requests wait.
+const MAX_CONCURRENT_THUMBNAIL_EXTRACTIONS: usize = 4;
+
+static THUMBNAIL_EXTRACTION_SLOTS: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_THUMBNAIL_EXTRACTIONS));
+
 async fn handle_thumbnail_generate(
     State(state): State<Arc<AppState>>,
     Path(hash): Path<String>,
@@ -1053,6 +1065,11 @@ async fn handle_thumbnail_generate(
     // Generate thumbnail. `extract_thumbnail` shells out with a synchronous
     // `Command`, so it must not run on a runtime worker — a cold feed can ask
     // for many posters at once and would otherwise stall unrelated requests.
+    // The semaphore bounds how many of those ffmpeg processes run at once.
+    let _permit = THUMBNAIL_EXTRACTION_SLOTS
+        .acquire()
+        .await
+        .expect("the extraction semaphore is never closed");
     let extraction = tokio::task::spawn_blocking(move || thumbnail::extract_thumbnail(&video_data))
         .await
         .map_err(|e| anyhow!("Thumbnail extraction task panicked: {}", e))
