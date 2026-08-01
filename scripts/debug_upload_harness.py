@@ -19,6 +19,23 @@ import urllib.request
 DEFAULT_TIMEOUT_SECONDS = 30
 SUCCESS_STATUSES = {200, 201, 204}
 
+# Combined wire budget for the X-ProofMode-* request headers, mirroring
+# BlossomUploadService.maxProofModeHeaderBytes in divine-mobile.
+#
+# media.divine.video rejects requests whose combined headers exceed 128 KiB
+# over HTTP/1.1 (with a 502) or 64 KiB over HTTP/2 (by closing the connection).
+# A device attestation lands in the request twice — base64 in
+# X-ProofMode-Manifest and again in X-ProofMode-Attestation — so a raw
+# attestation over roughly 47.5 KB busts the limit and replaying such a proof
+# through this harness reproduced the client bug instead of diagnosing it.
+# Android attestation size is device-dependent (it is the
+# X509Certificate.toString() dump of the whole chain), which is why only some
+# devices were affected.
+#
+# No Blossom server reads these headers; the canonical manifest is the
+# proofmode tag on the kind 34236 event.
+MAX_PROOF_HEADER_BYTES = 8192
+
 
 class HarnessError(RuntimeError):
     """Raised when the harness cannot execute a request or parse a response."""
@@ -100,9 +117,15 @@ def should_use_resumable(*, mode: str) -> bool:
     return mode == "resumable"
 
 
-def load_proof_json(path: str | Path) -> dict[str, object]:
+def load_proof_manifest(path: str | Path) -> tuple[dict[str, object], str]:
     proof_path = Path(path)
-    return json.loads(proof_path.read_text(encoding="utf-8"))
+    manifest_json = proof_path.read_text(encoding="utf-8")
+    return json.loads(manifest_json), manifest_json
+
+
+def load_proof_json(path: str | Path) -> dict[str, object]:
+    proof, _manifest_json = load_proof_manifest(path)
+    return proof
 
 
 def _encode_proof_header_value(value: object) -> str:
@@ -110,23 +133,71 @@ def _encode_proof_header_value(value: object) -> str:
     return base64.b64encode(string_value.encode("utf-8")).decode("ascii")
 
 
-def build_proof_headers(proof: dict[str, object]) -> dict[str, str]:
-    headers: dict[str, str] = {}
-    manifest_json = json.dumps(proof, separators=(",", ":"))
-    headers["X-ProofMode-Manifest"] = base64.b64encode(
-        manifest_json.encode("utf-8")
-    ).decode("ascii")
-    if "pgpSignature" in proof:
-        headers["X-ProofMode-Signature"] = _encode_proof_header_value(
-            proof["pgpSignature"]
-        )
-    if "deviceAttestation" in proof:
-        headers["X-ProofMode-Attestation"] = _encode_proof_header_value(
-            proof["deviceAttestation"]
-        )
+def build_proof_headers(
+    proof: dict[str, object],
+    *,
+    manifest_json: str | None = None,
+    max_bytes: int = MAX_PROOF_HEADER_BYTES,
+    warn: TextIO | None = None,
+) -> dict[str, str]:
+    """Build the X-ProofMode-* headers, capped at ``max_bytes`` on the wire.
+
+    Ordered cheapest-and-most-identifying first so a proof that busts the
+    budget still carries the C2PA id and the signature. See
+    ``MAX_PROOF_HEADER_BYTES`` for why an oversized proof is dropped.
+    Pass ``max_bytes=0`` to disable the cap for limit probing.
+    """
+    if manifest_json is None:
+        manifest_json = json.dumps(proof, separators=(",", ":"))
+    candidates: list[tuple[str, str]] = []
+
     c2pa_manifest_id = proof.get("c2paManifestId") or proof.get("c2pa_manifest_id")
     if c2pa_manifest_id is not None:
-        headers["X-ProofMode-C2PA"] = _encode_proof_header_value(c2pa_manifest_id)
+        candidates.append(
+            ("X-ProofMode-C2PA", _encode_proof_header_value(c2pa_manifest_id))
+        )
+    if "pgpSignature" in proof:
+        candidates.append(
+            ("X-ProofMode-Signature", _encode_proof_header_value(proof["pgpSignature"]))
+        )
+    # Paired with the signature: without the key the signature cannot be
+    # verified from headers alone.
+    if "publicKey" in proof:
+        candidates.append(
+            ("X-ProofMode-PublicKey", _encode_proof_header_value(proof["publicKey"]))
+        )
+    if "deviceAttestation" in proof:
+        candidates.append(
+            (
+                "X-ProofMode-Attestation",
+                _encode_proof_header_value(proof["deviceAttestation"]),
+            )
+        )
+    candidates.append(
+        (
+            "X-ProofMode-Manifest",
+            base64.b64encode(manifest_json.encode("utf-8")).decode("ascii"),
+        )
+    )
+
+    headers: dict[str, str] = {}
+    used_bytes = 0
+    dropped: list[str] = []
+    for name, value in candidates:
+        # "name: value\r\n" is what actually counts against the edge budget.
+        wire_bytes = len(name) + len(value) + 4
+        if max_bytes > 0 and used_bytes + wire_bytes > max_bytes:
+            dropped.append(f"{name} ({len(value)}B)")
+            continue
+        used_bytes += wire_bytes
+        headers[name] = value
+
+    if dropped and warn is not None:
+        print(
+            f"warning: ProofMode headers over the {max_bytes} byte budget; "
+            f"sending {used_bytes} bytes and dropping {', '.join(dropped)}",
+            file=warn,
+        )
     return headers
 
 
@@ -567,6 +638,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to a ProofMode manifest JSON file",
     )
     parser.add_argument(
+        "--max-proof-header-bytes",
+        type=int,
+        default=MAX_PROOF_HEADER_BYTES,
+        help=(
+            "Combined X-ProofMode-* wire budget in bytes; "
+            "use 0 to send all proof headers"
+        ),
+    )
+    parser.add_argument(
         "--complete-only",
         action="store_true",
         help="Replay only POST /upload/{id}/complete for an existing session",
@@ -598,6 +678,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    if args.max_proof_header_bytes < 0:
+        raise HarnessError("--max-proof-header-bytes must be non-negative")
+
     if args.complete_only:
         if not args.upload_id:
             raise HarnessError("--complete-only requires --upload-id")
@@ -620,11 +703,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         validate_args(args)
         server_url = normalize_server_url(args.server)
-        proof_headers = (
-            build_proof_headers(load_proof_json(args.proof_json))
-            if args.proof_json is not None
-            else None
-        )
+        proof_headers = None
+        if args.proof_json is not None:
+            proof, manifest_json = load_proof_manifest(args.proof_json)
+            proof_headers = build_proof_headers(
+                proof,
+                manifest_json=manifest_json,
+                max_bytes=args.max_proof_header_bytes,
+                warn=sys.stderr,
+            )
         client = UploadHttpClient(timeout_seconds=args.timeout_seconds)
 
         if args.complete_only:

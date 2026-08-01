@@ -42,6 +42,9 @@ jobs:
         working-directory: cloud-run-transcoder
         run: python3 -m unittest discover -s tests -p 'test_*.py'
 
+      - name: Run script Python tests
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
       - name: Run clippy
         run: cargo clippy --locked --all-targets --all-features
 
