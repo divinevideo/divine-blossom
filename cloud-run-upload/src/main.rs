@@ -585,7 +585,16 @@ async fn handle_resumable_complete(
         .complete_session(&upload_id, &auth_event.pubkey)
         .await
     {
-        Ok(response) => {
+        Ok(mut response) => {
+            // Parity with PUT /upload: the poster resolves lazily through the
+            // edge, so this path can advertise the same URL instead of a
+            // `null` clients must special-case.
+            response.thumbnail_url = video_thumbnail_url(
+                &state.config.cdn_base_url,
+                &response.content_type,
+                &response.sha256,
+            );
+
             maybe_trigger_derivatives(
                 state.config.transcoder_url.as_deref(),
                 state.config.transcriber_url.as_deref(),
@@ -651,8 +660,8 @@ async fn process_upload(
     // `GET /thumbnail/:hash` via the edge. Returning the URL keeps it resolvable
     // for callers that use it; it is generated on first request instead of on
     // every upload.
-    let thumbnail_url = thumbnail::is_video_type(&content_type)
-        .then(|| format!("{}/{}.jpg", state.config.cdn_base_url, sha256_hash));
+    let thumbnail_url =
+        video_thumbnail_url(&state.config.cdn_base_url, &content_type, &sha256_hash);
 
     let mut probe_error: Option<String> = None;
     // Probe video dimensions (non-blocking - failures don't fail the upload)
@@ -787,6 +796,15 @@ async fn process_upload(
         transcript_error_message,
         transcript_terminal,
     })
+}
+
+/// CDN URL where a video's poster is (or will be) served.
+///
+/// The object may not exist yet: the edge proxies a `{hash}.jpg` miss to
+/// `GET /thumbnail/:hash`, which generates and stores the poster on first
+/// request. Non-video uploads have no poster and get `None`.
+fn video_thumbnail_url(cdn_base_url: &str, content_type: &str, sha256: &str) -> Option<String> {
+    thumbnail::is_video_type(content_type).then(|| format!("{}/{}.jpg", cdn_base_url, sha256))
 }
 
 /// Whether the upload needs the ffmpeg remux before derivatives can use it.
@@ -1269,7 +1287,7 @@ async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
 mod tests {
     use super::{
         classify_invalid_media_signal, media_source_candidates, needs_derivative_sanitize,
-        new_temp_media_path,
+        new_temp_media_path, video_thumbnail_url,
     };
 
     #[test]
@@ -1383,6 +1401,20 @@ mod tests {
             "image/jpeg",
             &[0xFF, 0xD8, 0xFF, 0xE0]
         ));
+    }
+
+    #[test]
+    fn thumbnail_url_is_only_advertised_for_videos() {
+        let hash = "0a828bd76eb27c56dee1e970a2e73fe2b2e1ca4443550bbf6e0ee3aa9273e421";
+
+        assert_eq!(
+            video_thumbnail_url("https://cdn.example.com", "video/mp4", hash),
+            Some(format!("https://cdn.example.com/{hash}.jpg"))
+        );
+        assert_eq!(
+            video_thumbnail_url("https://cdn.example.com", "image/jpeg", hash),
+            None
+        );
     }
 }
 
