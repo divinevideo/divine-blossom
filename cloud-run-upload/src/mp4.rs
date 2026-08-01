@@ -43,7 +43,7 @@ pub fn is_faststart(data: &[u8]) -> Option<bool> {
             _ => {}
         }
 
-        let size = match declared {
+        let (size, header_len) = match declared {
             // `size == 0` means the box runs to end of file, so nothing we care
             // about can follow it.
             0 => return None,
@@ -52,14 +52,15 @@ pub fn is_faststart(data: &[u8]) -> Option<bool> {
                     return None;
                 }
                 let large = start + BOX_HEADER_LEN as usize;
-                u64::from_be_bytes(data[large..large + 8].try_into().ok()?)
+                let size = u64::from_be_bytes(data[large..large + 8].try_into().ok()?);
+                (size, BOX_HEADER_LEN + LARGE_SIZE_LEN)
             }
-            n => n,
+            n => (n, BOX_HEADER_LEN),
         };
 
-        // A box must at least contain its own header; anything smaller would
-        // stall or rewind the scan.
-        if size < BOX_HEADER_LEN {
+        // A box must at least contain its own header — 16 bytes in the
+        // large-size form; anything smaller would stall or rewind the scan.
+        if size < header_len {
             return None;
         }
 
@@ -181,6 +182,21 @@ mod tests {
         // A declared size below the 8-byte header would never advance.
         data.extend(4u32.to_be_bytes());
         data.extend(b"junk");
+
+        assert_eq!(is_faststart(&data), None);
+    }
+
+    #[test]
+    fn returns_none_on_undersized_large_size_box_rather_than_rewinding() {
+        let mut data = ftyp();
+        // The large-size form spends 16 bytes on its own header. A declared
+        // size of 12 used to advance the scan only 12 bytes, landing it on
+        // bytes the file controls — which here spell a fake `moov`.
+        data.extend(1u32.to_be_bytes());
+        data.extend(b"junk");
+        data.extend(12u64.to_be_bytes());
+        data.extend(b"moov");
+        data.extend(boxed(b"mdat", 16));
 
         assert_eq!(is_faststart(&data), None);
     }
