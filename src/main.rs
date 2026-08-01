@@ -3395,7 +3395,13 @@ fn should_record_upload_service_transcode_failure(
     current_status: Option<TranscodeStatus>,
     incoming_error_code: Option<&str>,
 ) -> bool {
-    incoming_error_code.is_some() && current_status != Some(TranscodeStatus::Complete)
+    // Never stomp a derivative that is already Complete, and never interrupt one
+    // that is currently Processing — the in-flight run's webhook is authoritative.
+    incoming_error_code.is_some()
+        && !matches!(
+            current_status,
+            Some(TranscodeStatus::Complete) | Some(TranscodeStatus::Processing)
+        )
 }
 
 fn should_reset_transcode_failure_on_clean_upload(
@@ -3412,7 +3418,13 @@ fn should_record_upload_service_transcript_failure(
     current_status: Option<TranscriptStatus>,
     incoming_error_code: Option<&str>,
 ) -> bool {
-    incoming_error_code.is_some() && current_status != Some(TranscriptStatus::Complete)
+    // Never stomp a derivative that is already Complete, and never interrupt one
+    // that is currently Processing — the in-flight run's webhook is authoritative.
+    incoming_error_code.is_some()
+        && !matches!(
+            current_status,
+            Some(TranscriptStatus::Complete) | Some(TranscriptStatus::Processing)
+        )
 }
 
 fn should_reset_transcript_failure_on_clean_upload(
@@ -3482,7 +3494,10 @@ fn publish_upload_service_upload(
             metadata.transcode_last_attempt_at = derivative_failure_recorded_at.clone();
             metadata.transcode_retry_after = None;
             metadata.transcode_attempt_count = metadata.transcode_attempt_count.max(1);
-            metadata.transcode_terminal = transcode_terminal;
+            // A previously recorded terminal verdict (e.g. from the transcoder
+            // webhook) stays terminal — a reupload of the same bytes is not
+            // evidence that the media became transcodable.
+            metadata.transcode_terminal = metadata.transcode_terminal || transcode_terminal;
         } else if should_reset_transcode_failure_on_clean_upload(
             &metadata.mime_type,
             metadata.transcode_status,
@@ -3507,7 +3522,8 @@ fn publish_upload_service_upload(
             metadata.transcript_last_attempt_at = derivative_failure_recorded_at.clone();
             metadata.transcript_retry_after = None;
             metadata.transcript_attempt_count = metadata.transcript_attempt_count.max(1);
-            metadata.transcript_terminal = transcript_terminal;
+            // See transcode note above: an existing terminal verdict is sticky.
+            metadata.transcript_terminal = metadata.transcript_terminal || transcript_terminal;
         } else if should_reset_transcript_failure_on_clean_upload(
             &metadata.mime_type,
             metadata.transcript_status,
@@ -6125,6 +6141,18 @@ mod tests {
         ));
         assert!(!should_record_upload_service_transcript_failure(
             Some(TranscriptStatus::Complete),
+            Some("invalid_media")
+        ));
+    }
+
+    #[test]
+    fn upload_service_dedupe_failure_does_not_stomp_in_flight_derivatives() {
+        assert!(!should_record_upload_service_transcode_failure(
+            Some(TranscodeStatus::Processing),
+            Some("invalid_media")
+        ));
+        assert!(!should_record_upload_service_transcript_failure(
+            Some(TranscriptStatus::Processing),
             Some("invalid_media")
         ));
     }
