@@ -8,7 +8,9 @@ Tasks by setting these Cloud Run env vars:
 - `STATUS_QUEUE_NAME=derivative-status`
 
 Run `cloud-run-transcoder/setup-status-queue.sh` before enabling the flag. The
-script creates or updates the queue with `--max-concurrent-dispatches=1`.
+script uses the same `GCP_PROJECT_ID`, `STATUS_QUEUE_LOCATION`, and
+`STATUS_QUEUE_NAME` values as `cloud-run-transcoder/deploy.sh`, and creates or
+updates the queue with `--max-concurrent-dispatches=1`.
 Serialized dispatch is part of the ordering contract: the edge receiver stores
 `transcode_generation` and `transcript_generation` on blob metadata and ignores
 callbacks whose generation is older than the stored value.
@@ -30,6 +32,11 @@ not update metadata.
 `cloud-run-transcoder/deploy.sh` owns the env var names and defaults the flag to
 `false`, so direct POST remains the rollback path. A production deploy should
 set `STATUS_QUEUE_ENABLED=true` only after the queue and IAM grant are present.
+If the transcoder must roll back to an image that does not send `generation`,
+set the Fastly config-store key `REQUIRE_DERIVATIVE_STATUS_GENERATION=false`
+before or alongside that rollback. Without that receiver-side kill switch,
+already-versioned blobs keep acknowledging missing-generation callbacks without
+updating metadata.
 
 The transcoder makes three total `CreateTask` attempts. If all attempts fail it logs
 `status_callback_enqueue_failed=true` and falls back to the direct POST path;
@@ -46,7 +53,8 @@ Tasks accepts some callbacks and rejects later ones. Treat
 
 Paused queues require separate monitoring. Cloud Tasks accepts `CreateTask` for
 a paused queue, so enqueue-failure logs do not catch that state. Alert on queue
-state, queue depth, and oldest task age before enabling the flag.
+state, queue depth, oldest task age, and tasks exhausted after `--max-attempts`
+before enabling the flag.
 
 The queue serializes transcode and transcript status callbacks together, so
 `--max-concurrent-dispatches=1` is also the project-wide dispatch ceiling for

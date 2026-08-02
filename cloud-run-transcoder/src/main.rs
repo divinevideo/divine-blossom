@@ -32,7 +32,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -256,6 +256,7 @@ impl Config {
                 .filter(|v| !v.is_empty()),
             status_queue_enabled: parse_bool(&mut lookup, "STATUS_QUEUE_ENABLED", false),
             status_queue_location: lookup("STATUS_QUEUE_LOCATION")
+                .or_else(|| lookup("GCP_REGION"))
                 .filter(|v| !v.trim().is_empty())
                 .unwrap_or_else(|| "us-central1".to_string()),
             status_queue_name: lookup("STATUS_QUEUE_NAME")
@@ -2971,8 +2972,8 @@ async fn fetch_gcp_access_token() -> std::result::Result<String, ProviderFailure
     // surface a `timed_out=true` failure so the per-provider retry loop
     // in `transcribe_audio_via_provider` treats it as transient — a
     // metadata blip should not collapse straight into the Gemini fallback.
-    let metadata_summary = last_metadata_error
-        .unwrap_or_else(|| "metadata server unreachable".to_string());
+    let metadata_summary =
+        last_metadata_error.unwrap_or_else(|| "metadata server unreachable".to_string());
 
     match tokio::process::Command::new("gcloud")
         .args(["auth", "print-access-token"])
@@ -3228,9 +3229,7 @@ pub(crate) fn identity_token_cache_for_audience(audience: &str) -> &'static Acce
 /// Fetch a Cloud Run identity token (OIDC) for `audience`. Cached per
 /// audience for 50 minutes. On metadata-server failure we apply the same
 /// 3-attempt retry as `fetch_gcp_access_token`.
-async fn fetch_gcp_identity_token(
-    audience: &str,
-) -> std::result::Result<String, ProviderFailure> {
+async fn fetch_gcp_identity_token(audience: &str) -> std::result::Result<String, ProviderFailure> {
     let cache = identity_token_cache_for_audience(audience);
     if let Some(token) = cache.get(Instant::now()) {
         return Ok(token);
@@ -4004,6 +4003,15 @@ mod tests {
     }
 
     #[test]
+    fn status_queue_location_defaults_to_gcp_region() {
+        let config = Config::from_lookup(|key| match key {
+            "GCP_REGION" => Some("us-east1".to_string()),
+            _ => None,
+        });
+        assert_eq!(config.status_queue_location, "us-east1");
+    }
+
+    #[test]
     fn attach_generation_adds_ordering_field() {
         let mut payload = serde_json::json!({"sha256": "abc123", "status": "complete"});
         attach_generation(&mut payload, 1_700_000_000_123);
@@ -4630,11 +4638,47 @@ mod tests {
     fn loop_guard_passes_long_unique_text() {
         let mut s = String::new();
         for word in [
-            "The", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "near", "the",
-            "river", "where", "the", "old", "mill", "stood", "for", "centuries", "until", "the",
-            "great", "flood", "carried", "it", "downstream", "into", "the", "harbor", "where",
-            "fishermen", "still", "remember", "its", "broken", "wheel", "rotting", "in", "the",
-            "salt", "spray",
+            "The",
+            "quick",
+            "brown",
+            "fox",
+            "jumps",
+            "over",
+            "the",
+            "lazy",
+            "dog",
+            "near",
+            "the",
+            "river",
+            "where",
+            "the",
+            "old",
+            "mill",
+            "stood",
+            "for",
+            "centuries",
+            "until",
+            "the",
+            "great",
+            "flood",
+            "carried",
+            "it",
+            "downstream",
+            "into",
+            "the",
+            "harbor",
+            "where",
+            "fishermen",
+            "still",
+            "remember",
+            "its",
+            "broken",
+            "wheel",
+            "rotting",
+            "in",
+            "the",
+            "salt",
+            "spray",
         ]
         .iter()
         .cycle()
@@ -5779,6 +5823,7 @@ fn build_transcode_status_webhook_payload(
 }
 
 static LAST_STATUS_GENERATION: AtomicU64 = AtomicU64::new(0);
+static STATUS_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 fn next_status_generation() -> u64 {
     let now = SystemTime::now()
@@ -5847,6 +5892,15 @@ fn status_task_id(label: &str, hash: &str, generation: u64) -> String {
     format!("{}-{}-{}", label, hash, generation)
 }
 
+fn status_http_client() -> &'static reqwest::Client {
+    STATUS_HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("failed to build bounded status HTTP client")
+    })
+}
+
 async fn deliver_status_payload(
     config: &Config,
     hash: &str,
@@ -5857,10 +5911,13 @@ async fn deliver_status_payload(
     generation: u64,
 ) {
     attach_generation(&mut payload, generation);
+    let client = status_http_client();
 
     if config.status_queue_enabled {
-        match enqueue_status_task_with_retry(config, target_url, label, hash, generation, &payload)
-            .await
+        match enqueue_status_task_with_retry(
+            client, config, target_url, label, hash, generation, &payload,
+        )
+        .await
         {
             Ok(()) => info!("{} status enqueued for {}: {}", label, hash, status),
             Err(e) => {
@@ -5868,16 +5925,18 @@ async fn deliver_status_payload(
                     "Failed to enqueue {} status task for {}: {}. status_callback_enqueue_failed=true",
                     label, hash, e
                 );
-                post_status_payload(config, target_url, label, hash, status, &payload).await;
+                post_status_payload(client, config, target_url, label, hash, status, &payload)
+                    .await;
             }
         }
         return;
     }
 
-    post_status_payload(config, target_url, label, hash, status, &payload).await;
+    post_status_payload(client, config, target_url, label, hash, status, &payload).await;
 }
 
 async fn post_status_payload(
+    client: &reqwest::Client,
     config: &Config,
     target_url: &str,
     label: &str,
@@ -5885,10 +5944,6 @@ async fn post_status_payload(
     status: &str,
     payload: &serde_json::Value,
 ) {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
     let mut request = client.post(target_url).json(&payload);
     if let Some(secret) = &config.webhook_secret {
         request = request.header("Authorization", format!("Bearer {}", secret));
@@ -5908,12 +5963,16 @@ async fn post_status_payload(
             );
         }
         Err(e) => {
-            error!("{} status webhook request failed for {}: {}", label, hash, e);
+            error!(
+                "{} status webhook request failed for {}: {}",
+                label, hash, e
+            );
         }
     }
 }
 
 async fn enqueue_status_task_with_retry(
+    client: &reqwest::Client,
     config: &Config,
     target_url: &str,
     label: &str,
@@ -5923,7 +5982,9 @@ async fn enqueue_status_task_with_retry(
 ) -> anyhow::Result<()> {
     let mut last_error: Option<anyhow::Error> = None;
     for attempt in 0..3 {
-        match enqueue_status_task(config, target_url, label, hash, generation, payload).await {
+        match enqueue_status_task(client, config, target_url, label, hash, generation, payload)
+            .await
+        {
             Ok(()) => return Ok(()),
             Err(error) => {
                 last_error = Some(error);
@@ -5937,6 +5998,7 @@ async fn enqueue_status_task_with_retry(
 }
 
 async fn enqueue_status_task(
+    client: &reqwest::Client,
     config: &Config,
     target_url: &str,
     label: &str,
@@ -5952,10 +6014,7 @@ async fn enqueue_status_task(
         "projects/{}/locations/{}/queues/{}",
         config.gcp_project_id, config.status_queue_location, config.status_queue_name
     );
-    let create_url = format!(
-        "https://cloudtasks.googleapis.com/v2/{}/tasks",
-        queue_path
-    );
+    let create_url = format!("https://cloudtasks.googleapis.com/v2/{}/tasks", queue_path);
     let task_id = status_task_id(label, hash, generation);
     let body = build_cloud_tasks_task_body(
         &queue_path,
@@ -5965,10 +6024,6 @@ async fn enqueue_status_task(
         payload,
     );
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
     let resp = client
         .post(&create_url)
         .header("Authorization", format!("Bearer {}", token))

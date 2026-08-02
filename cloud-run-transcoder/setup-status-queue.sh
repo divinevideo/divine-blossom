@@ -5,56 +5,58 @@
 set -euo pipefail
 
 PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project)}"
+GCP_PROJECT_ID="${GCP_PROJECT_ID:-${PROJECT_ID}}"
 REGION="${REGION:-us-central1}"
-QUEUE_NAME="${QUEUE_NAME:-derivative-status}"
-PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" --format="value(projectNumber)")"
+STATUS_QUEUE_LOCATION="${STATUS_QUEUE_LOCATION:-${REGION}}"
+STATUS_QUEUE_NAME="${STATUS_QUEUE_NAME:-derivative-status}"
+PROJECT_NUMBER="$(gcloud projects describe "${GCP_PROJECT_ID}" --format="value(projectNumber)")"
 SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-${PROJECT_NUMBER}-compute@developer.gserviceaccount.com}"
 
 gcloud services enable cloudtasks.googleapis.com \
-  --project "${PROJECT_ID}"
+  --project "${GCP_PROJECT_ID}"
 
-if gcloud tasks queues describe "${QUEUE_NAME}" \
-  --project "${PROJECT_ID}" \
-  --location "${REGION}" >/dev/null 2>&1; then
-  gcloud tasks queues update "${QUEUE_NAME}" \
-    --project "${PROJECT_ID}" \
-    --location "${REGION}" \
+if gcloud tasks queues describe "${STATUS_QUEUE_NAME}" \
+  --project "${GCP_PROJECT_ID}" \
+  --location "${STATUS_QUEUE_LOCATION}" >/dev/null 2>&1; then
+  gcloud tasks queues update "${STATUS_QUEUE_NAME}" \
+    --project "${GCP_PROJECT_ID}" \
+    --location "${STATUS_QUEUE_LOCATION}" \
     --max-attempts=10 \
     --min-backoff=5s \
     --max-backoff=600s \
     --max-concurrent-dispatches=1
 else
-  gcloud tasks queues create "${QUEUE_NAME}" \
-    --project "${PROJECT_ID}" \
-    --location "${REGION}" \
+  gcloud tasks queues create "${STATUS_QUEUE_NAME}" \
+    --project "${GCP_PROJECT_ID}" \
+    --location "${STATUS_QUEUE_LOCATION}" \
     --max-attempts=10 \
     --min-backoff=5s \
     --max-backoff=600s \
     --max-concurrent-dispatches=1
 fi
 
-QUEUE_STATE="$(gcloud tasks queues describe "${QUEUE_NAME}" \
-  --project "${PROJECT_ID}" \
-  --location "${REGION}" \
+QUEUE_STATE="$(gcloud tasks queues describe "${STATUS_QUEUE_NAME}" \
+  --project "${GCP_PROJECT_ID}" \
+  --location "${STATUS_QUEUE_LOCATION}" \
   --format="value(state)")"
 if [ "${QUEUE_STATE}" = "PAUSED" ]; then
-  gcloud tasks queues resume "${QUEUE_NAME}" \
-    --project "${PROJECT_ID}" \
-    --location "${REGION}"
-  QUEUE_STATE="$(gcloud tasks queues describe "${QUEUE_NAME}" \
-    --project "${PROJECT_ID}" \
-    --location "${REGION}" \
+  gcloud tasks queues resume "${STATUS_QUEUE_NAME}" \
+    --project "${GCP_PROJECT_ID}" \
+    --location "${STATUS_QUEUE_LOCATION}"
+  QUEUE_STATE="$(gcloud tasks queues describe "${STATUS_QUEUE_NAME}" \
+    --project "${GCP_PROJECT_ID}" \
+    --location "${STATUS_QUEUE_LOCATION}" \
     --format="value(state)")"
 fi
 
 if [ "${QUEUE_STATE}" != "RUNNING" ]; then
-  echo "Queue ${QUEUE_NAME} is ${QUEUE_STATE}, expected RUNNING" >&2
+  echo "Queue ${STATUS_QUEUE_NAME} is ${QUEUE_STATE}, expected RUNNING" >&2
   exit 1
 fi
 
-gcloud tasks queues add-iam-policy-binding "${QUEUE_NAME}" \
-  --project "${PROJECT_ID}" \
-  --location "${REGION}" \
+gcloud tasks queues add-iam-policy-binding "${STATUS_QUEUE_NAME}" \
+  --project "${GCP_PROJECT_ID}" \
+  --location "${STATUS_QUEUE_LOCATION}" \
   --member="serviceAccount:${SERVICE_ACCOUNT}" \
   --role=roles/cloudtasks.enqueuer \
   --condition=None

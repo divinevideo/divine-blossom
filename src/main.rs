@@ -448,10 +448,16 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
             }
             None => {
                 if !is_admin {
-                    eprintln!("[ACCESS] thumbnail hash={} metadata=None denied (non-admin)", video_hash);
+                    eprintln!(
+                        "[ACCESS] thumbnail hash={} metadata=None denied (non-admin)",
+                        video_hash
+                    );
                     return Err(BlossomError::NotFound("Blob not found".into()));
                 }
-                eprintln!("[ACCESS] thumbnail hash={} metadata=None allowed (admin bypass)", video_hash);
+                eprintln!(
+                    "[ACCESS] thumbnail hash={} metadata=None allowed (admin bypass)",
+                    video_hash
+                );
             }
         }
 
@@ -518,10 +524,16 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         }
         None => {
             if !is_admin {
-                eprintln!("[ACCESS] hash={} metadata=None denied (no metadata, non-admin)", hash);
+                eprintln!(
+                    "[ACCESS] hash={} metadata=None denied (no metadata, non-admin)",
+                    hash
+                );
                 return Err(BlossomError::NotFound("Blob not found".into()));
             }
-            eprintln!("[ACCESS] hash={} metadata=None allowed (admin bypass)", hash);
+            eprintln!(
+                "[ACCESS] hash={} metadata=None allowed (admin bypass)",
+                hash
+            );
         }
     }
 
@@ -2077,10 +2089,16 @@ fn handle_get_subtitle_by_hash(req: Request, path: &str) -> Result<Response> {
         }
         None => {
             if !is_admin {
-                eprintln!("[ACCESS] subtitle hash={} metadata=None denied (non-admin)", hash);
+                eprintln!(
+                    "[ACCESS] subtitle hash={} metadata=None denied (non-admin)",
+                    hash
+                );
                 return Err(BlossomError::NotFound("Video hash not found".into()));
             }
-            eprintln!("[ACCESS] subtitle hash={} metadata=None allowed (admin bypass)", hash);
+            eprintln!(
+                "[ACCESS] subtitle hash={} metadata=None allowed (admin bypass)",
+                hash
+            );
         }
     }
 
@@ -5237,28 +5255,23 @@ fn validate_transcoder_webhook(req: &Request, label: &str) -> Result<()> {
     }
 }
 
-fn stale_generation_response(sha256: &str, incoming: Option<u64>, stored: Option<u64>) -> Response {
-    let response = serde_json::json!({
-        "success": true,
-        "sha256": sha256,
-        "ignored": "stale_generation",
-        "incoming_generation": incoming,
-        "stored_generation": stored
-    });
-    let mut resp = json_response(StatusCode::OK, &response);
-    add_cors_headers(&mut resp);
-    resp
+fn derivative_generation_guard_enabled() -> bool {
+    !matches!(
+        crate::admin::get_config("REQUIRE_DERIVATIVE_STATUS_GENERATION").as_deref(),
+        Some("false") | Some("0")
+    )
 }
 
-fn duplicate_generation_response(
+fn ignored_generation_response(
     sha256: &str,
+    reason: &str,
     incoming: Option<u64>,
     stored: Option<u64>,
 ) -> Response {
     let response = serde_json::json!({
         "success": true,
         "sha256": sha256,
-        "ignored": "duplicate_generation",
+        "ignored": reason,
         "incoming_generation": incoming,
         "stored_generation": stored
     });
@@ -5267,28 +5280,58 @@ fn duplicate_generation_response(
     resp
 }
 
-fn missing_generation_response(sha256: &str, stored: Option<u64>) -> Response {
+fn derivative_reconciliation_response(sha256: &str, label: &str, status: &str) -> Response {
     let response = serde_json::json!({
         "success": true,
         "sha256": sha256,
-        "ignored": "missing_generation",
-        "stored_generation": stored
+        "reconciliation": "pending",
+        "message": format!("{} status accepted for later reconciliation", label),
+        "status": status
     });
-    let mut resp = json_response(StatusCode::OK, &response);
+    let mut resp = json_response(StatusCode::ACCEPTED, &response);
     add_cors_headers(&mut resp);
     resp
 }
 
-fn malformed_generation_response(sha256: &str, stored: Option<u64>) -> Response {
-    let response = serde_json::json!({
-        "success": true,
-        "sha256": sha256,
-        "ignored": "malformed_generation",
-        "stored_generation": stored
-    });
-    let mut resp = json_response(StatusCode::OK, &response);
-    add_cors_headers(&mut resp);
-    resp
+fn generation_ignore_response(
+    outcome: StatusUpdateOutcome,
+    sha256: &str,
+    label: &str,
+) -> Option<Response> {
+    let (reason, incoming, stored, log_detail) = match outcome {
+        StatusUpdateOutcome::Applied => return None,
+        StatusUpdateOutcome::StaleGeneration { incoming, stored } => (
+            "stale_generation",
+            incoming,
+            stored,
+            format!("incoming gen {:?} < stored {:?}", incoming, stored),
+        ),
+        StatusUpdateOutcome::DuplicateGeneration { incoming, stored } => (
+            "duplicate_generation",
+            incoming,
+            stored,
+            format!("incoming gen {:?} == stored {:?}", incoming, stored),
+        ),
+        StatusUpdateOutcome::MissingGeneration { stored } => (
+            "missing_generation",
+            None,
+            stored,
+            format!("stored gen {:?}", stored),
+        ),
+        StatusUpdateOutcome::MalformedGeneration { stored } => (
+            "malformed_generation",
+            None,
+            stored,
+            format!("stored gen {:?}", stored),
+        ),
+    };
+    eprintln!(
+        "[{}] Ignoring {} callback for {}: {}",
+        label, reason, sha256, log_detail
+    );
+    Some(ignored_generation_response(
+        sha256, reason, incoming, stored,
+    ))
 }
 
 /// POST /admin/transcode-status - Webhook from divine-transcoder service
@@ -5331,39 +5374,14 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
             terminal: Some(parsed.terminal),
             increment_attempt_count: matches!(parsed.status, TranscodeStatus::Failed),
             generation: parsed.generation,
-            require_generation_after_versioned: true,
+            require_generation_after_versioned: derivative_generation_guard_enabled(),
             malformed_generation: parsed.malformed_generation,
         },
     ) {
-        Ok(StatusUpdateOutcome::StaleGeneration { incoming, stored }) => {
-            eprintln!(
-                "[TRANSCODE] Ignoring stale callback for {}: incoming gen {:?} < stored {:?}",
-                sha256, incoming, stored
-            );
-            Ok(stale_generation_response(sha256, incoming, stored))
-        }
-        Ok(StatusUpdateOutcome::DuplicateGeneration { incoming, stored }) => {
-            eprintln!(
-                "[TRANSCODE] Ignoring duplicate callback for {}: incoming gen {:?} == stored {:?}",
-                sha256, incoming, stored
-            );
-            Ok(duplicate_generation_response(sha256, incoming, stored))
-        }
-        Ok(StatusUpdateOutcome::MissingGeneration { stored }) => {
-            eprintln!(
-                "[TRANSCODE] Ignoring missing-generation callback for {} after stored gen {:?}",
-                sha256, stored
-            );
-            Ok(missing_generation_response(sha256, stored))
-        }
-        Ok(StatusUpdateOutcome::MalformedGeneration { stored }) => {
-            eprintln!(
-                "[TRANSCODE] Ignoring malformed-generation callback for {} with stored gen {:?}",
-                sha256, stored
-            );
-            Ok(malformed_generation_response(sha256, stored))
-        }
-        Ok(StatusUpdateOutcome::Applied) => {
+        Ok(outcome) => {
+            if let Some(resp) = generation_ignore_response(outcome, sha256, "TRANSCODE") {
+                return Ok(resp);
+            }
             if let Some(ref d) = parsed.dim {
                 eprintln!(
                     "[TRANSCODE] Updated blob {} to transcode status {:?} with dim {}",
@@ -5401,15 +5419,18 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
             Ok(resp)
         }
         Err(BlossomError::NotFound(_)) => {
-            eprintln!("[TRANSCODE] Blob {} not found", sha256);
-            let response = serde_json::json!({
-                "success": false,
-                "sha256": sha256,
-                "error": "Blob not found"
-            });
-            let mut resp = json_response(StatusCode::NOT_FOUND, &response);
-            add_cors_headers(&mut resp);
-            Ok(resp)
+            eprintln!(
+                "[TRANSCODE] Reconciliation pending for missing blob {} status={:?} error_code={:?} retry_after={:?}",
+                sha256,
+                parsed.status,
+                parsed.error_code,
+                parsed.retry_after_epoch_secs
+            );
+            Ok(derivative_reconciliation_response(
+                sha256,
+                "Transcode",
+                &format!("{:?}", parsed.status).to_lowercase(),
+            ))
         }
         Err(e) => {
             eprintln!("[TRANSCODE] Failed to update blob {}: {:?}", sha256, e);
@@ -5450,39 +5471,14 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
             terminal: Some(parsed.terminal),
             increment_attempt_count: matches!(parsed.status, TranscriptStatus::Failed),
             generation: parsed.generation,
-            require_generation_after_versioned: true,
+            require_generation_after_versioned: derivative_generation_guard_enabled(),
             malformed_generation: parsed.malformed_generation,
         },
     ) {
-        Ok(StatusUpdateOutcome::StaleGeneration { incoming, stored }) => {
-            eprintln!(
-                "[TRANSCRIPT] Ignoring stale callback for {}: incoming gen {:?} < stored {:?}",
-                sha256, incoming, stored
-            );
-            Ok(stale_generation_response(sha256, incoming, stored))
-        }
-        Ok(StatusUpdateOutcome::DuplicateGeneration { incoming, stored }) => {
-            eprintln!(
-                "[TRANSCRIPT] Ignoring duplicate callback for {}: incoming gen {:?} == stored {:?}",
-                sha256, incoming, stored
-            );
-            Ok(duplicate_generation_response(sha256, incoming, stored))
-        }
-        Ok(StatusUpdateOutcome::MissingGeneration { stored }) => {
-            eprintln!(
-                "[TRANSCRIPT] Ignoring missing-generation callback for {} after stored gen {:?}",
-                sha256, stored
-            );
-            Ok(missing_generation_response(sha256, stored))
-        }
-        Ok(StatusUpdateOutcome::MalformedGeneration { stored }) => {
-            eprintln!(
-                "[TRANSCRIPT] Ignoring malformed-generation callback for {} with stored gen {:?}",
-                sha256, stored
-            );
-            Ok(malformed_generation_response(sha256, stored))
-        }
-        Ok(StatusUpdateOutcome::Applied) => {
+        Ok(outcome) => {
+            if let Some(resp) = generation_ignore_response(outcome, sha256, "TRANSCRIPT") {
+                return Ok(resp);
+            }
             eprintln!(
                 "[TRANSCRIPT] Updated blob {} to transcript status {:?}",
                 sha256, parsed.status
@@ -5562,15 +5558,11 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
                 parsed.error_code,
                 parsed.retry_after_epoch_secs
             );
-            let response = serde_json::json!({
-                "success": true,
-                "sha256": sha256,
-                "reconciliation": "pending",
-                "message": "Transcript status accepted for later reconciliation"
-            });
-            let mut resp = json_response(StatusCode::ACCEPTED, &response);
-            add_cors_headers(&mut resp);
-            Ok(resp)
+            Ok(derivative_reconciliation_response(
+                sha256,
+                "Transcript",
+                &format!("{:?}", parsed.status).to_lowercase(),
+            ))
         }
         Err(e) => {
             eprintln!("[TRANSCRIPT] Failed to update blob {}: {:?}", sha256, e);
@@ -5977,7 +5969,7 @@ pub(crate) fn purge_edge_cache(surrogate_key: &str) {
 
     let services: &[(&str, &str)] = &[
         ("ML7R82HKfmTaqTpHExIDVN", "VCL"),     // divine.video website
-        ("pOvEEWykEbpnylqst1KTrR", "Compute"),  // media.divine.video (Blossom)
+        ("pOvEEWykEbpnylqst1KTrR", "Compute"), // media.divine.video (Blossom)
     ];
 
     for &(service_id, label) in services {
@@ -5999,7 +5991,9 @@ pub(crate) fn purge_edge_cache(surrogate_key: &str) {
                 } else {
                     eprintln!(
                         "[PURGE] {} purge failed for key={}: HTTP {}",
-                        label, surrogate_key, status.as_u16()
+                        label,
+                        surrogate_key,
+                        status.as_u16()
                     );
                 }
             }
@@ -6150,25 +6144,25 @@ fn infer_mime_from_path(path: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-	use super::{
-		backfill_batch_cursor, classify_audio_reuse_availability, decide_transcode_fetch_action,
-		decide_transcript_fetch_action, duplicate_generation_response, error_response,
-		is_alias_only_audio_blob, is_quality_variant_path, malformed_generation_response,
-		missing_generation_response, parse_quality_variant_path,
-		parse_transcode_status_webhook_payload, parse_transcript_status_webhook_payload,
-		parse_upload_service_response, should_delete_derived_audio_blob,
-		should_eagerly_trigger_transcription, should_record_upload_service_transcode_failure,
-		should_record_upload_service_transcript_failure,
-		should_reset_transcode_failure_on_clean_upload,
-		should_reset_transcript_failure_on_clean_upload, should_set_audio_content_length,
-		stale_generation_response, trusted_upload_service_terminal_derivative_error,
-		upload_capability_headers, upload_control_host, upload_exposed_headers,
-		upload_from_resumable_completion, AudioReuseAvailability, DerivativeObservation,
-		TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState,
-	};
-	use crate::blossom::{ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus};
-	use crate::error::{BlossomError, Result as BlossomResult};
-	use fastly::http::StatusCode;
+    use super::{
+        backfill_batch_cursor, classify_audio_reuse_availability, decide_transcode_fetch_action,
+        decide_transcript_fetch_action, derivative_reconciliation_response, error_response,
+        ignored_generation_response, is_alias_only_audio_blob, is_quality_variant_path,
+        parse_quality_variant_path, parse_transcode_status_webhook_payload,
+        parse_transcript_status_webhook_payload, parse_upload_service_response,
+        should_delete_derived_audio_blob, should_eagerly_trigger_transcription,
+        should_record_upload_service_transcode_failure,
+        should_record_upload_service_transcript_failure,
+        should_reset_transcode_failure_on_clean_upload,
+        should_reset_transcript_failure_on_clean_upload, should_set_audio_content_length,
+        trusted_upload_service_terminal_derivative_error, upload_capability_headers,
+        upload_control_host, upload_exposed_headers, upload_from_resumable_completion,
+        AudioReuseAvailability, DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction,
+        TranscriptPendingState,
+    };
+    use crate::blossom::{ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus};
+    use crate::error::{BlossomError, Result as BlossomResult};
+    use fastly::http::StatusCode;
 
     #[test]
     fn upload_service_response_records_failure_fields_but_clamps_broad_invalid_media_terminal() {
@@ -6550,9 +6544,9 @@ mod tests {
     }
 
     #[test]
-    fn stale_generation_response_returns_successful_ignore() {
+    fn ignored_generation_response_returns_successful_ignore() {
         let hash = "50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a";
-        let resp = stale_generation_response(hash, Some(3), Some(5));
+        let resp = ignored_generation_response(hash, "stale_generation", Some(3), Some(5));
 
         assert_eq!(resp.get_status(), StatusCode::OK);
         assert_eq!(
@@ -6565,24 +6559,9 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_generation_response_returns_successful_ignore() {
+    fn ignored_generation_response_can_omit_incoming_generation() {
         let hash = "50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a";
-        let resp = duplicate_generation_response(hash, Some(5), Some(5));
-
-        assert_eq!(resp.get_status(), StatusCode::OK);
-        assert_eq!(
-            resp.get_header_str("Access-Control-Allow-Origin"),
-            Some("*")
-        );
-        assert!(resp
-            .into_body_str()
-            .contains("\"ignored\":\"duplicate_generation\""));
-    }
-
-    #[test]
-    fn missing_generation_response_returns_successful_ignore() {
-        let hash = "50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a";
-        let resp = missing_generation_response(hash, Some(5));
+        let resp = ignored_generation_response(hash, "missing_generation", None, Some(5));
 
         assert_eq!(resp.get_status(), StatusCode::OK);
         assert!(resp
@@ -6591,14 +6570,14 @@ mod tests {
     }
 
     #[test]
-    fn malformed_generation_response_returns_successful_ignore() {
+    fn derivative_reconciliation_response_acknowledges_missing_blob() {
         let hash = "50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a";
-        let resp = malformed_generation_response(hash, Some(5));
+        let resp = derivative_reconciliation_response(hash, "Transcode", "failed");
 
-        assert_eq!(resp.get_status(), StatusCode::OK);
+        assert_eq!(resp.get_status(), StatusCode::ACCEPTED);
         assert!(resp
             .into_body_str()
-            .contains("\"ignored\":\"malformed_generation\""));
+            .contains("\"reconciliation\":\"pending\""));
     }
 
     #[test]
@@ -6861,14 +6840,8 @@ mod tests {
         let resp = error_response(&BlossomError::NotFound("Blob not found".into()));
 
         assert_eq!(resp.get_status(), StatusCode::NOT_FOUND);
-        assert_eq!(
-            resp.get_header_str("Cache-Control"),
-            Some("no-store"),
-        );
-        assert_eq!(
-            resp.get_header_str("Surrogate-Control"),
-            Some("max-age=60"),
-        );
+        assert_eq!(resp.get_header_str("Cache-Control"), Some("no-store"),);
+        assert_eq!(resp.get_header_str("Surrogate-Control"), Some("max-age=60"),);
     }
 
     #[test]
