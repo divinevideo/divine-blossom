@@ -33,12 +33,13 @@ use k256::schnorr::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     env,
     sync::{Arc, LazyLock},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tempfile::NamedTempFile;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 use tower::Service;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
@@ -982,8 +983,6 @@ async fn download_best_available_media_bytes(
     ))
 }
 
-/// On-demand thumbnail generation endpoint
-/// Downloads video from GCS, generates thumbnail, stores it, returns the image
 /// Concurrent on-demand poster extractions allowed per instance.
 ///
 /// Each extraction runs a whole ffmpeg process over a temp copy of the video.
@@ -991,10 +990,19 @@ async fn download_best_available_media_bytes(
 /// up to the blocking pool's size; this bound keeps such a burst from
 /// exhausting the instance's CPU and memory while queued requests wait.
 const MAX_CONCURRENT_THUMBNAIL_EXTRACTIONS: usize = 4;
+const THUMBNAIL_EXTRACTION_WAIT: Duration = Duration::from_secs(10);
+const THUMBNAIL_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 static THUMBNAIL_EXTRACTION_SLOTS: LazyLock<Semaphore> =
     LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_THUMBNAIL_EXTRACTIONS));
+static THUMBNAIL_IN_FLIGHT: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static THUMBNAIL_NEGATIVE_CACHE: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// On-demand thumbnail generation endpoint.
+///
+/// Downloads video from GCS, generates thumbnail, stores it, returns the image.
 async fn handle_thumbnail_generate(
     State(state): State<Arc<AppState>>,
     Path(hash): Path<String>,
@@ -1013,41 +1021,41 @@ async fn handle_thumbnail_generate(
     }
 
     let hash = hash.to_lowercase();
+    generate_thumbnail_response(state, hash).await
+}
 
+async fn generate_thumbnail_response(state: Arc<AppState>, hash: String) -> Response {
     // First check if thumbnail already exists
     let thumb_path = format!("{}.jpg", hash);
-    let thumb_exists = state
-        .gcs_client
-        .get_object(&GetObjectRequest {
-            bucket: state.config.gcs_bucket.clone(),
-            object: thumb_path.clone(),
-            ..Default::default()
-        })
-        .await
-        .is_ok();
+    if let Some(response) = download_existing_thumbnail(&state, &thumb_path).await {
+        return response;
+    }
 
-    if thumb_exists {
-        // Thumbnail already exists, download and return it
-        match state
-            .gcs_client
-            .download_object(
-                &GetObjectRequest {
-                    bucket: state.config.gcs_bucket.clone(),
-                    object: thumb_path,
-                    ..Default::default()
-                },
-                &DownloadRange::default(),
-            )
-            .await
-        {
-            Ok(data) => {
-                return (StatusCode::OK, [(header::CONTENT_TYPE, "image/jpeg")], data)
-                    .into_response();
+    if thumbnail_generation_recently_failed(&hash).await {
+        return thumbnail_generation_unavailable_response("Thumbnail generation previously failed");
+    }
+
+    let generation_lock = thumbnail_generation_lock(&hash).await;
+    let _generation_guard =
+        match tokio::time::timeout(THUMBNAIL_EXTRACTION_WAIT, generation_lock.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                warn!(
+                    "Timed out waiting for in-flight thumbnail generation for {}",
+                    hash
+                );
+                return thumbnail_generation_busy_response();
             }
-            Err(e) => {
-                error!("Failed to download existing thumbnail: {}", e);
-            }
-        }
+        };
+
+    // Another request may have generated or failed this poster while we waited.
+    if let Some(response) = download_existing_thumbnail(&state, &thumb_path).await {
+        finish_thumbnail_generation(&hash, &generation_lock).await;
+        return response;
+    }
+    if thumbnail_generation_recently_failed(&hash).await {
+        finish_thumbnail_generation(&hash, &generation_lock).await;
+        return thumbnail_generation_unavailable_response("Thumbnail generation previously failed");
     }
 
     // Download the original blob, or fall back to the best available HLS transport stream.
@@ -1061,6 +1069,7 @@ async fn handle_thumbnail_generate(
         Ok(result) => result,
         Err(e) => {
             error!("Failed to download video {}: {}", hash, e);
+            finish_thumbnail_generation(&hash, &generation_lock).await;
             return (
                 StatusCode::NOT_FOUND,
                 [(header::CONTENT_TYPE, "application/json")],
@@ -1084,28 +1093,39 @@ async fn handle_thumbnail_generate(
     // `Command`, so it must not run on a runtime worker — a cold feed can ask
     // for many posters at once and would otherwise stall unrelated requests.
     // The semaphore bounds how many of those ffmpeg processes run at once.
-    let _permit = THUMBNAIL_EXTRACTION_SLOTS
-        .acquire()
-        .await
-        .expect("the extraction semaphore is never closed");
-    let extraction = tokio::task::spawn_blocking(move || thumbnail::extract_thumbnail(&video_data))
-        .await
-        .map_err(|e| anyhow!("Thumbnail extraction task panicked: {}", e))
-        .and_then(|result| result);
+    let extraction = match tokio::time::timeout(
+        THUMBNAIL_EXTRACTION_WAIT,
+        THUMBNAIL_EXTRACTION_SLOTS.acquire(),
+    )
+    .await
+    {
+        Ok(permit) => {
+            let permit = permit.expect("the extraction semaphore is never closed");
+            let extraction =
+                tokio::task::spawn_blocking(move || thumbnail::extract_thumbnail(&video_data))
+                    .await
+                    .map_err(|e| anyhow!("Thumbnail extraction task panicked: {}", e))
+                    .and_then(|result| result);
+            drop(permit);
+            extraction
+        }
+        Err(_) => {
+            warn!(
+                "Timed out waiting for thumbnail extraction slot for {}",
+                hash
+            );
+            finish_thumbnail_generation(&hash, &generation_lock).await;
+            return thumbnail_generation_busy_response();
+        }
+    };
 
     let thumb_result = match extraction {
         Ok(result) => result,
         Err(e) => {
             error!("Failed to generate thumbnail for {}: {}", hash, e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [(header::CONTENT_TYPE, "application/json")],
-                Json(ErrorResponse {
-                    error: "Failed to generate thumbnail".to_string(),
-                })
-                .into_response(),
-            )
-                .into_response();
+            remember_thumbnail_generation_failure(&hash).await;
+            finish_thumbnail_generation(&hash, &generation_lock).await;
+            return thumbnail_generation_unavailable_response("Failed to generate thumbnail");
         }
     };
 
@@ -1129,12 +1149,117 @@ async fn handle_thumbnail_generate(
     }
 
     info!("Generated on-demand thumbnail for {}", hash);
+    clear_thumbnail_generation_failure(&hash).await;
+    finish_thumbnail_generation(&hash, &generation_lock).await;
 
     // Return the thumbnail image
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "image/jpeg")],
         thumb_result.data,
+    )
+        .into_response()
+}
+
+async fn download_existing_thumbnail(state: &Arc<AppState>, thumb_path: &str) -> Option<Response> {
+    let thumb_exists = state
+        .gcs_client
+        .get_object(&GetObjectRequest {
+            bucket: state.config.gcs_bucket.clone(),
+            object: thumb_path.to_string(),
+            ..Default::default()
+        })
+        .await
+        .is_ok();
+
+    if !thumb_exists {
+        return None;
+    }
+
+    match state
+        .gcs_client
+        .download_object(
+            &GetObjectRequest {
+                bucket: state.config.gcs_bucket.clone(),
+                object: thumb_path.to_string(),
+                ..Default::default()
+            },
+            &DownloadRange::default(),
+        )
+        .await
+    {
+        Ok(data) => {
+            Some((StatusCode::OK, [(header::CONTENT_TYPE, "image/jpeg")], data).into_response())
+        }
+        Err(e) => {
+            error!("Failed to download existing thumbnail: {}", e);
+            None
+        }
+    }
+}
+
+async fn thumbnail_generation_lock(hash: &str) -> Arc<Mutex<()>> {
+    let mut in_flight = THUMBNAIL_IN_FLIGHT.lock().await;
+    in_flight
+        .entry(hash.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+async fn finish_thumbnail_generation(hash: &str, lock: &Arc<Mutex<()>>) {
+    let mut in_flight = THUMBNAIL_IN_FLIGHT.lock().await;
+    if in_flight
+        .get(hash)
+        .is_some_and(|current| Arc::ptr_eq(current, lock) && Arc::strong_count(lock) == 2)
+    {
+        in_flight.remove(hash);
+    }
+}
+
+async fn thumbnail_generation_recently_failed(hash: &str) -> bool {
+    let now = Instant::now();
+    let mut cache = THUMBNAIL_NEGATIVE_CACHE.lock().await;
+    match cache.get(hash) {
+        Some(expires_at) if *expires_at > now => true,
+        Some(_) => {
+            cache.remove(hash);
+            false
+        }
+        None => false,
+    }
+}
+
+async fn remember_thumbnail_generation_failure(hash: &str) {
+    THUMBNAIL_NEGATIVE_CACHE.lock().await.insert(
+        hash.to_string(),
+        Instant::now() + THUMBNAIL_NEGATIVE_CACHE_TTL,
+    );
+}
+
+async fn clear_thumbnail_generation_failure(hash: &str) {
+    THUMBNAIL_NEGATIVE_CACHE.lock().await.remove(hash);
+}
+
+fn thumbnail_generation_busy_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::CONTENT_TYPE, "application/json")],
+        Json(ErrorResponse {
+            error: "Thumbnail generation is busy".to_string(),
+        })
+        .into_response(),
+    )
+        .into_response()
+}
+
+fn thumbnail_generation_unavailable_response(message: &str) -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        [(header::CONTENT_TYPE, "application/json")],
+        Json(ErrorResponse {
+            error: message.to_string(),
+        })
+        .into_response(),
     )
         .into_response()
 }

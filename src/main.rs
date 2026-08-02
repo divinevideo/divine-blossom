@@ -638,7 +638,11 @@ fn handle_head_blob(path: &str) -> Result<Response> {
             }
         }
 
-        let resp = download_thumbnail(&thumbnail_key)?;
+        let resp = match download_thumbnail(&thumbnail_key) {
+            Ok(resp) => resp,
+            Err(BlossomError::NotFound(_)) => generate_thumbnail_on_demand(thumb_hash)?,
+            Err(e) => return Err(e),
+        };
         let content_length = resp
             .get_header_str("x-goog-stored-content-length")
             .or_else(|| resp.get_header_str("content-length"))
@@ -2795,6 +2799,14 @@ fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
         StatusCode::OK => Ok(resp),
         StatusCode::NOT_FOUND => Err(BlossomError::NotFound(
             "Video not found for thumbnail generation".into(),
+        )),
+        status if status == StatusCode::from_u16(422).unwrap() => {
+            Err(BlossomError::UnprocessableEntity(
+                "Thumbnail cannot be generated for this video".into(),
+            ))
+        }
+        StatusCode::SERVICE_UNAVAILABLE => Err(BlossomError::StorageError(
+            "Thumbnail generation is busy".into(),
         )),
         status => Err(BlossomError::StorageError(format!(
             "Thumbnail generation failed with status: {}",
