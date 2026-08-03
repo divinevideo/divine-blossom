@@ -7,7 +7,7 @@ use crate::blossom::{
 use crate::error::{BlossomError, Result};
 use fastly::cache::simple as simple_cache;
 use fastly::kv_store::{KVStore, KVStoreError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// TTL for cached metadata (5 minutes) — short because moderation status can change
 const METADATA_CACHE_TTL: Duration = Duration::from_secs(300);
@@ -263,12 +263,16 @@ pub fn update_blob_status(hash: &str, status: BlobStatus) -> Result<()> {
 
 /// Update transcode status for a video blob
 pub fn update_transcode_status(hash: &str, status: crate::blossom::TranscodeStatus) -> Result<()> {
+    let generation = Some(edge_transcode_status_generation(status));
     update_transcode_status_with_metadata(
         hash,
         status,
         None,
         None,
-        TranscodeMetadataUpdate::default(),
+        TranscodeMetadataUpdate {
+            generation,
+            ..TranscodeMetadataUpdate::default()
+        },
     )?;
     Ok(())
 }
@@ -310,13 +314,34 @@ fn stale_generation(incoming: Option<u64>, stored: Option<u64>) -> bool {
     matches!((incoming, stored), (Some(incoming), Some(stored)) if incoming < stored)
 }
 
-fn duplicate_failed_generation(
-    incoming: Option<u64>,
-    stored: Option<u64>,
-    increment_attempt_count: bool,
-) -> bool {
-    increment_attempt_count
-        && matches!((incoming, stored), (Some(incoming), Some(stored)) if incoming == stored)
+fn transcode_status_event_sequence(status: crate::blossom::TranscodeStatus) -> u64 {
+    match status {
+        crate::blossom::TranscodeStatus::Pending
+        | crate::blossom::TranscodeStatus::Processing => 0,
+        crate::blossom::TranscodeStatus::Complete | crate::blossom::TranscodeStatus::Failed => 1,
+    }
+}
+
+fn status_generation_from_ms(timestamp_ms: u64, event_sequence: u64) -> u64 {
+    timestamp_ms
+        .checked_mul(10)
+        .and_then(|base| base.checked_add(event_sequence))
+        .unwrap_or(u64::MAX)
+}
+
+fn current_generation_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
+fn edge_transcode_status_generation(status: crate::blossom::TranscodeStatus) -> u64 {
+    status_generation_from_ms(current_generation_ms(), transcode_status_event_sequence(status))
+}
+
+fn duplicate_generation(incoming: Option<u64>, stored: Option<u64>) -> bool {
+    matches!((incoming, stored), (Some(incoming), Some(stored)) if incoming == stored)
 }
 
 fn generation_rejection(
@@ -324,7 +349,7 @@ fn generation_rejection(
     stored: Option<u64>,
     require_generation_after_versioned: bool,
     malformed_generation: bool,
-    increment_attempt_count: bool,
+    _increment_attempt_count: bool,
 ) -> Option<StatusUpdateOutcome> {
     if malformed_generation {
         return Some(StatusUpdateOutcome::MalformedGeneration { stored });
@@ -335,7 +360,7 @@ fn generation_rejection(
     if stale_generation(incoming, stored) {
         return Some(StatusUpdateOutcome::StaleGeneration { incoming, stored });
     }
-    if duplicate_failed_generation(incoming, stored, increment_attempt_count) {
+    if duplicate_generation(incoming, stored) {
         return Some(StatusUpdateOutcome::DuplicateGeneration { incoming, stored });
     }
     None
@@ -1342,7 +1367,8 @@ pub fn delete_audio_source_refs(audio_hash: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        duplicate_failed_generation, generation_rejection, stale_generation, StatusUpdateOutcome,
+        duplicate_generation, generation_rejection, stale_generation, status_generation_from_ms,
+        transcode_status_event_sequence, StatusUpdateOutcome,
     };
 
     #[test]
@@ -1356,13 +1382,34 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_failed_generation_requires_equal_known_generation_and_increment() {
-        assert!(duplicate_failed_generation(Some(5), Some(5), true));
-        assert!(!duplicate_failed_generation(Some(4), Some(5), true));
-        assert!(!duplicate_failed_generation(Some(6), Some(5), true));
-        assert!(!duplicate_failed_generation(Some(5), Some(5), false));
-        assert!(!duplicate_failed_generation(None, Some(5), true));
-        assert!(!duplicate_failed_generation(Some(5), None, true));
+    fn duplicate_generation_requires_equal_known_generation() {
+        assert!(duplicate_generation(Some(5), Some(5)));
+        assert!(!duplicate_generation(Some(4), Some(5)));
+        assert!(!duplicate_generation(Some(6), Some(5)));
+        assert!(!duplicate_generation(None, Some(5)));
+        assert!(!duplicate_generation(Some(5), None));
+    }
+
+    #[test]
+    fn edge_transcode_generation_uses_callback_event_ordering() {
+        let timestamp_ms = 1_700_000_000_123;
+        assert_eq!(
+            transcode_status_event_sequence(crate::blossom::TranscodeStatus::Processing),
+            0
+        );
+        assert_eq!(
+            transcode_status_event_sequence(crate::blossom::TranscodeStatus::Complete),
+            1
+        );
+        assert!(
+            status_generation_from_ms(
+                timestamp_ms,
+                transcode_status_event_sequence(crate::blossom::TranscodeStatus::Processing),
+            ) < status_generation_from_ms(
+                timestamp_ms,
+                transcode_status_event_sequence(crate::blossom::TranscodeStatus::Complete),
+            )
+        );
     }
 
     #[test]
@@ -1375,6 +1422,17 @@ mod tests {
         assert_eq!(
             generation_rejection(None, Some(5), false, false, false),
             None
+        );
+    }
+
+    #[test]
+    fn generation_rejection_blocks_equal_generation_for_any_status() {
+        assert_eq!(
+            generation_rejection(Some(5), Some(5), true, false, false),
+            Some(StatusUpdateOutcome::DuplicateGeneration {
+                incoming: Some(5),
+                stored: Some(5),
+            })
         );
     }
 

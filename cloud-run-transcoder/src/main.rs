@@ -2972,8 +2972,8 @@ async fn fetch_gcp_access_token() -> std::result::Result<String, ProviderFailure
     // surface a `timed_out=true` failure so the per-provider retry loop
     // in `transcribe_audio_via_provider` treats it as transient — a
     // metadata blip should not collapse straight into the Gemini fallback.
-    let metadata_summary =
-        last_metadata_error.unwrap_or_else(|| "metadata server unreachable".to_string());
+    let metadata_summary = last_metadata_error
+        .unwrap_or_else(|| "metadata server unreachable".to_string());
 
     match tokio::process::Command::new("gcloud")
         .args(["auth", "print-access-token"])
@@ -3229,7 +3229,9 @@ pub(crate) fn identity_token_cache_for_audience(audience: &str) -> &'static Acce
 /// Fetch a Cloud Run identity token (OIDC) for `audience`. Cached per
 /// audience for 50 minutes. On metadata-server failure we apply the same
 /// 3-attempt retry as `fetch_gcp_access_token`.
-async fn fetch_gcp_identity_token(audience: &str) -> std::result::Result<String, ProviderFailure> {
+async fn fetch_gcp_identity_token(
+    audience: &str,
+) -> std::result::Result<String, ProviderFailure> {
     let cache = identity_token_cache_for_audience(audience);
     if let Some(token) = cache.get(Instant::now()) {
         return Ok(token);
@@ -3916,6 +3918,7 @@ mod tests {
         attach_generation, build_cloud_tasks_task_body, build_transcode_status_webhook_payload,
         classify_audio_extract_error, constant_time_eq, contains_instruction_echo,
         decide_transcript_lock_action, ensure_transcribe_audio_size,
+        enqueue_status_task_request, enqueue_status_task_request_with_retry,
         identity_token_cache_for_audience, is_empty_transcript_normalize_error,
         is_implausible_text_density, is_loop_hallucination, is_retryable_provider_failure,
         next_status_generation, normalize_transcript_to_vtt, parakeet_request_url,
@@ -3923,11 +3926,53 @@ mod tests {
         should_drop_low_signal_transcript, status_event_generation, status_task_id,
         token_fetch_retry_delay, transcript_drop_reason, transcription_response_format,
         AccessTokenCache, AudioAnalysis, AudioExtractErrorKind, Config, ParsedVtt,
-        TranscriptConfidence, TranscriptDropReason, TranscriptLockAction, TranscriptLockState,
-        TranscriptLockStatus, VideoInfo, MAX_TRANSCRIBE_AUDIO_BYTES, STATUS_EVENT_PROCESSING,
-        STATUS_EVENT_TERMINAL,
+        StatusTaskRequest, TranscriptConfidence, TranscriptDropReason, TranscriptLockAction,
+        TranscriptLockState, TranscriptLockStatus, VideoInfo, MAX_TRANSCRIBE_AUDIO_BYTES,
+        STATUS_EVENT_PROCESSING, STATUS_EVENT_TERMINAL,
     };
-    use std::time::{Duration, Instant};
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        thread,
+        time::{Duration, Instant},
+    };
+
+    fn spawn_status_server(
+        statuses: Vec<u16>,
+    ) -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&request_count);
+        let handle = thread::spawn(move || {
+            for status in statuses {
+                let (mut stream, _) = listener.accept().expect("accept test request");
+                count.fetch_add(1, Ordering::SeqCst);
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = [0_u8; 8192];
+                let _ = stream.read(&mut buf);
+                let reason = match status {
+                    200 => "OK",
+                    409 => "Conflict",
+                    500 => "Internal Server Error",
+                    502 => "Bad Gateway",
+                    _ => "Status",
+                };
+                let response = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+                    status, reason
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write test response");
+            }
+        });
+        (url, request_count, handle)
+    }
 
     #[test]
     fn transcribe_audio_size_guard_rejects_empty_and_oversize() {
@@ -4120,6 +4165,72 @@ mod tests {
         assert!(body["task"]["httpRequest"]["headers"]
             .get("Authorization")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn enqueue_status_task_request_treats_conflict_as_success() {
+        let (create_url, request_count, server) = spawn_status_server(vec![409]);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let payload = serde_json::json!({
+            "sha256": "abc123",
+            "status": "complete",
+            "generation": 42_u64
+        });
+
+        let hash = "a".repeat(64);
+        let request = StatusTaskRequest {
+            create_url: &create_url,
+            queue_path: "projects/proj/locations/us-central1/queues/derivative-status",
+            target_url: "https://edge.example/admin/transcode-status",
+            label: "transcode",
+            hash: &hash,
+            generation: 42,
+            payload: &payload,
+            token: "access-token",
+            webhook_secret: Some("webhook-secret"),
+        };
+
+        let result = enqueue_status_task_request(&client, &request).await;
+
+        assert!(result.is_ok());
+        server.join().expect("server thread should finish");
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn enqueue_status_task_request_retries_create_task_failures() {
+        let (create_url, request_count, server) = spawn_status_server(vec![500, 502, 200]);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let payload = serde_json::json!({
+            "sha256": "abc123",
+            "status": "processing",
+            "generation": 42_u64
+        });
+
+        let hash = "a".repeat(64);
+        let request = StatusTaskRequest {
+            create_url: &create_url,
+            queue_path: "projects/proj/locations/us-central1/queues/derivative-status",
+            target_url: "https://edge.example/admin/transcode-status",
+            label: "transcode",
+            hash: &hash,
+            generation: 42,
+            payload: &payload,
+            token: "access-token",
+            webhook_secret: None,
+        };
+
+        let result = enqueue_status_task_request_with_retry(&client, &request).await;
+
+        assert!(result.is_ok());
+        server.join().expect("server thread should finish");
+        assert_eq!(request_count.load(Ordering::SeqCst), 3);
     }
 
     #[test]
@@ -4638,47 +4749,11 @@ mod tests {
     fn loop_guard_passes_long_unique_text() {
         let mut s = String::new();
         for word in [
-            "The",
-            "quick",
-            "brown",
-            "fox",
-            "jumps",
-            "over",
-            "the",
-            "lazy",
-            "dog",
-            "near",
-            "the",
-            "river",
-            "where",
-            "the",
-            "old",
-            "mill",
-            "stood",
-            "for",
-            "centuries",
-            "until",
-            "the",
-            "great",
-            "flood",
-            "carried",
-            "it",
-            "downstream",
-            "into",
-            "the",
-            "harbor",
-            "where",
-            "fishermen",
-            "still",
-            "remember",
-            "its",
-            "broken",
-            "wheel",
-            "rotting",
-            "in",
-            "the",
-            "salt",
-            "spray",
+            "The", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "near",
+            "the", "river", "where", "the", "old", "mill", "stood", "for", "centuries",
+            "until", "the", "great", "flood", "carried", "it", "downstream", "into", "the",
+            "harbor", "where", "fishermen", "still", "remember", "its", "broken", "wheel",
+            "rotting", "in", "the", "salt", "spray",
         ]
         .iter()
         .cycle()
@@ -5980,11 +6055,44 @@ async fn enqueue_status_task_with_retry(
     generation: u64,
     payload: &serde_json::Value,
 ) -> anyhow::Result<()> {
+    let token = fetch_gcp_access_token()
+        .await
+        .map_err(|e| anyhow!("access token: {:?}", e))?;
+    let queue_path = cloud_tasks_queue_path(config);
+    let create_url = cloud_tasks_create_url(&queue_path);
+    let request = StatusTaskRequest {
+        create_url: &create_url,
+        queue_path: &queue_path,
+        target_url,
+        label,
+        hash,
+        generation,
+        payload,
+        token: &token,
+        webhook_secret: config.webhook_secret.as_deref(),
+    };
+    enqueue_status_task_request_with_retry(client, &request).await
+}
+
+struct StatusTaskRequest<'a> {
+    create_url: &'a str,
+    queue_path: &'a str,
+    target_url: &'a str,
+    label: &'a str,
+    hash: &'a str,
+    generation: u64,
+    payload: &'a serde_json::Value,
+    token: &'a str,
+    webhook_secret: Option<&'a str>,
+}
+
+async fn enqueue_status_task_request_with_retry(
+    client: &reqwest::Client,
+    request: &StatusTaskRequest<'_>,
+) -> anyhow::Result<()> {
     let mut last_error: Option<anyhow::Error> = None;
     for attempt in 0..3 {
-        match enqueue_status_task(client, config, target_url, label, hash, generation, payload)
-            .await
-        {
+        match enqueue_status_task_request(client, request).await {
             Ok(()) => return Ok(()),
             Err(error) => {
                 last_error = Some(error);
@@ -5997,36 +6105,33 @@ async fn enqueue_status_task_with_retry(
     Err(last_error.unwrap_or_else(|| anyhow!("create task failed without an error")))
 }
 
-async fn enqueue_status_task(
-    client: &reqwest::Client,
-    config: &Config,
-    target_url: &str,
-    label: &str,
-    hash: &str,
-    generation: u64,
-    payload: &serde_json::Value,
-) -> anyhow::Result<()> {
-    let token = fetch_gcp_access_token()
-        .await
-        .map_err(|e| anyhow!("access token: {:?}", e))?;
-
-    let queue_path = format!(
+fn cloud_tasks_queue_path(config: &Config) -> String {
+    format!(
         "projects/{}/locations/{}/queues/{}",
         config.gcp_project_id, config.status_queue_location, config.status_queue_name
-    );
-    let create_url = format!("https://cloudtasks.googleapis.com/v2/{}/tasks", queue_path);
-    let task_id = status_task_id(label, hash, generation);
+    )
+}
+
+fn cloud_tasks_create_url(queue_path: &str) -> String {
+    format!("https://cloudtasks.googleapis.com/v2/{}/tasks", queue_path)
+}
+
+async fn enqueue_status_task_request(
+    client: &reqwest::Client,
+    request: &StatusTaskRequest<'_>,
+) -> anyhow::Result<()> {
+    let task_id = status_task_id(request.label, request.hash, request.generation);
     let body = build_cloud_tasks_task_body(
-        &queue_path,
+        request.queue_path,
         &task_id,
-        target_url,
-        config.webhook_secret.as_deref(),
-        payload,
+        request.target_url,
+        request.webhook_secret,
+        request.payload,
     );
 
     let resp = client
-        .post(&create_url)
-        .header("Authorization", format!("Bearer {}", token))
+        .post(request.create_url)
+        .header("Authorization", format!("Bearer {}", request.token))
         .json(&body)
         .send()
         .await

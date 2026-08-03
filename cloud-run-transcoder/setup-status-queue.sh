@@ -9,8 +9,11 @@ GCP_PROJECT_ID="${GCP_PROJECT_ID:-${PROJECT_ID}}"
 REGION="${REGION:-us-central1}"
 STATUS_QUEUE_LOCATION="${STATUS_QUEUE_LOCATION:-${REGION}}"
 STATUS_QUEUE_NAME="${STATUS_QUEUE_NAME:-derivative-status}"
-PROJECT_NUMBER="$(gcloud projects describe "${GCP_PROJECT_ID}" --format="value(projectNumber)")"
-SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-${PROJECT_NUMBER}-compute@developer.gserviceaccount.com}"
+SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-}"
+if [ -z "${SERVICE_ACCOUNT}" ]; then
+  PROJECT_NUMBER="$(gcloud projects describe "${GCP_PROJECT_ID}" --format="value(projectNumber)")"
+  SERVICE_ACCOUNT="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+fi
 
 gcloud services enable cloudtasks.googleapis.com \
   --project "${GCP_PROJECT_ID}"

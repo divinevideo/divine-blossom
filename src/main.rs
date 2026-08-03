@@ -448,16 +448,10 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
             }
             None => {
                 if !is_admin {
-                    eprintln!(
-                        "[ACCESS] thumbnail hash={} metadata=None denied (non-admin)",
-                        video_hash
-                    );
+                    eprintln!("[ACCESS] thumbnail hash={} metadata=None denied (non-admin)", video_hash);
                     return Err(BlossomError::NotFound("Blob not found".into()));
                 }
-                eprintln!(
-                    "[ACCESS] thumbnail hash={} metadata=None allowed (admin bypass)",
-                    video_hash
-                );
+                eprintln!("[ACCESS] thumbnail hash={} metadata=None allowed (admin bypass)", video_hash);
             }
         }
 
@@ -524,16 +518,10 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         }
         None => {
             if !is_admin {
-                eprintln!(
-                    "[ACCESS] hash={} metadata=None denied (no metadata, non-admin)",
-                    hash
-                );
+                eprintln!("[ACCESS] hash={} metadata=None denied (no metadata, non-admin)", hash);
                 return Err(BlossomError::NotFound("Blob not found".into()));
             }
-            eprintln!(
-                "[ACCESS] hash={} metadata=None allowed (admin bypass)",
-                hash
-            );
+            eprintln!("[ACCESS] hash={} metadata=None allowed (admin bypass)", hash);
         }
     }
 
@@ -2089,16 +2077,10 @@ fn handle_get_subtitle_by_hash(req: Request, path: &str) -> Result<Response> {
         }
         None => {
             if !is_admin {
-                eprintln!(
-                    "[ACCESS] subtitle hash={} metadata=None denied (non-admin)",
-                    hash
-                );
+                eprintln!("[ACCESS] subtitle hash={} metadata=None denied (non-admin)", hash);
                 return Err(BlossomError::NotFound("Video hash not found".into()));
             }
-            eprintln!(
-                "[ACCESS] subtitle hash={} metadata=None allowed (admin bypass)",
-                hash
-            );
+            eprintln!("[ACCESS] subtitle hash={} metadata=None allowed (admin bypass)", hash);
         }
     }
 
@@ -5155,8 +5137,7 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
             .as_str()
             .unwrap_or("Creator-initiated deletion via kind 5");
 
-        let physical_delete_enabled =
-            crate::admin::get_config("ENABLE_PHYSICAL_DELETE").as_deref() == Some("true");
+        let physical_delete_enabled = config_flag_enabled("ENABLE_PHYSICAL_DELETE", false);
 
         let meta_json = serde_json::to_string(&metadata).ok();
 
@@ -5255,11 +5236,19 @@ fn validate_transcoder_webhook(req: &Request, label: &str) -> Result<()> {
     }
 }
 
+fn config_flag_enabled(key: &str, default: bool) -> bool {
+    match crate::admin::get_config(key) {
+        Some(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" => true,
+            "false" | "0" => false,
+            _ => default,
+        },
+        None => default,
+    }
+}
+
 fn derivative_generation_guard_enabled() -> bool {
-    !matches!(
-        crate::admin::get_config("REQUIRE_DERIVATIVE_STATUS_GENERATION").as_deref(),
-        Some("false") | Some("0")
-    )
+    config_flag_enabled("REQUIRE_DERIVATIVE_STATUS_GENERATION", true)
 }
 
 fn ignored_generation_response(
@@ -5969,7 +5958,7 @@ pub(crate) fn purge_edge_cache(surrogate_key: &str) {
 
     let services: &[(&str, &str)] = &[
         ("ML7R82HKfmTaqTpHExIDVN", "VCL"),     // divine.video website
-        ("pOvEEWykEbpnylqst1KTrR", "Compute"), // media.divine.video (Blossom)
+        ("pOvEEWykEbpnylqst1KTrR", "Compute"),  // media.divine.video (Blossom)
     ];
 
     for &(service_id, label) in services {
@@ -5991,9 +5980,7 @@ pub(crate) fn purge_edge_cache(surrogate_key: &str) {
                 } else {
                     eprintln!(
                         "[PURGE] {} purge failed for key={}: HTTP {}",
-                        label,
-                        surrogate_key,
-                        status.as_u16()
+                        label, surrogate_key, status.as_u16()
                     );
                 }
             }
@@ -6840,8 +6827,14 @@ mod tests {
         let resp = error_response(&BlossomError::NotFound("Blob not found".into()));
 
         assert_eq!(resp.get_status(), StatusCode::NOT_FOUND);
-        assert_eq!(resp.get_header_str("Cache-Control"), Some("no-store"),);
-        assert_eq!(resp.get_header_str("Surrogate-Control"), Some("max-age=60"),);
+        assert_eq!(
+            resp.get_header_str("Cache-Control"),
+            Some("no-store"),
+        );
+        assert_eq!(
+            resp.get_header_str("Surrogate-Control"),
+            Some("max-age=60"),
+        );
     }
 
     #[test]

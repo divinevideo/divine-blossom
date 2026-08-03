@@ -29,6 +29,11 @@ Malformed generations, such as strings, floats, negative values, or values
 outside `u64`, are acknowledged with `ignored: "malformed_generation"` and do
 not update metadata.
 
+If a derivative status callback references a blob whose metadata no longer
+exists, the edge acknowledges it with HTTP 202 and `reconciliation: "pending"`.
+That keeps deleted or missing blobs from repeatedly consuming the serialized
+queue through Cloud Tasks redelivery.
+
 `cloud-run-transcoder/deploy.sh` owns the env var names and defaults the flag to
 `false`, so direct POST remains the rollback path. A production deploy should
 set `STATUS_QUEUE_ENABLED=true` only after the queue and IAM grant are present.
