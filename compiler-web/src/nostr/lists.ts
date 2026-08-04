@@ -8,10 +8,55 @@ import type { ListRelay } from './relay'
 
 const VIDEO_KINDS = new Set([34235, 34236])
 
-export function videoCoordinates(event: NostrEvent): string[] {
+export interface ProfileMeta {
+  name?: string
+  display_name?: string
+  picture?: string
+}
+
+export function displayNameFromProfile(meta: ProfileMeta | null): string | undefined {
+  return meta?.display_name || meta?.name || undefined
+}
+
+export function dedupeLatestLists(events: NostrEvent[]): NostrEvent[] {
+  const latestByIdentifier = new Map<string, NostrEvent>()
+  const noIdentifier: NostrEvent[] = []
+  for (const event of events) {
+    const identifier = event.tags.find(
+      (tag) => tag[0] === 'd' && typeof tag[1] === 'string' && tag[1].length > 0,
+    )?.[1]
+    if (!identifier) {
+      noIdentifier.push(event)
+      continue
+    }
+    const current = latestByIdentifier.get(identifier)
+    if (
+      !current ||
+      event.created_at - current.created_at > 0 ||
+      (event.created_at === current.created_at && event.id.localeCompare(current.id) > 0)
+    ) {
+      latestByIdentifier.set(identifier, event)
+    }
+  }
+  return [...latestByIdentifier.values(), ...noIdentifier].sort(
+    (left, right) =>
+      right.created_at - left.created_at || right.id.localeCompare(left.id),
+  )
+}
+
+/**
+ * Ordered clip references in a signed list. The Divine app writes `e` tags
+ * holding video event ids; the compiler editor writes `a` tags holding
+ * addressable coordinates. Both are honoured, in literal tag order.
+ */
+export function videoReferences(event: NostrEvent): string[] {
   return event.tags
     .filter(isVideoTag)
     .map((tag) => tag[1])
+}
+
+export function isEventReference(reference: string): boolean {
+  return /^[0-9a-f]{64}$/.test(reference)
 }
 
 export function listIdentifier(event: NostrEvent): string {
@@ -26,22 +71,22 @@ export function listIdentifier(event: NostrEvent): string {
 
 export function buildReorderedListEvent(
   base: NostrEvent,
-  orderedCoordinates: string[],
+  orderedReferences: string[],
   createdAt: number,
 ): UnsignedNostrEvent {
   if (base.kind !== 30005) {
     throw new Error('Only kind 30005 video lists can be edited.')
   }
   listIdentifier(base)
-  const currentCoordinates = videoCoordinates(base)
-  if (!sameUniqueValues(currentCoordinates, orderedCoordinates)) {
-    throw new Error('The replacement must contain the same video coordinates exactly once.')
+  const currentReferences = videoReferences(base)
+  if (!sameUniqueValues(currentReferences, orderedReferences)) {
+    throw new Error('The replacement must contain the same video references exactly once.')
   }
 
-  const tagByCoordinate = new Map<string, NostrTag>()
+  const tagByReference = new Map<string, NostrTag>()
   for (const tag of base.tags) {
     if (isVideoTag(tag)) {
-      tagByCoordinate.set(tag[1], tag)
+      tagByReference.set(tag[1], tag)
     }
   }
 
@@ -61,8 +106,8 @@ export function buildReorderedListEvent(
         tags.push(['play-order', 'manual'])
         keptPlayOrder = true
       }
-      const coordinate = orderedCoordinates[videoIndex]
-      const originalTag = tagByCoordinate.get(coordinate)
+      const reference = orderedReferences[videoIndex]
+      const originalTag = tagByReference.get(reference)
       if (!originalTag) {
         throw new Error('A reordered video tag disappeared.')
       }
@@ -92,7 +137,7 @@ export async function saveReorderedList(
   relay: ListRelay,
   signer: NostrSigner,
   base: NostrEvent,
-  orderedCoordinates: string[],
+  orderedReferences: string[],
   createdAt = Math.floor(Date.now() / 1000),
 ): Promise<NostrEvent> {
   const signerPubkey = await signer.getPublicKey()
@@ -105,7 +150,7 @@ export async function saveReorderedList(
   }
   assertCurrentEditBase(base.id, latest.id)
 
-  const unsigned = buildReorderedListEvent(base, orderedCoordinates, createdAt)
+  const unsigned = buildReorderedListEvent(base, orderedReferences, createdAt)
   const signed = await signer.signEvent(unsigned)
   if (signed.pubkey !== base.pubkey || signed.kind !== 30005) {
     throw new Error('The signer returned the wrong list identity.')
@@ -115,7 +160,13 @@ export async function saveReorderedList(
 }
 
 function isVideoTag(tag: NostrTag): boolean {
-  if (tag[0] !== 'a' || typeof tag[1] !== 'string') {
+  if (typeof tag[1] !== 'string') {
+    return false
+  }
+  if (tag[0] === 'e') {
+    return isEventReference(tag[1])
+  }
+  if (tag[0] !== 'a') {
     return false
   }
   const [kindText, pubkey, identifier] = tag[1].split(':', 3)
@@ -140,5 +191,5 @@ function sameUniqueValues(current: string[], replacement: string[]): boolean {
   ) {
     return false
   }
-  return [...currentSet].every((coordinate) => replacementSet.has(coordinate))
+  return [...currentSet].every((reference) => replacementSet.has(reference))
 }

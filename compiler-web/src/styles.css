@@ -200,6 +200,61 @@ h1 {
   border-radius: 0 9px 9px 0;
 }
 
+.my-lists {
+  margin-top: 10px;
+  padding: 4px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.my-lists-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 9px 11px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ink);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.my-lists-row:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.my-lists-row.loading,
+.my-lists-row.empty {
+  color: var(--muted);
+  cursor: default;
+}
+
+.my-lists-row.loading:hover,
+.my-lists-row.empty:hover {
+  background: transparent;
+}
+
+.my-lists-row.loading {
+  justify-content: flex-start;
+  gap: 8px;
+}
+
+.my-lists-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.my-lists-count {
+  flex-shrink: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .notice {
   border: 1px solid #2c5f49;
   background: #12271d;

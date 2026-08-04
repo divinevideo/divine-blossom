@@ -21,7 +21,7 @@ export function Timeline({ clips, selected, onSelect, onReorder }: TimelineProps
       <ol className="timeline-list">
         {clips.map((clip, index) => (
           <li
-            key={clip.coordinate}
+            key={clip.reference}
             className={selected === index ? 'timeline-item selected' : 'timeline-item'}
             draggable
             onDragStart={() => setDragging(index)}

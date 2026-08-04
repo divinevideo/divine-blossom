@@ -64,7 +64,8 @@ export interface CompilationJob {
 }
 
 export interface VideoClip {
-  coordinate: string
+  /** The list tag value: an `e` event id or an `a` addressable coordinate. */
+  reference: string
   event: NostrEvent
   videoUrl?: string
   title: string

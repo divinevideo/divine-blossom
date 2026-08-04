@@ -3,8 +3,10 @@ import type { NostrEvent, NostrSigner } from '../types'
 import {
   assertCurrentEditBase,
   buildReorderedListEvent,
+  dedupeLatestLists,
+  displayNameFromProfile,
   saveReorderedList,
-  videoCoordinates,
+  videoReferences,
 } from './lists'
 import type { ListRelay } from './relay'
 
@@ -64,14 +66,14 @@ describe('ordered list replacement', () => {
 
   it('rejects missing, duplicate, or foreign coordinates', () => {
     expect(() => buildReorderedListEvent(baseEvent, [coordinateA], 200)).toThrow(
-      'same video coordinates',
+      'same video references',
     )
     expect(() =>
       buildReorderedListEvent(baseEvent, [coordinateA, coordinateA], 200),
-    ).toThrow('same video coordinates')
+    ).toThrow('same video references')
     expect(() =>
       buildReorderedListEvent(baseEvent, [coordinateA, `34236:${pubkey}:foreign`], 200),
-    ).toThrow('same video coordinates')
+    ).toThrow('same video references')
   })
 
   it('rejects a stale edit base using full event IDs', () => {
@@ -103,6 +105,120 @@ describe('ordered list replacement', () => {
   })
 
   it('extracts only literal supported video coordinates', () => {
-    expect(videoCoordinates(baseEvent)).toEqual([coordinateA, coordinateB])
+    expect(videoReferences(baseEvent)).toEqual([coordinateA, coordinateB])
+  })
+})
+
+describe('app authored lists that reference clips by event id', () => {
+  const eventIdA = '1'.repeat(64)
+  const eventIdB = '2'.repeat(64)
+  const appList: NostrEvent = {
+    ...baseEvent,
+    tags: [
+      ['d', 'list_1785619462240'],
+      ['title', 'Halloween square Divine'],
+      ['play-order', 'chronological'],
+      ['e', eventIdA],
+      ['e', eventIdB],
+      ['e', 'not-an-event-id'],
+      ['p', 'f'.repeat(64)],
+    ],
+  }
+
+  it('reads ordered e tags and ignores malformed ones', () => {
+    expect(videoReferences(appList)).toEqual([eventIdA, eventIdB])
+  })
+
+  it('reorders e tag slots and leaves other tags in place', () => {
+    const result = buildReorderedListEvent(appList, [eventIdB, eventIdA], 300)
+
+    expect(result.tags).toEqual([
+      ['d', 'list_1785619462240'],
+      ['title', 'Halloween square Divine'],
+      ['play-order', 'manual'],
+      ['e', eventIdB],
+      ['e', eventIdA],
+      ['e', 'not-an-event-id'],
+      ['p', 'f'.repeat(64)],
+    ])
+  })
+
+  it('reorders lists that mix event ids and coordinates', () => {
+    const mixed: NostrEvent = {
+      ...baseEvent,
+      tags: [
+        ['d', 'mixed'],
+        ['e', eventIdA],
+        ['a', coordinateA],
+      ],
+    }
+
+    const result = buildReorderedListEvent(mixed, [coordinateA, eventIdA], 300)
+
+    expect(result.tags).toEqual([
+      ['d', 'mixed'],
+      ['play-order', 'manual'],
+      ['a', coordinateA],
+      ['e', eventIdA],
+    ])
+  })
+})
+
+describe('displayNameFromProfile', () => {
+  it('prefers display_name over name', () => {
+    expect(
+      displayNameFromProfile({ name: 'alice', display_name: 'Alice A.' }),
+    ).toBe('Alice A.')
+  })
+
+  it('falls back to name when display_name is missing', () => {
+    expect(displayNameFromProfile({ name: 'alice' })).toBe('alice')
+  })
+
+  it('returns undefined for null or empty profiles', () => {
+    expect(displayNameFromProfile(null)).toBeUndefined()
+    expect(displayNameFromProfile({})).toBeUndefined()
+  })
+})
+
+describe('dedupeLatestLists', () => {
+  const list = (id: string, dTag: string, createdAt: number): NostrEvent => ({
+    id,
+    pubkey,
+    created_at: createdAt,
+    kind: 30005,
+    tags: [['d', dTag]],
+    content: '',
+    sig: 'e'.repeat(128),
+  })
+
+  it('keeps only the newest event per d tag', () => {
+    const stale = list('1'.repeat(64), 'picks', 100)
+    const fresh = list('2'.repeat(64), 'picks', 200)
+
+    expect(dedupeLatestLists([stale, fresh])).toEqual([fresh])
+    expect(dedupeLatestLists([fresh, stale])).toEqual([fresh])
+  })
+
+  it('breaks created_at ties by id descending', () => {
+    const lower = list('a'.repeat(64), 'picks', 100)
+    const higher = list('b'.repeat(64), 'picks', 100)
+
+    expect(dedupeLatestLists([lower, higher])).toEqual([higher])
+  })
+
+  it('sorts distinct lists newest first', () => {
+    const old = list('1'.repeat(64), 'old', 100)
+    const mid = list('2'.repeat(64), 'mid', 200)
+    const fresh = list('3'.repeat(64), 'fresh', 300)
+
+    expect(dedupeLatestLists([mid, old, fresh])).toEqual([fresh, mid, old])
+  })
+
+  it('treats events without a d tag as distinct entries', () => {
+    const noTagA = { ...list('1'.repeat(64), 'x', 100), tags: [] }
+    const noTagB = { ...list('2'.repeat(64), 'y', 200), tags: [] }
+
+    expect(dedupeLatestLists([noTagA, noTagB])).toHaveLength(2)
   })
 })

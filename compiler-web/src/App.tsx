@@ -21,7 +21,13 @@ import {
   setClipFit,
   setDefaultFit,
 } from './editorState'
-import { listIdentifier, saveReorderedList, videoCoordinates } from './nostr/lists'
+import {
+  displayNameFromProfile,
+  isEventReference,
+  listIdentifier,
+  saveReorderedList,
+  videoReferences,
+} from './nostr/lists'
 import { DivineListRelay } from './nostr/relay'
 import type {
   Aspect,
@@ -36,6 +42,9 @@ export function App() {
   const relay = useMemo(() => new DivineListRelay(), [])
   const [signer, setSigner] = useState<NostrSigner | null>(null)
   const [pubkey, setPubkey] = useState<string>()
+  const [displayName, setDisplayName] = useState<string>()
+  const [myLists, setMyLists] = useState<NostrEvent[]>()
+  const [myListsLoading, setMyListsLoading] = useState(false)
   const [authReady, setAuthReady] = useState(false)
   const [listReference, setListReference] = useState('')
   const [savedEvent, setSavedEvent] = useState<NostrEvent>()
@@ -68,7 +77,24 @@ export function App() {
           : await restoreDivineSigner()
         if (active && nextSigner) {
           setSigner(nextSigner)
-          setPubkey(await nextSigner.getPublicKey())
+          const nextPubkey = await nextSigner.getPublicKey()
+          setPubkey(nextPubkey)
+          setMyListsLoading(true)
+          relay
+            .profile(nextPubkey)
+            .then((meta) => {
+              if (active) setDisplayName(displayNameFromProfile(meta))
+            })
+            .catch(() => {})
+          relay
+            .authoredLists(nextPubkey)
+            .then((lists) => {
+              if (active) setMyLists(lists)
+            })
+            .catch(() => {})
+            .finally(() => {
+              if (active) setMyListsLoading(false)
+            })
           await loadRecent()
         }
       } catch (caught) {
@@ -85,20 +111,20 @@ export function App() {
     }
   }, [loadRecent, relay])
 
-  const currentOrder = clips.map((clip) => clip.coordinate)
+  const currentOrder = clips.map((clip) => clip.reference)
   const dirty = savedEvent
     ? hasUnsavedOrder(savedOrder, currentOrder)
     : false
   const currentClip = clips[selectedClip]
   const currentFit = currentClip
-    ? fitForClip(renders, selectedAspect, currentClip.coordinate)
+    ? fitForClip(renders, selectedAspect, currentClip.reference)
     : renders[selectedAspect].defaultFit
   const listName = savedEvent
     ? savedEvent.tags.find((tag) => tag[0] === 'title')?.[1] ??
       listIdentifier(savedEvent)
     : undefined
 
-  const loadList = async () => {
+  const loadList = async (referenceValue = listReference) => {
     if (!signer || !pubkey) {
       setError('Connect Divine before opening an editorial list.')
       return
@@ -107,19 +133,19 @@ export function App() {
     setError(undefined)
     setNotice(undefined)
     try {
-      const reference = parseListReference(listReference, pubkey)
+      const reference = parseListReference(referenceValue, pubkey)
       const event = await relay.latestList(reference.pubkey, reference.identifier)
       if (!event) throw new Error('No kind 30005 list matched that reference.')
       if (event.pubkey !== pubkey) {
         throw new Error('Connect the Divine identity that owns this list.')
       }
-      const coordinates = videoCoordinates(event)
-      const events = await relay.videoEvents(coordinates)
-      const loaded = coordinates.map((coordinate) =>
-        clipFromEvent(coordinate, events.get(coordinate)),
+      const references = videoReferences(event)
+      const events = await relay.videoEvents(references)
+      const loaded = references.map((reference) =>
+        clipFromEvent(reference, events.get(reference)),
       )
       setSavedEvent(event)
-      setSavedOrder(coordinates)
+      setSavedOrder(references)
       setClips(loaded)
       setSelectedClip(0)
       setRenders(defaultRenders)
@@ -194,9 +220,18 @@ export function App() {
     logoutDivine()
     setSigner(null)
     setPubkey(undefined)
+    setDisplayName(undefined)
+    setMyLists(undefined)
+    setMyListsLoading(false)
     setSavedEvent(undefined)
     setClips([])
     setRecentJobs([])
+  }
+
+  const openAuthoredList = (event: NostrEvent) => {
+    const coordinate = `30005:${event.pubkey}:${listIdentifier(event)}`
+    setListReference(coordinate)
+    void loadList(coordinate)
   }
 
   if (!authReady) {
@@ -212,6 +247,7 @@ export function App() {
     <div className="app-shell">
       <Header
         pubkey={pubkey}
+        displayName={displayName}
         listName={listName}
         onLogin={() => void beginDivineLogin()}
         onLogout={logout}
@@ -249,6 +285,42 @@ export function App() {
                 {loadingList ? <SpinnerGap className="spinner" /> : <ArrowRight />}
               </button>
             </div>
+            {signer && (
+              <div className="my-lists">
+                {myListsLoading && (
+                  <div className="my-lists-row loading">
+                    <SpinnerGap className="spinner" size={16} />
+                    <span>Finding your lists…</span>
+                  </div>
+                )}
+                {!myListsLoading && myLists && myLists.length === 0 && (
+                  <div className="my-lists-row empty">No lists found on relay.</div>
+                )}
+                {!myListsLoading &&
+                  myLists?.map((event) => {
+                    const identifier = event.tags.find(
+                      (tag) => tag[0] === 'd' && typeof tag[1] === 'string' && tag[1],
+                    )?.[1]
+                    if (!identifier) return null
+                    return (
+                      <button
+                        key={event.id}
+                        type="button"
+                        className="my-lists-row"
+                        onClick={() => openAuthoredList(event)}
+                      >
+                        <span className="my-lists-title">
+                          {event.tags.find((tag) => tag[0] === 'title')?.[1] ??
+                            identifier}
+                        </span>
+                        <span className="my-lists-count">
+                          {videoReferences(event).length} clips
+                        </span>
+                      </button>
+                    )
+                  })}
+              </div>
+            )}
           </div>
         </section>
 
@@ -281,7 +353,7 @@ export function App() {
             onClipFit={(fit: FitMode) => {
               if (currentClip) {
                 setRenders((current) =>
-                  setClipFit(current, selectedAspect, currentClip.coordinate, fit),
+                  setClipFit(current, selectedAspect, currentClip.reference, fit),
                 )
               }
             }}
@@ -320,19 +392,21 @@ function parseListReference(
   return { pubkey, identifier: identifier.join(':') }
 }
 
-function clipFromEvent(coordinate: string, event?: NostrEvent): VideoClip {
-  const title =
-    event?.tags.find((tag) => tag[0] === 'title')?.[1] ??
-    coordinate.split(':').slice(2).join(':')
+function clipFromEvent(reference: string, event?: NostrEvent): VideoClip {
+  const listedById = isEventReference(reference)
+  const fallbackTitle = listedById
+    ? `${reference.slice(0, 12)}…`
+    : reference.split(':').slice(2).join(':')
+  const title = event?.tags.find((tag) => tag[0] === 'title')?.[1] ?? fallbackTitle
   return {
-    coordinate,
+    reference,
     event:
       event ??
       ({
-        id: '',
-        pubkey: coordinate.split(':')[1],
+        id: listedById ? reference : '',
+        pubkey: listedById ? '' : reference.split(':')[1],
         created_at: 0,
-        kind: Number(coordinate.split(':')[0]),
+        kind: listedById ? 0 : Number(reference.split(':')[0]),
         tags: [],
         content: '',
         sig: '',
