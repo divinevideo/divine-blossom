@@ -65,7 +65,9 @@ The queue serializes transcode and transcript status callbacks together, so
 `--max-concurrent-dispatches=1` is also the project-wide dispatch ceiling for
 derivative status delivery. The task header includes the existing bearer
 webhook secret, which means Cloud Tasks stores that shared secret at rest until
-the task is dispatched.
+the task is dispatched. TODO(#168): replace the queued callback Authorization
+header with Cloud Tasks native OIDC so tasks do not store a shared webhook
+secret at rest.
 
 Measure dispatch throughput in the target region before enabling production
 traffic. Each callback performs one Fastly Compute request with an uncached

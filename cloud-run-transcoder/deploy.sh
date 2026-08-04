@@ -11,10 +11,10 @@
 # Default GOOGLE_STT_MODEL is `chirp_3`.
 #
 # Cloud Run runtime SA needs roles/speech.client on the project. Grant once:
-#   gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+#   gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \
 #     --member="serviceAccount:$SERVICE_ACCOUNT" --role=roles/speech.client
 # Also enable the API once per project:
-#   gcloud services enable speech.googleapis.com --project "$PROJECT_ID"
+#   gcloud services enable speech.googleapis.com --project "$GCP_PROJECT_ID"
 #
 # To canary with fallback to current provider:
 #   TRANSCRIPTION_PROVIDER=google_stt_v2 \
@@ -30,17 +30,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project)}"
+GCP_PROJECT_ID="${GCP_PROJECT_ID:-${PROJECT_ID}}"
 REGION="${REGION:-us-central1}"
 SERVICE_NAME="${SERVICE_NAME:-divine-transcoder}"
 SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-}"
 if [ -z "${SERVICE_ACCOUNT}" ]; then
-  PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" --format="value(projectNumber)")"
+  PROJECT_NUMBER="$(gcloud projects describe "${GCP_PROJECT_ID}" --format="value(projectNumber)")"
   SERVICE_ACCOUNT="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
 fi
 IMAGE_TAG="${IMAGE_TAG:-$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M%S)}"
 IMAGE="gcr.io/${PROJECT_ID}/${SERVICE_NAME}:${IMAGE_TAG}"
 
-GCP_PROJECT_ID="${GCP_PROJECT_ID:-${PROJECT_ID}}"
 GCS_BUCKET="${GCS_BUCKET:-divine-blossom-media}"
 WEBHOOK_URL="${WEBHOOK_URL:-https://media.divine.video/admin/transcode-status}"
 TRANSCRIPT_WEBHOOK_URL="${TRANSCRIPT_WEBHOOK_URL:-https://media.divine.video/admin/transcript-status}"

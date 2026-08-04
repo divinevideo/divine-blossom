@@ -1296,6 +1296,20 @@ fn purge_transcript_content_cache(hash: &str) {
     let _ = simple_cache::purge(cache_key);
 }
 
+fn edge_transcript_metadata_update(status: TranscriptStatus) -> TranscriptMetadataUpdate {
+    TranscriptMetadataUpdate {
+        generation: Some(crate::metadata::edge_transcript_status_generation(status)),
+        ..TranscriptMetadataUpdate::default()
+    }
+}
+
+fn edge_transcript_metadata_update_now(status: TranscriptStatus) -> TranscriptMetadataUpdate {
+    TranscriptMetadataUpdate {
+        last_attempt_at: Some(current_timestamp()),
+        ..edge_transcript_metadata_update(status)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedTranscodeStatusWebhook {
     sha256: String,
@@ -1640,10 +1654,7 @@ fn serve_transcript_by_hash(
                 let _ = update_transcript_status(
                     hash,
                     TranscriptStatus::Complete,
-                    TranscriptMetadataUpdate {
-                        last_attempt_at: Some(current_timestamp()),
-                        ..Default::default()
-                    },
+                    edge_transcript_metadata_update_now(TranscriptStatus::Complete),
                 );
             }
             resp.set_header("Content-Type", "text/vtt; charset=utf-8");
@@ -1692,10 +1703,7 @@ fn serve_transcript_by_hash(
                     let _ = update_transcript_status(
                         hash,
                         TranscriptStatus::Processing,
-                        TranscriptMetadataUpdate {
-                            last_attempt_at: Some(current_timestamp()),
-                            ..Default::default()
-                        },
+                        edge_transcript_metadata_update_now(TranscriptStatus::Processing),
                     );
                     let _ = trigger_on_demand_transcription(hash, &metadata.owner, None, None);
 
@@ -1780,10 +1788,7 @@ fn handle_head_transcript_by_hash(hash: &str) -> Result<Response> {
                 let _ = update_transcript_status(
                     hash,
                     TranscriptStatus::Complete,
-                    TranscriptMetadataUpdate {
-                        last_attempt_at: Some(current_timestamp()),
-                        ..Default::default()
-                    },
+                    edge_transcript_metadata_update_now(TranscriptStatus::Complete),
                 );
             }
             let mut resp = Response::from_status(StatusCode::OK);
@@ -1883,10 +1888,7 @@ fn dispatch_subtitle_job(job: &mut SubtitleJob, owner: &str) -> Result<()> {
     let _ = crate::metadata::update_transcript_status(
         &job.video_sha256,
         TranscriptStatus::Processing,
-        TranscriptMetadataUpdate {
-            last_attempt_at: Some(current_timestamp()),
-            ..Default::default()
-        },
+        edge_transcript_metadata_update_now(TranscriptStatus::Processing),
     );
 
     let lang_for_provider = job
@@ -2998,11 +3000,11 @@ fn trigger_on_demand_transcription(
             vtt.len() as u64,
             owner,
         )?;
-        use crate::metadata::{update_transcript_status, TranscriptMetadataUpdate};
+        use crate::metadata::update_transcript_status;
         update_transcript_status(
             hash,
             crate::blossom::TranscriptStatus::Complete,
-            TranscriptMetadataUpdate::default(),
+            edge_transcript_metadata_update(crate::blossom::TranscriptStatus::Complete),
         )?;
         if let Some(id) = job_id {
             if let Ok(Some(mut job)) = crate::metadata::get_subtitle_job(id) {
@@ -3072,10 +3074,7 @@ fn eagerly_trigger_transcription_if_needed(
                 let _ = crate::metadata::update_transcript_status(
                     hash,
                     TranscriptStatus::Processing,
-                    TranscriptMetadataUpdate {
-                        last_attempt_at: Some(current_timestamp()),
-                        ..Default::default()
-                    },
+                    edge_transcript_metadata_update_now(TranscriptStatus::Processing),
                 );
             }
         }

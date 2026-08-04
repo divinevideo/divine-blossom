@@ -322,6 +322,14 @@ fn transcode_status_event_sequence(status: crate::blossom::TranscodeStatus) -> u
     }
 }
 
+fn transcript_status_event_sequence(status: crate::blossom::TranscriptStatus) -> u64 {
+    match status {
+        crate::blossom::TranscriptStatus::Pending
+        | crate::blossom::TranscriptStatus::Processing => 0,
+        crate::blossom::TranscriptStatus::Complete | crate::blossom::TranscriptStatus::Failed => 1,
+    }
+}
+
 fn status_generation_from_ms(timestamp_ms: u64, event_sequence: u64) -> u64 {
     timestamp_ms
         .checked_mul(10)
@@ -340,6 +348,10 @@ fn edge_transcode_status_generation(status: crate::blossom::TranscodeStatus) -> 
     status_generation_from_ms(current_generation_ms(), transcode_status_event_sequence(status))
 }
 
+pub fn edge_transcript_status_generation(status: crate::blossom::TranscriptStatus) -> u64 {
+    status_generation_from_ms(current_generation_ms(), transcript_status_event_sequence(status))
+}
+
 fn duplicate_generation(incoming: Option<u64>, stored: Option<u64>) -> bool {
     matches!((incoming, stored), (Some(incoming), Some(stored)) if incoming == stored)
 }
@@ -349,7 +361,6 @@ fn generation_rejection(
     stored: Option<u64>,
     require_generation_after_versioned: bool,
     malformed_generation: bool,
-    _increment_attempt_count: bool,
 ) -> Option<StatusUpdateOutcome> {
     if malformed_generation {
         return Some(StatusUpdateOutcome::MalformedGeneration { stored });
@@ -382,7 +393,6 @@ pub fn update_transcode_status_with_metadata(
         metadata.transcode_generation,
         update.require_generation_after_versioned,
         update.malformed_generation,
-        update.increment_attempt_count,
     ) {
         return Ok(outcome);
     }
@@ -461,7 +471,6 @@ pub fn update_transcript_status(
         metadata.transcript_generation,
         update.require_generation_after_versioned,
         update.malformed_generation,
-        update.increment_attempt_count,
     ) {
         return Ok(outcome);
     }
@@ -579,25 +588,6 @@ pub fn get_subtitle_job_by_hash(hash: &str) -> Result<Option<SubtitleJob>> {
         return get_subtitle_job(&job_id);
     }
     Ok(None)
-}
-
-/// Update transcode status and optionally the file size and dimensions for a video blob
-/// The new_size is provided when faststart optimization replaces the original file
-/// The dim is provided by the transcoder's ffprobe as "WIDTHxHEIGHT" (display dimensions)
-pub fn update_transcode_status_with_size(
-    hash: &str,
-    status: crate::blossom::TranscodeStatus,
-    new_size: Option<u64>,
-    dim: Option<String>,
-) -> Result<()> {
-    update_transcode_status_with_metadata(
-        hash,
-        status,
-        new_size,
-        dim,
-        TranscodeMetadataUpdate::default(),
-    )?;
-    Ok(())
 }
 
 /// Check if user owns the blob
@@ -1368,7 +1358,7 @@ pub fn delete_audio_source_refs(audio_hash: &str) -> Result<()> {
 mod tests {
     use super::{
         duplicate_generation, generation_rejection, stale_generation, status_generation_from_ms,
-        transcode_status_event_sequence, StatusUpdateOutcome,
+        transcript_status_event_sequence, transcode_status_event_sequence, StatusUpdateOutcome,
     };
 
     #[test]
@@ -1413,14 +1403,36 @@ mod tests {
     }
 
     #[test]
+    fn edge_transcript_generation_uses_callback_event_ordering() {
+        let timestamp_ms = 1_700_000_000_123;
+        assert_eq!(
+            transcript_status_event_sequence(crate::blossom::TranscriptStatus::Processing),
+            0
+        );
+        assert_eq!(
+            transcript_status_event_sequence(crate::blossom::TranscriptStatus::Complete),
+            1
+        );
+        assert!(
+            status_generation_from_ms(
+                timestamp_ms,
+                transcript_status_event_sequence(crate::blossom::TranscriptStatus::Processing),
+            ) < status_generation_from_ms(
+                timestamp_ms,
+                transcript_status_event_sequence(crate::blossom::TranscriptStatus::Complete),
+            )
+        );
+    }
+
+    #[test]
     fn generation_rejection_blocks_missing_generation_after_versioned_state() {
         assert_eq!(
-            generation_rejection(None, Some(5), true, false, false),
+            generation_rejection(None, Some(5), true, false),
             Some(StatusUpdateOutcome::MissingGeneration { stored: Some(5) })
         );
-        assert_eq!(generation_rejection(None, None, true, false, false), None);
+        assert_eq!(generation_rejection(None, None, true, false), None);
         assert_eq!(
-            generation_rejection(None, Some(5), false, false, false),
+            generation_rejection(None, Some(5), false, false),
             None
         );
     }
@@ -1428,7 +1440,7 @@ mod tests {
     #[test]
     fn generation_rejection_blocks_equal_generation_for_any_status() {
         assert_eq!(
-            generation_rejection(Some(5), Some(5), true, false, false),
+            generation_rejection(Some(5), Some(5), true, false),
             Some(StatusUpdateOutcome::DuplicateGeneration {
                 incoming: Some(5),
                 stored: Some(5),
@@ -1439,11 +1451,11 @@ mod tests {
     #[test]
     fn generation_rejection_blocks_malformed_generation() {
         assert_eq!(
-            generation_rejection(None, Some(5), true, true, false),
+            generation_rejection(None, Some(5), true, true),
             Some(StatusUpdateOutcome::MalformedGeneration { stored: Some(5) })
         );
         assert_eq!(
-            generation_rejection(None, None, true, true, false),
+            generation_rejection(None, None, true, true),
             Some(StatusUpdateOutcome::MalformedGeneration { stored: None })
         );
     }
