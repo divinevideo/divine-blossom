@@ -52,14 +52,14 @@ fn render_job(use_gpu: bool) -> AspectRenderJob {
     }
 }
 
+fn filter_graph(job: &AspectRenderJob) -> String {
+    let args = build_ffmpeg_args(job).unwrap();
+    args[args.iter().position(|arg| arg == "-filter_complex").unwrap() + 1].clone()
+}
+
 #[test]
 fn per_clip_fit_and_audio_normalization_are_in_filter_graph() {
-    let args = build_ffmpeg_args(&render_job(true)).unwrap();
-    let filter = &args[args
-        .iter()
-        .position(|arg| arg == "-filter_complex")
-        .unwrap()
-        + 1];
+    let filter = filter_graph(&render_job(true));
 
     assert!(filter.contains("boxblur="));
     assert!(filter.contains("crop=1080:1920"));
@@ -83,6 +83,29 @@ fn gpu_and_cpu_commands_select_expected_h264_encoder() {
     assert!(gpu
         .windows(2)
         .any(|pair| pair == ["-movflags", "+faststart"]));
+}
+
+#[test]
+fn credit_sits_below_the_clip_and_clear_of_the_watermark() {
+    let filter = filter_graph(&render_job(false));
+
+    // Anchored to the bottom of the frame, so it lands in the letterbox or
+    // blur band instead of across the seam at the bottom of the clip.
+    // 1080x1920 portrait: 4% edge margin is 77, the scaled logo needs 66.
+    assert!(
+        filter.contains("y=h-text_h-77"),
+        "unexpected credit placement in {filter}"
+    );
+
+    let mut unmarked = render_job(false);
+    unmarked.watermark.enabled = false;
+    assert!(filter_graph(&unmarked).contains("y=h-text_h-77"));
+
+    // Landscape's 43px edge margin would collide with the taller logo, so the
+    // credit is pushed above it.
+    let mut landscape = render_job(false);
+    landscape.aspect = Aspect::Landscape;
+    assert!(filter_graph(&landscape).contains("y=h-text_h-92"));
 }
 
 #[test]

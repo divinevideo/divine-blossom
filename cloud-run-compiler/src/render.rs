@@ -178,7 +178,7 @@ fn build_filter_graph(job: &AspectRenderJob) -> String {
             &next,
             &text,
             start,
-            height,
+            credit_margin(job, width, height),
             job.credit.duration_ms,
             &job.font_path,
         ));
@@ -210,6 +210,10 @@ fn build_filter_graph(job: &AspectRenderJob) -> String {
 /// unsharp pass restores the edge contrast the upscale softens.
 const UPSCALE: &str = "flags=lanczos+accurate_rnd+full_chroma_int";
 const SHARPEN: &str = "unsharp=5:5:0.5:5:5:0.0";
+
+/// Height of the shipped 1200x315 logo once `watermark_filter` scales it to
+/// 12% of the frame width.
+const LOGO_HEIGHT_RATIO: f64 = 0.12 * 315.0 / 1200.0;
 
 fn fit_filter(input: &str, output: &str, fit: FitMode, width: u32, height: u32) -> String {
     match fit {
@@ -268,12 +272,28 @@ fn format_credit(credit: &Credit, settings: &CreditSettings) -> String {
     }
 }
 
+/// Bottom margin for the credit box: clear of the frame edge, and clear of the
+/// watermark when one is burned in.
+fn credit_margin(job: &AspectRenderJob, width: u32, height: u32) -> u32 {
+    let edge = (f64::from(height) * 0.04).round() as u32;
+    if !job.watermark.enabled {
+        return edge;
+    }
+    let logo = (f64::from(width) * LOGO_HEIGHT_RATIO).round() as u32;
+    edge.max(logo + 32)
+}
+
+/// Sits in the letterbox or blur band under the clip rather than across it. A
+/// fixed fraction of the frame height lands on the seam whenever the clip is
+/// squarer than the output, so the box is anchored to the bottom margin
+/// instead. Full bleed clips leave no band, and the credit rides over the
+/// footage there.
 fn credit_filter(
     input: &str,
     output: &str,
     text: &str,
     start: f64,
-    height: u32,
+    margin: u32,
     duration_ms: u32,
     font_path: &Path,
 ) -> String {
@@ -283,10 +303,9 @@ fn credit_filter(
     let end = start + f64::from(duration_ms) / 1000.0;
     let fade_in_end = (start + 0.3).min(end);
     let fade_out_start = (end - 0.3).max(start);
-    let y = (height as f32 * 0.78).round() as u32;
     format!(
         "[{input}]drawtext=fontfile={font}:text='{text}':\
-         x=(w-text_w)/2:y={y}:fontsize=42:fontcolor=white:\
+         x=(w-text_w)/2:y=h-text_h-{margin}:fontsize=42:fontcolor=white:\
          box=1:boxcolor=black@0.55:boxborderw=12:\
          enable='between(t,{start:.3},{end:.3})':\
          alpha='if(lt(t,{fade_in_end:.3}),(t-{start:.3})/0.3,\
