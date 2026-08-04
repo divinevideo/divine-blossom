@@ -1,0 +1,28 @@
+# ABOUTME: Runs the compilation service test suite with the production media toolchain
+# ABOUTME: Matches the runtime image's FFmpeg and Noto font packages without CUDA
+
+FROM rust:1.83-slim-bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        ffmpeg \
+        fonts-noto-core \
+        pkg-config \
+        libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src \
+    && printf 'pub fn placeholder() {}' > src/lib.rs \
+    && printf 'fn main() {}' > src/main.rs \
+    && cargo build --tests --locked \
+    && rm -r src
+
+COPY src ./src
+COPY tests ./tests
+COPY assets ./assets
+RUN touch src/main.rs src/lib.rs
+
+CMD ["cargo", "test", "--locked", "--", "--include-ignored"]

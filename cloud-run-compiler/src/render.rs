@@ -5,10 +5,36 @@ use crate::domain::{
     Aspect, AudioSettings, Credit, CreditSettings, FitMode, Watermark, WatermarkPosition,
 };
 use anyhow::{anyhow, bail, Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
-const FONT_PATH: &str = "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf";
+pub const DEFAULT_FONT_PATH: &str = "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf";
+
+/// Fails fast when the host cannot burn creator credits, so a missing filter or
+/// font surfaces at startup instead of failing every aspect of every job.
+pub async fn verify_render_toolchain(font_path: &Path) -> Result<()> {
+    let filters = Command::new("ffmpeg")
+        .args(["-hide_banner", "-filters"])
+        .output()
+        .await
+        .context("run ffmpeg -filters")?;
+    if !filters.status.success() {
+        bail!("ffmpeg -filters failed with {}", filters.status);
+    }
+    if !String::from_utf8_lossy(&filters.stdout).contains("drawtext") {
+        bail!(
+            "this ffmpeg build has no drawtext filter, so creator credits cannot be rendered; \
+             install an ffmpeg built with libfreetype"
+        );
+    }
+    if !font_path.is_file() {
+        bail!(
+            "credit font {} is missing; set CREDIT_FONT_PATH to an installed font",
+            font_path.display()
+        );
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct ClipInput {
@@ -25,6 +51,7 @@ pub struct AspectRenderJob {
     pub aspect: Aspect,
     pub clips: Vec<ClipInput>,
     pub logo_path: PathBuf,
+    pub font_path: PathBuf,
     pub output_path: PathBuf,
     pub watermark: Watermark,
     pub credit: CreditSettings,
@@ -153,6 +180,7 @@ fn build_filter_graph(job: &AspectRenderJob) -> String {
             start,
             height,
             job.credit.duration_ms,
+            &job.font_path,
         ));
         current_video = next;
         start += clip.duration_sec;
@@ -177,24 +205,49 @@ fn build_filter_graph(job: &AspectRenderJob) -> String {
     filters.join(";")
 }
 
+/// Divine sources are often 480x480, so every clip is upscaled to 1080p.
+/// Lanczos keeps far more detail than FFmpeg's default bicubic, and a light
+/// unsharp pass restores the edge contrast the upscale softens.
+const UPSCALE: &str = "flags=lanczos+accurate_rnd+full_chroma_int";
+const SHARPEN: &str = "unsharp=5:5:0.5:5:5:0.0";
+
 fn fit_filter(input: &str, output: &str, fit: FitMode, width: u32, height: u32) -> String {
     match fit {
+        // The blurred backdrop is thrown out of focus anyway, so it keeps the
+        // cheap default scaler.
         FitMode::BlurPad => format!(
             "[{input}]split=2[bg{output}][fg{output}];\
              [bg{output}]scale={width}:{height}:force_original_aspect_ratio=increase,\
              crop={width}:{height},boxblur=20:5[blur{output}];\
-             [fg{output}]scale={width}:{height}:force_original_aspect_ratio=decrease[front{output}];\
+             [fg{output}]scale={width}:{height}:force_original_aspect_ratio=decrease:{UPSCALE},\
+             {SHARPEN}[front{output}];\
              [blur{output}][front{output}]overlay=(W-w)/2:(H-h)/2[{output}]"
         ),
         FitMode::CenterCrop => format!(
-            "[{input}]scale={width}:{height}:force_original_aspect_ratio=increase,\
-             crop={width}:{height}[{output}]"
+            "[{input}]scale={width}:{height}:force_original_aspect_ratio=increase:{UPSCALE},\
+             {SHARPEN},crop={width}:{height}[{output}]"
         ),
         FitMode::Letterbox => format!(
-            "[{input}]scale={width}:{height}:force_original_aspect_ratio=decrease,\
-             pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black[{output}]"
+            "[{input}]scale={width}:{height}:force_original_aspect_ratio=decrease:{UPSCALE},\
+             {SHARPEN},pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black[{output}]"
         ),
     }
+}
+
+/// Renders a NIP-05 identifier as the short social handle viewers expect.
+/// `alice@divine.video` becomes `@alice`; the root form `_@alice.divine.video`
+/// carries the name in the first domain label, so it becomes `@alice` too.
+pub fn nip05_handle(nip05: &str) -> Option<String> {
+    let (local, domain) = nip05.split_once('@')?;
+    let name = if local == "_" {
+        domain.split('.').next().unwrap_or_default()
+    } else {
+        local
+    };
+    if name.is_empty() {
+        return None;
+    }
+    Some(format!("@{name}"))
 }
 
 fn format_credit(credit: &Credit, settings: &CreditSettings) -> String {
@@ -202,14 +255,15 @@ fn format_credit(credit: &Credit, settings: &CreditSettings) -> String {
         .show_display_name
         .then_some(credit.display_name.as_deref())
         .flatten();
-    let nip05 = settings
+    let handle = settings
         .show_nip05
         .then_some(credit.nip05.as_deref())
-        .flatten();
-    match (display_name, nip05) {
-        (Some(name), Some(nip05)) => format!("{name} • {nip05}"),
+        .flatten()
+        .and_then(nip05_handle);
+    match (display_name, handle.as_deref()) {
+        (Some(name), Some(handle)) => format!("{name} • {handle}"),
         (Some(name), None) => name.into(),
-        (None, Some(nip05)) => nip05.into(),
+        (None, Some(handle)) => handle.into(),
         (None, None) => format!("pubkey: {}", credit.pubkey),
     }
 }
@@ -221,6 +275,7 @@ fn credit_filter(
     start: f64,
     height: u32,
     duration_ms: u32,
+    font_path: &Path,
 ) -> String {
     if duration_ms == 0 {
         return format!("[{input}]null[{output}]");
@@ -230,12 +285,13 @@ fn credit_filter(
     let fade_out_start = (end - 0.3).max(start);
     let y = (height as f32 * 0.78).round() as u32;
     format!(
-        "[{input}]drawtext=fontfile={FONT_PATH}:text='{text}':\
+        "[{input}]drawtext=fontfile={font}:text='{text}':\
          x=(w-text_w)/2:y={y}:fontsize=42:fontcolor=white:\
          box=1:boxcolor=black@0.55:boxborderw=12:\
          enable='between(t,{start:.3},{end:.3})':\
          alpha='if(lt(t,{fade_in_end:.3}),(t-{start:.3})/0.3,\
          if(gt(t,{fade_out_start:.3}),({end:.3}-t)/0.3,1))'[{output}]",
+        font = escape_drawtext(&font_path.to_string_lossy()),
         text = escape_drawtext(text)
     )
 }

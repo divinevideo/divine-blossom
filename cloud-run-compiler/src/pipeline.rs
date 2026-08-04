@@ -34,6 +34,7 @@ pub struct CompilationPipeline {
     client: Client,
     temp_root: PathBuf,
     logo_path: PathBuf,
+    font_path: PathBuf,
     allowed_media_hosts: HashSet<String>,
     use_gpu: bool,
 }
@@ -44,6 +45,7 @@ impl CompilationPipeline {
         publisher: ResumablePublisher,
         temp_root: PathBuf,
         logo_path: PathBuf,
+        font_path: PathBuf,
         allowed_media_hosts: impl IntoIterator<Item = String>,
         use_gpu: bool,
     ) -> Result<Self> {
@@ -61,14 +63,15 @@ impl CompilationPipeline {
                 .context("build media download client")?,
             temp_root,
             logo_path,
+            font_path,
             allowed_media_hosts,
             use_gpu,
         })
     }
 
     async fn execute_inner(&self, job: &Job, work_dir: &Path) -> Result<JobResult> {
-        let coordinates = job.request.source.list_event.video_coordinates()?;
-        let resolution = resolve_sources(self.repository.as_ref(), &coordinates).await?;
+        let references = job.request.source.list_event.video_references()?;
+        let resolution = resolve_sources(self.repository.as_ref(), &references).await?;
         let mut dropped = resolution.dropped;
         let mut prepared = Vec::new();
         let mut duration_sec = 0.0;
@@ -79,7 +82,7 @@ impl CompilationPipeline {
             if let Err(error) = self.download(&resolved, &path).await {
                 dropped.push(ClipDrop {
                     source_index: resolved.source_index,
-                    coordinate: resolved.coordinate,
+                    coordinate: resolved.reference,
                     reason: classify_download_error(&error),
                 });
                 continue;
@@ -89,7 +92,7 @@ impl CompilationPipeline {
                 Err(_) => {
                     dropped.push(ClipDrop {
                         source_index: resolved.source_index,
-                        coordinate: resolved.coordinate,
+                        coordinate: resolved.reference,
                         reason: "invalid-media".into(),
                     });
                     continue;
@@ -98,7 +101,7 @@ impl CompilationPipeline {
             if duration_sec + probe.duration_sec > max_duration {
                 dropped.push(ClipDrop {
                     source_index: resolved.source_index,
-                    coordinate: resolved.coordinate,
+                    coordinate: resolved.reference,
                     reason: "max-duration".into(),
                 });
                 continue;
@@ -142,10 +145,15 @@ impl CompilationPipeline {
             let clips = prepared
                 .iter()
                 .map(|clip| {
+                    // Overrides may name a clip by the list tag value or by the
+                    // addressable coordinate the reference resolved to.
                     let fit = render
                         .clip_overrides
                         .iter()
-                        .find(|candidate| candidate.coordinate == clip.resolved.coordinate)
+                        .find(|candidate| {
+                            candidate.coordinate == clip.resolved.reference
+                                || candidate.coordinate == clip.resolved.coordinate
+                        })
                         .map(|candidate| candidate.fit)
                         .unwrap_or(render.default_fit);
                     ClipInput {
@@ -162,6 +170,7 @@ impl CompilationPipeline {
                 aspect: render.aspect,
                 clips,
                 logo_path: self.logo_path.clone(),
+                font_path: self.font_path.clone(),
                 output_path: output_path.clone(),
                 watermark: job.request.watermark.clone(),
                 credit: job.request.credit.clone(),

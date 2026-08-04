@@ -1,10 +1,10 @@
 // ABOUTME: Resolves signed-list coordinates into ordered, renderable source clips
 // ABOUTME: Parses NIP-71 media metadata and carries complete creator credit identity
 
-use crate::domain::{ClipDrop, Credit, NostrEvent};
+use crate::domain::{ClipDrop, Credit, NostrEvent, VideoReference};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use nostr_sdk::{Client, EventSource, Filter, JsonUtil, Kind, PublicKey};
+use nostr_sdk::{Client, EventId, EventSource, Filter, JsonUtil, Kind, PublicKey};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -18,6 +18,9 @@ pub struct CreatorProfile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedClip {
     pub source_index: usize,
+    /// The list tag value that selected this clip, either an `a` coordinate or an `e` event id.
+    pub reference: String,
+    /// The addressable coordinate of the resolved event, regardless of how it was referenced.
     pub coordinate: String,
     pub event_id: String,
     pub media_url: String,
@@ -34,6 +37,7 @@ pub struct Resolution {
 #[async_trait]
 pub trait SourceRepository: Send + Sync {
     async fn addressable_events(&self, coordinates: &[String]) -> Result<Vec<NostrEvent>>;
+    async fn events_by_id(&self, ids: &[String]) -> Result<Vec<NostrEvent>>;
     async fn profiles(&self, pubkeys: &[String]) -> Result<HashMap<String, CreatorProfile>>;
 }
 
@@ -85,6 +89,30 @@ impl SourceRepository for RelaySourceRepository {
             .get_events_of(filters, EventSource::relays(Some(self.timeout)))
             .await
             .context("query source video events")?;
+        events
+            .into_iter()
+            .map(|event| {
+                serde_json::from_str(&event.as_json()).context("decode source video event")
+            })
+            .collect()
+    }
+
+    async fn events_by_id(&self, ids: &[String]) -> Result<Vec<NostrEvent>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<EventId> = ids
+            .iter()
+            .map(|id| EventId::from_hex(id).context("parse list event reference"))
+            .collect::<Result<_>>()?;
+        let events = self
+            .client
+            .get_events_of(
+                vec![Filter::new().ids(ids)],
+                EventSource::relays(Some(self.timeout)),
+            )
+            .await
+            .context("query listed video events by id")?;
         events
             .into_iter()
             .map(|event| {
@@ -152,33 +180,67 @@ struct ProfileContent {
 
 pub async fn resolve_sources(
     repository: &dyn SourceRepository,
-    coordinates: &[String],
+    references: &[VideoReference],
 ) -> Result<Resolution> {
-    let events = repository.addressable_events(coordinates).await?;
-    let mut newest_by_coordinate: HashMap<String, NostrEvent> = HashMap::new();
-    for event in events {
-        let Some(coordinate) = event_coordinate(&event) else {
-            continue;
-        };
-        if !coordinates.contains(&coordinate) {
-            continue;
-        }
+    let coordinates: Vec<String> = references
+        .iter()
+        .filter_map(|reference| match reference {
+            VideoReference::Coordinate(value) => Some(value.clone()),
+            VideoReference::Event(_) => None,
+        })
+        .collect();
+    let event_ids: Vec<String> = references
+        .iter()
+        .filter_map(|reference| match reference {
+            VideoReference::Event(value) => Some(value.clone()),
+            VideoReference::Coordinate(_) => None,
+        })
+        .collect();
 
-        let replace = newest_by_coordinate
-            .get(&coordinate)
-            .map(|current| {
-                event.created_at > current.created_at
-                    || (event.created_at == current.created_at && event.id > current.id)
-            })
-            .unwrap_or(true);
-        if replace {
-            newest_by_coordinate.insert(coordinate, event);
+    let mut newest_by_coordinate: HashMap<String, NostrEvent> = HashMap::new();
+    if !coordinates.is_empty() {
+        for event in repository.addressable_events(&coordinates).await? {
+            let Some(coordinate) = event_coordinate(&event) else {
+                continue;
+            };
+            if !coordinates.contains(&coordinate) {
+                continue;
+            }
+
+            let replace = newest_by_coordinate
+                .get(&coordinate)
+                .map(|current| {
+                    event.created_at > current.created_at
+                        || (event.created_at == current.created_at && event.id > current.id)
+                })
+                .unwrap_or(true);
+            if replace {
+                newest_by_coordinate.insert(coordinate, event);
+            }
         }
     }
 
-    let author_pubkeys: Vec<String> = coordinates
+    let mut by_event_id: HashMap<String, NostrEvent> = HashMap::new();
+    if !event_ids.is_empty() {
+        for event in repository.events_by_id(&event_ids).await? {
+            if !event_ids.contains(&event.id) || !matches!(event.kind, 34_235 | 34_236) {
+                continue;
+            }
+            by_event_id.insert(event.id.clone(), event);
+        }
+    }
+
+    let selected: Vec<Option<&NostrEvent>> = references
         .iter()
-        .filter_map(|coordinate| newest_by_coordinate.get(coordinate))
+        .map(|reference| match reference {
+            VideoReference::Coordinate(value) => newest_by_coordinate.get(value),
+            VideoReference::Event(value) => by_event_id.get(value),
+        })
+        .collect();
+
+    let author_pubkeys: Vec<String> = selected
+        .iter()
+        .flatten()
         .map(|event| event.pubkey.clone())
         .collect::<HashSet<_>>()
         .into_iter()
@@ -186,11 +248,11 @@ pub async fn resolve_sources(
     let profiles = repository.profiles(&author_pubkeys).await?;
 
     let mut resolution = Resolution::default();
-    for (source_index, coordinate) in coordinates.iter().enumerate() {
-        let Some(event) = newest_by_coordinate.get(coordinate) else {
+    for (source_index, (reference, event)) in references.iter().zip(selected).enumerate() {
+        let Some(event) = event else {
             resolution.dropped.push(ClipDrop {
                 source_index,
-                coordinate: coordinate.clone(),
+                coordinate: reference.as_str().into(),
                 reason: "event-not-found".into(),
             });
             continue;
@@ -199,21 +261,23 @@ pub async fn resolve_sources(
         let Some((media_url, sha256)) = original_mp4(event) else {
             resolution.dropped.push(ClipDrop {
                 source_index,
-                coordinate: coordinate.clone(),
+                coordinate: reference.as_str().into(),
                 reason: "missing-original-mp4".into(),
             });
             continue;
         };
 
+        let coordinate = event_coordinate(event).unwrap_or_else(|| reference.as_str().into());
         let profile = profiles.get(&event.pubkey).cloned().unwrap_or_default();
         resolution.usable.push(ResolvedClip {
             source_index,
+            reference: reference.as_str().into(),
             coordinate: coordinate.clone(),
             event_id: event.id.clone(),
             media_url,
             sha256,
             credit: Credit {
-                coordinate: coordinate.clone(),
+                coordinate,
                 pubkey: event.pubkey.clone(),
                 nip05: profile.nip05,
                 display_name: profile.display_name,

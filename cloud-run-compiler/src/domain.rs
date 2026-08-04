@@ -28,16 +28,45 @@ impl NostrEvent {
             .filter(|value| !value.is_empty())
     }
 
-    pub fn video_coordinates(&self) -> Result<Vec<String>, ValidationError> {
+    /// Ordered video references, accepting both the addressable `a` coordinates
+    /// written by the compiler editor and the `e` event ids written by the
+    /// Divine mobile app.
+    pub fn video_references(&self) -> Result<Vec<VideoReference>, ValidationError> {
         self.tags
             .iter()
-            .filter(|tag| tag.first().map(String::as_str) == Some("a"))
-            .filter_map(|tag| tag.get(1))
-            .map(|coordinate| {
-                validate_video_coordinate(coordinate)?;
-                Ok(coordinate.clone())
+            .filter_map(|tag| match (tag.first().map(String::as_str), tag.get(1)) {
+                (Some("a"), Some(value)) => Some(Ok(value)
+                    .and_then(|coordinate| {
+                        validate_video_coordinate(coordinate)?;
+                        Ok(VideoReference::Coordinate(coordinate.clone()))
+                    })),
+                (Some("e"), Some(value)) => Some(Ok(value).and_then(|id| {
+                    if !is_hex_64(id) {
+                        return Err(ValidationError::InvalidEventReference);
+                    }
+                    Ok(VideoReference::Event(id.clone()))
+                })),
+                _ => None,
             })
             .collect()
+    }
+}
+
+/// A single ordered clip slot in a signed list.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum VideoReference {
+    /// `a` tag holding a `34235:`/`34236:` addressable coordinate.
+    Coordinate(String),
+    /// `e` tag holding a video event id.
+    Event(String),
+}
+
+impl VideoReference {
+    /// The tag value exactly as it appears in the signed list.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Coordinate(value) | Self::Event(value) => value,
+        }
     }
 }
 
@@ -50,17 +79,18 @@ fn validate_video_coordinate(coordinate: &str) -> Result<(), ValidationError> {
     let pubkey = parts.next().ok_or(ValidationError::UnsupportedCoordinate)?;
     let identifier = parts.next().ok_or(ValidationError::UnsupportedCoordinate)?;
 
-    if !matches!(kind, 34_235 | 34_236)
-        || pubkey.len() != 64
-        || !pubkey
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        || identifier.is_empty()
-    {
+    if !matches!(kind, 34_235 | 34_236) || !is_hex_64(pubkey) || identifier.is_empty() {
         return Err(ValidationError::UnsupportedCoordinate);
     }
 
     Ok(())
+}
+
+fn is_hex_64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -87,15 +117,16 @@ impl CompileRequest {
             return Err(ValidationError::MissingDTag);
         }
 
-        let coordinates = self.source.list_event.video_coordinates()?;
-        if coordinates.len() > MAX_CLIPS {
+        let references = self.source.list_event.video_references()?;
+        if references.len() > MAX_CLIPS {
             return Err(ValidationError::TooManyClips);
         }
         if self.renders.is_empty() {
             return Err(ValidationError::EmptyRenders);
         }
 
-        let coordinate_set: HashSet<&str> = coordinates.iter().map(String::as_str).collect();
+        let coordinate_set: HashSet<&str> =
+            references.iter().map(VideoReference::as_str).collect();
         let mut aspects = HashSet::new();
         for render in &self.renders {
             if !aspects.insert(render.aspect) {
@@ -324,6 +355,8 @@ pub enum ValidationError {
     MissingDTag,
     #[error("list contains an unsupported addressable coordinate")]
     UnsupportedCoordinate,
+    #[error("list contains an event reference that is not a 64 character event id")]
+    InvalidEventReference,
     #[error("list contains more than 500 video coordinates")]
     TooManyClips,
     #[error("at least one render aspect is required")]

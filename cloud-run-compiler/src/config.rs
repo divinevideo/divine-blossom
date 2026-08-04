@@ -17,6 +17,7 @@ pub struct CompilerConfig {
     pub allowed_media_hosts: Vec<String>,
     pub temp_root: PathBuf,
     pub logo_path: PathBuf,
+    pub credit_font_path: PathBuf,
     pub max_jobs_per_hour: usize,
     pub max_concurrent_jobs: usize,
     pub use_gpu: bool,
@@ -51,6 +52,10 @@ impl CompilerConfig {
             logo_path: PathBuf::from(
                 std::env::var("DIVINE_LOGO_PATH")
                     .unwrap_or_else(|_| "/opt/divine/divine-logo.png".into()),
+            ),
+            credit_font_path: PathBuf::from(
+                std::env::var("CREDIT_FONT_PATH")
+                    .unwrap_or_else(|_| crate::render::DEFAULT_FONT_PATH.into()),
             ),
             max_jobs_per_hour: parse_env("RATE_LIMIT_PER_HOUR", 20)?,
             max_concurrent_jobs: parse_env("MAX_CONCURRENT_JOBS", 4)?,

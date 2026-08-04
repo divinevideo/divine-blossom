@@ -2,7 +2,10 @@ use divine_compiler::{
     domain::{
         Aspect, AudioSettings, Credit, CreditSettings, FitMode, Watermark, WatermarkPosition,
     },
-    render::{build_ffmpeg_args, escape_drawtext, AspectRenderJob, ClipInput},
+    render::{
+        build_ffmpeg_args, escape_drawtext, nip05_handle, AspectRenderJob, ClipInput,
+        DEFAULT_FONT_PATH,
+    },
 };
 use std::{
     path::PathBuf,
@@ -36,6 +39,7 @@ fn render_job(use_gpu: bool) -> AspectRenderJob {
             clip("crop", FitMode::CenterCrop, 5.0, false),
         ],
         logo_path: PathBuf::from("/opt/divine/divine-logo.png"),
+        font_path: PathBuf::from(DEFAULT_FONT_PATH),
         output_path: PathBuf::from("/tmp/output.mp4"),
         watermark: Watermark {
             enabled: true,
@@ -59,6 +63,11 @@ fn per_clip_fit_and_audio_normalization_are_in_filter_graph() {
 
     assert!(filter.contains("boxblur="));
     assert!(filter.contains("crop=1080:1920"));
+    // 480x480 sources are upscaled to 1080p, so the visible scale passes must
+    // use lanczos rather than FFmpeg's default bicubic.
+    assert!(filter.contains("force_original_aspect_ratio=decrease:flags=lanczos"));
+    assert!(filter.contains("force_original_aspect_ratio=increase:flags=lanczos"));
+    assert!(filter.contains("unsharp="));
     assert!(filter.contains("anullsrc=channel_layout=stereo:sample_rate=48000"));
     assert!(filter.contains("fps=30"));
     assert!(filter.contains("loudnorm=I=-14.0"));
@@ -74,6 +83,23 @@ fn gpu_and_cpu_commands_select_expected_h264_encoder() {
     assert!(gpu
         .windows(2)
         .any(|pair| pair == ["-movflags", "+faststart"]));
+}
+
+#[test]
+fn nip05_renders_as_a_short_social_handle() {
+    // Divine issues per-creator subdomains with the NIP-05 root identifier.
+    assert_eq!(
+        nip05_handle("_@ig-bricknooks.divine.video").as_deref(),
+        Some("@ig-bricknooks")
+    );
+    assert_eq!(
+        nip05_handle("alice@divine.video").as_deref(),
+        Some("@alice")
+    );
+    assert_eq!(nip05_handle("bob@example.com").as_deref(), Some("@bob"));
+    assert_eq!(nip05_handle("nonsense").as_deref(), None);
+    assert_eq!(nip05_handle("@divine.video").as_deref(), None);
+    assert_eq!(nip05_handle("_@").as_deref(), None);
 }
 
 #[test]
@@ -148,12 +174,14 @@ async fn cpu_render_smoke_handles_clips_with_and_without_audio() {
                 },
             ],
             logo_path: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/divine-logo.png"),
+            font_path: PathBuf::from(font_path()),
             output_path: output.clone(),
             watermark: Watermark::default(),
-            credit: CreditSettings {
-                duration_ms: 0,
-                ..CreditSettings::default()
-            },
+            // Credits are burned in with drawtext, which needs an ffmpeg built
+            // with libfreetype and a real font file. Exercise it here so a
+            // toolchain that cannot render credits fails the smoke test rather
+            // than every aspect of every production job.
+            credit: CreditSettings::default(),
             audio: AudioSettings::default(),
             use_gpu: false,
         };
@@ -178,4 +206,8 @@ async fn cpu_render_smoke_handles_clips_with_and_without_audio() {
         assert_eq!(String::from_utf8_lossy(&probe.stdout).trim(), dimensions);
     }
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+fn font_path() -> String {
+    std::env::var("CREDIT_FONT_PATH").unwrap_or_else(|_| DEFAULT_FONT_PATH.into())
 }

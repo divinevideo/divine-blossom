@@ -6,6 +6,7 @@ use divine_compiler::{
     config::CompilerConfig,
     http::{router, ApiState},
     pipeline::CompilationPipeline,
+    render::verify_render_toolchain,
     source::RelaySourceRepository,
     store::{FirestoreJobStore, JobStore},
     upload::ResumablePublisher,
@@ -24,6 +25,9 @@ async fn main() -> Result<()> {
         .init();
 
     let config = CompilerConfig::from_env()?;
+    verify_render_toolchain(&config.credit_font_path)
+        .await
+        .context("the render toolchain cannot burn creator credits")?;
     let signing_secret =
         std::env::var("COMPILER_OUTPUT_NSEC").context("COMPILER_OUTPUT_NSEC is required")?;
     let signing_keys =
@@ -47,6 +51,7 @@ async fn main() -> Result<()> {
         publisher,
         config.temp_root.clone(),
         config.logo_path.clone(),
+        config.credit_font_path.clone(),
         config.allowed_media_hosts.clone(),
         config.use_gpu,
     )?);

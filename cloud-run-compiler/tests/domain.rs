@@ -1,6 +1,6 @@
 use divine_compiler::domain::{
     Aspect, AspectFailure, ClipOverride, CompileRequest, FitMode, JobResult, JobStatus, NostrEvent,
-    Output, RenderRequest, Source, ValidationError,
+    Output, RenderRequest, Source, ValidationError, VideoReference,
 };
 
 const LIST_PUBKEY: &str = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -53,7 +53,54 @@ fn list_coordinates_keep_literal_tag_order() {
     let second = coordinate(34_235, VIDEO_PUBKEY_B, "second");
     let event = list_event(&[first.clone(), second.clone()]);
 
-    assert_eq!(event.video_coordinates().unwrap(), vec![first, second]);
+    assert_eq!(
+        event.video_references().unwrap(),
+        vec![
+            VideoReference::Coordinate(first),
+            VideoReference::Coordinate(second)
+        ]
+    );
+}
+
+#[test]
+fn list_event_references_keep_literal_tag_order_alongside_coordinates() {
+    let coordinate = coordinate(34_236, VIDEO_PUBKEY_A, "first");
+    let event_id = "4".repeat(64);
+    let mut event = list_event(&[coordinate.clone()]);
+    // The Divine app writes ordered `e` tags; the editor writes `a` tags.
+    event.tags.insert(2, vec!["e".into(), event_id.clone()]);
+
+    assert_eq!(
+        event.video_references().unwrap(),
+        vec![
+            VideoReference::Event(event_id),
+            VideoReference::Coordinate(coordinate)
+        ]
+    );
+}
+
+#[test]
+fn rejects_event_references_that_are_not_event_ids() {
+    let mut event = list_event(&[]);
+    event.tags.push(vec!["e".into(), "not-an-event-id".into()]);
+
+    assert_eq!(
+        event.video_references().unwrap_err(),
+        ValidationError::InvalidEventReference
+    );
+}
+
+#[test]
+fn accepts_a_list_that_only_uses_event_references() {
+    let event_id = "5".repeat(64);
+    let mut compile = request(&[]);
+    compile
+        .source
+        .list_event
+        .tags
+        .push(vec!["e".into(), event_id]);
+
+    compile.validate().unwrap();
 }
 
 #[test]
