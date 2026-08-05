@@ -33,7 +33,7 @@ It targets the same Cloud Run service that CI deploys on merge, so treat the CI
 job and the manual script as competing deploy paths for one service, not two
 separate services.
 
-## The Cloud Run services are not in the production project
+## The edge Cloud Run backends are not in the production project
 
 The edge hardcodes its backends to project number `149672065768`:
 
