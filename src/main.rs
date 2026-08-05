@@ -1298,7 +1298,7 @@ fn purge_transcript_content_cache(hash: &str) {
 
 fn edge_transcript_metadata_update(status: TranscriptStatus) -> TranscriptMetadataUpdate {
     TranscriptMetadataUpdate {
-        generation: Some(crate::metadata::edge_transcript_status_generation(status)),
+        generation: crate::metadata::edge_transcript_status_generation(status),
         ..TranscriptMetadataUpdate::default()
     }
 }

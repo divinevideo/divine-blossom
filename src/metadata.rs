@@ -263,7 +263,7 @@ pub fn update_blob_status(hash: &str, status: BlobStatus) -> Result<()> {
 
 /// Update transcode status for a video blob
 pub fn update_transcode_status(hash: &str, status: crate::blossom::TranscodeStatus) -> Result<()> {
-    let generation = Some(edge_transcode_status_generation(status));
+    let generation = edge_transcode_status_generation(status);
     update_transcode_status_with_metadata(
         hash,
         status,
@@ -344,12 +344,42 @@ fn current_generation_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn edge_transcode_status_generation(status: crate::blossom::TranscodeStatus) -> u64 {
-    status_generation_from_ms(current_generation_ms(), transcode_status_event_sequence(status))
+/// Generation for an edge-originated transcode status write, if it deserves one.
+///
+/// Only terminal states are stamped. A `processing` write records that the edge
+/// asked for work, not that any happened, and its timestamp is the moment of the
+/// write rather than the start of an attempt. Stamping it lets a re-trigger that
+/// does no work outrank the attempt that actually finishes, because the winning
+/// attempt's terminal generation is anchored to its earlier start.
+fn edge_transcode_status_generation(status: crate::blossom::TranscodeStatus) -> Option<u64> {
+    match status {
+        crate::blossom::TranscodeStatus::Pending | crate::blossom::TranscodeStatus::Processing => {
+            None
+        }
+        crate::blossom::TranscodeStatus::Complete | crate::blossom::TranscodeStatus::Failed => {
+            Some(status_generation_from_ms(
+                current_generation_ms(),
+                transcode_status_event_sequence(status),
+            ))
+        }
+    }
 }
 
-pub fn edge_transcript_status_generation(status: crate::blossom::TranscriptStatus) -> u64 {
-    status_generation_from_ms(current_generation_ms(), transcript_status_event_sequence(status))
+/// Generation for an edge-originated transcript status write, if it deserves one.
+///
+/// See [`edge_transcode_status_generation`] for why non-terminal writes are not
+/// stamped.
+pub fn edge_transcript_status_generation(status: crate::blossom::TranscriptStatus) -> Option<u64> {
+    match status {
+        crate::blossom::TranscriptStatus::Pending
+        | crate::blossom::TranscriptStatus::Processing => None,
+        crate::blossom::TranscriptStatus::Complete | crate::blossom::TranscriptStatus::Failed => {
+            Some(status_generation_from_ms(
+                current_generation_ms(),
+                transcript_status_event_sequence(status),
+            ))
+        }
+    }
 }
 
 fn duplicate_generation(incoming: Option<u64>, stored: Option<u64>) -> bool {
@@ -1357,8 +1387,9 @@ pub fn delete_audio_source_refs(audio_hash: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        duplicate_generation, generation_rejection, stale_generation, status_generation_from_ms,
-        transcript_status_event_sequence, transcode_status_event_sequence, StatusUpdateOutcome,
+        duplicate_generation, edge_transcode_status_generation, edge_transcript_status_generation,
+        generation_rejection, stale_generation, status_generation_from_ms,
+        transcode_status_event_sequence, transcript_status_event_sequence, StatusUpdateOutcome,
     };
 
     #[test]
@@ -1457,6 +1488,88 @@ mod tests {
         assert_eq!(
             generation_rejection(None, None, true, true),
             Some(StatusUpdateOutcome::MalformedGeneration { stored: None })
+        );
+    }
+
+    #[test]
+    fn edge_writes_stamp_only_terminal_states() {
+        use crate::blossom::{TranscodeStatus, TranscriptStatus};
+
+        assert_eq!(
+            edge_transcode_status_generation(TranscodeStatus::Processing),
+            None
+        );
+        assert_eq!(
+            edge_transcode_status_generation(TranscodeStatus::Pending),
+            None
+        );
+        assert!(edge_transcode_status_generation(TranscodeStatus::Complete).is_some());
+        assert!(edge_transcode_status_generation(TranscodeStatus::Failed).is_some());
+
+        assert_eq!(
+            edge_transcript_status_generation(TranscriptStatus::Processing),
+            None
+        );
+        assert_eq!(
+            edge_transcript_status_generation(TranscriptStatus::Pending),
+            None
+        );
+        assert!(edge_transcript_status_generation(TranscriptStatus::Complete).is_some());
+        assert!(edge_transcript_status_generation(TranscriptStatus::Failed).is_some());
+    }
+
+    #[test]
+    fn edge_retrigger_does_not_outrank_the_attempt_that_finishes() {
+        // Reproduces blob 8b1067db on 2026-08-05. A transcript attempt started at
+        // 02:20:54.669 and completed at 02:21:00. Between those, the edge asked for
+        // transcription again; the transcoder logged the second request as a
+        // duplicate and did no work for it.
+        //
+        // The edge previously stamped that re-trigger with a write-time generation,
+        // which outranked the finishing attempt's terminal generation because the
+        // latter is anchored to its earlier start. The completion was discarded and
+        // the blob stayed at `processing` while its VTT sat in storage.
+        let attempt_start_ms = 1_785_896_454_669;
+        let retrigger_ms = 1_785_896_456_908;
+
+        let attempt_processing = status_generation_from_ms(
+            attempt_start_ms,
+            transcript_status_event_sequence(crate::blossom::TranscriptStatus::Processing),
+        );
+        let attempt_terminal = status_generation_from_ms(
+            attempt_start_ms,
+            transcript_status_event_sequence(crate::blossom::TranscriptStatus::Complete),
+        );
+
+        // The write-time stamp the edge used to produce, kept here to show why the
+        // completion lost rather than to assert current behaviour.
+        let retrigger_stamp = status_generation_from_ms(
+            retrigger_ms,
+            transcript_status_event_sequence(crate::blossom::TranscriptStatus::Processing),
+        );
+        assert!(attempt_terminal < retrigger_stamp);
+        assert_eq!(
+            generation_rejection(Some(attempt_terminal), Some(retrigger_stamp), true, false),
+            Some(StatusUpdateOutcome::StaleGeneration {
+                incoming: Some(attempt_terminal),
+                stored: Some(retrigger_stamp),
+            })
+        );
+
+        // The edge no longer stamps a re-trigger, so the stored generation stays at
+        // the attempt's own processing event and the completion applies.
+        assert_eq!(
+            edge_transcript_status_generation(crate::blossom::TranscriptStatus::Processing),
+            None
+        );
+        assert_eq!(
+            generation_rejection(
+                Some(attempt_terminal),
+                Some(attempt_processing),
+                true,
+                false
+            ),
+            None
         );
     }
 }
