@@ -10,6 +10,7 @@ This directory is the index for repository documentation. Current docs first, hi
 - [CHANGELOG.md](../CHANGELOG.md) — release history
 - [docs/api/](api/) — cross-service API contracts (creator-delete, etc.)
 - [docs/runbooks/](runbooks/) — operational runbooks
+- [docs/runbooks/deployment.md](runbooks/deployment.md) — what deploys automatically, what deploys by hand, and which GCP project each service lives in
 - [docs/derivative-status-queue.md](derivative-status-queue.md) — Cloud Tasks rollout notes for derivative status callbacks
 
 ## Historical
