@@ -1,0 +1,122 @@
+# Deployment
+
+Some of this repository deploys itself and some of it does not. After tests pass,
+merging to `main` publishes the Fastly edge service to production within minutes,
+with no human step. Most Cloud Run services do not ship that way — each one is a
+script someone runs by hand.
+
+That asymmetry is the thing to plan around. Any change that spans the edge and a
+Cloud Run service goes out in two stages, the edge first, and there is a window
+where new edge code is talking to an old backend.
+
+## What ships automatically
+
+`.github/workflows/ci.yml` runs on every push to `main`. After the `test` job
+passes, it deploys, in parallel:
+
+- the edge service to Fastly (`fastly compute publish`), followed by a CDN purge
+- `process-blob` to Cloud Run
+- the container image to GHCR
+
+## What ships by hand
+
+These services are not deployed by CI. Each is a script you run yourself.
+
+| Service | Script |
+| --- | --- |
+| `divine-transcoder` | `cloud-run-transcoder/deploy.sh` |
+| upload service | `cloud-run-upload/deploy.sh` |
+| Parakeet ASR | `cloud-run-asr-parakeet/deploy.sh` |
+
+`process-blob` also has `scripts/deploy-cloud-function.sh` for manual deploys.
+It targets the same Cloud Run service that CI deploys on merge, so treat the CI
+job and the manual script as competing deploy paths for one service, not two
+separate services.
+
+## The edge Cloud Run backends are not in the production project
+
+The edge hardcodes its backends to project number `149672065768`:
+
+```rust
+const CLOUD_RUN_TRANSCODER_HOST: &str = "divine-transcoder-149672065768.us-central1.run.app";
+const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
+```
+
+That is the proof-of-concept project `rich-compiler-479518-d2`, not
+`dv-platform-prod`. See issue #32, which is open and tracks moving them.
+
+Most deploy scripts default `PROJECT_ID` to whatever your active `gcloud`
+configuration points at. `scripts/deploy-cloud-function.sh` is the exception: it
+requires `GCP_PROJECT_ID` and exits if it is unset. If your context is
+`dv-platform-prod` — the normal case — running a script that reads the active
+context without an explicit project may build and deploy into the wrong project.
+The edge keeps calling the old service, and nothing changes except a stray
+service in production. The transcoder script is especially easy to mis-run this
+way because it derives its runtime service account from the target project.
+
+Always pass the project explicitly, using the variable the script reads:
+
+```bash
+PROJECT_ID=rich-compiler-479518-d2 ./cloud-run-transcoder/deploy.sh
+PROJECT_ID=rich-compiler-479518-d2 ./cloud-run-upload/deploy.sh
+PROJECT_ID=rich-compiler-479518-d2 ./cloud-run-asr-parakeet/deploy.sh
+GCP_PROJECT_ID=rich-compiler-479518-d2 ./scripts/deploy-cloud-function.sh
+```
+
+## Check live configuration before running a deploy script
+
+Only `cloud-run-transcoder/deploy.sh` currently uses `--update-env-vars` and
+`--update-secrets`, so unnamed keys are preserved for transcoder deploys. Keys it
+*does* name are overwritten with the script's defaults, which may not match what
+is running. Compare before you deploy, and read names rather than values:
+
+```bash
+gcloud run services describe divine-transcoder \
+  --project rich-compiler-479518-d2 --region us-central1 --format=json \
+  | python3 -c "
+import json,sys
+c=json.load(sys.stdin)['spec']['template']['spec']['containers'][0]
+print('image:', c['image'])
+print('env:', sorted(e['name'] for e in c.get('env',[]) if 'value' in e))
+print('secrets:', sorted(e['name'] for e in c.get('env',[]) if 'valueFrom' in e))
+"
+```
+
+Do not assume that safety applies to the other deploy paths yet:
+
+- `cloud-run-upload/deploy.sh` still uses `--set-env-vars` and `--set-secrets`.
+- `cloud-run-asr-parakeet/deploy.sh` still uses `--set-env-vars`.
+- `scripts/deploy-cloud-function.sh` still uses `--set-env-vars`.
+- `.github/workflows/ci.yml` still deploys `process-blob` with
+  `--set-env-vars`, so every merge to `main` can replace live `process-blob`
+  environment variables with the smaller CI set.
+
+Never add new `--set-env-vars` or `--set-secrets` usage unless the command owns
+the complete live configuration. Both replace the entire configuration and
+silently drop live settings the deploy path does not name. PR #153 fixed this
+for the transcoder script only; the other deploy paths still need the same
+treatment; see issue #171.
+
+## Staged rollout when the edge and a backend change together
+
+The edge is already live by the time you start deploying the backend, so the
+compatibility question is always "what does new edge do when the old backend
+answers?" Where the edge has a receiver-side switch, set it before merging, not
+after.
+
+The derivative status generation guard is one such switch. See
+[derivative-status-queue.md](../derivative-status-queue.md) for its rollout,
+including the `REQUIRE_DERIVATIVE_STATUS_GENERATION` config-store key that must
+be `false` while the transcoder is still an image that does not send
+`generation`.
+
+## Verifying a transcoder deploy landed
+
+The transcoder does not report its version anywhere the edge can see. Confirm
+from the Cloud Run side that the image tag matches the commit you deployed:
+
+```bash
+gcloud run services describe divine-transcoder \
+  --project rich-compiler-479518-d2 --region us-central1 \
+  --format='value(spec.template.spec.containers[0].image)'
+```
