@@ -38,7 +38,7 @@ use crate::metadata::{
     put_blob_metadata, put_subtitle_job, remove_from_audio_source_refs, remove_from_blob_refs,
     remove_from_recent_index, remove_from_user_index, remove_from_user_list,
     set_subtitle_job_id_for_hash, update_blob_status, update_stats_on_add, update_stats_on_remove,
-    TranscodeMetadataUpdate, TranscriptMetadataUpdate,
+    StatusUpdateOutcome, TranscodeMetadataUpdate, TranscriptMetadataUpdate,
 };
 use crate::storage::{
     blob_exists, check_funnelcake_audio_reuse, current_timestamp, delete_blob as storage_delete,
@@ -1296,6 +1296,20 @@ fn purge_transcript_content_cache(hash: &str) {
     let _ = simple_cache::purge(cache_key);
 }
 
+fn edge_transcript_metadata_update(status: TranscriptStatus) -> TranscriptMetadataUpdate {
+    TranscriptMetadataUpdate {
+        generation: Some(crate::metadata::edge_transcript_status_generation(status)),
+        ..TranscriptMetadataUpdate::default()
+    }
+}
+
+fn edge_transcript_metadata_update_now(status: TranscriptStatus) -> TranscriptMetadataUpdate {
+    TranscriptMetadataUpdate {
+        last_attempt_at: Some(current_timestamp()),
+        ..edge_transcript_metadata_update(status)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedTranscodeStatusWebhook {
     sha256: String,
@@ -1306,6 +1320,8 @@ struct ParsedTranscodeStatusWebhook {
     error_message: Option<String>,
     retry_after_epoch_secs: Option<u64>,
     terminal: bool,
+    generation: Option<u64>,
+    malformed_generation: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1320,6 +1336,8 @@ struct ParsedTranscriptStatusWebhook {
     error_message: Option<String>,
     retry_after_epoch_secs: Option<u64>,
     terminal: bool,
+    generation: Option<u64>,
+    malformed_generation: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1372,6 +1390,16 @@ fn parse_optional_bool(payload: &serde_json::Value, field: &str) -> Option<bool>
         .or_else(|| payload[field].as_str().and_then(|value| value.parse().ok()))
 }
 
+fn parse_generation_field(payload: &serde_json::Value) -> (Option<u64>, bool) {
+    match payload.get("generation") {
+        None | Some(serde_json::Value::Null) => (None, false),
+        Some(value) => match value.as_u64() {
+            Some(generation) => (Some(generation), false),
+            None => (None, true),
+        },
+    }
+}
+
 fn parse_transcode_status_webhook_payload(
     payload: &serde_json::Value,
     now_epoch_secs: u64,
@@ -1405,6 +1433,8 @@ fn parse_transcode_status_webhook_payload(
         _ => None,
     };
 
+    let (generation, malformed_generation) = parse_generation_field(payload);
+
     Ok(ParsedTranscodeStatusWebhook {
         sha256,
         status,
@@ -1414,6 +1444,8 @@ fn parse_transcode_status_webhook_payload(
         error_message: payload["error_message"].as_str().map(|s| s.to_string()),
         retry_after_epoch_secs: parse_optional_retry_after_epoch(payload, now_epoch_secs),
         terminal: parse_optional_bool(payload, "terminal").unwrap_or(false),
+        generation,
+        malformed_generation,
     })
 }
 
@@ -1443,6 +1475,8 @@ fn parse_transcript_status_webhook_payload(
         }
     };
 
+    let (generation, malformed_generation) = parse_generation_field(payload);
+
     Ok(ParsedTranscriptStatusWebhook {
         sha256,
         status,
@@ -1454,6 +1488,8 @@ fn parse_transcript_status_webhook_payload(
         error_message: payload["error_message"].as_str().map(|s| s.to_string()),
         retry_after_epoch_secs: parse_optional_retry_after_epoch(payload, now_epoch_secs),
         terminal: parse_optional_bool(payload, "terminal").unwrap_or(false),
+        generation,
+        malformed_generation,
     })
 }
 
@@ -1618,10 +1654,7 @@ fn serve_transcript_by_hash(
                 let _ = update_transcript_status(
                     hash,
                     TranscriptStatus::Complete,
-                    TranscriptMetadataUpdate {
-                        last_attempt_at: Some(current_timestamp()),
-                        ..Default::default()
-                    },
+                    edge_transcript_metadata_update_now(TranscriptStatus::Complete),
                 );
             }
             resp.set_header("Content-Type", "text/vtt; charset=utf-8");
@@ -1670,10 +1703,7 @@ fn serve_transcript_by_hash(
                     let _ = update_transcript_status(
                         hash,
                         TranscriptStatus::Processing,
-                        TranscriptMetadataUpdate {
-                            last_attempt_at: Some(current_timestamp()),
-                            ..Default::default()
-                        },
+                        edge_transcript_metadata_update_now(TranscriptStatus::Processing),
                     );
                     let _ = trigger_on_demand_transcription(hash, &metadata.owner, None, None);
 
@@ -1758,10 +1788,7 @@ fn handle_head_transcript_by_hash(hash: &str) -> Result<Response> {
                 let _ = update_transcript_status(
                     hash,
                     TranscriptStatus::Complete,
-                    TranscriptMetadataUpdate {
-                        last_attempt_at: Some(current_timestamp()),
-                        ..Default::default()
-                    },
+                    edge_transcript_metadata_update_now(TranscriptStatus::Complete),
                 );
             }
             let mut resp = Response::from_status(StatusCode::OK);
@@ -1861,10 +1888,7 @@ fn dispatch_subtitle_job(job: &mut SubtitleJob, owner: &str) -> Result<()> {
     let _ = crate::metadata::update_transcript_status(
         &job.video_sha256,
         TranscriptStatus::Processing,
-        TranscriptMetadataUpdate {
-            last_attempt_at: Some(current_timestamp()),
-            ..Default::default()
-        },
+        edge_transcript_metadata_update_now(TranscriptStatus::Processing),
     );
 
     let lang_for_provider = job
@@ -2241,6 +2265,7 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
         transcode_retry_after: None,
         transcode_attempt_count: 0,
         transcode_terminal: false,
+        transcode_generation: None,
         dim: None,
         transcript_status: None,
         transcript_error_code: None,
@@ -2249,6 +2274,7 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
         transcript_retry_after: None,
         transcript_attempt_count: 0,
         transcript_terminal: false,
+        transcript_generation: None,
     };
     let _ = put_blob_metadata(&audio_metadata);
 
@@ -2974,11 +3000,11 @@ fn trigger_on_demand_transcription(
             vtt.len() as u64,
             owner,
         )?;
-        use crate::metadata::{update_transcript_status, TranscriptMetadataUpdate};
+        use crate::metadata::update_transcript_status;
         update_transcript_status(
             hash,
             crate::blossom::TranscriptStatus::Complete,
-            TranscriptMetadataUpdate::default(),
+            edge_transcript_metadata_update(crate::blossom::TranscriptStatus::Complete),
         )?;
         if let Some(id) = job_id {
             if let Ok(Some(mut job)) = crate::metadata::get_subtitle_job(id) {
@@ -3048,10 +3074,7 @@ fn eagerly_trigger_transcription_if_needed(
                 let _ = crate::metadata::update_transcript_status(
                     hash,
                     TranscriptStatus::Processing,
-                    TranscriptMetadataUpdate {
-                        last_attempt_at: Some(current_timestamp()),
-                        ..Default::default()
-                    },
+                    edge_transcript_metadata_update_now(TranscriptStatus::Processing),
                 );
             }
         }
@@ -3235,6 +3258,7 @@ fn handle_upload(mut req: Request) -> Result<Response> {
         transcode_retry_after: None,
         transcode_attempt_count: 0,
         transcode_terminal: false,
+        transcode_generation: None,
         dim: None, // Set by transcoder webhook when transcoding completes
         transcript_status: if is_transcribable_mime_type(&content_type) {
             Some(TranscriptStatus::Pending)
@@ -3247,6 +3271,7 @@ fn handle_upload(mut req: Request) -> Result<Response> {
         transcript_retry_after: None,
         transcript_attempt_count: 0,
         transcript_terminal: false,
+        transcript_generation: None,
     };
 
     put_blob_metadata(&metadata)?;
@@ -3615,6 +3640,7 @@ fn publish_upload_service_upload(
             0
         },
         transcode_terminal,
+        transcode_generation: None,
         dim: dim.clone(),
         transcript_status: if is_transcribable_mime_type(&content_type) {
             if transcript_error_code.is_some() {
@@ -3637,6 +3663,7 @@ fn publish_upload_service_upload(
             0
         },
         transcript_terminal,
+        transcript_generation: None,
     };
 
     put_blob_metadata(&metadata)?;
@@ -4719,6 +4746,7 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
         transcode_retry_after: None,
         transcode_attempt_count: 0,
         transcode_terminal: false,
+        transcode_generation: None,
         dim: None, // Set by transcoder webhook when transcoding completes
         transcript_status: if is_transcribable_mime_type(&content_type) {
             Some(TranscriptStatus::Pending)
@@ -4731,6 +4759,7 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
         transcript_retry_after: None,
         transcript_attempt_count: 0,
         transcript_terminal: false,
+        transcript_generation: None,
     };
 
     put_blob_metadata(&metadata)?;
@@ -5107,8 +5136,7 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
             .as_str()
             .unwrap_or("Creator-initiated deletion via kind 5");
 
-        let physical_delete_enabled =
-            crate::admin::get_config("ENABLE_PHYSICAL_DELETE").as_deref() == Some("true");
+        let physical_delete_enabled = config_flag_enabled("ENABLE_PHYSICAL_DELETE", false);
 
         let meta_json = serde_json::to_string(&metadata).ok();
 
@@ -5207,6 +5235,93 @@ fn validate_transcoder_webhook(req: &Request, label: &str) -> Result<()> {
     }
 }
 
+fn config_flag_enabled(key: &str, default: bool) -> bool {
+    match crate::admin::get_config(key) {
+        Some(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" => true,
+            "false" | "0" => false,
+            _ => default,
+        },
+        None => default,
+    }
+}
+
+fn derivative_generation_guard_enabled() -> bool {
+    config_flag_enabled("REQUIRE_DERIVATIVE_STATUS_GENERATION", true)
+}
+
+fn ignored_generation_response(
+    sha256: &str,
+    reason: &str,
+    incoming: Option<u64>,
+    stored: Option<u64>,
+) -> Response {
+    let response = serde_json::json!({
+        "success": true,
+        "sha256": sha256,
+        "ignored": reason,
+        "incoming_generation": incoming,
+        "stored_generation": stored
+    });
+    let mut resp = json_response(StatusCode::OK, &response);
+    add_cors_headers(&mut resp);
+    resp
+}
+
+fn derivative_reconciliation_response(sha256: &str, label: &str, status: &str) -> Response {
+    let response = serde_json::json!({
+        "success": true,
+        "sha256": sha256,
+        "reconciliation": "pending",
+        "message": format!("{} status accepted for later reconciliation", label),
+        "status": status
+    });
+    let mut resp = json_response(StatusCode::ACCEPTED, &response);
+    add_cors_headers(&mut resp);
+    resp
+}
+
+fn generation_ignore_response(
+    outcome: StatusUpdateOutcome,
+    sha256: &str,
+    label: &str,
+) -> Option<Response> {
+    let (reason, incoming, stored, log_detail) = match outcome {
+        StatusUpdateOutcome::Applied => return None,
+        StatusUpdateOutcome::StaleGeneration { incoming, stored } => (
+            "stale_generation",
+            incoming,
+            stored,
+            format!("incoming gen {:?} < stored {:?}", incoming, stored),
+        ),
+        StatusUpdateOutcome::DuplicateGeneration { incoming, stored } => (
+            "duplicate_generation",
+            incoming,
+            stored,
+            format!("incoming gen {:?} == stored {:?}", incoming, stored),
+        ),
+        StatusUpdateOutcome::MissingGeneration { stored } => (
+            "missing_generation",
+            None,
+            stored,
+            format!("stored gen {:?}", stored),
+        ),
+        StatusUpdateOutcome::MalformedGeneration { stored } => (
+            "malformed_generation",
+            None,
+            stored,
+            format!("stored gen {:?}", stored),
+        ),
+    };
+    eprintln!(
+        "[{}] Ignoring {} callback for {}: {}",
+        label, reason, sha256, log_detail
+    );
+    Some(ignored_generation_response(
+        sha256, reason, incoming, stored,
+    ))
+}
+
 /// POST /admin/transcode-status - Webhook from divine-transcoder service
 /// Updates transcode status for a blob after HLS generation
 fn handle_transcode_status(mut req: Request) -> Result<Response> {
@@ -5246,9 +5361,15 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
             retry_after: parsed.retry_after_epoch_secs,
             terminal: Some(parsed.terminal),
             increment_attempt_count: matches!(parsed.status, TranscodeStatus::Failed),
+            generation: parsed.generation,
+            require_generation_after_versioned: derivative_generation_guard_enabled(),
+            malformed_generation: parsed.malformed_generation,
         },
     ) {
-        Ok(()) => {
+        Ok(outcome) => {
+            if let Some(resp) = generation_ignore_response(outcome, sha256, "TRANSCODE") {
+                return Ok(resp);
+            }
             if let Some(ref d) = parsed.dim {
                 eprintln!(
                     "[TRANSCODE] Updated blob {} to transcode status {:?} with dim {}",
@@ -5286,15 +5407,18 @@ fn handle_transcode_status(mut req: Request) -> Result<Response> {
             Ok(resp)
         }
         Err(BlossomError::NotFound(_)) => {
-            eprintln!("[TRANSCODE] Blob {} not found", sha256);
-            let response = serde_json::json!({
-                "success": false,
-                "sha256": sha256,
-                "error": "Blob not found"
-            });
-            let mut resp = json_response(StatusCode::NOT_FOUND, &response);
-            add_cors_headers(&mut resp);
-            Ok(resp)
+            eprintln!(
+                "[TRANSCODE] Reconciliation pending for missing blob {} status={:?} error_code={:?} retry_after={:?}",
+                sha256,
+                parsed.status,
+                parsed.error_code,
+                parsed.retry_after_epoch_secs
+            );
+            Ok(derivative_reconciliation_response(
+                sha256,
+                "Transcode",
+                &format!("{:?}", parsed.status).to_lowercase(),
+            ))
         }
         Err(e) => {
             eprintln!("[TRANSCODE] Failed to update blob {}: {:?}", sha256, e);
@@ -5334,9 +5458,15 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
             retry_after: parsed.retry_after_epoch_secs,
             terminal: Some(parsed.terminal),
             increment_attempt_count: matches!(parsed.status, TranscriptStatus::Failed),
+            generation: parsed.generation,
+            require_generation_after_versioned: derivative_generation_guard_enabled(),
+            malformed_generation: parsed.malformed_generation,
         },
     ) {
-        Ok(()) => {
+        Ok(outcome) => {
+            if let Some(resp) = generation_ignore_response(outcome, sha256, "TRANSCRIPT") {
+                return Ok(resp);
+            }
             eprintln!(
                 "[TRANSCRIPT] Updated blob {} to transcript status {:?}",
                 sha256, parsed.status
@@ -5416,15 +5546,11 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
                 parsed.error_code,
                 parsed.retry_after_epoch_secs
             );
-            let response = serde_json::json!({
-                "success": true,
-                "sha256": sha256,
-                "reconciliation": "pending",
-                "message": "Transcript status accepted for later reconciliation"
-            });
-            let mut resp = json_response(StatusCode::ACCEPTED, &response);
-            add_cors_headers(&mut resp);
-            Ok(resp)
+            Ok(derivative_reconciliation_response(
+                sha256,
+                "Transcript",
+                &format!("{:?}", parsed.status).to_lowercase(),
+            ))
         }
         Err(e) => {
             eprintln!("[TRANSCRIPT] Failed to update blob {}: {:?}", sha256, e);
@@ -6006,8 +6132,9 @@ fn infer_mime_from_path(path: &str) -> Option<&'static str> {
 mod tests {
     use super::{
         backfill_batch_cursor, classify_audio_reuse_availability, decide_transcode_fetch_action,
-        decide_transcript_fetch_action, error_response, is_alias_only_audio_blob,
-        is_quality_variant_path, parse_quality_variant_path,
+        decide_transcript_fetch_action, derivative_reconciliation_response, error_response,
+        ignored_generation_response, is_alias_only_audio_blob, is_quality_variant_path,
+        parse_quality_variant_path, parse_transcode_status_webhook_payload,
         parse_transcript_status_webhook_payload, parse_upload_service_response,
         should_delete_derived_audio_blob, should_eagerly_trigger_transcription,
         should_record_upload_service_transcode_failure,
@@ -6345,6 +6472,98 @@ mod tests {
 
         assert_eq!(parsed.error_code.as_deref(), Some("provider_rate_limited"));
         assert_eq!(parsed.retry_after_epoch_secs, Some(1_015));
+    }
+
+    #[test]
+    fn parses_transcode_webhook_generation() {
+        let payload = serde_json::json!({
+            "sha256": "50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a",
+            "status": "complete",
+            "generation": 1_700_000_000_123_u64
+        });
+
+        let parsed = parse_transcode_status_webhook_payload(&payload, 1_000).unwrap();
+
+        assert_eq!(parsed.generation, Some(1_700_000_000_123));
+        assert!(!parsed.malformed_generation);
+    }
+
+    #[test]
+    fn parses_transcript_webhook_generation() {
+        let payload = serde_json::json!({
+            "sha256": "50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a",
+            "status": "processing",
+            "generation": 42_u64
+        });
+
+        let parsed = parse_transcript_status_webhook_payload(&payload, 1_000).unwrap();
+
+        assert_eq!(parsed.generation, Some(42));
+        assert!(!parsed.malformed_generation);
+    }
+
+    #[test]
+    fn parses_missing_webhook_generation_as_legacy_absent() {
+        let payload = serde_json::json!({
+            "sha256": "50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a",
+            "status": "complete"
+        });
+
+        let parsed = parse_transcode_status_webhook_payload(&payload, 1_000).unwrap();
+
+        assert_eq!(parsed.generation, None);
+        assert!(!parsed.malformed_generation);
+    }
+
+    #[test]
+    fn parses_malformed_webhook_generation_distinctly() {
+        let payload = serde_json::json!({
+            "sha256": "50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a",
+            "status": "failed",
+            "generation": "123"
+        });
+
+        let parsed = parse_transcode_status_webhook_payload(&payload, 1_000).unwrap();
+
+        assert_eq!(parsed.generation, None);
+        assert!(parsed.malformed_generation);
+    }
+
+    #[test]
+    fn ignored_generation_response_returns_successful_ignore() {
+        let hash = "50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a";
+        let resp = ignored_generation_response(hash, "stale_generation", Some(3), Some(5));
+
+        assert_eq!(resp.get_status(), StatusCode::OK);
+        assert_eq!(
+            resp.get_header_str("Access-Control-Allow-Origin"),
+            Some("*")
+        );
+        assert!(resp
+            .into_body_str()
+            .contains("\"ignored\":\"stale_generation\""));
+    }
+
+    #[test]
+    fn ignored_generation_response_can_omit_incoming_generation() {
+        let hash = "50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a";
+        let resp = ignored_generation_response(hash, "missing_generation", None, Some(5));
+
+        assert_eq!(resp.get_status(), StatusCode::OK);
+        assert!(resp
+            .into_body_str()
+            .contains("\"ignored\":\"missing_generation\""));
+    }
+
+    #[test]
+    fn derivative_reconciliation_response_acknowledges_missing_blob() {
+        let hash = "50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a";
+        let resp = derivative_reconciliation_response(hash, "Transcode", "failed");
+
+        assert_eq!(resp.get_status(), StatusCode::ACCEPTED);
+        assert!(resp
+            .into_body_str()
+            .contains("\"reconciliation\":\"pending\""));
     }
 
     #[test]

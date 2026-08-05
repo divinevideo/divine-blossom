@@ -30,7 +30,10 @@ use std::{
     collections::HashMap,
     env,
     path::Path,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, OnceLock,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tempfile::TempDir;
@@ -107,6 +110,13 @@ struct Config {
     /// proxy injects it; the service is `--allow-unauthenticated`, so when this
     /// is unset the route fails closed (503).
     transcribe_shared_secret: Option<String>,
+    /// When true, status callbacks are enqueued to Cloud Tasks instead of sent
+    /// directly. Default false keeps direct POST as the rollback path.
+    status_queue_enabled: bool,
+    /// Cloud Tasks location for durable derivative status callbacks.
+    status_queue_location: String,
+    /// Cloud Tasks queue id for durable derivative status callbacks.
+    status_queue_name: String,
 }
 
 impl Config {
@@ -244,6 +254,14 @@ impl Config {
             transcribe_shared_secret: lookup("TRANSCRIBE_SHARED_SECRET")
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty()),
+            status_queue_enabled: parse_bool(&mut lookup, "STATUS_QUEUE_ENABLED", false),
+            status_queue_location: lookup("STATUS_QUEUE_LOCATION")
+                .or_else(|| lookup("GCP_REGION"))
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "us-central1".to_string()),
+            status_queue_name: lookup("STATUS_QUEUE_NAME")
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "derivative-status".to_string()),
         }
     }
 
@@ -1234,6 +1252,7 @@ async fn process_transcode(
         return Err(anyhow!("Invalid hash format: must be 64 hex characters"));
     }
 
+    let attempt_generation = next_status_generation();
     info!("Starting transcode for {}", hash);
 
     // Check if HLS already exists
@@ -1250,6 +1269,7 @@ async fn process_transcode(
             None,
             None,
             None,
+            status_event_generation(attempt_generation, STATUS_EVENT_TERMINAL),
             false,
         )
         .await;
@@ -1284,6 +1304,7 @@ async fn process_transcode(
         None,
         None,
         None,
+        status_event_generation(attempt_generation, STATUS_EVENT_PROCESSING),
         false,
     )
     .await;
@@ -1312,6 +1333,7 @@ async fn process_transcode(
             Some("download_failed"),
             Some(&e.to_string()),
             None,
+            status_event_generation(attempt_generation, STATUS_EVENT_TERMINAL),
             false,
         )
         .await;
@@ -1400,6 +1422,7 @@ async fn process_transcode(
                 Some(error_code),
                 Some(&error_message),
                 None,
+                status_event_generation(attempt_generation, STATUS_EVENT_TERMINAL),
                 terminal,
             )
             .await;
@@ -1433,6 +1456,7 @@ async fn process_transcode(
             Some("upload_failed"),
             Some(&e.to_string()),
             None,
+            status_event_generation(attempt_generation, STATUS_EVENT_TERMINAL),
             false,
         )
         .await;
@@ -1451,6 +1475,7 @@ async fn process_transcode(
         None,
         None,
         None,
+        status_event_generation(attempt_generation, STATUS_EVENT_TERMINAL),
         false,
     )
     .await;
@@ -1598,6 +1623,7 @@ async fn process_transcribe(
         return Err(anyhow!("Invalid hash format: must be 64 hex characters"));
     }
 
+    let attempt_generation = next_status_generation();
     info!("Starting transcription for {}", hash);
 
     let vtt_path = format!("{}/vtt/main.vtt", hash);
@@ -1618,6 +1644,7 @@ async fn process_transcribe(
             None,
             None,
             None,
+            status_event_generation(attempt_generation, STATUS_EVENT_TERMINAL),
             false,
         )
         .await;
@@ -1675,6 +1702,7 @@ async fn process_transcribe(
         None,
         None,
         None,
+        status_event_generation(attempt_generation, STATUS_EVENT_PROCESSING),
         false,
     )
     .await;
@@ -1715,6 +1743,7 @@ async fn process_transcribe(
             None,
             Some("download_failed"),
             Some(&e.to_string()),
+            status_event_generation(attempt_generation, STATUS_EVENT_TERMINAL),
             false,
         )
         .await;
@@ -1734,6 +1763,7 @@ async fn process_transcribe(
             requested_lang.as_deref(),
             parsed_vtt,
             &vtt_path,
+            attempt_generation,
         )
         .await;
         if let Err(lock_error) = delete_transcript_lock(
@@ -1793,6 +1823,7 @@ async fn process_transcribe(
             None,
             Some(error_code),
             Some(&error_message),
+            status_event_generation(attempt_generation, STATUS_EVENT_TERMINAL),
             terminal,
         )
         .await;
@@ -1832,6 +1863,7 @@ async fn process_transcribe(
             requested_lang.as_deref(),
             parsed_vtt,
             &vtt_path,
+            attempt_generation,
         )
         .await;
         if let Err(lock_error) = delete_transcript_lock(
@@ -1946,6 +1978,7 @@ async fn process_transcribe(
                     e.retry_after().map(|duration| duration.as_secs().max(1)),
                     Some(e.error_code()),
                     Some(&e.to_string()),
+                    status_event_generation(attempt_generation, STATUS_EVENT_TERMINAL),
                     false,
                 )
                 .await;
@@ -1996,6 +2029,7 @@ async fn process_transcribe(
                     None,
                     Some("normalize_failed"),
                     Some(&e.to_string()),
+                    status_event_generation(attempt_generation, STATUS_EVENT_TERMINAL),
                     false,
                 )
                 .await;
@@ -2042,6 +2076,7 @@ async fn process_transcribe(
                     None,
                     Some("normalize_failed"),
                     Some(&e.to_string()),
+                    status_event_generation(attempt_generation, STATUS_EVENT_TERMINAL),
                     false,
                 )
                 .await;
@@ -2161,6 +2196,7 @@ async fn process_transcribe(
         requested_lang.as_deref(),
         parsed_vtt,
         &vtt_path,
+        attempt_generation,
     )
     .await;
     if let Err(lock_error) = delete_transcript_lock(
@@ -2891,9 +2927,9 @@ const ACCESS_TOKEN_CACHE_TTL: Duration = Duration::from_secs(50 * 60);
 
 const METADATA_FETCH_MAX_ATTEMPTS: u32 = 3;
 
-/// Backoff for sequential metadata-server attempts. Kept short because
-/// each fetch already has a 5s socket timeout — the goal is to ride
-/// through brief Cloud Run metadata-server hiccups, not long outages.
+/// Backoff for short control-plane retries. Kept short because callers already
+/// bound each request with a timeout; the goal is to ride through brief Cloud
+/// Run or Google API hiccups, not long outages.
 fn token_fetch_retry_delay(attempt: u32) -> Duration {
     match attempt {
         0 => Duration::from_millis(200),
@@ -3822,6 +3858,7 @@ async fn finalize_transcript(
     requested_lang: Option<&str>,
     parsed_vtt: ParsedVtt,
     vtt_path: &str,
+    attempt_generation: u64,
 ) -> Result<TranscribeResponse> {
     if let Err(e) = upload_transcript_to_gcs(
         &state.gcs_client,
@@ -3843,6 +3880,7 @@ async fn finalize_transcript(
             None,
             Some("upload_failed"),
             Some(&e.to_string()),
+            status_event_generation(attempt_generation, STATUS_EVENT_TERMINAL),
             false,
         )
         .await;
@@ -3861,6 +3899,7 @@ async fn finalize_transcript(
         None,
         None,
         None,
+        status_event_generation(attempt_generation, STATUS_EVENT_TERMINAL),
         false,
     )
     .await;
@@ -3876,19 +3915,64 @@ async fn finalize_transcript(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_transcode_status_webhook_payload, classify_audio_extract_error,
-        constant_time_eq, contains_instruction_echo, decide_transcript_lock_action,
-        ensure_transcribe_audio_size,
+        attach_generation, build_cloud_tasks_task_body, build_transcode_status_webhook_payload,
+        classify_audio_extract_error, constant_time_eq, contains_instruction_echo,
+        decide_transcript_lock_action, ensure_transcribe_audio_size,
+        enqueue_status_task_request, enqueue_status_task_request_with_retry,
         identity_token_cache_for_audience, is_empty_transcript_normalize_error,
         is_implausible_text_density, is_loop_hallucination, is_retryable_provider_failure,
-        normalize_transcript_to_vtt, parakeet_request_url, parse_audio_analysis_output,
-        parse_provider_status, retry_delay_for_attempt, should_drop_low_signal_transcript,
+        next_status_generation, normalize_transcript_to_vtt, parakeet_request_url,
+        parse_audio_analysis_output, parse_provider_status, retry_delay_for_attempt,
+        should_drop_low_signal_transcript, status_event_generation, status_task_id,
         token_fetch_retry_delay, transcript_drop_reason, transcription_response_format,
         AccessTokenCache, AudioAnalysis, AudioExtractErrorKind, Config, ParsedVtt,
-        TranscriptConfidence, TranscriptDropReason, TranscriptLockAction, TranscriptLockState,
-        TranscriptLockStatus, VideoInfo, MAX_TRANSCRIBE_AUDIO_BYTES,
+        StatusTaskRequest, TranscriptConfidence, TranscriptDropReason, TranscriptLockAction,
+        TranscriptLockState, TranscriptLockStatus, VideoInfo, MAX_TRANSCRIBE_AUDIO_BYTES,
+        STATUS_EVENT_PROCESSING, STATUS_EVENT_TERMINAL,
     };
-    use std::time::{Duration, Instant};
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        thread,
+        time::{Duration, Instant},
+    };
+
+    fn spawn_status_server(
+        statuses: Vec<u16>,
+    ) -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&request_count);
+        let handle = thread::spawn(move || {
+            for status in statuses {
+                let (mut stream, _) = listener.accept().expect("accept test request");
+                count.fetch_add(1, Ordering::SeqCst);
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = [0_u8; 8192];
+                let _ = stream.read(&mut buf);
+                let reason = match status {
+                    200 => "OK",
+                    409 => "Conflict",
+                    500 => "Internal Server Error",
+                    502 => "Bad Gateway",
+                    _ => "Status",
+                };
+                let response = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+                    status, reason
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write test response");
+            }
+        });
+        (url, request_count, handle)
+    }
 
     #[test]
     fn transcribe_audio_size_guard_rejects_empty_and_oversize() {
@@ -3945,6 +4029,208 @@ mod tests {
         assert_eq!(config.transcription_provider, "gemini");
         assert_eq!(config.gcp_project_id, "rich-compiler-479518-d2");
         assert_eq!(config.gcp_region, "us-central1");
+        assert!(!config.status_queue_enabled);
+        assert_eq!(config.status_queue_location, "us-central1");
+        assert_eq!(config.status_queue_name, "derivative-status");
+    }
+
+    #[test]
+    fn status_queue_config_parses_explicit_values() {
+        let config = Config::from_lookup(|key| match key {
+            "STATUS_QUEUE_ENABLED" => Some("true".to_string()),
+            "STATUS_QUEUE_LOCATION" => Some("europe-west1".to_string()),
+            "STATUS_QUEUE_NAME" => Some("status-callbacks".to_string()),
+            _ => None,
+        });
+        assert!(config.status_queue_enabled);
+        assert_eq!(config.status_queue_location, "europe-west1");
+        assert_eq!(config.status_queue_name, "status-callbacks");
+    }
+
+    #[test]
+    fn status_queue_location_defaults_to_gcp_region() {
+        let config = Config::from_lookup(|key| match key {
+            "GCP_REGION" => Some("us-east1".to_string()),
+            _ => None,
+        });
+        assert_eq!(config.status_queue_location, "us-east1");
+    }
+
+    #[test]
+    fn attach_generation_adds_ordering_field() {
+        let mut payload = serde_json::json!({"sha256": "abc123", "status": "complete"});
+        attach_generation(&mut payload, 1_700_000_000_123);
+        assert_eq!(payload["generation"], 1_700_000_000_123_u64);
+        assert_eq!(payload["status"], "complete");
+    }
+
+    #[test]
+    fn next_status_generation_is_monotonic_within_process() {
+        let first = next_status_generation();
+        let second = next_status_generation();
+
+        assert!(second > first);
+    }
+
+    #[test]
+    fn status_event_generation_orders_events_within_attempt() {
+        let attempt_generation = 1_700_000_000_123;
+
+        assert!(
+            status_event_generation(attempt_generation, STATUS_EVENT_PROCESSING)
+                < status_event_generation(attempt_generation, STATUS_EVENT_TERMINAL)
+        );
+    }
+
+    #[test]
+    fn status_event_generation_keeps_later_attempt_ahead_of_older_terminal() {
+        let older_attempt = 1_700_000_000_123;
+        let newer_attempt = older_attempt + 1;
+
+        assert!(
+            status_event_generation(older_attempt, STATUS_EVENT_TERMINAL)
+                < status_event_generation(newer_attempt, STATUS_EVENT_PROCESSING)
+        );
+    }
+
+    #[test]
+    fn status_event_generation_stays_ordered_past_2028() {
+        let older_attempt = 2_000_000_000_000;
+        let newer_attempt = older_attempt + 1;
+
+        assert!(
+            status_event_generation(older_attempt, STATUS_EVENT_PROCESSING)
+                < status_event_generation(older_attempt, STATUS_EVENT_TERMINAL)
+        );
+        assert!(
+            status_event_generation(older_attempt, STATUS_EVENT_TERMINAL)
+                < status_event_generation(newer_attempt, STATUS_EVENT_PROCESSING)
+        );
+    }
+
+    #[test]
+    fn status_task_id_is_stable_for_idempotent_create_task_retries() {
+        let hash = "a".repeat(64);
+        assert_eq!(
+            status_task_id("transcode", &hash, 42),
+            format!("transcode-{}-42", hash)
+        );
+    }
+
+    #[test]
+    fn cloud_tasks_body_wraps_payload_as_base64_http_request() {
+        let payload = serde_json::json!({
+            "sha256": "abc123",
+            "status": "complete",
+            "generation": 1_700_000_000_123_u64
+        });
+        let body = build_cloud_tasks_task_body(
+            "projects/proj/locations/us-central1/queues/derivative-status",
+            "transcode-abc123-1700000000123",
+            "https://edge.example/admin/transcode-status",
+            Some("s3cr3t"),
+            &payload,
+        );
+
+        let http = &body["task"]["httpRequest"];
+        assert_eq!(
+            body["task"]["name"],
+            "projects/proj/locations/us-central1/queues/derivative-status/tasks/transcode-abc123-1700000000123"
+        );
+        assert_eq!(http["url"], "https://edge.example/admin/transcode-status");
+        assert_eq!(http["httpMethod"], "POST");
+        assert_eq!(http["headers"]["Content-Type"], "application/json");
+        assert_eq!(http["headers"]["Authorization"], "Bearer s3cr3t");
+
+        use base64::Engine as _;
+        let b64 = http["body"].as_str().expect("body should be a string");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("body should be valid base64");
+        let round: serde_json::Value =
+            serde_json::from_slice(&decoded).expect("decoded body should be JSON");
+        assert_eq!(round, payload);
+    }
+
+    #[test]
+    fn cloud_tasks_body_omits_authorization_when_no_secret() {
+        let payload = serde_json::json!({"sha256": "abc123", "status": "pending"});
+        let body = build_cloud_tasks_task_body(
+            "projects/proj/locations/us-central1/queues/derivative-status",
+            "transcode-abc123-1",
+            "https://edge.example/admin/transcode-status",
+            None,
+            &payload,
+        );
+        assert!(body["task"]["httpRequest"]["headers"]
+            .get("Authorization")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn enqueue_status_task_request_treats_conflict_as_success() {
+        let (create_url, request_count, server) = spawn_status_server(vec![409]);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let payload = serde_json::json!({
+            "sha256": "abc123",
+            "status": "complete",
+            "generation": 42_u64
+        });
+
+        let hash = "a".repeat(64);
+        let request = StatusTaskRequest {
+            create_url: &create_url,
+            queue_path: "projects/proj/locations/us-central1/queues/derivative-status",
+            target_url: "https://edge.example/admin/transcode-status",
+            label: "transcode",
+            hash: &hash,
+            generation: 42,
+            payload: &payload,
+            token: "access-token",
+            webhook_secret: Some("webhook-secret"),
+        };
+
+        let result = enqueue_status_task_request(&client, &request).await;
+
+        assert!(result.is_ok());
+        server.join().expect("server thread should finish");
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn enqueue_status_task_request_retries_create_task_failures() {
+        let (create_url, request_count, server) = spawn_status_server(vec![500, 502, 200]);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let payload = serde_json::json!({
+            "sha256": "abc123",
+            "status": "processing",
+            "generation": 42_u64
+        });
+
+        let hash = "a".repeat(64);
+        let request = StatusTaskRequest {
+            create_url: &create_url,
+            queue_path: "projects/proj/locations/us-central1/queues/derivative-status",
+            target_url: "https://edge.example/admin/transcode-status",
+            label: "transcode",
+            hash: &hash,
+            generation: 42,
+            payload: &payload,
+            token: "access-token",
+            webhook_secret: None,
+        };
+
+        let result = enqueue_status_task_request_with_retry(&client, &request).await;
+
+        assert!(result.is_ok());
+        server.join().expect("server thread should finish");
+        assert_eq!(request_count.load(Ordering::SeqCst), 3);
     }
 
     #[test]
@@ -4463,11 +4749,11 @@ mod tests {
     fn loop_guard_passes_long_unique_text() {
         let mut s = String::new();
         for word in [
-            "The", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "near", "the",
-            "river", "where", "the", "old", "mill", "stood", "for", "centuries", "until", "the",
-            "great", "flood", "carried", "it", "downstream", "into", "the", "harbor", "where",
-            "fishermen", "still", "remember", "its", "broken", "wheel", "rotting", "in", "the",
-            "salt", "spray",
+            "The", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "near",
+            "the", "river", "where", "the", "old", "mill", "stood", "for", "centuries",
+            "until", "the", "great", "flood", "carried", "it", "downstream", "into", "the",
+            "harbor", "where", "fishermen", "still", "remember", "its", "broken", "wheel",
+            "rotting", "in", "the", "salt", "spray",
         ]
         .iter()
         .cycle()
@@ -5506,6 +5792,7 @@ async fn send_status_webhook(
     error_code: Option<&str>,
     error_message: Option<&str>,
     retry_after_secs: Option<u64>,
+    generation: u64,
     terminal: bool,
 ) {
     let webhook_url = match &config.webhook_url {
@@ -5519,7 +5806,6 @@ async fn send_status_webhook(
         }
     };
 
-    let client = reqwest::Client::new();
     let payload = build_transcode_status_webhook_payload(
         hash,
         status,
@@ -5542,30 +5828,16 @@ async fn send_status_webhook(
         );
     }
 
-    let mut request = client.post(webhook_url).json(&payload);
-
-    // Add auth header if secret is configured
-    if let Some(secret) = &config.webhook_secret {
-        request = request.header("Authorization", format!("Bearer {}", secret));
-    }
-
-    match request.send().await {
-        Ok(response) => {
-            if response.status().is_success() {
-                info!("Status webhook sent for {}: {}", hash, status);
-            } else {
-                error!(
-                    "Status webhook failed for {}: {} - {}",
-                    hash,
-                    response.status(),
-                    response.text().await.unwrap_or_default()
-                );
-            }
-        }
-        Err(e) => {
-            error!("Status webhook request failed for {}: {}", hash, e);
-        }
-    }
+    deliver_status_payload(
+        config,
+        hash,
+        "transcode",
+        status,
+        webhook_url,
+        payload,
+        generation,
+    )
+    .await;
 }
 
 fn resolve_transcript_webhook_url(config: &Config) -> Option<String> {
@@ -5625,6 +5897,255 @@ fn build_transcode_status_webhook_payload(
     payload
 }
 
+static LAST_STATUS_GENERATION: AtomicU64 = AtomicU64::new(0);
+static STATUS_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn next_status_generation() -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0);
+
+    let mut previous = LAST_STATUS_GENERATION.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(previous.saturating_add(1));
+        match LAST_STATUS_GENERATION.compare_exchange_weak(
+            previous,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(actual) => previous = actual,
+        }
+    }
+}
+
+const STATUS_EVENT_PROCESSING: u64 = 0;
+const STATUS_EVENT_TERMINAL: u64 = 1;
+
+fn status_event_generation(attempt_generation: u64, event_sequence: u64) -> u64 {
+    attempt_generation
+        .checked_mul(10)
+        .and_then(|base| base.checked_add(event_sequence))
+        .unwrap_or(u64::MAX)
+}
+
+fn attach_generation(payload: &mut serde_json::Value, generation: u64) {
+    payload["generation"] = serde_json::json!(generation);
+}
+
+fn build_cloud_tasks_task_body(
+    queue_path: &str,
+    task_id: &str,
+    target_url: &str,
+    webhook_secret: Option<&str>,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    let body_b64 = base64::engine::general_purpose::STANDARD
+        .encode(serde_json::to_vec(payload).expect("serializing JSON Value should not fail"));
+
+    let mut headers = serde_json::json!({ "Content-Type": "application/json" });
+    if let Some(secret) = webhook_secret {
+        headers["Authorization"] = serde_json::json!(format!("Bearer {}", secret));
+    }
+
+    serde_json::json!({
+        "task": {
+            "name": format!("{}/tasks/{}", queue_path, task_id),
+            "httpRequest": {
+                "url": target_url,
+                "httpMethod": "POST",
+                "headers": headers,
+                "body": body_b64,
+            }
+        }
+    })
+}
+
+fn status_task_id(label: &str, hash: &str, generation: u64) -> String {
+    format!("{}-{}-{}", label, hash, generation)
+}
+
+fn status_http_client() -> &'static reqwest::Client {
+    STATUS_HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("failed to build bounded status HTTP client")
+    })
+}
+
+async fn deliver_status_payload(
+    config: &Config,
+    hash: &str,
+    label: &str,
+    status: &str,
+    target_url: &str,
+    mut payload: serde_json::Value,
+    generation: u64,
+) {
+    attach_generation(&mut payload, generation);
+    let client = status_http_client();
+
+    if config.status_queue_enabled {
+        match enqueue_status_task_with_retry(
+            client, config, target_url, label, hash, generation, &payload,
+        )
+        .await
+        {
+            Ok(()) => info!("{} status enqueued for {}: {}", label, hash, status),
+            Err(e) => {
+                error!(
+                    "Failed to enqueue {} status task for {}: {}. status_callback_enqueue_failed=true",
+                    label, hash, e
+                );
+                post_status_payload(client, config, target_url, label, hash, status, &payload)
+                    .await;
+            }
+        }
+        return;
+    }
+
+    post_status_payload(client, config, target_url, label, hash, status, &payload).await;
+}
+
+async fn post_status_payload(
+    client: &reqwest::Client,
+    config: &Config,
+    target_url: &str,
+    label: &str,
+    hash: &str,
+    status: &str,
+    payload: &serde_json::Value,
+) {
+    let mut request = client.post(target_url).json(&payload);
+    if let Some(secret) = &config.webhook_secret {
+        request = request.header("Authorization", format!("Bearer {}", secret));
+    }
+
+    match request.send().await {
+        Ok(response) if response.status().is_success() => {
+            info!("{} status webhook sent for {}: {}", label, hash, status);
+        }
+        Ok(response) => {
+            error!(
+                "{} status webhook failed for {}: {} - {}",
+                label,
+                hash,
+                response.status(),
+                response.text().await.unwrap_or_default()
+            );
+        }
+        Err(e) => {
+            error!(
+                "{} status webhook request failed for {}: {}",
+                label, hash, e
+            );
+        }
+    }
+}
+
+async fn enqueue_status_task_with_retry(
+    client: &reqwest::Client,
+    config: &Config,
+    target_url: &str,
+    label: &str,
+    hash: &str,
+    generation: u64,
+    payload: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let token = fetch_gcp_access_token()
+        .await
+        .map_err(|e| anyhow!("access token: {:?}", e))?;
+    let queue_path = cloud_tasks_queue_path(config);
+    let create_url = cloud_tasks_create_url(&queue_path);
+    let request = StatusTaskRequest {
+        create_url: &create_url,
+        queue_path: &queue_path,
+        target_url,
+        label,
+        hash,
+        generation,
+        payload,
+        token: &token,
+        webhook_secret: config.webhook_secret.as_deref(),
+    };
+    enqueue_status_task_request_with_retry(client, &request).await
+}
+
+struct StatusTaskRequest<'a> {
+    create_url: &'a str,
+    queue_path: &'a str,
+    target_url: &'a str,
+    label: &'a str,
+    hash: &'a str,
+    generation: u64,
+    payload: &'a serde_json::Value,
+    token: &'a str,
+    webhook_secret: Option<&'a str>,
+}
+
+async fn enqueue_status_task_request_with_retry(
+    client: &reqwest::Client,
+    request: &StatusTaskRequest<'_>,
+) -> anyhow::Result<()> {
+    let mut last_error: Option<anyhow::Error> = None;
+    for attempt in 0..3 {
+        match enqueue_status_task_request(client, request).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < 2 {
+                    tokio::time::sleep(token_fetch_retry_delay(attempt)).await;
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("create task failed without an error")))
+}
+
+fn cloud_tasks_queue_path(config: &Config) -> String {
+    format!(
+        "projects/{}/locations/{}/queues/{}",
+        config.gcp_project_id, config.status_queue_location, config.status_queue_name
+    )
+}
+
+fn cloud_tasks_create_url(queue_path: &str) -> String {
+    format!("https://cloudtasks.googleapis.com/v2/{}/tasks", queue_path)
+}
+
+async fn enqueue_status_task_request(
+    client: &reqwest::Client,
+    request: &StatusTaskRequest<'_>,
+) -> anyhow::Result<()> {
+    let task_id = status_task_id(request.label, request.hash, request.generation);
+    let body = build_cloud_tasks_task_body(
+        request.queue_path,
+        &task_id,
+        request.target_url,
+        request.webhook_secret,
+        request.payload,
+    );
+
+    let resp = client
+        .post(request.create_url)
+        .header("Authorization", format!("Bearer {}", request.token))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow!("create task request failed: {}", e))?;
+
+    if resp.status().is_success() || resp.status() == reqwest::StatusCode::CONFLICT {
+        Ok(())
+    } else {
+        let code = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        Err(anyhow!("create task returned {}: {}", code, text))
+    }
+}
+
 fn classify_invalid_media_error(
     message: &str,
     fallback_code: &'static str,
@@ -5655,6 +6176,7 @@ async fn send_transcript_status_webhook(
     retry_after_secs: Option<u64>,
     error_code: Option<&str>,
     error_message: Option<&str>,
+    generation: u64,
     terminal: bool,
 ) {
     let webhook_url = match resolve_transcript_webhook_url(config) {
@@ -5668,7 +6190,6 @@ async fn send_transcript_status_webhook(
         }
     };
 
-    let client = reqwest::Client::new();
     let mut payload = serde_json::json!({
         "sha256": hash,
         "status": status
@@ -5701,29 +6222,14 @@ async fn send_transcript_status_webhook(
         payload["terminal"] = serde_json::json!(true);
     }
 
-    let mut request = client.post(webhook_url).json(&payload);
-    if let Some(secret) = &config.webhook_secret {
-        request = request.header("Authorization", format!("Bearer {}", secret));
-    }
-
-    match request.send().await {
-        Ok(response) => {
-            if response.status().is_success() {
-                info!("Transcript status webhook sent for {}: {}", hash, status);
-            } else {
-                error!(
-                    "Transcript status webhook failed for {}: {} - {}",
-                    hash,
-                    response.status(),
-                    response.text().await.unwrap_or_default()
-                );
-            }
-        }
-        Err(e) => {
-            error!(
-                "Transcript status webhook request failed for {}: {}",
-                hash, e
-            );
-        }
-    }
+    deliver_status_payload(
+        config,
+        hash,
+        "transcript",
+        status,
+        &webhook_url,
+        payload,
+        generation,
+    )
+    .await;
 }

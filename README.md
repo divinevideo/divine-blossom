@@ -115,6 +115,7 @@ Configuration is split across the Fastly config store (non-secret) and secret st
 | `gcs_project_id` | GCP project ID |
 | `funnelcake_api_url` | Funnelcake permission API base URL |
 | `ENABLE_PHYSICAL_DELETE` | When `"true"`, creator-delete via `/admin/api/moderate` physically removes bytes from GCS and purges edge caches; when `"false"` (default), it flips status only. Admin DMCA via `/admin/api/delete` is always a soft-delete regardless of this flag. |
+| `REQUIRE_DERIVATIVE_STATUS_GENERATION` | Set to `"false"` only during rollback to a transcoder image that does not send derivative status `generation` values. Defaults to required once a blob has versioned derivative state. |
 
 ### Secret store (`blossom_secrets`)
 

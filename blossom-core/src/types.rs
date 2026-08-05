@@ -76,6 +76,9 @@ pub struct BlobMetadata {
     /// Whether HLS generation has reached a terminal failure state
     #[serde(default)]
     pub transcode_terminal: bool,
+    /// Ordering token from the last applied transcode status callback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcode_generation: Option<u64>,
     /// Video dimensions as "WIDTHxHEIGHT" (display dimensions after rotation)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dim: Option<String>,
@@ -100,6 +103,9 @@ pub struct BlobMetadata {
     /// Whether transcript generation has reached a terminal failure state
     #[serde(default)]
     pub transcript_terminal: bool,
+    /// Ordering token from the last applied transcript status callback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript_generation: Option<u64>,
 }
 
 /// Moderation status for blobs
@@ -813,6 +819,7 @@ mod tests {
             transcode_retry_after: None,
             transcode_attempt_count: 0,
             transcode_terminal: false,
+            transcode_generation: None,
             dim: None,
             transcript_status: None,
             transcript_error_code: None,
@@ -821,6 +828,7 @@ mod tests {
             transcript_retry_after: None,
             transcript_attempt_count: 0,
             transcript_terminal: false,
+            transcript_generation: None,
         }
     }
 
@@ -992,6 +1000,7 @@ mod tests {
             transcode_retry_after: None,
             transcode_attempt_count: 0,
             transcode_terminal: false,
+            transcode_generation: None,
             dim: None,
             transcript_status: None,
             transcript_error_code: None,
@@ -1000,6 +1009,7 @@ mod tests {
             transcript_retry_after: None,
             transcript_attempt_count: 0,
             transcript_terminal: false,
+            transcript_generation: None,
         }
     }
 
