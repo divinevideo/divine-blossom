@@ -20,7 +20,9 @@ from burn_rate_monitor import (  # noqa: E402
     THRESHOLDS,
     build_report,
     evaluate,
+    format_alert_message,
     per_hour,
+    should_alert,
 )
 
 
@@ -189,6 +191,68 @@ class TestEvaluate(unittest.TestCase):
         severity, alerts = evaluate(report)
         self.assertEqual(severity, 2)
         self.assertTrue(any("CRITICAL" in a and "viewer_delivery" in a for a in alerts))
+
+
+class TestShouldAlert(unittest.TestCase):
+    COOLDOWN = 900
+
+    def test_escalation_sends_immediately_despite_cooldown(self):
+        # A spike must never wait out a cooldown started by a lesser alert.
+        self.assertTrue(
+            should_alert(2, 1, last_sent_at=100.0, cooldown=self.COOLDOWN, now=101.0)
+        )
+
+    def test_first_alert_at_a_severity_sends(self):
+        self.assertTrue(
+            should_alert(1, 0, last_sent_at=None, cooldown=self.COOLDOWN, now=0.0)
+        )
+
+    def test_steady_state_is_suppressed_within_cooldown(self):
+        self.assertFalse(
+            should_alert(2, 2, last_sent_at=100.0, cooldown=self.COOLDOWN, now=500.0)
+        )
+
+    def test_steady_state_repeats_after_cooldown(self):
+        self.assertTrue(
+            should_alert(2, 2, last_sent_at=100.0, cooldown=self.COOLDOWN, now=1100.0)
+        )
+
+    def test_recovery_to_ok_sends_once(self):
+        self.assertTrue(
+            should_alert(0, 2, last_sent_at=100.0, cooldown=self.COOLDOWN, now=101.0)
+        )
+
+    def test_staying_ok_stays_quiet(self):
+        self.assertFalse(
+            should_alert(0, 0, last_sent_at=100.0, cooldown=self.COOLDOWN, now=99999.0)
+        )
+
+    def test_de_escalation_is_not_treated_as_recovery(self):
+        # Critical falling to warning is still a problem, so it should respect
+        # the cooldown rather than firing a fresh page.
+        self.assertFalse(
+            should_alert(1, 2, last_sent_at=100.0, cooldown=self.COOLDOWN, now=200.0)
+        )
+
+
+class TestFormatAlertMessage(unittest.TestCase):
+    def test_includes_severity_burn_rate_and_alert_detail(self):
+        # 2 GB/sec delivered is $864/hr, clear of the $500 critical threshold.
+        report = make_report(delivered_bytes=2 * GB, origin_bytes=GB)
+        severity, alerts = evaluate(report)
+        self.assertEqual(severity, 2)
+        message = format_alert_message(severity, alerts, report)
+        self.assertIn("CRITICAL", message)
+        self.assertIn("/hr", message)
+        self.assertIn("Gbps", message)
+        self.assertIn("assumptions", message)
+
+    def test_survives_a_missing_report_when_collection_failed(self):
+        # The blind-monitor path has no report, and must still produce a
+        # sendable message rather than throwing inside the alert path.
+        message = format_alert_message(3, ["could not collect stats: boom"], None)
+        self.assertIn("MONITOR BLIND", message)
+        self.assertIn("boom", message)
 
 
 if __name__ == "__main__":

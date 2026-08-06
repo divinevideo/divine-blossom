@@ -38,11 +38,14 @@ Requires the `fastly` CLI, authenticated. Never reads or prints credentials.
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 
 # Fastly service IDs. These match scripts/monitor-vcl-cache.sh.
 VCL_SERVICE = "ML7R82HKfmTaqTpHExIDVN"
@@ -83,6 +86,8 @@ THRESHOLDS = {
 
 GB = 1e9
 SECONDS_PER_HOUR = 3600
+
+SEVERITY_LABELS = {0: "OK", 1: "WARNING", 2: "CRITICAL", 3: "MONITOR BLIND"}
 
 
 class CollectionError(Exception):
@@ -288,6 +293,76 @@ def evaluate(report):
     return worst, alerts
 
 
+def format_alert_message(severity, alerts, report):
+    """Build the alert body. Slack's `text` field; most receivers accept it."""
+    lines = [f"[{SEVERITY_LABELS.get(severity, severity)}] Divine media burn rate"]
+
+    if report is not None:
+        v = report["volumes"]
+        total_hr = report["costs_per_hour"]["TOTAL"]
+        lines.append(
+            f"${total_hr:,.2f}/hr total "
+            f"(${report['costs_per_month']['TOTAL']:,.0f}/mo at this rate)"
+        )
+        lines.append(
+            f"{v['delivered_gb_per_hour']:,.1f} GB/hr delivered "
+            f"({v['gbps_delivered']:,.2f} Gbps), "
+            f"{v['origin_gb_per_hour']:,.1f} GB/hr from origin, "
+            f"{v['requests_per_second']:,.0f} req/sec"
+        )
+        if v["byte_offload_pct"] is not None:
+            lines.append(f"byte offload {v['byte_offload_pct']:.1f}%")
+
+    for alert in alerts:
+        lines.append(f"  {alert}")
+
+    lines.append("Rates are list-price assumptions, not invoiced amounts.")
+    return "\n".join(lines)
+
+
+def post_alert(webhook_url, severity, alerts, report):
+    """Send an alert to the webhook. Never raises; a failed alert must not
+    take down the monitor, but it must be visible on stderr."""
+    payload = json.dumps(
+        {"text": format_alert_message(severity, alerts, report)}
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        webhook_url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            if response.status >= 300:
+                print(
+                    f"ERROR: alert webhook returned HTTP {response.status}",
+                    file=sys.stderr,
+                )
+                return False
+        return True
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        # Deliberately does not print the URL, which may embed a secret token.
+        print(f"ERROR: could not deliver alert: {exc}", file=sys.stderr)
+        return False
+
+
+def should_alert(severity, last_severity, last_sent_at, cooldown, now):
+    """Decide whether to send, given what was last sent.
+
+    Escalation always sends immediately. A steady non-zero state repeats only
+    once per cooldown, so a sustained spike does not flood the channel. A
+    return to OK sends once, as a recovery notice.
+    """
+    if severity > last_severity:
+        return True
+    if severity == 0:
+        return last_severity > 0
+    if last_sent_at is None:
+        return True
+    return (now - last_sent_at) >= cooldown
+
+
 def render(report, alerts):
     v = report["volumes"]
     c = report["costs_per_hour"]
@@ -345,12 +420,26 @@ def main():
         "--json", action="store_true", dest="as_json",
         help="emit machine-readable JSON instead of a rendered report",
     )
+    parser.add_argument(
+        "--webhook-url", default=os.environ.get("BURN_RATE_WEBHOOK_URL"),
+        help="POST alerts here as JSON {\"text\": ...}. Defaults to "
+             "$BURN_RATE_WEBHOOK_URL. Pass via environment, not on the "
+             "command line, so the token stays out of shell history.",
+    )
+    parser.add_argument(
+        "--alert-cooldown", type=int, default=900,
+        help="minimum seconds between repeat alerts at an unchanged severity "
+             "(default: 900). Escalations always send immediately.",
+    )
     args = parser.parse_args()
 
     if args.seconds < 1:
         parser.error("--seconds must be at least 1")
 
+    last_severity = 0
+    last_sent_at = None
     worst_seen = 0
+
     while True:
         try:
             (vcl, vcl_samples), (compute, compute_samples) = sample_both(args.seconds)
@@ -358,21 +447,26 @@ def main():
             # Collection failure is itself actionable during a launch: it means
             # the monitor is blind, which must never be mistaken for "quiet".
             print(f"ERROR: could not collect stats: {exc}", file=sys.stderr)
-            if not args.watch:
-                return 3
-            worst_seen = max(worst_seen, 3)
-            time.sleep(args.interval)
-            continue
+            severity, alerts, report = 3, [f"could not collect stats: {exc}"], None
+        else:
+            report = build_report(vcl, vcl_samples, compute, compute_samples)
+            severity, alerts = evaluate(report)
 
-        report = build_report(vcl, vcl_samples, compute, compute_samples)
-        severity, alerts = evaluate(report)
+            if args.as_json:
+                print(json.dumps({**report, "alerts": alerts, "severity": severity}))
+            else:
+                render(report, alerts)
+            sys.stdout.flush()
+
         worst_seen = max(worst_seen, severity)
 
-        if args.as_json:
-            print(json.dumps({**report, "alerts": alerts, "severity": severity}))
-        else:
-            render(report, alerts)
-        sys.stdout.flush()
+        if args.webhook_url:
+            now = time.monotonic()
+            if should_alert(severity, last_severity, last_sent_at,
+                            args.alert_cooldown, now):
+                if post_alert(args.webhook_url, severity, alerts, report):
+                    last_sent_at = now
+            last_severity = severity
 
         if not args.watch:
             return severity
