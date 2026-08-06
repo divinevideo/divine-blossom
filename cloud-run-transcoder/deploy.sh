@@ -53,6 +53,33 @@ TRANSCRIPTION_MODEL="${TRANSCRIPTION_MODEL:-gemini-2.5-flash}"
 TRANSCRIPTION_API_URL="${TRANSCRIPTION_API_URL:-https://api.openai.com/v1/audio/transcriptions}"
 USE_GPU="${USE_GPU:-false}"
 SENTRY_ENVIRONMENT="${SENTRY_ENVIRONMENT:-production}"
+
+# --- Autoscaling -----------------------------------------------------------
+#
+# CONCURRENCY must stay low. Cloud Run scales out on concurrency utilization,
+# so this value is a promise about how many requests one instance can actually
+# serve at once. A single POST /transcode runs one ffmpeg process that encodes
+# both the 720p and 480p variants together (-var_stream_map), and no -threads
+# limit is set, so libx264 takes every core on the instance. One request
+# therefore saturates all 4 vCPUs.
+#
+# With a high value here, Cloud Run believes an instance has spare capacity,
+# declines to add instances, and piles jobs onto one box until they timeshare
+# into the 900 s timeout -- without ever reaching MAX_INSTANCES. 2 lets one
+# request occupy the CPU while another is in its GCS download or upload phase,
+# which is I/O-bound and uses no CPU.
+CONCURRENCY="${CONCURRENCY:-2}"
+
+# MAX_INSTANCES is a ceiling, not a reservation: unused instances cost nothing,
+# so it is set well above steady-state need to absorb bursts. Note this is
+# capped in turn by the project's regional Cloud Run vCPU quota, which fails
+# silently when exceeded -- MAX_INSTANCES x CPU must fit inside it.
+MAX_INSTANCES="${MAX_INSTANCES:-100}"
+
+# MIN_INSTANCES is billed whether or not it serves traffic, so it defaults to
+# scale-to-zero. Raise it ahead of any scheduled traffic event: autoscaling
+# reacts in tens of seconds, which is far slower than a burst arrives.
+MIN_INSTANCES="${MIN_INSTANCES:-0}"
 GOOGLE_CLOUD_LOCATION="${GOOGLE_CLOUD_LOCATION:-us}"
 GOOGLE_STT_RECOGNIZER="${GOOGLE_STT_RECOGNIZER:-_}"
 GOOGLE_STT_MODEL="${GOOGLE_STT_MODEL:-chirp_3}"
@@ -84,9 +111,10 @@ gcloud run deploy "${SERVICE_NAME}" \
   --service-account "${SERVICE_ACCOUNT}" \
   --cpu 4 \
   --memory 8Gi \
-  --concurrency 320 \
+  --concurrency "${CONCURRENCY}" \
   --timeout 900 \
-  --max-instances 20 \
+  --max-instances "${MAX_INSTANCES}" \
+  --min-instances "${MIN_INSTANCES}" \
   --no-cpu-throttling \
   --update-env-vars "^@@^GCP_PROJECT_ID=${GCP_PROJECT_ID}@@GCS_BUCKET=${GCS_BUCKET}@@WEBHOOK_URL=${WEBHOOK_URL}@@TRANSCRIPT_WEBHOOK_URL=${TRANSCRIPT_WEBHOOK_URL}@@TRANSCRIPTION_PROVIDER=${TRANSCRIPTION_PROVIDER}@@TRANSCRIPTION_MODEL=${TRANSCRIPTION_MODEL}@@TRANSCRIPTION_API_URL=${TRANSCRIPTION_API_URL}@@USE_GPU=${USE_GPU}@@SENTRY_ENVIRONMENT=${SENTRY_ENVIRONMENT}@@GOOGLE_CLOUD_LOCATION=${GOOGLE_CLOUD_LOCATION}@@GOOGLE_STT_RECOGNIZER=${GOOGLE_STT_RECOGNIZER}@@GOOGLE_STT_MODEL=${GOOGLE_STT_MODEL}@@GOOGLE_STT_LANGUAGE_CODES=${GOOGLE_STT_LANGUAGE_CODES}@@TRANSCRIPTION_FALLBACK_PROVIDER=${TRANSCRIPTION_FALLBACK_PROVIDER}@@TRANSCRIPTION_FALLBACK_ON_PROVIDER_ERROR=${TRANSCRIPTION_FALLBACK_ON_PROVIDER_ERROR}@@STATUS_QUEUE_ENABLED=${STATUS_QUEUE_ENABLED}@@STATUS_QUEUE_LOCATION=${STATUS_QUEUE_LOCATION}@@STATUS_QUEUE_NAME=${STATUS_QUEUE_NAME}" \
   --update-secrets "WEBHOOK_SECRET=webhook_secret:latest,TRANSCRIPTION_API_KEY=openai_api_key:latest,SENTRY_DSN=${SENTRY_SECRET}:latest,TRANSCRIBE_SHARED_SECRET=transcribe_shared_secret:latest"
