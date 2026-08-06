@@ -85,15 +85,75 @@ check_service "blossom-upload-rust" "cloud-run-upload/deploy.sh" 200
 
 # --- Regional CPU quota ----------------------------------------------------
 
-echo "--- Cloud Run CPU quota ---"
-echo "  maxScale x cpu must fit inside the regional Cloud Run CPU quota, which"
-echo "  caps scale-out silently when exceeded. Quota increases take roughly a"
-echo "  week, so request before you need the headroom, not when you hit it."
+echo "--- Cloud Run regional quota headroom ---"
+echo "  CPU quota is enforced on CPU actually allocated at once, across every"
+echo "  Cloud Run service in the region -- not on configured maxima. Summing"
+echo "  maxScale x cpu therefore gives the worst case if everything scaled out"
+echo "  together, which is the number worth having before a traffic event."
 echo
-echo "  Read current quota (needs the gcloud alpha component):"
-echo "    gcloud alpha quotas info list --service=run.googleapis.com --project=${PROJECT_ID}"
-echo "  Or in the console:"
-echo "    https://console.cloud.google.com/iam-admin/quotas?project=${PROJECT_ID}&service=run.googleapis.com"
+
+CPU_QUOTA=$(gcloud alpha quotas info list --service=run.googleapis.com \
+  --project "${PROJECT_ID}" --filter="quotaId=CpuAllocPerProjectRegion" \
+  --format="value(dimensionsInfos[0].details.value)" 2>/dev/null | head -1)
+
+if [ -z "${CPU_QUOTA}" ]; then
+  echo "  could not read quota. Needs the gcloud alpha component:"
+  echo "    gcloud components install alpha"
+  echo "  Or read it in the console:"
+  echo "    https://console.cloud.google.com/iam-admin/quotas?project=${PROJECT_ID}&service=run.googleapis.com"
+else
+  gcloud run services list --project "${PROJECT_ID}" --region "${REGION}" \
+    --format="csv[no-heading](metadata.name,spec.template.spec.containers[0].resources.limits.cpu,spec.template.metadata.annotations['autoscaling.knative.dev/maxScale'])" \
+    2>/dev/null \
+    | CPU_QUOTA="${CPU_QUOTA}" python3 -c '
+import os, sys
+
+quota = float(os.environ["CPU_QUOTA"])
+total = 0.0
+rows = []
+
+for line in sys.stdin:
+    parts = line.strip().split(",")
+    if len(parts) < 3 or not parts[0]:
+        continue
+    name, cpu, max_scale = parts[0], parts[1], parts[2]
+    # Cloud Run reports cpu either as millicores ("1000m") or cores ("4").
+    millicores = float(cpu[:-1]) if cpu.endswith("m") else float(cpu) * 1000
+    scale = float(max_scale) if max_scale else 0.0
+    peak = millicores * scale
+    total += peak
+    rows.append((name, cpu, int(scale), peak))
+
+rows.sort(key=lambda r: -r[3])
+for name, cpu, scale, peak in rows:
+    print(f"    {name:<26s} {cpu:>6s} x {scale:>4d} = {peak/1000:>8,.0f} vCPU")
+
+print()
+# Labels are bound to names rather than written inline: this block is passed to
+# python via `sh -c "..."`, where an inline single-quoted string would terminate
+# the surrounding shell quoting.
+label_total = "worst-case total"
+label_quota = "regional quota"
+label_headroom = "headroom"
+print(f"    {label_total:<26s} {total/1000:>22,.0f} vCPU")
+print(f"    {label_quota:<26s} {quota/1000:>22,.0f} vCPU")
+headroom = quota - total
+pct = total / quota * 100 if quota else 0
+print(f"    {label_headroom:<26s} {headroom/1000:>22,.0f} vCPU  ({pct:.0f}% consumed)")
+print()
+if pct >= 100:
+    print("    OVER QUOTA: services cannot all reach maxScale. Scale-out will")
+    print("    fail silently once the regional limit is hit.")
+elif pct >= 85:
+    print("    TIGHT: little room to raise maxScale anywhere without a quota")
+    print("    increase, which takes roughly a week to be granted.")
+else:
+    print("    Sufficient headroom for the configured maxima.")
+print()
+print("    Services no longer serving traffic still count toward this worst")
+print("    case. Retiring one reclaims its whole reservation.")
+'
+fi
 echo
 
 # --- Transcode queue -------------------------------------------------------
