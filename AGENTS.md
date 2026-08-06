@@ -31,7 +31,8 @@ If a Divine Brain search or ask tool is available, you may use it for company me
 - Deployment and environment config lives in `fastly.toml*`, `Dockerfile.local`, and service-specific config files. Verify current config before changing domains, buckets, or service bindings.
 
 ## Build, Test, and Validation Commands
-- `cargo check --tests --locked`: check the Fastly edge crate.
+- `./scripts/run-edge-tests.sh`: run the Fastly edge crate tests under Viceroy.
+- `cargo check --tests --locked`: compile-check the Fastly edge crate tests.
 - `cargo test --manifest-path cloud-run-upload/Cargo.toml --locked`: upload service tests.
 - `cargo clippy --locked --all-targets --all-features`: lint gate used in CI.
 - Use the relevant service-local test or validation command when touching `cloud-run-transcoder/` or `cloud-functions/process-blob/`.
