@@ -37,7 +37,11 @@ Response latency on an established connection, all cache hits:
 | us-central1 | **~85%** | 13 ms | **14 ms** | **13 ms** |
 | europe-west1 | ~11% | **3 ms** | 9 ms | 11 ms |
 | australia-southeast1 | <1% | 2 ms | **97 ms** | 3 ms |
-| nz-wellington (consumer) | — | 12 ms | **144 ms** | 18 ms |
+| nz-wellington † | **0%** | 12 ms | **144 ms** | 18 ms |
+
+† Wellington is where the team is based, not where users are — New Zealand is not in the top 24
+countries by active users. Useful for isolating Volume's worst case, and a warning that staff QA
+impressions from there will not reflect user experience.
 
 An earlier revision claimed Volume *beat* Fastly in NA and EU. That was an artifact of a probe which
 counted the TLS handshake as server latency; it is retracted. See the corrected measurement.

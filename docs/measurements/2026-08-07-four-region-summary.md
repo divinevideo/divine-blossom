@@ -12,6 +12,14 @@ Three regions were measured from throwaway `e2-small` GCE instances (since delet
 measured from a consumer connection. **GCE network paths are better than a real user's**, so treat
 absolute numbers as optimistic and the *relative* comparison as the signal.
 
+> **SUPERSEDED 2026-08-07.** The numbers below came from a probe that opened a fresh TLS connection
+> per request and reported handshake plus response time as a single `ttfb_ms`, which systematically
+> overstated distant edges. It also weighted four regions equally when North America is ~85% of
+> delivered watch time.
+>
+> **Corrected results:** [`2026-08-07-four-region-corrected.md`](./2026-08-07-four-region-corrected.md).
+> Retained for the record; the PoP-routing observations still hold.
+
 ## Results
 
 | Region | Edge | Serving PoP | p50 TTFB | p95 TTFB | Mbps | Verdict |
