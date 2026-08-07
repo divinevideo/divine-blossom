@@ -3,6 +3,7 @@
 
 mod mp4;
 mod resumable;
+mod tasks;
 mod thumbnail;
 
 use anyhow::{anyhow, Result};
@@ -56,6 +57,9 @@ struct Config {
     transcriber_url: Option<String>,
     resumable_session_ttl_secs: u64,
     resumable_chunk_size: u64,
+    /// Cloud Tasks queue for transcode jobs. `None` leaves transcoding on the
+    /// direct-dispatch path, so the service runs before the queue is created.
+    transcode_queue: Option<tasks::TaskQueueConfig>,
 }
 
 impl Config {
@@ -72,6 +76,7 @@ impl Config {
                 .parse()
                 .unwrap_or(8080),
             migration_nsec: env::var("MIGRATION_NSEC").ok(),
+            transcode_queue: tasks::TaskQueueConfig::from_env(),
             // URL of the divine-transcoder service for HLS generation
             transcoder_url: env::var("TRANSCODER_URL").ok(),
             // URL of the transcription service (defaults to TRANSCODER_URL when not explicitly set)
@@ -701,14 +706,34 @@ async fn process_upload(
         );
     }
 
-    // Trigger HLS transcoding for videos (fire-and-forget)
+    // Trigger HLS transcoding for videos. Never blocks the upload response, and
+    // never fails the upload: the GCS object is already durable at this point.
     if thumbnail::is_video_type(&content_type) && derivative_failure.is_none() {
         if let Some(ref transcoder_url) = state.config.transcoder_url {
-            // Spawn background task to trigger transcoder - don't block upload response
             let transcoder_url = transcoder_url.clone();
             let hash = sha256_hash.clone();
             let owner = auth_event.pubkey.clone();
+            let queue = state.config.transcode_queue.clone();
             tokio::spawn(async move {
+                // With a queue configured, the spawn only has to survive long
+                // enough to hand the job over; the queue then owns retries and
+                // survives this instance being terminated. Without one, fall
+                // back to dispatching directly so this is safe to deploy before
+                // the queue exists -- but that path still loses work on churn.
+                if let Some(queue) = queue {
+                    match tasks::enqueue_transcode(&queue, &transcoder_url, &hash, &owner)
+                        .await
+                    {
+                        Ok(()) => return,
+                        Err(e) => {
+                            error!(
+                                "Failed to enqueue transcoding for {}: {} \
+                                 -- falling back to direct dispatch",
+                                hash, e
+                            );
+                        }
+                    }
+                }
                 if let Err(e) = trigger_transcoding(&transcoder_url, &hash, &owner).await {
                     error!("Failed to trigger transcoding for {}: {}", hash, e);
                 }
