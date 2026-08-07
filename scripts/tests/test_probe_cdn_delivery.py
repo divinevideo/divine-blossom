@@ -157,5 +157,45 @@ class TestCompareToBaseline(unittest.TestCase):
         self.assertEqual(compare_to_baseline(empty, base, margin_pct=20.0).verdict, "NO_DATA")
 
 
+class TestConnectionTiming(unittest.TestCase):
+    """Timing must separate connection setup from server response.
+
+    Bundling DNS/TCP/TLS into a per-request latency figure overstates any distant
+    edge, because a real client reuses connections across a session.
+    """
+
+    def _s(self, connect_ms, header_ms):
+        return Sample(edge="e", region="r", ttfb_ms=header_ms, total_ms=header_ms + 40.0,
+                      bytes_read=1_000_000, error=None, connect_ms=connect_ms)
+
+    def test_sample_carries_connect_separately(self):
+        s = self._s(300.0, 150.0)
+        self.assertEqual(s.connect_ms, 300.0)
+        self.assertEqual(s.ttfb_ms, 150.0)
+
+    def test_summary_reports_connect_percentiles(self):
+        out = summarize("e", "r", [self._s(100.0, 10.0), self._s(300.0, 30.0)])
+        self.assertEqual(out.connect_p50_ms, 200.0)
+        self.assertEqual(out.ttfb_p50_ms, 20.0)
+
+    def test_connect_absent_is_none_not_zero(self):
+        out = summarize("e", "r", [Sample(edge="e", region="r", ttfb_ms=10.0, total_ms=50.0,
+                                          bytes_read=100, error=None)])
+        self.assertIsNone(out.connect_p50_ms)
+
+    def test_errors_excluded_from_connect_stats(self):
+        bad = Sample(edge="e", region="r", ttfb_ms=0.0, total_ms=0.0, bytes_read=0,
+                     error="boom", connect_ms=9999.0)
+        out = summarize("e", "r", [self._s(100.0, 10.0), bad])
+        self.assertEqual(out.connect_p50_ms, 100.0)
+        self.assertEqual(out.errors, 1)
+
+    def test_verdict_uses_response_latency_not_connect(self):
+        base = summarize("fastly", "r", [self._s(20.0, 100.0)] * 5)
+        cand = summarize("bunny", "r", [self._s(400.0, 105.0)] * 5)
+        v = compare_to_baseline(cand, base, margin_pct=20.0)
+        self.assertEqual(v.verdict, "PASS", "a slow handshake must not fail an edge on response time")
+
+
 if __name__ == "__main__":
     unittest.main()

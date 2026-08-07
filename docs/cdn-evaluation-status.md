@@ -11,7 +11,8 @@ Entry point for the delivery-origin and second-CDN evaluation. Start here, then 
 |---|---|
 | [cdn-object-storage-vendor-notes.md](cdn-object-storage-vendor-notes.md) | Verified vendor limits, pricing, and API capabilities |
 | [superpowers/specs/2026-08-06-cdn-delivery-steering-design.md](superpowers/specs/2026-08-06-cdn-delivery-steering-design.md) | How to steer traffic between two CDNs, server-side |
-| [measurements/2026-08-07-four-region-summary.md](measurements/2026-08-07-four-region-summary.md) | **The current headline result** |
+| [measurements/2026-08-07-four-region-corrected.md](measurements/2026-08-07-four-region-corrected.md) | **The current headline result** |
+| [measurements/2026-08-07-four-region-summary.md](measurements/2026-08-07-four-region-summary.md) | Superseded — timing method bundled TLS handshake |
 | [measurements/2026-08-07-replica-as-acl-validation.md](measurements/2026-08-07-replica-as-acl-validation.md) | Working test system proving absence-is-denial |
 | [measurements/2026-08-07-takedown-drill.md](measurements/2026-08-07-takedown-drill.md) | Takedown semantics — **B2 hide does not erase data** |
 | [measurements/2026-08-07-nz-wellington.md](measurements/2026-08-07-nz-wellington.md) | First measurement; superseded in scope, still valid for Oceania |
@@ -24,23 +25,26 @@ this repository, which is public. It lives in `divine-context` under `repo-conte
 
 ## What is established
 
-**bunny's Volume network matches or beats Fastly wherever it has a PoP**, and fails badly where it
-does not. Measured across four regions, cache hits only, zero errors:
+**In North America — 85% of delivered watch time — Fastly, bunny Volume, and bunny Standard are
+within 1 ms of each other.** Volume is therefore the right default there: indistinguishable latency
+at half the Standard rate. Its weakness is confined to regions where it has no PoP, which is under
+1% of traffic.
 
-| Region | Fastly p95 | bunny Volume p95 | bunny Standard p95 |
-|---|---:|---:|---:|
-| us-central1 | 53 ms | **47 ms** (−11%) | 64 ms |
-| europe-west1 | 60 ms | **26 ms** (−56%) | 57 ms |
-| australia-southeast1 | 311 ms ⚠ | 302 ms (Singapore) | **38 ms** |
-| nz-wellington | 50 ms | 490 ms (Los Angeles) | 58 ms |
+Response latency on an established connection, all cache hits:
 
-The failures are entirely predictable from bunny's published Volume PoP list. That makes them
-routable around rather than disqualifying.
+| Region | Share of watch time | Fastly | bunny Volume | bunny Standard |
+|---|---:|---:|---:|---:|
+| us-central1 | **~85%** | 13 ms | **14 ms** | **13 ms** |
+| europe-west1 | ~11% | **3 ms** | 9 ms | 11 ms |
+| australia-southeast1 | <1% | 2 ms | **97 ms** | 3 ms |
+| nz-wellington (consumer) | — | 12 ms | **144 ms** | 18 ms |
+
+An earlier revision claimed Volume *beat* Fastly in NA and EU. That was an artifact of a probe which
+counted the TLS handshake as server latency; it is retracted. See the corrected measurement.
 
 **Implied architecture:** Volume in North America and Europe, Standard where Volume has no PoP,
-Fastly retained for all request-time logic and as failover. The steering decision must be
-**geographic first** — a percentage rollout ignoring geography would look fine in aggregate while
-shipping a one-second startup delay to every Oceania viewer.
+Fastly retained for request-time logic and as failover — blended ~$0.0062/GB against ~$0.0110/GB for
+all-Standard.
 
 ## What is built
 

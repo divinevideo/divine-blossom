@@ -21,14 +21,22 @@ fails it outright: a cheaper edge that intermittently 5xxs is not cheaper.
 
 Note on caching: the first fetch of a path on a cold edge measures a cache fill,
 not steady-state delivery. --warmup (default 2) issues unmeasured fetches first.
+
+Note on timing: connection setup (DNS, TCP, TLS) is measured and reported
+SEPARATELY from `ttfb_ms`, which is time from request write to response headers on
+an already-established connection. Bundling them overstates any distant edge,
+because a client scrolling a feed reuses one connection across many objects. Use
+`--no-reuse` to force a fresh connection per request if cold-start is what you want.
 """
 
 import argparse
+import http.client
 import json
 import ssl
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional
@@ -52,6 +60,8 @@ class Sample:
     status: Optional[int] = None
     cache_status: Optional[str] = None
     cache_headers: Dict[str, str] = field(default_factory=dict)
+    connect_ms: Optional[float] = None
+    """DNS + TCP + TLS. None when the connection was reused."""
 
 
 @dataclass
@@ -63,6 +73,8 @@ class Summary:
     ttfb_p50_ms: Optional[float] = None
     ttfb_p95_ms: Optional[float] = None
     total_p95_ms: Optional[float] = None
+    connect_p50_ms: Optional[float] = None
+    connect_p95_ms: Optional[float] = None
     throughput_mbps: Optional[float] = None
     bytes_total: int = 0
     cache_statuses: Dict[str, int] = field(default_factory=dict)
@@ -119,6 +131,8 @@ def summarize(edge: str, region: str, samples: List[Sample]) -> Summary:
         region=region,
         n=len(samples),
         errors=errors,
+        connect_p50_ms=percentile([s.connect_ms for s in ok if s.connect_ms is not None], 50),
+        connect_p95_ms=percentile([s.connect_ms for s in ok if s.connect_ms is not None], 95),
         ttfb_p50_ms=percentile([s.ttfb_ms for s in ok], 50),
         ttfb_p95_ms=percentile([s.ttfb_ms for s in ok], 95),
         total_p95_ms=percentile([s.total_ms for s in ok], 95),
@@ -178,13 +192,52 @@ def compare_to_baseline(candidate: Summary, baseline: Summary, margin_pct: float
     )
 
 
-def fetch(url: str, edge: str, region: str, path: str, timeout: float) -> Sample:
-    """One measured fetch. TTFB is time to response headers; total includes the body."""
-    req = urllib.request.Request(url, headers={"User-Agent": "divine-cdn-probe/1"})
-    ctx = ssl.create_default_context()
-    started = time.perf_counter()
-    try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+class EdgeSession:
+    """Holds one keep-alive connection per edge so response latency excludes handshake."""
+
+    def __init__(self, base_url: str, timeout: float, reuse: bool = True):
+        p = urllib.parse.urlparse(base_url)
+        self.host = p.netloc
+        self.timeout = timeout
+        self.reuse = reuse
+        self.ctx = ssl.create_default_context()
+        self.conn: Optional[http.client.HTTPSConnection] = None
+        self.connect_samples: List[float] = []
+
+    def measure_connect(self, rounds: int = 3) -> None:
+        """Sample handshake cost explicitly; with reuse it is otherwise paid once, unmeasured."""
+        for _ in range(rounds):
+            self.close()
+            self._connect()
+        self.close()
+
+    def _connect(self) -> float:
+        started = time.perf_counter()
+        self.conn = http.client.HTTPSConnection(self.host, context=self.ctx, timeout=self.timeout)
+        self.conn.connect()
+        elapsed = (time.perf_counter() - started) * 1000.0
+        self.connect_samples.append(elapsed)
+        return elapsed
+
+    def close(self):
+        if self.conn:
+            try:
+                self.conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.conn = None
+
+    def fetch(self, path: str, edge: str, region: str) -> Sample:
+        connect_ms = None
+        try:
+            if self.conn is None or not self.reuse:
+                self.close()
+                connect_ms = self._connect()
+
+            started = time.perf_counter()
+            self.conn.request("GET", path, headers={"User-Agent": "divine-cdn-probe/2",
+                                                    "Connection": "keep-alive"})
+            resp = self.conn.getresponse()
             ttfb = (time.perf_counter() - started) * 1000.0
             read = 0
             while True:
@@ -193,15 +246,19 @@ def fetch(url: str, edge: str, region: str, path: str, timeout: float) -> Sample
                     break
                 read += len(chunk)
             total = (time.perf_counter() - started) * 1000.0
-            cache_headers = capture_cache_headers(resp.headers)
-            cache = select_cache_status(resp.headers)
-            return Sample(edge, region, ttfb, total, read, None, path, resp.status, cache, cache_headers)
-    except urllib.error.HTTPError as exc:
-        elapsed = (time.perf_counter() - started) * 1000.0
-        return Sample(edge, region, elapsed, elapsed, 0, f"HTTP {exc.code}", path, exc.code)
-    except Exception as exc:  # noqa: BLE001 - any failure to fetch is a failed sample
-        elapsed = (time.perf_counter() - started) * 1000.0
-        return Sample(edge, region, elapsed, elapsed, 0, type(exc).__name__, path)
+
+            if resp.status >= 400:
+                self.close()
+                return Sample(edge, region, ttfb, total, 0, f"HTTP {resp.status}", path,
+                              resp.status, None, {}, connect_ms)
+
+            headers = resp.headers
+            return Sample(edge, region, ttfb, total, read, None, path, resp.status,
+                          select_cache_status(headers), capture_cache_headers(headers), connect_ms)
+        except Exception as exc:  # noqa: BLE001 - any failure to fetch is a failed sample
+            self.close()
+            return Sample(edge, region, 0.0, 0.0, 0, type(exc).__name__, path,
+                          None, None, {}, connect_ms)
 
 
 def parse_edge(spec: str) -> tuple:
@@ -223,6 +280,8 @@ def main(argv=None) -> int:
     ap.add_argument("--warmup", type=int, default=2, help="unmeasured fetches per path per edge first")
     ap.add_argument("--margin-pct", type=float, default=20.0, help="allowed p95 TTFB regression")
     ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    ap.add_argument("--no-reuse", action="store_true",
+                    help="force a fresh connection per request (measures cold-start, not steady state)")
     ap.add_argument("--json", metavar="FILE", help="write full results as JSON")
     args = ap.parse_args(argv)
 
@@ -232,16 +291,26 @@ def main(argv=None) -> int:
         return 2
 
     by_edge: Dict[str, List[Sample]] = {name: [] for name in edges}
+    connect_by_edge: Dict[str, List[float]] = {}
     for name, base in edges.items():
-        for path in args.path:
-            url = base + path
-            for _ in range(max(0, args.warmup)):
-                fetch(url, name, args.region, path, args.timeout)
-            for _ in range(args.iterations):
-                by_edge[name].append(fetch(url, name, args.region, path, args.timeout))
+        session = EdgeSession(base, args.timeout, reuse=not args.no_reuse)
+        try:
+            session.measure_connect()
+            for path in args.path:
+                for _ in range(max(0, args.warmup)):
+                    session.fetch(path, name, args.region)
+                for _ in range(args.iterations):
+                    by_edge[name].append(session.fetch(path, name, args.region))
+        finally:
+            connect_by_edge[name] = list(session.connect_samples)
+            session.close()
         print(f"probed {name}: {len(by_edge[name])} samples", file=sys.stderr)
 
     summaries = {name: summarize(name, args.region, s) for name, s in by_edge.items()}
+    for name, samples in connect_by_edge.items():
+        if samples:
+            summaries[name].connect_p50_ms = percentile(samples, 50)
+            summaries[name].connect_p95_ms = percentile(samples, 95)
     baseline = summaries[args.baseline]
     verdicts = [
         compare_to_baseline(s, baseline, args.margin_pct) for name, s in summaries.items() if name != args.baseline
@@ -249,13 +318,16 @@ def main(argv=None) -> int:
 
     width = max(len(n) for n in edges)
     print(f"\nregion={args.region}  baseline={args.baseline}  margin={args.margin_pct:.0f}%\n")
-    print(f"{'edge'.ljust(width)}  {'p50 TTFB':>9}  {'p95 TTFB':>9}  {'Mbps':>7}  {'err':>4}  verdict")
+    print(f"{'edge'.ljust(width)}  {'connect':>8}  {'p50 resp':>9}  {'p95 resp':>9}  {'Mbps':>7}  {'err':>4}  verdict")
     for name, s in summaries.items():
+        conn = f"{s.connect_p50_ms:.0f}ms" if s.connect_p50_ms is not None else "-"
         p50 = f"{s.ttfb_p50_ms:.0f}ms" if s.ttfb_p50_ms is not None else "-"
         p95 = f"{s.ttfb_p95_ms:.0f}ms" if s.ttfb_p95_ms is not None else "-"
         mbps = f"{s.throughput_mbps:.1f}" if s.throughput_mbps is not None else "-"
         verdict = "baseline" if name == args.baseline else next(v.verdict for v in verdicts if v.edge == name)
-        print(f"{name.ljust(width)}  {p50:>9}  {p95:>9}  {mbps:>7}  {s.errors:>4}  {verdict}")
+        print(f"{name.ljust(width)}  {conn:>8}  {p50:>9}  {p95:>9}  {mbps:>7}  {s.errors:>4}  {verdict}")
+    print("\nconnect = DNS+TCP+TLS, paid once per session. p50/p95 resp = response latency on an "
+          "established connection.", file=sys.stderr)
 
     for v in verdicts:
         print(f"\n{v.edge}: {v.verdict} — {v.reason}")

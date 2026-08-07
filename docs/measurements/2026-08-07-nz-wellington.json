@@ -8,10 +8,12 @@
       "region": "nz-wellington",
       "n": 45,
       "errors": 0,
-      "ttfb_p50_ms": 41.737041901797056,
-      "ttfb_p95_ms": 49.82337460387497,
-      "total_p95_ms": 199.078633566387,
-      "throughput_mbps": 273.0723147729105,
+      "ttfb_p50_ms": 10.232583968900144,
+      "ttfb_p95_ms": 11.500075436197221,
+      "total_p95_ms": 104.9733663443476,
+      "connect_p50_ms": 27.718958037439734,
+      "connect_p95_ms": 44.943227607291185,
+      "throughput_mbps": 613.0968882007367,
       "bytes_total": 237033060,
       "cache_statuses": {
         "hit": 45
@@ -22,13 +24,15 @@
       "region": "nz-wellington",
       "n": 45,
       "errors": 0,
-      "ttfb_p50_ms": 463.3375840494409,
-      "ttfb_p95_ms": 490.08731665089726,
-      "total_p95_ms": 1839.1420249594375,
-      "throughput_mbps": 26.040085494990393,
+      "ttfb_p50_ms": 141.6472909040749,
+      "ttfb_p95_ms": 144.29954176303,
+      "total_p95_ms": 409.46495020762086,
+      "connect_p50_ms": 297.2686670254916,
+      "connect_p95_ms": 313.947597326478,
+      "throughput_mbps": 133.727905864379,
       "bytes_total": 237033060,
       "cache_statuses": {
-        "miss": 45
+        "hit": 45
       }
     },
     "bunny-standard": {
@@ -36,13 +40,15 @@
       "region": "nz-wellington",
       "n": 45,
       "errors": 0,
-      "ttfb_p50_ms": 53.3697500359267,
-      "ttfb_p95_ms": 58.04700863081961,
-      "total_p95_ms": 273.49734145682305,
-      "throughput_mbps": 193.65840295686806,
+      "ttfb_p50_ms": 15.982917044311762,
+      "ttfb_p95_ms": 18.461216799914837,
+      "total_p95_ms": 111.71414179261772,
+      "connect_p50_ms": 51.94885452510789,
+      "connect_p95_ms": 91.31217937101609,
+      "throughput_mbps": 552.0019261735688,
       "bytes_total": 237033060,
       "cache_statuses": {
-        "miss": 45
+        "hit": 45
       }
     }
   },
@@ -51,15 +57,15 @@
       "edge": "bunny-volume",
       "region": "nz-wellington",
       "verdict": "FAIL",
-      "delta_pct": 883.6493825385749,
-      "reason": "p95 TTFB +883.6% vs baseline, outside 20% margin"
+      "delta_pct": 1154.7703931474916,
+      "reason": "p95 TTFB +1154.8% vs baseline, outside 20% margin"
     },
     {
       "edge": "bunny-standard",
       "region": "nz-wellington",
-      "verdict": "PASS",
-      "delta_pct": 16.505574125252163,
-      "reason": "p95 TTFB +16.5% vs baseline"
+      "verdict": "FAIL",
+      "delta_pct": 60.53126696723204,
+      "reason": "p95 TTFB +60.5% vs baseline, outside 20% margin"
     }
   ],
   "samples": {
@@ -67,1491 +73,2121 @@
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 40.34199996385723,
-        "total_ms": 185.19654194824398,
+        "ttfb_ms": 10.68020798265934,
+        "total_ms": 93.91304093878716,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 43.099458096548915,
-        "total_ms": 186.019292101264,
+        "ttfb_ms": 11.100542033091187,
+        "total_ms": 102.06304199527949,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 54.816959076561034,
-        "total_ms": 194.89883398637176,
+        "ttfb_ms": 10.6049170717597,
+        "total_ms": 98.45562500413507,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 44.34974992182106,
-        "total_ms": 188.91154089942575,
+        "ttfb_ms": 9.809999959543347,
+        "total_ms": 98.22487505152822,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 37.03420888632536,
-        "total_ms": 199.96416696812958,
+        "ttfb_ms": 9.93833295069635,
+        "total_ms": 100.12837499380112,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 39.207707974128425,
-        "total_ms": 238.53033292107284,
+        "ttfb_ms": 9.80733404867351,
+        "total_ms": 112.53216699697077,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 39.053000044077635,
-        "total_ms": 190.3488750103861,
+        "ttfb_ms": 10.721582919359207,
+        "total_ms": 105.06908292882144,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 41.99924995191395,
-        "total_ms": 187.5828750198707,
+        "ttfb_ms": 9.42900008521974,
+        "total_ms": 104.5905000064522,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 39.90849992260337,
-        "total_ms": 182.85749992355704,
+        "ttfb_ms": 9.428541990928352,
+        "total_ms": 102.81645797658712,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 42.95391705818474,
-        "total_ms": 195.1392920454964,
+        "ttfb_ms": 11.08995801769197,
+        "total_ms": 98.49366603884846,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 41.976958978921175,
-        "total_ms": 181.5150419715792,
+        "ttfb_ms": 10.42299997061491,
+        "total_ms": 99.06520799268037,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 40.030915988609195,
-        "total_ms": 188.2632499327883,
+        "ttfb_ms": 10.583999915979803,
+        "total_ms": 115.65749999135733,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 42.15200000908226,
-        "total_ms": 195.5364999594167,
+        "ttfb_ms": 11.03291695471853,
+        "total_ms": 100.49170802813023,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 39.721000008285046,
-        "total_ms": 175.8497920818627,
+        "ttfb_ms": 10.232583968900144,
+        "total_ms": 101.86799999792129,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 39.43000000435859,
-        "total_ms": 175.7769170217216,
+        "ttfb_ms": 10.652458993718028,
+        "total_ms": 98.20195904467255,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 39.56879198085517,
-        "total_ms": 95.54716700222343,
+        "ttfb_ms": 11.188374948687851,
+        "total_ms": 30.50941601395607,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 37.618499947711825,
-        "total_ms": 102.19237499404699,
+        "ttfb_ms": 10.09012502618134,
+        "total_ms": 25.68316599354148,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 41.63908294867724,
-        "total_ms": 108.26987493783236,
+        "ttfb_ms": 11.756166000850499,
+        "total_ms": 25.719708064571023,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 43.43987500760704,
-        "total_ms": 109.6727920230478,
+        "ttfb_ms": 9.900665958411992,
+        "total_ms": 24.870999972335994,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 42.171332985162735,
-        "total_ms": 103.0176249332726,
+        "ttfb_ms": 10.166916996240616,
+        "total_ms": 24.6979589574039,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 42.08829195704311,
-        "total_ms": 110.31237500719726,
+        "ttfb_ms": 9.475458995439112,
+        "total_ms": 24.756542057730258,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 42.0165000250563,
-        "total_ms": 101.00791708100587,
+        "ttfb_ms": 9.600166929885745,
+        "total_ms": 24.273999966681004,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 44.08650007098913,
-        "total_ms": 104.01683300733566,
+        "ttfb_ms": 8.867040975019336,
+        "total_ms": 24.804540909826756,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 38.46145805437118,
-        "total_ms": 101.23791708610952,
+        "ttfb_ms": 9.55216703005135,
+        "total_ms": 27.000791975297034,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 42.83525003120303,
-        "total_ms": 101.78224998526275,
+        "ttfb_ms": 10.4857919504866,
+        "total_ms": 26.74987493082881,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 39.5275829359889,
-        "total_ms": 93.50608300883323,
+        "ttfb_ms": 9.577541961334646,
+        "total_ms": 27.12895895820111,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 37.90695802308619,
-        "total_ms": 102.75762504898012,
+        "ttfb_ms": 10.577250039204955,
+        "total_ms": 25.47304204199463,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 45.33491702750325,
-        "total_ms": 108.9012500597164,
+        "ttfb_ms": 11.326708015985787,
+        "total_ms": 26.245333021506667,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 40.6155000673607,
-        "total_ms": 105.59816705062985,
+        "ttfb_ms": 10.721500031650066,
+        "total_ms": 24.530082941055298,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 41.66641691699624,
-        "total_ms": 103.50824997294694,
+        "ttfb_ms": 10.048042051494122,
+        "total_ms": 24.01325001846999,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 39.50033301953226,
-        "total_ms": 154.64633307419717,
+        "ttfb_ms": 9.968416066840291,
+        "total_ms": 88.39504106435925,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 41.79229203145951,
-        "total_ms": 165.75429204385728,
+        "ttfb_ms": 11.945624952204525,
+        "total_ms": 76.23587490525097,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 37.248458014801145,
-        "total_ms": 161.26412502489984,
+        "ttfb_ms": 11.341291945427656,
+        "total_ms": 81.6347919171676,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 41.737041901797056,
-        "total_ms": 166.87329194974154,
+        "ttfb_ms": 10.42454200796783,
+        "total_ms": 79.54283303115517,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 132.7138339402154,
-        "total_ms": 217.10212493781,
+        "ttfb_ms": 10.388458031229675,
+        "total_ms": 75.2296670107171,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 36.98462503962219,
-        "total_ms": 158.67779206018895,
+        "ttfb_ms": 10.061250068247318,
+        "total_ms": 75.94925002194941,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 50.78183300793171,
-        "total_ms": 172.15187498368323,
+        "ttfb_ms": 9.375832974910736,
+        "total_ms": 74.91212501190603,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 39.86762510612607,
-        "total_ms": 164.69025006517768,
+        "ttfb_ms": 9.439541958272457,
+        "total_ms": 82.3872919427231,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 42.234541033394635,
-        "total_ms": 168.30941603984684,
+        "ttfb_ms": 10.12262492440641,
+        "total_ms": 76.58212492242455,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 39.69733405392617,
-        "total_ms": 165.85808398667723,
+        "ttfb_ms": 9.204292087815702,
+        "total_ms": 78.9881250821054,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 45.98954098764807,
-        "total_ms": 160.30770807992667,
+        "ttfb_ms": 10.342792025767267,
+        "total_ms": 75.20337507594377,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 38.64812501706183,
-        "total_ms": 164.14050001185387,
+        "ttfb_ms": 9.248334099538624,
+        "total_ms": 79.2552090715617,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 43.250791961327195,
-        "total_ms": 167.94508404564112,
+        "ttfb_ms": 11.374208959750831,
+        "total_ms": 77.79979193583131,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 42.28887497447431,
-        "total_ms": 168.9428749959916,
+        "ttfb_ms": 11.531542055308819,
+        "total_ms": 74.5659579988569,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       },
       {
         "edge": "fastly",
         "region": "nz-wellington",
-        "ttfb_ms": 43.36583300027996,
-        "total_ms": 169.80129200965166,
+        "ttfb_ms": 9.91662498563528,
+        "total_ms": 78.21758300997317,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "HIT"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        },
+        "connect_ms": null
       }
     ],
     "bunny-volume": [
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 425.47691706568,
-        "total_ms": 1625.2439169911668,
+        "ttfb_ms": 141.81716600432992,
+        "total_ms": 340.392166050151,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 484.05862506479025,
-        "total_ms": 1861.2795000663027,
+        "ttfb_ms": 144.75316694006324,
+        "total_ms": 353.14079199451953,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 460.6972500914708,
-        "total_ms": 1779.2439170880243,
+        "ttfb_ms": 142.0724579365924,
+        "total_ms": 415.79191701021045,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 459.21237498987466,
-        "total_ms": 1773.4284170437604,
+        "ttfb_ms": 143.96966702770442,
+        "total_ms": 411.69633297249675,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 504.969917004928,
-        "total_ms": 1797.6662090513855,
+        "ttfb_ms": 144.90516600199044,
+        "total_ms": 408.5005830274895,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 465.9353750757873,
-        "total_ms": 1663.35454210639,
+        "ttfb_ms": 139.76145803462714,
+        "total_ms": 406.93037502933294,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 424.7853340348229,
-        "total_ms": 1632.6861249981448,
+        "ttfb_ms": 140.63279202673584,
+        "total_ms": 405.46116698533297,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 457.41975004784763,
-        "total_ms": 1752.1993340924382,
+        "ttfb_ms": 141.08416601084173,
+        "total_ms": 408.27879100106657,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 479.65495800599456,
-        "total_ms": 2056.7772499052808,
+        "ttfb_ms": 140.92499995604157,
+        "total_ms": 406.6725838929415,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 421.78087506908923,
-        "total_ms": 1634.74754197523,
+        "ttfb_ms": 144.04237491544336,
+        "total_ms": 408.65200001280755,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 470.06650001276284,
-        "total_ms": 1809.486125013791,
+        "ttfb_ms": 141.55041601043195,
+        "total_ms": 408.6730829440057,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 443.6439590062946,
-        "total_ms": 1718.1041250005364,
+        "ttfb_ms": 139.80862509924918,
+        "total_ms": 409.66291702352464,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 514.2197919776663,
-        "total_ms": 1846.5559999458492,
+        "ttfb_ms": 141.00245805457234,
+        "total_ms": 406.8893330404535,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 491.0611250670627,
-        "total_ms": 1714.9698750581592,
+        "ttfb_ms": 142.09512504749,
+        "total_ms": 404.3700840556994,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 441.4210830582306,
-        "total_ms": 1711.2918751081452,
+        "ttfb_ms": 142.50266703311354,
+        "total_ms": 404.4210839783773,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 463.3375840494409,
-        "total_ms": 1415.03716702573,
+        "ttfb_ms": 142.26700004655868,
+        "total_ms": 186.56866601668298,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 486.1920829862356,
-        "total_ms": 1487.384333042428,
+        "ttfb_ms": 141.9405839405954,
+        "total_ms": 185.69766695145518,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 466.48950001690537,
-        "total_ms": 1451.374499942176,
+        "ttfb_ms": 142.2869999660179,
+        "total_ms": 186.35174992959946,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 464.88479094114155,
-        "total_ms": 1405.8768330141902,
+        "ttfb_ms": 142.59158400818706,
+        "total_ms": 185.59204204939306,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 482.3081670328975,
-        "total_ms": 1332.3922919807956,
+        "ttfb_ms": 140.37937496323138,
+        "total_ms": 187.01870797667652,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 464.0775410225615,
-        "total_ms": 1423.5843329224735,
+        "ttfb_ms": 143.05954100564122,
+        "total_ms": 187.30741599574685,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 459.72987497225404,
-        "total_ms": 1417.2338329954073,
+        "ttfb_ms": 141.8557500001043,
+        "total_ms": 186.31029094103724,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 428.77416708506644,
-        "total_ms": 1312.6067920820788,
+        "ttfb_ms": 141.5376669028774,
+        "total_ms": 185.36629190202802,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 425.67037499975413,
-        "total_ms": 1335.6353340204805,
+        "ttfb_ms": 144.00691608898342,
+        "total_ms": 188.92762507312,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 482.75779199320823,
-        "total_ms": 1479.516874998808,
+        "ttfb_ms": 141.05966710485518,
+        "total_ms": 185.11795799713582,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 428.1445830129087,
-        "total_ms": 1295.8720410242677,
+        "ttfb_ms": 141.84741699136794,
+        "total_ms": 185.47999998554587,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 464.1211659181863,
-        "total_ms": 1418.6924999812618,
+        "ttfb_ms": 139.58966708742082,
+        "total_ms": 186.09508406370878,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 443.8207501079887,
-        "total_ms": 1327.8320420067757,
+        "ttfb_ms": 144.2275409353897,
+        "total_ms": 189.4505829550326,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 464.73262505605817,
-        "total_ms": 1421.6537080937997,
+        "ttfb_ms": 141.6472909040749,
+        "total_ms": 186.1621249699965,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 474.87420903053135,
-        "total_ms": 1453.1330419704318,
+        "ttfb_ms": 142.56304106675088,
+        "total_ms": 188.39962501078844,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 475.91525001917034,
-        "total_ms": 1794.4446670589969,
+        "ttfb_ms": 142.56220893003047,
+        "total_ms": 358.48874994553626,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 463.6927091050893,
-        "total_ms": 1806.5002500079572,
+        "ttfb_ms": 140.05904202349484,
+        "total_ms": 355.0644579809159,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 459.61062505375594,
-        "total_ms": 1733.7850000476465,
+        "ttfb_ms": 141.14529197104275,
+        "total_ms": 357.5771249597892,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 437.81445804052055,
-        "total_ms": 1676.4709999551997,
+        "ttfb_ms": 141.51120907627046,
+        "total_ms": 358.8191670132801,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 473.07366703171283,
-        "total_ms": 1801.9607920432463,
+        "ttfb_ms": 142.1252089785412,
+        "total_ms": 359.0756669873372,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 461.33499999996275,
-        "total_ms": 1769.7742910822853,
+        "ttfb_ms": 140.39975008927286,
+        "total_ms": 362.7768340520561,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 427.6815839111805,
-        "total_ms": 1615.660166949965,
+        "ttfb_ms": 144.31754196994007,
+        "total_ms": 359.78337505366653,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 469.7258750675246,
-        "total_ms": 1768.9156250562519,
+        "ttfb_ms": 140.60912490822375,
+        "total_ms": 356.28900001756847,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 426.1975410627201,
-        "total_ms": 1588.7952910270542,
+        "ttfb_ms": 141.53837494086474,
+        "total_ms": 361.884415964596,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 440.8833329798654,
-        "total_ms": 1670.6629999680445,
+        "ttfb_ms": 142.29225006420165,
+        "total_ms": 359.09129201900214,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 464.010207913816,
-        "total_ms": 1600.2747499151155,
+        "ttfb_ms": 138.7407910078764,
+        "total_ms": 357.56545804906636,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 427.7402500156313,
-        "total_ms": 1613.2222920423374,
+        "ttfb_ms": 141.62266696803272,
+        "total_ms": 357.9408749938011,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 449.8397910501808,
-        "total_ms": 1678.5195410484448,
+        "ttfb_ms": 141.34529209695756,
+        "total_ms": 362.0630840305239,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 466.20904200244695,
-        "total_ms": 1755.6720420252532,
+        "ttfb_ms": 139.60204098839313,
+        "total_ms": 356.92087502684444,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-volume",
         "region": "nz-wellington",
-        "ttfb_ms": 424.41912495996803,
-        "total_ms": 1591.4584159618244,
+        "ttfb_ms": 141.1302499473095,
+        "total_ms": 357.30133298784494,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       }
     ],
     "bunny-standard": [
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 56.21320893988013,
-        "total_ms": 245.87683391291648,
+        "ttfb_ms": 16.54129195958376,
+        "total_ms": 121.43645796459168,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 52.31691699009389,
-        "total_ms": 247.8470839560032,
+        "ttfb_ms": 15.907166991382837,
+        "total_ms": 113.36854205001146,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 54.37729193363339,
-        "total_ms": 238.9238339383155,
+        "ttfb_ms": 17.30170799419284,
+        "total_ms": 106.42862494569272,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 53.3697500359267,
-        "total_ms": 238.20337501820177,
+        "ttfb_ms": 17.484167008660734,
+        "total_ms": 106.89841699786484,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 53.07700007688254,
-        "total_ms": 277.0302080316469,
+        "ttfb_ms": 15.291957999579608,
+        "total_ms": 106.61529202479869,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 50.882874988019466,
-        "total_ms": 244.0298330038786,
+        "ttfb_ms": 14.615208958275616,
+        "total_ms": 102.03424992505461,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 60.04649994429201,
-        "total_ms": 253.6476249806583,
+        "ttfb_ms": 15.11712500359863,
+        "total_ms": 103.95250003784895,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 50.38729193620384,
-        "total_ms": 251.8029169877991,
+        "ttfb_ms": 15.167250065132976,
+        "total_ms": 107.77604102622718,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 54.5319999800995,
-        "total_ms": 252.04691593535244,
+        "ttfb_ms": 18.438084051012993,
+        "total_ms": 106.38725000899285,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 49.62579207494855,
-        "total_ms": 253.8263340247795,
+        "ttfb_ms": 15.299416962079704,
+        "total_ms": 112.69866698421538,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 54.66591601725668,
-        "total_ms": 274.48558306787163,
+        "ttfb_ms": 18.466999987140298,
+        "total_ms": 103.53404108900577,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 51.928792032413185,
-        "total_ms": 248.55933396611363,
+        "ttfb_ms": 15.678082942031324,
+        "total_ms": 102.71687502972782,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 53.81508404389024,
-        "total_ms": 269.54437501262873,
+        "ttfb_ms": 16.625832999125123,
+        "total_ms": 107.05208301078528,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 52.276624948717654,
-        "total_ms": 254.97004098724574,
+        "ttfb_ms": 16.082750051282346,
+        "total_ms": 104.23558298498392,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 54.870666936039925,
-        "total_ms": 251.54849991668016,
+        "ttfb_ms": 16.10658399295062,
+        "total_ms": 102.93729195836931,
         "bytes_read": 7932750,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 51.80458398535848,
-        "total_ms": 150.87612508796155,
+        "ttfb_ms": 14.719958999194205,
+        "total_ms": 31.582541996613145,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 52.094166981987655,
-        "total_ms": 152.4076669011265,
+        "ttfb_ms": 15.348457964137197,
+        "total_ms": 30.621082987636328,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 51.32720805704594,
-        "total_ms": 151.77774999756366,
+        "ttfb_ms": 17.36166700720787,
+        "total_ms": 30.609917012043297,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 47.69616690464318,
-        "total_ms": 158.27208396513015,
+        "ttfb_ms": 16.277833958156407,
+        "total_ms": 32.331958995200694,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 54.19345898553729,
-        "total_ms": 159.59216700866818,
+        "ttfb_ms": 16.00324991159141,
+        "total_ms": 31.993665965273976,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 51.611041999422014,
-        "total_ms": 154.1169169358909,
+        "ttfb_ms": 17.60870893485844,
+        "total_ms": 32.77770895510912,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 54.46170805953443,
-        "total_ms": 154.25645804498345,
+        "ttfb_ms": 16.56633394304663,
+        "total_ms": 29.618749977089465,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 53.84716694243252,
-        "total_ms": 167.40020795259625,
+        "ttfb_ms": 15.599999926052988,
+        "total_ms": 32.971874927170575,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 54.85866602975875,
-        "total_ms": 157.22183301113546,
+        "ttfb_ms": 15.715291956439614,
+        "total_ms": 32.47104201000184,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 49.57933397963643,
-        "total_ms": 153.91075005754828,
+        "ttfb_ms": 18.158374936319888,
+        "total_ms": 32.45324990712106,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 50.79420900437981,
-        "total_ms": 191.3767500082031,
+        "ttfb_ms": 17.38262502476573,
+        "total_ms": 30.743000097572803,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 53.84275002870709,
-        "total_ms": 157.8744580037892,
+        "ttfb_ms": 15.65866603050381,
+        "total_ms": 29.457875061780214,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 67.65229208394885,
-        "total_ms": 176.4872920466587,
+        "ttfb_ms": 15.38875000551343,
+        "total_ms": 33.35195791441947,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 56.502875057049096,
-        "total_ms": 169.88395899534225,
+        "ttfb_ms": 17.045167041942477,
+        "total_ms": 32.45895903091878,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 53.370665991678834,
-        "total_ms": 156.84012498240918,
+        "ttfb_ms": 22.1362910233438,
+        "total_ms": 35.4095830116421,
         "bytes_read": 1375915,
         "error": null,
         "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 48.75816707499325,
-        "total_ms": 231.43195908050984,
+        "ttfb_ms": 15.73320897296071,
+        "total_ms": 85.88620903901756,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 52.66891710925847,
-        "total_ms": 228.8274170132354,
+        "ttfb_ms": 15.982917044311762,
+        "total_ms": 95.58170801028609,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 53.83754207286984,
-        "total_ms": 222.28116705082357,
+        "ttfb_ms": 15.926375053822994,
+        "total_ms": 95.64766602125019,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 53.660042001865804,
-        "total_ms": 232.10941697470844,
+        "ttfb_ms": 15.578584047034383,
+        "total_ms": 90.8623340073973,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 55.61429099179804,
-        "total_ms": 286.24774992931634,
+        "ttfb_ms": 14.537791954353452,
+        "total_ms": 92.81045896932483,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 52.14491696096957,
-        "total_ms": 235.37166696041822,
+        "ttfb_ms": 14.833334018476307,
+        "total_ms": 88.26116705313325,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 53.78499999642372,
-        "total_ms": 240.01133302226663,
+        "ttfb_ms": 14.732542098499835,
+        "total_ms": 87.51270803622901,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 55.521792033687234,
-        "total_ms": 248.90708306338638,
+        "ttfb_ms": 21.388374967500567,
+        "total_ms": 106.45733296405524,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 50.4070840543136,
-        "total_ms": 240.6282089650631,
+        "ttfb_ms": 16.650250065140426,
+        "total_ms": 97.80054201837629,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 52.23220796324313,
-        "total_ms": 236.18083307519555,
+        "ttfb_ms": 16.500249970704317,
+        "total_ms": 87.45387499220669,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 54.095375002361834,
-        "total_ms": 246.72304198611528,
+        "ttfb_ms": 14.652874902822077,
+        "total_ms": 84.9673330085352,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 46.50054103694856,
-        "total_ms": 221.39945800881833,
+        "ttfb_ms": 17.80062506441027,
+        "total_ms": 79.92720801848918,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 58.43304202426225,
-        "total_ms": 241.53424997348338,
+        "ttfb_ms": 17.473124898970127,
+        "total_ms": 93.12929201405495,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 49.16995903477073,
-        "total_ms": 225.88708403054625,
+        "ttfb_ms": 15.11712500359863,
+        "total_ms": 82.34079205431044,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       },
       {
         "edge": "bunny-standard",
         "region": "nz-wellington",
-        "ttfb_ms": 52.46316606644541,
-        "total_ms": 239.6226660348475,
+        "ttfb_ms": 15.377374948002398,
+        "total_ms": 79.68604192137718,
         "bytes_read": 6493539,
         "error": null,
         "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a.mp4",
         "status": 200,
-        "cache_status": "MISS"
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        },
+        "connect_ms": null
       }
     ]
   }
