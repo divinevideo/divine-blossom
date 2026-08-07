@@ -96,6 +96,75 @@ must never receive a `v.divine.video` URL at all. DNS decides *which CDN*; the s
 *whether the content is eligible to leave the Fastly path*. Those are separate concerns and both are
 required.
 
+## Delivery source selection — layered
+
+Content addressing supplies a property most CDN setups lack: **the client can verify what it got.**
+Fetch from any source, hash it, compare to the requested SHA-256. You cannot be served wrong bytes
+without detecting it. That makes multi-source fetching safe in a way ordinary CDN failover is not,
+and it is the foundation for everything below.
+
+### Layer 1 — `v.divine.video`, DNS-steered
+
+The floor. One owned hostname, CNAME'd to whichever CDN currently serves. Works for every client
+including ones that only understand a single URL. Handles slow-moving decisions: vendor choice,
+broad geo. Short TTL (60–300 s) so failover is a DNS change, not a migration.
+
+### Layer 2 — named per-CDN hostnames
+
+`v-a.divine.video` → bunny Volume, `v-b.divine.video` → bunny Standard, `v-c.divine.video` →
+Fastly. All owned, all CNAME'd, all independently retargetable. Costs nothing beyond DNS and certs
+(bunny issues free Let's Encrypt certificates for custom hostnames), and requires no client work.
+
+### Layer 3 — client-side preference and failover *(sketch, not yet designed)*
+
+The app fetches an ordered preference document — hostnames, weights, per-geo hints — measures real
+outcomes, and falls back on error. Because the hash verifies the bytes, falling back carries no trust
+cost.
+
+What it buys over DNS alone: instant failover with no TTL wait, health signal from actual client
+experience rather than a synthetic probe, per-client adaptation when one path is bad, and optional
+racing of two sources for tail latency.
+
+Where it is harder than it looks, and why it is deliberately last:
+
+- **The preference document is a new dependency.** If unreachable it must fall back to an embedded
+  default and never sit on the playback critical path. Done badly this adds a single point of
+  failure while trying to remove one.
+- **Herding.** Pure argmax selection sends every client to whichever CDN measured fastest, making
+  traffic distribution bimodal and unpredictable — which also wrecks forecasting against committed
+  volume tiers. Needs weighting and jitter.
+- **Stale preferences pin clients to dead CDNs.** Needs a TTL plus a client-side circuit breaker
+  that overrides the document when reality disagrees.
+- **Cost attribution becomes emergent.** When clients choose, "put 70% on Volume" stops being
+  something we control. That matters during a commit negotiation.
+
+**Do not design this until the cache-hit-ratio and US consumer-connection measurements exist.** The
+corrected data shows all three CDNs within 1 ms of each other in North America, which is ~85% of
+traffic. Client-side selection may have nothing meaningful to select between there, and the
+complexity would buy only the sub-1% tail.
+
+### Layer 4 — Blossom server list
+
+Publishing multiple owned delivery hostnames in the user's kind-10063 server list gives compliant
+third-party clients multi-source fallback for free, with no code from us. BUD-03 already specifies
+exactly this behaviour.
+
+### The federation boundary
+
+**Blobs hosted on someone else's Blossom server are fetched directly by the client from that
+server.** They are not proxied, and they are not our bandwidth. Selection logic applies only to
+hostnames we own; for any other server the client goes direct.
+
+This is a real cost boundary and a reason BUD-04 mirroring is economically useful: content that also
+lives elsewhere can be served from elsewhere.
+
+**Open question, unverified.** `fastly.toml.example` declares fallback backends for
+`cdn.divine.video`, `blossom.divine.video`, `cdn.satellite.earth`, and `image.nostr.build`, and the
+README describes a fallback chain for missing blobs. No usage of those backend names was found in
+`src/`, so they may be dead configuration or referenced dynamically. **If that chain proxies rather
+than redirects, it inverts the boundary above** — we would be paying delivery bandwidth to serve
+content hosted by third parties. Worth confirming before it scales.
+
 ## Moderation wiring
 
 ### Replicate on approval, never on upload
