@@ -137,8 +137,13 @@ carries a rounding error of traffic — but it means **a broken exclusion produc
 until someone finds it.** The cost of a leak is not proportional to its frequency; a single
 tombstoned blob served after a takedown is a legal event, not an error rate.
 
-Required: a **canary**. A permanently-tombstoned test hash that must always 404 on every delivery
-CDN, polled continuously, alarming if it ever returns 200. Add it to the takedown drill.
+Required: a **canary**, asserting all three of:
+
+1. A permanently-tombstoned hash returns 404 on **every** delivery zone.
+2. `CacheErrorResponses == False` on every delivery pull zone — that default is what lets an
+   approval take effect immediately instead of being masked by a cached 404.
+3. A deliberately-taken-down test blob has **zero versions** in the replica, not merely a hide
+   marker. This is the check that catches a delete path which only hides.
 
 ### Alternatives considered
 
@@ -156,14 +161,33 @@ does not use it is cost and certainty, not capability.
 
 ### Deletion and takedown
 
-bunny's purge API becomes an additional fan-out target alongside the existing Fastly surrogate-key
-purge. Note the existing failure mode this compounds: `purge_edge_cache` in `src/main.rs:5945`
-logs and skips the purge when `fastly_api_token` is unconfigured. **Make the purge fan-out fail
-loudly before enabling any bunny traffic**, or a takedown can succeed on one CDN and fail on the
-other.
+**The design is asymmetric, and this must not be glossed.** Content that was *never* replicated is
+protected structurally and cannot leak. Content that was already replicated and served is an
+ordinary distributed delete, with ordinary distributed-delete failure modes.
 
-Token authentication on the bunny zone is probably unnecessary — the content is public,
-content-addressed Blossom blobs, so there is nothing to protect. Revisit if that changes.
+Measured in [`../../measurements/2026-08-07-takedown-drill.md`](../../measurements/2026-08-07-takedown-drill.md),
+removing one blob requires all of:
+
+1. Tombstone in GCS (authoritative).
+2. Delete **every version** in the replica. On B2 that means `b2_delete_file_version` per version —
+   `b2_hide_file`, the B2 UI delete, and an S3 `DeleteObject` against a versioned bucket all leave
+   the bytes intact and retrievable by file id.
+3. Purge each delivery zone **independently** — Volume and Standard caches are separate. The drill
+   confirmed the CDN keeps serving a deleted object until purged.
+4. Surrogate-key purge on Fastly.
+5. Deny-list check in Compute, for instant enforcement ahead of the above.
+
+Make this **one idempotent, retryable job with an audit trail**, not a sequence of calls in a
+request handler. Every added zone adds a step, which is an argument for keeping the number of
+delivery zones small.
+
+**Pre-existing risk this compounds:** `vcl/fetch.vcl` documents that the moderation surrogate-key
+purge "is silently skipped if `fastly_api_token` is unconfigured". A takedown that succeeds on one
+CDN and silently fails on another is worse than one that fails loudly everywhere. **Fix that before
+a second CDN carries traffic.**
+
+Token authentication on the delivery zone is probably unnecessary — the content is public,
+content-addressed Blossom blobs, so there is nothing to protect.
 
 ## What can and cannot be measured server-side
 

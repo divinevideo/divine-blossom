@@ -13,6 +13,7 @@ Entry point for the delivery-origin and second-CDN evaluation. Start here, then 
 | [superpowers/specs/2026-08-06-cdn-delivery-steering-design.md](superpowers/specs/2026-08-06-cdn-delivery-steering-design.md) | How to steer traffic between two CDNs, server-side |
 | [measurements/2026-08-07-four-region-summary.md](measurements/2026-08-07-four-region-summary.md) | **The current headline result** |
 | [measurements/2026-08-07-replica-as-acl-validation.md](measurements/2026-08-07-replica-as-acl-validation.md) | Working test system proving absence-is-denial |
+| [measurements/2026-08-07-takedown-drill.md](measurements/2026-08-07-takedown-drill.md) | Takedown semantics — **B2 hide does not erase data** |
 | [measurements/2026-08-07-nz-wellington.md](measurements/2026-08-07-nz-wellington.md) | First measurement; superseded in scope, still valid for Oceania |
 | [../scripts/probe_cdn_delivery.py](../scripts/probe_cdn_delivery.py) | The measurement tool |
 
@@ -145,9 +146,11 @@ receive it — not a query over what already exists.
   serve it. No tokens, no deny-list, no edge compute, no per-request cost. This makes "replicate on
   approval, not on upload" a correctness requirement. See the steering design for the alternatives
   considered and why they cost more.
-- Takedown gains a fan-out target: bunny's purge API alongside the Fastly surrogate-key purge. The
-  existing purge already fails silently if `fastly_api_token` is unconfigured — that should fail
-  loudly before a second CDN is added.
+- **Takedown is the asymmetric case.** Never-replicated content is protected structurally;
+  already-replicated content needs an active multi-target delete. Drilled live: deleting from B2 left
+  bunny serving from cache until purged, and `b2_hide_file` leaves the bytes retrievable by file id.
+  See the takedown drill. The existing Fastly purge already fails silently if `fastly_api_token` is
+  unconfigured — that must fail loudly before a second CDN carries traffic.
 
 ## Next steps
 
