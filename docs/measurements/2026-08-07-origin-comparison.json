@@ -1,0 +1,1236 @@
+{
+  "region": "nz-wellington",
+  "baseline": "fastly",
+  "margin_pct": 20.0,
+  "summaries": {
+    "fastly": {
+      "edge": "fastly",
+      "region": "nz-wellington",
+      "n": 20,
+      "errors": 0,
+      "ttfb_p50_ms": 39.6279789856635,
+      "ttfb_p95_ms": 44.0140874881763,
+      "total_p95_ms": 105.13259972212836,
+      "throughput_mbps": 108.22925714036437,
+      "bytes_total": 26773080,
+      "cache_statuses": {
+        "hit": 20
+      }
+    },
+    "bunny-origin-fastly": {
+      "edge": "bunny-origin-fastly",
+      "region": "nz-wellington",
+      "n": 20,
+      "errors": 0,
+      "ttfb_p50_ms": 450.7206665002741,
+      "ttfb_p95_ms": 482.91804582695477,
+      "total_p95_ms": 1445.4252399154939,
+      "throughput_mbps": 7.932390422633225,
+      "bytes_total": 26773080,
+      "cache_statuses": {
+        "hit": 20
+      }
+    },
+    "bunny-origin-bunnystorage": {
+      "edge": "bunny-origin-bunnystorage",
+      "region": "nz-wellington",
+      "n": 20,
+      "errors": 0,
+      "ttfb_p50_ms": 452.43910449789837,
+      "ttfb_p95_ms": 474.41796042839997,
+      "total_p95_ms": 1413.235039357096,
+      "throughput_mbps": 7.985959288919905,
+      "bytes_total": 26773080,
+      "cache_statuses": {
+        "hit": 20
+      }
+    },
+    "bunny-origin-b2": {
+      "edge": "bunny-origin-b2",
+      "region": "nz-wellington",
+      "n": 20,
+      "errors": 0,
+      "ttfb_p50_ms": 461.1252499744296,
+      "ttfb_p95_ms": 503.7762371008285,
+      "total_p95_ms": 1449.0173535596114,
+      "throughput_mbps": 7.891370710329806,
+      "bytes_total": 26773080,
+      "cache_statuses": {
+        "hit": 20
+      }
+    }
+  },
+  "verdicts": [
+    {
+      "edge": "bunny-origin-fastly",
+      "region": "nz-wellington",
+      "verdict": "FAIL",
+      "delta_pct": 997.1897258046829,
+      "reason": "p95 TTFB +997.2% vs baseline, outside 20% margin"
+    },
+    {
+      "edge": "bunny-origin-bunnystorage",
+      "region": "nz-wellington",
+      "verdict": "FAIL",
+      "delta_pct": 977.8775330872074,
+      "reason": "p95 TTFB +977.9% vs baseline, outside 20% margin"
+    },
+    {
+      "edge": "bunny-origin-b2",
+      "region": "nz-wellington",
+      "verdict": "FAIL",
+      "delta_pct": 1044.5795331691477,
+      "reason": "p95 TTFB +1044.6% vs baseline, outside 20% margin"
+    }
+  ],
+  "samples": {
+    "fastly": [
+      {
+        "edge": "fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 38.65949995815754,
+        "total_ms": 100.47625005245209,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        }
+      },
+      {
+        "edge": "fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 41.2809579866007,
+        "total_ms": 95.9003750467673,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        }
+      },
+      {
+        "edge": "fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 38.804749958217144,
+        "total_ms": 101.99554089922458,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        }
+      },
+      {
+        "edge": "fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 38.10562496073544,
+        "total_ms": 100.05579190328717,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        }
+      },
+      {
+        "edge": "fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 38.71900006197393,
+        "total_ms": 95.59845796320587,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        }
+      },
+      {
+        "edge": "fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 37.19908301718533,
+        "total_ms": 93.02108304109424,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        }
+      },
+      {
+        "edge": "fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 39.517957950010896,
+        "total_ms": 96.5409999480471,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        }
+      },
+      {
+        "edge": "fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 38.901375024579465,
+        "total_ms": 100.28004192281514,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        }
+      },
+      {
+        "edge": "fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 36.41770908143371,
+        "total_ms": 100.4874591017142,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        }
+      },
+      {
+        "edge": "fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 43.81937498692423,
+        "total_ms": 104.53716607298702,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        }
+      },
+      {
+        "edge": "fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 41.99675004929304,
+        "total_ms": 97.88445895537734,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        }
+      },
+      {
+        "edge": "fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 39.46187510155141,
+        "total_ms": 102.2917500231415,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        }
+      },
+      {
+        "edge": "fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 38.05550001561642,
+        "total_ms": 90.45749995857477,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        }
+      },
+      {
+        "edge": "fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 41.15408309735358,
+        "total_ms": 105.06145807448775,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        }
+      },
+      {
+        "edge": "fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 47.71362501196563,
+        "total_ms": 106.48429102730006,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        }
+      },
+      {
+        "edge": "fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 40.64675001427531,
+        "total_ms": 100.2203329699114,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        }
+      },
+      {
+        "edge": "fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 40.531542035751045,
+        "total_ms": 102.28420898783952,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        }
+      },
+      {
+        "edge": "fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 39.96487508993596,
+        "total_ms": 93.96725008264184,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        }
+      },
+      {
+        "edge": "fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 39.73800002131611,
+        "total_ms": 95.58316599577665,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        }
+      },
+      {
+        "edge": "fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 41.80574999190867,
+        "total_ms": 95.86262505035847,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "x-cache": "HIT"
+        }
+      }
+    ],
+    "bunny-origin-fastly": [
+      {
+        "edge": "bunny-origin-fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 481.2982500297949,
+        "total_ms": 1457.9072500346228,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        }
+      },
+      {
+        "edge": "bunny-origin-fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 457.95420894864947,
+        "total_ms": 1385.717959026806,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        }
+      },
+      {
+        "edge": "bunny-origin-fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 428.2081249402836,
+        "total_ms": 1275.4725828999653,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        }
+      },
+      {
+        "edge": "bunny-origin-fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 460.3985829744488,
+        "total_ms": 1390.5396659392864,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        }
+      },
+      {
+        "edge": "bunny-origin-fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 419.99991599004716,
+        "total_ms": 1274.9412909615785,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        }
+      },
+      {
+        "edge": "bunny-origin-fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 433.93516598735005,
+        "total_ms": 1315.7241659937426,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        }
+      },
+      {
+        "edge": "bunny-origin-fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 458.3539169980213,
+        "total_ms": 1387.6018750015646,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        }
+      },
+      {
+        "edge": "bunny-origin-fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 457.410000031814,
+        "total_ms": 1380.3165419958532,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        }
+      },
+      {
+        "edge": "bunny-origin-fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 425.8749580476433,
+        "total_ms": 1293.1947920005769,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        }
+      },
+      {
+        "edge": "bunny-origin-fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 443.9292079769075,
+        "total_ms": 1346.253791009076,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        }
+      },
+      {
+        "edge": "bunny-origin-fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 513.6941659729928,
+        "total_ms": 1397.6125000044703,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        }
+      },
+      {
+        "edge": "bunny-origin-fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 444.0313329687342,
+        "total_ms": 1341.437374940142,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        }
+      },
+      {
+        "edge": "bunny-origin-fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 480.695083970204,
+        "total_ms": 1444.768292014487,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        }
+      },
+      {
+        "edge": "bunny-origin-fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 470.0045839417726,
+        "total_ms": 1287.7603749511763,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        }
+      },
+      {
+        "edge": "bunny-origin-fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 440.2420000405982,
+        "total_ms": 1332.5471669668332,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        }
+      },
+      {
+        "edge": "bunny-origin-fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 463.8357500080019,
+        "total_ms": 1387.876332970336,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        }
+      },
+      {
+        "edge": "bunny-origin-fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 424.02112507261336,
+        "total_ms": 1275.7171670673415,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        }
+      },
+      {
+        "edge": "bunny-origin-fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 426.43862508703023,
+        "total_ms": 1280.2718330640346,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        }
+      },
+      {
+        "edge": "bunny-origin-fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 443.830749951303,
+        "total_ms": 1347.0825419062749,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        }
+      },
+      {
+        "edge": "bunny-origin-fastly",
+        "region": "nz-wellington",
+        "ttfb_ms": 460.86020895745605,
+        "total_ms": 1398.5295839374885,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT",
+          "x-cache": "MISS"
+        }
+      }
+    ],
+    "bunny-origin-bunnystorage": [
+      {
+        "edge": "bunny-origin-bunnystorage",
+        "region": "nz-wellington",
+        "ttfb_ms": 460.1995409466326,
+        "total_ms": 1391.60366600845,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-bunnystorage",
+        "region": "nz-wellington",
+        "ttfb_ms": 421.8994170660153,
+        "total_ms": 1280.3827500902116,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-bunnystorage",
+        "region": "nz-wellington",
+        "ttfb_ms": 428.2820000080392,
+        "total_ms": 1295.571249909699,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-bunnystorage",
+        "region": "nz-wellington",
+        "ttfb_ms": 450.30195894651115,
+        "total_ms": 1367.4627499422058,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-bunnystorage",
+        "region": "nz-wellington",
+        "ttfb_ms": 474.78058305568993,
+        "total_ms": 1412.4219580553472,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-bunnystorage",
+        "region": "nz-wellington",
+        "ttfb_ms": 439.9729579454288,
+        "total_ms": 1358.774916967377,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-bunnystorage",
+        "region": "nz-wellington",
+        "ttfb_ms": 441.8259580852464,
+        "total_ms": 1363.9735410688445,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-bunnystorage",
+        "region": "nz-wellington",
+        "ttfb_ms": 447.34700000844896,
+        "total_ms": 1379.926583962515,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-bunnystorage",
+        "region": "nz-wellington",
+        "ttfb_ms": 461.90129197202623,
+        "total_ms": 1400.3245829371735,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-bunnystorage",
+        "region": "nz-wellington",
+        "ttfb_ms": 471.9533750321716,
+        "total_ms": 1428.6835840903223,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-bunnystorage",
+        "region": "nz-wellington",
+        "ttfb_ms": 460.0049579748884,
+        "total_ms": 1263.7447499437258,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-bunnystorage",
+        "region": "nz-wellington",
+        "ttfb_ms": 426.0329999960959,
+        "total_ms": 1279.5792919350788,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-bunnystorage",
+        "region": "nz-wellington",
+        "ttfb_ms": 454.5762500492856,
+        "total_ms": 1380.6545420084149,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-bunnystorage",
+        "region": "nz-wellington",
+        "ttfb_ms": 473.59762503765523,
+        "total_ms": 1295.2453340403736,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-bunnystorage",
+        "region": "nz-wellington",
+        "ttfb_ms": 474.39887502696365,
+        "total_ms": 1296.5650830883533,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-bunnystorage",
+        "region": "nz-wellington",
+        "ttfb_ms": 463.6744580930099,
+        "total_ms": 1389.701042091474,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-bunnystorage",
+        "region": "nz-wellington",
+        "ttfb_ms": 458.0234170425683,
+        "total_ms": 1384.0526669519022,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-bunnystorage",
+        "region": "nz-wellington",
+        "ttfb_ms": 423.1984579237178,
+        "total_ms": 1264.0075410017744,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-bunnystorage",
+        "region": "nz-wellington",
+        "ttfb_ms": 420.01704091671854,
+        "total_ms": 1269.8596250265837,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-bunnystorage",
+        "region": "nz-wellington",
+        "ttfb_ms": 437.9397080047056,
+        "total_ms": 1317.6162911113352,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      }
+    ],
+    "bunny-origin-b2": [
+      {
+        "edge": "bunny-origin-b2",
+        "region": "nz-wellington",
+        "ttfb_ms": 467.59079094044864,
+        "total_ms": 1406.5140830352902,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-b2",
+        "region": "nz-wellington",
+        "ttfb_ms": 500.7377079455182,
+        "total_ms": 1394.7588748997077,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-b2",
+        "region": "nz-wellington",
+        "ttfb_ms": 454.4788330094889,
+        "total_ms": 1391.6405000491068,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-b2",
+        "region": "nz-wellington",
+        "ttfb_ms": 445.6304159248248,
+        "total_ms": 1343.946082983166,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-b2",
+        "region": "nz-wellington",
+        "ttfb_ms": 561.5082910517231,
+        "total_ms": 1448.6534160096198,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-b2",
+        "region": "nz-wellington",
+        "ttfb_ms": 455.9498339658603,
+        "total_ms": 1396.6627500485629,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-b2",
+        "region": "nz-wellington",
+        "ttfb_ms": 429.2927919887006,
+        "total_ms": 1300.1075419597328,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-b2",
+        "region": "nz-wellington",
+        "ttfb_ms": 493.7283330364153,
+        "total_ms": 1361.620582989417,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-b2",
+        "region": "nz-wellington",
+        "ttfb_ms": 481.12583393231034,
+        "total_ms": 1455.9321670094505,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-b2",
+        "region": "nz-wellington",
+        "ttfb_ms": 445.8482500631362,
+        "total_ms": 1307.6177920447662,
+        "bytes_read": 1375915,
+        "error": null,
+        "path": "/832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-b2",
+        "region": "nz-wellington",
+        "ttfb_ms": 451.0535830631852,
+        "total_ms": 1350.8730829926208,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-b2",
+        "region": "nz-wellington",
+        "ttfb_ms": 468.48299994599074,
+        "total_ms": 1402.3542079376057,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-b2",
+        "region": "nz-wellington",
+        "ttfb_ms": 419.44145900197327,
+        "total_ms": 1272.0794590422884,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-b2",
+        "region": "nz-wellington",
+        "ttfb_ms": 470.7066250266507,
+        "total_ms": 1284.6228330163285,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-b2",
+        "region": "nz-wellington",
+        "ttfb_ms": 457.5994999613613,
+        "total_ms": 1394.2341250367463,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-b2",
+        "region": "nz-wellington",
+        "ttfb_ms": 495.73795800097287,
+        "total_ms": 1398.7229169579223,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-b2",
+        "region": "nz-wellington",
+        "ttfb_ms": 466.39354107901454,
+        "total_ms": 1294.4520830642432,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-b2",
+        "region": "nz-wellington",
+        "ttfb_ms": 464.6509999874979,
+        "total_ms": 1396.541333058849,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-b2",
+        "region": "nz-wellington",
+        "ttfb_ms": 426.17795895785093,
+        "total_ms": 1271.0664169862866,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      },
+      {
+        "edge": "bunny-origin-b2",
+        "region": "nz-wellington",
+        "ttfb_ms": 419.28229096811265,
+        "total_ms": 1269.226707983762,
+        "bytes_read": 1301393,
+        "error": null,
+        "path": "/50dfc6758bb3cdf823ef33315e72642ebb881a0b1d0f6b0d8bade0f0fad30c3a/720p.mp4",
+        "status": 200,
+        "cache_status": "HIT",
+        "cache_headers": {
+          "cdn-cache": "HIT"
+        }
+      }
+    ]
+  }
+}
