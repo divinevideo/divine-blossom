@@ -58,7 +58,8 @@ shipping a one-second startup delay to every Oceania viewer.
 | bunny pull zone `divine-probe-standard` | id 6288621, live | Standard tier, same origin |
 | bunny storage zone `divine-delivery-test` | id 1722644, region NY | Push replica, 4 approved objects |
 | bunny pull zone `divine-delivery-test` | id 6289348, Volume tier | Backed by the storage zone — the working ACL test |
-| Backblaze B2 | bucket `divine-delivery-probe`, **private only** | Blocked: B2 requires completed payment history for a public bucket |
+| Backblaze B2 | bucket `divine-delivery-probe`, public, 4 objects | Validated as a bunny pull-zone origin |
+| bunny pull zone `divine-b2-test` | id 6289364, Volume tier | Origin is the B2 bucket — full production-shaped topology |
 | Cloudflare R2 | not started | account exists; no bucket, no token |
 
 Both bunny zones are **temporary probe infrastructure** and pull through Fastly rather than from a
@@ -152,8 +153,8 @@ receive it — not a query over what already exists.
 
 1. Ship the `vcl_log` line and table that make finding 1 answerable.
 2. Add the tombstoned-hash canary described in the steering design, before any traffic is steered.
-3. ~~Stand up a real delivery origin and re-measure~~ — done with bunny Storage; storage-backed and
-   pull-through origins are within 3%, so origin choice is not the variable. A B2 or R2 origin still
-   needs testing for the production topology.
+3. ~~Stand up a real delivery origin and re-measure~~ — done. Fastly pull-through, bunny Storage,
+   and Backblaze B2 origins all land within 6% of each other on cache hits, so **origin choice does
+   not affect delivery performance** and can be decided on cost, durability, and lock-in alone.
 4. Measure South America and India.
 5. Delete the probe zones once the campaign closes (#178).

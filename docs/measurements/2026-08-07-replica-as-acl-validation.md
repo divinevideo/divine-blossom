@@ -46,20 +46,43 @@ Nothing enforces this. There is no rule to misconfigure and no policy to evaluat
 serve what its origin does not contain. That is the property the design was after: a control that
 cannot be eventually-consistent-wrong.
 
+## Also validated on a Backblaze B2 origin
+
+The same test was repeated with the full production-shaped topology —
+**GCS (authoritative) → B2 (approved-only replica) → bunny Volume → viewer** — using public bucket
+`divine-delivery-probe` as the pull-zone origin. Identical result:
+
+| Path | On replica? | bunny | Fastly |
+|---|---|---:|---:|
+| `832e9a4d…/720p.mp4` | yes | **200** | 206 |
+| `832e9a4d…3cd3f8a1.mp4` | yes | **200** | 206 |
+| `832e9a4d…3cd3f8a1` (bare hash) | **no** | **404** | **206** |
+| `832e9a4d…/480p.mp4` | **no** | **404** | **206** |
+
 ## Origin choice is not the variable — geography is
 
-Same probe, same paths, from Wellington:
+Same probe, same paths, from Wellington, across three completely different origin types:
 
 | Edge | Origin | p50 TTFB | p95 TTFB | Mbps |
 |---|---|---:|---:|---:|
-| Fastly | GCS via Compute | 40 ms | 45 ms | 106 |
-| bunny Volume | pull-through Fastly | 465 ms | 505 ms | 7.7 |
-| bunny Volume | **bunny Storage (NY)** | 456 ms | **491 ms** | 7.9 |
+| Fastly | GCS via Compute | 40 ms | 44 ms | 108 |
+| bunny Volume | pull-through Fastly | 451 ms | 483 ms | 7.9 |
+| bunny Volume | bunny Storage (NY) | 452 ms | **474 ms** | 8.0 |
+| bunny Volume | **Backblaze B2 (US-West)** | 461 ms | 504 ms | 7.9 |
 
-A storage-backed origin and a pull-through origin are within 3% of each other. The ~490 ms is
-Wellington being served from Los Angeles, as established in
-[`2026-08-07-four-region-summary.md`](./2026-08-07-four-region-summary.md) — **not** an origin
-effect. Swapping to a real delivery origin introduces no regression.
+**All three bunny origins land within 6% of each other.** The ~480 ms is Wellington being served
+from Los Angeles, as established in
+[`2026-08-07-four-region-summary.md`](./2026-08-07-four-region-summary.md) — not an origin effect.
+
+This is a useful simplification: **on cache hits, origin choice does not affect delivery
+performance at all.** The origin decision can therefore be made purely on storage cost, durability,
+egress terms, and lock-in — the criteria in
+[`../cdn-object-storage-vendor-notes.md`](../cdn-object-storage-vendor-notes.md) — without a
+performance trade-off to weigh against them.
+
+Cache-*miss* behaviour is a separate question and is not settled by this: a distant origin still
+costs on fill. Measured separately, bunny's miss penalty on a warm-region zone was 1.0–1.9× the warm
+TTFB, so fills are efficient, but that was against a Fastly origin rather than B2 or R2.
 
 (Absolute throughput is lower across all three than in earlier runs; local network variance. The
 relative comparison is unaffected.)
@@ -84,18 +107,12 @@ The canary from the steering design: a permanently-tombstoned hash that must alw
 delivery CDN, polled continuously, alarming if it ever returns 200. Gated content is a very small
 fraction of the corpus, so a broken exclusion produces no visible symptom until someone finds it.
 
-## Blocked
+## Note on the B2 public-bucket gate
 
-A Backblaze B2 origin could not be tested. B2 refuses to make a bucket public without **completed
-payment history** — a card on file is not sufficient:
-
-```
-{"code": "no_payment_history",
- "message": "Account has no payment history. Please make a payment before making a public bucket."}
-```
-
-Bucket `divine-delivery-probe` (id `f6f9ae1e0c0adabd9ff70517`) exists but is private and therefore
-unusable as a pull-zone origin, since B2 download authorization tokens expire.
+New B2 accounts cannot create or convert a public bucket until they have **completed payment
+history** — a card on file is not sufficient, and the error is `no_payment_history`. This blocked
+the B2 origin test until a payment was made. Worth knowing before planning around B2, since a
+private bucket cannot back a pull zone (B2 download authorization tokens expire).
 
 ## Teardown
 
@@ -104,4 +121,5 @@ Temporary, delete when the campaign closes (#178):
 - storage zone `divine-delivery-test` (1722644) and its four objects
 - pull zone `divine-delivery-test` (6289348)
 - pull zones `divine-probe-volume` (6288620), `divine-probe-standard` (6288621)
-- B2 bucket `divine-delivery-probe`
+- pull zone `divine-b2-test` (6289364)
+- B2 bucket `divine-delivery-probe` (`f6f9ae1e0c0adabd9ff70517`) and its four objects
