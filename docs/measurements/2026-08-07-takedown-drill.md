@@ -79,6 +79,47 @@ Each added delivery CDN or zone adds a step. This is an argument for keeping the
 zones small, and for making the purge fan-out a single idempotent, retryable job with an audit
 trail — not a sequence of calls in a request handler.
 
+## Per-record purge works on both CDNs, keyed on the content hash
+
+Content addressing means every derivative of a blob shares the hash as a path prefix, so **the
+SHA-256 is a natural purge key on both CDNs** — no separate tagging scheme is needed.
+
+**Fastly — already implemented.** `src/main.rs` sets `Surrogate-Key: {hash}` on cacheable responses
+(`add_cache_headers`, `add_private_cache_headers`), `vcl/deliver.vcl` strips it before the client
+sees it, and `purge_edge_cache(surrogate_key)` already calls
+`POST /service/{id}/purge/{key}` against both the VCL and Compute services.
+
+**bunny — verified working.** A single wildcard URL purge covers every derivative:
+
+```
+POST https://api.bunny.net/purge?url=https://{zone}.b-cdn.net/{sha256}*
+     AccessKey: <key>
+```
+
+Measured semantics, on a zone with two warm derivative paths:
+
+| Purge URL | `{hash}.mp4` | `{hash}/720p.mp4` |
+|---|---|---|
+| `{hash}*` | **MISS** (purged) | **MISS** (purged) |
+| `{hash}/*` | HIT (untouched) | **MISS** (purged) |
+
+It is a literal prefix match, so `{hash}*` catches `.mp4`, `/720p.mp4`, `/480p.mp4`, `.hls`,
+`/hls/*.ts`, `.vtt`, and thumbnails in one call. `{hash}/*` is the narrower form and would **miss**
+the extension-suffixed paths — use the bare `{hash}*`. Took effect within ~4 seconds.
+
+### What needs building
+
+1. **Extend `purge_edge_cache` with a bunny leg** — one wildcard purge per delivery zone. The
+   function already takes the hash, so the signature does not change.
+2. **Make it fail loudly.** As written it is explicitly best-effort: it returns early with only an
+   `eprintln!` when `fastly_api_token` is absent, and its own doc comment says it "logs errors but
+   never fails the calling request." That is reasonable for a cache optimisation and wrong for a
+   moderation control. A takedown that logs an error and reports success is a compliance hole, and
+   adding a second CDN doubles the number of ways it can happen. It should return a result the
+   moderation path can act on, with retry and alerting.
+
+Neither is large. The mechanism is there; it needs a second target and honest error handling.
+
 ## Pre-existing risk this compounds
 
 `vcl/fetch.vcl` documents that the moderation surrogate-key purge "is silently skipped if
