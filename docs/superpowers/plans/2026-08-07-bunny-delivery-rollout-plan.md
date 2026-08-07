@@ -165,6 +165,90 @@ README describes a fallback chain for missing blobs. No usage of those backend n
 than redirects, it inverts the boundary above** — we would be paying delivery bandwidth to serve
 content hosted by third parties. Worth confirming before it scales.
 
+## Replicator requirements
+
+Validated against the live test system. Each of these was found by something breaking, not by
+reading the code.
+
+### 1. Write URL-shaped keys, not storage-shaped keys
+
+**This is the one that would silently produce an unusable bucket.** Compute translates between the
+wire path and the GCS layout; the CDN has no such translation. Objects must be written under the
+path the client will request.
+
+| URL path | GCS storage path |
+|---|---|
+| `/{hash}` and `/{hash}.mp4` | `{hash}` |
+| `/{hash}/720p.mp4` | `{hash}/hls/stream_720p.mp4` |
+| `/{hash}/480p.mp4` | `{hash}/hls/stream_480p.mp4` |
+| `/{hash}/720p` | `{hash}/hls/stream_720p.ts` |
+| `/{hash}/480p` | `{hash}/hls/stream_480p.ts` |
+| `/{hash}.hls` | `{hash}/hls/master.m3u8` |
+| `/{hash}/hls/*` | `{hash}/hls/*` |
+| **`/{hash}.vtt`** | **`{hash}/vtt/main.vtt`** |
+| `/{hash}.jpg` | `{hash}.jpg` |
+
+A `rclone sync` of the GCS prefix mirrors the right-hand column and every request 404s. The
+replicator must enumerate the left-hand column — which also means the derivative inventory is a
+maintained list, and adding a rendition without updating it means that rendition silently never
+replicates.
+
+The `storage_delete` calls in the blob-deletion path are the current source of truth for this
+inventory; keep them and the replicator in sync, ideally from one shared constant.
+
+### 2. Preserve `Content-Type` from the source
+
+B2 stores whatever the upload declares, and the CDN serves that verbatim. Defaulting to
+`application/octet-stream` means `<track>` elements silently fail to parse subtitles while video
+plays fine — a bug that presents as a player problem. Read the origin's content type and carry it.
+
+### 3. Configure CORS explicitly on the bucket
+
+Before an explicit rule was set on the probe bucket, `.mp4` returned `access-control-allow-origin: *`
+and `.vtt` returned no CORS header at all. The MP4s had inherited it incidentally. Set a bucket rule
+covering `range` and conditional headers, and exposing `content-range` / `accept-ranges` so range
+requests work:
+
+```json
+{"corsRuleName":"divineDeliveryPublicRead","allowedOrigins":["*"],
+ "allowedOperations":["b2_download_file_by_name","b2_download_file_by_id"],
+ "allowedHeaders":["range","if-modified-since","if-none-match","origin","content-type"],
+ "exposeHeaders":["content-length","content-type","content-range","accept-ranges","etag"],
+ "maxAgeSeconds":3600}
+```
+
+### 4. Align cache-control across CDNs
+
+Fastly serves derivatives as `max-age=31536000, immutable`; bunny served the same VTT as
+`max-age=2592000`, its own default, because B2 sets no cache header. Two CDNs disagreeing on TTL for
+one object is its own problem — set the header at upload so both agree.
+
+## Mutable derivatives — an existing bug that a second CDN makes worse
+
+Blobs are immutable. **Derivatives are not.** `scan_and_repair_vtts.py` rewrites VTTs, and a
+`backfill-fmp4` endpoint regenerates renditions. Yet `add_cache_headers` marks them
+`max-age=31536000, immutable`.
+
+That is a one-year immutable pin on files that get rewritten. Today it is partially masked because
+`purge_transcript_content_cache` fires on transcript completion — but that covers the completion
+path only, not the repair-script path, which runs outside Compute entirely and issues no purge.
+
+Consequences for this plan:
+
+- **Replication needs an update path**, not just create and delete. A regenerated derivative must
+  overwrite the replica and purge every CDN.
+- **The repair script must trigger a purge.** It runs outside Compute, so it needs its own route to
+  `purge_edge_cache`, or the reconciler must detect content drift by comparing checksums rather than
+  presence.
+- **Presence-only reconciliation is insufficient** for derivatives. Presence is enough for the
+  immutable blob; derivatives need a content check.
+
+The purge mechanism already covers this once called: Fastly's surrogate key is `{hash}`, and bunny's
+`{hash}*` wildcard reaches every derivative in one call. The gap is invocation, not capability.
+
+**Fix the `immutable` header on mutable derivatives regardless of whether bunny ships.** It is a
+correctness bug today.
+
 ## Moderation wiring
 
 ### Replicate on approval, never on upload
