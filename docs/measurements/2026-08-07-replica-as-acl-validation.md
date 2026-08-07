@@ -167,10 +167,18 @@ private bucket cannot back a pull zone (B2 download authorization tokens expire)
 
 ## Teardown
 
-Temporary, delete when the campaign closes (#178):
+**Do not delete pull zone `divine-b2-test` (6289364).** It now carries the custom hostnames
+`v.divine.video` and `v-test.divine.video` with issued Let's Encrypt certificates, and production
+DNS points at it. Its name is misleading — bunny accepts a rename request but does not apply it.
+
+When a production replica bucket exists, **swap this zone's `OriginUrl`** from the test B2 bucket to
+the production one. The hostname, certificates and CNAME all stay put; there is no DNS change and no
+cutover.
+
+Temporary and safe to delete when the campaign closes (#178):
 
 - storage zone `divine-delivery-test` (1722644) and its four objects
 - pull zone `divine-delivery-test` (6289348)
 - pull zones `divine-probe-volume` (6288620), `divine-probe-standard` (6288621)
-- pull zone `divine-b2-test` (6289364)
-- B2 bucket `divine-delivery-probe` (`f6f9ae1e0c0adabd9ff70517`) and its four objects
+- B2 bucket `divine-delivery-probe` (`f6f9ae1e0c0adabd9ff70517`) — **only once zone 6289364's origin
+  has been re-pointed at a production bucket**, since it is that zone's origin
