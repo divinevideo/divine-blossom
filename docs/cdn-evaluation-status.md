@@ -136,8 +136,11 @@ receive it — not a query over what already exists.
 - Whether Fastly zero-egress treatment survives buckets and Compute being in different accounts.
 
 **Architecture**
-- bunny cannot run request-time access logic, so eligibility must be decided upstream. The steering
-  design gates on moderation status before any percentage or geographic bucket.
+- Access control on the second CDN is settled: **the replica is the access control**. Replicating
+  only on moderation-approval means a gated blob is never in the replica, so the second CDN cannot
+  serve it. No tokens, no deny-list, no edge compute, no per-request cost. This makes "replicate on
+  approval, not on upload" a correctness requirement. See the steering design for the alternatives
+  considered and why they cost more.
 - Takedown gains a fan-out target: bunny's purge API alongside the Fastly surrogate-key purge. The
   existing purge already fails silently if `fastly_api_token` is unconfigured — that should fail
   loudly before a second CDN is added.
@@ -145,6 +148,7 @@ receive it — not a query over what already exists.
 ## Next steps
 
 1. Ship the `vcl_log` line and table that make finding 1 answerable.
-2. Stand up a real delivery origin (B2 or R2) and re-measure with bunny pulling from it.
-3. Measure South America and India.
-4. Delete the probe zones once the campaign closes (#178).
+2. Add the tombstoned-hash canary described in the steering design, before any traffic is steered.
+3. Stand up a real delivery origin (B2 or R2) and re-measure with bunny pulling from it.
+4. Measure South America and India.
+5. Delete the probe zones once the campaign closes (#178).

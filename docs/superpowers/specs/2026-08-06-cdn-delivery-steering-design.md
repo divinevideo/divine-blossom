@@ -95,19 +95,64 @@ non-zero rollout.
 Secondary lever: DNS weighting on the delivery hostname. Coarse and TTL-bound, but independent of
 Compute, so it still works if Compute is the thing that is broken.
 
-### Eligibility
+### Eligibility — the replica is the access control
 
 Only `Active`, public, non-restricted blobs are steerable. Everything else — `Pending`,
 `Restricted`, `AgeRestricted`, admin bypass, tombstoned, legal hold — stays on the Fastly Compute
 path.
 
-bunny does have an edge compute runtime (Edge Scripting, Deno-based) but no persistent KV store yet,
-so a moderation gate there would need an external fetch on every request. Deciding access once, when
-the URL is issued, avoids that entirely and is the reason this design does not depend on the second
-CDN having compute at all.
+**Enforce this by replication policy, not by logic at the second CDN.** Replicate to the delivery
+store only on moderation-approval, never on upload. A gated blob is then simply not in the replica:
 
-This is a hard rule, not a default. The check belongs in `select_delivery_host`, before the
-percentage bucket, so a config mistake cannot route restricted content off the enforcing path.
+```
+Active + public   → in replica → bunny serves it
+anything else     → never replicated → origin 404s → bunny 404s
+```
+
+bunny cannot leak what it can never fetch. No tokens, no deny-list, no edge scripting, no
+per-request logic, and no per-request cost. **Absence is the denial, structurally rather than by
+enforcement.**
+
+In the normal path the 404 never happens, because Fastly Compute picks the URL at descriptor time
+and already knows the status — gated content is handed a Fastly URL and never points at bunny. The
+404 is a safety net for one race: content that was public when its URL was issued and was gated
+before that URL was fetched.
+
+Three consequences worth stating plainly:
+
+- **The origin must be the approved-only replica.** A pull zone fetches from origin on miss, so
+  pointing bunny at Fastly or at the authoritative store would let it fetch and cache a gated blob
+  and defeat the whole mechanism. "Replicate on approval, not on upload" is therefore a
+  *correctness* requirement, not a cost optimisation.
+- **`Pending` content is currently served publicly.** `vcl/fetch.vcl` documents that Pending blobs
+  return 200 to anonymous viewers while moderation is in flight. Those must stay off the replica
+  entirely, or every rejected upload becomes a purge obligation.
+- **Negative caching needs a short TTL.** bunny will cache the 404. When content is later approved,
+  or a replication lag resolves, a stale 404 would persist. Cache 404s briefly and purge on publish.
+
+### Monitoring a control whose correct behaviour is silence
+
+Gated content is a very small fraction of the corpus. That is good for cost — the Fastly fallback
+carries a rounding error of traffic — but it means **a broken exclusion produces no visible symptom
+until someone finds it.** The cost of a leak is not proportional to its frequency; a single
+tombstoned blob served after a takedown is a legal event, not an error rate.
+
+Required: a **canary**. A permanently-tombstoned test hash that must always 404 on every delivery
+CDN, polled continuously, alarming if it ever returns 200. Add it to the takedown drill.
+
+### Alternatives considered
+
+Both work and both cost more. Recorded so the choice is not relitigated.
+
+| Mechanism | Cost | Revocation | Why not chosen |
+|---|---|---|---|
+| **Replica-as-ACL** | $0 | purge | chosen — cannot be eventually-consistent-wrong |
+| Token authentication | $0 | token TTL, closed by purge | native bunny SHA256 directory tokens, validated at the edge with no origin call; but revocation is bounded by TTL rather than structural |
+| Edge Scripting deny-list | ~$0.20 per million requests, on *every* request | ~refresh interval | bunny's `onClientRequest` runs before cache and can short-circuit, and Deno module scope holds an in-memory bloom filter across requests; genuinely viable, and the right answer if sub-minute revocation of already-replicated content is ever required |
+
+bunny does have a real edge compute runtime (Edge Scripting, Deno/V8, middleware hooks
+`onClientRequest`, `onOriginRequest`, `onOriginResponse`, `onClientResponse`). The reason this design
+does not use it is cost and certainty, not capability.
 
 ### Deletion and takedown
 
