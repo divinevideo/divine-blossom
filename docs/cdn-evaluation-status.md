@@ -12,6 +12,7 @@ Entry point for the delivery-origin and second-CDN evaluation. Start here, then 
 | [cdn-object-storage-vendor-notes.md](cdn-object-storage-vendor-notes.md) | Verified vendor limits, pricing, and API capabilities |
 | [superpowers/specs/2026-08-06-cdn-delivery-steering-design.md](superpowers/specs/2026-08-06-cdn-delivery-steering-design.md) | How to steer traffic between two CDNs, server-side |
 | [measurements/2026-08-07-four-region-summary.md](measurements/2026-08-07-four-region-summary.md) | **The current headline result** |
+| [measurements/2026-08-07-replica-as-acl-validation.md](measurements/2026-08-07-replica-as-acl-validation.md) | Working test system proving absence-is-denial |
 | [measurements/2026-08-07-nz-wellington.md](measurements/2026-08-07-nz-wellington.md) | First measurement; superseded in scope, still valid for Oceania |
 | [../scripts/probe_cdn_delivery.py](../scripts/probe_cdn_delivery.py) | The measurement tool |
 
@@ -55,7 +56,9 @@ shipping a one-second startup delay to every Oceania viewer.
 |---|---|---|
 | bunny pull zone `divine-probe-volume` | id 6288620, live | Volume tier, origin `media.divine.video` |
 | bunny pull zone `divine-probe-standard` | id 6288621, live | Standard tier, same origin |
-| Backblaze B2 | authenticated, **no bucket yet** | key `blossom-dev` |
+| bunny storage zone `divine-delivery-test` | id 1722644, region NY | Push replica, 4 approved objects |
+| bunny pull zone `divine-delivery-test` | id 6289348, Volume tier | Backed by the storage zone — the working ACL test |
+| Backblaze B2 | bucket `divine-delivery-probe`, **private only** | Blocked: B2 requires completed payment history for a public bucket |
 | Cloudflare R2 | not started | account exists; no bucket, no token |
 
 Both bunny zones are **temporary probe infrastructure** and pull through Fastly rather than from a
@@ -149,6 +152,8 @@ receive it — not a query over what already exists.
 
 1. Ship the `vcl_log` line and table that make finding 1 answerable.
 2. Add the tombstoned-hash canary described in the steering design, before any traffic is steered.
-3. Stand up a real delivery origin (B2 or R2) and re-measure with bunny pulling from it.
+3. ~~Stand up a real delivery origin and re-measure~~ — done with bunny Storage; storage-backed and
+   pull-through origins are within 3%, so origin choice is not the variable. A B2 or R2 origin still
+   needs testing for the production topology.
 4. Measure South America and India.
 5. Delete the probe zones once the campaign closes (#178).
