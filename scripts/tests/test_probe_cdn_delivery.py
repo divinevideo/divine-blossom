@@ -197,5 +197,60 @@ class TestConnectionTiming(unittest.TestCase):
         self.assertEqual(v.verdict, "PASS", "a slow handshake must not fail an edge on response time")
 
 
+class TestLowLatencyFloor(unittest.TestCase):
+    """A percentage margin is meaningless against a single-digit millisecond baseline.
+
+    Sydney measured Fastly at 2ms and bunny Standard at 3ms; the percentage rule
+    called that a 43.5% regression and reported FAIL. One millisecond is not a
+    regression anyone can perceive, and a tool that cries wolf there will be
+    ignored when it matters.
+    """
+
+    def _sum(self, edge, ttfb, n=5):
+        return summarize(edge, "r", [Sample(edge=edge, region="r", ttfb_ms=ttfb,
+                                            total_ms=ttfb + 40, bytes_read=1_000_000,
+                                            error=None) for _ in range(n)])
+
+    def test_small_absolute_delta_passes_despite_large_percentage(self):
+        base = self._sum("fastly", 2.0)
+        cand = self._sum("bunny", 3.0)  # +50%, but 1ms
+        v = compare_to_baseline(cand, base, margin_pct=20.0, floor_ms=10.0)
+        self.assertEqual(v.verdict, "PASS")
+        self.assertIn("ms", v.reason)
+
+    def test_large_absolute_delta_still_fails(self):
+        base = self._sum("fastly", 12.0)
+        cand = self._sum("bunny", 144.0)
+        self.assertEqual(compare_to_baseline(cand, base, margin_pct=20.0, floor_ms=10.0).verdict, "FAIL")
+
+    def test_delta_exactly_at_floor_passes(self):
+        base = self._sum("fastly", 5.0)
+        cand = self._sum("bunny", 15.0)  # +10ms exactly
+        self.assertEqual(compare_to_baseline(cand, base, margin_pct=20.0, floor_ms=10.0).verdict, "PASS")
+
+    def test_floor_does_not_rescue_an_edge_with_errors(self):
+        # Fast survivors well inside the floor, but some requests were dropped.
+        base = self._sum("fastly", 2.0)
+        cand = summarize("bunny", "r", [
+            Sample(edge="bunny", region="r", ttfb_ms=3.0, total_ms=43.0,
+                   bytes_read=1_000_000, error=None),
+            Sample(edge="bunny", region="r", ttfb_ms=0.0, total_ms=0.0,
+                   bytes_read=0, error="boom"),
+        ])
+        self.assertEqual(compare_to_baseline(cand, base, margin_pct=20.0, floor_ms=10.0).verdict, "FAIL")
+
+    def test_all_errors_is_no_data_not_fail(self):
+        # Distinct from the above: nothing was measured, so nothing was shown to be worse.
+        base = self._sum("fastly", 2.0)
+        cand = summarize("bunny", "r", [Sample(edge="bunny", region="r", ttfb_ms=0.0, total_ms=0.0,
+                                               bytes_read=0, error="boom")])
+        self.assertEqual(compare_to_baseline(cand, base, margin_pct=20.0, floor_ms=10.0).verdict, "NO_DATA")
+
+    def test_floor_of_zero_restores_pure_percentage_behaviour(self):
+        base = self._sum("fastly", 2.0)
+        cand = self._sum("bunny", 3.0)
+        self.assertEqual(compare_to_baseline(cand, base, margin_pct=20.0, floor_ms=0.0).verdict, "FAIL")
+
+
 if __name__ == "__main__":
     unittest.main()
