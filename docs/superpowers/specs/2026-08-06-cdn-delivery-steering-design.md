@@ -99,7 +99,12 @@ Compute, so it still works if Compute is the thing that is broken.
 
 Only `Active`, public, non-restricted blobs are steerable. Everything else — `Pending`,
 `Restricted`, `AgeRestricted`, admin bypass, tombstoned, legal hold — stays on the Fastly Compute
-path, because bunny cannot run request-time access logic.
+path.
+
+bunny does have an edge compute runtime (Edge Scripting, Deno-based) but no persistent KV store yet,
+so a moderation gate there would need an external fetch on every request. Deciding access once, when
+the URL is issued, avoids that entirely and is the reason this design does not depend on the second
+CDN having compute at all.
 
 This is a hard rule, not a default. The check belongs in `select_delivery_host`, before the
 percentage bucket, so a config mistake cannot route restricted content off the enforcing path.

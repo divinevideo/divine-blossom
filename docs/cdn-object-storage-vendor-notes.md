@@ -194,9 +194,31 @@ Network is stated at 119 PoPs and 250+ Tbps. A contractual 99.99% SLA was introd
 or assurance that the service will run uninterrupted," and reserves the right to change prices "at
 bunny.net's sole discretion."
 
-**[I] Edge compute is limited** to roughly header manipulation and URL rewriting — request-time
-logic of the kind this service runs in Fastly Compute cannot be replicated there. Any second-CDN
-design must keep access decisions upstream.
+### Edge Scripting [V]
+
+bunny has a real edge compute platform, not just header rewriting. Deno/V8 runtime, native
+TypeScript, and **Middleware Apps** that "inject custom logic directly into the existing CDN
+processing pipeline", modifying both origin requests and responses. External `fetch` is supported.
+
+| Item | Rate |
+|---|---|
+| Requests | $0.20 per million |
+| CPU time | $0.02 per 1,000 seconds |
+
+Note this **reintroduces a per-request fee** that plain pull-zone delivery does not have.
+
+**[V] No persistent KV store yet.** A "globally distributed database" and a storage library are on
+the published roadmap, not shipped. Middleware Apps are documented as supporting request/response
+modification today, with "caching, revalidation, and other core CDN behaviors" planned.
+
+**[I] Implication for this codebase.** The blocker is state, not compute. A moderation gate needs a
+fast local lookup keyed on content hash; without KV every check becomes an external fetch on the
+request path. Fastly Compute has Config Store, KV Store, and Secret Store today. Separately, the
+existing logic is Rust compiled to Wasm, so moving it would be a TypeScript rewrite rather than a
+port.
+
+None of this blocks a second-CDN delivery design, because the access decision is made once when the
+URL is issued rather than per-request at the edge.
 
 ---
 
