@@ -87,6 +87,49 @@ TTFB, so fills are efficient, but that was against a Fastly origin rather than B
 (Absolute throughput is lower across all three than in earlier runs; local network variance. The
 relative comparison is unaffected.)
 
+## Negative caching is a non-issue by default — but it is a config invariant
+
+The design assumed a stale 404 could outlive approval and would need a short TTL plus
+purge-on-publish. Measured, it does not:
+
+1. Requested an unreplicated path three times — bunny returned 404 each time.
+2. Uploaded that object to B2, simulating moderation approval. Direct B2 fetch returned 200.
+3. Polled bunny: **it served 200 within ~1 second.** No purge was issued.
+
+The reason is a pull-zone setting: `CacheErrorResponses: False`, which is bunny's **default**. Error
+responses are not cached at all, so an approval takes effect on the next request.
+
+**This removes a requirement, and replaces it with an invariant.** If anyone ever enables
+`CacheErrorResponses` on a delivery zone, newly-approved content silently stays 404 for the cache
+lifetime. That setting should be asserted in the canary alongside the tombstone check, not assumed.
+
+## Cache-fill penalty by origin
+
+Purge, cold fetch, warm fetch — three rounds each, median. Same path, same Volume tier, from
+Wellington (so absolute numbers carry the Los Angeles routing; the **ratio** is the signal):
+
+| Origin | cold TTFB | warm TTFB | fill penalty |
+|---|---:|---:|---:|
+| Fastly (pull-through) | 470 ms | 458 ms | **1.0×** |
+| bunny Storage (NY) | 518 ms | 463 ms | **1.1×** |
+| Backblaze B2 (US-West) | 661 ms | 446 ms | **1.5×** |
+
+This is the one place origin choice does show up, and it is misses-only. bunny Storage is on-net;
+Fastly is a well-peered CDN; B2 is a third-party object store.
+
+**How much it matters depends entirely on cache hit ratio**, which remains unmeasured. Modelling the
+B2 case at various hit ratios `h`, average TTFB = `h × warm + (1−h) × cold`:
+
+| Hit ratio | Average TTFB | Penalty vs all-warm |
+|---:|---:|---:|
+| 95% | 457 ms | +2.4% |
+| 80% | 489 ms | +9.6% |
+| 50% | 554 ms | +24% |
+
+At a healthy hit ratio the B2 fill penalty amortises to near-nothing. At a poor one it becomes real.
+This is another reason cache hit ratio on the actual library is the most valuable remaining
+measurement.
+
 ## What this does and does not establish
 
 **Establishes**
@@ -94,18 +137,26 @@ relative comparison is unaffected.)
 - A push replica cannot be auto-populated by a pull zone, which is what makes it safe.
 - Origin choice does not measurably affect cache-hit delivery.
 
+- Negative caching does not block approval: bunny does not cache error responses by default, and a
+  newly-approved object served within ~1 second without a purge.
+- Cache-fill penalty is origin-dependent but misses-only: 1.0× Fastly, 1.1× bunny Storage, 1.5× B2.
+
 **Does not establish**
 - Behaviour when the replicator has a bug or lags. The mechanism is only as good as "replicate on
   approval, never on upload" being true in the replication code.
-- Negative-cache behaviour over time. bunny will cache the 404; a short TTL and purge-on-publish are
-  still required and untested here.
-- Cache hit ratio on a real library. Everything measured so far is a handful of hot objects.
+- **Cache hit ratio on a real library.** Everything measured so far is a handful of hot objects, and
+  this is now the single most valuable remaining measurement — it determines both the bill and how
+  much the B2 fill penalty costs.
 
 ## Required before any traffic is steered
 
 The canary from the steering design: a permanently-tombstoned hash that must always 404 on every
 delivery CDN, polled continuously, alarming if it ever returns 200. Gated content is a very small
 fraction of the corpus, so a broken exclusion produces no visible symptom until someone finds it.
+
+The canary should also assert **`CacheErrorResponses == False`** on every delivery pull zone. That
+default is what makes approvals take effect immediately; if it is ever flipped, newly-approved
+content silently stays 404.
 
 ## Note on the B2 public-bucket gate
 
