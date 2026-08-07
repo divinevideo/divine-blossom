@@ -79,5 +79,5 @@ would silently ship a one-second startup delay to every Oceania viewer.
   --json docs/measurements/<date>-<region>.json
 ```
 
-Probe zones `divine-probe-volume` (id 6288620) and `divine-probe-standard` (id 6288621) are
-temporary and should be deleted once the measurement campaign is finished.
+TODO(#178): Probe zones `divine-probe-volume` (id 6288620) and `divine-probe-standard`
+(id 6288621) are temporary and should be deleted once the measurement campaign is finished.

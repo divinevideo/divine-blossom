@@ -5,7 +5,8 @@
 
 **Date:** 2026-08-06
 **Status:** Design — not implemented
-**Related:** `docs/cdn-object-storage-vendor-notes.md` for the vendor limits this design works around.
+**Related:** `docs/cdn-object-storage-vendor-notes.md` for the vendor limits this design works around;
+`docs/measurements/2026-08-07-nz-wellington.md` for the first synthetic regional measurement.
 
 ## Goal
 
@@ -41,14 +42,14 @@ replica forecloses this entire design.
 ### Steering point
 
 All outbound media URLs already funnel through one function:
-`to_descriptor(&base_url)` in `blossom-core/src/types.rs:381`, fed by `get_base_url(&req)`.
+`to_descriptor(&base_url)` in `blossom-core/src/types.rs:387`, fed by `get_base_url(&req)`.
 
 Replace the base-URL source with a selector:
 
 ```rust
 fn select_delivery_host(req: &Request, meta: &BlobMetadata) -> &'static str {
     // Ineligible content never leaves the Fastly Compute path.
-    if !meta.status.is_publicly_cacheable() {
+    if !is_publicly_cacheable(meta) {
         return FASTLY_HOST;
     }
     let pct: u32 = config_store_get("bunny_traffic_pct").unwrap_or(0);
@@ -57,9 +58,15 @@ fn select_delivery_host(req: &Request, meta: &BlobMetadata) -> &'static str {
 
 /// Stable 0..99 bucket from the first 8 hex chars of the content hash.
 fn bucket_of(sha256: &str) -> u32 {
-    u32::from_str_radix(&sha256[0..8], 16).unwrap_or(0) % 100
+    sha256
+        .get(0..8)
+        .and_then(|prefix| u32::from_str_radix(prefix, 16).ok())
+        .unwrap_or(0)
+        % 100
 }
 ```
+
+`is_publicly_cacheable` is a proposed helper, not an existing `BlobMetadata` method.
 
 Why here: it is one function, it already governs every URL handed out, and the decision has full
 context available — moderation status, client geo, content type.
@@ -100,10 +107,10 @@ percentage bucket, so a config mistake cannot route restricted content off the e
 ### Deletion and takedown
 
 bunny's purge API becomes an additional fan-out target alongside the existing Fastly surrogate-key
-purge. Note the existing failure mode this compounds: `vcl/fetch.vcl` documents that the moderation
-purge "is silently skipped if `fastly_api_token` is unconfigured." **Make the purge fan-out fail
-loudly before enabling any bunny traffic**, or a takedown can succeed on one CDN and silently fail
-on the other.
+purge. Note the existing failure mode this compounds: `purge_edge_cache` in `src/main.rs:5945`
+logs and skips the purge when `fastly_api_token` is unconfigured. **Make the purge fan-out fail
+loudly before enabling any bunny traffic**, or a takedown can succeed on one CDN and fail on the
+other.
 
 Token authentication on the bunny zone is probably unnecessary — the content is public,
 content-addressed Blossom blobs, so there is nothing to protect. Revisit if that changes.
@@ -122,8 +129,8 @@ touching the app.
 ## Testing plan
 
 ### Phase 0 — synthetic, no user traffic
-Fork `scripts/probe_video_readiness.py` to fetch identical objects from Fastly, bunny Volume, and
-each candidate origin, from VMs in the top measured geographies. **Include Australia** — bunny's Volume
+Use `scripts/probe_cdn_delivery.py` to fetch identical objects from Fastly, bunny Volume, and each
+candidate origin, from VMs in the top measured geographies. **Include Australia** — bunny's Volume
 network has no PoP there, so it is the clearest latency risk. Compare TTFB, sustained throughput,
 and error rate.
 

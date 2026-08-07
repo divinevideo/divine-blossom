@@ -9,8 +9,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from probe_cdn_delivery import (  # noqa: E402
     Sample,
+    capture_cache_headers,
     compare_to_baseline,
     percentile,
+    select_cache_status,
     summarize,
 )
 
@@ -79,6 +81,36 @@ class TestSummarize(unittest.TestCase):
         s = summarize("edge-a", "us-east", [])
         self.assertEqual(s.n, 0)
         self.assertIsNone(s.ttfb_p95_ms)
+
+    def test_cache_status_counts_selected_status(self):
+        samples = [
+            Sample(edge="e", region="r", ttfb_ms=1.0, total_ms=2.0, bytes_read=1, cache_status="HIT"),
+            Sample(edge="e", region="r", ttfb_ms=1.0, total_ms=2.0, bytes_read=1, cache_status="MISS"),
+            Sample(edge="e", region="r", ttfb_ms=1.0, total_ms=2.0, bytes_read=1, cache_status="MISS"),
+        ]
+        s = summarize("e", "r", samples)
+        self.assertEqual(s.cache_statuses, {"hit": 1, "miss": 2})
+
+
+class TestCacheHeaders(unittest.TestCase):
+    def test_captures_all_cache_headers(self):
+        headers = {
+            "cdn-cache": "HIT",
+            "x-cache": "MISS",
+            "cf-cache-status": "DYNAMIC",
+            "server": "example",
+        }
+        self.assertEqual(
+            capture_cache_headers(headers),
+            {"cdn-cache": "HIT", "cf-cache-status": "DYNAMIC", "x-cache": "MISS"},
+        )
+
+    def test_prefers_edge_cache_header_over_forwarded_origin_cache(self):
+        headers = {"cdn-cache": "HIT", "x-cache": "MISS"}
+        self.assertEqual(select_cache_status(headers), "HIT")
+
+    def test_uses_x_cache_when_it_is_the_only_cache_signal(self):
+        self.assertEqual(select_cache_status({"x-cache": "HIT"}), "HIT")
 
 
 class TestCompareToBaseline(unittest.TestCase):

@@ -35,6 +35,7 @@ from typing import Dict, List, Optional
 
 READ_CHUNK = 65536
 DEFAULT_TIMEOUT = 30.0
+CACHE_HEADER_NAMES = ("cdn-cache", "cf-cache-status", "x-cache")
 
 
 @dataclass
@@ -50,6 +51,7 @@ class Sample:
     path: str = ""
     status: Optional[int] = None
     cache_status: Optional[str] = None
+    cache_headers: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -126,6 +128,25 @@ def summarize(edge: str, region: str, samples: List[Sample]) -> Summary:
     )
 
 
+def capture_cache_headers(headers) -> Dict[str, str]:
+    """Record CDN cache headers separately from forwarded origin headers."""
+    captured: Dict[str, str] = {}
+    for name in CACHE_HEADER_NAMES:
+        value = headers.get(name)
+        if value:
+            captured[name] = value
+    return captured
+
+
+def select_cache_status(headers) -> Optional[str]:
+    """Prefer the serving CDN's cache status over forwarded origin cache headers."""
+    captured = capture_cache_headers(headers)
+    for name in CACHE_HEADER_NAMES:
+        if name in captured:
+            return captured[name]
+    return None
+
+
 def compare_to_baseline(candidate: Summary, baseline: Summary, margin_pct: float) -> Verdict:
     """Judge a candidate edge against the baseline on p95 TTFB.
 
@@ -172,12 +193,9 @@ def fetch(url: str, edge: str, region: str, path: str, timeout: float) -> Sample
                     break
                 read += len(chunk)
             total = (time.perf_counter() - started) * 1000.0
-            cache = (
-                resp.headers.get("x-cache")
-                or resp.headers.get("cdn-cache")
-                or resp.headers.get("cf-cache-status")
-            )
-            return Sample(edge, region, ttfb, total, read, None, path, resp.status, cache)
+            cache_headers = capture_cache_headers(resp.headers)
+            cache = select_cache_status(resp.headers)
+            return Sample(edge, region, ttfb, total, read, None, path, resp.status, cache, cache_headers)
     except urllib.error.HTTPError as exc:
         elapsed = (time.perf_counter() - started) * 1000.0
         return Sample(edge, region, elapsed, elapsed, 0, f"HTTP {exc.code}", path, exc.code)

@@ -10,6 +10,8 @@ This directory is the index for repository documentation. Current docs first, hi
 - [CHANGELOG.md](../CHANGELOG.md) — release history
 - [docs/api/](api/) — cross-service API contracts (creator-delete, etc.)
 - [docs/runbooks/](runbooks/) — operational runbooks, including deployment and CDN view counting
+- [docs/cdn-object-storage-vendor-notes.md](cdn-object-storage-vendor-notes.md) — CDN and object-storage vendor capability notes
+- [docs/measurements/](measurements/) — synthetic CDN and delivery measurements
 - [docs/derivative-status-queue.md](derivative-status-queue.md) — Cloud Tasks rollout notes for derivative status callbacks
 
 ## Historical
