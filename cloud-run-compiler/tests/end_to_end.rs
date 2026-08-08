@@ -284,6 +284,7 @@ fn job_for(list_event: NostrEvent) -> Job {
         initiated_by: "end-to-end@divine.video".into(),
         created_at: 1,
         updated_at: 1,
+        lease_expires_at: None,
         result: None,
         error: None,
     }
@@ -399,7 +400,7 @@ async fn init(
         authorization.starts_with("Nostr "),
         "publisher must send a Blossom authorization header"
     );
-    assert_eq!(body["generateDerivatives"], json!(false));
+    assert!(body.get("generateDerivatives").is_none());
     assert_eq!(body["contentType"], json!("video/mp4"));
 
     let id = format!("upload-{}", state.counter.fetch_add(1, Ordering::SeqCst));

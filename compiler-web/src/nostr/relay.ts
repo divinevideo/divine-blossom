@@ -1,7 +1,14 @@
 import { SimplePool } from 'nostr-tools'
 import type { Filter } from 'nostr-tools'
 import type { NostrEvent } from '../types'
-import { dedupeLatestLists, isEventReference, profileNamesByPubkey } from './lists'
+import {
+  chunked,
+  coordinateFilters,
+  dedupeLatestLists,
+  isEventReference,
+  newestByCoordinate,
+  profileNamesByPubkey,
+} from './lists'
 import type { ProfileMeta } from './lists'
 
 export interface ListRelay {
@@ -49,12 +56,12 @@ export class DivineListRelay implements ListRelay {
   async profileNames(pubkeys: string[]): Promise<Map<string, string>> {
     const authors = [...new Set(pubkeys.filter((pubkey) => /^[0-9a-f]{64}$/.test(pubkey)))]
     if (authors.length === 0) return new Map()
-    const events = await this.pool.querySync(
-      this.relays,
-      { kinds: [0], authors },
-      { maxWait: 10_000 },
+    const events = await Promise.all(
+      chunked(authors).map((chunk) =>
+        this.pool.querySync(this.relays, { kinds: [0], authors: chunk }, { maxWait: 10_000 }),
+      ),
     )
-    return profileNamesByPubkey(events as NostrEvent[])
+    return profileNamesByPubkey(events.flat() as NostrEvent[])
   }
 
   async authoredLists(pubkey: string): Promise<NostrEvent[]> {
@@ -80,42 +87,25 @@ export class DivineListRelay implements ListRelay {
    * editor lists); the returned map is keyed by the reference as given.
    */
   async videoEvents(references: string[]): Promise<Map<string, NostrEvent>> {
-    const eventIds = references.filter(isEventReference)
-    const byId = new Map<string, NostrEvent>()
-    if (eventIds.length > 0) {
-      const events = await this.pool.querySync(
-        this.relays,
-        { ids: eventIds },
-        { maxWait: 10_000 },
-      )
-      for (const event of events as NostrEvent[]) {
-        byId.set(event.id, event)
-      }
-    }
+    const eventIds = [...new Set(references.filter(isEventReference))]
+    const coordinates = references.filter((reference) => !isEventReference(reference))
 
-    const pairs = await Promise.all(
-      references.map(async (reference) => {
-        if (isEventReference(reference)) {
-          return [reference, byId.get(reference) ?? null] as const
-        }
-        const [kindText, pubkey, ...identifierParts] = reference.split(':')
-        const identifier = identifierParts.join(':')
-        const event = await this.pool.get(
-          this.relays,
-          {
-            kinds: [Number(kindText)],
-            authors: [pubkey],
-            '#d': [identifier],
-            limit: 1,
-          },
-          { maxWait: 10_000 },
-        )
-        return [reference, event as NostrEvent | null] as const
-      }),
+    const idFilters = chunked(eventIds).map((ids) => ({ ids }))
+    const queries = [...idFilters, ...coordinateFilters(coordinates)].map((filter) =>
+      this.pool.querySync(this.relays, filter as Filter, { maxWait: 10_000 }),
     )
-    return new Map(
-      pairs.filter((pair): pair is readonly [string, NostrEvent] => pair[1] !== null),
-    )
+    const events = (await Promise.all(queries)).flat() as NostrEvent[]
+
+    const byId = new Map(events.map((event) => [event.id, event]))
+    const byCoordinate = newestByCoordinate(events)
+    const resolved = new Map<string, NostrEvent>()
+    for (const reference of references) {
+      const event = isEventReference(reference)
+        ? byId.get(reference)
+        : byCoordinate.get(reference)
+      if (event) resolved.set(reference, event)
+    }
+    return resolved
   }
 
   close(): void {

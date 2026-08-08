@@ -25,17 +25,21 @@ pub struct ResumableUploadInitRequest {
     pub size: u64,
     pub content_type: String,
     pub file_name: String,
-    pub generate_derivatives: bool,
 }
 
 impl ResumableUploadInitRequest {
+    /// Compilations are external outputs, so they must not gain thumbnails,
+    /// HLS ladders, or transcripts. `upload.divine.video` is the GKE-hosted
+    /// `divine-upload-server`, whose resumable completion path stores the
+    /// finalized object without starting any derivative work, so suppression
+    /// comes from using that path — not from a request flag the server would
+    /// ignore.
     pub fn compilation(sha256: &str, size: u64, file_name: &str) -> Self {
         Self {
             sha256: sha256.into(),
             size,
             content_type: "video/mp4".into(),
             file_name: file_name.into(),
-            generate_derivatives: false,
         }
     }
 }

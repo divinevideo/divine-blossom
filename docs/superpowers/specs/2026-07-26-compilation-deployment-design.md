@@ -55,6 +55,15 @@ starting thumbnail, HLS, or transcription derivatives. Compiler outputs use
 that existing path. No upload-server change is required for the compiler
 deployment.
 
+Derivative suppression therefore comes from the endpoint the compiler calls,
+not from a request flag. `divine-upload-server` has no `generateDerivatives`
+field, so sending one would read as a guarantee production does not honour;
+`ResumableUploadInitRequest` deliberately omits it, and
+`cloud-run-compiler/tests/upload.rs` asserts the field is absent from the
+payload. If derivative behaviour on that path ever changes, the suppression
+must be re-established in `divine-upload-server` — nothing in this repository
+can enforce it.
+
 ## Runtime Architecture
 
 ```text

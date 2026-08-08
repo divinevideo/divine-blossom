@@ -87,7 +87,7 @@ pub fn build_ffmpeg_args(job: &AspectRenderJob) -> Result<Vec<String>> {
     }
 
     args.push("-filter_complex".into());
-    args.push(build_filter_graph(job));
+    args.push(build_filter_graph(job, &write_credit_files(job)?));
     args.extend(["-map".into(), "[v_final]".into()]);
     args.extend(["-map".into(), "[a_final]".into()]);
 
@@ -132,7 +132,31 @@ pub fn build_ffmpeg_args(job: &AspectRenderJob) -> Result<Vec<String>> {
     Ok(args)
 }
 
-fn build_filter_graph(job: &AspectRenderJob) -> String {
+/// Credit text goes to disk rather than into the filtergraph. An apostrophe in
+/// a display name (`O'Brien`) closes drawtext's `text='...'` token, and no
+/// escaping inside those single quotes can prevent that, so the whole render
+/// fails on a legitimate creator name. `textfile=` has no escaping surface.
+pub fn credit_text_path(output_path: &Path, index: usize) -> PathBuf {
+    let stem = output_path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "compilation".into());
+    let directory = output_path.parent().unwrap_or_else(|| Path::new("."));
+    directory.join(format!("{stem}-credit-{index}.txt"))
+}
+
+fn write_credit_files(job: &AspectRenderJob) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::with_capacity(job.clips.len());
+    for (index, clip) in job.clips.iter().enumerate() {
+        let path = credit_text_path(&job.output_path, index);
+        std::fs::write(&path, format_credit(&clip.credit, &job.credit))
+            .with_context(|| format!("write credit text {}", path.display()))?;
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+fn build_filter_graph(job: &AspectRenderJob, credit_paths: &[PathBuf]) -> String {
     let (width, height) = job.aspect.dimensions();
     let mut filters = Vec::new();
     let mut concat_inputs = String::new();
@@ -172,11 +196,10 @@ fn build_filter_graph(job: &AspectRenderJob) -> String {
     let mut start = 0.0;
     for (index, clip) in job.clips.iter().enumerate() {
         let next = format!("vcredit{index}");
-        let text = format_credit(&clip.credit, &job.credit);
         filters.push(credit_filter(
             &current_video,
             &next,
-            &text,
+            &credit_paths[index],
             start,
             credit_margin(job, width, height),
             job.credit.duration_ms,
@@ -291,7 +314,7 @@ fn credit_margin(job: &AspectRenderJob, width: u32, height: u32) -> u32 {
 fn credit_filter(
     input: &str,
     output: &str,
-    text: &str,
+    text_path: &Path,
     start: f64,
     margin: u32,
     duration_ms: u32,
@@ -304,14 +327,14 @@ fn credit_filter(
     let fade_in_end = (start + 0.3).min(end);
     let fade_out_start = (end - 0.3).max(start);
     format!(
-        "[{input}]drawtext=fontfile={font}:text='{text}':\
+        "[{input}]drawtext=fontfile={font}:textfile={text}:\
          x=(w-text_w)/2:y=h-text_h-{margin}:fontsize=42:fontcolor=white:\
          box=1:boxcolor=black@0.55:boxborderw=12:\
          enable='between(t,{start:.3},{end:.3})':\
          alpha='if(lt(t,{fade_in_end:.3}),(t-{start:.3})/0.3,\
          if(gt(t,{fade_out_start:.3}),({end:.3}-t)/0.3,1))'[{output}]",
         font = escape_drawtext(&font_path.to_string_lossy()),
-        text = escape_drawtext(text)
+        text = escape_drawtext(&text_path.to_string_lossy())
     )
 }
 

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use divine_compiler::{
-    domain::{NostrEvent, VideoReference},
+    domain::{ListSlot, NostrEvent, VideoReference},
     source::{resolve_sources, CreatorProfile, SourceRepository},
 };
 use std::collections::HashMap;
@@ -13,12 +13,12 @@ fn coordinate(author: &str, identifier: &str) -> String {
     format!("34236:{author}:{identifier}")
 }
 
-fn addressed(author: &str, identifier: &str) -> VideoReference {
-    VideoReference::Coordinate(coordinate(author, identifier))
+fn addressed(author: &str, identifier: &str) -> ListSlot {
+    ListSlot::Video(VideoReference::Coordinate(coordinate(author, identifier)))
 }
 
-fn listed(hash_byte: char) -> VideoReference {
-    VideoReference::Event(hash_byte.to_string().repeat(64))
+fn listed(hash_byte: char) -> ListSlot {
+    ListSlot::Video(VideoReference::Event(hash_byte.to_string().repeat(64)))
 }
 
 fn video_event(author: &str, identifier: &str, hash_byte: char) -> NostrEvent {
@@ -221,4 +221,30 @@ async fn attaches_full_creator_credit_metadata() {
         Some("alice@divine.video")
     );
     assert_eq!(result.usable[0].credit.pubkey, AUTHOR_A);
+}
+
+#[tokio::test]
+async fn unsupported_list_tags_are_dropped_clips_rather_than_a_failed_render() {
+    let repository = FakeRepository {
+        events: vec![video_event(AUTHOR_A, "first", '1')],
+        ..FakeRepository::default()
+    };
+    let unsupported = ListSlot::Unsupported {
+        value: "30023:not-a-video:article".into(),
+        reason: "unsupported-coordinate",
+    };
+
+    let result = resolve_sources(
+        &repository,
+        &[unsupported.clone(), addressed(AUTHOR_A, "first")],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.usable.len(), 1);
+    assert_eq!(result.usable[0].source_index, 1);
+    assert_eq!(result.dropped.len(), 1);
+    assert_eq!(result.dropped[0].source_index, 0);
+    assert_eq!(result.dropped[0].coordinate, unsupported.as_str());
+    assert_eq!(result.dropped[0].reason, "unsupported-coordinate");
 }

@@ -70,8 +70,8 @@ impl CompilationPipeline {
     }
 
     async fn execute_inner(&self, job: &Job, work_dir: &Path) -> Result<JobResult> {
-        let references = job.request.source.list_event.video_references()?;
-        let resolution = resolve_sources(self.repository.as_ref(), &references).await?;
+        let slots = job.request.source.list_event.list_slots();
+        let resolution = resolve_sources(self.repository.as_ref(), &slots).await?;
         let mut dropped = resolution.dropped;
         let mut prepared = Vec::new();
         let mut duration_sec = 0.0;

@@ -91,6 +91,66 @@ export function videoReferences(event: NostrEvent): string[] {
     .map((tag) => tag[1])
 }
 
+/** Relays cap filter array sizes, so every batched lookup is chunked. */
+export const RELAY_FILTER_CHUNK = 100
+
+export function chunked<T>(values: T[], size = RELAY_FILTER_CHUNK): T[][] {
+  const chunks: T[][] = []
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size))
+  }
+  return chunks
+}
+
+/**
+ * Addressable lookups grouped by kind and author, so a 64-clip list is a
+ * handful of filters rather than 64 concurrent subscriptions.
+ */
+export function coordinateFilters(
+  coordinates: string[],
+): { kinds: number[]; authors: string[]; '#d': string[] }[] {
+  const byAuthorKind = new Map<string, Set<string>>()
+  for (const coordinate of new Set(coordinates)) {
+    const [kindText, pubkey, ...identifierParts] = coordinate.split(':')
+    const identifier = identifierParts.join(':')
+    if (!kindText || !pubkey || !identifier) continue
+    const key = `${Number(kindText)}:${pubkey}`
+    const identifiers = byAuthorKind.get(key) ?? new Set<string>()
+    identifiers.add(identifier)
+    byAuthorKind.set(key, identifiers)
+  }
+
+  const filters: { kinds: number[]; authors: string[]; '#d': string[] }[] = []
+  for (const [key, identifiers] of byAuthorKind) {
+    const [kindText, pubkey] = key.split(':')
+    for (const chunk of chunked([...identifiers])) {
+      filters.push({ kinds: [Number(kindText)], authors: [pubkey], '#d': chunk })
+    }
+  }
+  return filters
+}
+
+/** Newest replaceable event per `kind:pubkey:d` coordinate. */
+export function newestByCoordinate(events: NostrEvent[]): Map<string, NostrEvent> {
+  const newest = new Map<string, NostrEvent>()
+  for (const event of events) {
+    const identifier = event.tags.find(
+      (tag) => tag[0] === 'd' && typeof tag[1] === 'string' && tag[1].length > 0,
+    )?.[1]
+    if (!identifier) continue
+    const coordinate = `${event.kind}:${event.pubkey}:${identifier}`
+    const current = newest.get(coordinate)
+    if (
+      !current ||
+      event.created_at > current.created_at ||
+      (event.created_at === current.created_at && event.id.localeCompare(current.id) > 0)
+    ) {
+      newest.set(coordinate, event)
+    }
+  }
+  return newest
+}
+
 export function isEventReference(reference: string): boolean {
   return /^[0-9a-f]{64}$/.test(reference)
 }

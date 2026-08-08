@@ -4,7 +4,9 @@ import {
   assertCurrentEditBase,
   buildReorderedListEvent,
   dedupeLatestLists,
+  coordinateFilters,
   displayNameFromProfile,
+  newestByCoordinate,
   profileNamesByPubkey,
   saveReorderedList,
   videoReferences,
@@ -262,5 +264,61 @@ describe('profileNamesByPubkey', () => {
       sig: 'e'.repeat(128),
     }
     expect(profileNamesByPubkey([note]).size).toBe(0)
+  })
+})
+
+describe('coordinateFilters', () => {
+  const authorA = '7'.repeat(64)
+  const authorB = '8'.repeat(64)
+
+  it('groups identifiers by author and kind instead of one filter per clip', () => {
+    const filters = coordinateFilters([
+      `34236:${authorA}:one`,
+      `34236:${authorA}:two`,
+      `34235:${authorA}:three`,
+      `34236:${authorB}:four`,
+      `34236:${authorA}:one`,
+    ])
+
+    expect(filters).toHaveLength(3)
+    expect(filters).toContainEqual({
+      kinds: [34236],
+      authors: [authorA],
+      '#d': ['one', 'two'],
+    })
+    expect(filters).toContainEqual({ kinds: [34235], authors: [authorA], '#d': ['three'] })
+    expect(filters).toContainEqual({ kinds: [34236], authors: [authorB], '#d': ['four'] })
+  })
+
+  it('chunks large author groups and skips malformed coordinates', () => {
+    const many = Array.from({ length: 250 }, (_, index) => `34236:${authorA}:clip-${index}`)
+    const filters = coordinateFilters([...many, 'not-a-coordinate', `34236:${authorA}:`])
+
+    expect(filters).toHaveLength(3)
+    expect(filters.map((filter) => filter['#d'].length)).toEqual([100, 100, 50])
+  })
+})
+
+describe('newestByCoordinate', () => {
+  const author = '6'.repeat(64)
+  const video = (id: string, createdAt: number, identifier: string): NostrEvent => ({
+    id,
+    pubkey: author,
+    created_at: createdAt,
+    kind: 34236,
+    tags: [['d', identifier]],
+    content: '',
+    sig: 'e'.repeat(128),
+  })
+
+  it('keeps the newest event per coordinate', () => {
+    const stale = video('1'.repeat(64), 100, 'clip')
+    const fresh = video('2'.repeat(64), 200, 'clip')
+    const other = video('3'.repeat(64), 100, 'another')
+
+    const newest = newestByCoordinate([fresh, stale, other])
+
+    expect(newest.get(`34236:${author}:clip`)).toEqual(fresh)
+    expect(newest.get(`34236:${author}:another`)).toEqual(other)
   })
 })

@@ -4,7 +4,7 @@
 
 **Goal:** Build the internal `compiler.divine.video` editor, its private Cloud Run compilation API, and the trusted resumable upload behavior needed to produce downloadable external-platform compilations from existing ordered Nostr lists.
 
-**Architecture:** A React/Vite editor and Cloudflare Worker live in `compiler-web/`; the Worker serves assets, enforces the Cloudflare Access boundary, and invokes a private Cloud Run service with a Google identity token. `cloud-run-compiler/` verifies NIP-98 plus the exact signed list event, persists jobs in Firestore, resolves ordered video events from the Divine relay, renders each aspect independently with FFmpeg, and streams final files through `cloud-run-upload/`.
+**Architecture:** A React/Vite editor and Cloudflare Worker live in `compiler-web/`; the Worker serves assets, enforces the Cloudflare Access boundary, and invokes a private Cloud Run service with a Google identity token. `cloud-run-compiler/` verifies NIP-98 plus the exact signed list event, persists jobs in Firestore, resolves ordered video events from the Divine relay, renders each aspect independently with FFmpeg, and streams final files through the upload service at `upload.divine.video`.
 
 **Tech Stack:** Rust 1.83, axum 0.7, tokio, `nostr`/`nostr-sdk` 0.44, Firestore, FFmpeg/NVENC, React 18, TypeScript, Vite, Vitest, `@divinevideo/login`, `nostr-tools`, Cloudflare Workers, Wrangler.
 
@@ -15,11 +15,6 @@
 ## File Structure
 
 ```text
-cloud-run-upload/
-├── src/main.rs                    # authorize compiler-only derivative suppression
-├── src/resumable.rs               # persist generate_derivatives on upload sessions
-└── Cargo.lock
-
 cloud-run-compiler/
 ├── Cargo.toml
 ├── Cargo.lock
@@ -83,6 +78,14 @@ compiler-web/
 ```
 
 ## Task 1: Trusted Upload Derivative Suppression
+
+> **Superseded (2026-08-08):** this task targeted `cloud-run-upload/`, which
+> does not serve production `upload.divine.video` — the GKE-hosted
+> `divinevideo/divine-upload-server` does. Its resumable completion path
+> already stores the object without starting derivatives, so no flag and no
+> upload-service change are needed. `ResumableUploadInitRequest` sends no
+> `generateDerivatives` field. See
+> `docs/superpowers/specs/2026-07-26-compilation-deployment-design.md`.
 
 **Files:**
 - Modify: `cloud-run-upload/src/resumable.rs`

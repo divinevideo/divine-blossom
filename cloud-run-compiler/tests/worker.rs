@@ -52,6 +52,7 @@ fn queued_job() -> Job {
         initiated_by: "editor@example.com".into(),
         created_at: 1,
         updated_at: 1,
+        lease_expires_at: None,
         result: None,
         error: None,
     }

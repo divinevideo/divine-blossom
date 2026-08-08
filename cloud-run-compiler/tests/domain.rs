@@ -1,6 +1,6 @@
 use divine_compiler::domain::{
-    Aspect, AspectFailure, ClipOverride, CompileRequest, FitMode, JobResult, JobStatus, NostrEvent,
-    Output, RenderRequest, Source, ValidationError, VideoReference,
+    Aspect, AspectFailure, ClipOverride, CompileRequest, FitMode, JobResult, JobStatus, ListSlot,
+    NostrEvent, Output, RenderRequest, Source, ValidationError, VideoReference,
 };
 
 const LIST_PUBKEY: &str = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -54,7 +54,7 @@ fn list_coordinates_keep_literal_tag_order() {
     let event = list_event(&[first.clone(), second.clone()]);
 
     assert_eq!(
-        event.video_references().unwrap(),
+        event.video_references(),
         vec![
             VideoReference::Coordinate(first),
             VideoReference::Coordinate(second)
@@ -71,7 +71,7 @@ fn list_event_references_keep_literal_tag_order_alongside_coordinates() {
     event.tags.insert(2, vec!["e".into(), event_id.clone()]);
 
     assert_eq!(
-        event.video_references().unwrap(),
+        event.video_references(),
         vec![
             VideoReference::Event(event_id),
             VideoReference::Coordinate(coordinate)
@@ -80,13 +80,19 @@ fn list_event_references_keep_literal_tag_order_alongside_coordinates() {
 }
 
 #[test]
-fn rejects_event_references_that_are_not_event_ids() {
+fn drops_event_references_that_are_not_event_ids() {
+    // The editor filters these out of the timeline, so failing the whole
+    // request here would 400 a list that opens and saves fine in the UI.
     let mut event = list_event(&[]);
     event.tags.push(vec!["e".into(), "not-an-event-id".into()]);
 
+    assert!(event.video_references().is_empty());
     assert_eq!(
-        event.video_references().unwrap_err(),
-        ValidationError::InvalidEventReference
+        event.list_slots(),
+        vec![ListSlot::Unsupported {
+            value: "not-an-event-id".into(),
+            reason: "invalid-event-reference",
+        }]
     );
 }
 
@@ -104,11 +110,19 @@ fn accepts_a_list_that_only_uses_event_references() {
 }
 
 #[test]
-fn rejects_unsupported_addressable_kinds() {
+fn drops_unsupported_addressable_kinds_without_failing_the_request() {
     let unsupported = coordinate(30_023, VIDEO_PUBKEY_A, "article");
-    let error = request(&[unsupported]).validate().unwrap_err();
+    let compile = request(&[unsupported.clone()]);
 
-    assert_eq!(error, ValidationError::UnsupportedCoordinate);
+    compile.validate().unwrap();
+    assert!(compile.source.list_event.video_references().is_empty());
+    assert_eq!(
+        compile.source.list_event.list_slots(),
+        vec![ListSlot::Unsupported {
+            value: unsupported,
+            reason: "unsupported-coordinate",
+        }]
+    );
 }
 
 #[test]

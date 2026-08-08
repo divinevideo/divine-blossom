@@ -1,13 +1,19 @@
 // ABOUTME: Resolves signed-list coordinates into ordered, renderable source clips
 // ABOUTME: Parses NIP-71 media metadata and carries complete creator credit identity
 
-use crate::domain::{ClipDrop, Credit, NostrEvent, VideoReference};
+use crate::domain::{ClipDrop, Credit, ListSlot, NostrEvent, VideoReference};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use nostr_sdk::{Client, EventId, EventSource, Filter, JsonUtil, Kind, PublicKey};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
+
+/// Relays commonly cap the size of a single filter array and the number of
+/// filters in one REQ. Stay well inside both so a large list resolves instead
+/// of looking like every clip is missing.
+const MAX_IDENTIFIERS_PER_FILTER: usize = 100;
+const MAX_FILTERS_PER_REQUEST: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CreatorProfile {
@@ -67,29 +73,44 @@ impl RelaySourceRepository {
 #[async_trait]
 impl SourceRepository for RelaySourceRepository {
     async fn addressable_events(&self, coordinates: &[String]) -> Result<Vec<NostrEvent>> {
-        let filters: Vec<Filter> = coordinates
-            .iter()
-            .map(|coordinate| parse_coordinate(coordinate))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .map(|(kind, author, identifier)| {
-                Filter::new()
-                    .kind(Kind::Custom(kind as u16))
-                    .author(author)
-                    .identifier(identifier)
-                    .limit(1)
-            })
-            .collect();
+        // One filter per coordinate would send hundreds of filters in a single
+        // REQ for a large list, which common relays cap or reject outright, and
+        // the failure then looks like every clip is missing. Group the
+        // identifiers by author and kind, and chunk each group.
+        let mut by_author_kind: HashMap<(u32, PublicKey), Vec<String>> = HashMap::new();
+        for coordinate in coordinates {
+            let (kind, author, identifier) = parse_coordinate(coordinate)?;
+            by_author_kind
+                .entry((kind, author))
+                .or_default()
+                .push(identifier);
+        }
+
+        let mut filters: Vec<Filter> = Vec::new();
+        for ((kind, author), identifiers) in by_author_kind {
+            for chunk in identifiers.chunks(MAX_IDENTIFIERS_PER_FILTER) {
+                filters.push(
+                    Filter::new()
+                        .kind(Kind::Custom(kind as u16))
+                        .author(author)
+                        .identifiers(chunk.to_vec()),
+                );
+            }
+        }
         if filters.is_empty() {
             return Ok(Vec::new());
         }
 
-        let events = self
-            .client
-            .get_events_of(filters, EventSource::relays(Some(self.timeout)))
-            .await
-            .context("query source video events")?;
-        events
+        let mut collected = Vec::new();
+        for chunk in filters.chunks(MAX_FILTERS_PER_REQUEST) {
+            collected.extend(
+                self.client
+                    .get_events_of(chunk.to_vec(), EventSource::relays(Some(self.timeout)))
+                    .await
+                    .context("query source video events")?,
+            );
+        }
+        collected
             .into_iter()
             .map(|event| {
                 serde_json::from_str(&event.as_json()).context("decode source video event")
@@ -105,14 +126,18 @@ impl SourceRepository for RelaySourceRepository {
             .iter()
             .map(|id| EventId::from_hex(id).context("parse list event reference"))
             .collect::<Result<_>>()?;
-        let events = self
-            .client
-            .get_events_of(
-                vec![Filter::new().ids(ids)],
-                EventSource::relays(Some(self.timeout)),
-            )
-            .await
-            .context("query listed video events by id")?;
+        let mut events = Vec::new();
+        for chunk in ids.chunks(MAX_IDENTIFIERS_PER_FILTER) {
+            events.extend(
+                self.client
+                    .get_events_of(
+                        vec![Filter::new().ids(chunk.to_vec())],
+                        EventSource::relays(Some(self.timeout)),
+                    )
+                    .await
+                    .context("query listed video events by id")?,
+            );
+        }
         events
             .into_iter()
             .map(|event| {
@@ -129,14 +154,18 @@ impl SourceRepository for RelaySourceRepository {
             .iter()
             .map(|pubkey| PublicKey::from_hex(pubkey).context("parse profile pubkey"))
             .collect::<Result<_>>()?;
-        let events = self
-            .client
-            .get_events_of(
-                vec![Filter::new().kind(Kind::Metadata).authors(authors)],
-                EventSource::relays(Some(self.timeout)),
-            )
-            .await
-            .context("query creator profiles")?;
+        let mut events = Vec::new();
+        for chunk in authors.chunks(MAX_IDENTIFIERS_PER_FILTER) {
+            events.extend(
+                self.client
+                    .get_events_of(
+                        vec![Filter::new().kind(Kind::Metadata).authors(chunk.to_vec())],
+                        EventSource::relays(Some(self.timeout)),
+                    )
+                    .await
+                    .context("query creator profiles")?,
+            );
+        }
 
         let mut newest: HashMap<String, (u64, CreatorProfile)> = HashMap::new();
         for event in events {
@@ -178,10 +207,20 @@ struct ProfileContent {
     nip05: Option<String>,
 }
 
+/// Resolves every ordered slot of a signed list. Unsupported slots are reported
+/// as dropped clips, matching how the editor filters them out of the timeline,
+/// so one stray tag never fails the whole render.
 pub async fn resolve_sources(
     repository: &dyn SourceRepository,
-    references: &[VideoReference],
+    slots: &[ListSlot],
 ) -> Result<Resolution> {
+    let references: Vec<&VideoReference> = slots
+        .iter()
+        .filter_map(|slot| match slot {
+            ListSlot::Video(reference) => Some(reference),
+            ListSlot::Unsupported { .. } => None,
+        })
+        .collect();
     let coordinates: Vec<String> = references
         .iter()
         .filter_map(|reference| match reference {
@@ -230,11 +269,14 @@ pub async fn resolve_sources(
         }
     }
 
-    let selected: Vec<Option<&NostrEvent>> = references
+    let selected: Vec<Option<&NostrEvent>> = slots
         .iter()
-        .map(|reference| match reference {
-            VideoReference::Coordinate(value) => newest_by_coordinate.get(value),
-            VideoReference::Event(value) => by_event_id.get(value),
+        .map(|slot| match slot {
+            ListSlot::Video(VideoReference::Coordinate(value)) => {
+                newest_by_coordinate.get(value)
+            }
+            ListSlot::Video(VideoReference::Event(value)) => by_event_id.get(value),
+            ListSlot::Unsupported { .. } => None,
         })
         .collect();
 
@@ -248,7 +290,18 @@ pub async fn resolve_sources(
     let profiles = repository.profiles(&author_pubkeys).await?;
 
     let mut resolution = Resolution::default();
-    for (source_index, (reference, event)) in references.iter().zip(selected).enumerate() {
+    for (source_index, (slot, event)) in slots.iter().zip(selected).enumerate() {
+        let reference = match slot {
+            ListSlot::Video(reference) => reference,
+            ListSlot::Unsupported { value, reason } => {
+                resolution.dropped.push(ClipDrop {
+                    source_index,
+                    coordinate: value.clone(),
+                    reason: (*reason).into(),
+                });
+                continue;
+            }
+        };
         let Some(event) = event else {
             resolution.dropped.push(ClipDrop {
                 source_index,

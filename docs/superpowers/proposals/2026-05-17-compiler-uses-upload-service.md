@@ -1,5 +1,13 @@
 # Proposal: refactor `BlossomPublisher` to call `cloud-run-upload` instead of writing Fastly KV directly
 
+> **Status note (2026-08-08):** "the upload service" here means whatever serves
+> `upload.divine.video`. That is the GKE-hosted `divinevideo/divine-upload-server`,
+> not the `cloud-run-upload/` directory in this repository. See
+> `docs/superpowers/specs/2026-07-26-compilation-deployment-design.md` for the
+> current ownership and for why derivative suppression comes from the resumable
+> completion path rather than a request flag.
+
+
 **Status:** proposed
 **Targets:** `docs/superpowers/plans/2026-05-17-compilation-service.md`, `docs/superpowers/specs/2026-05-17-compilation-service-design.md`
 **Audience:** whoever picks up the next plan revision (codex or human)

@@ -3,7 +3,7 @@
 
 use crate::{
     domain::{Job, JobError, JobResult, JobStatus},
-    store::JobStore,
+    store::{JobStore, LEASE_SECONDS},
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -18,12 +18,35 @@ pub trait JobExecutor: Send + Sync {
     async fn execute(&self, job: &Job) -> Result<JobResult>;
 }
 
+/// Heartbeat interval. Well inside the lease, so one slow or failed write does
+/// not hand a live job to another instance.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(LEASE_SECONDS / 5);
+
 pub async fn run_next_job(store: Arc<dyn JobStore>, executor: &dyn JobExecutor) -> Result<bool> {
     let Some(mut job) = store.claim_next().await? else {
         return Ok(false);
     };
 
-    match executor.execute(&job).await {
+    // Hold the claim for as long as this instance is actually rendering. If the
+    // instance disappears, the heartbeat stops and the lease expires, so
+    // claim_next requeues the job instead of leaving it running forever.
+    let heartbeat = tokio::spawn({
+        let store = store.clone();
+        let id = job.id.clone();
+        async move {
+            loop {
+                tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+                if let Err(error) = store.renew_lease(&id).await {
+                    tracing::warn!(%error, job_id = %id, "could not renew compilation job lease");
+                }
+            }
+        }
+    });
+
+    let outcome = executor.execute(&job).await;
+    heartbeat.abort();
+
+    match outcome {
         Ok(result) => {
             job.status = result.terminal_status();
             job.progress = 1.0;
@@ -45,6 +68,7 @@ pub async fn run_next_job(store: Arc<dyn JobStore>, executor: &dyn JobExecutor) 
         }
     }
     job.updated_at = unix_timestamp();
+    job.lease_expires_at = None;
     store.save(&job).await?;
     Ok(true)
 }

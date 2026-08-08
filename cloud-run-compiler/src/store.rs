@@ -20,7 +20,27 @@ pub trait JobStore: Send + Sync {
     async fn get(&self, id: &str) -> Result<Option<Job>>;
     async fn save(&self, job: &Job) -> Result<()>;
     async fn recent_for_initiator(&self, initiated_by: &str, limit: usize) -> Result<Vec<Job>>;
+    /// Claims the oldest queued job, or reclaims a running job whose lease has
+    /// expired because the instance rendering it went away.
     async fn claim_next(&self) -> Result<Option<Job>>;
+    /// Extends the claim on a job the caller is still rendering.
+    async fn renew_lease(&self, id: &str) -> Result<()>;
+}
+
+/// How long a claim survives without a heartbeat. Long enough for a slow render
+/// step, short enough that a replaced instance frees the job in one poll cycle.
+pub const LEASE_SECONDS: u64 = 300;
+
+pub fn unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// A running job nobody is heartbeating any more.
+fn lease_expired(job: &Job, now: u64) -> bool {
+    job.status == JobStatus::Running && job.lease_expires_at.unwrap_or(0) <= now
 }
 
 #[derive(Clone, Default)]
@@ -108,24 +128,40 @@ impl JobStore for MemoryJobStore {
             .jobs
             .write()
             .map_err(|_| anyhow!("job store lock poisoned"))?;
-        let next_id = jobs
-            .values()
-            .filter(|job| job.status == JobStatus::Queued)
-            .min_by(|left, right| {
-                left.created_at
-                    .cmp(&right.created_at)
-                    .then_with(|| left.id.cmp(&right.id))
-            })
-            .map(|job| job.id.clone());
+        let now = unix_timestamp();
+        let oldest = |claimable: &dyn Fn(&Job) -> bool| {
+            jobs.values()
+                .filter(|job| claimable(job))
+                .min_by(|left, right| {
+                    left.created_at
+                        .cmp(&right.created_at)
+                        .then_with(|| left.id.cmp(&right.id))
+                })
+                .map(|job| job.id.clone())
+        };
 
-        let Some(next_id) = next_id else {
+        let queued = oldest(&|job: &Job| job.status == JobStatus::Queued);
+        let Some(next_id) = queued.or_else(|| oldest(&|job: &Job| lease_expired(job, now))) else {
             return Ok(None);
         };
         let job = jobs
             .get_mut(&next_id)
             .ok_or_else(|| anyhow!("claimed job disappeared"))?;
         job.status = JobStatus::Running;
+        job.lease_expires_at = Some(now + LEASE_SECONDS);
         Ok(Some(job.clone()))
+    }
+
+    async fn renew_lease(&self, id: &str) -> Result<()> {
+        let mut jobs = self
+            .jobs
+            .write()
+            .map_err(|_| anyhow!("job store lock poisoned"))?;
+        let job = jobs
+            .get_mut(id)
+            .ok_or_else(|| anyhow!("job {id} does not exist"))?;
+        job.lease_expires_at = Some(unix_timestamp() + LEASE_SECONDS);
+        Ok(())
     }
 }
 
@@ -363,34 +399,32 @@ impl JobStore for FirestoreJobStore {
     }
 
     async fn claim_next(&self) -> Result<Option<Job>> {
+        let now = unix_timestamp();
         for _ in 0..3 {
             let transaction = self.begin_transaction().await?;
-            let query = json!({
-                "from": [{ "collectionId": self.collection }],
-                "where": {
-                    "fieldFilter": {
-                        "field": { "fieldPath": "status" },
-                        "op": "EQUAL",
-                        "value": { "stringValue": "queued" }
-                    }
-                },
-                "orderBy": [
-                    { "field": { "fieldPath": "created_at" }, "direction": "ASCENDING" },
-                    { "field": { "fieldPath": "__name__" }, "direction": "ASCENDING" }
-                ],
-                "limit": 1
-            });
-            let rows = self.run_query(query, Some(&transaction)).await?;
-            let Some(document) = rows.into_iter().find_map(|row| row.document) else {
+            let rows = self
+                .run_query(queued_job_query(&self.collection), Some(&transaction))
+                .await?;
+            let mut document = rows.into_iter().find_map(|row| row.document);
+            // Nothing queued: pick up a job whose renderer went away rather
+            // than leaving it running forever.
+            if document.is_none() {
+                let expired = self
+                    .run_query(expired_lease_query(&self.collection, now), Some(&transaction))
+                    .await?;
+                document = expired.into_iter().find_map(|row| row.document);
+            }
+            let Some(document) = document else {
                 self.rollback(&transaction).await;
                 return Ok(None);
             };
             let mut job = decode_job(&document)?;
-            if job.status != JobStatus::Queued {
+            if job.status != JobStatus::Queued && !lease_expired(&job, now) {
                 self.rollback(&transaction).await;
                 continue;
             }
             job.status = JobStatus::Running;
+            job.lease_expires_at = Some(now + LEASE_SECONDS);
             let name = document.name.context("claimed Firestore job has no name")?;
             let update_time = document
                 .update_time
@@ -405,6 +439,64 @@ impl JobStore for FirestoreJobStore {
         }
         Ok(None)
     }
+
+    async fn renew_lease(&self, id: &str) -> Result<()> {
+        let Some(mut job) = self.get(id).await? else {
+            bail!("job {id} does not exist");
+        };
+        job.lease_expires_at = Some(unix_timestamp() + LEASE_SECONDS);
+        self.save(&job).await
+    }
+}
+
+fn queued_job_query(collection: &str) -> Value {
+    json!({
+        "from": [{ "collectionId": collection }],
+        "where": {
+            "fieldFilter": {
+                "field": { "fieldPath": "status" },
+                "op": "EQUAL",
+                "value": { "stringValue": "queued" }
+            }
+        },
+        "orderBy": [
+            { "field": { "fieldPath": "created_at" }, "direction": "ASCENDING" },
+            { "field": { "fieldPath": "__name__" }, "direction": "ASCENDING" }
+        ],
+        "limit": 1
+    })
+}
+
+fn expired_lease_query(collection: &str, now: u64) -> Value {
+    json!({
+        "from": [{ "collectionId": collection }],
+        "where": {
+            "compositeFilter": {
+                "op": "AND",
+                "filters": [
+                    {
+                        "fieldFilter": {
+                            "field": { "fieldPath": "status" },
+                            "op": "EQUAL",
+                            "value": { "stringValue": "running" }
+                        }
+                    },
+                    {
+                        "fieldFilter": {
+                            "field": { "fieldPath": "lease_expires_at" },
+                            "op": "LESS_THAN_OR_EQUAL",
+                            "value": { "integerValue": now.to_string() }
+                        }
+                    }
+                ]
+            }
+        },
+        "orderBy": [
+            { "field": { "fieldPath": "lease_expires_at" }, "direction": "ASCENDING" },
+            { "field": { "fieldPath": "__name__" }, "direction": "ASCENDING" }
+        ],
+        "limit": 1
+    })
 }
 
 #[derive(Deserialize)]
@@ -437,7 +529,8 @@ fn job_document(job: &Job, name: Option<&str>) -> Result<Value> {
             "status": { "stringValue": status_name(job.status) },
             "initiated_by": { "stringValue": job.initiated_by },
             "created_at": { "integerValue": job.created_at.to_string() },
-            "updated_at": { "integerValue": job.updated_at.to_string() }
+            "updated_at": { "integerValue": job.updated_at.to_string() },
+            "lease_expires_at": { "integerValue": job.lease_expires_at.unwrap_or(0).to_string() }
         }
     });
     if let Some(name) = name {

@@ -3,8 +3,8 @@ use divine_compiler::{
         Aspect, AudioSettings, Credit, CreditSettings, FitMode, Watermark, WatermarkPosition,
     },
     render::{
-        build_ffmpeg_args, escape_drawtext, nip05_handle, AspectRenderJob, ClipInput,
-        DEFAULT_FONT_PATH,
+        build_ffmpeg_args, credit_text_path, escape_drawtext, nip05_handle, AspectRenderJob,
+        ClipInput, DEFAULT_FONT_PATH,
     },
 };
 use std::{
@@ -126,6 +126,36 @@ fn nip05_renders_as_a_short_social_handle() {
 }
 
 #[test]
+fn credit_text_is_passed_as_a_file_rather_than_an_inline_token() {
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let mut job = render_job(false);
+    // Own the credit files, so cleanup here cannot race another test rendering
+    // the shared /tmp/output.mp4 job.
+    job.output_path = std::env::temp_dir().join(format!("divine-compiler-{suffix}.mp4"));
+    let filter = filter_graph(&job);
+
+    // An apostrophe in a display name closes drawtext's text='...' token and
+    // breaks the whole filtergraph, and nothing inside those quotes can escape
+    // it, so the text must never be inlined.
+    assert!(!filter.contains("drawtext=fontfile=") || !filter.contains(":text='"));
+    for index in 0..job.clips.len() {
+        let path = credit_text_path(&job.output_path, index);
+        assert!(
+            filter.contains(&format!("textfile={}", path.display())),
+            "clip {index} credit missing from {filter}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), {
+            let name = if index == 0 { "blur" } else { "crop" };
+            format!("{name} • @{name}")
+        });
+        std::fs::remove_file(&path).unwrap();
+    }
+}
+
+#[test]
 fn credits_escape_ffmpeg_control_characters() {
     assert_eq!(
         escape_drawtext(r"Bob, 100% O'Brien: \wow"),
@@ -233,4 +263,53 @@ async fn cpu_render_smoke_handles_clips_with_and_without_audio() {
 
 fn font_path() -> String {
     std::env::var("CREDIT_FONT_PATH").unwrap_or_else(|_| DEFAULT_FONT_PATH.into())
+}
+
+/// Regression: a display name with an apostrophe used to terminate drawtext's
+/// `text='...'` token and fail the render outright.
+#[tokio::test]
+#[ignore = "requires system ffmpeg"]
+async fn apostrophe_bearing_credit_renders() {
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!("divine-compiler-credit-{suffix}"));
+    std::fs::create_dir_all(&directory).unwrap();
+    let source = directory.join("source.mp4");
+    assert!(Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=green:size=320x240:rate=30:duration=0.5",
+            "-pix_fmt",
+            "yuv420p",
+            source.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap()
+        .success());
+
+    let output = directory.join("credit.mp4");
+    let mut awkward = clip("awkward", FitMode::BlurPad, 0.5, false);
+    awkward.path = source;
+    awkward.credit.display_name = Some("O'Brien, 100%: \\ [the] real".into());
+    awkward.credit.nip05 = None;
+    let job = AspectRenderJob {
+        aspect: Aspect::Portrait,
+        clips: vec![awkward],
+        logo_path: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/divine-logo.png"),
+        font_path: PathBuf::from(font_path()),
+        output_path: output.clone(),
+        watermark: Watermark::default(),
+        credit: CreditSettings::default(),
+        audio: AudioSettings::default(),
+        use_gpu: false,
+    };
+
+    divine_compiler::render::render_aspect(&job).await.unwrap();
+    assert!(output.metadata().unwrap().len() > 0);
+    std::fs::remove_dir_all(directory).unwrap();
 }

@@ -96,6 +96,7 @@ async fn create_job(State(state): State<ApiState>, headers: HeaderMap, body: Byt
         initiated_by,
         created_at: now,
         updated_at: now,
+        lease_expires_at: None,
         result: None,
         error: None,
     };

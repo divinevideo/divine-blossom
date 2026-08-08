@@ -28,27 +28,68 @@ impl NostrEvent {
             .filter(|value| !value.is_empty())
     }
 
-    /// Ordered video references, accepting both the addressable `a` coordinates
+    /// Ordered list slots, accepting both the addressable `a` coordinates
     /// written by the compiler editor and the `e` event ids written by the
     /// Divine mobile app.
-    pub fn video_references(&self) -> Result<Vec<VideoReference>, ValidationError> {
+    ///
+    /// A tag that is neither shape is kept as an unsupported slot rather than
+    /// failing the request. The editor's `videoReferences()` filters those tags
+    /// out, so rejecting the whole list here would let a list open and save in
+    /// the UI and then 400 at render time.
+    pub fn list_slots(&self) -> Vec<ListSlot> {
         self.tags
             .iter()
             .filter_map(|tag| match (tag.first().map(String::as_str), tag.get(1)) {
-                (Some("a"), Some(value)) => Some(Ok(value)
-                    .and_then(|coordinate| {
-                        validate_video_coordinate(coordinate)?;
-                        Ok(VideoReference::Coordinate(coordinate.clone()))
-                    })),
-                (Some("e"), Some(value)) => Some(Ok(value).and_then(|id| {
-                    if !is_hex_64(id) {
-                        return Err(ValidationError::InvalidEventReference);
+                (Some("a"), Some(value)) => Some(match validate_video_coordinate(value) {
+                    Ok(()) => ListSlot::Video(VideoReference::Coordinate(value.clone())),
+                    Err(reason) => ListSlot::Unsupported {
+                        value: value.clone(),
+                        reason,
+                    },
+                }),
+                (Some("e"), Some(value)) => Some(if is_hex_64(value) {
+                    ListSlot::Video(VideoReference::Event(value.clone()))
+                } else {
+                    ListSlot::Unsupported {
+                        value: value.clone(),
+                        reason: "invalid-event-reference",
                     }
-                    Ok(VideoReference::Event(id.clone()))
-                })),
+                }),
                 _ => None,
             })
             .collect()
+    }
+
+    /// The renderable references only, in signed list order.
+    pub fn video_references(&self) -> Vec<VideoReference> {
+        self.list_slots()
+            .into_iter()
+            .filter_map(|slot| match slot {
+                ListSlot::Video(reference) => Some(reference),
+                ListSlot::Unsupported { .. } => None,
+            })
+            .collect()
+    }
+}
+
+/// One ordered position in a signed list. Unsupported positions keep their
+/// place so a dropped clip can be reported against the index the editor shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListSlot {
+    Video(VideoReference),
+    Unsupported {
+        value: String,
+        reason: &'static str,
+    },
+}
+
+impl ListSlot {
+    /// The tag value exactly as it appears in the signed list.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Video(reference) => reference.as_str(),
+            Self::Unsupported { value, .. } => value,
+        }
     }
 }
 
@@ -70,17 +111,17 @@ impl VideoReference {
     }
 }
 
-fn validate_video_coordinate(coordinate: &str) -> Result<(), ValidationError> {
+fn validate_video_coordinate(coordinate: &str) -> Result<(), &'static str> {
     let mut parts = coordinate.splitn(3, ':');
     let kind = parts
         .next()
         .and_then(|value| value.parse::<u32>().ok())
-        .ok_or(ValidationError::UnsupportedCoordinate)?;
-    let pubkey = parts.next().ok_or(ValidationError::UnsupportedCoordinate)?;
-    let identifier = parts.next().ok_or(ValidationError::UnsupportedCoordinate)?;
+        .ok_or("unsupported-coordinate")?;
+    let pubkey = parts.next().ok_or("unsupported-coordinate")?;
+    let identifier = parts.next().ok_or("unsupported-coordinate")?;
 
     if !matches!(kind, 34_235 | 34_236) || !is_hex_64(pubkey) || identifier.is_empty() {
-        return Err(ValidationError::UnsupportedCoordinate);
+        return Err("unsupported-coordinate");
     }
 
     Ok(())
@@ -117,7 +158,7 @@ impl CompileRequest {
             return Err(ValidationError::MissingDTag);
         }
 
-        let references = self.source.list_event.video_references()?;
+        let references = self.source.list_event.video_references();
         if references.len() > MAX_CLIPS {
             return Err(ValidationError::TooManyClips);
         }
@@ -278,6 +319,11 @@ pub struct Job {
     pub initiated_by: String,
     pub created_at: u64,
     pub updated_at: u64,
+    /// When the running worker's claim expires. A job whose lease has passed is
+    /// reclaimable, so a crashed or replaced instance cannot strand it in
+    /// `running` forever.
+    #[serde(default)]
+    pub lease_expires_at: Option<u64>,
     #[serde(default)]
     pub result: Option<JobResult>,
     #[serde(default)]
@@ -353,10 +399,6 @@ pub enum ValidationError {
     InvalidListKind,
     #[error("list event must contain a non-empty d tag")]
     MissingDTag,
-    #[error("list contains an unsupported addressable coordinate")]
-    UnsupportedCoordinate,
-    #[error("list contains an event reference that is not a 64 character event id")]
-    InvalidEventReference,
     #[error("list contains more than 500 video coordinates")]
     TooManyClips,
     #[error("at least one render aspect is required")]

@@ -6,11 +6,15 @@ const SECRET_KEY: &str = "000000000000000000000000000000000000000000000000000000
 const SHA256: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 #[test]
-fn init_request_explicitly_disables_derivatives() {
+fn init_request_sends_only_fields_the_upload_server_reads() {
     let request = ResumableUploadInitRequest::compilation(SHA256, 17, "portrait.mp4");
     let json = serde_json::to_value(request).unwrap();
 
-    assert_eq!(json["generateDerivatives"], false);
+    // Derivative suppression comes from the resumable completion path itself,
+    // which stores the object without starting thumbnail, HLS, or transcription
+    // work. A generateDerivatives flag would read as a guarantee that
+    // production does not actually honour.
+    assert!(json.get("generateDerivatives").is_none());
     assert_eq!(json["contentType"], "video/mp4");
 }
 
