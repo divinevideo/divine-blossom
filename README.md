@@ -2,69 +2,6 @@
 
 Content-addressed media storage for the [Divine](https://divine.video) platform, implementing the [Blossom](https://github.com/hzrd149/blossom) protocol for Nostr on [Fastly Compute](https://www.fastly.com/products/edge-compute). Divine Blossom serves media at `media.divine.video`: blobs are addressed by their SHA-256 hash, uploads are authorized with signed Nostr events, and video is transcoded to adaptive HLS with generated transcripts. The Fastly edge service handles retrieval, auth, and admin; heavier work (large uploads, transcoding, speech-to-text, moderation) runs in companion Cloud Run services on GCP.
 
-## Internal Compilation Editor
-
-The compilation editor is a standalone internal tool, not part of
-`divine.video`. It starts from an existing kind `30005` Nostr video list so the
-workflow encourages list making. Editors can reorder the list, choose
-aspect-specific fit modes, save the reordered signed list, and render external
-files for Reels, TikTok, and YouTube.
-
-Compilation output is stored as an ordinary Blossom blob for preview, download,
-and URL sharing. The compiler does **not** create a Divine video event and the
-editor has no “Publish to Divine” action: a multi-clip compilation is not a
-six-second Divine post.
-
-### Local verification
-
-```bash
-cargo test --manifest-path cloud-run-compiler/Cargo.toml --locked
-cargo clippy --manifest-path cloud-run-compiler/Cargo.toml \
-  --all-targets --all-features --locked -- -D warnings
-cloud-run-compiler/scripts/smoke-test.sh
-
-npm --prefix compiler-web ci
-npm --prefix compiler-web test -- --run
-npm --prefix compiler-web run build
-```
-
-The FFmpeg smoke renders two generated clips, including one without audio, into
-all three supported dimensions and checks each result with `ffprobe`.
-
-### Production configuration
-
-The private `cloud-run-compiler` service requires:
-
-- `FIRESTORE_PROJECT`; optional collection defaults to `compilation_jobs`
-- `SOURCE_RELAYS`, `UPLOAD_SERVICE_URL`, `MEDIA_ORIGIN`, and
-  `ALLOWED_MEDIA_HOSTS`
-- `PUBLIC_ORIGIN=https://compiler.divine.video`
-- Secret Manager secret `compiler-output-nsec-production`, exposed only as
-  `COMPILER_OUTPUT_NSEC`
-
-These resources, both Firestore indexes, Cloud Run GPU sizing, service
-accounts, IAM, DNS, and Cloudflare Access are owned by the production
-`compiler-service` Terragrunt stack in `divine-iac-coreconfig`. Do not deploy
-Cloud Run imperatively from this repository.
-
-Production `upload.divine.video` is the GKE-hosted
-`divine-upload-server`. Its resumable completion path stores compiler outputs
-without starting the normal thumbnail, HLS, or transcription derivative work.
-
-The Cloudflare Worker needs non-secret variables `COMPILER_SERVICE_URL` and
-`GOOGLE_SERVICE_ACCOUNT_EMAIL`, plus the
-`GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY` Wrangler secret. Protect
-`compiler.divine.video` with Cloudflare Access and permit only the internal
-staff domain. Register OAuth client `compiler-divine-video` with callback
-`https://compiler.divine.video/auth/callback`.
-
-Run the manual `Compiler Release` GitHub Actions workflow to test and publish an
-immutable image digest, propose it through a coreconfig PR, and deploy the
-Worker after the private service URL exists. See
-`docs/superpowers/specs/2026-07-26-compilation-deployment-design.md`.
-
-Deployment does not publish compilation files as Divine posts.
-
 ## Features
 
 - **Content-addressed storage** — blobs stored and retrieved by SHA-256 hash, backed by Google Cloud Storage
@@ -117,6 +54,83 @@ Client → Fastly Compute (Rust WASM) → GCS (blobs) + Fastly KV (metadata)
 - GCS bucket: `divine-blossom-media`
 - CDN / public host: `media.divine.video` (Fastly)
 - Fastly stores: KV store `blossom_metadata`, config store `blossom_config`, secret store `blossom_secrets`
+
+## Internal Compilation Editor
+
+The compilation editor is a standalone internal tool, not part of
+`divine.video`. It starts from an existing kind `30005` Nostr video list so the
+workflow encourages list making. Editors can reorder the list, choose
+aspect-specific fit modes, save the reordered signed list, and render external
+files for Reels, TikTok, and YouTube.
+
+Compilation output is stored as an ordinary Blossom blob for preview, download,
+and URL sharing. The compiler does **not** create a Divine video event and the
+editor has no “Publish to Divine” action: a multi-clip compilation is not a
+six-second Divine post.
+
+### Local verification
+
+```bash
+cargo test --manifest-path cloud-run-compiler/Cargo.toml --locked
+cargo clippy --manifest-path cloud-run-compiler/Cargo.toml \
+  --all-targets --all-features --locked -- -D warnings
+cloud-run-compiler/scripts/smoke-test.sh
+
+npm --prefix compiler-web ci
+npm --prefix compiler-web test -- --run
+npm --prefix compiler-web run build
+```
+
+The FFmpeg smoke renders two generated clips, including one without audio, into
+all three supported dimensions and checks each result with `ffprobe`. It also
+renders a credit containing an apostrophe, which used to break the whole
+filtergraph. `drawtext` and the Noto font are absent on a bare macOS host, so
+run `cloud-run-compiler/scripts/end-to-end.sh` there instead.
+
+The durable job store is covered against a Firestore emulator:
+
+```bash
+docker run -d --name firestore-emulator -p 8080:8080 \
+  gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators \
+  gcloud emulators firestore start --host-port=0.0.0.0:8080
+
+FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 cargo test \
+  --manifest-path cloud-run-compiler/Cargo.toml --locked --test store -- --ignored
+```
+
+### Production configuration
+
+The private `cloud-run-compiler` service requires:
+
+- `FIRESTORE_PROJECT`; optional collection defaults to `compilation_jobs`
+- `SOURCE_RELAYS`, `UPLOAD_SERVICE_URL`, `MEDIA_ORIGIN`, and
+  `ALLOWED_MEDIA_HOSTS`
+- `PUBLIC_ORIGIN=https://compiler.divine.video`
+- Secret Manager secret `compiler-output-nsec-production`, exposed only as
+  `COMPILER_OUTPUT_NSEC`
+
+These resources, both Firestore indexes, Cloud Run GPU sizing, service
+accounts, IAM, DNS, and Cloudflare Access are owned by the production
+`compiler-service` Terragrunt stack in `divine-iac-coreconfig`. Do not deploy
+Cloud Run imperatively from this repository.
+
+Production `upload.divine.video` is the GKE-hosted
+`divine-upload-server`. Its resumable completion path stores compiler outputs
+without starting the normal thumbnail, HLS, or transcription derivative work.
+
+The Cloudflare Worker needs non-secret variables `COMPILER_SERVICE_URL` and
+`GOOGLE_SERVICE_ACCOUNT_EMAIL`, plus the
+`GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY` Wrangler secret. Protect
+`compiler.divine.video` with Cloudflare Access and permit only the internal
+staff domain. Register OAuth client `compiler-divine-video` with callback
+`https://compiler.divine.video/auth/callback`.
+
+Run the manual `Compiler Release` GitHub Actions workflow to test and publish an
+immutable image digest, propose it through a coreconfig PR, and deploy the
+Worker after the private service URL exists. See
+`docs/superpowers/specs/2026-07-26-compilation-deployment-design.md`.
+
+Deployment does not publish compilation files as Divine posts.
 
 ## Getting started
 
