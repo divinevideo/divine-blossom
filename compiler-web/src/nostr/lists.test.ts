@@ -5,6 +5,7 @@ import {
   buildReorderedListEvent,
   dedupeLatestLists,
   displayNameFromProfile,
+  profileNamesByPubkey,
   saveReorderedList,
   videoReferences,
 } from './lists'
@@ -220,5 +221,46 @@ describe('dedupeLatestLists', () => {
     const noTagB = { ...list('2'.repeat(64), 'y', 200), tags: [] }
 
     expect(dedupeLatestLists([noTagA, noTagB])).toHaveLength(2)
+  })
+})
+
+describe('profileNamesByPubkey', () => {
+  const author = '9'.repeat(64)
+  const profile = (id: string, createdAt: number, content: string): NostrEvent => ({
+    id,
+    pubkey: author,
+    created_at: createdAt,
+    kind: 0,
+    tags: [],
+    content,
+    sig: 'e'.repeat(128),
+  })
+
+  it('keeps the newest profile per pubkey', () => {
+    const stale = profile('1'.repeat(64), 100, '{"name":"old"}')
+    const fresh = profile('2'.repeat(64), 200, '{"display_name":"Fresh Name"}')
+
+    expect(profileNamesByPubkey([fresh, stale]).get(author)).toBe('Fresh Name')
+    expect(profileNamesByPubkey([stale, fresh]).get(author)).toBe('Fresh Name')
+  })
+
+  it('falls back to name and skips unusable profiles', () => {
+    expect(profileNamesByPubkey([profile('3'.repeat(64), 1, '{"name":"handle"}')]).get(author))
+      .toBe('handle')
+    expect(profileNamesByPubkey([profile('4'.repeat(64), 1, 'not json')]).size).toBe(0)
+    expect(profileNamesByPubkey([profile('5'.repeat(64), 1, '{}')]).size).toBe(0)
+  })
+
+  it('ignores non profile events', () => {
+    const note: NostrEvent = {
+      id: '6'.repeat(64),
+      pubkey: author,
+      created_at: 1,
+      kind: 1,
+      tags: [],
+      content: '{"name":"nope"}',
+      sig: 'e'.repeat(128),
+    }
+    expect(profileNamesByPubkey([note]).size).toBe(0)
   })
 })

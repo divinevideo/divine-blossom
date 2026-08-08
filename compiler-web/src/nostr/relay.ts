@@ -1,7 +1,7 @@
 import { SimplePool } from 'nostr-tools'
 import type { Filter } from 'nostr-tools'
 import type { NostrEvent } from '../types'
-import { dedupeLatestLists, isEventReference } from './lists'
+import { dedupeLatestLists, isEventReference, profileNamesByPubkey } from './lists'
 import type { ProfileMeta } from './lists'
 
 export interface ListRelay {
@@ -43,6 +43,18 @@ export class DivineListRelay implements ListRelay {
     } catch {
       return null
     }
+  }
+
+  /** Display names for many authors in one query; missing profiles are absent. */
+  async profileNames(pubkeys: string[]): Promise<Map<string, string>> {
+    const authors = [...new Set(pubkeys.filter((pubkey) => /^[0-9a-f]{64}$/.test(pubkey)))]
+    if (authors.length === 0) return new Map()
+    const events = await this.pool.querySync(
+      this.relays,
+      { kinds: [0], authors },
+      { maxWait: 10_000 },
+    )
+    return profileNamesByPubkey(events as NostrEvent[])
   }
 
   async authoredLists(pubkey: string): Promise<NostrEvent[]> {

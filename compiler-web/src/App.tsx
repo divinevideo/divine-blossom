@@ -1,6 +1,6 @@
 import { ArrowRight, ListDashes, SpinnerGap } from '@phosphor-icons/react'
 import { nip19 } from 'nostr-tools'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   beginDivineLogin,
   completeDivineLoginCallback,
@@ -40,6 +40,7 @@ import type {
 
 export function App() {
   const relay = useMemo(() => new DivineListRelay(), [])
+  const loadedListIdRef = useRef<string>()
   const [signer, setSigner] = useState<NostrSigner | null>(null)
   const [pubkey, setPubkey] = useState<string>()
   const [displayName, setDisplayName] = useState<string>()
@@ -144,16 +145,41 @@ export function App() {
       const loaded = references.map((reference) =>
         clipFromEvent(reference, events.get(reference)),
       )
+      loadedListIdRef.current = event.id
       setSavedEvent(event)
       setSavedOrder(references)
       setClips(loaded)
       setSelectedClip(0)
       setRenders(defaultRenders)
       setNotice(`Loaded ${loaded.length} clips in signed list order.`)
+      void applyCreatorNames(event.id, loaded)
     } catch (caught) {
       setError(message(caught))
     } finally {
       setLoadingList(false)
+    }
+  }
+
+  /**
+   * Creator names are an enhancement over the npub fallback: they land after
+   * the clips render, never block the load, and are dropped if another list
+   * was opened meanwhile.
+   */
+  const applyCreatorNames = async (listEventId: string, loaded: VideoClip[]) => {
+    try {
+      const names = await relay.profileNames(
+        loaded.map((clip) => clip.event.pubkey),
+      )
+      if (names.size === 0) return
+      setClips((current) => {
+        if (loadedListIdRef.current !== listEventId) return current
+        return current.map((clip) => {
+          const name = names.get(clip.event.pubkey)
+          return name ? { ...clip, creator: name } : clip
+        })
+      })
+    } catch {
+      // Keep the npub fallback when the relay cannot serve profiles.
     }
   }
 
@@ -218,6 +244,7 @@ export function App() {
 
   const logout = () => {
     logoutDivine()
+    loadedListIdRef.current = undefined
     setSigner(null)
     setPubkey(undefined)
     setDisplayName(undefined)
@@ -413,8 +440,15 @@ function clipFromEvent(reference: string, event?: NostrEvent): VideoClip {
       } satisfies NostrEvent),
     videoUrl: event ? mediaUrl(event) : undefined,
     title,
-    creator: event ? `${event.pubkey.slice(0, 10)}…` : 'Missing event',
+    creator: event ? shortNpub(event.pubkey) : 'Missing event',
   }
+}
+
+/** Readable stand-in until the kind 0 profile name arrives. */
+function shortNpub(pubkey: string): string {
+  if (!/^[0-9a-f]{64}$/.test(pubkey)) return 'Unknown creator'
+  const npub = nip19.npubEncode(pubkey)
+  return `${npub.slice(0, 12)}…${npub.slice(-4)}`
 }
 
 function mediaUrl(event: NostrEvent): string | undefined {

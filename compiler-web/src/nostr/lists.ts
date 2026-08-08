@@ -18,6 +18,42 @@ export function displayNameFromProfile(meta: ProfileMeta | null): string | undef
   return meta?.display_name || meta?.name || undefined
 }
 
+/**
+ * Latest kind 0 profile per author, parsed into display metadata. Relays may
+ * return several kind 0 events for one pubkey; the newest wins.
+ */
+export function profileNamesByPubkey(events: NostrEvent[]): Map<string, string> {
+  const latest = new Map<string, NostrEvent>()
+  for (const event of events) {
+    if (event.kind !== 0) continue
+    const current = latest.get(event.pubkey)
+    if (
+      !current ||
+      event.created_at > current.created_at ||
+      (event.created_at === current.created_at && event.id.localeCompare(current.id) > 0)
+    ) {
+      latest.set(event.pubkey, event)
+    }
+  }
+
+  const names = new Map<string, string>()
+  for (const [pubkey, event] of latest) {
+    const name = displayNameFromProfile(parseProfile(event.content))
+    if (name) names.set(pubkey, name)
+  }
+  return names
+}
+
+function parseProfile(content: string): ProfileMeta | null {
+  try {
+    const meta: unknown = JSON.parse(content)
+    if (typeof meta !== 'object' || meta === null) return null
+    return meta as ProfileMeta
+  } catch {
+    return null
+  }
+}
+
 export function dedupeLatestLists(events: NostrEvent[]): NostrEvent[] {
   const latestByIdentifier = new Map<string, NostrEvent>()
   const noIdentifier: NostrEvent[] = []
