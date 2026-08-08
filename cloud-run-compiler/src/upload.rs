@@ -1,5 +1,5 @@
-// ABOUTME: Publishes rendered compilations through cloud-run-upload resumable sessions
-// ABOUTME: Signs Blossom authorization and always suppresses ordinary video derivatives
+// ABOUTME: Publishes rendered compilations through upload.divine.video resumable sessions
+// ABOUTME: Signs Blossom authorization; the resumable path starts no video derivatives
 
 use crate::domain::Aspect;
 use anyhow::{bail, Context, Result};
