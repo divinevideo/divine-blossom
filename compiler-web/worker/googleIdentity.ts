@@ -66,14 +66,16 @@ async function serviceAccountAssertion(
   return `${unsigned}.${base64Url(new Uint8Array(signature))}`
 }
 
-function decodePem(value: string): ArrayBuffer {
+/// Returns the view rather than its `ArrayBuffer`. Under a jsdom test realm the
+/// buffer is cross-realm and Node's WebCrypto rejects it, while an
+/// ArrayBufferView passes the same check in both Node and Workers.
+function decodePem(value: string): Uint8Array<ArrayBuffer> {
   const normalized = value.replace(/\\n/g, '\n')
   const base64 = normalized
     .replace('-----BEGIN PRIVATE KEY-----', '')
     .replace('-----END PRIVATE KEY-----', '')
     .replace(/\s/g, '')
-  const bytes = Uint8Array.from(atob(base64), (character) => character.charCodeAt(0))
-  return bytes.buffer
+  return Uint8Array.from(atob(base64), (character) => character.charCodeAt(0))
 }
 
 function encodeJson(value: unknown): string {
