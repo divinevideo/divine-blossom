@@ -111,6 +111,10 @@ through to the regex engine verbatim. Written as `\\?`, the pattern means
 "optional literal backslash", which matches the empty string and makes the whole
 alternation accept any path beginning with `/{sha}`.
 
+The extracted `sha256` and `path` are lowercased with `std.tolower`. The service
+accepts uppercase hex in the request path and normalises it server-side, so an
+un-normalised log row would carry a hash that joins against nothing downstream.
+
 Proposed log payload:
 
 ```json

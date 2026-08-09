@@ -19,6 +19,11 @@
 # Every logged row = one view. No dedup, no rate limiting.
 # No client IP stored — only POP for geographic distribution.
 #
+# The path pattern accepts uppercase hex because the service does: routing
+# validates with is_ascii_hexdigit and then normalises with to_lowercase
+# (blossom-core/src/types.rs). std.tolower on the logged sha256 and path keeps
+# the emitted rows joinable with the lowercase hashes stored everywhere else.
+#
 # Escaping: VCL string literals do not process backslash escapes (Fastly uses
 # percent escapes, e.g. "%22"). A backslash reaches the regex engine verbatim,
 # so regex escapes are written with a SINGLE backslash. Doubling them would
@@ -40,8 +45,8 @@ if (req.method == "GET"
     {"{"}
       {""v":2,"}
       {""ts":"} time.start.sec {","}
-      {""sha256":""} regsub(req.url, "^/([0-9a-fA-F]{64}).*", "\1") {"","}
-      {""path":""} regsub(req.url, "\?.*$", "") {"","}
+      {""sha256":""} std.tolower(regsub(req.url, "^/([0-9a-fA-F]{64}).*", "\1")) {"","}
+      {""path":""} std.tolower(regsub(req.url, "\?.*$", "")) {"","}
       {""status":"} resp.status {","}
       {""bytes":"} resp.body_bytes_written {","}
       {""pop":""} server.datacenter {"","}
