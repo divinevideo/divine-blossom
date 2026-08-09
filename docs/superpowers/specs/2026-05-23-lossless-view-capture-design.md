@@ -98,12 +98,18 @@ Proposed response condition:
 
 ```vcl
 req.method == "GET"
-&& req.url ~ "^/[0-9a-fA-F]{64}($|\\?|\\.mp4(\\?|$)|/(720p|480p)(\\.mp4)?(\\?|$)|/hls/stream_(720p|480p)\\.(ts|mp4)(\\?|$))"
+&& req.url ~ "^/[0-9a-fA-F]{64}($|\?|\.mp4(\?|$)|/(720p|480p)(\.mp4)?(\?|$)|/hls/stream_(720p|480p)\.(ts|mp4)(\?|$))"
 && resp.http.Content-Type ~ "^video/"
 && resp.status >= 200
 && resp.status < 300
 && resp.body_bytes_written > 0
 ```
+
+Regex escapes are single backslashes. VCL string literals do not process
+backslash escapes — Fastly uses percent escapes (`%22`) and passes a backslash
+through to the regex engine verbatim. Written as `\\?`, the pattern means
+"optional literal backslash", which matches the empty string and makes the whole
+alternation accept any path beginning with `/{sha}`.
 
 Proposed log payload:
 

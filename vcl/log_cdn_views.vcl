@@ -18,9 +18,20 @@
 #
 # Every logged row = one view. No dedup, no rate limiting.
 # No client IP stored — only POP for geographic distribution.
+#
+# Escaping: VCL string literals do not process backslash escapes (Fastly uses
+# percent escapes, e.g. "%22"). A backslash reaches the regex engine verbatim,
+# so regex escapes are written with a SINGLE backslash. Doubling them would
+# produce "\\?" — an optional literal backslash, which matches the empty string
+# and silently disables the alternation.
+#
+# This file is the authoritative source for the three regex literals below.
+# scripts/tests/test_cdn_view_vcl.py parses them out of this file, exercises
+# them against real request paths, and asserts the copies in
+# docs/runbooks/cdn-view-counting.md have not drifted.
 
 if (req.method == "GET"
-    && req.url ~ "^/[0-9a-fA-F]{64}($|\\?|\\.mp4(\\?|$)|/(720p|480p)(\\.mp4)?(\\?|$)|/hls/stream_(720p|480p)\\.(ts|mp4)(\\?|$))"
+    && req.url ~ "^/[0-9a-fA-F]{64}($|\?|\.mp4(\?|$)|/(720p|480p)(\.mp4)?(\?|$)|/hls/stream_(720p|480p)\.(ts|mp4)(\?|$))"
     && resp.http.Content-Type ~ "^video/"
     && resp.status >= 200
     && resp.status < 300
@@ -30,7 +41,7 @@ if (req.method == "GET"
       {""v":2,"}
       {""ts":"} time.start.sec {","}
       {""sha256":""} regsub(req.url, "^/([0-9a-fA-F]{64}).*", "\1") {"","}
-      {""path":""} regsub(req.url, "\\?.*$", "") {"","}
+      {""path":""} regsub(req.url, "\?.*$", "") {"","}
       {""status":"} resp.status {","}
       {""bytes":"} resp.body_bytes_written {","}
       {""pop":""} server.datacenter {"","}
