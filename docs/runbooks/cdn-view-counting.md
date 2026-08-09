@@ -41,35 +41,11 @@ gcloud iam service-accounts keys create fastly-pubsub-key.json \
 
 **Delete the key file after uploading to Fastly dashboard.**
 
-## 3. Configure Fastly Log Endpoint
+## 3. Run ClickHouse Migrations
 
-In the Fastly dashboard for VCL service `ML7R82HKfmTaqTpHExIDVN`:
-
-1. Go to **Logging** → **Create endpoint** → **Google Cloud Pub/Sub**
-2. Configure:
-   - **Name:** `cdn-view-logs`
-   - **Project ID:** `rich-compiler-479518-d2`
-   - **Topic:** `cdn-view-logs`
-   - **Secret key:** paste contents of `fastly-pubsub-key.json`
-   - **Format version:** `2` (`vcl_log`)
-   - **Format:**
-     ```text
-     {"v":2,"ts":%{time.start.sec}V,"sha256":"%{regsub(req.url, "^/([0-9a-fA-F]{64}).*", "\1")}V","path":"%{regsub(req.url, "\\?.*$", "")}V","status":%{resp.status}V,"bytes":%{resp.body_bytes_written}V,"pop":"%{server.datacenter}V","cache":"%{fastly_info.state}V"}
-     ```
-3. Create or update the response condition named `cdn-view-log-condition`:
-   ```vcl
-   req.method == "GET"
-   && req.url ~ "^/[0-9a-fA-F]{64}($|\\?|\\.mp4(\\?|$)|/(720p|480p)(\\.mp4)?(\\?|$)|/hls/stream_(720p|480p)\\.(ts|mp4)(\\?|$))"
-   && resp.http.Content-Type ~ "^video/"
-   && resp.status >= 200
-   && resp.status < 300
-   && resp.body_bytes_written > 0
-   ```
-4. Activate the new version.
-
-`vcl/log_cdn_views.vcl` contains the equivalent snippet form if the endpoint is ever moved back to explicit VCL. Production currently uses the Google Pub/Sub endpoint format plus response condition above.
-
-## 4. Run ClickHouse Migrations
+Do this **before** activating the Fastly change. Once Fastly emits `"v":2` rows
+for range and derivative paths, a pipeline that still only understands v1 drops
+them on the floor.
 
 In the divine-funnelcake repo:
 
@@ -80,7 +56,10 @@ In the divine-funnelcake repo:
 # Use your standard migration workflow (golang-migrate)
 ```
 
-## 5. Deploy the Subscriber
+## 4. Deploy the Subscriber
+
+Also before Fastly activation: the subscriber must accept v2 payloads (and keep
+accepting v1) before any v2 row is published.
 
 In the divine-funnelcake repo:
 
@@ -93,6 +72,49 @@ gcloud run deploy cdn-view-subscriber \
   --min-instances=1 \
   --max-instances=3
 ```
+
+## 5. Configure Fastly Log Endpoint
+
+`vcl/log_cdn_views.vcl` is the authoritative source for the three regex
+literals used here. Copy them from that file rather than retyping them;
+`scripts/tests/test_cdn_view_vcl.py` fails if the copies below drift from it.
+
+VCL string literals do not process backslash escapes (Fastly uses percent
+escapes such as `%22`), so every regex escape below is a **single** backslash.
+Doubling one turns `\?` into "optional literal backslash", which matches the
+empty string and quietly disables the surrounding alternation.
+
+In the Fastly dashboard for VCL service `ML7R82HKfmTaqTpHExIDVN`:
+
+1. Go to **Logging** → **Create endpoint** → **Google Cloud Pub/Sub**
+2. Configure:
+   - **Name:** `cdn-view-logs`
+   - **Project ID:** `rich-compiler-479518-d2`
+   - **Topic:** `cdn-view-logs`
+   - **Secret key:** paste contents of `fastly-pubsub-key.json`
+   - **Format version:** `2` (`vcl_log`)
+   - **Format:**
+     ```text
+     {"v":2,"ts":%{time.start.sec}V,"sha256":"%{std.tolower(regsub(req.url, "^/([0-9a-fA-F]{64}).*", "\1"))}V","path":"%{std.tolower(regsub(req.url, "\?.*$", ""))}V","status":%{resp.status}V,"bytes":%{resp.body_bytes_written}V,"pop":"%{server.datacenter}V","cache":"%{fastly_info.state}V"}
+     ```
+3. Create or update the response condition named `cdn-view-log-condition`:
+   ```vcl
+   req.method == "GET"
+   && req.url ~ "^/[0-9a-fA-F]{64}($|\?|\.mp4(\?|$)|/(720p|480p)(\.mp4)?(\?|$)|/hls/stream_(720p|480p)\.(ts|mp4)(\?|$))"
+   && resp.http.Content-Type ~ "^video/"
+   && resp.status >= 200
+   && resp.status < 300
+   && resp.body_bytes_written > 0
+   ```
+4. **Save into a cloned version and confirm it compiles before activating.** The
+   format string nests braces (`{64}`) and double quotes inside `%{...}V`; a
+   parse failure there is silent from the outside and only shows up as missing
+   log rows. Check Fastly's logging diagnostics on the cloned version first.
+5. Activate the new version.
+
+`vcl/log_cdn_views.vcl` holds the equivalent explicit-snippet form if the
+endpoint is ever moved back to a `vcl_log` snippet. Production uses the Google
+Pub/Sub endpoint format plus response condition above.
 
 ## 6. Verify End-to-End
 
