@@ -52,9 +52,13 @@ them on the floor.
 > **Blocker.** The migration that creates `cdn_media_delivery_events` has not
 > been written. On `divine-funnelcake` main, `000149` is
 > `000149_fix_view_counts_sort_key`, and no ref in that repository contains
-> `cdn_media_delivery_events`. Do not read the number `000149` here or in the
-> design doc as "already applied" — the raw-capture sink is unbuilt funnelcake
-> work, and step 5 must not be run until it lands.
+> `cdn_media_delivery_events`. Nothing about that sink is applied yet, whatever
+> the surrounding documents imply: the design doc describes the table as though
+> it exists, and the implementation plan
+> (`docs/superpowers/plans/2026-05-23-lossless-view-capture.md`) carries `[x]`
+> checkboxes over a `000149_lossless_cdn_view_capture` migration that exists in
+> no ref of divine-funnelcake. This runbook is the operational path; step 5 must
+> not be run until that work lands.
 
 In the divine-funnelcake repo:
 
