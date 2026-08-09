@@ -1,7 +1,12 @@
 # ABOUTME: VCL log snippet for CDN video view counting
 # ABOUTME: Logs delivered video bytes to Google Cloud Pub/Sub for view count aggregation
 #
-# Applied via Fastly dashboard as a VCL snippet in vcl_log subroutine.
+# Production does NOT apply this file as a snippet. It runs the equivalent as a
+# Google Cloud Pub/Sub logging endpoint format plus a response condition named
+# `cdn-view-log-condition`, both set in the Fastly dashboard — see
+# docs/runbooks/cdn-view-counting.md. This file is the authoritative source for
+# the regex literals and the snippet form to fall back to if the endpoint is
+# ever moved back into an explicit `vcl_log` snippet.
 #
 # Fastly log endpoint setup:
 #   Type: Google Cloud Pub/Sub
