@@ -46,7 +46,7 @@
 # docs/runbooks/cdn-view-counting.md have not drifted.
 
 if (req.method == "GET"
-    && req.url ~ "^/[0-9a-fA-F]{64}($|\?|\.mp4(\?|$)|/(720p|480p)(\.mp4)?(\?|$)|/hls/stream_(720p|480p)\.(ts|mp4)(\?|$))"
+    && req.url ~ "^/[0-9a-fA-F]{64}($|\?|\.(mp4|m4v|webm|mov|mkv|ogv|avi)(\?|$)|/(720p|480p)(\.mp4)?(\?|$)|/hls/stream_(720p|480p)\.(ts|mp4)(\?|$))"
     && resp.http.Content-Type ~ "^video/"
     && resp.status >= 200
     && resp.status < 300

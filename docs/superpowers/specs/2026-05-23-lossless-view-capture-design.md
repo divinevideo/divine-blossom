@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-23
 **Status:** design approved, implementation pending
-**Repos involved:** `divine-blossom-stt`, `divine-funnelcake`, `divine-web`, `divine-mobile`
+**Repos involved:** `divine-blossom`, `divine-funnelcake`, `divine-web`, `divine-mobile`
 
 ## Problem
 
@@ -38,7 +38,7 @@ The fix should not try to decide "real view" at the CDN edge. The edge should ca
   && resp.http.Content-Type ~ "^video/"
   ```
 - `divine-web` can use HLS URLs derived from `media.divine.video/{sha}/hls/master.m3u8`, variant playlists, and direct media URLs.
-- `divine-blossom-stt` serves direct quality variants at `/{sha}/720p`, `/{sha}/480p`, `/{sha}/720p.mp4`, and `/{sha}/480p.mp4`.
+- `divine-blossom` serves direct quality variants at `/{sha}/720p`, `/{sha}/480p`, `/{sha}/720p.mp4`, and `/{sha}/480p.mp4`.
 - `cloud-run-transcoder` produces HLS media files under `{sha}/hls/stream_720p.*` and `{sha}/hls/stream_480p.*`.
 
 ## Architecture
@@ -94,11 +94,13 @@ Excluded from display candidates by default:
 
 Optional debug capture can be added later for manifests, but it should not feed display counts.
 
-Proposed response condition:
+Proposed response condition, shown as an illustrative copy. The authoritative
+condition lives in `vcl/log_cdn_views.vcl` and is drift-checked against
+`docs/runbooks/cdn-view-counting.md`.
 
 ```vcl
 req.method == "GET"
-&& req.url ~ "^/[0-9a-fA-F]{64}($|\?|\.mp4(\?|$)|/(720p|480p)(\.mp4)?(\?|$)|/hls/stream_(720p|480p)\.(ts|mp4)(\?|$))"
+&& req.url ~ "^/[0-9a-fA-F]{64}($|\?|\.(mp4|m4v|webm|mov|mkv|ogv|avi)(\?|$)|/(720p|480p)(\.mp4)?(\?|$)|/hls/stream_(720p|480p)\.(ts|mp4)(\?|$))"
 && resp.http.Content-Type ~ "^video/"
 && resp.status >= 200
 && resp.status < 300
@@ -292,8 +294,8 @@ Expected result: new raw rows exceed old rows, especially for videos played thro
 
 ## References
 
-- `divine-blossom-stt/vcl/log_cdn_views.vcl`
-- `divine-blossom-stt/docs/runbooks/cdn-view-counting.md`
+- `divine-blossom/vcl/log_cdn_views.vcl`
+- `divine-blossom/docs/runbooks/cdn-view-counting.md`
 - `divine-funnelcake/database/migrations/000105_cdn_view_counts.up.sql`
 - `divine-funnelcake/docs/superpowers/plans/2026-05-23-cdn-view-pipeline-audit.md`
 - ClickHouse rule: `insert-batch-size`

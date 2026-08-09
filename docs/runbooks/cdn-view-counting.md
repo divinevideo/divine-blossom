@@ -55,9 +55,8 @@ them on the floor.
 > `cdn_media_delivery_events`. Nothing about that sink is applied yet, whatever
 > the surrounding documents imply: the design doc describes the table as though
 > it exists, and the implementation plan
-> (`docs/superpowers/plans/2026-05-23-lossless-view-capture.md`) carries `[x]`
-> checkboxes over a `000149_lossless_cdn_view_capture` migration that exists in
-> no ref of divine-funnelcake. This runbook is the operational path; step 5 must
+> (`docs/superpowers/plans/2026-05-23-lossless-view-capture.md`) tracks the
+> remaining funnelcake work. This runbook is the operational path; step 5 must
 > not be run until that work lands.
 
 In the divine-funnelcake repo:
@@ -116,7 +115,7 @@ In the Fastly dashboard for VCL service `ML7R82HKfmTaqTpHExIDVN`:
 3. Create or update the response condition named `cdn-view-log-condition`:
    ```vcl
    req.method == "GET"
-   && req.url ~ "^/[0-9a-fA-F]{64}($|\?|\.mp4(\?|$)|/(720p|480p)(\.mp4)?(\?|$)|/hls/stream_(720p|480p)\.(ts|mp4)(\?|$))"
+   && req.url ~ "^/[0-9a-fA-F]{64}($|\?|\.(mp4|m4v|webm|mov|mkv|ogv|avi)(\?|$)|/(720p|480p)(\.mp4)?(\?|$)|/hls/stream_(720p|480p)\.(ts|mp4)(\?|$))"
    && resp.http.Content-Type ~ "^video/"
    && resp.status >= 200
    && resp.status < 300
