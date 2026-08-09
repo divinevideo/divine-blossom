@@ -7,7 +7,9 @@ Pipeline: Fastly VCL log → Google Cloud Pub/Sub → Cloud Run subscriber → C
 - GCP project: `rich-compiler-479518-d2`
 - Fastly VCL service: `ML7R82HKfmTaqTpHExIDVN`
 - ClickHouse cluster accessible from Cloud Run
-- Migrations 000105 + 000106 + 000149 applied (in divine-funnelcake repo)
+- Migrations 000105 + 000106 applied (in divine-funnelcake repo)
+- The v2 sink — `cdn_media_delivery_events` and a subscriber that parses `"v":2`
+  — **does not exist yet.** See step 3; it gates step 5.
 
 ## 1. Create Pub/Sub Topic and Subscription
 
@@ -47,19 +49,29 @@ Do this **before** activating the Fastly change. Once Fastly emits `"v":2` rows
 for range and derivative paths, a pipeline that still only understands v1 drops
 them on the floor.
 
+> **Blocker.** The migration that creates `cdn_media_delivery_events` has not
+> been written. On `divine-funnelcake` main, `000149` is
+> `000149_fix_view_counts_sort_key`, and no ref in that repository contains
+> `cdn_media_delivery_events`. Do not read the number `000149` here or in the
+> design doc as "already applied" — the raw-capture sink is unbuilt funnelcake
+> work, and step 5 must not be run until it lands.
+
 In the divine-funnelcake repo:
 
 ```bash
 # Migration 000105: cdn_view_counts table + video_total_views unified view
 # Migration 000106: rewire video_stats to use unified counts
-# Migration 000149: raw cdn_media_delivery_events table + total views from raw deliveries
+# Then: the raw cdn_media_delivery_events table + total views from raw
+#       deliveries, once that migration exists (see the blocker above)
 # Use your standard migration workflow (golang-migrate)
 ```
 
 ## 4. Deploy the Subscriber
 
 Also before Fastly activation: the subscriber must accept v2 payloads (and keep
-accepting v1) before any v2 row is published.
+accepting v1) before any v2 row is published. The current `cdn-view-subscriber`
+deserializes v1 fields only and writes to `cdn_view_counts`; extra v2 keys are
+ignored. That work is part of the same funnelcake blocker above.
 
 In the divine-funnelcake repo:
 
