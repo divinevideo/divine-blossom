@@ -177,10 +177,17 @@ Document the production Google Pub/Sub endpoint format and response condition, i
 Run:
 
 ```bash
-ruby -e 're=%r{^/[0-9a-fA-F]{64}($|\\?|\\.mp4(\\?|$)|/(720p|480p)(\\.mp4)?(\\?|$)|/hls/stream_(720p|480p)\\.(ts|mp4)(\\?|$))}; h="a"*64; ok=["/#{h}","/#{h}?x=1","/#{h}.mp4","/#{h}/720p","/#{h}/480p.mp4","/#{h}/hls/stream_720p.ts","/#{h}/hls/stream_480p.mp4"]; bad=["/#{h}.jpg","/#{h}.vtt","/#{h}/hls/master.m3u8","/#{h}/hls/stream_720p.m3u8"]; abort("ok failed") unless ok.all?{|s| s.match?(re)}; abort("bad failed") unless bad.none?{|s| s.match?(re)}; puts "cdn view regex smoke passed"'
+python3 -m unittest discover -s scripts/tests -p 'test_cdn_view_vcl.py'
 ```
 
-Expected: `cdn view regex smoke passed`.
+Expected: `OK`.
+
+The check has to read the pattern out of `vcl/log_cdn_views.vcl` rather than
+retype it, because the failure mode is the escaping of the VCL literal itself. A
+hand-typed copy in a shell one-liner gets its backslashes processed by the shell
+and the host language before the regex engine sees them, so it can pass while
+the deployed pattern is broken — which is exactly what happened here. CI runs
+this test.
 
 ### Task 5: Final Verification
 
@@ -196,7 +203,7 @@ cargo test --manifest-path bin/cdn-view-subscriber/Cargo.toml
 
 - [x] **Step 2: Run Blossom VCL/doc smoke**
 
-Run the Ruby regex smoke from Task 4.
+Run the regex test from Task 4.
 
 - [x] **Step 3: Review diffs**
 
