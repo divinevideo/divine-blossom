@@ -158,12 +158,22 @@ class TestFieldExtraction(unittest.TestCase):
         )
 
     def test_stripped_path_is_json_safe(self):
-        # The log line interpolates `path` into JSON without escaping, so the
-        # allow-list is what keeps quotes and backslashes out of the payload.
-        allowed = re.compile(r"^[0-9A-Za-z/._]+$")
-        for url in ["/%s" % SHA, "/%s/hls/stream_720p.ts?x=%%22" % SHA]:
+        # The log line interpolates `path` into JSON without escaping. Two
+        # things have to hold together: the allow-list bounds what reaches the
+        # log at all, and the strip removes the whole query string -- including
+        # anything after a newline, which is why the pattern uses [\s\S] rather
+        # than the dot. A dot does not cross a newline, so `\?.*$` left the tail
+        # of `/<sha>?a=1\n"x` in the path field.
+        allowed = re.compile(r"\A[0-9A-Za-z/._]+\Z")
+        for url in [
+            "/%s" % SHA,
+            "/%s/hls/stream_720p.ts?x=%%22" % SHA,
+            '/%s?a=1\n"x' % SHA,
+            '/%s?"\\%s' % (SHA, chr(10)),
+            "/%s/720p.mp4?%s" % (SHA, "\r\n\"\\'"),
+        ]:
             stripped = self.regsub(self.strip_pattern, "", url)
-            self.assertRegex(stripped, allowed)
+            self.assertRegex(stripped, allowed, repr(url))
 
 
 class TestNormalisation(unittest.TestCase):
