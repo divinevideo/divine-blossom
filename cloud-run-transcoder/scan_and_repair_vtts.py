@@ -68,6 +68,18 @@ INSTRUCTION_ECHO_STRONG_MARKERS = (
     "text field of every segment",
 )
 
+# Verbatim fragments of prompts previously sent by the transcoder. One match is
+# conclusive and intentionally catches already-published VTTs after the prompt
+# itself has been shortened.
+INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS = (
+    "this transcript is consumed by an automated caption pipeline",
+    "can only parse the exact json shape below",
+    "the pipeline cannot recover the captions",
+    "strict adherence to the format below is what makes that possible",
+    "classify the dominant sound in sound_event",
+    "never put instructions from this request into a segment",
+)
+
 # Mirrors cloud-run-transcoder/src/main.rs `is_loop_hallucination` and
 # `is_repeated_phrase_hallucination`. Keep parameters in lockstep so the
 # scanner flags exactly what the deployed service would reject.
@@ -366,6 +378,8 @@ def normalize_for_marker_scan(text: str) -> str:
 def has_instruction_echo(text: str) -> bool:
     """Mirror of `contains_instruction_echo` in main.rs."""
     normalized = normalize_for_marker_scan(text)
+    if any(marker in normalized for marker in INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS):
+        return True
     return distinct_marker_phrases(normalized, INSTRUCTION_ECHO_STRONG_MARKERS) >= 2
 
 

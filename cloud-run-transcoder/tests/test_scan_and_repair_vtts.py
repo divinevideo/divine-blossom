@@ -36,6 +36,19 @@ class ScanAndRepairVttsTests(unittest.TestCase):
 
         self.assertEqual(classifier(body, check_empty=False), "instruction_echo")
 
+    def test_classifies_automated_caption_prompt_echo(self):
+        module = load_script_module(self)
+        classifier = getattr(module, "classify_vtt", None)
+        self.assertIsNotNone(classifier, "classify_vtt should exist")
+
+        body = (
+            "WEBVTT\n\n1\n00:00:00.000 --> 00:00:07.000\n"
+            "Why this matters this transcript is consumed by an automated caption "
+            "pipeline that can only parse the exact JSON shape below.\n"
+        )
+
+        self.assertEqual(classifier(body, check_empty=False), "instruction_echo")
+
     def test_ignores_technical_json_speech(self):
         module = load_script_module(self)
         classifier = getattr(module, "classify_vtt", None)

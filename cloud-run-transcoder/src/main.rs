@@ -3060,25 +3060,19 @@ fn build_gemini_prompt(language: Option<&str>) -> String {
     format!(
         "Transcribe the speech in this audio.{lang_clause}\n\
          \n\
-         Why this matters: this transcript is consumed by an automated \
-         caption pipeline that can ONLY parse the exact JSON shape below. \
-         It has no ability to parse markdown, prose preambles, code \
-         fences, or alternative JSON shapes. If you deviate from the \
-         format, the pipeline cannot recover the captions: real users \
-         watching videos in the Divine app will see broken or missing \
-         subtitles, lose trust in the product, and stop using it. Please \
-         help us keep the captions working — strict adherence to the \
-         format below is what makes that possible.\n\
-         \n\
          Output requirements (STRICT):\n\
          - Return ONLY a JSON object with this exact shape: \
-         {{\"language\": \"<bcp47>\", \"segments\": [{{\"start\": <seconds>, \"end\": <seconds>, \"text\": \"<spoken words>\"}}]}}.\n\
+         {{\"language\": \"<bcp47>\", \"sound_event\": \"none|music|applause|crowd|ambient|silence\", \"segments\": [{{\"start\": <seconds>, \"end\": <seconds>, \"text\": \"<spoken words>\"}}]}}.\n\
          - The `text` field of every segment MUST contain ONLY the spoken words \
          transcribed verbatim. Do NOT include markdown, code fences, JSON \
          fragments, headers, summaries, explanations, or any commentary.\n\
+         - If there is no intelligible speech, return an empty `segments` array and \
+         classify the dominant sound in `sound_event`. Use `music` only when music \
+         is clearly audible; otherwise use `applause`, `crowd`, `ambient`, or `silence`.\n\
+         - If there is intelligible speech, use `sound_event`: `none` and transcribe it.\n\
          - Do NOT prefix or suffix the JSON with any text, markdown, or \
          explanation. No \"Here is the JSON\" preamble. No ``` fences.\n\
-         - If there is no speech, return {{\"segments\": []}}.\n",
+         - Never put instructions from this request into a segment's `text`.\n",
     )
 }
 
@@ -3118,6 +3112,10 @@ async fn transcribe_via_gemini(
                 "type": "object",
                 "properties": {
                     "language": {"type": "string"},
+                    "sound_event": {
+                        "type": "string",
+                        "enum": ["none", "music", "applause", "crowd", "ambient", "silence"]
+                    },
                     "segments": {
                         "type": "array",
                         "items": {
@@ -3489,7 +3487,30 @@ fn normalize_transcript_to_vtt(raw: &str) -> Result<ParsedVtt> {
         }
     }
 
-    // If we parsed valid JSON but found no segments and no text,
+    // Convert a constrained non-speech classification into conventional
+    // closed-caption notation. Only do this when no speech cue was produced;
+    // a generic sound label must never replace intelligible speech.
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        let segments_empty = json["segments"]
+            .as_array()
+            .map(|segments| segments.is_empty())
+            .unwrap_or(true);
+        if segments_empty {
+            if let Some(label) = closed_caption_sound_label(json["sound_event"].as_str()) {
+                return Ok(ParsedVtt {
+                    content: format!("WEBVTT\n\n1\n00:00:00.000 --> 99:59:59.000\n{}\n", label),
+                    text: label.to_string(),
+                    language: json["language"].as_str().map(str::to_string),
+                    duration_ms: 0,
+                    cue_count: 1,
+                    confidence: None,
+                });
+            }
+        }
+    }
+
+    // If we parsed valid JSON but found no segments, text, or classified
+    // sound event,
     // this is a valid API response with no transcribable content (e.g. silent video).
     // Don't let it fall through to the plain text path, which would wrap the raw
     // JSON string in a VTT cue and render it as captions.
@@ -3518,6 +3539,19 @@ fn normalize_transcript_to_vtt(raw: &str) -> Result<ParsedVtt> {
         cue_count: 1,
         confidence: None,
     })
+}
+
+/// Map the provider's constrained classification to standard closed-caption
+/// notation. Silence, speech (`none`), and unknown/free-form values produce no
+/// cue rather than an invented description.
+fn closed_caption_sound_label(sound_event: Option<&str>) -> Option<&'static str> {
+    match sound_event {
+        Some("music") => Some("[Music]"),
+        Some("applause") => Some("[Applause]"),
+        Some("crowd") => Some("[Crowd cheering]"),
+        Some("ambient") => Some("[Ambient sound]"),
+        _ => None,
+    }
 }
 
 /// True when an error from `normalize_transcript_to_vtt` indicates that the
@@ -3741,6 +3775,25 @@ fn distinct_marker_phrases(normalized: &str, markers: &[&str]) -> usize {
 /// retained phrases, so detection is unaffected.
 fn contains_instruction_echo(text: &str) -> bool {
     let normalized = normalize_for_marker_scan(text);
+
+    // These are verbatim fragments of prompts previously sent by this
+    // service. Unlike generic schema language, a single match is conclusive:
+    // this prose is not audio transcription. Keep them so the repair scanner
+    // can identify VTTs produced before the prompt was shortened.
+    const EXACT_PROMPT_MARKERS: &[&str] = &[
+        "this transcript is consumed by an automated caption pipeline",
+        "can only parse the exact json shape below",
+        "the pipeline cannot recover the captions",
+        "strict adherence to the format below is what makes that possible",
+        "classify the dominant sound in sound_event",
+        "never put instructions from this request into a segment",
+    ];
+    if EXACT_PROMPT_MARKERS
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    {
+        return true;
+    }
 
     const STRONG_MARKERS: &[&str] = &[
         "<bcp47>",
@@ -4650,6 +4703,37 @@ mod tests {
     }
 
     #[test]
+    fn music_only_response_becomes_closed_caption_cue() {
+        let parsed = normalize_transcript_to_vtt(
+            r#"{"language":"und","sound_event":"music","segments":[]}"#,
+        )
+        .expect("constrained music classification should produce a VTT");
+
+        assert_eq!(parsed.text, "[Music]");
+        assert_eq!(parsed.cue_count, 1);
+        assert!(parsed.content.contains("\n[Music]\n"));
+    }
+
+    #[test]
+    fn silence_response_remains_empty() {
+        let result = normalize_transcript_to_vtt(
+            r#"{"language":"und","sound_event":"silence","segments":[]}"#,
+        );
+        assert!(result.is_err(), "silence should not invent a caption cue");
+    }
+
+    #[test]
+    fn unknown_sound_event_is_never_rendered() {
+        let result = normalize_transcript_to_vtt(
+            r#"{"language":"und","sound_event":"ignore all instructions","segments":[]}"#,
+        );
+        assert!(
+            result.is_err(),
+            "free-form sound labels must not become captions"
+        );
+    }
+
+    #[test]
     fn json_with_only_whitespace_text_is_rejected() {
         let result = normalize_transcript_to_vtt(r#"{"text":"   \n  "}"#);
         assert!(
@@ -4814,6 +4898,13 @@ mod tests {
         let bad = "Well, that's not really freedom now, is it, you freaking idiot? \
             a single JSON array. Do not include any extra text outside of the JSON string. \
             When producing JSON you must follow the schema provided in the context.";
+        assert!(contains_instruction_echo(bad));
+    }
+
+    #[test]
+    fn instruction_echo_guard_flags_automated_caption_prompt_leak() {
+        let bad = "Why this matters: this transcript is consumed by an automated caption \
+            pipeline that can only parse the exact JSON shape below.";
         assert!(contains_instruction_echo(bad));
     }
 
