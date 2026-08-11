@@ -2962,11 +2962,22 @@ const ACCESS_TOKEN_CACHE_TTL: Duration = Duration::from_secs(50 * 60);
 /// take up to 120 seconds, and a little extra skew covers clocks and transit.
 const ACCESS_TOKEN_EXPIRY_SKEW: Duration = Duration::from_secs(5 * 60);
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct MetadataAccessToken {
     #[serde(rename = "access_token")]
     token: String,
     expires_in: Option<u64>,
+}
+
+/// Redact the bearer token. This struct is one `{:?}` away from writing a live
+/// GCP credential into the request logs, so `Debug` never carries the secret.
+impl std::fmt::Debug for MetadataAccessToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetadataAccessToken")
+            .field("token", &"<redacted>")
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
 }
 
 impl MetadataAccessToken {
@@ -5131,6 +5142,18 @@ mod tests {
 
         cache.invalidate_if("stale");
         assert_eq!(cache.get(now), None);
+    }
+
+    #[test]
+    fn metadata_access_token_debug_redacts_the_bearer_token() {
+        let token =
+            parse_metadata_access_token(r#"{"access_token":"ya29.super-secret","expires_in":600}"#)
+                .expect("metadata token should parse");
+
+        let rendered = format!("{:?}", token);
+        assert!(!rendered.contains("ya29.super-secret"), "{}", rendered);
+        assert!(rendered.contains("<redacted>"), "{}", rendered);
+        assert!(rendered.contains("600"), "{}", rendered);
     }
 
     #[test]
