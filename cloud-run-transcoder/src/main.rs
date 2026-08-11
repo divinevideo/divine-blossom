@@ -3498,8 +3498,15 @@ fn normalize_transcript_to_vtt(raw: &str) -> Result<ParsedVtt> {
                 text: label.to_string(),
                 language: parsed_language,
                 duration_ms: 0,
+                // Deliberately not the provider's speech confidence. Logprobs
+                // here score the classification tokens, and low speech
+                // confidence is the *expected* reading of audio with no
+                // speech. Forwarding it would let `transcript_drop_reason`
+                // drop a correct `[Music]` cue as LowProviderConfidence, and a
+                // drop is terminal (empty VTT, status=complete, edge-cached,
+                // no auto-retranscribe).
+                confidence: None,
                 cue_count: 1,
-                confidence,
             });
         }
     }
@@ -4727,6 +4734,23 @@ mod tests {
         assert_eq!(parsed.text, "[Music]");
         assert_eq!(parsed.cue_count, 1);
         assert!(parsed.content.contains("\n[Music]\n"));
+    }
+
+    #[test]
+    fn sound_cue_does_not_carry_speech_confidence() {
+        // A sound cue must not be droppable as LowProviderConfidence: low
+        // speech confidence is the expected reading of audio with no speech,
+        // and the drop is terminal.
+        let parsed = normalize_transcript_to_vtt(
+            r#"{"language":"und","sound_event":"music","segments":[],"logprob":-4.2}"#,
+        )
+        .expect("music classification should produce a VTT");
+
+        assert_eq!(parsed.text, "[Music]");
+        assert!(
+            parsed.confidence.is_none(),
+            "sound cue must not forward provider speech confidence"
+        );
     }
 
     #[test]
