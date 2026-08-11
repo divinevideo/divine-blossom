@@ -266,8 +266,9 @@ Hook `update_blob_status`. When the transition is *into* `Active`:
 Note the ordering: the descriptor must not point at bunny until replication is confirmed, or a
 freshly-approved video 404s for its first viewers — the worst possible moment for new content.
 
-`Pending` blobs are currently served publicly while moderation is in flight (`vcl/fetch.vcl`
-documents this). They must stay off the replica entirely, or every rejected upload becomes a purge
+`Pending` blobs are currently served publicly while moderation is in flight
+(`BlobMetadata::access_for` in `blossom-core/src/types.rs` maps `Pending` to `Allowed`). They must
+stay off the replica entirely, or every rejected upload becomes a purge
 obligation.
 
 ### Extend the deletion fan-out
