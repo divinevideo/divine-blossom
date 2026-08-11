@@ -47,6 +47,9 @@ use crate::storage::{
     trigger_cloud_run_delete_blob, upload_blob, write_audit_log,
 };
 use crate::viewer_auth::{ViewerAuthDiagnostics, ViewerAuthState};
+use blossom_core::cache_policy::{
+    immutable_blob_cache_headers, mutable_derivative_cache_headers,
+};
 use fastly_blossom::resumable_complete::parse_resumable_complete_request_body;
 
 use fastly::cache::simple as simple_cache;
@@ -760,7 +763,7 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
             if is_admin || meta.status.requires_private_cache() {
                 add_private_cache_headers(&mut resp, &hash);
             } else {
-                add_cache_headers(&mut resp, &hash);
+                add_derivative_cache_headers(&mut resp, &hash);
             }
             resp.set_header("X-Sha256", &hash);
             if let Some(c2pa) = c2pa_manifest_id {
@@ -878,7 +881,7 @@ fn handle_head_hls_master(path: &str) -> Result<Response> {
             }
             let mut resp = Response::from_status(StatusCode::OK);
             resp.set_header("Content-Type", "application/vnd.apple.mpegurl");
-            add_cache_headers(&mut resp, &hash);
+            add_derivative_cache_headers(&mut resp, &hash);
             resp.set_header("X-Sha256", &hash);
             add_cors_headers(&mut resp);
             Ok(resp)
@@ -1003,7 +1006,7 @@ fn handle_get_hls_content(req: Request, path: &str) -> Result<Response> {
             if is_restricted {
                 add_private_cache_headers(&mut resp, &hash);
             } else {
-                add_cache_headers(&mut resp, &hash);
+                add_derivative_cache_headers(&mut resp, &hash);
             }
             resp.set_header("X-Sha256", &hash);
             if let Some(c2pa) = c2pa_manifest_id {
@@ -1138,7 +1141,7 @@ fn handle_head_hls_content(path: &str) -> Result<Response> {
         Ok(_) => {
             let mut resp = Response::from_status(StatusCode::OK);
             resp.set_header("Content-Type", content_type);
-            add_cache_headers(&mut resp, &hash_lower);
+            add_derivative_cache_headers(&mut resp, &hash_lower);
             resp.set_header("X-Sha256", &hash_lower);
             add_cors_headers(&mut resp);
             Ok(resp)
@@ -1666,7 +1669,7 @@ fn serve_transcript_by_hash(
             if is_admin || metadata.status.requires_private_cache() {
                 add_private_cache_headers(&mut resp, &hash);
             } else {
-                add_cache_headers(&mut resp, &hash);
+                add_derivative_cache_headers(&mut resp, hash);
             }
             add_cors_headers(&mut resp);
             Ok(resp)
@@ -1798,7 +1801,7 @@ fn handle_head_transcript_by_hash(hash: &str) -> Result<Response> {
             }
             let mut resp = Response::from_status(StatusCode::OK);
             resp.set_header("Content-Type", "text/vtt; charset=utf-8");
-            add_cache_headers(&mut resp, hash);
+            add_derivative_cache_headers(&mut resp, hash);
             add_cors_headers(&mut resp);
             Ok(resp)
         }
@@ -2432,7 +2435,7 @@ fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
             if is_admin || meta.status.requires_private_cache() {
                 add_private_cache_headers(&mut resp, &hash);
             } else {
-                add_cache_headers(&mut resp, &hash);
+                add_derivative_cache_headers(&mut resp, &hash);
             }
             resp.set_header("Accept-Ranges", "bytes");
             add_cors_headers(&mut resp);
@@ -5924,9 +5927,29 @@ fn error_response(error: &BlossomError) -> Response {
 /// - Surrogate-Control: tells Fastly edge to cache for 1 year (stripped before client)
 /// - Surrogate-Key: enables targeted purging via `fastly purge --key {hash}`
 fn add_cache_headers(resp: &mut Response, hash: &str) {
-    resp.set_header("Cache-Control", "public, max-age=31536000, immutable");
-    resp.set_header("Surrogate-Control", "max-age=31536000");
-    resp.set_header("Surrogate-Key", hash);
+    let headers = immutable_blob_cache_headers(hash);
+    resp.set_header("Cache-Control", headers.cache_control);
+    resp.set_header("Surrogate-Control", headers.surrogate_control);
+    resp.set_header("Surrogate-Key", headers.surrogate_key);
+}
+
+/// Cache headers for *derived* content: renditions, HLS manifests and segments,
+/// and transcripts.
+///
+/// Unlike the blob, these are not immutable. The transcoder regenerates renditions
+/// via `/backfill-fmp4`, and `scan_and_repair_vtts.py` rewrites transcripts — both
+/// while the URL stays the same. Marking them `immutable` tells a browser never to
+/// revalidate, even on reload, and browser caches cannot be purged; a client that
+/// fetched a broken transcript would keep it for the full year.
+///
+/// The edge TTL stays long because `purge_edge_cache` can invalidate it instantly by
+/// Surrogate-Key. Only the browser TTL needs to be short enough that a repair reaches
+/// clients that already cached the old version.
+fn add_derivative_cache_headers(resp: &mut Response, hash: &str) {
+    let headers = mutable_derivative_cache_headers(hash);
+    resp.set_header("Cache-Control", headers.cache_control);
+    resp.set_header("Surrogate-Control", headers.surrogate_control);
+    resp.set_header("Surrogate-Key", headers.surrogate_key);
 }
 
 /// Like add_cache_headers but for authenticated or admin-only content that must
