@@ -61,7 +61,10 @@ Why B2 instead of letting bunny read GCS directly:
   and conditional headers and exposing `content-range` / `accept-ranges`; `Content-Type` carried
   from the source, because an `application/octet-stream` default makes `<track>` subtitles fail
   silently while video still plays; and cache-control set at upload so Fastly and bunny do not
-  disagree on TTL for the same object. The rollout plan has the specifics.
+  disagree on TTL for the same object. The rollout plan has the specifics, but its CORS rule was
+  written against B2's native download operations, and a B2 CORS rule applies only to the operations
+  it lists. Derive and record the S3-endpoint equivalent as part of the pilot rather than copying
+  that rule — signing can prove out while browser range and VTT requests still fail CORS.
 - B2 is always versioned. An S3 `DeleteObject` or `b2_hide_file` can leave older bytes retrievable;
   takedown must enumerate and permanently delete every file version
   ([B2 file versions](https://www.backblaze.com/docs/cloud-storage-file-versions)).
