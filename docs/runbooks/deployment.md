@@ -68,29 +68,30 @@ GCP_PROJECT_ID=rich-compiler-479518-d2 ./scripts/deploy-cloud-function.sh
 Only `cloud-run-transcoder/deploy.sh` currently uses `--update-env-vars` and
 `--update-secrets`, so unnamed keys are preserved for transcoder deploys. Keys it
 *does* name are overwritten with the script's defaults, which may not match what
-is running. Compare against the revision serving traffic, not the service's
-`spec.template`, and read names rather than values:
+is running.
+
+`gcloud run deploy` creates or updates the *service*, and `--update-env-vars`
+merges its pairs onto the service's `spec.template`. The template is therefore
+the baseline the next deploy merges onto, and it is what this check has to read.
+Read names rather than values:
 
 ```bash
-REVISION="$(gcloud run services describe divine-transcoder \
+gcloud run services describe divine-transcoder \
   --project rich-compiler-479518-d2 --region us-central1 --format=json \
   | python3 -c "
 import json,sys
-traffic=json.load(sys.stdin).get('status',{}).get('traffic',[])
-serving=[t for t in traffic if t.get('percent')]
-print(max(serving,key=lambda t:t['percent']).get('revisionName','') if serving else '')
-")"
-
-gcloud run revisions describe "$REVISION" \
-  --project rich-compiler-479518-d2 --region us-central1 --format=json \
-  | python3 -c "
-import json,sys
-c=json.load(sys.stdin)['spec']['containers'][0]
+c=json.load(sys.stdin)['spec']['template']['spec']['containers'][0]
 print('image:', c['image'])
 print('env:', sorted(e['name'] for e in c.get('env',[]) if 'value' in e))
 print('secrets:', sorted(e['name'] for e in c.get('env',[]) if 'valueFrom' in e))
 "
 ```
+
+The template is not necessarily what production is running: after a traffic
+rollback the two diverge. See [A traffic rollback pins the
+service](#a-traffic-rollback-pins-the-service) for that case, and read the
+serving revision when the question is what production is answering with rather
+than what the next deploy will merge onto.
 
 Do not assume that safety applies to the other deploy paths yet:
 
@@ -109,9 +110,13 @@ treatment; see issue #171.
 
 ## Exported shell variables override script defaults
 
-The deploy scripts resolve every setting as `VAR="${VAR:-production-default}"`,
-so an exported shell variable silently wins over the production default. On
-2026-08-07 a shell with `GCS_BUCKET=divine-blossom-media-staging` exported
+The three hand-run Cloud Run deploy scripts resolve most settings as
+`VAR="${VAR:-production-default}"`, so an exported shell variable silently wins
+over the production default. (`scripts/deploy-cloud-function.sh` is the exception
+noted above: it requires `GCP_PROJECT_ID`, and its bucket variable is
+`GCS_BUCKET_NAME`, not `GCS_BUCKET`.)
+
+On 2026-08-07 a shell with `GCS_BUCKET=divine-blossom-media-staging` exported
 pointed the production transcoder at the staging bucket, where its service
 account has no read access; every transcode failed with 403 for four and a
 half hours.
@@ -120,15 +125,28 @@ Do not export deploy-time variables (`GCS_BUCKET`, `PROJECT_ID`, and friends)
 from a shell profile. Set them inline on the one command that needs them.
 
 Nothing in this repository checks a deploy's resolved variables against what is
-running, so there is no automated backstop for this trap today. The manual
-comparison in the section above is the only thing between an exported variable
-and a production misconfiguration. Run it.
+running, so there is no automated backstop for this trap today. The
+configuration check above will not catch it either: that check deliberately
+reads names and not values, so a `GCS_BUCKET` aimed at the staging bucket looks
+identical to one aimed at production.
 
-Whoever adds such a guard: it has to compare *fully resolved* values, it has to
-compare them against the revision currently serving traffic, and it has to run
-after the script resolves its variables and before it builds anything. A check
-that parses the defaults out of the script text cannot catch this failure mode,
-because the whole failure is the default not applying.
+What does catch it is checking your own shell before you deploy. Test whether
+each deploy-time variable is exported at all, without printing any value:
+
+```bash
+for v in GCS_BUCKET PROJECT_ID GCP_PROJECT_ID REGION SERVICE_NAME IMAGE_TAG; do
+  printenv "$v" >/dev/null && echo "$v is exported — unset it, or pass it inline"
+done
+```
+
+Whoever adds an automated guard: it has to compare *fully resolved* values, and
+it has to run after the script resolves its variables and before it builds
+anything. A check that parses the defaults out of the script text cannot catch
+this failure mode, because the whole failure is the default not applying. Its
+comparison baseline is the revision currently serving traffic, not
+`spec.template` — the question such a guard asks is "am I about to change what
+production is running?", which is the serving revision's question, not the merge
+baseline's.
 
 ## Staged rollout when the edge and a backend change together
 
@@ -159,10 +177,14 @@ serving=[t for t in traffic if t.get('percent')]
 print(max(serving,key=lambda t:t['percent']).get('revisionName','') if serving else '')
 ")"
 
-printf 'serving revision: %s\n' "$REVISION"
-gcloud run revisions describe "$REVISION" \
-  --project rich-compiler-479518-d2 --region us-central1 \
-  --format='value(spec.containers[0].image)'
+if [ -z "$REVISION" ]; then
+  echo 'no revision is serving traffic'
+else
+  printf 'serving revision: %s\n' "$REVISION"
+  gcloud run revisions describe "$REVISION" \
+    --project rich-compiler-479518-d2 --region us-central1 \
+    --format='value(spec.containers[0].image)'
+fi
 ```
 
 ## A traffic rollback pins the service
@@ -188,6 +210,11 @@ gcloud run services describe divine-transcoder \
   --format='json(status.traffic)'
 ```
 
-The same pinning is why the pre-deploy environment check compares against the
-serving revision rather than the service's `spec.template`: after a rollback,
-the spec still describes the newest rolled-back revision.
+This pinning is also why the two checks above read different places. After a
+rollback, the service's `spec.template` describes the newest revision *created*,
+which is not the one serving traffic. The pre-deploy configuration check reads
+`spec.template`, because that is the baseline the next deploy merges onto. The
+deploy-landed check reads the serving revision, because that is what production
+is answering with. Do not substitute one for the other — during a pinned window
+they give different answers, and each is the wrong answer to the other's
+question.
