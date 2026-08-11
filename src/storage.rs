@@ -1,7 +1,10 @@
-// ABOUTME: Google Cloud Storage operations via S3-compatible API
-// ABOUTME: Implements AWS v4 signing with GCS HMAC authentication
+// ABOUTME: Object storage operations against S3-compatible origins (GCS and Fastly Object Storage)
+// ABOUTME: Implements AWS v4 signing plus read-through delivery from the FOS mirror
 
 use crate::error::{BlossomError, Result};
+use blossom_core::read_through::{
+    object_path, parse_bool_flag, write_back_decision, MAX_WRITE_BACK_BYTES, SOURCE_FOS, SOURCE_GCS,
+};
 use fastly::http::{Method, StatusCode};
 use fastly::{Body, Request, Response};
 use hmac::{Hmac, Mac};
@@ -10,6 +13,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Backend name (must match fastly.toml)
 const GCS_BACKEND: &str = "gcs_storage";
+
+/// Fastly Object Storage backend name (must exist on the service).
+const FOS_BACKEND: &str = "fos_storage";
 
 /// Cloud Run backend for uploads/migrations
 const CLOUD_RUN_BACKEND: &str = "cloud_run_upload";
@@ -31,6 +37,22 @@ const SERVICE: &str = "s3";
 
 /// GCS region for signing (use "auto" for path-style)
 const GCS_REGION: &str = "auto";
+
+/// GCS S3-compatible endpoint host
+const GCS_HOST: &str = "storage.googleapis.com";
+
+/// Fastly Object Storage endpoint host (override with config key `fos_host`)
+const FOS_HOST: &str = "us-east.object.fastlystorage.app";
+
+/// Fastly Object Storage region for signing (override with config key `fos_region`)
+const FOS_REGION: &str = "us-east";
+
+/// Fastly Object Storage delivery bucket (override with config key `fos_bucket`)
+const FOS_BUCKET: &str = "divine-media-delivery";
+
+/// Config keys for the two independent read-through feature flags.
+const FOS_READ_FLAG: &str = "fos_read_enabled";
+const FOS_WRITE_BACK_FLAG: &str = "fos_write_back_enabled";
 
 /// Multipart upload threshold (5MB)
 const MULTIPART_THRESHOLD: u64 = 5 * 1024 * 1024;
@@ -68,24 +90,45 @@ fn get_secret(key: &str) -> Result<String> {
         .map_err(|e| BlossomError::Internal(format!("Secret is not valid UTF-8: {}", e)))
 }
 
-/// GCS configuration
-struct GCSConfig {
+/// Credentials and addressing for one S3-compatible origin.
+///
+/// Both GCS (via its S3-compat endpoint) and Fastly Object Storage speak
+/// SigV4 path-style S3, so a single config type and a single signer serve
+/// both; only the host, region, bucket, and credentials differ.
+struct S3Config {
     access_key: String, // HMAC access key
     secret_key: String, // HMAC secret key
     bucket: String,
+    host: String,
+    region: String,
 }
 
-impl GCSConfig {
-    fn load() -> Result<Self> {
-        Ok(GCSConfig {
+impl S3Config {
+    fn load_gcs() -> Result<Self> {
+        Ok(S3Config {
             access_key: get_secret("gcs_access_key")?,
             secret_key: get_secret("gcs_secret_key")?,
             bucket: get_config("gcs_bucket")?,
+            host: GCS_HOST.to_string(),
+            region: GCS_REGION.to_string(),
+        })
+    }
+
+    /// Fastly Object Storage mirror. Host, region, and bucket may be
+    /// overridden from the config store; the defaults match the provisioned
+    /// delivery bucket.
+    fn load_fos() -> Result<Self> {
+        Ok(S3Config {
+            access_key: get_secret("fos_access_key")?,
+            secret_key: get_secret("fos_secret_key")?,
+            bucket: get_config("fos_bucket").unwrap_or_else(|_| FOS_BUCKET.to_string()),
+            host: get_config("fos_host").unwrap_or_else(|_| FOS_HOST.to_string()),
+            region: get_config("fos_region").unwrap_or_else(|_| FOS_REGION.to_string()),
         })
     }
 
     fn host(&self) -> String {
-        "storage.googleapis.com".to_string()
+        self.host.clone()
     }
 
     fn endpoint(&self) -> String {
@@ -93,7 +136,12 @@ impl GCSConfig {
     }
 
     fn region(&self) -> &str {
-        GCS_REGION
+        &self.region
+    }
+
+    /// Path-style object path, shared byte for byte across origins.
+    fn object_path(&self, key: &str) -> String {
+        object_path(&self.bucket, key)
     }
 }
 
@@ -106,7 +154,7 @@ pub fn upload_blob(
     size: u64,
     owner: &str,
 ) -> Result<()> {
-    let config = GCSConfig::load()?;
+    let config = S3Config::load_gcs()?;
 
     // For large files, use multipart upload
     if size > MULTIPART_THRESHOLD {
@@ -143,7 +191,7 @@ pub fn upload_blob(
 
 /// Download a thumbnail from GCS (stored as {hash}.jpg)
 pub fn download_thumbnail(gcs_key: &str) -> Result<Response> {
-    let config = GCSConfig::load()?;
+    let config = S3Config::load_gcs()?;
     let path = format!("/{}/{}", config.bucket, gcs_key);
     let url = format!("{}{}", config.endpoint(), path);
 
@@ -169,7 +217,7 @@ pub fn download_thumbnail(gcs_key: &str) -> Result<Response> {
 /// Download HLS content from GCS (manifests and segments)
 /// gcs_key format: {hash}/hls/{filename}
 pub fn download_hls_from_gcs(gcs_key: &str, range: Option<&str>) -> Result<Response> {
-    let config = GCSConfig::load()?;
+    let config = S3Config::load_gcs()?;
     let path = format!("/{}/{}", config.bucket, gcs_key);
     let url = format!("{}{}", config.endpoint(), path);
 
@@ -199,7 +247,7 @@ pub fn download_hls_from_gcs(gcs_key: &str, range: Option<&str>) -> Result<Respo
 /// Download transcript content from GCS (WebVTT files)
 /// gcs_key format: {hash}/vtt/{filename}
 pub fn download_transcript_from_gcs(gcs_key: &str) -> Result<Response> {
-    let config = GCSConfig::load()?;
+    let config = S3Config::load_gcs()?;
     let path = format!("/{}/{}", config.bucket, gcs_key);
     let url = format!("{}{}", config.endpoint(), path);
 
@@ -226,9 +274,8 @@ pub fn download_transcript_from_gcs(gcs_key: &str) -> Result<Response> {
 
 /// Download a blob from GCS (returns the response to stream back)
 pub fn download_blob(hash: &str, range: Option<&str>) -> Result<Response> {
-    let config = GCSConfig::load()?;
-    let path = format!("/{}/{}", config.bucket, hash);
-    let url = format!("{}{}", config.endpoint(), path);
+    let config = S3Config::load_gcs()?;
+    let url = format!("{}{}", config.endpoint(), config.object_path(hash));
 
     let mut req = Request::new(Method::GET, &url);
     req.set_header("Host", config.host());
@@ -273,7 +320,7 @@ pub fn download_blob_with_fallback(
         Ok(resp) => {
             return Ok(FallbackDownloadResult {
                 response: resp,
-                source: "gcs".to_string(),
+                source: SOURCE_GCS.to_string(),
             });
         }
         Err(BlossomError::NotFound(_)) => {
@@ -341,9 +388,238 @@ fn try_fallback_download(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Fastly Object Storage read-through mirror
+//
+// FOS is a delivery cache in front of the authoritative GCS bucket. It is not
+// allowed to break delivery, so every function below that touches FOS is
+// infallible at its boundary: `try_download_blob_from_fos` returns `Option`
+// and `try_write_back_to_fos` returns nothing. The fallible plumbing is
+// private and its errors can only be converted into "no mirror hit" or "no
+// write-back" — there is no path by which a FOS failure reaches the caller.
+// ---------------------------------------------------------------------------
+
+/// Read a feature flag from the config store. Absent or unparseable is off.
+fn config_flag(key: &str) -> bool {
+    parse_bool_flag(get_config(key).ok().as_deref())
+}
+
+/// Whether to look in the FOS mirror before falling back to GCS.
+pub fn fos_read_enabled() -> bool {
+    config_flag(FOS_READ_FLAG)
+}
+
+/// Whether to copy GCS-served objects into the FOS mirror.
+pub fn fos_write_back_enabled() -> bool {
+    config_flag(FOS_WRITE_BACK_FLAG)
+}
+
+/// Fallible FOS GET. Private: callers must go through `try_download_blob_from_fos`.
+fn download_blob_from_fos(hash: &str, range: Option<&str>) -> Result<Response> {
+    let config = S3Config::load_fos()?;
+    let url = format!("{}{}", config.endpoint(), config.object_path(hash));
+
+    let mut req = Request::new(Method::GET, &url);
+    req.set_header("Host", config.host());
+
+    if let Some(range_value) = range {
+        req.set_header("Range", range_value);
+    }
+
+    sign_request(&mut req, &config, Some("UNSIGNED-PAYLOAD".into()))?;
+
+    let resp = req
+        .send(FOS_BACKEND)
+        .map_err(|e| BlossomError::StorageError(format!("FOS request failed: {}", e)))?;
+
+    let status = resp.get_status();
+    match status {
+        StatusCode::OK | StatusCode::PARTIAL_CONTENT => Ok(resp),
+        _ => Err(BlossomError::NotFound(format!(
+            "FOS returned status: {}",
+            status
+        ))),
+    }
+}
+
+/// Try to serve a blob from the FOS mirror.
+///
+/// `None` means "not served from the mirror" for every possible reason:
+/// missing credentials or backend, transport failure, timeout, 404, or any
+/// other non-success status. The caller falls back to GCS.
+fn try_download_blob_from_fos(hash: &str, range: Option<&str>) -> Option<Response> {
+    match download_blob_from_fos(hash, range) {
+        Ok(resp) => Some(resp),
+        Err(e) => {
+            eprintln!("[FOS] miss hash={} reason={}", hash, e);
+            None
+        }
+    }
+}
+
+/// A body read that stopped either at EOF or at the memory ceiling.
+enum BufferedBody {
+    /// The whole body fit under the ceiling.
+    Complete(Vec<u8>),
+    /// The ceiling was hit or the stream errored; these are the bytes read so
+    /// far and the rest is still in `body`.
+    Partial(Vec<u8>),
+}
+
+/// Read at most `limit` bytes of `body` into memory.
+///
+/// This is the hard memory bound. The `Content-Length` check in
+/// `write_back_decision` is only an early filter; this loop is what guarantees
+/// we never buffer more than the ceiling even if an origin declares a length
+/// it does not honour.
+fn buffer_body_up_to(body: &mut Body, limit: usize) -> BufferedBody {
+    let mut buf: Vec<u8> = Vec::new();
+
+    for chunk in body.read_chunks(STREAMING_CHUNK_SIZE) {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(_) => return BufferedBody::Partial(buf),
+        };
+        if buf.len() + chunk.len() > limit {
+            buf.extend_from_slice(&chunk);
+            return BufferedBody::Partial(buf);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+
+    BufferedBody::Complete(buf)
+}
+
+/// Fallible FOS PUT. Private: callers must go through `try_write_back_to_fos`.
+fn upload_blob_to_fos(
+    hash: &str,
+    bytes: &[u8],
+    content_type: &str,
+    payload_hash: &str,
+) -> Result<()> {
+    let config = S3Config::load_fos()?;
+    let url = format!("{}{}", config.endpoint(), config.object_path(hash));
+
+    let mut req = Request::new(Method::PUT, &url);
+    req.set_header("Host", config.host());
+    req.set_header("Content-Type", content_type);
+    req.set_header("Content-Length", bytes.len().to_string());
+
+    // The object key is the SHA-256 of the content, so the digest computed by
+    // the caller is also the correct SigV4 payload hash.
+    sign_request(&mut req, &config, Some(payload_hash.to_string()))?;
+    req.set_body(Body::from(bytes.to_vec()));
+
+    let resp = req
+        .send(FOS_BACKEND)
+        .map_err(|e| BlossomError::StorageError(format!("FOS upload failed: {}", e)))?;
+
+    let status = resp.get_status();
+    if !status.is_success() {
+        return Err(BlossomError::StorageError(format!(
+            "FOS upload returned status: {}",
+            status
+        )));
+    }
+
+    Ok(())
+}
+
+/// Copy an object into the FOS mirror. Failures are logged and discarded.
+fn try_write_back_to_fos(hash: &str, bytes: &[u8], content_type: &str) {
+    // Never mirror bytes that do not match the content address they would be
+    // stored under.
+    let digest = hex::encode(Sha256::digest(bytes));
+    if digest != hash.to_ascii_lowercase() {
+        eprintln!(
+            "[FOS] write-back skipped hash={} reason=digest_mismatch actual={}",
+            hash, digest
+        );
+        return;
+    }
+
+    match upload_blob_to_fos(hash, bytes, content_type, &digest) {
+        Ok(()) => eprintln!("[FOS] write-back ok hash={} bytes={}", hash, bytes.len()),
+        Err(e) => eprintln!("[FOS] write-back failed hash={} reason={}", hash, e),
+    }
+}
+
+/// Download a blob, preferring the FOS mirror, and lazily populate the mirror.
+///
+/// Behaviour is identical to `download_blob_with_fallback` when both flags are
+/// off, and identical in every FOS failure mode.
+pub fn download_blob_read_through(
+    hash: &str,
+    range: Option<&str>,
+) -> Result<FallbackDownloadResult> {
+    if fos_read_enabled() {
+        if let Some(response) = try_download_blob_from_fos(hash, range) {
+            return Ok(FallbackDownloadResult {
+                response,
+                source: SOURCE_FOS.to_string(),
+            });
+        }
+    }
+
+    let result = download_blob_with_fallback(hash, range)?;
+    Ok(write_back_if_eligible(hash, range, result))
+}
+
+/// Mirror a GCS-served body into FOS when it is safe to buffer it.
+///
+/// The returned result always carries the same bytes, status, and headers as
+/// the input; only the body's provenance (streamed vs. replayed from memory)
+/// can differ.
+fn write_back_if_eligible(
+    hash: &str,
+    range: Option<&str>,
+    mut result: FallbackDownloadResult,
+) -> FallbackDownloadResult {
+    let decision = write_back_decision(
+        fos_write_back_enabled(),
+        &result.source,
+        result.response.get_status().as_u16(),
+        range.is_some(),
+        result.response.get_content_length().map(|len| len as u64),
+        MAX_WRITE_BACK_BYTES,
+    );
+
+    if !decision.is_eligible() {
+        return result;
+    }
+
+    let content_type = result
+        .response
+        .get_header_str("Content-Type")
+        .unwrap_or("application/octet-stream")
+        .to_string();
+
+    let mut body = result.response.take_body();
+    match buffer_body_up_to(&mut body, MAX_WRITE_BACK_BYTES as usize) {
+        BufferedBody::Complete(bytes) => {
+            try_write_back_to_fos(hash, &bytes, &content_type);
+            result.response.set_body(Body::from(bytes));
+        }
+        BufferedBody::Partial(bytes) => {
+            // Larger than declared, or the stream faulted. Stitch the buffered
+            // prefix back in front of the untouched remainder and skip the
+            // write-back.
+            eprintln!(
+                "[FOS] write-back skipped hash={} reason=exceeded_ceiling",
+                hash
+            );
+            let mut stitched = Body::from(bytes);
+            stitched.append(body);
+            result.response.set_body(stitched);
+        }
+    }
+
+    result
+}
+
 /// Check if a blob exists in GCS
 pub fn blob_exists(hash: &str) -> Result<bool> {
-    let config = GCSConfig::load()?;
+    let config = S3Config::load_gcs()?;
     let path = format!("/{}/{}", config.bucket, hash);
 
     let mut req = Request::new(Method::HEAD, format!("{}{}", config.endpoint(), path));
@@ -360,7 +636,7 @@ pub fn blob_exists(hash: &str) -> Result<bool> {
 
 /// Delete a blob from GCS
 pub fn delete_blob(hash: &str) -> Result<()> {
-    let config = GCSConfig::load()?;
+    let config = S3Config::load_gcs()?;
     let path = format!("/{}/{}", config.bucket, hash);
 
     let mut req = Request::new(Method::DELETE, format!("{}{}", config.endpoint(), path));
@@ -384,7 +660,7 @@ pub fn delete_blob(hash: &str) -> Result<()> {
 
 /// Initiate a multipart upload to GCS
 fn initiate_multipart_upload(key: &str, content_type: &str) -> Result<String> {
-    let config = GCSConfig::load()?;
+    let config = S3Config::load_gcs()?;
     // Note: query string must be "uploads=" not just "uploads" for correct AWS4 signing
     let path = format!("/{}/{}?uploads=", config.bucket, key);
 
@@ -425,7 +701,7 @@ fn initiate_multipart_upload_with_owner(
     content_type: &str,
     owner: &str,
 ) -> Result<String> {
-    let config = GCSConfig::load()?;
+    let config = S3Config::load_gcs()?;
     // Note: query string must be "uploads=" not just "uploads" for correct AWS4 signing
     let path = format!("/{}/{}?uploads=", config.bucket, key);
 
@@ -476,7 +752,7 @@ fn extract_upload_id(xml: &str) -> Option<String> {
 
 /// Upload a single part of a multipart upload
 fn upload_part(hash: &str, upload_id: &str, part_number: u32, body: &[u8]) -> Result<String> {
-    let config = GCSConfig::load()?;
+    let config = S3Config::load_gcs()?;
     let path = format!(
         "/{}/{}?partNumber={}&uploadId={}",
         config.bucket, hash, part_number, upload_id
@@ -520,7 +796,7 @@ fn complete_multipart_upload(
     upload_id: &str,
     parts: &[(u32, String)], // (part_number, etag)
 ) -> Result<()> {
-    let config = GCSConfig::load()?;
+    let config = S3Config::load_gcs()?;
     let path = format!("/{}/{}?uploadId={}", config.bucket, hash, upload_id);
 
     // Build XML body
@@ -618,7 +894,7 @@ const STREAMING_CHUNK_SIZE: usize = 256 * 1024;
 pub fn upload_blob_streaming(body: Body, content_type: &str, expected_size: u64) -> Result<String> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let config = GCSConfig::load()?;
+    let config = S3Config::load_gcs()?;
 
     // Generate temporary object name with random suffix to avoid collisions
     let timestamp = SystemTime::now()
@@ -638,7 +914,7 @@ fn upload_blob_streaming_simple(
     content_type: &str,
     expected_size: u64,
     temp_key: &str,
-    config: &GCSConfig,
+    config: &S3Config,
 ) -> Result<String> {
     // Step 1: Stream body directly to temp location (no buffering!)
     let path = format!("/{}/{}", config.bucket, temp_key);
@@ -685,7 +961,7 @@ fn upload_blob_streaming_simple(
 
 /// Download a blob from GCS and compute its SHA-256 hash in streaming fashion
 fn compute_hash_from_gcs(key: &str) -> Result<String> {
-    let config = GCSConfig::load()?;
+    let config = S3Config::load_gcs()?;
     let path = format!("/{}/{}", config.bucket, key);
 
     let mut req = Request::new(Method::GET, format!("{}{}", config.endpoint(), path));
@@ -728,7 +1004,7 @@ fn upload_blob_streaming_multipart(
     content_type: &str,
     expected_size: u64,
     temp_key: &str,
-    config: &GCSConfig,
+    config: &S3Config,
 ) -> Result<String> {
     // For large files, still use the streaming approach:
     // 1. Stream body directly to temp (Fastly handles the streaming)
@@ -783,7 +1059,7 @@ fn upload_blob_streaming_multipart(
 
 /// Copy a blob from source to destination within the same bucket
 fn copy_blob(source_key: &str, dest_key: &str) -> Result<()> {
-    let config = GCSConfig::load()?;
+    let config = S3Config::load_gcs()?;
     let path = format!("/{}/{}", config.bucket, dest_key);
 
     let mut req = Request::new(Method::PUT, format!("{}{}", config.endpoint(), path));
@@ -815,7 +1091,7 @@ fn copy_blob(source_key: &str, dest_key: &str) -> Result<()> {
 }
 
 /// Sign a copy request (includes x-amz-copy-source in signed headers)
-fn sign_copy_request(req: &mut Request, config: &GCSConfig, copy_source: &str) -> Result<()> {
+fn sign_copy_request(req: &mut Request, config: &S3Config, copy_source: &str) -> Result<()> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -894,7 +1170,7 @@ fn sign_copy_request(req: &mut Request, config: &GCSConfig, copy_source: &str) -
 
 /// Abort a multipart upload (cleanup on error)
 fn abort_multipart_upload(key: &str, upload_id: &str) -> Result<()> {
-    let config = GCSConfig::load()?;
+    let config = S3Config::load_gcs()?;
     let path = format!("/{}/{}?uploadId={}", config.bucket, key, upload_id);
 
     let mut req = Request::new(Method::DELETE, format!("{}{}", config.endpoint(), path));
@@ -974,7 +1250,7 @@ fn is_leap_year(year: i64) -> bool {
 }
 
 /// AWS v4 request signing (works with GCS HMAC)
-fn sign_request(req: &mut Request, config: &GCSConfig, payload_hash: Option<String>) -> Result<()> {
+fn sign_request(req: &mut Request, config: &S3Config, payload_hash: Option<String>) -> Result<()> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -1054,7 +1330,7 @@ fn sign_request(req: &mut Request, config: &GCSConfig, payload_hash: Option<Stri
 /// or GCS will reject the request with a signature mismatch
 fn sign_request_with_owner(
     req: &mut Request,
-    config: &GCSConfig,
+    config: &S3Config,
     payload_hash: Option<String>,
     owner: &str,
 ) -> Result<()> {
