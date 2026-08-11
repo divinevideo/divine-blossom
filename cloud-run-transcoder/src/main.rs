@@ -2462,7 +2462,26 @@ fn parse_provider_status(
 }
 
 fn is_retryable_provider_failure(failure: &ProviderFailure) -> bool {
-    failure.timed_out || matches!(failure.status_code, Some(429 | 500 | 502 | 503 | 504))
+    failure.timed_out
+        || matches!(failure.status_code, Some(429 | 500 | 502 | 503 | 504))
+        || is_expired_gcp_access_token_response(failure.status_code, &failure.body)
+}
+
+fn is_expired_gcp_access_token_response(status_code: Option<u16>, body: &str) -> bool {
+    status_code == Some(StatusCode::UNAUTHORIZED.as_u16()) && body.contains("ACCESS_TOKEN_EXPIRED")
+}
+
+pub(crate) fn invalidate_gcp_access_token_if_expired_response(
+    access_token: &str,
+    status_code: Option<u16>,
+    body: &str,
+) {
+    if is_expired_gcp_access_token_response(status_code, body) {
+        // The provider is authoritative about token validity. Clear only the
+        // token used by this request so the outer provider retry fetches a
+        // fresh credential without erasing another request's newer token.
+        access_token_cache().invalidate_if(access_token);
+    }
 }
 
 fn retry_delay_for_attempt(
@@ -2875,8 +2894,8 @@ fn transcription_response_format(model: &str) -> &'static str {
     }
 }
 
-/// Process-global cache for GCP access tokens. Tokens issued by the
-/// metadata server are valid for ~60 minutes; we cache for less so a
+/// Process-global cache for GCP access tokens. Metadata access tokens are cached
+/// according to the reported remaining lifetime, minus a safety window, so a
 /// callsite never hands a near-expired token to a long upstream call.
 struct AccessTokenCache {
     inner: std::sync::Mutex<Option<CachedAccessToken>>,
@@ -2912,6 +2931,21 @@ impl AccessTokenCache {
             });
         }
     }
+
+    /// Drop a rejected token without racing a concurrent refresh. A second
+    /// request may already have replaced the stale entry by the time its 401
+    /// arrives, so only clear the cache when it still contains that token.
+    fn invalidate_if(&self, token: &str) {
+        if let Ok(mut guard) = self.inner.lock() {
+            if guard
+                .as_ref()
+                .map(|cached| cached.token == token)
+                .unwrap_or(false)
+            {
+                *guard = None;
+            }
+        }
+    }
 }
 
 static ACCESS_TOKEN_CACHE: std::sync::OnceLock<AccessTokenCache> = std::sync::OnceLock::new();
@@ -2920,10 +2954,30 @@ fn access_token_cache() -> &'static AccessTokenCache {
     ACCESS_TOKEN_CACHE.get_or_init(AccessTokenCache::new)
 }
 
-/// Cache fresh tokens for slightly less than the metadata-server TTL so
-/// a request that uses the cached token cannot exceed the actual token
-/// expiry mid-flight.
+/// Upper bound for cached access and identity tokens. Access-token caching is
+/// also bounded by the metadata server's reported remaining lifetime below.
 const ACCESS_TOKEN_CACHE_TTL: Duration = Duration::from_secs(50 * 60);
+
+/// Do not hand a token to a provider near its actual expiry. Gemini calls can
+/// take up to 120 seconds, and a little extra skew covers clocks and transit.
+const ACCESS_TOKEN_EXPIRY_SKEW: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Debug, Deserialize)]
+struct MetadataAccessToken {
+    #[serde(rename = "access_token")]
+    token: String,
+    expires_in: Option<u64>,
+}
+
+impl MetadataAccessToken {
+    fn cache_ttl(&self) -> Duration {
+        self.expires_in
+            .map(Duration::from_secs)
+            .map(|ttl| ttl.saturating_sub(ACCESS_TOKEN_EXPIRY_SKEW))
+            .unwrap_or(ACCESS_TOKEN_CACHE_TTL)
+            .min(ACCESS_TOKEN_CACHE_TTL)
+    }
+}
 
 const METADATA_FETCH_MAX_ATTEMPTS: u32 = 3;
 
@@ -2941,8 +2995,8 @@ fn token_fetch_retry_delay(attempt: u32) -> Duration {
 /// Fetch a GCP access token from the metadata server (works on Cloud Run)
 /// or fall back to `gcloud auth print-access-token` locally.
 ///
-/// Tokens are cached process-wide for `ACCESS_TOKEN_CACHE_TTL`. On a cache
-/// miss, the metadata server is retried `METADATA_FETCH_MAX_ATTEMPTS`
+/// Tokens are cached process-wide for no longer than `ACCESS_TOKEN_CACHE_TTL`.
+/// On a cache miss, the metadata server is retried `METADATA_FETCH_MAX_ATTEMPTS`
 /// times before giving up — a transient hiccup used to fall straight
 /// through to a `gcloud` exec that doesn't exist in the container, which
 /// in turn triggered an expensive Vertex AI Gemini fallback.
@@ -2955,9 +3009,10 @@ async fn fetch_gcp_access_token() -> std::result::Result<String, ProviderFailure
 
     for attempt in 0..METADATA_FETCH_MAX_ATTEMPTS {
         match fetch_token_from_metadata_server().await {
-            Ok(token) => {
-                access_token_cache().set(token.clone(), ACCESS_TOKEN_CACHE_TTL, Instant::now());
-                return Ok(token);
+            Ok(metadata_token) => {
+                let cache_ttl = metadata_token.cache_ttl();
+                access_token_cache().set(metadata_token.token.clone(), cache_ttl, Instant::now());
+                return Ok(metadata_token.token);
             }
             Err(err) => {
                 last_metadata_error = Some(err);
@@ -2972,8 +3027,8 @@ async fn fetch_gcp_access_token() -> std::result::Result<String, ProviderFailure
     // surface a `timed_out=true` failure so the per-provider retry loop
     // in `transcribe_audio_via_provider` treats it as transient — a
     // metadata blip should not collapse straight into the Gemini fallback.
-    let metadata_summary = last_metadata_error
-        .unwrap_or_else(|| "metadata server unreachable".to_string());
+    let metadata_summary =
+        last_metadata_error.unwrap_or_else(|| "metadata server unreachable".to_string());
 
     match tokio::process::Command::new("gcloud")
         .args(["auth", "print-access-token"])
@@ -3004,9 +3059,9 @@ async fn fetch_gcp_access_token() -> std::result::Result<String, ProviderFailure
     }
 }
 
-/// One round-trip to the GCE/Cloud Run metadata server. Returns the raw
-/// access token on success, or a short human-readable error on failure.
-async fn fetch_token_from_metadata_server() -> std::result::Result<String, String> {
+/// One round-trip to the GCE/Cloud Run metadata server. Returns both the token
+/// and its remaining lifetime; the latter must drive the application cache.
+async fn fetch_token_from_metadata_server() -> std::result::Result<MetadataAccessToken, String> {
     let metadata_url =
         "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
     let client = reqwest::Client::new();
@@ -3027,12 +3082,16 @@ async fn fetch_token_from_metadata_server() -> std::result::Result<String, Strin
         .text()
         .await
         .map_err(|e| format!("failed to read metadata body: {}", e))?;
-    let json: serde_json::Value =
-        serde_json::from_str(&body).map_err(|e| format!("failed to parse metadata json: {}", e))?;
-    json["access_token"]
-        .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| "no access_token in metadata response".to_string())
+    parse_metadata_access_token(&body)
+}
+
+fn parse_metadata_access_token(body: &str) -> std::result::Result<MetadataAccessToken, String> {
+    let token: MetadataAccessToken =
+        serde_json::from_str(body).map_err(|e| format!("failed to parse metadata json: {}", e))?;
+    if token.token.trim().is_empty() {
+        return Err("no access_token in metadata response".to_string());
+    }
+    Ok(token)
 }
 
 /// Build the Gemini transcription prompt, optionally biased to a specific
@@ -3166,6 +3225,12 @@ async fn transcribe_via_gemini(
         )
     })?;
 
+    invalidate_gcp_access_token_if_expired_response(
+        &access_token,
+        Some(status.as_u16()),
+        &resp_body,
+    );
+
     if !status.is_success() {
         return Err(parse_provider_status(
             Some(status.as_u16()),
@@ -3229,9 +3294,7 @@ pub(crate) fn identity_token_cache_for_audience(audience: &str) -> &'static Acce
 /// Fetch a Cloud Run identity token (OIDC) for `audience`. Cached per
 /// audience for 50 minutes. On metadata-server failure we apply the same
 /// 3-attempt retry as `fetch_gcp_access_token`.
-async fn fetch_gcp_identity_token(
-    audience: &str,
-) -> std::result::Result<String, ProviderFailure> {
+async fn fetch_gcp_identity_token(audience: &str) -> std::result::Result<String, ProviderFailure> {
     let cache = identity_token_cache_for_audience(audience);
     if let Some(token) = cache.get(Instant::now()) {
         return Ok(token);
@@ -3917,18 +3980,18 @@ mod tests {
     use super::{
         attach_generation, build_cloud_tasks_task_body, build_transcode_status_webhook_payload,
         classify_audio_extract_error, constant_time_eq, contains_instruction_echo,
-        decide_transcript_lock_action, ensure_transcribe_audio_size,
-        enqueue_status_task_request, enqueue_status_task_request_with_retry,
+        decide_transcript_lock_action, enqueue_status_task_request,
+        enqueue_status_task_request_with_retry, ensure_transcribe_audio_size,
         identity_token_cache_for_audience, is_empty_transcript_normalize_error,
         is_implausible_text_density, is_loop_hallucination, is_retryable_provider_failure,
         next_status_generation, normalize_transcript_to_vtt, parakeet_request_url,
-        parse_audio_analysis_output, parse_provider_status, retry_delay_for_attempt,
-        should_drop_low_signal_transcript, status_event_generation, status_task_id,
-        token_fetch_retry_delay, transcript_drop_reason, transcription_response_format,
-        AccessTokenCache, AudioAnalysis, AudioExtractErrorKind, Config, ParsedVtt,
-        StatusTaskRequest, TranscriptConfidence, TranscriptDropReason, TranscriptLockAction,
-        TranscriptLockState, TranscriptLockStatus, VideoInfo, MAX_TRANSCRIBE_AUDIO_BYTES,
-        STATUS_EVENT_PROCESSING, STATUS_EVENT_TERMINAL,
+        parse_audio_analysis_output, parse_metadata_access_token, parse_provider_status,
+        retry_delay_for_attempt, should_drop_low_signal_transcript, status_event_generation,
+        status_task_id, token_fetch_retry_delay, transcript_drop_reason,
+        transcription_response_format, AccessTokenCache, AudioAnalysis, AudioExtractErrorKind,
+        Config, ParsedVtt, StatusTaskRequest, TranscriptConfidence, TranscriptDropReason,
+        TranscriptLockAction, TranscriptLockState, TranscriptLockStatus, VideoInfo,
+        MAX_TRANSCRIBE_AUDIO_BYTES, STATUS_EVENT_PROCESSING, STATUS_EVENT_TERMINAL,
     };
     use std::{
         io::{Read, Write},
@@ -4749,11 +4812,47 @@ mod tests {
     fn loop_guard_passes_long_unique_text() {
         let mut s = String::new();
         for word in [
-            "The", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "near",
-            "the", "river", "where", "the", "old", "mill", "stood", "for", "centuries",
-            "until", "the", "great", "flood", "carried", "it", "downstream", "into", "the",
-            "harbor", "where", "fishermen", "still", "remember", "its", "broken", "wheel",
-            "rotting", "in", "the", "salt", "spray",
+            "The",
+            "quick",
+            "brown",
+            "fox",
+            "jumps",
+            "over",
+            "the",
+            "lazy",
+            "dog",
+            "near",
+            "the",
+            "river",
+            "where",
+            "the",
+            "old",
+            "mill",
+            "stood",
+            "for",
+            "centuries",
+            "until",
+            "the",
+            "great",
+            "flood",
+            "carried",
+            "it",
+            "downstream",
+            "into",
+            "the",
+            "harbor",
+            "where",
+            "fishermen",
+            "still",
+            "remember",
+            "its",
+            "broken",
+            "wheel",
+            "rotting",
+            "in",
+            "the",
+            "salt",
+            "spray",
         ]
         .iter()
         .cycle()
@@ -5020,6 +5119,66 @@ mod tests {
             cache.get(now + Duration::from_secs(20)),
             Some("second".to_string())
         );
+    }
+
+    #[test]
+    fn access_token_cache_only_invalidates_the_token_that_failed() {
+        let cache = AccessTokenCache::new();
+        let now = Instant::now();
+        cache.set("stale".to_string(), Duration::from_secs(60), now);
+        cache.invalidate_if("different");
+        assert_eq!(cache.get(now), Some("stale".to_string()));
+
+        cache.invalidate_if("stale");
+        assert_eq!(cache.get(now), None);
+    }
+
+    #[test]
+    fn metadata_access_token_uses_reported_remaining_lifetime() {
+        let token = parse_metadata_access_token(
+            r#"{"access_token":"token-abc","expires_in":600,"token_type":"Bearer"}"#,
+        )
+        .expect("metadata token should parse");
+
+        assert_eq!(token.token, "token-abc");
+        assert_eq!(token.cache_ttl(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn metadata_access_token_cache_ttl_is_capped() {
+        let token = parse_metadata_access_token(
+            r#"{"access_token":"token-abc","expires_in":3600,"token_type":"Bearer"}"#,
+        )
+        .expect("metadata token should parse");
+
+        assert_eq!(token.cache_ttl(), Duration::from_secs(50 * 60));
+    }
+
+    #[test]
+    fn metadata_access_token_without_lifetime_uses_cache_cap() {
+        let token = parse_metadata_access_token(r#"{"access_token":"token-abc"}"#)
+            .expect("metadata token should parse");
+
+        assert_eq!(token.cache_ttl(), Duration::from_secs(50 * 60));
+    }
+
+    #[test]
+    fn expired_gcp_access_token_is_retryable() {
+        let failure = parse_provider_status(
+            Some(401),
+            None,
+            r#"{"error":{"status":"UNAUTHENTICATED","details":[{"reason":"ACCESS_TOKEN_EXPIRED"}]}}"#,
+            false,
+        );
+
+        assert!(is_retryable_provider_failure(&failure));
+    }
+
+    #[test]
+    fn unrelated_unauthorized_response_is_not_retryable() {
+        let failure = parse_provider_status(Some(401), None, "invalid API key", false);
+
+        assert!(!is_retryable_provider_failure(&failure));
     }
 
     #[test]
