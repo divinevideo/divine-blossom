@@ -89,11 +89,14 @@ Do not mix strategies within one experiment; the results stop being interpretabl
 ### Rollback
 
 `bunny_traffic_pct` lives in a Fastly Config Store, so changing it takes effect without a deploy.
-`0` is a full rollback. This is the primary safety mechanism and must be tested before the first
-non-zero rollout.
+`0` stops new descriptors being issued with the second host, and must be tested before the first
+non-zero rollout. It is roll-forward control, not a retroactive rollback: a client already holding a
+second-provider URL keeps using it until it refreshes the descriptor, so rollback verification has to
+cover that window too.
 
-Secondary lever: DNS weighting on the delivery hostname. Coarse and TTL-bound, but independent of
-Compute, so it still works if Compute is the thing that is broken.
+The retroactive lever is DNS on the delivery hostname — it moves already-published URLs back to
+Fastly. Coarse and TTL-bound, but independent of Compute, so it still works if Compute is the thing
+that is broken.
 
 ### Eligibility — the replica is the access control
 
