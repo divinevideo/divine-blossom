@@ -3826,6 +3826,7 @@ const EXACT_PROMPT_MARKERS_CURRENT: &[&str] = &[
 ///
 /// Keep byte-identical with `INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_RETIRED` in
 /// `scan_and_repair_vtts.py` (CI asserts parity).
+#[cfg(test)]
 const EXACT_PROMPT_MARKERS_RETIRED: &[&str] = &[
     "why this matters: this transcript is consumed by an automated caption pipeline",
     "caption pipeline that can only parse the exact json shape below",
