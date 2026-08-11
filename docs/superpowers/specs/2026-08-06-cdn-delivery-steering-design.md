@@ -247,8 +247,8 @@ cost.
 
 ## Open questions
 
-- Does bunny's pull-zone origin authentication work against R2 and B2 signed access, or does it
-  require public bucket reads?
+- Does bunny's AWS-signing mode work against the private B2 S3 endpoint, or does it require public
+  bucket reads? R2 remains untested fallback.
 - What is bunny's purge API latency and rate limit, and is it sufficient for a takedown SLA?
 - Does splitting traffic across two CDNs degrade either one's cache hit ratio enough to matter at
   low percentages? (Hash bucketing should prevent this; verify rather than assume.)
