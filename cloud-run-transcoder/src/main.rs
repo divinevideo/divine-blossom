@@ -3989,9 +3989,9 @@ async fn finalize_transcript(
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_generation, build_cloud_tasks_task_body, build_transcode_status_webhook_payload,
-        classify_audio_extract_error, constant_time_eq, contains_instruction_echo,
-        decide_transcript_lock_action, enqueue_status_task_request,
+        access_token_cache, attach_generation, build_cloud_tasks_task_body,
+        build_transcode_status_webhook_payload, classify_audio_extract_error, constant_time_eq,
+        contains_instruction_echo, decide_transcript_lock_action, enqueue_status_task_request,
         enqueue_status_task_request_with_retry, ensure_transcribe_audio_size,
         identity_token_cache_for_audience, is_empty_transcript_normalize_error,
         is_implausible_text_density, is_loop_hallucination, is_retryable_provider_failure,
@@ -4018,12 +4018,23 @@ mod tests {
     fn spawn_status_server(
         statuses: Vec<u16>,
     ) -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+        spawn_status_server_with_bodies(
+            statuses
+                .into_iter()
+                .map(|status| (status, "OK".to_string()))
+                .collect(),
+        )
+    }
+
+    fn spawn_status_server_with_bodies(
+        responses: Vec<(u16, String)>,
+    ) -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
         let url = format!("http://{}", listener.local_addr().expect("local addr"));
         let request_count = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&request_count);
         let handle = thread::spawn(move || {
-            for status in statuses {
+            for (status, body) in responses {
                 let (mut stream, _) = listener.accept().expect("accept test request");
                 count.fetch_add(1, Ordering::SeqCst);
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
@@ -4031,14 +4042,18 @@ mod tests {
                 let _ = stream.read(&mut buf);
                 let reason = match status {
                     200 => "OK",
+                    401 => "Unauthorized",
                     409 => "Conflict",
                     500 => "Internal Server Error",
                     502 => "Bad Gateway",
                     _ => "Status",
                 };
                 let response = format!(
-                    "HTTP/1.1 {} {}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
-                    status, reason
+                    "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    reason,
+                    body.len(),
+                    body
                 );
                 stream
                     .write_all(response.as_bytes())
@@ -5154,6 +5169,46 @@ mod tests {
         assert!(!rendered.contains("ya29.super-secret"), "{}", rendered);
         assert!(rendered.contains("<redacted>"), "{}", rendered);
         assert!(rendered.contains("600"), "{}", rendered);
+    }
+
+    #[tokio::test]
+    async fn enqueue_status_task_drops_a_token_google_rejected_as_expired() {
+        let expired_body = r#"{"error":{"code":401,"status":"UNAUTHENTICATED","details":[{"reason":"ACCESS_TOKEN_EXPIRED"}]}}"#;
+        let (create_url, _count, server) =
+            spawn_status_server_with_bodies(vec![(401, expired_body.to_string())]);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let payload = serde_json::json!({"sha256": "abc123", "status": "complete"});
+        let hash = "b".repeat(64);
+
+        // A token value unique to this test, so the assertion cannot be
+        // disturbed by another test sharing the process-global cache.
+        let token = "expired-token-for-enqueue-test";
+        access_token_cache().set(token.to_string(), Duration::from_secs(600), Instant::now());
+
+        let request = StatusTaskRequest {
+            create_url: &create_url,
+            queue_path: "projects/proj/locations/us-central1/queues/derivative-status",
+            target_url: "https://edge.example/admin/transcode-status",
+            label: "transcode",
+            hash: &hash,
+            generation: 7,
+            payload: &payload,
+            token,
+            webhook_secret: None,
+        };
+
+        let result = enqueue_status_task_request(&client, &request).await;
+
+        assert!(result.is_err());
+        server.join().expect("server thread should finish");
+        assert_ne!(
+            access_token_cache().get(Instant::now()),
+            Some(token.to_string()),
+            "a token Google rejected as expired must not stay in the shared cache",
+        );
     }
 
     #[test]
@@ -6324,6 +6379,11 @@ async fn enqueue_status_task_request(
     } else {
         let code = resp.status();
         let text = resp.text().await.unwrap_or_default();
+        // Cloud Tasks reads the same process-global access-token cache as the
+        // transcription providers. Without this, a token Google has already
+        // rejected stays cached for the rest of its TTL and every status
+        // webhook enqueued in that window fails the same way.
+        invalidate_gcp_access_token_if_expired_response(request.token, Some(code.as_u16()), &text);
         Err(anyhow!("create task returned {}: {}", code, text))
     }
 }
