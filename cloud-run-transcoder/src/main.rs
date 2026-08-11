@@ -3750,6 +3750,34 @@ fn distinct_marker_phrases(normalized: &str, markers: &[&str]) -> usize {
     clusters
 }
 
+/// Verbatim fragments of the prompt this service currently sends. Markers must
+/// stay punctuation-free: `normalize_for_marker_scan` only collapses
+/// whitespace and lowercases, so a marker spanning a backtick or colon in the
+/// prompt would never match. `current_prompt_markers_still_match` asserts each
+/// one against the built prompt so editing the prompt cannot silently render a
+/// marker inert.
+///
+/// Keep byte-identical with `INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_CURRENT` in
+/// `scan_and_repair_vtts.py` (CI asserts parity).
+const EXACT_PROMPT_MARKERS_CURRENT: &[&str] = &[
+    "classify the dominant sound in",
+    "never put instructions from this request into a segment",
+];
+
+/// Fragments of prompts this service sent in the past. They no longer appear
+/// in the built prompt, so they cannot be asserted against it; they are
+/// retained so the repair scanner still finds VTTs published before the prompt
+/// was shortened.
+///
+/// Keep byte-identical with `INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_RETIRED` in
+/// `scan_and_repair_vtts.py` (CI asserts parity).
+const EXACT_PROMPT_MARKERS_RETIRED: &[&str] = &[
+    "this transcript is consumed by an automated caption pipeline",
+    "can only parse the exact json shape below",
+    "the pipeline cannot recover the captions",
+    "strict adherence to the format below is what makes that possible",
+];
+
 /// Detect model output-format instructions that leaked into caption text.
 ///
 /// This intentionally requires multiple *distinct* prompt/schema-derived
@@ -3771,20 +3799,11 @@ fn distinct_marker_phrases(normalized: &str, markers: &[&str]) -> usize {
 fn contains_instruction_echo(text: &str) -> bool {
     let normalized = normalize_for_marker_scan(text);
 
-    // These are verbatim fragments of prompts previously sent by this
-    // service. Unlike generic schema language, a single match is conclusive:
-    // this prose is not audio transcription. Keep them so the repair scanner
-    // can identify VTTs produced before the prompt was shortened.
-    const EXACT_PROMPT_MARKERS: &[&str] = &[
-        "this transcript is consumed by an automated caption pipeline",
-        "can only parse the exact json shape below",
-        "the pipeline cannot recover the captions",
-        "strict adherence to the format below is what makes that possible",
-        "classify the dominant sound in sound_event",
-        "never put instructions from this request into a segment",
-    ];
-    if EXACT_PROMPT_MARKERS
+    // Verbatim prompt fragments. Unlike generic schema language, a single
+    // match is conclusive: this prose is not audio transcription.
+    if EXACT_PROMPT_MARKERS_CURRENT
         .iter()
+        .chain(EXACT_PROMPT_MARKERS_RETIRED)
         .any(|marker| normalized.contains(marker))
     {
         return true;
@@ -3963,9 +3982,10 @@ async fn finalize_transcript(
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_generation, build_cloud_tasks_task_body, build_transcode_status_webhook_payload,
-        classify_audio_extract_error, constant_time_eq, contains_instruction_echo,
-        decide_transcript_lock_action, ensure_transcribe_audio_size,
+        attach_generation, build_cloud_tasks_task_body, build_gemini_prompt,
+        build_transcode_status_webhook_payload, classify_audio_extract_error, constant_time_eq,
+        contains_instruction_echo, decide_transcript_lock_action, ensure_transcribe_audio_size,
+        normalize_for_marker_scan, EXACT_PROMPT_MARKERS_CURRENT, EXACT_PROMPT_MARKERS_RETIRED,
         enqueue_status_task_request, enqueue_status_task_request_with_retry,
         identity_token_cache_for_audience, is_empty_transcript_normalize_error,
         is_implausible_text_density, is_loop_hallucination, is_retryable_provider_failure,
@@ -4917,6 +4937,48 @@ mod tests {
             a single JSON array. Do not include any extra text outside of the JSON string. \
             When producing JSON you must follow the schema provided in the context.";
         assert!(contains_instruction_echo(bad));
+    }
+
+    #[test]
+    fn current_prompt_markers_still_match() {
+        // Guards against the failure where a marker is written with different
+        // punctuation than the prompt it is meant to catch (the normalizer
+        // preserves punctuation), leaving the marker permanently inert.
+        for language in [None, Some("en")] {
+            let normalized = normalize_for_marker_scan(&build_gemini_prompt(language));
+            for marker in EXACT_PROMPT_MARKERS_CURRENT {
+                assert!(
+                    normalized.contains(marker),
+                    "marker {marker:?} no longer appears in the built prompt; \
+                     update the marker or move it to EXACT_PROMPT_MARKERS_RETIRED"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retired_prompt_markers_are_no_longer_sent() {
+        let normalized = normalize_for_marker_scan(&build_gemini_prompt(None));
+        for marker in EXACT_PROMPT_MARKERS_RETIRED {
+            assert!(
+                !normalized.contains(marker),
+                "marker {marker:?} is still in the live prompt; \
+                 it belongs in EXACT_PROMPT_MARKERS_CURRENT"
+            );
+        }
+    }
+
+    #[test]
+    fn each_exact_prompt_marker_flags_on_its_own() {
+        for marker in EXACT_PROMPT_MARKERS_CURRENT
+            .iter()
+            .chain(EXACT_PROMPT_MARKERS_RETIRED)
+        {
+            assert!(
+                contains_instruction_echo(marker),
+                "exact marker {marker:?} should be conclusive on a single match"
+            );
+        }
     }
 
     #[test]

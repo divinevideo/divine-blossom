@@ -135,29 +135,83 @@ class ScanAndRepairVttsTests(unittest.TestCase):
         )
 
 
+def _rust_marker_list(declaration: str) -> tuple:
+    """Extract a `const NAME: &[&str] = &[...]` string list from main.rs."""
+    rust_path = SCRIPT_PATH.parent / "src" / "main.rs"
+    source = rust_path.read_text(encoding="utf-8")
+    start = source.index(declaration) + len(declaration)
+    end = source.index("];", start)
+    return tuple(
+        line.strip().strip(",").strip('"')
+        for line in source[start:end].splitlines()
+        if line.strip()
+    )
+
+
 class MarkerParityTests(unittest.TestCase):
     """The Rust gate and the Python scanner must use the same marker list."""
 
     def test_rust_and_python_strong_markers_match(self):
         module = load_script_module(self)
         python_markers = tuple(module.INSTRUCTION_ECHO_STRONG_MARKERS)
-
-        rust_path = SCRIPT_PATH.parent / "src" / "main.rs"
-        source = rust_path.read_text(encoding="utf-8")
-        marker = "const STRONG_MARKERS: &[&str] = &["
-        start = source.index(marker) + len(marker)
-        end = source.index("];", start)
-        rust_markers = tuple(
-            line.strip().strip(",").strip('"')
-            for line in source[start:end].splitlines()
-            if line.strip()
-        )
+        rust_markers = _rust_marker_list("const STRONG_MARKERS: &[&str] = &[")
 
         self.assertEqual(
             rust_markers,
             python_markers,
             "STRONG_MARKERS drifted between main.rs and scan_and_repair_vtts.py",
         )
+
+    def test_rust_and_python_current_prompt_markers_match(self):
+        module = load_script_module(self)
+
+        self.assertEqual(
+            _rust_marker_list("const EXACT_PROMPT_MARKERS_CURRENT: &[&str] = &["),
+            tuple(module.INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_CURRENT),
+            "EXACT_PROMPT_MARKERS_CURRENT drifted between main.rs and "
+            "scan_and_repair_vtts.py",
+        )
+
+    def test_rust_and_python_retired_prompt_markers_match(self):
+        module = load_script_module(self)
+
+        self.assertEqual(
+            _rust_marker_list("const EXACT_PROMPT_MARKERS_RETIRED: &[&str] = &["),
+            tuple(module.INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_RETIRED),
+            "EXACT_PROMPT_MARKERS_RETIRED drifted between main.rs and "
+            "scan_and_repair_vtts.py",
+        )
+
+    def test_current_prompt_markers_match_the_live_rust_prompt(self):
+        """Mirror of the Rust `current_prompt_markers_still_match` guard.
+
+        A marker whose punctuation differs from the prompt would be inert; the
+        scanner normalizer does not strip punctuation either.
+        """
+        module = load_script_module(self)
+        rust_path = SCRIPT_PATH.parent / "src" / "main.rs"
+        source = rust_path.read_text(encoding="utf-8")
+        start = source.index("fn build_gemini_prompt(")
+        prompt_source = source[start : source.index("\n}\n", start)]
+        normalized = module.normalize_for_marker_scan(
+            prompt_source.replace("\\\n", "").replace("\\", "")
+        )
+
+        for marker in module.INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_CURRENT:
+            self.assertIn(
+                marker,
+                normalized,
+                f"marker {marker!r} no longer appears in build_gemini_prompt",
+            )
+
+    def test_each_exact_prompt_marker_flags_on_its_own(self):
+        module = load_script_module(self)
+
+        for marker in module.INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS:
+            self.assertTrue(
+                module.has_instruction_echo(marker),
+                f"exact marker {marker!r} should be conclusive on a single match",
+            )
 
 
 if __name__ == "__main__":

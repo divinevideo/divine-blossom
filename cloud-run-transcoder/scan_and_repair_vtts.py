@@ -68,16 +68,31 @@ INSTRUCTION_ECHO_STRONG_MARKERS = (
     "text field of every segment",
 )
 
-# Verbatim fragments of prompts previously sent by the transcoder. One match is
-# conclusive and intentionally catches already-published VTTs after the prompt
-# itself has been shortened.
-INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS = (
+# Verbatim fragments of the prompt the transcoder currently sends. One match is
+# conclusive. Markers must stay punctuation-free: normalize_for_marker_scan only
+# collapses whitespace and lowercases, so a marker spanning a backtick or colon
+# in the prompt would never match.
+# Keep byte-identical with the Rust EXACT_PROMPT_MARKERS_CURRENT (CI asserts
+# parity).
+INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_CURRENT = (
+    "classify the dominant sound in",
+    "never put instructions from this request into a segment",
+)
+
+# Fragments of prompts the transcoder sent in the past. Retained so the scanner
+# still finds already-published VTTs after the prompt itself was shortened.
+# Keep byte-identical with the Rust EXACT_PROMPT_MARKERS_RETIRED (CI asserts
+# parity).
+INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_RETIRED = (
     "this transcript is consumed by an automated caption pipeline",
     "can only parse the exact json shape below",
     "the pipeline cannot recover the captions",
     "strict adherence to the format below is what makes that possible",
-    "classify the dominant sound in sound_event",
-    "never put instructions from this request into a segment",
+)
+
+INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS = (
+    INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_CURRENT
+    + INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_RETIRED
 )
 
 # Mirrors cloud-run-transcoder/src/main.rs `is_loop_hallucination` and
