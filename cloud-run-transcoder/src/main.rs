@@ -5302,6 +5302,12 @@ mod tests {
     }
 
     #[tokio::test]
+    // The guard is deliberately held across the await: it serializes this test
+    // against the other tests that seed the process-global token cache, and the
+    // seed has to be in place before the request runs. It cannot deadlock —
+    // each `#[tokio::test]` gets its own current-thread runtime on its own
+    // thread, so a second test blocking on `.lock()` cannot stall the holder.
+    #[allow(clippy::await_holding_lock)]
     async fn enqueue_status_task_drops_a_token_google_rejected_as_expired() {
         let _guard = lock_global_token_cache();
         let expired_body = r#"{"error":{"code":401,"status":"UNAUTHENTICATED","details":[{"reason":"ACCESS_TOKEN_EXPIRED"}]}}"#;
