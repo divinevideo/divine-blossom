@@ -204,6 +204,25 @@ class MarkerParityTests(unittest.TestCase):
                 f"marker {marker!r} no longer appears in build_gemini_prompt",
             )
 
+    def test_exact_markers_do_not_flag_audio_engineering_speech(self):
+        """No exact marker may be a phrase a real speaker could plausibly utter.
+
+        The scanner repairs on a single match, so a generic marker would wipe
+        legitimate captions.
+        """
+        module = load_script_module(self)
+
+        for speech in (
+            "The model has to classify the dominant sound in each clip "
+            "before we run the tagger.",
+            "Our job is to classify the dominant sound in a recording, then label it.",
+            "Please classify the dominant sound in every scene before editing.",
+        ):
+            self.assertFalse(
+                module.has_instruction_echo(speech),
+                f"legitimate speech must not be flagged: {speech!r}",
+            )
+
     def test_each_exact_prompt_marker_flags_on_its_own(self):
         module = load_script_module(self)
 

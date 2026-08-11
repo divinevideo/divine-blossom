@@ -69,13 +69,16 @@ INSTRUCTION_ECHO_STRONG_MARKERS = (
 )
 
 # Verbatim fragments of the prompt the transcoder currently sends. One match is
-# conclusive. Markers must stay punctuation-free: normalize_for_marker_scan only
-# collapses whitespace and lowercases, so a marker spanning a backtick or colon
-# in the prompt would never match.
+# conclusive, so each marker must (1) appear byte-identically in the live prompt
+# — normalize_for_marker_scan preserves punctuation, so keep the prompt's
+# backticks rather than dropping them — and (2) be long enough to self-identify
+# as this pipeline's prompt. Truncating a marker to dodge punctuation would turn
+# it into ordinary speech ("classify the dominant sound in") and permanently
+# destroy the captions of any clip that says it.
 # Keep byte-identical with the Rust EXACT_PROMPT_MARKERS_CURRENT (CI asserts
 # parity).
 INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_CURRENT = (
-    "classify the dominant sound in",
+    "classify the dominant sound in `sound_event`",
     "never put instructions from this request into a segment",
 )
 

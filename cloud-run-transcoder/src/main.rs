@@ -3757,17 +3757,28 @@ fn distinct_marker_phrases(normalized: &str, markers: &[&str]) -> usize {
     clusters
 }
 
-/// Verbatim fragments of the prompt this service currently sends. Markers must
-/// stay punctuation-free: `normalize_for_marker_scan` only collapses
-/// whitespace and lowercases, so a marker spanning a backtick or colon in the
-/// prompt would never match. `current_prompt_markers_still_match` asserts each
-/// one against the built prompt so editing the prompt cannot silently render a
-/// marker inert.
+/// Verbatim fragments of the prompt this service currently sends.
+///
+/// Two invariants, both load-bearing because one match here is conclusive and a
+/// drop is terminal (empty VTT → status=complete → edge-cached, no
+/// auto-retranscribe → permanent caption loss):
+///
+/// 1. Each marker must appear **byte-identically** in the built prompt.
+///    `normalize_for_marker_scan` collapses whitespace and lowercases but
+///    preserves punctuation, so a marker must keep the prompt's punctuation
+///    (including backticks) rather than drop it.
+///    `current_prompt_markers_still_match` asserts this, so editing the prompt
+///    cannot silently render a marker inert.
+/// 2. Each marker must be long enough to self-identify as this pipeline's
+///    prompt. Truncating a marker to dodge punctuation is not an option: a
+///    short generic fragment such as "classify the dominant sound in" is
+///    ordinary audio-engineering speech and would permanently destroy the
+///    captions of any clip that says it.
 ///
 /// Keep byte-identical with `INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_CURRENT` in
 /// `scan_and_repair_vtts.py` (CI asserts parity).
 const EXACT_PROMPT_MARKERS_CURRENT: &[&str] = &[
-    "classify the dominant sound in",
+    "classify the dominant sound in `sound_event`",
     "never put instructions from this request into a segment",
 ];
 
@@ -4988,6 +4999,23 @@ mod tests {
                 !normalized.contains(marker),
                 "marker {marker:?} is still in the live prompt; \
                  it belongs in EXACT_PROMPT_MARKERS_CURRENT"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_markers_do_not_flag_audio_engineering_speech() {
+        // An exact marker is single-match-conclusive and a drop is terminal, so
+        // no marker may be a phrase a real speaker could plausibly utter.
+        for speech in [
+            "The model has to classify the dominant sound in each clip before we run the tagger.",
+            "Our job is to classify the dominant sound in a recording, then label it.",
+            "Please classify the dominant sound in every scene before editing.",
+            "You should classify the dominant sound in the mix first.",
+        ] {
+            assert!(
+                !contains_instruction_echo(speech),
+                "legitimate speech must not be dropped as an instruction echo: {speech:?}"
             );
         }
     }
