@@ -11,7 +11,9 @@
 ## Goal
 
 Be able to serve a controllable fraction of media bytes from a second CDN (bunny.net) instead of
-Fastly, compare the two on real traffic, and roll back instantly — without any client change.
+Fastly, compare the two on real traffic, and roll back without a deploy or any client change. See
+Rollback below for what "roll back" reaches: a config flip stops new descriptors, and DNS on the
+delivery hostname is what moves already-published URLs.
 
 ## Scope
 
@@ -95,8 +97,9 @@ second-provider URL keeps using it until it refreshes the descriptor, so rollbac
 cover that window too.
 
 The retroactive lever is DNS on the delivery hostname — it moves already-published URLs back to
-Fastly. Coarse and TTL-bound, but independent of Compute, so it still works if Compute is the thing
-that is broken.
+Fastly. This works only while descriptors emit a Divine-owned hostname rather than a vendor one.
+Coarse and TTL-bound, but independent of Compute, so it still works if Compute is the thing that is
+broken.
 
 ### Eligibility — the replica is the access control
 

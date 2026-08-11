@@ -132,10 +132,18 @@ Server-side only, per the steering design: a `select_delivery_host()` call at th
 Ineligible content never gets the second host. The percentage lives in the config store. Setting it
 to 0 stops issuing new bunny URLs without a deploy.
 
-That is **roll-forward control, not request-level failover**. A client that already holds a bunny
-URL continues using it until it refreshes the descriptor. The pilot must measure and bound that URL
-lifetime. Automatic retry from bunny to Fastly requires a client-visible fallback URL or a separate
-provider failover mechanism and is deferred; this plan must not claim it already exists.
+That is **roll-forward control, not request-level failover**. A client that already holds a
+second-provider URL continues using it until it refreshes the descriptor. The pilot must measure and
+bound that URL lifetime.
+
+The retroactive lever is DNS, and it only exists if the delivery URLs are on a Divine-owned
+hostname. Descriptors must therefore never emit a vendor hostname, per the rollout plan's stage 0a
+(`v.divine.video` as a custom hostname on the delivery zone). Repointing that record moves
+already-published URLs back to Fastly; a cache purge does not, because purging only forces bunny to
+refetch from B2 and it keeps serving.
+
+Automatic retry from bunny to Fastly requires a client-visible fallback URL or a separate provider
+failover mechanism and is deferred; this plan must not claim it already exists.
 
 For HLS, the manifest and its segments come from one host for a given playback session. Do not
 alternate providers per segment.
@@ -176,8 +184,9 @@ edge deny-list before increasing rollout; descriptor steering alone is insuffici
 6. Tombstone one test hash; confirm it is unreachable on both paths.
 7. Decide.
 
-Rollback at every step begins by setting the steering percentage to 0. Existing bunny URLs remain
-valid until descriptor refresh or explicit purge, so rollback verification must include both.
+Rollback at every step begins by setting the steering percentage to 0, which stops new descriptors.
+Already-published URLs keep resolving to bunny until they are repointed by DNS, so rollback
+verification must exercise both levers — the config flip and the hostname move.
 
 ## Go/no-go
 
