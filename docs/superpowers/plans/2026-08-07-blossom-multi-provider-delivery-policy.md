@@ -179,8 +179,8 @@ edge deny-list before increasing rollout; descriptor steering alone is insuffici
 4. Measure against Fastly on the same content: startup latency, rebuffering, cache hit rate, miss
    latency, origin bytes, billed units.
 5. Exercise B2 404, 5xx, and timeout behavior. Verify that setting rollout to 0 stops new bunny
-   descriptors, and measure how long already-issued URLs remain in use. Do not label this automatic
-   failover.
+   descriptors, measure how long already-issued URLs remain in use, and exercise the DNS move that
+   retires them. Do not label either one automatic failover.
 6. Tombstone one test hash; confirm it is unreachable on both paths.
 7. Decide.
 
@@ -191,7 +191,7 @@ verification must exercise both levers — the config flip and the hostname move
 ## Go/no-go
 
 - byte-identical content and correct range behavior from the second provider;
-- no playback regression in the top regions (cost review §1, GA4 geography);
+- no playback regression in the top regions (cost review §2, GA4 geographic distribution);
 - measured cost per delivered GB beats Fastly's rate on the same content;
 - tombstone honored on both paths;
 - B2 remains private and bunny origin authentication works without public bucket access;
