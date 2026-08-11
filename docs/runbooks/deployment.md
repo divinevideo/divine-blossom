@@ -112,9 +112,12 @@ treatment; see issue #171.
 
 The three hand-run Cloud Run deploy scripts resolve most settings as
 `VAR="${VAR:-production-default}"`, so an exported shell variable silently wins
-over the production default. (`scripts/deploy-cloud-function.sh` is the exception
-noted above: it requires `GCP_PROJECT_ID`, and its bucket variable is
-`GCS_BUCKET_NAME`, not `GCS_BUCKET`.)
+over the production default. `scripts/deploy-cloud-function.sh` resolves its
+project differently — it requires `GCP_PROJECT_ID` and exits if it is unset — but
+it is not exempt from the trap: its bucket and region come from exported
+`GCS_BUCKET_NAME` and `GCS_REGION`. A different variable name is not immunity,
+it is the same trap wearing a different name, and it lands on the one service
+with two competing deploy paths.
 
 On 2026-08-07 a shell with `GCS_BUCKET=divine-blossom-media-staging` exported
 pointed the production transcoder at the staging bucket, where its service
@@ -137,12 +140,18 @@ repository root:
 
 ```bash
 for script in cloud-run-transcoder/deploy.sh cloud-run-upload/deploy.sh \
-              cloud-run-asr-parakeet/deploy.sh; do
-  for v in $(sed -n 's/^\([A-Z_][A-Z0-9_]*\)="\${\1:-.*/\1/p' "$script"); do
+              cloud-run-asr-parakeet/deploy.sh scripts/deploy-cloud-function.sh; do
+  for v in $(sed -n 's/^[A-Z_][A-Z0-9_]*="\{0,1\}\${\([A-Z_][A-Z0-9_]*\):-.*/\1/p' "$script"); do
     printenv "$v" >/dev/null && echo "$v is exported — $script would use your value"
   done
 done
 ```
+
+That captures the name on the *right* of the `:-`, which is the name `printenv`
+is being asked about. It matters: `scripts/deploy-cloud-function.sh` assigns
+`BUCKET_NAME="${GCS_BUCKET_NAME:-blossom-media}"`, where the two sides differ, so
+a pattern keyed to the left-hand name would miss exactly the variable that can
+misdirect `process-blob`.
 
 `GCS_BUCKET` is not the only variable that can bite this way. The transcoder
 script alone resolves 27 settings from the environment, and several have names
