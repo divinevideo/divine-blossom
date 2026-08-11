@@ -44,10 +44,13 @@ the required public-endpoint capacity.
 
 Why B2 instead of letting bunny read GCS directly:
 
-- Backblaze lists bunny as a partner CDN with unlimited free egress and prices B2 at $6.95/TB-month
-  with free Class A/B/C transactions
-  ([B2 pricing](https://www.backblaze.com/cloud-storage/pricing)). GCS charges network egress on
-  every bunny cache miss, which preserves the cost line this pilot exists to remove.
+- B2 is $6.95/TB-month with free Class A/B/C transactions
+  ([B2 pricing](https://www.backblaze.com/cloud-storage/pricing)), and Backblaze *claims* unlimited
+  free egress through partner CDNs including bunny
+  ([CDN partners](https://www.backblaze.com/cloud-storage/solutions/cdn)). Treat the partner-CDN
+  rate as **unverified**: the vendor notes tag it `[U]` and the mechanism is undocumented. The
+  downside case if it does not apply is $0.01/GB above the 3× storage allowance, which is still
+  below GCS network egress on every bunny cache miss — the cost line this pilot exists to remove.
 - B2 has a private S3-compatible endpoint and bucket-scoped application keys. bunny pull zones
   expose AWS signing configuration
   (`AWSSigningEnabled`, key, secret, and region) in the
@@ -59,6 +62,14 @@ Why B2 instead of letting bunny read GCS directly:
   ([B2 file versions](https://www.backblaze.com/docs/cloud-storage-file-versions)).
 - B2 is a disposable replica. Its availability does not replace GCS durability because rollout can
   be set to zero and Fastly/GCS remains the authoritative path.
+
+Why B2 and not R2, which the cost review ranks first (§8.1 step 5): on paper R2's $0 egress to any
+consumer is the stronger position, and that ranking still stands on cost alone. B2 wins on evidence.
+It has been stood up and drilled end-to-end as a real bunny pull-zone origin — delivery latency
+within 6% of the alternatives, and the takedown semantics measured live — while R2 has no bucket and
+no token (`../../cdn-evaluation-status.md`). Choosing the measured option for a pilot whose whole
+purpose is measurement is the cheaper mistake to unwind: this is a disposable replica, and if
+partner-CDN egress does not materialise on the billing account, R2 is the first fallback to test.
 
 The initial GCS-to-B2 copy incurs one-time GCS egress; measure that separately from steady-state
 delivery cost. Confirm on the production billing account that bunny-origin reads receive the
