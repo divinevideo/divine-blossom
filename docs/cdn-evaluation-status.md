@@ -16,6 +16,7 @@ Entry point for the delivery-origin and second-CDN evaluation. Start here, then 
 | [measurements/2026-08-07-replica-as-acl-validation.md](measurements/2026-08-07-replica-as-acl-validation.md) | Working test system proving absence-is-denial |
 | [measurements/2026-08-07-takedown-drill.md](measurements/2026-08-07-takedown-drill.md) | Takedown semantics — **B2 hide does not erase data** |
 | [measurements/2026-08-07-nz-wellington.md](measurements/2026-08-07-nz-wellington.md) | First measurement; superseded in scope, still valid for Oceania |
+| [superpowers/plans/2026-08-07-bunny-delivery-rollout-plan.md](superpowers/plans/2026-08-07-bunny-delivery-rollout-plan.md) | **Implementation plan** — hook points, client migration, tests, staged rollout |
 | [../scripts/probe_cdn_delivery.py](../scripts/probe_cdn_delivery.py) | The measurement tool |
 
 Commercial analysis — traffic volumes, cost models, vendor questions — is deliberately **not** in
