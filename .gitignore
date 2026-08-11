@@ -62,3 +62,7 @@ scripts/backfill-orientation-failed.txt
 .claude/
 __pycache__/
 *.log
+
+# Local storage credentials (never commit)
+.fastly-fos-objects-key.json
+.gcs-hmac-mirror.json
