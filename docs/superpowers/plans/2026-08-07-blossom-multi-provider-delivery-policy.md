@@ -83,7 +83,7 @@ That single rule deletes, from the earlier draft:
 
 - the playback-authorization API and short-lived signed CDN URLs;
 - separate public and protected zones per provider;
-- provider-side age and geography enforcement;
+- provider-side age and geography enforcement.
 
 If restricted content ever needs multi-provider delivery, that is a separate plan with its own
 justification. This rule does **not** remove the takedown obligation for content that was Active,
