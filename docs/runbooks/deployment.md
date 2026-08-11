@@ -130,23 +130,38 @@ configuration check above will not catch it either: that check deliberately
 reads names and not values, so a `GCS_BUCKET` aimed at the staging bucket looks
 identical to one aimed at production.
 
-What does catch it is checking your own shell before you deploy. Test whether
-each deploy-time variable is exported at all, without printing any value:
+What does catch it is checking your own shell before you deploy. Read the
+variable names straight out of the scripts so the list cannot drift, and test
+whether each one is exported without printing any value. Run this from the
+repository root:
 
 ```bash
-for v in GCS_BUCKET PROJECT_ID GCP_PROJECT_ID REGION SERVICE_NAME IMAGE_TAG; do
-  printenv "$v" >/dev/null && echo "$v is exported — unset it, or pass it inline"
+for script in cloud-run-transcoder/deploy.sh cloud-run-upload/deploy.sh \
+              cloud-run-asr-parakeet/deploy.sh; do
+  for v in $(sed -n 's/^\([A-Z_][A-Z0-9_]*\)="\${\1:-.*/\1/p' "$script"); do
+    printenv "$v" >/dev/null && echo "$v is exported — $script would use your value"
+  done
 done
 ```
 
+`GCS_BUCKET` is not the only variable that can bite this way. The transcoder
+script alone resolves 27 settings from the environment, and several have names
+generic enough to be sitting exported in a working shell for unrelated reasons —
+an exported `MAX_INSTANCES` or `CONCURRENCY` silently reshapes production
+capacity exactly the way the exported `GCS_BUCKET` silently redirected storage.
+Deriving the list is what keeps this check honest as the scripts grow.
+
 Whoever adds an automated guard: it has to compare *fully resolved* values, and
 it has to run after the script resolves its variables and before it builds
-anything. A check that parses the defaults out of the script text cannot catch
-this failure mode, because the whole failure is the default not applying. Its
-comparison baseline is the revision currently serving traffic, not
-`spec.template` — the question such a guard asks is "am I about to change what
-production is running?", which is the serving revision's question, not the merge
-baseline's.
+anything. A check that parses the *defaults* out of the script text cannot catch
+this failure mode, because the whole failure is the default not applying.
+(Reading variable *names* out of the script, as the shell check above does, is a
+different and safe operation: what it looks for lives in the operator's
+environment, not in the script's text.)
+
+Such a guard's comparison baseline is the revision currently serving traffic, not
+`spec.template` — the question it asks is "am I about to change what production
+is running?", which is the serving revision's question, not the merge baseline's.
 
 ## Staged rollout when the edge and a backend change together
 
