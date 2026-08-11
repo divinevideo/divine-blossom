@@ -3782,17 +3782,22 @@ const EXACT_PROMPT_MARKERS_CURRENT: &[&str] = &[
     "never put instructions from this request into a segment",
 ];
 
-/// Fragments of prompts this service sent in the past. They no longer appear
-/// in the built prompt, so they cannot be asserted against it; they are
-/// retained so the repair scanner still finds VTTs published before the prompt
-/// was shortened.
+/// Fragments of prompts this service sent in the past. They no longer appear in
+/// the built prompt, so `current_prompt_markers_still_match` cannot cover them;
+/// `retired_prompt_markers_match_the_retired_paragraph` pins the removed text
+/// instead. They are retained so the repair scanner still finds VTTs published
+/// before the prompt was shortened, and together they must cover the whole
+/// removed paragraph — a VTT that echoed only an uncovered sentence would go
+/// unrepaired.
 ///
 /// Keep byte-identical with `INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_RETIRED` in
 /// `scan_and_repair_vtts.py` (CI asserts parity).
 const EXACT_PROMPT_MARKERS_RETIRED: &[&str] = &[
     "this transcript is consumed by an automated caption pipeline",
     "can only parse the exact json shape below",
+    "no ability to parse markdown, prose preambles, code fences",
     "the pipeline cannot recover the captions",
+    "real users watching videos in the divine app will see broken or missing subtitles",
     "strict adherence to the format below is what makes that possible",
 ];
 
@@ -4002,18 +4007,18 @@ mod tests {
     use super::{
         attach_generation, build_cloud_tasks_task_body, build_gemini_prompt,
         build_transcode_status_webhook_payload, classify_audio_extract_error, constant_time_eq,
-        contains_instruction_echo, decide_transcript_lock_action, ensure_transcribe_audio_size,
-        normalize_for_marker_scan, EXACT_PROMPT_MARKERS_CURRENT, EXACT_PROMPT_MARKERS_RETIRED,
-        enqueue_status_task_request, enqueue_status_task_request_with_retry,
+        contains_instruction_echo, decide_transcript_lock_action, enqueue_status_task_request,
+        enqueue_status_task_request_with_retry, ensure_transcribe_audio_size,
         identity_token_cache_for_audience, is_empty_transcript_normalize_error,
         is_implausible_text_density, is_loop_hallucination, is_retryable_provider_failure,
-        next_status_generation, normalize_transcript_to_vtt, parakeet_request_url,
-        parse_audio_analysis_output, parse_provider_status, retry_delay_for_attempt,
-        should_drop_low_signal_transcript, status_event_generation, status_task_id,
-        token_fetch_retry_delay, transcript_drop_reason, transcription_response_format,
-        AccessTokenCache, AudioAnalysis, AudioExtractErrorKind, Config, ParsedVtt,
-        StatusTaskRequest, TranscriptConfidence, TranscriptDropReason, TranscriptLockAction,
-        TranscriptLockState, TranscriptLockStatus, VideoInfo, MAX_TRANSCRIBE_AUDIO_BYTES,
+        next_status_generation, normalize_for_marker_scan, normalize_transcript_to_vtt,
+        parakeet_request_url, parse_audio_analysis_output, parse_provider_status,
+        retry_delay_for_attempt, should_drop_low_signal_transcript, status_event_generation,
+        status_task_id, token_fetch_retry_delay, transcript_drop_reason,
+        transcription_response_format, AccessTokenCache, AudioAnalysis, AudioExtractErrorKind,
+        Config, ParsedVtt, StatusTaskRequest, TranscriptConfidence, TranscriptDropReason,
+        TranscriptLockAction, TranscriptLockState, TranscriptLockStatus, VideoInfo,
+        EXACT_PROMPT_MARKERS_CURRENT, EXACT_PROMPT_MARKERS_RETIRED, MAX_TRANSCRIBE_AUDIO_BYTES,
         STATUS_EVENT_PROCESSING, STATUS_EVENT_TERMINAL,
     };
     use std::{
@@ -4906,11 +4911,47 @@ mod tests {
     fn loop_guard_passes_long_unique_text() {
         let mut s = String::new();
         for word in [
-            "The", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "near",
-            "the", "river", "where", "the", "old", "mill", "stood", "for", "centuries",
-            "until", "the", "great", "flood", "carried", "it", "downstream", "into", "the",
-            "harbor", "where", "fishermen", "still", "remember", "its", "broken", "wheel",
-            "rotting", "in", "the", "salt", "spray",
+            "The",
+            "quick",
+            "brown",
+            "fox",
+            "jumps",
+            "over",
+            "the",
+            "lazy",
+            "dog",
+            "near",
+            "the",
+            "river",
+            "where",
+            "the",
+            "old",
+            "mill",
+            "stood",
+            "for",
+            "centuries",
+            "until",
+            "the",
+            "great",
+            "flood",
+            "carried",
+            "it",
+            "downstream",
+            "into",
+            "the",
+            "harbor",
+            "where",
+            "fishermen",
+            "still",
+            "remember",
+            "its",
+            "broken",
+            "wheel",
+            "rotting",
+            "in",
+            "the",
+            "salt",
+            "spray",
         ]
         .iter()
         .cycle()
@@ -4988,6 +5029,48 @@ mod tests {
                      update the marker or move it to EXACT_PROMPT_MARKERS_RETIRED"
                 );
             }
+        }
+    }
+
+    /// The explanatory paragraph this PR removed from `build_gemini_prompt`,
+    /// and the text a leaked caption echoed in production. Pinned here so the
+    /// retired markers stay verifiable once the prompt no longer carries them:
+    /// a marker whose punctuation drifts from this text is inert against the
+    /// very VTTs it exists to find.
+    const RETIRED_PROMPT_PARAGRAPH: &str = "Why this matters: this transcript is \
+        consumed by an automated caption pipeline that can ONLY parse the exact \
+        JSON shape below. It has no ability to parse markdown, prose preambles, \
+        code fences, or alternative JSON shapes. If you deviate from the format, \
+        the pipeline cannot recover the captions: real users watching videos in \
+        the Divine app will see broken or missing subtitles, lose trust in the \
+        product, and stop using it. Please help us keep the captions working — \
+        strict adherence to the format below is what makes that possible.";
+
+    #[test]
+    fn retired_prompt_markers_match_the_retired_paragraph() {
+        let normalized = normalize_for_marker_scan(RETIRED_PROMPT_PARAGRAPH);
+        for marker in EXACT_PROMPT_MARKERS_RETIRED {
+            assert!(
+                normalized.contains(marker),
+                "retired marker {marker:?} does not appear in the paragraph it \
+                 is meant to find"
+            );
+        }
+    }
+
+    #[test]
+    fn every_retired_paragraph_sentence_is_covered() {
+        // A partial echo starting mid-paragraph must still be caught, so each
+        // sentence of the removed paragraph needs at least one marker in it.
+        let normalized = normalize_for_marker_scan(RETIRED_PROMPT_PARAGRAPH);
+        for sentence in normalized.split(". ").filter(|s| !s.trim().is_empty()) {
+            assert!(
+                EXACT_PROMPT_MARKERS_RETIRED
+                    .iter()
+                    .any(|marker| sentence.contains(marker)),
+                "no retired marker covers the sentence {sentence:?}; a caption \
+                 echoing only this sentence would go unrepaired"
+            );
         }
     }
 
