@@ -182,6 +182,25 @@ class MarkerParityTests(unittest.TestCase):
             "scan_and_repair_vtts.py",
         )
 
+    def test_combined_marker_tuple_is_current_plus_retired(self):
+        """The combined tuple is what the scanner actually scans.
+
+        Without this, dropping RETIRED from the combination would leave every
+        other parity test green while the scanner silently diverged from Rust.
+        """
+        module = load_script_module(self)
+
+        self.assertEqual(
+            module.INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS,
+            module.INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_CURRENT
+            + module.INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_RETIRED,
+        )
+        self.assertTrue(
+            module.INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_CURRENT
+            and module.INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_RETIRED,
+            "neither marker list may be empty; the parity tests would pass vacuously",
+        )
+
     def test_current_prompt_markers_match_the_live_rust_prompt(self):
         """Mirror of the Rust `current_prompt_markers_still_match` guard.
 
