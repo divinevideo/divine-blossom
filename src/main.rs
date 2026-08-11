@@ -42,9 +42,9 @@ use crate::metadata::{
 };
 use crate::storage::{
     blob_exists, check_funnelcake_audio_reuse, current_timestamp, delete_blob as storage_delete,
-    download_blob_with_fallback, download_thumbnail, trigger_audio_extraction,
-    trigger_audit_anonymize, trigger_cloud_run_bulk_delete, trigger_cloud_run_delete_blob,
-    upload_blob, write_audit_log,
+    download_blob_read_through, download_blob_with_fallback, download_thumbnail,
+    trigger_audio_extraction, trigger_audit_anonymize, trigger_cloud_run_bulk_delete,
+    trigger_cloud_run_delete_blob, upload_blob, write_audit_log,
 };
 use crate::viewer_auth::{ViewerAuthDiagnostics, ViewerAuthState};
 use fastly_blossom::resumable_complete::parse_resumable_complete_request_body;
@@ -531,16 +531,21 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
 
-    // Download from GCS with fallback to CDNs
-    let result = download_blob_with_fallback(&hash, range.as_deref())?;
+    // Serve from the FOS mirror when it has the object, otherwise GCS (with
+    // CDN fallback) and lazily copy the object into the mirror.
+    let result = download_blob_read_through(&hash, range.as_deref())?;
     let mut resp = result.response;
 
-    // Surface provenance metadata if present on the origin object.
+    // Surface provenance metadata if present on the origin object. GCS returns
+    // custom metadata as `x-goog-meta-*`; S3-compatible mirrors return the same
+    // values as `x-amz-meta-*`, so accept either spelling.
     let c2pa_manifest_id = resp
         .get_header_str("x-goog-meta-c2pa-manifest-id")
+        .or_else(|| resp.get_header_str("x-amz-meta-c2pa-manifest-id"))
         .map(|s| s.to_string());
     let source_sha256 = resp
         .get_header_str("x-goog-meta-source-sha256")
+        .or_else(|| resp.get_header_str("x-amz-meta-source-sha256"))
         .map(|s| s.to_string());
 
     // Add CORS headers
