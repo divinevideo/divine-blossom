@@ -119,16 +119,16 @@ half hours.
 Do not export deploy-time variables (`GCS_BUCKET`, `PROJECT_ID`, and friends)
 from a shell profile. Set them inline on the one command that needs them.
 
-After #195 merges, the transcoder and upload deploy scripts will run
-`scripts/require-env-match.sh` after resolving their variables and before
-building anything. It compares a named subset of fully resolved values against
-the revision currently serving traffic and aborts the deploy when they differ;
-re-run with `CONFIRM_ENV_CHANGES=1` when the change is intended. The check is a
-backstop, not a substitute for passing `PROJECT_ID` explicitly: it uses the
-resolved project to find the live service, and it skips when the service or
-serving revision cannot be read. The comparison has to use resolved values: a
-check that parses the default out of the script text cannot catch this failure
-mode, because the whole failure is the default not applying.
+Nothing in this repository checks a deploy's resolved variables against what is
+running, so there is no automated backstop for this trap today. The manual
+comparison in the section above is the only thing between an exported variable
+and a production misconfiguration. Run it.
+
+Whoever adds such a guard: it has to compare *fully resolved* values, it has to
+compare them against the revision currently serving traffic, and it has to run
+after the script resolves its variables and before it builds anything. A check
+that parses the defaults out of the script text cannot catch this failure mode,
+because the whole failure is the default not applying.
 
 ## Staged rollout when the edge and a backend change together
 
