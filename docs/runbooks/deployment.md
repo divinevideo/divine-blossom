@@ -68,7 +68,12 @@ GCP_PROJECT_ID=rich-compiler-479518-d2 ./scripts/deploy-cloud-function.sh
 Only `cloud-run-transcoder/deploy.sh` currently uses `--update-env-vars` and
 `--update-secrets`, so unnamed keys are preserved for transcoder deploys. Keys it
 *does* name are overwritten with the script's defaults, which may not match what
-is running. Compare before you deploy, and read names rather than values:
+is running.
+
+`gcloud run deploy` creates or updates the *service*, and `--update-env-vars`
+merges its pairs onto the service's `spec.template`. The template is therefore
+the baseline the next deploy merges onto, and it is what this check has to read.
+Read names rather than values:
 
 ```bash
 gcloud run services describe divine-transcoder \
@@ -81,6 +86,12 @@ print('env:', sorted(e['name'] for e in c.get('env',[]) if 'value' in e))
 print('secrets:', sorted(e['name'] for e in c.get('env',[]) if 'valueFrom' in e))
 "
 ```
+
+The template is not necessarily what production is running: after a traffic
+rollback the two diverge. See [A traffic rollback pins the
+service](#a-traffic-rollback-pins-the-service) for that case, and read the
+serving revision when the question is what production is answering with rather
+than what the next deploy will merge onto.
 
 Do not assume that safety applies to the other deploy paths yet:
 
@@ -96,6 +107,70 @@ the complete live configuration. Both replace the entire configuration and
 silently drop live settings the deploy path does not name. PR #153 fixed this
 for the transcoder script only; the other deploy paths still need the same
 treatment; see issue #171.
+
+## Exported shell variables override script defaults
+
+The three hand-run Cloud Run deploy scripts resolve most settings as
+`VAR="${VAR:-production-default}"`, so an exported shell variable silently wins
+over the production default. `scripts/deploy-cloud-function.sh` resolves its
+project differently — it requires `GCP_PROJECT_ID` and exits if it is unset — but
+it is not exempt from the trap: its bucket and region come from exported
+`GCS_BUCKET_NAME` and `GCS_REGION`. A different variable name is not immunity,
+it is the same trap wearing a different name, and it lands on the one service
+with two competing deploy paths.
+
+On 2026-08-07 a shell with `GCS_BUCKET=divine-blossom-media-staging` exported
+pointed the production transcoder at the staging bucket, where its service
+account has no read access; every transcode failed with 403 for four and a
+half hours.
+
+Do not export deploy-time variables (`GCS_BUCKET`, `PROJECT_ID`, and friends)
+from a shell profile. Set them inline on the one command that needs them.
+
+Nothing in this repository checks a deploy's resolved variables against what is
+running, so there is no automated backstop for this trap today. The
+configuration check above will not catch it either: that check deliberately
+reads names and not values, so a `GCS_BUCKET` aimed at the staging bucket looks
+identical to one aimed at production.
+
+What does catch it is checking your own shell before you deploy. Read the
+variable names straight out of the scripts so the list cannot drift, and test
+whether each one is exported without printing any value. Run this from the
+repository root:
+
+```bash
+for script in cloud-run-transcoder/deploy.sh cloud-run-upload/deploy.sh \
+              cloud-run-asr-parakeet/deploy.sh scripts/deploy-cloud-function.sh; do
+  for v in $(sed -n 's/^[A-Z_][A-Z0-9_]*="\{0,1\}\${\([A-Z_][A-Z0-9_]*\):-.*/\1/p' "$script"); do
+    printenv "$v" >/dev/null && echo "$v is exported — $script would use your value"
+  done
+done
+```
+
+That captures the name on the *right* of the `:-`, which is the name `printenv`
+is being asked about. It matters: `scripts/deploy-cloud-function.sh` assigns
+`BUCKET_NAME="${GCS_BUCKET_NAME:-blossom-media}"`, where the two sides differ, so
+a pattern keyed to the left-hand name would miss exactly the variable that can
+misdirect `process-blob`.
+
+`GCS_BUCKET` is not the only variable that can bite this way. The transcoder
+script alone resolves 27 settings from the environment, and several have names
+generic enough to be sitting exported in a working shell for unrelated reasons —
+an exported `MAX_INSTANCES` or `CONCURRENCY` silently reshapes production
+capacity exactly the way the exported `GCS_BUCKET` silently redirected storage.
+Deriving the list is what keeps this check honest as the scripts grow.
+
+Whoever adds an automated guard: it has to compare *fully resolved* values, and
+it has to run after the script resolves its variables and before it builds
+anything. A check that parses the *defaults* out of the script text cannot catch
+this failure mode, because the whole failure is the default not applying.
+(Reading variable *names* out of the script, as the shell check above does, is a
+different and safe operation: what it looks for lives in the operator's
+environment, not in the script's text.)
+
+Such a guard's comparison baseline is the revision currently serving traffic, not
+`spec.template` — the question it asks is "am I about to change what production
+is running?", which is the serving revision's question, not the merge baseline's.
 
 ## Staged rollout when the edge and a backend change together
 
@@ -113,10 +188,57 @@ be `false` while the transcoder is still an image that does not send
 ## Verifying a transcoder deploy landed
 
 The transcoder does not report its version anywhere the edge can see. Confirm
-from the Cloud Run side that the image tag matches the commit you deployed:
+from the Cloud Run side that the image tag on the revision serving traffic
+matches the commit you deployed:
+
+```bash
+REVISION="$(gcloud run services describe divine-transcoder \
+  --project rich-compiler-479518-d2 --region us-central1 --format=json \
+  | python3 -c "
+import json,sys
+traffic=json.load(sys.stdin).get('status',{}).get('traffic',[])
+serving=[t for t in traffic if t.get('percent')]
+print(max(serving,key=lambda t:t['percent']).get('revisionName','') if serving else '')
+")"
+
+if [ -z "$REVISION" ]; then
+  echo 'no revision is serving traffic'
+else
+  printf 'serving revision: %s\n' "$REVISION"
+  gcloud run revisions describe "$REVISION" \
+    --project rich-compiler-479518-d2 --region us-central1 \
+    --format='value(spec.containers[0].image)'
+fi
+```
+
+## A traffic rollback pins the service
+
+`gcloud run services update-traffic --to-revisions=<revision>=100` rolls back
+by pointing traffic at an explicit revision, and in doing so stops the service
+from migrating to the latest revision. A later `gcloud run deploy` then creates
+the new revision at 0% traffic while reporting success — the rollback target
+keeps serving.
+
+After any rollback, restore migration to latest explicitly:
+
+```bash
+gcloud run services update-traffic divine-transcoder \
+  --project rich-compiler-479518-d2 --region us-central1 --to-latest
+```
+
+Until that runs, check where traffic actually is after every deploy:
 
 ```bash
 gcloud run services describe divine-transcoder \
   --project rich-compiler-479518-d2 --region us-central1 \
-  --format='value(spec.template.spec.containers[0].image)'
+  --format='json(status.traffic)'
 ```
+
+This pinning is also why the two checks above read different places. After a
+rollback, the service's `spec.template` describes the newest revision *created*,
+which is not the one serving traffic. The pre-deploy configuration check reads
+`spec.template`, because that is the baseline the next deploy merges onto. The
+deploy-landed check reads the serving revision, because that is what production
+is answering with. Do not substitute one for the other — during a pinned window
+they give different answers, and each is the wrong answer to the other's
+question.
