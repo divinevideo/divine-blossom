@@ -163,7 +163,10 @@ content silently stays 404.
 New B2 accounts cannot create or convert a public bucket until they have **completed payment
 history** — a card on file is not sufficient, and the error is `no_payment_history`. This blocked
 the B2 origin test until a payment was made. Worth knowing before planning around B2, since a
-private bucket cannot back a pull zone (B2 download authorization tokens expire).
+private bucket cannot back a pull zone *over B2's native download path* — `b2_authorize_account`
+download tokens expire, so they cannot be pinned into a pull-zone config. That does not rule out the
+S3-compatible endpoint with AWS signing, which is the route the origin decision selects and which
+remains unproven rather than excluded.
 
 ## Teardown
 
