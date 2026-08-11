@@ -68,14 +68,24 @@ GCP_PROJECT_ID=rich-compiler-479518-d2 ./scripts/deploy-cloud-function.sh
 Only `cloud-run-transcoder/deploy.sh` currently uses `--update-env-vars` and
 `--update-secrets`, so unnamed keys are preserved for transcoder deploys. Keys it
 *does* name are overwritten with the script's defaults, which may not match what
-is running. Compare before you deploy, and read names rather than values:
+is running. Compare against the revision serving traffic, not the service's
+`spec.template`, and read names rather than values:
 
 ```bash
-gcloud run services describe divine-transcoder \
+REVISION="$(gcloud run services describe divine-transcoder \
   --project rich-compiler-479518-d2 --region us-central1 --format=json \
   | python3 -c "
 import json,sys
-c=json.load(sys.stdin)['spec']['template']['spec']['containers'][0]
+traffic=json.load(sys.stdin).get('status',{}).get('traffic',[])
+serving=[t for t in traffic if t.get('percent')]
+print(max(serving,key=lambda t:t['percent']).get('revisionName','') if serving else '')
+")"
+
+gcloud run revisions describe "$REVISION" \
+  --project rich-compiler-479518-d2 --region us-central1 --format=json \
+  | python3 -c "
+import json,sys
+c=json.load(sys.stdin)['spec']['containers'][0]
 print('image:', c['image'])
 print('env:', sorted(e['name'] for e in c.get('env',[]) if 'value' in e))
 print('secrets:', sorted(e['name'] for e in c.get('env',[]) if 'valueFrom' in e))
@@ -109,13 +119,16 @@ half hours.
 Do not export deploy-time variables (`GCS_BUCKET`, `PROJECT_ID`, and friends)
 from a shell profile. Set them inline on the one command that needs them.
 
-As a backstop, the transcoder and upload deploy scripts run
+After #195 merges, the transcoder and upload deploy scripts will run
 `scripts/require-env-match.sh` after resolving their variables and before
-building anything. It compares the fully resolved values against the revision
-currently serving traffic and aborts the deploy when they differ; re-run with
-`CONFIRM_ENV_CHANGES=1` when the change is intended. The comparison has to use
-resolved values: a check that parses the default out of the script text cannot
-catch this failure mode, because the whole failure is the default not applying.
+building anything. It compares a named subset of fully resolved values against
+the revision currently serving traffic and aborts the deploy when they differ;
+re-run with `CONFIRM_ENV_CHANGES=1` when the change is intended. The check is a
+backstop, not a substitute for passing `PROJECT_ID` explicitly: it uses the
+resolved project to find the live service, and it skips when the service or
+serving revision cannot be read. The comparison has to use resolved values: a
+check that parses the default out of the script text cannot catch this failure
+mode, because the whole failure is the default not applying.
 
 ## Staged rollout when the edge and a backend change together
 
@@ -133,12 +146,23 @@ be `false` while the transcoder is still an image that does not send
 ## Verifying a transcoder deploy landed
 
 The transcoder does not report its version anywhere the edge can see. Confirm
-from the Cloud Run side that the image tag matches the commit you deployed:
+from the Cloud Run side that the image tag on the revision serving traffic
+matches the commit you deployed:
 
 ```bash
-gcloud run services describe divine-transcoder \
+REVISION="$(gcloud run services describe divine-transcoder \
+  --project rich-compiler-479518-d2 --region us-central1 --format=json \
+  | python3 -c "
+import json,sys
+traffic=json.load(sys.stdin).get('status',{}).get('traffic',[])
+serving=[t for t in traffic if t.get('percent')]
+print(max(serving,key=lambda t:t['percent']).get('revisionName','') if serving else '')
+")"
+
+printf 'serving revision: %s\n' "$REVISION"
+gcloud run revisions describe "$REVISION" \
   --project rich-compiler-479518-d2 --region us-central1 \
-  --format='value(spec.template.spec.containers[0].image)'
+  --format='value(spec.containers[0].image)'
 ```
 
 ## A traffic rollback pins the service
@@ -166,4 +190,4 @@ gcloud run services describe divine-transcoder \
 
 The same pinning is why the pre-deploy environment check compares against the
 serving revision rather than the service's `spec.template`: after a rollback,
-the template describes the revision that was just reverted.
+the spec still describes the newest rolled-back revision.
