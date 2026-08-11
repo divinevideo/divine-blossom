@@ -11,6 +11,7 @@ Entry point for the delivery-origin and second-CDN evaluation. Start here, then 
 |---|---|
 | [cdn-object-storage-vendor-notes.md](cdn-object-storage-vendor-notes.md) | Verified vendor limits, pricing, and API capabilities |
 | [superpowers/specs/2026-08-06-cdn-delivery-steering-design.md](superpowers/specs/2026-08-06-cdn-delivery-steering-design.md) | How to steer traffic between two CDNs, server-side |
+| [superpowers/plans/2026-08-07-blossom-multi-provider-delivery-policy.md](superpowers/plans/2026-08-07-blossom-multi-provider-delivery-policy.md) | **The origin decision** — private B2 as the approved-only replica origin |
 | [measurements/2026-08-07-four-region-corrected.md](measurements/2026-08-07-four-region-corrected.md) | **The current headline result** |
 | [measurements/2026-08-07-four-region-summary.md](measurements/2026-08-07-four-region-summary.md) | Superseded — timing method bundled TLS handshake |
 | [measurements/2026-08-07-replica-as-acl-validation.md](measurements/2026-08-07-replica-as-acl-validation.md) | Working test system proving absence-is-denial |
@@ -167,5 +168,8 @@ receive it — not a query over what already exists.
 3. ~~Stand up a real delivery origin and re-measure~~ — done. Fastly pull-through, bunny Storage,
    and Backblaze B2 origins all land within 6% of each other on cache hits, so **origin choice does
    not affect delivery performance** and can be decided on cost, durability, and lock-in alone.
+   **Decided on that basis: a private Backblaze B2 bucket, approved-only, with R2 as the first
+   fallback** — see the origin decision plan. The open part is bunny's AWS-signing path to a
+   *private* B2 bucket; the validated probe bucket was public.
 4. Measure South America and India.
 5. Delete the probe zones once the campaign closes (#178).

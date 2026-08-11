@@ -31,13 +31,14 @@ and any change to how the app fetches or plays video.
 
 | Origin | Viable? | Note |
 |---|---|---|
-| Cloudflare R2 | Yes | $0 egress to any consumer via S3 API |
-| Backblaze B2 | Yes | $0 via partner-CDN program (unverified) or $0.01/GB over the 3× allowance |
+| **Backblaze B2** | **Selected** | $0 via partner-CDN program (unverified) or $0.01/GB over the 3× allowance |
+| Cloudflare R2 | Yes — fallback | $0 egress to any consumer via S3 API; not stood up |
 | GCS | Works | but GCS egress returns on bunny's cache misses |
 | **Fastly Object Storage** | **No** | **public S3 endpoint capped at ~150 Mbps / 100 req/s per bucket** |
 
-This is the decision that has to be made first. Adopting Fastly Object Storage as the delivery
-replica forecloses this entire design.
+This decision is recorded in the multi-provider delivery plan: B2, private, approved-only. R2 is the
+first fallback if partner-CDN egress does not appear on the billing account. Adopting Fastly Object
+Storage as the delivery replica would foreclose this entire design.
 
 ## Recommended approach
 

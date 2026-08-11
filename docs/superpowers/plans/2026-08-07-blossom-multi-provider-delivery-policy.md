@@ -56,7 +56,12 @@ Why B2 instead of letting bunny read GCS directly:
   (`AWSSigningEnabled`, key, secret, and region) in the
   [pull-zone API](https://docs.bunny.net/api-reference/core/pull-zone/add-pull-zone), so the pilot
   can keep the replica private. Prove the B2 region, endpoint, host/path style, and range behavior
-  against a real pull zone before traffic.
+  against a real pull zone before traffic. The browser-visible behavior was validated on a *public*
+  probe bucket, so a private signed origin has to re-prove it: an explicit CORS rule covering range
+  and conditional headers and exposing `content-range` / `accept-ranges`; `Content-Type` carried
+  from the source, because an `application/octet-stream` default makes `<track>` subtitles fail
+  silently while video still plays; and cache-control set at upload so Fastly and bunny do not
+  disagree on TTL for the same object. The rollout plan has the specifics.
 - B2 is always versioned. An S3 `DeleteObject` or `b2_hide_file` can leave older bytes retrievable;
   takedown must enumerate and permanently delete every file version
   ([B2 file versions](https://www.backblaze.com/docs/cloud-storage-file-versions)).
