@@ -6,8 +6,9 @@
 **Date:** 2026-08-07 (rewritten to cut scope)
 **Status:** Decision recorded — use Backblaze B2 as the second-CDN origin; pilot remains unapproved
 **Scope:** Public read path only. Not authorization to deploy.
-**Related:** `../specs/2026-08-06-cdn-delivery-steering-design.md`,
-`../specs/2026-08-06-media-delivery-cost-architecture-review.md`
+**Related:** `../specs/2026-08-06-cdn-delivery-steering-design.md`. The cost review this document
+cites by section is commercial analysis and is deliberately not in this public repository; it lives
+in `divine-context` under `repo-context/divine-blossom-media-delivery-cost-review-2026-08.md`.
 
 ## The question this answers
 
