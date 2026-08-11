@@ -104,7 +104,14 @@ replicated, and later banned or deleted.
 
 After a blob is approved and public, explicitly copy it to B2 from the existing pipeline. Verify
 length and SHA-256. Record which providers hold it as one field on the existing metadata record.
-Do not block publication on the copy.
+
+Publication does not wait for the copy, but **steering does**. Set the replicated flag only after
+the copy verifies, and route a hash to bunny only once that flag is set. Reversing this order 404s
+freshly-approved content for its first viewers. The implementation contract for that ordering — the
+queued job, the flag, and the reconciler that asserts replica presence for `Active` hashes and
+absence for everything else — is the bunny rollout plan
+(`2026-08-07-bunny-delivery-rollout-plan.md`); this document selects the origin and does not restate
+or override it.
 
 Do not configure a pull-through or automatic rehydration path from preserved GCS objects into B2. A
 deleted replica must not be silently recreated after a moderation action. The writer gets a
@@ -112,8 +119,9 @@ bucket-scoped credential with the explicit upload and version-delete capabilitie
 gets a separate bucket-scoped read-only credential. Neither credential belongs in source control or
 client-visible configuration.
 
-No queue, no reconciler, no replication framework, no BUD-04 `PUT /mirror` path. A periodic repair
-command covers gaps until measurement shows it does not.
+No generic replication framework and no BUD-04 `PUT /mirror` path. The queue is the existing
+derivative-status queue and the reconciler is a periodic repair pass over one flag — reuse, not new
+machinery.
 
 Recheck policy immediately before copying. A delayed job must never publish a hash that has since
 been tombstoned or restricted.
