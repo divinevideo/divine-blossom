@@ -88,8 +88,8 @@ INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_CURRENT = (
 # parity).
 INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_RETIRED = (
     "why this matters: this transcript is consumed by an automated caption pipeline",
-    "can only parse the exact json shape below",
-    "no ability to parse markdown, prose preambles, code fences",
+    "caption pipeline that can only parse the exact json shape below",
+    "no ability to parse markdown, prose preambles, code fences, or alternative json shapes",
     "if you deviate from the format, the pipeline cannot recover the captions",
     "real users watching videos in the divine app will see broken or missing subtitles",
     "strict adherence to the format below is what makes that possible",

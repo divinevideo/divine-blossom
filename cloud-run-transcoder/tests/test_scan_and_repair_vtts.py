@@ -240,6 +240,10 @@ class MarkerParityTests(unittest.TestCase):
             "captions automatically.",
             "This bug means the pipeline cannot recover the captions after a failed export.",
             "This transcript is consumed by an automated caption pipeline, so keep it clean.",
+            "Our validator can only parse the exact JSON shape below.",
+            "Heads up, the importer can only parse the exact JSON shape below.",
+            "The old client has no ability to parse markdown, prose preambles, "
+            "code fences, or XML.",
         ):
             self.assertFalse(
                 module.has_instruction_echo(speech),

@@ -3757,8 +3757,9 @@ fn distinct_marker_phrases(normalized: &str, markers: &[&str]) -> usize {
     clusters
 }
 
-/// Verbatim fragments of the prompt this service currently sends. This is the
-/// only exact-marker list in the live publish gate.
+/// Verbatim fragments of the prompt this service currently sends. Both this list
+/// and `EXACT_PROMPT_MARKERS_RETIRED` run in the live publish gate, and the
+/// invariants below bind each of them.
 ///
 /// Three invariants, all load-bearing because one match here is conclusive and a
 /// drop is terminal (empty VTT → status=complete → edge-cached, no
@@ -3803,14 +3804,19 @@ const EXACT_PROMPT_MARKERS_CURRENT: &[&str] = &[
 /// recognise the paragraph that leaked in production, and together they must
 /// cover every sentence of it.
 ///
-/// Invariant 2 above applies here with the same force. These markers run in the
-/// live gate, where the current prompt can no longer produce them, so any live
-/// match is by definition a real speaker saying the phrase — and that drop is
-/// terminal. Each one is therefore kept long enough that spontaneous speech
-/// would not reproduce it: "the pipeline cannot recover the captions" is an
-/// ordinary sentence about caption pipelines on its own, so it carries its
-/// leading clause, and "this transcript is consumed by..." carries the
-/// paragraph's opening "why this matters:".
+/// Invariant 2 above binds this list with *more* force than the current one, and
+/// this is the asymmetry to keep in mind before shortening anything here. These
+/// markers run in the live gate, but the current prompt can no longer produce
+/// them, so a live match is never a real echo — it is always a real speaker
+/// saying the phrase, and that drop is terminal. Retired markers therefore buy no
+/// live detection, only live risk, and every one is deliberately extended past
+/// the point where spontaneous speech could reproduce it. The test to apply is
+/// the invariant: does the marker span, *by itself*, identify this pipeline's
+/// prompt? A bare predicate like "can only parse the exact json shape below"
+/// does not — it is a substring of any sentence of the form "our validator can
+/// only parse the exact JSON shape below" — so each marker carries enough of its
+/// sentence's subject to name the pipeline, the captions, or the Divine app.
+/// `exact_markers_do_not_flag_audio_engineering_speech` pins the concrete cases.
 ///
 /// "please help us keep the captions working" is deliberately absent for the
 /// same reason: it is ordinary enough that a real speaker could say it. Dropping
@@ -3822,8 +3828,8 @@ const EXACT_PROMPT_MARKERS_CURRENT: &[&str] = &[
 /// `scan_and_repair_vtts.py` (CI asserts parity).
 const EXACT_PROMPT_MARKERS_RETIRED: &[&str] = &[
     "why this matters: this transcript is consumed by an automated caption pipeline",
-    "can only parse the exact json shape below",
-    "no ability to parse markdown, prose preambles, code fences",
+    "caption pipeline that can only parse the exact json shape below",
+    "no ability to parse markdown, prose preambles, code fences, or alternative json shapes",
     "if you deviate from the format, the pipeline cannot recover the captions",
     "real users watching videos in the divine app will see broken or missing subtitles",
     "strict adherence to the format below is what makes that possible",
@@ -5097,6 +5103,11 @@ mod tests {
             "If the VTT is overwritten, the pipeline cannot recover the captions automatically.",
             "This bug means the pipeline cannot recover the captions after a failed export.",
             "This transcript is consumed by an automated caption pipeline, so keep it clean.",
+            "Our validator can only parse the exact JSON shape below.",
+            "Heads up, the importer can only parse the exact JSON shape below.",
+            "The validator can only parse the exact JSON shape below, so pause and copy it.",
+            "The old client has no ability to parse markdown, prose preambles, code fences, \
+             or XML.",
         ] {
             assert!(
                 !contains_instruction_echo(speech),
