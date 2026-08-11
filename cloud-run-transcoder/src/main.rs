@@ -2484,6 +2484,37 @@ pub(crate) fn invalidate_gcp_access_token_if_expired_response(
     }
 }
 
+/// Turn a bearer-authenticated GCP provider response into a transcription
+/// result, dropping the credential first when the provider rejected it.
+///
+/// Every GCP provider needs the same two steps in the same order, and the
+/// order matters: the token must leave the shared cache even though the
+/// caller is about to return an error, or the retry re-sends the dead
+/// credential. Keeping it in one function means a new provider cannot wire up
+/// half of it.
+pub(crate) fn gcp_provider_response_outcome(
+    access_token: &str,
+    status_code: u16,
+    retry_after_header: Option<&str>,
+    body: String,
+) -> std::result::Result<String, ProviderFailure> {
+    invalidate_gcp_access_token_if_expired_response(access_token, Some(status_code), &body);
+
+    if StatusCode::from_u16(status_code)
+        .map(|status| status.is_success())
+        .unwrap_or(false)
+    {
+        Ok(body)
+    } else {
+        Err(parse_provider_status(
+            Some(status_code),
+            retry_after_header,
+            &body,
+            false,
+        ))
+    }
+}
+
 fn retry_delay_for_attempt(
     attempt: u32,
     base_delay_ms: u64,
@@ -3236,20 +3267,12 @@ async fn transcribe_via_gemini(
         )
     })?;
 
-    invalidate_gcp_access_token_if_expired_response(
+    let resp_body = gcp_provider_response_outcome(
         &access_token,
-        Some(status.as_u16()),
-        &resp_body,
-    );
-
-    if !status.is_success() {
-        return Err(parse_provider_status(
-            Some(status.as_u16()),
-            retry_after_header.as_deref(),
-            &resp_body,
-            false,
-        ));
-    }
+        status.as_u16(),
+        retry_after_header.as_deref(),
+        resp_body,
+    )?;
 
     // Extract text from Vertex AI response: candidates[0].content.parts[0].text
     let resp_json: serde_json::Value = serde_json::from_str(&resp_body).map_err(|e| {
@@ -3993,12 +4016,12 @@ mod tests {
         build_transcode_status_webhook_payload, classify_audio_extract_error, constant_time_eq,
         contains_instruction_echo, decide_transcript_lock_action, enqueue_status_task_request,
         enqueue_status_task_request_with_retry, ensure_transcribe_audio_size,
-        identity_token_cache_for_audience, is_empty_transcript_normalize_error,
-        is_implausible_text_density, is_loop_hallucination, is_retryable_provider_failure,
-        next_status_generation, normalize_transcript_to_vtt, parakeet_request_url,
-        parse_audio_analysis_output, parse_metadata_access_token, parse_provider_status,
-        retry_delay_for_attempt, should_drop_low_signal_transcript, status_event_generation,
-        status_task_id, token_fetch_retry_delay, transcript_drop_reason,
+        gcp_provider_response_outcome, identity_token_cache_for_audience,
+        is_empty_transcript_normalize_error, is_implausible_text_density, is_loop_hallucination,
+        is_retryable_provider_failure, next_status_generation, normalize_transcript_to_vtt,
+        parakeet_request_url, parse_audio_analysis_output, parse_metadata_access_token,
+        parse_provider_status, retry_delay_for_attempt, should_drop_low_signal_transcript,
+        status_event_generation, status_task_id, token_fetch_retry_delay, transcript_drop_reason,
         transcription_response_format, AccessTokenCache, AudioAnalysis, AudioExtractErrorKind,
         Config, ParsedVtt, StatusTaskRequest, TranscriptConfidence, TranscriptDropReason,
         TranscriptLockAction, TranscriptLockState, TranscriptLockStatus, VideoInfo,
@@ -4009,11 +4032,23 @@ mod tests {
         net::TcpListener,
         sync::{
             atomic::{AtomicUsize, Ordering},
-            Arc,
+            Arc, Mutex,
         },
         thread,
         time::{Duration, Instant},
     };
+
+    /// `access_token_cache()` is process-global, so the tests that seed it must
+    /// not run concurrently with each other. Held for the body of each such
+    /// test; poisoning is irrelevant because the guarded state is the cache,
+    /// not this unit.
+    static GLOBAL_TOKEN_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_global_token_cache() -> std::sync::MutexGuard<'static, ()> {
+        GLOBAL_TOKEN_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn spawn_status_server(
         statuses: Vec<u16>,
@@ -5173,6 +5208,7 @@ mod tests {
 
     #[tokio::test]
     async fn enqueue_status_task_drops_a_token_google_rejected_as_expired() {
+        let _guard = lock_global_token_cache();
         let expired_body = r#"{"error":{"code":401,"status":"UNAUTHENTICATED","details":[{"reason":"ACCESS_TOKEN_EXPIRED"}]}}"#;
         let (create_url, _count, server) =
             spawn_status_server_with_bodies(vec![(401, expired_body.to_string())]);
@@ -5204,11 +5240,59 @@ mod tests {
 
         assert!(result.is_err());
         server.join().expect("server thread should finish");
-        assert_ne!(
+        assert_eq!(
+            access_token_cache().get(Instant::now()),
+            None,
+            "a token Google rejected as expired must be cleared from the shared cache",
+        );
+    }
+
+    #[test]
+    fn gcp_provider_response_clears_the_rejected_token_and_reports_retryable() {
+        let _guard = lock_global_token_cache();
+        let expired_body = r#"{"error":{"code":401,"status":"UNAUTHENTICATED","details":[{"reason":"ACCESS_TOKEN_EXPIRED"}]}}"#;
+        let token = "expired-token-for-provider-outcome-test";
+        access_token_cache().set(token.to_string(), Duration::from_secs(600), Instant::now());
+
+        let failure = gcp_provider_response_outcome(token, 401, None, expired_body.to_string())
+            .expect_err("an expired-token response is a provider failure");
+
+        assert!(
+            is_retryable_provider_failure(&failure),
+            "an expired token must be retryable so the provider loop refetches",
+        );
+        assert_eq!(
+            access_token_cache().get(Instant::now()),
+            None,
+            "the rejected token must not survive in the shared cache",
+        );
+    }
+
+    #[test]
+    fn gcp_provider_response_keeps_a_token_rejected_for_another_reason() {
+        let _guard = lock_global_token_cache();
+        let token = "valid-token-for-provider-outcome-test";
+        access_token_cache().set(token.to_string(), Duration::from_secs(600), Instant::now());
+
+        let failure =
+            gcp_provider_response_outcome(token, 401, None, "invalid API key".to_string())
+                .expect_err("a 401 is still a provider failure");
+
+        assert!(!is_retryable_provider_failure(&failure));
+        assert_eq!(
             access_token_cache().get(Instant::now()),
             Some(token.to_string()),
-            "a token Google rejected as expired must not stay in the shared cache",
+            "only an expired-token rejection may clear the cache",
         );
+        access_token_cache().invalidate_if(token);
+    }
+
+    #[test]
+    fn gcp_provider_response_passes_a_success_body_through() {
+        let body = r#"{"results":[]}"#;
+        let outcome = gcp_provider_response_outcome("any-token", 200, None, body.to_string());
+
+        assert_eq!(outcome.expect("2xx is a success"), body);
     }
 
     #[test]

@@ -4,8 +4,7 @@
 use std::path::Path;
 
 use crate::{
-    invalidate_gcp_access_token_if_expired_response, parse_provider_status, Config, ParsedVtt,
-    ProviderFailure,
+    gcp_provider_response_outcome, parse_provider_status, Config, ParsedVtt, ProviderFailure,
 };
 use base64::Engine as _;
 
@@ -663,22 +662,12 @@ pub(crate) async fn transcribe(
         )
     })?;
 
-    invalidate_gcp_access_token_if_expired_response(
+    gcp_provider_response_outcome(
         &access_token,
-        Some(status.as_u16()),
-        &resp_body,
-    );
-
-    if !status.is_success() {
-        return Err(parse_provider_status(
-            Some(status.as_u16()),
-            retry_after.as_deref(),
-            &resp_body,
-            false,
-        ));
-    }
-
-    Ok(resp_body)
+        status.as_u16(),
+        retry_after.as_deref(),
+        resp_body,
+    )
 }
 
 pub(crate) fn contains_provider_json_artifact(text: &str) -> bool {
