@@ -54,6 +54,10 @@ fn select_delivery_host(req: &Request, meta: &BlobMetadata) -> &'static str {
     if !is_publicly_cacheable(meta) {
         return FASTLY_HOST;
     }
+    // Not yet copied and verified into the replica: bunny would 404 it.
+    if !meta.replicated {
+        return FASTLY_HOST;
+    }
     let pct: u32 = config_store_get("bunny_traffic_pct").unwrap_or(0);
     if bucket_of(&meta.sha256) < pct { BUNNY_HOST } else { FASTLY_HOST }
 }
@@ -103,9 +107,14 @@ broken.
 
 ### Eligibility — the replica is the access control
 
-Only `Active`, public, non-restricted blobs are steerable. Everything else — `Pending`,
-`Restricted`, `AgeRestricted`, admin bypass, tombstoned, legal hold — stays on the Fastly Compute
-path.
+Only `Active`, public, non-restricted blobs are steerable, **and only once the replica copy has been
+verified**. Everything else — `Pending`, `Restricted`, `AgeRestricted`, admin bypass, tombstoned,
+legal hold — stays on the Fastly Compute path.
+
+Eligibility and readiness are separate conditions and both are required. Absence from the replica
+denies restricted content, which is the access-control property below; but an approved blob that has
+not finished copying is also absent, and steering it would 404 the newest content at its worst
+moment. Route on the verified flag, not on approval alone.
 
 **Enforce this by replication policy, not by logic at the second CDN.** Replicate to the delivery
 store only on moderation-approval, never on upload. A gated blob is then simply not in the replica:

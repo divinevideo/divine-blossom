@@ -119,9 +119,10 @@ bucket-scoped credential with the explicit upload and version-delete capabilitie
 gets a separate bucket-scoped read-only credential. Neither credential belongs in source control or
 client-visible configuration.
 
-No generic replication framework and no BUD-04 `PUT /mirror` path. The queue is the existing
-derivative-status queue and the reconciler is a periodic repair pass over one flag — reuse, not new
-machinery.
+No generic replication framework and no BUD-04 `PUT /mirror` path. Enqueue on Cloud Tasks, following
+the pattern of the existing derivative-status queue rather than sharing that queue — its serialized
+dispatch is part of a generation-ordering contract replication has no generation for. The reconciler
+is a periodic repair pass over one flag, not new machinery.
 
 Recheck policy immediately before copying. A delayed job must never publish a hash that has since
 been tombstoned or restricted.
@@ -173,7 +174,8 @@ edge deny-list before increasing rollout; descriptor steering alone is insuffici
 20–100 representative approved public objects.
 
 1. Private non-production B2 bucket, separate scoped writer and read-only origin
-   credentials, and a bunny pull zone with AWS signing enabled.
+   credentials, a bunny pull zone with AWS signing enabled, and a Divine-owned delivery hostname
+   with a short TTL on that zone — step 5 cannot exercise the DNS move without it.
 2. Copy and verify the sample objects.
 3. Steer an explicit test-hash allowlist, then 1% of eligible public traffic.
 4. Measure against Fastly on the same content: startup latency, rebuffering, cache hit rate, miss
@@ -209,7 +211,8 @@ Each of these needs its own justification. None belong in the pilot.
   provider but does not retry a failed request on another provider. Decide separately after the
   pilot whether automatic per-request failover earns the client complexity.
 - Protected and age-gated content on the second provider (see the scope rule).
-- Durable replication queue, readiness reconciliation, dashboards.
+- Replication dashboards. The readiness flag and its repair pass are not deferred — steering
+  correctness depends on them.
 - A generic replication abstraction. Provider APIs called directly are fine for one provider.
 - A third provider, or geographic steering.
 - `backup.media.divine.video` as a separate published hostname. `media.divine.video` stays the
