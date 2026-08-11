@@ -47,6 +47,9 @@ use crate::storage::{
     upload_blob, write_audit_log,
 };
 use crate::viewer_auth::{ViewerAuthDiagnostics, ViewerAuthState};
+use blossom_core::cache_policy::{
+    immutable_blob_cache_headers, mutable_derivative_cache_headers,
+};
 use fastly_blossom::resumable_complete::parse_resumable_complete_request_body;
 
 use fastly::cache::simple as simple_cache;
@@ -1661,7 +1664,7 @@ fn serve_transcript_by_hash(
             if is_admin || metadata.status.requires_private_cache() {
                 add_private_cache_headers(&mut resp, &hash);
             } else {
-                add_derivative_cache_headers(&mut resp, &hash);
+                add_derivative_cache_headers(&mut resp, hash);
             }
             add_cors_headers(&mut resp);
             Ok(resp)
@@ -5919,13 +5922,14 @@ fn error_response(error: &BlossomError) -> Response {
 /// - Surrogate-Control: tells Fastly edge to cache for 1 year (stripped before client)
 /// - Surrogate-Key: enables targeted purging via `fastly purge --key {hash}`
 fn add_cache_headers(resp: &mut Response, hash: &str) {
-    resp.set_header("Cache-Control", "public, max-age=31536000, immutable");
-    resp.set_header("Surrogate-Control", "max-age=31536000");
-    resp.set_header("Surrogate-Key", hash);
+    let headers = immutable_blob_cache_headers(hash);
+    resp.set_header("Cache-Control", headers.cache_control);
+    resp.set_header("Surrogate-Control", headers.surrogate_control);
+    resp.set_header("Surrogate-Key", headers.surrogate_key);
 }
 
 /// Cache headers for *derived* content: renditions, HLS manifests and segments,
-/// transcripts, and thumbnails.
+/// and transcripts.
 ///
 /// Unlike the blob, these are not immutable. The transcoder regenerates renditions
 /// via `/backfill-fmp4`, and `scan_and_repair_vtts.py` rewrites transcripts — both
@@ -5937,9 +5941,10 @@ fn add_cache_headers(resp: &mut Response, hash: &str) {
 /// Surrogate-Key. Only the browser TTL needs to be short enough that a repair reaches
 /// clients that already cached the old version.
 fn add_derivative_cache_headers(resp: &mut Response, hash: &str) {
-    resp.set_header("Cache-Control", "public, max-age=86400");
-    resp.set_header("Surrogate-Control", "max-age=31536000");
-    resp.set_header("Surrogate-Key", hash);
+    let headers = mutable_derivative_cache_headers(hash);
+    resp.set_header("Cache-Control", headers.cache_control);
+    resp.set_header("Surrogate-Control", headers.surrogate_control);
+    resp.set_header("Surrogate-Key", headers.surrogate_key);
 }
 
 /// Like add_cache_headers but for authenticated or admin-only content that must
@@ -6160,15 +6165,13 @@ mod tests {
         should_reset_transcode_failure_on_clean_upload,
         should_reset_transcript_failure_on_clean_upload, should_set_audio_content_length,
         trusted_upload_service_terminal_derivative_error, upload_capability_headers,
-        add_cache_headers, add_derivative_cache_headers, upload_control_host,
-        upload_exposed_headers, upload_from_resumable_completion,
+        upload_control_host, upload_exposed_headers, upload_from_resumable_completion,
         AudioReuseAvailability, DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction,
         TranscriptPendingState,
     };
     use crate::blossom::{ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus};
     use crate::error::{BlossomError, Result as BlossomResult};
     use fastly::http::StatusCode;
-    use fastly::Response;
 
     #[test]
     fn upload_service_response_records_failure_fields_but_clamps_broad_invalid_media_terminal() {
@@ -6863,66 +6866,5 @@ mod tests {
         assert_eq!(resp.get_status(), StatusCode::BAD_REQUEST);
         assert_eq!(resp.get_header_str("Cache-Control"), None);
         assert_eq!(resp.get_header_str("Surrogate-Control"), None);
-    }
-
-    #[test]
-    fn blob_cache_headers_are_immutable() {
-        // The blob is the content of its own hash; it can never change.
-        let mut resp = Response::from_status(StatusCode::OK);
-        add_cache_headers(&mut resp, "abc123");
-
-        assert_eq!(
-            resp.get_header_str("Cache-Control"),
-            Some("public, max-age=31536000, immutable")
-        );
-        assert_eq!(resp.get_header_str("Surrogate-Control"), Some("max-age=31536000"));
-        assert_eq!(resp.get_header_str("Surrogate-Key"), Some("abc123"));
-    }
-
-    #[test]
-    fn derivative_cache_headers_are_never_immutable() {
-        // Derivatives are regenerated: scan_and_repair_vtts.py rewrites VTTs and
-        // backfill-fmp4 rebuilds renditions. A browser holding an `immutable`
-        // response will not revalidate even on reload, and browser caches cannot
-        // be purged, so a repaired file would never reach clients that saw the old one.
-        let mut resp = Response::from_status(StatusCode::OK);
-        add_derivative_cache_headers(&mut resp, "abc123");
-
-        let cc = resp.get_header_str("Cache-Control").unwrap();
-        assert!(!cc.contains("immutable"), "derivatives must not be immutable, got {cc:?}");
-        assert!(cc.contains("public"), "derivatives should still be shared-cacheable, got {cc:?}");
-    }
-
-    #[test]
-    fn derivative_browser_ttl_is_short_enough_to_recover_from_a_repair() {
-        let mut resp = Response::from_status(StatusCode::OK);
-        add_derivative_cache_headers(&mut resp, "abc123");
-
-        let cc = resp.get_header_str("Cache-Control").unwrap();
-        let max_age: u64 = cc
-            .split("max-age=")
-            .nth(1)
-            .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
-            .and_then(|d| d.parse().ok())
-            .expect("derivative Cache-Control must carry a max-age");
-        assert!(
-            max_age <= 86_400,
-            "a repaired derivative must reach clients within a day, got max-age={max_age}"
-        );
-    }
-
-    #[test]
-    fn derivative_keeps_long_edge_ttl_and_purge_key() {
-        // Edge caches stay long-lived because purge_edge_cache can invalidate them
-        // by Surrogate-Key; only the browser TTL needs shortening.
-        let mut resp = Response::from_status(StatusCode::OK);
-        add_derivative_cache_headers(&mut resp, "abc123");
-
-        assert_eq!(resp.get_header_str("Surrogate-Control"), Some("max-age=31536000"));
-        assert_eq!(
-            resp.get_header_str("Surrogate-Key"),
-            Some("abc123"),
-            "purge by hash must still reach every derivative"
-        );
     }
 }
