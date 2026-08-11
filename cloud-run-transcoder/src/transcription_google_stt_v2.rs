@@ -3,7 +3,9 @@
 
 use std::path::Path;
 
-use crate::{parse_provider_status, Config, ParsedVtt, ProviderFailure};
+use crate::{
+    gcp_provider_response_outcome, parse_provider_status, Config, ParsedVtt, ProviderFailure,
+};
 use base64::Engine as _;
 
 /// STT V2 sync `recognize` is limited to **10 MB OR 1 minute, whichever
@@ -57,9 +59,10 @@ pub(crate) fn build_recognize_request(
     // Per-request language wins over the env-default. Empty / "auto" / "und"
     // fall through to the configured codes (multi-language detection).
     let language_codes: Vec<String> = match language {
-        Some(lang) if !lang.trim().is_empty()
-            && !lang.eq_ignore_ascii_case("auto")
-            && !lang.eq_ignore_ascii_case("und") =>
+        Some(lang)
+            if !lang.trim().is_empty()
+                && !lang.eq_ignore_ascii_case("auto")
+                && !lang.eq_ignore_ascii_case("und") =>
         {
             vec![lang.trim().to_string()]
         }
@@ -381,9 +384,8 @@ fn strip_trailing_preamble(head: &str) -> &str {
         }
     }
     match earliest {
-        Some(pos) => trimmed[..pos].trim_end_matches(|c: char| {
-            c.is_whitespace() || c == ',' || c == ':' || c == '-'
-        }),
+        Some(pos) => trimmed[..pos]
+            .trim_end_matches(|c: char| c.is_whitespace() || c == ',' || c == ':' || c == '-'),
         None => trimmed,
     }
 }
@@ -660,16 +662,12 @@ pub(crate) async fn transcribe(
         )
     })?;
 
-    if !status.is_success() {
-        return Err(parse_provider_status(
-            Some(status.as_u16()),
-            retry_after.as_deref(),
-            &resp_body,
-            false,
-        ));
-    }
-
-    Ok(resp_body)
+    gcp_provider_response_outcome(
+        &access_token,
+        status.as_u16(),
+        retry_after.as_deref(),
+        resp_body,
+    )
 }
 
 pub(crate) fn contains_provider_json_artifact(text: &str) -> bool {
@@ -892,7 +890,10 @@ mod tests {
 
     #[test]
     fn unwrap_envelope_returns_none_for_plain_text() {
-        assert_eq!(unwrap_json_envelope("Hello world this is a normal sentence"), None);
+        assert_eq!(
+            unwrap_json_envelope("Hello world this is a normal sentence"),
+            None
+        );
     }
 
     #[test]
