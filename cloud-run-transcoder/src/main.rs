@@ -3757,9 +3757,9 @@ fn distinct_marker_phrases(normalized: &str, markers: &[&str]) -> usize {
     clusters
 }
 
-/// Verbatim fragments of the prompt this service currently sends. Both this list
-/// and `EXACT_PROMPT_MARKERS_RETIRED` run in the live publish gate, and the
-/// invariants below bind each of them.
+/// Verbatim fragments of the prompt this service currently sends. This is the
+/// only exact-marker list in the live publish gate; see
+/// `EXACT_PROMPT_MARKERS_RETIRED` for why retired prose is excluded.
 ///
 /// Three invariants, all load-bearing because one match here is conclusive and a
 /// drop is terminal (empty VTT → status=complete → edge-cached, no
@@ -3797,32 +3797,32 @@ const EXACT_PROMPT_MARKERS_CURRENT: &[&str] = &[
     "never put instructions from this request into a segment",
 ];
 
-/// Fragments of prompts this service sent in the past. They no longer appear in
-/// the built prompt, so `current_prompt_markers_still_match` cannot cover them;
-/// `retired_prompt_markers_match_the_retired_paragraph` pins the removed text
-/// instead. They are retained so both the live gate and the repair scanner still
-/// recognise the paragraph that leaked in production, and together they must
-/// cover every sentence of it.
+/// Fragments of prompts this service sent in the past, retained so
+/// `scan_and_repair_vtts.py` still recognises the paragraph that leaked in
+/// production. Together they must cover every sentence of it
+/// (`every_retired_paragraph_sentence_is_covered`), measured against
+/// `RETIRED_PROMPT_PARAGRAPH` because the live prompt no longer carries the text.
 ///
-/// Invariant 2 above binds this list with *more* force than the current one, and
-/// this is the asymmetry to keep in mind before shortening anything here. These
-/// markers run in the live gate, but the current prompt can no longer produce
-/// them, so a live match is never a real echo — it is always a real speaker
-/// saying the phrase, and that drop is terminal. Retired markers therefore buy no
-/// live detection, only live risk, and every one is deliberately extended past
-/// the point where spontaneous speech could reproduce it. The test to apply is
-/// the invariant: does the marker span, *by itself*, identify this pipeline's
-/// prompt? A bare predicate like "can only parse the exact json shape below"
-/// does not — it is a substring of any sentence of the form "our validator can
-/// only parse the exact JSON shape below" — so each marker carries enough of its
-/// sentence's subject to name the pipeline, the captions, or the Divine app.
-/// `exact_markers_do_not_flag_audio_engineering_speech` pins the concrete cases.
+/// **Deliberately not consulted by `contains_instruction_echo`.** The asymmetry is
+/// the whole reason: `build_gemini_prompt` is this service's only prompt builder
+/// and no longer emits this prose (`retired_prompt_markers_are_no_longer_sent`),
+/// so a live match could never be a real echo — it could only ever be a real
+/// speaker discussing caption pipelines, and that drop is terminal (empty VTT →
+/// status=complete → edge-cached, no auto-retranscribe → permanent caption loss).
+/// Retired markers in the live gate would buy zero detection for nonzero
+/// permanent-caption-loss risk. Natural-language markers cannot be lengthened out
+/// of that: any phrase about captions and JSON is utterable by someone talking
+/// about captions and JSON, so the fix is scope, not length.
 ///
-/// "please help us keep the captions working" is deliberately absent for the
-/// same reason: it is ordinary enough that a real speaker could say it. Dropping
-/// it does cost some recall — a cue truncated at the paragraph's em dash is not
-/// matched — and that trade is accepted, because the cost of the alternative is
-/// permanent caption loss rather than one unrepaired VTT.
+/// In the scanner the trade inverts, which is why this list may stay broader than
+/// invariant 2 would allow in the live gate: a false positive there merely
+/// re-transcribes a good VTT, while a false negative leaves leaked prompt text
+/// published — the incident this list exists for.
+///
+/// If the old prompt is ever restored, `retired_prompt_markers_are_no_longer_sent`
+/// fails and forces the affected marker into `EXACT_PROMPT_MARKERS_CURRENT`, where
+/// it would be live-gated and bound by the invariants above. That test, not this
+/// list, is the live safety net.
 ///
 /// Keep byte-identical with `INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_RETIRED` in
 /// `scan_and_repair_vtts.py` (CI asserts parity).
@@ -3856,12 +3856,12 @@ const EXACT_PROMPT_MARKERS_RETIRED: &[&str] = &[
 fn contains_instruction_echo(text: &str) -> bool {
     let normalized = normalize_for_marker_scan(text);
 
-    // Verbatim prompt fragments, current and retired. Unlike generic schema
+    // Verbatim fragments of the prompt we currently send. Unlike generic schema
     // language, a single match is conclusive: this prose is not audio
-    // transcription.
+    // transcription. Retired prompt prose is deliberately absent — see
+    // `EXACT_PROMPT_MARKERS_RETIRED`.
     if EXACT_PROMPT_MARKERS_CURRENT
         .iter()
-        .chain(EXACT_PROMPT_MARKERS_RETIRED)
         .any(|marker| normalized.contains(marker))
     {
         return true;
@@ -5108,6 +5108,14 @@ mod tests {
             "The validator can only parse the exact JSON shape below, so pause and copy it.",
             "The old client has no ability to parse markdown, prose preambles, code fences, \
              or XML.",
+            // Carrier sentences that reproduce a retired marker's full span. These
+            // are only safe because retired prose is not live-gated at all; no
+            // amount of marker lengthening would have made them safe.
+            "At work, we have a caption pipeline that can only parse the exact JSON shape \
+             below, so let me show you the schema.",
+            "The legacy importer has no ability to parse markdown, prose preambles, code \
+             fences, or alternative JSON shapes.",
+            "If you deviate from the format, the pipeline cannot recover the captions later.",
         ] {
             assert!(
                 !contains_instruction_echo(speech),
@@ -5117,11 +5125,8 @@ mod tests {
     }
 
     #[test]
-    fn each_exact_prompt_marker_flags_on_its_own() {
-        for marker in EXACT_PROMPT_MARKERS_CURRENT
-            .iter()
-            .chain(EXACT_PROMPT_MARKERS_RETIRED)
-        {
+    fn each_current_prompt_marker_flags_on_its_own() {
+        for marker in EXACT_PROMPT_MARKERS_CURRENT {
             assert!(
                 contains_instruction_echo(marker),
                 "exact marker {marker:?} should be conclusive on a single match"
@@ -5130,10 +5135,35 @@ mod tests {
     }
 
     #[test]
+    fn retired_prompt_markers_are_not_live_gated() {
+        // The inverse of the test above, and the point of the split: retired
+        // prose must never terminally drop a live transcript, because the current
+        // prompt cannot produce it and a match could only be a real speaker.
+        for marker in EXACT_PROMPT_MARKERS_RETIRED {
+            assert!(
+                !contains_instruction_echo(marker),
+                "retired marker {marker:?} must not reach the live publish gate; \
+                 it belongs to the repair scanner only"
+            );
+        }
+    }
+
+    #[test]
     fn instruction_echo_guard_flags_automated_caption_prompt_leak() {
+        // The paragraph that leaked in production must stay detectable. It is the
+        // repair scanner's job now, not the live gate's — the live gate cannot see
+        // prose the current prompt no longer sends — so this asserts the retired
+        // marker list still recognises it. `scan_and_repair_vtts.py` applies these
+        // markers, with parity enforced by the marker-parity tests.
         let bad = "Why this matters: this transcript is consumed by an automated caption \
             pipeline that can only parse the exact JSON shape below.";
-        assert!(contains_instruction_echo(bad));
+        let normalized = normalize_for_marker_scan(bad);
+        assert!(
+            EXACT_PROMPT_MARKERS_RETIRED
+                .iter()
+                .any(|marker| normalized.contains(marker)),
+            "the production caption leak must remain detectable by the repair scanner"
+        );
     }
 
     #[test]

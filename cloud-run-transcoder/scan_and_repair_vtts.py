@@ -84,6 +84,11 @@ INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_CURRENT = (
 
 # Fragments of prompts the transcoder sent in the past. Retained so the scanner
 # still finds already-published VTTs after the prompt itself was shortened.
+# These are scanner-only: the Rust publish gate deliberately does not consult
+# them, because the current prompt can no longer produce this prose, so a live
+# match could only be a real speaker and the drop would be terminal. Here the
+# trade inverts (a false positive only re-transcribes), so this list is allowed
+# to stay broader.
 # Keep byte-identical with the Rust EXACT_PROMPT_MARKERS_RETIRED (CI asserts
 # parity).
 INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_RETIRED = (
@@ -396,7 +401,14 @@ def normalize_for_marker_scan(text: str) -> str:
 
 
 def has_instruction_echo(text: str) -> bool:
-    """Mirror of `contains_instruction_echo` in main.rs."""
+    """Mirror of `contains_instruction_echo` in main.rs, plus retired prompt prose.
+
+    Deliberately a superset: the Rust gate scans only current-prompt markers,
+    because there a false positive is a terminal caption loss. Here a false
+    positive only re-transcribes a good VTT, while a false negative leaves leaked
+    prompt text published, so this scanner also carries the retired markers it
+    exists to find. See `EXACT_PROMPT_MARKERS_RETIRED` in main.rs.
+    """
     normalized = normalize_for_marker_scan(text)
     if any(marker in normalized for marker in INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS):
         return True
