@@ -4098,6 +4098,53 @@ mod tests {
         (url, request_count, handle)
     }
 
+    /// Like `spawn_status_server_with_bodies`, but records the `Authorization`
+    /// header of each request so a test can assert which credential was sent.
+    fn spawn_status_server_recording_auth(
+        responses: Vec<(u16, String)>,
+    ) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let bearers = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&bearers);
+        let handle = thread::spawn(move || {
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().expect("accept test request");
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = [0_u8; 8192];
+                let read = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                if let Some(header) = request
+                    .lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+                {
+                    seen.lock()
+                        .expect("bearer log")
+                        .push(header["authorization:".len()..].trim().to_string());
+                }
+                let reason = match status {
+                    200 => "OK",
+                    401 => "Unauthorized",
+                    409 => "Conflict",
+                    500 => "Internal Server Error",
+                    502 => "Bad Gateway",
+                    _ => "Status",
+                };
+                let response = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    reason,
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write test response");
+            }
+        });
+        (url, bearers, handle)
+    }
+
     #[test]
     fn transcribe_audio_size_guard_rejects_empty_and_oversize() {
         assert!(ensure_transcribe_audio_size(0).is_err());
@@ -4350,11 +4397,59 @@ mod tests {
             webhook_secret: None,
         };
 
-        let result = enqueue_status_task_request_with_retry(&client, &request).await;
+        let result = enqueue_status_task_request_with_retry(&client, &request, || async {
+            Ok("access-token".to_string())
+        })
+        .await;
 
         assert!(result.is_ok());
         server.join().expect("server thread should finish");
         assert_eq!(request_count.load(Ordering::SeqCst), 3);
+    }
+
+    /// The regression both second-judgment reviewers caught: clearing the
+    /// cached token is useless if the remaining attempts replay the dead one.
+    #[tokio::test]
+    async fn enqueue_status_task_retries_with_a_refreshed_token_after_expiry() {
+        let expired_body = r#"{"error":{"code":401,"status":"UNAUTHENTICATED","details":[{"reason":"ACCESS_TOKEN_EXPIRED"}]}}"#;
+        let (create_url, bearers, server) = spawn_status_server_recording_auth(vec![
+            (401, expired_body.to_string()),
+            (200, "OK".to_string()),
+        ]);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let payload = serde_json::json!({"sha256": "abc123", "status": "complete"});
+        let hash = "c".repeat(64);
+        let request = StatusTaskRequest {
+            create_url: &create_url,
+            queue_path: "projects/proj/locations/us-central1/queues/derivative-status",
+            target_url: "https://edge.example/admin/transcode-status",
+            label: "transcode",
+            hash: &hash,
+            generation: 9,
+            payload: &payload,
+            token: "stale-token",
+            webhook_secret: None,
+        };
+
+        let result = enqueue_status_task_request_with_retry(&client, &request, || async {
+            Ok("fresh-token".to_string())
+        })
+        .await;
+
+        assert!(result.is_ok());
+        server.join().expect("server thread should finish");
+        let seen = bearers.lock().expect("bearer log");
+        assert_eq!(
+            *seen,
+            vec![
+                "Bearer stale-token".to_string(),
+                "Bearer fresh-token".to_string()
+            ],
+            "the retry after a 401 must carry a refreshed credential",
+        );
     }
 
     #[test]
@@ -6392,9 +6487,10 @@ async fn enqueue_status_task_with_retry(
         token: &token,
         webhook_secret: config.webhook_secret.as_deref(),
     };
-    enqueue_status_task_request_with_retry(client, &request).await
+    enqueue_status_task_request_with_retry(client, &request, fetch_gcp_access_token).await
 }
 
+#[derive(Clone, Copy)]
 struct StatusTaskRequest<'a> {
     create_url: &'a str,
     queue_path: &'a str,
@@ -6407,18 +6503,40 @@ struct StatusTaskRequest<'a> {
     webhook_secret: Option<&'a str>,
 }
 
-async fn enqueue_status_task_request_with_retry(
+/// Retry a Cloud Tasks enqueue, re-reading the access token before each retry.
+///
+/// `refresh_token` is `fetch_gcp_access_token` in production, which serves the
+/// process-global cache. That is what makes the retry meaningful: a
+/// `401 ACCESS_TOKEN_EXPIRED` drops the rejected token from that cache, so the
+/// next call fetches a live credential instead of replaying the dead one. On
+/// any other failure the cache still holds the token and the refresh is a cheap
+/// read. A refresh that fails leaves the previous token in place, so a metadata
+/// blip degrades to the old behaviour rather than aborting the retry.
+async fn enqueue_status_task_request_with_retry<F, Fut>(
     client: &reqwest::Client,
     request: &StatusTaskRequest<'_>,
-) -> anyhow::Result<()> {
+    mut refresh_token: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<String, ProviderFailure>>,
+{
     let mut last_error: Option<anyhow::Error> = None;
+    let mut token = request.token.to_string();
     for attempt in 0..3 {
-        match enqueue_status_task_request(client, request).await {
+        let attempt_request = StatusTaskRequest {
+            token: &token,
+            ..*request
+        };
+        match enqueue_status_task_request(client, &attempt_request).await {
             Ok(()) => return Ok(()),
             Err(error) => {
                 last_error = Some(error);
                 if attempt < 2 {
                     tokio::time::sleep(token_fetch_retry_delay(attempt)).await;
+                    if let Ok(fresh) = refresh_token().await {
+                        token = fresh;
+                    }
                 }
             }
         }
