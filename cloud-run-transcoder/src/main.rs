@@ -3485,27 +3485,22 @@ fn normalize_transcript_to_vtt(raw: &str) -> Result<ParsedVtt> {
                 });
             }
         }
-    }
 
-    // Convert a constrained non-speech classification into conventional
-    // closed-caption notation. Only do this when no speech cue was produced;
-    // a generic sound label must never replace intelligible speech.
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
-        let segments_empty = json["segments"]
-            .as_array()
-            .map(|segments| segments.is_empty())
-            .unwrap_or(true);
-        if segments_empty {
-            if let Some(label) = closed_caption_sound_label(json["sound_event"].as_str()) {
-                return Ok(ParsedVtt {
-                    content: format!("WEBVTT\n\n1\n00:00:00.000 --> 99:59:59.000\n{}\n", label),
-                    text: label.to_string(),
-                    language: json["language"].as_str().map(str::to_string),
-                    duration_ms: 0,
-                    cue_count: 1,
-                    confidence: None,
-                });
-            }
+        // Reaching here means no speech cue was produced. Convert a
+        // constrained non-speech classification into conventional
+        // closed-caption notation. Gated on "no cue emitted" rather than "the
+        // segments array is empty" so a response carrying only blank segments
+        // still yields the sound cue; a generic sound label must never replace
+        // intelligible speech.
+        if let Some(label) = closed_caption_sound_label(json["sound_event"].as_str()) {
+            return Ok(ParsedVtt {
+                content: format!("WEBVTT\n\n1\n00:00:00.000 --> 99:59:59.000\n{}\n", label),
+                text: label.to_string(),
+                language: parsed_language,
+                duration_ms: 0,
+                cue_count: 1,
+                confidence,
+            });
         }
     }
 
@@ -4712,6 +4707,29 @@ mod tests {
         assert_eq!(parsed.text, "[Music]");
         assert_eq!(parsed.cue_count, 1);
         assert!(parsed.content.contains("\n[Music]\n"));
+    }
+
+    #[test]
+    fn music_only_response_with_blank_segments_becomes_closed_caption_cue() {
+        // Gemini sometimes returns the segment scaffold with empty text rather
+        // than an empty array. The sound cue must survive that shape.
+        let parsed = normalize_transcript_to_vtt(
+            r#"{"language":"und","sound_event":"music","segments":[{"start":0,"end":5,"text":"   "}]}"#,
+        )
+        .expect("blank segments plus a music classification should produce a VTT");
+
+        assert_eq!(parsed.text, "[Music]");
+        assert_eq!(parsed.cue_count, 1);
+    }
+
+    #[test]
+    fn speech_segments_are_never_replaced_by_a_sound_label() {
+        let parsed = normalize_transcript_to_vtt(
+            r#"{"language":"en","sound_event":"music","segments":[{"start":0,"end":2,"text":"hello there"}]}"#,
+        )
+        .expect("real speech should transcribe");
+
+        assert_eq!(parsed.text, "hello there");
     }
 
     #[test]
