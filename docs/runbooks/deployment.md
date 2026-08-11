@@ -97,6 +97,26 @@ silently drop live settings the deploy path does not name. PR #153 fixed this
 for the transcoder script only; the other deploy paths still need the same
 treatment; see issue #171.
 
+## Exported shell variables override script defaults
+
+The deploy scripts resolve every setting as `VAR="${VAR:-production-default}"`,
+so an exported shell variable silently wins over the production default. On
+2026-08-07 a shell with `GCS_BUCKET=divine-blossom-media-staging` exported
+pointed the production transcoder at the staging bucket, where its service
+account has no read access; every transcode failed with 403 for four and a
+half hours.
+
+Do not export deploy-time variables (`GCS_BUCKET`, `PROJECT_ID`, and friends)
+from a shell profile. Set them inline on the one command that needs them.
+
+As a backstop, the transcoder and upload deploy scripts run
+`scripts/require-env-match.sh` after resolving their variables and before
+building anything. It compares the fully resolved values against the revision
+currently serving traffic and aborts the deploy when they differ; re-run with
+`CONFIRM_ENV_CHANGES=1` when the change is intended. The comparison has to use
+resolved values: a check that parses the default out of the script text cannot
+catch this failure mode, because the whole failure is the default not applying.
+
 ## Staged rollout when the edge and a backend change together
 
 The edge is already live by the time you start deploying the backend, so the
@@ -120,3 +140,30 @@ gcloud run services describe divine-transcoder \
   --project rich-compiler-479518-d2 --region us-central1 \
   --format='value(spec.template.spec.containers[0].image)'
 ```
+
+## A traffic rollback pins the service
+
+`gcloud run services update-traffic --to-revisions=<revision>=100` rolls back
+by pointing traffic at an explicit revision, and in doing so stops the service
+from migrating to the latest revision. A later `gcloud run deploy` then creates
+the new revision at 0% traffic while reporting success — the rollback target
+keeps serving.
+
+After any rollback, restore migration to latest explicitly:
+
+```bash
+gcloud run services update-traffic divine-transcoder \
+  --project rich-compiler-479518-d2 --region us-central1 --to-latest
+```
+
+Until that runs, check where traffic actually is after every deploy:
+
+```bash
+gcloud run services describe divine-transcoder \
+  --project rich-compiler-479518-d2 --region us-central1 \
+  --format='json(status.traffic)'
+```
+
+The same pinning is why the pre-deploy environment check compares against the
+serving revision rather than the service's `spec.template`: after a rollback,
+the template describes the revision that was just reverted.
