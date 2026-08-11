@@ -236,6 +236,10 @@ class MarkerParityTests(unittest.TestCase):
             "before we run the tagger.",
             "Our job is to classify the dominant sound in a recording, then label it.",
             "Please classify the dominant sound in every scene before editing.",
+            "If the VTT is overwritten, the pipeline cannot recover the "
+            "captions automatically.",
+            "This bug means the pipeline cannot recover the captions after a failed export.",
+            "This transcript is consumed by an automated caption pipeline, so keep it clean.",
         ):
             self.assertFalse(
                 module.has_instruction_echo(speech),

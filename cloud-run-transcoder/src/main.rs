@@ -3757,9 +3757,10 @@ fn distinct_marker_phrases(normalized: &str, markers: &[&str]) -> usize {
     clusters
 }
 
-/// Verbatim fragments of the prompt this service currently sends.
+/// Verbatim fragments of the prompt this service currently sends. This is the
+/// only exact-marker list in the live publish gate.
 ///
-/// Two invariants, both load-bearing because one match here is conclusive and a
+/// Three invariants, all load-bearing because one match here is conclusive and a
 /// drop is terminal (empty VTT → status=complete → edge-cached, no
 /// auto-retranscribe → permanent caption loss):
 ///
@@ -3774,6 +3775,19 @@ fn distinct_marker_phrases(normalized: &str, markers: &[&str]) -> usize {
 ///    short generic fragment such as "classify the dominant sound in" is
 ///    ordinary audio-engineering speech and would permanently destroy the
 ///    captions of any clip that says it.
+///    `exact_markers_do_not_flag_audio_engineering_speech` pins that case.
+/// 3. Invariants 1 and 2 are in tension with recall, and this list resolves it
+///    in favour of never dropping real speech. A marker that carries the
+///    prompt's punctuation is **inert against an echo that dropped it**, and a
+///    model leaking an instruction into a field told to hold "ONLY the spoken
+///    words" may well drop backticks. So at least one marker here must stay
+///    punctuation-free to act as the backstop — currently
+///    "never put instructions from this request into a segment", which matches a
+///    stripped echo. The residual gap is a partial echo of only the
+///    `sound_event` bullet with its backticks removed; a fuller echo still trips
+///    the punctuation-free marker or two distinct `STRONG_MARKERS`. That gap is
+///    accepted deliberately: the alternative was a marker that terminally drops
+///    real speech.
 ///
 /// Keep byte-identical with `INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_CURRENT` in
 /// `scan_and_repair_vtts.py` (CI asserts parity).
@@ -3785,18 +3799,32 @@ const EXACT_PROMPT_MARKERS_CURRENT: &[&str] = &[
 /// Fragments of prompts this service sent in the past. They no longer appear in
 /// the built prompt, so `current_prompt_markers_still_match` cannot cover them;
 /// `retired_prompt_markers_match_the_retired_paragraph` pins the removed text
-/// instead. They are retained so the repair scanner still finds VTTs published
-/// before the prompt was shortened, and together they must cover the whole
-/// removed paragraph — a VTT that echoed only an uncovered sentence would go
-/// unrepaired.
+/// instead. They are retained so both the live gate and the repair scanner still
+/// recognise the paragraph that leaked in production, and together they must
+/// cover every sentence of it.
+///
+/// Invariant 2 above applies here with the same force. These markers run in the
+/// live gate, where the current prompt can no longer produce them, so any live
+/// match is by definition a real speaker saying the phrase — and that drop is
+/// terminal. Each one is therefore kept long enough that spontaneous speech
+/// would not reproduce it: "the pipeline cannot recover the captions" is an
+/// ordinary sentence about caption pipelines on its own, so it carries its
+/// leading clause, and "this transcript is consumed by..." carries the
+/// paragraph's opening "why this matters:".
+///
+/// "please help us keep the captions working" is deliberately absent for the
+/// same reason: it is ordinary enough that a real speaker could say it. Dropping
+/// it does cost some recall — a cue truncated at the paragraph's em dash is not
+/// matched — and that trade is accepted, because the cost of the alternative is
+/// permanent caption loss rather than one unrepaired VTT.
 ///
 /// Keep byte-identical with `INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_RETIRED` in
 /// `scan_and_repair_vtts.py` (CI asserts parity).
 const EXACT_PROMPT_MARKERS_RETIRED: &[&str] = &[
-    "this transcript is consumed by an automated caption pipeline",
+    "why this matters: this transcript is consumed by an automated caption pipeline",
     "can only parse the exact json shape below",
     "no ability to parse markdown, prose preambles, code fences",
-    "the pipeline cannot recover the captions",
+    "if you deviate from the format, the pipeline cannot recover the captions",
     "real users watching videos in the divine app will see broken or missing subtitles",
     "strict adherence to the format below is what makes that possible",
 ];
@@ -3822,8 +3850,9 @@ const EXACT_PROMPT_MARKERS_RETIRED: &[&str] = &[
 fn contains_instruction_echo(text: &str) -> bool {
     let normalized = normalize_for_marker_scan(text);
 
-    // Verbatim prompt fragments. Unlike generic schema language, a single
-    // match is conclusive: this prose is not audio transcription.
+    // Verbatim prompt fragments, current and retired. Unlike generic schema
+    // language, a single match is conclusive: this prose is not audio
+    // transcription.
     if EXACT_PROMPT_MARKERS_CURRENT
         .iter()
         .chain(EXACT_PROMPT_MARKERS_RETIRED)
@@ -5024,8 +5053,12 @@ mod tests {
 
     #[test]
     fn every_retired_paragraph_sentence_is_covered() {
-        // A partial echo starting mid-paragraph must still be caught, so each
-        // sentence of the removed paragraph needs at least one marker in it.
+        // Sentence granularity only: a cue echoing a whole sentence of the
+        // removed paragraph must match some marker. This deliberately does not
+        // promise coverage of arbitrary fragments — a cue truncated mid-sentence,
+        // or at the paragraph's em dash, can still escape. Tightening that would
+        // mean shorter markers, and a marker short enough to catch every fragment
+        // is short enough to drop real speech.
         let normalized = normalize_for_marker_scan(RETIRED_PROMPT_PARAGRAPH);
         for sentence in normalized.split(". ").filter(|s| !s.trim().is_empty()) {
             assert!(
@@ -5033,7 +5066,7 @@ mod tests {
                     .iter()
                     .any(|marker| sentence.contains(marker)),
                 "no retired marker covers the sentence {sentence:?}; a caption \
-                 echoing only this sentence would go unrepaired"
+                 echoing this whole sentence would go unrepaired"
             );
         }
     }
@@ -5059,6 +5092,11 @@ mod tests {
             "Our job is to classify the dominant sound in a recording, then label it.",
             "Please classify the dominant sound in every scene before editing.",
             "You should classify the dominant sound in the mix first.",
+            // Retired markers run in this gate too, where the current prompt can
+            // no longer produce them, so any live match is a real speaker.
+            "If the VTT is overwritten, the pipeline cannot recover the captions automatically.",
+            "This bug means the pipeline cannot recover the captions after a failed export.",
+            "This transcript is consumed by an automated caption pipeline, so keep it clean.",
         ] {
             assert!(
                 !contains_instruction_echo(speech),
