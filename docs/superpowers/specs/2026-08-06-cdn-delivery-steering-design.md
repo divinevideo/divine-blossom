@@ -72,7 +72,9 @@ fn bucket_of(sha256: &str) -> u32 {
 }
 ```
 
-`is_publicly_cacheable` is a proposed helper, not an existing `BlobMetadata` method.
+`is_publicly_cacheable` is a proposed helper, not an existing `BlobMetadata` method, and
+`meta.replicated` is a proposed field, not one that exists today. The bunny rollout plan describes
+where replication sets it.
 
 Why here: it is one function, it already governs every URL handed out, and the decision has full
 context available — moderation status, client geo, content type.
