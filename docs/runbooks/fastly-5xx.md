@@ -63,10 +63,11 @@ work:
    activation.
 4. Publish the Compute package through the repository deployment path, then
    activate the separately validated outer VCL version.
-5. Validate with approved, controlled requests that both streams receive the
-   same sanitized request ID and that a controlled outer backend failure retains
-   `obj.response`. Confirm the existing 503 status, JSON body, content type, and
-   CORS header remain unchanged.
+5. Validate each failure stage separately with approved, controlled requests.
+   Confirm a Compute 5xx record preserves its supplied request ID. Confirm an
+   outer backend failure preserves its supplied request ID and `obj.response`
+   without producing a matching Compute record. Confirm the existing 503 status,
+   JSON body, content type, and CORS header remain unchanged.
 6. Create separate outer `status_5xx_rate` and inner
    `compute_resp_status_5xx_rate` alerts with minimum request thresholds. Add a
    low-volume absolute 5xx alert only if sustained small failures require it.
