@@ -5,3 +5,4 @@ pub mod rate_limit;
 pub mod read_through;
 pub mod transcribe;
 pub mod types;
+pub mod upload_log;
