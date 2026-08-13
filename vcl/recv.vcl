@@ -4,6 +4,16 @@
 # Pass original host to Compute so it can generate correct URLs
 set req.http.X-Original-Host = req.http.Host;
 
+# Keep one correlation ID across the outer VCL and chained Compute services.
+if (!req.http.X-Request-Id) {
+  set req.http.X-Request-Id = uuid.version4();
+}
+# Preserve the outer service's sanitized value for cross-service correlation.
+set req.http.X-Divine-Edge-Request-Id = substr(regsuball(req.http.X-Request-Id, "[^A-Za-z0-9_-]", ""), 0, 16);
+if (!req.http.X-Divine-Edge-Request-Id) {
+  set req.http.X-Divine-Edge-Request-Id = uuid.version4();
+}
+
 # Force all traffic to the Compute backend
 set req.backend = F_compute_origin;
 

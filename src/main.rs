@@ -11,6 +11,7 @@ mod media_auth_log;
 mod metadata;
 mod rate_limit;
 mod req_id;
+mod request_log;
 mod storage;
 mod viewer_auth;
 
@@ -47,9 +48,8 @@ use crate::storage::{
     trigger_cloud_run_delete_blob, upload_blob, write_audit_log,
 };
 use crate::viewer_auth::{ViewerAuthDiagnostics, ViewerAuthState};
-use blossom_core::cache_policy::{
-    immutable_blob_cache_headers, mutable_derivative_cache_headers,
-};
+use blossom_core::cache_policy::{immutable_blob_cache_headers, mutable_derivative_cache_headers};
+use blossom_core::request_diagnostics::route_category;
 use fastly_blossom::resumable_complete::parse_resumable_complete_request_body;
 
 use fastly::cache::simple as simple_cache;
@@ -58,7 +58,7 @@ use fastly::kv_store::KVStore;
 use fastly::{Error, Request, Response};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// TTL for cached HLS manifests (1 hour) — immutable once transcoding completes
 const HLS_CACHE_TTL: Duration = Duration::from_secs(3600);
@@ -76,24 +76,33 @@ const DERIVATIVE_MAX_ATTEMPTS: u32 = 3;
 
 /// Entry point
 #[fastly::main]
-fn main(req: Request) -> std::result::Result<Response, Error> {
-    match handle_request(req) {
-        Ok(resp) => Ok(resp),
-        Err(e) => Ok(error_response(&e)),
-    }
+fn main(mut req: Request) -> std::result::Result<Response, Error> {
+    let started = Instant::now();
+    let request_id = req_id::for_request(&req);
+    req.set_header(req_id::REQUEST_ID_HEADER, &request_id);
+    let method = req.get_method().as_str().to_string();
+    let route = route_category(req.get_path());
+    let result = handle_request(req);
+    let (response, error) = match result {
+        Ok(response) => (response, None),
+        Err(error) => (error_response(&error), Some(error)),
+    };
+
+    request_log::emit(
+        &request_id,
+        &method,
+        route,
+        response.get_status().as_u16(),
+        error.as_ref(),
+        started.elapsed(),
+    );
+    Ok(response)
 }
 
 /// Route and handle the request
 fn handle_request(req: Request) -> Result<Response> {
     let method = req.get_method().clone();
     let path = req.get_path().to_string();
-    let host = req.get_header_str("host").unwrap_or("unknown");
-
-    eprintln!(
-        "[BLOSSOM ROUTE] method={} path={} host={}",
-        method, path, host
-    );
-
     match (method, path.as_str()) {
         // Landing page
         (Method::GET, "/") => Ok(handle_landing_page()),

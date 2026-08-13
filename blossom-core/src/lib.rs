@@ -3,5 +3,6 @@ pub mod delete_policy;
 pub mod error;
 pub mod rate_limit;
 pub mod read_through;
+pub mod request_diagnostics;
 pub mod transcribe;
 pub mod types;

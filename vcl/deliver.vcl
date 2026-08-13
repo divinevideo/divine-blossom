@@ -4,6 +4,7 @@
 # Strip internal headers that should not reach clients
 unset resp.http.Surrogate-Key;
 unset resp.http.Surrogate-Control;
+unset resp.http.X-Divine-Edge-Request-Id;
 
 # Strip GCS/S3 backend headers that leak through Compute
 unset resp.http.x-guploader-uploadid;
