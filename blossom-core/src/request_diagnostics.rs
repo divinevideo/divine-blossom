@@ -1,5 +1,10 @@
 const MAX_REQUEST_ID_LEN: usize = 16;
 
+/// Return whether a Compute response belongs in persistent diagnostics.
+pub fn should_persist_compute_diagnostic(status: u16) -> bool {
+    (500..=599).contains(&status)
+}
+
 /// Restrict an untrusted request ID to a short, injection-safe log value.
 pub fn sanitize_request_id(value: &str) -> String {
     value
@@ -90,6 +95,16 @@ mod tests {
     fn sanitizer_preserves_allowed_ascii_and_limits_length() {
         assert_eq!(sanitize_request_id("abc123-_"), "abc123-_");
         assert_eq!(sanitize_request_id(&"a".repeat(32)), "a".repeat(16));
+    }
+
+    #[test]
+    fn persistent_compute_diagnostics_are_error_only() {
+        assert!(!should_persist_compute_diagnostic(200));
+        assert!(!should_persist_compute_diagnostic(404));
+        assert!(should_persist_compute_diagnostic(500));
+        assert!(should_persist_compute_diagnostic(502));
+        assert!(should_persist_compute_diagnostic(599));
+        assert!(!should_persist_compute_diagnostic(600));
     }
 
     #[test]

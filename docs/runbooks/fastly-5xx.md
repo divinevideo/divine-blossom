@@ -14,9 +14,10 @@ The repository contains, but does not activate or configure:
 - `vcl/error.vcl`, an `vcl_error` snippet that writes Fastly-generated 503
   details to the endpoint named `vcl-error-diagnostics` before returning the
   existing JSON response.
-- Compute request logging to the endpoint named `compute-diagnostics` with the
-  sanitized request ID, method, normalized route, final status, available error
-  category, and duration.
+- Error-only Compute request logging to the endpoint named
+  `compute-diagnostics` with the sanitized request ID, method, normalized route,
+  final status, available error category, and duration. Routine successful and
+  client-error responses are not persisted.
 
 Neither endpoint is created by repository code. Compute logging fails open when
 `compute-diagnostics` is unavailable. The outer VCL source is not deployed by
@@ -36,7 +37,9 @@ removes that private header from client responses.
 
 `divine.blossom.compute_request.v1` records the sanitized request ID, method,
 normalized route category, final status, available backend/error category, and
-Compute duration in milliseconds. A route category never contains a path
+Compute duration in milliseconds for every final 5xx response. This includes
+storage, metadata, and internal failures without making persistent ingestion
+scale with successful request volume. A route category never contains a path
 parameter or query string.
 
 Do not point either schema at `cdn-view-logs`; that stream has a separate

@@ -1,4 +1,5 @@
 use blossom_core::error::BlossomError;
+use blossom_core::request_diagnostics::should_persist_compute_diagnostic;
 use fastly::log::Endpoint;
 use serde::Serialize;
 use std::io::Write;
@@ -26,6 +27,10 @@ pub(crate) fn emit(
     error: Option<&BlossomError>,
     duration: Duration,
 ) {
+    if !should_persist_compute_diagnostic(status) {
+        return;
+    }
+
     let record = RequestDiagnostic {
         schema: "divine.blossom.compute_request.v1",
         request_id,
