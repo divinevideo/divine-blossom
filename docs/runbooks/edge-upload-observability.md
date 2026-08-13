@@ -32,7 +32,7 @@ change that case had **zero** record anywhere.
 
 | flow | route | through Fastly? | logged here? |
 |---|---|---|---|
-| direct `PUT /upload` | via `media.divine.video`, full body proxied | yes | **yes** (`direct_put`) |
+| direct `PUT /upload` | via `media.divine.video`; body proxied to origin only above 500 KB or for video, otherwise stored inline by the edge | yes | **yes** (`direct_put`) |
 | resumable `POST /upload/init` | via `media.divine.video` | yes | **yes** (`resumable_init`) |
 | resumable `POST /upload/{id}/complete` | via `media.divine.video` | yes | **yes** (`resumable_complete`) |
 | resumable chunk `PUT /sessions/{id}` | client → `upload.divine.video` direct | **no** | no — bypasses the edge entirely |
@@ -61,9 +61,14 @@ are dashboard-managed. The logging endpoint is the same. Consequences:
   just stops
 
 There is no automated backstop for this today. The mitigation in code is that
-every line is also written to stderr, so `fastly log-tail` keeps working as a
-fallback and the loss is discoverable rather than invisible. That is a fallback,
-not a fix: stderr is ephemeral.
+every line is also written to stderr, so `fastly log-tail` still shows the lines.
+
+**Do not over-trust that mitigation.** `log-tail` is both ephemeral *and* lossy —
+measured, see the note under Verification. It is enough to confirm the guest is
+still emitting, and not enough to notice that the sink stopped receiving. If the
+endpoint is deleted, the realistic detection path is someone querying the sink
+and finding a gap, which is exactly the delayed, manual detection this warning
+exists to flag.
 
 To check the endpoint still exists on the active version:
 
