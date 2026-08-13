@@ -365,24 +365,25 @@ SELECT count() FROM nostr.edge_upload_logs
 WHERE route = 'direct_put' AND proxied_body AND timestamp >= today();
 ```
 
-Observed on 2026-08-13: one `PUT /upload` in a five-minute window against 2963
-total routed requests, i.e. roughly 12/hour or ~290/day of direct PUTs at the
-edge. That is consistent with the 241–523/day origin figure, but it is a
-five-minute sample taken through `log-tail` — which is itself lossy, see below —
-and should not be treated as a rate measurement.
+Measured over the first 13.3 hours (450 records, 2026-08-13 10:17Z–23:33Z):
 
-Both branches of the threshold were seen in real traffic the same day, which is
-worth knowing when reading the data:
+| | count | per day |
+|---|---|---|
+| `direct_put` total | 329 | ~595 |
+| `direct_put` proxied (`proxied_body = true`) | 176 | ~319 |
+| `direct_put` inline | 153 | ~276 |
+| `resumable_init` | 58 | ~105 |
+| `resumable_complete` | 63 | ~114 |
 
-| observed | `content_length` | `content_type` | `proxied_body` | `origin_status` | `proxy_duration_ms` |
-|---|---|---|---|---|---|
-| proxied because video | 5016 | `video/mp4` | true | 200 | 757 |
-| proxied because video | 5016 | `video/mp4` | true | 200 | 617 |
-| inline, under threshold | 100126 | `image/jpeg` | false | null | null |
+The **319/day proxied** figure sits inside the 241–523/day origin baseline, while
+the 595/day total does not — which is the expected result once the inline path is
+excluded, and is the cross-check that the instrumentation is counting the right
+things. `resumable_init` at ~105/day likewise matches the 62–103/day origin
+figure for resumable sessions.
 
-Note the 5 KB `video/mp4` files: the video MIME check fires at *any* size, so
-small videos proxy while much larger images do not. Size alone does not predict
-which path a request took — read `proxied_body`.
+Note that the video MIME check fires at *any* size, so 5 KB `video/mp4` files
+proxy while a 100 KB `image/jpeg` does not. Size alone does not predict which
+path a request took — read `proxied_body`.
 
 Other origin-side baselines for comparison: ~96–98% of direct PUTs return 200;
 408s run 1–6/day, 400s 4–10/day, 413s 1–5/day; client aborts mid-upload
