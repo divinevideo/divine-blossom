@@ -271,6 +271,14 @@ following a `Nostr` or `Bearer` scheme keyword with `[redacted]`. The control
 character stripping is not cosmetic: a raw newline in an error message would
 split one record into two on a line-delimited sink.
 
+No auth error message currently echoes the `Authorization` header — they are all
+fixed strings — so the credential redaction is defence in depth rather than a fix
+for a known leak. The field that genuinely carries external content is
+`error_message` on `origin_status_error`: `extract_upload_service_error_message`
+falls back to the raw origin response body when it cannot parse an `error` field
+out of it. That body is upstream text this service does not control, which is why
+it is capped and scrubbed rather than logged verbatim.
+
 ## Correlation with origin logs
 
 The edge sends its `req_id` to origin as an `X-Request-Id` header on all three
