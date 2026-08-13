@@ -321,8 +321,20 @@ gcloud pubsub subscriptions describe edge-upload-logs-sub \
 ### Fallback while the subscriber does not exist
 
 ```bash
-fastly log-tail --service-id pOvEEWykEbpnylqst1KTrR | grep '^\[UPLOAD\]'
+fastly log-tail --service-id pOvEEWykEbpnylqst1KTrR | grep '\[UPLOAD\]'
 ```
+
+**`log-tail` is lossy. Never count with it.** Measured on 2026-08-13: five
+`POST /upload/{id}/complete` requests issued during an active `log-tail` produced
+**no output at all** — not even the `[BLOSSOM ROUTE]` line that `handle_request`
+emits unconditionally for every request before any routing runs. All five were
+present in Pub/Sub. The tail samples across POPs and drops under load; the
+service handles thousands of requests per minute, of which uploads are a
+handful.
+
+Use `log-tail` to answer "is the guest emitting the shape I expect?", which it
+does well and immediately. Use Pub/Sub to answer "how many?", which `log-tail`
+cannot answer at all. An absence in `log-tail` is not evidence of anything.
 
 ### Sanity-check the volume — and mind the inline path
 
@@ -351,7 +363,21 @@ WHERE route = 'direct_put' AND proxied_body AND timestamp >= today();
 Observed on 2026-08-13: one `PUT /upload` in a five-minute window against 2963
 total routed requests, i.e. roughly 12/hour or ~290/day of direct PUTs at the
 edge. That is consistent with the 241–523/day origin figure, but it is a
-five-minute sample and should not be treated as a rate measurement.
+five-minute sample taken through `log-tail` — which is itself lossy, see below —
+and should not be treated as a rate measurement.
+
+Both branches of the threshold were seen in real traffic the same day, which is
+worth knowing when reading the data:
+
+| observed | `content_length` | `content_type` | `proxied_body` | `origin_status` | `proxy_duration_ms` |
+|---|---|---|---|---|---|
+| proxied because video | 5016 | `video/mp4` | true | 200 | 757 |
+| proxied because video | 5016 | `video/mp4` | true | 200 | 617 |
+| inline, under threshold | 100126 | `image/jpeg` | false | null | null |
+
+Note the 5 KB `video/mp4` files: the video MIME check fires at *any* size, so
+small videos proxy while much larger images do not. Size alone does not predict
+which path a request took — read `proxied_body`.
 
 Other origin-side baselines for comparison: ~96–98% of direct PUTs return 200;
 408s run 1–6/day, 400s 4–10/day, 413s 1–5/day; client aborts mid-upload
