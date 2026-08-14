@@ -73,6 +73,9 @@ impl UploadOutcome {
 /// free-text fields that could otherwise smuggle a credential in.
 #[derive(Debug, Clone)]
 pub struct UploadLogRecord {
+    /// Request occurrence time as Unix epoch milliseconds. Delivery to the sink
+    /// is batched, so subscriber insertion time is not an event timestamp.
+    pub occurred_at_ms: u64,
     pub route: UploadRoute,
     /// Correlation ID, also forwarded to origin as `X-Request-Id`.
     pub req_id: String,
@@ -102,8 +105,9 @@ pub struct UploadLogRecord {
 
 impl UploadLogRecord {
     /// A record for a request that has not done anything yet.
-    pub fn new(route: UploadRoute, req_id: String) -> Self {
+    pub fn new(route: UploadRoute, req_id: String, occurred_at_ms: u64) -> Self {
         UploadLogRecord {
+            occurred_at_ms,
             route,
             req_id,
             content_length: None,
@@ -203,6 +207,7 @@ pub fn record_failure(record: &mut UploadLogRecord, error: &crate::error::Blosso
 pub fn format_upload_log(record: &UploadLogRecord) -> String {
     let line = serde_json::json!({
         "schema": SCHEMA_VERSION,
+        "occurred_at_ms": record.occurred_at_ms,
         "route": record.route.as_str(),
         "outcome": record.outcome().as_str(),
         "req_id": sanitize_opt(Some(&record.req_id)),
@@ -262,6 +267,7 @@ mod tests {
 
     fn record() -> UploadLogRecord {
         UploadLogRecord {
+            occurred_at_ms: 1_700_000_000_123,
             route: UploadRoute::DirectPut,
             req_id: "abc123".into(),
             content_length: Some(1_048_576),
@@ -290,6 +296,7 @@ mod tests {
         let v = parse(&line);
 
         assert_eq!(v["outcome"], "ok");
+        assert_eq!(v["occurred_at_ms"], 1_700_000_000_123_u64);
         assert_eq!(v["route"], "direct_put");
         assert_eq!(v["origin_status"], 200);
         assert_eq!(v["content_length"], 1_048_576);
@@ -495,7 +502,7 @@ mod tests {
     // in src/ is effectively untested.
 
     fn fresh() -> UploadLogRecord {
-        UploadLogRecord::new(UploadRoute::DirectPut, "abc123".into())
+        UploadLogRecord::new(UploadRoute::DirectPut, "abc123".into(), 1_700_000_000_123)
     }
 
     #[test]

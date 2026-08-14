@@ -5,6 +5,7 @@ use blossom_core::upload_log::{format_upload_log, UploadLogRecord, UploadRoute};
 use fastly::http::header;
 use fastly::Request;
 use std::io::Write;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Name of the Fastly logging endpoint that carries these lines.
 ///
@@ -27,7 +28,11 @@ pub(crate) fn start_record(
     route: UploadRoute,
     req_id: String,
 ) -> UploadLogRecord {
-    let mut record = UploadLogRecord::new(route, req_id);
+    let occurred_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0);
+    let mut record = UploadLogRecord::new(route, req_id, occurred_at_ms);
 
     record.content_length = req
         .get_header(header::CONTENT_LENGTH)
