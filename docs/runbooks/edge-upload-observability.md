@@ -108,10 +108,17 @@ chmod 600 "$KEY_FILE"
 
 Create the `edge_upload_logs` Google Cloud Pub/Sub endpoint in the Fastly
 dashboard using the JSON file's `client_email` and `private_key` fields, then
-activate that service version. Delete the local key immediately; the trap does
-so when the shell exits. Do not pass the private key to `fastly logging
-googlepubsub create`: that command accepts the key only as an argument, which
-exposes it in process metadata.
+activate that service version. Immediately delete the local key and disarm the
+normal-exit cleanup after it succeeds:
+
+```bash
+rm -f "$KEY_FILE"
+trap - EXIT
+```
+
+The EXIT trap remains the abnormal-path backstop until those commands run. Do
+not pass the private key to `fastly logging googlepubsub create`: that command
+accepts the key only as an argument, which exposes it in process metadata.
 
 The endpoint name **must** be `edge_upload_logs`; it is matched by
 `UPLOAD_LOG_ENDPOINT` in `src/upload_log.rs`.
@@ -211,6 +218,14 @@ ENGINE = MergeTree
 PARTITION BY toYYYYMM(timestamp)
 ORDER BY (route, outcome, timestamp);
 ```
+
+The subscriber must normalize messages before `JSONEachRow` insertion. Schema 2
+already carries `occurred_at_ms`. For retained schema-1 messages, which predate
+that field, set `occurred_at_ms` from the Pub/Sub message's server-assigned
+publish time. Do not insert a missing value as zero or use ClickHouse insertion
+time: either choice moves delayed backlog into the wrong query window. Reject
+unknown future schema versions rather than silently applying the schema-1
+fallback.
 
 ## Schema
 
