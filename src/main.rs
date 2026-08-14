@@ -307,10 +307,10 @@ where
 
 /// Send a prepared request to the upload service, recording the attempt.
 ///
-/// A failed `send` is the case with no record anywhere else: the request never
-/// reached origin, so no origin access log, and none of the origin-side
-/// log-based metrics, will ever account for it. The timing is captured before
-/// the match so it survives that path too.
+/// A failed `send` means the edge received no complete origin response. Origin
+/// may still have received or processed some or all of the request, so this is
+/// deliberately not described as evidence that origin was never reached. The
+/// timing is captured before the match so it survives that path too.
 fn send_to_upload_service(proxy_req: Request, record: &mut UploadLogRecord) -> Result<Response> {
     let started = Instant::now();
     let sent = proxy_req.send(UPLOAD_SERVICE_BACKEND);

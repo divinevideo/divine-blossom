@@ -3,7 +3,7 @@
 
 /// Bumped whenever the emitted field set changes incompatibly. The sink's
 /// schema is owned by a different repo, so consumers need a version to key on.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Upper bound on any free-text field copied into a log line. Error text is
 /// partly attacker-influenced, and an unbounded message is both a cost and a
@@ -44,15 +44,14 @@ impl UploadRoute {
 pub enum UploadOutcome {
     /// Edge returned a success status.
     Ok,
-    /// The proxy send itself failed: the request never reached origin, so no
-    /// origin-side log or metric will ever account for it.
+    /// The proxy send did not yield a complete origin response.
     SendFailed,
     /// Origin replied, with a non-success status.
     OriginStatusError,
-    /// Edge returned a 4xx of its own. Check `origin_reached` to tell an
+    /// Edge returned a 4xx of its own. Check `origin_responded` to tell an
     /// edge-side precondition failure from a rejection relayed from origin.
     ValidationRejected,
-    /// Edge returned a 5xx of its own. With `origin_reached = true` this is a
+    /// Edge returned a 5xx of its own. With `origin_responded = true` this is a
     /// post-origin failure: the upload landed but the edge failed afterwards.
     EdgeError,
 }
@@ -83,10 +82,11 @@ pub struct UploadLogRecord {
     pub content_type: Option<String>,
     /// Whether a request body was streamed through the edge to origin.
     pub proxied_body: bool,
-    /// Whether an origin request was attempted and answered.
-    pub origin_reached: bool,
+    /// Whether origin returned a complete HTTP response.
+    pub origin_responded: bool,
     pub origin_status: Option<u16>,
-    /// The error from `.send()`. Populated only when origin was never reached.
+    /// The error from `.send()`. This does not establish whether origin
+    /// received or processed some or all of the request.
     pub send_error: Option<String>,
     /// Wall time around the origin send, present whenever a send was attempted
     /// — including when it failed.
@@ -109,7 +109,7 @@ impl UploadLogRecord {
             content_length: None,
             content_type: None,
             proxied_body: false,
-            origin_reached: false,
+            origin_responded: false,
             origin_status: None,
             send_error: None,
             proxy_duration_ms: None,
@@ -149,7 +149,7 @@ impl UploadLogRecord {
 pub enum OriginSendResult<'a> {
     /// Origin answered, with this status.
     Replied(u16),
-    /// The send itself failed; origin never saw the request.
+    /// The send did not yield a complete response.
     Failed(&'a str),
 }
 
@@ -166,11 +166,11 @@ pub fn record_send_attempt(
     record.proxy_duration_ms = Some(duration_ms);
     match result {
         OriginSendResult::Replied(status) => {
-            record.origin_reached = true;
+            record.origin_responded = true;
             record.origin_status = Some(status);
         }
         OriginSendResult::Failed(error) => {
-            record.origin_reached = false;
+            record.origin_responded = false;
             record.origin_status = None;
             record.send_error = Some(error.to_string());
         }
@@ -187,7 +187,7 @@ pub fn record_response(record: &mut UploadLogRecord, status: u16) {
 /// Additive only. An earlier `send_error` or `origin_status` must survive:
 /// both a failed send and an origin rejection get wrapped into a
 /// `BlossomError` before the handler returns, and overwriting here would erase
-/// the distinction between "origin never saw it", "origin refused it", and
+/// the distinction between "no complete response", "origin refused it", and
 /// "the edge itself broke".
 pub fn record_failure(record: &mut UploadLogRecord, error: &crate::error::BlossomError) {
     record.response_status = error.status_code().as_u16();
@@ -209,7 +209,7 @@ pub fn format_upload_log(record: &UploadLogRecord) -> String {
         "content_length": record.content_length,
         "content_type": sanitize_opt(record.content_type.as_deref()),
         "proxied_body": record.proxied_body,
-        "origin_reached": record.origin_reached,
+        "origin_responded": record.origin_responded,
         "origin_status": record.origin_status,
         "send_error": sanitize_opt(record.send_error.as_deref()),
         "proxy_duration_ms": record.proxy_duration_ms,
@@ -267,7 +267,7 @@ mod tests {
             content_length: Some(1_048_576),
             content_type: Some("video/mp4".into()),
             proxied_body: true,
-            origin_reached: true,
+            origin_responded: true,
             origin_status: Some(200),
             send_error: None,
             proxy_duration_ms: Some(4200),
@@ -298,10 +298,9 @@ mod tests {
 
     #[test]
     fn send_failure_is_classified_send_failed() {
-        // The invisible case: the request never reached origin, so no origin
-        // log and no origin-side metric will ever mention it.
+        // The edge did not receive a complete origin response.
         let mut r = record();
-        r.origin_reached = false;
+        r.origin_responded = false;
         r.origin_status = None;
         r.send_error = Some("connection closed by peer".into());
         r.response_status = 500;
@@ -311,7 +310,7 @@ mod tests {
 
         assert_eq!(v["outcome"], "send_failed");
         assert_eq!(v["send_error"], "connection closed by peer");
-        assert_eq!(v["origin_reached"], false);
+        assert_eq!(v["origin_responded"], false);
         assert!(v["origin_status"].is_null());
     }
 
@@ -322,7 +321,7 @@ mod tests {
         let mut r = record();
         r.send_error = Some("timeout".into());
         r.origin_status = None;
-        r.origin_reached = false;
+        r.origin_responded = false;
         r.proxy_duration_ms = Some(120_000);
         r.duration_ms = 120_050;
         r.response_status = 500;
@@ -345,13 +344,13 @@ mod tests {
 
         assert_eq!(v["outcome"], "origin_status_error");
         assert_eq!(v["origin_status"], 413);
-        assert_eq!(v["origin_reached"], true);
+        assert_eq!(v["origin_responded"], true);
     }
 
     #[test]
     fn client_error_before_origin_is_classified_validation_rejected() {
         let mut r = record();
-        r.origin_reached = false;
+        r.origin_responded = false;
         r.origin_status = None;
         r.proxy_duration_ms = None;
         r.proxied_body = false;
@@ -369,7 +368,7 @@ mod tests {
     #[test]
     fn server_error_before_origin_is_classified_edge_error() {
         let mut r = record();
-        r.origin_reached = false;
+        r.origin_responded = false;
         r.origin_status = None;
         r.response_status = 502;
         r.error_kind = Some("storage_error");
@@ -382,7 +381,7 @@ mod tests {
     #[test]
     fn edge_failure_after_successful_origin_reply_is_distinguishable() {
         // Origin accepted the upload but the edge failed afterwards (bad
-        // response parse, metadata write). Without origin_reached this is
+        // response parse, metadata write). Without origin_responded this is
         // indistinguishable from a pre-origin edge failure.
         let mut r = record();
         r.origin_status = Some(200);
@@ -392,7 +391,7 @@ mod tests {
         let v = parse(&format_upload_log(&r));
 
         assert_eq!(v["outcome"], "edge_error");
-        assert_eq!(v["origin_reached"], true);
+        assert_eq!(v["origin_responded"], true);
         assert_eq!(v["origin_status"], 200);
     }
 
@@ -505,18 +504,18 @@ mod tests {
         record_send_attempt(&mut r, OriginSendResult::Failed("connection reset"), 900);
 
         assert_eq!(r.send_error.as_deref(), Some("connection reset"));
-        assert!(!r.origin_reached);
+        assert!(!r.origin_responded);
         assert_eq!(r.origin_status, None);
         assert_eq!(r.proxy_duration_ms, Some(900));
         assert_eq!(r.outcome(), UploadOutcome::SendFailed);
     }
 
     #[test]
-    fn recording_a_reply_marks_origin_reached() {
+    fn recording_a_reply_marks_origin_responded() {
         let mut r = fresh();
         record_send_attempt(&mut r, OriginSendResult::Replied(201), 1500);
 
-        assert!(r.origin_reached);
+        assert!(r.origin_responded);
         assert_eq!(r.origin_status, Some(201));
         assert_eq!(r.send_error, None);
         assert_eq!(r.proxy_duration_ms, Some(1500));
@@ -594,6 +593,6 @@ mod tests {
 
         assert_eq!(r.outcome(), UploadOutcome::OriginStatusError);
         assert_eq!(r.origin_status, Some(413));
-        assert!(r.origin_reached);
+        assert!(r.origin_responded);
     }
 }
