@@ -5,7 +5,6 @@ use blossom_core::upload_log::{format_upload_log, UploadLogRecord, UploadRoute};
 use fastly::http::header;
 use fastly::Request;
 use std::io::Write;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Name of the Fastly logging endpoint that carries these lines.
 ///
@@ -17,17 +16,6 @@ pub(crate) const UPLOAD_LOG_ENDPOINT: &str = "edge_upload_logs";
 
 /// Header used to correlate an edge log line with the origin's access log.
 pub(crate) const CORRELATION_HEADER: &str = "X-Request-Id";
-
-/// Milliseconds since the epoch.
-///
-/// `SystemTime` rather than `Instant` to match `req_id.rs`, which is the only
-/// other clock user in this crate.
-pub(crate) fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 /// Seed a record from the inbound request.
 ///
@@ -67,11 +55,12 @@ pub(crate) fn start_record(
 /// Also mirrored to stderr. That is deliberate redundancy, not duplication:
 /// the endpoint is dashboard-managed config that this repo cannot assert on,
 /// and if it is ever deleted the platform drops writes without erroring. The
-/// stderr copy keeps `fastly log-tail` working as a fallback and makes the
-/// loss observable rather than silent.
+/// stderr copy keeps `fastly log-tail` useful for confirming that the guest is
+/// still emitting, though Pub/Sub remains the only durable count.
 pub(crate) fn emit(record: &UploadLogRecord) {
     let line = format_upload_log(record);
-    let mut endpoint = fastly::log::Endpoint::from_name(UPLOAD_LOG_ENDPOINT);
-    let _ = writeln!(endpoint, "{}", line);
+    if let Ok(mut endpoint) = fastly::log::Endpoint::try_from_name(UPLOAD_LOG_ENDPOINT) {
+        let _ = writeln!(endpoint, "{}", line);
+    }
     eprintln!("[UPLOAD] {}", line);
 }

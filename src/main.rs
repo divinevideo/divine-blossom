@@ -63,6 +63,7 @@ use fastly::kv_store::KVStore;
 use fastly::{Error, Request, Response};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
+use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// TTL for cached HLS manifests (1 hour) — immutable once transcoding completes
@@ -289,12 +290,12 @@ fn with_upload_log<F>(req: Request, route: UploadRoute, handler: F) -> Result<Re
 where
     F: FnOnce(Request, &mut UploadLogRecord) -> Result<Response>,
 {
-    let started = upload_log::now_millis();
+    let started = Instant::now();
     let mut record = upload_log::start_record(&req, route, req_id::for_request(&req));
 
     let result = handler(req, &mut record);
 
-    record.duration_ms = upload_log::now_millis().saturating_sub(started);
+    record.duration_ms = duration_millis(started.elapsed());
     match &result {
         Ok(resp) => record_response(&mut record, resp.get_status().as_u16()),
         Err(e) => record_failure(&mut record, e),
@@ -311,9 +312,9 @@ where
 /// log-based metrics, will ever account for it. The timing is captured before
 /// the match so it survives that path too.
 fn send_to_upload_service(proxy_req: Request, record: &mut UploadLogRecord) -> Result<Response> {
-    let started = upload_log::now_millis();
+    let started = Instant::now();
     let sent = proxy_req.send(UPLOAD_SERVICE_BACKEND);
-    let elapsed = upload_log::now_millis().saturating_sub(started);
+    let elapsed = duration_millis(started.elapsed());
 
     match sent {
         Ok(resp) => {
@@ -333,6 +334,10 @@ fn send_to_upload_service(proxy_req: Request, record: &mut UploadLogRecord) -> R
             )))
         }
     }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 fn classify_audio_reuse_availability(result: &Result<bool>) -> AudioReuseAvailability {
@@ -3977,6 +3982,11 @@ fn handle_upload_complete(
             ));
         }
     }
+
+    // The request body is a small control message; log the completed upload's
+    // declared media size and type so completion rows match init rows.
+    record.content_length = Some(complete_response.size);
+    record.content_type = Some(complete_response.content_type.clone());
 
     publish_upload_service_upload(
         auth,
