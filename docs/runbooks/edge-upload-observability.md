@@ -112,8 +112,7 @@ activate that service version. Immediately delete the local key and disarm the
 normal-exit cleanup after it succeeds:
 
 ```bash
-rm -f "$KEY_FILE"
-trap - EXIT
+rm -f "$KEY_FILE" && trap - EXIT
 ```
 
 The EXIT trap remains the abnormal-path backstop until those commands run. Do
@@ -220,10 +219,11 @@ ORDER BY (route, outcome, timestamp);
 ```
 
 The subscriber must normalize messages before `JSONEachRow` insertion. Schema 2
-already carries `occurred_at_ms`. For retained schema-1 messages, which predate
-that field, set `occurred_at_ms` from the Pub/Sub message's server-assigned
-publish time. Do not insert a missing value as zero or use ClickHouse insertion
-time: either choice moves delayed backlog into the wrong query window. Reject
+already carries `occurred_at_ms` and `origin_responded`. For retained schema-1
+messages, set `occurred_at_ms` from the Pub/Sub message's server-assigned publish
+time and rename `origin_reached` to `origin_responded`. Do not insert missing
+values as zero or use ClickHouse insertion time: either choice corrupts the
+normalized record or moves delayed backlog into the wrong query window. Reject
 unknown future schema versions rather than silently applying the schema-1
 fallback.
 
