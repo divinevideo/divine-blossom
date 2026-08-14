@@ -75,6 +75,7 @@ fastly logging googlepubsub list --service-id pOvEEWykEbpnylqst1KTrR --version a
 ### Recreating it from scratch
 
 ```bash
+umask 077
 PROJECT=rich-compiler-479518-d2
 SERVICE=pOvEEWykEbpnylqst1KTrR
 
@@ -95,24 +96,22 @@ gcloud pubsub topics add-iam-policy-binding edge-upload-logs \
   --role="roles/pubsub.publisher" \
   --project="$PROJECT"
 
-gcloud iam service-accounts keys create /tmp/edge-upload-logs-key.json \
+KEY_FILE=$(mktemp)
+trap 'rm -f "$KEY_FILE"' EXIT
+
+gcloud iam service-accounts keys create "$KEY_FILE" \
   --iam-account="fastly-edge-upload-logs@${PROJECT}.iam.gserviceaccount.com" \
   --project="$PROJECT"
 
-python3 -c "import json;k=json.load(open('/tmp/edge-upload-logs-key.json'));open('/tmp/pk.pem','w').write(k['private_key'])"
-
-fastly logging googlepubsub create \
-  --service-id "$SERVICE" \
-  --version active --autoclone \
-  --name edge_upload_logs \
-  --project-id "$PROJECT" \
-  --topic edge-upload-logs \
-  --user "fastly-edge-upload-logs@${PROJECT}.iam.gserviceaccount.com" \
-  --secret-key="$(cat /tmp/pk.pem)" \
-  --non-interactive
-
-rm -f /tmp/edge-upload-logs-key.json /tmp/pk.pem
+chmod 600 "$KEY_FILE"
 ```
+
+Create the `edge_upload_logs` Google Cloud Pub/Sub endpoint in the Fastly
+dashboard using the JSON file's `client_email` and `private_key` fields, then
+activate that service version. Delete the local key immediately; the trap does
+so when the shell exits. Do not pass the private key to `fastly logging
+googlepubsub create`: that command accepts the key only as an argument, which
+exposes it in process metadata.
 
 The endpoint name **must** be `edge_upload_logs`; it is matched by
 `UPLOAD_LOG_ENDPOINT` in `src/upload_log.rs`.
@@ -123,11 +122,8 @@ to this one topic.
 
 ### Traps
 
-- **`--secret-key` must use the `=` form.** The PEM body begins with `-----`, and
-  the CLI's argument parser reads a space-separated value starting with dashes as
-  a flag. `--secret-key "$(cat pk.pem)"` fails with
-  `expected argument for flag '--secret-key'`; `--secret-key="$(cat pk.pem)"`
-  works.
+- **Do not use the CLI's `--secret-key` flag.** It has no file or stdin form, so
+  the private key would be visible in process metadata.
 - **`fastly logging googlepubsub describe` prints the full private key** to
   stdout, in both the default and `--json` output. Never paste its output into a
   PR, an issue, a ticket, or a shared transcript. Use `list` when you only need
@@ -191,7 +187,8 @@ Proposed table for whoever picks this up:
 ```sql
 CREATE TABLE nostr.edge_upload_logs
 (
-    timestamp         DateTime DEFAULT now(),
+    occurred_at_ms    UInt64,
+    timestamp         DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(toInt64(occurred_at_ms)),
     schema            UInt32,
     route             LowCardinality(String),
     outcome           LowCardinality(String),
@@ -225,6 +222,7 @@ the stream without per-row key checks.
 | field | type | meaning |
 |---|---|---|
 | `schema` | int | Field-set version. Bumped on incompatible changes. Currently `2`; version 1 named `origin_responded` as `origin_reached`. |
+| `occurred_at_ms` | int | Request occurrence time in Unix epoch milliseconds; use this rather than delayed sink insertion time |
 | `route` | string | `direct_put`, `resumable_init`, `resumable_complete` |
 | `outcome` | string | see below |
 | `req_id` | string | Correlation ID, also sent to origin as `X-Request-Id` |
