@@ -97,13 +97,28 @@ Blobs may exist on multiple legacy servers:
 | Server | Notes |
 |--------|-------|
 | `https://cdn.divine.video` | Primary old CDN |
-| `https://stream.divine.video` | Streaming server |
+| `https://stream.divine.video` | Retired Bunny Stream hostname; legacy GUID paths must be mapped from event `imeta` `x` tags and backfilled to Blossom, not served live. |
 | `https://blossom.divine.video` | Old blossom server |
 
 ### URL Patterns
 - `/{sha256}` - Raw hash
 - `/{sha256}.mp4` - With extension
 - `/{sha256}.jpg` - Thumbnails
+
+### Bunny Stream GUID Backfill
+
+Some retired Bunny Stream events reference GUID-shaped `stream.divine.video`
+paths while carrying the canonical Blossom SHA-256 in the same `imeta` tag's
+`x` field. Use `scripts/migration/backfill_bunny_stream_guid_blobs.py` to
+extract those mappings and mirror them through Blossom's `/mirror` endpoint,
+which calls the upload service with `expected_hash` and creates the metadata
+needed for public `media.divine.video/{sha256}` reads. The script is dry-run by
+default; pass `--execute` only when ready to write verified bytes and metadata.
+The `--target upload-service` mode is storage-only and should be used only when
+metadata already exists or will be backfilled separately.
+For auth-protected legacy sources, add `--local-upload-fallback` so the script
+fetches with Blossom `get` auth, verifies the SHA-256 locally, then writes
+through Blossom `/upload`.
 
 ## Blossom Protocol Authentication
 

@@ -20,7 +20,10 @@ const FOS_BACKEND: &str = "fos_storage";
 /// Cloud Run backend for uploads/migrations
 const CLOUD_RUN_BACKEND: &str = "cloud_run_upload";
 
-/// Fallback backends removed — all content is now in GCS.
+/// Legacy CDN runtime fallback is intentionally disabled.
+///
+/// If a migration miss is discovered, backfill the verified bytes into GCS
+/// instead of reintroducing legacy hosts into the hot delivery path.
 const FALLBACK_BACKENDS: &[(&str, &str, &str)] = &[];
 
 /// Config store name

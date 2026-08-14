@@ -1,0 +1,124 @@
+# ABOUTME: Tests for legacy Bunny Stream GUID extraction and migrate candidate construction.
+# ABOUTME: Keeps the one-shot backfill script honest without touching the network.
+
+import os
+import sys
+import unittest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "migration"))
+
+from backfill_bunny_stream_guid_blobs import (  # noqa: E402
+    dedupe_candidates,
+    extract_candidates,
+    parse_imeta_tag,
+    stream_guid_from_url,
+)
+
+
+SHA = "7ff36c72fb2644f1ac1761d0f728b2bb989df9fac0b8c68a716f4023ef4a39e0"
+GUID = "35e9a15d-5db2-41f7-96fe-58c573ff8f21"
+
+
+class TestParseImetaTag(unittest.TestCase):
+    def test_space_separated_imeta_preserves_repeated_urls(self):
+        parsed = parse_imeta_tag([
+            "imeta",
+            f"url https://stream.divine.video/{GUID}/play_480p.mp4",
+            f"url https://cdn.divine.video/{SHA}.mp4",
+            f"image https://stream.divine.video/{GUID}/thumbnail.jpg",
+            f"x {SHA}",
+        ])
+
+        self.assertEqual(len(parsed["urls"]), 2)
+        self.assertEqual(parsed["images"], [f"https://stream.divine.video/{GUID}/thumbnail.jpg"])
+        self.assertEqual(parsed["x"], SHA)
+
+    def test_alternating_imeta_preserves_repeated_urls(self):
+        parsed = parse_imeta_tag([
+            "imeta",
+            "url", f"https://stream.divine.video/{GUID}/playlist.m3u8",
+            "url", f"https://cdn.divine.video/{SHA}.mp4",
+            "x", SHA,
+        ])
+
+        self.assertEqual(parsed["urls"], [
+            f"https://stream.divine.video/{GUID}/playlist.m3u8",
+            f"https://cdn.divine.video/{SHA}.mp4",
+        ])
+        self.assertEqual(parsed["url"], f"https://stream.divine.video/{GUID}/playlist.m3u8")
+
+
+class TestCandidateExtraction(unittest.TestCase):
+    def _event(self, tag):
+        return {
+            "id": "event-id",
+            "pubkey": "pubkey",
+            "created_at": 1750000000,
+            "tags": [tag],
+        }
+
+    def test_extracts_guid_sha_mapping_from_stream_url_and_x_tag(self):
+        candidates = extract_candidates(self._event([
+            "imeta",
+            f"url https://stream.divine.video/{GUID}/play_480p.mp4",
+            f"url https://cdn.divine.video/{SHA}.mp4",
+            f"image https://stream.divine.video/{GUID}/thumbnail.jpg",
+            f"x {SHA}",
+        ]))
+
+        self.assertEqual(len(candidates), 1)
+        candidate = candidates[0]
+        self.assertEqual(candidate.sha256, SHA)
+        self.assertEqual(candidate.guid, GUID)
+        self.assertEqual(candidate.source_urls[0], f"https://cdn.divine.video/{SHA}.mp4")
+        self.assertIn(f"https://cdn.divine.video/{SHA}", candidate.source_urls)
+
+    def test_skips_guid_event_without_x_hash(self):
+        candidates = extract_candidates(self._event([
+            "imeta",
+            f"url https://stream.divine.video/{GUID}/play_480p.mp4",
+        ]))
+
+        self.assertEqual(candidates, [])
+
+    def test_skips_non_stream_events(self):
+        candidates = extract_candidates(self._event([
+            "imeta",
+            f"url https://cdn.divine.video/{SHA}.mp4",
+            f"x {SHA}",
+        ]))
+
+        self.assertEqual(candidates, [])
+
+    def test_dedupes_by_hash_and_merges_source_urls(self):
+        first = extract_candidates(self._event([
+            "imeta",
+            f"url https://stream.divine.video/{GUID}/play.mp4",
+            f"x {SHA}",
+        ]))[0]
+        second = extract_candidates(self._event([
+            "imeta",
+            f"url https://stream.divine.video/{GUID}/playlist.m3u8",
+            f"url https://cdn.divine.video/{SHA}.mp4",
+            f"x {SHA}",
+        ]))[0]
+
+        merged = dedupe_candidates([first, second])
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].sha256, SHA)
+        self.assertIn(f"https://cdn.divine.video/{SHA}.mp4", merged[0].source_urls)
+
+
+class TestGuidParsing(unittest.TestCase):
+    def test_extracts_only_stream_guid_path(self):
+        self.assertEqual(
+            stream_guid_from_url(f"https://stream.divine.video/{GUID}/thumbnail.jpg"),
+            GUID,
+        )
+        self.assertIsNone(stream_guid_from_url(f"https://cdn.divine.video/{GUID}/thumbnail.jpg"))
+        self.assertIsNone(stream_guid_from_url("https://stream.divine.video/not-a-guid/thumbnail.jpg"))
+
+
+if __name__ == "__main__":
+    unittest.main()
