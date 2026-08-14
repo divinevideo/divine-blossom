@@ -18,15 +18,12 @@ record of doing so. Every measurement channel was missing at once:
 - this service logged only via `eprintln!`, which reaches `fastly log-tail` and
   nothing else
 
-Origin-side counters (divine-iac-core PR #1618) show ~94–96% of upload attempts
-succeeding, which does not match the volume of user complaints. The leading
-explanation is that failures at the edge are invisible: anything Fastly rejects
-or times out never reaches origin and therefore appears in no origin metric.
-
-The single most important field is `send_error`. When the proxy `send` to origin
-fails, the request never reached `divine-upload-server`, so it appears in no
-origin access log and in none of PR #1618's log-based metrics. Before this
-change that case had **zero** record anywhere.
+Origin-side counters cannot account for requests that fail at the edge before a
+complete origin response is received. The single most important field is
+`send_error`: it records those edge-visible failures independently of origin
+logging. A send error does not prove whether origin received or processed some
+or all of the request; correlate it with origin logs before drawing that
+conclusion.
 
 ## Scope
 
@@ -44,8 +41,7 @@ forwards only `Host`, `Authorization`, `Content-Type`, `Content-Length`,
 `Dart/3.12 (dart:io)` on chunk PUTs (client direct) and `-` on direct PUTs
 (edge-proxied).
 
-Sampling is not applied. Volume is a few hundred requests per day; every request
-is logged.
+Sampling is not applied; every request on the listed routes is logged.
 
 ## Where the config lives — read this before trusting the data
 
@@ -203,7 +199,7 @@ CREATE TABLE nostr.edge_upload_logs
     content_length    Nullable(UInt64),
     content_type      LowCardinality(Nullable(String)),
     proxied_body      Bool,
-    origin_reached    Bool,
+    origin_responded  Bool,
     origin_status     Nullable(UInt16),
     send_error        Nullable(String),
     proxy_duration_ms Nullable(UInt64),
@@ -228,16 +224,16 @@ the stream without per-row key checks.
 
 | field | type | meaning |
 |---|---|---|
-| `schema` | int | Field-set version. Bumped on incompatible changes. Currently `1`. |
+| `schema` | int | Field-set version. Bumped on incompatible changes. Currently `2`; version 1 named `origin_responded` as `origin_reached`. |
 | `route` | string | `direct_put`, `resumable_init`, `resumable_complete` |
 | `outcome` | string | see below |
 | `req_id` | string | Correlation ID, also sent to origin as `X-Request-Id` |
 | `content_length` | int? | **Declared** size, not measured — the body is never buffered. On `resumable_init` this is the declared *upload* size from the JSON body, not the control message's own length. |
 | `content_type` | string? | Separates video uploads from avatars and thumbnails |
 | `proxied_body` | bool | Whether a request body was streamed through the edge to origin |
-| `origin_reached` | bool | Whether origin was asked and answered |
+| `origin_responded` | bool | Whether origin returned a complete HTTP response. `false` does not prove origin received none of the request. |
 | `origin_status` | int? | Origin's HTTP status, when it replied at all |
-| `send_error` | string? | The error from `.send()`. **Populated only when origin was never reached.** |
+| `send_error` | string? | The error from `.send()` when no complete origin response was received |
 | `proxy_duration_ms` | int? | Wall time around the origin send, present whenever a send was attempted — including when it failed |
 | `duration_ms` | int | Wall time for the whole request at the edge |
 | `response_status` | int | What the edge returned to the client |
@@ -250,11 +246,11 @@ the stream without per-row key checks.
 
 | outcome | meaning |
 |---|---|
-| `ok` | Edge returned a success status. On `direct_put` this includes uploads handled entirely at the edge, which have `origin_reached = false` — see the inline-path note under Verification. |
-| `send_failed` | The send to origin failed. **The request never reached origin**, so nothing origin-side accounts for it. |
+| `ok` | Edge returned a success status. On `direct_put` this includes uploads handled entirely at the edge, which have `origin_responded = false` — see the inline-path note under Verification. |
+| `send_failed` | The send did not yield a complete origin response. Origin may still have received or processed the request. |
 | `origin_status_error` | Origin replied with a non-success status |
 | `validation_rejected` | Edge returned a 4xx of its own |
-| `edge_error` | Edge returned a 5xx of its own. With `origin_reached = true` this is a *post-origin* failure: the upload landed but the edge failed afterwards. |
+| `edge_error` | Edge returned a 5xx of its own. With `origin_responded = true` this is a *post-response* failure: origin replied successfully but the edge failed afterwards. |
 
 Classification is ordered: a failed send outranks everything, then a non-2xx
 origin status, then the edge's own status. This matters because both a failed
@@ -333,27 +329,21 @@ fastly log-tail --service-id pOvEEWykEbpnylqst1KTrR | grep '\[UPLOAD\]'
 `POST /upload/{id}/complete` requests issued during an active `log-tail` produced
 **no output at all** — not even the `[BLOSSOM ROUTE]` line that `handle_request`
 emits unconditionally for every request before any routing runs. All five were
-present in Pub/Sub. The tail samples across POPs and drops under load; the
-service handles thousands of requests per minute, of which uploads are a
-handful.
+present in Pub/Sub. The tail samples across POPs and can drop lines under load.
 
 Use `log-tail` to answer "is the guest emitting the shape I expect?", which it
 does well and immediately. Use Pub/Sub to answer "how many?", which `log-tail`
 cannot answer at all. An absence in `log-tail` is not evidence of anything.
 
-### Sanity-check the volume — and mind the inline path
-
-Direct `PUT /upload` reaching *origin* runs 241–523/day. Edge `direct_put` lines
-should be **materially higher**, and not only because of edge failures.
+### Mind the inline path when comparing datasets
 
 `handle_upload` proxies to the upload service only when the upload is larger
 than 500 KB *or* has a video MIME type (`UPLOAD_SERVICE_THRESHOLD`,
 `src/main.rs`). Everything else is buffered and stored by the edge itself and
-**never contacts origin at all**. Origin session records put p50 upload size at
-0.09 MB with 92% `image/jpeg`, so the majority of direct PUTs take the inline
-path and are absent from origin's direct-PUT counts by design.
+**never contacts origin at all**, so those requests are absent from origin's
+direct-PUT counts by design.
 
-Such a request logs `outcome = ok`, `origin_reached = false`,
+Such a request logs `outcome = ok`, `origin_responded = false`,
 `proxied_body = false`, `origin_status = null`, `proxy_duration_ms = null`. That
 is **normal, not a failure**, and it is not a `send_failed`. Any query comparing
 edge to origin counts must filter on `proxied_body = true` to compare like with
@@ -365,31 +355,9 @@ SELECT count() FROM nostr.edge_upload_logs
 WHERE route = 'direct_put' AND proxied_body AND timestamp >= today();
 ```
 
-Measured over the first 13.3 hours (450 records, 2026-08-13 10:17Z–23:33Z):
-
-| | count | per day |
-|---|---|---|
-| `direct_put` total | 329 | ~595 |
-| `direct_put` proxied (`proxied_body = true`) | 176 | ~319 |
-| `direct_put` inline | 153 | ~276 |
-| `resumable_init` | 58 | ~105 |
-| `resumable_complete` | 63 | ~114 |
-
-The **319/day proxied** figure sits inside the 241–523/day origin baseline, while
-the 595/day total does not — which is the expected result once the inline path is
-excluded, and is the cross-check that the instrumentation is counting the right
-things. `resumable_init` at ~105/day likewise matches the 62–103/day origin
-figure for resumable sessions.
-
 Note that the video MIME check fires at *any* size, so 5 KB `video/mp4` files
 proxy while a 100 KB `image/jpeg` does not. Size alone does not predict which
 path a request took — read `proxied_body`.
-
-Other origin-side baselines for comparison: ~96–98% of direct PUTs return 200;
-408s run 1–6/day, 400s 4–10/day, 413s 1–5/day; client aborts mid-upload
-("prematurely closed connection") run 6–14/day. Resumable sessions run
-62–103/day at 96.8–100% completion. Upload sizes are p50 0.09 MB, p99 7.94 MB,
-max 18.47 MB; 92% `image/jpeg`, 8% `video/mp4`.
 
 ## Worked queries
 
@@ -411,25 +379,23 @@ GROUP BY route, outcome
 ORDER BY route, n DESC;
 ```
 
-Compare the `direct_put` non-`ok` share against the ~4–6% failure rate the
-origin-side counters report. **An edge failure rate materially above the origin
-rate is the finding this whole pipeline exists to produce**: it is the share of
-attempts that origin never saw.
+Compare the `direct_put` non-`ok` share with origin-side counters, while treating
+the two datasets as overlapping rather than disjoint. A send error may have a
+corresponding partial or complete origin request even though the edge received
+no complete response.
 
 For a like-for-like comparison against origin, add `AND proxied_body` — without
 it the denominator includes inline uploads that origin never sees by design, and
 the edge failure rate comes out artificially *low*.
 
-### 2. How many die before ever reaching origin?
-
-This is the population that has no record anywhere else.
+### 2. How many receive no complete origin response?
 
 ```sql
 SELECT
     toDate(timestamp)                              AS day,
-    countIf(outcome = 'send_failed')               AS never_reached_origin,
+    countIf(outcome = 'send_failed')               AS no_complete_origin_response,
     count()                                        AS attempts,
-    round(100 * countIf(outcome = 'send_failed') / count(), 3) AS pct_invisible
+    round(100 * countIf(outcome = 'send_failed') / count(), 3) AS pct_send_failed
 FROM nostr.edge_upload_logs
 WHERE route = 'direct_put'
   AND timestamp >= now() - INTERVAL 30 DAY
@@ -470,18 +436,16 @@ GROUP BY outcome
 ORDER BY n DESC;
 ```
 
-A cluster of `send_failed` rows with `proxy_duration_ms` near 120000 is direct
-evidence of edge timeouts. A `p99` far below it rules the theory out. Either
-result settles the question.
+A cluster of `send_failed` rows with `proxy_duration_ms` near 120000 is evidence
+that the edge did not receive complete responses before its timeout. It does not
+by itself establish whether the client, edge-to-origin stream, or origin stalled.
 
 **Caveat on this query.** It can only count requests whose handler returned. If
 Fastly terminates the guest outright at the timeout, or the client disconnects
 mid-upload and the instance is torn down, no line is emitted at all. So
-`at_or_past_ceiling` is a **floor**, not a measurement — the true number of
-timeout deaths is at least this, possibly higher. Cross-check against origin's
-"prematurely closed connection" count (6–14/day) and against total attempts: a
-`direct_put` line count *below* the origin-side count of direct PUTs reaching
-origin would indicate exactly this kind of silent loss.
+`at_or_past_ceiling` is a **floor**, not a complete measurement. Cross-check it
+against origin logs and total attempts to look for requests missing from the
+edge dataset.
 
 ### 4. Does failure concentrate in large uploads or particular networks?
 
@@ -503,9 +467,8 @@ GROUP BY size_bucket
 ORDER BY min(content_length);
 ```
 
-Origin session records put p50 at 0.09 MB and p99 at 7.94 MB, so most traffic
-lands in the smallest two buckets; a failure rate that climbs with size is the
-"bad connections" hypothesis showing up in data.
+A failure rate that climbs with size is evidence for investigating slow or
+interrupted request streams, not proof of which hop caused them.
 
 By country, to separate "one network is bad" from "everything is bad":
 
