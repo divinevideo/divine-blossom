@@ -12,6 +12,7 @@ mod metadata;
 mod rate_limit;
 mod req_id;
 mod storage;
+mod upload_log;
 mod viewer_auth;
 
 use crate::auth::{diagnose_viewer_auth, validate_auth, validate_hash_match, viewer_pubkey};
@@ -50,6 +51,10 @@ use crate::viewer_auth::{ViewerAuthDiagnostics, ViewerAuthState};
 use blossom_core::cache_policy::{
     immutable_blob_cache_headers, mutable_derivative_cache_headers,
 };
+use blossom_core::upload_log::{
+    record_failure, record_response, record_send_attempt, OriginSendResult, UploadLogRecord,
+    UploadRoute,
+};
 use fastly_blossom::resumable_complete::parse_resumable_complete_request_body;
 
 use fastly::cache::simple as simple_cache;
@@ -58,6 +63,7 @@ use fastly::kv_store::KVStore;
 use fastly::{Error, Request, Response};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
+use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// TTL for cached HLS manifests (1 hour) — immutable once transcoding completes
@@ -142,16 +148,20 @@ fn handle_request(req: Request) -> Result<Response> {
         (Method::HEAD, p) if is_hash_path(p) => handle_head_blob(p),
 
         // BUD-02: Upload
-        (Method::PUT, "/upload") => handle_upload(req),
+        (Method::PUT, "/upload") => with_upload_log(req, UploadRoute::DirectPut, handle_upload),
         // BUD-06: Upload requirements/pre-validation
         (Method::HEAD, "/upload") => handle_upload_requirements(req),
         // Synchronous audio transcription — thin forward to the upload service's
         // authenticated /transcribe proxy (which calls the transcoder).
         (Method::POST, "/transcribe") => handle_transcribe_proxy(req),
         // Divine resumable control plane
-        (Method::POST, "/upload/init") => handle_upload_init(req),
+        (Method::POST, "/upload/init") => {
+            with_upload_log(req, UploadRoute::ResumableInit, handle_upload_init)
+        }
         (Method::POST, p) if p.starts_with("/upload/") && p.ends_with("/complete") => {
-            handle_upload_complete(req, p)
+            with_upload_log(req, UploadRoute::ResumableComplete, |req, record| {
+                handle_upload_complete(req, p, record)
+            })
         }
 
         // BUD-02: Delete
@@ -267,6 +277,67 @@ fn media_viewer_context(
 
 fn log_media_outcome(route: &str, diagnostics: &ViewerAuthDiagnostics, outcome: &str) {
     eprintln!("{}", format_media_auth_log(route, diagnostics, outcome));
+}
+
+/// Run an edge-proxied upload handler and emit exactly one structured log line
+/// for it, whatever the outcome.
+///
+/// The wrapper owns emission rather than the handlers because handlers have
+/// many early returns via `?`. Logging inside them would mean one emit site per
+/// return, and the failure paths — the entire reason this exists — are the ones
+/// most likely to be missed.
+fn with_upload_log<F>(req: Request, route: UploadRoute, handler: F) -> Result<Response>
+where
+    F: FnOnce(Request, &mut UploadLogRecord) -> Result<Response>,
+{
+    let started = Instant::now();
+    let mut record = upload_log::start_record(&req, route, req_id::for_request(&req));
+
+    let result = handler(req, &mut record);
+
+    record.duration_ms = duration_millis(started.elapsed());
+    match &result {
+        Ok(resp) => record_response(&mut record, resp.get_status().as_u16()),
+        Err(e) => record_failure(&mut record, e),
+    }
+
+    upload_log::emit(&record);
+    result
+}
+
+/// Send a prepared request to the upload service, recording the attempt.
+///
+/// A failed `send` means the edge received no complete origin response. Origin
+/// may still have received or processed some or all of the request, so this is
+/// deliberately not described as evidence that origin was never reached. The
+/// timing is captured before the match so it survives that path too.
+fn send_to_upload_service(proxy_req: Request, record: &mut UploadLogRecord) -> Result<Response> {
+    let started = Instant::now();
+    let sent = proxy_req.send(UPLOAD_SERVICE_BACKEND);
+    let elapsed = duration_millis(started.elapsed());
+
+    match sent {
+        Ok(resp) => {
+            record_send_attempt(
+                record,
+                OriginSendResult::Replied(resp.get_status().as_u16()),
+                elapsed,
+            );
+            Ok(resp)
+        }
+        Err(e) => {
+            let message = e.to_string();
+            record_send_attempt(record, OriginSendResult::Failed(&message), elapsed);
+            Err(BlossomError::Internal(format!(
+                "Failed to proxy to upload service: {}",
+                message
+            )))
+        }
+    }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 fn classify_audio_reuse_availability(result: &Result<bool>) -> AudioReuseAvailability {
@@ -3148,7 +3219,7 @@ fn trigger_moderation_scan(sha256: &str, pubkey: &str) {
 }
 
 /// PUT /upload - Upload blob
-fn handle_upload(mut req: Request) -> Result<Response> {
+fn handle_upload(mut req: Request, record: &mut UploadLogRecord) -> Result<Response> {
     // Validate auth
     let auth = validate_auth(&req, AuthAction::Upload)?;
 
@@ -3186,7 +3257,14 @@ fn handle_upload(mut req: Request) -> Result<Response> {
     if !crate::storage::is_local_mode()
         && (content_length > UPLOAD_SERVICE_THRESHOLD || is_video_mime_type(&content_type))
     {
-        return handle_upload_service_proxy(req, auth, content_type, content_length, base_url);
+        return handle_upload_service_proxy(
+            req,
+            auth,
+            content_type,
+            content_length,
+            base_url,
+            record,
+        );
     }
 
     // For small files (or all files in local mode), buffer in memory
@@ -3714,7 +3792,7 @@ fn publish_upload_service_upload(
     Ok(resp)
 }
 
-fn handle_upload_init(mut req: Request) -> Result<Response> {
+fn handle_upload_init(mut req: Request, record: &mut UploadLogRecord) -> Result<Response> {
     let auth = validate_auth(&req, AuthAction::Upload)?;
     let auth_header = extract_authorization_header(&req)?;
     let base_url = get_base_url(&req);
@@ -3726,6 +3804,12 @@ fn handle_upload_init(mut req: Request) -> Result<Response> {
 
     let init_request: ResumableUploadInitRequest = serde_json::from_str(&body)
         .map_err(|e| BlossomError::BadRequest(format!("Invalid JSON: {}", e)))?;
+
+    // Overwrite the header-derived values: on this route the request body is a
+    // small JSON control message, so its own Content-Length says nothing useful.
+    // The declared upload size is what makes init lines comparable to direct_put.
+    record.content_length = Some(init_request.size);
+    record.content_type = Some(init_request.content_type.clone());
 
     if init_request.size == 0 {
         return Err(BlossomError::BadRequest(
@@ -3792,11 +3876,10 @@ fn handle_upload_init(mut req: Request) -> Result<Response> {
     proxy_req.set_header(header::AUTHORIZATION, &auth_header);
     proxy_req.set_header(header::CONTENT_TYPE, "application/json");
     proxy_req.set_header(header::CONTENT_LENGTH, body.len().to_string());
+    proxy_req.set_header(upload_log::CORRELATION_HEADER, &record.req_id);
     proxy_req.set_body(body);
 
-    let mut proxy_resp = proxy_req
-        .send(UPLOAD_SERVICE_BACKEND)
-        .map_err(|e| BlossomError::Internal(format!("Failed to proxy to Cloud Run: {}", e)))?;
+    let mut proxy_resp = send_to_upload_service(proxy_req, record)?;
     if !proxy_resp.get_status().is_success() {
         let status = proxy_resp.get_status();
         let body = proxy_resp.take_body().into_string();
@@ -3805,7 +3888,9 @@ fn handle_upload_init(mut req: Request) -> Result<Response> {
 
     let response_body = proxy_resp.take_body().into_string();
     let init_response: ResumableUploadInitResponse = serde_json::from_str(&response_body)
-        .map_err(|e| BlossomError::Internal(format!("Invalid Cloud Run init response: {}", e)))?;
+        .map_err(|e| {
+            BlossomError::Internal(format!("Invalid upload service init response: {}", e))
+        })?;
 
     let mut resp = json_response(StatusCode::OK, &init_response);
     add_upload_capability_headers(&mut resp, &control_host);
@@ -3835,7 +3920,11 @@ fn upload_from_resumable_completion(
     }
 }
 
-fn handle_upload_complete(mut req: Request, path: &str) -> Result<Response> {
+fn handle_upload_complete(
+    mut req: Request,
+    path: &str,
+    record: &mut UploadLogRecord,
+) -> Result<Response> {
     let auth = validate_auth(&req, AuthAction::Upload)?;
     let auth_header = extract_authorization_header(&req)?;
     let base_url = get_base_url(&req);
@@ -3866,15 +3955,14 @@ fn handle_upload_complete(mut req: Request, path: &str) -> Result<Response> {
     );
     proxy_req.set_header("Host", UPLOAD_SERVICE_HOST);
     proxy_req.set_header(header::AUTHORIZATION, &auth_header);
+    proxy_req.set_header(upload_log::CORRELATION_HEADER, &record.req_id);
     if expected_request_hash.is_some() {
         proxy_req.set_header(header::CONTENT_TYPE, "application/json");
         proxy_req.set_header(header::CONTENT_LENGTH, request_body.len().to_string());
         proxy_req.set_body(request_body);
     }
 
-    let mut proxy_resp = proxy_req
-        .send(UPLOAD_SERVICE_BACKEND)
-        .map_err(|e| BlossomError::Internal(format!("Failed to proxy to Cloud Run: {}", e)))?;
+    let mut proxy_resp = send_to_upload_service(proxy_req, record)?;
     if !proxy_resp.get_status().is_success() {
         let status = proxy_resp.get_status();
         let body = proxy_resp.take_body().into_string();
@@ -3884,7 +3972,7 @@ fn handle_upload_complete(mut req: Request, path: &str) -> Result<Response> {
     let response_body = proxy_resp.take_body().into_string();
     let complete_response: ResumableUploadCompleteResponse = serde_json::from_str(&response_body)
         .map_err(|e| {
-        BlossomError::Internal(format!("Invalid Cloud Run completion response: {}", e))
+        BlossomError::Internal(format!("Invalid upload service completion response: {}", e))
     })?;
 
     if let Some(ref request_hash) = expected_request_hash {
@@ -3894,6 +3982,11 @@ fn handle_upload_complete(mut req: Request, path: &str) -> Result<Response> {
             ));
         }
     }
+
+    // The request body is a small control message; log the completed upload's
+    // declared media size and type so completion rows match init rows.
+    record.content_length = Some(complete_response.size);
+    record.content_type = Some(complete_response.content_type.clone());
 
     publish_upload_service_upload(
         auth,
@@ -4009,6 +4102,7 @@ fn handle_upload_service_proxy(
     content_type: String,
     content_length: u64,
     base_url: String,
+    record: &mut UploadLogRecord,
 ) -> Result<Response> {
     let auth_header = extract_authorization_header(&req)?;
 
@@ -4024,14 +4118,13 @@ fn handle_upload_service_proxy(
     proxy_req.set_header(header::AUTHORIZATION, &auth_header);
     proxy_req.set_header(header::CONTENT_TYPE, &content_type);
     proxy_req.set_header(header::CONTENT_LENGTH, content_length.to_string());
+    proxy_req.set_header(upload_log::CORRELATION_HEADER, &record.req_id);
     proxy_req.set_body(body);
+    record.proxied_body = true;
 
-    // Send to Cloud Run
-    let mut proxy_resp = proxy_req
-        .send(UPLOAD_SERVICE_BACKEND)
-        .map_err(|e| BlossomError::Internal(format!("Failed to proxy to Cloud Run: {}", e)))?;
+    let mut proxy_resp = send_to_upload_service(proxy_req, record)?;
 
-    // Check for errors from Cloud Run
+    // Check for errors from the upload service
     if !proxy_resp.get_status().is_success() {
         let status = proxy_resp.get_status();
         let body = proxy_resp.take_body().into_string();
