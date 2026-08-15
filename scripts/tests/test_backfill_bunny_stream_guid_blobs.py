@@ -11,10 +11,12 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "migration"))
 
 from backfill_bunny_stream_guid_blobs import (  # noqa: E402
+    BackfillCandidate,
     dedupe_candidates,
     extract_candidates,
     parse_args,
     parse_imeta_tag,
+    select_pending_candidates,
     stream_guid_from_url,
 )
 
@@ -94,6 +96,18 @@ class TestCandidateExtraction(unittest.TestCase):
 
         self.assertEqual(candidates, [])
 
+    def test_extracts_video_hash_when_guid_appears_only_in_image(self):
+        candidates = extract_candidates(self._event([
+            "imeta",
+            f"url https://cdn.divine.video/{SHA}.mp4",
+            f"image https://stream.divine.video/{GUID}/thumbnail.jpg",
+            f"x {SHA}",
+        ]))
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].sha256, SHA)
+        self.assertEqual(candidates[0].guid, GUID)
+
     def test_dedupes_by_hash_and_merges_source_urls(self):
         first = extract_candidates(self._event([
             "imeta",
@@ -143,10 +157,34 @@ class TestArguments(unittest.TestCase):
 
         self.assertEqual(args.progress_file, Path("custom-progress.json"))
 
+    def test_nsec_cannot_be_passed_on_command_line(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parse_args(["--nsec", "secret"])
+
     def test_rejects_non_positive_concurrency(self):
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 parse_args(["--concurrency", "0"])
+
+
+class TestPendingSelection(unittest.TestCase):
+    def test_limit_is_applied_after_completed_candidates_are_removed(self):
+        candidates = [
+            BackfillCandidate(
+                sha256=str(index).zfill(64),
+                guid=GUID,
+                event_id=str(index),
+                pubkey="pubkey",
+                created_at=index,
+                source_urls=(f"https://cdn.divine.video/{str(index).zfill(64)}",),
+            )
+            for index in range(3)
+        ]
+
+        pending = select_pending_candidates(candidates, {candidates[0].sha256}, 1)
+
+        self.assertEqual(pending, [candidates[1]])
 
 
 if __name__ == "__main__":

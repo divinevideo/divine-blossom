@@ -9,6 +9,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import os
 import re
 import time
 from dataclasses import dataclass, replace
@@ -205,10 +206,14 @@ async def fetch_all_events(relay_url: str, since: int | None, until: int | None)
             while True:
                 try:
                     msg = await asyncio.wait_for(ws.recv(), timeout=30)
-                except asyncio.TimeoutError:
-                    break
-                except ConnectionClosed:
-                    break
+                except asyncio.TimeoutError as exc:
+                    raise RuntimeError(
+                        f"Relay timed out before EOSE on page {page}; backfill aborted"
+                    ) from exc
+                except ConnectionClosed as exc:
+                    raise RuntimeError(
+                        f"Relay disconnected before EOSE on page {page}; backfill aborted"
+                    ) from exc
 
                 data = json.loads(msg)
                 if data[0] == "EVENT":
@@ -248,6 +253,13 @@ def save_progress(path: Path, done: set[str]) -> None:
     path.write_text(json.dumps(sorted(done), indent=2) + "\n")
 
 
+def select_pending_candidates(
+    candidates: list[BackfillCandidate], done: set[str], limit: int | None
+) -> list[BackfillCandidate]:
+    pending = [candidate for candidate in candidates if candidate.sha256 not in done]
+    return pending[:limit] if limit else pending
+
+
 async def migrate_candidate(session, migrate_url: str, candidate: BackfillCandidate) -> tuple[str, str]:
     for source_url in candidate.source_urls:
         payload = {
@@ -273,7 +285,14 @@ async def migrate_candidate(session, migrate_url: str, candidate: BackfillCandid
     return "not_found", last_error if "last_error" in locals() else "no source URLs"
 
 
-def load_nostr_keys(nsec: str | None):
+def load_nostr_keys():
+    nsec = os.environ.get("NOSTR_NSEC")
+    if not nsec:
+        raise SystemExit(
+            "NOSTR_NSEC is required for Blossom writes. Inject it with the operator's "
+            "credential manager instead of passing secret material on the command line."
+        )
+
     try:
         from nostr_sdk import Keys
     except ModuleNotFoundError as exc:
@@ -282,9 +301,7 @@ def load_nostr_keys(nsec: str | None):
             "with `python3 -m pip install aiohttp websockets nostr-sdk`."
         ) from exc
 
-    if nsec:
-        return Keys.parse(nsec)
-    return Keys.generate()
+    return Keys.parse(nsec)
 
 
 def create_blossom_auth_header(keys, action: str, sha256: str) -> str:
@@ -388,15 +405,12 @@ async def run_backfill(args) -> None:
         for candidate in extract_candidates(event)
     )
     total_candidates = len(candidates)
-    if args.limit:
-        candidates = candidates[: args.limit]
-
     done = load_progress(args.progress_file)
-    pending = [candidate for candidate in candidates if candidate.sha256 not in done]
+    pending = select_pending_candidates(candidates, done, args.limit)
 
     print(
         f"events={len(events)} candidates={total_candidates} "
-        f"selected={len(candidates)} done={len(done)} pending={len(pending)}"
+        f"selected={len(pending)} done={len(done)} pending={len(pending)}"
     )
     if not args.execute:
         for candidate in pending[:10]:
@@ -414,7 +428,7 @@ async def run_backfill(args) -> None:
             "with `python3 -m pip install aiohttp websockets`."
         ) from exc
 
-    keys = load_nostr_keys(args.nsec) if args.target == "blossom" else None
+    keys = load_nostr_keys() if args.target == "blossom" else None
     stats = {"ok": 0, "migrated": 0, "already_present": 0, "not_found": 0, "failed": 0}
     connector = aiohttp.TCPConnector(limit=args.concurrency)
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -464,7 +478,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mirror-url", default=MIRROR_URL)
     parser.add_argument("--upload-url", default=UPLOAD_URL)
     parser.add_argument("--migrate-url", default=MIGRATE_URL)
-    parser.add_argument("--nsec", help="Nostr nsec for Blossom upload auth. Defaults to a generated migration key.")
     parser.add_argument(
         "--local-upload-fallback",
         action="store_true",
