@@ -6,11 +6,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import hashlib
 import json
 import re
 import time
-import base64
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable
@@ -22,7 +22,10 @@ MIRROR_URL = "https://media.divine.video/mirror"
 UPLOAD_URL = "https://media.divine.video/upload"
 MIGRATE_URL = "https://upload.divine.video/migrate"
 CDN_BASE_URL = "https://cdn.divine.video"
-PROGRESS_FILE = Path("bunny_stream_guid_backfill_progress.json")
+PROGRESS_FILES = {
+    "blossom": Path("bunny_stream_guid_backfill_progress.json"),
+    "upload-service": Path("bunny_stream_guid_upload_service_backfill_progress.json"),
+}
 KINDS = [34235, 34236]
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GUID_RE = re.compile(
@@ -446,7 +449,7 @@ async def run_backfill(args) -> None:
     print("complete " + " ".join(f"{key}={value}" for key, value in stats.items()))
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Backfill Blossom blobs for Bunny Stream GUID-era events."
     )
@@ -467,13 +470,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="For auth-protected legacy sources, fetch locally with Nostr get auth, verify SHA, then PUT /upload.",
     )
-    parser.add_argument("--progress-file", type=Path, default=PROGRESS_FILE)
+    parser.add_argument("--progress-file", type=Path)
     parser.add_argument("--since", type=int, help="Relay since timestamp.")
     parser.add_argument("--until", type=int, help="Relay until timestamp.")
     parser.add_argument("--limit", type=int, help="Only process the first N deduped candidates.")
     parser.add_argument("--concurrency", type=int, default=5)
     parser.add_argument("--verbose", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.progress_file is None:
+        args.progress_file = PROGRESS_FILES[args.target]
+    if args.concurrency < 1:
+        parser.error("--concurrency must be at least 1")
+    return args
 
 
 def main() -> None:

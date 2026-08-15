@@ -1,15 +1,19 @@
 # ABOUTME: Tests for legacy Bunny Stream GUID extraction and migrate candidate construction.
 # ABOUTME: Keeps the one-shot backfill script honest without touching the network.
 
+import contextlib
+import io
 import os
 import sys
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "migration"))
 
 from backfill_bunny_stream_guid_blobs import (  # noqa: E402
     dedupe_candidates,
     extract_candidates,
+    parse_args,
     parse_imeta_tag,
     stream_guid_from_url,
 )
@@ -118,6 +122,31 @@ class TestGuidParsing(unittest.TestCase):
         )
         self.assertIsNone(stream_guid_from_url(f"https://cdn.divine.video/{GUID}/thumbnail.jpg"))
         self.assertIsNone(stream_guid_from_url("https://stream.divine.video/not-a-guid/thumbnail.jpg"))
+
+
+class TestArguments(unittest.TestCase):
+    def test_write_targets_use_separate_default_progress_files(self):
+        blossom_args = parse_args([])
+        upload_service_args = parse_args(["--target", "upload-service"])
+
+        self.assertEqual(
+            blossom_args.progress_file,
+            Path("bunny_stream_guid_backfill_progress.json"),
+        )
+        self.assertEqual(
+            upload_service_args.progress_file,
+            Path("bunny_stream_guid_upload_service_backfill_progress.json"),
+        )
+
+    def test_explicit_progress_file_is_preserved(self):
+        args = parse_args(["--progress-file", "custom-progress.json"])
+
+        self.assertEqual(args.progress_file, Path("custom-progress.json"))
+
+    def test_rejects_non_positive_concurrency(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parse_args(["--concurrency", "0"])
 
 
 if __name__ == "__main__":

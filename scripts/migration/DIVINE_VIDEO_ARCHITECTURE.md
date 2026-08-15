@@ -115,7 +115,9 @@ which calls the upload service with `expected_hash` and creates the metadata
 needed for public `media.divine.video/{sha256}` reads. The script is dry-run by
 default; pass `--execute` only when ready to write verified bytes and metadata.
 The `--target upload-service` mode is storage-only and should be used only when
-metadata already exists or will be backfilled separately.
+metadata already exists or will be backfilled separately. Each target uses a
+separate default progress file so a storage-only run cannot suppress a later
+Blossom metadata backfill.
 For auth-protected legacy sources, add `--local-upload-fallback` so the script
 fetches with Blossom `get` auth, verifies the SHA-256 locally, then writes
 through Blossom `/upload`.
