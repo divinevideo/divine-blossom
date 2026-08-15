@@ -5,8 +5,10 @@ import contextlib
 import io
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "migration"))
 
@@ -14,8 +16,10 @@ from backfill_bunny_stream_guid_blobs import (  # noqa: E402
     BackfillCandidate,
     dedupe_candidates,
     extract_candidates,
+    load_nostr_keys,
     parse_args,
     parse_imeta_tag,
+    save_progress,
     select_pending_candidates,
     stream_guid_from_url,
 )
@@ -162,10 +166,22 @@ class TestArguments(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 parse_args(["--nsec", "secret"])
 
+    def test_blossom_writes_require_injected_nsec(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(SystemExit, "NOSTR_NSEC is required"):
+                load_nostr_keys()
+
     def test_rejects_non_positive_concurrency(self):
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 parse_args(["--concurrency", "0"])
+
+    def test_rejects_non_positive_limit(self):
+        for value in ("0", "-1"):
+            with self.subTest(value=value):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        parse_args(["--limit", value])
 
 
 class TestPendingSelection(unittest.TestCase):
@@ -185,6 +201,19 @@ class TestPendingSelection(unittest.TestCase):
         pending = select_pending_candidates(candidates, {candidates[0].sha256}, 1)
 
         self.assertEqual(pending, [candidates[1]])
+
+
+class TestProgress(unittest.TestCase):
+    def test_failed_atomic_replace_preserves_existing_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "progress.json"
+            path.write_text('["old"]\n')
+
+            with mock.patch("os.replace", side_effect=OSError("interrupted")):
+                with self.assertRaises(OSError):
+                    save_progress(path, {"new"})
+
+            self.assertEqual(path.read_text(), '["old"]\n')
 
 
 if __name__ == "__main__":

@@ -250,7 +250,13 @@ def load_progress(path: Path) -> set[str]:
 
 
 def save_progress(path: Path, done: set[str]) -> None:
-    path.write_text(json.dumps(sorted(done), indent=2) + "\n")
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    with temporary_path.open("w") as f:
+        json.dump(sorted(done), f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temporary_path, path)
 
 
 def select_pending_candidates(
@@ -494,6 +500,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.progress_file = PROGRESS_FILES[args.target]
     if args.concurrency < 1:
         parser.error("--concurrency must be at least 1")
+    if args.limit is not None and args.limit < 1:
+        parser.error("--limit must be at least 1")
     return args
 
 

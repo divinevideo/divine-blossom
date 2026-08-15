@@ -120,7 +120,9 @@ separate default progress file so a storage-only run cannot suppress a later
 Blossom metadata backfill.
 Blossom writes require `NOSTR_NSEC` to be injected by the operator's credential
 manager. Newly created metadata is owned by that durable migration identity;
-do not use an ephemeral key or place an nsec in command-line arguments.
+original event authors are not automatically added to `/list` or granted delete
+ownership. Do not use an ephemeral key or place an nsec in command-line
+arguments.
 For auth-protected legacy sources, add `--local-upload-fallback` so the script
 fetches with Blossom `get` auth, verifies the SHA-256 locally, then writes
 through Blossom `/upload`.
@@ -287,7 +289,7 @@ For migration scripts:
 export GCS_ACCESS_KEY="GOOG1..."
 export GCS_SECRET_KEY="..."
 export GCS_BUCKET="divine-blossom-media-staging"
-export NOSTR_NSEC=""  # Optional - auto-generates if not set
+# Inject NOSTR_NSEC with the credential manager for the GUID backfill script.
 ```
 
 ## Python Dependencies
