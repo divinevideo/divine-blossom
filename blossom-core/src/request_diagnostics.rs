@@ -1,3 +1,4 @@
+use crate::error::BlossomError;
 use crate::types::{
     is_audio_path, is_hash_path, is_quality_variant_path, is_transcript_path, is_vtt_file_path,
 };
@@ -93,6 +94,47 @@ pub fn route_category(path: &str) -> &'static str {
     }
 }
 
+/// Backend and error labels for a persisted 5xx diagnostic record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PersistedErrorCategories {
+    pub backend: Option<&'static str>,
+    pub category: &'static str,
+}
+
+/// Categories for a persisted diagnostic record, or `None` when the error
+/// never produces a 5xx response. `BlossomError::status_code` maps only
+/// StorageError (502), MetadataError (500), and Internal (500) into the 5xx
+/// range, so only those three ever receive categories here. The match is
+/// exhaustive with no wildcard on purpose: a variant that newly maps to 5xx
+/// fails compilation in this function rather than silently logging
+/// `backend: null` or a category that can never be emitted. The companion
+/// test also catches an existing variant being remapped to 5xx.
+pub fn persisted_error_categories(error: &BlossomError) -> Option<PersistedErrorCategories> {
+    match error {
+        BlossomError::StorageError(_) => Some(PersistedErrorCategories {
+            backend: Some("origin"),
+            category: "storage",
+        }),
+        BlossomError::MetadataError(_) => Some(PersistedErrorCategories {
+            backend: Some("metadata"),
+            category: "metadata",
+        }),
+        BlossomError::Internal(_) => Some(PersistedErrorCategories {
+            backend: None,
+            category: "internal",
+        }),
+        BlossomError::AuthRequired(_)
+        | BlossomError::AuthInvalid(_)
+        | BlossomError::Forbidden(_)
+        | BlossomError::NotFound(_)
+        | BlossomError::Conflict(_)
+        | BlossomError::BadRequest(_)
+        | BlossomError::Gone(_)
+        | BlossomError::RangeNotSatisfiable(_)
+        | BlossomError::UnprocessableEntity(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +183,31 @@ mod tests {
             Some("cf".to_string())
         );
         assert_eq!(external_request_id(None, Some("\n"), Some("\r")), None);
+    }
+
+    #[test]
+    fn persisted_categories_track_5xx_status_mapping() {
+        let samples = [
+            BlossomError::AuthRequired("x".into()),
+            BlossomError::AuthInvalid("x".into()),
+            BlossomError::Forbidden("x".into()),
+            BlossomError::NotFound("x".into()),
+            BlossomError::Conflict("x".into()),
+            BlossomError::BadRequest("x".into()),
+            BlossomError::Gone("x".into()),
+            BlossomError::RangeNotSatisfiable("x".into()),
+            BlossomError::UnprocessableEntity("x".into()),
+            BlossomError::StorageError("x".into()),
+            BlossomError::MetadataError("x".into()),
+            BlossomError::Internal("x".into()),
+        ];
+        for error in &samples {
+            assert_eq!(
+                error.status_code().is_server_error(),
+                persisted_error_categories(error).is_some(),
+                "category mapping out of sync with status mapping for {error:?}"
+            );
+        }
     }
 
     #[test]

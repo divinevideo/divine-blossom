@@ -6093,8 +6093,8 @@ mod tests {
     use super::{
         backfill_batch_cursor, classify_audio_reuse_availability, decide_transcode_fetch_action,
         decide_transcript_fetch_action, derivative_reconciliation_response, error_response,
-        ignored_generation_response, is_alias_only_audio_blob, is_quality_variant_path,
-        parse_quality_variant_path, parse_transcode_status_webhook_payload,
+        ignored_generation_response, is_alias_only_audio_blob,
+        parse_transcode_status_webhook_payload,
         parse_transcript_status_webhook_payload, parse_upload_service_response,
         should_delete_derived_audio_blob, should_eagerly_trigger_transcription,
         should_record_upload_service_transcode_failure,
@@ -6345,62 +6345,6 @@ mod tests {
             DerivativeObservation::Unavailable,
             None
         ));
-    }
-
-    #[test]
-    fn quality_variant_path_valid() {
-        let hash = "a".repeat(64);
-        assert!(is_quality_variant_path(&format!("/{}/720p", hash)));
-        assert!(is_quality_variant_path(&format!("/{}/480p", hash)));
-        assert!(is_quality_variant_path(&format!("/{}/720p.mp4", hash)));
-        assert!(is_quality_variant_path(&format!("/{}/480p.mp4", hash)));
-
-        let (parsed_hash, filename, ct) =
-            parse_quality_variant_path(&format!("/{}/720p", hash)).unwrap();
-        assert_eq!(parsed_hash, hash);
-        assert_eq!(filename, "stream_720p.ts");
-        assert_eq!(ct, "video/mp2t");
-
-        let (parsed_hash, filename, ct) =
-            parse_quality_variant_path(&format!("/{}/720p.mp4", hash)).unwrap();
-        assert_eq!(parsed_hash, hash);
-        assert_eq!(filename, "stream_720p.mp4");
-        assert_eq!(ct, "video/mp4");
-    }
-
-    #[test]
-    fn quality_variant_path_no_underflow_on_short_input() {
-        // These must not panic (previously caused u32::MAX underflow)
-        assert!(!is_quality_variant_path("/720p"));
-        assert!(!is_quality_variant_path("/480p"));
-        assert!(!is_quality_variant_path("/720p.mp4"));
-        assert!(!is_quality_variant_path("/480p.mp4"));
-        assert!(!is_quality_variant_path("720p"));
-        assert!(!is_quality_variant_path("480p"));
-        assert!(!is_quality_variant_path(""));
-        assert!(parse_quality_variant_path("/480p").is_none());
-        assert!(parse_quality_variant_path("720p").is_none());
-        assert!(parse_quality_variant_path("/720p.mp4").is_none());
-        assert!(parse_quality_variant_path("480p.mp4").is_none());
-    }
-
-    #[test]
-    fn mp4_variant_maps_to_ts_counterpart() {
-        let hash = "a".repeat(64);
-
-        // 720p.mp4 derives correct .ts counterpart for backfill check
-        let (_, filename, ct) = parse_quality_variant_path(&format!("/{}/720p.mp4", hash)).unwrap();
-        assert_eq!(ct, "video/mp4");
-        assert_eq!(filename.replace(".mp4", ".ts"), "stream_720p.ts");
-
-        // 480p.mp4 likewise
-        let (_, filename, ct) = parse_quality_variant_path(&format!("/{}/480p.mp4", hash)).unwrap();
-        assert_eq!(ct, "video/mp4");
-        assert_eq!(filename.replace(".mp4", ".ts"), "stream_480p.ts");
-
-        // .ts variants have different content type — backfill path won't trigger
-        let (_, _, ct) = parse_quality_variant_path(&format!("/{}/720p", hash)).unwrap();
-        assert_eq!(ct, "video/mp2t");
     }
 
     #[test]

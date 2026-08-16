@@ -17,8 +17,11 @@ const CF_RAY_HEADER: &str = "cf-ray";
 ///
 /// Priority:
 /// 1. `x-divine-edge-request-id` when the outer VCL service pinned it
-///    (authoritative cross-service value; preferred so nothing downstream can
-///    change the ID the outer service already logged).
+///    (preferred so nothing downstream can change the ID the outer service
+///    already logged). Trustworthy only once the outer VCL service is
+///    activated in front of Compute — it overwrites the header on every
+///    chained request; until then a direct-to-Compute caller can set this
+///    header itself and pin the logged correlation ID.
 /// 2. `x-request-id` if the caller provided one (lets upstream retry loops pin
 ///    the same ID across attempts).
 /// 3. Leading segment of `cf-ray` (Cloudflare-provided; free correlation with

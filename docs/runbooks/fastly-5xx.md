@@ -18,9 +18,13 @@ The repository contains, but does not activate or configure:
 - Error-only Compute request logging to the endpoint named
   `compute-diagnostics` with the sanitized request ID, method, normalized route,
   final status, available error category, and duration. Routine successful and
-  client-error responses are not persisted. Rust panics are also routed to
-  `compute-diagnostics` via `fastly::log::set_panic_endpoint`; those records
-  carry the panic message rather than the JSON schema.
+  client-error responses are not persisted. Rust panics are moved (not copied)
+  to `compute-diagnostics` via `fastly::log::set_panic_endpoint`: once that
+  endpoint exists on the service, panic text is written there and no longer
+  appears on stderr / `log-tail`. While the endpoint is absent, the call fails
+  open and panics keep their default stderr output. A panic record carries only
+  the panic message — no request ID or schema — so correlate it with outer VCL
+  records by UTC timestamp and POP, not by request ID.
 
 Neither endpoint is created by repository code. Compute logging fails open when
 `compute-diagnostics` is unavailable. The outer VCL source is not deployed by
@@ -99,10 +103,11 @@ cross-service production correlation remain operator validation.
 
 - An outer VCL 5xx with no matching Compute record means one of two things:
   the request failed before Compute completed, **or** Compute terminated
-  without returning — a Rust panic (plain panic record on
-  `compute-diagnostics`), a guest trap or OOM, or a wall-clock timeout (which
-  may leave no Compute record at all). Do not treat a missing Compute record
-  as proof the request never reached Compute.
+  without returning — a Rust panic (plain panic message on
+  `compute-diagnostics`, matched by timestamp/POP rather than request ID), a
+  guest trap or OOM, or a wall-clock timeout (which may leave no Compute
+  record at all). Do not treat a missing Compute record as proof the request
+  never reached Compute.
 - A matching Compute 5xx identifies an application or origin-side failure; use
   its normalized error category without assuming the VCL record is a second
   independent request.
