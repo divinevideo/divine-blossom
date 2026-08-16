@@ -5,15 +5,16 @@
 set req.http.X-Original-Host = req.http.Host;
 
 # Keep one correlation ID across the outer VCL and chained Compute services.
-if (!req.http.X-Request-Id) {
+if (std.strlen(req.http.X-Request-Id) == 0) {
   set req.http.X-Request-Id = uuid.version4();
 }
 # Preserve the outer service's sanitized value for cross-service correlation.
 # The 64-character cap must match blossom-core request_diagnostics
 # MAX_REQUEST_ID_LEN so both services truncate caller IDs identically.
 set req.http.X-Divine-Edge-Request-Id = substr(regsuball(req.http.X-Request-Id, "[^A-Za-z0-9_-]", ""), 0, 64);
-if (!req.http.X-Divine-Edge-Request-Id) {
+if (std.strlen(req.http.X-Divine-Edge-Request-Id) == 0) {
   set req.http.X-Divine-Edge-Request-Id = uuid.version4();
+  set req.http.X-Request-Id = req.http.X-Divine-Edge-Request-Id;
 }
 
 # Force all traffic to the Compute backend

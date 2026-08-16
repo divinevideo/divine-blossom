@@ -16,7 +16,8 @@ value, keyed `request_id` here and `req_id` there, and label a given
 The repository contains, but does not activate or configure:
 
 - `vcl/recv.vcl`, which preserves a non-empty caller `X-Request-Id`, creates a
-  UUID when it is absent, and forwards the header to Compute.
+  UUID when it is absent or sanitizes to empty, and forwards the header to
+  Compute.
 - `vcl/error.vcl`, an `vcl_error` snippet that writes every Fastly-generated
   5xx (`obj.status` 500–599) to the endpoint named `vcl-error-diagnostics`.
   The client-facing synthetic JSON response remains 503-only; other 5xx
@@ -52,6 +53,9 @@ ids, `traceparent` values — are preserved verbatim across both services;
 longer caller values are preserved as their sanitized 64-character prefix, so
 caller-side correlation for those is prefix-match only. `vcl/deliver.vcl`
 removes that private header from client responses.
+When a caller supplies only characters outside the allowed request-ID charset,
+the outer service generates a fallback UUID and writes it to both
+`X-Request-Id` and `X-Divine-Edge-Request-Id`.
 
 `divine.blossom.compute_request.v1` records the sanitized request ID, method,
 normalized route category, final status, available backend/error category, and
@@ -91,10 +95,11 @@ work:
 5. Validate each failure stage separately with approved, controlled requests.
    Confirm a Compute 5xx preserves its supplied request ID (verbatim for
    IDs up to 64 characters after sanitization; longer IDs keep a 64-character
-   prefix). Confirm an outer backend failure preserves its supplied request ID
-   and `obj.response` without producing a matching Compute record. Confirm the
-   existing 503 status, JSON body, content type, and CORS header remain
-   unchanged.
+   prefix). Confirm an all-filtered request ID generates one shared fallback ID
+   in both `X-Request-Id` and `X-Divine-Edge-Request-Id`. Confirm an outer
+   backend failure preserves its supplied request ID and `obj.response` without
+   producing a matching Compute record. Confirm the existing 503 status, JSON
+   body, content type, and CORS header remain unchanged.
 6. Create separate outer `status_5xx_rate` and inner
    `compute_resp_status_5xx_rate` alerts with minimum request thresholds. Add a
    low-volume absolute 5xx alert only if sustained small failures require it.

@@ -48,8 +48,8 @@ pub(crate) fn emit(
     let Ok(line) = serde_json::to_string(&record) else {
         return;
     };
-    let Ok(mut endpoint) = Endpoint::try_from_name(ENDPOINT_NAME) else {
-        return;
-    };
-    let _ = endpoint.write_all(line.as_bytes());
+    if let Ok(mut endpoint) = Endpoint::try_from_name(ENDPOINT_NAME) {
+        let _ = endpoint.write_all(line.as_bytes());
+    }
+    eprintln!("[COMPUTE_DIAGNOSTIC] {}", line);
 }
