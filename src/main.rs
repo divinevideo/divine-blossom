@@ -77,6 +77,11 @@ const DERIVATIVE_MAX_ATTEMPTS: u32 = 3;
 /// Entry point
 #[fastly::main]
 fn main(mut req: Request) -> std::result::Result<Response, Error> {
+    // Route Rust panics to the persistent diagnostics endpoint so a
+    // non-returning guest failure still leaves a record. The message is the
+    // panic text, not the compute_request JSON schema. Fails open when the
+    // endpoint is not configured, matching request_log::emit.
+    let _ = fastly::log::set_panic_endpoint(request_log::ENDPOINT_NAME);
     let started = Instant::now();
     let request_id = req_id::for_request(&req);
     req.set_header(req_id::REQUEST_ID_HEADER, &request_id);

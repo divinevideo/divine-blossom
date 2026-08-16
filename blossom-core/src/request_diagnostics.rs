@@ -1,4 +1,10 @@
-const MAX_REQUEST_ID_LEN: usize = 16;
+/// Cap keeps the ID short enough for both the Compute sanitizer and the outer
+/// VCL `substr` copy to agree while still preserving common caller IDs
+/// verbatim: UUIDs (36), W3C trace ids (32), and `traceparent` values (55).
+/// Longer caller values survive as their sanitized 64-character prefix, so
+/// cross-service correlation stays exact while very long caller-side
+/// correlation matches on the prefix only.
+const MAX_REQUEST_ID_LEN: usize = 64;
 
 /// Return whether a Compute response belongs in persistent diagnostics.
 pub fn should_persist_compute_diagnostic(status: u16) -> bool {
@@ -94,7 +100,9 @@ mod tests {
     #[test]
     fn sanitizer_preserves_allowed_ascii_and_limits_length() {
         assert_eq!(sanitize_request_id("abc123-_"), "abc123-_");
-        assert_eq!(sanitize_request_id(&"a".repeat(32)), "a".repeat(16));
+        let uuid = "8f14e45f-ceea-467f-8302-9157b1dce6d4";
+        assert_eq!(sanitize_request_id(uuid), uuid);
+        assert_eq!(sanitize_request_id(&"a".repeat(80)), "a".repeat(64));
     }
 
     #[test]

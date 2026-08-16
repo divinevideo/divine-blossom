@@ -9,7 +9,9 @@ if (!req.http.X-Request-Id) {
   set req.http.X-Request-Id = uuid.version4();
 }
 # Preserve the outer service's sanitized value for cross-service correlation.
-set req.http.X-Divine-Edge-Request-Id = substr(regsuball(req.http.X-Request-Id, "[^A-Za-z0-9_-]", ""), 0, 16);
+# The 64-character cap must match blossom-core request_diagnostics
+# MAX_REQUEST_ID_LEN so both services truncate caller IDs identically.
+set req.http.X-Divine-Edge-Request-Id = substr(regsuball(req.http.X-Request-Id, "[^A-Za-z0-9_-]", ""), 0, 64);
 if (!req.http.X-Divine-Edge-Request-Id) {
   set req.http.X-Divine-Edge-Request-Id = uuid.version4();
 }
