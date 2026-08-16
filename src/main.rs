@@ -51,9 +51,7 @@ use crate::storage::{
     trigger_cloud_run_delete_blob, upload_blob, write_audit_log,
 };
 use crate::viewer_auth::{ViewerAuthDiagnostics, ViewerAuthState};
-use blossom_core::cache_policy::{
-    blob_response_is_private, immutable_blob_cache_headers, mutable_derivative_cache_headers,
-};
+use blossom_core::cache_policy::{immutable_blob_cache_headers, mutable_derivative_cache_headers};
 use blossom_core::request_diagnostics::route_category;
 use blossom_core::upload_log::{
     record_failure, record_response, record_send_attempt, OriginSendResult, UploadLogRecord,
@@ -682,24 +680,16 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         resp.set_header("X-Sha256", &hash);
     }
 
-    // Content is addressed by SHA256 hash, so it's immutable - cache aggressively.
-    // Exception: restricted/admin content must not be publicly cached.
+    // Active content is addressed by SHA256 hash, so it's immutable - cache aggressively.
+    // Pending blobs are public while moderation runs, but keep browser caches revocable.
     if is_admin {
         // Admin bypass: never cache, expose moderation status
-        resp.set_header("Cache-Control", "private, no-store");
+        add_private_cache_headers(&mut resp, &hash);
         if let Some(ref meta) = metadata {
-            resp.set_header("X-Moderation-Status", &format!("{:?}", meta.status));
+            resp.set_header("X-Moderation-Status", format!("{:?}", meta.status));
         }
     } else {
-        let is_restricted = metadata
-            .as_ref()
-            .map(|m| blob_response_is_private(m.status))
-            .unwrap_or(false);
-        if is_restricted {
-            add_private_cache_headers(&mut resp, &hash);
-        } else {
-            add_cache_headers(&mut resp, &hash);
-        }
+        add_blob_response_cache_headers(&mut resp, &hash, metadata.as_ref().map(|m| m.status));
     }
 
     if let Some(c2pa) = c2pa_manifest_id {
@@ -5978,6 +5968,16 @@ fn add_derivative_cache_headers(resp: &mut Response, hash: &str) {
     resp.set_header("Surrogate-Key", headers.surrogate_key);
 }
 
+fn add_blob_response_cache_headers(resp: &mut Response, hash: &str, status: Option<BlobStatus>) {
+    match status {
+        Some(BlobStatus::Pending) => add_derivative_cache_headers(resp, hash),
+        Some(status) if status.requires_private_cache() || status.blocks_public_access() => {
+            add_private_cache_headers(resp, hash);
+        }
+        _ => add_cache_headers(resp, hash),
+    }
+}
+
 /// Like add_cache_headers but for authenticated or admin-only content that must
 /// not be stored in shared caches.
 fn add_private_cache_headers(resp: &mut Response, hash: &str) {
@@ -6185,12 +6185,13 @@ fn infer_mime_from_path(path: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        backfill_batch_cursor, classify_audio_reuse_availability, decide_transcode_fetch_action,
-        decide_transcript_fetch_action, derivative_reconciliation_response, error_response,
-        ignored_generation_response, is_alias_only_audio_blob,
-        parse_transcode_status_webhook_payload, parse_transcript_status_webhook_payload,
-        parse_upload_service_response, should_delete_derived_audio_blob,
-        should_eagerly_trigger_transcription, should_record_upload_service_transcode_failure,
+        add_blob_response_cache_headers, backfill_batch_cursor, classify_audio_reuse_availability,
+        decide_transcode_fetch_action, decide_transcript_fetch_action,
+        derivative_reconciliation_response, error_response, ignored_generation_response,
+        is_alias_only_audio_blob, parse_transcode_status_webhook_payload,
+        parse_transcript_status_webhook_payload, parse_upload_service_response,
+        should_delete_derived_audio_blob, should_eagerly_trigger_transcription,
+        should_record_upload_service_transcode_failure,
         should_record_upload_service_transcript_failure,
         should_reset_transcode_failure_on_clean_upload,
         should_reset_transcript_failure_on_clean_upload, should_set_audio_content_length,
@@ -6199,9 +6200,12 @@ mod tests {
         AudioReuseAvailability, DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction,
         TranscriptPendingState,
     };
-    use crate::blossom::{ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus};
+    use crate::blossom::{
+        BlobStatus, ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus,
+    };
     use crate::error::{BlossomError, Result as BlossomResult};
     use fastly::http::StatusCode;
+    use fastly::Response;
 
     #[test]
     fn upload_service_response_records_failure_fields_but_clamps_broad_invalid_media_terminal() {
@@ -6809,6 +6813,61 @@ mod tests {
         assert!(exposed_headers.contains("X-Divine-Upload-Data-Host"));
         // Browser clients must be able to read the 429 throttle backoff.
         assert!(exposed_headers.contains("Retry-After"));
+    }
+
+    #[test]
+    fn pending_blob_get_uses_short_browser_cache_with_purgeable_edge_ttl() {
+        let mut resp = Response::from_status(StatusCode::OK);
+
+        add_blob_response_cache_headers(&mut resp, "abc123", Some(BlobStatus::Pending));
+
+        assert_eq!(
+            resp.get_header_str("Cache-Control"),
+            Some("public, max-age=86400")
+        );
+        assert_eq!(
+            resp.get_header_str("Surrogate-Control"),
+            Some("max-age=31536000")
+        );
+        assert_eq!(resp.get_header_str("Surrogate-Key"), Some("abc123"));
+    }
+
+    #[test]
+    fn active_blob_get_keeps_immutable_cache_policy() {
+        let mut resp = Response::from_status(StatusCode::OK);
+
+        add_blob_response_cache_headers(&mut resp, "abc123", Some(BlobStatus::Active));
+
+        assert_eq!(
+            resp.get_header_str("Cache-Control"),
+            Some("public, max-age=31536000, immutable"),
+        );
+        assert_eq!(
+            resp.get_header_str("Surrogate-Control"),
+            Some("max-age=31536000")
+        );
+        assert_eq!(resp.get_header_str("Surrogate-Key"), Some("abc123"));
+    }
+
+    #[test]
+    fn moderated_blob_get_statuses_are_not_cacheable() {
+        for status in [
+            BlobStatus::Restricted,
+            BlobStatus::AgeRestricted,
+            BlobStatus::Banned,
+            BlobStatus::Deleted,
+        ] {
+            let mut resp = Response::from_status(StatusCode::OK);
+
+            add_blob_response_cache_headers(&mut resp, "abc123", Some(status));
+
+            assert_eq!(
+                resp.get_header_str("Cache-Control"),
+                Some("private, no-store")
+            );
+            assert_eq!(resp.get_header_str("Surrogate-Control"), Some("no-store"));
+            assert_eq!(resp.get_header_str("Surrogate-Key"), Some("abc123"));
+        }
     }
 
     #[test]
