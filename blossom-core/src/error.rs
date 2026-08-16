@@ -39,6 +39,27 @@ impl BlossomError {
         }
     }
 
+    /// Stable, message-free label for this error variant.
+    ///
+    /// Log sinks group on this, so it is spelled out rather than derived from
+    /// `Debug`: a variant rename must not silently repartition existing data.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            BlossomError::AuthRequired(_) => "auth_required",
+            BlossomError::AuthInvalid(_) => "auth_invalid",
+            BlossomError::Forbidden(_) => "forbidden",
+            BlossomError::NotFound(_) => "not_found",
+            BlossomError::Conflict(_) => "conflict",
+            BlossomError::BadRequest(_) => "bad_request",
+            BlossomError::Gone(_) => "gone",
+            BlossomError::RangeNotSatisfiable(_) => "range_not_satisfiable",
+            BlossomError::UnprocessableEntity(_) => "unprocessable_entity",
+            BlossomError::StorageError(_) => "storage_error",
+            BlossomError::MetadataError(_) => "metadata_error",
+            BlossomError::Internal(_) => "internal",
+        }
+    }
+
     pub fn message(&self) -> &str {
         match self {
             BlossomError::AuthRequired(msg) => msg,
@@ -121,6 +142,39 @@ mod tests {
             BlossomError::Internal("".into()).status_code(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    #[test]
+    fn kind_labels_are_stable_snake_case() {
+        // These land in a log sink and get grouped on, so they must not drift
+        // with Rust naming or Debug formatting.
+        assert_eq!(BlossomError::AuthRequired("".into()).kind(), "auth_required");
+        assert_eq!(BlossomError::AuthInvalid("".into()).kind(), "auth_invalid");
+        assert_eq!(BlossomError::Forbidden("".into()).kind(), "forbidden");
+        assert_eq!(BlossomError::NotFound("".into()).kind(), "not_found");
+        assert_eq!(BlossomError::Conflict("".into()).kind(), "conflict");
+        assert_eq!(BlossomError::BadRequest("".into()).kind(), "bad_request");
+        assert_eq!(BlossomError::Gone("".into()).kind(), "gone");
+        assert_eq!(
+            BlossomError::RangeNotSatisfiable("".into()).kind(),
+            "range_not_satisfiable"
+        );
+        assert_eq!(
+            BlossomError::UnprocessableEntity("".into()).kind(),
+            "unprocessable_entity"
+        );
+        assert_eq!(BlossomError::StorageError("".into()).kind(), "storage_error");
+        assert_eq!(
+            BlossomError::MetadataError("".into()).kind(),
+            "metadata_error"
+        );
+        assert_eq!(BlossomError::Internal("".into()).kind(), "internal");
+    }
+
+    #[test]
+    fn kind_does_not_leak_the_message() {
+        let err = BlossomError::AuthInvalid("Nostr eyJzZWNyZXQiOiJ4In0=".into());
+        assert_eq!(err.kind(), "auth_invalid");
     }
 
     #[test]

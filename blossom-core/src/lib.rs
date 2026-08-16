@@ -6,3 +6,4 @@ pub mod read_through;
 pub mod request_diagnostics;
 pub mod transcribe;
 pub mod types;
+pub mod upload_log;
