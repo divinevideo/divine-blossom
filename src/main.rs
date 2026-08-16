@@ -17,11 +17,13 @@ mod viewer_auth;
 
 use crate::auth::{diagnose_viewer_auth, validate_auth, validate_hash_match, viewer_pubkey};
 use crate::blossom::{
-    is_audio_path, is_hash_path, is_transcribable_mime_type, is_video_mime_type, parse_audio_path,
-    parse_hash_from_path, parse_thumbnail_path, AudioMapping, AuthAction, BlobAccess,
-    BlobDescriptor, BlobMetadata, BlobStatus, ResumableUploadCompleteResponse,
-    ResumableUploadInitRequest, ResumableUploadInitResponse, SubtitleJob, SubtitleJobCreateRequest,
-    SubtitleJobStatus, TranscodeStatus, TranscriptStatus, UploadRequirements,
+    is_audio_path, is_hash_path, is_quality_variant_path, is_transcribable_mime_type,
+    is_transcript_path, is_video_mime_type, is_vtt_file_path, parse_audio_path,
+    parse_hash_from_path, parse_quality_variant_path, parse_thumbnail_path, parse_transcript_path,
+    parse_vtt_file_path, AudioMapping, AuthAction, BlobAccess, BlobDescriptor, BlobMetadata,
+    BlobStatus, ResumableUploadCompleteResponse, ResumableUploadInitRequest,
+    ResumableUploadInitResponse, SubtitleJob, SubtitleJobCreateRequest, SubtitleJobStatus,
+    TranscodeStatus, TranscriptStatus, UploadRequirements, QUALITY_VARIANTS,
 };
 use crate::delete_policy::{
     build_creator_delete_response, handle_creator_delete, map_webhook_moderate_action,
@@ -1231,51 +1233,6 @@ fn download_hls_content(gcs_path: &str, range: Option<&str>) -> Result<Response>
     Ok(resp)
 }
 
-/// Parse transcript path: /{sha256}/VTT (case-insensitive).
-fn parse_transcript_path(path: &str) -> Option<String> {
-    let path_trimmed = path.trim_start_matches('/');
-    let mut parts = path_trimmed.split('/');
-    let hash = parts.next()?;
-    let suffix = parts.next()?;
-
-    if parts.next().is_some() {
-        return None;
-    }
-
-    if suffix.eq_ignore_ascii_case("vtt")
-        && hash.len() == 64
-        && hash.chars().all(|c| c.is_ascii_hexdigit())
-    {
-        Some(hash.to_lowercase())
-    } else {
-        None
-    }
-}
-
-/// Parse transcript file path: /{sha256}.vtt.
-fn parse_vtt_file_path(path: &str) -> Option<String> {
-    let path_trimmed = path.trim_start_matches('/');
-    if !path_trimmed.ends_with(".vtt") {
-        return None;
-    }
-    let hash = path_trimmed.strip_suffix(".vtt")?;
-    if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
-        Some(hash.to_lowercase())
-    } else {
-        None
-    }
-}
-
-/// Check if a path is a transcript request path.
-fn is_transcript_path(path: &str) -> bool {
-    parse_transcript_path(path).is_some()
-}
-
-/// Check if a path is a transcript file request path.
-fn is_vtt_file_path(path: &str) -> bool {
-    parse_vtt_file_path(path).is_some()
-}
-
 /// Download transcript content from GCS
 /// Download transcript content from GCS (with POP-local Simple Cache)
 fn download_transcript_content(gcs_path: &str) -> Result<Response> {
@@ -2148,14 +2105,6 @@ fn handle_get_subtitle_by_hash(req: Request, path: &str) -> Result<Response> {
     ))
 }
 
-/// Valid quality variant suffixes: (url_suffix, gcs_filename, content_type)
-const QUALITY_VARIANTS: &[(&str, &str, &str)] = &[
-    ("/720p", "stream_720p.ts", "video/mp2t"),
-    ("/480p", "stream_480p.ts", "video/mp2t"),
-    ("/720p.mp4", "stream_720p.mp4", "video/mp4"),
-    ("/480p.mp4", "stream_480p.mp4", "video/mp4"),
-];
-
 /// GET /{sha256}.audio.m4a - Extract and serve audio from a video blob.
 ///
 /// Permission is hash-level: if ANY public current video event for this sha256
@@ -2374,37 +2323,6 @@ fn handle_head_audio(path: &str) -> Result<Response> {
 
     // No audio extracted yet
     Err(BlossomError::NotFound("Audio not yet extracted".into()))
-}
-
-/// Check if a path is a quality variant request like /{hash}/720p
-fn is_quality_variant_path(path: &str) -> bool {
-    let path = path.trim_start_matches('/');
-    for (suffix, _, _) in QUALITY_VARIANTS {
-        let suffix = suffix.trim_start_matches('/');
-        // Need at least hash(64) + '/' + suffix
-        if path.ends_with(suffix) && path.len() > suffix.len() + 1 {
-            let hash_part = &path[..path.len() - suffix.len() - 1];
-            if hash_part.len() == 64 && hash_part.chars().all(|c| c.is_ascii_hexdigit()) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Parse quality variant path into (hash, gcs_filename, content_type)
-fn parse_quality_variant_path(path: &str) -> Option<(String, &'static str, &'static str)> {
-    let path = path.trim_start_matches('/');
-    for (suffix, filename, content_type) in QUALITY_VARIANTS {
-        let suffix = suffix.trim_start_matches('/');
-        if path.ends_with(suffix) && path.len() > suffix.len() + 1 {
-            let hash_part = &path[..path.len() - suffix.len() - 1];
-            if hash_part.len() == 64 && hash_part.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Some((hash_part.to_lowercase(), filename, content_type));
-            }
-        }
-    }
-    None
 }
 
 /// GET /<sha256>/720p or /<sha256>/480p - Direct access to transcoded quality variant

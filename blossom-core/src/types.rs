@@ -757,6 +757,82 @@ pub fn is_hash_path(path: &str) -> bool {
     parse_hash_from_path(path).is_some()
 }
 
+/// Parse transcript path: /{sha256}/VTT (case-insensitive).
+pub fn parse_transcript_path(path: &str) -> Option<String> {
+    let path_trimmed = path.trim_start_matches('/');
+    let mut parts = path_trimmed.split('/');
+    let hash = parts.next()?;
+    let suffix = parts.next()?;
+
+    if parts.next().is_some() {
+        return None;
+    }
+
+    if suffix.eq_ignore_ascii_case("vtt")
+        && hash.len() == 64
+        && hash.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        Some(hash.to_lowercase())
+    } else {
+        None
+    }
+}
+
+/// Check if a path is a transcript request path.
+pub fn is_transcript_path(path: &str) -> bool {
+    parse_transcript_path(path).is_some()
+}
+
+/// Parse transcript file path: /{sha256}.vtt.
+pub fn parse_vtt_file_path(path: &str) -> Option<String> {
+    let path_trimmed = path.trim_start_matches('/');
+    if !path_trimmed.ends_with(".vtt") {
+        return None;
+    }
+    let hash = path_trimmed.strip_suffix(".vtt")?;
+    if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(hash.to_lowercase())
+    } else {
+        None
+    }
+}
+
+/// Check if a path is a transcript file request path.
+pub fn is_vtt_file_path(path: &str) -> bool {
+    parse_vtt_file_path(path).is_some()
+}
+
+/// Valid quality variant suffixes: (url_suffix, gcs_filename, content_type).
+/// Shared by the Compute router and request_diagnostics::route_category so the
+/// diagnostic category cannot drift from actual routing.
+pub const QUALITY_VARIANTS: &[(&str, &str, &str)] = &[
+    ("/720p", "stream_720p.ts", "video/mp2t"),
+    ("/480p", "stream_480p.ts", "video/mp2t"),
+    ("/720p.mp4", "stream_720p.mp4", "video/mp4"),
+    ("/480p.mp4", "stream_480p.mp4", "video/mp4"),
+];
+
+/// Check if a path is a quality variant request like /{hash}/720p
+pub fn is_quality_variant_path(path: &str) -> bool {
+    parse_quality_variant_path(path).is_some()
+}
+
+/// Parse quality variant path into (hash, gcs_filename, content_type)
+pub fn parse_quality_variant_path(path: &str) -> Option<(String, &'static str, &'static str)> {
+    let path = path.trim_start_matches('/');
+    for (suffix, filename, content_type) in QUALITY_VARIANTS {
+        let suffix = suffix.trim_start_matches('/');
+        // Need at least hash(64) + '/' + suffix
+        if path.ends_with(suffix) && path.len() > suffix.len() + 1 {
+            let hash_part = &path[..path.len() - suffix.len() - 1];
+            if hash_part.len() == 64 && hash_part.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Some((hash_part.to_lowercase(), filename, content_type));
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1152,7 +1228,7 @@ mod tests {
 
     #[test]
     fn test_local_mode_stub_filenames_match_quality_variants() {
-        // QUALITY_VARIANTS in main.rs defines the route-to-filename mapping:
+        // QUALITY_VARIANTS (this module) defines the route-to-filename mapping:
         //   ("/720p", "stream_720p.ts"), ("/480p", "stream_480p.ts")
         // The local mode stub must write files with these exact base names.
         // This test catches drift between the stub and route handler.

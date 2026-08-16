@@ -16,11 +16,14 @@ const CF_RAY_HEADER: &str = "cf-ray";
 /// Extract or generate a request correlation ID.
 ///
 /// Priority:
-/// 1. `x-request-id` if the caller provided one (preferred; lets upstream
-///    retry loops pin the same ID across attempts).
-/// 2. Leading segment of `cf-ray` (Cloudflare-provided; free correlation
-///    with CF edge logs).
-/// 3. Generated short hex ID derived from the current nanosecond clock.
+/// 1. `x-divine-edge-request-id` when the outer VCL service pinned it
+///    (authoritative cross-service value; preferred so nothing downstream can
+///    change the ID the outer service already logged).
+/// 2. `x-request-id` if the caller provided one (lets upstream retry loops pin
+///    the same ID across attempts).
+/// 3. Leading segment of `cf-ray` (Cloudflare-provided; free correlation with
+///    CF edge logs).
+/// 4. Generated short hex ID derived from the current nanosecond clock.
 pub(crate) fn for_request(req: &Request) -> String {
     if let Some(request_id) = external_request_id(
         req.get_header_str(EDGE_REQUEST_ID_HEADER),

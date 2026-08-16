@@ -50,6 +50,13 @@ storage, metadata, and internal failures without making persistent ingestion
 scale with successful request volume. A route category never contains a path
 parameter or query string.
 
+This change deliberately removes the old unconditional `[BLOSSOM ROUTE]`
+stderr line, which logged every request's method, full path, and host to the
+ephemeral Compute log. Route visibility now exists only as the route category
+in persisted 5xx records; routine traffic writes no per-request route log.
+Operators who relied on `[BLOSSOM ROUTE]` in `log-tail` for live debugging no
+longer have it at any status.
+
 Do not point either schema at `cdn-view-logs`; that stream has a separate
 view-counting contract.
 

@@ -1,3 +1,7 @@
+use crate::types::{
+    is_audio_path, is_hash_path, is_quality_variant_path, is_transcript_path, is_vtt_file_path,
+};
+
 /// Cap keeps the ID short enough for both the Compute sanitizer and the outer
 /// VCL `substr` copy to agree while still preserving common caller IDs
 /// verbatim: UUIDs (36), W3C trace ids (32), and `traceparent` values (55).
@@ -45,11 +49,31 @@ pub fn external_request_id(
 }
 
 /// Return a stable route category without retaining path parameters.
+///
+/// Path-shape checks reuse the exported blossom-core predicates and follow the
+/// router's arm order in the Compute service so the recorded category cannot
+/// drift from actual routing.
 pub fn route_category(path: &str) -> &'static str {
     if path == "/" {
         "landing"
     } else if path == "/version" {
         "version"
+    } else if path.ends_with(".hls") {
+        "hls_master"
+    } else if path.contains("/hls/") {
+        "hls_content"
+    } else if is_vtt_file_path(path) || is_transcript_path(path) {
+        "transcript"
+    } else if path.starts_with("/v1/subtitles/") {
+        "subtitle_api"
+    } else if path.ends_with("/provenance") {
+        "provenance"
+    } else if is_audio_path(path) {
+        "audio"
+    } else if is_quality_variant_path(path) {
+        "quality_variant"
+    } else if is_hash_path(path) {
+        "blob"
     } else if path == "/upload" || path.starts_with("/upload/") {
         "upload"
     } else if path == "/transcribe" {
@@ -62,35 +86,11 @@ pub fn route_category(path: &str) -> &'static str {
         "mirror"
     } else if path.starts_with("/list/") {
         "list"
-    } else if path.starts_with("/admin/") || path == "/admin" {
+    } else if path == "/admin" || path.starts_with("/admin/") {
         "admin"
-    } else if path.starts_with("/v1/subtitles/") {
-        "subtitle_api"
-    } else if path.ends_with("/provenance") {
-        "provenance"
-    } else if path.ends_with(".hls") {
-        "hls_master"
-    } else if path.contains("/hls/") {
-        "hls_content"
-    } else if path.ends_with(".vtt") || path.ends_with("/VTT") || path.ends_with("/vtt") {
-        "transcript"
-    } else if path.ends_with(".audio.m4a") {
-        "audio"
-    } else if path.contains("/720p") || path.contains("/480p") {
-        "quality_variant"
-    } else if is_hash_path(path) {
-        "blob"
     } else {
         "other"
     }
-}
-
-fn is_hash_path(path: &str) -> bool {
-    path.strip_prefix('/')
-        .and_then(|value| value.split(['.', '/']).next())
-        .is_some_and(|value| {
-            value.len() == 64 && value.chars().all(|character| character.is_ascii_hexdigit())
-        })
 }
 
 #[cfg(test)]
@@ -153,5 +153,27 @@ mod tests {
         );
         assert_eq!(route_category("/admin/api/user/sensitive-value"), "admin");
         assert_eq!(route_category("/unknown?secret=value"), "other");
+    }
+
+    #[test]
+    fn route_categories_match_router_predicates() {
+        let hash = "a".repeat(64);
+        // Transcript casing follows parse_transcript_path (case-insensitive).
+        assert_eq!(route_category(&format!("/{hash}/Vtt")), "transcript");
+        assert_eq!(route_category(&format!("/{hash}.vtt")), "transcript");
+        // Invalid transcript-shaped paths route to 404, not "transcript".
+        assert_eq!(route_category("/not-a-hash.vtt"), "other");
+        // Router arm order: /hls/ wins over a /provenance suffix.
+        assert_eq!(
+            route_category(&format!("/{hash}/hls/provenance")),
+            "hls_content"
+        );
+        // Quality-variant detection requires a valid hash, not just a
+        // "/720p" substring.
+        assert_eq!(route_category("/720p"), "other");
+        assert_eq!(route_category(&format!("/{hash}/720p")), "quality_variant");
+        // The blob category follows the exported is_hash_path semantics:
+        // a valid hash followed by an unknown segment is not a blob route.
+        assert_eq!(route_category(&format!("/{hash}/junk")), "other");
     }
 }

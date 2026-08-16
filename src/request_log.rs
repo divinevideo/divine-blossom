@@ -31,14 +31,15 @@ pub(crate) fn emit(
         return;
     }
 
+    let categories = error.and_then(diagnostic_categories);
     let record = RequestDiagnostic {
         schema: "divine.blossom.compute_request.v1",
         request_id,
         method,
         route,
         status,
-        backend: backend_category(error),
-        error_category: error.map(error_category),
+        backend: categories.and_then(|fields| fields.backend),
+        error_category: categories.map(|fields| fields.category),
         duration_ms: duration.as_millis(),
     };
 
@@ -51,27 +52,40 @@ pub(crate) fn emit(
     let _ = endpoint.write_all(line.as_bytes());
 }
 
-fn backend_category(error: Option<&BlossomError>) -> Option<&'static str> {
-    match error {
-        Some(BlossomError::StorageError(_)) => Some("origin"),
-        Some(BlossomError::MetadataError(_)) => Some("metadata"),
-        _ => None,
-    }
+#[derive(Clone, Copy)]
+struct PersistedCategories {
+    backend: Option<&'static str>,
+    category: &'static str,
 }
-
-fn error_category(error: &BlossomError) -> &'static str {
+/// Categories for a persisted diagnostic record, or `None` when the error
+/// never produces a 5xx response. `BlossomError::status_code` maps only
+/// StorageError (502), MetadataError (500), and Internal (500) into the 5xx
+/// range, so only those three ever receive categories here. The match is
+/// exhaustive with no wildcard on purpose: a variant that newly maps to 5xx
+/// fails compilation in this function rather than silently logging
+/// `backend: null` or a category that can never be emitted.
+fn diagnostic_categories(error: &BlossomError) -> Option<PersistedCategories> {
     match error {
-        BlossomError::AuthRequired(_) => "auth_required",
-        BlossomError::AuthInvalid(_) => "auth_invalid",
-        BlossomError::Forbidden(_) => "forbidden",
-        BlossomError::NotFound(_) => "not_found",
-        BlossomError::Conflict(_) => "conflict",
-        BlossomError::BadRequest(_) => "bad_request",
-        BlossomError::Gone(_) => "gone",
-        BlossomError::RangeNotSatisfiable(_) => "range_not_satisfiable",
-        BlossomError::UnprocessableEntity(_) => "unprocessable_entity",
-        BlossomError::StorageError(_) => "storage",
-        BlossomError::MetadataError(_) => "metadata",
-        BlossomError::Internal(_) => "internal",
+        BlossomError::StorageError(_) => Some(PersistedCategories {
+            backend: Some("origin"),
+            category: "storage",
+        }),
+        BlossomError::MetadataError(_) => Some(PersistedCategories {
+            backend: Some("metadata"),
+            category: "metadata",
+        }),
+        BlossomError::Internal(_) => Some(PersistedCategories {
+            backend: None,
+            category: "internal",
+        }),
+        BlossomError::AuthRequired(_)
+        | BlossomError::AuthInvalid(_)
+        | BlossomError::Forbidden(_)
+        | BlossomError::NotFound(_)
+        | BlossomError::Conflict(_)
+        | BlossomError::BadRequest(_)
+        | BlossomError::Gone(_)
+        | BlossomError::RangeNotSatisfiable(_)
+        | BlossomError::UnprocessableEntity(_) => None,
     }
 }
