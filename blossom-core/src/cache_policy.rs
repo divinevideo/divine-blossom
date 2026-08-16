@@ -1,6 +1,8 @@
 // ABOUTME: Shared cache policy for immutable blobs and repairable derivatives.
 // ABOUTME: Keeps browser and edge cache lifetimes testable outside Fastly Compute.
 
+use crate::types::BlobStatus;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PublicCacheHeaders<'a> {
     pub cache_control: &'static str,
@@ -24,9 +26,16 @@ pub fn mutable_derivative_cache_headers(hash: &str) -> PublicCacheHeaders<'_> {
     }
 }
 
+pub fn blob_response_is_private(status: BlobStatus) -> bool {
+    status.requires_private_cache()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{immutable_blob_cache_headers, mutable_derivative_cache_headers};
+    use super::{
+        blob_response_is_private, immutable_blob_cache_headers, mutable_derivative_cache_headers,
+    };
+    use crate::types::BlobStatus;
 
     fn max_age(cache_control: &str) -> u64 {
         cache_control
@@ -67,5 +76,13 @@ mod tests {
 
         assert_eq!(headers.surrogate_control, "max-age=31536000");
         assert_eq!(headers.surrogate_key, "abc123");
+    }
+
+    #[test]
+    fn pending_blob_gets_the_same_public_cache_policy_as_other_public_routes() {
+        assert!(!blob_response_is_private(BlobStatus::Active));
+        assert!(!blob_response_is_private(BlobStatus::Pending));
+        assert!(blob_response_is_private(BlobStatus::Restricted));
+        assert!(blob_response_is_private(BlobStatus::AgeRestricted));
     }
 }

@@ -52,7 +52,7 @@ use crate::storage::{
 };
 use crate::viewer_auth::{ViewerAuthDiagnostics, ViewerAuthState};
 use blossom_core::cache_policy::{
-    immutable_blob_cache_headers, mutable_derivative_cache_headers,
+    blob_response_is_private, immutable_blob_cache_headers, mutable_derivative_cache_headers,
 };
 use blossom_core::request_diagnostics::route_category;
 use blossom_core::upload_log::{
@@ -693,7 +693,7 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
     } else {
         let is_restricted = metadata
             .as_ref()
-            .map(|m| m.status != BlobStatus::Active)
+            .map(|m| blob_response_is_private(m.status))
             .unwrap_or(false);
         if is_restricted {
             add_private_cache_headers(&mut resp, &hash);
