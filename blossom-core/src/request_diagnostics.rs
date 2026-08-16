@@ -108,20 +108,22 @@ pub struct PersistedErrorCategories {
 /// exhaustive with no wildcard on purpose: a variant that newly maps to 5xx
 /// fails compilation in this function rather than silently logging
 /// `backend: null` or a category that can never be emitted. The companion
-/// test also catches an existing variant being remapped to 5xx.
+/// test also catches an existing variant being remapped to 5xx. The category
+/// label itself comes from `BlossomError::kind()` so this sink and the edge
+/// upload log group identical failures under one vocabulary.
 pub fn persisted_error_categories(error: &BlossomError) -> Option<PersistedErrorCategories> {
     match error {
         BlossomError::StorageError(_) => Some(PersistedErrorCategories {
             backend: Some("origin"),
-            category: "storage",
+            category: error.kind(),
         }),
         BlossomError::MetadataError(_) => Some(PersistedErrorCategories {
             backend: Some("metadata"),
-            category: "metadata",
+            category: error.kind(),
         }),
         BlossomError::Internal(_) => Some(PersistedErrorCategories {
             backend: None,
-            category: "internal",
+            category: error.kind(),
         }),
         BlossomError::AuthRequired(_)
         | BlossomError::AuthInvalid(_)
@@ -202,11 +204,18 @@ mod tests {
             BlossomError::Internal("x".into()),
         ];
         for error in &samples {
+            let categories = persisted_error_categories(error);
             assert_eq!(
                 error.status_code().is_server_error(),
-                persisted_error_categories(error).is_some(),
+                categories.is_some(),
                 "category mapping out of sync with status mapping for {error:?}"
             );
+            if let Some(fields) = categories {
+                // The category label must be the shared kind() vocabulary so
+                // this sink and the edge upload log group one failure under
+                // one label.
+                assert_eq!(fields.category, error.kind());
+            }
         }
     }
 

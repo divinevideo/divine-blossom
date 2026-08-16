@@ -5,6 +5,12 @@ the inner Compute service. Service chaining can make one request appear in both
 services, so compare each service over the same UTC window rather than adding
 their 5xx counts together.
 
+Failed uploads additionally carry per-upload records on the separate
+`edge_upload_logs` sink; see the [edge upload observability
+runbook](edge-upload-observability.md). Both records share one correlation
+value, keyed `request_id` here and `req_id` there, and label a given
+`BlossomError` with the same `kind()` vocabulary.
+
 ## Repository State
 
 The repository contains, but does not activate or configure:
