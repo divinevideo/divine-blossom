@@ -11,17 +11,20 @@ mod media_auth_log;
 mod metadata;
 mod rate_limit;
 mod req_id;
+mod request_log;
 mod storage;
 mod upload_log;
 mod viewer_auth;
 
 use crate::auth::{diagnose_viewer_auth, validate_auth, validate_hash_match, viewer_pubkey};
 use crate::blossom::{
-    is_audio_path, is_hash_path, is_transcribable_mime_type, is_video_mime_type, parse_audio_path,
-    parse_hash_from_path, parse_thumbnail_path, AudioMapping, AuthAction, BlobAccess,
-    BlobDescriptor, BlobMetadata, BlobStatus, ResumableUploadCompleteResponse,
-    ResumableUploadInitRequest, ResumableUploadInitResponse, SubtitleJob, SubtitleJobCreateRequest,
-    SubtitleJobStatus, TranscodeStatus, TranscriptStatus, UploadRequirements,
+    is_audio_path, is_hash_path, is_quality_variant_path, is_transcribable_mime_type,
+    is_transcript_path, is_video_mime_type, is_vtt_file_path, parse_audio_path,
+    parse_hash_from_path, parse_quality_variant_path, parse_thumbnail_path, parse_transcript_path,
+    parse_vtt_file_path, AudioMapping, AuthAction, BlobAccess, BlobDescriptor, BlobMetadata,
+    BlobStatus, ResumableUploadCompleteResponse, ResumableUploadInitRequest,
+    ResumableUploadInitResponse, SubtitleJob, SubtitleJobCreateRequest, SubtitleJobStatus,
+    TranscodeStatus, TranscriptStatus, UploadRequirements, QUALITY_VARIANTS,
 };
 use crate::delete_policy::{
     build_creator_delete_response, handle_creator_delete, map_webhook_moderate_action,
@@ -51,6 +54,7 @@ use crate::viewer_auth::{ViewerAuthDiagnostics, ViewerAuthState};
 use blossom_core::cache_policy::{
     immutable_blob_cache_headers, mutable_derivative_cache_headers,
 };
+use blossom_core::request_diagnostics::route_category;
 use blossom_core::upload_log::{
     record_failure, record_response, record_send_attempt, OriginSendResult, UploadLogRecord,
     UploadRoute,
@@ -63,8 +67,7 @@ use fastly::kv_store::KVStore;
 use fastly::{Error, Request, Response};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
-use std::time::Instant;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// TTL for cached HLS manifests (1 hour) — immutable once transcoding completes
 const HLS_CACHE_TTL: Duration = Duration::from_secs(3600);
@@ -82,24 +85,38 @@ const DERIVATIVE_MAX_ATTEMPTS: u32 = 3;
 
 /// Entry point
 #[fastly::main]
-fn main(req: Request) -> std::result::Result<Response, Error> {
-    match handle_request(req) {
-        Ok(resp) => Ok(resp),
-        Err(e) => Ok(error_response(&e)),
-    }
+fn main(mut req: Request) -> std::result::Result<Response, Error> {
+    // Route Rust panics to the persistent diagnostics endpoint so a
+    // non-returning guest failure still leaves a record. The message is the
+    // panic text, not the compute_request JSON schema. Fails open when the
+    // endpoint is not configured, matching request_log::emit.
+    let _ = fastly::log::set_panic_endpoint(request_log::ENDPOINT_NAME);
+    let started = Instant::now();
+    let request_id = req_id::for_request(&req);
+    req.set_header(req_id::REQUEST_ID_HEADER, &request_id);
+    let method = req.get_method().as_str().to_string();
+    let route = route_category(req.get_path());
+    let result = handle_request(req);
+    let (response, error) = match result {
+        Ok(response) => (response, None),
+        Err(error) => (error_response(&error), Some(error)),
+    };
+
+    request_log::emit(
+        &request_id,
+        &method,
+        route,
+        response.get_status().as_u16(),
+        error.as_ref(),
+        started.elapsed(),
+    );
+    Ok(response)
 }
 
 /// Route and handle the request
 fn handle_request(req: Request) -> Result<Response> {
     let method = req.get_method().clone();
     let path = req.get_path().to_string();
-    let host = req.get_header_str("host").unwrap_or("unknown");
-
-    eprintln!(
-        "[BLOSSOM ROUTE] method={} path={} host={}",
-        method, path, host
-    );
-
     match (method, path.as_str()) {
         // Landing page
         (Method::GET, "/") => Ok(handle_landing_page()),
@@ -1288,51 +1305,6 @@ fn download_hls_content(gcs_path: &str, range: Option<&str>) -> Result<Response>
     Ok(resp)
 }
 
-/// Parse transcript path: /{sha256}/VTT (case-insensitive).
-fn parse_transcript_path(path: &str) -> Option<String> {
-    let path_trimmed = path.trim_start_matches('/');
-    let mut parts = path_trimmed.split('/');
-    let hash = parts.next()?;
-    let suffix = parts.next()?;
-
-    if parts.next().is_some() {
-        return None;
-    }
-
-    if suffix.eq_ignore_ascii_case("vtt")
-        && hash.len() == 64
-        && hash.chars().all(|c| c.is_ascii_hexdigit())
-    {
-        Some(hash.to_lowercase())
-    } else {
-        None
-    }
-}
-
-/// Parse transcript file path: /{sha256}.vtt.
-fn parse_vtt_file_path(path: &str) -> Option<String> {
-    let path_trimmed = path.trim_start_matches('/');
-    if !path_trimmed.ends_with(".vtt") {
-        return None;
-    }
-    let hash = path_trimmed.strip_suffix(".vtt")?;
-    if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
-        Some(hash.to_lowercase())
-    } else {
-        None
-    }
-}
-
-/// Check if a path is a transcript request path.
-fn is_transcript_path(path: &str) -> bool {
-    parse_transcript_path(path).is_some()
-}
-
-/// Check if a path is a transcript file request path.
-fn is_vtt_file_path(path: &str) -> bool {
-    parse_vtt_file_path(path).is_some()
-}
-
 /// Download transcript content from GCS
 /// Download transcript content from GCS (with POP-local Simple Cache)
 fn download_transcript_content(gcs_path: &str) -> Result<Response> {
@@ -2205,14 +2177,6 @@ fn handle_get_subtitle_by_hash(req: Request, path: &str) -> Result<Response> {
     ))
 }
 
-/// Valid quality variant suffixes: (url_suffix, gcs_filename, content_type)
-const QUALITY_VARIANTS: &[(&str, &str, &str)] = &[
-    ("/720p", "stream_720p.ts", "video/mp2t"),
-    ("/480p", "stream_480p.ts", "video/mp2t"),
-    ("/720p.mp4", "stream_720p.mp4", "video/mp4"),
-    ("/480p.mp4", "stream_480p.mp4", "video/mp4"),
-];
-
 /// GET /{sha256}.audio.m4a - Extract and serve audio from a video blob.
 ///
 /// Permission is hash-level: if ANY public current video event for this sha256
@@ -2431,37 +2395,6 @@ fn handle_head_audio(path: &str) -> Result<Response> {
 
     // No audio extracted yet
     Err(BlossomError::NotFound("Audio not yet extracted".into()))
-}
-
-/// Check if a path is a quality variant request like /{hash}/720p
-fn is_quality_variant_path(path: &str) -> bool {
-    let path = path.trim_start_matches('/');
-    for (suffix, _, _) in QUALITY_VARIANTS {
-        let suffix = suffix.trim_start_matches('/');
-        // Need at least hash(64) + '/' + suffix
-        if path.ends_with(suffix) && path.len() > suffix.len() + 1 {
-            let hash_part = &path[..path.len() - suffix.len() - 1];
-            if hash_part.len() == 64 && hash_part.chars().all(|c| c.is_ascii_hexdigit()) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Parse quality variant path into (hash, gcs_filename, content_type)
-fn parse_quality_variant_path(path: &str) -> Option<(String, &'static str, &'static str)> {
-    let path = path.trim_start_matches('/');
-    for (suffix, filename, content_type) in QUALITY_VARIANTS {
-        let suffix = suffix.trim_start_matches('/');
-        if path.ends_with(suffix) && path.len() > suffix.len() + 1 {
-            let hash_part = &path[..path.len() - suffix.len() - 1];
-            if hash_part.len() == 64 && hash_part.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Some((hash_part.to_lowercase(), filename, content_type));
-            }
-        }
-    }
-    None
 }
 
 /// GET /<sha256>/720p or /<sha256>/480p - Direct access to transcoded quality variant
@@ -6254,11 +6187,10 @@ mod tests {
     use super::{
         backfill_batch_cursor, classify_audio_reuse_availability, decide_transcode_fetch_action,
         decide_transcript_fetch_action, derivative_reconciliation_response, error_response,
-        ignored_generation_response, is_alias_only_audio_blob, is_quality_variant_path,
-        parse_quality_variant_path, parse_transcode_status_webhook_payload,
-        parse_transcript_status_webhook_payload, parse_upload_service_response,
-        should_delete_derived_audio_blob, should_eagerly_trigger_transcription,
-        should_record_upload_service_transcode_failure,
+        ignored_generation_response, is_alias_only_audio_blob,
+        parse_transcode_status_webhook_payload, parse_transcript_status_webhook_payload,
+        parse_upload_service_response, should_delete_derived_audio_blob,
+        should_eagerly_trigger_transcription, should_record_upload_service_transcode_failure,
         should_record_upload_service_transcript_failure,
         should_reset_transcode_failure_on_clean_upload,
         should_reset_transcript_failure_on_clean_upload, should_set_audio_content_length,
@@ -6506,62 +6438,6 @@ mod tests {
             DerivativeObservation::Unavailable,
             None
         ));
-    }
-
-    #[test]
-    fn quality_variant_path_valid() {
-        let hash = "a".repeat(64);
-        assert!(is_quality_variant_path(&format!("/{}/720p", hash)));
-        assert!(is_quality_variant_path(&format!("/{}/480p", hash)));
-        assert!(is_quality_variant_path(&format!("/{}/720p.mp4", hash)));
-        assert!(is_quality_variant_path(&format!("/{}/480p.mp4", hash)));
-
-        let (parsed_hash, filename, ct) =
-            parse_quality_variant_path(&format!("/{}/720p", hash)).unwrap();
-        assert_eq!(parsed_hash, hash);
-        assert_eq!(filename, "stream_720p.ts");
-        assert_eq!(ct, "video/mp2t");
-
-        let (parsed_hash, filename, ct) =
-            parse_quality_variant_path(&format!("/{}/720p.mp4", hash)).unwrap();
-        assert_eq!(parsed_hash, hash);
-        assert_eq!(filename, "stream_720p.mp4");
-        assert_eq!(ct, "video/mp4");
-    }
-
-    #[test]
-    fn quality_variant_path_no_underflow_on_short_input() {
-        // These must not panic (previously caused u32::MAX underflow)
-        assert!(!is_quality_variant_path("/720p"));
-        assert!(!is_quality_variant_path("/480p"));
-        assert!(!is_quality_variant_path("/720p.mp4"));
-        assert!(!is_quality_variant_path("/480p.mp4"));
-        assert!(!is_quality_variant_path("720p"));
-        assert!(!is_quality_variant_path("480p"));
-        assert!(!is_quality_variant_path(""));
-        assert!(parse_quality_variant_path("/480p").is_none());
-        assert!(parse_quality_variant_path("720p").is_none());
-        assert!(parse_quality_variant_path("/720p.mp4").is_none());
-        assert!(parse_quality_variant_path("480p.mp4").is_none());
-    }
-
-    #[test]
-    fn mp4_variant_maps_to_ts_counterpart() {
-        let hash = "a".repeat(64);
-
-        // 720p.mp4 derives correct .ts counterpart for backfill check
-        let (_, filename, ct) = parse_quality_variant_path(&format!("/{}/720p.mp4", hash)).unwrap();
-        assert_eq!(ct, "video/mp4");
-        assert_eq!(filename.replace(".mp4", ".ts"), "stream_720p.ts");
-
-        // 480p.mp4 likewise
-        let (_, filename, ct) = parse_quality_variant_path(&format!("/{}/480p.mp4", hash)).unwrap();
-        assert_eq!(ct, "video/mp4");
-        assert_eq!(filename.replace(".mp4", ".ts"), "stream_480p.ts");
-
-        // .ts variants have different content type — backfill path won't trigger
-        let (_, _, ct) = parse_quality_variant_path(&format!("/{}/720p", hash)).unwrap();
-        assert_eq!(ct, "video/mp2t");
     }
 
     #[test]

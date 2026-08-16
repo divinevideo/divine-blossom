@@ -5,6 +5,13 @@ merging to `main` publishes the Fastly edge service to production within minutes
 with no human step. Most Cloud Run services do not ship that way — each one is a
 script someone runs by hand.
 
+The VCL caching layer is also manual. Files under `vcl/` are source copies of
+snippets for the outer Fastly VCL service; the Compute publish job does not
+activate them. Apply and validate those snippets in a cloned VCL service version,
+then activate that version separately. The VCL changes themselves have no
+production effect until that activation happens. CI still republishes and purges
+the Compute service after any merge to `main`, including a VCL-only merge.
+
 That asymmetry is the thing to plan around. Any change that spans the edge and a
 Cloud Run service goes out in two stages, the edge first, and there is a window
 where new edge code is talking to an old backend.
@@ -17,6 +24,11 @@ passes, it deploys, in parallel:
 - the edge service to Fastly (`fastly compute publish`), followed by a CDN purge
 - `process-blob` to Cloud Run
 - the container image to GHCR
+
+The Fastly publish and purge target the Compute service. They do not deploy or
+purge the outer VCL caching service. See [Fastly 5xx
+diagnostics](fastly-5xx.md) for the separate logging endpoint and VCL activation
+work required by the diagnostic sources in this repository.
 
 ## What ships by hand
 

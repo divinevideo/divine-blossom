@@ -5,6 +5,11 @@ Structured logging for upload requests that pass through `media.divine.video`.
 Pipeline: Fastly Compute (`fastly-blossom`) → Google Cloud Pub/Sub → *(subscriber
 not yet built)* → ClickHouse
 
+Upload 5xx responses are also recorded on the separate `compute-diagnostics`
+sink with a route category rather than the upload-specific fields; see the
+[Fastly 5xx diagnostics runbook](fastly-5xx.md). Both records carry the same
+correlation value, keyed `req_id` here and `request_id` there.
+
 ## Why this exists
 
 `media.divine.video` proxied upload request bodies to origin and kept no durable
@@ -298,8 +303,10 @@ it is capped and scrubbed rather than logged verbatim.
 The edge sends its `req_id` to origin as an `X-Request-Id` header on all three
 proxied upload routes. This is a change to what origin receives.
 
-`req_id::for_request` prefers an inbound `X-Request-Id`, falls back to the
-leading segment of `cf-ray`, and otherwise generates one.
+`req_id::for_request` prefers `x-divine-edge-request-id` once the outer VCL
+service is chained in front of Compute (trustworthy only after that service is
+activated), then an inbound `X-Request-Id`, then the leading segment of
+`cf-ray`, and otherwise generates one.
 
 **Origin nginx does not log this header yet.** To close the loop, add
 `$http_x_request_id` to the `divine-upload-server` access log format. Until that
@@ -341,7 +348,10 @@ fastly log-tail --service-id pOvEEWykEbpnylqst1KTrR | grep '\[UPLOAD\]'
 **`log-tail` is lossy. Never count with it.** Measured on 2026-08-13: five
 `POST /upload/{id}/complete` requests issued during an active `log-tail` produced
 **no output at all** — not even the `[BLOSSOM ROUTE]` line that `handle_request`
-emits unconditionally for every request before any routing runs. All five were
+emitted unconditionally for every request at the time of the measurement. (That
+line is removed on this branch: route visibility now exists only as the route
+category in persisted 5xx records; see the [Fastly 5xx diagnostics
+runbook](fastly-5xx.md).) All five were
 present in Pub/Sub. The tail samples across POPs and can drop lines under load.
 
 Use `log-tail` to answer "is the guest emitting the shape I expect?", which it
