@@ -4,24 +4,35 @@
 use crate::types::BlobStatus;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PublicCacheHeaders<'a> {
+pub struct CacheHeaders<'a> {
     pub cache_control: &'static str,
     pub surrogate_control: &'static str,
     pub surrogate_key: &'a str,
 }
 
-pub fn immutable_blob_cache_headers(hash: &str) -> PublicCacheHeaders<'_> {
-    PublicCacheHeaders {
+pub fn immutable_blob_cache_headers(hash: &str) -> CacheHeaders<'_> {
+    CacheHeaders {
         cache_control: "public, max-age=31536000, immutable",
         surrogate_control: "max-age=31536000",
         surrogate_key: hash,
     }
 }
 
-pub fn mutable_derivative_cache_headers(hash: &str) -> PublicCacheHeaders<'_> {
-    PublicCacheHeaders {
+pub fn mutable_derivative_cache_headers(hash: &str) -> CacheHeaders<'_> {
+    CacheHeaders {
         cache_control: "public, max-age=86400",
         surrogate_control: "max-age=31536000",
+        surrogate_key: hash,
+    }
+}
+
+/// Headers for responses that must not be stored in browser or shared caches.
+/// The Surrogate-Key is still carried so a moderation purge can evict any edge
+/// copy cached before the status changed.
+pub fn private_no_store_cache_headers(hash: &str) -> CacheHeaders<'_> {
+    CacheHeaders {
+        cache_control: "private, no-store",
+        surrogate_control: "no-store",
         surrogate_key: hash,
     }
 }
@@ -51,11 +62,20 @@ pub fn blob_cache_policy(status: BlobStatus) -> BlobCachePolicy {
     }
 }
 
+/// Whether a response for this status must stay private. Routes that serve
+/// derivative content (HLS, variants, transcripts) branch on this so every
+/// status decision flows through the single exhaustive [`blob_cache_policy`]
+/// match: a future `BlobStatus` variant fails to compile there instead of
+/// silently inheriting public derivative caching.
+pub fn status_requires_private_response(status: BlobStatus) -> bool {
+    blob_cache_policy(status) == BlobCachePolicy::PrivateNoStore
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         blob_cache_policy, immutable_blob_cache_headers, mutable_derivative_cache_headers,
-        BlobCachePolicy,
+        private_no_store_cache_headers, status_requires_private_response, BlobCachePolicy,
     };
     use crate::types::BlobStatus;
 
@@ -98,6 +118,54 @@ mod tests {
 
         assert_eq!(headers.surrogate_control, "max-age=31536000");
         assert_eq!(headers.surrogate_key, "abc123");
+    }
+
+    #[test]
+    fn every_cache_policy_sends_the_headers_its_name_promises() {
+        // The edge binary's tests are compile-only in CI, so these literals
+        // are the executing coverage for the header strings each policy must
+        // send on every serving route.
+        for (policy, cache_control, surrogate_control) in [
+            (
+                BlobCachePolicy::ImmutablePublic,
+                "public, max-age=31536000, immutable",
+                "max-age=31536000",
+            ),
+            (
+                BlobCachePolicy::RevocablePublic,
+                "public, max-age=86400",
+                "max-age=31536000",
+            ),
+            (
+                BlobCachePolicy::PrivateNoStore,
+                "private, no-store",
+                "no-store",
+            ),
+        ] {
+            let headers = match policy {
+                BlobCachePolicy::ImmutablePublic => immutable_blob_cache_headers("abc123"),
+                BlobCachePolicy::RevocablePublic => mutable_derivative_cache_headers("abc123"),
+                BlobCachePolicy::PrivateNoStore => private_no_store_cache_headers("abc123"),
+            };
+
+            assert_eq!(headers.cache_control, cache_control);
+            assert_eq!(headers.surrogate_control, surrogate_control);
+            assert_eq!(headers.surrogate_key, "abc123");
+        }
+    }
+
+    #[test]
+    fn moderated_statuses_route_derivatives_through_the_policy_match() {
+        for status in [
+            BlobStatus::Restricted,
+            BlobStatus::AgeRestricted,
+            BlobStatus::Banned,
+            BlobStatus::Deleted,
+        ] {
+            assert!(status_requires_private_response(status));
+        }
+        assert!(!status_requires_private_response(BlobStatus::Active));
+        assert!(!status_requires_private_response(BlobStatus::Pending));
     }
 
     #[test]

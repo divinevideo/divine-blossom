@@ -53,7 +53,7 @@ use crate::storage::{
 use crate::viewer_auth::{ViewerAuthDiagnostics, ViewerAuthState};
 use blossom_core::cache_policy::{
     blob_cache_policy, immutable_blob_cache_headers, mutable_derivative_cache_headers,
-    BlobCachePolicy,
+    private_no_store_cache_headers, status_requires_private_response, BlobCachePolicy,
 };
 use blossom_core::request_diagnostics::route_category;
 use blossom_core::upload_log::{
@@ -839,7 +839,7 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
                 .map(|s| s.to_string());
 
             resp.set_header("Content-Type", "application/vnd.apple.mpegurl");
-            if is_admin || meta.status.requires_private_cache() {
+            if is_admin || status_requires_private_response(meta.status) {
                 add_private_cache_headers(&mut resp, &hash);
             } else {
                 add_derivative_cache_headers(&mut resp, &hash);
@@ -1027,7 +1027,7 @@ fn handle_get_hls_content(req: Request, path: &str) -> Result<Response> {
             match meta.access_for(requester_pk.as_deref(), is_admin) {
                 BlobAccess::Allowed => {
                     log_media_outcome("hls_content", &auth_diagnostics, "allowed");
-                    if meta.status.requires_private_cache() {
+                    if status_requires_private_response(meta.status) {
                         is_restricted = true;
                     }
                 }
@@ -1702,7 +1702,7 @@ fn serve_transcript_by_hash(
                 );
             }
             resp.set_header("Content-Type", "text/vtt; charset=utf-8");
-            if is_admin || metadata.status.requires_private_cache() {
+            if is_admin || status_requires_private_response(metadata.status) {
                 add_private_cache_headers(&mut resp, &hash);
             } else {
                 add_derivative_cache_headers(&mut resp, hash);
@@ -2442,7 +2442,7 @@ fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
     match download_hls_content(&gcs_path, range.as_deref()) {
         Ok(mut resp) => {
             resp.set_header("Content-Type", content_type);
-            if is_admin || meta.status.requires_private_cache() {
+            if is_admin || status_requires_private_response(meta.status) {
                 add_private_cache_headers(&mut resp, &hash);
             } else {
                 add_derivative_cache_headers(&mut resp, &hash);
@@ -6000,9 +6000,10 @@ fn add_blob_response_cache_headers(resp: &mut Response, hash: &str, status: Opti
 /// Like add_cache_headers but for authenticated or admin-only content that must
 /// not be stored in shared caches.
 fn add_private_cache_headers(resp: &mut Response, hash: &str) {
-    resp.set_header("Cache-Control", "private, no-store");
-    resp.set_header("Surrogate-Control", "no-store");
-    resp.set_header("Surrogate-Key", hash);
+    let headers = private_no_store_cache_headers(hash);
+    resp.set_header("Cache-Control", headers.cache_control);
+    resp.set_header("Surrogate-Control", headers.surrogate_control);
+    resp.set_header("Surrogate-Key", headers.surrogate_key);
 }
 
 /// Mark a response as explicitly uncacheable (used for 202 in-progress responses).
