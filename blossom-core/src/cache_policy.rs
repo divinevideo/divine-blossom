@@ -71,11 +71,23 @@ pub fn status_requires_private_response(status: BlobStatus) -> bool {
     blob_cache_policy(status) == BlobCachePolicy::PrivateNoStore
 }
 
+/// The headers a serving route must send for a cache policy. Production routes
+/// apply this mapping instead of re-stating it, so the policy-to-headers
+/// decision is covered by the executing blossom-core tests.
+pub fn cache_headers_for_policy<'a>(policy: BlobCachePolicy, hash: &'a str) -> CacheHeaders<'a> {
+    match policy {
+        BlobCachePolicy::ImmutablePublic => immutable_blob_cache_headers(hash),
+        BlobCachePolicy::RevocablePublic => mutable_derivative_cache_headers(hash),
+        BlobCachePolicy::PrivateNoStore => private_no_store_cache_headers(hash),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        blob_cache_policy, immutable_blob_cache_headers, mutable_derivative_cache_headers,
-        private_no_store_cache_headers, status_requires_private_response, BlobCachePolicy,
+        blob_cache_policy, cache_headers_for_policy, immutable_blob_cache_headers,
+        mutable_derivative_cache_headers, private_no_store_cache_headers,
+        status_requires_private_response, BlobCachePolicy,
     };
     use crate::types::BlobStatus;
 
@@ -142,11 +154,7 @@ mod tests {
                 "no-store",
             ),
         ] {
-            let headers = match policy {
-                BlobCachePolicy::ImmutablePublic => immutable_blob_cache_headers("abc123"),
-                BlobCachePolicy::RevocablePublic => mutable_derivative_cache_headers("abc123"),
-                BlobCachePolicy::PrivateNoStore => private_no_store_cache_headers("abc123"),
-            };
+            let headers = cache_headers_for_policy(policy, "abc123");
 
             assert_eq!(headers.cache_control, cache_control);
             assert_eq!(headers.surrogate_control, surrogate_control);

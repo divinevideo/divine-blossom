@@ -52,8 +52,8 @@ use crate::storage::{
 };
 use crate::viewer_auth::{ViewerAuthDiagnostics, ViewerAuthState};
 use blossom_core::cache_policy::{
-    blob_cache_policy, immutable_blob_cache_headers, mutable_derivative_cache_headers,
-    private_no_store_cache_headers, status_requires_private_response, BlobCachePolicy,
+    blob_cache_policy, cache_headers_for_policy, mutable_derivative_cache_headers,
+    status_requires_private_response, BlobCachePolicy, CacheHeaders,
 };
 use blossom_core::request_diagnostics::route_category;
 use blossom_core::upload_log::{
@@ -426,11 +426,7 @@ fn add_audio_response_headers(
     resp.set_header("X-Audio-Duration", format!("{}", duration_seconds));
     resp.set_header("X-Audio-Size", size_bytes.to_string());
     resp.set_header("Accept-Ranges", "bytes");
-    match cache_policy {
-        BlobCachePolicy::ImmutablePublic => add_cache_headers(resp, source_hash),
-        BlobCachePolicy::RevocablePublic => add_derivative_cache_headers(resp, source_hash),
-        BlobCachePolicy::PrivateNoStore => add_private_cache_headers(resp, source_hash),
-    }
+    apply_cache_headers(resp, &cache_headers_for_policy(cache_policy, source_hash));
     add_cors_headers(resp);
 }
 
@@ -5953,13 +5949,7 @@ fn error_response(error: &BlossomError) -> Response {
     resp
 }
 
-/// Add CORS headers
-/// Set immutable cache headers and surrogate key for content-addressed responses.
-/// - Cache-Control: tells browsers to cache for 1 year
-/// - Surrogate-Control: tells Fastly edge to cache for 1 year (stripped before client)
-/// - Surrogate-Key: enables targeted purging via `fastly purge --key {hash}`
-fn add_cache_headers(resp: &mut Response, hash: &str) {
-    let headers = immutable_blob_cache_headers(hash);
+fn apply_cache_headers(resp: &mut Response, headers: &CacheHeaders<'_>) {
     resp.set_header("Cache-Control", headers.cache_control);
     resp.set_header("Surrogate-Control", headers.surrogate_control);
     resp.set_header("Surrogate-Key", headers.surrogate_key);
@@ -5978,32 +5968,25 @@ fn add_cache_headers(resp: &mut Response, hash: &str) {
 /// Surrogate-Key. Only the browser TTL needs to be short enough that a repair reaches
 /// clients that already cached the old version.
 fn add_derivative_cache_headers(resp: &mut Response, hash: &str) {
-    let headers = mutable_derivative_cache_headers(hash);
-    resp.set_header("Cache-Control", headers.cache_control);
-    resp.set_header("Surrogate-Control", headers.surrogate_control);
-    resp.set_header("Surrogate-Key", headers.surrogate_key);
+    apply_cache_headers(resp, &mutable_derivative_cache_headers(hash));
 }
 
 /// Apply the moderation-status cache policy to a blob response. `None` (no
 /// metadata; reachable only via admin bypass) keeps the immutable policy.
 fn add_blob_response_cache_headers(resp: &mut Response, hash: &str, status: Option<BlobStatus>) {
-    match status
+    let policy = status
         .map(blob_cache_policy)
-        .unwrap_or(BlobCachePolicy::ImmutablePublic)
-    {
-        BlobCachePolicy::ImmutablePublic => add_cache_headers(resp, hash),
-        BlobCachePolicy::RevocablePublic => add_derivative_cache_headers(resp, hash),
-        BlobCachePolicy::PrivateNoStore => add_private_cache_headers(resp, hash),
-    }
+        .unwrap_or(BlobCachePolicy::ImmutablePublic);
+    apply_cache_headers(resp, &cache_headers_for_policy(policy, hash));
 }
 
 /// Like add_cache_headers but for authenticated or admin-only content that must
 /// not be stored in shared caches.
 fn add_private_cache_headers(resp: &mut Response, hash: &str) {
-    let headers = private_no_store_cache_headers(hash);
-    resp.set_header("Cache-Control", headers.cache_control);
-    resp.set_header("Surrogate-Control", headers.surrogate_control);
-    resp.set_header("Surrogate-Key", headers.surrogate_key);
+    apply_cache_headers(
+        resp,
+        &cache_headers_for_policy(BlobCachePolicy::PrivateNoStore, hash),
+    );
 }
 
 /// Mark a response as explicitly uncacheable (used for 202 in-progress responses).
