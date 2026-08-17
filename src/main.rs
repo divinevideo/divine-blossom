@@ -547,7 +547,12 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
 
         // Try to download existing thumbnail from GCS
         let set_thumb_cache = |resp: &mut Response| {
-            add_blob_response_cache_headers(resp, video_hash, cache_status);
+            // Admin bypass responses stay private, mirroring handle_get_blob.
+            if is_admin {
+                add_private_cache_headers(resp, video_hash);
+            } else {
+                add_blob_response_cache_headers(resp, video_hash, cache_status);
+            }
         };
         match download_thumbnail(&thumbnail_key) {
             Ok(mut resp) => {
@@ -1077,7 +1082,9 @@ fn handle_get_hls_content(req: Request, path: &str) -> Result<Response> {
             };
 
             resp.set_header("Content-Type", content_type);
-            if is_restricted {
+            // Admin bypass responses stay private, mirroring handle_get_blob
+            // and the HLS master route.
+            if is_admin || is_restricted {
                 add_private_cache_headers(&mut resp, &hash);
             } else {
                 add_derivative_cache_headers(&mut resp, &hash);
