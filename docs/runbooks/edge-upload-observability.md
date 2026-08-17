@@ -194,7 +194,7 @@ The subscriber lives in `divine-funnelcake` at
 Query it directly:
 
 ```sql
-SELECT count(), max(occurred_at) FROM nostr.edge_upload_logs;
+SELECT count(), max(occurred_at) FROM nostr.edge_upload_logs FINAL;
 ```
 
 Expect the newest row to lag real time by roughly ten minutes. That is Fastly's
@@ -250,10 +250,15 @@ written against the earlier proposal in this file will not run.
 ### Archived backlog
 
 The records published before the subscriber existed were exported to
-`gs://divine-edge-upload-log-archive/` as gzipped JSONL, and were subsequently
-consumed into ClickHouse as well. The archive is redundant with the table and
-kept only as a belt-and-braces copy of the pre-subscriber window
-(2026-08-13 → 2026-08-17).
+`gs://divine-edge-upload-log-archive/edge_upload_logs_2026-08-13_to_2026-08-16_20260816T233153Z.jsonl.gz`
+as gzipped JSONL. The subscriber backfilled that object into ClickHouse; verify
+the table has rows from that window before treating the archive as redundant:
+
+```sql
+SELECT min(occurred_at), max(occurred_at), count()
+FROM nostr.edge_upload_logs FINAL
+WHERE schema = 1;
+```
 
 ## Schema
 
@@ -337,7 +342,7 @@ lands, the header is forwarded and available but the join is not possible.
 
 ## Verification
 
-### Confirm lines are reaching Pub/Sub
+### Confirm raw lines and subscriber health
 
 ```bash
 gcloud pubsub subscriptions pull edge-upload-logs-sub \
@@ -345,22 +350,38 @@ gcloud pubsub subscriptions pull edge-upload-logs-sub \
   --limit=10 --format=json | python3 -m json.tool
 ```
 
-Without `--auto-ack` this does not consume messages, but it does make them
-invisible for the 60s ack deadline. A second pull run immediately after the
-first therefore returns almost nothing — that is the deadline, not an empty
-subscription. Wait out the deadline before concluding anything from a small
-result.
+Without `--auto-ack` this does not consume messages, but it does make any pulled
+messages invisible for the 60s ack deadline. With the deployed subscriber
+draining normally, this pull often returns nothing because the messages have
+already been inserted and acked. Treat it as a raw-payload spot check only, not
+as a count or health signal.
 
-The deployed subscriber acks normally, so the backlog sits near 0. A pull here
-is for spot-checking raw payloads; ClickHouse is the place to count.
-
-Undelivered count:
+ClickHouse is the place to count delivered rows. Pub/Sub backlog is a subscriber
+health signal; it should stay near 0:
 
 ```bash
-gcloud pubsub subscriptions describe edge-upload-logs-sub \
-  --project=rich-compiler-479518-d2 \
-  --format="value(numUndeliveredMessages)"
+START="$(python3 -c 'from datetime import datetime, timedelta, timezone; print((datetime.now(timezone.utc) - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+END="$(python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+
+curl -sS -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+  --get "https://monitoring.googleapis.com/v3/projects/rich-compiler-479518-d2/timeSeries" \
+  --data-urlencode 'filter=metric.type="pubsub.googleapis.com/subscription/num_undelivered_messages" AND resource.labels.subscription_id="edge-upload-logs-sub"' \
+  --data-urlencode "interval.startTime=${START}" \
+  --data-urlencode "interval.endTime=${END}" \
+  --data-urlencode 'view=FULL' \
+  | jq -r '.timeSeries[0].points[0].value.int64Value // "0"'
 ```
+
+If backlog rises and stays non-zero, inspect the subscriber first:
+
+```bash
+gcloud run services logs read edge-upload-log-subscriber \
+  --project=rich-compiler-479518-d2 \
+  --region=us-central1
+```
+
+The subscriber's deploy and configuration notes live in
+`divine-funnelcake/bin/edge-upload-log-subscriber/README.md`.
 
 ### Spot-checking the guest directly
 
@@ -378,8 +399,8 @@ runbook](fastly-5xx.md).) All five were
 present in Pub/Sub. The tail samples across POPs and can drop lines under load.
 
 Use `log-tail` to answer "is the guest emitting the shape I expect?", which it
-does well and immediately. Use Pub/Sub to answer "how many?", which `log-tail`
-cannot answer at all. An absence in `log-tail` is not evidence of anything.
+does well and immediately. Use ClickHouse to answer "how many?". An absence in
+`log-tail` is not evidence of anything.
 
 ### Mind the inline path when comparing datasets
 
@@ -397,8 +418,11 @@ like:
 
 ```sql
 -- edge requests that should have a matching origin access-log entry
-SELECT count() FROM nostr.edge_upload_logs
-WHERE route = 'direct_put' AND proxied_body AND occurred_at >= today();
+SELECT count() FROM nostr.edge_upload_logs FINAL
+WHERE schema = 2
+  AND route = 'direct_put'
+  AND proxied_body
+  AND occurred_at >= today();
 ```
 
 Note that the video MIME check fires at *any* size, so 5 KB `video/mp4` files
@@ -407,9 +431,10 @@ path a request took — read `proxied_body`.
 
 ## Worked queries
 
-These assume the ClickHouse table above. Until the subscriber exists, the same
-questions can be answered by pulling from the subscription and aggregating
-locally.
+These assume the ClickHouse table above. They use `FINAL` so pre-merge duplicate
+deliveries do not inflate counts, and `schema = 2` so time windows use edge event
+time rather than Pub/Sub publish time. Remove the schema filter only when you
+intentionally want to include the schema-1 backfill window.
 
 ### 1. What fraction of edge upload attempts fail?
 
@@ -419,8 +444,9 @@ SELECT
     outcome,
     count()                                        AS n,
     round(100 * count() / sum(count()) OVER (PARTITION BY route), 2) AS pct
-FROM nostr.edge_upload_logs
-WHERE occurred_at >= now() - INTERVAL 7 DAY
+FROM nostr.edge_upload_logs FINAL
+WHERE schema = 2
+  AND occurred_at >= now() - INTERVAL 7 DAY
 GROUP BY route, outcome
 ORDER BY route, n DESC;
 ```
@@ -438,12 +464,13 @@ the edge failure rate comes out artificially *low*.
 
 ```sql
 SELECT
-    toDate(occurred_at)                              AS day,
+    toDate(occurred_at)                            AS day,
     countIf(outcome = 'send_failed')               AS no_complete_origin_response,
     count()                                        AS attempts,
     round(100 * countIf(outcome = 'send_failed') / count(), 3) AS pct_send_failed
-FROM nostr.edge_upload_logs
-WHERE route = 'direct_put'
+FROM nostr.edge_upload_logs FINAL
+WHERE schema = 2
+  AND route = 'direct_put'
   AND occurred_at >= now() - INTERVAL 30 DAY
 GROUP BY day
 ORDER BY day;
@@ -453,8 +480,9 @@ Break the failures down by cause:
 
 ```sql
 SELECT send_error, count() AS n, round(avg(proxy_duration_ms)) AS avg_ms
-FROM nostr.edge_upload_logs
-WHERE outcome = 'send_failed'
+FROM nostr.edge_upload_logs FINAL
+WHERE schema = 2
+  AND outcome = 'send_failed'
   AND occurred_at >= now() - INTERVAL 7 DAY
 GROUP BY send_error
 ORDER BY n DESC;
@@ -475,8 +503,9 @@ SELECT
     max(duration_ms)                          AS max_ms,
     countIf(duration_ms > 110000)             AS within_10s_of_ceiling,
     countIf(duration_ms >= 120000)            AS at_or_past_ceiling
-FROM nostr.edge_upload_logs
-WHERE route = 'direct_put'
+FROM nostr.edge_upload_logs FINAL
+WHERE schema = 2
+  AND route = 'direct_put'
   AND occurred_at >= now() - INTERVAL 7 DAY
 GROUP BY outcome
 ORDER BY n DESC;
@@ -506,8 +535,9 @@ SELECT
     countIf(outcome != 'ok')                       AS failures,
     round(100 * countIf(outcome != 'ok') / count(), 2) AS pct_failed,
     quantile(0.95)(duration_ms)                    AS p95_ms
-FROM nostr.edge_upload_logs
-WHERE route = 'direct_put'
+FROM nostr.edge_upload_logs FINAL
+WHERE schema = 2
+  AND route = 'direct_put'
   AND occurred_at >= now() - INTERVAL 7 DAY
 GROUP BY size_bucket
 ORDER BY min(content_length);
@@ -521,8 +551,9 @@ By country, to separate "one network is bad" from "everything is bad":
 ```sql
 SELECT client_geo_country, count() AS attempts,
        round(100 * countIf(outcome != 'ok') / count(), 2) AS pct_failed
-FROM nostr.edge_upload_logs
-WHERE route = 'direct_put'
+FROM nostr.edge_upload_logs FINAL
+WHERE schema = 2
+  AND route = 'direct_put'
   AND occurred_at >= now() - INTERVAL 7 DAY
 GROUP BY client_geo_country
 HAVING attempts > 50
@@ -536,4 +567,6 @@ ORDER BY pct_failed DESC;
   `ML7R82HKfmTaqTpHExIDVN`, the VCL service)
 - divine-iac-core PR #1618 — origin-side log-based metrics and Grafana dashboard,
   which this sits in front of
+- `divine-funnelcake/bin/edge-upload-log-subscriber/README.md` — subscriber
+  configuration, delivery semantics, and deploy command
 - `docs/runbooks/deployment.md` — deploy traps
