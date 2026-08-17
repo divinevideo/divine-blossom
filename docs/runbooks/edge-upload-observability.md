@@ -2,8 +2,8 @@
 
 Structured logging for upload requests that pass through `media.divine.video`.
 
-Pipeline: Fastly Compute (`fastly-blossom`) → Google Cloud Pub/Sub → *(subscriber
-not yet built)* → ClickHouse
+Pipeline: Fastly Compute (`fastly-blossom`) → Google Cloud Pub/Sub →
+`edge-upload-log-subscriber` (Cloud Run) → ClickHouse `nostr.edge_upload_logs`
 
 Upload 5xx responses are also recorded on the separate `compute-diagnostics`
 sink with a route category rather than the upload-specific fields; see the
@@ -177,60 +177,83 @@ to this one topic.
   immediate and tells you whether the *guest* is emitting, which separates a
   code problem from a delivery problem.
 
-## Sink status — incomplete, read before querying
+## Sink status — live
 
-Fastly publishes to the `edge-upload-logs` topic and the
-`edge-upload-logs-sub` subscription retains messages for **7 days**.
+Pipeline, end to end and running as of 2026-08-17:
 
-**The ClickHouse half of this pipeline does not exist yet.** There is no
-subscriber and no table. That work lives in `divine-funnelcake`, alongside the
-existing `cdn-view-subscriber`, and is out of scope for the divine-blossom PR
-that shipped the edge instrumentation.
-
-Until it ships:
-
-- data is durable for 7 days in the subscription and no longer
-- messages accumulate as unacked; nothing is consuming them
-- **if the subscriber is not built within 7 days, the oldest data is lost**
-
-Proposed table for whoever picks this up:
-
-```sql
-CREATE TABLE nostr.edge_upload_logs
-(
-    occurred_at_ms    UInt64,
-    timestamp         DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(toInt64(occurred_at_ms)),
-    schema            UInt32,
-    route             LowCardinality(String),
-    outcome           LowCardinality(String),
-    req_id            String,
-    content_length    Nullable(UInt64),
-    content_type      LowCardinality(Nullable(String)),
-    proxied_body      Bool,
-    origin_responded  Bool,
-    origin_status     Nullable(UInt16),
-    send_error        Nullable(String),
-    proxy_duration_ms Nullable(UInt64),
-    duration_ms       UInt64,
-    response_status   UInt16,
-    error_kind        LowCardinality(Nullable(String)),
-    error_message     Nullable(String),
-    client_ip_present Bool,
-    client_geo_country LowCardinality(Nullable(String))
-)
-ENGINE = MergeTree
-PARTITION BY toYYYYMM(timestamp)
-ORDER BY (route, outcome, timestamp);
+```
+Fastly Compute (fastly-blossom) → Pub/Sub topic edge-upload-logs
+  → Cloud Run edge-upload-log-subscriber → nostr.edge_upload_logs
 ```
 
-The subscriber must normalize messages before `JSONEachRow` insertion. Schema 2
-already carries `occurred_at_ms` and `origin_responded`. For retained schema-1
-messages, set `occurred_at_ms` from the Pub/Sub message's server-assigned publish
-time and rename `origin_reached` to `origin_responded`. Do not insert missing
-values as zero or use ClickHouse insertion time: either choice corrupts the
-normalized record or moves delayed backlog into the wrong query window. Reject
-unknown future schema versions rather than silently applying the schema-1
-fallback.
+The subscriber lives in `divine-funnelcake` at
+`bin/edge-upload-log-subscriber` (PR #1017), deployed to Cloud Run in
+`rich-compiler-479518-d2`. The table was created by migration
+`000231_edge_upload_logs`.
+
+Query it directly:
+
+```sql
+SELECT count(), max(occurred_at) FROM nostr.edge_upload_logs;
+```
+
+Expect the newest row to lag real time by roughly ten minutes. That is Fastly's
+log-batching delay, not subscriber lag — the Pub/Sub backlog normally sits at 0.
+
+### Delivery semantics that affect your queries
+
+- **At-least-once, deduplicated in the table.** The table is a
+  `ReplacingMergeTree` sorted by `(route, outcome, occurred_at, req_id)`. A
+  redelivered message is byte-identical and collapses on merge. A count taken
+  before a merge can include duplicates — use `FINAL` or group by the sorting
+  key if that matters.
+- **The subscriber acks only after a successful insert.** A ClickHouse outage
+  stalls the pipeline rather than losing records.
+- **Schema 1 timestamps are approximate.** Version 1 carried no event time, so
+  its `occurred_at` is the Pub/Sub publish time and is late by the batching
+  delay. Filter to `schema = 2` for time-sensitive analysis.
+
+### The shipped table
+
+This is what exists, which differs from the shape originally proposed here.
+Booleans are `UInt8` rather than `Bool` (this database has no `Bool` columns),
+there is no `PARTITION BY` (only 4 of 344 tables partition), and the engine
+deduplicates.
+
+```sql
+CREATE TABLE nostr.edge_upload_logs (
+    occurred_at        DateTime64(3),
+    schema             UInt32,
+    route              LowCardinality(String),
+    outcome            LowCardinality(String),
+    req_id             String,
+    content_length     Nullable(UInt64),
+    content_type       Nullable(String),
+    proxied_body       UInt8,
+    origin_responded   UInt8,
+    origin_status      Nullable(UInt16),
+    send_error         Nullable(String),
+    proxy_duration_ms  Nullable(UInt64),
+    duration_ms        UInt64,
+    response_status    UInt16,
+    error_kind         Nullable(String),
+    error_message      Nullable(String),
+    client_ip_present  UInt8,
+    client_geo_country Nullable(String)
+) ENGINE = ReplacingMergeTree()
+ORDER BY (route, outcome, occurred_at, req_id);
+```
+
+Note the column is `occurred_at`, not `timestamp` or `occurred_at_ms` — queries
+written against the earlier proposal in this file will not run.
+
+### Archived backlog
+
+The records published before the subscriber existed were exported to
+`gs://divine-edge-upload-log-archive/` as gzipped JSONL, and were subsequently
+consumed into ClickHouse as well. The archive is redundant with the table and
+kept only as a belt-and-braces copy of the pre-subscriber window
+(2026-08-13 → 2026-08-17).
 
 ## Schema
 
@@ -328,8 +351,8 @@ first therefore returns almost nothing — that is the deadline, not an empty
 subscription. Wait out the deadline before concluding anything from a small
 result.
 
-Because nothing is acking, this is also destructive to no one: the backlog keeps
-growing until the subscriber exists or the 7-day retention expires.
+The deployed subscriber acks normally, so the backlog sits near 0. A pull here
+is for spot-checking raw payloads; ClickHouse is the place to count.
 
 Undelivered count:
 
@@ -339,7 +362,7 @@ gcloud pubsub subscriptions describe edge-upload-logs-sub \
   --format="value(numUndeliveredMessages)"
 ```
 
-### Fallback while the subscriber does not exist
+### Spot-checking the guest directly
 
 ```bash
 fastly log-tail --service-id pOvEEWykEbpnylqst1KTrR | grep '\[UPLOAD\]'
@@ -375,7 +398,7 @@ like:
 ```sql
 -- edge requests that should have a matching origin access-log entry
 SELECT count() FROM nostr.edge_upload_logs
-WHERE route = 'direct_put' AND proxied_body AND timestamp >= today();
+WHERE route = 'direct_put' AND proxied_body AND occurred_at >= today();
 ```
 
 Note that the video MIME check fires at *any* size, so 5 KB `video/mp4` files
@@ -397,7 +420,7 @@ SELECT
     count()                                        AS n,
     round(100 * count() / sum(count()) OVER (PARTITION BY route), 2) AS pct
 FROM nostr.edge_upload_logs
-WHERE timestamp >= now() - INTERVAL 7 DAY
+WHERE occurred_at >= now() - INTERVAL 7 DAY
 GROUP BY route, outcome
 ORDER BY route, n DESC;
 ```
@@ -415,13 +438,13 @@ the edge failure rate comes out artificially *low*.
 
 ```sql
 SELECT
-    toDate(timestamp)                              AS day,
+    toDate(occurred_at)                              AS day,
     countIf(outcome = 'send_failed')               AS no_complete_origin_response,
     count()                                        AS attempts,
     round(100 * countIf(outcome = 'send_failed') / count(), 3) AS pct_send_failed
 FROM nostr.edge_upload_logs
 WHERE route = 'direct_put'
-  AND timestamp >= now() - INTERVAL 30 DAY
+  AND occurred_at >= now() - INTERVAL 30 DAY
 GROUP BY day
 ORDER BY day;
 ```
@@ -432,7 +455,7 @@ Break the failures down by cause:
 SELECT send_error, count() AS n, round(avg(proxy_duration_ms)) AS avg_ms
 FROM nostr.edge_upload_logs
 WHERE outcome = 'send_failed'
-  AND timestamp >= now() - INTERVAL 7 DAY
+  AND occurred_at >= now() - INTERVAL 7 DAY
 GROUP BY send_error
 ORDER BY n DESC;
 ```
@@ -454,7 +477,7 @@ SELECT
     countIf(duration_ms >= 120000)            AS at_or_past_ceiling
 FROM nostr.edge_upload_logs
 WHERE route = 'direct_put'
-  AND timestamp >= now() - INTERVAL 7 DAY
+  AND occurred_at >= now() - INTERVAL 7 DAY
 GROUP BY outcome
 ORDER BY n DESC;
 ```
@@ -485,7 +508,7 @@ SELECT
     quantile(0.95)(duration_ms)                    AS p95_ms
 FROM nostr.edge_upload_logs
 WHERE route = 'direct_put'
-  AND timestamp >= now() - INTERVAL 7 DAY
+  AND occurred_at >= now() - INTERVAL 7 DAY
 GROUP BY size_bucket
 ORDER BY min(content_length);
 ```
@@ -500,7 +523,7 @@ SELECT client_geo_country, count() AS attempts,
        round(100 * countIf(outcome != 'ok') / count(), 2) AS pct_failed
 FROM nostr.edge_upload_logs
 WHERE route = 'direct_put'
-  AND timestamp >= now() - INTERVAL 7 DAY
+  AND occurred_at >= now() - INTERVAL 7 DAY
 GROUP BY client_geo_country
 HAVING attempts > 50
 ORDER BY pct_failed DESC;
