@@ -5972,16 +5972,17 @@ fn add_derivative_cache_headers(resp: &mut Response, hash: &str) {
 }
 
 /// Apply the moderation-status cache policy to a blob response. `None` (no
-/// metadata; reachable only via admin bypass) keeps the immutable policy.
+/// metadata) fails closed to the private policy so no caller can silently hand
+/// out an immutable public copy for content whose status is unknown.
 fn add_blob_response_cache_headers(resp: &mut Response, hash: &str, status: Option<BlobStatus>) {
     let policy = status
         .map(blob_cache_policy)
-        .unwrap_or(BlobCachePolicy::ImmutablePublic);
+        .unwrap_or(BlobCachePolicy::PrivateNoStore);
     apply_cache_headers(resp, &cache_headers_for_policy(policy, hash));
 }
 
-/// Like add_cache_headers but for authenticated or admin-only content that must
-/// not be stored in shared caches.
+/// Cache headers for authenticated or admin-only content that must not be
+/// stored in shared caches.
 fn add_private_cache_headers(resp: &mut Response, hash: &str) {
     apply_cache_headers(
         resp,
@@ -6872,6 +6873,20 @@ mod tests {
             assert_eq!(resp.get_header_str("Surrogate-Control"), Some("no-store"));
             assert_eq!(resp.get_header_str("Surrogate-Key"), Some("abc123"));
         }
+    }
+
+    #[test]
+    fn blob_get_without_metadata_fails_closed_to_private_cache() {
+        let mut resp = Response::from_status(StatusCode::OK);
+
+        add_blob_response_cache_headers(&mut resp, "abc123", None);
+
+        assert_eq!(
+            resp.get_header_str("Cache-Control"),
+            Some("private, no-store")
+        );
+        assert_eq!(resp.get_header_str("Surrogate-Control"), Some("no-store"));
+        assert_eq!(resp.get_header_str("Surrogate-Key"), Some("abc123"));
     }
 
     #[test]
