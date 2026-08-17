@@ -51,7 +51,10 @@ use crate::storage::{
     trigger_cloud_run_delete_blob, upload_blob, write_audit_log,
 };
 use crate::viewer_auth::{ViewerAuthDiagnostics, ViewerAuthState};
-use blossom_core::cache_policy::{immutable_blob_cache_headers, mutable_derivative_cache_headers};
+use blossom_core::cache_policy::{
+    blob_cache_policy, immutable_blob_cache_headers, mutable_derivative_cache_headers,
+    BlobCachePolicy,
+};
 use blossom_core::request_diagnostics::route_category;
 use blossom_core::upload_log::{
     record_failure, record_response, record_send_attempt, OriginSendResult, UploadLogRecord,
@@ -5968,13 +5971,13 @@ fn add_derivative_cache_headers(resp: &mut Response, hash: &str) {
     resp.set_header("Surrogate-Key", headers.surrogate_key);
 }
 
+/// Apply the moderation-status cache policy to a blob response. `None` (no
+/// metadata; reachable only via admin bypass) keeps the immutable policy.
 fn add_blob_response_cache_headers(resp: &mut Response, hash: &str, status: Option<BlobStatus>) {
-    match status {
-        Some(BlobStatus::Pending) => add_derivative_cache_headers(resp, hash),
-        Some(status) if status.requires_private_cache() || status.blocks_public_access() => {
-            add_private_cache_headers(resp, hash);
-        }
-        _ => add_cache_headers(resp, hash),
+    match status.map(blob_cache_policy).unwrap_or(BlobCachePolicy::ImmutablePublic) {
+        BlobCachePolicy::ImmutablePublic => add_cache_headers(resp, hash),
+        BlobCachePolicy::RevocablePublic => add_derivative_cache_headers(resp, hash),
+        BlobCachePolicy::PrivateNoStore => add_private_cache_headers(resp, hash),
     }
 }
 
