@@ -68,6 +68,77 @@ impl WriteBackDecision {
     }
 }
 
+/// Whether a response from the mirror can be trusted to be the addressed object.
+///
+/// The mirror is a copy of content-addressed data, so its declared length must
+/// agree with the size recorded for the hash. An S3-compatible origin can answer
+/// a `Range` request for a missing key with an error document under a `2xx`
+/// status; the body is then XML, but the serving route stamps the stored MIME
+/// type over it and the client receives a video-labelled error page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorResponseCheck {
+    /// Declared length agrees with the addressed size.
+    Trusted,
+    /// The mirror did not declare a usable length.
+    SizeUnknown,
+    /// No addressed size to compare against.
+    ExpectedSizeUnknown,
+    /// The mirror declared a length the addressed object does not have.
+    LengthMismatch,
+}
+
+impl MirrorResponseCheck {
+    pub fn is_trusted(&self) -> bool {
+        matches!(self, MirrorResponseCheck::Trusted)
+    }
+
+    /// Stable short label for logging.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            MirrorResponseCheck::Trusted => "trusted",
+            MirrorResponseCheck::SizeUnknown => "size_unknown",
+            MirrorResponseCheck::ExpectedSizeUnknown => "expected_size_unknown",
+            MirrorResponseCheck::LengthMismatch => "length_mismatch",
+        }
+    }
+}
+
+/// Read the complete-length field out of a `Content-Range` header value.
+///
+/// `None` for the unsatisfied form (`bytes 0-99/*`) and for anything that does
+/// not end in a decimal length.
+pub fn parse_content_range_total(value: &str) -> Option<u64> {
+    value.rsplit_once('/')?.1.trim().parse().ok()
+}
+
+/// Check a mirror response against the size recorded for its hash.
+///
+/// Every non-`Trusted` outcome costs one fetch from the authoritative origin and
+/// nothing else, so this fails closed: an unverifiable response is not served.
+pub fn check_mirror_response(
+    status: u16,
+    content_length: Option<u64>,
+    content_range: Option<&str>,
+    expected_size: Option<u64>,
+) -> MirrorResponseCheck {
+    let expected = match expected_size {
+        Some(size) => size,
+        None => return MirrorResponseCheck::ExpectedSizeUnknown,
+    };
+
+    let declared = if status == 206 {
+        content_range.and_then(parse_content_range_total)
+    } else {
+        content_length
+    };
+
+    match declared {
+        None => MirrorResponseCheck::SizeUnknown,
+        Some(size) if size == expected => MirrorResponseCheck::Trusted,
+        Some(_) => MirrorResponseCheck::LengthMismatch,
+    }
+}
+
 /// Decide whether a just-fetched object may be copied into the mirror.
 ///
 /// Every guard is a hard requirement: only a complete, length-declared,
@@ -117,6 +188,91 @@ pub fn object_path(bucket: &str, key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Mirror response trust (issue #198) ---
+    //
+    // The reported failure: a Range request for a bare blob returned a 249-byte
+    // S3 `NoSuchKey` XML document as `206 Partial Content` with
+    // `Content-Range: bytes 0-99/249`, while the object is 855345 bytes. The
+    // caller then stamped `Content-Type: video/mp4` from KV metadata over it, so
+    // the client received XML labelled as video.
+
+    #[test]
+    fn full_mirror_response_matching_the_addressed_size_is_trusted() {
+        assert_eq!(
+            check_mirror_response(200, Some(855_345), None, Some(855_345)),
+            MirrorResponseCheck::Trusted
+        );
+    }
+
+    #[test]
+    fn full_mirror_response_shorter_than_the_addressed_size_is_rejected() {
+        assert_eq!(
+            check_mirror_response(200, Some(249), None, Some(855_345)),
+            MirrorResponseCheck::LengthMismatch
+        );
+    }
+
+    #[test]
+    fn partial_mirror_response_whose_total_matches_is_trusted() {
+        assert_eq!(
+            check_mirror_response(206, Some(100), Some("bytes 0-99/855345"), Some(855_345)),
+            MirrorResponseCheck::Trusted
+        );
+    }
+
+    #[test]
+    fn partial_mirror_response_reporting_the_error_body_size_is_rejected() {
+        assert_eq!(
+            check_mirror_response(206, Some(100), Some("bytes 0-99/249"), Some(855_345)),
+            MirrorResponseCheck::LengthMismatch
+        );
+    }
+
+    #[test]
+    fn mirror_response_without_a_declared_size_is_rejected() {
+        assert_eq!(
+            check_mirror_response(200, None, None, Some(855_345)),
+            MirrorResponseCheck::SizeUnknown
+        );
+        assert_eq!(
+            check_mirror_response(206, Some(100), None, Some(855_345)),
+            MirrorResponseCheck::SizeUnknown
+        );
+        assert_eq!(
+            check_mirror_response(206, Some(100), Some("bytes 0-99/*"), Some(855_345)),
+            MirrorResponseCheck::SizeUnknown
+        );
+    }
+
+    #[test]
+    fn mirror_response_is_rejected_when_the_addressed_size_is_unknown() {
+        // No metadata means nothing to check the mirror against. Fail closed and
+        // let the authoritative origin answer; the only cost is a mirror miss.
+        assert_eq!(
+            check_mirror_response(200, Some(855_345), None, None),
+            MirrorResponseCheck::ExpectedSizeUnknown
+        );
+    }
+
+    #[test]
+    fn content_range_total_is_parsed_from_the_standard_form() {
+        assert_eq!(parse_content_range_total("bytes 0-99/855345"), Some(855_345));
+        assert_eq!(
+            parse_content_range_total("bytes 500335-565870/565871"),
+            Some(565_871)
+        );
+    }
+
+    #[test]
+    fn content_range_total_is_absent_when_unsatisfiable_or_malformed() {
+        assert_eq!(parse_content_range_total("bytes 0-99/*"), None);
+        assert_eq!(parse_content_range_total("bytes */855345"), Some(855_345));
+        assert_eq!(parse_content_range_total("garbage"), None);
+        assert_eq!(parse_content_range_total(""), None);
+        assert_eq!(parse_content_range_total("bytes 0-99/notanumber"), None);
+    }
+
 
     #[test]
     fn absent_flag_is_disabled() {
