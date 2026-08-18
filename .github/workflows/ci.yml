@@ -39,7 +39,7 @@ jobs:
           VICEROY_VERSION: v0.20.1
           VICEROY_SHA256: c358540ae3054b0f3203125da47a76d50d2facd41cc1ac009a7e7d1f332b0437
         run: |
-          curl -sSfL -o /tmp/viceroy.tar.gz \
+          curl --retry 3 --retry-all-errors -sSfL -o /tmp/viceroy.tar.gz \
             "https://github.com/fastly/Viceroy/releases/download/${VICEROY_VERSION}/viceroy_${VICEROY_VERSION}_linux-amd64.tar.gz"
           echo "${VICEROY_SHA256}  /tmp/viceroy.tar.gz" | sha256sum -c -
           tar xzf /tmp/viceroy.tar.gz -C /usr/local/bin/
