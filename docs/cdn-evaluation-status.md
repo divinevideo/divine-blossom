@@ -11,6 +11,7 @@ Entry point for the delivery-origin and second-CDN evaluation. Start here, then 
 |---|---|
 | [cdn-object-storage-vendor-notes.md](cdn-object-storage-vendor-notes.md) | Verified vendor limits, pricing, and API capabilities |
 | [superpowers/specs/2026-08-06-cdn-delivery-steering-design.md](superpowers/specs/2026-08-06-cdn-delivery-steering-design.md) | How to steer traffic between two CDNs, server-side |
+| [superpowers/plans/2026-08-07-blossom-multi-provider-delivery-policy.md](superpowers/plans/2026-08-07-blossom-multi-provider-delivery-policy.md) | **The origin decision** — private B2 as the approved-only replica origin |
 | [measurements/2026-08-07-four-region-corrected.md](measurements/2026-08-07-four-region-corrected.md) | **The current headline result** |
 | [measurements/2026-08-07-four-region-summary.md](measurements/2026-08-07-four-region-summary.md) | Superseded — timing method bundled TLS handshake |
 | [measurements/2026-08-07-replica-as-acl-validation.md](measurements/2026-08-07-replica-as-acl-validation.md) | Working test system proving absence-is-denial |
@@ -69,11 +70,12 @@ all-Standard.
 | bunny storage zone `divine-delivery-test` | id 1722644, region NY | Push replica, 4 approved objects |
 | bunny pull zone `divine-delivery-test` | id 6289348, Volume tier | Backed by the storage zone — the working ACL test |
 | Backblaze B2 | bucket `divine-delivery-probe`, public, 4 objects | Validated as a bunny pull-zone origin |
-| bunny pull zone `divine-b2-test` | id 6289364, Volume tier | Origin is the B2 bucket — full production-shaped topology |
+| bunny pull zone `divine-b2-test` | id 6289364, Volume tier | Origin is the B2 bucket — production-shaped except that the bucket is public, not privately signed |
 | Cloudflare R2 | not started | account exists; no bucket, no token |
 
-Both bunny zones are **temporary probe infrastructure** and pull through Fastly rather than from a
-real delivery origin. They should be deleted when the campaign ends — tracked in #178.
+The `divine-probe-*` zones are **temporary probe infrastructure** and pull through Fastly rather than
+from a real delivery origin; `divine-b2-test` is the one that pulls from B2 directly. All of them
+should be deleted when the campaign ends — tracked in #178.
 
 **The B2 key `blossom-dev` is not scoped.** It reports `ALL BUCKETS` with `deleteBuckets`,
 `writeKeys`, and `bypassGovernance` — the last of which overrides retention and legal hold. It
@@ -137,8 +139,9 @@ receive it — not a query over what already exists.
 ## Open questions
 
 **Measurement**
-- Behaviour against a real delivery origin. Both bunny zones currently pull through Fastly, so
-  origin-fetch and cache-fill behaviour is untested.
+- Behaviour against a *privately signed* delivery origin. The B2 origin measured in next-step 3 was
+  a public bucket; the probe zones pull through Fastly, so origin-fetch and cache-fill behaviour
+  behind AWS signing is untested.
 - Mobile networks and behaviour under load.
 - South America, India, Africa. São Paulo is a Volume PoP; India and Africa are not.
 - Whether Fastly's Sydney p95 outlier (311 ms against a 21 ms p50) reproduces.
@@ -168,5 +171,10 @@ receive it — not a query over what already exists.
 3. ~~Stand up a real delivery origin and re-measure~~ — done. Fastly pull-through, bunny Storage,
    and Backblaze B2 origins all land within 6% of each other on cache hits, so **origin choice does
    not affect delivery performance** and can be decided on cost, durability, and lock-in alone.
+   **Decided — on measured readiness rather than on cost: a private Backblaze B2 bucket,
+   approved-only, with R2 as the first fallback.** R2 remains the stronger paper position on egress
+   and published durability; B2 is the one that has been stood up and drilled. See the origin
+   decision plan. The open part is bunny's AWS-signing path to a
+   *private* B2 bucket; the validated probe bucket was public.
 4. Measure South America and India.
 5. Delete the probe zones once the campaign closes (#178).

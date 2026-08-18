@@ -292,7 +292,10 @@ than assuming.
   from a still-live source URL?
 - Backblaze: does partner-CDN free egress apply to an edge-compute S3 fetch, or only a direct pull
   zone?
-- bunny: can a pull zone originate from R2 or B2 with private-bucket authentication?
+- bunny: can a pull zone originate from B2 with private-bucket authentication? B2 is validated as a
+  pull-zone origin against a *public* probe bucket; the AWS-signing path to a private bucket is the
+  part still unproven, and it is the blocking open question for the selected origin. R2 is untested
+  either way.
 - bunny: purge API latency and rate limits.
 
 ---

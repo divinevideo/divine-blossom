@@ -11,7 +11,9 @@
 ## Goal
 
 Be able to serve a controllable fraction of media bytes from a second CDN (bunny.net) instead of
-Fastly, compare the two on real traffic, and roll back instantly — without any client change.
+Fastly, compare the two on real traffic, and roll back without a deploy or any client change. See
+Rollback below for what "roll back" reaches: a config flip stops new descriptors, and DNS on the
+delivery hostname is what moves already-published URLs.
 
 ## Scope
 
@@ -29,13 +31,14 @@ and any change to how the app fetches or plays video.
 
 | Origin | Viable? | Note |
 |---|---|---|
-| Cloudflare R2 | Yes | $0 egress to any consumer via S3 API |
-| Backblaze B2 | Yes | $0 via partner-CDN program (unverified) or $0.01/GB over the 3× allowance |
+| **Backblaze B2** | **Selected** | $0 via partner-CDN program (unverified) or $0.01/GB over the 3× allowance |
+| Cloudflare R2 | Yes — fallback | $0 egress to any consumer via S3 API; not stood up |
 | GCS | Works | but GCS egress returns on bunny's cache misses |
 | **Fastly Object Storage** | **No** | **public S3 endpoint capped at ~150 Mbps / 100 req/s per bucket** |
 
-This is the decision that has to be made first. Adopting Fastly Object Storage as the delivery
-replica forecloses this entire design.
+This decision is recorded in the multi-provider delivery plan: B2, private, approved-only. R2 is the
+first fallback if partner-CDN egress does not appear on the billing account. Adopting Fastly Object
+Storage as the delivery replica would foreclose this entire design.
 
 ## Recommended approach
 
@@ -52,6 +55,10 @@ fn select_delivery_host(req: &Request, meta: &BlobMetadata) -> &'static str {
     if !is_publicly_cacheable(meta) {
         return FASTLY_HOST;
     }
+    // Not yet copied and verified into the replica: bunny would 404 it.
+    if !meta.replicated {
+        return FASTLY_HOST;
+    }
     let pct: u32 = config_store_get("bunny_traffic_pct").unwrap_or(0);
     if bucket_of(&meta.sha256) < pct { BUNNY_HOST } else { FASTLY_HOST }
 }
@@ -66,7 +73,9 @@ fn bucket_of(sha256: &str) -> u32 {
 }
 ```
 
-`is_publicly_cacheable` is a proposed helper, not an existing `BlobMetadata` method.
+`is_publicly_cacheable` is a proposed helper, not an existing `BlobMetadata` method, and
+`meta.replicated` is a proposed field, not one that exists today. The bunny rollout plan describes
+where replication sets it.
 
 Why here: it is one function, it already governs every URL handed out, and the decision has full
 context available — moderation status, client geo, content type.
@@ -89,17 +98,26 @@ Do not mix strategies within one experiment; the results stop being interpretabl
 ### Rollback
 
 `bunny_traffic_pct` lives in a Fastly Config Store, so changing it takes effect without a deploy.
-`0` is a full rollback. This is the primary safety mechanism and must be tested before the first
-non-zero rollout.
+`0` stops new descriptors being issued with the second host, and must be tested before the first
+non-zero rollout. It is roll-forward control, not a retroactive rollback: a client already holding a
+second-provider URL keeps using it until it refreshes the descriptor, so rollback verification has to
+cover that window too.
 
-Secondary lever: DNS weighting on the delivery hostname. Coarse and TTL-bound, but independent of
-Compute, so it still works if Compute is the thing that is broken.
+The retroactive lever is DNS on the delivery hostname — it moves already-published URLs back to
+Fastly. This works only while descriptors emit a Divine-owned hostname rather than a vendor one.
+Coarse and TTL-bound, but independent of Compute, so it still works if Compute is the thing that is
+broken.
 
 ### Eligibility — the replica is the access control
 
-Only `Active`, public, non-restricted blobs are steerable. Everything else — `Pending`,
-`Restricted`, `AgeRestricted`, admin bypass, tombstoned, legal hold — stays on the Fastly Compute
-path.
+Only `Active`, public, non-restricted blobs are steerable, **and only once the replica copy has been
+verified**. Everything else — `Pending`, `Restricted`, `AgeRestricted`, admin bypass, tombstoned,
+legal hold — stays on the Fastly Compute path.
+
+Eligibility and readiness are separate conditions and both are required. Absence from the replica
+denies restricted content, which is the access-control property below; but an approved blob that has
+not finished copying is also absent, and steering it would 404 the newest content at its worst
+moment. Route on the verified flag, not on approval alone.
 
 **Enforce this by replication policy, not by logic at the second CDN.** Replicate to the delivery
 store only on moderation-approval, never on upload. A gated blob is then simply not in the replica:
@@ -229,8 +247,8 @@ cost.
 
 ## Open questions
 
-- Does bunny's pull-zone origin authentication work against R2 and B2 signed access, or does it
-  require public bucket reads?
+- Does bunny's AWS-signing mode work against the private B2 S3 endpoint, or does it require public
+  bucket reads? R2 remains untested fallback.
 - What is bunny's purge API latency and rate limit, and is it sufficient for a takedown SLA?
 - Does splitting traffic across two CDNs degrade either one's cache hit ratio enough to matter at
   low percentages? (Hash bucketing should prevent this; verify rather than assume.)
