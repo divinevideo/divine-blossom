@@ -9,7 +9,9 @@ Pipeline: Fastly VCL log → Google Cloud Pub/Sub → Cloud Run subscriber → C
 - ClickHouse cluster accessible from Cloud Run
 - Migrations 000105 + 000106 applied (in divine-funnelcake repo)
 - The v2 sink — `cdn_media_delivery_events` and a subscriber that parses `"v":2`
-  — **does not exist yet.** See step 3; it gates step 5.
+  — **does not exist yet.** It is tracked in
+  [divine-funnelcake#1070](https://github.com/divinevideo/divine-funnelcake/issues/1070);
+  see step 3, which gates step 5.
 
 ## 1. Create Pub/Sub Topic and Subscription
 
@@ -56,8 +58,10 @@ them on the floor.
 > the surrounding documents imply: the design doc describes the table as though
 > it exists, and the implementation plan
 > (`docs/superpowers/plans/2026-05-23-lossless-view-capture.md`) tracks the
-> remaining funnelcake work. This runbook is the operational path; step 5 must
-> not be run until that work lands.
+> remaining funnelcake work. The deployable dependency is tracked in
+> [divine-funnelcake#1070](https://github.com/divinevideo/divine-funnelcake/issues/1070).
+> This runbook is the operational path; step 5 must not be run until that issue
+> is complete and its end-to-end verification is recorded.
 
 In the divine-funnelcake repo:
 
