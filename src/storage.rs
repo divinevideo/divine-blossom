@@ -2,14 +2,16 @@
 // ABOUTME: Implements AWS v4 signing plus read-through delivery from the FOS mirror
 
 use crate::error::{BlossomError, Result};
+use blossom_core::cache_policy::{immutable_storage_cache_policy, ImmutableStorageCachePolicy};
 use blossom_core::read_through::{
-    object_path, parse_bool_flag, write_back_decision, MAX_WRITE_BACK_BYTES, SOURCE_FOS, SOURCE_GCS,
+    check_mirror_response, object_path, parse_bool_flag, write_back_decision, MAX_WRITE_BACK_BYTES,
+    SOURCE_FOS, SOURCE_GCS,
 };
 use fastly::http::{Method, StatusCode};
 use fastly::{Body, Request, Response};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Backend name (must match fastly.toml)
 const GCS_BACKEND: &str = "gcs_storage";
@@ -56,6 +58,11 @@ const FOS_BUCKET: &str = "divine-media-delivery";
 /// Config keys for the two independent read-through feature flags.
 const FOS_READ_FLAG: &str = "fos_read_enabled";
 const FOS_WRITE_BACK_FLAG: &str = "fos_write_back_enabled";
+
+/// Header copied from the storage subrequest before the outer VCL service
+/// replaces `X-Cache` with its own cache result. This is intentionally only a
+/// cache-state label (HIT/MISS), never a credential or storage identifier.
+pub const STORAGE_CACHE_HEADER: &str = "X-Divine-Storage-Cache";
 
 /// Multipart upload threshold (5MB)
 const MULTIPART_THRESHOLD: u64 = 5 * 1024 * 1024;
@@ -289,10 +296,12 @@ pub fn download_blob(hash: &str, range: Option<&str>) -> Result<Response> {
 
     // Sign the request
     sign_request(&mut req, &config, Some("UNSIGNED-PAYLOAD".into()))?;
+    enable_immutable_storage_cache(&mut req, hash);
 
-    let resp = req
+    let mut resp = req
         .send(GCS_BACKEND)
         .map_err(|e| BlossomError::StorageError(format!("Failed to download: {}", e)))?;
+    preserve_storage_cache_state(&mut resp);
 
     let status = resp.get_status();
     match status {
@@ -430,10 +439,12 @@ fn download_blob_from_fos(hash: &str, range: Option<&str>) -> Result<Response> {
     }
 
     sign_request(&mut req, &config, Some("UNSIGNED-PAYLOAD".into()))?;
+    enable_immutable_storage_cache(&mut req, hash);
 
-    let resp = req
+    let mut resp = req
         .send(FOS_BACKEND)
         .map_err(|e| BlossomError::StorageError(format!("FOS request failed: {}", e)))?;
+    preserve_storage_cache_state(&mut resp);
 
     let status = resp.get_status();
     match status {
@@ -445,19 +456,90 @@ fn download_blob_from_fos(hash: &str, range: Option<&str>) -> Result<Response> {
     }
 }
 
+/// Configure Fastly's HTTP read-through cache for a storage GET.
+///
+/// The caller reaches this function only after the media route has evaluated
+/// metadata access using a cryptographically validated NIP-98/BUD-01 event.
+/// The cache key is the storage URL/host, not the viewer credential, so every
+/// authorized request can reuse the same immutable bytes while authorization
+/// is still rechecked on every outer request.
+fn enable_immutable_storage_cache(req: &mut Request, hash: &str) {
+    let surrogate_key = hash.to_ascii_lowercase();
+
+    req.set_after_send(move |candidate| {
+        match immutable_storage_cache_policy(candidate.get_status().as_u16()) {
+            ImmutableStorageCachePolicy::Store {
+                ttl_seconds,
+                stale_while_revalidate_seconds,
+            } => {
+                candidate.set_cacheable();
+                candidate.set_ttl(Duration::from_secs(ttl_seconds.into()));
+                candidate.set_stale_while_revalidate(Duration::from_secs(
+                    stale_while_revalidate_seconds.into(),
+                ));
+                candidate.set_surrogate_keys([surrogate_key.as_str()]);
+            }
+            ImmutableStorageCachePolicy::DoNotStore => {
+                candidate.set_uncacheable(false);
+            }
+        }
+        Ok(())
+    });
+}
+
+fn preserve_storage_cache_state(resp: &mut Response) {
+    if let Some(cache_state) = resp.get_header_str("X-Cache").map(str::to_owned) {
+        resp.set_header(STORAGE_CACHE_HEADER, cache_state);
+    }
+}
+
 /// Try to serve a blob from the FOS mirror.
 ///
 /// `None` means "not served from the mirror" for every possible reason:
-/// missing credentials or backend, transport failure, timeout, 404, or any
-/// other non-success status. The caller falls back to GCS.
-fn try_download_blob_from_fos(hash: &str, range: Option<&str>) -> Option<Response> {
-    match download_blob_from_fos(hash, range) {
-        Ok(resp) => Some(resp),
+/// missing credentials or backend, transport failure, timeout, 404, any other
+/// non-success status, or a body whose declared length does not match the size
+/// recorded for the hash. The caller falls back to GCS.
+///
+/// The length check exists because a `2xx` from the mirror is not by itself
+/// evidence that the mirror holds the object: an S3-compatible origin can answer
+/// a `Range` request for a missing key with an error document under `206`, and
+/// the serving route stamps the stored MIME type over whatever body arrives.
+fn try_download_blob_from_fos(
+    hash: &str,
+    range: Option<&str>,
+    expected_size: Option<u64>,
+) -> Option<Response> {
+    let resp = match download_blob_from_fos(hash, range) {
+        Ok(resp) => resp,
         Err(e) => {
             eprintln!("[FOS] miss hash={} reason={}", hash, e);
-            None
+            return None;
         }
+    };
+
+    let status = resp.get_status().as_u16();
+    let content_length = resp.get_content_length().map(|len| len as u64);
+    let content_range = resp
+        .get_header_str("Content-Range")
+        .map(|value| value.to_string());
+
+    let check = check_mirror_response(
+        status,
+        content_length,
+        content_range.as_deref(),
+        expected_size,
+    );
+    if !check.is_trusted() {
+        eprintln!(
+            "[FOS] miss hash={} reason=untrusted_response check={} status={}",
+            hash,
+            check.reason(),
+            status
+        );
+        return None;
     }
+
+    Some(resp)
 }
 
 /// A body read that stopped either at EOF or at the memory ceiling.
@@ -554,9 +636,10 @@ fn try_write_back_to_fos(hash: &str, bytes: &[u8], content_type: &str) {
 pub fn download_blob_read_through(
     hash: &str,
     range: Option<&str>,
+    expected_size: Option<u64>,
 ) -> Result<FallbackDownloadResult> {
     if fos_read_enabled() {
-        if let Some(response) = try_download_blob_from_fos(hash, range) {
+        if let Some(response) = try_download_blob_from_fos(hash, range, expected_size) {
             return Ok(FallbackDownloadResult {
                 response,
                 source: SOURCE_FOS.to_string(),

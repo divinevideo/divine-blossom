@@ -43,12 +43,13 @@ if (beresp.status == 200 || beresp.status == 206) {
   # which is the case this helps most.
   set beresp.do_stream = true;
 
-  # Compute owns browser policy: blobs are immutable, but repairable derivatives
-  # have a shorter browser TTL. Retain the immutable default for legacy responses
-  # that do not provide an explicit policy.
-  if (!beresp.http.Cache-Control) {
-    set beresp.http.Cache-Control = "public, max-age=31536000, immutable";
-  }
+  # No Cache-Control fallback here on purpose. Compute owns browser policy, so a
+  # missing header must not be rewritten as public and immutable for a year.
+  # Browser caches cannot be purged after such a response is delivered.
+  #
+  # This removal affects browser policy only. The successful-response branch
+  # above still assigns an edge TTL when Surrogate-Control is absent.
+  # TODO(#210): make an unclassified edge response fail closed as well.
 
 } else if (beresp.status == 202) {
   # 202 Accepted = transcoding/transcription in progress

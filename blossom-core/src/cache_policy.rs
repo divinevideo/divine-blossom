@@ -10,6 +10,36 @@ pub struct CacheHeaders<'a> {
     pub surrogate_key: &'a str,
 }
 
+/// Full content-addressed objects may live in the Compute service's internal
+/// read-through cache for a year. Access control still runs before that cache
+/// is consulted; this policy applies only to the storage subrequest made after
+/// the viewer has been authorized.
+pub const IMMUTABLE_STORAGE_CACHE_TTL_SECS: u32 = 31_536_000;
+pub const IMMUTABLE_STORAGE_CACHE_SWR_SECS: u32 = 86_400;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImmutableStorageCachePolicy {
+    Store {
+        ttl_seconds: u32,
+        stale_while_revalidate_seconds: u32,
+    },
+    DoNotStore,
+}
+
+/// Cache only a complete storage response. A partial response must never
+/// populate the shared object key, and missing/error responses must remain
+/// retryable so a later upload or origin recovery can succeed immediately.
+pub fn immutable_storage_cache_policy(status: u16) -> ImmutableStorageCachePolicy {
+    if status == 200 {
+        ImmutableStorageCachePolicy::Store {
+            ttl_seconds: IMMUTABLE_STORAGE_CACHE_TTL_SECS,
+            stale_while_revalidate_seconds: IMMUTABLE_STORAGE_CACHE_SWR_SECS,
+        }
+    } else {
+        ImmutableStorageCachePolicy::DoNotStore
+    }
+}
+
 pub fn immutable_blob_cache_headers(hash: &str) -> CacheHeaders<'_> {
     CacheHeaders {
         cache_control: "public, max-age=31536000, immutable",
@@ -86,8 +116,9 @@ pub fn cache_headers_for_policy<'a>(policy: BlobCachePolicy, hash: &'a str) -> C
 mod tests {
     use super::{
         blob_cache_policy, cache_headers_for_policy, immutable_blob_cache_headers,
-        mutable_derivative_cache_headers, private_no_store_cache_headers,
-        status_requires_private_response, BlobCachePolicy,
+        immutable_storage_cache_policy, mutable_derivative_cache_headers,
+        status_requires_private_response, BlobCachePolicy, ImmutableStorageCachePolicy,
+        IMMUTABLE_STORAGE_CACHE_SWR_SECS, IMMUTABLE_STORAGE_CACHE_TTL_SECS,
     };
     use crate::types::BlobStatus;
 
@@ -229,6 +260,30 @@ mod tests {
                 BlobCachePolicy::PrivateNoStore,
                 "{:?} must not be publicly cacheable",
                 status
+            );
+        }
+    }
+
+    #[test]
+    fn full_storage_responses_are_cached_for_a_year() {
+        assert_eq!(
+            immutable_storage_cache_policy(200),
+            ImmutableStorageCachePolicy::Store {
+                ttl_seconds: IMMUTABLE_STORAGE_CACHE_TTL_SECS,
+                stale_while_revalidate_seconds: IMMUTABLE_STORAGE_CACHE_SWR_SECS,
+            }
+        );
+        assert_eq!(IMMUTABLE_STORAGE_CACHE_TTL_SECS, 31_536_000);
+        assert_eq!(IMMUTABLE_STORAGE_CACHE_SWR_SECS, 86_400);
+    }
+
+    #[test]
+    fn partial_or_error_storage_responses_are_never_cached() {
+        for status in [206, 404, 416, 500, 503] {
+            assert_eq!(
+                immutable_storage_cache_policy(status),
+                ImmutableStorageCachePolicy::DoNotStore,
+                "status {status} must not populate the shared full-object cache"
             );
         }
     }

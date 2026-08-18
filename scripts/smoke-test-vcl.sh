@@ -3,7 +3,10 @@
 # ABOUTME: Tests all critical paths after domain switch
 
 DOMAIN="${1:-media.divine.video}"
-HASH="832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1"
+# Fixture blob. Override with $2 to smoke a blob in a different moderation
+# status -- the cache-policy section below derives its expectations from the
+# response, so it is valid for Active and Pending alike.
+HASH="${2:-832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1}"
 PASS=0
 FAIL=0
 
@@ -29,7 +32,7 @@ R1=$(curl -s -D /tmp/smoke_h1 -o /dev/null -w "%{http_code}" "https://$DOMAIN/$H
 H1=$(cat /tmp/smoke_h1)
 check "200 OK" "200" "$R1"
 check "Content-Type video" "video/mp4" "$H1"
-check "Cache-Control immutable" "immutable" "$H1"
+check "Cache-Control public" "public" "$H1"
 if echo "$H1" | grep -qi "access-control-allow-origin"; then
   echo "  PASS: CORS headers"; PASS=$((PASS + 1))
 else
@@ -107,6 +110,76 @@ else
   echo "  PASS: No Surrogate-Key leaked"
   PASS=$((PASS + 1))
 fi
+echo ""
+
+# 9b. Cache policy agrees across every route that serves the same blob
+#
+# The bug this guards against (#205, #206): GET returned `private, no-store` for
+# a Pending blob while HEAD and the derivative routes treated the same blob as
+# publicly cacheable. That made ~72% of production video objects uncacheable
+# while every individual route looked self-consistent.
+#
+# Expectations are derived from the response rather than hard-coded, so this
+# holds for any moderation status that serves 200 to an anonymous caller:
+#   Active  -> public, max-age=31536000, immutable
+#   Pending -> public, max-age=86400      (revocable: purgeable at the edge,
+#                                          short enough in browsers that a later
+#                                          moderation decision reaches clients)
+echo "[9b] Cache policy consistent across routes"
+
+policy_of() {
+  # Collapse a Cache-Control value to a policy class.
+  case "$1" in
+    *private*|*no-store*) echo "private" ;;
+    *immutable*)          echo "immutable-public" ;;
+    *public*)             echo "revocable-public" ;;
+    *)                    echo "unknown" ;;
+  esac
+}
+
+cc_of() {
+  curl -s -I --max-time 20 "$1" 2>/dev/null \
+    | grep -i '^cache-control:' | cut -d' ' -f2- | tr -d '\r'
+}
+
+CC_GET=$(curl -s -D - -o /dev/null --max-time 30 "https://$DOMAIN/$HASH" 2>/dev/null \
+  | grep -i '^cache-control:' | cut -d' ' -f2- | tr -d '\r')
+CC_HEAD=$(cc_of "https://$DOMAIN/$HASH")
+CC_THUMB=$(cc_of "https://$DOMAIN/$HASH.jpg")
+
+P_GET=$(policy_of "$CC_GET")
+P_HEAD=$(policy_of "$CC_HEAD")
+P_THUMB=$(policy_of "$CC_THUMB")
+
+echo "  INFO: GET=$CC_GET"
+echo "  INFO: HEAD=$CC_HEAD"
+echo "  INFO: thumbnail=$CC_THUMB"
+
+if [ "$P_GET" = "$P_HEAD" ] && [ "$P_GET" = "$P_THUMB" ]; then
+  echo "  PASS: GET, HEAD and thumbnail agree ($P_GET)"; PASS=$((PASS + 1))
+else
+  echo "  FAIL: routes disagree (GET=$P_GET HEAD=$P_HEAD thumbnail=$P_THUMB)"
+  FAIL=$((FAIL + 1))
+fi
+
+# A blob this fixture can fetch anonymously must be publicly cacheable. A
+# private policy here means the edge stores nothing and every play is an
+# origin fetch.
+if [ "$P_GET" = "private" ] || [ "$P_GET" = "unknown" ]; then
+  echo "  FAIL: anonymously readable blob is not publicly cacheable ($CC_GET)"
+  FAIL=$((FAIL + 1))
+else
+  echo "  PASS: anonymously readable blob is publicly cacheable"
+  PASS=$((PASS + 1))
+fi
+
+# Whichever class it is, the max-age must match it. Immutable content is
+# content-addressed and pinned for a year; revocable content must not outlive a
+# day in caches that cannot be purged.
+case "$P_GET" in
+  immutable-public) check "immutable blob pinned for a year" "max-age=31536000" "$CC_GET" ;;
+  revocable-public) check "revocable blob capped at a day" "max-age=86400" "$CC_GET" ;;
+esac
 echo ""
 
 # 10. Stats summary
