@@ -109,6 +109,62 @@ else
 fi
 echo ""
 
+# 9b. Credentialed media is cacheable, and its cache is separate from anonymous.
+#
+# Media responses do not vary by which user is authenticated, only by whether
+# credentials were present, so the auth-presence bit is in the cache key. Both
+# variants must be able to go hot, and they must never share an entry.
+#
+# Requires RESTRICTED_HASH and AUTH_HEADER to exercise the security half. Without
+# them the anonymous/credentialed caching checks still run and the security
+# checks are reported as SKIPPED -- never as passed.
+echo "[9b] Credentialed media caching and cache-key separation"
+
+# Warm, then confirm a credentialed repeat can HIT. Before the auth-presence key
+# split, every credentialed request was a pass and could never report HIT.
+curl -s -o /dev/null -H "Authorization: Nostr c21va2U=" "https://$DOMAIN/$HASH"
+sleep 1
+AUTH_HIT=$(curl -s -D - -o /dev/null -H "Authorization: Nostr c21va2U=" "https://$DOMAIN/$HASH" | tr -d '\r' | grep -i "^x-cache:")
+check "credentialed request can be served from cache" "HIT" "$AUTH_HIT"
+
+# The anonymous variant must still cache independently.
+curl -s -o /dev/null "https://$DOMAIN/$HASH"
+sleep 1
+ANON_HIT=$(curl -s -D - -o /dev/null "https://$DOMAIN/$HASH" | tr -d '\r' | grep -i "^x-cache:")
+check "anonymous request can be served from cache" "HIT" "$ANON_HIT"
+
+if [ -n "$RESTRICTED_HASH" ] && [ -n "$AUTH_HEADER" ]; then
+  # THE security property. Fetch restricted content WITH credentials so any
+  # cacheable copy is populated, then ask for it anonymously. The anonymous
+  # caller must be refused. A 200 here means restricted content leaked out of
+  # the cache across the auth boundary.
+  curl -s -o /dev/null -H "Authorization: $AUTH_HEADER" "https://$DOMAIN/$RESTRICTED_HASH"
+  sleep 1
+  ANON_CODE=$(curl -s -o /dev/null -w "%{http_code}" "https://$DOMAIN/$RESTRICTED_HASH")
+  if [ "$ANON_CODE" = "200" ]; then
+    echo "  FAIL: restricted content served to anonymous caller after credentialed fetch (got 200)"
+    FAIL=$((FAIL + 1))
+  else
+    echo "  PASS: restricted content withheld from anonymous caller (got $ANON_CODE)"
+    PASS=$((PASS + 1))
+  fi
+
+  # Second, independent layer: a private/no-store response must never be stored,
+  # regardless of the key split.
+  RESTRICTED_HDRS=$(curl -s -D - -o /dev/null -H "Authorization: $AUTH_HEADER" "https://$DOMAIN/$RESTRICTED_HASH" | tr -d '\r')
+  if echo "$RESTRICTED_HDRS" | grep -qiE "^cache-control:.*(private|no-store)"; then
+    echo "  PASS: restricted response carries private/no-store"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL: restricted response is missing private/no-store"
+    FAIL=$((FAIL + 1))
+  fi
+else
+  echo "  SKIPPED: set RESTRICTED_HASH and AUTH_HEADER to test the auth boundary"
+  echo "           the cache-key split is UNVERIFIED without them"
+fi
+echo ""
+
 # 10. Stats summary
 echo "[10] Cache stats (VCL service)"
 echo "  Run: fastly stats --service-id ML7R82HKfmTaqTpHExIDVN"

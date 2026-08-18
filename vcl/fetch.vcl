@@ -4,6 +4,21 @@
 # Strip any anti-caching headers leaked from GCS through Compute
 unset beresp.http.Pragma;
 
+# Origin owns the decision about what must not be cached. Compute marks
+# restricted and admin content `private, no-store` (src/main.rs, via
+# requires_private_cache), and that must win over the long TTL set below --
+# otherwise a credentialed fetch of restricted content would be stored at the
+# edge for a year. This check must come first: the 200/206 branch sets a 365-day
+# TTL unconditionally and would otherwise cache it regardless of this header.
+#
+# Second of the two independent layers protecting restricted content; the first
+# is the auth-presence cache-key split in the vcl_recv and vcl_hash snippets.
+if (beresp.http.Cache-Control ~ "(?i)(private|no-store)") {
+  set beresp.ttl = 0s;
+  set beresp.grace = 0s;
+  return(pass);
+}
+
 if (beresp.status == 200 || beresp.status == 206) {
   # Successful content responses: keep a long, purgeable edge TTL.
   set beresp.ttl = 365d;
