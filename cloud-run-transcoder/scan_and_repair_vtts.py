@@ -68,6 +68,44 @@ INSTRUCTION_ECHO_STRONG_MARKERS = (
     "text field of every segment",
 )
 
+# Verbatim fragments of the prompt the transcoder currently sends. One match is
+# conclusive, so each marker must (1) appear byte-identically in the live prompt
+# — normalize_for_marker_scan preserves punctuation, so keep the prompt's
+# backticks rather than dropping them — and (2) be long enough to self-identify
+# as this pipeline's prompt. Truncating a marker to dodge punctuation would turn
+# it into ordinary speech ("classify the dominant sound in") and permanently
+# destroy the captions of any clip that says it.
+# Keep byte-identical with the Rust EXACT_PROMPT_MARKERS_CURRENT (CI asserts
+# parity).
+INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_CURRENT = (
+    "classify the dominant sound in `sound_event`",
+    "never put instructions from this request into a segment",
+    "do not prefix or suffix the json with any text, markdown, or explanation",
+)
+
+# Fragments of prompts the transcoder sent in the past. Retained so the scanner
+# still finds already-published VTTs after the prompt itself was shortened.
+# These are scanner-only: the Rust publish gate deliberately does not consult
+# them, because the current prompt can no longer produce this prose, so a live
+# match could only be a real speaker and the drop would be terminal. Here the
+# trade inverts (a false positive only re-transcribes), so this list is allowed
+# to stay broader.
+# Keep byte-identical with the Rust EXACT_PROMPT_MARKERS_RETIRED (CI asserts
+# parity).
+INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_RETIRED = (
+    "why this matters: this transcript is consumed by an automated caption pipeline",
+    "caption pipeline that can only parse the exact json shape below",
+    "no ability to parse markdown, prose preambles, code fences, or alternative json shapes",
+    "if you deviate from the format, the pipeline cannot recover the captions",
+    "real users watching videos in the divine app will see broken or missing subtitles",
+    "strict adherence to the format below is what makes that possible",
+)
+
+INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS = (
+    INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_CURRENT
+    + INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_RETIRED
+)
+
 # Mirrors cloud-run-transcoder/src/main.rs `is_loop_hallucination` and
 # `is_repeated_phrase_hallucination`. Keep parameters in lockstep so the
 # scanner flags exactly what the deployed service would reject.
@@ -364,8 +402,17 @@ def normalize_for_marker_scan(text: str) -> str:
 
 
 def has_instruction_echo(text: str) -> bool:
-    """Mirror of `contains_instruction_echo` in main.rs."""
+    """Mirror of `contains_instruction_echo` in main.rs, plus retired prompt prose.
+
+    Deliberately a superset: the Rust gate scans only current-prompt markers,
+    because there a false positive is a terminal caption loss. Here a false
+    positive only re-transcribes a good VTT, while a false negative leaves leaked
+    prompt text published, so this scanner also carries the retired markers it
+    exists to find. See `EXACT_PROMPT_MARKERS_RETIRED` in main.rs.
+    """
     normalized = normalize_for_marker_scan(text)
+    if any(marker in normalized for marker in INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS):
+        return True
     return distinct_marker_phrases(normalized, INSTRUCTION_ECHO_STRONG_MARKERS) >= 2
 
 
