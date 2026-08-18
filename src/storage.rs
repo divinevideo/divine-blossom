@@ -507,10 +507,15 @@ fn normalize_storage_cache_state(value: &str) -> Option<&'static str> {
 }
 
 fn preserve_storage_cache_state(resp: &mut Response) {
-    if let Some(cache_state) = resp
-        .get_header_str("X-Cache")
-        .and_then(normalize_storage_cache_state)
-    {
+    // Read the last X-Cache value: the SDK comma-joins a single prior value but
+    // appends a separate header line when two or more exist, and the Compute
+    // cache result is always the final value.
+    let cache_state = resp
+        .get_header_all_str("X-Cache")
+        .last()
+        .copied()
+        .and_then(normalize_storage_cache_state);
+    if let Some(cache_state) = cache_state {
         resp.set_header(STORAGE_CACHE_HEADER, cache_state);
     } else {
         resp.remove_header(STORAGE_CACHE_HEADER);
@@ -1877,9 +1882,10 @@ mod tests {
     use super::{
         normalize_storage_cache_state, parse_audio_extraction_error_response,
         parse_funnelcake_audio_reuse_response, prepare_storage_cache_miss,
+        preserve_storage_cache_state, STORAGE_CACHE_HEADER,
     };
     use fastly::http::header;
-    use fastly::Request;
+    use fastly::{Request, Response};
 
     #[test]
     fn storage_cache_miss_fetches_the_complete_object() {
@@ -1897,6 +1903,28 @@ mod tests {
         assert_eq!(normalize_storage_cache_state("MISS, HIT"), Some("HIT"));
         assert_eq!(normalize_storage_cache_state("hit"), Some("HIT"));
         assert_eq!(normalize_storage_cache_state("backend-only"), None);
+    }
+
+    #[test]
+    fn storage_cache_state_uses_the_last_x_cache_header_line() {
+        let mut resp = Response::new();
+        resp.append_header("X-Cache", "HIT");
+        resp.append_header("X-Cache", "HIT");
+        resp.append_header("X-Cache", "MISS");
+
+        preserve_storage_cache_state(&mut resp);
+
+        assert_eq!(resp.get_header_str(STORAGE_CACHE_HEADER), Some("MISS"));
+    }
+
+    #[test]
+    fn storage_cache_state_drops_an_unrecognized_backend_value() {
+        let mut resp = Response::new();
+        resp.append_header("X-Cache", "backend-only");
+
+        preserve_storage_cache_state(&mut resp);
+
+        assert!(!resp.contains_header(STORAGE_CACHE_HEADER));
     }
 
     #[test]
