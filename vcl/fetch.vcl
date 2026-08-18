@@ -43,15 +43,13 @@ if (beresp.status == 200 || beresp.status == 206) {
   # which is the case this helps most.
   set beresp.do_stream = true;
 
-  # No Cache-Control fallback here on purpose. This block used to stamp
-  # `public, max-age=31536000, immutable` onto any response that arrived without
-  # a policy, which meant a response the origin had not classified was published
-  # to browsers as immutable for a year -- uninvalidatable, since browser caches
-  # cannot be purged. Compute sets an explicit policy on every response it means
-  # to be cacheable, so a missing header signals an origin that did not decide,
-  # and the edge must not decide on its behalf.
+  # No Cache-Control fallback here on purpose. Compute owns browser policy, so a
+  # missing header must not be rewritten as public and immutable for a year.
+  # Browser caches cannot be purged after such a response is delivered.
   #
-  # Removed on Fastly's review (Kay Sawada, 2026-08-18, service version 16).
+  # This removal affects browser policy only. The successful-response branch
+  # above still assigns an edge TTL when Surrogate-Control is absent.
+  # TODO(#210): make an unclassified edge response fail closed as well.
 
 } else if (beresp.status == 202) {
   # 202 Accepted = transcoding/transcription in progress
