@@ -34,10 +34,39 @@ class EdgeCacheContractTests(unittest.TestCase):
         self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("purge_cache:", workflow)
         self.assertIn(
-            "if: github.event_name == 'workflow_dispatch' && inputs.purge_cache",
+            "if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.purge_cache",
             workflow,
         )
         self.assertNotIn("github.event.head_commit.message", workflow)
+
+        deploy_job = workflow.split("\n  deploy:\n", 1)[1].split(
+            "\n  purge-cache:\n", 1
+        )[0]
+        self.assertIn("\n  purge-cache:\n", workflow)
+        purge_job = workflow.split("\n  purge-cache:\n", 1)[1].split(
+            "\n  deploy-process-blob:\n", 1
+        )[0]
+
+        self.assertIn("github.event_name == 'push'", deploy_job)
+        self.assertNotIn("workflow_dispatch", deploy_job)
+        self.assertNotIn("fastly compute publish", purge_job)
+        self.assertIn("fastly purge --all", purge_job)
+
+    def test_admin_media_routes_apply_browser_and_edge_private_policy(self):
+        main_rs = (ROOT / "src" / "main.rs").read_text()
+
+        quality_variant = main_rs.split(
+            "fn handle_admin_quality_variant", 1
+        )[1].split("fn handle_admin_hls_content", 1)[0]
+        hls_content = main_rs.split("fn handle_admin_hls_content", 1)[1].split(
+            "fn generate_thumbnail_on_demand", 1
+        )[0]
+
+        for route in (quality_variant, hls_content):
+            self.assertIn("add_private_cache_headers(&mut resp, &hash);", route)
+            self.assertNotIn(
+                'resp.set_header("Cache-Control", "private, no-store")', route
+            )
 
     def test_operator_docs_do_not_require_a_global_purge(self):
         for relative_path in (

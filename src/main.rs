@@ -2605,7 +2605,7 @@ fn handle_admin_quality_variant(req: Request, path: &str) -> Result<Response> {
             resp.set_header("X-Sha256", &hash);
             resp.set_header("X-Moderation-Status", &format!("{:?}", meta.status));
             resp.set_header("Accept-Ranges", "bytes");
-            resp.set_header("Cache-Control", "private, no-store");
+            add_private_cache_headers(&mut resp, &hash);
             add_cors_headers(&mut resp);
             Ok(resp)
         }
@@ -2719,7 +2719,7 @@ fn handle_admin_hls_content(req: Request, path: &str) -> Result<Response> {
             resp.set_header("Content-Type", content_type);
             resp.set_header("X-Sha256", &hash);
             resp.set_header("X-Moderation-Status", &format!("{:?}", meta.status));
-            resp.set_header("Cache-Control", "private, no-store");
+            add_private_cache_headers(&mut resp, &hash);
             add_cors_headers(&mut resp);
             Ok(resp)
         }

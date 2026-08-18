@@ -160,6 +160,8 @@ mod tests {
             resp.get_header_str("Cache-Control"),
             Some("private, no-store")
         );
+        assert_eq!(resp.get_header_str("Surrogate-Control"), Some("no-store"));
+        assert_eq!(resp.get_header_str("Surrogate-Key"), Some(hash.as_str()));
         assert_eq!(resp.get_header_str("Accept-Ranges"), Some("bytes"));
     }
 
@@ -815,7 +817,7 @@ fn set_admin_blob_response_headers(
         resp.set_header("X-Sha256", hash);
     }
 
-    resp.set_header("Cache-Control", "private, no-store");
+    crate::add_private_cache_headers(resp, hash);
     resp.set_header("Accept-Ranges", "bytes");
 
     // Inline CORS headers (add_cors_headers is private to main.rs)
