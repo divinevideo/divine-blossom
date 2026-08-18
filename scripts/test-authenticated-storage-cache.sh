@@ -48,10 +48,11 @@ while [ "$ATTEMPT" -lt 5 ]; do
   REPEAT_CODE=$(nak curl -sS -D "$SECOND_HEADERS" -o /dev/null -w '%{http_code}' "$URL")
   [ "$REPEAT_CODE" = "200" ] || \
     fail "authorized repeat $ATTEMPT returned $REPEAT_CODE, expected 200"
-  if grep -qi '^x-divine-storage-cache:.*HIT' "$SECOND_HEADERS"; then
+  if grep -qi '^x-divine-storage-cache:[[:space:]]*HIT[[:space:]]*$' "$SECOND_HEADERS"; then
     CACHE_HIT=true
     break
   fi
+  sleep 1
 done
 [ "$CACHE_HIT" = "true" ] || \
   fail "internal storage cache did not produce a HIT within 5 authorized repeats"
@@ -61,7 +62,7 @@ RANGE_CODE=$(nak curl -sS -D "$RANGE_HEADERS" -o /dev/null -w '%{http_code}' \
 [ "$RANGE_CODE" = "206" ] || fail "authorized range request returned $RANGE_CODE, expected 206"
 grep -qi '^content-range: bytes 0-1023/' "$RANGE_HEADERS" || \
   fail "authorized range response is missing the requested Content-Range"
-grep -qi '^x-divine-storage-cache:.*HIT' "$RANGE_HEADERS" || \
+grep -qi '^x-divine-storage-cache:[[:space:]]*HIT[[:space:]]*$' "$RANGE_HEADERS" || \
   fail "authorized range request was not synthesized from the internal cached object"
 
 ANON_AFTER_WARM_CODE=$(curl -sS -o /dev/null -w '%{http_code}' "$URL")

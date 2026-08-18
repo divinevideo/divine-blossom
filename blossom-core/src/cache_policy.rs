@@ -26,11 +26,12 @@ pub enum ImmutableStorageCachePolicy {
     DoNotStore,
 }
 
-/// Cache only a complete storage response. A partial response must never
-/// populate the shared object key, and missing/error responses must remain
-/// retryable so a later upload or origin recovery can succeed immediately.
+/// Cache complete storage responses and refresh an existing entry after a
+/// successful conditional revalidation. A partial response must never populate
+/// the shared object key, and missing/error responses must remain retryable so
+/// a later upload or origin recovery can succeed immediately.
 pub fn immutable_storage_cache_policy(status: u16) -> ImmutableStorageCachePolicy {
-    if status == 200 {
+    if status == 200 || status == 304 {
         ImmutableStorageCachePolicy::Store {
             ttl_seconds: IMMUTABLE_STORAGE_CACHE_TTL_SECS,
             stale_while_revalidate_seconds: IMMUTABLE_STORAGE_CACHE_SWR_SECS,
@@ -286,5 +287,16 @@ mod tests {
                 "status {status} must not populate the shared full-object cache"
             );
         }
+    }
+
+    #[test]
+    fn successful_storage_revalidation_refreshes_the_cached_object() {
+        assert_eq!(
+            immutable_storage_cache_policy(304),
+            ImmutableStorageCachePolicy::Store {
+                ttl_seconds: IMMUTABLE_STORAGE_CACHE_TTL_SECS,
+                stale_while_revalidate_seconds: IMMUTABLE_STORAGE_CACHE_SWR_SECS,
+            }
+        );
     }
 }
