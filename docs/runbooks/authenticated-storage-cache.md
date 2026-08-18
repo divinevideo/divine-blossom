@@ -32,8 +32,8 @@ header. The outer VCL service's own state remains in `X-Cache`.
 
 ## Live authenticated probe
 
-Run `scripts/test-authenticated-storage-cache.sh` with `nak`, `curl`, and a
-maintained age-restricted test fixture:
+Run `scripts/test-authenticated-storage-cache.sh` with `nak`, `curl`, the
+`fastly` CLI, and a maintained age-restricted test fixture:
 
 ```bash
 AGE_RESTRICTED_HASH=<64-hex-test-fixture> \
@@ -45,9 +45,12 @@ access checks. Confirm immediately before running that it is still classified
 as age-restricted and is safe for operational probing. Do not commit a real
 creator identifier or media hash to the repository.
 
-The probe verifies anonymous and forged requests remain unauthorized after the
-cache is warm, valid signed requests can hit the internal cache, and a range
-request is synthesized as `206` from the cached full object.
+The probe first issues a targeted purge of the fixture's content hash, then
+verifies a genuinely cold authorized range request returns `206` with an exact
+`X-Divine-Storage-Cache: MISS`, a repeat range request over different bytes is
+synthesized from the stored full object with an exact `HIT`, anonymous and
+forged requests remain unauthorized after the cache is warm, and authorized
+full-object repeats hit the internal cache.
 
 ## Purging
 
