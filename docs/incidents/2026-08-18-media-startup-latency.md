@@ -3,7 +3,9 @@
 
 # Media startup latency — investigation log (2026-08-18)
 
-**Status: unresolved. No root cause established.**
+**Status: unresolved. No root cause established.** Second session same day:
+the section 8 hypothesis is falsified (12.1) and every server-side change in
+the incident window is now exonerated or proven dormant (12.2–12.4).
 
 This is a working log, not a conclusion. It exists so the next person does not
 repeat the checks already done. Every claim below is labelled as **measured**
@@ -177,8 +179,9 @@ independent, worth fixing, **not a 6-second smoking gun**.
 
 - **Which config key was deleted at `2026-08-17T21:02:12Z`, or by whom.** The
   Fastly CLI exposes no event/audit command. This needs Fastly's audit log.
-- **Whether the log endpoints `compute-diagnostics` and `vcl-error-diagnostics`
-  exist on the service.** Not yet checked. This matters — see section 8.
+- ~~Whether the log endpoints `compute-diagnostics` and
+  `vcl-error-diagnostics` exist on the service.~~ **Resolved 2026-08-18: they
+  do not exist, on either service, under any provider type** (section 12.1).
 - **Any server-side timing for the incident.** Slow *successful* 200/206
   responses are not recorded anywhere (`src/request_log.rs:24` returns early
   unless the request is a persisted failure), and the request-ID correlation
@@ -190,7 +193,11 @@ independent, worth fixing, **not a 6-second smoking gun**.
 
 ---
 
-## 8. Leading hypothesis (untested)
+## 8. Leading hypothesis — FALSIFIED 2026-08-18
+
+**Falsified, see section 12.1: neither endpoint exists on either service under
+any provider type, current or legacy. The diagnostics shipped dormant and are
+still dormant.** Original text kept for the record:
 
 PR #200 (`7330f36`, "persistent Fastly diagnostics") shipped as Compute v337 at
 `2026-08-16T17:01` and is carried in v338. It added
@@ -222,7 +229,11 @@ so if they exist, they were created no later than v338's clone at
    `blossom_config` (`eiGxcbPYmkaCvCZyCtTVD3`) around **21:02:12 UTC**. We can
    see the store's `updated_at` moved but no surviving entry matches, so we
    believe a key was deleted. We need the key name and the actor. The CLI has no
-   event command, so this cannot be self-served.
+   event command, so this cannot be self-served. From a code cross-check
+   (section 12.4), the candidate set is small: `local_mode`,
+   `google_allowed_domain`, `google_client_id`, `github_allowed_org`, or a key
+   no deployed code reads. It is **not** any key the delivery path reads —
+   those are all still present.
 2. On service `ML7R82HKfmTaqTpHExIDVN` v15, backend `compute_origin` shields to
    `iad-va-us` and `vcl_fetch` sets `beresp.do_stream = true`. Does that take
    effect at the **shield node**, or only the edge node? Does the shield buffer
@@ -241,12 +252,17 @@ so if they exist, they were created no later than v338's clone at
 
 ## 10. Next steps, in priority order
 
-1. Check whether `compute-diagnostics` / `vcl-error-diagnostics` log endpoints
-   exist and when they were created. Cheap, and tests section 8.
-2. Get the audit log answer for the 21:02 deletion.
+1. ~~Check whether `compute-diagnostics` / `vcl-error-diagnostics` log
+   endpoints exist and when they were created.~~ **Done 2026-08-18: neither
+   exists; section 8 falsified (12.1).**
+2. Get the audit log answer for the 21:02 deletion. Candidate key set now
+   bounded (12.4); blast radius is off the delivery path regardless.
 3. Build the cold/warm probe harness (approved) and point it at **US POPs** as
    well as CHC, using a synthetic non-user object. Never broadly purge user
-   content. Establishes the cold-fill baseline nobody has.
+   content. Establishes the cold-fill baseline nobody has. **Now the critical
+   path:** with the server-side window exonerated, this is the only instrument
+   that can separate "cold path got slower" from "cold path was always like
+   this" (12.6).
 4. Add sampled slow-success telemetry for the `quality_variant` route so slow
    200/206s stop being invisible. Privacy rules from the handoff apply: no
    hashes, URLs, pubkeys, auth headers, IPs, or account identifiers.
@@ -277,6 +293,107 @@ That is being investigated separately and is not covered by this log.
 
 ---
 
+## 12. Second-session measurements (2026-08-18)
+
+Follow-up on section 8 and the config-store deletion. Endpoint and config data
+is **measured** against the live services on 2026-08-18; code-path claims are
+**measured** by reading the deployed commit `63de4ff`.
+
+### 12.1 Log endpoints: the section 8 hypothesis is falsified
+
+Scanned every Fastly logging endpoint type on the active versions of both
+services (Compute v338, outer VCL v15): all 27 provider types the CLI models,
+plus the two legacy types the CLI no longer knows (`http`, `logentries`)
+queried directly against the API. The only log endpoints that exist anywhere:
+
+- Compute: `edge_upload_logs` (googlepubsub, created `2026-08-13T10:07:18Z`) —
+  the #199 upload-route sink. Compute endpoints are code-driven; this one only
+  receives writes from the three upload routes.
+- Outer VCL: `cdn-view-logs` (googlepubsub, created `2026-04-07`) — the
+  response-conditioned view counter the 5xx runbook says not to reuse.
+
+**Neither `compute-diagnostics` nor `vcl-error-diagnostics` exists.** PR #200
+shipped dormant and is still dormant; nothing on 08-17 flipped it live. The
+tension noted in section 8 (no v339, so any endpoint must predate v338's
+clone) never materialized — there is nothing to explain.
+
+### 12.2 PR #200 per-request cost on the success path: ~nil
+
+Read of the deployed code: `main()` (`src/main.rs:88-113`) does
+`set_panic_endpoint` (fails open while the endpoint is absent), one `Instant`,
+a ≤64-char request-ID sanitize, and a route classify per request;
+`request_log::emit` (`src/request_log.rs:24`) returns immediately unless the
+final status is 500–599 (`should_persist_compute_diagnostic`,
+`blossom-core/src/request_diagnostics.rs:15`). The `eprintln` mirror only runs
+for persisted records. No per-request I/O is added to 200/206 responses.
+#199's `with_upload_log` wraps exactly three upload routes
+(`src/main.rs:168,176,179`) and never runs on media GETs.
+
+### 12.3 Deploy-to-commit map for the incident window
+
+| Version | Commit | Active (UTC) | Content |
+|---|---|---|---|
+| v335 | `a8c07c4` (#199 upload logging) | 08-15 01:52 → 16:58 | upload routes only |
+| v336 | `cec892d` (#204 legacy-media backfill) | 08-15 16:58 → 08-16 17:01 | Python migration script + tests; its `src/storage.rs` diff is **comment-only** |
+| v337 | `7330f36` (#200 diagnostics) | 08-16 17:01 → 08-17 08:12 | dormant per 12.1/12.2 |
+| v338 | `63de4ff` (#207 docs-only) | since 08-17 08:12 | same runtime code as v337 |
+
+In the ~31h before the incident the only Compute code change that went live
+was #200 (dormant). The outer VCL has not changed since v15 on 08-11.
+
+### 12.4 Config-store deletion: blast radius bounded from the code side
+
+Keys the deployed code reads (`grep` over `src/`): `local_mode`, `gcs_bucket`,
+`fos_bucket`, `fos_host`, `fos_region`, `fos_read_enabled`,
+`fos_write_back_enabled`, `funnelcake_api_url`, `google_allowed_domain`,
+`google_client_id`, `github_allowed_org`.
+
+- The prod store holds **every delivery-path key** (`gcs_bucket`, `fos_*`,
+  `funnelcake_api_url`) — all present, newest dated 08-11.
+- Code-read keys **absent** from prod: `local_mode`, `google_allowed_domain`,
+  `google_client_id`, `github_allowed_org` — each is read with a safe default
+  or an optional gate, and all are admin/local-mode scope. None is on the
+  media GET path.
+- A deleted-then-recreated key would carry a post-08-11 `updated_at`; no entry
+  does. So the 21:02 event was a true deletion, as suspected.
+
+**Conclusion (inferred):** whatever was deleted at 21:02, it was not a key the
+delivery path reads. Candidate set for the audit answer: the four absent
+code-read keys above, or a key no deployed code reads (the staging-only
+`gcs_project_id` remains ruled out — no code reads it). The audit log is still
+needed for the key name and the actor.
+
+### 12.5 Cold-route anatomy, confirmed against the deployed code
+
+`GET /HASH/720p.mp4` on an outer-VCL cache miss costs: auth-header parse +
+Nostr signature verification (local CPU, no I/O), one metadata lookup
+(`get_blob_metadata`: 5-minute POP-local Simple Cache in front of KV store
+`blossom_metadata`), then a SigV4-signed GCS GET with the client Range
+forwarded (`download_hls_from_gcs`). Derivatives are never in Compute Simple
+Cache (only m3u8 manifests are), so every outer-cache miss reaches GCS. Edge
+TTL for derivatives post-#186 remains one year via `Surrogate-Control`
+(`blossom-core/src/cache_policy.rs:19-25`), so #186 did not create a re-fetch
+storm; cold fills happen for new/purged/long-tail content only.
+
+### 12.6 Where this leaves the incident
+
+Every server-side change in the window is now either dormant (#200),
+upload-only (#199), comment-only (#204), docs-only (#207), or a week old
+(the 08-11 bundle). The 21:02 deletion cannot touch the delivery path (12.4).
+Remaining live explanations, none provable from this repo alone:
+
+1. **Client-side.** The only evidence is one device on the new release, which
+   carries the confirmed 8s wall-clock cancel bug; its 0.198s minimum prefetch
+   shows the warm path was healthy. Concurrent prefetching on one device
+   inflates each download's wall-clock time with no server change at all.
+2. **Cold-fill latency that has never been measured.** The probe harness is
+   the only instrument that can separate "cold path got slower" from "cold
+   path was always like this" — and it must answer from US POPs, not just CHC.
+3. **Fastly-side network/POP behaviour in the window** — covered by the
+   section 9 asks, which stand.
+
+---
+
 ## Appendix: commands used
 
 ```
@@ -293,5 +410,35 @@ fastly config-store-entry list --store-id 93s9TpdiGoAhDuOrpMqxk5 --json
 Repo checks: `git log --since=2026-08-11 --name-only`, `git show 7ce2aee -- vcl/`,
 `git show b19b7b0`, `git show 7330f36 --stat -- vcl/`, and grep for
 `try_download_blob_from_fos` / `download_hls_content` call sites.
+
+Second session additions:
+
+```
+# Log endpoint scan (all 27 CLI-modeled types × both services, --version active --json)
+fastly logging <type> list --service-id pOvEEWykEbpnylqst1KTrR --version active --json
+fastly logging <type> list --service-id ML7R82HKfmTaqTpHExIDVN --version active --json
+# Legacy types the CLI no longer models, via direct API:
+GET /service/pOvEEWykEbpnylqst1KTrR/version/338/logging/{http,logentries}  -> []
+GET /service/ML7R82HKfmTaqTpHExIDVN/version/15/logging/{http,logentries}   -> []
+# Deploy-to-commit mapping:
+fastly service-version list --service-id pOvEEWykEbpnylqst1KTrR --json
+# Config key inventory (field names are item_key / created_at / updated_at):
+fastly config-store-entry list --store-id eiGxcbPYmkaCvCZyCtTVD3 --json
+fastly config-store-entry list --store-id 93s9TpdiGoAhDuOrpMqxk5 --json
+```
+
+Repo checks: `git show cec892d -- src/storage.rs` (comment-only diff),
+`git show a8c07c4 --stat`, greps for `get_config(`, `with_upload_log(`,
+`request_log::emit`, `should_persist_compute_diagnostic`, and reads of
+`src/main.rs:75-130,1269-1340,2400-2470,5974-6018`, `src/request_log.rs`,
+`src/metadata.rs:54-120`, `src/auth.rs:40-123`,
+`blossom-core/src/cache_policy.rs`, `blossom-core/src/request_diagnostics.rs`.
+
+Note for future operators: `fastly logging <type> list` fails silently into an
+empty result if given an invalid `--version` value (e.g. `latest-active` —
+valid values are a number, `latest`, `active`, `staged`); a scan that swallows
+stderr will report phantom absence. Verify one call by hand first.
+`fastly profile list` prints API tokens to stdout; do not run it where output
+is captured or shared.
 
 Branch: `wip/media-latency-diagnostics`.
