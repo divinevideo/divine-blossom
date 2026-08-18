@@ -1,6 +1,7 @@
 """Regression contracts for the hand-managed outer Fastly VCL."""
 
 from pathlib import Path
+import re
 import unittest
 
 
@@ -15,7 +16,9 @@ class EdgeCacheContractTests(unittest.TestCase):
         )[1]
 
         self.assertIn('if (req.url !~ "^/[0-9a-fA-F]{64}")', hash_policy)
-        self.assertNotIn("return(lookup)", hash_policy)
+        # return (lookup) with arbitrary spacing is valid VCL and would bypass
+        # Fastly's generated shield selection just like return(lookup).
+        self.assertIsNone(re.search(r"return\s*\(\s*lookup\s*\)", hash_policy))
         self.assertIn("Deliberately fall through", hash_policy)
 
 
