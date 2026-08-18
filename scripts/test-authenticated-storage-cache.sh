@@ -20,7 +20,8 @@ fi
 URL="https://${DOMAIN}/${AGE_RESTRICTED_HASH}"
 FIRST_HEADERS=$(mktemp)
 SECOND_HEADERS=$(mktemp)
-trap 'rm -f "$FIRST_HEADERS" "$SECOND_HEADERS"' EXIT
+RANGE_HEADERS=$(mktemp)
+trap 'rm -f "$FIRST_HEADERS" "$SECOND_HEADERS" "$RANGE_HEADERS"' EXIT
 
 fail() {
   echo "FAIL: $1" >&2
@@ -45,6 +46,14 @@ SECOND_CODE=$(nak curl -sS -D "$SECOND_HEADERS" -o /dev/null -w '%{http_code}' "
 
 grep -qi '^x-divine-storage-cache:.*HIT' "$SECOND_HEADERS" || \
   fail "second authorized request was not served from the internal storage cache"
+
+RANGE_CODE=$(nak curl -sS -D "$RANGE_HEADERS" -o /dev/null -w '%{http_code}' \
+  -H 'Range: bytes=0-1023' "$URL")
+[ "$RANGE_CODE" = "206" ] || fail "authorized range request returned $RANGE_CODE, expected 206"
+grep -qi '^content-range: bytes 0-1023/' "$RANGE_HEADERS" || \
+  fail "authorized range response is missing the requested Content-Range"
+grep -qi '^x-divine-storage-cache:.*HIT' "$RANGE_HEADERS" || \
+  fail "authorized range request was not synthesized from the internal cached object"
 
 ANON_AFTER_WARM_CODE=$(curl -sS -o /dev/null -w '%{http_code}' "$URL")
 [ "$ANON_AFTER_WARM_CODE" = "401" ] || \
