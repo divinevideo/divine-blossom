@@ -119,6 +119,13 @@ silently drop live settings the deploy path does not name. PR #153 fixed the
 transcoder script; the remaining manual deploy paths still need the same
 treatment; see issue #171.
 
+The CI `process-blob` job also sets the service's runtime identity explicitly:
+it deploys with `--service-account="$GCP_RUNTIME_SERVICE_ACCOUNT"`, read from
+the `GCP_RUNTIME_SERVICE_ACCOUNT` repository secret, and the step fails before
+`gcloud` runs when that secret is unset. The secret does not exist yet, so the
+deploy job cannot succeed until it is created and the paired IaC change
+(divine-iac-coreconfig#1767) is applied.
+
 ## Exported shell variables override script defaults
 
 The three hand-run Cloud Run deploy scripts resolve most settings as
