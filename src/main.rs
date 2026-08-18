@@ -620,7 +620,11 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
 
     // Serve from the FOS mirror when it has the object, otherwise GCS (with
     // CDN fallback) and lazily copy the object into the mirror.
-    let result = download_blob_read_through(&hash, range.as_deref())?;
+    let result = download_blob_read_through(
+        &hash,
+        range.as_deref(),
+        metadata.as_ref().map(|meta| meta.size),
+    )?;
     let mut resp = result.response;
 
     // Surface provenance metadata if present on the origin object. GCS returns

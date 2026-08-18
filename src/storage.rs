@@ -3,7 +3,8 @@
 
 use crate::error::{BlossomError, Result};
 use blossom_core::read_through::{
-    object_path, parse_bool_flag, write_back_decision, MAX_WRITE_BACK_BYTES, SOURCE_FOS, SOURCE_GCS,
+    check_mirror_response, object_path, parse_bool_flag, write_back_decision, MAX_WRITE_BACK_BYTES,
+    SOURCE_FOS, SOURCE_GCS,
 };
 use fastly::http::{Method, StatusCode};
 use fastly::{Body, Request, Response};
@@ -448,16 +449,50 @@ fn download_blob_from_fos(hash: &str, range: Option<&str>) -> Result<Response> {
 /// Try to serve a blob from the FOS mirror.
 ///
 /// `None` means "not served from the mirror" for every possible reason:
-/// missing credentials or backend, transport failure, timeout, 404, or any
-/// other non-success status. The caller falls back to GCS.
-fn try_download_blob_from_fos(hash: &str, range: Option<&str>) -> Option<Response> {
-    match download_blob_from_fos(hash, range) {
-        Ok(resp) => Some(resp),
+/// missing credentials or backend, transport failure, timeout, 404, any other
+/// non-success status, or a body whose declared length does not match the size
+/// recorded for the hash. The caller falls back to GCS.
+///
+/// The length check exists because a `2xx` from the mirror is not by itself
+/// evidence that the mirror holds the object: an S3-compatible origin can answer
+/// a `Range` request for a missing key with an error document under `206`, and
+/// the serving route stamps the stored MIME type over whatever body arrives.
+fn try_download_blob_from_fos(
+    hash: &str,
+    range: Option<&str>,
+    expected_size: Option<u64>,
+) -> Option<Response> {
+    let resp = match download_blob_from_fos(hash, range) {
+        Ok(resp) => resp,
         Err(e) => {
             eprintln!("[FOS] miss hash={} reason={}", hash, e);
-            None
+            return None;
         }
+    };
+
+    let status = resp.get_status().as_u16();
+    let content_length = resp.get_content_length().map(|len| len as u64);
+    let content_range = resp
+        .get_header_str("Content-Range")
+        .map(|value| value.to_string());
+
+    let check = check_mirror_response(
+        status,
+        content_length,
+        content_range.as_deref(),
+        expected_size,
+    );
+    if !check.is_trusted() {
+        eprintln!(
+            "[FOS] miss hash={} reason=untrusted_response check={} status={}",
+            hash,
+            check.reason(),
+            status
+        );
+        return None;
     }
+
+    Some(resp)
 }
 
 /// A body read that stopped either at EOF or at the memory ceiling.
@@ -554,9 +589,10 @@ fn try_write_back_to_fos(hash: &str, bytes: &[u8], content_type: &str) {
 pub fn download_blob_read_through(
     hash: &str,
     range: Option<&str>,
+    expected_size: Option<u64>,
 ) -> Result<FallbackDownloadResult> {
     if fos_read_enabled() {
-        if let Some(response) = try_download_blob_from_fos(hash, range) {
+        if let Some(response) = try_download_blob_from_fos(hash, range, expected_size) {
             return Ok(FallbackDownloadResult {
                 response,
                 source: SOURCE_FOS.to_string(),
