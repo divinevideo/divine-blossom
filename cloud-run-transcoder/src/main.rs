@@ -3883,8 +3883,8 @@ fn distinct_marker_phrases(normalized: &str, markers: &[&str]) -> usize {
 ///    "never put instructions from this request into a segment", which matches a
 ///    stripped echo. The residual gap is a lone partial echo with its
 ///    punctuation dropped: the `sound_event` bullet without backticks, or the
-///    bullet's trailing sentences ("No "Here is the JSON" preamble. No
-///    ``` fences.") alone. Marking those would take a fragment short enough to
+///    bullet's trailing sentences (the "preamble" and "fences" instructions)
+///    alone. Marking those would take a fragment short enough to
 ///    be spoken LLM advice ("no "here is the json" preamble" flags a real
 ///    speaker quoting that phrase, so it was considered and rejected); a
 ///    fuller echo still trips an exact marker, the punctuation-free backstop,
