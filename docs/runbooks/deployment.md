@@ -172,10 +172,10 @@ an exported `MAX_INSTANCES` or `CONCURRENCY` silently reshapes production
 capacity exactly the way the exported `GCS_BUCKET` silently redirected storage.
 Deriving the list is what keeps this check honest as the scripts grow.
 
-Whoever adds the broader automated guard: it has to compare *fully resolved* values, and
-it has to run after the script resolves its variables and before it builds
-anything. A check that parses the *defaults* out of the script text cannot catch
-this failure mode, because the whole failure is the default not applying.
+Whoever adds the broader automated guard: it has to compare *fully resolved*
+values, and it has to run after the script resolves its variables and before it
+builds anything. A check that parses the *defaults* out of the script text cannot
+catch this failure mode, because the whole failure is the default not applying.
 (Reading variable *names* out of the script, as the shell check above does, is a
 different and safe operation: what it looks for lives in the operator's
 environment, not in the script's text.)
