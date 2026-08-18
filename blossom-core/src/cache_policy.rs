@@ -1,32 +1,95 @@
 // ABOUTME: Shared cache policy for immutable blobs and repairable derivatives.
 // ABOUTME: Keeps browser and edge cache lifetimes testable outside Fastly Compute.
 
+use crate::types::BlobStatus;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PublicCacheHeaders<'a> {
+pub struct CacheHeaders<'a> {
     pub cache_control: &'static str,
     pub surrogate_control: &'static str,
     pub surrogate_key: &'a str,
 }
 
-pub fn immutable_blob_cache_headers(hash: &str) -> PublicCacheHeaders<'_> {
-    PublicCacheHeaders {
+pub fn immutable_blob_cache_headers(hash: &str) -> CacheHeaders<'_> {
+    CacheHeaders {
         cache_control: "public, max-age=31536000, immutable",
         surrogate_control: "max-age=31536000",
         surrogate_key: hash,
     }
 }
 
-pub fn mutable_derivative_cache_headers(hash: &str) -> PublicCacheHeaders<'_> {
-    PublicCacheHeaders {
+pub fn mutable_derivative_cache_headers(hash: &str) -> CacheHeaders<'_> {
+    CacheHeaders {
         cache_control: "public, max-age=86400",
         surrogate_control: "max-age=31536000",
         surrogate_key: hash,
     }
 }
 
+/// Headers for responses that must not be stored in browser or shared caches.
+/// The Surrogate-Key is still carried so a moderation purge can evict any edge
+/// copy cached before the status changed.
+pub fn private_no_store_cache_headers(hash: &str) -> CacheHeaders<'_> {
+    CacheHeaders {
+        cache_control: "private, no-store",
+        surrogate_control: "no-store",
+        surrogate_key: hash,
+    }
+}
+
+/// Cache policy for responses whose cacheability is driven by the blob's
+/// moderation status. The match is exhaustive so a future `BlobStatus`
+/// variant fails to compile until a policy is chosen for it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlobCachePolicy {
+    /// Content is moderated and content-addressed: immutable, one-year public caching.
+    ImmutablePublic,
+    /// Public while moderation runs, but revocable: short browser TTL with a
+    /// long edge TTL that `purge_edge_cache` can invalidate by Surrogate-Key.
+    RevocablePublic,
+    /// Must not be stored in shared caches.
+    PrivateNoStore,
+}
+
+pub fn blob_cache_policy(status: BlobStatus) -> BlobCachePolicy {
+    match status {
+        BlobStatus::Active => BlobCachePolicy::ImmutablePublic,
+        BlobStatus::Pending => BlobCachePolicy::RevocablePublic,
+        BlobStatus::Restricted
+        | BlobStatus::AgeRestricted
+        | BlobStatus::Banned
+        | BlobStatus::Deleted => BlobCachePolicy::PrivateNoStore,
+    }
+}
+
+/// Whether a response for this status must stay private. Routes that serve
+/// derivative content (HLS, variants, transcripts) branch on this so every
+/// status decision flows through the single exhaustive [`blob_cache_policy`]
+/// match: a future `BlobStatus` variant fails to compile there instead of
+/// silently inheriting public derivative caching.
+pub fn status_requires_private_response(status: BlobStatus) -> bool {
+    blob_cache_policy(status) == BlobCachePolicy::PrivateNoStore
+}
+
+/// The headers a serving route must send for a cache policy. Production routes
+/// apply this mapping instead of re-stating it, so the policy-to-headers
+/// decision is covered by the executing blossom-core tests.
+pub fn cache_headers_for_policy<'a>(policy: BlobCachePolicy, hash: &'a str) -> CacheHeaders<'a> {
+    match policy {
+        BlobCachePolicy::ImmutablePublic => immutable_blob_cache_headers(hash),
+        BlobCachePolicy::RevocablePublic => mutable_derivative_cache_headers(hash),
+        BlobCachePolicy::PrivateNoStore => private_no_store_cache_headers(hash),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{immutable_blob_cache_headers, mutable_derivative_cache_headers};
+    use super::{
+        blob_cache_policy, cache_headers_for_policy, immutable_blob_cache_headers,
+        mutable_derivative_cache_headers, private_no_store_cache_headers,
+        status_requires_private_response, BlobCachePolicy,
+    };
+    use crate::types::BlobStatus;
 
     fn max_age(cache_control: &str) -> u64 {
         cache_control
@@ -67,5 +130,82 @@ mod tests {
 
         assert_eq!(headers.surrogate_control, "max-age=31536000");
         assert_eq!(headers.surrogate_key, "abc123");
+    }
+
+    #[test]
+    fn every_cache_policy_sends_the_headers_its_name_promises() {
+        // The edge binary's tests are compile-only in CI, so these literals
+        // are the executing coverage for the header strings each policy must
+        // send on every serving route.
+        for (policy, cache_control, surrogate_control) in [
+            (
+                BlobCachePolicy::ImmutablePublic,
+                "public, max-age=31536000, immutable",
+                "max-age=31536000",
+            ),
+            (
+                BlobCachePolicy::RevocablePublic,
+                "public, max-age=86400",
+                "max-age=31536000",
+            ),
+            (
+                BlobCachePolicy::PrivateNoStore,
+                "private, no-store",
+                "no-store",
+            ),
+        ] {
+            let headers = cache_headers_for_policy(policy, "abc123");
+
+            assert_eq!(headers.cache_control, cache_control);
+            assert_eq!(headers.surrogate_control, surrogate_control);
+            assert_eq!(headers.surrogate_key, "abc123");
+        }
+    }
+
+    #[test]
+    fn moderated_statuses_route_derivatives_through_the_policy_match() {
+        for status in [
+            BlobStatus::Restricted,
+            BlobStatus::AgeRestricted,
+            BlobStatus::Banned,
+            BlobStatus::Deleted,
+        ] {
+            assert!(status_requires_private_response(status));
+        }
+        assert!(!status_requires_private_response(BlobStatus::Active));
+        assert!(!status_requires_private_response(BlobStatus::Pending));
+    }
+
+    #[test]
+    fn active_media_stays_immutable() {
+        assert_eq!(
+            blob_cache_policy(BlobStatus::Active),
+            BlobCachePolicy::ImmutablePublic
+        );
+    }
+
+    #[test]
+    fn pending_media_is_public_but_revocable() {
+        assert_eq!(
+            blob_cache_policy(BlobStatus::Pending),
+            BlobCachePolicy::RevocablePublic
+        );
+    }
+
+    #[test]
+    fn moderated_media_is_never_publicly_cacheable() {
+        for status in [
+            BlobStatus::Restricted,
+            BlobStatus::AgeRestricted,
+            BlobStatus::Banned,
+            BlobStatus::Deleted,
+        ] {
+            assert_eq!(
+                blob_cache_policy(status),
+                BlobCachePolicy::PrivateNoStore,
+                "{:?} must not be publicly cacheable",
+                status
+            );
+        }
     }
 }
