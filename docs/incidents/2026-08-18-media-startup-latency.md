@@ -3,7 +3,8 @@
 
 # Media startup latency — investigation log (2026-08-18)
 
-**Status: unresolved. No root cause established.** Second session same day:
+**Status: primary cause identified 2026-08-18. See section 0. Secondary
+structural cause identified and NOT yet fixed.** Second session same day:
 the section 8 hypothesis is falsified (12.1) and every server-side change in
 the incident window is now exonerated or proven dormant (12.2–12.4).
 
@@ -13,6 +14,93 @@ repeat the checks already done. Every claim below is labelled as **measured**
 
 Written during an in-progress support call with Fastly, so the "asks" section is
 phrased for handing to their engineers.
+
+---
+
+## 0. Findings (added after the sections below were written)
+
+The sections below record the investigation in the order it happened, including
+hypotheses later withdrawn. This section is the current conclusion.
+
+### 0.1 CI purged the entire edge cache on every deploy — FIXED
+
+`.github/workflows/ci.yml` ran `fastly purge --all` unconditionally on every
+push to `main`. That invalidates a 365-day edge TTL across the whole catalogue,
+and a refill takes days.
+
+**Measured:** 12 Compute deploys in the 7 days to 2026-08-18 — so 12 full cache
+purges in a week. Byte offload never exceeded 13% on any day in that week,
+against the ~25% `vcl/miss.vcl` was introduced to achieve. Daily request hit
+ratio oscillated 45%-69% with a visible dip-and-recover after the 08-11 deploy.
+
+The cache was structurally prevented from ever getting hot.
+
+Fixed: the purge step now requires `[purge-cache]` in the commit message.
+Targeted `Surrogate-Key` purges remain available and are preferred — Compute
+already sets the hash as the key on every cacheable response.
+
+### 0.2 Authenticated requests bypass cache entirely — NOT FIXED
+
+`vcl/recv.vcl` returns `pass` for any request carrying an `Authorization`
+header, and that check runs **before** the hash-path lookup. SHA-256-addressed,
+immutable, public video is therefore uncacheable for any authenticated client.
+
+**Measured**, outer VCL service, over the week:
+
+| | 08-11 | 08-17 |
+|---|---:|---:|
+| pass share of requests | 31% | 48% |
+| pass share of delivered bytes | 36% | 64% |
+
+The climb is consistent with a mobile release rollout progressively sending
+`Authorization` on media GETs. By 08-17, roughly two thirds of delivered bytes
+never touched cache.
+
+The justification in the VCL comment ("restricted content needs auth check") is
+redundant: Compute already marks restricted content `private, no-store`
+(`src/main.rs:689`) and `requires_private_cache()` drives
+`add_private_cache_headers` at seven call sites. The origin already tells the
+edge what must not be cached.
+
+**Do not fix this in recv.vcl alone.** `vcl/fetch.vcl` sets `beresp.ttl = 365d`
+for any 200/206 unconditionally; it defers to origin `Cache-Control` only when
+setting the response *header*, not the TTL. Removing the `Authorization` pass
+without also making the TTL honour `private`/`no-store` would cache restricted
+content at the edge for a year and serve it to unauthorised clients. Both files
+must change together, with tests.
+
+### 0.3 The 2026-08-17 22:00 UTC step change — cause not confirmed
+
+Hit ratio and 503 rate both broke sharply at 22:00 UTC and were still degraded
+at the last data point. Diurnal explanation is **refuted** by a control against
+the same hours on the previous night.
+
+| hour (UTC) | control 08-16/17 hit% | incident 08-17/18 hit% | control 503% | incident 503% |
+|---|---:|---:|---:|---:|
+| 20:00 | 58.0% | 67.1% | 0.163% | 0.052% |
+| 21:00 | 64.6% | 67.1% | 0.040% | 0.056% |
+| 22:00 | 62.4% | **56.8%** | 0.033% | **0.204%** |
+| 23:00 | 66.5% | **49.6%** | 0.040% | **0.237%** |
+| 00:00 | 63.2% | **50.6%** | 0.079% | **0.403%** |
+| 01:00 | 62.1% | **52.4%** | 0.070% | **0.342%** |
+| 02:00 | 64.1% | **51.0%** | 0.130% | **0.382%** |
+
+Control overnight hit ratio never fell below 58%; incident night never rose
+above 57%. All 5xx were **503** — the outer VCL's synthetic backend-unreachable
+response, not Compute 500s.
+
+Best explanation is a **manual** `fastly purge --all` around 21:00-22:00. Note a
+manual purge creates no service version, so it leaves no trace in version
+history — consistent with `blossom_config` being hand-mutated at 21:02:12 in the
+same window. **Unconfirmed**; needs Fastly's audit log (section 9, ask 1).
+
+### 0.4 Withdrawn hypotheses
+
+- **Regional/APAC shielding.** Contradicted by delivery having worked well from
+  NZ before, and by the 08-07 NZ baseline. Geography is a constant, not the change.
+- **The purge alone explains everything.** It explains the step change in
+  *request* hit ratio. It does **not** explain byte offload sitting at 1-13% for
+  the entire week, which is structural (0.1 and 0.2).
 
 ---
 
