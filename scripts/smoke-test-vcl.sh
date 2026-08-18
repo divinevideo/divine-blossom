@@ -9,6 +9,8 @@ DOMAIN="${1:-media.divine.video}"
 HASH="${2:-832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1}"
 PASS=0
 FAIL=0
+SMOKE_TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/divine-blossom-smoke.XXXXXX")
+trap 'rm -rf "$SMOKE_TMP_DIR"' EXIT
 
 check() {
   local name="$1"
@@ -28,8 +30,8 @@ echo ""
 
 # 1. Content GET (cache miss, then hit)
 echo "[1] Content GET (cache MISS then HIT)"
-R1=$(curl -s -D /tmp/smoke_h1 -o /dev/null -w "%{http_code}" "https://$DOMAIN/$HASH" 2>&1)
-H1=$(cat /tmp/smoke_h1)
+R1=$(curl -s -D "$SMOKE_TMP_DIR/h1" -o /dev/null -w "%{http_code}" "https://$DOMAIN/$HASH" 2>&1)
+H1=$(cat "$SMOKE_TMP_DIR/h1")
 check "200 OK" "200" "$R1"
 check "Content-Type video" "video/mp4" "$H1"
 check "Cache-Control public" "public" "$H1"
@@ -41,8 +43,8 @@ fi
 echo ""
 
 sleep 2
-R2=$(curl -s -D /tmp/smoke_h2 -o /dev/null -w "%{http_code} %{time_total}" "https://$DOMAIN/$HASH" 2>&1)
-H2=$(cat /tmp/smoke_h2)
+R2=$(curl -s -D "$SMOKE_TMP_DIR/h2" -o /dev/null -w "%{http_code} %{time_total}" "https://$DOMAIN/$HASH" 2>&1)
+H2=$(cat "$SMOKE_TMP_DIR/h2")
 check "Cache HIT on 2nd request" "HIT" "$H2"
 TOTAL_TIME=$(echo "$R2" | awk '{print $2}')
 echo "  INFO: Response time: ${TOTAL_TIME}s"
@@ -50,8 +52,8 @@ echo ""
 
 # 2. Range request
 echo "[2] Range request"
-R3=$(curl -s -D /tmp/smoke_h3 -o /dev/null -w "%{http_code}" -H "Range: bytes=0-1023" "https://$DOMAIN/$HASH" 2>&1)
-H3=$(cat /tmp/smoke_h3)
+R3=$(curl -s -D "$SMOKE_TMP_DIR/h3" -o /dev/null -w "%{http_code}" -H "Range: bytes=0-1023" "https://$DOMAIN/$HASH" 2>&1)
+H3=$(cat "$SMOKE_TMP_DIR/h3")
 check "206 Partial Content" "206" "$R3"
 if echo "$H3" | grep -qi "content-range"; then
   echo "  PASS: Content-Range present"; PASS=$((PASS + 1))
@@ -62,8 +64,8 @@ echo ""
 
 # 3. HLS manifest
 echo "[3] HLS manifest"
-R4=$(curl -s -D /tmp/smoke_h4 -o /dev/null -w "%{http_code}" "https://$DOMAIN/$HASH.hls" 2>&1)
-H4=$(cat /tmp/smoke_h4)
+R4=$(curl -s -D "$SMOKE_TMP_DIR/h4" -o /dev/null -w "%{http_code}" "https://$DOMAIN/$HASH.hls" 2>&1)
+H4=$(cat "$SMOKE_TMP_DIR/h4")
 check "HLS 200 OK" "200" "$R4"
 check "HLS Content-Type" "mpegurl" "$H4"
 echo ""
@@ -82,8 +84,8 @@ echo ""
 
 # 6. CORS preflight
 echo "[6] CORS preflight"
-R7=$(curl -s -D /tmp/smoke_h7 -o /dev/null -w "%{http_code}" -X OPTIONS "https://$DOMAIN/upload" 2>&1)
-H7=$(cat /tmp/smoke_h7)
+R7=$(curl -s -D "$SMOKE_TMP_DIR/h7" -o /dev/null -w "%{http_code}" -X OPTIONS "https://$DOMAIN/upload" 2>&1)
+H7=$(cat "$SMOKE_TMP_DIR/h7")
 check "OPTIONS 204" "204" "$R7"
 check "CORS Allow-Methods" "PUT" "$H7"
 echo ""
@@ -96,7 +98,7 @@ echo ""
 
 # 8. 404 for non-existent hash
 echo "[8] Non-existent content"
-R9=$(curl -s -D /tmp/smoke_h9 -o /dev/null -w "%{http_code}" "https://$DOMAIN/0000000000000000000000000000000000000000000000000000000000000000" 2>&1)
+R9=$(curl -s -D "$SMOKE_TMP_DIR/h9" -o /dev/null -w "%{http_code}" "https://$DOMAIN/0000000000000000000000000000000000000000000000000000000000000000" 2>&1)
 check "404 for missing" "404" "$R9"
 echo ""
 
@@ -142,6 +144,34 @@ cc_of() {
     | grep -i '^cache-control:' | cut -d' ' -f2- | tr -d '\r'
 }
 
+check_ttl() {
+  # Bounded match: a plain substring grep would let max-age=86400 pass on
+  # max-age=864000, silently hiding the TTL regression this block exists to catch.
+  local name="$1"
+  local expected_ttl="$2"
+  local cache_control="$3"
+  if echo "$cache_control" | grep -qE "max-age=${expected_ttl}([^0-9]|$)"; then
+    echo "  PASS: $name"; PASS=$((PASS + 1))
+  else
+    echo "  FAIL: $name (expected 'max-age=$expected_ttl')"; FAIL=$((FAIL + 1))
+  fi
+}
+
+check_policy_ttl() {
+  local route="$1"
+  local policy="$2"
+  local cache_control="$3"
+
+  case "$policy" in
+    immutable-public)
+      check_ttl "$route immutable policy pinned for a year" 31536000 "$cache_control"
+      ;;
+    revocable-public)
+      check_ttl "$route revocable policy capped at a day" 86400 "$cache_control"
+      ;;
+  esac
+}
+
 CC_GET=$(curl -s -D - -o /dev/null --max-time 30 "https://$DOMAIN/$HASH" 2>/dev/null \
   | grep -i '^cache-control:' | cut -d' ' -f2- | tr -d '\r')
 CC_HEAD=$(cc_of "https://$DOMAIN/$HASH")
@@ -173,13 +203,12 @@ else
   PASS=$((PASS + 1))
 fi
 
-# Whichever class it is, the max-age must match it. Immutable content is
-# content-addressed and pinned for a year; revocable content must not outlive a
-# day in caches that cannot be purged.
-case "$P_GET" in
-  immutable-public) check "immutable blob pinned for a year" "max-age=31536000" "$CC_GET" ;;
-  revocable-public) check "revocable blob capped at a day" "max-age=86400" "$CC_GET" ;;
-esac
+# Whichever class it is, every route's max-age must match it. Immutable content
+# is content-addressed and pinned for a year; revocable content must not outlive
+# a day in caches that cannot be purged.
+check_policy_ttl "GET" "$P_GET" "$CC_GET"
+check_policy_ttl "HEAD" "$P_HEAD" "$CC_HEAD"
+check_policy_ttl "thumbnail" "$P_THUMB" "$CC_THUMB"
 echo ""
 
 # 10. Stats summary
@@ -196,6 +225,3 @@ else
   echo "ALL TESTS PASSED"
   exit 0
 fi
-
-# Cleanup
-rm -f /tmp/smoke_h1 /tmp/smoke_h2 /tmp/smoke_h3 /tmp/smoke_h4 /tmp/smoke_h7 /tmp/smoke_h9
