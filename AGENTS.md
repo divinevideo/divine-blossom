@@ -55,15 +55,16 @@ If a Divine Brain search or ask tool is available, you may use it for company me
 
 ### Deployment Workflow
 ```bash
-fastly compute publish --comment "description" && fastly purge --all --service-id pOvEEWykEbpnylqst1KTrR
+fastly compute publish --comment "description"
 ```
 
 ### Key Lessons
 - `fastly compute publish --comment "description"` is the correct way to deploy.
 - Do NOT use `fastly compute deploy` separately.
 - Local testing with `fastly compute serve` works correctly for verification.
-- **CRITICAL: Always purge after deploy!** Run `fastly purge --all --service-id pOvEEWykEbpnylqst1KTrR` after publishing.
-- **Propagation can be SLOW** — even after purge, Compute package propagation to all POPs can take several minutes. The version may show as "active" in the API but edge POPs may still serve old code. Be patient.
+- Do not purge the whole cache after routine deploys. Blob responses are content-addressed and carry their hash as a surrogate key; use `fastly purge --key <hash> --service-id pOvEEWykEbpnylqst1KTrR` when one object must be invalidated.
+- A rare global purge must be an explicit manual CI run on `main` with the `purge_cache` input enabled.
+- **Propagation can be SLOW** — Compute package propagation to all POPs can take several minutes after a publish. The version may show as "active" in the API while edge POPs still serve old code. Be patient.
 - Remember it takes a few minutes for Fastly deploys to roll out; relax and let it happen.
 
 ## Pull Request Guardrails
