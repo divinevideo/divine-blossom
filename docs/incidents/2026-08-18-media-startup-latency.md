@@ -1,0 +1,297 @@
+# ABOUTME: Investigation log for the 2026-08-18 video startup stall reports on /HASH/720p.mp4.
+# ABOUTME: Records what was verified against live Fastly config, what was ruled out, and what is still unknown.
+
+# Media startup latency — investigation log (2026-08-18)
+
+**Status: unresolved. No root cause established.**
+
+This is a working log, not a conclusion. It exists so the next person does not
+repeat the checks already done. Every claim below is labelled as **measured**
+(read from live config or the repo) or **inferred** (reasoning, not yet tested).
+
+Written during an in-progress support call with Fastly, so the "asks" section is
+phrased for handing to their engineers.
+
+---
+
+## 1. What was handed to me
+
+A triage report on intermittent video startup stalls and playback stumbling,
+Divine Mobile 1.0.20+848 on iOS, incident window 2026-08-18 ~12:31 device-local
+(NZST) = ~00:31 UTC. Private evidence is a device log outside this repo; account
+identifiers, media hashes and exact URLs were deliberately omitted from it and
+are omitted here.
+
+Its headline numbers, all client-side:
+
+- 27 completed prefetches: min 0.198s, median 2.447s, mean 2.585s, p90 3.677s, max 6.077s
+- Immediately pre-incident completions of ~5.07s, ~4.97s, ~6.08s
+- Two 720p prefetches cancelled at exactly 8.001s / 8.002s
+- Active-player "source ready" delays of 0.98 / 3.68 / 3.75 / 1.19 / 3.49 / 2.75 / 6.18s
+
+Its two conclusions were: (a) a confirmed Divine Mobile bug where an 8s
+wall-clock deadline is mislabelled as a "stall" and cancels healthy in-progress
+downloads, and (b) probable intermittent cold-path latency through
+Fastly -> Compute -> GCS that cannot be attributed because slow *successful*
+200/206 responses are not recorded anywhere.
+
+**Provenance caveat that matters:** every one of those latency numbers came from
+a single device in Christchurch, New Zealand. There is no US client evidence in
+the report at all.
+
+---
+
+## 2. Corrections from Rabble during the session
+
+These reframe the problem and invalidate parts of my own earlier reasoning:
+
+1. **Most users are in the US, and an upcoming marketing campaign targets the
+   US.** The NZ device is not a representative sample of production traffic.
+2. **Delivery worked well from New Zealand until the latest mobile app release
+   and service updates in the last day.** Therefore geography/RTT is a
+   *constant*, not the change. Any hypothesis resting on trans-Pacific distance
+   is wrong by construction.
+
+I initially proposed regional/APAC shielding as a likely factor. **That was a
+dead end and is withdrawn.** It contradicts correction 2.
+
+---
+
+## 3. Independent support for "NZ was fine before"
+
+**Measured**, from `docs/measurements/2026-08-07-nz-wellington.md` (2026-08-07,
+11 days before the incident):
+
+| Edge | Serving PoP | p50 TTFB | p95 TTFB | Throughput | Errors |
+|---|---|---:|---:|---:|---:|
+| Fastly | `CHC` Christchurch, NZ | 42 ms | 50 ms | 273 Mbps | 0/45 |
+
+45 measured fetches, real production blobs including a 1.4 MB 720p rendition.
+
+**Caveat, and it is a large one:** that run warmed the cache first and every
+measured response was a verified cache HIT. It establishes that **steady-state
+NZ delivery was excellent**, and it rebuts "NZ is inherently slow". It says
+**nothing** about cold-fill behaviour, which is the path under suspicion. We
+have no cold-fill baseline from any region.
+
+---
+
+## 4. Verified against live Fastly config
+
+All of this is **measured** via the Fastly CLI/MCP on 2026-08-18, not read from
+the repo. Repo state and deployed state had to be checked separately because
+they disagree.
+
+### 4.1 Outer classic VCL service `ML7R82HKfmTaqTpHExIDVN`
+
+- **v15 is active, activated `2026-08-11T08:22:38Z`. It is the newest version
+  that exists** — there is nothing above it. Confirms the deployment drift the
+  handoff suspected.
+- `beresp.do_stream = true` **is present and live** in the `fetch` snippet
+  ("Override backend cache headers", `qFBT5RfdLDRnIY5xKdk8V6`).
+- The `vcl_miss` Range-strip snippet ("Cache full objects for range requests",
+  `0yNLGmOZcBWHEi0owDoba2`) has **`CreatedAt: 2026-07-29T09:46:02Z`**.
+  `unset bereq.http.Range` therefore predates the incident by ~3 weeks. It was
+  only *recorded into git* on 08-11; the git date is misleading.
+  **Do not let anyone chase this as a recent change.**
+- The live `recv` / `deliver` / `error` snippets contain **none** of PR #200's
+  diagnostics additions. No request-ID plumbing, no 5xx logging. Drift confirmed
+  by direct inspection, not inferred.
+- Backend `compute_origin`: shield `iad-va-us`, connect 1000ms, first-byte
+  15000ms, between-bytes 10000ms.
+
+### 4.2 Compute service `pOvEEWykEbpnylqst1KTrR`
+
+- **v338 active since `2026-08-17T08:12:01Z`.** Comment `deploy from 63de4ff`
+  (a docs-only commit — but a Compute deploy rebuilds the whole tree, so v338
+  carries everything beneath it).
+- **12 deploys in the last week**, with auto-generated `deploy from <sha>`
+  comments. The outer VCL service has 15 versions *in total, ever*.
+- **This answers "why was Compute deployed but not the VCL":** the two services
+  have no coupled deploy path. Compute deploys are automated per-commit; the
+  outer VCL is hand-managed. It is not a one-off oversight, it is structural.
+- Backends `gcs_storage` and `fos_storage` both have **no shield** — Compute to
+  storage is direct. `gcs_storage` first-byte timeout is 15000ms.
+
+### 4.3 Config store `blossom_config` (`eiGxcbPYmkaCvCZyCtTVD3`)
+
+- **`fos_read_enabled = true`** and **`fos_write_back_enabled = true`**, both set
+  `2026-08-11T05:13:5xZ`. Bucket `divine-media-delivery`, host
+  `us-east.object.fastlystorage.app`, region `us-east`.
+  This is a real in-window change **invisible to git history** — but it is a week
+  old, so it does not fit "worked until the last day".
+- **UNEXPLAINED: the store's `updated_at` is `2026-08-17T21:02:12Z`** — roughly
+  3.5 hours before the incident — **but no surviving entry carries that
+  timestamp** (newest entry is 08-11). Since an edit would bump the entry's own
+  `updated_at`, this was almost certainly a **deletion**.
+- **Config stores are not versioned.** They are the only thing on this service
+  that can change without a new service version. That makes this the sole
+  post-deploy mutation in the window.
+- I could not identify the deleted key. Deleted entries do not appear in the
+  listing. My one candidate, `gcs_project_id` (present in the staging store,
+  absent from prod), was **ruled out**: `grep` finds no code reading it.
+
+---
+
+## 5. New finding: a real regression, but NOT this incident
+
+`src/storage.rs` -> `download_blob_read_through` -> `write_back_if_eligible`
+calls `buffer_body_up_to`, which **fully buffers the response body in Compute
+memory before any byte is returned to the client**.
+
+The eligibility gate is `had_range` (`blossom-core/src/read_through.rs:90`) — but
+the outer VCL **strips Range on cache miss**, so a cold fill arrives at Compute
+with no Range. `had_range` is false, and every <=32MiB blob becomes eligible.
+Compute emits nothing until the whole object has landed, which **defeats the
+outer `do_stream` for that route**. The streaming fix and this buffering landed
+the same day, 2026-08-11.
+
+**However — this does not explain the reported incident.** Call-site check:
+`/HASH/720p.mp4` (`src/main.rs:2436`) uses `download_hls_content`, **not**
+`download_blob_read_through`. The handoff's claim that FOS read-through does not
+cover derivatives holds up. This regression is on the **bare blob route only**.
+
+**Sizing it honestly (inferred, not measured):** p99 blob is ~3.4 MB and the
+ceiling is 32 MiB, so the added buffer wait is likely sub-second for typical
+traffic and approaches ~a second only at the largest objects. Real, geography-
+independent, worth fixing, **not a 6-second smoking gun**.
+
+---
+
+## 6. Ruled out
+
+- **Permanently broken media.** The handoff re-tested seven exact 720p URLs: all
+  currently return 206, correct `Content-Range`, correct `Content-Length`,
+  `video/mp4`, `Accept-Ranges`. The two objects that blew the 8s client deadline
+  now serve warm at ~19-20 MB/s, ~0.12s.
+- **`do_stream` missing from production.** It is live on v15. Measured.
+- **The `vcl_miss` Range strip as a recent change.** Live since 2026-07-29. Measured.
+- **`gcs_project_id` as the deleted config key.** No code reads it. Measured.
+- **FOS read-through as the cause of 720p latency.** Wrong route. Measured by call site.
+- **Trans-Pacific distance / APAC shielding.** Contradicted by Rabble's correction
+  2 and by the 08-07 NZ baseline.
+
+---
+
+## 7. Could NOT determine
+
+- **Which config key was deleted at `2026-08-17T21:02:12Z`, or by whom.** The
+  Fastly CLI exposes no event/audit command. This needs Fastly's audit log.
+- **Whether the log endpoints `compute-diagnostics` and `vcl-error-diagnostics`
+  exist on the service.** Not yet checked. This matters — see section 8.
+- **Any server-side timing for the incident.** Slow *successful* 200/206
+  responses are not recorded anywhere (`src/request_log.rs:24` returns early
+  unless the request is a persisted failure), and the request-ID correlation
+  from #200 is not deployed on the outer VCL service. This is the core
+  observability gap and it blocks attribution.
+- **Cold-fill performance from any region, including the US.** Never measured.
+  The 08-07 baseline is warm-cache only.
+- **Whether US users are affected at all.** No US client evidence exists.
+
+---
+
+## 8. Leading hypothesis (untested)
+
+PR #200 (`7330f36`, "persistent Fastly diagnostics") shipped as Compute v337 at
+`2026-08-16T17:01` and is carried in v338. It added
+`fastly::log::set_panic_endpoint("compute-diagnostics")` at `src/main.rs:93`
+plus per-request diagnostics.
+
+`docs/runbooks/fastly-5xx.md:36` is explicit that **neither endpoint is created
+by repository code**, and that Compute logging **fails open while the endpoint is
+absent**. So the code shipped in a dormant state and becomes live the moment
+someone creates those endpoints by hand.
+
+**Hypothesis:** if a diagnostics log endpoint was created recently — plausibly
+the unexplained config-store-adjacent activity on 08-17 — that flips diagnostics
+from a no-op into work on the request path, which would slow requests
+service-wide, independent of geography, matching "worked great until the last
+day".
+
+**This is unverified.** Next step is simply to check whether those endpoints
+exist and when they were created. Note the tension to resolve: creating a
+logging endpoint normally requires a new service version, and there is no v339 —
+so if they exist, they were created no later than v338's clone at
+`2026-08-17T08:11:56Z`.
+
+---
+
+## 9. Asks for Fastly
+
+1. Audit/event log for the account on **2026-08-17**, specifically config store
+   `blossom_config` (`eiGxcbPYmkaCvCZyCtTVD3`) around **21:02:12 UTC**. We can
+   see the store's `updated_at` moved but no surviving entry matches, so we
+   believe a key was deleted. We need the key name and the actor. The CLI has no
+   event command, so this cannot be self-served.
+2. On service `ML7R82HKfmTaqTpHExIDVN` v15, backend `compute_origin` shields to
+   `iad-va-us` and `vcl_fetch` sets `beresp.do_stream = true`. Does that take
+   effect at the **shield node**, or only the edge node? Does the shield buffer
+   the full object into cache before the edge begins receiving bytes?
+3. With request collapsing: a second request arrives for the same object while a
+   `do_stream` fill is in flight. Does it stream from that fill, or wait for the
+   fill to complete before first byte?
+4. Cold-fill first-byte timings from **US edge POPs** over the last week — the
+   distribution, not a single trace. A US campaign is about to run through this
+   and the cold path has never been measured from the US.
+5. Under a spike where many clients hit the same cold objects at once, does
+   shield request collapsing hold, or is there a concurrency limit to know about
+   before driving campaign traffic at it?
+
+---
+
+## 10. Next steps, in priority order
+
+1. Check whether `compute-diagnostics` / `vcl-error-diagnostics` log endpoints
+   exist and when they were created. Cheap, and tests section 8.
+2. Get the audit log answer for the 21:02 deletion.
+3. Build the cold/warm probe harness (approved) and point it at **US POPs** as
+   well as CHC, using a synthetic non-user object. Never broadly purge user
+   content. Establishes the cold-fill baseline nobody has.
+4. Add sampled slow-success telemetry for the `quality_variant` route so slow
+   200/206s stop being invisible. Privacy rules from the handoff apply: no
+   hashes, URLs, pubkeys, auth headers, IPs, or account identifiers.
+5. Deploy the drifted outer VCL so one sanitized request ID survives
+   edge -> shield -> Compute. Separately from any behavioural cache change.
+6. Fix the blob-route buffering regression in section 5 (independent of this
+   incident).
+
+**Do not** change Range forwarding in the Compute handler — authenticated and
+restricted traffic bypasses the outer cache and depends on correct origin Range
+forwarding. **Do not** blanket-preserve Range on public cache miss — that
+restores uncached origin reads for every seek and replay.
+
+---
+
+## 11. Divine Mobile side (not this repo)
+
+The handoff's confirmed client bug, recorded here only so it is not lost:
+`mobile/packages/infinite_video_feed/lib/src/services/disk_prefetcher.dart:214`
+applies `op.result.timeout(_stallTimeout)` with an 8s value. Despite comments
+describing an idle/progress detector, it is a **wall-clock deadline for the
+entire download** — a healthy, still-progressing download is cancelled at 8s and
+logged as a "stall". It predates 2026-08-18, so it is not the regression, but it
+converts moderate latency into visible playback failure.
+
+Rabble also reports the latest mobile app release as a suspect in its own right.
+That is being investigated separately and is not covered by this log.
+
+---
+
+## Appendix: commands used
+
+```
+fastly service-version list --service-id ML7R82HKfmTaqTpHExIDVN --json
+fastly service-version list --service-id pOvEEWykEbpnylqst1KTrR --json
+fastly vcl snippet list --service-id ML7R82HKfmTaqTpHExIDVN --version 15 --json
+fastly backend list --service-id ML7R82HKfmTaqTpHExIDVN --version 15 --json
+fastly backend list --service-id pOvEEWykEbpnylqst1KTrR --version 338 --json
+fastly config-store list --json
+fastly config-store-entry list --store-id eiGxcbPYmkaCvCZyCtTVD3 --json
+fastly config-store-entry list --store-id 93s9TpdiGoAhDuOrpMqxk5 --json
+```
+
+Repo checks: `git log --since=2026-08-11 --name-only`, `git show 7ce2aee -- vcl/`,
+`git show b19b7b0`, `git show 7330f36 --stat -- vcl/`, and grep for
+`try_download_blob_from_fos` / `download_hls_content` call sites.
+
+Branch: `wip/media-latency-diagnostics`.
