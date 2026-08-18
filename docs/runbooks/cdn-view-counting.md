@@ -114,7 +114,7 @@ In the Fastly dashboard for VCL service `ML7R82HKfmTaqTpHExIDVN`:
    - **Format version:** `2` (`vcl_log`)
    - **Format:**
      ```text
-     {"v":2,"ts":%{time.start.sec}V,"sha256":"%{std.tolower(regsub(req.url, "^/([0-9a-fA-F]{64}).*", "\1"))}V","path":"%{std.tolower(regsub(req.url, "\?[\s\S]*$", ""))}V","status":%{resp.status}V,"bytes":%{resp.body_bytes_written}V,"pop":"%{server.datacenter}V","cache":"%{fastly_info.state}V"}
+     {"v":2,"ts":%{time.start.sec}V,"sha256":"%{std.tolower(regsub(req.url, "^/([0-9a-fA-F]{64})[\s\S]*", "\1"))}V","path":"%{std.tolower(regsub(req.url, "\?[\s\S]*$", ""))}V","status":%{resp.status}V,"bytes":%{resp.body_bytes_written}V,"pop":"%{server.datacenter}V","cache":"%{fastly_info.state}V"}
      ```
 3. Create or update the response condition named `cdn-view-log-condition`:
    ```vcl

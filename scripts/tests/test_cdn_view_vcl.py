@@ -150,6 +150,20 @@ class TestFieldExtraction(unittest.TestCase):
         ]:
             self.assertEqual(self.regsub(self.sha_pattern, "\\1", url), SHA)
 
+    def test_extracted_sha256_is_json_safe(self):
+        # The log line interpolates `sha256` into JSON without escaping. Use a
+        # character class that consumes newlines so no request suffix survives
+        # extraction, matching the defence-in-depth applied to `path` below.
+        allowed = re.compile(r"\A[0-9a-fA-F]{64}\Z")
+        for url in [
+            "/%s" % SHA,
+            "/%s/720p.mp4?t=3" % SHA,
+            '/%s?a=1\n"x' % SHA,
+            "/%s/720p.mp4?%s" % (SHA, "\r\n\"\\'"),
+        ]:
+            extracted = self.regsub(self.sha_pattern, "\\1", url)
+            self.assertRegex(extracted, allowed, repr(url))
+
     def test_query_strip_keeps_the_path(self):
         # The bug this replaces: an over-escaped pattern matched at offset 0 and
         # replaced the entire URL with the empty string, so every row lost the

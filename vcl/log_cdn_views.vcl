@@ -55,7 +55,7 @@ if (req.method == "GET"
     {"{"}
       {""v":2,"}
       {""ts":"} time.start.sec {","}
-      {""sha256":""} std.tolower(regsub(req.url, "^/([0-9a-fA-F]{64}).*", "\1")) {"","}
+      {""sha256":""} std.tolower(regsub(req.url, "^/([0-9a-fA-F]{64})[\s\S]*", "\1")) {"","}
       {""path":""} std.tolower(regsub(req.url, "\?[\s\S]*$", "")) {"","}
       {""status":"} resp.status {","}
       {""bytes":"} resp.body_bytes_written {","}
