@@ -11,8 +11,8 @@ unset beresp.http.Pragma;
 # 404 responses use browser `no-store` together with an edge `max-age=60` policy.
 # This check must come first because the 200/206 branch sets a 365-day TTL.
 #
-# This is the only thing keeping non-public responses out of the shared edge
-# cache, so it must stay first and must stay broad.
+# This is the origin-policy enforcement layer that keeps explicitly non-public
+# responses out of the shared edge cache, so it must stay first and stay broad.
 if (beresp.http.Surrogate-Control ~ "(?i)(private|no-store)") {
   set beresp.ttl = 0s;
   set beresp.grace = 0s;
@@ -49,7 +49,7 @@ if (beresp.status == 200 || beresp.status == 206) {
   #
   # This removal affects browser policy only. The successful-response branch
   # above still assigns an edge TTL when Surrogate-Control is absent.
-  # TODO(#210): make an unclassified edge response fail closed as well.
+  # TODO(#223): make an unclassified edge response fail closed as well.
 
 } else if (beresp.status == 202) {
   # 202 Accepted = transcoding/transcription in progress

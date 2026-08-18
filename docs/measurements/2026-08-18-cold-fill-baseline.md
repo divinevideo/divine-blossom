@@ -6,16 +6,15 @@
 Tool: `curl`, single client, sequential. Not `probe_cdn_delivery.py` — that harness
 warms before measuring, and a warm cache is exactly what had to be avoided here.
 
-Media hashes are omitted, per the convention in
-[`docs/incidents/2026-08-18-media-startup-latency.md`](../incidents/2026-08-18-media-startup-latency.md).
-Objects are labelled A-G and identified only by size.
+Media hashes are omitted because production object identifiers do not belong in
+committed measurement records. Objects are labelled A-G and identified only by
+size.
 
 ## Why this run exists
 
-Section 3 of the incident log records that no cold-fill baseline had ever been
-taken, from any region: the 2026-08-07 NZ run warmed the cache first and every
-measured response was a HIT. Cold fill was the leading unmeasured candidate for
-the reported startup stalls.
+No cold-fill baseline had previously been taken from any region: the 2026-08-07
+NZ run warmed the cache first and every measured response was a HIT. Cold fill
+was the leading unmeasured candidate for the reported startup stalls.
 
 Two things made this window usable. The deploy of Compute v339 at 03:06 UTC ran
 `fastly purge --all` (the `[purge-cache]` gate had not merged yet), so the whole
@@ -94,9 +93,9 @@ in Compute memory before emitting a byte. The derivative route uses
 Range on a fill, `had_range` is false and every object under the 32 MiB ceiling
 is write-back eligible — so the buffer runs on every cold bare-blob fill.
 
-Section 5 of the incident log identified this path and estimated its cost as
-"likely sub-second for typical traffic ... not a 6-second smoking gun". These
-numbers are not consistent with that estimate.
+The initial investigation identified this path and estimated its cost as likely
+sub-second for typical traffic, rather than sufficient to explain a six-second
+stall. These numbers are not consistent with that estimate.
 
 **This is a hypothesis, not an attribution.** Unresolved confounds:
 
@@ -130,12 +129,12 @@ catalogue-wide status census. It is the more relevant population for cache
 behaviour, since it is what traffic actually requests. `GET /admin/api/stats`
 returns the true `status_counts` and needs an admin credential.
 
-**This corrects section 0.2 of the incident log.** That section attributed the
-byte-offload deficit to authenticated requests bypassing cache. That mechanism is
-real, but it cannot be the main one: roughly three quarters of sampled video
-objects were uncacheable for anonymous callers too. Note also that these videos
-are published as bare-blob URLs (`media.divine.video/<hash>`, no rendition
-suffix), so the bare-blob route is a primary delivery path, not a fallback.
+An earlier hypothesis attributed the byte-offload deficit to authenticated
+requests bypassing cache. That mechanism is real, but it cannot be the main one:
+roughly three quarters of sampled video objects were uncacheable for anonymous
+callers too. Note also that these videos are published as bare-blob URLs
+(`media.divine.video/<hash>`, no rendition suffix), so the bare-blob route is a
+primary delivery path, not a fallback.
 
 ## 4. Purge recovery
 
@@ -152,4 +151,4 @@ in section 1 were found.
 - Cannot split cold-fill cost across mirror lookup, GCS fetch and write-back
   buffering without server-side timing.
 - Whether request collapsing holds when many clients hit the same cold object is
-  unmeasured (section 9 ask 5 of the incident log).
+  unmeasured.
