@@ -144,6 +144,19 @@ cc_of() {
     | grep -i '^cache-control:' | cut -d' ' -f2- | tr -d '\r'
 }
 
+check_ttl() {
+  # Bounded match: a plain substring grep would let max-age=86400 pass on
+  # max-age=864000, silently hiding the TTL regression this block exists to catch.
+  local name="$1"
+  local expected_ttl="$2"
+  local cache_control="$3"
+  if echo "$cache_control" | grep -qE "max-age=${expected_ttl}([^0-9]|$)"; then
+    echo "  PASS: $name"; PASS=$((PASS + 1))
+  else
+    echo "  FAIL: $name (expected 'max-age=$expected_ttl')"; FAIL=$((FAIL + 1))
+  fi
+}
+
 check_policy_ttl() {
   local route="$1"
   local policy="$2"
@@ -151,10 +164,10 @@ check_policy_ttl() {
 
   case "$policy" in
     immutable-public)
-      check "$route immutable policy pinned for a year" "max-age=31536000" "$cache_control"
+      check_ttl "$route immutable policy pinned for a year" 31536000 "$cache_control"
       ;;
     revocable-public)
-      check "$route revocable policy capped at a day" "max-age=86400" "$cache_control"
+      check_ttl "$route revocable policy capped at a day" 86400 "$cache_control"
       ;;
   esac
 }
