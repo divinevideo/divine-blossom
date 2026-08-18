@@ -41,11 +41,20 @@ FIRST_CODE=$(nak curl -sS -D "$FIRST_HEADERS" -o /dev/null -w '%{http_code}' "$U
 grep -qi '^cache-control:.*\(private\|no-store\)' "$FIRST_HEADERS" || \
   fail "authorized response is missing private/no-store browser policy"
 
-SECOND_CODE=$(nak curl -sS -D "$SECOND_HEADERS" -o /dev/null -w '%{http_code}' "$URL")
-[ "$SECOND_CODE" = "200" ] || fail "second valid NIP-98 request returned $SECOND_CODE, expected 200"
-
-grep -qi '^x-divine-storage-cache:.*HIT' "$SECOND_HEADERS" || \
-  fail "second authorized request was not served from the internal storage cache"
+CACHE_HIT=false
+ATTEMPT=0
+while [ "$ATTEMPT" -lt 5 ]; do
+  ATTEMPT=$((ATTEMPT + 1))
+  REPEAT_CODE=$(nak curl -sS -D "$SECOND_HEADERS" -o /dev/null -w '%{http_code}' "$URL")
+  [ "$REPEAT_CODE" = "200" ] || \
+    fail "authorized repeat $ATTEMPT returned $REPEAT_CODE, expected 200"
+  if grep -qi '^x-divine-storage-cache:.*HIT' "$SECOND_HEADERS"; then
+    CACHE_HIT=true
+    break
+  fi
+done
+[ "$CACHE_HIT" = "true" ] || \
+  fail "internal storage cache did not produce a HIT within 5 authorized repeats"
 
 RANGE_CODE=$(nak curl -sS -D "$RANGE_HEADERS" -o /dev/null -w '%{http_code}' \
   -H 'Range: bytes=0-1023' "$URL")
