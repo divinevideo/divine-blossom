@@ -2537,6 +2537,10 @@ fn handle_head_quality_variant(path: &str) -> Result<Response> {
     let mut resp = Response::from_status(StatusCode::OK);
     resp.set_header("Content-Type", content_type);
     resp.set_header("Accept-Ranges", "bytes");
+    // Non-owner gating above means a 200 here is always public content, so the
+    // same derivative policy as GET applies: repairable renditions must not be
+    // pinned immutable in browser caches.
+    add_derivative_cache_headers(&mut resp, &hash);
     add_cors_headers(&mut resp);
     Ok(resp)
 }
