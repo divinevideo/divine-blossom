@@ -36,12 +36,23 @@ import fs from 'fs';
 const SERVER = process.env.SERVER || 'https://media.divine.video';
 const FILE = process.env.FILE || 'test.mp4';
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+// Case 3 needs a blob that is already Active. A freshly uploaded one starts
+// Pending, and main.rs serves anything with `status != Active` as
+// `private, no-store`, so it can never cache no matter what the VCL does.
+// Uploading a fixture for the cache control would test nothing.
+const PUBLIC_HASH = process.env.PUBLIC_HASH
+  || '832e9a4d6b9de70ceffb134ddd77b96b9b9de371457892092aa6aa853cd3f8a1';
 
-if (!WEBHOOK_SECRET) {
-  console.error('WEBHOOK_SECRET is required — it is needed to set moderation status.');
-  console.error('Without it this script cannot create restricted fixtures and must not');
-  console.error('report success. Refusing to run.');
-  process.exit(2);
+// Without the secret the identity-varying cases cannot be built at all. Those
+// are the security half, so their absence must never look like a pass. The
+// public control needs no moderation, so it still runs and still reports —
+// but the script exits 2, never 0, so no caller can mistake a partial run for
+// a verified boundary.
+const CAN_MODERATE = Boolean(WEBHOOK_SECRET);
+if (!CAN_MODERATE) {
+  console.log('WEBHOOK_SECRET not set — cases 1 and 2 (the auth boundary) CANNOT RUN.');
+  console.log('Running case 3 (public cache control) only. This does NOT verify the');
+  console.log('auth boundary and will exit non-zero regardless of case 3\'s result.\n');
 }
 
 const owner = generateSecretKey();
@@ -76,9 +87,20 @@ function assertStatus(label, actual, allowed) {
 
 async function fetchStatus(url, authHeader) {
   const headers = authHeader ? { Authorization: authHeader } : {};
-  const r = await fetch(url, { headers, cache: 'no-store' });
+  // No `cache: 'no-store'` — undici turns it into a request Cache-Control
+  // header, which changes what the edge does and contaminates the measurement.
+  const r = await fetch(url, { headers });
   await r.arrayBuffer();
-  return { status: r.status, cache: r.headers.get('x-cache'), cc: r.headers.get('cache-control') };
+  return {
+    status: r.status,
+    // Age is the reliable signal that a response came from cache. X-Cache is
+    // not: deliver.vcl runs on every node in the chain and the client sees the
+    // outermost one, which routinely reports MISS while an inner node holds the
+    // object and serves it (observed: age=830 alongside X-Cache: MISS).
+    age: Number(r.headers.get('age') ?? -1),
+    cache: r.headers.get('x-cache'),
+    cc: r.headers.get('cache-control'),
+  };
 }
 
 async function upload(bytes, hash) {
@@ -131,6 +153,7 @@ try {
   console.log(`server ${SERVER}\n`);
 
   // ---- Case 1: Restricted is owner-only, and must not leak via the shared key.
+  if (CAN_MODERATE) {
   console.log('[1] Restricted: owner-only, shared auth=1 cache key');
   const r1 = freshBlob('restricted');
   const up1 = await upload(r1.bytes, r1.hash);
@@ -159,7 +182,10 @@ try {
   const anonRes = await fetchStatus(url1, null);
   assertStatus('anonymous caller is refused', anonRes.status, [404]);
 
+  } // end case 1
+
   // ---- Case 2: AgeRestricted varies by auth presence only.
+  if (CAN_MODERATE) {
   console.log('\n[2] AgeRestricted: authenticated allowed, anonymous age-gated');
   const r2 = freshBlob('age');
   const up2 = await upload(r2.bytes, r2.hash);
@@ -178,28 +204,31 @@ try {
   const ageAnon = await fetchStatus(url2, null);
   assertStatus('anonymous caller is age-gated, not served', ageAnon.status, [401]);
 
+  } // end case 2
+
   // ---- Case 3: public control. Both variants must actually cache, or the
   // whole change is pointless. Warm each key, then require a HIT.
-  console.log('\n[3] Public control: both cache-key variants go hot');
-  const r3 = freshBlob('public');
-  const up3 = await upload(r3.bytes, r3.hash);
-  if (up3.status !== 200) {
-    console.error(`  setup failed: upload returned ${up3.status}`);
+  console.log(`\n[3] Public control on an Active blob: both cache-key variants go hot`);
+  const url3 = `${SERVER}/${PUBLIC_HASH}`;
+  const control = await fetchStatus(url3, null);
+  if (control.status !== 200 || !/public/i.test(control.cc || '')) {
+    console.error(`  setup failed: PUBLIC_HASH is not an Active public blob `
+      + `(status ${control.status}, cache-control ${control.cc}). `
+      + `Set PUBLIC_HASH to a blob whose status is Active.`);
     process.exit(2);
   }
-  created.push(r3.hash);
-  await sleep(2000);
 
-  const url3 = `${SERVER}/${r3.hash}`;
-  const authHdr = authFor(stranger, 'get', [['x', r3.hash]]);
+  const cached = (r) => r.age > 0;
+
+  const authHdr = authFor(stranger, 'get', [['x', PUBLIC_HASH]]);
   await fetchStatus(url3, authHdr);
   await sleep(1500);
   const authWarm = await fetchStatus(url3, authHdr);
   assertStatus('credentialed public read succeeds', authWarm.status, [200]);
-  if (authWarm.cache && /HIT/i.test(authWarm.cache)) {
-    console.log(`  PASS: credentialed public read is served from cache (${authWarm.cache})`);
+  if (cached(authWarm)) {
+    console.log(`  PASS: credentialed public read came from cache (age=${authWarm.age})`);
   } else {
-    console.log(`  FAIL: credentialed public read did not HIT (${authWarm.cache}) — auth traffic is still uncached`);
+    console.log(`  FAIL: credentialed public read did not come from cache (age=${authWarm.age}) — auth traffic is still uncached`);
     failures++;
   }
 
@@ -207,10 +236,10 @@ try {
   await sleep(1500);
   const anonWarm = await fetchStatus(url3, null);
   assertStatus('anonymous public read succeeds', anonWarm.status, [200]);
-  if (anonWarm.cache && /HIT/i.test(anonWarm.cache)) {
-    console.log(`  PASS: anonymous public read is served from cache (${anonWarm.cache})`);
+  if (cached(anonWarm)) {
+    console.log(`  PASS: anonymous public read came from cache (age=${anonWarm.age})`);
   } else {
-    console.log(`  FAIL: anonymous public read did not HIT (${anonWarm.cache})`);
+    console.log(`  FAIL: anonymous public read did not come from cache (age=${anonWarm.age})`);
     failures++;
   }
 } finally {
@@ -219,5 +248,9 @@ try {
   console.log(`  removed ${created.length} fixture blob(s)`);
 }
 
+if (!CAN_MODERATE) {
+  console.log(`\n=== AUTH BOUNDARY NOT VERIFIED (cases 1-2 skipped; case 3 had ${failures} failure(s)) ===`);
+  process.exit(2);
+}
 console.log(`\n=== ${failures === 0 ? 'ALL BOUNDARIES HELD' : `${failures} BOUNDARY FAILURE(S)`} ===`);
 process.exit(failures === 0 ? 0 : 1);
