@@ -38,7 +38,7 @@ deleted), Wellington from a consumer connection. All cache hits.
 |---|---:|---:|---:|---:|
 | **us-central1** | **~85%** | 13 ms | **14 ms** | **13 ms** |
 | europe-west1 | ~11% | **3 ms** | 9 ms | 11 ms |
-| australia-southeast1 | <1% | 2 ms | **97 ms** | 3 ms |
+| australia-southeast1 | <1% | 2 ms | **97 ms** | 3 ms ✅ |
 | nz-wellington † | **0%** | 12 ms | **144 ms** | 18 ms |
 
 **† Wellington is where the team is based, not where users are.** New Zealand does not appear in the
@@ -83,7 +83,15 @@ roughly $35K/month at 1M DAU.
   same-metro fibre. **A US consumer-connection datapoint is still missing and is now the most
   valuable outstanding measurement**, since it covers 85% of traffic and every US number here comes
   from a datacentre.
-- **The verdict logic manufactures failures at low latency.** Sydney Standard was marked FAIL at
-  +43.5% — that is 3 ms against 2 ms. A percentage margin is meaningless against a single-digit
-  baseline; the tool needs an absolute floor.
+- ~~**The verdict logic manufactures failures at low latency.**~~ **Fixed.** The probe now requires a
+  regression to exceed *both* a relative margin and an absolute floor (default 10 ms) before failing.
+  Re-judged with the floor, Sydney reads correctly:
+
+  | Edge | Verdict | Reason |
+  |---|---|---|
+  | bunny Standard | **PASS** | +50.0% but only +1.0 ms, within the 10 ms floor |
+  | bunny Volume | **FAIL** | +4750.0% (+95.0 ms), outside both |
+
+  Errors still bypass the floor entirely — an edge that drops requests fails however fast the
+  survivors were.
 - Cache hit ratio on a real library remains unmeasured and still determines the bill.

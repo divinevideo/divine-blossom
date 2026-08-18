@@ -48,7 +48,7 @@ cannot be eventually-consistent-wrong.
 
 ## Also validated on a Backblaze B2 origin
 
-The same test was repeated with the full production-shaped topology —
+The same test was repeated with the production-shaped topology —
 **GCS (authoritative) → B2 (approved-only replica) → bunny Volume → viewer** — using public bucket
 `divine-delivery-probe` as the pull-zone origin. Identical result:
 
@@ -163,14 +163,26 @@ content silently stays 404.
 New B2 accounts cannot create or convert a public bucket until they have **completed payment
 history** — a card on file is not sufficient, and the error is `no_payment_history`. This blocked
 the B2 origin test until a payment was made. Worth knowing before planning around B2, since a
-private bucket cannot back a pull zone (B2 download authorization tokens expire).
+private bucket cannot back a pull zone *over B2's native download path* — the download authorization
+from `b2_get_download_authorization`, like the account token from `b2_authorize_account`, is
+time-limited, so neither can be pinned into a pull-zone config. That does not rule out the
+S3-compatible endpoint with AWS signing, which is the route the origin decision selects and which
+remains unproven rather than excluded.
 
 ## Teardown
 
-Temporary, delete when the campaign closes (#178):
+**Do not delete pull zone `divine-b2-test` (6289364).** It now carries the custom hostnames
+`v.divine.video` and `v-test.divine.video` with issued Let's Encrypt certificates, and production
+DNS points at it. Its name is misleading — bunny accepts a rename request but does not apply it.
+
+When a production replica bucket exists, **swap this zone's `OriginUrl`** from the test B2 bucket to
+the production one. The hostname, certificates and CNAME all stay put; there is no DNS change and no
+cutover.
+
+Temporary and safe to delete when the campaign closes (#178):
 
 - storage zone `divine-delivery-test` (1722644) and its four objects
 - pull zone `divine-delivery-test` (6289348)
 - pull zones `divine-probe-volume` (6288620), `divine-probe-standard` (6288621)
-- pull zone `divine-b2-test` (6289364)
-- B2 bucket `divine-delivery-probe` (`f6f9ae1e0c0adabd9ff70517`) and its four objects
+- B2 bucket `divine-delivery-probe` (`f6f9ae1e0c0adabd9ff70517`) — **only once zone 6289364's origin
+  has been re-pointed at a production bucket**, since it is that zone's origin

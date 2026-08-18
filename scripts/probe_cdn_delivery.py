@@ -43,6 +43,13 @@ from typing import Dict, List, Optional
 
 READ_CHUNK = 65536
 DEFAULT_TIMEOUT = 30.0
+DEFAULT_FLOOR_MS = 10.0
+"""Absolute latency delta below which a percentage regression is not meaningful.
+
+Measured Sydney at Fastly 2ms vs bunny Standard 3ms: a pure percentage rule calls
+that +43.5% and reports FAIL. One millisecond is imperceptible, and a tool that
+cries wolf there gets ignored when it matters.
+"""
 CACHE_HEADER_NAMES = ("cdn-cache", "cf-cache-status", "x-cache")
 
 
@@ -161,8 +168,14 @@ def select_cache_status(headers) -> Optional[str]:
     return None
 
 
-def compare_to_baseline(candidate: Summary, baseline: Summary, margin_pct: float) -> Verdict:
-    """Judge a candidate edge against the baseline on p95 TTFB.
+def compare_to_baseline(candidate: Summary, baseline: Summary, margin_pct: float,
+                        floor_ms: float = DEFAULT_FLOOR_MS) -> Verdict:
+    """Judge a candidate edge against the baseline on p95 response latency.
+
+    Two gates, both of which must be exceeded to fail: a relative margin and an
+    absolute floor. The floor exists because percentages are meaningless against a
+    single-digit millisecond baseline. Errors bypass both — an edge that drops
+    requests fails regardless of how fast the survivors were.
 
     NO_DATA is deliberately distinct from FAIL: an edge we failed to measure has
     not passed, but it has not been shown to be worse either.
@@ -180,15 +193,23 @@ def compare_to_baseline(candidate: Summary, baseline: Summary, margin_pct: float
             f"{candidate.errors}/{candidate.n} requests failed",
         )
 
-    delta = (candidate.ttfb_p95_ms - baseline.ttfb_p95_ms) / baseline.ttfb_p95_ms * 100.0
+    delta_ms = candidate.ttfb_p95_ms - baseline.ttfb_p95_ms
+    delta = delta_ms / baseline.ttfb_p95_ms * 100.0
+
     if delta <= margin_pct:
-        return Verdict(candidate.edge, candidate.region, "PASS", delta, f"p95 TTFB {delta:+.1f}% vs baseline")
+        return Verdict(candidate.edge, candidate.region, "PASS", delta,
+                       f"p95 {delta:+.1f}% ({delta_ms:+.1f}ms) vs baseline")
+    if delta_ms <= floor_ms:
+        return Verdict(candidate.edge, candidate.region, "PASS", delta,
+                       f"p95 {delta:+.1f}% but only {delta_ms:+.1f}ms, within the "
+                       f"{floor_ms:.0f}ms floor")
     return Verdict(
         candidate.edge,
         candidate.region,
         "FAIL",
         delta,
-        f"p95 TTFB {delta:+.1f}% vs baseline, outside {margin_pct:.0f}% margin",
+        f"p95 {delta:+.1f}% ({delta_ms:+.1f}ms) vs baseline, outside {margin_pct:.0f}% "
+        f"margin and {floor_ms:.0f}ms floor",
     )
 
 
@@ -278,7 +299,9 @@ def main(argv=None) -> int:
     ap.add_argument("--region", default="unknown", help="label for where this probe is running")
     ap.add_argument("--iterations", type=int, default=10, help="measured fetches per path per edge")
     ap.add_argument("--warmup", type=int, default=2, help="unmeasured fetches per path per edge first")
-    ap.add_argument("--margin-pct", type=float, default=20.0, help="allowed p95 TTFB regression")
+    ap.add_argument("--margin-pct", type=float, default=20.0, help="allowed p95 response-latency regression")
+    ap.add_argument("--floor-ms", type=float, default=DEFAULT_FLOOR_MS,
+                    help="absolute delta below which a percentage regression is not meaningful")
     ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     ap.add_argument("--no-reuse", action="store_true",
                     help="force a fresh connection per request (measures cold-start, not steady state)")
@@ -313,11 +336,13 @@ def main(argv=None) -> int:
             summaries[name].connect_p95_ms = percentile(samples, 95)
     baseline = summaries[args.baseline]
     verdicts = [
-        compare_to_baseline(s, baseline, args.margin_pct) for name, s in summaries.items() if name != args.baseline
+        compare_to_baseline(s, baseline, args.margin_pct, args.floor_ms)
+        for name, s in summaries.items() if name != args.baseline
     ]
 
     width = max(len(n) for n in edges)
-    print(f"\nregion={args.region}  baseline={args.baseline}  margin={args.margin_pct:.0f}%\n")
+    print(f"\nregion={args.region}  baseline={args.baseline}  "
+          f"margin={args.margin_pct:.0f}%  floor={args.floor_ms:.0f}ms\n")
     print(f"{'edge'.ljust(width)}  {'connect':>8}  {'p50 resp':>9}  {'p95 resp':>9}  {'Mbps':>7}  {'err':>4}  verdict")
     for name, s in summaries.items():
         conn = f"{s.connect_p50_ms:.0f}ms" if s.connect_p50_ms is not None else "-"

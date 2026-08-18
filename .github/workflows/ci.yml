@@ -117,7 +117,21 @@ jobs:
           FASTLY_API_TOKEN: ${{ secrets.FASTLY_API_TOKEN }}
         run: fastly compute publish --token "$FASTLY_API_TOKEN" --service-id "$FASTLY_SERVICE_ID" --comment "deploy from ${{ github.sha }}"
 
+      # Purging everything invalidates a 365-day edge TTL across the whole
+      # catalogue, and a full refill takes days. Running it on every deploy kept
+      # the cache permanently cold: 12 deploys in the week to 2026-08-18 meant 12
+      # full purges, and byte offload never rose above 13% on any day in that week.
+      #
+      # Blobs are SHA-256 addressed and cannot change, so a deploy almost never
+      # needs this. Prefer a targeted purge by Surrogate-Key -- Compute sets the
+      # hash as the key on every cacheable response, so one key reaches a blob and
+      # all of its derivatives.
+      #
+      # Opt in only when a deploy changes response semantics for already-cached
+      # objects (headers, status mapping, body framing), by putting [purge-cache]
+      # in the commit message.
       - name: Purge CDN cache
+        if: contains(github.event.head_commit.message, '[purge-cache]')
         env:
           FASTLY_API_TOKEN: ${{ secrets.FASTLY_API_TOKEN }}
         run: fastly purge --all --service-id "$FASTLY_SERVICE_ID" --token "$FASTLY_API_TOKEN"

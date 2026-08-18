@@ -2462,7 +2462,57 @@ fn parse_provider_status(
 }
 
 fn is_retryable_provider_failure(failure: &ProviderFailure) -> bool {
-    failure.timed_out || matches!(failure.status_code, Some(429 | 500 | 502 | 503 | 504))
+    failure.timed_out
+        || matches!(failure.status_code, Some(429 | 500 | 502 | 503 | 504))
+        || is_expired_gcp_access_token_response(failure.status_code, &failure.body)
+}
+
+fn is_expired_gcp_access_token_response(status_code: Option<u16>, body: &str) -> bool {
+    status_code == Some(StatusCode::UNAUTHORIZED.as_u16()) && body.contains("ACCESS_TOKEN_EXPIRED")
+}
+
+pub(crate) fn invalidate_gcp_access_token_if_expired_response(
+    access_token: &str,
+    status_code: Option<u16>,
+    body: &str,
+) {
+    if is_expired_gcp_access_token_response(status_code, body) {
+        // The provider is authoritative about token validity. Clear only the
+        // token used by this request so the outer provider retry fetches a
+        // fresh credential without erasing another request's newer token.
+        access_token_cache().invalidate_if(access_token);
+    }
+}
+
+/// Turn a bearer-authenticated GCP provider response into a transcription
+/// result, dropping the credential first when the provider rejected it.
+///
+/// Every GCP provider needs the same two steps in the same order, and the
+/// order matters: the token must leave the shared cache even though the
+/// caller is about to return an error, or the retry re-sends the dead
+/// credential. Keeping it in one function means a new provider cannot wire up
+/// half of it.
+pub(crate) fn gcp_provider_response_outcome(
+    access_token: &str,
+    status_code: u16,
+    retry_after_header: Option<&str>,
+    body: String,
+) -> std::result::Result<String, ProviderFailure> {
+    invalidate_gcp_access_token_if_expired_response(access_token, Some(status_code), &body);
+
+    if StatusCode::from_u16(status_code)
+        .map(|status| status.is_success())
+        .unwrap_or(false)
+    {
+        Ok(body)
+    } else {
+        Err(parse_provider_status(
+            Some(status_code),
+            retry_after_header,
+            &body,
+            false,
+        ))
+    }
 }
 
 fn retry_delay_for_attempt(
@@ -2875,8 +2925,8 @@ fn transcription_response_format(model: &str) -> &'static str {
     }
 }
 
-/// Process-global cache for GCP access tokens. Tokens issued by the
-/// metadata server are valid for ~60 minutes; we cache for less so a
+/// Process-global cache for GCP access tokens. Metadata access tokens are cached
+/// according to the reported remaining lifetime, minus a safety window, so a
 /// callsite never hands a near-expired token to a long upstream call.
 struct AccessTokenCache {
     inner: std::sync::Mutex<Option<CachedAccessToken>>,
@@ -2912,6 +2962,21 @@ impl AccessTokenCache {
             });
         }
     }
+
+    /// Drop a rejected token without racing a concurrent refresh. A second
+    /// request may already have replaced the stale entry by the time its 401
+    /// arrives, so only clear the cache when it still contains that token.
+    fn invalidate_if(&self, token: &str) {
+        if let Ok(mut guard) = self.inner.lock() {
+            if guard
+                .as_ref()
+                .map(|cached| cached.token == token)
+                .unwrap_or(false)
+            {
+                *guard = None;
+            }
+        }
+    }
 }
 
 static ACCESS_TOKEN_CACHE: std::sync::OnceLock<AccessTokenCache> = std::sync::OnceLock::new();
@@ -2920,10 +2985,41 @@ fn access_token_cache() -> &'static AccessTokenCache {
     ACCESS_TOKEN_CACHE.get_or_init(AccessTokenCache::new)
 }
 
-/// Cache fresh tokens for slightly less than the metadata-server TTL so
-/// a request that uses the cached token cannot exceed the actual token
-/// expiry mid-flight.
+/// Upper bound for cached access and identity tokens. Access-token caching is
+/// also bounded by the metadata server's reported remaining lifetime below.
 const ACCESS_TOKEN_CACHE_TTL: Duration = Duration::from_secs(50 * 60);
+
+/// Do not hand a token to a provider near its actual expiry. Gemini calls can
+/// take up to 120 seconds, and a little extra skew covers clocks and transit.
+const ACCESS_TOKEN_EXPIRY_SKEW: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Deserialize)]
+struct MetadataAccessToken {
+    #[serde(rename = "access_token")]
+    token: String,
+    expires_in: Option<u64>,
+}
+
+/// Redact the bearer token. This struct is one `{:?}` away from writing a live
+/// GCP credential into the request logs, so `Debug` never carries the secret.
+impl std::fmt::Debug for MetadataAccessToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetadataAccessToken")
+            .field("token", &"<redacted>")
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
+}
+
+impl MetadataAccessToken {
+    fn cache_ttl(&self) -> Duration {
+        self.expires_in
+            .map(Duration::from_secs)
+            .map(|ttl| ttl.saturating_sub(ACCESS_TOKEN_EXPIRY_SKEW))
+            .unwrap_or(ACCESS_TOKEN_CACHE_TTL)
+            .min(ACCESS_TOKEN_CACHE_TTL)
+    }
+}
 
 const METADATA_FETCH_MAX_ATTEMPTS: u32 = 3;
 
@@ -2941,8 +3037,8 @@ fn token_fetch_retry_delay(attempt: u32) -> Duration {
 /// Fetch a GCP access token from the metadata server (works on Cloud Run)
 /// or fall back to `gcloud auth print-access-token` locally.
 ///
-/// Tokens are cached process-wide for `ACCESS_TOKEN_CACHE_TTL`. On a cache
-/// miss, the metadata server is retried `METADATA_FETCH_MAX_ATTEMPTS`
+/// Tokens are cached process-wide for no longer than `ACCESS_TOKEN_CACHE_TTL`.
+/// On a cache miss, the metadata server is retried `METADATA_FETCH_MAX_ATTEMPTS`
 /// times before giving up — a transient hiccup used to fall straight
 /// through to a `gcloud` exec that doesn't exist in the container, which
 /// in turn triggered an expensive Vertex AI Gemini fallback.
@@ -2955,9 +3051,10 @@ async fn fetch_gcp_access_token() -> std::result::Result<String, ProviderFailure
 
     for attempt in 0..METADATA_FETCH_MAX_ATTEMPTS {
         match fetch_token_from_metadata_server().await {
-            Ok(token) => {
-                access_token_cache().set(token.clone(), ACCESS_TOKEN_CACHE_TTL, Instant::now());
-                return Ok(token);
+            Ok(metadata_token) => {
+                let cache_ttl = metadata_token.cache_ttl();
+                access_token_cache().set(metadata_token.token.clone(), cache_ttl, Instant::now());
+                return Ok(metadata_token.token);
             }
             Err(err) => {
                 last_metadata_error = Some(err);
@@ -2972,8 +3069,8 @@ async fn fetch_gcp_access_token() -> std::result::Result<String, ProviderFailure
     // surface a `timed_out=true` failure so the per-provider retry loop
     // in `transcribe_audio_via_provider` treats it as transient — a
     // metadata blip should not collapse straight into the Gemini fallback.
-    let metadata_summary = last_metadata_error
-        .unwrap_or_else(|| "metadata server unreachable".to_string());
+    let metadata_summary =
+        last_metadata_error.unwrap_or_else(|| "metadata server unreachable".to_string());
 
     match tokio::process::Command::new("gcloud")
         .args(["auth", "print-access-token"])
@@ -3004,9 +3101,9 @@ async fn fetch_gcp_access_token() -> std::result::Result<String, ProviderFailure
     }
 }
 
-/// One round-trip to the GCE/Cloud Run metadata server. Returns the raw
-/// access token on success, or a short human-readable error on failure.
-async fn fetch_token_from_metadata_server() -> std::result::Result<String, String> {
+/// One round-trip to the GCE/Cloud Run metadata server. Returns both the token
+/// and its remaining lifetime; the latter must drive the application cache.
+async fn fetch_token_from_metadata_server() -> std::result::Result<MetadataAccessToken, String> {
     let metadata_url =
         "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
     let client = reqwest::Client::new();
@@ -3027,12 +3124,16 @@ async fn fetch_token_from_metadata_server() -> std::result::Result<String, Strin
         .text()
         .await
         .map_err(|e| format!("failed to read metadata body: {}", e))?;
-    let json: serde_json::Value =
-        serde_json::from_str(&body).map_err(|e| format!("failed to parse metadata json: {}", e))?;
-    json["access_token"]
-        .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| "no access_token in metadata response".to_string())
+    parse_metadata_access_token(&body)
+}
+
+fn parse_metadata_access_token(body: &str) -> std::result::Result<MetadataAccessToken, String> {
+    let token: MetadataAccessToken =
+        serde_json::from_str(body).map_err(|e| format!("failed to parse metadata json: {}", e))?;
+    if token.token.trim().is_empty() {
+        return Err("no access_token in metadata response".to_string());
+    }
+    Ok(token)
 }
 
 /// Build the Gemini transcription prompt, optionally biased to a specific
@@ -3164,14 +3265,12 @@ async fn transcribe_via_gemini(
         )
     })?;
 
-    if !status.is_success() {
-        return Err(parse_provider_status(
-            Some(status.as_u16()),
-            retry_after_header.as_deref(),
-            &resp_body,
-            false,
-        ));
-    }
+    let resp_body = gcp_provider_response_outcome(
+        &access_token,
+        status.as_u16(),
+        retry_after_header.as_deref(),
+        resp_body,
+    )?;
 
     // Extract text from Vertex AI response: candidates[0].content.parts[0].text
     let resp_json: serde_json::Value = serde_json::from_str(&resp_body).map_err(|e| {
@@ -3227,9 +3326,7 @@ pub(crate) fn identity_token_cache_for_audience(audience: &str) -> &'static Acce
 /// Fetch a Cloud Run identity token (OIDC) for `audience`. Cached per
 /// audience for 50 minutes. On metadata-server failure we apply the same
 /// 3-attempt retry as `fetch_gcp_access_token`.
-async fn fetch_gcp_identity_token(
-    audience: &str,
-) -> std::result::Result<String, ProviderFailure> {
+async fn fetch_gcp_identity_token(audience: &str) -> std::result::Result<String, ProviderFailure> {
     let cache = identity_token_cache_for_audience(audience);
     if let Some(token) = cache.get(Instant::now()) {
         return Ok(token);
@@ -4041,42 +4138,66 @@ async fn finalize_transcript(
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_generation, build_cloud_tasks_task_body, build_gemini_prompt,
+        access_token_cache, attach_generation, build_cloud_tasks_task_body, build_gemini_prompt,
         build_transcode_status_webhook_payload, classify_audio_extract_error, constant_time_eq,
         contains_instruction_echo, decide_transcript_lock_action, enqueue_status_task_request,
         enqueue_status_task_request_with_retry, ensure_transcribe_audio_size,
-        identity_token_cache_for_audience, is_empty_transcript_normalize_error,
-        is_implausible_text_density, is_loop_hallucination, is_retryable_provider_failure,
-        next_status_generation, normalize_for_marker_scan, normalize_transcript_to_vtt,
-        parakeet_request_url, parse_audio_analysis_output, parse_provider_status,
-        retry_delay_for_attempt, should_drop_low_signal_transcript, status_event_generation,
-        status_task_id, token_fetch_retry_delay, transcript_drop_reason,
-        transcription_response_format, AccessTokenCache, AudioAnalysis, AudioExtractErrorKind,
-        Config, ParsedVtt, StatusTaskRequest, TranscriptConfidence, TranscriptDropReason,
-        TranscriptLockAction, TranscriptLockState, TranscriptLockStatus, VideoInfo,
-        EXACT_PROMPT_MARKERS_CURRENT, EXACT_PROMPT_MARKERS_RETIRED, MAX_TRANSCRIBE_AUDIO_BYTES,
-        STATUS_EVENT_PROCESSING, STATUS_EVENT_TERMINAL,
+        gcp_provider_response_outcome, identity_token_cache_for_audience,
+        is_empty_transcript_normalize_error, is_implausible_text_density, is_loop_hallucination,
+        is_retryable_provider_failure, next_status_generation, normalize_for_marker_scan,
+        normalize_transcript_to_vtt, parakeet_request_url, parse_audio_analysis_output,
+        parse_metadata_access_token, parse_provider_status, retry_delay_for_attempt,
+        should_drop_low_signal_transcript, status_event_generation, status_task_id,
+        token_fetch_retry_delay, transcript_drop_reason, transcription_response_format,
+        AccessTokenCache, AudioAnalysis, AudioExtractErrorKind, Config, ParsedVtt,
+        StatusTaskRequest, TranscriptConfidence, TranscriptDropReason, TranscriptLockAction,
+        TranscriptLockState, TranscriptLockStatus, VideoInfo, EXACT_PROMPT_MARKERS_CURRENT,
+        EXACT_PROMPT_MARKERS_RETIRED, MAX_TRANSCRIBE_AUDIO_BYTES, STATUS_EVENT_PROCESSING,
+        STATUS_EVENT_TERMINAL,
     };
     use std::{
         io::{Read, Write},
         net::TcpListener,
         sync::{
             atomic::{AtomicUsize, Ordering},
-            Arc,
+            Arc, Mutex,
         },
         thread,
         time::{Duration, Instant},
     };
 
+    /// `access_token_cache()` is process-global, so the tests that seed it must
+    /// not run concurrently with each other. Held for the body of each such
+    /// test; poisoning is irrelevant because the guarded state is the cache,
+    /// not this unit.
+    static GLOBAL_TOKEN_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_global_token_cache() -> std::sync::MutexGuard<'static, ()> {
+        GLOBAL_TOKEN_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn spawn_status_server(
         statuses: Vec<u16>,
+    ) -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+        spawn_status_server_with_bodies(
+            statuses
+                .into_iter()
+                .map(|status| (status, "OK".to_string()))
+                .collect(),
+        )
+    }
+
+    fn spawn_status_server_with_bodies(
+        responses: Vec<(u16, String)>,
     ) -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
         let url = format!("http://{}", listener.local_addr().expect("local addr"));
         let request_count = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&request_count);
         let handle = thread::spawn(move || {
-            for status in statuses {
+            for (status, body) in responses {
                 let (mut stream, _) = listener.accept().expect("accept test request");
                 count.fetch_add(1, Ordering::SeqCst);
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
@@ -4084,14 +4205,18 @@ mod tests {
                 let _ = stream.read(&mut buf);
                 let reason = match status {
                     200 => "OK",
+                    401 => "Unauthorized",
                     409 => "Conflict",
                     500 => "Internal Server Error",
                     502 => "Bad Gateway",
                     _ => "Status",
                 };
                 let response = format!(
-                    "HTTP/1.1 {} {}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
-                    status, reason
+                    "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    reason,
+                    body.len(),
+                    body
                 );
                 stream
                     .write_all(response.as_bytes())
@@ -4099,6 +4224,53 @@ mod tests {
             }
         });
         (url, request_count, handle)
+    }
+
+    /// Like `spawn_status_server_with_bodies`, but records the `Authorization`
+    /// header of each request so a test can assert which credential was sent.
+    fn spawn_status_server_recording_auth(
+        responses: Vec<(u16, String)>,
+    ) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let bearers = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&bearers);
+        let handle = thread::spawn(move || {
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().expect("accept test request");
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = [0_u8; 8192];
+                let read = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                if let Some(header) = request
+                    .lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+                {
+                    seen.lock()
+                        .expect("bearer log")
+                        .push(header["authorization:".len()..].trim().to_string());
+                }
+                let reason = match status {
+                    200 => "OK",
+                    401 => "Unauthorized",
+                    409 => "Conflict",
+                    500 => "Internal Server Error",
+                    502 => "Bad Gateway",
+                    _ => "Status",
+                };
+                let response = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    reason,
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write test response");
+            }
+        });
+        (url, bearers, handle)
     }
 
     #[test]
@@ -4353,11 +4525,59 @@ mod tests {
             webhook_secret: None,
         };
 
-        let result = enqueue_status_task_request_with_retry(&client, &request).await;
+        let result = enqueue_status_task_request_with_retry(&client, &request, || async {
+            Ok("access-token".to_string())
+        })
+        .await;
 
         assert!(result.is_ok());
         server.join().expect("server thread should finish");
         assert_eq!(request_count.load(Ordering::SeqCst), 3);
+    }
+
+    /// The regression both second-judgment reviewers caught: clearing the
+    /// cached token is useless if the remaining attempts replay the dead one.
+    #[tokio::test]
+    async fn enqueue_status_task_retries_with_a_refreshed_token_after_expiry() {
+        let expired_body = r#"{"error":{"code":401,"status":"UNAUTHENTICATED","details":[{"reason":"ACCESS_TOKEN_EXPIRED"}]}}"#;
+        let (create_url, bearers, server) = spawn_status_server_recording_auth(vec![
+            (401, expired_body.to_string()),
+            (200, "OK".to_string()),
+        ]);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let payload = serde_json::json!({"sha256": "abc123", "status": "complete"});
+        let hash = "c".repeat(64);
+        let request = StatusTaskRequest {
+            create_url: &create_url,
+            queue_path: "projects/proj/locations/us-central1/queues/derivative-status",
+            target_url: "https://edge.example/admin/transcode-status",
+            label: "transcode",
+            hash: &hash,
+            generation: 9,
+            payload: &payload,
+            token: "stale-token",
+            webhook_secret: None,
+        };
+
+        let result = enqueue_status_task_request_with_retry(&client, &request, || async {
+            Ok("fresh-token".to_string())
+        })
+        .await;
+
+        assert!(result.is_ok());
+        server.join().expect("server thread should finish");
+        let seen = bearers.lock().expect("bearer log");
+        assert_eq!(
+            *seen,
+            vec![
+                "Bearer stale-token".to_string(),
+                "Bearer fresh-token".to_string()
+            ],
+            "the retry after a 401 must carry a refreshed credential",
+        );
     }
 
     #[test]
@@ -4947,11 +5167,47 @@ mod tests {
     fn loop_guard_passes_long_unique_text() {
         let mut s = String::new();
         for word in [
-            "The", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "near",
-            "the", "river", "where", "the", "old", "mill", "stood", "for", "centuries",
-            "until", "the", "great", "flood", "carried", "it", "downstream", "into", "the",
-            "harbor", "where", "fishermen", "still", "remember", "its", "broken", "wheel",
-            "rotting", "in", "the", "salt", "spray",
+            "The",
+            "quick",
+            "brown",
+            "fox",
+            "jumps",
+            "over",
+            "the",
+            "lazy",
+            "dog",
+            "near",
+            "the",
+            "river",
+            "where",
+            "the",
+            "old",
+            "mill",
+            "stood",
+            "for",
+            "centuries",
+            "until",
+            "the",
+            "great",
+            "flood",
+            "carried",
+            "it",
+            "downstream",
+            "into",
+            "the",
+            "harbor",
+            "where",
+            "fishermen",
+            "still",
+            "remember",
+            "its",
+            "broken",
+            "wheel",
+            "rotting",
+            "in",
+            "the",
+            "salt",
+            "spray",
         ]
         .iter()
         .cycle()
@@ -5370,6 +5626,173 @@ mod tests {
             cache.get(now + Duration::from_secs(20)),
             Some("second".to_string())
         );
+    }
+
+    #[test]
+    fn access_token_cache_only_invalidates_the_token_that_failed() {
+        let cache = AccessTokenCache::new();
+        let now = Instant::now();
+        cache.set("stale".to_string(), Duration::from_secs(60), now);
+        cache.invalidate_if("different");
+        assert_eq!(cache.get(now), Some("stale".to_string()));
+
+        cache.invalidate_if("stale");
+        assert_eq!(cache.get(now), None);
+    }
+
+    #[test]
+    fn metadata_access_token_debug_redacts_the_bearer_token() {
+        let token =
+            parse_metadata_access_token(r#"{"access_token":"ya29.super-secret","expires_in":600}"#)
+                .expect("metadata token should parse");
+
+        let rendered = format!("{:?}", token);
+        assert!(!rendered.contains("ya29.super-secret"), "{}", rendered);
+        assert!(rendered.contains("<redacted>"), "{}", rendered);
+        assert!(rendered.contains("600"), "{}", rendered);
+    }
+
+    #[tokio::test]
+    // The guard is deliberately held across the await: it serializes this test
+    // against the other tests that seed the process-global token cache, and the
+    // seed has to be in place before the request runs. It cannot deadlock —
+    // each `#[tokio::test]` gets its own current-thread runtime on its own
+    // thread, so a second test blocking on `.lock()` cannot stall the holder.
+    #[allow(clippy::await_holding_lock)]
+    async fn enqueue_status_task_drops_a_token_google_rejected_as_expired() {
+        let _guard = lock_global_token_cache();
+        let expired_body = r#"{"error":{"code":401,"status":"UNAUTHENTICATED","details":[{"reason":"ACCESS_TOKEN_EXPIRED"}]}}"#;
+        let (create_url, _count, server) =
+            spawn_status_server_with_bodies(vec![(401, expired_body.to_string())]);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let payload = serde_json::json!({"sha256": "abc123", "status": "complete"});
+        let hash = "b".repeat(64);
+
+        // A token value unique to this test, so the assertion cannot be
+        // disturbed by another test sharing the process-global cache.
+        let token = "expired-token-for-enqueue-test";
+        access_token_cache().set(token.to_string(), Duration::from_secs(600), Instant::now());
+
+        let request = StatusTaskRequest {
+            create_url: &create_url,
+            queue_path: "projects/proj/locations/us-central1/queues/derivative-status",
+            target_url: "https://edge.example/admin/transcode-status",
+            label: "transcode",
+            hash: &hash,
+            generation: 7,
+            payload: &payload,
+            token,
+            webhook_secret: None,
+        };
+
+        let result = enqueue_status_task_request(&client, &request).await;
+
+        assert!(result.is_err());
+        server.join().expect("server thread should finish");
+        assert_eq!(
+            access_token_cache().get(Instant::now()),
+            None,
+            "a token Google rejected as expired must be cleared from the shared cache",
+        );
+    }
+
+    #[test]
+    fn gcp_provider_response_clears_the_rejected_token_and_reports_retryable() {
+        let _guard = lock_global_token_cache();
+        let expired_body = r#"{"error":{"code":401,"status":"UNAUTHENTICATED","details":[{"reason":"ACCESS_TOKEN_EXPIRED"}]}}"#;
+        let token = "expired-token-for-provider-outcome-test";
+        access_token_cache().set(token.to_string(), Duration::from_secs(600), Instant::now());
+
+        let failure = gcp_provider_response_outcome(token, 401, None, expired_body.to_string())
+            .expect_err("an expired-token response is a provider failure");
+
+        assert!(
+            is_retryable_provider_failure(&failure),
+            "an expired token must be retryable so the provider loop refetches",
+        );
+        assert_eq!(
+            access_token_cache().get(Instant::now()),
+            None,
+            "the rejected token must not survive in the shared cache",
+        );
+    }
+
+    #[test]
+    fn gcp_provider_response_keeps_a_token_rejected_for_another_reason() {
+        let _guard = lock_global_token_cache();
+        let token = "valid-token-for-provider-outcome-test";
+        access_token_cache().set(token.to_string(), Duration::from_secs(600), Instant::now());
+
+        let failure =
+            gcp_provider_response_outcome(token, 401, None, "invalid API key".to_string())
+                .expect_err("a 401 is still a provider failure");
+
+        assert!(!is_retryable_provider_failure(&failure));
+        assert_eq!(
+            access_token_cache().get(Instant::now()),
+            Some(token.to_string()),
+            "only an expired-token rejection may clear the cache",
+        );
+        access_token_cache().invalidate_if(token);
+    }
+
+    #[test]
+    fn gcp_provider_response_passes_a_success_body_through() {
+        let body = r#"{"results":[]}"#;
+        let outcome = gcp_provider_response_outcome("any-token", 200, None, body.to_string());
+
+        assert_eq!(outcome.expect("2xx is a success"), body);
+    }
+
+    #[test]
+    fn metadata_access_token_uses_reported_remaining_lifetime() {
+        let token = parse_metadata_access_token(
+            r#"{"access_token":"token-abc","expires_in":600,"token_type":"Bearer"}"#,
+        )
+        .expect("metadata token should parse");
+
+        assert_eq!(token.token, "token-abc");
+        assert_eq!(token.cache_ttl(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn metadata_access_token_cache_ttl_is_capped() {
+        let token = parse_metadata_access_token(
+            r#"{"access_token":"token-abc","expires_in":3600,"token_type":"Bearer"}"#,
+        )
+        .expect("metadata token should parse");
+
+        assert_eq!(token.cache_ttl(), Duration::from_secs(50 * 60));
+    }
+
+    #[test]
+    fn metadata_access_token_without_lifetime_uses_cache_cap() {
+        let token = parse_metadata_access_token(r#"{"access_token":"token-abc"}"#)
+            .expect("metadata token should parse");
+
+        assert_eq!(token.cache_ttl(), Duration::from_secs(50 * 60));
+    }
+
+    #[test]
+    fn expired_gcp_access_token_is_retryable() {
+        let failure = parse_provider_status(
+            Some(401),
+            None,
+            r#"{"error":{"status":"UNAUTHENTICATED","details":[{"reason":"ACCESS_TOKEN_EXPIRED"}]}}"#,
+            false,
+        );
+
+        assert!(is_retryable_provider_failure(&failure));
+    }
+
+    #[test]
+    fn unrelated_unauthorized_response_is_not_retryable() {
+        let failure = parse_provider_status(Some(401), None, "invalid API key", false);
+
+        assert!(!is_retryable_provider_failure(&failure));
     }
 
     #[test]
@@ -6421,9 +6844,10 @@ async fn enqueue_status_task_with_retry(
         token: &token,
         webhook_secret: config.webhook_secret.as_deref(),
     };
-    enqueue_status_task_request_with_retry(client, &request).await
+    enqueue_status_task_request_with_retry(client, &request, fetch_gcp_access_token).await
 }
 
+#[derive(Clone, Copy)]
 struct StatusTaskRequest<'a> {
     create_url: &'a str,
     queue_path: &'a str,
@@ -6436,18 +6860,40 @@ struct StatusTaskRequest<'a> {
     webhook_secret: Option<&'a str>,
 }
 
-async fn enqueue_status_task_request_with_retry(
+/// Retry a Cloud Tasks enqueue, re-reading the access token before each retry.
+///
+/// `refresh_token` is `fetch_gcp_access_token` in production, which serves the
+/// process-global cache. That is what makes the retry meaningful: a
+/// `401 ACCESS_TOKEN_EXPIRED` drops the rejected token from that cache, so the
+/// next call fetches a live credential instead of replaying the dead one. On
+/// any other failure the cache still holds the token and the refresh is a cheap
+/// read. A refresh that fails leaves the previous token in place, so a metadata
+/// blip degrades to the old behaviour rather than aborting the retry.
+async fn enqueue_status_task_request_with_retry<F, Fut>(
     client: &reqwest::Client,
     request: &StatusTaskRequest<'_>,
-) -> anyhow::Result<()> {
+    mut refresh_token: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<String, ProviderFailure>>,
+{
     let mut last_error: Option<anyhow::Error> = None;
+    let mut token = request.token.to_string();
     for attempt in 0..3 {
-        match enqueue_status_task_request(client, request).await {
+        let attempt_request = StatusTaskRequest {
+            token: &token,
+            ..*request
+        };
+        match enqueue_status_task_request(client, &attempt_request).await {
             Ok(()) => return Ok(()),
             Err(error) => {
                 last_error = Some(error);
                 if attempt < 2 {
                     tokio::time::sleep(token_fetch_retry_delay(attempt)).await;
+                    if let Ok(fresh) = refresh_token().await {
+                        token = fresh;
+                    }
                 }
             }
         }
@@ -6492,6 +6938,11 @@ async fn enqueue_status_task_request(
     } else {
         let code = resp.status();
         let text = resp.text().await.unwrap_or_default();
+        // Cloud Tasks reads the same process-global access-token cache as the
+        // transcription providers. Without this, a token Google has already
+        // rejected stays cached for the rest of its TTL and every status
+        // webhook enqueued in that window fails the same way.
+        invalidate_gcp_access_token_if_expired_response(request.token, Some(code.as_u16()), &text);
         Err(anyhow!("create task returned {}: {}", code, text))
     }
 }
