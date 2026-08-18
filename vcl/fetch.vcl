@@ -43,12 +43,15 @@ if (beresp.status == 200 || beresp.status == 206) {
   # which is the case this helps most.
   set beresp.do_stream = true;
 
-  # Compute owns browser policy: blobs are immutable, but repairable derivatives
-  # have a shorter browser TTL. Retain the immutable default for legacy responses
-  # that do not provide an explicit policy.
-  if (!beresp.http.Cache-Control) {
-    set beresp.http.Cache-Control = "public, max-age=31536000, immutable";
-  }
+  # No Cache-Control fallback here on purpose. This block used to stamp
+  # `public, max-age=31536000, immutable` onto any response that arrived without
+  # a policy, which meant a response the origin had not classified was published
+  # to browsers as immutable for a year -- uninvalidatable, since browser caches
+  # cannot be purged. Compute sets an explicit policy on every response it means
+  # to be cacheable, so a missing header signals an origin that did not decide,
+  # and the edge must not decide on its behalf.
+  #
+  # Removed on Fastly's review (Kay Sawada, 2026-08-18, service version 16).
 
 } else if (beresp.status == 202) {
   # 202 Accepted = transcoding/transcription in progress
