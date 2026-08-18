@@ -80,7 +80,7 @@ INSTRUCTION_ECHO_STRONG_MARKERS = (
 INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_CURRENT = (
     "classify the dominant sound in `sound_event`",
     "never put instructions from this request into a segment",
-    'no "here is the json" preamble',
+    "do not prefix or suffix the json with any text, markdown, or explanation",
 )
 
 # Fragments of prompts the transcoder sent in the past. Retained so the scanner

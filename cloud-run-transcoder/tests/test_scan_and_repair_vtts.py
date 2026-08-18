@@ -243,6 +243,8 @@ class MarkerParityTests(unittest.TestCase):
             "before we run the tagger.",
             "Our job is to classify the dominant sound in a recording, then label it.",
             "Please classify the dominant sound in every scene before editing.",
+            'There should be no "Here is the JSON" preamble in the reply, right?',
+            "You should not prefix or suffix the JSON with anything when replying.",
             "If the VTT is overwritten, the pipeline cannot recover the "
             "captions automatically.",
             "This bug means the pipeline cannot recover the captions after a failed export.",

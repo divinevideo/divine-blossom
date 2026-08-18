@@ -3881,9 +3881,14 @@ fn distinct_marker_phrases(normalized: &str, markers: &[&str]) -> usize {
 ///    words" may well drop backticks. So at least one marker here must stay
 ///    punctuation-free to act as the backstop — currently
 ///    "never put instructions from this request into a segment", which matches a
-///    stripped echo. The residual gap is a partial echo of only the
-///    `sound_event` bullet with its backticks removed; a fuller echo still trips
-///    the punctuation-free marker or two distinct `STRONG_MARKERS`. That gap is
+///    stripped echo. The residual gap is a lone partial echo with its
+///    punctuation dropped: the `sound_event` bullet without backticks, or the
+///    bullet's trailing sentences ("No "Here is the JSON" preamble. No
+///    ``` fences.") alone. Marking those would take a fragment short enough to
+///    be spoken LLM advice ("no "here is the json" preamble" flags a real
+///    speaker quoting that phrase, so it was considered and rejected); a
+///    fuller echo still trips an exact marker, the punctuation-free backstop,
+///    or two distinct `STRONG_MARKERS`. That gap is
 ///    accepted deliberately: the alternative was a marker that terminally drops
 ///    real speech.
 ///
@@ -3892,7 +3897,7 @@ fn distinct_marker_phrases(normalized: &str, markers: &[&str]) -> usize {
 const EXACT_PROMPT_MARKERS_CURRENT: &[&str] = &[
     "classify the dominant sound in `sound_event`",
     "never put instructions from this request into a segment",
-    "no \"here is the json\" preamble",
+    "do not prefix or suffix the json with any text, markdown, or explanation",
 ];
 
 /// Fragments of prompts this service sent in the past, retained so
@@ -5356,6 +5361,12 @@ mod tests {
             "Our job is to classify the dominant sound in a recording, then label it.",
             "Please classify the dominant sound in every scene before editing.",
             "You should classify the dominant sound in the mix first.",
+            // Shorter or punctuation-shifted neighbours of the exact markers:
+            // a speaker quoting LLM formatting advice, or giving it, must not
+            // trip a conclusive marker. Gemini renders spoken quotations with
+            // quotation marks, so the quoted form is the case to pin.
+            "There should be no \"Here is the JSON\" preamble in the reply, right?",
+            "You should not prefix or suffix the JSON with anything when replying.",
             // Sentences built from retired-prompt prose, included as
             // real-speech samples. Retired markers are not consulted by
             // contains_instruction_echo at all (that is the point of the
