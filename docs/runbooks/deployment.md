@@ -105,19 +105,18 @@ service](#a-traffic-rollback-pins-the-service) for that case, and read the
 serving revision when the question is what production is answering with rather
 than what the next deploy will merge onto.
 
-Do not assume that safety applies to the other deploy paths yet:
+Current configuration-preservation status by deploy path:
 
 - `cloud-run-upload/deploy.sh` still uses `--set-env-vars` and `--set-secrets`.
 - `cloud-run-asr-parakeet/deploy.sh` still uses `--set-env-vars`.
 - `scripts/deploy-cloud-function.sh` still uses `--set-env-vars`.
-- `.github/workflows/ci.yml` still deploys `process-blob` with
-  `--set-env-vars`, so every merge to `main` can replace live `process-blob`
-  environment variables with the smaller CI set.
+- `.github/workflows/ci.yml` deploys `process-blob` with `--update-env-vars`,
+  preserving keys that the workflow does not manage.
 
 Never add new `--set-env-vars` or `--set-secrets` usage unless the command owns
 the complete live configuration. Both replace the entire configuration and
-silently drop live settings the deploy path does not name. PR #153 fixed this
-for the transcoder script only; the other deploy paths still need the same
+silently drop live settings the deploy path does not name. PR #153 fixed the
+transcoder script; the remaining manual deploy paths still need the same
 treatment; see issue #171.
 
 ## Exported shell variables override script defaults
