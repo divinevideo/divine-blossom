@@ -101,6 +101,9 @@ same window. **Unconfirmed**; needs Fastly's audit log (section 9, ask 1).
 - **The purge alone explains everything.** It explains the step change in
   *request* hit ratio. It does **not** explain byte offload sitting at 1-13% for
   the entire week, which is structural (0.1 and 0.2).
+- **PR #200 diagnostics going live on the request path.** Falsified by a second
+  session — neither log endpoint exists on either service under any provider
+  type. See sections 8 and 12.1.
 
 ---
 
@@ -479,6 +482,20 @@ Remaining live explanations, none provable from this repo alone:
    path was always like this" — and it must answer from US POPs, not just CHC.
 3. **Fastly-side network/POP behaviour in the window** — covered by the
    section 9 asks, which stand.
+
+**Reconciliation with section 0 (written in a parallel session).** 12.6's
+conclusion — that no *code* change in the window explains this — holds, and
+section 0 agrees with it. The cause found in section 0 is not a code change: it
+is a recurring *operation*. CI ran `fastly purge --all` on every deploy, so the
+cache was wiped 12 times that week and never filled, and the 22:00 step change
+is best explained by a manual purge, which leaves no service version behind.
+That is why it is invisible to a deploy-to-commit audit. Both analyses converge
+on the same place: nothing that shipped did this, the cache handling did.
+
+Item 2 above still stands and is still the right instrument — but note it now
+has a confound to control for. Any cold-path measurement taken before the CI
+purge fix lands, or shortly after any purge, is measuring a cache that was
+recently emptied, not a steady-state cold path.
 
 ---
 
