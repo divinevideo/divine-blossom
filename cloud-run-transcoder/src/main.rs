@@ -5356,8 +5356,13 @@ mod tests {
             "Our job is to classify the dominant sound in a recording, then label it.",
             "Please classify the dominant sound in every scene before editing.",
             "You should classify the dominant sound in the mix first.",
-            // Retired markers run in this gate too, where the current prompt can
-            // no longer produce them, so any live match is a real speaker.
+            // Sentences built from retired-prompt prose, included as
+            // real-speech samples. Retired markers are not consulted by
+            // contains_instruction_echo at all (that is the point of the
+            // split, pinned by retired_prompt_markers_are_not_live_gated), so
+            // these exercise only the STRONG_MARKERS path: a speaker whose
+            // words overlap one retired sentence must not reach the
+            // two-cluster threshold.
             "If the VTT is overwritten, the pipeline cannot recover the captions automatically.",
             "This bug means the pipeline cannot recover the captions after a failed export.",
             "This transcript is consumed by an automated caption pipeline, so keep it clean.",
