@@ -77,10 +77,10 @@ GCP_PROJECT_ID=rich-compiler-479518-d2 ./scripts/deploy-cloud-function.sh
 
 ## Check live configuration before running a deploy script
 
-Only `cloud-run-transcoder/deploy.sh` currently uses `--update-env-vars` and
-`--update-secrets`, so unnamed keys are preserved for transcoder deploys. Keys it
-*does* name are overwritten with the script's defaults, which may not match what
-is running.
+`cloud-run-transcoder/deploy.sh` and the CI `process-blob` job use
+`--update-env-vars`; the transcoder script also uses `--update-secrets`. Unnamed
+keys are therefore preserved for those deploys. Keys they *do* name are
+overwritten with the deploy path's values, which may not match what is running.
 
 `gcloud run deploy` creates or updates the *service*, and `--update-env-vars`
 merges its pairs onto the service's `spec.template`. The template is therefore

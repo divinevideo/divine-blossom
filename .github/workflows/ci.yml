@@ -176,12 +176,19 @@ jobs:
 
       - name: Deploy process-blob to Cloud Run
         working-directory: cloud-functions/process-blob
+        env:
+          GCP_RUNTIME_SERVICE_ACCOUNT: ${{ secrets.GCP_RUNTIME_SERVICE_ACCOUNT }}
         run: |
+          if [ -z "$GCP_RUNTIME_SERVICE_ACCOUNT" ]; then
+            echo "GCP_RUNTIME_SERVICE_ACCOUNT is required"
+            exit 1
+          fi
+
           gcloud run deploy process-blob \
             --project="${{ secrets.GCP_PROJECT_ID }}" \
             --region=us-central1 \
             --source=. \
-            --service-account="${{ secrets.GCP_RUNTIME_SERVICE_ACCOUNT }}" \
+            --service-account="$GCP_RUNTIME_SERVICE_ACCOUNT" \
             --memory=1Gi \
             --timeout=300s \
             --no-allow-unauthenticated \
