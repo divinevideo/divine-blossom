@@ -54,10 +54,9 @@ class TranscoderDeployGuardTest(unittest.TestCase):
     def test_production_deploy_rejects_nonproduction_bucket_before_build(self) -> None:
         # Reproduces the deploy that redirected the production transcoder to a
         # non-production bucket and broke transcoding for four and a half hours.
-        # The bucket name here is deliberately fictional: the guard rejects any
-        # value that is not the production bucket, so naming a real one would
-        # add a live infrastructure identifier to a public repository without
-        # making the test any stronger.
+        # divine-blossom-media-staging is the real staging bucket, in the
+        # dv-platform-staging project, so this is the value an operator shell
+        # could actually have exported.
         result, calls = self.run_deploy(
             project_id="rich-compiler-479518-d2",
             service_name="divine-transcoder",
