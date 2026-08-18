@@ -28,8 +28,11 @@ class ProcessBlobDeployContractTest(unittest.TestCase):
 
     def test_deploy_preserves_unmanaged_environment_variables(self) -> None:
         self.assertIn("--update-env-vars=", self.job)
-        self.assertNotIn("--set-env-vars=", self.job)
-        self.assertNotIn("--set-secrets=", self.job)
+        # No trailing "=" in the rejected flags: gcloud accepts both
+        # "--set-env-vars=..." and "--set-secrets X=y:latest" spellings, and the
+        # space-separated form is what this repo's deploy scripts use.
+        self.assertNotIn("--set-env-vars", self.job)
+        self.assertNotIn("--set-secrets", self.job)
 
     def test_deploy_uses_an_explicit_runtime_identity(self) -> None:
         self.assertIn(
