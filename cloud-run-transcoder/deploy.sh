@@ -42,6 +42,16 @@ IMAGE_TAG="${IMAGE_TAG:-$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/nu
 IMAGE="gcr.io/${PROJECT_ID}/${SERVICE_NAME}:${IMAGE_TAG}"
 
 GCS_BUCKET="${GCS_BUCKET:-divine-blossom-media}"
+PRODUCTION_PROJECT_ID="rich-compiler-479518-d2"
+PRODUCTION_SERVICE_NAME="divine-transcoder"
+PRODUCTION_GCS_BUCKET="divine-blossom-media"
+if [ "${PROJECT_ID}" = "${PRODUCTION_PROJECT_ID}" ] && \
+  [ "${SERVICE_NAME}" = "${PRODUCTION_SERVICE_NAME}" ] && \
+  [ "${GCS_BUCKET}" != "${PRODUCTION_GCS_BUCKET}" ]; then
+  echo "Refusing production deploy: GCS_BUCKET must be ${PRODUCTION_GCS_BUCKET} for ${PRODUCTION_SERVICE_NAME} in ${PRODUCTION_PROJECT_ID}." >&2
+  echo "Unset the exported GCS_BUCKET and retry." >&2
+  exit 1
+fi
 WEBHOOK_URL="${WEBHOOK_URL:-https://media.divine.video/admin/transcode-status}"
 TRANSCRIPT_WEBHOOK_URL="${TRANSCRIPT_WEBHOOK_URL:-https://media.divine.video/admin/transcript-status}"
 TRANSCRIPTION_PROVIDER="${TRANSCRIPTION_PROVIDER:-gemini}"
