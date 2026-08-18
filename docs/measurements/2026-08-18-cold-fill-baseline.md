@@ -98,9 +98,12 @@ in Compute memory before emitting a byte. The derivative route uses
 Range on a fill, `had_range` is false and every object under the 32 MiB ceiling
 is write-back eligible — so the buffer runs on every cold bare-blob fill.
 
-The initial investigation identified this path and estimated its cost as likely
-sub-second for typical traffic, rather than sufficient to explain a six-second
-stall. These numbers are not consistent with that estimate.
+Section 5 of the incident log identified this path and estimated the added
+buffer wait as "likely sub-second for typical traffic ... not a 6-second smoking
+gun". These end-to-end numbers cannot test that estimate directly, because the
+buffer's share of the total fill time is unmeasured (see the confounds below).
+What they do show is the route's total cold cost reaching several seconds, which
+is the cost the client actually pays.
 
 **This is a hypothesis, not an attribution.** Unresolved confounds:
 
