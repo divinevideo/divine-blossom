@@ -51,6 +51,10 @@ if [ "${PROJECT_ID}" = "${PRODUCTION_PROJECT_ID}" ] && \
   echo "Refusing production deploy: GCS_BUCKET must be ${PRODUCTION_GCS_BUCKET} for ${PRODUCTION_SERVICE_NAME} in ${PRODUCTION_PROJECT_ID}." >&2
   echo "Unset the exported GCS_BUCKET and retry." >&2
   exit 1
+elif [ "${GCP_PROJECT_ID}" != "${PRODUCTION_PROJECT_ID}" ] && [ "${SERVICE_NAME}" = "${PRODUCTION_SERVICE_NAME}" ]; then
+  echo "Refusing production service deploy: GCP_PROJECT_ID must be ${PRODUCTION_PROJECT_ID} for ${PRODUCTION_SERVICE_NAME}." >&2
+  echo "Unset the exported GCP_PROJECT_ID and retry." >&2
+  exit 1
 fi
 WEBHOOK_URL="${WEBHOOK_URL:-https://media.divine.video/admin/transcode-status}"
 TRANSCRIPT_WEBHOOK_URL="${TRANSCRIPT_WEBHOOK_URL:-https://media.divine.video/admin/transcript-status}"
