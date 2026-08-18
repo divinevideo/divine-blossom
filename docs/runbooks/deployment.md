@@ -122,9 +122,9 @@ treatment; see issue #171.
 The CI `process-blob` job also sets the service's runtime identity explicitly:
 it deploys with `--service-account="$GCP_RUNTIME_SERVICE_ACCOUNT"`, read from
 the `GCP_RUNTIME_SERVICE_ACCOUNT` repository secret, and the step fails before
-`gcloud` runs when that secret is unset. The secret does not exist yet, so the
-deploy job cannot succeed until it is created and the paired IaC change
-(divine-iac-coreconfig#1767) is applied.
+`gcloud` runs when that secret is unset. The deploy job cannot succeed until
+the secret is created and the paired IaC change (divine-iac-coreconfig#1767)
+is applied.
 
 ## Exported shell variables override script defaults
 
