@@ -124,6 +124,30 @@ mod tests {
         assert!(max_age(headers.cache_control) <= 86_400);
     }
 
+    // The outer VCL fetch snippet refuses to cache any response whose
+    // Cache-Control matches `private` or `no-store`, which is what keeps
+    // non-Active content out of the shared edge cache. These tests pin the
+    // header text that check matches on, so changing the wording fails CI here
+    // instead of silently re-enabling the edge caching of private responses.
+    #[test]
+    fn public_cache_headers_carry_the_token_the_vcl_matches() {
+        for cache_control in [
+            immutable_blob_cache_headers("abc123").cache_control,
+            mutable_derivative_cache_headers("abc123").cache_control,
+        ] {
+            assert!(
+                cache_control.contains("public"),
+                "vcl_fetch caches credentialed responses only when Cache-Control \
+                 contains `public`; got {cache_control:?}"
+            );
+            assert!(
+                !cache_control.contains("private") && !cache_control.contains("no-store"),
+                "vcl_fetch refuses to cache anything matching private/no-store; \
+                 got {cache_control:?}"
+            );
+        }
+    }
+
     #[test]
     fn derivatives_keep_a_long_purgeable_edge_ttl() {
         let headers = mutable_derivative_cache_headers("abc123");
