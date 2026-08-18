@@ -30,11 +30,13 @@ if (req.http.Authorization) {
   return(pass);
 }
 
-# Cache hash-based content paths: /{64-char-hex}[.ext], /{hash}.hls, /{hash}/hls/*, /{hash}.vtt, /{hash}/{quality}
-# Match paths starting with / followed by 64 hex chars
-if (req.url ~ "^/[0-9a-fA-F]{64}") {
-  return(lookup);
+# Cache hash-based content paths: /{64-char-hex}[.ext], /{hash}.hls,
+# /{hash}/hls/*, /{hash}.vtt, /{hash}/{quality}. Everything else (uploads,
+# admin, API, list, etc.) passes to Compute.
+if (req.url !~ "^/[0-9a-fA-F]{64}") {
+  return(pass);
 }
 
-# Everything else (uploads, admin, API, list, etc.) passes to Compute
-return(pass);
+# Deliberately fall through for cacheable hash paths. Fastly's generated
+# vcl_recv code selects the configured shield after this snippet, then performs
+# the default lookup. Returning lookup here would bypass that shield selection.
