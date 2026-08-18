@@ -226,16 +226,15 @@ Admin and moderation endpoints accept an `X-Request-Id` header and echo it into 
 
 ## Deployment
 
-Deploys go to Fastly Compute with a single atomic command, followed by a cache purge:
+Deploys go to Fastly Compute with a single atomic command:
 
 ```bash
 fastly compute publish --comment "description"
-fastly purge --all --service-id <service-id>
 ```
 
-Always use `fastly compute publish` (build + deploy in one step), never separate `build` and `deploy`. Package propagation to all POPs can take several minutes even after a purge.
+Always use `fastly compute publish` (build + deploy in one step), never separate `build` and `deploy`. Do not globally purge after a routine deploy. To invalidate one blob and its derivatives, purge its hash surrogate key with `fastly purge --key <hash> --service-id <service-id>`. When a response-semantics change truly requires invalidating the entire catalogue, manually run the CI workflow on `main` with its `purge_cache` input enabled. Package propagation to all POPs can take several minutes after a publish.
 
-CI (`.github/workflows/ci.yml`) runs the edge, core, upload, transcoder, and Python test suites plus clippy on every push and PR. On a push to `main` it then, in parallel: publishes the edge service to Fastly and purges the CDN, builds and pushes the container image to GHCR, and deploys `process-blob` to Cloud Run (`us-central1`).
+CI (`.github/workflows/ci.yml`) runs the edge, core, upload, transcoder, and Python test suites plus clippy on every push and PR. On a push to `main` it then, in parallel: publishes the edge service to Fastly without globally purging the CDN, builds and pushes the container image to GHCR, and deploys `process-blob` to Cloud Run (`us-central1`).
 
 ## License
 

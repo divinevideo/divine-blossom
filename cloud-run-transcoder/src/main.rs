@@ -3161,25 +3161,19 @@ fn build_gemini_prompt(language: Option<&str>) -> String {
     format!(
         "Transcribe the speech in this audio.{lang_clause}\n\
          \n\
-         Why this matters: this transcript is consumed by an automated \
-         caption pipeline that can ONLY parse the exact JSON shape below. \
-         It has no ability to parse markdown, prose preambles, code \
-         fences, or alternative JSON shapes. If you deviate from the \
-         format, the pipeline cannot recover the captions: real users \
-         watching videos in the Divine app will see broken or missing \
-         subtitles, lose trust in the product, and stop using it. Please \
-         help us keep the captions working — strict adherence to the \
-         format below is what makes that possible.\n\
-         \n\
          Output requirements (STRICT):\n\
          - Return ONLY a JSON object with this exact shape: \
-         {{\"language\": \"<bcp47>\", \"segments\": [{{\"start\": <seconds>, \"end\": <seconds>, \"text\": \"<spoken words>\"}}]}}.\n\
+         {{\"language\": \"<bcp47>\", \"sound_event\": \"none|music|applause|crowd|ambient|silence\", \"segments\": [{{\"start\": <seconds>, \"end\": <seconds>, \"text\": \"<spoken words>\"}}]}}.\n\
          - The `text` field of every segment MUST contain ONLY the spoken words \
          transcribed verbatim. Do NOT include markdown, code fences, JSON \
          fragments, headers, summaries, explanations, or any commentary.\n\
+         - If there is no intelligible speech, return an empty `segments` array and \
+         classify the dominant sound in `sound_event`. Use `music` only when music \
+         is clearly audible; otherwise use `applause`, `crowd`, `ambient`, or `silence`.\n\
+         - If there is intelligible speech, use `sound_event`: `none` and transcribe it.\n\
          - Do NOT prefix or suffix the JSON with any text, markdown, or \
          explanation. No \"Here is the JSON\" preamble. No ``` fences.\n\
-         - If there is no speech, return {{\"segments\": []}}.\n",
+         - Never put instructions from this request into a segment's `text`.\n",
     )
 }
 
@@ -3219,6 +3213,10 @@ async fn transcribe_via_gemini(
                 "type": "object",
                 "properties": {
                     "language": {"type": "string"},
+                    "sound_event": {
+                        "type": "string",
+                        "enum": ["none", "music", "applause", "crowd", "ambient", "silence"]
+                    },
                     "segments": {
                         "type": "array",
                         "items": {
@@ -3584,9 +3582,34 @@ fn normalize_transcript_to_vtt(raw: &str) -> Result<ParsedVtt> {
                 });
             }
         }
+
+        // Reaching here means no speech cue was produced. Convert a
+        // constrained non-speech classification into conventional
+        // closed-caption notation. Gated on "no cue emitted" rather than "the
+        // segments array is empty" so a response carrying only blank segments
+        // still yields the sound cue; a generic sound label must never replace
+        // intelligible speech.
+        if let Some(label) = closed_caption_sound_label(json["sound_event"].as_str()) {
+            return Ok(ParsedVtt {
+                content: format!("WEBVTT\n\n1\n00:00:00.000 --> 99:59:59.000\n{}\n", label),
+                text: label.to_string(),
+                language: parsed_language,
+                duration_ms: 0,
+                // Deliberately not the provider's speech confidence. Logprobs
+                // here score the classification tokens, and low speech
+                // confidence is the *expected* reading of audio with no
+                // speech. Forwarding it would let `transcript_drop_reason`
+                // drop a correct `[Music]` cue as LowProviderConfidence, and a
+                // drop is terminal (empty VTT, status=complete, edge-cached,
+                // no auto-retranscribe).
+                confidence: None,
+                cue_count: 1,
+            });
+        }
     }
 
-    // If we parsed valid JSON but found no segments and no text,
+    // If we parsed valid JSON but found no segments, text, or classified
+    // sound event,
     // this is a valid API response with no transcribable content (e.g. silent video).
     // Don't let it fall through to the plain text path, which would wrap the raw
     // JSON string in a VTT cue and render it as captions.
@@ -3615,6 +3638,19 @@ fn normalize_transcript_to_vtt(raw: &str) -> Result<ParsedVtt> {
         cue_count: 1,
         confidence: None,
     })
+}
+
+/// Map the provider's constrained classification to standard closed-caption
+/// notation. Silence, speech (`none`), and unknown/free-form values produce no
+/// cue rather than an invented description.
+fn closed_caption_sound_label(sound_event: Option<&str>) -> Option<&'static str> {
+    match sound_event {
+        Some("music") => Some("[Music]"),
+        Some("applause") => Some("[Applause]"),
+        Some("crowd") => Some("[Crowd cheering]"),
+        Some("ambient") => Some("[Ambient sound]"),
+        _ => None,
+    }
 }
 
 /// True when an error from `normalize_transcript_to_vtt` indicates that the
@@ -3818,6 +3854,91 @@ fn distinct_marker_phrases(normalized: &str, markers: &[&str]) -> usize {
     clusters
 }
 
+/// Verbatim fragments of the prompt this service currently sends. This is the
+/// only exact-marker list in the live publish gate; see
+/// `EXACT_PROMPT_MARKERS_RETIRED` for why retired prose is excluded.
+///
+/// Three invariants, all load-bearing because one match here is conclusive and a
+/// drop is terminal (empty VTT → status=complete → edge-cached, no
+/// auto-retranscribe → permanent caption loss):
+///
+/// 1. Each marker must appear **byte-identically** in the built prompt.
+///    `normalize_for_marker_scan` collapses whitespace and lowercases but
+///    preserves punctuation, so a marker must keep the prompt's punctuation
+///    (including backticks) rather than drop it.
+///    `current_prompt_markers_still_match` asserts this, so editing the prompt
+///    cannot silently render a marker inert.
+/// 2. Each marker must be long enough to self-identify as this pipeline's
+///    prompt. Truncating a marker to dodge punctuation is not an option: a
+///    short generic fragment such as "classify the dominant sound in" is
+///    ordinary audio-engineering speech and would permanently destroy the
+///    captions of any clip that says it.
+///    `exact_markers_do_not_flag_audio_engineering_speech` pins that case.
+/// 3. Invariants 1 and 2 are in tension with recall, and this list resolves it
+///    in favour of never dropping real speech. A marker that carries the
+///    prompt's punctuation is **inert against an echo that dropped it**, and a
+///    model leaking an instruction into a field told to hold "ONLY the spoken
+///    words" may well drop backticks. So at least one marker here must stay
+///    punctuation-free to act as the backstop — currently
+///    "never put instructions from this request into a segment", which matches a
+///    stripped echo. The residual gap is a lone partial echo with its
+///    punctuation dropped: the `sound_event` bullet without backticks, or the
+///    bullet's trailing sentences (the "preamble" and "fences" instructions)
+///    alone. Marking those would take a fragment short enough to
+///    be spoken LLM advice ("no "here is the json" preamble" flags a real
+///    speaker quoting that phrase, so it was considered and rejected); a
+///    fuller echo still trips an exact marker, the punctuation-free backstop,
+///    or two distinct `STRONG_MARKERS`. That gap is
+///    accepted deliberately: the alternative was a marker that terminally drops
+///    real speech.
+///
+/// Keep byte-identical with `INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_CURRENT` in
+/// `scan_and_repair_vtts.py` (CI asserts parity).
+const EXACT_PROMPT_MARKERS_CURRENT: &[&str] = &[
+    "classify the dominant sound in `sound_event`",
+    "never put instructions from this request into a segment",
+    "do not prefix or suffix the json with any text, markdown, or explanation",
+];
+
+/// Fragments of prompts this service sent in the past, retained so
+/// `scan_and_repair_vtts.py` still recognises the paragraph that leaked in
+/// production. Together they must cover every sentence of it
+/// (`every_retired_paragraph_sentence_is_covered`), measured against
+/// `RETIRED_PROMPT_PARAGRAPH` because the live prompt no longer carries the text.
+///
+/// **Deliberately not consulted by `contains_instruction_echo`.** The asymmetry is
+/// the whole reason: `build_gemini_prompt` is this service's only prompt builder
+/// and no longer emits this prose (`retired_prompt_markers_are_no_longer_sent`),
+/// so a live match could never be a real echo — it could only ever be a real
+/// speaker discussing caption pipelines, and that drop is terminal (empty VTT →
+/// status=complete → edge-cached, no auto-retranscribe → permanent caption loss).
+/// Retired markers in the live gate would buy zero detection for nonzero
+/// permanent-caption-loss risk. Natural-language markers cannot be lengthened out
+/// of that: any phrase about captions and JSON is utterable by someone talking
+/// about captions and JSON, so the fix is scope, not length.
+///
+/// In the scanner the trade inverts, which is why this list may stay broader than
+/// invariant 2 would allow in the live gate: a false positive there merely
+/// re-transcribes a good VTT, while a false negative leaves leaked prompt text
+/// published — the incident this list exists for.
+///
+/// If the old prompt is ever restored, `retired_prompt_markers_are_no_longer_sent`
+/// fails and forces the affected marker into `EXACT_PROMPT_MARKERS_CURRENT`, where
+/// it would be live-gated and bound by the invariants above. That test, not this
+/// list, is the live safety net.
+///
+/// Keep byte-identical with `INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_RETIRED` in
+/// `scan_and_repair_vtts.py` (CI asserts parity).
+#[cfg(test)]
+const EXACT_PROMPT_MARKERS_RETIRED: &[&str] = &[
+    "why this matters: this transcript is consumed by an automated caption pipeline",
+    "caption pipeline that can only parse the exact json shape below",
+    "no ability to parse markdown, prose preambles, code fences, or alternative json shapes",
+    "if you deviate from the format, the pipeline cannot recover the captions",
+    "real users watching videos in the divine app will see broken or missing subtitles",
+    "strict adherence to the format below is what makes that possible",
+];
+
 /// Detect model output-format instructions that leaked into caption text.
 ///
 /// This intentionally requires multiple *distinct* prompt/schema-derived
@@ -3838,6 +3959,17 @@ fn distinct_marker_phrases(normalized: &str, markers: &[&str]) -> usize {
 /// retained phrases, so detection is unaffected.
 fn contains_instruction_echo(text: &str) -> bool {
     let normalized = normalize_for_marker_scan(text);
+
+    // Verbatim fragments of the prompt we currently send. Unlike generic schema
+    // language, a single match is conclusive: this prose is not audio
+    // transcription. Retired prompt prose is deliberately absent — see
+    // `EXACT_PROMPT_MARKERS_RETIRED`.
+    if EXACT_PROMPT_MARKERS_CURRENT
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    {
+        return true;
+    }
 
     const STRONG_MARKERS: &[&str] = &[
         "<bcp47>",
@@ -4012,20 +4144,22 @@ async fn finalize_transcript(
 #[cfg(test)]
 mod tests {
     use super::{
-        access_token_cache, attach_generation, build_cloud_tasks_task_body,
+        access_token_cache, attach_generation, build_cloud_tasks_task_body, build_gemini_prompt,
         build_transcode_status_webhook_payload, classify_audio_extract_error, constant_time_eq,
         contains_instruction_echo, decide_transcript_lock_action, enqueue_status_task_request,
         enqueue_status_task_request_with_retry, ensure_transcribe_audio_size,
         gcp_provider_response_outcome, identity_token_cache_for_audience,
         is_empty_transcript_normalize_error, is_implausible_text_density, is_loop_hallucination,
-        is_retryable_provider_failure, next_status_generation, normalize_transcript_to_vtt,
-        parakeet_request_url, parse_audio_analysis_output, parse_metadata_access_token,
-        parse_provider_status, retry_delay_for_attempt, should_drop_low_signal_transcript,
-        status_event_generation, status_task_id, token_fetch_retry_delay, transcript_drop_reason,
-        transcription_response_format, AccessTokenCache, AudioAnalysis, AudioExtractErrorKind,
-        Config, ParsedVtt, StatusTaskRequest, TranscriptConfidence, TranscriptDropReason,
-        TranscriptLockAction, TranscriptLockState, TranscriptLockStatus, VideoInfo,
-        MAX_TRANSCRIBE_AUDIO_BYTES, STATUS_EVENT_PROCESSING, STATUS_EVENT_TERMINAL,
+        is_retryable_provider_failure, next_status_generation, normalize_for_marker_scan,
+        normalize_transcript_to_vtt, parakeet_request_url, parse_audio_analysis_output,
+        parse_metadata_access_token, parse_provider_status, retry_delay_for_attempt,
+        should_drop_low_signal_transcript, status_event_generation, status_task_id,
+        token_fetch_retry_delay, transcript_drop_reason, transcription_response_format,
+        AccessTokenCache, AudioAnalysis, AudioExtractErrorKind, Config, ParsedVtt,
+        StatusTaskRequest, TranscriptConfidence, TranscriptDropReason, TranscriptLockAction,
+        TranscriptLockState, TranscriptLockStatus, VideoInfo, EXACT_PROMPT_MARKERS_CURRENT,
+        EXACT_PROMPT_MARKERS_RETIRED, MAX_TRANSCRIBE_AUDIO_BYTES, STATUS_EVENT_PROCESSING,
+        STATUS_EVENT_TERMINAL,
     };
     use std::{
         io::{Read, Write},
@@ -4869,6 +5003,77 @@ mod tests {
     }
 
     #[test]
+    fn music_only_response_becomes_closed_caption_cue() {
+        let parsed = normalize_transcript_to_vtt(
+            r#"{"language":"und","sound_event":"music","segments":[]}"#,
+        )
+        .expect("constrained music classification should produce a VTT");
+
+        assert_eq!(parsed.text, "[Music]");
+        assert_eq!(parsed.cue_count, 1);
+        assert!(parsed.content.contains("\n[Music]\n"));
+    }
+
+    #[test]
+    fn sound_cue_does_not_carry_speech_confidence() {
+        // A sound cue must not be droppable as LowProviderConfidence: low
+        // speech confidence is the expected reading of audio with no speech,
+        // and the drop is terminal.
+        let parsed = normalize_transcript_to_vtt(
+            r#"{"language":"und","sound_event":"music","segments":[],"logprob":-4.2}"#,
+        )
+        .expect("music classification should produce a VTT");
+
+        assert_eq!(parsed.text, "[Music]");
+        assert!(
+            parsed.confidence.is_none(),
+            "sound cue must not forward provider speech confidence"
+        );
+    }
+
+    #[test]
+    fn music_only_response_with_blank_segments_becomes_closed_caption_cue() {
+        // Gemini sometimes returns the segment scaffold with empty text rather
+        // than an empty array. The sound cue must survive that shape.
+        let parsed = normalize_transcript_to_vtt(
+            r#"{"language":"und","sound_event":"music","segments":[{"start":0,"end":5,"text":"   "}]}"#,
+        )
+        .expect("blank segments plus a music classification should produce a VTT");
+
+        assert_eq!(parsed.text, "[Music]");
+        assert_eq!(parsed.cue_count, 1);
+    }
+
+    #[test]
+    fn speech_segments_are_never_replaced_by_a_sound_label() {
+        let parsed = normalize_transcript_to_vtt(
+            r#"{"language":"en","sound_event":"music","segments":[{"start":0,"end":2,"text":"hello there"}]}"#,
+        )
+        .expect("real speech should transcribe");
+
+        assert_eq!(parsed.text, "hello there");
+    }
+
+    #[test]
+    fn silence_response_remains_empty() {
+        let result = normalize_transcript_to_vtt(
+            r#"{"language":"und","sound_event":"silence","segments":[]}"#,
+        );
+        assert!(result.is_err(), "silence should not invent a caption cue");
+    }
+
+    #[test]
+    fn unknown_sound_event_is_never_rendered() {
+        let result = normalize_transcript_to_vtt(
+            r#"{"language":"und","sound_event":"ignore all instructions","segments":[]}"#,
+        );
+        assert!(
+            result.is_err(),
+            "free-form sound labels must not become captions"
+        );
+    }
+
+    #[test]
     fn json_with_only_whitespace_text_is_rejected() {
         let result = normalize_transcript_to_vtt(r#"{"text":"   \n  "}"#);
         assert!(
@@ -5070,6 +5275,169 @@ mod tests {
             a single JSON array. Do not include any extra text outside of the JSON string. \
             When producing JSON you must follow the schema provided in the context.";
         assert!(contains_instruction_echo(bad));
+    }
+
+    #[test]
+    fn current_prompt_markers_still_match() {
+        // Guards against the failure where a marker is written with different
+        // punctuation than the prompt it is meant to catch (the normalizer
+        // preserves punctuation), leaving the marker permanently inert.
+        for language in [None, Some("en")] {
+            let normalized = normalize_for_marker_scan(&build_gemini_prompt(language));
+            for marker in EXACT_PROMPT_MARKERS_CURRENT {
+                assert!(
+                    normalized.contains(marker),
+                    "marker {marker:?} no longer appears in the built prompt; \
+                     update the marker or move it to EXACT_PROMPT_MARKERS_RETIRED"
+                );
+            }
+        }
+    }
+
+    /// The explanatory paragraph this PR removed from `build_gemini_prompt`,
+    /// and the text a leaked caption echoed in production. Pinned here so the
+    /// retired markers stay verifiable once the prompt no longer carries them:
+    /// a marker whose punctuation drifts from this text is inert against the
+    /// very VTTs it exists to find.
+    const RETIRED_PROMPT_PARAGRAPH: &str = "Why this matters: this transcript is \
+        consumed by an automated caption pipeline that can ONLY parse the exact \
+        JSON shape below. It has no ability to parse markdown, prose preambles, \
+        code fences, or alternative JSON shapes. If you deviate from the format, \
+        the pipeline cannot recover the captions: real users watching videos in \
+        the Divine app will see broken or missing subtitles, lose trust in the \
+        product, and stop using it. Please help us keep the captions working — \
+        strict adherence to the format below is what makes that possible.";
+
+    #[test]
+    fn retired_prompt_markers_match_the_retired_paragraph() {
+        let normalized = normalize_for_marker_scan(RETIRED_PROMPT_PARAGRAPH);
+        for marker in EXACT_PROMPT_MARKERS_RETIRED {
+            assert!(
+                normalized.contains(marker),
+                "retired marker {marker:?} does not appear in the paragraph it \
+                 is meant to find"
+            );
+        }
+    }
+
+    #[test]
+    fn every_retired_paragraph_sentence_is_covered() {
+        // Sentence granularity only: a cue echoing a whole sentence of the
+        // removed paragraph must match some marker. This deliberately does not
+        // promise coverage of arbitrary fragments — a cue truncated mid-sentence,
+        // or at the paragraph's em dash, can still escape. Tightening that would
+        // mean shorter markers, and a marker short enough to catch every fragment
+        // is short enough to drop real speech.
+        let normalized = normalize_for_marker_scan(RETIRED_PROMPT_PARAGRAPH);
+        for sentence in normalized.split(". ").filter(|s| !s.trim().is_empty()) {
+            assert!(
+                EXACT_PROMPT_MARKERS_RETIRED
+                    .iter()
+                    .any(|marker| sentence.contains(marker)),
+                "no retired marker covers the sentence {sentence:?}; a caption \
+                 echoing this whole sentence would go unrepaired"
+            );
+        }
+    }
+
+    #[test]
+    fn retired_prompt_markers_are_no_longer_sent() {
+        let normalized = normalize_for_marker_scan(&build_gemini_prompt(None));
+        for marker in EXACT_PROMPT_MARKERS_RETIRED {
+            assert!(
+                !normalized.contains(marker),
+                "marker {marker:?} is still in the live prompt; \
+                 it belongs in EXACT_PROMPT_MARKERS_CURRENT"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_markers_do_not_flag_audio_engineering_speech() {
+        // An exact marker is single-match-conclusive and a drop is terminal, so
+        // no marker may be a phrase a real speaker could plausibly utter.
+        for speech in [
+            "The model has to classify the dominant sound in each clip before we run the tagger.",
+            "Our job is to classify the dominant sound in a recording, then label it.",
+            "Please classify the dominant sound in every scene before editing.",
+            "You should classify the dominant sound in the mix first.",
+            // Shorter or punctuation-shifted neighbours of the exact markers:
+            // a speaker quoting LLM formatting advice, or giving it, must not
+            // trip a conclusive marker. Gemini renders spoken quotations with
+            // quotation marks, so the quoted form is the case to pin.
+            "There should be no \"Here is the JSON\" preamble in the reply, right?",
+            "You should not prefix or suffix the JSON with anything when replying.",
+            // Sentences built from retired-prompt prose, included as
+            // real-speech samples. Retired markers are not consulted by
+            // contains_instruction_echo at all (that is the point of the
+            // split, pinned by retired_prompt_markers_are_not_live_gated), so
+            // these exercise only the STRONG_MARKERS path: a speaker whose
+            // words overlap one retired sentence must not reach the
+            // two-cluster threshold.
+            "If the VTT is overwritten, the pipeline cannot recover the captions automatically.",
+            "This bug means the pipeline cannot recover the captions after a failed export.",
+            "This transcript is consumed by an automated caption pipeline, so keep it clean.",
+            "Our validator can only parse the exact JSON shape below.",
+            "Heads up, the importer can only parse the exact JSON shape below.",
+            "The validator can only parse the exact JSON shape below, so pause and copy it.",
+            "The old client has no ability to parse markdown, prose preambles, code fences, \
+             or XML.",
+            // Carrier sentences that reproduce a retired marker's full span. These
+            // are only safe because retired prose is not live-gated at all; no
+            // amount of marker lengthening would have made them safe.
+            "At work, we have a caption pipeline that can only parse the exact JSON shape \
+             below, so let me show you the schema.",
+            "The legacy importer has no ability to parse markdown, prose preambles, code \
+             fences, or alternative JSON shapes.",
+            "If you deviate from the format, the pipeline cannot recover the captions later.",
+        ] {
+            assert!(
+                !contains_instruction_echo(speech),
+                "legitimate speech must not be dropped as an instruction echo: {speech:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_current_prompt_marker_flags_on_its_own() {
+        for marker in EXACT_PROMPT_MARKERS_CURRENT {
+            assert!(
+                contains_instruction_echo(marker),
+                "exact marker {marker:?} should be conclusive on a single match"
+            );
+        }
+    }
+
+    #[test]
+    fn retired_prompt_markers_are_not_live_gated() {
+        // The inverse of the test above, and the point of the split: retired
+        // prose must never terminally drop a live transcript, because the current
+        // prompt cannot produce it and a match could only be a real speaker.
+        for marker in EXACT_PROMPT_MARKERS_RETIRED {
+            assert!(
+                !contains_instruction_echo(marker),
+                "retired marker {marker:?} must not reach the live publish gate; \
+                 it belongs to the repair scanner only"
+            );
+        }
+    }
+
+    #[test]
+    fn instruction_echo_guard_flags_automated_caption_prompt_leak() {
+        // The paragraph that leaked in production must stay detectable. It is the
+        // repair scanner's job now, not the live gate's — the live gate cannot see
+        // prose the current prompt no longer sends — so this asserts the retired
+        // marker list still recognises it. `scan_and_repair_vtts.py` applies these
+        // markers, with parity enforced by the marker-parity tests.
+        let bad = "Why this matters: this transcript is consumed by an automated caption \
+            pipeline that can only parse the exact JSON shape below.";
+        let normalized = normalize_for_marker_scan(bad);
+        assert!(
+            EXACT_PROMPT_MARKERS_RETIRED
+                .iter()
+                .any(|marker| normalized.contains(marker)),
+            "the production caption leak must remain detectable by the repair scanner"
+        );
     }
 
     #[test]

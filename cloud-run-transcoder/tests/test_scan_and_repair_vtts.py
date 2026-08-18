@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -32,6 +33,19 @@ class ScanAndRepairVttsTests(unittest.TestCase):
             "Well, that's not really freedom now, is it? a single JSON array. "
             "Do not include any extra text outside of the JSON string. "
             "When producing JSON you must follow the schema provided in the context.\n"
+        )
+
+        self.assertEqual(classifier(body, check_empty=False), "instruction_echo")
+
+    def test_classifies_automated_caption_prompt_echo(self):
+        module = load_script_module(self)
+        classifier = getattr(module, "classify_vtt", None)
+        self.assertIsNotNone(classifier, "classify_vtt should exist")
+
+        body = (
+            "WEBVTT\n\n1\n00:00:00.000 --> 00:00:07.000\n"
+            "Why this matters this transcript is consumed by an automated caption "
+            "pipeline that can only parse the exact JSON shape below.\n"
         )
 
         self.assertEqual(classifier(body, check_empty=False), "instruction_echo")
@@ -122,29 +136,137 @@ class ScanAndRepairVttsTests(unittest.TestCase):
         )
 
 
+def _rust_marker_list(declaration: str) -> tuple:
+    """Extract a `const NAME: &[&str] = &[...]` string list from main.rs.
+
+    Each list entry is one Rust string literal on its own line; json.loads
+    decodes it so markers containing escaped characters (e.g. \" for a quote
+    the prompt itself carries) compare against the Python list as their real
+    text rather than as Rust source escapes.
+    """
+    rust_path = SCRIPT_PATH.parent / "src" / "main.rs"
+    source = rust_path.read_text(encoding="utf-8")
+    start = source.index(declaration) + len(declaration)
+    end = source.index("];", start)
+    return tuple(
+        json.loads(line.strip().rstrip(","))
+        for line in source[start:end].splitlines()
+        if line.strip()
+    )
+
+
 class MarkerParityTests(unittest.TestCase):
     """The Rust gate and the Python scanner must use the same marker list."""
 
     def test_rust_and_python_strong_markers_match(self):
         module = load_script_module(self)
         python_markers = tuple(module.INSTRUCTION_ECHO_STRONG_MARKERS)
-
-        rust_path = SCRIPT_PATH.parent / "src" / "main.rs"
-        source = rust_path.read_text(encoding="utf-8")
-        marker = "const STRONG_MARKERS: &[&str] = &["
-        start = source.index(marker) + len(marker)
-        end = source.index("];", start)
-        rust_markers = tuple(
-            line.strip().strip(",").strip('"')
-            for line in source[start:end].splitlines()
-            if line.strip()
-        )
+        rust_markers = _rust_marker_list("const STRONG_MARKERS: &[&str] = &[")
 
         self.assertEqual(
             rust_markers,
             python_markers,
             "STRONG_MARKERS drifted between main.rs and scan_and_repair_vtts.py",
         )
+
+    def test_rust_and_python_current_prompt_markers_match(self):
+        module = load_script_module(self)
+
+        self.assertEqual(
+            _rust_marker_list("const EXACT_PROMPT_MARKERS_CURRENT: &[&str] = &["),
+            tuple(module.INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_CURRENT),
+            "EXACT_PROMPT_MARKERS_CURRENT drifted between main.rs and "
+            "scan_and_repair_vtts.py",
+        )
+
+    def test_rust_and_python_retired_prompt_markers_match(self):
+        module = load_script_module(self)
+
+        self.assertEqual(
+            _rust_marker_list("const EXACT_PROMPT_MARKERS_RETIRED: &[&str] = &["),
+            tuple(module.INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_RETIRED),
+            "EXACT_PROMPT_MARKERS_RETIRED drifted between main.rs and "
+            "scan_and_repair_vtts.py",
+        )
+
+    def test_combined_marker_tuple_is_current_plus_retired(self):
+        """The combined tuple is what the scanner actually scans.
+
+        Without this, dropping RETIRED from the combination would leave every
+        other parity test green while the scanner silently diverged from Rust.
+        """
+        module = load_script_module(self)
+
+        self.assertEqual(
+            module.INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS,
+            module.INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_CURRENT
+            + module.INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_RETIRED,
+        )
+        self.assertTrue(
+            module.INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_CURRENT
+            and module.INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_RETIRED,
+            "neither marker list may be empty; the parity tests would pass vacuously",
+        )
+
+    def test_current_prompt_markers_match_the_live_rust_prompt(self):
+        """Mirror of the Rust `current_prompt_markers_still_match` guard.
+
+        A marker whose punctuation differs from the prompt would be inert; the
+        scanner normalizer does not strip punctuation either.
+        """
+        module = load_script_module(self)
+        rust_path = SCRIPT_PATH.parent / "src" / "main.rs"
+        source = rust_path.read_text(encoding="utf-8")
+        start = source.index("fn build_gemini_prompt(")
+        prompt_source = source[start : source.index("\n}\n", start)]
+        normalized = module.normalize_for_marker_scan(
+            prompt_source.replace("\\\n", "").replace("\\", "")
+        )
+
+        for marker in module.INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS_CURRENT:
+            self.assertIn(
+                marker,
+                normalized,
+                f"marker {marker!r} no longer appears in build_gemini_prompt",
+            )
+
+    def test_exact_markers_do_not_flag_audio_engineering_speech(self):
+        """No exact marker may be a phrase a real speaker could plausibly utter.
+
+        The scanner repairs on a single match, so a generic marker would wipe
+        legitimate captions.
+        """
+        module = load_script_module(self)
+
+        for speech in (
+            "The model has to classify the dominant sound in each clip "
+            "before we run the tagger.",
+            "Our job is to classify the dominant sound in a recording, then label it.",
+            "Please classify the dominant sound in every scene before editing.",
+            'There should be no "Here is the JSON" preamble in the reply, right?',
+            "You should not prefix or suffix the JSON with anything when replying.",
+            "If the VTT is overwritten, the pipeline cannot recover the "
+            "captions automatically.",
+            "This bug means the pipeline cannot recover the captions after a failed export.",
+            "This transcript is consumed by an automated caption pipeline, so keep it clean.",
+            "Our validator can only parse the exact JSON shape below.",
+            "Heads up, the importer can only parse the exact JSON shape below.",
+            "The old client has no ability to parse markdown, prose preambles, "
+            "code fences, or XML.",
+        ):
+            self.assertFalse(
+                module.has_instruction_echo(speech),
+                f"legitimate speech must not be flagged: {speech!r}",
+            )
+
+    def test_each_exact_prompt_marker_flags_on_its_own(self):
+        module = load_script_module(self)
+
+        for marker in module.INSTRUCTION_ECHO_EXACT_PROMPT_MARKERS:
+            self.assertTrue(
+                module.has_instruction_echo(marker),
+                f"exact marker {marker!r} should be conclusive on a single match",
+            )
 
 
 if __name__ == "__main__":

@@ -64,5 +64,10 @@ Add three new backends in the [Fastly control panel](https://manage.fastly.com/)
 ## 6. Deploy
 
 ```bash
-fastly compute publish --comment "feat: add OAuth admin login" && fastly purge --all --service-id pOvEEWykEbpnylqst1KTrR
+fastly compute publish --comment "feat: add OAuth admin login"
 ```
+
+Do not globally purge the edge cache after a routine deploy. Purge a specific
+blob by hash surrogate key when needed. If a response-semantics change requires
+a full invalidation, manually run the CI workflow on `main` with `purge_cache`
+enabled.

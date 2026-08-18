@@ -244,12 +244,14 @@ def main():
         file=sys.stderr,
     )
     promoted = 0
+    promoted_keys = []
     failed = 0
     for key, meta in eligible:
         meta["status"] = "age_restricted"
         try:
             put_metadata(s, args.store_id, key, meta)
             promoted += 1
+            promoted_keys.append(key)
         except Exception as e:
             failed += 1
             print(f"  FAILED {key}: {e}", file=sys.stderr)
@@ -264,11 +266,13 @@ def main():
         f"\nDone. Promoted: {promoted}, Failed: {failed}",
         file=sys.stderr,
     )
-    print(
-        "\nNext step: purge VCL cache so the new status takes effect:\n"
-        "  fastly purge --all --service-id pOvEEWykEbpnylqst1KTrR",
-        file=sys.stderr,
-    )
+    print("\nNext step: purge each promoted hash by Surrogate-Key:", file=sys.stderr)
+    for key in promoted_keys:
+        print(
+            f"  fastly purge --key {key} --service-id pOvEEWykEbpnylqst1KTrR",
+            file=sys.stderr,
+        )
+    print("Do not globally purge the edge cache.", file=sys.stderr)
     return 0 if failed == 0 else 1
 
 
