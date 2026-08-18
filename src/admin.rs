@@ -1014,7 +1014,8 @@ pub fn handle_admin_bulk_approve(mut req: Request) -> Result<Response> {
         })
         .unwrap_or_default();
 
-    // skip_purge=true skips per-blob VCL purge (caller should do purge --all after)
+    // skip_purge=true skips per-blob VCL purge (caller then purges each hash
+    // by Surrogate-Key; never `purge --all` for routine moderation)
     let skip_purge = payload["skip_purge"].as_bool().unwrap_or(false);
 
     if hashes.is_empty() {
