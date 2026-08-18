@@ -64,7 +64,7 @@ class TranscoderDeployGuardTest(unittest.TestCase):
 
     def test_nonproduction_service_can_use_nonproduction_bucket(self) -> None:
         result, calls = self.run_deploy(
-            project_id="rich-compiler-479518-d2",
+            project_id="staging-project-999",
             service_name="divine-transcoder-staging",
             gcs_bucket="divine-blossom-media-staging",
         )
