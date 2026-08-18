@@ -61,6 +61,32 @@ mod tests {
         assert!(max_age(headers.cache_control) <= 86_400);
     }
 
+    // The outer VCL fetch snippet caches a credentialed response only when its
+    // Cache-Control carries the literal token `public`, and refuses to cache
+    // anything matching `private` or `no-store`. That is what keeps one
+    // authenticated caller's Restricted or admin-visible content from being
+    // served to every other authenticated caller out of the shared auth=1 cache
+    // entry. These tests pin the header text the VCL matches on, so changing it
+    // fails CI here instead of silently turning caching off -- or, worse, on.
+    #[test]
+    fn public_cache_headers_carry_the_token_the_vcl_matches() {
+        for cache_control in [
+            immutable_blob_cache_headers("abc123").cache_control,
+            mutable_derivative_cache_headers("abc123").cache_control,
+        ] {
+            assert!(
+                cache_control.contains("public"),
+                "vcl_fetch caches credentialed responses only when Cache-Control \
+                 contains `public`; got {cache_control:?}"
+            );
+            assert!(
+                !cache_control.contains("private") && !cache_control.contains("no-store"),
+                "vcl_fetch refuses to cache anything matching private/no-store; \
+                 got {cache_control:?}"
+            );
+        }
+    }
+
     #[test]
     fn derivatives_keep_a_long_purgeable_edge_ttl() {
         let headers = mutable_derivative_cache_headers("abc123");
