@@ -69,6 +69,13 @@ without also making the TTL honour `private`/`no-store` would cache restricted
 content at the edge for a year and serve it to unauthorised clients. Both files
 must change together, with tests.
 
+**Refinement from section 12.7 (measured):** the client does not send
+`Authorization` on media GETs generally — only as a 401 retry on gated
+content, and the prefetcher sends none at all. The bypass climb is therefore
+not "the app progressively authenticating everything"; it is gated plays
+growing *while* the 08-11 V15 change removed edge caching for them. The two
+mechanisms multiplied.
+
 ### 0.3 The 2026-08-17 22:00 UTC step change — cause not confirmed
 
 Hit ratio and 503 rate both broke sharply at 22:00 UTC and were still degraded
@@ -497,6 +504,65 @@ has a confound to control for. Any cold-path measurement taken before the CI
 purge fix lands, or shortly after any purge, is measuring a cache that was
 recently emptied, not a steady-state cold path.
 
+### 12.7 What drives the bypass volume: per-response cache policy, not just request auth
+
+**Measured** (v14→v15 fetch-snippet diff from the live API; the recv, miss,
+deliver and error snippets are byte-identical across v12–v15). Beyond
+`do_stream`, the 08-11 fetch snippet changed one more thing: v14 **forced**
+`Cache-Control: public, max-age=31536000, immutable` onto every 200/206,
+overriding whatever Compute sent. v15 applies that only as a default when
+Compute sent no `Cache-Control`, and otherwise honors Compute's per-response
+policy.
+
+**Measured** (code): for statuses where `requires_private_cache()` is true
+(`blossom-core/src/types.rs:148`), Compute sends `Cache-Control: private,
+no-store` (`add_private_cache_headers`, `src/main.rs:5983`). Until 08-11 the
+outer VCL masked that with the uniform public policy; since v15 the header
+reaches the edge intact and standard private-response handling keeps the
+response out of the shared cache. So **every** authorized play of
+privacy-scoped content is a full origin trip, not only the first one. The
+fetch snippet also `return(pass)`es 202s and non-2xx errors, so
+transcode-polling retries and gate-discovery 401s always reach Compute.
+
+**Measured** (mobile code, `divine-mobile`): the app does not attach
+`Authorization` to media GETs up front. Auth headers exist only as a
+401 retry for gated content (`mobile/lib/services/media_auth_interceptor.dart`,
+`mobile/lib/services/media_viewer_auth_service.dart`), and the feed
+prefetcher (`infinite_video_feed/.../disk_prefetcher.dart`, via
+`package:media_cache`) never sends auth at all. So the client half of 0.2's
+mechanism is not "the app increasingly authenticates all media GETs"; it is
+"gated plays grew, and each gated play now always bypasses". (The two halves
+are measured; mapping them onto the traffic curve is inferred.)
+
+This sharpens 0.2's fix direction: the knob is not the client and not only
+the recv pass rule, but an edge design that can cache privacy-scoped content
+safely (cache it, but re-check authorization per request at the edge). Any
+change must keep the current guarantee that `private`/`no-store` responses
+are never served from a shared cache without a fresh authorization check.
+
+### 12.8 Additional second-session measurements
+
+- **Compute-side latency, incident evening** (measured, Fastly stats): mean
+  Compute request time roughly tripled for about two hours on 08-17
+  (~20:00–22:00 UTC) against the same hours on 08-14 and 08-16, with
+  per-request guest CPU about doubling, then recovered. No deploy happened
+  in that window. The 21:02 config-store mutation and the suspected manual
+  purge (0.3) both sit inside it; a bulk data job would produce the same
+  signature. Unverified — folded into the section 9 audit ask.
+- **At the NZ report time (~00:31 UTC 08-18)** (measured): ANZAC aggregate
+  miss and bypass timings sat in their normal range with zero 5xx in that
+  hour. Nothing was wrong at aggregate level at the moment of the report;
+  the device's experience was the tail, not the mean.
+- **Fastly public incident history** (measured): no delivery-path event on
+  08-17/18. There *was* an Object Storage 429/503/timeout incident at IAD
+  and FRA on **08-10** — context for the bare-blob read-through route only;
+  `/HASH/720p.mp4` reads GCS directly.
+- **Stats blind spot** (measured): historical stats have no per-path or
+  per-method dimension, and Domain Inspector / Origin Inspector return empty
+  for these services (not enabled). The bypass traffic's exact path mix
+  cannot be decomposed from Fastly aggregates — one more reason the sampled
+  slow-success telemetry (next step 4) matters.
+
 ---
 
 ## Appendix: commands used
@@ -545,5 +611,26 @@ valid values are a number, `latest`, `active`, `staged`); a scan that swallows
 stderr will report phantom absence. Verify one call by hand first.
 `fastly profile list` prints API tokens to stdout; do not run it where output
 is captured or shared.
+
+Third block (traffic-shape and cache-policy analysis):
+
+```
+# Daily/hourly traffic shape, whole service or per region:
+fastly stats historical --service-id ML7R82HKfmTaqTpHExIDVN \
+  --from <ISO> --to <ISO> --by day|hour [--region usa|anzac|europe] --json
+# (fields used: requests, hits, miss, pass, status_401, miss_time, pass_time,
+#  pass_resp_body_bytes, all_status_5xx; Compute service: compute_requests,
+#  compute_request_time_ms, compute_execution_time_ms)
+fastly stats historical --service-id pOvEEWykEbpnylqst1KTrR --from ... --json
+# Snippet content diff across versions (CLI has no content-diff; use the API):
+GET /service/ML7R82HKfmTaqTpHExIDVN/version/{12,13,14,15}/snippet/<name>
+# Domain ownership of an FQDN (version-scoped domain lists can be misleading):
+fastly domain list --fqdn media.divine.video --json
+```
+
+Mobile-side reads in `../divine-mobile`: `mobile/lib/services/
+media_auth_interceptor.dart`, `mobile/lib/services/media_viewer_auth_service.dart`,
+`mobile/packages/infinite_video_feed/lib/src/services/disk_prefetcher.dart`,
+and a repo-wide grep showing `packages/media_cache` never sets `Authorization`.
 
 Branch: `wip/media-latency-diagnostics`.
