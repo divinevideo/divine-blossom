@@ -11,30 +11,9 @@ unset beresp.http.Pragma;
 # edge for a year. This check must come first: the 200/206 branch sets a 365-day
 # TTL unconditionally and would otherwise cache it regardless of this header.
 #
-# Second of the two independent layers protecting restricted content; the first
-# is the auth-presence cache-key split in the vcl_recv and vcl_hash snippets.
+# This is the only thing keeping non-public responses out of the shared edge
+# cache, so it must stay first and must stay broad.
 if (beresp.http.Cache-Control ~ "(?i)(private|no-store)") {
-  set beresp.ttl = 0s;
-  set beresp.grace = 0s;
-  return(pass);
-}
-
-# Credentialed responses cache ONLY when the origin explicitly says public.
-#
-# The auth-presence bit in the cache key separates anonymous from credentialed,
-# but it does NOT separate one credentialed caller from another -- they all share
-# the "1" key. Two statuses vary by identity rather than by auth presence:
-# Restricted is owner-only (owner 200, other authenticated callers 404), and
-# Banned/Deleted are served to admins. Caching either under the shared "1" key
-# would hand one caller's private content to every authenticated client.
-#
-# So this fails closed. A credentialed response is stored only if it carries an
-# explicit `public` cache policy, which blossom-core sets for exactly the two
-# public cases (immutable_blob_cache_headers, mutable_derivative_cache_headers).
-# Anything else -- private, no-store, or a new endpoint that simply forgets to
-# set the header -- is not cached. A missing header must cost a cache miss, never
-# a disclosure.
-if (req.http.X-Auth-Present == "1" && beresp.http.Cache-Control !~ "(?i)public") {
   set beresp.ttl = 0s;
   set beresp.grace = 0s;
   return(pass);

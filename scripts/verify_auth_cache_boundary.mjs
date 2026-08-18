@@ -1,19 +1,24 @@
-// ABOUTME: Verifies restricted media never crosses the auth boundary via the edge cache.
+// ABOUTME: Verifies non-Active media never reaches the shared edge cache.
 // ABOUTME: Creates its own throwaway blobs, exercises the matrix, and deletes them.
 
 /**
- * Gate for the auth-presence cache key (vcl/hash.vcl, vcl/recv.vcl, vcl/fetch.vcl).
+ * Gate for the vcl_fetch private/no-store check.
  *
- * The edge caches credentialed media under a single shared "auth present" key.
- * That is safe only while responses which vary by *identity* never enter that
- * entry. BlobMetadata::access_for varies by identity for two statuses:
+ * The edge shares one cache entry across all callers of a given object. Nothing
+ * whose response varies by identity may enter it, and BlobMetadata::access_for
+ * varies by identity for two statuses:
  *
  *   Restricted     owner -> 200, any other authenticated caller -> 404
  *   Banned/Deleted admin -> 200, everyone else -> 404
  *
- * So this asserts the dangerous orderings specifically: the privileged caller
- * fetches FIRST, populating whatever the edge is willing to store, and only then
- * do the unprivileged callers ask. If the cache ever serves them the privileged
+ * main.rs serves anything whose status is not Active as `private, no-store`, and
+ * the vcl_fetch snippet refuses to cache responses matching that. Before
+ * 2026-08-11 the snippet overwrote Cache-Control unconditionally, so these
+ * responses WERE force-cached as public -- this is the regression guard for that.
+ *
+ * Asserts the dangerous ordering specifically: the privileged caller fetches
+ * FIRST, populating whatever the edge is willing to store, and only then do the
+ * unprivileged callers ask. If the cache ever serves them the privileged
  * response, that is a disclosure and this script fails.
  *
  * Runs against real infrastructure with real credentials. It never mocks, and it
@@ -21,13 +26,15 @@
  *
  * Usage:
  *   WEBHOOK_SECRET=... node scripts/verify_auth_cache_boundary.mjs
- *   WEBHOOK_SECRET=... SERVER=https://media.divine.video FILE=test.mp4 node scripts/verify_auth_cache_boundary.mjs
+ *   WEBHOOK_SECRET=... SERVER=https://media.divine.video PUBLIC_HASH=<active-hash> node scripts/verify_auth_cache_boundary.mjs
  *
  * WEBHOOK_SECRET must match `webhook_secret` in the blossom_secrets store; it is
  * required to set moderation status and is never read from anywhere but the env.
  *
- * Exit codes: 0 all assertions held, 1 a boundary was violated, 2 setup failed.
+ * Exit codes: 0 all assertions held, 1 a boundary was violated, 2 setup failed
+ * or the boundary cases could not run.
  */
+
 
 import { generateSecretKey, finalizeEvent } from 'nostr-tools/pure';
 import crypto from 'crypto';
@@ -154,7 +161,7 @@ try {
 
   // ---- Case 1: Restricted is owner-only, and must not leak via the shared key.
   if (CAN_MODERATE) {
-  console.log('[1] Restricted: owner-only, shared auth=1 cache key');
+  console.log('[1] Restricted: owner-only, must not reach the shared cache');
   const r1 = freshBlob('restricted');
   const up1 = await upload(r1.bytes, r1.hash);
   if (up1.status !== 200) {

@@ -61,13 +61,11 @@ mod tests {
         assert!(max_age(headers.cache_control) <= 86_400);
     }
 
-    // The outer VCL fetch snippet caches a credentialed response only when its
-    // Cache-Control carries the literal token `public`, and refuses to cache
-    // anything matching `private` or `no-store`. That is what keeps one
-    // authenticated caller's Restricted or admin-visible content from being
-    // served to every other authenticated caller out of the shared auth=1 cache
-    // entry. These tests pin the header text the VCL matches on, so changing it
-    // fails CI here instead of silently turning caching off -- or, worse, on.
+    // The outer VCL fetch snippet refuses to cache any response whose
+    // Cache-Control matches `private` or `no-store`, which is what keeps
+    // non-Active content out of the shared edge cache. These tests pin the
+    // header text that check matches on, so changing the wording fails CI here
+    // instead of silently re-enabling the edge caching of private responses.
     #[test]
     fn public_cache_headers_carry_the_token_the_vcl_matches() {
         for cache_control in [
