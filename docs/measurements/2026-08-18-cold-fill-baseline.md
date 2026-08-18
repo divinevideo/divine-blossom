@@ -1,5 +1,5 @@
 # ABOUTME: First cold-fill latency baseline for media.divine.video, measured from Christchurch NZ after the 2026-08-18 cache-policy fix.
-# ABOUTME: Establishes that cold fills cost 0.7-5.8s TTFB and that the bare-blob route is far slower cold than the derivative route.
+# ABOUTME: Establishes that successful cold fills ranged from 0.757-5.836s TTFB and that the bare-blob route is far slower cold than the derivative route.
 
 # Cold-fill baseline — Christchurch, NZ (2026-08-18)
 
@@ -38,9 +38,10 @@ warm as well as cold for the first time.
 
 ## 1. Cold vs warm, bare-blob route
 
-Seven long-tail objects, first request then immediate repeat.
+Six long-tail blobs and one object that returned 404, first request then immediate
+repeat.
 
-| object | cold TTFB | warm TTFB |
+| object | first-response TTFB | repeat-response TTFB |
 |---|---:|---:|
 | A | 0.757 s | 0.053 s |
 | B | 1.061 s | 0.052 s |
@@ -50,15 +51,18 @@ Seven long-tail objects, first request then immediate repeat.
 | F | 5.836 s | 0.056 s |
 | G (404) | 0.724 s | 0.054 s |
 
-n=7. Cold median ~1.7 s, cold max 5.8 s. Warm is flat at 52-82 ms regardless of
-object.
+Six successful blob fills: n=6, median 1.744 s, range 0.757-5.836 s. Object G's
+404 response took 0.724 s and is excluded from the fill statistics. Immediate
+repeat responses are flat at 52-82 ms regardless of object.
 
 For comparison, the client-side "source ready" delays in the incident handoff
 were 0.98 / 1.19 / 2.75 / 3.49 / 3.68 / 3.75 / 6.18 s, and two prefetches were
 cancelled at exactly 8.001 s by the wall-clock deadline in the mobile client.
-The cold distribution measured here covers that range. This does **not** prove
-the reported stalls were cold fills — it establishes that cold fill is capable
-of producing them, which was previously unknown.
+The successful-fill range overlaps six of the seven source-ready delays. It does
+not cover the 6.18 s delay or the two 8.001 s cancellations. This does **not**
+prove the reported stalls were cold fills — it establishes that cold fills can
+produce multi-second delays overlapping much of the observed source-ready
+distribution, which was previously unknown.
 
 Object G is referenced by a published nostr event but returns 404 at the edge.
 Recorded here because it means the catalogue and the event index disagree.
@@ -81,8 +85,9 @@ by real traffic.
 Rows I and J are the only clean cold-vs-cold pairs: comparable object sizes
 (1.23 vs 0.72 MB, 0.79 vs 0.74 MB) and 7-8x the TTFB on the bare-blob route.
 Note also that the *larger* bare blobs (H, K, L at ~6-7 MB) were **faster** than
-the smaller ones (I, J at ~1 MB), which rules out byte transfer as the driver and
-suggests H, K and L were not fully cold either.
+the smaller ones (I, J at ~1 MB). That pattern is consistent with a latency
+source other than byte transfer, but does not establish one: H, K and L were
+likely not fully cold, so the comparison is uncontrolled.
 
 ### What this points at, and what it does not establish
 
