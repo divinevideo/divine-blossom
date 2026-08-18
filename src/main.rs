@@ -97,11 +97,22 @@ fn main(mut req: Request) -> std::result::Result<Response, Error> {
     req.set_header(req_id::REQUEST_ID_HEADER, &request_id);
     let method = req.get_method().as_str().to_string();
     let route = route_category(req.get_path());
+    let path = req.get_path().to_string();
     let result = handle_request(req);
-    let (response, error) = match result {
+    let (mut response, error) = match result {
         Ok(response) => (response, None),
         Err(error) => (error_response(&error), Some(error)),
     };
+
+    // 404s on hash-addressed blobs are cached at the edge for 60s
+    // (vcl/fetch.vcl). Tag them with the blob's Surrogate-Key so the targeted
+    // purge path the operator docs promote (`fastly purge --key <hash>`) can
+    // evict a stale negative entry when moderation status flips.
+    if response.get_status() == StatusCode::NOT_FOUND {
+        if let Some(hash) = surrogate_key_hash_from_path(&path) {
+            response.set_header("Surrogate-Key", hash);
+        }
+    }
 
     request_log::emit(
         &request_id,
@@ -5935,6 +5946,20 @@ fn json_response<T: serde::Serialize>(status: StatusCode, body: &T) -> Response 
     resp
 }
 
+/// Extract the leading SHA-256 hash from a hash-addressed path
+/// (`/<hash>`, `/<hash>.mp4`, `/<hash>/hls/...`), matching the prefix shape
+/// that vcl/recv.vcl routes to the Compute lookup backend. Returns the
+/// lowercased hash so the key matches the Surrogate-Key set on successful
+/// responses.
+fn surrogate_key_hash_from_path(path: &str) -> Option<String> {
+    let hash = path.strip_prefix('/')?.get(..64)?;
+    if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(hash.to_lowercase())
+    } else {
+        None
+    }
+}
+
 /// Create error response
 fn error_response(error: &BlossomError) -> Response {
     let mut resp = Response::from_status(error.status_code());
@@ -6203,6 +6228,7 @@ mod tests {
         ignored_generation_response, is_alias_only_audio_blob,
         parse_transcode_status_webhook_payload, parse_transcript_status_webhook_payload,
         parse_upload_service_response, should_delete_derived_audio_blob,
+        surrogate_key_hash_from_path,
         should_eagerly_trigger_transcription, should_record_upload_service_transcode_failure,
         should_record_upload_service_transcript_failure,
         should_reset_transcode_failure_on_clean_upload,
@@ -6947,5 +6973,40 @@ mod tests {
         assert_eq!(resp.get_status(), StatusCode::BAD_REQUEST);
         assert_eq!(resp.get_header_str("Cache-Control"), None);
         assert_eq!(resp.get_header_str("Surrogate-Control"), None);
+    }
+
+    #[test]
+    fn surrogate_key_hash_from_path_extracts_hash_addressed_prefixes() {
+        let hash = "a".repeat(64);
+        let upper_hash = "A".repeat(64);
+
+        assert_eq!(
+            surrogate_key_hash_from_path(&format!("/{hash}")),
+            Some(hash.clone())
+        );
+        assert_eq!(
+            surrogate_key_hash_from_path(&format!("/{hash}.mp4")),
+            Some(hash.clone())
+        );
+        assert_eq!(
+            surrogate_key_hash_from_path(&format!("/{hash}/hls/master.m3u8")),
+            Some(hash.clone())
+        );
+        assert_eq!(
+            surrogate_key_hash_from_path(&format!("/{upper_hash}")),
+            Some(hash.clone())
+        );
+
+        assert_eq!(surrogate_key_hash_from_path("/"), None);
+        assert_eq!(surrogate_key_hash_from_path("/upload"), None);
+        assert_eq!(surrogate_key_hash_from_path("/admin/api/stats"), None);
+        assert_eq!(
+            surrogate_key_hash_from_path(&format!("/{}", "a".repeat(63))),
+            None
+        );
+        assert_eq!(
+            surrogate_key_hash_from_path(&format!("/{}z", "a".repeat(63))),
+            None
+        );
     }
 }

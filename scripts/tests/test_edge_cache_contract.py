@@ -68,6 +68,17 @@ class EdgeCacheContractTests(unittest.TestCase):
                 'resp.set_header("Cache-Control", "private, no-store")', route
             )
 
+    def test_cached_404s_carry_surrogate_key_for_targeted_purge(self):
+        main_rs = (ROOT / "src" / "main.rs").read_text()
+
+        # vcl/fetch.vcl caches 404s for 60s and comments that the response
+        # Surrogate-Key enables instant purge; the origin must actually set it,
+        # or `fastly purge --key <hash>` cannot evict a stale negative entry.
+        fetch_vcl = (ROOT / "vcl" / "fetch.vcl").read_text()
+        self.assertIn("set beresp.ttl = 60s", fetch_vcl)
+        self.assertIn("surrogate_key_hash_from_path", main_rs)
+        self.assertIn('response.set_header("Surrogate-Key", hash);', main_rs)
+
     def test_operator_docs_do_not_require_a_global_purge(self):
         for relative_path in (
             "AGENTS.md",
