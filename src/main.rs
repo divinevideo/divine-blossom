@@ -11,16 +11,20 @@ mod media_auth_log;
 mod metadata;
 mod rate_limit;
 mod req_id;
+mod request_log;
 mod storage;
+mod upload_log;
 mod viewer_auth;
 
 use crate::auth::{diagnose_viewer_auth, validate_auth, validate_hash_match, viewer_pubkey};
 use crate::blossom::{
-    is_audio_path, is_hash_path, is_transcribable_mime_type, is_video_mime_type, parse_audio_path,
-    parse_hash_from_path, parse_thumbnail_path, AudioMapping, AuthAction, BlobAccess,
-    BlobDescriptor, BlobMetadata, BlobStatus, ResumableUploadCompleteResponse,
-    ResumableUploadInitRequest, ResumableUploadInitResponse, SubtitleJob, SubtitleJobCreateRequest,
-    SubtitleJobStatus, TranscodeStatus, TranscriptStatus, UploadRequirements,
+    is_audio_path, is_hash_path, is_quality_variant_path, is_transcribable_mime_type,
+    is_transcript_path, is_video_mime_type, is_vtt_file_path, parse_audio_path,
+    parse_hash_from_path, parse_quality_variant_path, parse_thumbnail_path, parse_transcript_path,
+    parse_vtt_file_path, AudioMapping, AuthAction, BlobAccess, BlobDescriptor, BlobMetadata,
+    BlobStatus, ResumableUploadCompleteResponse, ResumableUploadInitRequest,
+    ResumableUploadInitResponse, SubtitleJob, SubtitleJobCreateRequest, SubtitleJobStatus,
+    TranscodeStatus, TranscriptStatus, UploadRequirements, QUALITY_VARIANTS,
 };
 use crate::delete_policy::{
     build_creator_delete_response, handle_creator_delete, map_webhook_moderate_action,
@@ -42,11 +46,20 @@ use crate::metadata::{
 };
 use crate::storage::{
     blob_exists, check_funnelcake_audio_reuse, current_timestamp, delete_blob as storage_delete,
-    download_blob_with_fallback, download_thumbnail, trigger_audio_extraction,
-    trigger_audit_anonymize, trigger_cloud_run_bulk_delete, trigger_cloud_run_delete_blob,
-    upload_blob, write_audit_log,
+    download_blob_read_through, download_blob_with_fallback, download_thumbnail,
+    trigger_audio_extraction, trigger_audit_anonymize, trigger_cloud_run_bulk_delete,
+    trigger_cloud_run_delete_blob, upload_blob, write_audit_log,
 };
 use crate::viewer_auth::{ViewerAuthDiagnostics, ViewerAuthState};
+use blossom_core::cache_policy::{
+    blob_cache_policy, cache_headers_for_policy, mutable_derivative_cache_headers,
+    status_requires_private_response, BlobCachePolicy, CacheHeaders,
+};
+use blossom_core::request_diagnostics::route_category;
+use blossom_core::upload_log::{
+    record_failure, record_response, record_send_attempt, OriginSendResult, UploadLogRecord,
+    UploadRoute,
+};
 use fastly_blossom::resumable_complete::parse_resumable_complete_request_body;
 
 use fastly::cache::simple as simple_cache;
@@ -55,7 +68,7 @@ use fastly::kv_store::KVStore;
 use fastly::{Error, Request, Response};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// TTL for cached HLS manifests (1 hour) — immutable once transcoding completes
 const HLS_CACHE_TTL: Duration = Duration::from_secs(3600);
@@ -73,24 +86,38 @@ const DERIVATIVE_MAX_ATTEMPTS: u32 = 3;
 
 /// Entry point
 #[fastly::main]
-fn main(req: Request) -> std::result::Result<Response, Error> {
-    match handle_request(req) {
-        Ok(resp) => Ok(resp),
-        Err(e) => Ok(error_response(&e)),
-    }
+fn main(mut req: Request) -> std::result::Result<Response, Error> {
+    // Route Rust panics to the persistent diagnostics endpoint so a
+    // non-returning guest failure still leaves a record. The message is the
+    // panic text, not the compute_request JSON schema. Fails open when the
+    // endpoint is not configured, matching request_log::emit.
+    let _ = fastly::log::set_panic_endpoint(request_log::ENDPOINT_NAME);
+    let started = Instant::now();
+    let request_id = req_id::for_request(&req);
+    req.set_header(req_id::REQUEST_ID_HEADER, &request_id);
+    let method = req.get_method().as_str().to_string();
+    let route = route_category(req.get_path());
+    let result = handle_request(req);
+    let (response, error) = match result {
+        Ok(response) => (response, None),
+        Err(error) => (error_response(&error), Some(error)),
+    };
+
+    request_log::emit(
+        &request_id,
+        &method,
+        route,
+        response.get_status().as_u16(),
+        error.as_ref(),
+        started.elapsed(),
+    );
+    Ok(response)
 }
 
 /// Route and handle the request
 fn handle_request(req: Request) -> Result<Response> {
     let method = req.get_method().clone();
     let path = req.get_path().to_string();
-    let host = req.get_header_str("host").unwrap_or("unknown");
-
-    eprintln!(
-        "[BLOSSOM ROUTE] method={} path={} host={}",
-        method, path, host
-    );
-
     match (method, path.as_str()) {
         // Landing page
         (Method::GET, "/") => Ok(handle_landing_page()),
@@ -139,16 +166,20 @@ fn handle_request(req: Request) -> Result<Response> {
         (Method::HEAD, p) if is_hash_path(p) => handle_head_blob(p),
 
         // BUD-02: Upload
-        (Method::PUT, "/upload") => handle_upload(req),
+        (Method::PUT, "/upload") => with_upload_log(req, UploadRoute::DirectPut, handle_upload),
         // BUD-06: Upload requirements/pre-validation
         (Method::HEAD, "/upload") => handle_upload_requirements(req),
         // Synchronous audio transcription — thin forward to the upload service's
         // authenticated /transcribe proxy (which calls the transcoder).
         (Method::POST, "/transcribe") => handle_transcribe_proxy(req),
         // Divine resumable control plane
-        (Method::POST, "/upload/init") => handle_upload_init(req),
+        (Method::POST, "/upload/init") => {
+            with_upload_log(req, UploadRoute::ResumableInit, handle_upload_init)
+        }
         (Method::POST, p) if p.starts_with("/upload/") && p.ends_with("/complete") => {
-            handle_upload_complete(req, p)
+            with_upload_log(req, UploadRoute::ResumableComplete, |req, record| {
+                handle_upload_complete(req, p, record)
+            })
         }
 
         // BUD-02: Delete
@@ -266,6 +297,67 @@ fn log_media_outcome(route: &str, diagnostics: &ViewerAuthDiagnostics, outcome: 
     eprintln!("{}", format_media_auth_log(route, diagnostics, outcome));
 }
 
+/// Run an edge-proxied upload handler and emit exactly one structured log line
+/// for it, whatever the outcome.
+///
+/// The wrapper owns emission rather than the handlers because handlers have
+/// many early returns via `?`. Logging inside them would mean one emit site per
+/// return, and the failure paths — the entire reason this exists — are the ones
+/// most likely to be missed.
+fn with_upload_log<F>(req: Request, route: UploadRoute, handler: F) -> Result<Response>
+where
+    F: FnOnce(Request, &mut UploadLogRecord) -> Result<Response>,
+{
+    let started = Instant::now();
+    let mut record = upload_log::start_record(&req, route, req_id::for_request(&req));
+
+    let result = handler(req, &mut record);
+
+    record.duration_ms = duration_millis(started.elapsed());
+    match &result {
+        Ok(resp) => record_response(&mut record, resp.get_status().as_u16()),
+        Err(e) => record_failure(&mut record, e),
+    }
+
+    upload_log::emit(&record);
+    result
+}
+
+/// Send a prepared request to the upload service, recording the attempt.
+///
+/// A failed `send` means the edge received no complete origin response. Origin
+/// may still have received or processed some or all of the request, so this is
+/// deliberately not described as evidence that origin was never reached. The
+/// timing is captured before the match so it survives that path too.
+fn send_to_upload_service(proxy_req: Request, record: &mut UploadLogRecord) -> Result<Response> {
+    let started = Instant::now();
+    let sent = proxy_req.send(UPLOAD_SERVICE_BACKEND);
+    let elapsed = duration_millis(started.elapsed());
+
+    match sent {
+        Ok(resp) => {
+            record_send_attempt(
+                record,
+                OriginSendResult::Replied(resp.get_status().as_u16()),
+                elapsed,
+            );
+            Ok(resp)
+        }
+        Err(e) => {
+            let message = e.to_string();
+            record_send_attempt(record, OriginSendResult::Failed(&message), elapsed);
+            Err(BlossomError::Internal(format!(
+                "Failed to proxy to upload service: {}",
+                message
+            )))
+        }
+    }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
 fn classify_audio_reuse_availability(result: &Result<bool>) -> AudioReuseAvailability {
     match result {
         Ok(true) => AudioReuseAvailability::Allowed,
@@ -321,7 +413,7 @@ fn audio_reuse_denied_response() -> Response {
 fn add_audio_response_headers(
     resp: &mut Response,
     source_hash: &str,
-    private_cache: bool,
+    cache_policy: BlobCachePolicy,
     mime_type: &str,
     size_bytes: u64,
     duration_seconds: f64,
@@ -334,11 +426,7 @@ fn add_audio_response_headers(
     resp.set_header("X-Audio-Duration", format!("{}", duration_seconds));
     resp.set_header("X-Audio-Size", size_bytes.to_string());
     resp.set_header("Accept-Ranges", "bytes");
-    if private_cache {
-        add_private_cache_headers(resp, source_hash);
-    } else {
-        add_cache_headers(resp, source_hash);
-    }
+    apply_cache_headers(resp, &cache_headers_for_policy(cache_policy, source_hash));
     add_cors_headers(resp);
 }
 
@@ -425,16 +513,14 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         let is_admin = admin::validate_bearer_token(&req).is_ok();
 
         // Check parent video's moderation status - thumbnails inherit video access rules
-        let mut is_restricted = false;
+        let mut cache_status: Option<BlobStatus> = None;
         match get_blob_metadata(video_hash)? {
             Some(meta) => {
                 let (requester_pk, auth_diagnostics) = media_viewer_context(&req, "thumbnail")?;
                 match meta.access_for(requester_pk.as_deref(), is_admin) {
                     BlobAccess::Allowed => {
                         log_media_outcome("thumbnail", &auth_diagnostics, "allowed");
-                        if meta.status.requires_private_cache() {
-                            is_restricted = true;
-                        }
+                        cache_status = Some(meta.status);
                     }
                     BlobAccess::NotFound => {
                         log_media_outcome("thumbnail", &auth_diagnostics, "not_found");
@@ -457,10 +543,11 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
 
         // Try to download existing thumbnail from GCS
         let set_thumb_cache = |resp: &mut Response| {
-            if is_restricted {
+            // Admin bypass responses stay private, mirroring handle_get_blob.
+            if is_admin {
                 add_private_cache_headers(resp, video_hash);
             } else {
-                add_cache_headers(resp, video_hash);
+                add_blob_response_cache_headers(resp, video_hash, cache_status);
             }
         };
         match download_thumbnail(&thumbnail_key) {
@@ -531,16 +618,21 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
 
-    // Download from GCS with fallback to CDNs
-    let result = download_blob_with_fallback(&hash, range.as_deref())?;
+    // Serve from the FOS mirror when it has the object, otherwise GCS (with
+    // CDN fallback) and lazily copy the object into the mirror.
+    let result = download_blob_read_through(&hash, range.as_deref())?;
     let mut resp = result.response;
 
-    // Surface provenance metadata if present on the origin object.
+    // Surface provenance metadata if present on the origin object. GCS returns
+    // custom metadata as `x-goog-meta-*`; S3-compatible mirrors return the same
+    // values as `x-amz-meta-*`, so accept either spelling.
     let c2pa_manifest_id = resp
         .get_header_str("x-goog-meta-c2pa-manifest-id")
+        .or_else(|| resp.get_header_str("x-amz-meta-c2pa-manifest-id"))
         .map(|s| s.to_string());
     let source_sha256 = resp
         .get_header_str("x-goog-meta-source-sha256")
+        .or_else(|| resp.get_header_str("x-amz-meta-source-sha256"))
         .map(|s| s.to_string());
 
     // Add CORS headers
@@ -586,24 +678,16 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         resp.set_header("X-Sha256", &hash);
     }
 
-    // Content is addressed by SHA256 hash, so it's immutable - cache aggressively.
-    // Exception: restricted/admin content must not be publicly cached.
+    // Active content is addressed by SHA256 hash, so it's immutable - cache aggressively.
+    // Pending blobs are public while moderation runs, but keep browser caches revocable.
     if is_admin {
         // Admin bypass: never cache, expose moderation status
-        resp.set_header("Cache-Control", "private, no-store");
+        add_private_cache_headers(&mut resp, &hash);
         if let Some(ref meta) = metadata {
-            resp.set_header("X-Moderation-Status", &format!("{:?}", meta.status));
+            resp.set_header("X-Moderation-Status", format!("{:?}", meta.status));
         }
     } else {
-        let is_restricted = metadata
-            .as_ref()
-            .map(|m| m.status != BlobStatus::Active)
-            .unwrap_or(false);
-        if is_restricted {
-            add_private_cache_headers(&mut resp, &hash);
-        } else {
-            add_cache_headers(&mut resp, &hash);
-        }
+        add_blob_response_cache_headers(&mut resp, &hash, metadata.as_ref().map(|m| m.status));
     }
 
     if let Some(c2pa) = c2pa_manifest_id {
@@ -623,18 +707,17 @@ fn handle_head_blob(path: &str) -> Result<Response> {
         let thumb_hash = thumbnail_key.trim_end_matches(".jpg");
 
         // HEAD has no auth context — apply non-owner access rules.
-        match get_blob_metadata(thumb_hash)? {
-            Some(meta) => match meta.access_for(None, false) {
-                BlobAccess::Allowed => {}
-                BlobAccess::NotFound => {
-                    return Err(BlossomError::NotFound("Blob not found".into()));
-                }
-                BlobAccess::AgeGated => {
-                    return Err(BlossomError::AuthRequired("age_restricted".into()));
-                }
-            },
-            None => {
+        let meta = match get_blob_metadata(thumb_hash)? {
+            Some(meta) => meta,
+            None => return Err(BlossomError::NotFound("Blob not found".into())),
+        };
+        match meta.access_for(None, false) {
+            BlobAccess::Allowed => {}
+            BlobAccess::NotFound => {
                 return Err(BlossomError::NotFound("Blob not found".into()));
+            }
+            BlobAccess::AgeGated => {
+                return Err(BlossomError::AuthRequired("age_restricted".into()));
             }
         }
 
@@ -651,7 +734,7 @@ fn handle_head_blob(path: &str) -> Result<Response> {
         let mut head_resp = Response::from_status(StatusCode::OK);
         head_resp.set_header("Content-Type", "image/jpeg");
         head_resp.set_header("Content-Length", &content_length);
-        add_cache_headers(&mut head_resp, thumb_hash);
+        add_blob_response_cache_headers(&mut head_resp, thumb_hash, Some(meta.status));
         head_resp.set_header("Accept-Ranges", "bytes");
         add_cors_headers(&mut head_resp);
         return Ok(head_resp);
@@ -683,7 +766,7 @@ fn handle_head_blob(path: &str) -> Result<Response> {
     resp.set_header(header::CONTENT_LENGTH, metadata.size.to_string());
     resp.set_header("X-Sha256", &metadata.sha256);
     resp.set_header("X-Content-Length", metadata.size.to_string());
-    add_cache_headers(&mut resp, &hash);
+    add_blob_response_cache_headers(&mut resp, &hash, Some(metadata.status));
     resp.set_header("Accept-Ranges", "bytes");
     add_cors_headers(&mut resp);
 
@@ -752,10 +835,10 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
                 .map(|s| s.to_string());
 
             resp.set_header("Content-Type", "application/vnd.apple.mpegurl");
-            if is_admin || meta.status.requires_private_cache() {
+            if is_admin || status_requires_private_response(meta.status) {
                 add_private_cache_headers(&mut resp, &hash);
             } else {
-                add_cache_headers(&mut resp, &hash);
+                add_derivative_cache_headers(&mut resp, &hash);
             }
             resp.set_header("X-Sha256", &hash);
             if let Some(c2pa) = c2pa_manifest_id {
@@ -873,7 +956,7 @@ fn handle_head_hls_master(path: &str) -> Result<Response> {
             }
             let mut resp = Response::from_status(StatusCode::OK);
             resp.set_header("Content-Type", "application/vnd.apple.mpegurl");
-            add_cache_headers(&mut resp, &hash);
+            add_derivative_cache_headers(&mut resp, &hash);
             resp.set_header("X-Sha256", &hash);
             add_cors_headers(&mut resp);
             Ok(resp)
@@ -940,7 +1023,7 @@ fn handle_get_hls_content(req: Request, path: &str) -> Result<Response> {
             match meta.access_for(requester_pk.as_deref(), is_admin) {
                 BlobAccess::Allowed => {
                     log_media_outcome("hls_content", &auth_diagnostics, "allowed");
-                    if meta.status.requires_private_cache() {
+                    if status_requires_private_response(meta.status) {
                         is_restricted = true;
                     }
                 }
@@ -995,10 +1078,12 @@ fn handle_get_hls_content(req: Request, path: &str) -> Result<Response> {
             };
 
             resp.set_header("Content-Type", content_type);
-            if is_restricted {
+            // Admin bypass responses stay private, mirroring handle_get_blob
+            // and the HLS master route.
+            if is_admin || is_restricted {
                 add_private_cache_headers(&mut resp, &hash);
             } else {
-                add_cache_headers(&mut resp, &hash);
+                add_derivative_cache_headers(&mut resp, &hash);
             }
             resp.set_header("X-Sha256", &hash);
             if let Some(c2pa) = c2pa_manifest_id {
@@ -1133,7 +1218,7 @@ fn handle_head_hls_content(path: &str) -> Result<Response> {
         Ok(_) => {
             let mut resp = Response::from_status(StatusCode::OK);
             resp.set_header("Content-Type", content_type);
-            add_cache_headers(&mut resp, &hash_lower);
+            add_derivative_cache_headers(&mut resp, &hash_lower);
             resp.set_header("X-Sha256", &hash_lower);
             add_cors_headers(&mut resp);
             Ok(resp)
@@ -1207,51 +1292,6 @@ fn download_hls_content(gcs_path: &str, range: Option<&str>) -> Result<Response>
     }
     resp.set_body(body_bytes);
     Ok(resp)
-}
-
-/// Parse transcript path: /{sha256}/VTT (case-insensitive).
-fn parse_transcript_path(path: &str) -> Option<String> {
-    let path_trimmed = path.trim_start_matches('/');
-    let mut parts = path_trimmed.split('/');
-    let hash = parts.next()?;
-    let suffix = parts.next()?;
-
-    if parts.next().is_some() {
-        return None;
-    }
-
-    if suffix.eq_ignore_ascii_case("vtt")
-        && hash.len() == 64
-        && hash.chars().all(|c| c.is_ascii_hexdigit())
-    {
-        Some(hash.to_lowercase())
-    } else {
-        None
-    }
-}
-
-/// Parse transcript file path: /{sha256}.vtt.
-fn parse_vtt_file_path(path: &str) -> Option<String> {
-    let path_trimmed = path.trim_start_matches('/');
-    if !path_trimmed.ends_with(".vtt") {
-        return None;
-    }
-    let hash = path_trimmed.strip_suffix(".vtt")?;
-    if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
-        Some(hash.to_lowercase())
-    } else {
-        None
-    }
-}
-
-/// Check if a path is a transcript request path.
-fn is_transcript_path(path: &str) -> bool {
-    parse_transcript_path(path).is_some()
-}
-
-/// Check if a path is a transcript file request path.
-fn is_vtt_file_path(path: &str) -> bool {
-    parse_vtt_file_path(path).is_some()
 }
 
 /// Download transcript content from GCS
@@ -1658,10 +1698,10 @@ fn serve_transcript_by_hash(
                 );
             }
             resp.set_header("Content-Type", "text/vtt; charset=utf-8");
-            if is_admin || metadata.status.requires_private_cache() {
+            if is_admin || status_requires_private_response(metadata.status) {
                 add_private_cache_headers(&mut resp, &hash);
             } else {
-                add_cache_headers(&mut resp, &hash);
+                add_derivative_cache_headers(&mut resp, hash);
             }
             add_cors_headers(&mut resp);
             Ok(resp)
@@ -1793,7 +1833,7 @@ fn handle_head_transcript_by_hash(hash: &str) -> Result<Response> {
             }
             let mut resp = Response::from_status(StatusCode::OK);
             resp.set_header("Content-Type", "text/vtt; charset=utf-8");
-            add_cache_headers(&mut resp, hash);
+            add_derivative_cache_headers(&mut resp, hash);
             add_cors_headers(&mut resp);
             Ok(resp)
         }
@@ -2126,14 +2166,6 @@ fn handle_get_subtitle_by_hash(req: Request, path: &str) -> Result<Response> {
     ))
 }
 
-/// Valid quality variant suffixes: (url_suffix, gcs_filename, content_type)
-const QUALITY_VARIANTS: &[(&str, &str, &str)] = &[
-    ("/720p", "stream_720p.ts", "video/mp2t"),
-    ("/480p", "stream_480p.ts", "video/mp2t"),
-    ("/720p.mp4", "stream_720p.mp4", "video/mp4"),
-    ("/480p.mp4", "stream_480p.mp4", "video/mp4"),
-];
-
 /// GET /{sha256}.audio.m4a - Extract and serve audio from a video blob.
 ///
 /// Permission is hash-level: if ANY public current video event for this sha256
@@ -2180,7 +2212,13 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
         AudioReuseAvailability::LookupUnavailable => return Ok(audio_lookup_unavailable_response()),
     }
 
-    let private_cache = is_admin || metadata.status.requires_private_cache();
+    // Admin responses stay private; otherwise the source video's moderation
+    // status drives the policy (Pending source => revocable public caching).
+    let audio_cache_policy = if is_admin {
+        BlobCachePolicy::PrivateNoStore
+    } else {
+        blob_cache_policy(metadata.status)
+    };
 
     // 4. Must be a video source
     if !is_video_mime_type(&metadata.mime_type) {
@@ -2209,7 +2247,7 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
             add_audio_response_headers(
                 &mut resp,
                 &hash,
-                private_cache,
+                audio_cache_policy,
                 &mapping.mime_type,
                 mapping.size_bytes,
                 mapping.duration_seconds,
@@ -2294,7 +2332,14 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
     // 8. Download and serve the audio
     let result = download_blob_with_fallback(&audio_sha256, range.as_deref())?;
     let mut resp = result.response;
-    add_audio_response_headers(&mut resp, &hash, private_cache, &mime_type, size, duration);
+    add_audio_response_headers(
+        &mut resp,
+        &hash,
+        audio_cache_policy,
+        &mime_type,
+        size,
+        duration,
+    );
     Ok(resp)
 }
 
@@ -2340,7 +2385,7 @@ fn handle_head_audio(path: &str) -> Result<Response> {
             add_audio_response_headers(
                 &mut resp,
                 &hash,
-                metadata.status.requires_private_cache(),
+                blob_cache_policy(metadata.status),
                 &mapping.mime_type,
                 mapping.size_bytes,
                 mapping.duration_seconds,
@@ -2352,37 +2397,6 @@ fn handle_head_audio(path: &str) -> Result<Response> {
 
     // No audio extracted yet
     Err(BlossomError::NotFound("Audio not yet extracted".into()))
-}
-
-/// Check if a path is a quality variant request like /{hash}/720p
-fn is_quality_variant_path(path: &str) -> bool {
-    let path = path.trim_start_matches('/');
-    for (suffix, _, _) in QUALITY_VARIANTS {
-        let suffix = suffix.trim_start_matches('/');
-        // Need at least hash(64) + '/' + suffix
-        if path.ends_with(suffix) && path.len() > suffix.len() + 1 {
-            let hash_part = &path[..path.len() - suffix.len() - 1];
-            if hash_part.len() == 64 && hash_part.chars().all(|c| c.is_ascii_hexdigit()) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Parse quality variant path into (hash, gcs_filename, content_type)
-fn parse_quality_variant_path(path: &str) -> Option<(String, &'static str, &'static str)> {
-    let path = path.trim_start_matches('/');
-    for (suffix, filename, content_type) in QUALITY_VARIANTS {
-        let suffix = suffix.trim_start_matches('/');
-        if path.ends_with(suffix) && path.len() > suffix.len() + 1 {
-            let hash_part = &path[..path.len() - suffix.len() - 1];
-            if hash_part.len() == 64 && hash_part.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Some((hash_part.to_lowercase(), filename, content_type));
-            }
-        }
-    }
-    None
 }
 
 /// GET /<sha256>/720p or /<sha256>/480p - Direct access to transcoded quality variant
@@ -2424,10 +2438,10 @@ fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
     match download_hls_content(&gcs_path, range.as_deref()) {
         Ok(mut resp) => {
             resp.set_header("Content-Type", content_type);
-            if is_admin || meta.status.requires_private_cache() {
+            if is_admin || status_requires_private_response(meta.status) {
                 add_private_cache_headers(&mut resp, &hash);
             } else {
-                add_cache_headers(&mut resp, &hash);
+                add_derivative_cache_headers(&mut resp, &hash);
             }
             resp.set_header("Accept-Ranges", "bytes");
             add_cors_headers(&mut resp);
@@ -2523,6 +2537,10 @@ fn handle_head_quality_variant(path: &str) -> Result<Response> {
     let mut resp = Response::from_status(StatusCode::OK);
     resp.set_header("Content-Type", content_type);
     resp.set_header("Accept-Ranges", "bytes");
+    // Non-owner gating above means a 200 here is always public content, so the
+    // same derivative policy as GET applies: repairable renditions must not be
+    // pinned immutable in browser caches.
+    add_derivative_cache_headers(&mut resp, &hash);
     add_cors_headers(&mut resp);
     Ok(resp)
 }
@@ -3140,7 +3158,7 @@ fn trigger_moderation_scan(sha256: &str, pubkey: &str) {
 }
 
 /// PUT /upload - Upload blob
-fn handle_upload(mut req: Request) -> Result<Response> {
+fn handle_upload(mut req: Request, record: &mut UploadLogRecord) -> Result<Response> {
     // Validate auth
     let auth = validate_auth(&req, AuthAction::Upload)?;
 
@@ -3178,7 +3196,14 @@ fn handle_upload(mut req: Request) -> Result<Response> {
     if !crate::storage::is_local_mode()
         && (content_length > UPLOAD_SERVICE_THRESHOLD || is_video_mime_type(&content_type))
     {
-        return handle_upload_service_proxy(req, auth, content_type, content_length, base_url);
+        return handle_upload_service_proxy(
+            req,
+            auth,
+            content_type,
+            content_length,
+            base_url,
+            record,
+        );
     }
 
     // For small files (or all files in local mode), buffer in memory
@@ -3706,7 +3731,7 @@ fn publish_upload_service_upload(
     Ok(resp)
 }
 
-fn handle_upload_init(mut req: Request) -> Result<Response> {
+fn handle_upload_init(mut req: Request, record: &mut UploadLogRecord) -> Result<Response> {
     let auth = validate_auth(&req, AuthAction::Upload)?;
     let auth_header = extract_authorization_header(&req)?;
     let base_url = get_base_url(&req);
@@ -3718,6 +3743,12 @@ fn handle_upload_init(mut req: Request) -> Result<Response> {
 
     let init_request: ResumableUploadInitRequest = serde_json::from_str(&body)
         .map_err(|e| BlossomError::BadRequest(format!("Invalid JSON: {}", e)))?;
+
+    // Overwrite the header-derived values: on this route the request body is a
+    // small JSON control message, so its own Content-Length says nothing useful.
+    // The declared upload size is what makes init lines comparable to direct_put.
+    record.content_length = Some(init_request.size);
+    record.content_type = Some(init_request.content_type.clone());
 
     if init_request.size == 0 {
         return Err(BlossomError::BadRequest(
@@ -3784,11 +3815,10 @@ fn handle_upload_init(mut req: Request) -> Result<Response> {
     proxy_req.set_header(header::AUTHORIZATION, &auth_header);
     proxy_req.set_header(header::CONTENT_TYPE, "application/json");
     proxy_req.set_header(header::CONTENT_LENGTH, body.len().to_string());
+    proxy_req.set_header(upload_log::CORRELATION_HEADER, &record.req_id);
     proxy_req.set_body(body);
 
-    let mut proxy_resp = proxy_req
-        .send(UPLOAD_SERVICE_BACKEND)
-        .map_err(|e| BlossomError::Internal(format!("Failed to proxy to Cloud Run: {}", e)))?;
+    let mut proxy_resp = send_to_upload_service(proxy_req, record)?;
     if !proxy_resp.get_status().is_success() {
         let status = proxy_resp.get_status();
         let body = proxy_resp.take_body().into_string();
@@ -3797,7 +3827,9 @@ fn handle_upload_init(mut req: Request) -> Result<Response> {
 
     let response_body = proxy_resp.take_body().into_string();
     let init_response: ResumableUploadInitResponse = serde_json::from_str(&response_body)
-        .map_err(|e| BlossomError::Internal(format!("Invalid Cloud Run init response: {}", e)))?;
+        .map_err(|e| {
+            BlossomError::Internal(format!("Invalid upload service init response: {}", e))
+        })?;
 
     let mut resp = json_response(StatusCode::OK, &init_response);
     add_upload_capability_headers(&mut resp, &control_host);
@@ -3827,7 +3859,11 @@ fn upload_from_resumable_completion(
     }
 }
 
-fn handle_upload_complete(mut req: Request, path: &str) -> Result<Response> {
+fn handle_upload_complete(
+    mut req: Request,
+    path: &str,
+    record: &mut UploadLogRecord,
+) -> Result<Response> {
     let auth = validate_auth(&req, AuthAction::Upload)?;
     let auth_header = extract_authorization_header(&req)?;
     let base_url = get_base_url(&req);
@@ -3858,15 +3894,14 @@ fn handle_upload_complete(mut req: Request, path: &str) -> Result<Response> {
     );
     proxy_req.set_header("Host", UPLOAD_SERVICE_HOST);
     proxy_req.set_header(header::AUTHORIZATION, &auth_header);
+    proxy_req.set_header(upload_log::CORRELATION_HEADER, &record.req_id);
     if expected_request_hash.is_some() {
         proxy_req.set_header(header::CONTENT_TYPE, "application/json");
         proxy_req.set_header(header::CONTENT_LENGTH, request_body.len().to_string());
         proxy_req.set_body(request_body);
     }
 
-    let mut proxy_resp = proxy_req
-        .send(UPLOAD_SERVICE_BACKEND)
-        .map_err(|e| BlossomError::Internal(format!("Failed to proxy to Cloud Run: {}", e)))?;
+    let mut proxy_resp = send_to_upload_service(proxy_req, record)?;
     if !proxy_resp.get_status().is_success() {
         let status = proxy_resp.get_status();
         let body = proxy_resp.take_body().into_string();
@@ -3876,7 +3911,7 @@ fn handle_upload_complete(mut req: Request, path: &str) -> Result<Response> {
     let response_body = proxy_resp.take_body().into_string();
     let complete_response: ResumableUploadCompleteResponse = serde_json::from_str(&response_body)
         .map_err(|e| {
-        BlossomError::Internal(format!("Invalid Cloud Run completion response: {}", e))
+        BlossomError::Internal(format!("Invalid upload service completion response: {}", e))
     })?;
 
     if let Some(ref request_hash) = expected_request_hash {
@@ -3886,6 +3921,11 @@ fn handle_upload_complete(mut req: Request, path: &str) -> Result<Response> {
             ));
         }
     }
+
+    // The request body is a small control message; log the completed upload's
+    // declared media size and type so completion rows match init rows.
+    record.content_length = Some(complete_response.size);
+    record.content_type = Some(complete_response.content_type.clone());
 
     publish_upload_service_upload(
         auth,
@@ -4001,6 +4041,7 @@ fn handle_upload_service_proxy(
     content_type: String,
     content_length: u64,
     base_url: String,
+    record: &mut UploadLogRecord,
 ) -> Result<Response> {
     let auth_header = extract_authorization_header(&req)?;
 
@@ -4016,14 +4057,13 @@ fn handle_upload_service_proxy(
     proxy_req.set_header(header::AUTHORIZATION, &auth_header);
     proxy_req.set_header(header::CONTENT_TYPE, &content_type);
     proxy_req.set_header(header::CONTENT_LENGTH, content_length.to_string());
+    proxy_req.set_header(upload_log::CORRELATION_HEADER, &record.req_id);
     proxy_req.set_body(body);
+    record.proxied_body = true;
 
-    // Send to Cloud Run
-    let mut proxy_resp = proxy_req
-        .send(UPLOAD_SERVICE_BACKEND)
-        .map_err(|e| BlossomError::Internal(format!("Failed to proxy to Cloud Run: {}", e)))?;
+    let mut proxy_resp = send_to_upload_service(proxy_req, record)?;
 
-    // Check for errors from Cloud Run
+    // Check for errors from the upload service
     if !proxy_resp.get_status().is_success() {
         let status = proxy_resp.get_status();
         let body = proxy_resp.take_body().into_string();
@@ -5913,23 +5953,45 @@ fn error_response(error: &BlossomError) -> Response {
     resp
 }
 
-/// Add CORS headers
-/// Set immutable cache headers and surrogate key for content-addressed responses.
-/// - Cache-Control: tells browsers to cache for 1 year
-/// - Surrogate-Control: tells Fastly edge to cache for 1 year (stripped before client)
-/// - Surrogate-Key: enables targeted purging via `fastly purge --key {hash}`
-fn add_cache_headers(resp: &mut Response, hash: &str) {
-    resp.set_header("Cache-Control", "public, max-age=31536000, immutable");
-    resp.set_header("Surrogate-Control", "max-age=31536000");
-    resp.set_header("Surrogate-Key", hash);
+fn apply_cache_headers(resp: &mut Response, headers: &CacheHeaders<'_>) {
+    resp.set_header("Cache-Control", headers.cache_control);
+    resp.set_header("Surrogate-Control", headers.surrogate_control);
+    resp.set_header("Surrogate-Key", headers.surrogate_key);
 }
 
-/// Like add_cache_headers but for authenticated or admin-only content that must
-/// not be stored in shared caches.
+/// Cache headers for *derived* content: renditions, HLS manifests and segments,
+/// and transcripts.
+///
+/// Unlike the blob, these are not immutable. The transcoder regenerates renditions
+/// via `/backfill-fmp4`, and `scan_and_repair_vtts.py` rewrites transcripts — both
+/// while the URL stays the same. Marking them `immutable` tells a browser never to
+/// revalidate, even on reload, and browser caches cannot be purged; a client that
+/// fetched a broken transcript would keep it for the full year.
+///
+/// The edge TTL stays long because `purge_edge_cache` can invalidate it instantly by
+/// Surrogate-Key. Only the browser TTL needs to be short enough that a repair reaches
+/// clients that already cached the old version.
+fn add_derivative_cache_headers(resp: &mut Response, hash: &str) {
+    apply_cache_headers(resp, &mutable_derivative_cache_headers(hash));
+}
+
+/// Apply the moderation-status cache policy to a blob response. `None` (no
+/// metadata) fails closed to the private policy so no caller can silently hand
+/// out an immutable public copy for content whose status is unknown.
+fn add_blob_response_cache_headers(resp: &mut Response, hash: &str, status: Option<BlobStatus>) {
+    let policy = status
+        .map(blob_cache_policy)
+        .unwrap_or(BlobCachePolicy::PrivateNoStore);
+    apply_cache_headers(resp, &cache_headers_for_policy(policy, hash));
+}
+
+/// Cache headers for authenticated or admin-only content that must not be
+/// stored in shared caches.
 fn add_private_cache_headers(resp: &mut Response, hash: &str) {
-    resp.set_header("Cache-Control", "private, no-store");
-    resp.set_header("Surrogate-Control", "no-store");
-    resp.set_header("Surrogate-Key", hash);
+    apply_cache_headers(
+        resp,
+        &cache_headers_for_policy(BlobCachePolicy::PrivateNoStore, hash),
+    );
 }
 
 /// Mark a response as explicitly uncacheable (used for 202 in-progress responses).
@@ -6131,13 +6193,13 @@ fn infer_mime_from_path(path: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        backfill_batch_cursor, classify_audio_reuse_availability, decide_transcode_fetch_action,
+        add_audio_response_headers, add_blob_response_cache_headers, backfill_batch_cursor,
+        classify_audio_reuse_availability, decide_transcode_fetch_action,
         decide_transcript_fetch_action, derivative_reconciliation_response, error_response,
-        ignored_generation_response, is_alias_only_audio_blob, is_quality_variant_path,
-        parse_quality_variant_path, parse_transcode_status_webhook_payload,
-        parse_transcript_status_webhook_payload, parse_upload_service_response,
-        should_delete_derived_audio_blob, should_eagerly_trigger_transcription,
-        should_record_upload_service_transcode_failure,
+        ignored_generation_response, is_alias_only_audio_blob,
+        parse_transcode_status_webhook_payload, parse_transcript_status_webhook_payload,
+        parse_upload_service_response, should_delete_derived_audio_blob,
+        should_eagerly_trigger_transcription, should_record_upload_service_transcode_failure,
         should_record_upload_service_transcript_failure,
         should_reset_transcode_failure_on_clean_upload,
         should_reset_transcript_failure_on_clean_upload, should_set_audio_content_length,
@@ -6146,9 +6208,13 @@ mod tests {
         AudioReuseAvailability, DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction,
         TranscriptPendingState,
     };
-    use crate::blossom::{ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus};
+    use crate::blossom::{
+        BlobStatus, ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus,
+    };
     use crate::error::{BlossomError, Result as BlossomResult};
+    use blossom_core::cache_policy::BlobCachePolicy;
     use fastly::http::StatusCode;
+    use fastly::Response;
 
     #[test]
     fn upload_service_response_records_failure_fields_but_clamps_broad_invalid_media_terminal() {
@@ -6385,62 +6451,6 @@ mod tests {
             DerivativeObservation::Unavailable,
             None
         ));
-    }
-
-    #[test]
-    fn quality_variant_path_valid() {
-        let hash = "a".repeat(64);
-        assert!(is_quality_variant_path(&format!("/{}/720p", hash)));
-        assert!(is_quality_variant_path(&format!("/{}/480p", hash)));
-        assert!(is_quality_variant_path(&format!("/{}/720p.mp4", hash)));
-        assert!(is_quality_variant_path(&format!("/{}/480p.mp4", hash)));
-
-        let (parsed_hash, filename, ct) =
-            parse_quality_variant_path(&format!("/{}/720p", hash)).unwrap();
-        assert_eq!(parsed_hash, hash);
-        assert_eq!(filename, "stream_720p.ts");
-        assert_eq!(ct, "video/mp2t");
-
-        let (parsed_hash, filename, ct) =
-            parse_quality_variant_path(&format!("/{}/720p.mp4", hash)).unwrap();
-        assert_eq!(parsed_hash, hash);
-        assert_eq!(filename, "stream_720p.mp4");
-        assert_eq!(ct, "video/mp4");
-    }
-
-    #[test]
-    fn quality_variant_path_no_underflow_on_short_input() {
-        // These must not panic (previously caused u32::MAX underflow)
-        assert!(!is_quality_variant_path("/720p"));
-        assert!(!is_quality_variant_path("/480p"));
-        assert!(!is_quality_variant_path("/720p.mp4"));
-        assert!(!is_quality_variant_path("/480p.mp4"));
-        assert!(!is_quality_variant_path("720p"));
-        assert!(!is_quality_variant_path("480p"));
-        assert!(!is_quality_variant_path(""));
-        assert!(parse_quality_variant_path("/480p").is_none());
-        assert!(parse_quality_variant_path("720p").is_none());
-        assert!(parse_quality_variant_path("/720p.mp4").is_none());
-        assert!(parse_quality_variant_path("480p.mp4").is_none());
-    }
-
-    #[test]
-    fn mp4_variant_maps_to_ts_counterpart() {
-        let hash = "a".repeat(64);
-
-        // 720p.mp4 derives correct .ts counterpart for backfill check
-        let (_, filename, ct) = parse_quality_variant_path(&format!("/{}/720p.mp4", hash)).unwrap();
-        assert_eq!(ct, "video/mp4");
-        assert_eq!(filename.replace(".mp4", ".ts"), "stream_720p.ts");
-
-        // 480p.mp4 likewise
-        let (_, filename, ct) = parse_quality_variant_path(&format!("/{}/480p.mp4", hash)).unwrap();
-        assert_eq!(ct, "video/mp4");
-        assert_eq!(filename.replace(".mp4", ".ts"), "stream_480p.ts");
-
-        // .ts variants have different content type — backfill path won't trigger
-        let (_, _, ct) = parse_quality_variant_path(&format!("/{}/720p", hash)).unwrap();
-        assert_eq!(ct, "video/mp2t");
     }
 
     #[test]
@@ -6812,6 +6822,96 @@ mod tests {
         assert!(exposed_headers.contains("X-Divine-Upload-Data-Host"));
         // Browser clients must be able to read the 429 throttle backoff.
         assert!(exposed_headers.contains("Retry-After"));
+    }
+
+    #[test]
+    fn pending_blob_get_uses_short_browser_cache_with_purgeable_edge_ttl() {
+        let mut resp = Response::from_status(StatusCode::OK);
+
+        add_blob_response_cache_headers(&mut resp, "abc123", Some(BlobStatus::Pending));
+
+        assert_eq!(
+            resp.get_header_str("Cache-Control"),
+            Some("public, max-age=86400")
+        );
+        assert_eq!(
+            resp.get_header_str("Surrogate-Control"),
+            Some("max-age=31536000")
+        );
+        assert_eq!(resp.get_header_str("Surrogate-Key"), Some("abc123"));
+    }
+
+    #[test]
+    fn active_blob_get_keeps_immutable_cache_policy() {
+        let mut resp = Response::from_status(StatusCode::OK);
+
+        add_blob_response_cache_headers(&mut resp, "abc123", Some(BlobStatus::Active));
+
+        assert_eq!(
+            resp.get_header_str("Cache-Control"),
+            Some("public, max-age=31536000, immutable"),
+        );
+        assert_eq!(
+            resp.get_header_str("Surrogate-Control"),
+            Some("max-age=31536000")
+        );
+        assert_eq!(resp.get_header_str("Surrogate-Key"), Some("abc123"));
+    }
+
+    #[test]
+    fn moderated_blob_get_statuses_are_not_cacheable() {
+        for status in [
+            BlobStatus::Restricted,
+            BlobStatus::AgeRestricted,
+            BlobStatus::Banned,
+            BlobStatus::Deleted,
+        ] {
+            let mut resp = Response::from_status(StatusCode::OK);
+
+            add_blob_response_cache_headers(&mut resp, "abc123", Some(status));
+
+            assert_eq!(
+                resp.get_header_str("Cache-Control"),
+                Some("private, no-store")
+            );
+            assert_eq!(resp.get_header_str("Surrogate-Control"), Some("no-store"));
+            assert_eq!(resp.get_header_str("Surrogate-Key"), Some("abc123"));
+        }
+    }
+
+    #[test]
+    fn blob_get_without_metadata_fails_closed_to_private_cache() {
+        let mut resp = Response::from_status(StatusCode::OK);
+
+        add_blob_response_cache_headers(&mut resp, "abc123", None);
+
+        assert_eq!(
+            resp.get_header_str("Cache-Control"),
+            Some("private, no-store")
+        );
+        assert_eq!(resp.get_header_str("Surrogate-Control"), Some("no-store"));
+        assert_eq!(resp.get_header_str("Surrogate-Key"), Some("abc123"));
+    }
+
+    #[test]
+    fn audio_responses_follow_the_source_cache_policy() {
+        for (policy, cache_control) in [
+            (
+                BlobCachePolicy::ImmutablePublic,
+                "public, max-age=31536000, immutable",
+            ),
+            (BlobCachePolicy::RevocablePublic, "public, max-age=86400"),
+            (BlobCachePolicy::PrivateNoStore, "private, no-store"),
+        ] {
+            let mut resp = Response::from_status(StatusCode::OK);
+
+            add_audio_response_headers(&mut resp, "src123", policy, "audio/mp4", 42, 1.5);
+
+            assert_eq!(resp.get_header_str("Cache-Control"), Some(cache_control));
+            // Audio responses are keyed by the source video hash so moderation
+            // purges invalidate them together with the source.
+            assert_eq!(resp.get_header_str("Surrogate-Key"), Some("src123"));
+        }
     }
 
     #[test]

@@ -1,18 +1,54 @@
 # ABOUTME: VCL fetch snippet for Divine Blossom VCL caching layer
-# ABOUTME: Overrides backend cache headers from Compute/GCS to enforce aggressive caching
+# ABOUTME: Enforces long edge caching while preserving explicit browser cache policy
 
 # Strip any anti-caching headers leaked from GCS through Compute
 unset beresp.http.Pragma;
 
+# Origin owns the decision about what must not be cached. Compute marks
+# restricted and admin content `private, no-store` (src/main.rs, via
+# requires_private_cache), and that must win over the long TTL set below --
+# otherwise a credentialed fetch of restricted content would be stored at the
+# edge for a year. This check must come first: the 200/206 branch sets a 365-day
+# TTL unconditionally and would otherwise cache it regardless of this header.
+#
+# This is the only thing keeping non-public responses out of the shared edge
+# cache, so it must stay first and must stay broad.
+if (beresp.http.Cache-Control ~ "(?i)(private|no-store)") {
+  set beresp.ttl = 0s;
+  set beresp.grace = 0s;
+  return(pass);
+}
+
 if (beresp.status == 200 || beresp.status == 206) {
-  # Successful content responses: cache aggressively (1 year)
-  # Content is SHA256-addressed and immutable
+  # Successful content responses: keep a long, purgeable edge TTL.
   set beresp.ttl = 365d;
   set beresp.grace = 24h;
   set beresp.stale_while_revalidate = 24h;
 
-  # Override any anti-caching headers from GCS (no-cache, no-store, private)
-  set beresp.http.Cache-Control = "public, max-age=31536000, immutable";
+  # Deliver bytes to the client as they arrive from origin instead of buffering
+  # the whole object first. This is the required counterpart to the vcl_miss
+  # snippet that strips the client Range header: that strip makes every cache
+  # fill fetch the FULL object, so without streaming a client asking for the
+  # first 1KB of a cold video waits for the entire object to land.
+  #
+  # Measured on 2026-08-11 before this line existed:
+  #   cold range request, Range stripped, buffered : 3.1-4.0s to first byte
+  #   cold range request, Range forwarded (control): 1.34s
+  #   warm range request (cache hit)               : 0.09s
+  #
+  # Streaming keeps the whole object cached -- the byte-offload gain is
+  # unaffected -- while removing the buffer wait. Caveats: a mid-stream origin
+  # failure cannot be cleanly retried, and a range starting mid-object still
+  # waits for the stream to reach that offset. Players request bytes=0- first,
+  # which is the case this helps most.
+  set beresp.do_stream = true;
+
+  # Compute owns browser policy: blobs are immutable, but repairable derivatives
+  # have a shorter browser TTL. Retain the immutable default for legacy responses
+  # that do not provide an explicit policy.
+  if (!beresp.http.Cache-Control) {
+    set beresp.http.Cache-Control = "public, max-age=31536000, immutable";
+  }
 
 } else if (beresp.status == 202) {
   # 202 Accepted = transcoding/transcription in progress

@@ -757,6 +757,82 @@ pub fn is_hash_path(path: &str) -> bool {
     parse_hash_from_path(path).is_some()
 }
 
+/// Parse transcript path: /{sha256}/VTT (case-insensitive).
+pub fn parse_transcript_path(path: &str) -> Option<String> {
+    let path_trimmed = path.trim_start_matches('/');
+    let mut parts = path_trimmed.split('/');
+    let hash = parts.next()?;
+    let suffix = parts.next()?;
+
+    if parts.next().is_some() {
+        return None;
+    }
+
+    if suffix.eq_ignore_ascii_case("vtt")
+        && hash.len() == 64
+        && hash.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        Some(hash.to_lowercase())
+    } else {
+        None
+    }
+}
+
+/// Check if a path is a transcript request path.
+pub fn is_transcript_path(path: &str) -> bool {
+    parse_transcript_path(path).is_some()
+}
+
+/// Parse transcript file path: /{sha256}.vtt.
+pub fn parse_vtt_file_path(path: &str) -> Option<String> {
+    let path_trimmed = path.trim_start_matches('/');
+    if !path_trimmed.ends_with(".vtt") {
+        return None;
+    }
+    let hash = path_trimmed.strip_suffix(".vtt")?;
+    if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(hash.to_lowercase())
+    } else {
+        None
+    }
+}
+
+/// Check if a path is a transcript file request path.
+pub fn is_vtt_file_path(path: &str) -> bool {
+    parse_vtt_file_path(path).is_some()
+}
+
+/// Valid quality variant suffixes: (url_suffix, gcs_filename, content_type).
+/// Shared by the Compute router and request_diagnostics::route_category so the
+/// diagnostic category cannot drift from actual routing.
+pub const QUALITY_VARIANTS: &[(&str, &str, &str)] = &[
+    ("/720p", "stream_720p.ts", "video/mp2t"),
+    ("/480p", "stream_480p.ts", "video/mp2t"),
+    ("/720p.mp4", "stream_720p.mp4", "video/mp4"),
+    ("/480p.mp4", "stream_480p.mp4", "video/mp4"),
+];
+
+/// Check if a path is a quality variant request like /{hash}/720p
+pub fn is_quality_variant_path(path: &str) -> bool {
+    parse_quality_variant_path(path).is_some()
+}
+
+/// Parse quality variant path into (hash, gcs_filename, content_type)
+pub fn parse_quality_variant_path(path: &str) -> Option<(String, &'static str, &'static str)> {
+    let path = path.trim_start_matches('/');
+    for (suffix, filename, content_type) in QUALITY_VARIANTS {
+        let suffix = suffix.trim_start_matches('/');
+        // Need at least hash(64) + '/' + suffix
+        if path.ends_with(suffix) && path.len() > suffix.len() + 1 {
+            let hash_part = &path[..path.len() - suffix.len() - 1];
+            if hash_part.len() == 64 && hash_part.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Some((hash_part.to_lowercase(), filename, content_type));
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1152,7 +1228,7 @@ mod tests {
 
     #[test]
     fn test_local_mode_stub_filenames_match_quality_variants() {
-        // QUALITY_VARIANTS in main.rs defines the route-to-filename mapping:
+        // QUALITY_VARIANTS (this module) defines the route-to-filename mapping:
         //   ("/720p", "stream_720p.ts"), ("/480p", "stream_480p.ts")
         // The local mode stub must write files with these exact base names.
         // This test catches drift between the stub and route handler.
@@ -1197,6 +1273,84 @@ mod tests {
                 path
             );
         }
+    }
+
+    #[test]
+    fn quality_variant_path_valid() {
+        let hash = "a".repeat(64);
+        assert!(is_quality_variant_path(&format!("/{}/720p", hash)));
+        assert!(is_quality_variant_path(&format!("/{}/480p", hash)));
+        assert!(is_quality_variant_path(&format!("/{}/720p.mp4", hash)));
+        assert!(is_quality_variant_path(&format!("/{}/480p.mp4", hash)));
+
+        let (parsed_hash, filename, ct) =
+            parse_quality_variant_path(&format!("/{}/720p", hash)).unwrap();
+        assert_eq!(parsed_hash, hash);
+        assert_eq!(filename, "stream_720p.ts");
+        assert_eq!(ct, "video/mp2t");
+
+        let (parsed_hash, filename, ct) =
+            parse_quality_variant_path(&format!("/{}/720p.mp4", hash)).unwrap();
+        assert_eq!(parsed_hash, hash);
+        assert_eq!(filename, "stream_720p.mp4");
+        assert_eq!(ct, "video/mp4");
+    }
+
+    #[test]
+    fn quality_variant_path_no_underflow_on_short_input() {
+        // These must not panic (previously caused u32::MAX underflow)
+        assert!(!is_quality_variant_path("/720p"));
+        assert!(!is_quality_variant_path("/480p"));
+        assert!(!is_quality_variant_path("/720p.mp4"));
+        assert!(!is_quality_variant_path("/480p.mp4"));
+        assert!(!is_quality_variant_path("720p"));
+        assert!(!is_quality_variant_path("480p"));
+        assert!(!is_quality_variant_path(""));
+        assert!(parse_quality_variant_path("/480p").is_none());
+        assert!(parse_quality_variant_path("720p").is_none());
+        assert!(parse_quality_variant_path("/720p.mp4").is_none());
+        assert!(parse_quality_variant_path("480p.mp4").is_none());
+    }
+
+    #[test]
+    fn mp4_variant_maps_to_ts_counterpart() {
+        let hash = "a".repeat(64);
+
+        // 720p.mp4 derives correct .ts counterpart for backfill check
+        let (_, filename, ct) = parse_quality_variant_path(&format!("/{}/720p.mp4", hash)).unwrap();
+        assert_eq!(ct, "video/mp4");
+        assert_eq!(filename.replace(".mp4", ".ts"), "stream_720p.ts");
+
+        // 480p.mp4 likewise
+        let (_, filename, ct) = parse_quality_variant_path(&format!("/{}/480p.mp4", hash)).unwrap();
+        assert_eq!(ct, "video/mp4");
+        assert_eq!(filename.replace(".mp4", ".ts"), "stream_480p.ts");
+
+        // .ts variants have different content type — backfill path won't trigger
+        let (_, _, ct) = parse_quality_variant_path(&format!("/{}/720p", hash)).unwrap();
+        assert_eq!(ct, "video/mp2t");
+    }
+
+    #[test]
+    fn transcript_paths_parse_with_case_insensitive_suffix() {
+        let hash = "a".repeat(64);
+        for suffix in ["VTT", "vtt", "Vtt"] {
+            assert_eq!(
+                parse_transcript_path(&format!("/{hash}/{suffix}")),
+                Some(hash.clone()),
+                "suffix {suffix} must parse"
+            );
+        }
+        // Extra segments are not a transcript route.
+        assert_eq!(parse_transcript_path(&format!("/{hash}/vtt/x")), None);
+        assert_eq!(parse_transcript_path("/not-a-hash/vtt"), None);
+        // File form is extension-based, not segment-based.
+        assert_eq!(
+            parse_vtt_file_path(&format!("/{hash}.vtt")),
+            Some(hash.clone())
+        );
+        assert_eq!(parse_vtt_file_path("/not-a-hash.vtt"), None);
+        assert_eq!(parse_vtt_file_path(&format!("/{hash}.VTT")), None);
     }
 
     #[test]

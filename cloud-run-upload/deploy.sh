@@ -17,6 +17,31 @@ TRANSCRIBER_URL="${TRANSCRIBER_URL:-${TRANSCODER_URL}}"
 SENTRY_ENVIRONMENT="${SENTRY_ENVIRONMENT:-production}"
 SENTRY_SECRET="${SENTRY_SECRET:-sentry_dsn}"
 
+# --- Autoscaling -----------------------------------------------------------
+#
+# This service streams uploads to GCS rather than buffering them, so it is
+# I/O-bound and a high concurrency per instance is appropriate here -- unlike
+# the CPU-bound transcoder, where the same setting prevents scale-out.
+CONCURRENCY="${CONCURRENCY:-80}"
+MAX_INSTANCES="${MAX_INSTANCES:-100}"
+
+# This service sits in the synchronous upload path, so a cold start is visible
+# to the user who is waiting on it. MIN_INSTANCES is billed continuously, so it
+# defaults to scale-to-zero; raise it ahead of scheduled traffic events, where
+# autoscaling reacts far slower than a burst arrives.
+MIN_INSTANCES="${MIN_INSTANCES:-0}"
+
+# --- Transcode dispatch ----------------------------------------------------
+#
+# With TRANSCODE_QUEUE set, transcode jobs are handed to Cloud Tasks, which owns
+# retries and survives this instance terminating. Left empty, the service falls
+# back to dispatching directly to the transcoder, which loses work when an
+# instance is recycled mid-flight. Provision with scripts/provision-transcode-queue.sh.
+TRANSCODE_QUEUE="${TRANSCODE_QUEUE:-}"
+# Service account Cloud Tasks uses to mint an OIDC token for the transcoder.
+# Only needed once the transcoder stops allowing unauthenticated invocation.
+TRANSCODE_QUEUE_INVOKER_SA="${TRANSCODE_QUEUE_INVOKER_SA:-}"
+
 echo "Deploying ${SERVICE_NAME} from source..."
 gcloud run deploy "${SERVICE_NAME}" \
   --project "${PROJECT_ID}" \
@@ -26,10 +51,11 @@ gcloud run deploy "${SERVICE_NAME}" \
   --service-account "${SERVICE_ACCOUNT}" \
   --cpu 1 \
   --memory 512Mi \
-  --concurrency 80 \
+  --concurrency "${CONCURRENCY}" \
   --timeout 300 \
-  --max-instances 100 \
-  --set-env-vars "CDN_BASE_URL=${CDN_BASE_URL},TRANSCODER_URL=${TRANSCODER_URL},TRANSCRIBER_URL=${TRANSCRIBER_URL},SENTRY_ENVIRONMENT=${SENTRY_ENVIRONMENT}" \
+  --max-instances "${MAX_INSTANCES}" \
+  --min-instances "${MIN_INSTANCES}" \
+  --set-env-vars "CDN_BASE_URL=${CDN_BASE_URL},TRANSCODER_URL=${TRANSCODER_URL},TRANSCRIBER_URL=${TRANSCRIBER_URL},SENTRY_ENVIRONMENT=${SENTRY_ENVIRONMENT},TRANSCODE_QUEUE=${TRANSCODE_QUEUE},TRANSCODE_QUEUE_INVOKER_SA=${TRANSCODE_QUEUE_INVOKER_SA}" \
   --set-secrets "SENTRY_DSN=${SENTRY_SECRET}:latest"
 
 echo "Done! Service URL:"
