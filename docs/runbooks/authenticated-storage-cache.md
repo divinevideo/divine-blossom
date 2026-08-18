@@ -41,16 +41,20 @@ AGE_RESTRICTED_HASH=<64-hex-test-fixture> \
 ```
 
 Select the fixture from the maintained test accounts used for production media
-access checks. Confirm immediately before running that it is still classified
-as age-restricted and is safe for operational probing. Do not commit a real
-creator identifier or media hash to the repository.
+access checks. The probe reads `bytes=0-1023` and `bytes=1024-2047`, so the
+fixture must be at least 2048 bytes; every maintained age-restricted fixture is
+a video and satisfies this. Confirm immediately before running that it is still
+classified as age-restricted and is safe for operational probing. Do not commit
+a real creator identifier or media hash to the repository.
 
 The probe first issues a targeted purge of the fixture's content hash, then
 verifies a genuinely cold authorized range request returns `206` with an exact
 `X-Divine-Storage-Cache: MISS`, a repeat range request over different bytes is
 synthesized from the stored full object with an exact `HIT`, anonymous and
-forged requests remain unauthorized after the cache is warm, and authorized
-full-object repeats hit the internal cache.
+forged requests remain unauthorized both before and after the cache is warm,
+and authorized full-object repeats hit the internal cache. `DOMAIN` and
+`COMPUTE_SERVICE_ID` are environment-overridable; the defaults target
+production.
 
 ## Purging
 

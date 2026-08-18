@@ -6,7 +6,7 @@ set -eu
 
 DOMAIN="${DOMAIN:-media.divine.video}"
 AGE_RESTRICTED_HASH="${AGE_RESTRICTED_HASH:-}"
-COMPUTE_SERVICE_ID="pOvEEWykEbpnylqst1KTrR"
+COMPUTE_SERVICE_ID="${COMPUTE_SERVICE_ID:-pOvEEWykEbpnylqst1KTrR}"
 
 if ! command -v nak >/dev/null 2>&1; then
   echo "FAIL: nak is required (https://github.com/fiatjaf/nak)" >&2
@@ -105,6 +105,11 @@ done
 ANON_AFTER_WARM_CODE=$(curl -sS -o /dev/null -w '%{http_code}' "$URL")
 [ "$ANON_AFTER_WARM_CODE" = "401" ] || \
   fail "anonymous request returned $ANON_AFTER_WARM_CODE after cache warm, expected 401"
+
+FORGED_AFTER_WARM_CODE=$(curl -sS -o /dev/null -w '%{http_code}' \
+  -H 'Authorization: Nostr c21va2U=' "$URL")
+[ "$FORGED_AFTER_WARM_CODE" = "401" ] || \
+  fail "forged NIP-98 request returned $FORGED_AFTER_WARM_CODE after cache warm, expected 401"
 
 echo "PASS: NIP-98 is checked before an authorized internal storage-cache HIT"
 echo "PASS: a cold authorized range request populated the internal cache"
