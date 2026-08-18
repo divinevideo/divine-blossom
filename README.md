@@ -97,7 +97,8 @@ fastly compute serve
 ### Tests
 
 ```bash
-cargo check --tests --locked                                  # edge crate
+./scripts/run-edge-tests.sh                                  # edge crate tests under Viceroy
+cargo check --tests --locked                                  # edge crate compile check
 cargo test -p blossom-core --locked                           # pure-logic core
 cargo test --manifest-path cloud-run-upload/Cargo.toml --locked
 cargo clippy --locked --all-targets --all-features            # lint gate used in CI
