@@ -139,11 +139,11 @@ half hours.
 Do not export deploy-time variables (`GCS_BUCKET`, `PROJECT_ID`, and friends)
 from a shell profile. Set them inline on the one command that needs them.
 
-Nothing in this repository checks a deploy's resolved variables against what is
-running, so there is no automated backstop for this trap today. The
-configuration check above will not catch it either: that check deliberately
-reads names and not values, so a `GCS_BUCKET` aimed at the staging bucket looks
-identical to one aimed at production.
+The transcoder deploy script has one narrow automated backstop: before starting
+Cloud Build, it refuses to deploy the production service in the production
+project with any bucket other than `divine-blossom-media`. The configuration
+check above would not catch this by itself because it deliberately reads names
+and not values. Other resolved deploy variables are still unchecked.
 
 What does catch it is checking your own shell before you deploy. Read the
 variable names straight out of the scripts so the list cannot drift, and test
@@ -172,10 +172,10 @@ an exported `MAX_INSTANCES` or `CONCURRENCY` silently reshapes production
 capacity exactly the way the exported `GCS_BUCKET` silently redirected storage.
 Deriving the list is what keeps this check honest as the scripts grow.
 
-Whoever adds an automated guard: it has to compare *fully resolved* values, and
-it has to run after the script resolves its variables and before it builds
-anything. A check that parses the *defaults* out of the script text cannot catch
-this failure mode, because the whole failure is the default not applying.
+Whoever adds the broader automated guard: it has to compare *fully resolved*
+values, and it has to run after the script resolves its variables and before it
+builds anything. A check that parses the *defaults* out of the script text cannot
+catch this failure mode, because the whole failure is the default not applying.
 (Reading variable *names* out of the script, as the shell check above does, is a
 different and safe operation: what it looks for lives in the operator's
 environment, not in the script's text.)
