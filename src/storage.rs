@@ -466,6 +466,14 @@ fn download_blob_from_fos(hash: &str, range: Option<&str>) -> Result<Response> {
 fn enable_immutable_storage_cache(req: &mut Request, hash: &str) {
     let surrogate_key = hash.to_ascii_lowercase();
 
+    // Keep Range on the cache lookup so Fastly can synthesize a 206 from a
+    // stored full object. On a miss, fetch the complete object so the response
+    // is eligible for insertion instead of forwarding an uncacheable 206.
+    req.set_before_send(|backend_req| {
+        prepare_storage_cache_miss(backend_req);
+        Ok(())
+    });
+
     req.set_after_send(move |candidate| {
         match immutable_storage_cache_policy(candidate.get_status().as_u16()) {
             ImmutableStorageCachePolicy::Store {
@@ -487,9 +495,31 @@ fn enable_immutable_storage_cache(req: &mut Request, hash: &str) {
     });
 }
 
+fn prepare_storage_cache_miss(req: &mut Request) {
+    req.remove_header("Range");
+}
+
+fn normalize_storage_cache_state(value: &str) -> Option<&'static str> {
+    match value.rsplit(',').next().map(str::trim) {
+        Some(value) if value.eq_ignore_ascii_case("HIT") => Some("HIT"),
+        Some(value) if value.eq_ignore_ascii_case("MISS") => Some("MISS"),
+        _ => None,
+    }
+}
+
 fn preserve_storage_cache_state(resp: &mut Response) {
-    if let Some(cache_state) = resp.get_header_str("X-Cache").map(str::to_owned) {
+    // Read the last X-Cache value: the SDK comma-joins a single prior value but
+    // appends a separate header line when two or more exist, and the Compute
+    // cache result is always the final value.
+    let cache_state = resp
+        .get_header_all_str("X-Cache")
+        .last()
+        .copied()
+        .and_then(normalize_storage_cache_state);
+    if let Some(cache_state) = cache_state {
         resp.set_header(STORAGE_CACHE_HEADER, cache_state);
+    } else {
+        resp.remove_header(STORAGE_CACHE_HEADER);
     }
 }
 
@@ -1886,8 +1916,52 @@ pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtracti
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_audio_extraction_error_response, parse_funnelcake_audio_reuse_response,
+        normalize_storage_cache_state, parse_audio_extraction_error_response,
+        parse_funnelcake_audio_reuse_response, prepare_storage_cache_miss,
+        preserve_storage_cache_state, STORAGE_CACHE_HEADER,
     };
+    use fastly::http::header;
+    use fastly::{Request, Response};
+
+    #[test]
+    fn storage_cache_miss_fetches_the_complete_object() {
+        let mut req = Request::get("https://storage.example/object");
+        req.set_header(header::RANGE, "bytes=0-1023");
+
+        prepare_storage_cache_miss(&mut req);
+
+        assert!(!req.contains_header(header::RANGE));
+    }
+
+    #[test]
+    fn storage_cache_state_uses_the_compute_cache_result() {
+        assert_eq!(normalize_storage_cache_state("HIT, MISS"), Some("MISS"));
+        assert_eq!(normalize_storage_cache_state("MISS, HIT"), Some("HIT"));
+        assert_eq!(normalize_storage_cache_state("hit"), Some("HIT"));
+        assert_eq!(normalize_storage_cache_state("backend-only"), None);
+    }
+
+    #[test]
+    fn storage_cache_state_uses_the_last_x_cache_header_line() {
+        let mut resp = Response::new();
+        resp.append_header("X-Cache", "HIT");
+        resp.append_header("X-Cache", "HIT");
+        resp.append_header("X-Cache", "MISS");
+
+        preserve_storage_cache_state(&mut resp);
+
+        assert_eq!(resp.get_header_str(STORAGE_CACHE_HEADER), Some("MISS"));
+    }
+
+    #[test]
+    fn storage_cache_state_drops_an_unrecognized_backend_value() {
+        let mut resp = Response::new();
+        resp.append_header("X-Cache", "backend-only");
+
+        preserve_storage_cache_state(&mut resp);
+
+        assert!(!resp.contains_header(STORAGE_CACHE_HEADER));
+    }
 
     #[test]
     fn parses_funnelcake_audio_reuse_allow_flag() {
