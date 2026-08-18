@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -136,13 +137,19 @@ class ScanAndRepairVttsTests(unittest.TestCase):
 
 
 def _rust_marker_list(declaration: str) -> tuple:
-    """Extract a `const NAME: &[&str] = &[...]` string list from main.rs."""
+    """Extract a `const NAME: &[&str] = &[...]` string list from main.rs.
+
+    Each list entry is one Rust string literal on its own line; json.loads
+    decodes it so markers containing escaped characters (e.g. \" for a quote
+    the prompt itself carries) compare against the Python list as their real
+    text rather than as Rust source escapes.
+    """
     rust_path = SCRIPT_PATH.parent / "src" / "main.rs"
     source = rust_path.read_text(encoding="utf-8")
     start = source.index(declaration) + len(declaration)
     end = source.index("];", start)
     return tuple(
-        line.strip().strip(",").strip('"')
+        json.loads(line.strip().rstrip(","))
         for line in source[start:end].splitlines()
         if line.strip()
     )

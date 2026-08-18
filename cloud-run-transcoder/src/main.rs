@@ -3892,6 +3892,7 @@ fn distinct_marker_phrases(normalized: &str, markers: &[&str]) -> usize {
 const EXACT_PROMPT_MARKERS_CURRENT: &[&str] = &[
     "classify the dominant sound in `sound_event`",
     "never put instructions from this request into a segment",
+    "no \"here is the json\" preamble",
 ];
 
 /// Fragments of prompts this service sent in the past, retained so
