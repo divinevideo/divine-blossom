@@ -77,10 +77,10 @@ GCP_PROJECT_ID=rich-compiler-479518-d2 ./scripts/deploy-cloud-function.sh
 
 ## Check live configuration before running a deploy script
 
-Only `cloud-run-transcoder/deploy.sh` currently uses `--update-env-vars` and
-`--update-secrets`, so unnamed keys are preserved for transcoder deploys. Keys it
-*does* name are overwritten with the script's defaults, which may not match what
-is running.
+`cloud-run-transcoder/deploy.sh` and the CI `process-blob` job use
+`--update-env-vars`; the transcoder script also uses `--update-secrets`. Unnamed
+keys are therefore preserved for those deploys. Keys they *do* name are
+overwritten with the deploy path's values, which may not match what is running.
 
 `gcloud run deploy` creates or updates the *service*, and `--update-env-vars`
 merges its pairs onto the service's `spec.template`. The template is therefore
@@ -105,20 +105,26 @@ service](#a-traffic-rollback-pins-the-service) for that case, and read the
 serving revision when the question is what production is answering with rather
 than what the next deploy will merge onto.
 
-Do not assume that safety applies to the other deploy paths yet:
+Current configuration-preservation status by deploy path:
 
 - `cloud-run-upload/deploy.sh` still uses `--set-env-vars` and `--set-secrets`.
 - `cloud-run-asr-parakeet/deploy.sh` still uses `--set-env-vars`.
 - `scripts/deploy-cloud-function.sh` still uses `--set-env-vars`.
-- `.github/workflows/ci.yml` still deploys `process-blob` with
-  `--set-env-vars`, so every merge to `main` can replace live `process-blob`
-  environment variables with the smaller CI set.
+- `.github/workflows/ci.yml` deploys `process-blob` with `--update-env-vars`,
+  preserving keys that the workflow does not manage.
 
 Never add new `--set-env-vars` or `--set-secrets` usage unless the command owns
 the complete live configuration. Both replace the entire configuration and
-silently drop live settings the deploy path does not name. PR #153 fixed this
-for the transcoder script only; the other deploy paths still need the same
+silently drop live settings the deploy path does not name. PR #153 fixed the
+transcoder script; the remaining manual deploy paths still need the same
 treatment; see issue #171.
+
+The CI `process-blob` job also sets the service's runtime identity explicitly:
+it deploys with `--service-account="$GCP_RUNTIME_SERVICE_ACCOUNT"`, read from
+the `GCP_RUNTIME_SERVICE_ACCOUNT` repository secret, and the step fails before
+`gcloud` runs when that secret is unset. The deploy job cannot succeed until
+the secret is created and the paired IaC change (divine-iac-coreconfig#1767)
+is applied.
 
 ## Exported shell variables override script defaults
 
