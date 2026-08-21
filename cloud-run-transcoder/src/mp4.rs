@@ -184,16 +184,19 @@ fn boxes(data: &[u8], start: usize, end: usize) -> impl Iterator<Item = ([u8; 4]
         };
 
         // A box must at least contain its own header, and must fit the span;
-        // anything else would stall or rewind the walk.
-        if size < header_len || offset + size > end {
+        // anything else would stall or rewind the walk. `checked_add` matters
+        // because a 64-bit size can be large enough to wrap the addition, and
+        // a wrapped end reads as "fits" and then rewinds `offset`.
+        let box_end = offset.checked_add(size)?;
+        if size < header_len || box_end > end {
             return None;
         }
 
         let span = BoxSpan {
             start: offset + header_len,
-            end: offset + size,
+            end: box_end,
         };
-        offset += size;
+        offset = box_end;
         Some((kind, span))
     })
 }
@@ -300,11 +303,13 @@ fn track_audio_specific_config(data: &[u8], trak: &BoxSpan) -> Option<Vec<u8>> {
         // AudioSampleEntry: reserved(6) + data_reference_index(2), then a
         // version-dependent block of legacy QuickTime sound fields, then the
         // child boxes we are after.
-        let version = u16::from_be_bytes(
-            data.get(entry.start + 8..entry.start + 10)?
-                .try_into()
-                .ok()?,
-        );
+        let Some(version) = data
+            .get(entry.start + 8..entry.start + 10)
+            .and_then(|b| b.try_into().ok())
+            .map(u16::from_be_bytes)
+        else {
+            continue;
+        };
         // Version 0 carries version(2), revision(2), vendor(4), channels(2),
         // sample size(2), compression ID(2), packet size(2) and a 16.16 sample
         // rate(4). Versions 1 and 2 append further QuickTime-era fields.
@@ -701,6 +706,21 @@ mod tests {
             read_movie_facts(&data).unwrap().clamped_movie_duration(),
             None
         );
+    }
+
+    #[test]
+    fn a_64_bit_box_size_that_would_wrap_the_walk_stops_it() {
+        // `size == 1` puts the real size in the following 64 bits. A value
+        // that close to the address space wraps `offset + size`, and a
+        // wrapped end reads as "fits" and then rewinds the walk.
+        let mut moov = Vec::new();
+        moov.extend_from_slice(&1u32.to_be_bytes());
+        moov.extend_from_slice(b"mvhd");
+        moov.extend_from_slice(&u64::MAX.to_be_bytes());
+        moov.extend_from_slice(&[0u8; 96]);
+        let data = boxed(b"moov", &moov);
+
+        assert!(read_movie_facts(&data).is_err());
     }
 
     #[test]
