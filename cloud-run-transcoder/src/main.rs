@@ -4156,7 +4156,7 @@ mod tests {
         parse_metadata_access_token, parse_provider_status, retry_delay_for_attempt,
         should_drop_low_signal_transcript, status_event_generation, status_task_id,
         token_fetch_retry_delay, transcript_drop_reason, transcription_response_format,
-        AccessTokenCache, AudioAnalysis, AudioExtractErrorKind, Config, ParsedVtt,
+        AccessTokenCache, AudioAnalysis, AudioExtractErrorKind, AudioRemux, Config, ParsedVtt,
         StatusTaskRequest, TranscriptConfidence, TranscriptDropReason, TranscriptLockAction,
         TranscriptLockState, TranscriptLockStatus, VideoInfo, EXACT_PROMPT_MARKERS_CURRENT,
         EXACT_PROMPT_MARKERS_RETIRED, MAX_TRANSCRIBE_AUDIO_BYTES, STATUS_EVENT_PROCESSING,
@@ -5951,6 +5951,26 @@ mod tests {
                 "{msg:?} should NOT be treated as an empty-transcript signal",
             );
         }
+    }
+
+    #[test]
+    fn the_mp4_remux_copies_audio_instead_of_re_encoding_it() {
+        // The whole point of #235: re-encoding here made ffmpeg's native AAC
+        // encoder write a 5-byte AudioSpecificConfig, and AVFoundation pays
+        // for that marker on every lap of a loop. A previous commit removed
+        // `-c copy` from this path without anyone noticing, so pin it.
+        assert_eq!(
+            AudioRemux::Copy.ffmpeg_args(),
+            ["-c:a", "copy", "-bsf:a", "aac_adtstoasc"]
+        );
+    }
+
+    #[test]
+    fn the_remux_fallback_re_encodes_so_a_variant_is_never_dropped() {
+        assert_eq!(
+            AudioRemux::Reencode.ffmpeg_args(),
+            ["-c:a", "aac", "-b:a", "128k"]
+        );
     }
 }
 
