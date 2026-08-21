@@ -644,6 +644,9 @@ struct VideoInfo {
     display_height: u32,
     /// Whether the video has an audio stream
     has_audio: bool,
+    /// Output frame rate to pin, as an FFmpeg-ready `num/den` string, set only
+    /// when the container's guessed rate runs ahead of the measured average.
+    frame_rate_override: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1379,6 +1382,7 @@ async fn process_transcode(
                 display_width: 1920,
                 display_height: 1080,
                 has_audio: true,
+                frame_rate_override: None,
             }
         }
     };
@@ -4147,7 +4151,7 @@ mod tests {
         access_token_cache, attach_generation, build_cloud_tasks_task_body, build_gemini_prompt,
         build_transcode_status_webhook_payload, classify_audio_extract_error, constant_time_eq,
         contains_instruction_echo, decide_transcript_lock_action, enqueue_status_task_request,
-        enqueue_status_task_request_with_retry, ensure_transcribe_audio_size,
+        enqueue_status_task_request_with_retry, ensure_transcribe_audio_size, frame_rate_override,
         gcp_provider_response_outcome, identity_token_cache_for_audience,
         is_empty_transcript_normalize_error, is_implausible_text_density, is_loop_hallucination,
         is_retryable_provider_failure, next_status_generation, normalize_for_marker_scan,
@@ -4682,6 +4686,44 @@ mod tests {
     }
 
     #[test]
+    fn frame_rate_override_leaves_an_honest_constant_rate_source_alone() {
+        assert_eq!(frame_rate_override("30/1", "30/1"), None);
+        assert_eq!(frame_rate_override("60/1", "60/1"), None);
+        assert_eq!(frame_rate_override("30000/1001", "30000/1001"), None);
+    }
+
+    #[test]
+    fn frame_rate_override_pins_the_average_when_the_guess_is_inflated() {
+        // Real case: a 5.3s clip holding 158 frames (~30 fps) whose timestamps
+        // make ffprobe guess 120 fps. Encoding at the guess quadruples every
+        // frame and the rendition reads as high-frame-rate footage.
+        assert_eq!(
+            frame_rate_override("14220000/476197", "120/1"),
+            Some("14220000/476197".to_string())
+        );
+        assert_eq!(
+            frame_rate_override("30/1", "120/1"),
+            Some("30/1".to_string())
+        );
+    }
+
+    #[test]
+    fn frame_rate_override_tolerates_a_modest_gap() {
+        // A guess slightly ahead of the average is normal for variable-rate
+        // sources and not worth overriding.
+        assert_eq!(frame_rate_override("30/1", "40/1"), None);
+    }
+
+    #[test]
+    fn frame_rate_override_ignores_unusable_probe_values() {
+        assert_eq!(frame_rate_override("0/0", "120/1"), None);
+        assert_eq!(frame_rate_override("30/1", "0/0"), None);
+        assert_eq!(frame_rate_override("", "120/1"), None);
+        assert_eq!(frame_rate_override("30/1", ""), None);
+        assert_eq!(frame_rate_override("N/A", "120/1"), None);
+    }
+
+    #[test]
     fn transcode_webhook_payload_includes_failure_fields() {
         let video_info = VideoInfo {
             width: 1920,
@@ -4690,6 +4732,7 @@ mod tests {
             display_width: 1080,
             display_height: 1920,
             has_audio: true,
+            frame_rate_override: None,
         };
 
         let payload = build_transcode_status_webhook_payload(
@@ -6034,6 +6077,41 @@ async fn upload_transcript_to_gcs(
     Ok(())
 }
 
+/// How far the guessed frame rate may run ahead of the measured average before
+/// the encode pins the rate itself.
+const FRAME_RATE_INFLATION_FACTOR: f64 = 1.5;
+
+/// Parse an ffprobe rational such as `30/1` or `14220000/476197`.
+fn parse_rational(value: &str) -> Option<f64> {
+    let (num, den) = value.split_once('/')?;
+    let num: f64 = num.trim().parse().ok()?;
+    let den: f64 = den.trim().parse().ok()?;
+    if den == 0.0 || num <= 0.0 {
+        return None;
+    }
+    Some(num / den)
+}
+
+/// Decide whether the encode has to pin an explicit output frame rate.
+///
+/// FFmpeg writes constant-rate output at the input's `r_frame_rate`, which is a
+/// guess at the *highest* rate the timestamps allow rather than the real one. A
+/// source carrying one short gap between frames can guess 120 fps for 30 fps of
+/// actual content, and the encode then duplicates every frame four times: the
+/// rendition is larger for no added detail, and players that key off frame rate
+/// treat it as high-frame-rate footage. Returns the measured average when the
+/// guess runs ahead of it, and `None` when the two agree, so an honest
+/// constant-rate source keeps FFmpeg's own choice.
+fn frame_rate_override(avg_frame_rate: &str, r_frame_rate: &str) -> Option<String> {
+    let avg = parse_rational(avg_frame_rate)?;
+    let guessed = parse_rational(r_frame_rate)?;
+    if guessed > avg * FRAME_RATE_INFLATION_FACTOR {
+        Some(avg_frame_rate.to_string())
+    } else {
+        None
+    }
+}
+
 /// Probe video file with ffprobe to get dimensions and rotation metadata
 async fn probe_video(input_path: &Path) -> Result<VideoInfo> {
     let input_str = input_path.to_string_lossy();
@@ -6121,6 +6199,16 @@ async fn probe_video(input_path: &Path) -> Result<VideoInfo> {
     // Check for audio streams with a second ffprobe call
     let has_audio = check_has_audio(input_path).await;
 
+    let avg_frame_rate = stream["avg_frame_rate"].as_str().unwrap_or("");
+    let r_frame_rate = stream["r_frame_rate"].as_str().unwrap_or("");
+    let frame_rate_override = frame_rate_override(avg_frame_rate, r_frame_rate);
+    if let Some(rate) = &frame_rate_override {
+        info!(
+            "Frame rate guess {} runs ahead of measured {}, pinning output to {}",
+            r_frame_rate, avg_frame_rate, rate
+        );
+    }
+
     info!(
         "Video probe: raw={}x{}, rotation={}, display={}x{}, has_audio={}",
         width, height, rotation_abs, display_width, display_height, has_audio
@@ -6133,6 +6221,7 @@ async fn probe_video(input_path: &Path) -> Result<VideoInfo> {
         display_width,
         display_height,
         has_audio,
+        frame_rate_override,
     })
 }
 
@@ -6362,6 +6451,12 @@ async fn run_ffmpeg_hls(
             "-bf:v:1",
             "0",
         ]);
+    }
+
+    // Pin the output rate when the container's guess is inflated, so the encode
+    // does not pad the rendition with duplicated frames.
+    if let Some(rate) = &video_info.frame_rate_override {
+        cmd.args(["-r:v:0", rate, "-r:v:1", rate]);
     }
 
     // Audio encoding (only if audio stream exists)
