@@ -6220,8 +6220,16 @@ async fn probe_video(input_path: &Path) -> Result<VideoInfo> {
     }
 
     info!(
-        "Video probe: raw={}x{}, rotation={}, display={}x{}, has_audio={}",
-        width, height, rotation_abs, display_width, display_height, has_audio
+        "Video probe: raw={}x{}, rotation={}, display={}x{}, has_audio={}, \
+         avg_frame_rate={}, r_frame_rate={}",
+        width,
+        height,
+        rotation_abs,
+        display_width,
+        display_height,
+        has_audio,
+        avg_frame_rate,
+        r_frame_rate
     );
 
     Ok(VideoInfo {
