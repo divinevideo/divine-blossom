@@ -53,6 +53,20 @@ impl MovieFacts {
         }
     }
 
+    /// The value `mvhd.duration` should carry so the movie ends with the
+    /// picture, or `None` when there is nothing to correct.
+    pub fn clamped_movie_duration(&self) -> Option<u64> {
+        let video = self.video_duration?;
+        // A zero-length video track means ffmpeg could not measure the
+        // picture — a `.ts` whose video stream carried no decodable frames,
+        // say. Clamping to that would declare a zero-length movie, which is
+        // far worse than the stall this exists to remove.
+        if video == 0 || self.duration <= video {
+            return None;
+        }
+        Some(video)
+    }
+
     /// Whether the sound track carries a usable AAC-LC decoder config.
     ///
     /// A file with no audio at all counts as fine — there is nothing to be
@@ -634,6 +648,59 @@ mod tests {
         let data = boxed(b"moov", &moov);
 
         assert!(read_movie_facts(&data).is_err());
+    }
+
+    #[test]
+    fn clamps_only_when_the_movie_outlives_a_measured_picture() {
+        let facts = read_movie_facts(&video_with_longer_audio()).unwrap();
+        assert_eq!(facts.clamped_movie_duration(), Some(3124));
+    }
+
+    #[test]
+    fn a_movie_that_already_ends_with_the_picture_is_left_alone() {
+        let mut moov = mvhd_v0(1000, 2000);
+        moov.extend_from_slice(&trak(b"vide", tkhd_v0(2000), None));
+        let data = boxed(b"moov", &moov);
+
+        assert_eq!(
+            read_movie_facts(&data).unwrap().clamped_movie_duration(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_video_track_of_no_measured_length_is_never_clamped_to() {
+        // A .ts whose video stream carried no decodable frames yields a
+        // zero-duration video track. Clamping to it would publish a
+        // zero-length movie, so there is nothing to correct here.
+        let mut moov = mvhd_v0(1000, 3135);
+        moov.extend_from_slice(&trak(b"vide", tkhd_v0(0), None));
+        moov.extend_from_slice(&trak(
+            b"soun",
+            tkhd_v0(3135),
+            Some(mp4a_stsd(Some(esds(&[0x12, 0x08])))),
+        ));
+        let data = boxed(b"moov", &moov);
+
+        let facts = read_movie_facts(&data).unwrap();
+        assert_eq!(facts.video_duration, Some(0));
+        assert_eq!(facts.clamped_movie_duration(), None);
+    }
+
+    #[test]
+    fn a_sound_only_movie_has_nothing_to_clamp_to() {
+        let mut moov = mvhd_v0(1000, 3135);
+        moov.extend_from_slice(&trak(
+            b"soun",
+            tkhd_v0(3135),
+            Some(mp4a_stsd(Some(esds(&[0x12, 0x08])))),
+        ));
+        let data = boxed(b"moov", &moov);
+
+        assert_eq!(
+            read_movie_facts(&data).unwrap().clamped_movie_duration(),
+            None
+        );
     }
 
     #[test]
