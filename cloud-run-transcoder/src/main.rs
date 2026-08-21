@@ -4712,6 +4712,13 @@ mod tests {
         // A guess slightly ahead of the average is normal for variable-rate
         // sources and not worth overriding.
         assert_eq!(frame_rate_override("30/1", "40/1"), None);
+        // Exactly at the threshold still counts as tolerable: the guess has to
+        // run past 1.5x, not merely reach it.
+        assert_eq!(frame_rate_override("30/1", "45/1"), None);
+        assert_eq!(
+            frame_rate_override("30/1", "46/1"),
+            Some("30/1".to_string())
+        );
     }
 
     #[test]
