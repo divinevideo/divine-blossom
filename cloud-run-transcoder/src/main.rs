@@ -4721,6 +4721,10 @@ mod tests {
         assert_eq!(frame_rate_override("", "120/1"), None);
         assert_eq!(frame_rate_override("30/1", ""), None);
         assert_eq!(frame_rate_override("N/A", "120/1"), None);
+        // A negative rate would fail the encode outright rather than just the
+        // one option, so it must never be forwarded.
+        assert_eq!(frame_rate_override("30/-1", "120/1"), None);
+        assert_eq!(frame_rate_override("30/1", "120/-1"), None);
     }
 
     #[test]
@@ -6081,12 +6085,18 @@ async fn upload_transcript_to_gcs(
 /// the encode pins the rate itself.
 const FRAME_RATE_INFLATION_FACTOR: f64 = 1.5;
 
-/// Parse an ffprobe rational such as `30/1` or `14220000/476197`.
+/// Parse an ffprobe rational such as `30/1` or `14220000/476197` into a
+/// positive rate.
+///
+/// Both terms must be positive. A non-positive denominator would yield a
+/// negative rate, and FFmpeg rejects that outright (`Invalid framerate value`),
+/// failing the whole encode rather than the one option — so an unusable probe
+/// value has to fall out here as `None` and leave the rate alone.
 fn parse_rational(value: &str) -> Option<f64> {
     let (num, den) = value.split_once('/')?;
     let num: f64 = num.trim().parse().ok()?;
     let den: f64 = den.trim().parse().ok()?;
-    if den == 0.0 || num <= 0.0 {
+    if num <= 0.0 || den <= 0.0 {
         return None;
     }
     Some(num / den)
