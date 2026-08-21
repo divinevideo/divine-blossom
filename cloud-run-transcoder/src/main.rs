@@ -6452,7 +6452,8 @@ impl AudioRemux {
 /// Uses regular MP4 (not fragmented) with moov at front — same approach as
 /// TikTok/Instagram for short-form video delivery.
 ///
-/// Neither track is re-encoded. Video was always copied; audio is copied too,
+/// Neither track is re-encoded on the normal path — see [`remux_variant`] for
+/// the fallback. Video was always copied; audio is copied too,
 /// through the `aac_adtstoasc` bitstream filter, because re-encoding it made
 /// ffmpeg's native AAC encoder write its 5-byte AudioSpecificConfig — two
 /// bytes of AAC-LC config plus an explicit "SBR absent" marker. AVFoundation
@@ -6470,6 +6471,14 @@ async fn remux_ts_to_fmp4(hls_dir: &Path) -> Result<()> {
 
         if let Err(e) = remux_variant(&ts_path, &mp4_path, variant).await {
             warn!("MP4 remux failed for {}: {}", variant, e);
+            // ffmpeg truncates its output the moment it opens it, so a failed
+            // run leaves a zero-byte .mp4 here. upload_hls_to_gcs uploads
+            // whatever the directory holds, with a year of immutable caching,
+            // so leaving it would publish an unplayable variant — and on
+            // /backfill-fmp4 it would replace a working one.
+            if let Err(e) = tokio::fs::remove_file(&mp4_path).await {
+                warn!("Could not remove failed {} MP4: {}", variant, e);
+            }
             continue;
         }
 
