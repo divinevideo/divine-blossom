@@ -453,7 +453,15 @@ mod tests {
         out
     }
 
-    fn esds(asc: &[u8]) -> Vec<u8> {
+    /// The same descriptor with the length written in the four-byte form
+    /// (`80 80 80 nn`) that ffmpeg's mov muxer actually emits.
+    fn descriptor_padded_length(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag, 0x80, 0x80, 0x80, body.len() as u8];
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn esds_with(asc: &[u8], descriptor: fn(u8, &[u8]) -> Vec<u8>) -> Vec<u8> {
         let dsi = descriptor(TAG_DECODER_SPECIFIC_INFO, asc);
         let mut decoder_config = vec![0x40, 0x15]; // AAC object type, audio stream
         decoder_config.extend_from_slice(&[0, 0, 0]); // bufferSizeDB
@@ -469,6 +477,10 @@ mod tests {
         let mut payload = vec![0u8; 4]; // FullBox version + flags
         payload.extend_from_slice(&esd);
         boxed(b"esds", &payload)
+    }
+
+    fn esds(asc: &[u8]) -> Vec<u8> {
+        esds_with(asc, descriptor)
     }
 
     fn mp4a_stsd(asc_box: Option<Vec<u8>>) -> Vec<u8> {
@@ -706,6 +718,28 @@ mod tests {
             read_movie_facts(&data).unwrap().clamped_movie_duration(),
             None
         );
+    }
+
+    #[test]
+    fn reads_the_config_through_ffmpegs_padded_descriptor_lengths() {
+        // ffmpeg's mov muxer writes every descriptor length in the four-byte
+        // form, so `05 80 80 80 02 12 08` is what a real remux produces. The
+        // compact form the other fixtures use never appears in our output.
+        let mut moov = mvhd_v0(1000, 3135);
+        moov.extend_from_slice(&trak(b"vide", tkhd_v0(3124), None));
+        moov.extend_from_slice(&trak(
+            b"soun",
+            tkhd_v0(3135),
+            Some(mp4a_stsd(Some(esds_with(
+                &[0x12, 0x08],
+                descriptor_padded_length,
+            )))),
+        ));
+        let data = boxed(b"moov", &moov);
+
+        let facts = read_movie_facts(&data).unwrap();
+        assert_eq!(facts.audio_specific_config, Some(vec![0x12, 0x08]));
+        assert!(facts.has_usable_audio_config());
     }
 
     #[test]
