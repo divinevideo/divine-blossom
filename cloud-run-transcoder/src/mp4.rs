@@ -4,8 +4,8 @@
 //! What this exists for
 //!
 //! A looping player restarts at `mvhd.duration`. ffmpeg writes that field as
-//! the longest track's presentation end, and after an AAC re-encode the audio
-//! track outlives the picture by a frame or two — so the movie keeps running
+//! the longest track's presentation end, and the muxed audio track can outlive
+//! the picture by a frame or two — so the movie keeps running
 //! after the last video sample and the player holds the final frame across the
 //! gap. Clamping the movie header to the video track's presentation end costs
 //! no samples and removes the stall (issue #235).

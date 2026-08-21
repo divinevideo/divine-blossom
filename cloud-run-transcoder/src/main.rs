@@ -5955,10 +5955,10 @@ mod tests {
 
     #[test]
     fn the_mp4_remux_copies_audio_instead_of_re_encoding_it() {
-        // The whole point of #235: re-encoding here made ffmpeg's native AAC
-        // encoder write a 5-byte AudioSpecificConfig, and AVFoundation pays
-        // for that marker on every lap of a loop. A previous commit removed
-        // `-c copy` from this path without anyone noticing, so pin it.
+        // Re-encoding here made ffmpeg's native AAC encoder write a 5-byte
+        // AudioSpecificConfig instead of preserving the input frames. A
+        // previous commit removed `-c copy` from this path without anyone
+        // noticing, so pin it.
         assert_eq!(
             AudioRemux::Copy.ffmpeg_args(),
             ["-c:a", "copy", "-bsf:a", "aac_adtstoasc"]
@@ -6476,9 +6476,9 @@ impl AudioRemux {
 /// the fallback. Video was always copied; audio is copied too,
 /// through the `aac_adtstoasc` bitstream filter, because re-encoding it made
 /// ffmpeg's native AAC encoder write its 5-byte AudioSpecificConfig — two
-/// bytes of AAC-LC config plus an explicit "SBR absent" marker. AVFoundation
-/// builds a heavier decoder path for that marker, and `AVPlayerLooper` pays
-/// the cost on every lap, which is a ~200 ms audio freeze per loop (#235).
+/// bytes of AAC-LC config plus an explicit "SBR absent" marker. Copying avoids
+/// an unnecessary generation of lossy re-encoding and produces the measured
+/// 2-byte configuration without claiming an unverified playback cost (#235).
 async fn remux_ts_to_fmp4(hls_dir: &Path) -> Result<()> {
     for variant in &["stream_720p", "stream_480p"] {
         let ts_path = hls_dir.join(format!("{}.ts", variant));
