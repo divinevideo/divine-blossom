@@ -43,6 +43,7 @@ use tower::Service;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
+mod mp4;
 mod transcription_google_stt_v2;
 
 // Configuration
@@ -6426,11 +6427,37 @@ async fn run_ffmpeg_hls(
     ])
 }
 
+/// How the sound track crosses from the .ts into the MP4.
+#[derive(Clone, Copy)]
+enum AudioRemux {
+    /// Copy the AAC frames and let `aac_adtstoasc` build the decoder config
+    /// from the ADTS headers. This is the path we want: it costs no quality,
+    /// no encode time, and it yields the 2-byte AudioSpecificConfig.
+    Copy,
+    /// Re-encode to AAC-LC. Only used when the copy path cannot produce a
+    /// usable file, so a variant never disappears over an audio defect.
+    Reencode,
+}
+
+impl AudioRemux {
+    fn ffmpeg_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Copy => &["-c:a", "copy", "-bsf:a", "aac_adtstoasc"],
+            Self::Reencode => &["-c:a", "aac", "-b:a", "128k"],
+        }
+    }
+}
+
 /// Remux HLS .ts files to regular MP4 with faststart for progressive download.
-/// Video is copied without re-encoding. Audio is re-encoded to AAC-LC
-/// because the ADTS-to-ASC bitstream filter produces invalid headers.
 /// Uses regular MP4 (not fragmented) with moov at front — same approach as
 /// TikTok/Instagram for short-form video delivery.
+///
+/// Neither track is re-encoded. Video was always copied; audio is copied too,
+/// through the `aac_adtstoasc` bitstream filter, because re-encoding it made
+/// ffmpeg's native AAC encoder write its 5-byte AudioSpecificConfig — two
+/// bytes of AAC-LC config plus an explicit "SBR absent" marker. AVFoundation
+/// builds a heavier decoder path for that marker, and `AVPlayerLooper` pays
+/// the cost on every lap, which is a ~200 ms audio freeze per loop (#235).
 async fn remux_ts_to_fmp4(hls_dir: &Path) -> Result<()> {
     for variant in &["stream_720p", "stream_480p"] {
         let ts_path = hls_dir.join(format!("{}.ts", variant));
@@ -6441,35 +6468,83 @@ async fn remux_ts_to_fmp4(hls_dir: &Path) -> Result<()> {
             continue;
         }
 
-        let output = tokio::process::Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-v",
-                "warning",
-                "-i",
-                &ts_path.to_string_lossy(),
-                "-c:v",
-                "copy",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "128k",
-                "-movflags",
-                "+faststart",
-                &mp4_path.to_string_lossy(),
-            ])
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            warn!("MP4 remux failed for {}: {}", variant, stderr);
+        if let Err(e) = remux_variant(&ts_path, &mp4_path, variant).await {
+            warn!("MP4 remux failed for {}: {}", variant, e);
             continue;
         }
 
         info!("Remuxed {} to MP4", variant);
     }
 
+    Ok(())
+}
+
+async fn remux_variant(ts_path: &Path, mp4_path: &Path, variant: &str) -> Result<()> {
+    match remux_with_audio(ts_path, mp4_path, variant, AudioRemux::Copy).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // The copy path needs the .ts to carry well-formed ADTS. If it
+            // does not, a missing or unplayable variant would be worse than
+            // one that stalls, so fall back rather than drop the derivative.
+            warn!(
+                "{}: audio copy remux failed ({}), falling back to re-encode",
+                variant, e
+            );
+            remux_with_audio(ts_path, mp4_path, variant, AudioRemux::Reencode).await
+        }
+    }
+}
+
+/// Produce one MP4 variant, then check and correct what a looping player reads.
+async fn remux_with_audio(
+    ts_path: &Path,
+    mp4_path: &Path,
+    variant: &str,
+    audio: AudioRemux,
+) -> Result<()> {
+    let mut cmd = tokio::process::Command::new("ffmpeg");
+    cmd.args(["-y", "-v", "warning", "-i", &ts_path.to_string_lossy()]);
+    cmd.args(["-c:v", "copy"]);
+    cmd.args(audio.ffmpeg_args());
+    cmd.args(["-movflags", "+faststart", &mp4_path.to_string_lossy()]);
+
+    let output = cmd.output().await?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "ffmpeg exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let mut data = tokio::fs::read(mp4_path).await?;
+    let facts = mp4::read_movie_facts(&data)?;
+    if !facts.has_usable_audio_config() {
+        return Err(anyhow!("sound track carries no usable AAC decoder config"));
+    }
+
+    // A looping player restarts at mvhd.duration, and ffmpeg writes that as
+    // the longest track's presentation end — for these clips the sound track,
+    // which runs a frame or two past the last picture. The player holds the
+    // final frame across the difference: a measured 127–180 ms standstill on
+    // every seam (#235). Clamping the header drops no samples from any track.
+    let Some(video_duration) = facts.video_duration else {
+        return Ok(());
+    };
+    if facts.duration <= video_duration {
+        return Ok(());
+    }
+
+    mp4::write_movie_duration(&mut data, video_duration)?;
+    tokio::fs::write(mp4_path, &data).await?;
+
+    info!(
+        "{}: clamped movie duration {} -> {} ({} ms with no picture behind it)",
+        variant,
+        facts.duration,
+        video_duration,
+        facts.video_overhang() * 1000 / u64::from(facts.timescale.max(1)),
+    );
     Ok(())
 }
 
