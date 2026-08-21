@@ -6669,23 +6669,37 @@ async fn remux_with_audio(
     // which runs a frame or two past the last picture. The player holds the
     // final frame across the difference: a measured 127–180 ms standstill on
     // every seam (#235). Clamping the header drops no samples from any track.
-    let Some(video_duration) = facts.video_duration else {
+    //
+    // Everything below is an improvement on a file that is already correct
+    // and shippable, so a failure here is logged and the variant kept. Only
+    // the audio verdict above may reject a remux, because only that one is
+    // something the re-encode fallback can actually fix.
+    let Some(clamped) = facts.clamped_movie_duration() else {
         return Ok(());
     };
-    if facts.duration <= video_duration {
+
+    if let Err(e) = clamp_movie_duration(mp4_path, &mut data, clamped).await {
+        warn!(
+            "{}: keeping the remux unclamped, movie duration patch failed: {}",
+            variant, e
+        );
         return Ok(());
     }
-
-    mp4::write_movie_duration(&mut data, video_duration)?;
-    tokio::fs::write(mp4_path, &data).await?;
 
     info!(
         "{}: clamped movie duration {} -> {} ({} ms with no picture behind it)",
         variant,
         facts.duration,
-        video_duration,
+        clamped,
         facts.video_overhang() * 1000 / u64::from(facts.timescale.max(1)),
     );
+    Ok(())
+}
+
+/// Patch `mvhd.duration` in the buffer and write the file back.
+async fn clamp_movie_duration(mp4_path: &Path, data: &mut [u8], duration: u64) -> Result<()> {
+    mp4::write_movie_duration(data, duration)?;
+    tokio::fs::write(mp4_path, &*data).await?;
     Ok(())
 }
 
