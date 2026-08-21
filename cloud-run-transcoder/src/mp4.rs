@@ -324,7 +324,7 @@ fn track_audio_specific_config(data: &[u8], trak: &BoxSpan) -> Option<Vec<u8>> {
         }
         if let Some(esds) = find_box(data, children, entry.end, b"esds") {
             // esds is a FullBox wrapping an MPEG-4 descriptor tree.
-            return audio_specific_config_from_descriptors(&data[esds.start + 4..esds.end]);
+            return audio_specific_config_from_descriptors(data.get(esds.start + 4..esds.end)?);
         }
     }
     None
@@ -615,6 +615,21 @@ mod tests {
     fn a_sound_track_without_a_decoder_config_is_not_usable() {
         let mut moov = mvhd_v0(1000, 3135);
         moov.extend_from_slice(&trak(b"soun", tkhd_v0(3135), Some(mp4a_stsd(None))));
+        let data = boxed(b"moov", &moov);
+
+        let facts = read_movie_facts(&data).unwrap();
+        assert_eq!(facts.audio_specific_config, None);
+        assert!(!facts.has_usable_audio_config());
+    }
+
+    #[test]
+    fn a_truncated_esds_full_box_is_not_a_usable_decoder_config() {
+        let mut moov = mvhd_v0(1000, 3135);
+        moov.extend_from_slice(&trak(
+            b"soun",
+            tkhd_v0(3135),
+            Some(mp4a_stsd(Some(boxed(b"esds", &[])))),
+        ));
         let data = boxed(b"moov", &moov);
 
         let facts = read_movie_facts(&data).unwrap();
