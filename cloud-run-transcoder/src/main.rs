@@ -644,6 +644,10 @@ struct VideoInfo {
     display_height: u32,
     /// Whether the video has an audio stream
     has_audio: bool,
+    /// Whether the encode must emit the source's own frames rather than
+    /// resample to the container's guessed rate. Set only when that guess runs
+    /// ahead of the measured average.
+    preserve_source_timing: bool,
 }
 
 #[derive(Serialize)]
@@ -1379,6 +1383,7 @@ async fn process_transcode(
                 display_width: 1920,
                 display_height: 1080,
                 has_audio: true,
+                preserve_source_timing: false,
             }
         }
     };
@@ -4153,13 +4158,13 @@ mod tests {
         is_retryable_provider_failure, next_status_generation, normalize_for_marker_scan,
         normalize_transcript_to_vtt, parakeet_request_url, parse_audio_analysis_output,
         parse_metadata_access_token, parse_provider_status, retry_delay_for_attempt,
-        should_drop_low_signal_transcript, status_event_generation, status_task_id,
-        token_fetch_retry_delay, transcript_drop_reason, transcription_response_format,
-        AccessTokenCache, AudioAnalysis, AudioExtractErrorKind, Config, ParsedVtt,
-        StatusTaskRequest, TranscriptConfidence, TranscriptDropReason, TranscriptLockAction,
-        TranscriptLockState, TranscriptLockStatus, VideoInfo, EXACT_PROMPT_MARKERS_CURRENT,
-        EXACT_PROMPT_MARKERS_RETIRED, MAX_TRANSCRIBE_AUDIO_BYTES, STATUS_EVENT_PROCESSING,
-        STATUS_EVENT_TERMINAL,
+        should_drop_low_signal_transcript, should_preserve_source_timing, status_event_generation,
+        status_task_id, token_fetch_retry_delay, transcript_drop_reason,
+        transcription_response_format, AccessTokenCache, AudioAnalysis, AudioExtractErrorKind,
+        Config, ParsedVtt, StatusTaskRequest, TranscriptConfidence, TranscriptDropReason,
+        TranscriptLockAction, TranscriptLockState, TranscriptLockStatus, VideoInfo,
+        EXACT_PROMPT_MARKERS_CURRENT, EXACT_PROMPT_MARKERS_RETIRED, MAX_TRANSCRIBE_AUDIO_BYTES,
+        STATUS_EVENT_PROCESSING, STATUS_EVENT_TERMINAL,
     };
     use std::{
         io::{Read, Write},
@@ -4682,6 +4687,65 @@ mod tests {
     }
 
     #[test]
+    fn source_timing_is_left_alone_for_an_honest_constant_rate_source() {
+        assert!(!should_preserve_source_timing("30/1", "30/1"));
+        assert!(!should_preserve_source_timing("60/1", "60/1"));
+        assert!(!should_preserve_source_timing("30000/1001", "30000/1001"));
+        // Real high-frame-rate footage must keep its rate: the two numbers agree,
+        // so nothing here mistakes genuine 120 fps for an inflated guess.
+        assert!(!should_preserve_source_timing("120/1", "120/1"));
+    }
+
+    #[test]
+    fn source_timing_is_preserved_when_the_guess_is_inflated() {
+        // Real case: a 5.3s clip holding 158 frames (~30 fps) whose timestamps
+        // make ffprobe guess 120 fps. Resampling to the guess quadruples every
+        // frame and the rendition reads as high-frame-rate footage.
+        assert!(should_preserve_source_timing("14220000/476197", "120/1"));
+        assert!(should_preserve_source_timing("30/1", "120/1"));
+    }
+
+    #[test]
+    fn source_timing_is_preserved_for_genuine_variable_rate_footage() {
+        // A clip that holds one frame for a while and then moves at 30 fps
+        // averages ~15 fps, so this trips the same signal as an inflated guess
+        // and the two are not separable from the two rates alone.
+        //
+        // That is why the remedy is "emit the source's own frames" rather than
+        // "pin the average": pinning would resample the 30 fps motion section
+        // down to 15 and destroy half its frames. Measured on FFmpeg 4.4.8, the
+        // deployed base, against a 152-frame clip carrying 127 distinct
+        // timestamps: pinning the average yielded 103 frames, while emitting the
+        // source frames yielded 128. This assertion is what routes such a source
+        // to the second path.
+        assert!(should_preserve_source_timing("15/1", "30/1"));
+        assert!(should_preserve_source_timing("152/15", "25/1"));
+    }
+
+    #[test]
+    fn source_timing_tolerates_a_modest_gap() {
+        // A guess slightly ahead of the average is normal and not worth
+        // changing the encode over.
+        assert!(!should_preserve_source_timing("30/1", "40/1"));
+        // Exactly at the threshold still counts as tolerable: the guess has to
+        // run past 1.5x, not merely reach it.
+        assert!(!should_preserve_source_timing("30/1", "45/1"));
+        assert!(should_preserve_source_timing("30/1", "46/1"));
+    }
+
+    #[test]
+    fn source_timing_ignores_unusable_probe_values() {
+        assert!(!should_preserve_source_timing("0/0", "120/1"));
+        assert!(!should_preserve_source_timing("30/1", "0/0"));
+        assert!(!should_preserve_source_timing("", "120/1"));
+        assert!(!should_preserve_source_timing("30/1", ""));
+        assert!(!should_preserve_source_timing("N/A", "120/1"));
+        // A negative rate is not a usable measurement either.
+        assert!(!should_preserve_source_timing("30/-1", "120/1"));
+        assert!(!should_preserve_source_timing("30/1", "120/-1"));
+    }
+
+    #[test]
     fn transcode_webhook_payload_includes_failure_fields() {
         let video_info = VideoInfo {
             width: 1920,
@@ -4690,6 +4754,7 @@ mod tests {
             display_width: 1080,
             display_height: 1920,
             has_audio: true,
+            preserve_source_timing: false,
         };
 
         let payload = build_transcode_status_webhook_payload(
@@ -6034,6 +6099,55 @@ async fn upload_transcript_to_gcs(
     Ok(())
 }
 
+/// How far the guessed frame rate may run ahead of the measured average before
+/// the encode stops trusting it and emits the source's frames instead.
+const FRAME_RATE_INFLATION_FACTOR: f64 = 1.5;
+
+/// Parse an ffprobe rational such as `30/1` or `14220000/476197` into a
+/// positive rate.
+///
+/// Both terms must be positive, because the caller compares the two rates as a
+/// ratio: a negative average would make any positive guess look inflated and
+/// silently change the encode for a source nothing is wrong with. An unusable
+/// probe value has to fall out here as `None` instead.
+fn parse_rational(value: &str) -> Option<f64> {
+    let (num, den) = value.split_once('/')?;
+    let num: f64 = num.trim().parse().ok()?;
+    let den: f64 = den.trim().parse().ok()?;
+    if num <= 0.0 || den <= 0.0 {
+        return None;
+    }
+    Some(num / den)
+}
+
+/// Decide whether the encode must emit the source's own frames instead of
+/// resampling to the rate FFmpeg guessed for the container.
+///
+/// FFmpeg writes constant-rate output at the input's `r_frame_rate`, which is a
+/// guess at the *highest* rate the timestamps allow rather than the real one. A
+/// source carrying one short gap between frames can guess 120 fps for 30 fps of
+/// actual content, and the encode then duplicates every frame four times: the
+/// rendition is larger for no added detail, and players that key off frame rate
+/// treat it as high-frame-rate footage.
+///
+/// The signal for that is the guess running ahead of the measured average, but
+/// the signal is deliberately not treated as a diagnosis. Genuine
+/// variable-rate footage trips it too — a clip that holds one frame for a while
+/// and then moves at 30 fps averages far below the rate its motion section
+/// actually needs — and those two cases are not separable from the two numbers
+/// alone. So the remedy has to be one that is correct for both: emit exactly the
+/// frames the source carries, at their own timestamps. That removes the invented
+/// duplicates in the inflated case and keeps every distinct frame in the
+/// variable-rate case, which is why a false positive here costs nothing and the
+/// threshold only has to bound how many encodes change behaviour.
+fn should_preserve_source_timing(avg_frame_rate: &str, r_frame_rate: &str) -> bool {
+    let (Some(avg), Some(guessed)) = (parse_rational(avg_frame_rate), parse_rational(r_frame_rate))
+    else {
+        return false;
+    };
+    guessed > avg * FRAME_RATE_INFLATION_FACTOR
+}
+
 /// Probe video file with ffprobe to get dimensions and rotation metadata
 async fn probe_video(input_path: &Path) -> Result<VideoInfo> {
     let input_str = input_path.to_string_lossy();
@@ -6121,9 +6235,27 @@ async fn probe_video(input_path: &Path) -> Result<VideoInfo> {
     // Check for audio streams with a second ffprobe call
     let has_audio = check_has_audio(input_path).await;
 
+    let avg_frame_rate = stream["avg_frame_rate"].as_str().unwrap_or("");
+    let r_frame_rate = stream["r_frame_rate"].as_str().unwrap_or("");
+    let preserve_source_timing = should_preserve_source_timing(avg_frame_rate, r_frame_rate);
+    if preserve_source_timing {
+        info!(
+            "Frame rate guess {} runs ahead of measured {}, emitting source frames as-is",
+            r_frame_rate, avg_frame_rate
+        );
+    }
+
     info!(
-        "Video probe: raw={}x{}, rotation={}, display={}x{}, has_audio={}",
-        width, height, rotation_abs, display_width, display_height, has_audio
+        "Video probe: raw={}x{}, rotation={}, display={}x{}, has_audio={}, \
+         avg_frame_rate={}, r_frame_rate={}",
+        width,
+        height,
+        rotation_abs,
+        display_width,
+        display_height,
+        has_audio,
+        avg_frame_rate,
+        r_frame_rate
     );
 
     Ok(VideoInfo {
@@ -6133,6 +6265,7 @@ async fn probe_video(input_path: &Path) -> Result<VideoInfo> {
         display_width,
         display_height,
         has_audio,
+        preserve_source_timing,
     })
 }
 
@@ -6362,6 +6495,14 @@ async fn run_ffmpeg_hls(
             "-bf:v:1",
             "0",
         ]);
+    }
+
+    // Emit the source's own frames when the container's guessed rate is not
+    // trustworthy, instead of resampling to it. `-vsync 2` (rather than
+    // `-fps_mode vfr`) because the deployed base is FFmpeg 4.4, which predates
+    // `-fps_mode`.
+    if video_info.preserve_source_timing {
+        cmd.args(["-vsync", "2"]);
     }
 
     // Audio encoding (only if audio stream exists)
