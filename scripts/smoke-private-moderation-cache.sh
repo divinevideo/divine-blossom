@@ -35,6 +35,8 @@ require_hash() {
 
 require_command curl
 require_command nak
+nak --help 2>&1 | grep -Eiq 'nostr' || \
+  fail "nak must be the Nostr army knife from github.com/fiatjaf/nak"
 require_value OWNER_NSEC
 require_value ADMIN_TOKEN
 require_hash RESTRICTED_HASH
@@ -85,11 +87,15 @@ request() {
       fi
       ;;
     owner)
+      [ "$request_method" = "GET" ] || \
+        fail "owner requests only support GET (got $request_method)"
       # nak signs a fresh NIP-98 event for the exact method and URL.
       NOSTR_SECRET_KEY="$OWNER_NSEC" nak curl -sS -D "$HEADERS_FILE" \
         -o /dev/null -w '%{http_code}' --max-time 30 "$request_url"
       ;;
     admin)
+      [ "$request_method" = "GET" ] || \
+        fail "admin requests only support GET (got $request_method)"
       curl -sS --config "$ADMIN_CURL_CONFIG" -D "$HEADERS_FILE" \
         -o /dev/null -w '%{http_code}' --max-time 30 "$request_url"
       ;;
@@ -103,6 +109,23 @@ assert_code() {
   assert_actual="$3"
   [ "$assert_actual" = "$assert_expected" ] || \
     fail "$assert_label returned $assert_actual, expected $assert_expected"
+}
+
+assert_route_code() {
+  route_label="$1"
+  route_path="$2"
+  route_expected="$3"
+  route_actual="$4"
+
+  case "$route_path:$route_actual" in
+    *.audio.m4a:403)
+      fail "$route_label was denied by the audio-reuse policy; repair the synthetic fixture"
+      ;;
+    *.audio.m4a:503)
+      fail "$route_label could not verify audio-reuse permission because Funnelcake is unavailable"
+      ;;
+  esac
+  assert_code "$route_label" "$route_expected" "$route_actual"
 }
 
 assert_private() {
@@ -141,15 +164,28 @@ route_paths() {
     "/$route_hash.hls"
 }
 
+route_label() {
+  label_hash="$1"
+  label_path="$2"
+  case "$label_path" in
+    "/$label_hash") printf 'blob' ;;
+    "/$label_hash.jpg") printf 'thumbnail' ;;
+    "/$label_hash.audio.m4a") printf 'audio' ;;
+    "/$label_hash.hls") printf 'HLS master' ;;
+    *) fail "unknown synthetic fixture route" ;;
+  esac
+}
+
 check_anonymous_fixture() {
   anon_status="$1"
   anon_hash="$2"
   anon_expected="$3"
 
   route_paths "$anon_hash" | while IFS= read -r anon_path; do
+    anon_route=$(route_label "$anon_hash" "$anon_path")
     for anon_method in GET HEAD; do
       for anon_attempt in 1 2; do
-        anon_label="anonymous $anon_method $anon_status $anon_path attempt $anon_attempt"
+        anon_label="anonymous $anon_method $anon_status $anon_route attempt $anon_attempt"
         anon_code=$(request anonymous "$anon_method" "https://$DOMAIN$anon_path")
         assert_code "$anon_label" "$anon_expected" "$anon_code"
         if [ "$anon_expected" = "404" ]; then
@@ -169,11 +205,12 @@ check_owner_fixture() {
   owner_expected="$3"
 
   route_paths "$owner_hash" | while IFS= read -r owner_path; do
+    owner_route=$(route_label "$owner_hash" "$owner_path")
     owner_url="https://$DOMAIN$owner_path?private-smoke=$RUN_ID-owner"
     for owner_attempt in 1 2; do
-      owner_label="owner GET $owner_status $owner_path attempt $owner_attempt"
+      owner_label="owner GET $owner_status $owner_route attempt $owner_attempt"
       owner_code=$(request owner GET "$owner_url")
-      assert_code "$owner_label" "$owner_expected" "$owner_code"
+      assert_route_code "$owner_label" "$owner_path" "$owner_expected" "$owner_code"
       if [ "$owner_expected" = "200" ]; then
         assert_private "$owner_label"
       else
@@ -181,7 +218,7 @@ check_owner_fixture() {
       fi
       printf 'PASS: %s\n' "$owner_label"
     done
-    check_anonymous_after_credential owner "$owner_status" "$owner_path" "$owner_url"
+    check_anonymous_after_credential owner "$owner_status" "$owner_route" "$owner_path" "$owner_url"
   done
 }
 
@@ -190,11 +227,12 @@ check_admin_fixture() {
   admin_hash="$2"
 
   route_paths "$admin_hash" | while IFS= read -r admin_path; do
+    admin_route=$(route_label "$admin_hash" "$admin_path")
     admin_url="https://$DOMAIN$admin_path?private-smoke=$RUN_ID-admin"
     for admin_attempt in 1 2; do
-      admin_label="admin GET $admin_status $admin_path attempt $admin_attempt"
+      admin_label="admin GET $admin_status $admin_route attempt $admin_attempt"
       admin_code=$(request admin GET "$admin_url")
-      assert_code "$admin_label" 200 "$admin_code"
+      assert_route_code "$admin_label" "$admin_path" 200 "$admin_code"
       assert_private "$admin_label"
       if [ "$admin_path" = "/$admin_hash" ]; then
         header_equals x-moderation-status "$admin_status" || \
@@ -202,22 +240,23 @@ check_admin_fixture() {
       fi
       printf 'PASS: %s\n' "$admin_label"
     done
-    check_anonymous_after_credential admin "$admin_status" "$admin_path" "$admin_url"
+    check_anonymous_after_credential admin "$admin_status" "$admin_route" "$admin_path" "$admin_url"
   done
 }
 
 check_anonymous_after_credential() {
   post_credential="$1"
   post_status="$2"
-  post_path="$3"
-  post_url="$4"
+  post_route="$3"
+  post_path="$4"
+  post_url="$5"
 
   case "$post_status" in
     AgeRestricted) post_expected=401 ;;
     *) post_expected=404 ;;
   esac
 
-  post_label="anonymous after $post_credential GET $post_status $post_path"
+  post_label="anonymous after $post_credential GET $post_status $post_route"
   post_code=$(request anonymous GET "$post_url")
   assert_code "$post_label" "$post_expected" "$post_code"
   if [ "$post_expected" = "404" ]; then
@@ -227,7 +266,7 @@ check_anonymous_after_credential() {
   fi
   printf 'PASS: %s\n' "$post_label"
 
-  bare_label="anonymous bare URL after $post_credential GET $post_status $post_path"
+  bare_label="anonymous bare URL after $post_credential GET $post_status $post_route"
   bare_code=$(request anonymous GET "https://$DOMAIN$post_path")
   assert_code "$bare_label" "$post_expected" "$bare_code"
   if [ "$post_expected" = "404" ]; then
@@ -238,7 +277,33 @@ check_anonymous_after_credential() {
   printf 'PASS: %s\n' "$bare_label"
 }
 
+preflight_credentials() {
+  owner_auth_url="https://$DOMAIN/$AGE_RESTRICTED_HASH?private-smoke=$RUN_ID-owner-auth"
+  owner_auth_code=$(request owner GET "$owner_auth_url")
+  [ "$owner_auth_code" = "200" ] || \
+    fail "owner credential preflight returned $owner_auth_code on AgeRestricted, expected 200; OWNER_NSEC did not authenticate"
+  assert_private "owner credential preflight"
+
+  owner_identity_url="https://$DOMAIN/$RESTRICTED_HASH?private-smoke=$RUN_ID-owner-identity"
+  owner_identity_code=$(request owner GET "$owner_identity_url")
+  [ "$owner_identity_code" = "200" ] || \
+    fail "owner identity preflight returned $owner_identity_code on Restricted, expected 200; OWNER_NSEC is not the fixture owner"
+  assert_private "owner identity preflight"
+
+  admin_auth_url="https://$DOMAIN/$BANNED_HASH?private-smoke=$RUN_ID-admin-auth"
+  admin_auth_code=$(request admin GET "$admin_auth_url")
+  [ "$admin_auth_code" = "200" ] || \
+    fail "admin credential preflight returned $admin_auth_code on Banned, expected 200; ADMIN_TOKEN did not authenticate"
+  assert_private "admin credential preflight"
+  header_equals x-moderation-status Banned || \
+    fail "admin credential preflight did not identify the Banned synthetic fixture"
+
+  printf 'PASS: owner and admin credential preflights authenticated\n'
+}
+
 printf '=== Private moderation cache smoke: https://%s ===\n' "$DOMAIN"
+
+preflight_credentials
 
 check_anonymous_fixture Restricted "$RESTRICTED_HASH" 404
 check_anonymous_fixture AgeRestricted "$AGE_RESTRICTED_HASH" 401

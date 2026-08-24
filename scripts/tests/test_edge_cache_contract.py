@@ -100,42 +100,14 @@ class EdgeCacheContractTests(unittest.TestCase):
                 deliver_vcl,
             )
 
-    def test_private_moderation_smoke_requires_external_synthetic_fixtures(self):
-        smoke = (ROOT / "scripts" / "smoke-private-moderation-cache.sh").read_text()
-        runbook = (
-            ROOT / "docs" / "runbooks" / "private-moderation-cache-smoke.md"
-        ).read_text()
-
-        for status in ("Restricted", "AgeRestricted", "Banned", "Deleted"):
-            self.assertIn(status, smoke)
-            self.assertIn(status, runbook)
-
-        for route in (
-            "/$route_hash",
-            "/$route_hash.jpg",
-            "/$route_hash.audio.m4a",
-            "/$route_hash.hls",
-        ):
-            self.assertIn(route, smoke)
-
-        for variable in (
-            "OWNER_NSEC",
-            "ADMIN_TOKEN",
-            "RESTRICTED_HASH",
-            "AGE_RESTRICTED_HASH",
-            "BANNED_HASH",
-            "DELETED_HASH",
-        ):
-            requirement = "require_value" if variable in (
-                "OWNER_NSEC",
-                "ADMIN_TOKEN",
-            ) else "require_hash"
-            self.assertIn(f"{requirement} {variable}", smoke)
-            self.assertIn(f"`{variable}`", runbook)
-
-        self.assertNotIn("smoke-private-moderation-cache.sh", (
-            ROOT / ".github" / "workflows" / "ci.yml"
-        ).read_text())
+    def test_private_moderation_smoke_is_excluded_from_pull_request_workflows(self):
+        workflows = ROOT / ".github" / "workflows"
+        for workflow in (*workflows.glob("*.yml"), *workflows.glob("*.yaml")):
+            self.assertNotIn(
+                "smoke-private-moderation-cache.sh",
+                workflow.read_text(),
+                workflow,
+            )
 
     def test_private_moderation_smoke_exercises_access_matrix(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -167,6 +139,12 @@ class EdgeCacheContractTests(unittest.TestCase):
                 auth = os.environ.get("SMOKE_AUTH", "anonymous")
                 if "--config" in args:
                     auth = "admin"
+                if auth == "owner" and os.environ.get("FAKE_INVALID_OWNER_AUTH"):
+                    auth = "anonymous"
+                elif auth == "owner" and os.environ.get("FAKE_WRONG_OWNER"):
+                    auth = "stranger"
+                elif auth == "admin" and os.environ.get("FAKE_INVALID_ADMIN_AUTH"):
+                    auth = "anonymous"
 
                 state = Path(os.environ["SMOKE_FAKE_STATE"])
                 marker = state / hashlib.sha256(url.encode()).hexdigest()
@@ -176,10 +154,18 @@ class EdgeCacheContractTests(unittest.TestCase):
                     code = "200"
                 elif auth == "owner" and status in ("Restricted", "AgeRestricted"):
                     code = "200"
+                elif auth == "stranger" and status == "AgeRestricted":
+                    code = "200"
                 elif status == "AgeRestricted":
                     code = "401"
                 else:
                     code = "404"
+
+                if path.split("?", 1)[0].endswith(".audio.m4a") and code == "200":
+                    if os.environ.get("FAKE_AUDIO_REUSE_DENIED"):
+                        code = "403"
+                    elif os.environ.get("FAKE_AUDIO_LOOKUP_UNAVAILABLE"):
+                        code = "503"
 
                 if auth != "anonymous" and code == "200":
                     marker.touch()
@@ -210,6 +196,14 @@ class EdgeCacheContractTests(unittest.TestCase):
             fake_nak = bin_dir / "nak"
             fake_nak.write_text(textwrap.dedent("""\
                 #!/bin/sh
+                if [ "$1" = "--help" ]; then
+                  if [ -n "${FAKE_NAK_NOT_NOSTR:-}" ]; then
+                    echo "unrelated search utility"
+                  else
+                    echo "nak: the nostr army knife"
+                  fi
+                  exit 0
+                fi
                 [ "$1" = "curl" ] || exit 2
                 shift
                 SMOKE_AUTH=owner exec curl "$@"
@@ -244,6 +238,22 @@ class EdgeCacheContractTests(unittest.TestCase):
                 {"GET", "HEAD"},
             )
 
+            for flag, message in (
+                ("FAKE_NAK_NOT_NOSTR", "nak must be the Nostr army knife"),
+                ("FAKE_INVALID_OWNER_AUTH", "OWNER_NSEC did not authenticate"),
+                ("FAKE_WRONG_OWNER", "OWNER_NSEC is not the fixture owner"),
+                ("FAKE_INVALID_ADMIN_AUTH", "ADMIN_TOKEN did not authenticate"),
+                ("FAKE_AUDIO_REUSE_DENIED", "audio-reuse policy"),
+                ("FAKE_AUDIO_LOOKUP_UNAVAILABLE", "Funnelcake is unavailable"),
+            ):
+                env[flag] = "1"
+                result = subprocess.run(
+                    [str(smoke)], env=env, text=True, capture_output=True, check=False
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+                env.pop(flag)
+
             env["FAKE_PRIVATE_HIT"] = "1"
             result = subprocess.run(
                 [str(smoke)], env=env, text=True, capture_output=True, check=False
@@ -265,7 +275,7 @@ class EdgeCacheContractTests(unittest.TestCase):
                 [str(smoke)], env=env, text=True, capture_output=True, check=False
             )
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("anonymous bare URL after", result.stderr)
+            self.assertIn("returned 200", result.stderr)
 
     def test_private_edge_policy_does_not_disable_short_404_caching(self):
         fetch_vcl = (ROOT / "vcl" / "fetch.vcl").read_text()

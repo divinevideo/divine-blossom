@@ -25,6 +25,11 @@ environment with equivalent protected secret bindings:
 | `DELETED_HASH` | Synthetic fixture currently soft-deleted as `Deleted` |
 | `DOMAIN` | Optional target host; defaults to `media.divine.video` |
 
+The script requires `curl` and the Nostr army knife from
+`github.com/fiatjaf/nak`. Another utility with the same `nak` executable name
+does not satisfy the prerequisite; the script verifies the CLI identity before
+handling credentials.
+
 Do not put these values in this repository, command history, CI logs, issue or
 pull-request prose, or shared fixture documentation. The script turns off shell
 tracing before handling them; the calling shell or CI wrapper must also avoid
@@ -34,21 +39,23 @@ the file on exit. `nak` receives the owner key through its documented
 `NOSTR_SECRET_KEY` environment input, not a command-line argument, and uses it
 only to sign fresh, URL-bound NIP-98 requests.
 
-For a local operator run, the preferred pattern is a credential namespace that
-injects the variables without sourcing a file:
+For a local operator run, use the team's approved credential manager to inject
+the variables directly into the process without sourcing a plaintext file. The
+exact command depends on that manager; verify all six required variable names
+are bound before starting the script.
 
-```bash
-credchain divine-blossom-smoke scripts/smoke-private-moderation-cache.sh
-```
-
-The probe performs read-only HTTP requests. It does not deploy, change fixture
-state, purge caches, or rotate credentials.
+The probe does not deploy, change moderation status, purge caches, or rotate
+credentials. It is not strictly read-only: derivative GET handlers may repair
+metadata or source-reference records, clear a stale audio mapping, synchronously
+extract missing audio, or trigger missing thumbnail/HLS generation. Provision
+and verify every derivative before the run to avoid intentionally exercising
+those repair paths, but treat the probe as capable of production writes.
 
 ## Synthetic fixture provisioning
 
 Provision fixtures through the normal upload and moderation paths in a
 controlled maintenance session. This setup changes live state and is separate
-from the read-only smoke command:
+from the smoke command:
 
 1. Generate four distinct, small, unmistakably synthetic videos. Each needs a
    thumbnail, completed HLS master, and extracted audio. Do not derive them from
@@ -89,13 +96,27 @@ git history.
 | `Banned` | `404`; browser `no-store` | `404` | `200`; `private, no-store` |
 | `Deleted` | `404`; browser `no-store` | `404` | `200`; `private, no-store` |
 
+Before this matrix, the probe uses the existing fixtures as credential positive
+controls. An owner request must pass the `AgeRestricted` fixture to prove NIP-98
+authentication and the `Restricted` fixture to prove ownership. An admin request
+must bypass the `Banned` fixture. These failures are reported as credential
+problems instead of moderation regressions.
+
+The audio route also depends on the fixture's audio-reuse permission and on a
+successful Funnelcake lookup. An unexpected `403` is reported as fixture drift;
+an unexpected `503` is reported as a dependency outage. Neither is reported as
+an access-matrix regression.
+
 The same expectation is applied twice to blob, thumbnail, audio, and HLS master
 routes so a response accidentally stored on the first request is detected on
 the second. Each owner/admin check uses a run-specific query string, then makes
 an anonymous request to both the exact same URL and the bare route URL. These
 checks detect credentialed bytes leaking through either the full query-bearing
 cache key or a query-normalized cache key. A successful credentialed response
-must not report a shared `X-Cache: HIT`.
+must not report a shared `X-Cache: HIT`. Authorization currently makes the outer
+VCL pass the request, so the post-credential anonymous checks are the primary
+shared-cache leak coverage; the credentialed `X-Cache` assertion is defense in
+depth.
 
 The public VCL service intentionally strips `Surrogate-Control` before delivery,
 so the smoke does not require that origin-only header. The repository contract
@@ -108,6 +129,8 @@ and repeated access behavior.
 Do not add this probe to an ordinary pull-request job: forks and untrusted code
 must never receive its credentials. Automation is appropriate only in a
 protected post-deploy environment that binds all six inputs above, suppresses
-secret-bearing command traces, and runs the read-only smoke after deployment
-propagation. Missing bindings must fail closed rather than falling back to a
-public or real-user fixture.
+secret-bearing command traces, and runs the smoke after deployment propagation.
+Missing bindings must fail closed rather than falling back to a public or
+real-user fixture. Because derivative repair paths can write production state,
+the protected runner must also be authorized for operational probes against
+these dedicated fixtures.
