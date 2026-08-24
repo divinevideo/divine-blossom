@@ -1,7 +1,11 @@
 """Regression contracts for the hand-managed outer Fastly VCL and deploy flow."""
 
 from pathlib import Path
+import os
 import re
+import subprocess
+import tempfile
+import textwrap
 import unittest
 
 
@@ -95,6 +99,130 @@ class EdgeCacheContractTests(unittest.TestCase):
                 f"unset resp.http.X-Divine-Internal-Diagnostic-{suffix};",
                 deliver_vcl,
             )
+
+    def test_private_moderation_smoke_requires_external_synthetic_fixtures(self):
+        smoke = (ROOT / "scripts" / "smoke-private-moderation-cache.sh").read_text()
+        runbook = (
+            ROOT / "docs" / "runbooks" / "private-moderation-cache-smoke.md"
+        ).read_text()
+
+        for status in ("Restricted", "AgeRestricted", "Banned", "Deleted"):
+            self.assertIn(status, smoke)
+            self.assertIn(status, runbook)
+
+        for route in ("/$hash", "/$hash.jpg", "/$hash.audio.m4a", "/$hash.hls"):
+            self.assertIn(route, smoke)
+
+        for variable in (
+            "OWNER_NSEC",
+            "ADMIN_TOKEN",
+            "RESTRICTED_HASH",
+            "AGE_RESTRICTED_HASH",
+            "BANNED_HASH",
+            "DELETED_HASH",
+        ):
+            requirement = "require_value" if variable in (
+                "OWNER_NSEC",
+                "ADMIN_TOKEN",
+            ) else "require_hash"
+            self.assertIn(f"{requirement} {variable}", smoke)
+            self.assertIn(f"`{variable}`", runbook)
+
+        self.assertNotIn("smoke-private-moderation-cache.sh", (
+            ROOT / ".github" / "workflows" / "ci.yml"
+        ).read_text())
+
+    def test_private_moderation_smoke_exercises_access_matrix(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            bin_dir = Path(temp_dir)
+            fake_curl = bin_dir / "curl"
+            fake_curl.write_text(textwrap.dedent("""\
+                #!/usr/bin/env python3
+                import os
+                from pathlib import Path
+                import sys
+
+                args = sys.argv[1:]
+                method = args[args.index("-X") + 1]
+                headers_path = Path(args[args.index("-D") + 1])
+                url = next(arg for arg in args if arg.startswith("https://"))
+                path = "/" + url.split("/", 3)[3]
+                fixture = path[1:65]
+                status = {
+                    "a" * 64: "Restricted",
+                    "b" * 64: "AgeRestricted",
+                    "c" * 64: "Banned",
+                    "d" * 64: "Deleted",
+                }[fixture]
+                auth = os.environ.get("SMOKE_AUTH", "anonymous")
+                if "--config" in args:
+                    auth = "admin"
+
+                if auth == "admin":
+                    code = "200"
+                elif auth == "owner" and status in ("Restricted", "AgeRestricted"):
+                    code = "200"
+                elif status == "AgeRestricted":
+                    code = "401"
+                else:
+                    code = "404"
+
+                headers = [f"HTTP/1.1 {code}"]
+                if code == "200":
+                    headers += [
+                        "Cache-Control: private, no-store",
+                        "Surrogate-Control: no-store",
+                        "X-Cache: " + ("HIT" if os.environ.get("FAKE_PRIVATE_HIT") else "MISS"),
+                    ]
+                    if path == f"/{fixture}":
+                        headers.append(f"X-Moderation-Status: {status}")
+                elif code == "404":
+                    headers += [
+                        "Cache-Control: no-store",
+                        "Surrogate-Control: max-age=60",
+                    ]
+                else:
+                    headers.append("X-Cache: MISS")
+                headers_path.write_text("\\r\\n".join(headers) + "\\r\\n")
+                print(code, end="")
+                """))
+            fake_nak = bin_dir / "nak"
+            fake_nak.write_text(textwrap.dedent("""\
+                #!/bin/sh
+                [ "$1" = "curl" ] || exit 2
+                shift
+                SMOKE_AUTH=owner exec curl "$@"
+                """))
+            fake_curl.chmod(0o755)
+            fake_nak.chmod(0o755)
+
+            env = os.environ.copy()
+            env.update({
+                "PATH": f"{bin_dir}:{env['PATH']}",
+                "OWNER_NSEC": "synthetic-owner-key",
+                "ADMIN_TOKEN": "synthetic-admin-token",
+                "RESTRICTED_HASH": "a" * 64,
+                "AGE_RESTRICTED_HASH": "b" * 64,
+                "BANNED_HASH": "c" * 64,
+                "DELETED_HASH": "d" * 64,
+            })
+            smoke = ROOT / "scripts" / "smoke-private-moderation-cache.sh"
+            result = subprocess.run(
+                [str(smoke)], env=env, text=True, capture_output=True, check=False
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "PASS: all private moderation-status routes preserved access and cache policy",
+                result.stdout,
+            )
+
+            env["FAKE_PRIVATE_HIT"] = "1"
+            result = subprocess.run(
+                [str(smoke)], env=env, text=True, capture_output=True, check=False
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("stored in the shared edge cache", result.stderr)
 
     def test_private_edge_policy_does_not_disable_short_404_caching(self):
         fetch_vcl = (ROOT / "vcl" / "fetch.vcl").read_text()
