@@ -23,6 +23,8 @@ const LARGE_SIZE_LEN: usize = 8;
 const MAX_BOXES_SCANNED: usize = 4096;
 /// `AudioObjectType` 2 in an AudioSpecificConfig: AAC Low Complexity.
 const AUDIO_OBJECT_TYPE_AAC_LC: u8 = 2;
+/// Maximum audio-only tail that may be treated as muxing overhang.
+const MAX_VIDEO_OVERHANG_MILLIS: u64 = 250;
 
 /// The parts of a `moov` that decide how a clip loops.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,7 +63,15 @@ impl MovieFacts {
         // picture — a `.ts` whose video stream carried no decodable frames,
         // say. Clamping to that would declare a zero-length movie, which is
         // far worse than the stall this exists to remove.
-        if video == 0 || self.duration <= video {
+        if video == 0 || self.duration <= video || self.timescale == 0 {
+            return None;
+        }
+        let overhang = self.duration - video;
+        // A small tail is muxing granularity; a long one is source content.
+        // Never shorten an intentional audio tail just to make the picture loop.
+        if u128::from(overhang) * 1000
+            > u128::from(self.timescale) * u128::from(MAX_VIDEO_OVERHANG_MILLIS)
+        {
             return None;
         }
         Some(video)
@@ -685,6 +695,34 @@ mod tests {
     fn clamps_only_when_the_movie_outlives_a_measured_picture() {
         let facts = read_movie_facts(&video_with_longer_audio()).unwrap();
         assert_eq!(facts.clamped_movie_duration(), Some(3124));
+    }
+
+    #[test]
+    fn a_long_audio_tail_is_not_mistaken_for_muxing_overhang() {
+        let facts = MovieFacts {
+            timescale: 1000,
+            duration: 6037,
+            video_duration: Some(1023),
+            has_audio_track: true,
+            audio_specific_config: Some(vec![0x12, 0x08]),
+        };
+
+        assert_eq!(facts.clamped_movie_duration(), None);
+    }
+
+    #[test]
+    fn clamp_overhang_limit_is_inclusive() {
+        let mut facts = MovieFacts {
+            timescale: 1000,
+            duration: 1250,
+            video_duration: Some(1000),
+            has_audio_track: true,
+            audio_specific_config: Some(vec![0x12, 0x08]),
+        };
+
+        assert_eq!(facts.clamped_movie_duration(), Some(1000));
+        facts.duration += 1;
+        assert_eq!(facts.clamped_movie_duration(), None);
     }
 
     #[test]

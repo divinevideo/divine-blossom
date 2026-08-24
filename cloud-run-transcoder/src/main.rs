@@ -6637,8 +6637,11 @@ async fn remux_ts_to_fmp4(hls_dir: &Path) -> Result<()> {
             // whatever the directory holds, with a year of immutable caching,
             // so leaving it would publish an unplayable variant — and on
             // /backfill-fmp4 it would replace a working one.
-            if let Err(e) = tokio::fs::remove_file(&mp4_path).await {
-                warn!("Could not remove failed {} MP4: {}", variant, e);
+            match tokio::fs::remove_file(&mp4_path).await {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    warn!("Could not remove failed {} MP4: {}", variant, e);
+                }
+                _ => {}
             }
             continue;
         }
