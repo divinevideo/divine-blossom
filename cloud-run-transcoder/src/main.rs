@@ -36,7 +36,7 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tempfile::TempDir;
+use tempfile::{NamedTempFile, TempDir};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tower::Service;
@@ -4162,10 +4162,10 @@ mod tests {
         should_drop_low_signal_transcript, should_preserve_source_timing, status_event_generation,
         status_task_id, token_fetch_retry_delay, transcript_drop_reason,
         transcription_response_format, AccessTokenCache, AudioAnalysis, AudioExtractErrorKind,
-        AudioRemux, Config, ParsedVtt, StatusTaskRequest, TranscriptConfidence, TranscriptDropReason,
-        TranscriptLockAction, TranscriptLockState, TranscriptLockStatus, VideoInfo,
-        EXACT_PROMPT_MARKERS_CURRENT, EXACT_PROMPT_MARKERS_RETIRED, MAX_TRANSCRIBE_AUDIO_BYTES,
-        STATUS_EVENT_PROCESSING, STATUS_EVENT_TERMINAL,
+        AudioRemux, Config, ParsedVtt, StatusTaskRequest, TranscriptConfidence,
+        TranscriptDropReason, TranscriptLockAction, TranscriptLockState, TranscriptLockStatus,
+        VideoInfo, EXACT_PROMPT_MARKERS_CURRENT, EXACT_PROMPT_MARKERS_RETIRED,
+        MAX_TRANSCRIBE_AUDIO_BYTES, STATUS_EVENT_PROCESSING, STATUS_EVENT_TERMINAL,
     };
     use std::{
         io::{Read, Write},
@@ -6725,10 +6725,17 @@ async fn remux_with_audio(
     Ok(())
 }
 
-/// Patch `mvhd.duration` in the buffer and write the file back.
+/// Patch `mvhd.duration` and atomically replace the original file.
 async fn clamp_movie_duration(mp4_path: &Path, data: &mut [u8], duration: u64) -> Result<()> {
     mp4::write_movie_duration(data, duration)?;
-    tokio::fs::write(mp4_path, &*data).await?;
+    let parent = mp4_path
+        .parent()
+        .ok_or_else(|| anyhow!("MP4 path has no parent: {}", mp4_path.display()))?;
+    let replacement = NamedTempFile::new_in(parent)?;
+    tokio::fs::write(replacement.path(), &*data).await?;
+    replacement
+        .persist(mp4_path)
+        .map_err(|e| anyhow!("Failed to replace {}: {}", mp4_path.display(), e.error))?;
     Ok(())
 }
 

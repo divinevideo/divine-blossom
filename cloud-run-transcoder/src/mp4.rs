@@ -592,8 +592,7 @@ mod tests {
     #[test]
     fn accepts_the_five_byte_sbr_signalled_config() {
         // ffmpeg's native AAC encoder appends an explicit "SBR absent" marker.
-        // It is the reason clips stall, but it is not a broken config, so the
-        // usability check must not reject it.
+        // It is not a broken config, so the usability check must not reject it.
         let mut moov = mvhd_v0(1000, 3135);
         moov.extend_from_slice(&trak(b"vide", tkhd_v0(3124), None));
         moov.extend_from_slice(&trak(
