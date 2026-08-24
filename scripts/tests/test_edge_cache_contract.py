@@ -151,6 +151,9 @@ class EdgeCacheContractTests(unittest.TestCase):
                 args = sys.argv[1:]
                 if "-X" in args and args[args.index("-X") + 1] == "HEAD":
                     raise SystemExit("HEAD must use curl -I")
+                method = "HEAD" if "-I" in args else "GET"
+                with Path(os.environ["SMOKE_FAKE_METHOD_LOG"]).open("a") as log:
+                    log.write(method + "\\n")
                 headers_path = Path(args[args.index("-D") + 1])
                 url = next(arg for arg in args if arg.startswith("https://"))
                 path = "/" + url.split("/", 3)[3]
@@ -167,6 +170,7 @@ class EdgeCacheContractTests(unittest.TestCase):
 
                 state = Path(os.environ["SMOKE_FAKE_STATE"])
                 marker = state / hashlib.sha256(url.encode()).hexdigest()
+                bare_marker = state / hashlib.sha256(url.split("?", 1)[0].encode()).hexdigest()
 
                 if auth == "admin":
                     code = "200"
@@ -179,7 +183,11 @@ class EdgeCacheContractTests(unittest.TestCase):
 
                 if auth != "anonymous" and code == "200":
                     marker.touch()
+                    if os.environ.get("FAKE_STRIP_QUERY_LEAK"):
+                        bare_marker.touch()
                 elif auth == "anonymous" and marker.exists() and os.environ.get("FAKE_LEAK_PRIVATE"):
+                    code = "200"
+                elif auth == "anonymous" and "?" not in url and bare_marker.exists() and os.environ.get("FAKE_STRIP_QUERY_LEAK"):
                     code = "200"
 
                 headers = [f"HTTP/1.1 {code}"]
@@ -219,6 +227,7 @@ class EdgeCacheContractTests(unittest.TestCase):
                 "BANNED_HASH": "c" * 64,
                 "DELETED_HASH": "d" * 64,
                 "SMOKE_FAKE_STATE": str(bin_dir),
+                "SMOKE_FAKE_METHOD_LOG": str(bin_dir / "methods.log"),
             })
             smoke = ROOT / "scripts" / "smoke-private-moderation-cache.sh"
             result = subprocess.run(
@@ -229,6 +238,10 @@ class EdgeCacheContractTests(unittest.TestCase):
             self.assertIn(
                 "PASS: all private moderation-status routes preserved access and cache policy",
                 result.stdout,
+            )
+            self.assertEqual(
+                set((bin_dir / "methods.log").read_text().splitlines()),
+                {"GET", "HEAD"},
             )
 
             env["FAKE_PRIVATE_HIT"] = "1"
@@ -245,6 +258,14 @@ class EdgeCacheContractTests(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("anonymous after", result.stderr)
+
+            env.pop("FAKE_LEAK_PRIVATE")
+            env["FAKE_STRIP_QUERY_LEAK"] = "1"
+            result = subprocess.run(
+                [str(smoke)], env=env, text=True, capture_output=True, check=False
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("anonymous bare URL after", result.stderr)
 
     def test_private_edge_policy_does_not_disable_short_404_caching(self):
         fetch_vcl = (ROOT / "vcl" / "fetch.vcl").read_text()

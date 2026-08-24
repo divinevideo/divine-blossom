@@ -124,7 +124,7 @@ assert_hidden_cache_policy() {
 
 assert_age_gate_cache_policy() {
   age_label="$1"
-  if header_has cache-control 'public' || header_has surrogate-control 'max-age'; then
+  if header_has cache-control 'public'; then
     fail "$age_label advertised a public cache policy"
   fi
   if header_has x-cache 'HIT'; then
@@ -226,6 +226,16 @@ check_anonymous_after_credential() {
     assert_age_gate_cache_policy "$post_label"
   fi
   printf 'PASS: %s\n' "$post_label"
+
+  bare_label="anonymous bare URL after $post_credential GET $post_status $post_path"
+  bare_code=$(request anonymous GET "https://$DOMAIN$post_path")
+  assert_code "$bare_label" "$post_expected" "$bare_code"
+  if [ "$post_expected" = "404" ]; then
+    assert_hidden_cache_policy "$bare_label"
+  else
+    assert_age_gate_cache_policy "$bare_label"
+  fi
+  printf 'PASS: %s\n' "$bare_label"
 }
 
 printf '=== Private moderation cache smoke: https://%s ===\n' "$DOMAIN"

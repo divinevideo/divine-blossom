@@ -92,8 +92,9 @@ git history.
 The same expectation is applied twice to blob, thumbnail, audio, and HLS master
 routes so a response accidentally stored on the first request is detected on
 the second. Each owner/admin check uses a run-specific query string, then makes
-an anonymous request to the exact same URL; this directly detects credentialed
-bytes leaking through a shared cache key. A successful credentialed response
+an anonymous request to both the exact same URL and the bare route URL. These
+checks detect credentialed bytes leaking through either the full query-bearing
+cache key or a query-normalized cache key. A successful credentialed response
 must not report a shared `X-Cache: HIT`.
 
 The public VCL service intentionally strips `Surrogate-Control` before delivery,
