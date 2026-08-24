@@ -6,6 +6,7 @@ set -eu
 set +x
 
 DOMAIN="${DOMAIN:-media.divine.video}"
+RUN_ID="$(date +%s)-$$"
 umask 077
 SMOKE_TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/divine-blossom-private-smoke.XXXXXX")
 HEADERS_FILE="$SMOKE_TMP_DIR/headers"
@@ -56,142 +57,175 @@ done
 printf 'header = "Authorization: Bearer %s"\n' "$ADMIN_TOKEN" >"$ADMIN_CURL_CONFIG"
 
 header_has() {
-  name="$1"
-  pattern="$2"
-  grep -Eiq "^${name}:[[:space:]]*.*${pattern}" "$HEADERS_FILE"
+  header_name="$1"
+  header_pattern="$2"
+  grep -Eiq "^${header_name}:[[:space:]]*.*${header_pattern}" "$HEADERS_FILE"
+}
+
+header_equals() {
+  exact_header_name="$1"
+  exact_header_value="$2"
+  grep -Eiq "^${exact_header_name}:[[:space:]]*${exact_header_value}[[:space:]]*$" "$HEADERS_FILE"
 }
 
 request() {
-  auth="$1"
-  method="$2"
-  url="$3"
+  request_auth="$1"
+  request_method="$2"
+  request_url="$3"
 
   : >"$HEADERS_FILE"
-  case "$auth" in
+  case "$request_auth" in
     anonymous)
-      curl -sS -X "$method" -D "$HEADERS_FILE" -o /dev/null \
-        -w '%{http_code}' --max-time 30 "$url"
+      if [ "$request_method" = "HEAD" ]; then
+        curl -sS -I -D "$HEADERS_FILE" -o /dev/null \
+          -w '%{http_code}' --max-time 30 "$request_url"
+      else
+        curl -sS -D "$HEADERS_FILE" -o /dev/null \
+          -w '%{http_code}' --max-time 30 "$request_url"
+      fi
       ;;
     owner)
       # nak signs a fresh NIP-98 event for the exact method and URL.
-      NOSTR_SECRET_KEY="$OWNER_NSEC" nak curl -sS -X "$method" -D "$HEADERS_FILE" \
-        -o /dev/null -w '%{http_code}' --max-time 30 "$url"
+      NOSTR_SECRET_KEY="$OWNER_NSEC" nak curl -sS -D "$HEADERS_FILE" \
+        -o /dev/null -w '%{http_code}' --max-time 30 "$request_url"
       ;;
     admin)
-      curl -sS -X "$method" --config "$ADMIN_CURL_CONFIG" -D "$HEADERS_FILE" \
-        -o /dev/null -w '%{http_code}' --max-time 30 "$url"
+      curl -sS --config "$ADMIN_CURL_CONFIG" -D "$HEADERS_FILE" \
+        -o /dev/null -w '%{http_code}' --max-time 30 "$request_url"
       ;;
-    *) fail "unknown auth mode: $auth" ;;
+    *) fail "unknown auth mode: $request_auth" ;;
   esac
 }
 
 assert_code() {
-  label="$1"
-  expected="$2"
-  actual="$3"
-  [ "$actual" = "$expected" ] || \
-    fail "$label returned $actual, expected $expected"
+  assert_label="$1"
+  assert_expected="$2"
+  assert_actual="$3"
+  [ "$assert_actual" = "$assert_expected" ] || \
+    fail "$assert_label returned $assert_actual, expected $assert_expected"
 }
 
 assert_private() {
-  label="$1"
+  private_label="$1"
   header_has cache-control 'private([,[:space:]]|$)' || \
-    fail "$label is missing Cache-Control: private"
+    fail "$private_label is missing Cache-Control: private"
   header_has cache-control 'no-store([,[:space:]]|$)' || \
-    fail "$label is missing Cache-Control: no-store"
-  header_has surrogate-control 'no-store([,[:space:]]|$)' || \
-    fail "$label is missing Surrogate-Control: no-store"
+    fail "$private_label is missing Cache-Control: no-store"
   if header_has x-cache 'HIT'; then
-    fail "$label was stored in the shared edge cache"
+    fail "$private_label was stored in the shared edge cache"
   fi
 }
 
 assert_hidden_cache_policy() {
-  label="$1"
+  hidden_label="$1"
   header_has cache-control 'no-store([,[:space:]]|$)' || \
-    fail "$label is missing browser no-store"
-  header_has surrogate-control 'max-age=60([^0-9]|$)' || \
-    fail "$label is missing the bounded 60-second edge policy"
+    fail "$hidden_label is missing browser no-store"
 }
 
 assert_age_gate_cache_policy() {
-  label="$1"
+  age_label="$1"
   if header_has cache-control 'public' || header_has surrogate-control 'max-age'; then
-    fail "$label advertised a public cache policy"
+    fail "$age_label advertised a public cache policy"
   fi
   if header_has x-cache 'HIT'; then
-    fail "$label was stored in the shared edge cache"
+    fail "$age_label was stored in the shared edge cache"
   fi
 }
 
 route_paths() {
-  hash="$1"
+  route_hash="$1"
   printf '%s\n' \
-    "/$hash" \
-    "/$hash.jpg" \
-    "/$hash.audio.m4a" \
-    "/$hash.hls"
+    "/$route_hash" \
+    "/$route_hash.jpg" \
+    "/$route_hash.audio.m4a" \
+    "/$route_hash.hls"
 }
 
 check_anonymous_fixture() {
-  status="$1"
-  hash="$2"
-  expected="$3"
+  anon_status="$1"
+  anon_hash="$2"
+  anon_expected="$3"
 
-  route_paths "$hash" | while IFS= read -r path; do
-    for method in GET HEAD; do
-      for attempt in 1 2; do
-        label="anonymous $method $status $path attempt $attempt"
-        code=$(request anonymous "$method" "https://$DOMAIN$path")
-        assert_code "$label" "$expected" "$code"
-        if [ "$expected" = "404" ]; then
-          assert_hidden_cache_policy "$label"
+  route_paths "$anon_hash" | while IFS= read -r anon_path; do
+    for anon_method in GET HEAD; do
+      for anon_attempt in 1 2; do
+        anon_label="anonymous $anon_method $anon_status $anon_path attempt $anon_attempt"
+        anon_code=$(request anonymous "$anon_method" "https://$DOMAIN$anon_path")
+        assert_code "$anon_label" "$anon_expected" "$anon_code"
+        if [ "$anon_expected" = "404" ]; then
+          assert_hidden_cache_policy "$anon_label"
         else
-          assert_age_gate_cache_policy "$label"
+          assert_age_gate_cache_policy "$anon_label"
         fi
-        printf 'PASS: %s\n' "$label"
+        printf 'PASS: %s\n' "$anon_label"
       done
     done
   done
 }
 
 check_owner_fixture() {
-  status="$1"
-  hash="$2"
-  expected="$3"
+  owner_status="$1"
+  owner_hash="$2"
+  owner_expected="$3"
 
-  route_paths "$hash" | while IFS= read -r path; do
-    for attempt in 1 2; do
-      label="owner GET $status $path attempt $attempt"
-      code=$(request owner GET "https://$DOMAIN$path")
-      assert_code "$label" "$expected" "$code"
-      if [ "$expected" = "200" ]; then
-        assert_private "$label"
+  route_paths "$owner_hash" | while IFS= read -r owner_path; do
+    owner_url="https://$DOMAIN$owner_path?private-smoke=$RUN_ID-owner"
+    for owner_attempt in 1 2; do
+      owner_label="owner GET $owner_status $owner_path attempt $owner_attempt"
+      owner_code=$(request owner GET "$owner_url")
+      assert_code "$owner_label" "$owner_expected" "$owner_code"
+      if [ "$owner_expected" = "200" ]; then
+        assert_private "$owner_label"
       else
-        assert_hidden_cache_policy "$label"
+        assert_hidden_cache_policy "$owner_label"
       fi
-      printf 'PASS: %s\n' "$label"
+      printf 'PASS: %s\n' "$owner_label"
     done
+    check_anonymous_after_credential owner "$owner_status" "$owner_path" "$owner_url"
   done
 }
 
 check_admin_fixture() {
-  status="$1"
-  hash="$2"
+  admin_status="$1"
+  admin_hash="$2"
 
-  route_paths "$hash" | while IFS= read -r path; do
-    for attempt in 1 2; do
-      label="admin GET $status $path attempt $attempt"
-      code=$(request admin GET "https://$DOMAIN$path")
-      assert_code "$label" 200 "$code"
-      assert_private "$label"
-      if [ "$path" = "/$hash" ]; then
-        header_has x-moderation-status "${status}[[:space:]]*$" || \
-          fail "$label did not identify the expected synthetic fixture status"
+  route_paths "$admin_hash" | while IFS= read -r admin_path; do
+    admin_url="https://$DOMAIN$admin_path?private-smoke=$RUN_ID-admin"
+    for admin_attempt in 1 2; do
+      admin_label="admin GET $admin_status $admin_path attempt $admin_attempt"
+      admin_code=$(request admin GET "$admin_url")
+      assert_code "$admin_label" 200 "$admin_code"
+      assert_private "$admin_label"
+      if [ "$admin_path" = "/$admin_hash" ]; then
+        header_equals x-moderation-status "$admin_status" || \
+          fail "$admin_label did not identify the expected synthetic fixture status"
       fi
-      printf 'PASS: %s\n' "$label"
+      printf 'PASS: %s\n' "$admin_label"
     done
+    check_anonymous_after_credential admin "$admin_status" "$admin_path" "$admin_url"
   done
+}
+
+check_anonymous_after_credential() {
+  post_credential="$1"
+  post_status="$2"
+  post_path="$3"
+  post_url="$4"
+
+  case "$post_status" in
+    AgeRestricted) post_expected=401 ;;
+    *) post_expected=404 ;;
+  esac
+
+  post_label="anonymous after $post_credential GET $post_status $post_path"
+  post_code=$(request anonymous GET "$post_url")
+  assert_code "$post_label" "$post_expected" "$post_code"
+  if [ "$post_expected" = "404" ]; then
+    assert_hidden_cache_policy "$post_label"
+  else
+    assert_age_gate_cache_policy "$post_label"
+  fi
+  printf 'PASS: %s\n' "$post_label"
 }
 
 printf '=== Private moderation cache smoke: https://%s ===\n' "$DOMAIN"

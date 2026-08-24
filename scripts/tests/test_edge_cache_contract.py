@@ -110,7 +110,12 @@ class EdgeCacheContractTests(unittest.TestCase):
             self.assertIn(status, smoke)
             self.assertIn(status, runbook)
 
-        for route in ("/$hash", "/$hash.jpg", "/$hash.audio.m4a", "/$hash.hls"):
+        for route in (
+            "/$route_hash",
+            "/$route_hash.jpg",
+            "/$route_hash.audio.m4a",
+            "/$route_hash.hls",
+        ):
             self.assertIn(route, smoke)
 
         for variable in (
@@ -138,12 +143,14 @@ class EdgeCacheContractTests(unittest.TestCase):
             fake_curl = bin_dir / "curl"
             fake_curl.write_text(textwrap.dedent("""\
                 #!/usr/bin/env python3
+                import hashlib
                 import os
                 from pathlib import Path
                 import sys
 
                 args = sys.argv[1:]
-                method = args[args.index("-X") + 1]
+                if "-X" in args and args[args.index("-X") + 1] == "HEAD":
+                    raise SystemExit("HEAD must use curl -I")
                 headers_path = Path(args[args.index("-D") + 1])
                 url = next(arg for arg in args if arg.startswith("https://"))
                 path = "/" + url.split("/", 3)[3]
@@ -158,6 +165,9 @@ class EdgeCacheContractTests(unittest.TestCase):
                 if "--config" in args:
                     auth = "admin"
 
+                state = Path(os.environ["SMOKE_FAKE_STATE"])
+                marker = state / hashlib.sha256(url.encode()).hexdigest()
+
                 if auth == "admin":
                     code = "200"
                 elif auth == "owner" and status in ("Restricted", "AgeRestricted"):
@@ -167,19 +177,22 @@ class EdgeCacheContractTests(unittest.TestCase):
                 else:
                     code = "404"
 
+                if auth != "anonymous" and code == "200":
+                    marker.touch()
+                elif auth == "anonymous" and marker.exists() and os.environ.get("FAKE_LEAK_PRIVATE"):
+                    code = "200"
+
                 headers = [f"HTTP/1.1 {code}"]
                 if code == "200":
                     headers += [
                         "Cache-Control: private, no-store",
-                        "Surrogate-Control: no-store",
                         "X-Cache: " + ("HIT" if os.environ.get("FAKE_PRIVATE_HIT") else "MISS"),
                     ]
-                    if path == f"/{fixture}":
+                    if path.split("?", 1)[0] == f"/{fixture}":
                         headers.append(f"X-Moderation-Status: {status}")
                 elif code == "404":
                     headers += [
                         "Cache-Control: no-store",
-                        "Surrogate-Control: max-age=60",
                     ]
                 else:
                     headers.append("X-Cache: MISS")
@@ -205,6 +218,7 @@ class EdgeCacheContractTests(unittest.TestCase):
                 "AGE_RESTRICTED_HASH": "b" * 64,
                 "BANNED_HASH": "c" * 64,
                 "DELETED_HASH": "d" * 64,
+                "SMOKE_FAKE_STATE": str(bin_dir),
             })
             smoke = ROOT / "scripts" / "smoke-private-moderation-cache.sh"
             result = subprocess.run(
@@ -223,6 +237,14 @@ class EdgeCacheContractTests(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("stored in the shared edge cache", result.stderr)
+
+            env.pop("FAKE_PRIVATE_HIT")
+            env["FAKE_LEAK_PRIVATE"] = "1"
+            result = subprocess.run(
+                [str(smoke)], env=env, text=True, capture_output=True, check=False
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("anonymous after", result.stderr)
 
     def test_private_edge_policy_does_not_disable_short_404_caching(self):
         fetch_vcl = (ROOT / "vcl" / "fetch.vcl").read_text()

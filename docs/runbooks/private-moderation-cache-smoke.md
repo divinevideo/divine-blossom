@@ -84,15 +84,23 @@ git history.
 
 | Status | Anonymous GET/HEAD | Owner GET | Admin GET |
 | --- | --- | --- | --- |
-| `Restricted` | `404`; browser `no-store`, edge `max-age=60` | `200`; `private, no-store` | `200`; `private, no-store` |
+| `Restricted` | `404`; browser `no-store` | `200`; `private, no-store` | `200`; `private, no-store` |
 | `AgeRestricted` | `401`; never a shared-cache hit | `200`; `private, no-store` | `200`; `private, no-store` |
-| `Banned` | `404`; browser `no-store`, edge `max-age=60` | `404` | `200`; `private, no-store` |
-| `Deleted` | `404`; browser `no-store`, edge `max-age=60` | `404` | `200`; `private, no-store` |
+| `Banned` | `404`; browser `no-store` | `404` | `200`; `private, no-store` |
+| `Deleted` | `404`; browser `no-store` | `404` | `200`; `private, no-store` |
 
 The same expectation is applied twice to blob, thumbnail, audio, and HLS master
 routes so a response accidentally stored on the first request is detected on
-the second. A successful credentialed response must also carry
-`Surrogate-Control: no-store` and must not report a shared `X-Cache: HIT`.
+the second. Each owner/admin check uses a run-specific query string, then makes
+an anonymous request to the exact same URL; this directly detects credentialed
+bytes leaking through a shared cache key. A successful credentialed response
+must not report a shared `X-Cache: HIT`.
+
+The public VCL service intentionally strips `Surrogate-Control` before delivery,
+so the smoke does not require that origin-only header. The repository contract
+test for `vcl/fetch.vcl` verifies the 60-second edge TTL for hidden `404`
+responses; the live probe verifies the client-visible browser `no-store` policy
+and repeated access behavior.
 
 ## Automation boundary
 
