@@ -47,6 +47,9 @@ DELIVERY_PATH_FAILURE = "delivery_path_failure"
 INCONSISTENT_METADATA = "inconsistent_metadata"
 PROBE_ERROR = "probe_error"
 
+BULK_SCAN_MINIMUM = 20
+MAX_BULK_MISSING_PERCENT = 10
+
 EXPECTED_PUBLIC_STATUS = {
     "active": {200, 206},
     "pending": {200, 206},
@@ -253,10 +256,19 @@ def scan(
     ]
     if repair and confirm_missing_count is None:
         raise ValueError("repair requires the confirmed missing-byte count from a prior scan")
-    if repair and len(repair_candidates) != confirm_missing_count:
-        repair_counts["skipped_count_mismatch"] = len(repair_candidates)
+    if (
+        repair
+        and len(classifications) >= BULK_SCAN_MINIMUM
+        and len(repair_candidates) * 100
+        > len(classifications) * MAX_BULK_MISSING_PERCENT
+    ):
+        repair_counts["skipped_high_missing_ratio"] = len(repair_candidates)
     elif repair and len(repair_candidates) > max_repairs:
         repair_counts["skipped_over_limit"] = len(repair_candidates)
+    # Aggregate-only output cannot bind approval to specific hashes. Equality is
+    # deliberately a blast-radius check, while every candidate is reclassified.
+    elif repair and len(repair_candidates) != confirm_missing_count:
+        repair_counts["skipped_count_mismatch"] = len(repair_candidates)
     elif repair:
         for blob_hash in repair_candidates:
             repair_counts["soft_deleted" if repair(blob_hash) else "failed"] += 1
