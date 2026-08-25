@@ -251,14 +251,20 @@ class PrivacyTests(unittest.TestCase):
                 confirm_missing_count=1,
             )
 
-    def test_repair_refusal_is_visible_to_exit_code_layer(self):
+    def test_unsuccessful_repair_is_visible_to_exit_code_layer(self):
         self.assertTrue(
-            MODULE.repair_was_refused({"repairs": {"skipped_count_mismatch": 1}})
+            MODULE.repair_did_not_complete({"repairs": {"skipped_count_mismatch": 1}})
         )
         self.assertTrue(
-            MODULE.repair_was_refused({"repairs": {"skipped_count_mismatch": 0}})
+            MODULE.repair_did_not_complete({"repairs": {"skipped_count_mismatch": 0}})
         )
-        self.assertFalse(MODULE.repair_was_refused({"repairs": {"soft_deleted": 1}}))
+        self.assertTrue(MODULE.repair_did_not_complete({"repairs": {"failed": 1}}))
+        self.assertTrue(
+            MODULE.repair_did_not_complete(
+                {"repairs": {"failed": 1, "soft_deleted": 1}}
+            )
+        )
+        self.assertFalse(MODULE.repair_did_not_complete({"repairs": {"soft_deleted": 1}}))
 
 
 if __name__ == "__main__":

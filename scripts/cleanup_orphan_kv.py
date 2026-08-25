@@ -257,6 +257,8 @@ def scan(
         raise ValueError("repair requires a curated hash file")
     if repair and confirm_missing_count is None:
         raise ValueError("repair requires the confirmed missing-byte count from a prior scan")
+    # Curation is the defence against a systematically wrong storage probe.
+    # Count equality detects drift between the read-only and repair scans.
     if repair and len(repair_candidates) > max_repairs:
         repair_counts["skipped_over_limit"] = len(repair_candidates)
     # Aggregate-only output cannot bind approval to specific hashes. Equality is
@@ -329,9 +331,11 @@ def validate_repair_request(
     return None
 
 
-def repair_was_refused(result: dict[str, object]) -> bool:
+def repair_did_not_complete(result: dict[str, object]) -> bool:
     repairs = result.get("repairs")
-    return isinstance(repairs, dict) and any(key.startswith("skipped_") for key in repairs)
+    return isinstance(repairs, dict) and any(
+        key.startswith("skipped_") or key == "failed" for key in repairs
+    )
 
 
 def main() -> int:
@@ -403,7 +407,7 @@ def main() -> int:
         args.hash_file is not None,
     )
     print(json.dumps(result, sort_keys=True))
-    return 3 if args.repair_missing_bytes and repair_was_refused(result) else 0
+    return 3 if args.repair_missing_bytes and repair_did_not_complete(result) else 0
 
 
 if __name__ == "__main__":
