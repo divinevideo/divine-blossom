@@ -59,13 +59,13 @@ EXPECTED_PUBLIC_STATUS = {
 ACTION_BY_CLASS = {
     AVAILABLE: "none",
     MISSING_BYTES: "soft_delete_stale_metadata",
-    MISSING_METADATA: "restore_status_preserving_metadata_from_verified_backup",
+    MISSING_METADATA: "restore_original_metadata_from_verified_backup",
     STALE_EVENT_REFERENCE: "repair_at_event_source",
     MODERATION_HIDDEN: "none",
     AGE_RESTRICTED: "none",
     DELETED: "none",
     DELIVERY_PATH_FAILURE: "investigate_delivery_path",
-    INCONSISTENT_METADATA: "restore_status_preserving_metadata_from_verified_backup",
+    INCONSISTENT_METADATA: "quarantine_then_restore_original_metadata_from_verified_backup",
     PROBE_ERROR: "retry_probe",
 }
 
@@ -101,8 +101,6 @@ def classify_blob(
             return DELIVERY_PATH_FAILURE
         return AGE_RESTRICTED
     if storage is Presence.MISSING:
-        if public_status is not None and public_status != 404:
-            return DELIVERY_PATH_FAILURE
         return MISSING_BYTES
     if public_status is not None and public_status not in EXPECTED_PUBLIC_STATUS[status]:
         return DELIVERY_PATH_FAILURE
@@ -233,6 +231,7 @@ def scan(
     public_probe: Optional[Callable[[str], Optional[int]]] = None,
     repair: Optional[Callable[[str], bool]] = None,
     max_repairs: int = 0,
+    confirm_missing_count: Optional[int] = None,
 ) -> dict[str, object]:
     counts: Counter[str] = Counter()
     action_counts: Counter[str] = Counter()
@@ -252,7 +251,11 @@ def scan(
         for blob_hash, classification in classifications
         if classification == MISSING_BYTES
     ]
-    if repair and len(repair_candidates) > max_repairs:
+    if repair and confirm_missing_count is None:
+        raise ValueError("repair requires the confirmed missing-byte count from a prior scan")
+    if repair and len(repair_candidates) != confirm_missing_count:
+        repair_counts["skipped_count_mismatch"] = len(repair_candidates)
+    elif repair and len(repair_candidates) > max_repairs:
         repair_counts["skipped_over_limit"] = len(repair_candidates)
     elif repair:
         for blob_hash in repair_candidates:
@@ -274,7 +277,10 @@ def parse_args() -> argparse.Namespace:
     source.add_argument("--all", action="store_true", help="Scan all blob metadata keys")
     parser.add_argument("--hex-prefix", help="Restrict --all to a lowercase hex prefix")
     parser.add_argument("--limit", type=int, help="Scan at most this many hashes")
-    parser.add_argument("--public-endpoint", help="Also verify expected anonymous HTTP status")
+    parser.add_argument(
+        "--public-endpoint",
+        help="Diagnose anonymous HTTP status; CDN responses are not origin proof",
+    )
     parser.add_argument(
         "--repair-missing-bytes",
         action="store_true",
@@ -286,7 +292,32 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Hard cap required with --repair-missing-bytes",
     )
+    parser.add_argument(
+        "--confirm-missing-count",
+        type=int,
+        help="Exact missing_bytes count from a prior read-only scan",
+    )
     return parser.parse_args()
+
+
+def validate_repair_request(
+    repair_requested: bool,
+    admin_token: Optional[str],
+    admin_endpoint: Optional[str],
+    max_repairs: int,
+    confirm_missing_count: Optional[int],
+) -> Optional[str]:
+    if not repair_requested:
+        return None
+    if not admin_token or not admin_endpoint:
+        return "repair requires FASTLY_ADMIN_TOKEN and BLOSSOM_ADMIN_ENDPOINT"
+    if max_repairs < 1:
+        return "repair requires a positive --max-repairs cap"
+    if confirm_missing_count is None or confirm_missing_count < 1:
+        return "repair requires a positive --confirm-missing-count from a prior scan"
+    if confirm_missing_count > max_repairs:
+        return "--confirm-missing-count cannot exceed --max-repairs"
+    return None
 
 
 def main() -> int:
@@ -334,20 +365,29 @@ def main() -> int:
     if args.repair_missing_bytes:
         admin_token = os.environ.get("FASTLY_ADMIN_TOKEN")
         admin_endpoint = os.environ.get("BLOSSOM_ADMIN_ENDPOINT")
-        if not admin_token or not admin_endpoint or not args.public_endpoint:
-            print(
-                "repair requires FASTLY_ADMIN_TOKEN, BLOSSOM_ADMIN_ENDPOINT, and --public-endpoint",
-                file=sys.stderr,
-            )
-            return 2
-        if args.max_repairs < 1:
-            print("repair requires a positive --max-repairs cap", file=sys.stderr)
+        repair_error = validate_repair_request(
+            True,
+            admin_token,
+            admin_endpoint,
+            args.max_repairs,
+            args.confirm_missing_count,
+        )
+        if repair_error:
+            print(repair_error, file=sys.stderr)
             return 2
         repair_fn = lambda value: soft_delete_missing_bytes(admin_endpoint, admin_token, value)
 
     print(
         json.dumps(
-            scan(hashes, metadata_fn, storage_fn, public_fn, repair_fn, args.max_repairs),
+            scan(
+                hashes,
+                metadata_fn,
+                storage_fn,
+                public_fn,
+                repair_fn,
+                args.max_repairs,
+                args.confirm_missing_count,
+            ),
             sort_keys=True,
         )
     )

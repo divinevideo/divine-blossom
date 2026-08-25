@@ -158,6 +158,7 @@ class PrivacyTests(unittest.TestCase):
             lambda _value: 404,
             repair=lambda value: repaired.append(value) is None,
             max_repairs=1,
+            confirm_missing_count=1,
         )
 
         self.assertEqual(repaired, [synthetic_hashes[0]])
@@ -174,18 +175,55 @@ class PrivacyTests(unittest.TestCase):
             lambda _value: 404,
             repair=lambda value: repaired.append(value) is None,
             max_repairs=1,
+            confirm_missing_count=2,
         )
 
         self.assertEqual(repaired, [])
         self.assertEqual(result["repairs"], {"skipped_over_limit": 2})
 
-    def test_storage_miss_conflicting_with_public_success_is_not_repaired(self):
+    def test_cached_public_success_does_not_override_authoritative_storage_miss(self):
         metadata = MODULE.MetadataProbe(MODULE.Presence.PRESENT, "active")
 
         self.assertEqual(
             MODULE.classify_blob(metadata, MODULE.Presence.MISSING, 206),
-            MODULE.DELIVERY_PATH_FAILURE,
+            MODULE.MISSING_BYTES,
         )
+
+    def test_scan_refuses_repair_without_prior_count_confirmation(self):
+        repaired = []
+
+        with self.assertRaisesRegex(ValueError, "confirmed missing-byte count"):
+            MODULE.scan(
+                ["7" * 64],
+                lambda _value: MODULE.MetadataProbe(MODULE.Presence.PRESENT, "active"),
+                lambda _value: MODULE.Presence.MISSING,
+                repair=lambda value: repaired.append(value) is None,
+                max_repairs=1,
+            )
+
+        self.assertEqual(repaired, [])
+
+    def test_scan_skips_repair_when_live_count_changed_since_confirmation(self):
+        repaired = []
+
+        result = MODULE.scan(
+            ["8" * 64, "9" * 64],
+            lambda _value: MODULE.MetadataProbe(MODULE.Presence.PRESENT, "active"),
+            lambda _value: MODULE.Presence.MISSING,
+            repair=lambda value: repaired.append(value) is None,
+            max_repairs=3,
+            confirm_missing_count=1,
+        )
+
+        self.assertEqual(repaired, [])
+        self.assertEqual(result["repairs"], {"skipped_count_mismatch": 2})
+
+    def test_repair_request_requires_credentials_cap_and_confirmed_count(self):
+        self.assertIsNotNone(MODULE.validate_repair_request(True, None, None, 1, 1))
+        self.assertIsNotNone(MODULE.validate_repair_request(True, "token", "url", 0, 1))
+        self.assertIsNotNone(MODULE.validate_repair_request(True, "token", "url", 1, None))
+        self.assertIsNotNone(MODULE.validate_repair_request(True, "token", "url", 1, 2))
+        self.assertIsNone(MODULE.validate_repair_request(True, "token", "url", 2, 1))
 
 
 if __name__ == "__main__":
