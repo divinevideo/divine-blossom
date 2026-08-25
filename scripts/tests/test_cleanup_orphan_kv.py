@@ -159,6 +159,7 @@ class PrivacyTests(unittest.TestCase):
             repair=lambda value: repaired.append(value) is None,
             max_repairs=1,
             confirm_missing_count=1,
+            curated_input=True,
         )
 
         self.assertEqual(repaired, [synthetic_hashes[0]])
@@ -176,6 +177,7 @@ class PrivacyTests(unittest.TestCase):
             repair=lambda value: repaired.append(value) is None,
             max_repairs=1,
             confirm_missing_count=2,
+            curated_input=True,
         )
 
         self.assertEqual(repaired, [])
@@ -199,6 +201,7 @@ class PrivacyTests(unittest.TestCase):
                 lambda _value: MODULE.Presence.MISSING,
                 repair=lambda value: repaired.append(value) is None,
                 max_repairs=1,
+                curated_input=True,
             )
 
         self.assertEqual(repaired, [])
@@ -213,6 +216,7 @@ class PrivacyTests(unittest.TestCase):
             repair=lambda value: repaired.append(value) is None,
             max_repairs=3,
             confirm_missing_count=1,
+            curated_input=True,
         )
 
         self.assertEqual(repaired, [])
@@ -232,17 +236,46 @@ class PrivacyTests(unittest.TestCase):
             repair=lambda value: repaired.append(value) is None,
             max_repairs=3,
             confirm_missing_count=3,
+            curated_input=True,
         )
 
         self.assertEqual(repaired, [])
         self.assertEqual(result["repairs"], {"skipped_high_missing_ratio": 3})
 
     def test_repair_request_requires_credentials_cap_and_confirmed_count(self):
-        self.assertIsNotNone(MODULE.validate_repair_request(True, None, None, 1, 1))
-        self.assertIsNotNone(MODULE.validate_repair_request(True, "token", "url", 0, 1))
-        self.assertIsNotNone(MODULE.validate_repair_request(True, "token", "url", 1, None))
-        self.assertIsNotNone(MODULE.validate_repair_request(True, "token", "url", 1, 2))
-        self.assertIsNone(MODULE.validate_repair_request(True, "token", "url", 2, 1))
+        self.assertIsNotNone(MODULE.validate_repair_request(True, None, None, 1, 1, True))
+        self.assertIsNotNone(
+            MODULE.validate_repair_request(True, "token", "url", 1, 1, False)
+        )
+        self.assertIsNotNone(
+            MODULE.validate_repair_request(True, "token", "url", 0, 1, True)
+        )
+        self.assertIsNotNone(
+            MODULE.validate_repair_request(True, "token", "url", 1, None, True)
+        )
+        self.assertIsNotNone(
+            MODULE.validate_repair_request(True, "token", "url", 1, 2, True)
+        )
+        self.assertIsNone(
+            MODULE.validate_repair_request(True, "token", "url", 2, 1, True)
+        )
+
+    def test_scan_refuses_repair_from_uncurated_all_source(self):
+        with self.assertRaisesRegex(ValueError, "curated hash file"):
+            MODULE.scan(
+                ["a" * 64],
+                lambda _value: MODULE.MetadataProbe(MODULE.Presence.PRESENT, "active"),
+                lambda _value: MODULE.Presence.MISSING,
+                repair=lambda _value: True,
+                max_repairs=1,
+                confirm_missing_count=1,
+            )
+
+    def test_repair_refusal_is_visible_to_exit_code_layer(self):
+        self.assertTrue(
+            MODULE.repair_was_refused({"repairs": {"skipped_count_mismatch": 1}})
+        )
+        self.assertFalse(MODULE.repair_was_refused({"repairs": {"soft_deleted": 1}}))
 
 
 if __name__ == "__main__":

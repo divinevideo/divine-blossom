@@ -3,7 +3,8 @@
 
 Input hashes stay in a local file or come from the Fastly KV key listing. Output
 contains aggregate counts only. Missing bytes may be reconciled by soft-deleting
-the stale metadata through the existing admin API; all other classes are
+the stale metadata through the existing admin API from a curated hash file;
+whole-store scans are always read-only. All other classes are
 read-only because reconstructing metadata or changing moderation state without
 their original evidence would weaken access controls.
 """
@@ -235,6 +236,7 @@ def scan(
     repair: Optional[Callable[[str], bool]] = None,
     max_repairs: int = 0,
     confirm_missing_count: Optional[int] = None,
+    curated_input: bool = False,
 ) -> dict[str, object]:
     counts: Counter[str] = Counter()
     action_counts: Counter[str] = Counter()
@@ -254,6 +256,8 @@ def scan(
         for blob_hash, classification in classifications
         if classification == MISSING_BYTES
     ]
+    if repair and not curated_input:
+        raise ValueError("repair requires a curated hash file")
     if repair and confirm_missing_count is None:
         raise ValueError("repair requires the confirmed missing-byte count from a prior scan")
     if (
@@ -318,11 +322,14 @@ def validate_repair_request(
     admin_endpoint: Optional[str],
     max_repairs: int,
     confirm_missing_count: Optional[int],
+    curated_input: bool,
 ) -> Optional[str]:
     if not repair_requested:
         return None
     if not admin_token or not admin_endpoint:
         return "repair requires FASTLY_ADMIN_TOKEN and BLOSSOM_ADMIN_ENDPOINT"
+    if not curated_input:
+        return "repair requires --hash-file; --all is read-only"
     if max_repairs < 1:
         return "repair requires a positive --max-repairs cap"
     if confirm_missing_count is None or confirm_missing_count < 1:
@@ -330,6 +337,13 @@ def validate_repair_request(
     if confirm_missing_count > max_repairs:
         return "--confirm-missing-count cannot exceed --max-repairs"
     return None
+
+
+def repair_was_refused(result: dict[str, object]) -> bool:
+    repairs = result.get("repairs")
+    return isinstance(repairs, dict) and any(
+        key.startswith("skipped_") and value for key, value in repairs.items()
+    )
 
 
 def main() -> int:
@@ -383,27 +397,25 @@ def main() -> int:
             admin_endpoint,
             args.max_repairs,
             args.confirm_missing_count,
+            args.hash_file is not None,
         )
         if repair_error:
             print(repair_error, file=sys.stderr)
             return 2
         repair_fn = lambda value: soft_delete_missing_bytes(admin_endpoint, admin_token, value)
 
-    print(
-        json.dumps(
-            scan(
-                hashes,
-                metadata_fn,
-                storage_fn,
-                public_fn,
-                repair_fn,
-                args.max_repairs,
-                args.confirm_missing_count,
-            ),
-            sort_keys=True,
-        )
+    result = scan(
+        hashes,
+        metadata_fn,
+        storage_fn,
+        public_fn,
+        repair_fn,
+        args.max_repairs,
+        args.confirm_missing_count,
+        args.hash_file is not None,
     )
-    return 0
+    print(json.dumps(result, sort_keys=True))
+    return 3 if args.repair_missing_bytes and repair_was_refused(result) else 0
 
 
 if __name__ == "__main__":
