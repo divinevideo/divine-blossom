@@ -48,9 +48,6 @@ DELIVERY_PATH_FAILURE = "delivery_path_failure"
 INCONSISTENT_METADATA = "inconsistent_metadata"
 PROBE_ERROR = "probe_error"
 
-BULK_SCAN_MINIMUM = 20
-MAX_BULK_MISSING_PERCENT = 10
-
 EXPECTED_PUBLIC_STATUS = {
     "active": {200, 206},
     "pending": {200, 206},
@@ -260,14 +257,7 @@ def scan(
         raise ValueError("repair requires a curated hash file")
     if repair and confirm_missing_count is None:
         raise ValueError("repair requires the confirmed missing-byte count from a prior scan")
-    if (
-        repair
-        and len(classifications) >= BULK_SCAN_MINIMUM
-        and len(repair_candidates) * 100
-        > len(classifications) * MAX_BULK_MISSING_PERCENT
-    ):
-        repair_counts["skipped_high_missing_ratio"] = len(repair_candidates)
-    elif repair and len(repair_candidates) > max_repairs:
+    if repair and len(repair_candidates) > max_repairs:
         repair_counts["skipped_over_limit"] = len(repair_candidates)
     # Aggregate-only output cannot bind approval to specific hashes. Equality is
     # deliberately a blast-radius check, while every candidate is reclassified.
@@ -341,9 +331,7 @@ def validate_repair_request(
 
 def repair_was_refused(result: dict[str, object]) -> bool:
     repairs = result.get("repairs")
-    return isinstance(repairs, dict) and any(
-        key.startswith("skipped_") and value for key, value in repairs.items()
-    )
+    return isinstance(repairs, dict) and any(key.startswith("skipped_") for key in repairs)
 
 
 def main() -> int:

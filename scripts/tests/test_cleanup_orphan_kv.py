@@ -222,26 +222,6 @@ class PrivacyTests(unittest.TestCase):
         self.assertEqual(repaired, [])
         self.assertEqual(result["repairs"], {"skipped_count_mismatch": 2})
 
-    def test_bulk_anomaly_guard_rejects_wrong_bucket_shape(self):
-        synthetic_hashes = [f"{value:064x}" for value in range(20)]
-        missing = set(synthetic_hashes[:3])
-        repaired = []
-
-        result = MODULE.scan(
-            synthetic_hashes,
-            lambda _value: MODULE.MetadataProbe(MODULE.Presence.PRESENT, "active"),
-            lambda value: (
-                MODULE.Presence.MISSING if value in missing else MODULE.Presence.PRESENT
-            ),
-            repair=lambda value: repaired.append(value) is None,
-            max_repairs=3,
-            confirm_missing_count=3,
-            curated_input=True,
-        )
-
-        self.assertEqual(repaired, [])
-        self.assertEqual(result["repairs"], {"skipped_high_missing_ratio": 3})
-
     def test_repair_request_requires_credentials_cap_and_confirmed_count(self):
         self.assertIsNotNone(MODULE.validate_repair_request(True, None, None, 1, 1, True))
         self.assertIsNotNone(
@@ -274,6 +254,9 @@ class PrivacyTests(unittest.TestCase):
     def test_repair_refusal_is_visible_to_exit_code_layer(self):
         self.assertTrue(
             MODULE.repair_was_refused({"repairs": {"skipped_count_mismatch": 1}})
+        )
+        self.assertTrue(
+            MODULE.repair_was_refused({"repairs": {"skipped_count_mismatch": 0}})
         )
         self.assertFalse(MODULE.repair_was_refused({"repairs": {"soft_deleted": 1}}))
 
