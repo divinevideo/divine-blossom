@@ -62,9 +62,10 @@ class ProcessBlobDeployContractTest(unittest.TestCase):
         dockerfile = PROCESS_BLOB_DOCKERFILE.read_text(encoding="utf-8")
 
         self.assertIn("github.com/contentauth/c2pa-rs/releases/download/", dockerfile)
-        self.assertIn("curl -fsSL", dockerfile)
+        self.assertIn("curl --retry 3 --retry-all-errors -fsSL", dockerfile)
         self.assertIn("sha256sum -c -", dockerfile)
         self.assertIn("--strip-components=1 c2patool/c2patool", dockerfile)
+        self.assertIn("c2patool --version", dockerfile)
         self.assertNotIn("github.com/contentauth/c2patool/releases/", dockerfile)
 
 
