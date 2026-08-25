@@ -59,13 +59,13 @@ EXPECTED_PUBLIC_STATUS = {
 ACTION_BY_CLASS = {
     AVAILABLE: "none",
     MISSING_BYTES: "soft_delete_stale_metadata",
-    MISSING_METADATA: "restore_original_metadata_from_verified_backup",
+    MISSING_METADATA: "restore_status_preserving_metadata_from_verified_backup",
     STALE_EVENT_REFERENCE: "repair_at_event_source",
     MODERATION_HIDDEN: "none",
     AGE_RESTRICTED: "none",
     DELETED: "none",
     DELIVERY_PATH_FAILURE: "investigate_delivery_path",
-    INCONSISTENT_METADATA: "restore_original_metadata_from_verified_backup",
+    INCONSISTENT_METADATA: "restore_status_preserving_metadata_from_verified_backup",
     PROBE_ERROR: "retry_probe",
 }
 
@@ -89,14 +89,20 @@ def classify_blob(
     if status not in EXPECTED_PUBLIC_STATUS:
         return PROBE_ERROR
     if status == "deleted":
+        if public_status is not None and public_status not in EXPECTED_PUBLIC_STATUS[status]:
+            return DELIVERY_PATH_FAILURE
         return DELETED
     if status in {"restricted", "banned"}:
+        if public_status is not None and public_status not in EXPECTED_PUBLIC_STATUS[status]:
+            return DELIVERY_PATH_FAILURE
         return MODERATION_HIDDEN
     if status == "age_restricted":
         if public_status is not None and public_status not in EXPECTED_PUBLIC_STATUS[status]:
             return DELIVERY_PATH_FAILURE
         return AGE_RESTRICTED
     if storage is Presence.MISSING:
+        if public_status is not None and public_status != 404:
+            return DELIVERY_PATH_FAILURE
         return MISSING_BYTES
     if public_status is not None and public_status not in EXPECTED_PUBLIC_STATUS[status]:
         return DELIVERY_PATH_FAILURE
@@ -226,10 +232,12 @@ def scan(
     storage_probe: Callable[[str], Presence],
     public_probe: Optional[Callable[[str], Optional[int]]] = None,
     repair: Optional[Callable[[str], bool]] = None,
+    max_repairs: int = 0,
 ) -> dict[str, object]:
     counts: Counter[str] = Counter()
     action_counts: Counter[str] = Counter()
     repair_counts: Counter[str] = Counter()
+    classifications: list[tuple[str, str]] = []
     for blob_hash in hashes:
         metadata = metadata_probe(blob_hash)
         storage = storage_probe(blob_hash)
@@ -237,7 +245,17 @@ def scan(
         classification = classify_blob(metadata, storage, public_status)
         counts[classification] += 1
         action_counts[ACTION_BY_CLASS[classification]] += 1
-        if repair and classification == MISSING_BYTES:
+        classifications.append((blob_hash, classification))
+
+    repair_candidates = [
+        blob_hash
+        for blob_hash, classification in classifications
+        if classification == MISSING_BYTES
+    ]
+    if repair and len(repair_candidates) > max_repairs:
+        repair_counts["skipped_over_limit"] = len(repair_candidates)
+    elif repair:
+        for blob_hash in repair_candidates:
             repair_counts["soft_deleted" if repair(blob_hash) else "failed"] += 1
 
     return {
@@ -255,11 +273,18 @@ def parse_args() -> argparse.Namespace:
     source.add_argument("--hash-file", type=Path, help="Private file with one full hash per line")
     source.add_argument("--all", action="store_true", help="Scan all blob metadata keys")
     parser.add_argument("--hex-prefix", help="Restrict --all to a lowercase hex prefix")
+    parser.add_argument("--limit", type=int, help="Scan at most this many hashes")
     parser.add_argument("--public-endpoint", help="Also verify expected anonymous HTTP status")
     parser.add_argument(
         "--repair-missing-bytes",
         action="store_true",
         help="Soft-delete visible metadata after confirmed missing storage bytes",
+    )
+    parser.add_argument(
+        "--max-repairs",
+        type=int,
+        default=0,
+        help="Hard cap required with --repair-missing-bytes",
     )
     return parser.parse_args()
 
@@ -286,6 +311,12 @@ def main() -> int:
         print(str(error), file=sys.stderr)
         return 2
 
+    if args.limit is not None:
+        if args.limit < 1:
+            print("--limit must be positive", file=sys.stderr)
+            return 2
+        hashes = hashes[: args.limit]
+
     try:
         from google.cloud import storage as gcs
     except ImportError:
@@ -303,15 +334,23 @@ def main() -> int:
     if args.repair_missing_bytes:
         admin_token = os.environ.get("FASTLY_ADMIN_TOKEN")
         admin_endpoint = os.environ.get("BLOSSOM_ADMIN_ENDPOINT")
-        if not admin_token or not admin_endpoint:
+        if not admin_token or not admin_endpoint or not args.public_endpoint:
             print(
-                "FASTLY_ADMIN_TOKEN and BLOSSOM_ADMIN_ENDPOINT are required for repair",
+                "repair requires FASTLY_ADMIN_TOKEN, BLOSSOM_ADMIN_ENDPOINT, and --public-endpoint",
                 file=sys.stderr,
             )
             return 2
+        if args.max_repairs < 1:
+            print("repair requires a positive --max-repairs cap", file=sys.stderr)
+            return 2
         repair_fn = lambda value: soft_delete_missing_bytes(admin_endpoint, admin_token, value)
 
-    print(json.dumps(scan(hashes, metadata_fn, storage_fn, public_fn, repair_fn), sort_keys=True))
+    print(
+        json.dumps(
+            scan(hashes, metadata_fn, storage_fn, public_fn, repair_fn, args.max_repairs),
+            sort_keys=True,
+        )
+    )
     return 0
 
 

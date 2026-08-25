@@ -2,6 +2,7 @@ import importlib.util
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 
 SCRIPT = Path(__file__).parents[1] / "cleanup_orphan_kv.py"
@@ -52,6 +53,14 @@ class ClassificationTests(unittest.TestCase):
             MODULE.AGE_RESTRICTED,
         )
 
+    def test_detects_public_moderation_or_deletion_bypass(self):
+        for status in ("restricted", "banned", "deleted"):
+            metadata = MODULE.MetadataProbe(MODULE.Presence.PRESENT, status)
+            self.assertEqual(
+                MODULE.classify_blob(metadata, MODULE.Presence.PRESENT, 200),
+                MODULE.DELIVERY_PATH_FAILURE,
+            )
+
     def test_probe_errors_never_become_missing_state(self):
         metadata_error = MODULE.MetadataProbe(MODULE.Presence.ERROR)
         active = MODULE.MetadataProbe(MODULE.Presence.PRESENT, "active")
@@ -89,8 +98,19 @@ class ClassificationTests(unittest.TestCase):
             MODULE.classify_blob(initial, MODULE.Presence.PRESENT, 404),
             MODULE.MISSING_METADATA,
         )
+        response = Mock(status_code=206)
+        with patch.object(MODULE.requests, "get", return_value=response) as request:
+            public_status = MODULE.probe_public("https://media.example", synthetic_hash)
+
+        request.assert_called_once_with(
+            f"https://media.example/{synthetic_hash}",
+            headers={"Range": "bytes=0-0"},
+            allow_redirects=False,
+            timeout=15,
+        )
+        self.assertEqual(public_status, 206)
         self.assertEqual(
-            MODULE.classify_blob(repaired, MODULE.Presence.PRESENT, 206),
+            MODULE.classify_blob(repaired, MODULE.Presence.PRESENT, public_status),
             MODULE.AVAILABLE,
         )
 
@@ -135,11 +155,37 @@ class PrivacyTests(unittest.TestCase):
                 "active" if value == synthetic_hashes[0] else "restricted",
             ),
             lambda _value: MODULE.Presence.MISSING,
+            lambda _value: 404,
             repair=lambda value: repaired.append(value) is None,
+            max_repairs=1,
         )
 
         self.assertEqual(repaired, [synthetic_hashes[0]])
         self.assertEqual(result["repairs"], {"soft_deleted": 1})
+
+    def test_repair_stops_when_candidates_exceed_cap(self):
+        synthetic_hashes = ["5" * 64, "6" * 64]
+        repaired = []
+
+        result = MODULE.scan(
+            synthetic_hashes,
+            lambda _value: MODULE.MetadataProbe(MODULE.Presence.PRESENT, "active"),
+            lambda _value: MODULE.Presence.MISSING,
+            lambda _value: 404,
+            repair=lambda value: repaired.append(value) is None,
+            max_repairs=1,
+        )
+
+        self.assertEqual(repaired, [])
+        self.assertEqual(result["repairs"], {"skipped_over_limit": 2})
+
+    def test_storage_miss_conflicting_with_public_success_is_not_repaired(self):
+        metadata = MODULE.MetadataProbe(MODULE.Presence.PRESENT, "active")
+
+        self.assertEqual(
+            MODULE.classify_blob(metadata, MODULE.Presence.MISSING, 206),
+            MODULE.DELIVERY_PATH_FAILURE,
+        )
 
 
 if __name__ == "__main__":
