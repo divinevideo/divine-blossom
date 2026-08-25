@@ -7,6 +7,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github/workflows/ci.yml"
+PROCESS_BLOB_DOCKERFILE = ROOT / "cloud-functions/process-blob/Dockerfile"
 
 
 def extract_job(workflow: str, job_name: str) -> str:
@@ -56,6 +57,16 @@ class ProcessBlobDeployContractTest(unittest.TestCase):
             "    steps:\n      - run: expected\n",
             extract_job(workflow, "deploy-process-blob"),
         )
+
+    def test_c2patool_download_uses_the_official_release_and_verifies_it(self) -> None:
+        dockerfile = PROCESS_BLOB_DOCKERFILE.read_text(encoding="utf-8")
+
+        self.assertIn("github.com/contentauth/c2pa-rs/releases/download/", dockerfile)
+        self.assertIn("curl --retry 3 --retry-all-errors -fsSL", dockerfile)
+        self.assertIn("sha256sum -c -", dockerfile)
+        self.assertIn("--strip-components=1 c2patool/c2patool", dockerfile)
+        self.assertIn("c2patool --version", dockerfile)
+        self.assertNotIn("github.com/contentauth/c2patool/releases/", dockerfile)
 
 
 if __name__ == "__main__":
