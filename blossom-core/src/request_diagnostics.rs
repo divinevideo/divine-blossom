@@ -10,10 +10,28 @@ use crate::types::{
 /// cross-service correlation stays exact while very long caller-side
 /// correlation matches on the prefix only.
 const MAX_REQUEST_ID_LEN: usize = 64;
+const MAX_PROBE_ID_LEN: usize = 64;
+
+/// Successful bare-blob requests at or above this duration are diagnostic samples.
+pub const SLOW_BLOB_THRESHOLD_MS: u128 = 750;
 
 /// Return whether a Compute response belongs in persistent diagnostics.
 pub fn should_persist_compute_diagnostic(status: u16) -> bool {
     (500..=599).contains(&status)
+}
+
+/// Return whether a successful bare-blob fetch is cold or slow enough to sample.
+pub fn should_persist_blob_fetch_diagnostic(
+    status: u16,
+    route: &str,
+    duration_ms: u128,
+    has_phase_diagnostics: bool,
+    is_cold_fill: bool,
+) -> bool {
+    matches!(status, 200 | 206)
+        && route == "blob"
+        && has_phase_diagnostics
+        && (duration_ms >= SLOW_BLOB_THRESHOLD_MS || is_cold_fill)
 }
 
 /// Restrict an untrusted request ID to a short, injection-safe log value.
@@ -25,6 +43,20 @@ pub fn sanitize_request_id(value: &str) -> String {
         })
         .take(MAX_REQUEST_ID_LEN)
         .collect()
+}
+
+/// Accept a bounded machine-generated cold-fill probe correlation value.
+pub fn diagnostic_probe_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    if !value.starts_with("coldfill-")
+        || value.len() > MAX_PROBE_ID_LEN
+        || !value.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        })
+    {
+        return None;
+    }
+    Some(value.to_string())
 }
 
 /// Select and sanitize an externally supplied request correlation ID.
@@ -160,10 +192,54 @@ mod tests {
     }
 
     #[test]
+    fn blob_fetch_diagnostics_require_success_phases_and_a_sample_reason() {
+        assert!(should_persist_blob_fetch_diagnostic(
+            200, "blob", 750, true, false
+        ));
+        assert!(should_persist_blob_fetch_diagnostic(
+            206, "blob", 5_000, true, false
+        ));
+        assert!(should_persist_blob_fetch_diagnostic(
+            200, "blob", 200, true, true
+        ));
+        assert!(!should_persist_blob_fetch_diagnostic(
+            200, "blob", 749, true, false
+        ));
+        assert!(!should_persist_blob_fetch_diagnostic(
+            200, "blob", 5_000, false, false
+        ));
+        assert!(!should_persist_blob_fetch_diagnostic(
+            200,
+            "hls_content",
+            5_000,
+            true,
+            true
+        ));
+        assert!(!should_persist_blob_fetch_diagnostic(
+            500, "blob", 5_000, true, true
+        ));
+    }
+
+    #[test]
     fn sanitizer_removes_log_injection_characters() {
         assert_eq!(sanitize_request_id("abc\n[ADMIN] fake"), "abcADMINfake");
         assert_eq!(sanitize_request_id("\x1b[31mred\x1b[0m"), "31mred0m");
         assert_eq!(sanitize_request_id("\n\r\t "), "");
+    }
+
+    #[test]
+    fn diagnostic_probe_ids_are_bounded_to_a_machine_namespace() {
+        assert_eq!(
+            diagnostic_probe_id("coldfill-20260826t120000z-42-concurrent-1").as_deref(),
+            Some("coldfill-20260826t120000z-42-concurrent-1")
+        );
+        assert_eq!(diagnostic_probe_id("user-123"), None);
+        assert_eq!(diagnostic_probe_id("coldfill-account@example.com"), None);
+        assert_eq!(diagnostic_probe_id("coldfill-a\nforged"), None);
+        assert_eq!(
+            diagnostic_probe_id(&format!("coldfill-{}", "a".repeat(64))),
+            None
+        );
     }
 
     #[test]

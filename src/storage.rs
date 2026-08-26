@@ -11,7 +11,7 @@ use fastly::http::{Method, StatusCode};
 use fastly::{Body, Request, Response};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Backend name (must match fastly.toml)
 const GCS_BACKEND: &str = "gcs_storage";
@@ -318,6 +318,19 @@ pub fn download_blob(hash: &str, range: Option<&str>) -> Result<Response> {
 pub struct FallbackDownloadResult {
     pub response: Response,
     pub source: String, // "gcs" or the backend name that served the content
+    pub diagnostics: Option<BlobFetchDiagnostics>,
+}
+
+/// Privacy-safe phase timings for one bare-blob origin fetch.
+#[derive(Debug, Default)]
+pub struct BlobFetchDiagnostics {
+    pub fos_lookup_ms: Option<u128>,
+    pub fos_outcome: Option<&'static str>,
+    pub gcs_fetch_ms: Option<u128>,
+    pub buffer_ms: Option<u128>,
+    pub write_back_ms: Option<u128>,
+    pub source: Option<&'static str>,
+    pub storage_cache: Option<&'static str>,
 }
 
 /// Download a blob with fallback to CDNs
@@ -333,6 +346,7 @@ pub fn download_blob_with_fallback(
             return Ok(FallbackDownloadResult {
                 response: resp,
                 source: SOURCE_GCS.to_string(),
+                diagnostics: None,
             });
         }
         Err(BlossomError::NotFound(_)) => {
@@ -351,6 +365,7 @@ pub fn download_blob_with_fallback(
                 return Ok(FallbackDownloadResult {
                     response: resp,
                     source: backend_name.to_string(),
+                    diagnostics: None,
                 });
             }
             Err(_) => {
@@ -668,17 +683,41 @@ pub fn download_blob_read_through(
     range: Option<&str>,
     expected_size: Option<u64>,
 ) -> Result<FallbackDownloadResult> {
+    let mut diagnostics = BlobFetchDiagnostics::default();
     if fos_read_enabled() {
+        let started = Instant::now();
         if let Some(response) = try_download_blob_from_fos(hash, range, expected_size) {
+            diagnostics.fos_lookup_ms = Some(started.elapsed().as_millis());
+            diagnostics.fos_outcome = Some("hit");
+            diagnostics.source = Some(SOURCE_FOS);
+            diagnostics.storage_cache = response
+                .get_header_str(STORAGE_CACHE_HEADER)
+                .and_then(normalize_storage_cache_state);
             return Ok(FallbackDownloadResult {
                 response,
                 source: SOURCE_FOS.to_string(),
+                diagnostics: Some(diagnostics),
             });
         }
+        diagnostics.fos_lookup_ms = Some(started.elapsed().as_millis());
+        diagnostics.fos_outcome = Some("miss");
+    } else {
+        diagnostics.fos_outcome = Some("disabled");
     }
 
+    let started = Instant::now();
     let result = download_blob_with_fallback(hash, range)?;
-    Ok(write_back_if_eligible(hash, range, result))
+    if result.source == SOURCE_GCS {
+        diagnostics.gcs_fetch_ms = Some(started.elapsed().as_millis());
+        diagnostics.source = Some(SOURCE_GCS);
+    } else {
+        diagnostics.source = Some("fallback");
+    }
+    diagnostics.storage_cache = result
+        .response
+        .get_header_str(STORAGE_CACHE_HEADER)
+        .and_then(normalize_storage_cache_state);
+    Ok(write_back_if_eligible(hash, range, result, diagnostics))
 }
 
 /// Mirror a GCS-served body into FOS when it is safe to buffer it.
@@ -690,6 +729,7 @@ fn write_back_if_eligible(
     hash: &str,
     range: Option<&str>,
     mut result: FallbackDownloadResult,
+    mut diagnostics: BlobFetchDiagnostics,
 ) -> FallbackDownloadResult {
     let decision = write_back_decision(
         fos_write_back_enabled(),
@@ -701,6 +741,7 @@ fn write_back_if_eligible(
     );
 
     if !decision.is_eligible() {
+        result.diagnostics = Some(diagnostics);
         return result;
     }
 
@@ -711,12 +752,17 @@ fn write_back_if_eligible(
         .to_string();
 
     let mut body = result.response.take_body();
+    let buffer_started = Instant::now();
     match buffer_body_up_to(&mut body, MAX_WRITE_BACK_BYTES as usize) {
         BufferedBody::Complete(bytes) => {
+            diagnostics.buffer_ms = Some(buffer_started.elapsed().as_millis());
+            let write_back_started = Instant::now();
             try_write_back_to_fos(hash, &bytes, &content_type);
+            diagnostics.write_back_ms = Some(write_back_started.elapsed().as_millis());
             result.response.set_body(Body::from(bytes));
         }
         BufferedBody::Partial(bytes) => {
+            diagnostics.buffer_ms = Some(buffer_started.elapsed().as_millis());
             // Larger than declared, or the stream faulted. Stitch the buffered
             // prefix back in front of the untouched remainder and skip the
             // write-back.
@@ -730,6 +776,7 @@ fn write_back_if_eligible(
         }
     }
 
+    result.diagnostics = Some(diagnostics);
     result
 }
 
