@@ -36,8 +36,17 @@ CONCURRENCY=8 \
   scripts/probe-cold-blob.sh
 ```
 
-The output reports only status, timing, cache state, serving POP, and generated
-probe IDs. Keep the final `collapse_prefix`.
+The default sends full-object requests so successful FOS-miss/GCS responses are
+eligible for body buffering and write-back. Set `RANGE` only for a separate
+range-path experiment; doing so intentionally makes those two phases absent.
+
+The output reports only status, timing, fixed source/cache labels, serving POP,
+and bounded probe IDs. It also reports `distinct_compute_fills` from all
+concurrent client responses. One distinct echoed marker establishes one Compute
+response filled the request group. Multiple markers establish duplicate Compute
+responses; their `source` and `fos_outcome` labels show whether those executions
+also duplicated the GCS fill. This response set is exhaustive for the requests
+the script started and does not depend on Pub/Sub pull completeness.
 
 After the diagnostic records arrive, an authorized operator can read the sink
 without acknowledging messages:
@@ -46,12 +55,10 @@ without acknowledging messages:
 REQUEST_PREFIX=<collapse-prefix> scripts/tail-edge-errors.sh 500
 ```
 
-Exactly one `divine.blossom.blob_fetch.v1` record with `sample_reason` equal to
-`cold_fill` or `slow_cold_fill` for the concurrent prefix establishes that the
-request group produced one GCS fill. More than one establishes duplicate GCS
-fills. Zero is inconclusive: it means the sink
-or request-ID path did not provide evidence and must not be reported as
-successful collapsing.
+Use the sink records for phase durations, not for an exhaustive request count.
+Pub/Sub pull can return a subset of available messages, so one matching record
+does not prove that no other fill occurred. Zero matching records is likewise
+inconclusive and must not be reported as successful telemetry.
 
 ## Diagnostic interpretation
 
@@ -64,6 +71,11 @@ IP, or account identifier. `authorization_present` is only a boolean path label.
 - `write_back_ms`: time spent writing the verified body to FOS.
 - `duration_ms`: full Compute request duration, including metadata and access checks.
 - `storage_cache`: normalized internal cache state when Fastly exposes one.
+
+`probe_id`, `source`, and `fos_outcome` are echoed only for a syntactically
+bounded `coldfill-*` probe request. They contain no object or user identifier.
+The marker is an untrusted measurement hint, not authorization and not evidence
+by itself; the probe trusts only the markers on its own complete response set.
 
 The sink records every verified FOS-miss/GCS cold fill and every successful
 bare-blob response taking at least 750 ms. This captures cold probes even when

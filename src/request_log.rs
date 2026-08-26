@@ -13,6 +13,8 @@ use crate::storage::BlobFetchDiagnostics;
 
 pub(crate) const ENDPOINT_NAME: &str = "compute-diagnostics";
 pub(crate) const PROBE_ID_HEADER: &str = "X-Divine-Diagnostic-Probe";
+pub(crate) const PROBE_SOURCE_HEADER: &str = "X-Divine-Diagnostic-Source";
+pub(crate) const PROBE_FOS_OUTCOME_HEADER: &str = "X-Divine-Diagnostic-FOS-Outcome";
 
 const DIAGNOSTIC_PREFIX: &str = "X-Divine-Internal-Diagnostic-";
 const AUTHORIZATION_PRESENT_HEADER: &str = "X-Divine-Internal-Diagnostic-Authorization-Present";
@@ -62,6 +64,11 @@ pub(crate) fn attach_blob_phases(
     authorization_present: bool,
     probe_id: Option<&str>,
 ) {
+    if let Some(probe_id) = probe_id {
+        response.set_header(PROBE_ID_HEADER, probe_id);
+        set_optional_header(response, PROBE_SOURCE_HEADER, diagnostics.source);
+        set_optional_header(response, PROBE_FOS_OUTCOME_HEADER, diagnostics.fos_outcome);
+    }
     response.set_header(
         AUTHORIZATION_PRESENT_HEADER,
         if authorization_present {
@@ -157,11 +164,15 @@ pub(crate) fn emit(
         return;
     }
 
-    let sample_reason = match (duration_ms >= SLOW_BLOB_THRESHOLD_MS, is_cold_fill) {
-        (true, true) => Some("slow_cold_fill"),
-        (true, false) => Some("slow_success"),
-        (false, true) => Some("cold_fill"),
-        (false, false) => None,
+    let sample_reason = if persist_blob_fetch {
+        match (duration_ms >= SLOW_BLOB_THRESHOLD_MS, is_cold_fill) {
+            (true, true) => Some("slow_cold_fill"),
+            (true, false) => Some("slow_success"),
+            (false, true) => Some("cold_fill"),
+            (false, false) => None,
+        }
+    } else {
+        None
     };
 
     let categories = error.and_then(persisted_error_categories);
@@ -217,6 +228,15 @@ mod tests {
         let (phases, probe_id) = take_blob_phases(&mut response).expect("attached phases");
         assert!(phases.authorization_present);
         assert_eq!(probe_id.as_deref(), Some("coldfill-test-1"));
+        assert_eq!(
+            response.get_header_str(PROBE_ID_HEADER),
+            Some("coldfill-test-1")
+        );
+        assert_eq!(response.get_header_str(PROBE_SOURCE_HEADER), Some("gcs"));
+        assert_eq!(
+            response.get_header_str(PROBE_FOS_OUTCOME_HEADER),
+            Some("miss")
+        );
         assert_eq!(phases.source.as_deref(), Some("gcs"));
         assert_eq!(phases.fos_lookup_ms, Some(12));
         assert_eq!(phases.gcs_fetch_ms, Some(34));
