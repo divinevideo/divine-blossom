@@ -593,7 +593,7 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         .ok_or_else(|| BlossomError::BadRequest("Invalid hash in path".into()))?;
     let authorization_present = req.contains_header(header::AUTHORIZATION);
     let probe_id = req
-        .get_header_str(request_log::PROBE_ID_HEADER)
+        .get_header_str(request_log::PROBE_REQUEST_HEADER)
         .and_then(diagnostic_probe_id);
 
     // Check metadata for access control

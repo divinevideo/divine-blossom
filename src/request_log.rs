@@ -12,9 +12,12 @@ use std::time::Duration;
 use crate::storage::BlobFetchDiagnostics;
 
 pub(crate) const ENDPOINT_NAME: &str = "compute-diagnostics";
-pub(crate) const PROBE_ID_HEADER: &str = "X-Divine-Diagnostic-Probe";
-pub(crate) const PROBE_SOURCE_HEADER: &str = "X-Divine-Diagnostic-Source";
-pub(crate) const PROBE_FOS_OUTCOME_HEADER: &str = "X-Divine-Diagnostic-FOS-Outcome";
+pub(crate) const PROBE_REQUEST_HEADER: &str = "X-Divine-Diagnostic-Probe";
+const PROBE_ID_HEADER: &str = "X-Divine-Probe-Id";
+const PROBE_SOURCE_HEADER: &str = "X-Divine-Probe-Source";
+const PROBE_FOS_OUTCOME_HEADER: &str = "X-Divine-Probe-FOS-Outcome";
+const PROBE_BUFFER_HEADER: &str = "X-Divine-Probe-Buffer";
+const PROBE_WRITE_BACK_HEADER: &str = "X-Divine-Probe-Write-Back";
 
 const DIAGNOSTIC_PREFIX: &str = "X-Divine-Internal-Diagnostic-";
 const AUTHORIZATION_PRESENT_HEADER: &str = "X-Divine-Internal-Diagnostic-Authorization-Present";
@@ -68,6 +71,22 @@ pub(crate) fn attach_blob_phases(
         response.set_header(PROBE_ID_HEADER, probe_id);
         set_optional_header(response, PROBE_SOURCE_HEADER, diagnostics.source);
         set_optional_header(response, PROBE_FOS_OUTCOME_HEADER, diagnostics.fos_outcome);
+        response.set_header(
+            PROBE_BUFFER_HEADER,
+            if diagnostics.buffer_ms.is_some() {
+                "present"
+            } else {
+                "absent"
+            },
+        );
+        response.set_header(
+            PROBE_WRITE_BACK_HEADER,
+            if diagnostics.write_back_ms.is_some() {
+                "present"
+            } else {
+                "absent"
+            },
+        );
     }
     response.set_header(
         AUTHORIZATION_PRESENT_HEADER,
@@ -236,6 +255,14 @@ mod tests {
         assert_eq!(
             response.get_header_str(PROBE_FOS_OUTCOME_HEADER),
             Some("miss")
+        );
+        assert_eq!(
+            response.get_header_str(PROBE_BUFFER_HEADER),
+            Some("present")
+        );
+        assert_eq!(
+            response.get_header_str(PROBE_WRITE_BACK_HEADER),
+            Some("present")
         );
         assert_eq!(phases.source.as_deref(), Some("gcs"));
         assert_eq!(phases.fos_lookup_ms, Some(12));

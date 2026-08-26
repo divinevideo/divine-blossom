@@ -26,11 +26,15 @@ class ProbeColdBlobContractTest(unittest.TestCase):
     def test_concurrent_requests_have_a_shared_correlation_prefix(self):
         self.assertIn('prefix="$RUN_ID-concurrent-"', SCRIPT)
         self.assertIn("REQUEST_PREFIX=$prefix", SCRIPT)
-        self.assertIn('distinct_compute_fills=${#fills[@]}', SCRIPT)
+        self.assertIn('echo "distinct_compute_fills=$compute_fills"', SCRIPT)
+        self.assertIn('echo "distinct_gcs_fills=$gcs_fills"', SCRIPT)
+        self.assertIn("the concurrent fresh object did not exercise a GCS fill", SCRIPT)
 
     def test_full_object_is_the_default_for_buffer_and_write_back_evidence(self):
         self.assertIn('RANGE="${RANGE:-}"', SCRIPT)
         self.assertIn('if [ -n "$RANGE" ]', SCRIPT)
+        self.assertIn("anonymous cold request did not exercise buffering", SCRIPT)
+        self.assertIn("credentialed cold request did not exercise write-back", SCRIPT)
 
     def test_representative_pop_is_required(self):
         self.assertIn('EXPECTED_POP_REGEX="${EXPECTED_POP_REGEX:-}"', SCRIPT)

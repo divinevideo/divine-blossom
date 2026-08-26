@@ -14,7 +14,9 @@ It never globally purges a cache and does not print the object hash.
 - Upload three distinct, non-user synthetic objects that are valid for public
   and NIP-98 GET requests. Do not read them before the probe: an earlier read
   may populate the FOS replica, and a surrogate purge does not delete that
-  replica. Pass the hashes through `ANONYMOUS_BLOB_HASH`,
+  replica. Each object must be under 32 MiB and uploaded through the normal path
+  that writes its size to KV metadata; otherwise write-back is ineligible and
+  the probe will fail rather than claim phase coverage. Pass the hashes through `ANONYMOUS_BLOB_HASH`,
   `CREDENTIALED_BLOB_HASH`, and `CONCURRENT_BLOB_HASH`; do not put them in a
   command transcript, result document, or commit.
 - Install `curl`, `nak`, and the Fastly CLI. `nak curl` uses an ephemeral signer,
@@ -41,11 +43,13 @@ eligible for body buffering and write-back. Set `RANGE` only for a separate
 range-path experiment; doing so intentionally makes those two phases absent.
 
 The output reports only status, timing, fixed source/cache labels, serving POP,
-and bounded probe IDs. It also reports `distinct_compute_fills` from all
-concurrent client responses. One distinct echoed marker establishes one Compute
-response filled the request group. Multiple markers establish duplicate Compute
-responses; their `source` and `fos_outcome` labels show whether those executions
-also duplicated the GCS fill. This response set is exhaustive for the requests
+and fixed probe roles. It reports `distinct_compute_fills` and
+`distinct_gcs_fills` from all concurrent client responses. `vcl_deliver`
+compares each request marker with the cached fill leader and emits only a fixed
+`leader` or `follower` role; it strips the marker and cached probe metadata before
+delivery. One leader establishes one Compute response filled the request group.
+Multiple leaders establish duplicate Compute responses, while the source and FOS
+labels identify how many also duplicated the GCS fill. This response set is exhaustive for the requests
 the script started and does not depend on Pub/Sub pull completeness.
 
 After the diagnostic records arrive, an authorized operator can read the sink
@@ -72,10 +76,12 @@ IP, or account identifier. `authorization_present` is only a boolean path label.
 - `duration_ms`: full Compute request duration, including metadata and access checks.
 - `storage_cache`: normalized internal cache state when Fastly exposes one.
 
-`probe_id`, `source`, and `fos_outcome` are echoed only for a syntactically
-bounded `coldfill-*` probe request. They contain no object or user identifier.
-The marker is an untrusted measurement hint, not authorization and not evidence
-by itself; the probe trusts only the markers on its own complete response set.
+The request's syntactically bounded `coldfill-*` marker is an untrusted
+measurement hint, not authorization. It is stored only long enough for
+`vcl_deliver` to compare the request with the cached fill leader, then stripped.
+Clients receive only fixed `role`, `source`, `fos_outcome`, `buffer`, and
+`write_back` labels created during delivery; no marker, object identifier, or
+user identifier is returned or pinned in the shared object.
 
 The sink records every verified FOS-miss/GCS cold fill and every successful
 bare-blob response taking at least 750 ms. This captures cold probes even when

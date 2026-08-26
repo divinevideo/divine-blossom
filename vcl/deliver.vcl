@@ -6,6 +6,35 @@ unset resp.http.Surrogate-Key;
 unset resp.http.Surrogate-Control;
 unset resp.http.X-Divine-Edge-Request-Id;
 
+# Compare the request's bounded probe marker with the marker stored on the
+# cached backend response. These response headers are added in vcl_deliver, so
+# they are never stored in the shared object. The caller-controlled marker and
+# all cached probe metadata are always stripped before delivery.
+if (req.http.X-Divine-Diagnostic-Probe ~ "^coldfill-[a-z0-9-]{1,55}$" && resp.http.X-Divine-Probe-Id) {
+  if (req.http.X-Divine-Diagnostic-Probe == resp.http.X-Divine-Probe-Id) {
+    set resp.http.X-Divine-Diagnostic-Role = "leader";
+  } else {
+    set resp.http.X-Divine-Diagnostic-Role = "follower";
+  }
+  if (resp.http.X-Divine-Probe-Source ~ "^(gcs|fos|fallback)$") {
+    set resp.http.X-Divine-Diagnostic-Source = resp.http.X-Divine-Probe-Source;
+  }
+  if (resp.http.X-Divine-Probe-FOS-Outcome ~ "^(hit|miss|disabled)$") {
+    set resp.http.X-Divine-Diagnostic-FOS-Outcome = resp.http.X-Divine-Probe-FOS-Outcome;
+  }
+  if (resp.http.X-Divine-Probe-Buffer ~ "^(present|absent)$") {
+    set resp.http.X-Divine-Diagnostic-Buffer = resp.http.X-Divine-Probe-Buffer;
+  }
+  if (resp.http.X-Divine-Probe-Write-Back ~ "^(present|absent)$") {
+    set resp.http.X-Divine-Diagnostic-Write-Back = resp.http.X-Divine-Probe-Write-Back;
+  }
+}
+unset resp.http.X-Divine-Probe-Id;
+unset resp.http.X-Divine-Probe-Source;
+unset resp.http.X-Divine-Probe-FOS-Outcome;
+unset resp.http.X-Divine-Probe-Buffer;
+unset resp.http.X-Divine-Probe-Write-Back;
+
 # Strip GCS/S3 backend headers that leak through Compute
 unset resp.http.x-guploader-uploadid;
 unset resp.http.x-goog-generation;

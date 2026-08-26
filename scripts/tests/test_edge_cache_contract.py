@@ -9,6 +9,24 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class EdgeCacheContractTests(unittest.TestCase):
+    def test_probe_metadata_is_compared_then_stripped_at_delivery(self):
+        deliver_vcl = (ROOT / "vcl" / "deliver.vcl").read_text()
+
+        self.assertIn("X-Divine-Diagnostic-Role = \"leader\"", deliver_vcl)
+        self.assertIn("X-Divine-Diagnostic-Role = \"follower\"", deliver_vcl)
+        for header in (
+            "X-Divine-Probe-Id",
+            "X-Divine-Probe-Source",
+            "X-Divine-Probe-FOS-Outcome",
+            "X-Divine-Probe-Buffer",
+            "X-Divine-Probe-Write-Back",
+        ):
+            self.assertIn(f"unset resp.http.{header};", deliver_vcl)
+            self.assertLess(
+                deliver_vcl.index('X-Divine-Diagnostic-Role = "leader"'),
+                deliver_vcl.index(f"unset resp.http.{header};"),
+            )
+
     def test_private_edge_policy_does_not_disable_short_404_caching(self):
         fetch_vcl = (ROOT / "vcl" / "fetch.vcl").read_text()
 

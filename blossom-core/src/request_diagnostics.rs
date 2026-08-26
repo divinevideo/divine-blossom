@@ -49,6 +49,7 @@ pub fn sanitize_request_id(value: &str) -> String {
 pub fn diagnostic_probe_id(value: &str) -> Option<String> {
     let value = value.trim();
     if !value.starts_with("coldfill-")
+        || value.len() == "coldfill-".len()
         || value.len() > MAX_PROBE_ID_LEN
         || !value.chars().all(|character| {
             character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
@@ -234,6 +235,7 @@ mod tests {
             Some("coldfill-20260826t120000z-42-concurrent-1")
         );
         assert_eq!(diagnostic_probe_id("user-123"), None);
+        assert_eq!(diagnostic_probe_id("coldfill-"), None);
         assert_eq!(diagnostic_probe_id("coldfill-account@example.com"), None);
         assert_eq!(diagnostic_probe_id("coldfill-a\nforged"), None);
         assert_eq!(

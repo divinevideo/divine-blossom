@@ -76,24 +76,26 @@ fetch_one() {
 }
 
 report_one() {
-  local label="$1" headers="$2" metrics="$3" expected_probe_prefix="$4"
-  local status ttfb total served cache age internal probe source fos_outcome
+  local label="$1" headers="$2" metrics="$3"
+  local status ttfb total served cache age internal role source fos_outcome buffer write_back
   read -r status ttfb total <"$metrics"
   [[ "$status" = 200 || "$status" = 206 ]] || fail "$label returned HTTP $status"
   served=$(header_value x-served-by "$headers")
   cache=$(header_value x-cache "$headers")
   age=$(header_value age "$headers")
   internal=$(header_value x-divine-storage-cache "$headers")
-  probe=$(header_value x-divine-diagnostic-probe "$headers")
+  role=$(header_value x-divine-diagnostic-role "$headers")
   source=$(header_value x-divine-diagnostic-source "$headers")
   fos_outcome=$(header_value x-divine-diagnostic-fos-outcome "$headers")
+  buffer=$(header_value x-divine-diagnostic-buffer "$headers")
+  write_back=$(header_value x-divine-diagnostic-write-back "$headers")
   [[ "$served" =~ $EXPECTED_POP_REGEX ]] || \
     fail "$label served-by '$served' does not match EXPECTED_POP_REGEX"
-  [[ "$probe" == "$expected_probe_prefix"* ]] || \
-    fail "$label did not return the expected run-scoped probe id"
-  [[ "$source" != - && "$fos_outcome" != - ]] || \
+  [[ "$role" =~ ^(leader|follower)$ ]] || \
+    fail "$label did not return probe role evidence"
+  [[ "$source" != - && "$fos_outcome" != - && "$buffer" != - && "$write_back" != - ]] || \
     fail "$label did not return probe source evidence"
-  echo "$label status=$status ttfb_s=$ttfb total_s=$total x_cache=$cache age=$age storage_cache=$internal probe_id=$probe source=$source fos_outcome=$fos_outcome served_by=$served"
+  echo "$label status=$status ttfb_s=$ttfb total_s=$total x_cache=$cache age=$age storage_cache=$internal role=$role source=$source fos_outcome=$fos_outcome buffer=$buffer write_back=$write_back served_by=$served"
 }
 
 echo "run_id=$RUN_ID domain=$DOMAIN concurrency=$CONCURRENCY"
@@ -101,11 +103,27 @@ echo "The object identifier is intentionally omitted from output."
 
 purge_fixture "$ANONYMOUS_BLOB_HASH"
 fetch_one anonymous "$ANONYMOUS_BLOB_HASH" "$RUN_ID-anon" "$TMP/anon.headers" "$TMP/anon.metrics"
-report_one anonymous "$TMP/anon.headers" "$TMP/anon.metrics" "$RUN_ID-anon"
+report_one anonymous "$TMP/anon.headers" "$TMP/anon.metrics"
+grep -qi '^x-divine-diagnostic-role:[[:space:]]*leader' "$TMP/anon.headers" || \
+  fail "anonymous cold request was not the fill leader"
+grep -qi '^x-divine-diagnostic-source:[[:space:]]*gcs' "$TMP/anon.headers" || \
+  fail "anonymous fresh object did not use GCS"
+grep -qi '^x-divine-diagnostic-buffer:[[:space:]]*present' "$TMP/anon.headers" || \
+  fail "anonymous cold request did not exercise buffering"
+grep -qi '^x-divine-diagnostic-write-back:[[:space:]]*present' "$TMP/anon.headers" || \
+  fail "anonymous cold request did not exercise write-back"
 
 purge_fixture "$CREDENTIALED_BLOB_HASH"
 fetch_one credentialed "$CREDENTIALED_BLOB_HASH" "$RUN_ID-credentialed" "$TMP/credentialed.headers" "$TMP/credentialed.metrics"
-report_one credentialed "$TMP/credentialed.headers" "$TMP/credentialed.metrics" "$RUN_ID-credentialed"
+report_one credentialed "$TMP/credentialed.headers" "$TMP/credentialed.metrics"
+grep -qi '^x-divine-diagnostic-role:[[:space:]]*leader' "$TMP/credentialed.headers" || \
+  fail "credentialed cold request was not the fill leader"
+grep -qi '^x-divine-diagnostic-source:[[:space:]]*gcs' "$TMP/credentialed.headers" || \
+  fail "credentialed fresh object did not use GCS"
+grep -qi '^x-divine-diagnostic-buffer:[[:space:]]*present' "$TMP/credentialed.headers" || \
+  fail "credentialed cold request did not exercise buffering"
+grep -qi '^x-divine-diagnostic-write-back:[[:space:]]*present' "$TMP/credentialed.headers" || \
+  fail "credentialed cold request did not exercise write-back"
 
 purge_fixture "$CONCURRENT_BLOB_HASH"
 prefix="$RUN_ID-concurrent-"
@@ -120,19 +138,31 @@ for pid in "${pids[@]}"; do
 done
 for ((index = 1; index <= CONCURRENCY; index++)); do
   report_one "concurrent_$index" "$TMP/concurrent-$index.headers" \
-    "$TMP/concurrent-$index.metrics" "$prefix"
+    "$TMP/concurrent-$index.metrics"
 done
 
-declare -A fills=()
+compute_fills=0
+gcs_fills=0
 for ((index = 1; index <= CONCURRENCY; index++)); do
-  probe=$(header_value x-divine-diagnostic-probe "$TMP/concurrent-$index.headers")
+  role=$(header_value x-divine-diagnostic-role "$TMP/concurrent-$index.headers")
   source=$(header_value x-divine-diagnostic-source "$TMP/concurrent-$index.headers")
   fos_outcome=$(header_value x-divine-diagnostic-fos-outcome "$TMP/concurrent-$index.headers")
-  [[ "$probe" == "$prefix"* ]] || fail "concurrent_$index did not return a run-scoped probe id"
-  fills["$probe|$source|$fos_outcome"]=1
+  buffer=$(header_value x-divine-diagnostic-buffer "$TMP/concurrent-$index.headers")
+  write_back=$(header_value x-divine-diagnostic-write-back "$TMP/concurrent-$index.headers")
+  if [ "$role" = leader ]; then
+    compute_fills=$((compute_fills + 1))
+    if [ "$source" = gcs ] && [ "$fos_outcome" = miss ]; then
+      [ "$buffer" = present ] && [ "$write_back" = present ] || \
+        fail "concurrent GCS leader did not exercise buffering and write-back"
+      gcs_fills=$((gcs_fills + 1))
+    fi
+  fi
 done
-echo "distinct_compute_fills=${#fills[@]}"
-if [ "${#fills[@]}" -eq 1 ]; then
+[ "$compute_fills" -gt 0 ] || fail "no concurrent response identified the fill leader"
+[ "$gcs_fills" -gt 0 ] || fail "the concurrent fresh object did not exercise a GCS fill"
+echo "distinct_compute_fills=$compute_fills"
+echo "distinct_gcs_fills=$gcs_fills"
+if [ "$compute_fills" -eq 1 ]; then
   echo "collapse_result=one Compute response filled the concurrent request group"
 else
   echo "collapse_result=duplicate Compute responses filled the concurrent request group"
