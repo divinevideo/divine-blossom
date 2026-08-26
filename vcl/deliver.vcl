@@ -6,10 +6,10 @@ unset resp.http.Surrogate-Key;
 unset resp.http.Surrogate-Control;
 unset resp.http.X-Divine-Edge-Request-Id;
 
-# Compare the request's bounded probe marker with the marker stored on the
-# cached backend response. These response headers are added in vcl_deliver, so
-# they are never stored in the shared object. The caller-controlled marker and
-# all cached probe metadata are always stripped before delivery.
+# Compare the request's bounded probe marker with the marker stored in the
+# shared backend response. Only the fixed Diagnostic headers are added during
+# delivery and avoid storage. The caller-controlled marker and all cached probe
+# metadata are always stripped before a response reaches a client.
 if (req.http.X-Divine-Diagnostic-Probe ~ "^coldfill-[a-z0-9-]{1,55}$" && resp.http.X-Divine-Probe-Id) {
   if (req.http.X-Divine-Diagnostic-Probe == resp.http.X-Divine-Probe-Id) {
     set resp.http.X-Divine-Diagnostic-Role = "leader";

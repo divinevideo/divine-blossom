@@ -23,6 +23,11 @@ It never globally purges a cache and does not print the object hash.
   so no user key or reusable credential is needed.
 - Confirm the `compute-diagnostics` sink is configured before the run. Client
   timings alone cannot establish how many requests reached Compute or origin.
+- Confirm the outer service has already activated this revision's
+  `vcl/deliver.vcl` before publishing the Compute package. Compute emits cached
+  `X-Divine-Probe-*` metadata; publishing it before the delivery-time stripping
+  logic creates a window where those internal headers can reach clients. Do not
+  send any probe request until both versions are active.
 
 ## Run
 
@@ -77,11 +82,12 @@ IP, or account identifier. `authorization_present` is only a boolean path label.
 - `storage_cache`: normalized internal cache state when Fastly exposes one.
 
 The request's syntactically bounded `coldfill-*` marker is an untrusted
-measurement hint, not authorization. It is stored only long enough for
-`vcl_deliver` to compare the request with the cached fill leader, then stripped.
-Clients receive only fixed `role`, `source`, `fos_outcome`, `buffer`, and
-`write_back` labels created during delivery; no marker, object identifier, or
-user identifier is returned or pinned in the shared object.
+measurement hint, not authorization. It is stored as internal metadata on the
+shared fill so `vcl_deliver` can compare later requests with the cached leader.
+Every delivery strips that marker and the other cached probe metadata. Clients
+receive only fixed `role`, `source`, `fos_outcome`, `buffer`, and `write_back`
+labels created during delivery; no marker, object identifier, or user identifier
+reaches a client.
 
 The sink records every verified FOS-miss/GCS cold fill and every successful
 bare-blob response taking at least 750 ms. This captures cold probes even when

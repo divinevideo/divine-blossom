@@ -90,8 +90,11 @@ work:
 3. Compile the cloned version, confirm the generated VCL contains all three
    snippets once in their named subroutines, and review the diff before
    activation.
-4. Publish the Compute package through the repository deployment path, then
-   activate the separately validated outer VCL version.
+4. Activate the separately validated outer VCL version first, then publish the
+   Compute package through the repository deployment path. This order is
+   required because Compute may emit internal response metadata that the deliver
+   snippet strips; publishing Compute first can expose those headers until the
+   outer version is active.
 5. Validate each failure stage separately with approved, controlled requests.
    Confirm a Compute 5xx preserves its supplied request ID (verbatim for
    IDs up to 64 characters after sanitization; longer IDs keep a 64-character

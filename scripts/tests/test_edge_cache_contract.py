@@ -9,6 +9,18 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class EdgeCacheContractTests(unittest.TestCase):
+    def test_outer_header_stripping_activates_before_compute_publish(self):
+        diagnostics_runbook = (ROOT / "docs" / "runbooks" / "fastly-5xx.md").read_text()
+        cold_fill_runbook = (
+            ROOT / "docs" / "runbooks" / "cold-fill-validation.md"
+        ).read_text()
+
+        ordering = diagnostics_runbook.split(
+            "Activate the separately validated outer VCL version first", 1
+        )[1].split("\n5.", 1)[0]
+        self.assertIn("then publish the", ordering)
+        self.assertIn("before publishing the Compute package", cold_fill_runbook)
+
     def test_probe_metadata_is_compared_then_stripped_at_delivery(self):
         deliver_vcl = (ROOT / "vcl" / "deliver.vcl").read_text()
 
