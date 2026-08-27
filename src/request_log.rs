@@ -1,5 +1,4 @@
 use blossom_core::error::BlossomError;
-use blossom_core::read_through::parse_bool_flag;
 use blossom_core::request_diagnostics::{
     persisted_error_categories, should_persist_blob_fetch_diagnostic,
     should_persist_compute_diagnostic, SLOW_BLOB_THRESHOLD_MS,
@@ -10,7 +9,7 @@ use serde::Serialize;
 use std::io::Write;
 use std::time::Duration;
 
-use crate::storage::BlobFetchDiagnostics;
+use crate::storage::{config_flag, BlobFetchDiagnostics};
 
 pub(crate) const ENDPOINT_NAME: &str = "compute-diagnostics";
 pub(crate) const PROBE_REQUEST_HEADER: &str = "X-Divine-Diagnostic-Probe";
@@ -23,14 +22,13 @@ const PROBE_WRITE_BACK_HEADER: &str = "X-Divine-Probe-Write-Back";
 const DIAGNOSTIC_PREFIX: &str = "X-Divine-Internal-Diagnostic-";
 const AUTHORIZATION_PRESENT_HEADER: &str = "X-Divine-Internal-Diagnostic-Authorization-Present";
 const SOURCE_HEADER: &str = "X-Divine-Internal-Diagnostic-Source";
-const STORAGE_CACHE_HEADER: &str = "X-Divine-Internal-Diagnostic-Storage-Cache";
+const INTERNAL_STORAGE_CACHE_HEADER: &str = "X-Divine-Internal-Diagnostic-Storage-Cache";
 const FOS_OUTCOME_HEADER: &str = "X-Divine-Internal-Diagnostic-FOS-Outcome";
 const FOS_LOOKUP_MS_HEADER: &str = "X-Divine-Internal-Diagnostic-FOS-Lookup-Ms";
 const GCS_FETCH_MS_HEADER: &str = "X-Divine-Internal-Diagnostic-GCS-Fetch-Ms";
 const BUFFER_MS_HEADER: &str = "X-Divine-Internal-Diagnostic-Buffer-Ms";
 const WRITE_BACK_MS_HEADER: &str = "X-Divine-Internal-Diagnostic-Write-Back-Ms";
 const INTERNAL_PROBE_ID_HEADER: &str = "X-Divine-Internal-Diagnostic-Probe-Id";
-const CONFIG_STORE: &str = "blossom_config";
 const COLD_FILL_DIAGNOSTICS_FLAG: &str = "cold_fill_diagnostics_enabled";
 
 #[derive(Default, Serialize)]
@@ -100,7 +98,11 @@ pub(crate) fn attach_blob_phases(
         },
     );
     set_optional_header(response, SOURCE_HEADER, diagnostics.source);
-    set_optional_header(response, STORAGE_CACHE_HEADER, diagnostics.storage_cache);
+    set_optional_header(
+        response,
+        INTERNAL_STORAGE_CACHE_HEADER,
+        diagnostics.storage_cache,
+    );
     set_optional_header(response, FOS_OUTCOME_HEADER, diagnostics.fos_outcome);
     set_optional_number(response, FOS_LOOKUP_MS_HEADER, diagnostics.fos_lookup_ms);
     set_optional_number(response, GCS_FETCH_MS_HEADER, diagnostics.gcs_fetch_ms);
@@ -128,7 +130,7 @@ fn take_blob_phases(response: &mut Response) -> Option<(BlobPhases, Option<Strin
         authorization_present: response.get_header_str(AUTHORIZATION_PRESENT_HEADER)
             == Some("true"),
         source: take_header(response, SOURCE_HEADER),
-        storage_cache: take_header(response, STORAGE_CACHE_HEADER),
+        storage_cache: take_header(response, INTERNAL_STORAGE_CACHE_HEADER),
         fos_outcome: take_header(response, FOS_OUTCOME_HEADER),
         fos_lookup_ms: take_number(response, FOS_LOOKUP_MS_HEADER),
         gcs_fetch_ms: take_number(response, GCS_FETCH_MS_HEADER),
@@ -151,18 +153,7 @@ fn take_number(response: &mut Response, name: &str) -> Option<u128> {
 }
 
 fn cold_fill_diagnostics_enabled() -> bool {
-    let value = fastly::config_store::ConfigStore::try_open(CONFIG_STORE)
-        .ok()
-        .and_then(|store| store.try_get(COLD_FILL_DIAGNOSTICS_FLAG).ok().flatten());
-    parse_bool_flag(value.as_deref())
-}
-
-fn is_enabled_cold_probe(
-    is_cold_fill: bool,
-    has_probe_id: bool,
-    diagnostics_enabled: bool,
-) -> bool {
-    is_cold_fill && has_probe_id && diagnostics_enabled
+    config_flag(COLD_FILL_DIAGNOSTICS_FLAG)
 }
 
 pub(crate) fn emit(
@@ -191,9 +182,7 @@ pub(crate) fn emit(
         phases.fos_outcome.as_deref() == Some("miss") && phases.source.as_deref() == Some("gcs")
     });
     let has_probe_id = probe_id.is_some();
-    let diagnostics_enabled = is_cold_fill && has_probe_id && cold_fill_diagnostics_enabled();
-    let is_enabled_cold_probe =
-        is_enabled_cold_probe(is_cold_fill, has_probe_id, diagnostics_enabled);
+    let is_enabled_cold_probe = is_cold_fill && has_probe_id && cold_fill_diagnostics_enabled();
     let persist_blob_fetch = should_persist_blob_fetch_diagnostic(
         status,
         route,
@@ -309,10 +298,6 @@ mod tests {
     #[test]
     fn cold_fill_diagnostics_are_off_by_default() {
         assert!(!cold_fill_diagnostics_enabled());
-        assert!(is_enabled_cold_probe(true, true, true));
-        assert!(!is_enabled_cold_probe(true, true, false));
-        assert!(!is_enabled_cold_probe(true, false, true));
-        assert!(!is_enabled_cold_probe(false, true, true));
     }
 
     #[test]

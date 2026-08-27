@@ -120,9 +120,7 @@ jobs:
 
   deploy:
     needs: test
-    if: >-
-      github.ref == 'refs/heads/main' &&
-      (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_compute))
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_compute && !inputs.purge_cache))
     concurrency:
       group: fastly-deploy
       cancel-in-progress: false
@@ -162,7 +160,7 @@ jobs:
   # Prefer targeted Surrogate-Key purges for individual content-addressed blobs.
   purge-cache:
     needs: test
-    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.purge_cache
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.purge_cache && !inputs.publish_compute
     concurrency:
       group: fastly-deploy
       cancel-in-progress: false

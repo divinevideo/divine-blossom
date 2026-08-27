@@ -122,7 +122,7 @@ class EdgeCacheContractTests(unittest.TestCase):
         self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("purge_cache:", workflow)
         self.assertIn(
-            "if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.purge_cache",
+            "if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.purge_cache && !inputs.publish_compute",
             workflow,
         )
         self.assertNotIn("github.event.head_commit.message", workflow)
@@ -137,6 +137,8 @@ class EdgeCacheContractTests(unittest.TestCase):
 
         self.assertIn("github.event_name == 'push'", deploy_job)
         self.assertIn("github.event_name == 'workflow_dispatch'", deploy_job)
+        self.assertIn("inputs.publish_compute && !inputs.purge_cache", deploy_job)
+        self.assertIn("inputs.purge_cache && !inputs.publish_compute", purge_job)
         self.assertNotIn("fastly compute publish", purge_job)
         self.assertIn("fastly purge --all", purge_job)
 

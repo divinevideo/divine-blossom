@@ -427,8 +427,11 @@ fn try_fallback_download(
 // ---------------------------------------------------------------------------
 
 /// Read a feature flag from the config store. Absent or unparseable is off.
-fn config_flag(key: &str) -> bool {
-    parse_bool_flag(get_config(key).ok().as_deref())
+pub(crate) fn config_flag(key: &str) -> bool {
+    let value = fastly::config_store::ConfigStore::try_open(CONFIG_STORE)
+        .ok()
+        .and_then(|store| store.try_get(key).ok().flatten());
+    parse_bool_flag(value.as_deref())
 }
 
 /// Whether to look in the FOS mirror before falling back to GCS.

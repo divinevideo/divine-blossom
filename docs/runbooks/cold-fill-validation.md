@@ -61,6 +61,7 @@ CREDENTIALED_BLOB_HASH=<fresh-test-object-b> \
 CONCURRENT_BLOB_HASH=<fresh-test-object-c> \
 EXPECTED_POP_REGEX='^(IAD|DFW|SJC)' \
 CONCURRENCY=8 \
+COLD_FILL_DIAGNOSTICS_ACK=<true-after-verifying-live-flag> \
   scripts/probe-cold-blob.sh
 ```
 
