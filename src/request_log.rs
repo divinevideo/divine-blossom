@@ -151,8 +151,14 @@ fn take_number(response: &mut Response, name: &str) -> Option<u128> {
 }
 
 fn cold_fill_diagnostics_enabled() -> bool {
-    let store = fastly::config_store::ConfigStore::open(CONFIG_STORE);
-    parse_bool_flag(store.get(COLD_FILL_DIAGNOSTICS_FLAG).as_deref())
+    let value = fastly::config_store::ConfigStore::try_open(CONFIG_STORE)
+        .ok()
+        .and_then(|store| store.try_get(COLD_FILL_DIAGNOSTICS_FLAG).ok().flatten());
+    parse_bool_flag(value.as_deref())
+}
+
+fn is_enabled_cold_probe(is_cold_fill: bool, has_probe_id: bool) -> bool {
+    is_cold_fill && has_probe_id && cold_fill_diagnostics_enabled()
 }
 
 pub(crate) fn emit(
@@ -180,8 +186,7 @@ pub(crate) fn emit(
     let is_cold_fill = blob_phases.as_ref().is_some_and(|phases| {
         phases.fos_outcome.as_deref() == Some("miss") && phases.source.as_deref() == Some("gcs")
     });
-    let is_enabled_cold_probe =
-        is_cold_fill && probe_id.is_some() && cold_fill_diagnostics_enabled();
+    let is_enabled_cold_probe = is_enabled_cold_probe(is_cold_fill, probe_id.is_some());
     let persist_blob_fetch = should_persist_blob_fetch_diagnostic(
         status,
         route,
@@ -292,6 +297,14 @@ mod tests {
 
         assert!(take_blob_phases(&mut response).is_none());
         assert!(!response.contains_header(SOURCE_HEADER));
+    }
+
+    #[test]
+    fn cold_fill_diagnostics_are_off_by_default() {
+        assert!(!cold_fill_diagnostics_enabled());
+        assert!(!is_enabled_cold_probe(true, true));
+        assert!(!is_enabled_cold_probe(true, false));
+        assert!(!is_enabled_cold_probe(false, true));
     }
 
     #[test]

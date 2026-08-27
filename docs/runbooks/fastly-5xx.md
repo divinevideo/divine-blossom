@@ -94,7 +94,8 @@ work:
    Compute package through the repository deployment path. After activation,
    set the GitHub Actions repository variable
    `FASTLY_OUTER_DIAGNOSTICS_ACTIVE=true`; it is absent/off by default and gates
-   both automatic and manually requested Compute publishes. If the merge
+   both automatic and manually requested Compute publishes. A missing or false
+   value makes the deploy job fail visibly without publishing. If the merge
    happened while the gate was off, run the `CI` workflow with
    `publish_compute` enabled after setting the variable. This order is
    required because Compute may emit internal response metadata that the deliver

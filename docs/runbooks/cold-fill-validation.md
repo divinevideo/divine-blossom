@@ -30,6 +30,9 @@ It never globally purges a cache and does not print the object hash.
   `blossom_config` Config Store only for the bounded probe window. The key is
   absent/off by default. Set it back to `false` after the diagnostic records
   arrive; successful requests at or above 750 ms remain sampled independently.
+  After verifying the live value, pass `COLD_FILL_DIAGNOSTICS_ACK=true` to the
+  probe. The explicit acknowledgement is required before its first purge, so a
+  forgotten runtime flag cannot silently consume the three fresh fixtures.
 - Confirm the outer service has already activated this revision's
   `vcl/deliver.vcl` before publishing the Compute package. Then set the GitHub
   Actions repository variable `FASTLY_OUTER_DIAGNOSTICS_ACTIVE` to `true` and
@@ -58,6 +61,7 @@ CREDENTIALED_BLOB_HASH=<fresh-test-object-b> \
 CONCURRENT_BLOB_HASH=<fresh-test-object-c> \
 EXPECTED_POP_REGEX='^(IAD|DFW|SJC)' \
 CONCURRENCY=8 \
+COLD_FILL_DIAGNOSTICS_ACK=true \
   scripts/probe-cold-blob.sh
 ```
 

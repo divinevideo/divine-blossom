@@ -13,6 +13,7 @@ COMPUTE_SERVICE_ID="${COMPUTE_SERVICE_ID:-pOvEEWykEbpnylqst1KTrR}"
 EXPECTED_POP_REGEX="${EXPECTED_POP_REGEX:-}"
 CONCURRENCY="${CONCURRENCY:-8}"
 RANGE="${RANGE:-}"
+COLD_FILL_DIAGNOSTICS_ACK="${COLD_FILL_DIAGNOSTICS_ACK:-}"
 
 fail() {
   echo "FAIL: $1" >&2
@@ -35,6 +36,8 @@ done
 [[ "$CONCURRENCY" =~ ^[1-9][0-9]*$ ]] || fail "CONCURRENCY must be a positive integer"
 [[ -n "$EXPECTED_POP_REGEX" ]] || \
   fail "set EXPECTED_POP_REGEX to the representative US POP pattern"
+[[ "$COLD_FILL_DIAGNOSTICS_ACK" = true ]] || \
+  fail "set COLD_FILL_DIAGNOSTICS_ACK=true after verifying the runtime flag is enabled"
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT

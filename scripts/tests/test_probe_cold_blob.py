@@ -21,7 +21,7 @@ class ProbeColdBlobContractTest(unittest.TestCase):
         self.assertIn('purge --key "$normalized_hash" --service-id "$OUTER_SERVICE_ID"', SCRIPT)
         self.assertIn('purge --key "$normalized_hash" --service-id "$COMPUTE_SERVICE_ID"', SCRIPT)
 
-    def test_executes_targeted_purges_with_portable_lowercase_normalization(self):
+    def test_executes_mocked_targeted_purges_with_lowercase_normalization(self):
         with tempfile.TemporaryDirectory() as directory:
             temp = Path(directory)
             command_dir = temp / "bin"
@@ -73,11 +73,15 @@ printf '200 0.1 0.2\\n'
                 {
                     "PATH": f"{command_dir}:{env['PATH']}",
                     "FASTLY_LOG": str(fastly_log),
+                    "DOMAIN": "probe.example.invalid",
+                    "OUTER_SERVICE_ID": "outer-test-service",
+                    "COMPUTE_SERVICE_ID": "compute-test-service",
                     "ANONYMOUS_BLOB_HASH": "A" * 64,
                     "CREDENTIALED_BLOB_HASH": "B" * 64,
                     "CONCURRENT_BLOB_HASH": "C" * 64,
                     "EXPECTED_POP_REGEX": "TEST",
                     "CONCURRENCY": "2",
+                    "COLD_FILL_DIAGNOSTICS_ACK": "true",
                 }
             )
             result = subprocess.run(
@@ -125,6 +129,14 @@ printf '200 0.1 0.2\\n'
     def test_python_is_checked_before_the_first_purge(self):
         self.assertIn("for command in curl fastly nak python3", SCRIPT)
         self.assertLess(SCRIPT.index("for command in curl"), SCRIPT.index('purge_fixture "$ANONYMOUS_BLOB_HASH"'))
+
+    def test_runtime_flag_acknowledgement_is_required_before_the_first_purge(self):
+        self.assertIn('COLD_FILL_DIAGNOSTICS_ACK="${COLD_FILL_DIAGNOSTICS_ACK:-}"', SCRIPT)
+        self.assertIn('[[ "$COLD_FILL_DIAGNOSTICS_ACK" = true ]]', SCRIPT)
+        self.assertLess(
+            SCRIPT.index('[[ "$COLD_FILL_DIAGNOSTICS_ACK" = true ]]'),
+            SCRIPT.index('purge_fixture "$ANONYMOUS_BLOB_HASH"'),
+        )
 
     def test_representative_pop_is_required(self):
         self.assertIn('EXPECTED_POP_REGEX="${EXPECTED_POP_REGEX:-}"', SCRIPT)

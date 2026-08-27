@@ -25,8 +25,15 @@ class EdgeCacheContractTests(unittest.TestCase):
         deploy_job = workflow.split("\n  deploy:\n", 1)[1].split(
             "\n  purge-cache:\n", 1
         )[0]
-        self.assertIn("vars.FASTLY_OUTER_DIAGNOSTICS_ACTIVE == 'true'", deploy_job)
+        self.assertIn("name: Verify required outer VCL is active", deploy_job)
+        self.assertIn(
+            'if [ "$FASTLY_OUTER_DIAGNOSTICS_ACTIVE" != "true" ]', deploy_job
+        )
         self.assertIn("inputs.publish_compute", deploy_job)
+        self.assertLess(
+            deploy_job.index("name: Verify required outer VCL is active"),
+            deploy_job.index("name: Deploy to Fastly"),
+        )
 
     def test_probe_metadata_is_compared_then_stripped_at_delivery(self):
         deliver_vcl = (ROOT / "vcl" / "deliver.vcl").read_text()

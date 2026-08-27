@@ -122,7 +122,6 @@ jobs:
     needs: test
     if: >-
       github.ref == 'refs/heads/main' &&
-      vars.FASTLY_OUTER_DIAGNOSTICS_ACTIVE == 'true' &&
       (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_compute))
     concurrency:
       group: fastly-deploy
@@ -130,6 +129,15 @@ jobs:
     runs-on: ubuntu-24.04-16core
     steps:
       - uses: actions/checkout@v4
+
+      - name: Verify required outer VCL is active
+        env:
+          FASTLY_OUTER_DIAGNOSTICS_ACTIVE: ${{ vars.FASTLY_OUTER_DIAGNOSTICS_ACTIVE }}
+        run: |
+          if [ "$FASTLY_OUTER_DIAGNOSTICS_ACTIVE" != "true" ]; then
+            echo "::error::Set FASTLY_OUTER_DIAGNOSTICS_ACTIVE=true only after activating the required outer VCL."
+            exit 1
+          fi
 
       # TODO: replace with fastly/compute-actions when it supports wasm32-wasip1
       - name: Install Fastly CLI
