@@ -157,8 +157,12 @@ fn cold_fill_diagnostics_enabled() -> bool {
     parse_bool_flag(value.as_deref())
 }
 
-fn is_enabled_cold_probe(is_cold_fill: bool, has_probe_id: bool) -> bool {
-    is_cold_fill && has_probe_id && cold_fill_diagnostics_enabled()
+fn is_enabled_cold_probe(
+    is_cold_fill: bool,
+    has_probe_id: bool,
+    diagnostics_enabled: bool,
+) -> bool {
+    is_cold_fill && has_probe_id && diagnostics_enabled
 }
 
 pub(crate) fn emit(
@@ -186,7 +190,10 @@ pub(crate) fn emit(
     let is_cold_fill = blob_phases.as_ref().is_some_and(|phases| {
         phases.fos_outcome.as_deref() == Some("miss") && phases.source.as_deref() == Some("gcs")
     });
-    let is_enabled_cold_probe = is_enabled_cold_probe(is_cold_fill, probe_id.is_some());
+    let has_probe_id = probe_id.is_some();
+    let diagnostics_enabled = is_cold_fill && has_probe_id && cold_fill_diagnostics_enabled();
+    let is_enabled_cold_probe =
+        is_enabled_cold_probe(is_cold_fill, has_probe_id, diagnostics_enabled);
     let persist_blob_fetch = should_persist_blob_fetch_diagnostic(
         status,
         route,
@@ -302,9 +309,10 @@ mod tests {
     #[test]
     fn cold_fill_diagnostics_are_off_by_default() {
         assert!(!cold_fill_diagnostics_enabled());
-        assert!(!is_enabled_cold_probe(true, true));
-        assert!(!is_enabled_cold_probe(true, false));
-        assert!(!is_enabled_cold_probe(false, true));
+        assert!(is_enabled_cold_probe(true, true, true));
+        assert!(!is_enabled_cold_probe(true, true, false));
+        assert!(!is_enabled_cold_probe(true, false, true));
+        assert!(!is_enabled_cold_probe(false, true, true));
     }
 
     #[test]

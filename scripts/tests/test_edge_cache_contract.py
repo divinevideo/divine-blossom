@@ -29,7 +29,15 @@ class EdgeCacheContractTests(unittest.TestCase):
         self.assertIn(
             'if [ "$FASTLY_OUTER_DIAGNOSTICS_ACTIVE" != "true" ]', deploy_job
         )
+        gate_step = deploy_job.split(
+            "- name: Verify required outer VCL is active", 1
+        )[1].split("\n      -", 1)[0]
+        self.assertIn("exit 1", gate_step)
         self.assertIn("inputs.publish_compute", deploy_job)
+        self.assertLess(
+            deploy_job.index("name: Verify required outer VCL is active"),
+            deploy_job.index("name: Install Fastly CLI"),
+        )
         self.assertLess(
             deploy_job.index("name: Verify required outer VCL is active"),
             deploy_job.index("name: Deploy to Fastly"),
