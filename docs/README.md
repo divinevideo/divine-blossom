@@ -8,7 +8,7 @@ This directory is the index for repository documentation. Current docs first, hi
 - [CLAUDE.md](../CLAUDE.md) — working notes for AI-assisted development
 - [OAUTH_SETUP.md](../OAUTH_SETUP.md) — OAuth configuration for admin UI
 - [CHANGELOG.md](../CHANGELOG.md) — release history
-- [docs/api/](api/) — cross-service API contracts (creator-delete, etc.)
+- [docs/api/](api/) — cross-service API contracts (creator delete, vanish, etc.)
 - [docs/runbooks/](runbooks/) — operational runbooks, including deployment, authenticated storage caching, CDN view counting, edge upload observability, and Fastly 5xx diagnostics
 - [docs/cdn-evaluation-status.md](cdn-evaluation-status.md) — **start here** for the CDN and delivery-origin evaluation: current state, results, open questions
 - [docs/cdn-object-storage-vendor-notes.md](cdn-object-storage-vendor-notes.md) — CDN and object-storage vendor capability notes

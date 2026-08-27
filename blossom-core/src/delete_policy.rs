@@ -7,6 +7,11 @@ pub enum DeletePlan {
     UnlinkOnly,
 }
 
+/// A vanish request is complete only when no discovered blob needs retry.
+pub fn vanish_is_complete(errors: u32) -> bool {
+    errors == 0
+}
+
 /// Validates that a SHA-256 string is exactly 64 hex characters.
 /// Used by both `/admin/moderate` and `/admin/api/moderate` before any
 /// metadata lookup.
@@ -83,15 +88,45 @@ pub struct CreatorDeleteOutcome {
     pub physical_deleted: bool,
 }
 
+/// Physical-erasure side effects shared by creator deletion and account vanish.
+pub trait BlobErasureOps {
+    fn cleanup_derived_audio(&self, hash: &str);
+    fn delete_blob_from_gcs(&self, hash: &str) -> Result<()>;
+    fn delete_blob_from_replica(&self, hash: &str) -> Result<()>;
+    fn delete_blob_gcs_artifacts(&self, hash: &str);
+    fn purge_vcl_cache(&self, hash: &str);
+}
+
+/// Erase a blob from every required origin before invalidating edge caches.
+///
+/// Both origin DELETEs are idempotent, so a failure can safely be retried after
+/// an earlier origin has already confirmed deletion.
+pub fn erase_blob_with_ops<O: BlobErasureOps>(hash: &str, req_id: &str, ops: &O) -> Result<()> {
+    ops.cleanup_derived_audio(hash);
+    ops.delete_blob_from_gcs(hash).map_err(|e| {
+        eprintln!(
+            "[req={}] [ERASURE] GCS delete failed for {}: {}",
+            req_id, hash, e
+        );
+        e
+    })?;
+    ops.delete_blob_from_replica(hash).map_err(|e| {
+        eprintln!(
+            "[req={}] [ERASURE] FOS delete failed for {}: {}. GCS may already be deleted; retry is safe.",
+            req_id, hash, e
+        );
+        e
+    })?;
+    ops.delete_blob_gcs_artifacts(hash);
+    ops.purge_vcl_cache(hash);
+    Ok(())
+}
+
 /// Side-effects used by `handle_creator_delete_with_ops`. The binary crate
 /// provides `DefaultCreatorDeleteOps` (forwards to Fastly KV / GCS / VCL).
 /// Tests substitute a mock so the policy logic can run natively.
-pub trait CreatorDeleteOps {
+pub trait CreatorDeleteOps: BlobErasureOps {
     fn soft_delete(&self, hash: &str, metadata: &BlobMetadata, reason: &str) -> Result<()>;
-    fn cleanup_derived_audio(&self, hash: &str);
-    fn delete_blob(&self, hash: &str) -> Result<()>;
-    fn delete_blob_gcs_artifacts(&self, hash: &str);
-    fn purge_vcl_cache(&self, hash: &str);
 }
 
 /// Core creator-delete policy. Runs the delete steps against an injectable
@@ -110,17 +145,7 @@ pub fn handle_creator_delete_with_ops<O: CreatorDeleteOps>(
     ops.soft_delete(hash, metadata, reason)?;
 
     let physical_deleted = if physical_delete_enabled {
-        ops.cleanup_derived_audio(hash);
-        ops.delete_blob(hash).map_err(|e| {
-            eprintln!(
-                "[req={}] [CREATOR-DELETE] storage::delete_blob failed for {}: {}. \
-                 Soft delete applied; bytes may remain on GCS.",
-                req_id, hash, e
-            );
-            e
-        })?;
-        ops.delete_blob_gcs_artifacts(hash);
-        ops.purge_vcl_cache(hash);
+        erase_blob_with_ops(hash, req_id, ops)?;
         true
     } else {
         false
@@ -159,24 +184,25 @@ mod tests {
     #[derive(Default)]
     struct MockOps {
         soft_delete_err: Option<BlossomError>,
-        delete_blob_err: Option<BlossomError>,
+        delete_gcs_err: Option<BlossomError>,
+        delete_replica_err: Option<BlossomError>,
         calls: RefCell<Vec<&'static str>>,
     }
 
-    impl CreatorDeleteOps for MockOps {
-        fn soft_delete(&self, _hash: &str, _metadata: &BlobMetadata, _reason: &str) -> Result<()> {
-            self.calls.borrow_mut().push("soft_delete");
-            match &self.soft_delete_err {
+    impl BlobErasureOps for MockOps {
+        fn cleanup_derived_audio(&self, _hash: &str) {
+            self.calls.borrow_mut().push("cleanup_derived_audio");
+        }
+        fn delete_blob_from_gcs(&self, _hash: &str) -> Result<()> {
+            self.calls.borrow_mut().push("delete_blob_from_gcs");
+            match &self.delete_gcs_err {
                 Some(e) => Err(clone_error(e)),
                 None => Ok(()),
             }
         }
-        fn cleanup_derived_audio(&self, _hash: &str) {
-            self.calls.borrow_mut().push("cleanup_derived_audio");
-        }
-        fn delete_blob(&self, _hash: &str) -> Result<()> {
-            self.calls.borrow_mut().push("delete_blob");
-            match &self.delete_blob_err {
+        fn delete_blob_from_replica(&self, _hash: &str) -> Result<()> {
+            self.calls.borrow_mut().push("delete_blob_from_replica");
+            match &self.delete_replica_err {
                 Some(e) => Err(clone_error(e)),
                 None => Ok(()),
             }
@@ -186,6 +212,16 @@ mod tests {
         }
         fn purge_vcl_cache(&self, _hash: &str) {
             self.calls.borrow_mut().push("purge_vcl_cache");
+        }
+    }
+
+    impl CreatorDeleteOps for MockOps {
+        fn soft_delete(&self, _hash: &str, _metadata: &BlobMetadata, _reason: &str) -> Result<()> {
+            self.calls.borrow_mut().push("soft_delete");
+            match &self.soft_delete_err {
+                Some(e) => Err(clone_error(e)),
+                None => Ok(()),
+            }
         }
     }
 
@@ -261,7 +297,8 @@ mod tests {
             vec![
                 "soft_delete",
                 "cleanup_derived_audio",
-                "delete_blob",
+                "delete_blob_from_gcs",
+                "delete_blob_from_replica",
                 "delete_blob_gcs_artifacts",
                 "purge_vcl_cache",
             ]
@@ -272,7 +309,7 @@ mod tests {
     fn creator_delete_flag_on_byte_delete_failure_returns_err_after_soft_delete_already_applied() {
         let metadata = sample_metadata(BlobStatus::Active);
         let ops = MockOps {
-            delete_blob_err: Some(BlossomError::StorageError("simulated GCS 500".into())),
+            delete_gcs_err: Some(BlossomError::StorageError("simulated GCS 500".into())),
             ..Default::default()
         };
 
@@ -285,7 +322,37 @@ mod tests {
         );
         assert_eq!(
             *ops.calls.borrow(),
-            vec!["soft_delete", "cleanup_derived_audio", "delete_blob"]
+            vec![
+                "soft_delete",
+                "cleanup_derived_audio",
+                "delete_blob_from_gcs"
+            ]
+        );
+    }
+
+    #[test]
+    fn creator_delete_replica_failure_is_retryable_and_does_not_purge() {
+        let metadata = sample_metadata(BlobStatus::Active);
+        let ops = MockOps {
+            delete_replica_err: Some(BlossomError::StorageError("simulated FOS 403".into())),
+            ..Default::default()
+        };
+
+        let result = handle_creator_delete_with_ops(HASH, &metadata, "user", true, REQ_ID, &ops);
+
+        assert!(
+            matches!(result, Err(BlossomError::StorageError(ref m)) if m.contains("simulated FOS 403")),
+            "expected FOS StorageError to propagate, got {:?}",
+            result,
+        );
+        assert_eq!(
+            *ops.calls.borrow(),
+            vec![
+                "soft_delete",
+                "cleanup_derived_audio",
+                "delete_blob_from_gcs",
+                "delete_blob_from_replica",
+            ]
         );
     }
 
@@ -334,6 +401,13 @@ mod tests {
     #[test]
     fn non_owner_delete_plan_unlinks_only() {
         assert_eq!(plan_user_delete(false), DeletePlan::UnlinkOnly);
+    }
+
+    #[test]
+    fn vanish_completion_requires_zero_errors() {
+        assert!(vanish_is_complete(0));
+        assert!(!vanish_is_complete(1));
+        assert!(!vanish_is_complete(u32::MAX));
     }
 
     #[test]

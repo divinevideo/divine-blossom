@@ -15,6 +15,26 @@ pub const SOURCE_FOS: &str = "fos";
 /// media object observed in the catalogue is 27.9 MB.
 pub const MAX_WRITE_BACK_BYTES: u64 = 32 * 1024 * 1024;
 
+/// Meaning of an HTTP response from an idempotent replica DELETE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicaDeleteOutcome {
+    /// The replica confirmed deletion with a successful response.
+    Deleted,
+    /// The object was already absent, which satisfies erasure.
+    NotPresent,
+    /// The replica did not confirm deletion.
+    Failed,
+}
+
+/// Classify a replica DELETE response without depending on the Fastly runtime.
+pub fn replica_delete_outcome(status: u16) -> ReplicaDeleteOutcome {
+    match status {
+        200..=299 => ReplicaDeleteOutcome::Deleted,
+        404 => ReplicaDeleteOutcome::NotPresent,
+        _ => ReplicaDeleteOutcome::Failed,
+    }
+}
+
 /// Parse a config-store feature flag.
 ///
 /// A flag is enabled only when it is present and explicitly affirmative.
@@ -188,6 +208,18 @@ pub fn object_path(bucket: &str, key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replica_delete_accepts_success_and_absence_only() {
+        assert_eq!(replica_delete_outcome(200), ReplicaDeleteOutcome::Deleted);
+        assert_eq!(replica_delete_outcome(204), ReplicaDeleteOutcome::Deleted);
+        assert_eq!(
+            replica_delete_outcome(404),
+            ReplicaDeleteOutcome::NotPresent
+        );
+        assert_eq!(replica_delete_outcome(403), ReplicaDeleteOutcome::Failed);
+        assert_eq!(replica_delete_outcome(500), ReplicaDeleteOutcome::Failed);
+    }
 
     // --- Mirror response trust (issue #198) ---
     //

@@ -27,8 +27,8 @@ use crate::blossom::{
     TranscodeStatus, TranscriptStatus, UploadRequirements, QUALITY_VARIANTS,
 };
 use crate::delete_policy::{
-    build_creator_delete_response, handle_creator_delete, map_webhook_moderate_action,
-    plan_user_delete, soft_delete_blob, validate_sha256_format, DeletePlan,
+    build_creator_delete_response, erase_blob, handle_creator_delete, map_webhook_moderate_action,
+    plan_user_delete, soft_delete_blob, validate_sha256_format, vanish_is_complete, DeletePlan,
 };
 use crate::error::{BlossomError, Result};
 use crate::media_auth_log::format_media_auth_log;
@@ -4395,6 +4395,7 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
 /// For each blob the user owns or references:
 /// - Sole owner: full delete (GCS + KV + VCL cache purge)
 /// - Shared content: unlink (remove from refs, transfer ownership if needed)
+///
 /// Returns (fully_deleted, unlinked, errors) counts.
 fn execute_vanish(pubkey: &str) -> (u32, u32, u32) {
     let mut fully_deleted: u32 = 0;
@@ -4440,14 +4441,18 @@ fn execute_vanish(pubkey: &str) -> (u32, u32, u32) {
 
         if is_owner && other_refs.is_empty() {
             // Sole owner: full delete
-            cleanup_derived_audio_for_source(hash);
-            let _ = storage_delete(hash);
-            delete_blob_gcs_artifacts(hash);
+            if let Err(e) = erase_blob(hash, "vanish") {
+                eprintln!(
+                    "[VANISH] Required-origin deletion failed for {}: {}. Retry state preserved.",
+                    hash, e
+                );
+                errors += 1;
+                continue;
+            }
             let _ = delete_blob_metadata(hash);
             delete_blob_kv_artifacts(hash);
             let _ = update_stats_on_remove(&metadata);
             let _ = remove_from_recent_index(hash);
-            purge_edge_cache(hash);
             fully_deleted += 1;
         } else if is_owner {
             // Transfer ownership to next ref
@@ -4462,9 +4467,12 @@ fn execute_vanish(pubkey: &str) -> (u32, u32, u32) {
         }
     }
 
-    // Delete user's KV list and remove from user index
-    let _ = delete_user_list(pubkey);
-    let _ = remove_from_user_index(pubkey);
+    // Preserve the list when erasure is incomplete so a retry can rediscover
+    // blobs whose metadata and replica bytes still need cleanup.
+    if vanish_is_complete(errors) {
+        let _ = delete_user_list(pubkey);
+        let _ = remove_from_user_index(pubkey);
+    }
 
     // Fire-and-forget Cloud Run bulk delete for thorough GCS cleanup
     trigger_cloud_run_bulk_delete(pubkey, &hashes_for_cloud_run);
@@ -4478,6 +4486,14 @@ fn execute_vanish(pubkey: &str) -> (u32, u32, u32) {
     );
 
     (fully_deleted, unlinked, errors)
+}
+
+fn vanish_response_status(errors: u32) -> StatusCode {
+    if vanish_is_complete(errors) {
+        StatusCode::OK
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
 }
 
 /// DELETE /vanish - User-initiated GDPR right to erasure
@@ -4499,14 +4515,14 @@ fn handle_vanish(req: Request) -> Result<Response> {
     let (fully_deleted, unlinked, errors) = execute_vanish(&auth.pubkey);
 
     let result = serde_json::json!({
-        "vanished": true,
+        "vanished": vanish_is_complete(errors),
         "pubkey": auth.pubkey,
         "fully_deleted": fully_deleted,
         "unlinked": unlinked,
         "errors": errors,
     });
 
-    let mut resp = json_response(StatusCode::OK, &result);
+    let mut resp = json_response(vanish_response_status(errors), &result);
     add_cors_headers(&mut resp);
     Ok(resp)
 }
@@ -4541,7 +4557,7 @@ fn handle_admin_vanish(req: Request) -> Result<Response> {
     let (fully_deleted, unlinked, errors) = execute_vanish(&pubkey);
 
     let result = serde_json::json!({
-        "vanished": true,
+        "vanished": vanish_is_complete(errors),
         "pubkey": pubkey,
         "reason": reason,
         "fully_deleted": fully_deleted,
@@ -4549,7 +4565,7 @@ fn handle_admin_vanish(req: Request) -> Result<Response> {
         "errors": errors,
     });
 
-    let mut resp = json_response(StatusCode::OK, &result);
+    let mut resp = json_response(vanish_response_status(errors), &result);
     add_cors_headers(&mut resp);
     Ok(resp)
 }
@@ -6235,8 +6251,8 @@ mod tests {
         should_reset_transcript_failure_on_clean_upload, should_set_audio_content_length,
         trusted_upload_service_terminal_derivative_error, upload_capability_headers,
         upload_control_host, upload_exposed_headers, upload_from_resumable_completion,
-        AudioReuseAvailability, DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction,
-        TranscriptPendingState,
+        vanish_response_status, AudioReuseAvailability, DerivativeObservation, TranscodeFetchAction,
+        TranscriptFetchAction, TranscriptPendingState,
     };
     use crate::blossom::{
         BlobStatus, ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus,
@@ -6245,6 +6261,15 @@ mod tests {
     use blossom_core::cache_policy::BlobCachePolicy;
     use fastly::http::StatusCode;
     use fastly::Response;
+
+    #[test]
+    fn vanish_response_is_retryable_when_any_blob_failed() {
+        assert_eq!(vanish_response_status(0), StatusCode::OK);
+        assert_eq!(
+            vanish_response_status(1),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
 
     #[test]
     fn upload_service_response_records_failure_fields_but_clamps_broad_invalid_media_terminal() {

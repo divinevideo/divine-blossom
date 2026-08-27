@@ -37,15 +37,15 @@ pub fn soft_delete_blob(
 
 pub(crate) struct DefaultCreatorDeleteOps;
 
-impl CreatorDeleteOps for DefaultCreatorDeleteOps {
-    fn soft_delete(&self, hash: &str, metadata: &BlobMetadata, reason: &str) -> Result<()> {
-        soft_delete_blob(hash, metadata, reason, false)
-    }
+impl BlobErasureOps for DefaultCreatorDeleteOps {
     fn cleanup_derived_audio(&self, hash: &str) {
         crate::cleanup_derived_audio_for_source(hash);
     }
-    fn delete_blob(&self, hash: &str) -> Result<()> {
+    fn delete_blob_from_gcs(&self, hash: &str) -> Result<()> {
         crate::storage::delete_blob(hash)
+    }
+    fn delete_blob_from_replica(&self, hash: &str) -> Result<()> {
+        crate::storage::delete_blob_from_fos(hash)
     }
     fn delete_blob_gcs_artifacts(&self, hash: &str) {
         crate::delete_blob_gcs_artifacts(hash);
@@ -53,6 +53,16 @@ impl CreatorDeleteOps for DefaultCreatorDeleteOps {
     fn purge_vcl_cache(&self, hash: &str) {
         crate::purge_edge_cache(hash);
     }
+}
+
+impl CreatorDeleteOps for DefaultCreatorDeleteOps {
+    fn soft_delete(&self, hash: &str, metadata: &BlobMetadata, reason: &str) -> Result<()> {
+        soft_delete_blob(hash, metadata, reason, false)
+    }
+}
+
+pub(crate) fn erase_blob(hash: &str, req_id: &str) -> Result<()> {
+    erase_blob_with_ops(hash, req_id, &DefaultCreatorDeleteOps)
 }
 
 pub fn handle_creator_delete(
