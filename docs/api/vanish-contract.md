@@ -26,7 +26,9 @@ The admin endpoint additionally echoes its `reason`; both responses identify the
 
 Origin DELETE operations are idempotent: a 404 means that origin is already erased. If GCS succeeds and FOS fails, the response is still a retryable `5xx`; the next attempt accepts GCS's 404 and retries FOS.
 
-When any blob fails required-origin deletion or required metadata/reference cleanup, Blossom preserves the account's blob-list entry so the next request can rediscover unfinished work. It does not increment `fully_deleted` or `unlinked` for that blob. Missing metadata is also a retryable failure because Blossom cannot safely determine whether the blob should be erased or transferred without it.
+When any blob fails required-origin deletion or required metadata/reference cleanup, Blossom preserves that blob's account-list entry so the next request can rediscover unfinished work. Completed blobs are removed from the list individually, so a later failure elsewhere in the same account does not cause them to be processed again. Blossom does not increment `fully_deleted` or `unlinked` until that per-blob list update succeeds.
+
+If a retry finds a list entry whose metadata was already deleted, Blossom first removes the account from the blob's references. When other references remain, it treats the entry as a shared unlink. Otherwise it idempotently reconfirms deletion from both origins before removing the dangling list entry. This covers an earlier attempt that erased the blob and metadata but failed to update the account list without erasing bytes still referenced by another account.
 
 The account list and user-index entry are part of completion. A failure to delete either returns the same retryable failure response rather than reporting that vanish completed.
 

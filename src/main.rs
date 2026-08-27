@@ -4418,11 +4418,52 @@ fn execute_vanish(pubkey: &str) -> (u32, u32, u32) {
         let metadata = match get_blob_metadata(hash) {
             Ok(Some(m)) => m,
             Ok(None) => {
-                eprintln!(
-                    "[VANISH] Metadata missing for {}. Cannot determine whether erasure or unlinking is safe.",
-                    hash
-                );
-                errors += 1;
+                let remaining_refs = match remove_from_blob_refs(hash, pubkey) {
+                    Ok(refs) => refs,
+                    Err(e) => {
+                        eprintln!(
+                            "[VANISH] Failed to update refs for metadata-less blob {}: {}",
+                            hash, e
+                        );
+                        errors += 1;
+                        continue;
+                    }
+                };
+                if !remaining_refs.is_empty() {
+                    if let Err(e) = remove_from_user_list(pubkey, hash) {
+                        eprintln!(
+                            "[VANISH] Failed to remove metadata-less shared blob {} from user list: {}",
+                            hash, e
+                        );
+                        errors += 1;
+                        continue;
+                    }
+                    unlinked += 1;
+                    continue;
+                }
+
+                // A previous attempt may have erased the origins and metadata
+                // before its per-user list update failed. Reconfirm erasure
+                // idempotently so dangling list entries can converge safely.
+                if let Err(e) = erase_blob(hash, "vanish") {
+                    eprintln!(
+                        "[VANISH] Failed to erase metadata-less blob {}: {}. Retry state preserved.",
+                        hash, e
+                    );
+                    errors += 1;
+                    continue;
+                }
+                delete_blob_kv_artifacts(hash);
+                let _ = remove_from_recent_index(hash);
+                if let Err(e) = remove_from_user_list(pubkey, hash) {
+                    eprintln!(
+                        "[VANISH] Failed to remove metadata-less blob {} from user list: {}",
+                        hash, e
+                    );
+                    errors += 1;
+                    continue;
+                }
+                fully_deleted += 1;
                 continue;
             }
             Err(e) => {
@@ -4470,6 +4511,14 @@ fn execute_vanish(pubkey: &str) -> (u32, u32, u32) {
             delete_blob_kv_artifacts(hash);
             let _ = update_stats_on_remove(&metadata);
             let _ = remove_from_recent_index(hash);
+            if let Err(e) = remove_from_user_list(pubkey, hash) {
+                eprintln!(
+                    "[VANISH] Failed to remove erased blob {} from user list: {}",
+                    hash, e
+                );
+                errors += 1;
+                continue;
+            }
             fully_deleted += 1;
         } else if is_owner {
             // Transfer ownership to next ref
@@ -4481,9 +4530,25 @@ fn execute_vanish(pubkey: &str) -> (u32, u32, u32) {
                 errors += 1;
                 continue;
             }
+            if let Err(e) = remove_from_user_list(pubkey, hash) {
+                eprintln!(
+                    "[VANISH] Failed to remove transferred blob {} from user list: {}",
+                    hash, e
+                );
+                errors += 1;
+                continue;
+            }
             unlinked += 1;
         } else {
             // Non-owner ref: already unlinked from refs above
+            if let Err(e) = remove_from_user_list(pubkey, hash) {
+                eprintln!(
+                    "[VANISH] Failed to remove unlinked blob {} from user list: {}",
+                    hash, e
+                );
+                errors += 1;
+                continue;
+            }
             unlinked += 1;
         }
     }
