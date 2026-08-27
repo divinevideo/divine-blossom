@@ -252,7 +252,7 @@ pub fn build_creator_delete_response(
 mod tests {
     use super::*;
     use crate::types::ModerationResult;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     #[derive(Default)]
     struct MockOps {
@@ -346,7 +346,7 @@ mod tests {
         refs: RefCell<Vec<String>>,
         delete_replica_err: bool,
         delete_metadata_err: bool,
-        remove_user_list_err: bool,
+        remove_user_list_err: Cell<bool>,
         calls: RefCell<Vec<&'static str>>,
     }
 
@@ -411,7 +411,7 @@ mod tests {
         }
         fn remove_from_user_list(&self, _pubkey: &str, _hash: &str) -> Result<()> {
             self.calls.borrow_mut().push("remove_from_user_list");
-            if self.remove_user_list_err {
+            if self.remove_user_list_err.get() {
                 Err(BlossomError::MetadataError("user list failed".into()))
             } else {
                 Ok(())
@@ -485,24 +485,22 @@ mod tests {
     #[test]
     fn vanish_list_failure_after_metadata_delete_retries_as_metadata_less_erasure() {
         let first = MockVanishOps {
-            remove_user_list_err: true,
+            remove_user_list_err: Cell::new(true),
             ..vanish_ops_with_owner()
         };
 
         let first_result = handle_vanish_blob_with_ops(HASH, &"1".repeat(64), REQ_ID, &first);
         assert!(matches!(first_result, Err(BlossomError::MetadataError(_))));
         assert!(first.metadata.borrow().is_none());
+        assert!(first.refs.borrow().is_empty());
 
-        let retry = MockVanishOps {
-            metadata: RefCell::new(None),
-            refs: RefCell::new(Vec::new()),
-            ..Default::default()
-        };
-        let retry_outcome = handle_vanish_blob_with_ops(HASH, &"1".repeat(64), REQ_ID, &retry)
+        first.remove_user_list_err.set(false);
+        first.calls.borrow_mut().clear();
+        let retry_outcome = handle_vanish_blob_with_ops(HASH, &"1".repeat(64), REQ_ID, &first)
             .expect("metadata-less retry should converge");
 
         assert_eq!(retry_outcome, VanishBlobOutcome::FullyDeleted);
-        assert!(retry.calls.borrow().contains(&"remove_from_user_list"));
+        assert!(first.calls.borrow().contains(&"remove_from_user_list"));
     }
 
     #[test]
@@ -518,6 +516,42 @@ mod tests {
 
         assert_eq!(outcome, VanishBlobOutcome::Unlinked);
         assert!(!ops.calls.borrow().contains(&"delete_blob_from_gcs"));
+        assert!(ops.calls.borrow().contains(&"remove_from_user_list"));
+    }
+
+    #[test]
+    fn vanish_owner_transfers_shared_blob_before_removing_list_entry() {
+        let ops = MockVanishOps {
+            metadata: RefCell::new(Some(sample_metadata(BlobStatus::Active))),
+            refs: RefCell::new(vec!["1".repeat(64), "2".repeat(64)]),
+            ..Default::default()
+        };
+
+        let outcome = handle_vanish_blob_with_ops(HASH, &"1".repeat(64), REQ_ID, &ops)
+            .expect("shared owner should transfer the blob");
+
+        assert_eq!(outcome, VanishBlobOutcome::Unlinked);
+        assert_eq!(ops.metadata.borrow().as_ref().unwrap().owner, "2".repeat(64));
+        assert_eq!(
+            &ops.calls.borrow()[2..],
+            &["put_blob_metadata", "remove_from_user_list"]
+        );
+    }
+
+    #[test]
+    fn vanish_non_owner_unlinks_without_changing_metadata() {
+        let ops = MockVanishOps {
+            metadata: RefCell::new(Some(sample_metadata(BlobStatus::Active))),
+            refs: RefCell::new(vec!["1".repeat(64), "2".repeat(64)]),
+            ..Default::default()
+        };
+
+        let outcome = handle_vanish_blob_with_ops(HASH, &"2".repeat(64), REQ_ID, &ops)
+            .expect("non-owner should unlink");
+
+        assert_eq!(outcome, VanishBlobOutcome::Unlinked);
+        assert_eq!(ops.metadata.borrow().as_ref().unwrap().owner, "1".repeat(64));
+        assert!(!ops.calls.borrow().contains(&"put_blob_metadata"));
         assert!(ops.calls.borrow().contains(&"remove_from_user_list"));
     }
 
