@@ -61,8 +61,46 @@ impl CreatorDeleteOps for DefaultCreatorDeleteOps {
     }
 }
 
-pub(crate) fn erase_blob(hash: &str, req_id: &str) -> Result<()> {
-    erase_blob_with_ops(hash, req_id, &DefaultCreatorDeleteOps)
+impl VanishBlobOps for DefaultCreatorDeleteOps {
+    fn get_blob_metadata(&self, hash: &str) -> Result<Option<BlobMetadata>> {
+        crate::metadata::get_blob_metadata(hash)
+    }
+
+    fn remove_from_blob_refs(&self, hash: &str, pubkey: &str) -> Result<Vec<String>> {
+        crate::metadata::remove_from_blob_refs(hash, pubkey)
+    }
+
+    fn delete_blob_metadata(&self, hash: &str) -> Result<()> {
+        crate::metadata::delete_blob_metadata(hash)
+    }
+
+    fn delete_blob_kv_artifacts(&self, hash: &str) {
+        crate::delete_blob_kv_artifacts(hash);
+    }
+
+    fn update_stats_on_remove(&self, metadata: &BlobMetadata) {
+        let _ = crate::metadata::update_stats_on_remove(metadata);
+    }
+
+    fn remove_from_recent_index(&self, hash: &str) {
+        let _ = crate::metadata::remove_from_recent_index(hash);
+    }
+
+    fn put_blob_metadata(&self, metadata: &BlobMetadata) -> Result<()> {
+        crate::metadata::put_blob_metadata(metadata)
+    }
+
+    fn remove_from_user_list(&self, pubkey: &str, hash: &str) -> Result<()> {
+        crate::metadata::remove_from_user_list(pubkey, hash)
+    }
+}
+
+pub(crate) fn handle_vanish_blob(
+    hash: &str,
+    pubkey: &str,
+    req_id: &str,
+) -> Result<VanishBlobOutcome> {
+    handle_vanish_blob_with_ops(hash, pubkey, req_id, &DefaultCreatorDeleteOps)
 }
 
 pub fn handle_creator_delete(

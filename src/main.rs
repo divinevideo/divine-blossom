@@ -27,8 +27,9 @@ use crate::blossom::{
     TranscodeStatus, TranscriptStatus, UploadRequirements, QUALITY_VARIANTS,
 };
 use crate::delete_policy::{
-    build_creator_delete_response, erase_blob, handle_creator_delete, map_webhook_moderate_action,
-    plan_user_delete, soft_delete_blob, validate_sha256_format, vanish_is_complete, DeletePlan,
+    build_creator_delete_response, handle_creator_delete, handle_vanish_blob,
+    map_webhook_moderate_action, plan_user_delete, soft_delete_blob, validate_sha256_format,
+    vanish_is_complete, DeletePlan, VanishBlobOutcome,
 };
 use crate::error::{BlossomError, Result};
 use crate::media_auth_log::format_media_auth_log;
@@ -40,9 +41,9 @@ use crate::metadata::{
     get_blob_metadata_uncached, get_blob_refs, get_subtitle_job, get_subtitle_job_by_hash,
     get_tombstone, get_user_blobs, list_blobs_with_metadata, put_audio_mapping, put_auth_event,
     put_blob_metadata, put_subtitle_job, remove_from_audio_source_refs, remove_from_blob_refs,
-    remove_from_recent_index, remove_from_user_index, remove_from_user_list,
-    set_subtitle_job_id_for_hash, update_blob_status, update_stats_on_add, update_stats_on_remove,
-    StatusUpdateOutcome, TranscodeMetadataUpdate, TranscriptMetadataUpdate,
+    remove_from_user_index, remove_from_user_list, set_subtitle_job_id_for_hash,
+    update_blob_status, update_stats_on_add, StatusUpdateOutcome, TranscodeMetadataUpdate,
+    TranscriptMetadataUpdate,
 };
 use crate::storage::{
     blob_exists, check_funnelcake_audio_reuse, current_timestamp, delete_blob as storage_delete,
@@ -4414,142 +4415,16 @@ fn execute_vanish(pubkey: &str) -> (u32, u32, u32) {
     let hashes_for_cloud_run = hashes.clone();
 
     for hash in &hashes {
-        // Get metadata for this blob
-        let metadata = match get_blob_metadata(hash) {
-            Ok(Some(m)) => m,
-            Ok(None) => {
-                let remaining_refs = match remove_from_blob_refs(hash, pubkey) {
-                    Ok(refs) => refs,
-                    Err(e) => {
-                        eprintln!(
-                            "[VANISH] Failed to update refs for metadata-less blob {}: {}",
-                            hash, e
-                        );
-                        errors += 1;
-                        continue;
-                    }
-                };
-                if !remaining_refs.is_empty() {
-                    if let Err(e) = remove_from_user_list(pubkey, hash) {
-                        eprintln!(
-                            "[VANISH] Failed to remove metadata-less shared blob {} from user list: {}",
-                            hash, e
-                        );
-                        errors += 1;
-                        continue;
-                    }
-                    unlinked += 1;
-                    continue;
-                }
-
-                // A previous attempt may have erased the origins and metadata
-                // before its per-user list update failed. Reconfirm erasure
-                // idempotently so dangling list entries can converge safely.
-                if let Err(e) = erase_blob(hash, "vanish") {
-                    eprintln!(
-                        "[VANISH] Failed to erase metadata-less blob {}: {}. Retry state preserved.",
-                        hash, e
-                    );
-                    errors += 1;
-                    continue;
-                }
-                delete_blob_kv_artifacts(hash);
-                let _ = remove_from_recent_index(hash);
-                if let Err(e) = remove_from_user_list(pubkey, hash) {
-                    eprintln!(
-                        "[VANISH] Failed to remove metadata-less blob {} from user list: {}",
-                        hash, e
-                    );
-                    errors += 1;
-                    continue;
-                }
-                fully_deleted += 1;
-                continue;
-            }
+        match handle_vanish_blob(hash, pubkey, "vanish") {
+            Ok(VanishBlobOutcome::FullyDeleted) => fully_deleted += 1,
+            Ok(VanishBlobOutcome::Unlinked) => unlinked += 1,
             Err(e) => {
-                eprintln!("[VANISH] Failed to get metadata for {}: {}", hash, e);
-                errors += 1;
-                continue;
-            }
-        };
-
-        let is_owner = metadata.owner.to_lowercase() == pubkey.to_lowercase();
-
-        // Remove self from refs
-        let remaining_refs = match remove_from_blob_refs(hash, pubkey) {
-            Ok(refs) => refs,
-            Err(e) => {
-                eprintln!("[VANISH] Failed to update refs for {}: {}", hash, e);
-                errors += 1;
-                continue;
-            }
-        };
-        let other_refs: Vec<String> = remaining_refs
-            .iter()
-            .filter(|r| r.to_lowercase() != pubkey.to_lowercase())
-            .cloned()
-            .collect();
-
-        if is_owner && other_refs.is_empty() {
-            // Sole owner: full delete
-            if let Err(e) = erase_blob(hash, "vanish") {
                 eprintln!(
-                    "[VANISH] Required-origin deletion failed for {}: {}. Retry state preserved.",
+                    "[VANISH] Failed to complete {}: {}. Retry state preserved.",
                     hash, e
                 );
                 errors += 1;
-                continue;
             }
-            if let Err(e) = delete_blob_metadata(hash) {
-                eprintln!(
-                    "[VANISH] Failed to delete metadata for {} after origin erasure: {}. Retry state preserved.",
-                    hash, e
-                );
-                errors += 1;
-                continue;
-            }
-            delete_blob_kv_artifacts(hash);
-            let _ = update_stats_on_remove(&metadata);
-            let _ = remove_from_recent_index(hash);
-            if let Err(e) = remove_from_user_list(pubkey, hash) {
-                eprintln!(
-                    "[VANISH] Failed to remove erased blob {} from user list: {}",
-                    hash, e
-                );
-                errors += 1;
-                continue;
-            }
-            fully_deleted += 1;
-        } else if is_owner {
-            // Transfer ownership to next ref
-            let new_owner = other_refs[0].clone();
-            let mut updated_meta = metadata;
-            updated_meta.owner = new_owner;
-            if let Err(e) = put_blob_metadata(&updated_meta) {
-                eprintln!("[VANISH] Failed to transfer ownership for {}: {}", hash, e);
-                errors += 1;
-                continue;
-            }
-            if let Err(e) = remove_from_user_list(pubkey, hash) {
-                eprintln!(
-                    "[VANISH] Failed to remove transferred blob {} from user list: {}",
-                    hash, e
-                );
-                errors += 1;
-                continue;
-            }
-            unlinked += 1;
-        } else {
-            // Non-owner ref: already unlinked from refs above
-            if let Err(e) = remove_from_user_list(pubkey, hash) {
-                eprintln!(
-                    "[VANISH] Failed to remove unlinked blob {} from user list: {}",
-                    hash, e
-                );
-                errors += 1;
-                continue;
-            }
-            unlinked += 1;
         }
     }
 
