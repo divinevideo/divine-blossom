@@ -46,7 +46,7 @@ Field semantics:
 | `sha256` | string | Echoes the request blob hash. |
 | `old_status` | string | Lowercase `BlobStatus` the blob was in before this call. Current values: `active`, `restricted`, `age_restricted`, `pending`, `banned`, `deleted`. |
 | `new_status` | string | Always `"deleted"` on success. |
-| `physical_deleted` | bool | `true` only when the main GCS blob delete succeeded. `false` when the flag is off *or* when physical delete wasn't attempted. |
+| `physical_deleted` | bool | `true` only when the main blob was deleted from both authoritative GCS and the FOS delivery replica. `false` when the flag is off and physical delete was not attempted. |
 | `physical_delete_skipped` | bool | `true` when `ENABLE_PHYSICAL_DELETE` was off; `false` when it was on. |
 
 Callers can rely on these fields without reading Blossom source. Additional fields may be added; clients must ignore unknown fields.
@@ -58,7 +58,7 @@ Callers can rely on these fields without reading Blossom source. Additional fiel
 | Validation window (flag off) | false | not attempted | 200 | `false` | `true` |
 | Full delete succeeds | true | ok | 200 | `true` | `false` |
 | Soft delete ok, byte delete fails | true | error | **5xx** | n/a (error response) | n/a |
-| Blob already `deleted` (idempotent retry) | either | 404-from-GCS treated as success | 200 | `true` if flag on, else `false` | `!physical_delete_enabled` |
+| Blob already `deleted` (idempotent retry) | either | 404 from either origin treated as success | 200 | `true` if flag on, else `false` | `!physical_delete_enabled` |
 | Soft delete itself fails | either | not attempted | **5xx** | n/a | n/a |
 
 ## Error responses
@@ -70,7 +70,7 @@ Callers can rely on these fields without reading Blossom source. Additional fiel
 | `sha256` missing or not 64 hex chars | 400 | `{"error":"Invalid sha256 format"}` |
 | Blob not found in KV | 404 | `{"error":"Blob not found"}` |
 | Soft-delete failure (KV write error) | 5xx | `{"error":"<BlossomError>"}` |
-| Physical-delete failure (GCS write error, flag on) | 5xx | `{"error":"<BlossomError>"}` |
+| Physical-delete failure (GCS or FOS error, flag on) | 5xx | `{"error":"<BlossomError>"}` |
 
 ## Failure states
 
@@ -87,10 +87,10 @@ Triggered by a KV write error in `soft_delete_blob`. State after:
 
 ### Byte-delete fails (flag on only)
 
-Triggered by a GCS failure in `storage::delete_blob`, after `soft_delete_blob` has already succeeded. State after:
+Triggered by a GCS or FOS failure after `soft_delete_blob` has already succeeded. State after:
 
 - Blob metadata is in `Deleted` status. Content stops serving to public viewers (BlobStatus::Deleted returns 404 to non-owners).
-- Main GCS blob bytes may remain. Best-effort artifact cleanup (HLS variants, VTT, derived audio) was not attempted because the byte-delete failure aborts the happy path.
+- Main blob bytes may remain on one or both origins. GCS is attempted first, so an FOS failure can leave GCS already deleted while the replica remains. Best-effort GCS artifact cleanup is not attempted until both main-object deletes succeed.
 - Audit: `creator_delete_attempt` entry exists. No paired `creator_delete` entry.
 - Response: `5xx`.
 
@@ -103,11 +103,11 @@ Bad sha256, missing blob, malformed JSON, and auth failures return their error c
 **Repeated `action: "DELETE"` for the same `sha256` is safe.** On retry:
 
 - `soft_delete_blob` is a no-op when the blob is already in `Deleted` status. Status, user-list cleanup, recent-index, and VCL cache purge are all idempotent.
-- `storage::delete_blob` treats a missing GCS object as success (404 response from GCS → `Ok`). A retry after a previous byte delete succeeded still returns `Ok`.
+- Both origin DELETE operations treat a missing object as success. A retry after GCS succeeded and FOS failed therefore converges safely instead of failing on the already-absent GCS object.
 - Audit writes are append-only. Each retry adds one `creator_delete_attempt` entry; each successful completion adds one `creator_delete` entry. Retries increase audit volume; they do not corrupt state.
 
 Moderation-service can safely retry on 5xx:
-- Previous attempt's soft-delete succeeded but byte-delete failed → retry runs byte-delete only (soft-delete is no-op) and converges. `physical_deleted` will be `true` in the retry response if GCS is healthy.
+- Previous attempt's soft-delete succeeded but an origin delete failed → retry runs byte deletion again (soft-delete is a no-op) and converges. `physical_deleted` is `true` only after both origins confirm deletion or absence.
 - Previous attempt failed at soft-delete → retry re-runs the full flow from a clean state (nothing mutated).
 
 Callers should treat partial failure as non-terminal and retry with the same request body.
@@ -117,7 +117,7 @@ Callers should treat partial failure as non-terminal and retry with the same req
 Retry responses are not byte-equivalent to the original request's response — they describe the current operation, not the aggregate history:
 
 - `old_status` reflects the blob's status at the start of the retry call. After a prior attempt that applied soft-delete, the retry sees `old_status: "deleted"` where the first attempt saw `old_status: "active"`.
-- `physical_deleted` reflects whether the current call's byte-delete step succeeded. If the prior call's byte-delete failed and the retry's byte-delete succeeds, the retry returns `physical_deleted: true`.
+- `physical_deleted` reflects whether the current call confirmed deletion from both required origins. If the prior call partially succeeded and the retry completes the remaining origin, the retry returns `physical_deleted: true`.
 - `new_status` is always `"deleted"` on success.
 
 Mod-service retry logic should compare outcomes, not response bytes.
@@ -140,7 +140,7 @@ WHERE action = 'creator_delete_attempt'
 
 ## Config
 
-- `ENABLE_PHYSICAL_DELETE` — key in the `blossom_config` Config Store. Value `"true"` enables main-blob GCS deletion; anything else (including absent) disables it. Default posture is off during the validation window; flip on after the sample passes per the rollout plan.
+- `ENABLE_PHYSICAL_DELETE` — key in the `blossom_config` Config Store. Value `"true"` enables main-blob deletion from GCS and FOS; anything else (including absent) disables it. FOS deletion is not separately gated by the read or write-back flags because historical mirror copies may exist while those flags are off. Default posture is off during the validation window; flip on after the sample passes per the rollout plan.
 
 ## Observability
 

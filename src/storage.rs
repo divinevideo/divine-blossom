@@ -4,8 +4,8 @@
 use crate::error::{BlossomError, Result};
 use blossom_core::cache_policy::{immutable_storage_cache_policy, ImmutableStorageCachePolicy};
 use blossom_core::read_through::{
-    check_mirror_response, object_path, parse_bool_flag, write_back_decision, MAX_WRITE_BACK_BYTES,
-    SOURCE_FOS, SOURCE_GCS,
+    check_mirror_response, object_path, parse_bool_flag, replica_delete_outcome,
+    write_back_decision, ReplicaDeleteOutcome, MAX_WRITE_BACK_BYTES, SOURCE_FOS, SOURCE_GCS,
 };
 use fastly::http::{Method, StatusCode};
 use fastly::{Body, Request, Response};
@@ -404,11 +404,11 @@ fn try_fallback_download(
 // Fastly Object Storage read-through mirror
 //
 // FOS is a delivery cache in front of the authoritative GCS bucket. It is not
-// allowed to break delivery, so every function below that touches FOS is
-// infallible at its boundary: `try_download_blob_from_fos` returns `Option`
-// and `try_write_back_to_fos` returns nothing. The fallible plumbing is
-// private and its errors can only be converted into "no mirror hit" or "no
-// write-back" — there is no path by which a FOS failure reaches the caller.
+// allowed to break delivery, so reads and write-back remain infallible at
+// their boundaries: `try_download_blob_from_fos` returns `Option` and
+// `try_write_back_to_fos` returns nothing. Physical erasure is different:
+// `delete_blob_from_fos` is deliberately fallible so a caller cannot report
+// successful erasure while replica bytes may remain.
 // ---------------------------------------------------------------------------
 
 /// Read a feature flag from the config store. Absent or unparseable is off.
@@ -772,6 +772,34 @@ pub fn delete_blob(hash: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn build_fos_delete_request(key: &str, config: &S3Config) -> Result<Request> {
+    let url = format!("{}{}", config.endpoint(), config.object_path(key));
+    let mut req = Request::new(Method::DELETE, &url);
+    req.set_header("Host", config.host());
+    sign_request(&mut req, config, Some("UNSIGNED-PAYLOAD".into()))?;
+    Ok(req)
+}
+
+/// Delete an object from the Fastly Object Storage delivery replica.
+///
+/// This operation is intentionally not gated by the mirror feature flags: the
+/// historical bulk mirror may contain the object even when both flags are off.
+pub fn delete_blob_from_fos(key: &str) -> Result<()> {
+    let config = S3Config::load_fos()?;
+    let req = build_fos_delete_request(key, &config)?;
+    let resp = req
+        .send(FOS_BACKEND)
+        .map_err(|e| BlossomError::StorageError(format!("FOS delete failed: {}", e)))?;
+
+    match replica_delete_outcome(resp.get_status().as_u16()) {
+        ReplicaDeleteOutcome::Deleted | ReplicaDeleteOutcome::NotPresent => Ok(()),
+        ReplicaDeleteOutcome::Failed => Err(BlossomError::StorageError(format!(
+            "FOS delete failed with status: {}",
+            resp.get_status()
+        ))),
+    }
 }
 
 /// Initiate a multipart upload to GCS
@@ -1916,12 +1944,35 @@ pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtracti
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_storage_cache_state, parse_audio_extraction_error_response,
-        parse_funnelcake_audio_reuse_response, prepare_storage_cache_miss,
-        preserve_storage_cache_state, STORAGE_CACHE_HEADER,
+        build_fos_delete_request, normalize_storage_cache_state,
+        parse_audio_extraction_error_response, parse_funnelcake_audio_reuse_response,
+        prepare_storage_cache_miss, preserve_storage_cache_state, S3Config, FOS_BACKEND,
+        STORAGE_CACHE_HEADER,
     };
     use fastly::http::header;
     use fastly::{Request, Response};
+
+    #[test]
+    fn fos_delete_request_uses_the_replica_backend_address_and_delete_method() {
+        let config = S3Config {
+            access_key: "synthetic-access-key".into(),
+            secret_key: "synthetic-secret-key".into(),
+            bucket: "replica-bucket".into(),
+            host: "replica.example".into(),
+            region: "test-region".into(),
+        };
+
+        let req = build_fos_delete_request("abc123", &config).expect("request should sign");
+
+        assert_eq!(FOS_BACKEND, "fos_storage");
+        assert_eq!(req.get_method(), fastly::http::Method::DELETE);
+        assert_eq!(
+            req.get_url().as_str(),
+            "https://replica.example/replica-bucket/abc123"
+        );
+        assert_eq!(req.get_header_str("Host"), Some("replica.example"));
+        assert!(req.contains_header("Authorization"));
+    }
 
     #[test]
     fn storage_cache_miss_fetches_the_complete_object() {

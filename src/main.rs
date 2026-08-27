@@ -27,8 +27,9 @@ use crate::blossom::{
     TranscodeStatus, TranscriptStatus, UploadRequirements, QUALITY_VARIANTS,
 };
 use crate::delete_policy::{
-    build_creator_delete_response, handle_creator_delete, map_webhook_moderate_action,
-    plan_user_delete, soft_delete_blob, validate_sha256_format, DeletePlan,
+    build_creator_delete_response, handle_creator_delete, handle_vanish_blob,
+    map_webhook_moderate_action, plan_user_delete, soft_delete_blob, validate_sha256_format,
+    vanish_is_complete, DeletePlan, VanishBlobOutcome,
 };
 use crate::error::{BlossomError, Result};
 use crate::media_auth_log::format_media_auth_log;
@@ -40,9 +41,9 @@ use crate::metadata::{
     get_blob_metadata_uncached, get_blob_refs, get_subtitle_job, get_subtitle_job_by_hash,
     get_tombstone, get_user_blobs, list_blobs_with_metadata, put_audio_mapping, put_auth_event,
     put_blob_metadata, put_subtitle_job, remove_from_audio_source_refs, remove_from_blob_refs,
-    remove_from_recent_index, remove_from_user_index, remove_from_user_list,
-    set_subtitle_job_id_for_hash, update_blob_status, update_stats_on_add, update_stats_on_remove,
-    StatusUpdateOutcome, TranscodeMetadataUpdate, TranscriptMetadataUpdate,
+    remove_from_user_index, remove_from_user_list, set_subtitle_job_id_for_hash,
+    update_blob_status, update_stats_on_add, StatusUpdateOutcome, TranscodeMetadataUpdate,
+    TranscriptMetadataUpdate,
 };
 use crate::storage::{
     blob_exists, check_funnelcake_audio_reuse, current_timestamp, delete_blob as storage_delete,
@@ -4395,6 +4396,7 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
 /// For each blob the user owns or references:
 /// - Sole owner: full delete (GCS + KV + VCL cache purge)
 /// - Shared content: unlink (remove from refs, transfer ownership if needed)
+///
 /// Returns (fully_deleted, unlinked, errors) counts.
 fn execute_vanish(pubkey: &str) -> (u32, u32, u32) {
     let mut fully_deleted: u32 = 0;
@@ -4413,58 +4415,33 @@ fn execute_vanish(pubkey: &str) -> (u32, u32, u32) {
     let hashes_for_cloud_run = hashes.clone();
 
     for hash in &hashes {
-        // Get metadata for this blob
-        let metadata = match get_blob_metadata(hash) {
-            Ok(Some(m)) => m,
-            Ok(None) => {
-                // Metadata missing - clean up refs and move on
-                let _ = remove_from_blob_refs(hash, pubkey);
-                continue;
-            }
+        match handle_vanish_blob(hash, pubkey, "vanish") {
+            Ok(VanishBlobOutcome::FullyDeleted) => fully_deleted += 1,
+            Ok(VanishBlobOutcome::Unlinked) => unlinked += 1,
             Err(e) => {
-                eprintln!("[VANISH] Failed to get metadata for {}: {}", hash, e);
+                eprintln!(
+                    "[VANISH] Failed to complete {}: {}. Retry state preserved.",
+                    hash, e
+                );
                 errors += 1;
-                continue;
             }
-        };
-
-        let is_owner = metadata.owner.to_lowercase() == pubkey.to_lowercase();
-
-        // Remove self from refs
-        let remaining_refs = remove_from_blob_refs(hash, pubkey).unwrap_or_default();
-        let other_refs: Vec<String> = remaining_refs
-            .iter()
-            .filter(|r| r.to_lowercase() != pubkey.to_lowercase())
-            .cloned()
-            .collect();
-
-        if is_owner && other_refs.is_empty() {
-            // Sole owner: full delete
-            cleanup_derived_audio_for_source(hash);
-            let _ = storage_delete(hash);
-            delete_blob_gcs_artifacts(hash);
-            let _ = delete_blob_metadata(hash);
-            delete_blob_kv_artifacts(hash);
-            let _ = update_stats_on_remove(&metadata);
-            let _ = remove_from_recent_index(hash);
-            purge_edge_cache(hash);
-            fully_deleted += 1;
-        } else if is_owner {
-            // Transfer ownership to next ref
-            let new_owner = other_refs[0].clone();
-            let mut updated_meta = metadata;
-            updated_meta.owner = new_owner;
-            let _ = put_blob_metadata(&updated_meta);
-            unlinked += 1;
-        } else {
-            // Non-owner ref: already unlinked from refs above
-            unlinked += 1;
         }
     }
 
-    // Delete user's KV list and remove from user index
-    let _ = delete_user_list(pubkey);
-    let _ = remove_from_user_index(pubkey);
+    // Preserve the list when erasure is incomplete so a retry can rediscover
+    // blobs whose metadata and replica bytes still need cleanup.
+    if vanish_is_complete(errors) {
+        if let Err(e) = delete_user_list(pubkey) {
+            eprintln!("[VANISH] Failed to delete user list for {}: {}", pubkey, e);
+            errors += 1;
+        } else if let Err(e) = remove_from_user_index(pubkey) {
+            eprintln!(
+                "[VANISH] Failed to remove {} from user index: {}",
+                pubkey, e
+            );
+            errors += 1;
+        }
+    }
 
     // Fire-and-forget Cloud Run bulk delete for thorough GCS cleanup
     trigger_cloud_run_bulk_delete(pubkey, &hashes_for_cloud_run);
@@ -4478,6 +4455,14 @@ fn execute_vanish(pubkey: &str) -> (u32, u32, u32) {
     );
 
     (fully_deleted, unlinked, errors)
+}
+
+fn vanish_response_status(errors: u32) -> StatusCode {
+    if vanish_is_complete(errors) {
+        StatusCode::OK
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
 }
 
 /// DELETE /vanish - User-initiated GDPR right to erasure
@@ -4499,14 +4484,14 @@ fn handle_vanish(req: Request) -> Result<Response> {
     let (fully_deleted, unlinked, errors) = execute_vanish(&auth.pubkey);
 
     let result = serde_json::json!({
-        "vanished": true,
+        "vanished": vanish_is_complete(errors),
         "pubkey": auth.pubkey,
         "fully_deleted": fully_deleted,
         "unlinked": unlinked,
         "errors": errors,
     });
 
-    let mut resp = json_response(StatusCode::OK, &result);
+    let mut resp = json_response(vanish_response_status(errors), &result);
     add_cors_headers(&mut resp);
     Ok(resp)
 }
@@ -4541,7 +4526,7 @@ fn handle_admin_vanish(req: Request) -> Result<Response> {
     let (fully_deleted, unlinked, errors) = execute_vanish(&pubkey);
 
     let result = serde_json::json!({
-        "vanished": true,
+        "vanished": vanish_is_complete(errors),
         "pubkey": pubkey,
         "reason": reason,
         "fully_deleted": fully_deleted,
@@ -4549,7 +4534,7 @@ fn handle_admin_vanish(req: Request) -> Result<Response> {
         "errors": errors,
     });
 
-    let mut resp = json_response(StatusCode::OK, &result);
+    let mut resp = json_response(vanish_response_status(errors), &result);
     add_cors_headers(&mut resp);
     Ok(resp)
 }
@@ -6235,8 +6220,8 @@ mod tests {
         should_reset_transcript_failure_on_clean_upload, should_set_audio_content_length,
         trusted_upload_service_terminal_derivative_error, upload_capability_headers,
         upload_control_host, upload_exposed_headers, upload_from_resumable_completion,
-        AudioReuseAvailability, DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction,
-        TranscriptPendingState,
+        vanish_response_status, AudioReuseAvailability, DerivativeObservation, TranscodeFetchAction,
+        TranscriptFetchAction, TranscriptPendingState,
     };
     use crate::blossom::{
         BlobStatus, ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus,
@@ -6245,6 +6230,15 @@ mod tests {
     use blossom_core::cache_policy::BlobCachePolicy;
     use fastly::http::StatusCode;
     use fastly::Response;
+
+    #[test]
+    fn vanish_response_is_retryable_when_any_blob_failed() {
+        assert_eq!(vanish_response_status(0), StatusCode::OK);
+        assert_eq!(
+            vanish_response_status(1),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
 
     #[test]
     fn upload_service_response_records_failure_fields_but_clamps_broad_invalid_media_terminal() {
