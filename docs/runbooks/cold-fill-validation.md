@@ -28,6 +28,11 @@ It never globally purges a cache and does not print the object hash.
   `X-Divine-Probe-*` metadata; publishing it before the delivery-time stripping
   logic creates a window where those internal headers can reach clients. Do not
   send any probe request until both versions are active.
+- Confirm shielding is disabled for the bare-blob path during the probe. A
+  shield delivery strips the internal marker before the edge delivery can
+  compare it, so the edge deliberately clears the shield's derived labels and
+  the script fails closed with missing role evidence. Do not interpret that
+  failure as a collapse result.
 
 ## Run
 
@@ -49,10 +54,12 @@ range-path experiment; doing so intentionally makes those two phases absent.
 
 The output reports only status, timing, fixed source/cache labels, serving POP,
 and fixed probe roles. It reports `distinct_compute_fills` and
-`distinct_gcs_fills` from all concurrent client responses. `vcl_deliver`
-compares each request marker with the cached fill leader and emits only a fixed
-`leader` or `follower` role; it strips the marker and cached probe metadata before
-delivery. One leader establishes one Compute response filled the request group.
+`distinct_gcs_fills` from all concurrent client responses. With the required
+single-tier delivery path, `vcl_deliver` compares each request marker with the
+cached fill leader and emits only a fixed `leader` or `follower` role. It first
+clears derived labels that could have arrived from an upstream cache tier, then
+strips the marker and cached probe metadata before delivery. One leader
+establishes one Compute response filled the request group.
 Multiple leaders establish duplicate Compute responses, while the source and FOS
 labels identify how many also duplicated the GCS fill. This response set is exhaustive for the requests
 the script started and does not depend on Pub/Sub pull completeness.
@@ -84,10 +91,11 @@ IP, or account identifier. `authorization_present` is only a boolean path label.
 The request's syntactically bounded `coldfill-*` marker is an untrusted
 measurement hint, not authorization. It is stored as internal metadata on the
 shared fill so `vcl_deliver` can compare later requests with the cached leader.
-Every delivery strips that marker and the other cached probe metadata. Clients
-receive only fixed `role`, `source`, `fos_outcome`, `buffer`, and `write_back`
-labels created during delivery; no marker, object identifier, or user identifier
-reaches a client.
+Every delivery clears pre-existing derived labels, strips that marker and the
+other cached probe metadata, then creates fixed `role`, `source`, `fos_outcome`,
+`buffer`, and `write_back` labels only when the marker remains available for a
+valid comparison. No marker, object identifier, or user identifier reaches a
+client.
 
 The sink records every verified FOS-miss/GCS cold fill and every successful
 bare-blob response taking at least 750 ms. This captures cold probes even when

@@ -39,6 +39,22 @@ class EdgeCacheContractTests(unittest.TestCase):
                 deliver_vcl.index(f"unset resp.http.{header};"),
             )
 
+    def test_cached_probe_labels_are_cleared_before_delivery_evidence(self):
+        deliver_vcl = (ROOT / "vcl" / "deliver.vcl").read_text()
+        evidence_guard = deliver_vcl.index(
+            'if (req.http.X-Divine-Diagnostic-Probe ~ "^coldfill-'
+        )
+
+        for header in (
+            "X-Divine-Diagnostic-Role",
+            "X-Divine-Diagnostic-Source",
+            "X-Divine-Diagnostic-FOS-Outcome",
+            "X-Divine-Diagnostic-Buffer",
+            "X-Divine-Diagnostic-Write-Back",
+        ):
+            unset_offset = deliver_vcl.index(f"unset resp.http.{header};")
+            self.assertLess(unset_offset, evidence_guard)
+
     def test_private_edge_policy_does_not_disable_short_404_caching(self):
         fetch_vcl = (ROOT / "vcl" / "fetch.vcl").read_text()
 

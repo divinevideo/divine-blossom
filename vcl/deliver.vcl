@@ -6,10 +6,19 @@ unset resp.http.Surrogate-Key;
 unset resp.http.Surrogate-Control;
 unset resp.http.X-Divine-Edge-Request-Id;
 
+# A shield delivery may have added fixed labels to the response before it
+# reached this cache tier. Clear them so they cannot be stored or mistaken for
+# evidence from this delivery.
+unset resp.http.X-Divine-Diagnostic-Role;
+unset resp.http.X-Divine-Diagnostic-Source;
+unset resp.http.X-Divine-Diagnostic-FOS-Outcome;
+unset resp.http.X-Divine-Diagnostic-Buffer;
+unset resp.http.X-Divine-Diagnostic-Write-Back;
+
 # Compare the request's bounded probe marker with the marker stored in the
-# shared backend response. Only the fixed Diagnostic headers are added during
-# delivery and avoid storage. The caller-controlled marker and all cached probe
-# metadata are always stripped before a response reaches a client.
+# shared backend response. Only fixed Diagnostic headers are added during this
+# delivery. The caller-controlled marker and all cached probe metadata are
+# always stripped before a response reaches a client.
 if (req.http.X-Divine-Diagnostic-Probe ~ "^coldfill-[a-z0-9-]{1,55}$" && resp.http.X-Divine-Probe-Id) {
   if (req.http.X-Divine-Diagnostic-Probe == resp.http.X-Divine-Probe-Id) {
     set resp.http.X-Divine-Diagnostic-Role = "leader";
