@@ -91,7 +91,12 @@ work:
    snippets once in their named subroutines, and review the diff before
    activation.
 4. Activate the separately validated outer VCL version first, then publish the
-   Compute package through the repository deployment path. This order is
+   Compute package through the repository deployment path. After activation,
+   set the GitHub Actions repository variable
+   `FASTLY_OUTER_DIAGNOSTICS_ACTIVE=true`; it is absent/off by default and gates
+   both automatic and manually requested Compute publishes. If the merge
+   happened while the gate was off, run the `CI` workflow with
+   `publish_compute` enabled after setting the variable. This order is
    required because Compute may emit internal response metadata that the deliver
    snippet strips; publishing Compute first can expose those headers until the
    outer version is active.

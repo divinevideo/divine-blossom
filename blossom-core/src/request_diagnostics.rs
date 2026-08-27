@@ -20,18 +20,19 @@ pub fn should_persist_compute_diagnostic(status: u16) -> bool {
     (500..=599).contains(&status)
 }
 
-/// Return whether a successful bare-blob fetch is cold or slow enough to sample.
+/// Return whether a successful bare-blob fetch is slow or a marked cold probe.
 pub fn should_persist_blob_fetch_diagnostic(
     status: u16,
     route: &str,
     duration_ms: u128,
     has_phase_diagnostics: bool,
     is_cold_fill: bool,
+    is_enabled_cold_probe: bool,
 ) -> bool {
     matches!(status, 200 | 206)
         && route == "blob"
         && has_phase_diagnostics
-        && (duration_ms >= SLOW_BLOB_THRESHOLD_MS || is_cold_fill)
+        && (duration_ms >= SLOW_BLOB_THRESHOLD_MS || (is_cold_fill && is_enabled_cold_probe))
 }
 
 /// Restrict an untrusted request ID to a short, injection-safe log value.
@@ -195,29 +196,33 @@ mod tests {
     #[test]
     fn blob_fetch_diagnostics_require_success_phases_and_a_sample_reason() {
         assert!(should_persist_blob_fetch_diagnostic(
-            200, "blob", 750, true, false
+            200, "blob", 750, true, false, false
         ));
         assert!(should_persist_blob_fetch_diagnostic(
-            206, "blob", 5_000, true, false
+            206, "blob", 5_000, true, false, false
         ));
         assert!(should_persist_blob_fetch_diagnostic(
-            200, "blob", 200, true, true
+            200, "blob", 200, true, true, true
         ));
         assert!(!should_persist_blob_fetch_diagnostic(
-            200, "blob", 749, true, false
+            200, "blob", 200, true, true, false
         ));
         assert!(!should_persist_blob_fetch_diagnostic(
-            200, "blob", 5_000, false, false
+            200, "blob", 749, true, false, false
+        ));
+        assert!(!should_persist_blob_fetch_diagnostic(
+            200, "blob", 5_000, false, false, false
         ));
         assert!(!should_persist_blob_fetch_diagnostic(
             200,
             "hls_content",
             5_000,
             true,
+            true,
             true
         ));
         assert!(!should_persist_blob_fetch_diagnostic(
-            500, "blob", 5_000, true, true
+            500, "blob", 5_000, true, true, true
         ));
     }
 

@@ -1,4 +1,5 @@
 use blossom_core::error::BlossomError;
+use blossom_core::read_through::parse_bool_flag;
 use blossom_core::request_diagnostics::{
     persisted_error_categories, should_persist_blob_fetch_diagnostic,
     should_persist_compute_diagnostic, SLOW_BLOB_THRESHOLD_MS,
@@ -29,6 +30,8 @@ const GCS_FETCH_MS_HEADER: &str = "X-Divine-Internal-Diagnostic-GCS-Fetch-Ms";
 const BUFFER_MS_HEADER: &str = "X-Divine-Internal-Diagnostic-Buffer-Ms";
 const WRITE_BACK_MS_HEADER: &str = "X-Divine-Internal-Diagnostic-Write-Back-Ms";
 const INTERNAL_PROBE_ID_HEADER: &str = "X-Divine-Internal-Diagnostic-Probe-Id";
+const CONFIG_STORE: &str = "blossom_config";
+const COLD_FILL_DIAGNOSTICS_FLAG: &str = "cold_fill_diagnostics_enabled";
 
 #[derive(Default, Serialize)]
 struct BlobPhases {
@@ -147,6 +150,11 @@ fn take_number(response: &mut Response, name: &str) -> Option<u128> {
     take_header(response, name).and_then(|value| value.parse().ok())
 }
 
+fn cold_fill_diagnostics_enabled() -> bool {
+    let store = fastly::config_store::ConfigStore::open(CONFIG_STORE);
+    parse_bool_flag(store.get(COLD_FILL_DIAGNOSTICS_FLAG).as_deref())
+}
+
 pub(crate) fn emit(
     response: &mut Response,
     request_id: &str,
@@ -172,12 +180,15 @@ pub(crate) fn emit(
     let is_cold_fill = blob_phases.as_ref().is_some_and(|phases| {
         phases.fos_outcome.as_deref() == Some("miss") && phases.source.as_deref() == Some("gcs")
     });
+    let is_enabled_cold_probe =
+        is_cold_fill && probe_id.is_some() && cold_fill_diagnostics_enabled();
     let persist_blob_fetch = should_persist_blob_fetch_diagnostic(
         status,
         route,
         duration_ms,
         has_blob_phases,
         is_cold_fill,
+        is_enabled_cold_probe,
     );
     if !persist_error && !persist_blob_fetch {
         return;

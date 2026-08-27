@@ -5,6 +5,15 @@
 unset resp.http.Surrogate-Key;
 unset resp.http.Surrogate-Control;
 unset resp.http.X-Divine-Edge-Request-Id;
+unset resp.http.X-Divine-Internal-Diagnostic-Authorization-Present;
+unset resp.http.X-Divine-Internal-Diagnostic-Source;
+unset resp.http.X-Divine-Internal-Diagnostic-Storage-Cache;
+unset resp.http.X-Divine-Internal-Diagnostic-FOS-Outcome;
+unset resp.http.X-Divine-Internal-Diagnostic-FOS-Lookup-Ms;
+unset resp.http.X-Divine-Internal-Diagnostic-GCS-Fetch-Ms;
+unset resp.http.X-Divine-Internal-Diagnostic-Buffer-Ms;
+unset resp.http.X-Divine-Internal-Diagnostic-Write-Back-Ms;
+unset resp.http.X-Divine-Internal-Diagnostic-Probe-Id;
 
 # A shield delivery may have added fixed labels to the response before it
 # reached this cache tier. Clear them so they cannot be delivered or mistaken

@@ -21,6 +21,13 @@ class EdgeCacheContractTests(unittest.TestCase):
         self.assertIn("then publish the", ordering)
         self.assertIn("before publishing the Compute package", cold_fill_runbook)
 
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        deploy_job = workflow.split("\n  deploy:\n", 1)[1].split(
+            "\n  purge-cache:\n", 1
+        )[0]
+        self.assertIn("vars.FASTLY_OUTER_DIAGNOSTICS_ACTIVE == 'true'", deploy_job)
+        self.assertIn("inputs.publish_compute", deploy_job)
+
     def test_probe_metadata_is_compared_then_stripped_at_delivery(self):
         deliver_vcl = (ROOT / "vcl" / "deliver.vcl").read_text()
 
@@ -54,6 +61,25 @@ class EdgeCacheContractTests(unittest.TestCase):
         ):
             unset_offset = deliver_vcl.index(f"unset resp.http.{header};")
             self.assertLess(unset_offset, evidence_guard)
+
+    def test_internal_compute_diagnostic_headers_have_delivery_backstop(self):
+        deliver_vcl = (ROOT / "vcl" / "deliver.vcl").read_text()
+
+        for suffix in (
+            "Authorization-Present",
+            "Source",
+            "Storage-Cache",
+            "FOS-Outcome",
+            "FOS-Lookup-Ms",
+            "GCS-Fetch-Ms",
+            "Buffer-Ms",
+            "Write-Back-Ms",
+            "Probe-Id",
+        ):
+            self.assertIn(
+                f"unset resp.http.X-Divine-Internal-Diagnostic-{suffix};",
+                deliver_vcl,
+            )
 
     def test_private_edge_policy_does_not_disable_short_404_caching(self):
         fetch_vcl = (ROOT / "vcl" / "fetch.vcl").read_text()
@@ -95,7 +121,7 @@ class EdgeCacheContractTests(unittest.TestCase):
         )[0]
 
         self.assertIn("github.event_name == 'push'", deploy_job)
-        self.assertNotIn("workflow_dispatch", deploy_job)
+        self.assertIn("github.event_name == 'workflow_dispatch'", deploy_job)
         self.assertNotIn("fastly compute publish", purge_job)
         self.assertIn("fastly purge --all", purge_job)
 

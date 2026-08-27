@@ -19,7 +19,7 @@ fail() {
   exit 1
 }
 
-for command in curl fastly nak; do
+for command in curl fastly nak python3; do
   command -v "$command" >/dev/null 2>&1 || fail "$command is required"
 done
 
@@ -42,9 +42,11 @@ RUN_ID="coldfill-$(date -u +%Y%m%dt%H%M%Sz)-$$"
 
 purge_fixture() {
   local hash="$1"
+  local normalized_hash
+  normalized_hash=$(printf '%s' "$hash" | tr '[:upper:]' '[:lower:]')
   # Purge both services: the outer VCL and Compute internal cache are distinct.
-  fastly purge --key "${hash,,}" --service-id "$OUTER_SERVICE_ID" >/dev/null
-  fastly purge --key "${hash,,}" --service-id "$COMPUTE_SERVICE_ID" >/dev/null
+  fastly purge --key "$normalized_hash" --service-id "$OUTER_SERVICE_ID" >/dev/null
+  fastly purge --key "$normalized_hash" --service-id "$COMPUTE_SERVICE_ID" >/dev/null
   sleep 3
 }
 
@@ -120,10 +122,17 @@ grep -qi '^x-divine-diagnostic-role:[[:space:]]*leader' "$TMP/credentialed.heade
   fail "credentialed cold request was not the fill leader"
 grep -qi '^x-divine-diagnostic-source:[[:space:]]*gcs' "$TMP/credentialed.headers" || \
   fail "credentialed fresh object did not use GCS"
-grep -qi '^x-divine-diagnostic-buffer:[[:space:]]*present' "$TMP/credentialed.headers" || \
-  fail "credentialed cold request did not exercise buffering"
-grep -qi '^x-divine-diagnostic-write-back:[[:space:]]*present' "$TMP/credentialed.headers" || \
-  fail "credentialed cold request did not exercise write-back"
+if [ -n "$RANGE" ]; then
+  grep -qi '^x-divine-diagnostic-buffer:[[:space:]]*absent' "$TMP/credentialed.headers" || \
+    fail "credentialed range request unexpectedly exercised buffering"
+  grep -qi '^x-divine-diagnostic-write-back:[[:space:]]*absent' "$TMP/credentialed.headers" || \
+    fail "credentialed range request unexpectedly exercised write-back"
+else
+  grep -qi '^x-divine-diagnostic-buffer:[[:space:]]*present' "$TMP/credentialed.headers" || \
+    fail "credentialed cold request did not exercise buffering"
+  grep -qi '^x-divine-diagnostic-write-back:[[:space:]]*present' "$TMP/credentialed.headers" || \
+    fail "credentialed cold request did not exercise write-back"
+fi
 
 purge_fixture "$CONCURRENT_BLOB_HASH"
 prefix="$RUN_ID-concurrent-"

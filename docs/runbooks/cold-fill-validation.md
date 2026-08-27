@@ -15,16 +15,27 @@ It never globally purges a cache and does not print the object hash.
   and NIP-98 GET requests. Do not read them before the probe: an earlier read
   may populate the FOS replica, and a surrogate purge does not delete that
   replica. Each object must be under 32 MiB and uploaded through the normal path
-  that writes its size to KV metadata; otherwise write-back is ineligible and
-  the probe will fail rather than claim phase coverage. Pass the hashes through `ANONYMOUS_BLOB_HASH`,
+  that writes its size to KV metadata. KV size metadata is required to trust an
+  FOS read; write-back eligibility is determined separately from the GCS
+  response `Content-Length`, which must also be present and under 32 MiB. The
+  probe fails rather than claiming phase coverage when either precondition is
+  missing. Pass the hashes through `ANONYMOUS_BLOB_HASH`,
   `CREDENTIALED_BLOB_HASH`, and `CONCURRENT_BLOB_HASH`; do not put them in a
   command transcript, result document, or commit.
 - Install `curl`, `nak`, and the Fastly CLI. `nak curl` uses an ephemeral signer,
   so no user key or reusable credential is needed.
 - Confirm the `compute-diagnostics` sink is configured before the run. Client
   timings alone cannot establish how many requests reached Compute or origin.
+- Set `cold_fill_diagnostics_enabled=true` in the Compute service's
+  `blossom_config` Config Store only for the bounded probe window. The key is
+  absent/off by default. Set it back to `false` after the diagnostic records
+  arrive; successful requests at or above 750 ms remain sampled independently.
 - Confirm the outer service has already activated this revision's
-  `vcl/deliver.vcl` before publishing the Compute package. Compute emits cached
+  `vcl/deliver.vcl` before publishing the Compute package. Then set the GitHub
+  Actions repository variable `FASTLY_OUTER_DIAGNOSTICS_ACTIVE` to `true` and
+  either merge to trigger the normal publish or run the `CI` workflow manually
+  with `publish_compute` enabled after merge. The variable is absent/off by
+  default, so the deploy job cannot publish Compute first. Compute emits cached
   `X-Divine-Probe-*` metadata; publishing it before the delivery-time stripping
   logic creates a window where those internal headers can reach clients. Do not
   send any probe request until both versions are active.
@@ -52,7 +63,10 @@ CONCURRENCY=8 \
 
 The default sends full-object requests so successful FOS-miss/GCS responses are
 eligible for body buffering and write-back. Set `RANGE` only for a separate
-range-path experiment; doing so intentionally makes those two phases absent.
+range-path experiment. The outer `vcl_miss` removes `Range` from the anonymous
+and concurrent cache-fill requests, so those still fetch and buffer full
+objects. Credentialed traffic takes the pass path and forwards `Range` to
+Compute; only that case must report buffering and write-back as absent.
 
 The output reports only status, timing, fixed source/cache labels, serving POP,
 and fixed probe roles. It reports `distinct_compute_fills` and
@@ -99,9 +113,12 @@ other cached probe metadata, then creates fixed `role`, `source`, `fos_outcome`,
 valid comparison. No marker, object identifier, or user identifier reaches a
 client.
 
-The sink records every verified FOS-miss/GCS cold fill and every successful
-bare-blob response taking at least 750 ms. This captures cold probes even when
-they are fast while bounding steady-state diagnostic volume.
+The sink records every successful bare-blob response taking at least 750 ms.
+A verified FOS-miss/GCS fill below that threshold is recorded only when the
+request carries a valid bounded `coldfill-*` probe marker and the default-off
+`cold_fill_diagnostics_enabled` Config Store flag is active. This captures the
+deliberate cold probes while providing a runtime off switch and preventing
+ordinary cold objects from creating an unbounded below-threshold stream.
 
 Do not select a production change before the representative run. Compare phase
 distributions for anonymous and credentialed requests first, then make only the
