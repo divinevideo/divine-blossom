@@ -7,8 +7,8 @@ unset resp.http.Surrogate-Control;
 unset resp.http.X-Divine-Edge-Request-Id;
 
 # A shield delivery may have added fixed labels to the response before it
-# reached this cache tier. Clear them so they cannot be stored or mistaken for
-# evidence from this delivery.
+# reached this cache tier. Clear them so they cannot be delivered or mistaken
+# for evidence from this delivery.
 unset resp.http.X-Divine-Diagnostic-Role;
 unset resp.http.X-Divine-Diagnostic-Source;
 unset resp.http.X-Divine-Diagnostic-FOS-Outcome;

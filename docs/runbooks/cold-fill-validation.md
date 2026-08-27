@@ -28,11 +28,13 @@ It never globally purges a cache and does not print the object hash.
   `X-Divine-Probe-*` metadata; publishing it before the delivery-time stripping
   logic creates a window where those internal headers can reach clients. Do not
   send any probe request until both versions are active.
-- Confirm shielding is disabled for the bare-blob path during the probe. A
-  shield delivery strips the internal marker before the edge delivery can
-  compare it, so the edge deliberately clears the shield's derived labels and
-  the script fails closed with missing role evidence. Do not interpret that
-  failure as a collapse result.
+- Check the outer Fastly service configuration read-only and confirm shielding
+  is disabled for the bare-blob path. If shielding is enabled, stop and escalate
+  rather than changing delivery topology for the probe. A shield delivery strips
+  the internal marker before the edge delivery can compare it, so the edge
+  deliberately clears the shield's derived labels and the script fails closed
+  with missing role evidence. Do not interpret that failure as a collapse
+  result.
 
 ## Run
 
