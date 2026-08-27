@@ -4418,8 +4418,11 @@ fn execute_vanish(pubkey: &str) -> (u32, u32, u32) {
         let metadata = match get_blob_metadata(hash) {
             Ok(Some(m)) => m,
             Ok(None) => {
-                // Metadata missing - clean up refs and move on
-                let _ = remove_from_blob_refs(hash, pubkey);
+                eprintln!(
+                    "[VANISH] Metadata missing for {}. Cannot determine whether erasure or unlinking is safe.",
+                    hash
+                );
+                errors += 1;
                 continue;
             }
             Err(e) => {
@@ -4432,7 +4435,14 @@ fn execute_vanish(pubkey: &str) -> (u32, u32, u32) {
         let is_owner = metadata.owner.to_lowercase() == pubkey.to_lowercase();
 
         // Remove self from refs
-        let remaining_refs = remove_from_blob_refs(hash, pubkey).unwrap_or_default();
+        let remaining_refs = match remove_from_blob_refs(hash, pubkey) {
+            Ok(refs) => refs,
+            Err(e) => {
+                eprintln!("[VANISH] Failed to update refs for {}: {}", hash, e);
+                errors += 1;
+                continue;
+            }
+        };
         let other_refs: Vec<String> = remaining_refs
             .iter()
             .filter(|r| r.to_lowercase() != pubkey.to_lowercase())
@@ -4449,7 +4459,14 @@ fn execute_vanish(pubkey: &str) -> (u32, u32, u32) {
                 errors += 1;
                 continue;
             }
-            let _ = delete_blob_metadata(hash);
+            if let Err(e) = delete_blob_metadata(hash) {
+                eprintln!(
+                    "[VANISH] Failed to delete metadata for {} after origin erasure: {}. Retry state preserved.",
+                    hash, e
+                );
+                errors += 1;
+                continue;
+            }
             delete_blob_kv_artifacts(hash);
             let _ = update_stats_on_remove(&metadata);
             let _ = remove_from_recent_index(hash);
@@ -4459,7 +4476,11 @@ fn execute_vanish(pubkey: &str) -> (u32, u32, u32) {
             let new_owner = other_refs[0].clone();
             let mut updated_meta = metadata;
             updated_meta.owner = new_owner;
-            let _ = put_blob_metadata(&updated_meta);
+            if let Err(e) = put_blob_metadata(&updated_meta) {
+                eprintln!("[VANISH] Failed to transfer ownership for {}: {}", hash, e);
+                errors += 1;
+                continue;
+            }
             unlinked += 1;
         } else {
             // Non-owner ref: already unlinked from refs above
@@ -4470,8 +4491,16 @@ fn execute_vanish(pubkey: &str) -> (u32, u32, u32) {
     // Preserve the list when erasure is incomplete so a retry can rediscover
     // blobs whose metadata and replica bytes still need cleanup.
     if vanish_is_complete(errors) {
-        let _ = delete_user_list(pubkey);
-        let _ = remove_from_user_index(pubkey);
+        if let Err(e) = delete_user_list(pubkey) {
+            eprintln!("[VANISH] Failed to delete user list for {}: {}", pubkey, e);
+            errors += 1;
+        } else if let Err(e) = remove_from_user_index(pubkey) {
+            eprintln!(
+                "[VANISH] Failed to remove {} from user index: {}",
+                pubkey, e
+            );
+            errors += 1;
+        }
     }
 
     // Fire-and-forget Cloud Run bulk delete for thorough GCS cleanup
