@@ -19,7 +19,7 @@ class ClassificationTests(unittest.TestCase):
         missing = MODULE.MetadataProbe(MODULE.Presence.MISSING)
 
         self.assertEqual(
-            MODULE.classify_blob(present, MODULE.Presence.MISSING),
+            MODULE.classify_blob(present, MODULE.Presence.MISSING, 404),
             MODULE.MISSING_BYTES,
         )
         self.assertEqual(
@@ -183,13 +183,44 @@ class PrivacyTests(unittest.TestCase):
         self.assertEqual(repaired, [])
         self.assertEqual(result["repairs"], {"skipped_over_limit": 2})
 
-    def test_cached_public_success_does_not_override_authoritative_storage_miss(self):
+    def test_public_success_prevents_repair_of_replica_or_cache_served_bytes(self):
         metadata = MODULE.MetadataProbe(MODULE.Presence.PRESENT, "active")
 
         self.assertEqual(
             MODULE.classify_blob(metadata, MODULE.Presence.MISSING, 206),
-            MODULE.MISSING_BYTES,
+            MODULE.STORAGE_PATH_DIVERGENCE,
         )
+
+    def test_storage_miss_requires_public_evidence_before_repair(self):
+        metadata = MODULE.MetadataProbe(MODULE.Presence.PRESENT, "active")
+
+        self.assertEqual(
+            MODULE.classify_blob(metadata, MODULE.Presence.MISSING),
+            MODULE.PROBE_ERROR,
+        )
+        self.assertEqual(
+            MODULE.classify_blob(metadata, MODULE.Presence.MISSING, 500),
+            MODULE.DELIVERY_PATH_FAILURE,
+        )
+
+    def test_soft_delete_requires_admin_success(self):
+        synthetic_hash = "b" * 64
+        with patch.object(
+            MODULE.requests, "post", return_value=Mock(status_code=200)
+        ):
+            self.assertTrue(
+                MODULE.soft_delete_missing_bytes(
+                    "https://admin.example", "token", synthetic_hash
+                )
+            )
+        with patch.object(
+            MODULE.requests, "post", return_value=Mock(status_code=404)
+        ):
+            self.assertFalse(
+                MODULE.soft_delete_missing_bytes(
+                    "https://admin.example", "token", synthetic_hash
+                )
+            )
 
     def test_scan_refuses_repair_without_prior_count_confirmation(self):
         repaired = []
@@ -213,6 +244,7 @@ class PrivacyTests(unittest.TestCase):
             ["8" * 64, "9" * 64],
             lambda _value: MODULE.MetadataProbe(MODULE.Presence.PRESENT, "active"),
             lambda _value: MODULE.Presence.MISSING,
+            lambda _value: 404,
             repair=lambda value: repaired.append(value) is None,
             max_repairs=3,
             confirm_missing_count=1,
@@ -223,21 +255,26 @@ class PrivacyTests(unittest.TestCase):
         self.assertEqual(result["repairs"], {"skipped_count_mismatch": 2})
 
     def test_repair_request_requires_credentials_cap_and_confirmed_count(self):
-        self.assertIsNotNone(MODULE.validate_repair_request(True, None, None, 1, 1, True))
         self.assertIsNotNone(
-            MODULE.validate_repair_request(True, "token", "url", 1, 1, False)
+            MODULE.validate_repair_request(True, None, None, None, 1, 1, True)
         )
         self.assertIsNotNone(
-            MODULE.validate_repair_request(True, "token", "url", 0, 1, True)
+            MODULE.validate_repair_request(True, "token", "url", None, 1, 1, True)
         )
         self.assertIsNotNone(
-            MODULE.validate_repair_request(True, "token", "url", 1, None, True)
+            MODULE.validate_repair_request(True, "token", "url", "public", 1, 1, False)
         )
         self.assertIsNotNone(
-            MODULE.validate_repair_request(True, "token", "url", 1, 2, True)
+            MODULE.validate_repair_request(True, "token", "url", "public", 0, 1, True)
+        )
+        self.assertIsNotNone(
+            MODULE.validate_repair_request(True, "token", "url", "public", 1, None, True)
+        )
+        self.assertIsNotNone(
+            MODULE.validate_repair_request(True, "token", "url", "public", 1, 2, True)
         )
         self.assertIsNone(
-            MODULE.validate_repair_request(True, "token", "url", 2, 1, True)
+            MODULE.validate_repair_request(True, "token", "url", "public", 2, 1, True)
         )
 
     def test_scan_refuses_repair_from_uncurated_all_source(self):

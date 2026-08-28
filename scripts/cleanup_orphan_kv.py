@@ -45,6 +45,7 @@ MODERATION_HIDDEN = "moderation_hidden"
 AGE_RESTRICTED = "age_restricted"
 DELETED = "deleted"
 DELIVERY_PATH_FAILURE = "delivery_path_failure"
+STORAGE_PATH_DIVERGENCE = "storage_path_divergence"
 INCONSISTENT_METADATA = "inconsistent_metadata"
 PROBE_ERROR = "probe_error"
 
@@ -66,6 +67,7 @@ ACTION_BY_CLASS = {
     AGE_RESTRICTED: "none",
     DELETED: "none",
     DELIVERY_PATH_FAILURE: "investigate_delivery_path",
+    STORAGE_PATH_DIVERGENCE: "investigate_storage_origins",
     INCONSISTENT_METADATA: "quarantine_then_restore_original_metadata_from_verified_backup",
     PROBE_ERROR: "retry_probe",
 }
@@ -102,7 +104,13 @@ def classify_blob(
             return DELIVERY_PATH_FAILURE
         return AGE_RESTRICTED
     if storage is Presence.MISSING:
-        return MISSING_BYTES
+        if public_status is None:
+            return PROBE_ERROR
+        if public_status in EXPECTED_PUBLIC_STATUS[status]:
+            return STORAGE_PATH_DIVERGENCE
+        if public_status == 404:
+            return MISSING_BYTES
+        return DELIVERY_PATH_FAILURE
     if public_status is not None and public_status not in EXPECTED_PUBLIC_STATUS[status]:
         return DELIVERY_PATH_FAILURE
     return AVAILABLE
@@ -220,7 +228,7 @@ def soft_delete_missing_bytes(endpoint: str, token: str, blob_hash: str) -> bool
             },
             timeout=30,
         )
-        return response.status_code in {200, 404}
+        return response.status_code == 200
     except requests.RequestException:
         return False
 
@@ -312,6 +320,7 @@ def validate_repair_request(
     repair_requested: bool,
     admin_token: Optional[str],
     admin_endpoint: Optional[str],
+    public_endpoint: Optional[str],
     max_repairs: int,
     confirm_missing_count: Optional[int],
     curated_input: bool,
@@ -320,6 +329,8 @@ def validate_repair_request(
         return None
     if not admin_token or not admin_endpoint:
         return "repair requires FASTLY_ADMIN_TOKEN and BLOSSOM_ADMIN_ENDPOINT"
+    if not public_endpoint:
+        return "repair requires --public-endpoint to rule out replica-served bytes"
     if not curated_input:
         return "repair requires --hash-file; --all is read-only"
     if max_repairs < 1:
@@ -387,6 +398,7 @@ def main() -> int:
             True,
             admin_token,
             admin_endpoint,
+            args.public_endpoint,
             args.max_repairs,
             args.confirm_missing_count,
             args.hash_file is not None,
