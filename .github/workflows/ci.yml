@@ -11,6 +11,10 @@ on:
         description: Purge the entire edge cache without publishing
         default: false
         type: boolean
+      publish_compute:
+        description: Publish Compute after confirming the required outer VCL is active
+        default: false
+        type: boolean
 
 env:
   REGISTRY: ghcr.io
@@ -116,13 +120,22 @@ jobs:
 
   deploy:
     needs: test
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_compute && !inputs.purge_cache))
     concurrency:
       group: fastly-deploy
       cancel-in-progress: false
     runs-on: ubuntu-24.04-16core
     steps:
       - uses: actions/checkout@v4
+
+      - name: Verify required outer VCL is active
+        env:
+          FASTLY_OUTER_DIAGNOSTICS_ACTIVE: ${{ vars.FASTLY_OUTER_DIAGNOSTICS_ACTIVE }}
+        run: |
+          if [ "$FASTLY_OUTER_DIAGNOSTICS_ACTIVE" != "true" ]; then
+            echo "::error::Set FASTLY_OUTER_DIAGNOSTICS_ACTIVE=true only after activating the required outer VCL."
+            exit 1
+          fi
 
       # TODO: replace with fastly/compute-actions when it supports wasm32-wasip1
       - name: Install Fastly CLI
@@ -147,7 +160,7 @@ jobs:
   # Prefer targeted Surrogate-Key purges for individual content-addressed blobs.
   purge-cache:
     needs: test
-    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.purge_cache
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.purge_cache && !inputs.publish_compute
     concurrency:
       group: fastly-deploy
       cancel-in-progress: false

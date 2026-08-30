@@ -56,7 +56,7 @@ use blossom_core::cache_policy::{
     blob_cache_policy, cache_headers_for_policy, mutable_derivative_cache_headers,
     status_requires_private_response, BlobCachePolicy, CacheHeaders,
 };
-use blossom_core::request_diagnostics::route_category;
+use blossom_core::request_diagnostics::{diagnostic_probe_id, route_category};
 use blossom_core::upload_log::{
     record_failure, record_response, record_send_attempt, OriginSendResult, UploadLogRecord,
     UploadRoute,
@@ -115,11 +115,13 @@ fn main(mut req: Request) -> std::result::Result<Response, Error> {
         }
     }
 
+    let status = response.get_status().as_u16();
     request_log::emit(
+        &mut response,
         &request_id,
         &method,
         route,
-        response.get_status().as_u16(),
+        status,
         error.as_ref(),
         started.elapsed(),
     );
@@ -589,6 +591,10 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
 
     let hash = parse_hash_from_path(path)
         .ok_or_else(|| BlossomError::BadRequest("Invalid hash in path".into()))?;
+    let authorization_present = req.contains_header(header::AUTHORIZATION);
+    let probe_id = req
+        .get_header_str(request_log::PROBE_REQUEST_HEADER)
+        .and_then(diagnostic_probe_id);
 
     // Check metadata for access control
     let metadata = get_blob_metadata(&hash)?;
@@ -637,7 +643,16 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         range.as_deref(),
         metadata.as_ref().map(|meta| meta.size),
     )?;
+    let diagnostics = result.diagnostics;
     let mut resp = result.response;
+    if let Some(diagnostics) = diagnostics {
+        request_log::attach_blob_phases(
+            &mut resp,
+            diagnostics,
+            authorization_present,
+            probe_id.as_deref(),
+        );
+    }
 
     // Surface provenance metadata if present on the origin object. GCS returns
     // custom metadata as `x-goog-meta-*`; S3-compatible mirrors return the same

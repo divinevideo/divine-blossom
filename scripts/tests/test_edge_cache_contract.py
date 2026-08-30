@@ -9,6 +9,93 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class EdgeCacheContractTests(unittest.TestCase):
+    def test_outer_header_stripping_activates_before_compute_publish(self):
+        diagnostics_runbook = (ROOT / "docs" / "runbooks" / "fastly-5xx.md").read_text()
+        cold_fill_runbook = (
+            ROOT / "docs" / "runbooks" / "cold-fill-validation.md"
+        ).read_text()
+
+        ordering = diagnostics_runbook.split(
+            "Activate the separately validated outer VCL version first", 1
+        )[1].split("\n5.", 1)[0]
+        self.assertIn("then publish the", ordering)
+        self.assertIn("before publishing the Compute package", cold_fill_runbook)
+
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        deploy_job = workflow.split("\n  deploy:\n", 1)[1].split(
+            "\n  purge-cache:\n", 1
+        )[0]
+        self.assertIn("name: Verify required outer VCL is active", deploy_job)
+        self.assertIn(
+            'if [ "$FASTLY_OUTER_DIAGNOSTICS_ACTIVE" != "true" ]', deploy_job
+        )
+        gate_step = deploy_job.split(
+            "- name: Verify required outer VCL is active", 1
+        )[1].split("\n      -", 1)[0]
+        self.assertIn("exit 1", gate_step)
+        self.assertIn("inputs.publish_compute", deploy_job)
+        self.assertLess(
+            deploy_job.index("name: Verify required outer VCL is active"),
+            deploy_job.index("name: Install Fastly CLI"),
+        )
+        self.assertLess(
+            deploy_job.index("name: Verify required outer VCL is active"),
+            deploy_job.index("name: Deploy to Fastly"),
+        )
+
+    def test_probe_metadata_is_compared_then_stripped_at_delivery(self):
+        deliver_vcl = (ROOT / "vcl" / "deliver.vcl").read_text()
+
+        self.assertIn("X-Divine-Diagnostic-Role = \"leader\"", deliver_vcl)
+        self.assertIn("X-Divine-Diagnostic-Role = \"follower\"", deliver_vcl)
+        for header in (
+            "X-Divine-Probe-Id",
+            "X-Divine-Probe-Source",
+            "X-Divine-Probe-FOS-Outcome",
+            "X-Divine-Probe-Buffer",
+            "X-Divine-Probe-Write-Back",
+        ):
+            self.assertIn(f"unset resp.http.{header};", deliver_vcl)
+            self.assertLess(
+                deliver_vcl.index('X-Divine-Diagnostic-Role = "leader"'),
+                deliver_vcl.index(f"unset resp.http.{header};"),
+            )
+
+    def test_cached_probe_labels_are_cleared_before_delivery_evidence(self):
+        deliver_vcl = (ROOT / "vcl" / "deliver.vcl").read_text()
+        evidence_guard = deliver_vcl.index(
+            'if (req.http.X-Divine-Diagnostic-Probe ~ "^coldfill-'
+        )
+
+        for header in (
+            "X-Divine-Diagnostic-Role",
+            "X-Divine-Diagnostic-Source",
+            "X-Divine-Diagnostic-FOS-Outcome",
+            "X-Divine-Diagnostic-Buffer",
+            "X-Divine-Diagnostic-Write-Back",
+        ):
+            unset_offset = deliver_vcl.index(f"unset resp.http.{header};")
+            self.assertLess(unset_offset, evidence_guard)
+
+    def test_internal_compute_diagnostic_headers_have_delivery_backstop(self):
+        deliver_vcl = (ROOT / "vcl" / "deliver.vcl").read_text()
+
+        for suffix in (
+            "Authorization-Present",
+            "Source",
+            "Storage-Cache",
+            "FOS-Outcome",
+            "FOS-Lookup-Ms",
+            "GCS-Fetch-Ms",
+            "Buffer-Ms",
+            "Write-Back-Ms",
+            "Probe-Id",
+        ):
+            self.assertIn(
+                f"unset resp.http.X-Divine-Internal-Diagnostic-{suffix};",
+                deliver_vcl,
+            )
+
     def test_private_edge_policy_does_not_disable_short_404_caching(self):
         fetch_vcl = (ROOT / "vcl" / "fetch.vcl").read_text()
 
@@ -35,7 +122,7 @@ class EdgeCacheContractTests(unittest.TestCase):
         self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("purge_cache:", workflow)
         self.assertIn(
-            "if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.purge_cache",
+            "if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.purge_cache && !inputs.publish_compute",
             workflow,
         )
         self.assertNotIn("github.event.head_commit.message", workflow)
@@ -49,7 +136,9 @@ class EdgeCacheContractTests(unittest.TestCase):
         )[0]
 
         self.assertIn("github.event_name == 'push'", deploy_job)
-        self.assertNotIn("workflow_dispatch", deploy_job)
+        self.assertIn("github.event_name == 'workflow_dispatch'", deploy_job)
+        self.assertIn("inputs.publish_compute && !inputs.purge_cache", deploy_job)
+        self.assertIn("inputs.purge_cache && !inputs.publish_compute", purge_job)
         self.assertNotIn("fastly compute publish", purge_job)
         self.assertIn("fastly purge --all", purge_job)
 
