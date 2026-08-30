@@ -1,543 +1,601 @@
 #!/usr/bin/env python3
+"""Classify and reconcile event-referenced Blossom blobs without emitting IDs.
+
+Input hashes stay in a local file or come from the Fastly KV key listing. Output
+contains aggregate counts only. Missing bytes may be reconciled by soft-deleting
+the stale metadata through the existing admin API from a curated hash file;
+whole-store scans are always read-only. All other classes are
+read-only because reconstructing metadata or changing moderation state without
+their original evidence would weaken access controls.
+
+Dependencies: pip install requests google-cloud-storage
 """
-Cleanup orphan KV metadata records in the Blossom metadata KV store.
 
-An "orphan" is a KV record (blob:{hash}) whose corresponding GCS object does not exist.
-These arise from two confirmed root causes:
-
-  1. Race in the old (pre-PR #57) full-delete path: storage_delete(hash) succeeded but
-     delete_blob_metadata(hash) failed (or was never reached due to an error), leaving
-     the KV record behind with status still set to the pre-delete value.
-
-  2. Partial vanish: the execute_vanish() path deletes GCS and KV atomically for sole
-     owners, but a Cloud Run timeout or error could leave GCS deleted and KV intact if
-     storage_delete() succeeded but delete_blob_metadata() was never reached.
-
-A secondary non-orphan class is covered for diagnostic purposes only:
-
-  3. "Ghost" hash (Case 2 from the investigation): the /provenance endpoint returns
-     {"owner": null, "uploaders": []} for ANY valid 64-char hex hash because it never
-     errors on unknown hashes. A hash in this state has NO KV record AND no GCS object —
-     it just appears as a potential problem but there is nothing to clean up.
-
-Usage:
-    # Dry-run (default): print what would be deleted but do nothing
-    python cleanup_orphan_kv.py --hashes ae1102b3... ff63ea82...
-
-    # Dry-run against all blob:* keys in the KV store
-    python cleanup_orphan_kv.py --all --dry-run
-
-    # Wet-run (delete): only do this after PR #59 is confirmed stable
-    python cleanup_orphan_kv.py --hashes ae1102b3... --admin-endpoint https://blossom.dvines.org
-
-    # Limit to one hex prefix (0-f) for parallelism
-    python cleanup_orphan_kv.py --all --hex-prefix a --dry-run
-
-Environment variables:
-    FASTLY_API_TOKEN   — Fastly API token with kv_store.read permission
-    FASTLY_ADMIN_TOKEN — Bearer token for POST /admin/api/delete (same as admin_token secret)
-    KV_STORE_ID        — Fastly KV store ID (find with: fastly kv-store list)
-    GCS_BUCKET         — GCS bucket name (default: divine-blossom-media)
-    GOOGLE_APPLICATION_CREDENTIALS — path to GCS service account key
-
-Dependencies:
-    pip install requests google-cloud-storage
-
-IMPORTANT: Run with --dry-run first. Do not run on production until PR #59 deploy is
-confirmed stable (check that resumable uploads complete correctly end-to-end).
-"""
+from __future__ import annotations
 
 import argparse
-import csv
-import io
 import json
 import os
+import secrets
 import sys
-import time
-from datetime import datetime, timezone
-from typing import Optional
+from collections import Counter
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from typing import Callable, Iterable, Optional
 
 import requests
-
-try:
-    from google.cloud import storage as gcs
-    from google.cloud.exceptions import NotFound
-except ImportError:
-    print("Error: google-cloud-storage not installed")
-    print("Install with: pip install google-cloud-storage")
-    sys.exit(1)
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Configuration helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def get_env(name: str, default: Optional[str] = None) -> Optional[str]:
-    val = os.environ.get(name, default)
-    return val if val else default
+class Presence(Enum):
+    PRESENT = "present"
+    MISSING = "missing"
+    ERROR = "error"
 
 
-def require_env(name: str) -> str:
-    val = os.environ.get(name)
-    if not val:
-        print(f"Error: {name} environment variable is required")
-        sys.exit(1)
-    return val
+class DeliveryRoute(Enum):
+    DIRECT = "direct"
+    ALIAS_ONLY_DERIVED_AUDIO = "alias_only_derived_audio"
+    ERROR = "error"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Fastly KV store access (read-only — for listing blob:* keys and fetching values)
-# ─────────────────────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class MetadataProbe:
+    presence: Presence
+    status: Optional[str] = None
+    consistent: bool = True
 
-def fastly_kv_list_blob_keys(store_id: str, api_token: str, hex_prefix: Optional[str] = None) -> list[str]:
-    """
-    List all blob:{hash} keys from the Fastly KV store.
 
-    If hex_prefix is given (e.g. "a"), only keys whose hash starts with that
-    prefix are returned. This allows parallel runs across 16 shards.
-    """
-    headers = {
-        "Fastly-Key": api_token,
-        "Accept": "application/json",
-    }
+AVAILABLE = "available"
+MISSING_BYTES = "missing_bytes"
+UNVERIFIED_MISSING_BYTES = "unverified_missing_bytes"
+MISSING_METADATA = "missing_metadata"
+STALE_EVENT_REFERENCE = "stale_event_reference"
+MODERATION_HIDDEN = "moderation_hidden"
+AGE_RESTRICTED = "age_restricted"
+DELETED = "deleted"
+DELIVERY_PATH_FAILURE = "delivery_path_failure"
+STORAGE_PATH_DIVERGENCE = "storage_path_divergence"
+INCONSISTENT_METADATA = "inconsistent_metadata"
+PROBE_ERROR = "probe_error"
+ALIAS_ONLY_DERIVED_AUDIO = "alias_only_derived_audio"
 
-    keys: list[str] = []
+EXPECTED_PUBLIC_STATUS = {
+    "active": {200, 206},
+    "pending": {200, 206},
+    "restricted": {404},
+    "banned": {404},
+    "deleted": {404},
+    "age_restricted": {401},
+}
+
+ACTION_BY_CLASS = {
+    AVAILABLE: "none",
+    MISSING_BYTES: "soft_delete_stale_metadata",
+    UNVERIFIED_MISSING_BYTES: "probe_public_delivery_before_repair",
+    MISSING_METADATA: "restore_original_metadata_from_verified_backup",
+    STALE_EVENT_REFERENCE: "repair_at_event_source",
+    MODERATION_HIDDEN: "none",
+    AGE_RESTRICTED: "none",
+    DELETED: "none",
+    DELIVERY_PATH_FAILURE: "investigate_delivery_path",
+    STORAGE_PATH_DIVERGENCE: "investigate_storage_origins",
+    INCONSISTENT_METADATA: "quarantine_then_restore_original_metadata_from_verified_backup",
+    PROBE_ERROR: "retry_probe",
+    ALIAS_ONLY_DERIVED_AUDIO: "none",
+}
+
+RETRY_STATUS = (429, 500, 502, 503, 504)
+PROGRESS_INTERVAL = 100
+
+
+def classify_blob(
+    metadata: MetadataProbe,
+    storage: Presence,
+    public_status: Optional[int] = None,
+    delivery_route: DeliveryRoute = DeliveryRoute.DIRECT,
+) -> str:
+    """Classify one referenced hash without retaining the hash itself."""
+    if (
+        metadata.presence is Presence.ERROR
+        or storage is Presence.ERROR
+        or delivery_route is DeliveryRoute.ERROR
+    ):
+        return PROBE_ERROR
+    if public_status == -1:
+        return PROBE_ERROR
+    if metadata.presence is Presence.MISSING:
+        return MISSING_METADATA if storage is Presence.PRESENT else STALE_EVENT_REFERENCE
+    if not metadata.consistent:
+        return INCONSISTENT_METADATA
+
+    status = (metadata.status or "").lower()
+    if status not in EXPECTED_PUBLIC_STATUS:
+        return INCONSISTENT_METADATA
+    if status == "deleted":
+        if public_status is not None and public_status not in EXPECTED_PUBLIC_STATUS[status]:
+            return DELIVERY_PATH_FAILURE
+        return DELETED
+    if status in {"restricted", "banned"}:
+        if public_status is not None and public_status not in EXPECTED_PUBLIC_STATUS[status]:
+            return DELIVERY_PATH_FAILURE
+        return MODERATION_HIDDEN
+    if status == "age_restricted":
+        if public_status is not None and public_status not in EXPECTED_PUBLIC_STATUS[status]:
+            return DELIVERY_PATH_FAILURE
+        return AGE_RESTRICTED
+    if delivery_route is DeliveryRoute.ALIAS_ONLY_DERIVED_AUDIO:
+        return ALIAS_ONLY_DERIVED_AUDIO
+    if storage is Presence.MISSING:
+        if public_status is None:
+            return UNVERIFIED_MISSING_BYTES
+        if public_status in EXPECTED_PUBLIC_STATUS[status]:
+            return STORAGE_PATH_DIVERGENCE
+        if public_status == 404:
+            return MISSING_BYTES
+        return DELIVERY_PATH_FAILURE
+    if public_status is not None and public_status not in EXPECTED_PUBLIC_STATUS[status]:
+        return DELIVERY_PATH_FAILURE
+    return AVAILABLE
+
+
+def validate_hash(value: str) -> str:
+    value = value.strip().lower()
+    if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+        raise ValueError("input contains an invalid SHA-256 identifier")
+    return value
+
+
+def read_hash_file(path: Path) -> list[str]:
+    hashes = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip() and not line.lstrip().startswith("#"):
+            hashes.append(validate_hash(line))
+    return list(dict.fromkeys(hashes))
+
+
+def fastly_session(api_token: str) -> requests.Session:
+    session = requests.Session()
+    session.headers.update({"Fastly-Key": api_token, "Accept": "application/json"})
+    retry = Retry(
+        total=5,
+        status_forcelist=RETRY_STATUS,
+        allowed_methods=("GET",),
+        backoff_factor=1.0,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    return session
+
+
+def list_blob_hashes(
+    session: requests.Session,
+    store_id: str,
+    hex_prefix: Optional[str],
+    limit: Optional[int] = None,
+) -> list[str]:
+    hashes: list[str] = []
+    seen: set[str] = set()
     cursor: Optional[str] = None
-    page = 0
-
     while True:
-        params: dict = {"limit": 1000, "prefix": "blob:"}
+        page_limit = min(1000, limit - len(hashes)) if limit else 1000
+        params = {"limit": page_limit, "prefix": f"blob:{hex_prefix or ''}"}
         if cursor:
             params["cursor"] = cursor
-
-        url = f"https://api.fastly.com/resources/stores/kv/{store_id}/keys"
-        resp = requests.get(url, headers=headers, params=params, timeout=30)
-
-        if resp.status_code != 200:
-            print(f"Error listing KV keys (page {page}): {resp.status_code} — {resp.text[:200]}")
-            sys.exit(1)
-
-        data = resp.json()
-        page += 1
-
-        for item in data.get("data", []):
-            key: str = item if isinstance(item, str) else item.get("name", item.get("key", ""))
+        response = session.get(
+            f"https://api.fastly.com/resources/stores/kv/{store_id}/keys",
+            params=params,
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        for item in payload.get("data", []):
+            key = item if isinstance(item, str) else item.get("name", item.get("key", ""))
             if not key.startswith("blob:"):
                 continue
-            hash_part = key[len("blob:"):]
-            if len(hash_part) != 64:
-                continue  # skip malformed keys
-            if hex_prefix and not hash_part.startswith(hex_prefix.lower()):
+            try:
+                blob_hash = validate_hash(key.removeprefix("blob:"))
+            except ValueError:
                 continue
-            keys.append(hash_part)
-
-        cursor = data.get("meta", {}).get("next_cursor")
+            if (hex_prefix is None or blob_hash.startswith(hex_prefix)) and blob_hash not in seen:
+                seen.add(blob_hash)
+                hashes.append(blob_hash)
+                if limit and len(hashes) >= limit:
+                    return hashes
+        cursor = payload.get("meta", {}).get("next_cursor")
         if not cursor:
-            break
-
-        if page % 10 == 0:
-            print(f"  ... listed {len(keys)} blob keys so far (page {page})", file=sys.stderr)
-
-    return keys
+            return list(dict.fromkeys(hashes))
 
 
-def fastly_kv_get_blob_metadata(store_id: str, api_token: str, sha256: str) -> Optional[dict]:
-    """Fetch a single blob:{hash} record from the KV store."""
-    headers = {"Fastly-Key": api_token}
-    key = f"blob:{sha256.lower()}"
+def probe_metadata(
+    session: requests.Session,
+    store_id: str,
+    blob_hash: str,
+) -> MetadataProbe:
+    key = requests.utils.quote(f"blob:{blob_hash}", safe="")
+    try:
+        response = session.get(
+            f"https://api.fastly.com/resources/stores/kv/{store_id}/keys/{key}",
+            timeout=15,
+        )
+        if response.status_code == 404:
+            return MetadataProbe(Presence.MISSING)
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return MetadataProbe(Presence.PRESENT, consistent=False)
+        status = payload.get("status")
+        required_strings = ("sha256", "type", "uploaded", "owner")
+        consistent = (
+            isinstance(status, str)
+            and status in EXPECTED_PUBLIC_STATUS
+            and all(isinstance(payload.get(field), str) for field in required_strings)
+            and payload.get("sha256", "").lower() == blob_hash
+            and len(payload.get("owner", "")) == 64
+            and all(char in "0123456789abcdef" for char in payload.get("owner", "").lower())
+            and isinstance(payload.get("size"), int)
+            and payload.get("size", -1) >= 0
+        )
+        return MetadataProbe(Presence.PRESENT, status, consistent)
+    except (requests.RequestException, ValueError):
+        return MetadataProbe(Presence.ERROR)
+
+
+def probe_json_list(
+    session: requests.Session,
+    store_id: str,
+    key: str,
+) -> tuple[Presence, list[str]]:
     encoded_key = requests.utils.quote(key, safe="")
-    url = f"https://api.fastly.com/resources/stores/kv/{store_id}/keys/{encoded_key}"
-    resp = requests.get(url, headers=headers, timeout=15)
-    if resp.status_code == 200:
+    try:
+        response = session.get(
+            f"https://api.fastly.com/resources/stores/kv/{store_id}/keys/{encoded_key}",
+            timeout=15,
+        )
+        if response.status_code == 404:
+            return Presence.MISSING, []
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, list):
+            return Presence.ERROR, []
         try:
-            return resp.json()
-        except Exception:
-            return None
-    if resp.status_code == 404:
-        return None
-    print(f"  Warning: KV lookup for {sha256[:8]} returned {resp.status_code}", file=sys.stderr)
+            validated = [validate_hash(value) for value in payload]
+        except (TypeError, ValueError):
+            return Presence.ERROR, []
+        return Presence.PRESENT, validated
+    except (requests.RequestException, ValueError):
+        return Presence.ERROR, []
+
+
+def probe_delivery_route(
+    session: requests.Session,
+    store_id: str,
+    blob_hash: str,
+) -> DeliveryRoute:
+    audio_presence, audio_refs = probe_json_list(session, store_id, f"audio_refs:{blob_hash}")
+    if audio_presence is Presence.ERROR:
+        return DeliveryRoute.ERROR
+    if not audio_refs:
+        return DeliveryRoute.DIRECT
+
+    refs_presence, blob_refs = probe_json_list(session, store_id, f"refs:{blob_hash}")
+    if refs_presence is Presence.ERROR:
+        return DeliveryRoute.ERROR
+    return (
+        DeliveryRoute.ALIAS_ONLY_DERIVED_AUDIO
+        if not blob_refs
+        else DeliveryRoute.DIRECT
+    )
+
+
+def get_bucket(client: object, bucket_name: str, not_found_type: type[Exception]) -> object:
+    try:
+        return client.get_bucket(bucket_name)
+    except not_found_type as error:
+        raise ValueError(f"configured GCS bucket does not exist: {bucket_name}") from error
+
+
+def probe_storage(
+    bucket: object,
+    blob_hash: str,
+    not_found_type: type[Exception],
+) -> Presence:
+    try:
+        bucket.blob(blob_hash).reload()
+        return Presence.PRESENT
+    except not_found_type:
+        return Presence.MISSING
+    except Exception:
+        return Presence.ERROR
+
+
+def probe_public(endpoint: str, blob_hash: str) -> Optional[int]:
+    cache_buster = secrets.token_hex(8)
+    try:
+        response = requests.get(
+            f"{endpoint.rstrip('/')}/{blob_hash}?_={cache_buster}",
+            headers={"Range": "bytes=0-0", "Cache-Control": "no-cache"},
+            allow_redirects=False,
+            stream=True,
+            timeout=15,
+        )
+        try:
+            return response.status_code
+        finally:
+            response.close()
+    except requests.RequestException:
+        return -1
+
+
+def soft_delete_missing_bytes(endpoint: str, token: str, blob_hash: str) -> bool:
+    try:
+        response = requests.post(
+            f"{endpoint.rstrip('/')}/admin/api/delete",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={
+                "sha256": blob_hash,
+                "reason": "Reconcile metadata whose object bytes are unavailable",
+                "legal_hold": False,
+            },
+            timeout=30,
+        )
+        return response.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def scan(
+    hashes: Iterable[str],
+    metadata_probe: Callable[[str], MetadataProbe],
+    storage_probe: Callable[[str], Presence],
+    public_probe: Optional[Callable[[str], Optional[int]]] = None,
+    repair: Optional[Callable[[str], bool]] = None,
+    max_repairs: int = 0,
+    confirm_missing_count: Optional[int] = None,
+    curated_input: bool = False,
+    progress: Optional[Callable[[int], None]] = None,
+    delivery_route_probe: Optional[Callable[[str], DeliveryRoute]] = None,
+) -> dict[str, object]:
+    counts: Counter[str] = Counter()
+    action_counts: Counter[str] = Counter()
+    repair_counts: Counter[str] = Counter()
+    classifications: list[tuple[str, str]] = []
+    for scanned, blob_hash in enumerate(hashes, start=1):
+        metadata = metadata_probe(blob_hash)
+        storage = storage_probe(blob_hash)
+        delivery_route = (
+            delivery_route_probe(blob_hash)
+            if delivery_route_probe
+            else DeliveryRoute.DIRECT
+        )
+        public_status = (
+            public_probe(blob_hash)
+            if public_probe and delivery_route is DeliveryRoute.DIRECT
+            else None
+        )
+        classification = classify_blob(metadata, storage, public_status, delivery_route)
+        counts[classification] += 1
+        action_counts[ACTION_BY_CLASS[classification]] += 1
+        classifications.append((blob_hash, classification))
+        if progress and scanned % PROGRESS_INTERVAL == 0:
+            progress(scanned)
+
+    repair_candidates = [
+        blob_hash
+        for blob_hash, classification in classifications
+        if classification == MISSING_BYTES
+    ]
+    if repair and not curated_input:
+        raise ValueError("repair requires a curated hash file")
+    if repair and confirm_missing_count is None:
+        raise ValueError("repair requires the confirmed missing-byte count from a prior scan")
+    # Curation is the defence against a systematically wrong storage probe.
+    # Count equality detects drift between the read-only and repair scans.
+    if repair and len(repair_candidates) > max_repairs:
+        repair_counts["skipped_over_limit"] = len(repair_candidates)
+    # Aggregate-only output cannot bind approval to specific hashes. Equality is
+    # deliberately a blast-radius check, while every candidate is reclassified.
+    elif repair and len(repair_candidates) != confirm_missing_count:
+        repair_counts["skipped_count_mismatch"] = len(repair_candidates)
+    elif repair:
+        for blob_hash in repair_candidates:
+            repair_counts["soft_deleted" if repair(blob_hash) else "failed"] += 1
+
+    return {
+        "total_scanned": sum(counts.values()),
+        "counts": dict(sorted(counts.items())),
+        "recommended_actions": dict(sorted(action_counts.items())),
+        "repairs": dict(sorted(repair_counts.items())),
+        "privacy": "aggregate_only",
+    }
+
+
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--hash-file", type=Path, help="Private file with one full hash per line")
+    source.add_argument("--all", action="store_true", help="Scan all blob metadata keys")
+    parser.add_argument("--hex-prefix", help="Restrict --all to a lowercase hex prefix")
+    parser.add_argument("--limit", type=int, help="Scan at most this many hashes")
+    parser.add_argument(
+        "--public-endpoint",
+        help="Diagnose anonymous HTTP status; CDN responses are not origin proof",
+    )
+    parser.add_argument(
+        "--repair-missing-bytes",
+        action="store_true",
+        help="Soft-delete visible metadata after confirmed missing storage bytes",
+    )
+    parser.add_argument(
+        "--max-repairs",
+        type=int,
+        help="Hard cap required with --repair-missing-bytes",
+    )
+    parser.add_argument(
+        "--confirm-missing-count",
+        type=int,
+        help="Exact missing_bytes count from a prior read-only scan",
+    )
+    return parser.parse_args(argv)
+
+
+def validate_cli_request(args: argparse.Namespace) -> Optional[str]:
+    if args.hex_prefix is not None:
+        if args.hash_file:
+            return "--hex-prefix can only be used with --all"
+        if not args.hex_prefix or len(args.hex_prefix) > 64 or any(
+            char not in "0123456789abcdef" for char in args.hex_prefix
+        ):
+            return "--hex-prefix must contain 1-64 lowercase hexadecimal characters"
+    if args.limit is not None and args.limit < 1:
+        return "--limit must be positive"
+    if args.max_repairs is not None and args.max_repairs < 0:
+        return "--max-repairs cannot be negative"
+    if not args.repair_missing_bytes:
+        if args.max_repairs is not None:
+            return "--max-repairs requires --repair-missing-bytes"
+        if args.confirm_missing_count is not None:
+            return "--confirm-missing-count requires --repair-missing-bytes"
+    else:
+        if not args.hash_file:
+            return "--repair-missing-bytes requires --hash-file; --all is read-only"
+        if args.limit is not None:
+            return "--limit cannot be used with --repair-missing-bytes"
+        if not args.public_endpoint:
+            return "--repair-missing-bytes requires --public-endpoint"
+        repair_error = validate_repair_parameters(
+            args.max_repairs, args.confirm_missing_count
+        )
+        if repair_error:
+            return repair_error
     return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# GCS existence check (read-only)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def gcs_blob_exists(bucket: "gcs.Bucket", sha256: str) -> bool:
-    """Return True if the main blob object exists in GCS."""
-    blob = bucket.blob(sha256.lower())
-    try:
-        blob.reload()  # lightweight metadata-only HEAD
-        return True
-    except NotFound:
-        return False
-    except Exception as exc:
-        print(f"  Warning: GCS check for {sha256[:8]} raised {exc}", file=sys.stderr)
-        # Treat errors as "exists" so we don't accidentally delete anything
-        return True
+def validate_repair_parameters(
+    max_repairs: Optional[int], confirm_missing_count: Optional[int]
+) -> Optional[str]:
+    if max_repairs is None or max_repairs < 1:
+        return "repair requires a positive --max-repairs cap"
+    if confirm_missing_count is None or confirm_missing_count < 1:
+        return "repair requires a positive --confirm-missing-count from a prior scan"
+    if confirm_missing_count > max_repairs:
+        return "--confirm-missing-count cannot exceed --max-repairs"
+    return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Fastly Compute admin delete (writes — only in wet-run mode)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def fastly_admin_delete(
-    admin_endpoint: str,
-    admin_token: str,
-    sha256: str,
-    reason: str = "Orphan KV cleanup — GCS blob missing",
-    legal_hold: bool = False,
-) -> bool:
-    """
-    Call POST /admin/api/delete on the Fastly Compute endpoint.
-
-    This soft-deletes the blob record (sets status=deleted, removes from user lists,
-    purges VCL cache). It does NOT remove the KV record itself — that only happens
-    in the full hard-delete / vanish path. For the orphan case this is fine: the record
-    is effectively invisible once status=deleted, and can be hard-purged later via the
-    Fastly KV API directly if needed.
-
-    Returns True if successful.
-    """
-    url = f"{admin_endpoint.rstrip('/')}/admin/api/delete"
-    headers = {
-        "Authorization": f"Bearer {admin_token}",
-        "Content-Type": "application/json",
-    }
-    body = {
-        "sha256": sha256.lower(),
-        "reason": reason,
-        "legal_hold": legal_hold,
-    }
-    try:
-        resp = requests.post(url, headers=headers, json=body, timeout=30)
-        if resp.status_code == 200:
-            return True
-        if resp.status_code == 404:
-            # Already gone from KV — treat as success
-            print(f"  Note: {sha256[:16]}... already absent from KV (404)", file=sys.stderr)
-            return True
-        print(
-            f"  Error: admin delete for {sha256[:16]}... returned {resp.status_code}: {resp.text[:200]}",
-            file=sys.stderr,
-        )
-        return False
-    except Exception as exc:
-        print(f"  Error: admin delete for {sha256[:16]}... raised {exc}", file=sys.stderr)
-        return False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Classification logic
-# ─────────────────────────────────────────────────────────────────────────────
-
-CLASSIFICATION_ORPHAN_KV = "orphan_kv"       # KV record exists, GCS blob missing
-CLASSIFICATION_GHOST_HASH = "ghost_hash"      # No KV record, no GCS object (case 2)
-CLASSIFICATION_HEALTHY = "healthy"            # KV record exists and GCS blob exists
-CLASSIFICATION_SOFT_DELETED = "soft_deleted"  # KV record exists, status=deleted, GCS might be gone
-
-
-def classify_hash(
-    sha256: str,
-    kv_metadata: Optional[dict],
-    gcs_exists: bool,
-) -> str:
-    has_kv = kv_metadata is not None
-    status = (kv_metadata or {}).get("status", "unknown")
-
-    if not has_kv and not gcs_exists:
-        return CLASSIFICATION_GHOST_HASH
-    if not has_kv and gcs_exists:
-        # GCS object exists but no KV record — unusual (orphan GCS)
-        return "orphan_gcs"
-    if has_kv and gcs_exists:
-        return CLASSIFICATION_HEALTHY
-    # has_kv and not gcs_exists
-    if status == "deleted":
-        # Soft-deleted: KV status=deleted but GCS was already removed.
-        # This is normal for the preserve-first policy where GCS was cleaned
-        # in an earlier full-delete and then metadata was changed to soft-delete.
-        # Not an error case — do not touch.
-        return CLASSIFICATION_SOFT_DELETED
-    return CLASSIFICATION_ORPHAN_KV
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main scan loop
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run_scan(
-    hashes: list[str],
-    kv_store_id: str,
-    api_token: str,
-    gcs_bucket_obj: "gcs.Bucket",
-    dry_run: bool,
-    admin_endpoint: Optional[str],
+def validate_repair_request(
+    repair_requested: bool,
     admin_token: Optional[str],
-    limit: Optional[int],
-    reason: str,
-) -> dict:
-    results = []
-    counts = {
-        CLASSIFICATION_HEALTHY: 0,
-        CLASSIFICATION_ORPHAN_KV: 0,
-        CLASSIFICATION_GHOST_HASH: 0,
-        CLASSIFICATION_SOFT_DELETED: 0,
-        "orphan_gcs": 0,
-        "deleted_ok": 0,
-        "delete_failed": 0,
-        "skipped_limit": 0,
-    }
-
-    total = len(hashes)
-    for i, sha256 in enumerate(hashes):
-        if limit is not None and i >= limit:
-            counts["skipped_limit"] = total - i
-            break
-
-        if (i + 1) % 50 == 0 or i == 0:
-            print(f"  [{i+1}/{total}] scanning {sha256[:16]}...", file=sys.stderr)
-
-        kv_meta = fastly_kv_get_blob_metadata(kv_store_id, api_token, sha256)
-        gcs_exists = gcs_blob_exists(gcs_bucket_obj, sha256)
-
-        classification = classify_hash(sha256, kv_meta, gcs_exists)
-        counts[classification] = counts.get(classification, 0) + 1
-
-        owner = (kv_meta or {}).get("owner", "")
-        status = (kv_meta or {}).get("status", "")
-        mime = (kv_meta or {}).get("type", "")
-        uploaded = (kv_meta or {}).get("uploaded", "")
-
-        action_taken = "none"
-
-        if classification == CLASSIFICATION_ORPHAN_KV:
-            if dry_run:
-                action_taken = "would_delete"
-                print(f"  [DRY-RUN] Would soft-delete orphan KV record: {sha256[:16]}... owner={owner[:12]}... status={status}")
-            else:
-                if not admin_endpoint or not admin_token:
-                    print(f"  [SKIP] --admin-endpoint and FASTLY_ADMIN_TOKEN required for wet-run", file=sys.stderr)
-                    action_taken = "skipped_no_creds"
-                else:
-                    ok = fastly_admin_delete(admin_endpoint, admin_token, sha256, reason=reason)
-                    if ok:
-                        action_taken = "soft_deleted"
-                        counts["deleted_ok"] += 1
-                        print(f"  [DELETE] Soft-deleted orphan KV: {sha256[:16]}...")
-                    else:
-                        action_taken = "delete_failed"
-                        counts["delete_failed"] += 1
-        elif classification == CLASSIFICATION_GHOST_HASH:
-            print(f"  [GHOST] Hash {sha256[:16]}... has no KV record and no GCS object — nothing to clean up")
-
-        results.append({
-            "sha256": sha256,
-            "classification": classification,
-            "kv_owner": owner,
-            "kv_status": status,
-            "kv_mime": mime,
-            "kv_uploaded": uploaded,
-            "gcs_exists": gcs_exists,
-            "action_taken": action_taken,
-        })
-
-        # Polite rate-limiting: 100ms pause every 20 items to avoid hammering APIs
-        if (i + 1) % 20 == 0:
-            time.sleep(0.1)
-
-    return {"results": results, "counts": counts}
+    admin_endpoint: Optional[str],
+    public_endpoint: Optional[str],
+    max_repairs: Optional[int],
+    confirm_missing_count: Optional[int],
+    curated_input: bool,
+) -> Optional[str]:
+    if not repair_requested:
+        return None
+    if not admin_token or not admin_endpoint:
+        return "repair requires FASTLY_ADMIN_TOKEN and BLOSSOM_ADMIN_ENDPOINT"
+    if not public_endpoint:
+        return "repair requires --public-endpoint to rule out replica-served bytes"
+    if not curated_input:
+        return "repair requires --hash-file; --all is read-only"
+    return validate_repair_parameters(max_repairs, confirm_missing_count)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────────────────────────────────────────────
-
-def main():
-    parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+def repair_did_not_complete(result: dict[str, object]) -> bool:
+    repairs = result.get("repairs")
+    return isinstance(repairs, dict) and any(
+        key.startswith("skipped_") or key == "failed" for key in repairs
     )
 
-    source_group = parser.add_mutually_exclusive_group(required=True)
-    source_group.add_argument(
-        "--hashes",
-        nargs="+",
-        metavar="SHA256",
-        help="One or more 64-char hex hashes to check.",
-    )
-    source_group.add_argument(
-        "--all",
-        action="store_true",
-        help="Scan all blob:* keys from the Fastly KV store. Requires FASTLY_API_TOKEN and KV_STORE_ID.",
-    )
 
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        default=True,
-        help="Do not delete anything, only report (default: true). Pass --no-dry-run to write.",
-    )
-    parser.add_argument(
-        "--no-dry-run",
-        dest="dry_run",
-        action="store_false",
-        help="Actually perform deletes. Requires --admin-endpoint and FASTLY_ADMIN_TOKEN.",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        metavar="N",
-        help="Stop after scanning N hashes (useful for small test runs).",
-    )
-    parser.add_argument(
-        "--hex-prefix",
-        metavar="HEX",
-        default=None,
-        help="Only scan hashes starting with this hex prefix (0-9, a-f). Enables parallel sharding.",
-    )
-    parser.add_argument(
-        "--admin-endpoint",
-        metavar="URL",
-        default="https://blossom.dvines.org",
-        help="Base URL of the Fastly Compute endpoint (default: https://blossom.dvines.org).",
-    )
-    parser.add_argument(
-        "--reason",
-        default="Orphan KV cleanup — GCS blob missing (cleanup_orphan_kv.py)",
-        help="Deletion reason written to audit log.",
-    )
-    parser.add_argument(
-        "--output-csv",
-        metavar="FILE",
-        default=None,
-        help="Write results to a CSV file in addition to JSON summary on stdout.",
-    )
-    parser.add_argument(
-        "--output-json",
-        metavar="FILE",
-        default=None,
-        help="Write full JSON results to this file.",
+def main() -> int:
+    args = parse_args()
+    cli_error = validate_cli_request(args)
+    if cli_error:
+        print(cli_error, file=sys.stderr)
+        return 2
+
+    api_token = os.environ.get("FASTLY_API_TOKEN")
+    store_id = os.environ.get("KV_STORE_ID")
+    if not api_token or not store_id:
+        print("FASTLY_API_TOKEN and KV_STORE_ID are required", file=sys.stderr)
+        return 2
+
+    session = fastly_session(api_token)
+
+    try:
+        hashes = (
+            read_hash_file(args.hash_file)
+            if args.hash_file
+            else list_blob_hashes(session, store_id, args.hex_prefix, args.limit)
+        )
+    except (OSError, ValueError, requests.RequestException) as error:
+        print(str(error), file=sys.stderr)
+        return 2
+
+    if args.limit is not None:
+        hashes = hashes[: args.limit]
+
+    try:
+        from google.cloud import storage as gcs
+        from google.api_core.exceptions import NotFound
+    except ImportError:
+        print("google-cloud-storage is required", file=sys.stderr)
+        return 2
+
+    bucket_name = os.environ.get("GCS_BUCKET")
+    if not bucket_name:
+        print("GCS_BUCKET is required", file=sys.stderr)
+        return 2
+    try:
+        bucket = get_bucket(gcs.Client(), bucket_name, NotFound)
+    except Exception as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    metadata_fn = lambda value: probe_metadata(session, store_id, value)
+    storage_fn = lambda value: probe_storage(bucket, value, NotFound)
+    delivery_route_fn = lambda value: probe_delivery_route(session, store_id, value)
+    public_fn = (
+        (lambda value: probe_public(args.public_endpoint, value)) if args.public_endpoint else None
     )
 
-    args = parser.parse_args()
+    repair_fn = None
+    if args.repair_missing_bytes:
+        admin_token = os.environ.get("FASTLY_ADMIN_TOKEN")
+        admin_endpoint = os.environ.get("BLOSSOM_ADMIN_ENDPOINT")
+        repair_error = validate_repair_request(
+            True,
+            admin_token,
+            admin_endpoint,
+            args.public_endpoint,
+            args.max_repairs,
+            args.confirm_missing_count,
+            args.hash_file is not None,
+        )
+        if repair_error:
+            print(repair_error, file=sys.stderr)
+            return 2
+        repair_fn = lambda value: soft_delete_missing_bytes(admin_endpoint, admin_token, value)
 
-    # ── Read environment ──────────────────────────────────────────────────────
-    api_token = get_env("FASTLY_API_TOKEN")
-    kv_store_id = get_env("KV_STORE_ID")
-    admin_token = get_env("FASTLY_ADMIN_TOKEN")
-    gcs_bucket_name = get_env("GCS_BUCKET", "divine-blossom-media")
-
-    if args.all and (not api_token or not kv_store_id):
-        print("Error: --all requires FASTLY_API_TOKEN and KV_STORE_ID environment variables")
-        sys.exit(1)
-
-    if not args.dry_run and not admin_token:
-        print("Error: --no-dry-run requires FASTLY_ADMIN_TOKEN environment variable")
-        sys.exit(1)
-
-    # ── Build hash list ───────────────────────────────────────────────────────
-    if args.hashes:
-        hashes = [h.lower() for h in args.hashes]
-        for h in hashes:
-            if len(h) != 64 or not all(c in "0123456789abcdef" for c in h):
-                print(f"Error: invalid hash: {h}")
-                sys.exit(1)
-        # For explicit hash list, we still need api_token + kv_store_id to read KV
-        if not api_token:
-            print("Warning: FASTLY_API_TOKEN not set — KV metadata will not be checked (GCS check only)")
-        if not kv_store_id:
-            print("Warning: KV_STORE_ID not set — KV metadata will not be checked (GCS check only)")
-    else:
-        print("Listing blob:* keys from Fastly KV store...")
-        hashes = fastly_kv_list_blob_keys(kv_store_id, api_token, hex_prefix=args.hex_prefix)
-        print(f"Found {len(hashes)} blob keys" + (f" with prefix '{args.hex_prefix}'" if args.hex_prefix else ""))
-
-    if args.limit:
-        print(f"Limiting scan to first {args.limit} hashes")
-
-    # ── GCS client ────────────────────────────────────────────────────────────
-    print(f"Connecting to GCS bucket: {gcs_bucket_name}")
-    gcs_client = gcs.Client()
-    bucket = gcs_client.bucket(gcs_bucket_name)
-
-    # ── Mode banner ───────────────────────────────────────────────────────────
-    if args.dry_run:
-        print("Mode: DRY-RUN (no deletes will happen)")
-    else:
-        print(f"Mode: WET-RUN — orphans will be soft-deleted via {args.admin_endpoint}")
-        print("      Press Ctrl-C within 5 seconds to abort...")
-        time.sleep(5)
-
-    print(f"Scanning {len(hashes)} hash(es)...")
-    print()
-
-    started_at = datetime.now(timezone.utc)
-
-    scan = run_scan(
-        hashes=hashes,
-        kv_store_id=kv_store_id or "",
-        api_token=api_token or "",
-        gcs_bucket_obj=bucket,
-        dry_run=args.dry_run,
-        admin_endpoint=args.admin_endpoint,
-        admin_token=admin_token,
-        limit=args.limit,
-        reason=args.reason,
+    result = scan(
+        hashes,
+        metadata_fn,
+        storage_fn,
+        public_probe=public_fn,
+        delivery_route_probe=delivery_route_fn,
+        repair=repair_fn,
+        max_repairs=args.max_repairs or 0,
+        confirm_missing_count=args.confirm_missing_count,
+        curated_input=args.hash_file is not None,
+        progress=lambda count: print(f"scanned={count}", file=sys.stderr),
     )
-
-    finished_at = datetime.now(timezone.utc)
-    elapsed = (finished_at - started_at).total_seconds()
-
-    # ── Summary ───────────────────────────────────────────────────────────────
-    counts = scan["counts"]
-    print()
-    print("=" * 60)
-    print(f"Scan complete in {elapsed:.1f}s")
-    print(f"  healthy           : {counts.get(CLASSIFICATION_HEALTHY, 0)}")
-    print(f"  orphan_kv         : {counts.get(CLASSIFICATION_ORPHAN_KV, 0)}  ← KV present, GCS missing")
-    print(f"  ghost_hash        : {counts.get(CLASSIFICATION_GHOST_HASH, 0)}  ← no KV, no GCS (nothing to do)")
-    print(f"  soft_deleted      : {counts.get(CLASSIFICATION_SOFT_DELETED, 0)}  ← status=deleted, GCS already gone")
-    print(f"  orphan_gcs        : {counts.get('orphan_gcs', 0)}  ← GCS present, no KV (rare)")
-    if not args.dry_run:
-        print(f"  deleted_ok        : {counts.get('deleted_ok', 0)}")
-        print(f"  delete_failed     : {counts.get('delete_failed', 0)}")
-    if counts.get("skipped_limit", 0):
-        print(f"  skipped (limit)   : {counts.get('skipped_limit', 0)}")
-    print("=" * 60)
-
-    # ── JSON output ───────────────────────────────────────────────────────────
-    summary = {
-        "started_at": started_at.isoformat(),
-        "finished_at": finished_at.isoformat(),
-        "elapsed_secs": elapsed,
-        "dry_run": args.dry_run,
-        "hex_prefix": args.hex_prefix,
-        "total_scanned": len(scan["results"]),
-        "counts": counts,
-        "results": scan["results"],
-    }
-
-    if args.output_json:
-        with open(args.output_json, "w") as f:
-            json.dump(summary, f, indent=2)
-        print(f"JSON written to {args.output_json}")
-    else:
-        print(json.dumps({"counts": counts, "dry_run": args.dry_run}, indent=2))
-
-    # ── CSV output ────────────────────────────────────────────────────────────
-    if args.output_csv:
-        with open(args.output_csv, "w", newline="") as f:
-            writer = csv.DictWriter(
-                f,
-                fieldnames=["sha256", "classification", "kv_owner", "kv_status",
-                            "kv_mime", "kv_uploaded", "gcs_exists", "action_taken"],
-            )
-            writer.writeheader()
-            writer.writerows(scan["results"])
-        print(f"CSV written to {args.output_csv}")
+    print(json.dumps(result, sort_keys=True))
+    return 3 if args.repair_missing_bytes and repair_did_not_complete(result) else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
