@@ -1636,17 +1636,9 @@ pub fn write_audit_log(
     }
 }
 
-/// Fire-and-forget: ask Cloud Run to delete a blob's GCS objects (main + prefix).
-/// This is a backstop for thorough cleanup including any HLS/VTT files
-/// that might not have been caught by the deterministic path deletion.
-pub fn trigger_cloud_run_delete_blob(hash: &str) {
-    let webhook_secret = match get_secret("webhook_secret") {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("[DELETE] webhook_secret not configured, skipping Cloud Run delete");
-            return;
-        }
-    };
+/// Ask Cloud Run to delete and verify all GCS objects associated with a hash.
+pub fn trigger_cloud_run_delete_blob(hash: &str) -> Result<()> {
+    let webhook_secret = get_secret("webhook_secret")?;
 
     let body = format!(r#"{{"hash":"{}"}}"#, hash);
 
@@ -1660,57 +1652,16 @@ pub fn trigger_cloud_run_delete_blob(hash: &str) {
     req.set_header("Authorization", format!("Bearer {}", webhook_secret));
     req.set_body(Body::from(body));
 
-    match req.send_async(CLOUD_RUN_BACKEND) {
-        Ok(_) => {
-            eprintln!("[DELETE] Triggered Cloud Run delete-blob for {}", hash);
-        }
-        Err(e) => {
-            eprintln!(
-                "[DELETE] Failed to trigger Cloud Run delete-blob for {}: {}",
-                hash, e
-            );
-        }
+    let resp = req.send(CLOUD_RUN_BACKEND).map_err(|e| {
+        BlossomError::StorageError(format!("Cloud Run derivative cleanup failed: {}", e))
+    })?;
+    if !resp.get_status().is_success() {
+        return Err(BlossomError::StorageError(format!(
+            "Cloud Run derivative cleanup returned {}",
+            resp.get_status()
+        )));
     }
-}
-
-/// Fire-and-forget: ask Cloud Run to delete all GCS objects for a user (vanish).
-/// Cloud Run does prefix-based listing + deletion as a thorough safety net.
-pub fn trigger_cloud_run_bulk_delete(pubkey: &str, hashes: &[String]) {
-    let webhook_secret = match get_secret("webhook_secret") {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("[VANISH] webhook_secret not configured, skipping Cloud Run bulk delete");
-            return;
-        }
-    };
-
-    let body = serde_json::json!({
-        "pubkey": pubkey,
-        "known_hashes": hashes,
-    })
-    .to_string();
-
-    const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
-    let mut req = Request::new(
-        Method::POST,
-        format!("https://{}/delete-blobs-by-owner", CLOUD_RUN_HOST),
-    );
-    req.set_header("Host", CLOUD_RUN_HOST);
-    req.set_header("Content-Type", "application/json");
-    req.set_header("Authorization", format!("Bearer {}", webhook_secret));
-    req.set_body(Body::from(body));
-
-    match req.send_async(CLOUD_RUN_BACKEND) {
-        Ok(_) => {
-            eprintln!(
-                "[VANISH] Triggered Cloud Run bulk delete for pubkey={}",
-                pubkey
-            );
-        }
-        Err(e) => {
-            eprintln!("[VANISH] Failed to trigger Cloud Run bulk delete: {}", e);
-        }
-    }
+    Ok(())
 }
 
 /// Fire-and-forget: ask Cloud Run to mark a pubkey for audit log anonymization.

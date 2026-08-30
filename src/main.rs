@@ -48,8 +48,8 @@ use crate::metadata::{
 use crate::storage::{
     blob_exists, check_funnelcake_audio_reuse, current_timestamp, delete_blob as storage_delete,
     download_blob_read_through, download_blob_with_fallback, download_thumbnail,
-    trigger_audio_extraction, trigger_audit_anonymize, trigger_cloud_run_bulk_delete,
-    trigger_cloud_run_delete_blob, upload_blob, write_audit_log,
+    trigger_audio_extraction, trigger_audit_anonymize, trigger_cloud_run_delete_blob, upload_blob,
+    write_audit_log,
 };
 use crate::viewer_auth::{ViewerAuthDiagnostics, ViewerAuthState};
 use blossom_core::cache_policy::{
@@ -4186,12 +4186,11 @@ fn handle_upload_requirements(req: Request) -> Result<Response> {
     Ok(resp)
 }
 
-/// Delete all GCS artifacts for a blob (thumbnail, HLS, VTT).
+/// Delete every required GCS artifact for a blob (thumbnail, HLS, VTT, and hash prefix).
 /// The main blob itself is NOT deleted here (caller handles that).
-/// Best-effort: logs errors but never fails.
-pub(crate) fn delete_blob_gcs_artifacts(hash: &str) {
+pub(crate) fn delete_blob_gcs_artifacts(hash: &str) -> Result<()> {
     // Thumbnail
-    let _ = storage_delete(&format!("{}.jpg", hash));
+    storage_delete(&format!("{}.jpg", hash))?;
 
     // HLS files (deterministic paths from transcoder using -hls_flags single_file)
     let hls_paths = [
@@ -4204,15 +4203,15 @@ pub(crate) fn delete_blob_gcs_artifacts(hash: &str) {
         format!("{}/hls/stream_480p.mp4", hash),
     ];
     for path in &hls_paths {
-        let _ = storage_delete(path);
+        storage_delete(path)?;
     }
 
     // VTT transcript
-    let _ = storage_delete(&format!("{}/vtt/main.vtt", hash));
+    storage_delete(&format!("{}/vtt/main.vtt", hash))?;
 
-    // Fire-and-forget Cloud Run request for thorough prefix-based cleanup
-    // (catches any files we missed with deterministic paths)
-    trigger_cloud_run_delete_blob(hash);
+    // Cloud Run lists and verifies the prefix, covering derivative names the
+    // edge cannot safely enumerate. Its response is part of erasure success.
+    trigger_cloud_run_delete_blob(hash)
 }
 
 /// Delete all KV artifacts for a blob (refs, auth events, subtitle data).
@@ -4412,8 +4411,6 @@ fn execute_vanish(pubkey: &str) -> (u32, u32, u32) {
         }
     };
 
-    let hashes_for_cloud_run = hashes.clone();
-
     for hash in &hashes {
         match handle_vanish_blob(hash, pubkey, "vanish") {
             Ok(VanishBlobOutcome::FullyDeleted) => fully_deleted += 1,
@@ -4442,9 +4439,6 @@ fn execute_vanish(pubkey: &str) -> (u32, u32, u32) {
             errors += 1;
         }
     }
-
-    // Fire-and-forget Cloud Run bulk delete for thorough GCS cleanup
-    trigger_cloud_run_bulk_delete(pubkey, &hashes_for_cloud_run);
 
     // Trigger audit anonymization
     trigger_audit_anonymize(pubkey);

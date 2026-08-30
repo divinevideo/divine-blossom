@@ -93,13 +93,14 @@ pub trait BlobErasureOps {
     fn cleanup_derived_audio(&self, hash: &str);
     fn delete_blob_from_gcs(&self, hash: &str) -> Result<()>;
     fn delete_blob_from_replica(&self, hash: &str) -> Result<()>;
-    fn delete_blob_gcs_artifacts(&self, hash: &str);
+    fn delete_blob_gcs_artifacts(&self, hash: &str) -> Result<()>;
     fn purge_vcl_cache(&self, hash: &str);
 }
 
 /// Result of completing one account-vanish list entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VanishBlobOutcome {
+    /// Every required main and derivative object was confirmed deleted or absent.
     FullyDeleted,
     Unlinked,
 }
@@ -136,7 +137,13 @@ pub fn erase_blob_with_ops<O: BlobErasureOps>(hash: &str, req_id: &str, ops: &O)
         );
         e
     })?;
-    ops.delete_blob_gcs_artifacts(hash);
+    ops.delete_blob_gcs_artifacts(hash).map_err(|e| {
+        eprintln!(
+            "[req={}] [ERASURE] derivative delete failed for {}: {}. Retry state preserved.",
+            req_id, hash, e
+        );
+        e
+    })?;
     ops.purge_vcl_cache(hash);
     Ok(())
 }
@@ -280,8 +287,9 @@ mod tests {
                 None => Ok(()),
             }
         }
-        fn delete_blob_gcs_artifacts(&self, _hash: &str) {
+        fn delete_blob_gcs_artifacts(&self, _hash: &str) -> Result<()> {
             self.calls.borrow_mut().push("delete_blob_gcs_artifacts");
+            Ok(())
         }
         fn purge_vcl_cache(&self, _hash: &str) {
             self.calls.borrow_mut().push("purge_vcl_cache");
@@ -345,6 +353,7 @@ mod tests {
         metadata: RefCell<Option<BlobMetadata>>,
         refs: RefCell<Vec<String>>,
         delete_replica_err: bool,
+        delete_artifacts_err: bool,
         delete_metadata_err: bool,
         remove_user_list_err: Cell<bool>,
         calls: RefCell<Vec<&'static str>>,
@@ -366,8 +375,13 @@ mod tests {
                 Ok(())
             }
         }
-        fn delete_blob_gcs_artifacts(&self, _hash: &str) {
+        fn delete_blob_gcs_artifacts(&self, _hash: &str) -> Result<()> {
             self.calls.borrow_mut().push("delete_blob_gcs_artifacts");
+            if self.delete_artifacts_err {
+                Err(BlossomError::StorageError("derivative failed".into()))
+            } else {
+                Ok(())
+            }
         }
         fn purge_vcl_cache(&self, _hash: &str) {
             self.calls.borrow_mut().push("purge_vcl_cache");
@@ -467,6 +481,47 @@ mod tests {
         assert!(ops.metadata.borrow().is_some());
         assert!(!ops.calls.borrow().contains(&"delete_blob_metadata"));
         assert!(!ops.calls.borrow().contains(&"remove_from_user_list"));
+    }
+
+    #[test]
+    fn vanish_derivative_failure_preserves_metadata_and_list_entry() {
+        let ops = MockVanishOps {
+            delete_artifacts_err: true,
+            ..vanish_ops_with_owner()
+        };
+
+        let result = handle_vanish_blob_with_ops(HASH, &"1".repeat(64), REQ_ID, &ops);
+
+        assert!(matches!(result, Err(BlossomError::StorageError(_))));
+        assert!(ops.metadata.borrow().is_some());
+        assert!(!ops.calls.borrow().contains(&"purge_vcl_cache"));
+        assert!(!ops.calls.borrow().contains(&"delete_blob_metadata"));
+        assert!(!ops.calls.borrow().contains(&"remove_from_user_list"));
+    }
+
+    #[test]
+    fn vanish_continues_other_hashes_after_a_derivative_failure() {
+        let failed = MockVanishOps {
+            delete_artifacts_err: true,
+            ..vanish_ops_with_owner()
+        };
+        let completed = vanish_ops_with_owner();
+
+        let first = handle_vanish_blob_with_ops(HASH, &"1".repeat(64), REQ_ID, &failed);
+        let second = handle_vanish_blob_with_ops(
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            &"1".repeat(64),
+            REQ_ID,
+            &completed,
+        );
+
+        assert!(first.is_err());
+        assert_eq!(
+            second.expect("absent derivatives are successful deletes"),
+            VanishBlobOutcome::FullyDeleted
+        );
+        assert!(failed.metadata.borrow().is_some());
+        assert!(completed.metadata.borrow().is_none());
     }
 
     #[test]

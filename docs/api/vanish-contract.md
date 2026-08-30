@@ -19,12 +19,12 @@ The admin endpoint additionally echoes its `reason`; both responses identify the
 
 - HTTP `200` and `vanished: true` mean every discovered blob was either erased or safely unlinked.
 - HTTP `5xx`, `vanished: false`, and `errors > 0` mean at least one blob could not be completed. Callers must retry the same account.
-- `fully_deleted` counts only sole-owner blobs whose main object was confirmed absent from both GCS and Fastly Object Storage (FOS) before metadata cleanup and the final CDN purge.
+- `fully_deleted` counts only sole-owner blobs whose main objects were confirmed deleted or absent from both GCS and Fastly Object Storage (FOS), and whose required GCS derivatives were confirmed deleted or absent, before metadata cleanup and the final CDN purge.
 - `unlinked` counts shared blobs that remain because another account still references them.
 
 ## Retry behavior
 
-Origin DELETE operations are idempotent: a 404 means that origin is already erased. If GCS succeeds and FOS fails, the response is still a retryable `5xx`; the next attempt accepts GCS's 404 and retries FOS.
+Origin and derivative DELETE operations are idempotent: a 404 means that object is already erased. If one required delete succeeds and another fails, the response is still a retryable `5xx`; the next attempt accepts earlier 404 responses and retries the outstanding work. The edge deletes the nine deterministic derivative keys directly, then requires an authenticated Cloud Run cleanup response that lists, deletes, and verifies any remaining hash-prefixed GCS objects.
 
 When any blob fails required-origin deletion or required metadata/reference cleanup, Blossom preserves that blob's account-list entry so the next request can rediscover unfinished work. Completed blobs are removed from the list individually, so a later failure elsewhere in the same account does not cause them to be processed again. Blossom does not increment `fully_deleted` or `unlinked` until that per-blob list update succeeds.
 
@@ -38,4 +38,4 @@ FOS erasure is not gated by `fos_read_enabled` or `fos_write_back_enabled`. Hist
 
 - Reversible moderation bans do not use this physical-erasure contract.
 - Legal `/admin/api/delete` remains a soft-delete path that may preserve evidence.
-- Fire-and-forget Cloud Run cleanup calls are not completion evidence.
+- Audit-log anonymization remains separate from the media-object completion counter.

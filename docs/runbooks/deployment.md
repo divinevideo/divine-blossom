@@ -107,7 +107,7 @@ than what the next deploy will merge onto.
 
 Current configuration-preservation status by deploy path:
 
-- `cloud-run-upload/deploy.sh` still uses `--set-env-vars` and `--set-secrets`.
+- `cloud-run-upload/deploy.sh` still uses `--set-env-vars`; secret bindings are updated in place.
 - `cloud-run-asr-parakeet/deploy.sh` still uses `--set-env-vars`.
 - `scripts/deploy-cloud-function.sh` still uses `--set-env-vars`.
 - `.github/workflows/ci.yml` deploys `process-blob` with `--update-env-vars`,

@@ -16,6 +16,7 @@ TRANSCODER_URL="${TRANSCODER_URL:-https://divine-transcoder-149672065768.us-cent
 TRANSCRIBER_URL="${TRANSCRIBER_URL:-${TRANSCODER_URL}}"
 SENTRY_ENVIRONMENT="${SENTRY_ENVIRONMENT:-production}"
 SENTRY_SECRET="${SENTRY_SECRET:-sentry_dsn}"
+WEBHOOK_SECRET="${WEBHOOK_SECRET:-webhook_secret}"
 
 # --- Autoscaling -----------------------------------------------------------
 #
@@ -56,7 +57,7 @@ gcloud run deploy "${SERVICE_NAME}" \
   --max-instances "${MAX_INSTANCES}" \
   --min-instances "${MIN_INSTANCES}" \
   --set-env-vars "CDN_BASE_URL=${CDN_BASE_URL},TRANSCODER_URL=${TRANSCODER_URL},TRANSCRIBER_URL=${TRANSCRIBER_URL},SENTRY_ENVIRONMENT=${SENTRY_ENVIRONMENT},TRANSCODE_QUEUE=${TRANSCODE_QUEUE},TRANSCODE_QUEUE_INVOKER_SA=${TRANSCODE_QUEUE_INVOKER_SA}" \
-  --set-secrets "SENTRY_DSN=${SENTRY_SECRET}:latest"
+  --update-secrets "SENTRY_DSN=${SENTRY_SECRET}:latest,WEBHOOK_SECRET=${WEBHOOK_SECRET}:latest"
 
 echo "Done! Service URL:"
 gcloud run services describe "${SERVICE_NAME}" \
