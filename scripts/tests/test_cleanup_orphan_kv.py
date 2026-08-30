@@ -110,7 +110,7 @@ class ClassificationTests(unittest.TestCase):
             public_status = MODULE.probe_public("https://media.example", synthetic_hash)
 
         request.assert_called_once_with(
-            f"https://media.example/{synthetic_hash}?reconcile_probe=cache-buster",
+            f"https://media.example/{synthetic_hash}?_=cache-buster",
             headers={"Range": "bytes=0-0", "Cache-Control": "no-cache"},
             allow_redirects=False,
             timeout=15,

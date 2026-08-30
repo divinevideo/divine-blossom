@@ -49,7 +49,8 @@ A catalogue scan makes several service requests per blob. Start with `--hex-pref
 1. Curate a private hash file from authorized incident evidence.
 2. Run the file read-only with the public endpoint and record only its aggregate `missing_bytes` count.
 3. Investigate every other class. Do not broaden the file to make the count match an expectation.
-4. Run the same file again with repair enabled, the prior count, and a hard cap no lower than that count.
+4. Wait at least 61 seconds after the read-only public probes so the edge's known 60-second negative-cache TTL has expired.
+5. Run the same file again with repair enabled, the prior count, and a hard cap no lower than that count.
 
 ```bash
 python3 scripts/cleanup_orphan_kv.py \
@@ -65,7 +66,7 @@ python3 scripts/cleanup_orphan_kv.py \
 ```
 
 The second run reclassifies the complete file before the first mutation. It writes nothing if the live candidate count changed or exceeds the cap. Whole-catalogue repair is rejected.
-Public probes add a unique query marker and request cache revalidation, so the repair run cannot reuse the read-only run's cached 404 as independent evidence.
+Public probes also add an opaque query marker and request cache revalidation. Treat that as additional protection, not a substitute for the wait, unless the deployed delivery cache key is verified to include the query string.
 
 ## Classification Meanings
 

@@ -313,7 +313,7 @@ def probe_public(endpoint: str, blob_hash: str) -> Optional[int]:
     cache_buster = secrets.token_hex(8)
     try:
         response = requests.get(
-            f"{endpoint.rstrip('/')}/{blob_hash}?reconcile_probe={cache_buster}",
+            f"{endpoint.rstrip('/')}/{blob_hash}?_={cache_buster}",
             headers={"Range": "bytes=0-0", "Cache-Control": "no-cache"},
             allow_redirects=False,
             timeout=15,
