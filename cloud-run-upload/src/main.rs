@@ -40,6 +40,7 @@ use std::{
     sync::{Arc, LazyLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use subtle::ConstantTimeEq;
 use tempfile::NamedTempFile;
 use tokio::sync::{Mutex, Semaphore};
 use tower::Service;
@@ -229,15 +230,15 @@ struct DeleteBlobRequest {
     hash: String,
 }
 
-#[derive(Deserialize)]
-struct DeleteBlobsRequest {
-    known_hashes: Vec<String>,
-}
-
 #[derive(Serialize)]
 struct CleanupErrorResponse {
     status: cleanup::CleanupStatus,
     error: String,
+}
+
+#[derive(Serialize)]
+struct CleanupHealthResponse {
+    status: cleanup::CleanupStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -333,7 +334,7 @@ async fn main() -> Result<()> {
         .route("/migrate", options(handle_cors_preflight))
         .route("/audit", post(handle_audit_log))
         .route("/delete-blob", post(handle_delete_blob))
-        .route("/delete-blobs-by-owner", post(handle_delete_blobs_by_owner))
+        .route("/delete-blob/health", get(handle_delete_blob_health))
         .route("/thumbnail/:hash", get(handle_thumbnail_generate))
         .route("/thumbnail/:hash", options(handle_cors_preflight))
         .route("/", put(handle_upload))
@@ -384,7 +385,7 @@ fn validate_webhook_auth(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .ok_or(WebhookAuthError::Unauthorized)?;
-    if provided != expected_secret {
+    if !bool::from(provided.as_bytes().ct_eq(expected_secret.as_bytes())) {
         return Err(WebhookAuthError::Unauthorized);
     }
     Ok(())
@@ -408,9 +409,7 @@ fn cleanup_error(
 fn cleanup_response_status(status: cleanup::CleanupStatus) -> StatusCode {
     match status {
         cleanup::CleanupStatus::Completed => StatusCode::OK,
-        cleanup::CleanupStatus::Partial | cleanup::CleanupStatus::Retryable => {
-            StatusCode::SERVICE_UNAVAILABLE
-        }
+        cleanup::CleanupStatus::Retryable => StatusCode::SERVICE_UNAVAILABLE,
         cleanup::CleanupStatus::Permanent => StatusCode::BAD_REQUEST,
     }
 }
@@ -447,10 +446,9 @@ async fn handle_delete_blob(
     (cleanup_response_status(result.status), Json(result)).into_response()
 }
 
-async fn handle_delete_blobs_by_owner(
+async fn handle_delete_blob_health(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(request): Json<DeleteBlobsRequest>,
 ) -> Response {
     if let Err(error) = validate_webhook_auth(&headers, state.config.webhook_secret.as_deref()) {
         return match error {
@@ -466,27 +464,14 @@ async fn handle_delete_blobs_by_owner(
             ),
         };
     }
-    if request.known_hashes.is_empty()
-        || request
-            .known_hashes
-            .iter()
-            .any(|hash| !cleanup::valid_hash(hash))
-    {
-        return cleanup_error(
-            StatusCode::BAD_REQUEST,
-            cleanup::CleanupStatus::Permanent,
-            "known_hashes must contain valid SHA-256 hashes",
-        );
-    }
 
-    let hashes: Vec<String> = request
-        .known_hashes
-        .into_iter()
-        .map(|hash| hash.to_ascii_lowercase())
-        .collect();
-    let backend = cleanup::GcsCleanupBackend::new(&state.gcs_client, &state.config.gcs_bucket);
-    let result = cleanup::cleanup_hashes(&backend, &hashes).await;
-    (cleanup_response_status(result.status), Json(result)).into_response()
+    (
+        StatusCode::OK,
+        Json(CleanupHealthResponse {
+            status: cleanup::CleanupStatus::Completed,
+        }),
+    )
+        .into_response()
 }
 
 fn auth_error_response(error: anyhow::Error) -> Response {
@@ -1578,10 +1563,26 @@ async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_invalid_media_signal, media_source_candidates, needs_derivative_sanitize,
-        new_temp_media_path, validate_webhook_auth, video_thumbnail_url,
+        classify_invalid_media_signal, cleanup_response_status, media_source_candidates,
+        needs_derivative_sanitize, new_temp_media_path, validate_webhook_auth, video_thumbnail_url,
     };
     use axum::http::{header, HeaderMap, HeaderValue};
+
+    #[test]
+    fn cleanup_outcomes_have_distinct_http_classes() {
+        assert_eq!(
+            cleanup_response_status(crate::cleanup::CleanupStatus::Completed),
+            axum::http::StatusCode::OK
+        );
+        assert_eq!(
+            cleanup_response_status(crate::cleanup::CleanupStatus::Retryable),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            cleanup_response_status(crate::cleanup::CleanupStatus::Permanent),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+    }
 
     #[test]
     fn cleanup_authorization_rejects_missing_and_wrong_bearer_tokens() {

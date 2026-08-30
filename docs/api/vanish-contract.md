@@ -19,7 +19,7 @@ The admin endpoint additionally echoes its `reason`; both responses identify the
 
 - HTTP `200` and `vanished: true` mean every discovered blob was either erased or safely unlinked.
 - HTTP `5xx`, `vanished: false`, and `errors > 0` mean at least one blob could not be completed. Callers must retry the same account.
-- `fully_deleted` counts only sole-owner blobs whose main objects were confirmed deleted or absent from both GCS and Fastly Object Storage (FOS), and whose required GCS derivatives were confirmed deleted or absent, before metadata cleanup and the final CDN purge.
+- `fully_deleted` counts only sole-owner blobs whose main objects were confirmed deleted or absent from both GCS and Fastly Object Storage (FOS), and whose required GCS derivatives and unshared derived audio were confirmed deleted or absent, before metadata cleanup and the final CDN purge.
 - `unlinked` counts shared blobs that remain because another account still references them.
 
 ## Retry behavior

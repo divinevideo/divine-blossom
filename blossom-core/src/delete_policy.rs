@@ -90,7 +90,7 @@ pub struct CreatorDeleteOutcome {
 
 /// Physical-erasure side effects shared by creator deletion and account vanish.
 pub trait BlobErasureOps {
-    fn cleanup_derived_audio(&self, hash: &str);
+    fn cleanup_derived_audio(&self, hash: &str) -> Result<()>;
     fn delete_blob_from_gcs(&self, hash: &str) -> Result<()>;
     fn delete_blob_from_replica(&self, hash: &str) -> Result<()>;
     fn delete_blob_gcs_artifacts(&self, hash: &str) -> Result<()>;
@@ -122,7 +122,7 @@ pub trait VanishBlobOps: BlobErasureOps {
 /// Both origin DELETEs are idempotent, so a failure can safely be retried after
 /// an earlier origin has already confirmed deletion.
 pub fn erase_blob_with_ops<O: BlobErasureOps>(hash: &str, req_id: &str, ops: &O) -> Result<()> {
-    ops.cleanup_derived_audio(hash);
+    ops.cleanup_derived_audio(hash)?;
     ops.delete_blob_from_gcs(hash).map_err(|e| {
         eprintln!(
             "[req={}] [ERASURE] GCS delete failed for {}: {}",
@@ -137,14 +137,17 @@ pub fn erase_blob_with_ops<O: BlobErasureOps>(hash: &str, req_id: &str, ops: &O)
         );
         e
     })?;
-    ops.delete_blob_gcs_artifacts(hash).map_err(|e| {
+    let derivative_result = ops.delete_blob_gcs_artifacts(hash).map_err(|e| {
         eprintln!(
             "[req={}] [ERASURE] derivative delete failed for {}: {}. Retry state preserved.",
             req_id, hash, e
         );
         e
-    })?;
+    });
+    // Origins are already erased at this point. Purge even when derivative
+    // cleanup failed so cached personal media does not survive until retry.
     ops.purge_vcl_cache(hash);
+    derivative_result?;
     Ok(())
 }
 
@@ -270,8 +273,9 @@ mod tests {
     }
 
     impl BlobErasureOps for MockOps {
-        fn cleanup_derived_audio(&self, _hash: &str) {
+        fn cleanup_derived_audio(&self, _hash: &str) -> Result<()> {
             self.calls.borrow_mut().push("cleanup_derived_audio");
+            Ok(())
         }
         fn delete_blob_from_gcs(&self, _hash: &str) -> Result<()> {
             self.calls.borrow_mut().push("delete_blob_from_gcs");
@@ -352,6 +356,7 @@ mod tests {
     struct MockVanishOps {
         metadata: RefCell<Option<BlobMetadata>>,
         refs: RefCell<Vec<String>>,
+        cleanup_audio_err: bool,
         delete_replica_err: bool,
         delete_artifacts_err: bool,
         delete_metadata_err: bool,
@@ -360,8 +365,13 @@ mod tests {
     }
 
     impl BlobErasureOps for MockVanishOps {
-        fn cleanup_derived_audio(&self, _hash: &str) {
+        fn cleanup_derived_audio(&self, _hash: &str) -> Result<()> {
             self.calls.borrow_mut().push("cleanup_derived_audio");
+            if self.cleanup_audio_err {
+                Err(BlossomError::StorageError("audio cleanup failed".into()))
+            } else {
+                Ok(())
+            }
         }
         fn delete_blob_from_gcs(&self, _hash: &str) -> Result<()> {
             self.calls.borrow_mut().push("delete_blob_from_gcs");
@@ -484,6 +494,21 @@ mod tests {
     }
 
     #[test]
+    fn vanish_audio_cleanup_failure_preserves_metadata_and_list_entry() {
+        let ops = MockVanishOps {
+            cleanup_audio_err: true,
+            ..vanish_ops_with_owner()
+        };
+
+        let result = handle_vanish_blob_with_ops(HASH, &"1".repeat(64), REQ_ID, &ops);
+
+        assert!(matches!(result, Err(BlossomError::StorageError(_))));
+        assert!(ops.metadata.borrow().is_some());
+        assert!(!ops.calls.borrow().contains(&"delete_blob_from_gcs"));
+        assert!(!ops.calls.borrow().contains(&"remove_from_user_list"));
+    }
+
+    #[test]
     fn vanish_derivative_failure_preserves_metadata_and_list_entry() {
         let ops = MockVanishOps {
             delete_artifacts_err: true,
@@ -494,7 +519,7 @@ mod tests {
 
         assert!(matches!(result, Err(BlossomError::StorageError(_))));
         assert!(ops.metadata.borrow().is_some());
-        assert!(!ops.calls.borrow().contains(&"purge_vcl_cache"));
+        assert!(ops.calls.borrow().contains(&"purge_vcl_cache"));
         assert!(!ops.calls.borrow().contains(&"delete_blob_metadata"));
         assert!(!ops.calls.borrow().contains(&"remove_from_user_list"));
     }

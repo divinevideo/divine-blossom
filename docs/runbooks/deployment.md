@@ -12,9 +12,9 @@ then activate that version separately. The VCL changes themselves have no
 production effect until that activation happens. CI still republishes and purges
 the Compute service after any merge to `main`, including a VCL-only merge.
 
-That asymmetry is the thing to plan around. Any change that spans the edge and a
-Cloud Run service goes out in two stages, the edge first, and there is a window
-where new edge code is talking to an old backend.
+That asymmetry is the thing to plan around. A merge deploys the edge before any
+manual Cloud Run step, so changes that require a new Cloud Run route must deploy
+and verify that backend from the approved branch before merging the edge change.
 
 ## What ships automatically
 
@@ -44,6 +44,22 @@ These services are not deployed by CI. Each is a script you run yourself.
 It targets the same Cloud Run service that CI deploys on merge, so treat the CI
 job and the manual script as competing deploy paths for one service, not two
 separate services.
+
+## Deploy cleanup dependencies before the edge
+
+The edge treats Cloud Run's authenticated `/delete-blob` response as required
+erasure evidence. For changes to that contract:
+
+1. Deploy `cloud-run-upload` from the approved branch.
+2. Verify an authenticated request reaches `/delete-blob/health` and returns a typed
+   response. A `401` means the Fastly `webhook_secret` and Cloud Run
+   `WEBHOOK_SECRET` bindings do not match; stop rather than merging the edge.
+3. Merge only after the backend route and authentication are verified. The
+   normal `main` workflow can then publish the dependent edge code.
+
+Do not put either secret value in the verification command, logs, screenshots,
+or pull-request text. Use the approved secret-injection tooling for the operator
+environment.
 
 ## The edge Cloud Run backends are not in the production project
 

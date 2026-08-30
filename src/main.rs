@@ -462,57 +462,38 @@ fn clear_stale_audio_mapping(source_hash: &str, audio_hash: &str) {
     }
 }
 
-pub(crate) fn cleanup_derived_audio_for_source(source_hash: &str) {
+pub(crate) fn cleanup_derived_audio_for_source(source_hash: &str) -> Result<()> {
     let mapping = match get_audio_mapping(source_hash) {
         Ok(Some(mapping)) => mapping,
-        Ok(None) => return,
+        Ok(None) => return Ok(()),
         Err(e) => {
-            eprintln!(
-                "[AUDIO] Failed to load audio mapping for cleanup {}: {}",
-                source_hash, e
-            );
-            return;
+            return Err(e);
         }
     };
 
-    let remaining_audio_sources =
-        match remove_from_audio_source_refs(&mapping.audio_sha256, source_hash) {
-            Ok(remaining) => remaining,
-            Err(e) => {
-                eprintln!(
-                    "[AUDIO] Failed to remove audio ref {} <- {}: {}",
-                    mapping.audio_sha256, source_hash, e
-                );
-                let _ = delete_audio_mapping(source_hash);
-                return;
-            }
-        };
-
-    let _ = delete_audio_mapping(source_hash);
+    let remaining_audio_sources: Vec<String> = get_audio_source_refs(&mapping.audio_sha256)?
+        .into_iter()
+        .filter(|hash| !hash.eq_ignore_ascii_case(source_hash))
+        .collect();
 
     if !remaining_audio_sources.is_empty() {
-        return;
+        remove_from_audio_source_refs(&mapping.audio_sha256, source_hash)?;
+        delete_audio_mapping(source_hash)?;
+        return Ok(());
     }
 
-    let blob_refs = match get_blob_refs(&mapping.audio_sha256) {
-        Ok(refs) => refs,
-        Err(e) => {
-            eprintln!(
-                "[AUDIO] Failed to load blob refs for derived audio {}: {}",
-                mapping.audio_sha256, e
-            );
-            return;
-        }
-    };
+    let blob_refs = get_blob_refs(&mapping.audio_sha256)?;
 
     if should_delete_derived_audio_blob(&remaining_audio_sources, &blob_refs) {
-        let _ = storage_delete(&mapping.audio_sha256);
-        let _ = delete_blob_metadata(&mapping.audio_sha256);
-        let _ = delete_audio_source_refs(&mapping.audio_sha256);
+        storage_delete(&mapping.audio_sha256)?;
+        let replica_result = storage::delete_blob_from_fos(&mapping.audio_sha256);
         purge_edge_cache(&mapping.audio_sha256);
-    } else {
-        let _ = delete_audio_source_refs(&mapping.audio_sha256);
+        replica_result?;
+        delete_blob_metadata(&mapping.audio_sha256)?;
     }
+    delete_audio_source_refs(&mapping.audio_sha256)?;
+    delete_audio_mapping(source_hash)?;
+    Ok(())
 }
 
 /// GET /<sha256>[.ext] - Retrieve blob
@@ -4189,11 +4170,8 @@ fn handle_upload_requirements(req: Request) -> Result<Response> {
 /// Delete every required GCS artifact for a blob (thumbnail, HLS, VTT, and hash prefix).
 /// The main blob itself is NOT deleted here (caller handles that).
 pub(crate) fn delete_blob_gcs_artifacts(hash: &str) -> Result<()> {
-    // Thumbnail
-    storage_delete(&format!("{}.jpg", hash))?;
-
-    // HLS files (deterministic paths from transcoder using -hls_flags single_file)
-    let hls_paths = [
+    let paths = [
+        format!("{}.jpg", hash),
         format!("{}/hls/master.m3u8", hash),
         format!("{}/hls/stream_720p.m3u8", hash),
         format!("{}/hls/stream_720p.ts", hash),
@@ -4201,17 +4179,29 @@ pub(crate) fn delete_blob_gcs_artifacts(hash: &str) -> Result<()> {
         format!("{}/hls/stream_480p.ts", hash),
         format!("{}/hls/stream_720p.mp4", hash),
         format!("{}/hls/stream_480p.mp4", hash),
+        format!("{}/vtt/main.vtt", hash),
     ];
-    for path in &hls_paths {
-        storage_delete(path)?;
+    let mut deterministic_failures = Vec::new();
+    for path in &paths {
+        if let Err(error) = storage_delete(path) {
+            deterministic_failures.push(format!("{}: {}", path, error));
+        }
     }
 
-    // VTT transcript
-    storage_delete(&format!("{}/vtt/main.vtt", hash))?;
-
     // Cloud Run lists and verifies the prefix, covering derivative names the
-    // edge cannot safely enumerate. Its response is part of erasure success.
-    trigger_cloud_run_delete_blob(hash)
+    // edge cannot safely enumerate. It also retries deterministic keys, so a
+    // direct edge failure is resolved when Cloud Run confirms the object gone.
+    match trigger_cloud_run_delete_blob(hash) {
+        Ok(()) => Ok(()),
+        Err(cloud_error) => {
+            deterministic_failures.push(format!("prefix cleanup: {}", cloud_error));
+            Err(BlossomError::StorageError(format!(
+                "{} required derivative cleanup operation(s) failed: {}",
+                deterministic_failures.len(),
+                deterministic_failures.join("; ")
+            )))
+        }
+    }
 }
 
 /// Delete all KV artifacts for a blob (refs, auth events, subtitle data).

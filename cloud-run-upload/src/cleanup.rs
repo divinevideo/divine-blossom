@@ -10,7 +10,6 @@ use std::collections::BTreeSet;
 #[serde(rename_all = "snake_case")]
 pub enum CleanupStatus {
     Completed,
-    Partial,
     Retryable,
     Permanent,
 }
@@ -22,12 +21,6 @@ pub struct HashCleanupResult {
     pub deleted: usize,
     pub absent: usize,
     pub failures: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct BulkCleanupResult {
-    pub status: CleanupStatus,
-    pub results: Vec<HashCleanupResult>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,13 +101,6 @@ pub async fn cleanup_hash(backend: &GcsCleanupBackend<'_>, hash: &str) -> HashCl
     cleanup_hash_with_backend(backend, hash).await
 }
 
-pub async fn cleanup_hashes(
-    backend: &GcsCleanupBackend<'_>,
-    hashes: &[String],
-) -> BulkCleanupResult {
-    cleanup_hashes_with_backend(backend, hashes).await
-}
-
 async fn cleanup_hash_with_backend<B: CleanupBackend + Sync>(
     backend: &B,
     hash: &str,
@@ -160,31 +146,8 @@ async fn cleanup_hash_with_backend<B: CleanupBackend + Sync>(
     }
 }
 
-async fn cleanup_hashes_with_backend<B: CleanupBackend + Sync>(
-    backend: &B,
-    hashes: &[String],
-) -> BulkCleanupResult {
-    let mut results = Vec::with_capacity(hashes.len());
-    for hash in hashes {
-        results.push(cleanup_hash_with_backend(backend, hash).await);
-    }
-    let completed = results
-        .iter()
-        .filter(|result| result.status == CleanupStatus::Completed)
-        .count();
-    let status = if completed == results.len() {
-        CleanupStatus::Completed
-    } else if completed == 0 {
-        CleanupStatus::Retryable
-    } else {
-        CleanupStatus::Partial
-    };
-    BulkCleanupResult { status, results }
-}
-
-fn is_not_found_error(error: &impl std::fmt::Display) -> bool {
-    let message = error.to_string();
-    message.contains("404") || message.contains("Not Found") || message.contains("No such object")
+fn is_not_found_error(error: &google_cloud_storage::http::Error) -> bool {
+    matches!(error, google_cloud_storage::http::Error::Response(response) if response.code == 404)
 }
 
 #[cfg(test)]
@@ -231,7 +194,6 @@ mod tests {
     }
 
     const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     #[tokio::test]
     async fn missing_objects_are_confirmed_absent() {
@@ -241,27 +203,6 @@ mod tests {
         assert_eq!(result.deleted, 0);
         assert_eq!(result.absent, 2);
         assert!(result.failures.is_empty());
-    }
-
-    #[tokio::test]
-    async fn partial_bulk_failure_identifies_retryable_hash() {
-        let backend = FakeBackend::default();
-        backend.objects.lock().expect("objects lock").extend([
-            format!("{HASH_A}/hls/custom.ts"),
-            format!("{HASH_B}/vtt/alt.vtt"),
-        ]);
-        backend
-            .failures
-            .lock()
-            .expect("failures lock")
-            .insert(format!("{HASH_B}/vtt/alt.vtt"), 1);
-
-        let result =
-            cleanup_hashes_with_backend(&backend, &[HASH_A.to_string(), HASH_B.to_string()]).await;
-
-        assert_eq!(result.status, CleanupStatus::Partial);
-        assert_eq!(result.results[0].status, CleanupStatus::Completed);
-        assert_eq!(result.results[1].status, CleanupStatus::Retryable);
     }
 
     #[tokio::test]
@@ -293,5 +234,26 @@ mod tests {
         assert!(!valid_hash(
             "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
         ));
+    }
+
+    #[test]
+    fn not_found_classification_uses_the_gcs_status_code() {
+        let not_found = google_cloud_storage::http::Error::Response(
+            google_cloud_storage::http::error::ErrorResponse {
+                code: 404,
+                errors: Vec::new(),
+                message: "object absent".to_string(),
+            },
+        );
+        let misleading_message = google_cloud_storage::http::Error::Response(
+            google_cloud_storage::http::error::ErrorResponse {
+                code: 500,
+                errors: Vec::new(),
+                message: "Not Found while processing".to_string(),
+            },
+        );
+
+        assert!(is_not_found_error(&not_found));
+        assert!(!is_not_found_error(&misleading_message));
     }
 }
