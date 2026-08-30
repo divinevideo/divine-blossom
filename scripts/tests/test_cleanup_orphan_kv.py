@@ -166,6 +166,7 @@ class PrivacyTests(unittest.TestCase):
             lambda _value: MODULE.Presence.MISSING,
             lambda _value: 404,
             repair=lambda value: repaired.append(value) is None,
+            vanish_retry_probe=lambda _value: MODULE.VanishRetryMarker.ABSENT,
             max_repairs=1,
             confirm_missing_count=1,
             curated_input=True,
@@ -184,6 +185,7 @@ class PrivacyTests(unittest.TestCase):
             lambda _value: MODULE.Presence.MISSING,
             lambda _value: 404,
             repair=lambda value: repaired.append(value) is None,
+            vanish_retry_probe=lambda _value: MODULE.VanishRetryMarker.ABSENT,
             max_repairs=1,
             confirm_missing_count=2,
             curated_input=True,
@@ -308,6 +310,7 @@ class PrivacyTests(unittest.TestCase):
             lambda _value: MODULE.Presence.MISSING,
             lambda _value: 404,
             repair=lambda value: repaired.append(value) is None,
+            vanish_retry_probe=lambda _value: MODULE.VanishRetryMarker.ABSENT,
             max_repairs=3,
             confirm_missing_count=1,
             curated_input=True,
@@ -315,6 +318,85 @@ class PrivacyTests(unittest.TestCase):
 
         self.assertEqual(repaired, [])
         self.assertEqual(result["repairs"], {"skipped_count_mismatch": 2})
+
+    def test_repair_excludes_outstanding_vanish_retry_marker(self):
+        synthetic_hash = "c" * 64
+        repaired = []
+
+        result = MODULE.scan(
+            [synthetic_hash],
+            lambda _value: MODULE.MetadataProbe(MODULE.Presence.PRESENT, "active"),
+            lambda _value: MODULE.Presence.MISSING,
+            lambda _value: 404,
+            repair=lambda value: repaired.append(value) is None,
+            vanish_retry_probe=lambda _value: MODULE.VanishRetryMarker.OUTSTANDING,
+            max_repairs=1,
+            confirm_missing_count=1,
+            curated_input=True,
+        )
+
+        self.assertEqual(repaired, [])
+        self.assertEqual(result["repairs"], {"excluded_vanish_retry": 1})
+
+    def test_repair_proceeds_without_vanish_retry_marker(self):
+        synthetic_hash = "d" * 64
+        repaired = []
+
+        result = MODULE.scan(
+            [synthetic_hash],
+            lambda _value: MODULE.MetadataProbe(MODULE.Presence.PRESENT, "active"),
+            lambda _value: MODULE.Presence.MISSING,
+            lambda _value: 404,
+            repair=lambda value: repaired.append(value) is None,
+            vanish_retry_probe=lambda _value: MODULE.VanishRetryMarker.ABSENT,
+            max_repairs=1,
+            confirm_missing_count=1,
+            curated_input=True,
+        )
+
+        self.assertEqual(repaired, [synthetic_hash])
+        self.assertEqual(result["repairs"], {"soft_deleted": 1})
+
+    def test_vanish_starting_after_scan_is_excluded_at_repair_time(self):
+        synthetic_hash = "e" * 64
+        marker_checks = []
+        repaired = []
+
+        result = MODULE.scan(
+            [synthetic_hash],
+            lambda _value: MODULE.MetadataProbe(MODULE.Presence.PRESENT, "active"),
+            lambda _value: MODULE.Presence.MISSING,
+            lambda _value: 404,
+            repair=lambda value: repaired.append(value) is None,
+            vanish_retry_probe=lambda value: (
+                marker_checks.append(value) or MODULE.VanishRetryMarker.OUTSTANDING
+            ),
+            max_repairs=1,
+            confirm_missing_count=1,
+            curated_input=True,
+        )
+
+        self.assertEqual(marker_checks, [synthetic_hash])
+        self.assertEqual(repaired, [])
+        self.assertEqual(result["repairs"], {"excluded_vanish_retry": 1})
+
+    def test_vanish_retry_probe_failure_prevents_repair(self):
+        repaired = []
+
+        result = MODULE.scan(
+            ["f" * 64],
+            lambda _value: MODULE.MetadataProbe(MODULE.Presence.PRESENT, "active"),
+            lambda _value: MODULE.Presence.MISSING,
+            lambda _value: 404,
+            repair=lambda value: repaired.append(value) is None,
+            vanish_retry_probe=lambda _value: MODULE.VanishRetryMarker.ERROR,
+            max_repairs=1,
+            confirm_missing_count=1,
+            curated_input=True,
+        )
+
+        self.assertEqual(repaired, [])
+        self.assertEqual(result["repairs"], {"failed_vanish_retry_probe": 1})
 
     def test_repair_request_requires_credentials_cap_and_confirmed_count(self):
         self.assertIsNotNone(
@@ -358,6 +440,14 @@ class PrivacyTests(unittest.TestCase):
             MODULE.repair_did_not_complete({"repairs": {"skipped_count_mismatch": 0}})
         )
         self.assertTrue(MODULE.repair_did_not_complete({"repairs": {"failed": 1}}))
+        self.assertTrue(
+            MODULE.repair_did_not_complete({"repairs": {"excluded_vanish_retry": 1}})
+        )
+        self.assertTrue(
+            MODULE.repair_did_not_complete(
+                {"repairs": {"failed_vanish_retry_probe": 1}}
+            )
+        )
         self.assertTrue(
             MODULE.repair_did_not_complete(
                 {"repairs": {"failed": 1, "soft_deleted": 1}}
@@ -409,7 +499,10 @@ class ProbeTests(unittest.TestCase):
         missing = MODULE.probe_metadata(session, "store", blob_hash)
         inconsistent = MODULE.probe_metadata(session, "store", blob_hash)
 
-        self.assertEqual(present, MODULE.MetadataProbe(MODULE.Presence.PRESENT, "active", True))
+        self.assertEqual(
+            present,
+            MODULE.MetadataProbe(MODULE.Presence.PRESENT, "active", True, "b" * 64),
+        )
         self.assertEqual(missing, MODULE.MetadataProbe(MODULE.Presence.MISSING))
         self.assertEqual(inconsistent.presence, MODULE.Presence.PRESENT)
         self.assertFalse(inconsistent.consistent)
@@ -461,6 +554,38 @@ class ProbeTests(unittest.TestCase):
         route = MODULE.probe_delivery_route(session, "store", "b" * 64)
 
         self.assertEqual(route, MODULE.DeliveryRoute.ALIAS_ONLY_DERIVED_AUDIO)
+
+    def test_vanish_retry_probe_checks_current_owner_list(self):
+        blob_hash = "b" * 64
+        owner = "c" * 64
+        metadata = {
+            "sha256": blob_hash,
+            "type": "video/mp4",
+            "uploaded": "2026-08-30T00:00:00Z",
+            "owner": owner,
+            "size": 1,
+            "status": "active",
+        }
+        session = Mock()
+        session.get.side_effect = [
+            Mock(status_code=200, json=Mock(return_value=metadata)),
+            Mock(status_code=200, json=Mock(return_value=[blob_hash])),
+            Mock(status_code=200, json=Mock(return_value=metadata)),
+            Mock(status_code=404),
+        ]
+
+        self.assertEqual(
+            MODULE.probe_vanish_retry_marker(session, "store", blob_hash),
+            MODULE.VanishRetryMarker.OUTSTANDING,
+        )
+        self.assertEqual(
+            MODULE.probe_vanish_retry_marker(session, "store", blob_hash),
+            MODULE.VanishRetryMarker.ABSENT,
+        )
+        self.assertIn(
+            MODULE.requests.utils.quote(f"list:{owner}", safe=""),
+            session.get.call_args_list[1].args[0],
+        )
 
 
 class InputAndCliTests(unittest.TestCase):

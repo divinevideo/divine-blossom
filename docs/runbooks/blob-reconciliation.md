@@ -71,7 +71,7 @@ python3 scripts/cleanup_orphan_kv.py \
   --max-repairs APPROVED_CAP
 ```
 
-The second run reclassifies the complete file before the first mutation. It writes nothing if the live candidate count changed or exceeds the cap. Whole-catalogue repair is rejected.
+The second run reclassifies the complete file before the first mutation. It writes nothing if the live candidate count changed or exceeds the cap. Immediately before each soft delete, it also re-reads the blob owner and that owner's blob list. A hash still in the owner list may be retry state for an interrupted account vanish, so the tool excludes it rather than clearing the marker. A failed marker probe also prevents repair. Whole-catalogue repair is rejected.
 Public probes stream and close the response without retaining the body, but the opaque query marker deliberately forces a cold cache fill. Because the deployed delivery cache key includes the query string, each probe can fetch the full object from origin and leave a separate edge entry for its cache lifetime. Treat this as an operational workload and do not use it casually at catalogue scale; the 61-second wait remains required for negative-cache expiry.
 
 ## Classification Meanings
@@ -94,6 +94,6 @@ Public probes stream and close the response without retaining the body, but the 
 
 - Exit `0`: the read-only scan completed, or every approved repair completed.
 - Exit `2`: configuration, input, dependency, bucket validation, or CLI validation failed. No repair scan started.
-- Exit `3`: repair was skipped, partially failed, or did not complete. Some earlier candidates may already have been soft-deleted.
+- Exit `3`: repair was skipped, excluded an outstanding vanish retry, partially failed, or did not complete. Some earlier candidates may already have been soft-deleted.
 
-On exit `3`, retain the private file, inspect the aggregate `repairs` counters, correct the service or authorization failure, and start again with a new read-only count-confirmation run. Repeating the repair command without a fresh first run is not recovery. Soft deletion is idempotent only through the admin API's current contract; verify the live aggregate result rather than assuming a retry completed previous work.
+On exit `3`, retain the private file and inspect the aggregate `repairs` counters. `excluded_vanish_retry` means the hash remained discoverable by account vanish and must not be repaired here. `failed_vanish_retry_probe` means the safety check could not read current metadata or owner-list state. Correct any service or authorization failure, then start again with a new read-only count-confirmation run. Repeating the repair command without a fresh first run is not recovery. Soft deletion is idempotent only through the admin API's current contract; verify the live aggregate result rather than assuming a retry completed previous work.

@@ -41,11 +41,18 @@ class DeliveryRoute(Enum):
     ERROR = "error"
 
 
+class VanishRetryMarker(Enum):
+    OUTSTANDING = "outstanding"
+    ABSENT = "absent"
+    ERROR = "error"
+
+
 @dataclass(frozen=True)
 class MetadataProbe:
     presence: Presence
     status: Optional[str] = None
     consistent: bool = True
+    owner: Optional[str] = None
 
 
 AVAILABLE = "available"
@@ -238,7 +245,13 @@ def probe_metadata(
             and isinstance(payload.get("size"), int)
             and payload.get("size", -1) >= 0
         )
-        return MetadataProbe(Presence.PRESENT, status, consistent)
+        owner = payload.get("owner")
+        return MetadataProbe(
+            Presence.PRESENT,
+            status,
+            consistent,
+            owner.lower() if isinstance(owner, str) else None,
+        )
     except (requests.RequestException, ValueError):
         return MetadataProbe(Presence.ERROR)
 
@@ -287,6 +300,32 @@ def probe_delivery_route(
         DeliveryRoute.ALIAS_ONLY_DERIVED_AUDIO
         if not blob_refs
         else DeliveryRoute.DIRECT
+    )
+
+
+def probe_vanish_retry_marker(
+    session: requests.Session,
+    store_id: str,
+    blob_hash: str,
+) -> VanishRetryMarker:
+    # Account vanish keeps this list entry until all blob erasure work succeeds.
+    metadata = probe_metadata(session, store_id, blob_hash)
+    if (
+        metadata.presence is not Presence.PRESENT
+        or not metadata.consistent
+        or not metadata.owner
+    ):
+        return VanishRetryMarker.ERROR
+
+    list_presence, hashes = probe_json_list(
+        session, store_id, f"list:{metadata.owner}"
+    )
+    if list_presence is Presence.ERROR:
+        return VanishRetryMarker.ERROR
+    return (
+        VanishRetryMarker.OUTSTANDING
+        if blob_hash in hashes
+        else VanishRetryMarker.ABSENT
     )
 
 
@@ -357,6 +396,7 @@ def scan(
     curated_input: bool = False,
     progress: Optional[Callable[[int], None]] = None,
     delivery_route_probe: Optional[Callable[[str], DeliveryRoute]] = None,
+    vanish_retry_probe: Optional[Callable[[str], VanishRetryMarker]] = None,
 ) -> dict[str, object]:
     counts: Counter[str] = Counter()
     action_counts: Counter[str] = Counter()
@@ -391,6 +431,8 @@ def scan(
         raise ValueError("repair requires a curated hash file")
     if repair and confirm_missing_count is None:
         raise ValueError("repair requires the confirmed missing-byte count from a prior scan")
+    if repair and not vanish_retry_probe:
+        raise ValueError("repair requires a live vanish retry marker probe")
     # Curation is the defence against a systematically wrong storage probe.
     # Count equality detects drift between the read-only and repair scans.
     if repair and len(repair_candidates) > max_repairs:
@@ -401,7 +443,13 @@ def scan(
         repair_counts["skipped_count_mismatch"] = len(repair_candidates)
     elif repair:
         for blob_hash in repair_candidates:
-            repair_counts["soft_deleted" if repair(blob_hash) else "failed"] += 1
+            marker = vanish_retry_probe(blob_hash)
+            if marker is VanishRetryMarker.OUTSTANDING:
+                repair_counts["excluded_vanish_retry"] += 1
+            elif marker is VanishRetryMarker.ERROR:
+                repair_counts["failed_vanish_retry_probe"] += 1
+            else:
+                repair_counts["soft_deleted" if repair(blob_hash) else "failed"] += 1
 
     return {
         "total_scanned": sum(counts.values()),
@@ -508,7 +556,7 @@ def validate_repair_request(
 def repair_did_not_complete(result: dict[str, object]) -> bool:
     repairs = result.get("repairs")
     return isinstance(repairs, dict) and any(
-        key.startswith("skipped_") or key == "failed" for key in repairs
+        key.startswith(("skipped_", "excluded_", "failed")) for key in repairs
     )
 
 
@@ -559,6 +607,7 @@ def main() -> int:
     metadata_fn = lambda value: probe_metadata(session, store_id, value)
     storage_fn = lambda value: probe_storage(bucket, value, NotFound)
     delivery_route_fn = lambda value: probe_delivery_route(session, store_id, value)
+    vanish_retry_fn = lambda value: probe_vanish_retry_marker(session, store_id, value)
     public_fn = (
         (lambda value: probe_public(args.public_endpoint, value)) if args.public_endpoint else None
     )
@@ -587,6 +636,7 @@ def main() -> int:
         storage_fn,
         public_probe=public_fn,
         delivery_route_probe=delivery_route_fn,
+        vanish_retry_probe=vanish_retry_fn,
         repair=repair_fn,
         max_repairs=args.max_repairs or 0,
         confirm_missing_count=args.confirm_missing_count,
