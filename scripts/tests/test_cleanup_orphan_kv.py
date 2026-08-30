@@ -1,5 +1,9 @@
+import argparse
 import importlib.util
+import io
 import sys
+import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -196,11 +200,64 @@ class PrivacyTests(unittest.TestCase):
 
         self.assertEqual(
             MODULE.classify_blob(metadata, MODULE.Presence.MISSING),
-            MODULE.PROBE_ERROR,
+            MODULE.UNVERIFIED_MISSING_BYTES,
         )
         self.assertEqual(
             MODULE.classify_blob(metadata, MODULE.Presence.MISSING, 500),
             MODULE.DELIVERY_PATH_FAILURE,
+        )
+
+    def test_alias_only_derived_audio_is_not_a_repair_candidate(self):
+        metadata = MODULE.MetadataProbe(MODULE.Presence.PRESENT, "active")
+
+        self.assertEqual(
+            MODULE.classify_blob(
+                metadata,
+                MODULE.Presence.PRESENT,
+                delivery_route=MODULE.DeliveryRoute.ALIAS_ONLY_DERIVED_AUDIO,
+            ),
+            MODULE.ALIAS_ONLY_DERIVED_AUDIO,
+        )
+        self.assertEqual(
+            MODULE.classify_blob(
+                metadata,
+                MODULE.Presence.ERROR,
+                delivery_route=MODULE.DeliveryRoute.ALIAS_ONLY_DERIVED_AUDIO,
+            ),
+            MODULE.PROBE_ERROR,
+        )
+        self.assertEqual(
+            MODULE.classify_blob(
+                metadata,
+                MODULE.Presence.MISSING,
+                404,
+                MODULE.DeliveryRoute.ALIAS_ONLY_DERIVED_AUDIO,
+            ),
+            MODULE.ALIAS_ONLY_DERIVED_AUDIO,
+        )
+
+    def test_alias_only_derived_audio_skips_the_direct_public_probe(self):
+        public_probe = Mock(return_value=404)
+
+        result = MODULE.scan(
+            ["a" * 64],
+            lambda _value: MODULE.MetadataProbe(MODULE.Presence.PRESENT, "active"),
+            lambda _value: MODULE.Presence.PRESENT,
+            public_probe=public_probe,
+            delivery_route_probe=lambda _value: (
+                MODULE.DeliveryRoute.ALIAS_ONLY_DERIVED_AUDIO
+            ),
+        )
+
+        self.assertEqual(result["counts"], {MODULE.ALIAS_ONLY_DERIVED_AUDIO: 1})
+        public_probe.assert_not_called()
+
+    def test_unknown_status_is_inconsistent_metadata(self):
+        metadata = MODULE.MetadataProbe(MODULE.Presence.PRESENT, "unknown")
+
+        self.assertEqual(
+            MODULE.classify_blob(metadata, MODULE.Presence.PRESENT),
+            MODULE.INCONSISTENT_METADATA,
         )
 
     def test_soft_delete_requires_admin_success(self):
@@ -302,6 +359,239 @@ class PrivacyTests(unittest.TestCase):
             )
         )
         self.assertFalse(MODULE.repair_did_not_complete({"repairs": {"soft_deleted": 1}}))
+
+    def test_progress_reports_counts_without_hashes(self):
+        progress = []
+        hashes = [f"{value:064x}" for value in range(MODULE.PROGRESS_INTERVAL)]
+
+        MODULE.scan(
+            hashes,
+            lambda _value: MODULE.MetadataProbe(MODULE.Presence.PRESENT, "active"),
+            lambda _value: MODULE.Presence.PRESENT,
+            progress=progress.append,
+        )
+
+        self.assertEqual(progress, [MODULE.PROGRESS_INTERVAL])
+
+
+class ProbeTests(unittest.TestCase):
+    def test_fastly_session_retries_rate_limits_and_server_errors(self):
+        session = MODULE.fastly_session("token")
+        retry = session.get_adapter("https://").max_retries
+
+        self.assertEqual(retry.total, 5)
+        self.assertEqual(set(retry.status_forcelist), set(MODULE.RETRY_STATUS))
+        self.assertEqual(set(retry.allowed_methods), {"GET"})
+
+    def test_probe_metadata_handles_present_missing_and_inconsistent_records(self):
+        blob_hash = "a" * 64
+        valid = {
+            "sha256": blob_hash,
+            "type": "video/mp4",
+            "uploaded": "2026-08-30T00:00:00Z",
+            "owner": "b" * 64,
+            "size": 1,
+            "status": "active",
+        }
+        session = Mock()
+        session.get.side_effect = [
+            Mock(status_code=200, json=Mock(return_value=valid)),
+            Mock(status_code=404),
+            Mock(status_code=200, json=Mock(return_value=[])),
+        ]
+
+        present = MODULE.probe_metadata(session, "store", blob_hash)
+        missing = MODULE.probe_metadata(session, "store", blob_hash)
+        inconsistent = MODULE.probe_metadata(session, "store", blob_hash)
+
+        self.assertEqual(present, MODULE.MetadataProbe(MODULE.Presence.PRESENT, "active", True))
+        self.assertEqual(missing, MODULE.MetadataProbe(MODULE.Presence.MISSING))
+        self.assertEqual(inconsistent.presence, MODULE.Presence.PRESENT)
+        self.assertFalse(inconsistent.consistent)
+
+    def test_probe_metadata_turns_request_failures_into_probe_errors(self):
+        session = Mock()
+        session.get.side_effect = MODULE.requests.RequestException("rate limited")
+
+        self.assertEqual(
+            MODULE.probe_metadata(session, "store", "a" * 64),
+            MODULE.MetadataProbe(MODULE.Presence.ERROR),
+        )
+
+    def test_probe_storage_distinguishes_missing_object_from_other_errors(self):
+        class NotFound(Exception):
+            pass
+
+        missing_bucket = Mock()
+        missing_bucket.blob.return_value.reload.side_effect = NotFound()
+        error_bucket = Mock()
+        error_bucket.blob.return_value.reload.side_effect = RuntimeError("denied")
+
+        self.assertEqual(
+            MODULE.probe_storage(missing_bucket, "a" * 64, NotFound),
+            MODULE.Presence.MISSING,
+        )
+        self.assertEqual(
+            MODULE.probe_storage(error_bucket, "a" * 64, NotFound),
+            MODULE.Presence.ERROR,
+        )
+
+    def test_bucket_validation_distinguishes_wrong_bucket_from_missing_object(self):
+        class NotFound(Exception):
+            pass
+
+        client = Mock()
+        client.get_bucket.side_effect = NotFound()
+
+        with self.assertRaisesRegex(ValueError, "configured GCS bucket does not exist"):
+            MODULE.get_bucket(client, "wrong-bucket", NotFound)
+
+    def test_delivery_route_detects_alias_only_audio(self):
+        session = Mock()
+        session.get.side_effect = [
+            Mock(status_code=200, json=Mock(return_value=["a" * 64])),
+            Mock(status_code=404),
+        ]
+
+        route = MODULE.probe_delivery_route(session, "store", "b" * 64)
+
+        self.assertEqual(route, MODULE.DeliveryRoute.ALIAS_ONLY_DERIVED_AUDIO)
+
+
+class InputAndCliTests(unittest.TestCase):
+    def test_hash_file_ignores_comments_deduplicates_and_rejects_invalid_hashes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "hashes.txt"
+            path.write_text(f"# private\n{'a' * 64}\n{'A' * 64}\n\n", encoding="utf-8")
+            self.assertEqual(MODULE.read_hash_file(path), ["a" * 64])
+            path.write_text("not-a-hash\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "invalid SHA-256"):
+                MODULE.read_hash_file(path)
+
+    def test_listing_follows_pagination_and_deduplicates_hashes(self):
+        first_hash = "1" * 64
+        second_hash = "2" * 64
+        session = Mock()
+        session.get.side_effect = [
+            Mock(
+                json=Mock(
+                    return_value={
+                        "data": [f"blob:{first_hash}", {"name": "not-a-blob"}],
+                        "meta": {"next_cursor": "next"},
+                    }
+                )
+            ),
+            Mock(
+                json=Mock(
+                    return_value={
+                        "data": [{"key": f"blob:{first_hash}"}, f"blob:{second_hash}"],
+                        "meta": {},
+                    }
+                )
+            ),
+        ]
+
+        hashes = MODULE.list_blob_hashes(session, "store", None)
+
+        self.assertEqual(hashes, [first_hash, second_hash])
+        self.assertEqual(session.get.call_args_list[1].kwargs["params"]["cursor"], "next")
+
+    def test_cli_rejects_ignored_flag_combinations(self):
+        cases = [
+            ["--hash-file", "private.txt", "--hex-prefix", "ab"],
+            ["--all", "--max-repairs", "1"],
+            ["--all", "--confirm-missing-count", "1"],
+            [
+                "--all",
+                "--repair-missing-bytes",
+                "--public-endpoint",
+                "https://media.example",
+                "--max-repairs",
+                "1",
+                "--confirm-missing-count",
+                "1",
+            ],
+        ]
+
+        for argv in cases:
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(MODULE.validate_cli_request(MODULE.parse_args(argv)))
+
+
+class MainExitCodeTests(unittest.TestCase):
+    @staticmethod
+    def args(repair=False):
+        return argparse.Namespace(
+            hash_file=Path("private.txt"),
+            all=False,
+            hex_prefix=None,
+            limit=None,
+            public_endpoint="https://media.example" if repair else None,
+            repair_missing_bytes=repair,
+            max_repairs=1 if repair else None,
+            confirm_missing_count=1 if repair else None,
+        )
+
+    @staticmethod
+    def google_modules():
+        google = types.ModuleType("google")
+        cloud = types.ModuleType("google.cloud")
+        storage = types.ModuleType("google.cloud.storage")
+        api_core = types.ModuleType("google.api_core")
+        exceptions = types.ModuleType("google.api_core.exceptions")
+
+        class NotFound(Exception):
+            pass
+
+        storage.Client = Mock
+        exceptions.NotFound = NotFound
+        google.cloud = cloud
+        google.api_core = api_core
+        cloud.storage = storage
+        api_core.exceptions = exceptions
+        return {
+            "google": google,
+            "google.cloud": cloud,
+            "google.cloud.storage": storage,
+            "google.api_core": api_core,
+            "google.api_core.exceptions": exceptions,
+        }
+
+    def run_main(self, repair, result):
+        environment = {
+            "FASTLY_API_TOKEN": "fastly-token",
+            "KV_STORE_ID": "store",
+            "GCS_BUCKET": "expected-bucket",
+            "FASTLY_ADMIN_TOKEN": "admin-token",
+            "BLOSSOM_ADMIN_ENDPOINT": "https://admin.example",
+        }
+        with (
+            patch.object(MODULE, "parse_args", return_value=self.args(repair)),
+            patch.object(MODULE, "read_hash_file", return_value=["a" * 64]),
+            patch.object(MODULE, "fastly_session", return_value=Mock()),
+            patch.object(MODULE, "get_bucket", return_value=Mock()),
+            patch.object(MODULE, "scan", return_value=result),
+            patch.object(MODULE.sys, "stdout", new=io.StringIO()),
+            patch.object(MODULE.sys, "stderr", new=io.StringIO()),
+            patch.dict(MODULE.os.environ, environment, clear=True),
+            patch.dict(sys.modules, self.google_modules()),
+        ):
+            return MODULE.main()
+
+    def test_main_returns_success_for_read_only_scan(self):
+        self.assertEqual(self.run_main(False, {"repairs": {}}), 0)
+
+    def test_main_returns_partial_failure_for_incomplete_repair(self):
+        self.assertEqual(self.run_main(True, {"repairs": {"failed": 1}}), 3)
+
+    def test_main_returns_usage_error_before_network_work(self):
+        args = self.args(False)
+        args.max_repairs = 1
+        with (
+            patch.object(MODULE, "parse_args", return_value=args),
+            patch.object(MODULE.sys, "stderr", new=io.StringIO()),
+        ):
+            self.assertEqual(MODULE.main(), 2)
 
 
 if __name__ == "__main__":
