@@ -7,6 +7,8 @@ the stale metadata through the existing admin API from a curated hash file;
 whole-store scans are always read-only. All other classes are
 read-only because reconstructing metadata or changing moderation state without
 their original evidence would weaken access controls.
+
+Dependencies: pip install requests google-cloud-storage
 """
 
 from __future__ import annotations
@@ -316,9 +318,13 @@ def probe_public(endpoint: str, blob_hash: str) -> Optional[int]:
             f"{endpoint.rstrip('/')}/{blob_hash}?_={cache_buster}",
             headers={"Range": "bytes=0-0", "Cache-Control": "no-cache"},
             allow_redirects=False,
+            stream=True,
             timeout=15,
         )
-        return response.status_code
+        try:
+            return response.status_code
+        finally:
+            response.close()
     except requests.RequestException:
         return -1
 
@@ -455,12 +461,27 @@ def validate_cli_request(args: argparse.Namespace) -> Optional[str]:
     else:
         if not args.hash_file:
             return "--repair-missing-bytes requires --hash-file; --all is read-only"
+        if args.limit is not None:
+            return "--limit cannot be used with --repair-missing-bytes"
         if not args.public_endpoint:
             return "--repair-missing-bytes requires --public-endpoint"
-        if args.max_repairs is None or args.max_repairs < 1:
-            return "--repair-missing-bytes requires a positive --max-repairs"
-        if args.confirm_missing_count is None or args.confirm_missing_count < 1:
-            return "--repair-missing-bytes requires a positive --confirm-missing-count"
+        repair_error = validate_repair_parameters(
+            args.max_repairs, args.confirm_missing_count
+        )
+        if repair_error:
+            return repair_error
+    return None
+
+
+def validate_repair_parameters(
+    max_repairs: Optional[int], confirm_missing_count: Optional[int]
+) -> Optional[str]:
+    if max_repairs is None or max_repairs < 1:
+        return "repair requires a positive --max-repairs cap"
+    if confirm_missing_count is None or confirm_missing_count < 1:
+        return "repair requires a positive --confirm-missing-count from a prior scan"
+    if confirm_missing_count > max_repairs:
+        return "--confirm-missing-count cannot exceed --max-repairs"
     return None
 
 
@@ -481,13 +502,7 @@ def validate_repair_request(
         return "repair requires --public-endpoint to rule out replica-served bytes"
     if not curated_input:
         return "repair requires --hash-file; --all is read-only"
-    if max_repairs is None or max_repairs < 1:
-        return "repair requires a positive --max-repairs cap"
-    if confirm_missing_count is None or confirm_missing_count < 1:
-        return "repair requires a positive --confirm-missing-count from a prior scan"
-    if confirm_missing_count > max_repairs:
-        return "--confirm-missing-count cannot exceed --max-repairs"
-    return None
+    return validate_repair_parameters(max_repairs, confirm_missing_count)
 
 
 def repair_did_not_complete(result: dict[str, object]) -> bool:

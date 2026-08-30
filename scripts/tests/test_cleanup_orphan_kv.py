@@ -113,8 +113,10 @@ class ClassificationTests(unittest.TestCase):
             f"https://media.example/{synthetic_hash}?_=cache-buster",
             headers={"Range": "bytes=0-0", "Cache-Control": "no-cache"},
             allow_redirects=False,
+            stream=True,
             timeout=15,
         )
+        response.close.assert_called_once_with()
         self.assertEqual(public_status, 206)
         self.assertEqual(
             MODULE.classify_blob(repaired, MODULE.Presence.PRESENT, public_status),
@@ -526,6 +528,19 @@ class InputAndCliTests(unittest.TestCase):
             ["--all", "--confirm-missing-count", "1"],
             [
                 "--all",
+                "--repair-missing-bytes",
+                "--public-endpoint",
+                "https://media.example",
+                "--max-repairs",
+                "1",
+                "--confirm-missing-count",
+                "1",
+            ],
+            [
+                "--hash-file",
+                "private.txt",
+                "--limit",
+                "1",
                 "--repair-missing-bytes",
                 "--public-endpoint",
                 "https://media.example",

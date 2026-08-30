@@ -2,6 +2,12 @@
 
 Use `scripts/cleanup_orphan_kv.py` to classify event-referenced blobs without printing their hashes. Catalogue scans are read-only. Repair is limited to a private, curated hash file and soft-deletes metadata only when storage bytes are missing and the normal direct delivery path also returns 404.
 
+Install the operator dependencies before running the tool:
+
+```bash
+python3 -m pip install requests google-cloud-storage
+```
+
 ## Required Configuration
 
 Read-only scans require:
@@ -66,7 +72,7 @@ python3 scripts/cleanup_orphan_kv.py \
 ```
 
 The second run reclassifies the complete file before the first mutation. It writes nothing if the live candidate count changed or exceeds the cap. Whole-catalogue repair is rejected.
-Public probes also add an opaque query marker and request cache revalidation. Treat that as additional protection, not a substitute for the wait, unless the deployed delivery cache key is verified to include the query string.
+Public probes stream and close the response without retaining the body, but the opaque query marker deliberately forces a cold cache fill. Because the deployed delivery cache key includes the query string, each probe can fetch the full object from origin and leave a separate edge entry for its cache lifetime. Treat this as an operational workload and do not use it casually at catalogue scale; the 61-second wait remains required for negative-cache expiry.
 
 ## Classification Meanings
 
