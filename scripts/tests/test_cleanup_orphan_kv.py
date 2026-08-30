@@ -103,12 +103,15 @@ class ClassificationTests(unittest.TestCase):
             MODULE.MISSING_METADATA,
         )
         response = Mock(status_code=206)
-        with patch.object(MODULE.requests, "get", return_value=response) as request:
+        with (
+            patch.object(MODULE.secrets, "token_hex", return_value="cache-buster"),
+            patch.object(MODULE.requests, "get", return_value=response) as request,
+        ):
             public_status = MODULE.probe_public("https://media.example", synthetic_hash)
 
         request.assert_called_once_with(
-            f"https://media.example/{synthetic_hash}",
-            headers={"Range": "bytes=0-0"},
+            f"https://media.example/{synthetic_hash}?reconcile_probe=cache-buster",
+            headers={"Range": "bytes=0-0", "Cache-Control": "no-cache"},
             allow_redirects=False,
             timeout=15,
         )
@@ -495,6 +498,26 @@ class InputAndCliTests(unittest.TestCase):
 
         self.assertEqual(hashes, [first_hash, second_hash])
         self.assertEqual(session.get.call_args_list[1].kwargs["params"]["cursor"], "next")
+
+    def test_listing_pushes_prefix_and_limit_into_fastly_requests(self):
+        first_hash = "ab" + "1" * 62
+        session = Mock()
+        session.get.return_value = Mock(
+            json=Mock(
+                return_value={
+                    "data": [f"blob:{first_hash}"],
+                    "meta": {"next_cursor": "unused"},
+                }
+            )
+        )
+
+        hashes = MODULE.list_blob_hashes(session, "store", "ab", 1)
+
+        self.assertEqual(hashes, [first_hash])
+        self.assertEqual(
+            session.get.call_args.kwargs["params"],
+            {"limit": 1, "prefix": "blob:ab"},
+        )
 
     def test_cli_rejects_ignored_flag_combinations(self):
         cases = [

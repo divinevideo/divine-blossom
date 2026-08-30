@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import sys
 from collections import Counter
 from dataclasses import dataclass
@@ -171,11 +172,14 @@ def list_blob_hashes(
     session: requests.Session,
     store_id: str,
     hex_prefix: Optional[str],
+    limit: Optional[int] = None,
 ) -> list[str]:
     hashes: list[str] = []
+    seen: set[str] = set()
     cursor: Optional[str] = None
     while True:
-        params = {"limit": 1000, "prefix": "blob:"}
+        page_limit = min(1000, limit - len(hashes)) if limit else 1000
+        params = {"limit": page_limit, "prefix": f"blob:{hex_prefix or ''}"}
         if cursor:
             params["cursor"] = cursor
         response = session.get(
@@ -193,8 +197,11 @@ def list_blob_hashes(
                 blob_hash = validate_hash(key.removeprefix("blob:"))
             except ValueError:
                 continue
-            if hex_prefix is None or blob_hash.startswith(hex_prefix):
+            if (hex_prefix is None or blob_hash.startswith(hex_prefix)) and blob_hash not in seen:
+                seen.add(blob_hash)
                 hashes.append(blob_hash)
+                if limit and len(hashes) >= limit:
+                    return hashes
         cursor = payload.get("meta", {}).get("next_cursor")
         if not cursor:
             return list(dict.fromkeys(hashes))
@@ -303,10 +310,11 @@ def probe_storage(
 
 
 def probe_public(endpoint: str, blob_hash: str) -> Optional[int]:
+    cache_buster = secrets.token_hex(8)
     try:
         response = requests.get(
-            f"{endpoint.rstrip('/')}/{blob_hash}",
-            headers={"Range": "bytes=0-0"},
+            f"{endpoint.rstrip('/')}/{blob_hash}?reconcile_probe={cache_buster}",
+            headers={"Range": "bytes=0-0", "Cache-Control": "no-cache"},
             allow_redirects=False,
             timeout=15,
         )
@@ -508,7 +516,7 @@ def main() -> int:
         hashes = (
             read_hash_file(args.hash_file)
             if args.hash_file
-            else list_blob_hashes(session, store_id, args.hex_prefix)
+            else list_blob_hashes(session, store_id, args.hex_prefix, args.limit)
         )
     except (OSError, ValueError, requests.RequestException) as error:
         print(str(error), file=sys.stderr)

@@ -9,7 +9,7 @@ Read-only scans require:
 - `FASTLY_API_TOKEN`: read access to the Fastly KV store.
 - `KV_STORE_ID`: the Fastly KV store containing `blob:*` metadata.
 - `GCS_BUCKET`: the exact GCS bucket to inspect. The script validates that the bucket exists before scanning.
-- Google application-default credentials with permission to read object metadata from that bucket.
+- Google application-default credentials with `storage.buckets.get` and permission to read object metadata from that bucket.
 
 Repair also requires:
 
@@ -42,6 +42,8 @@ python3 scripts/cleanup_orphan_kv.py --all --hex-prefix 0a --limit 1000
 
 Progress is written to stderr as aggregate `scanned=N` counters. The final JSON contains counts and recommended actions only.
 
+A catalogue scan makes several service requests per blob. Start with `--hex-prefix` and `--limit`, which are pushed into Fastly pagination, then expand deliberately. Schedule a full `--all --public-endpoint` run as an operational workload rather than an interactive sample.
+
 ## Two-Run Repair Protocol
 
 1. Curate a private hash file from authorized incident evidence.
@@ -63,6 +65,7 @@ python3 scripts/cleanup_orphan_kv.py \
 ```
 
 The second run reclassifies the complete file before the first mutation. It writes nothing if the live candidate count changed or exceeds the cap. Whole-catalogue repair is rejected.
+Public probes add a unique query marker and request cache revalidation, so the repair run cannot reuse the read-only run's cached 404 as independent evidence.
 
 ## Classification Meanings
 
