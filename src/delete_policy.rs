@@ -70,6 +70,10 @@ impl VanishBlobOps for DefaultCreatorDeleteOps {
         crate::metadata::remove_from_blob_refs(hash, pubkey)
     }
 
+    fn put_erasure_evidence(&self, hash: &str) -> Result<()> {
+        crate::metadata::put_erasure_evidence(hash)
+    }
+
     fn delete_blob_metadata(&self, hash: &str) -> Result<()> {
         crate::metadata::delete_blob_metadata(hash)
     }
