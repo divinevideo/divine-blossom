@@ -31,7 +31,7 @@ credentials, and optionally `GCS_BUCKET`. It reports:
 - `incomplete`: the canonical object or a deterministic thumbnail, HLS, or
   transcript object exists, whether or not evidence exists. The command exits
   nonzero.
-- `not_recorded`: no evidence exists, even if every probed object is absent.
+- `not_recorded`: no evidence exists and every probed object is absent.
 
 The audit is explicit-hash only. Erasure evidence is intentionally not an
 enumerable replacement for deleted blob or account metadata.
