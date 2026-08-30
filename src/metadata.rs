@@ -1432,6 +1432,14 @@ mod tests {
     }
 
     #[test]
+    fn erasure_evidence_key_matches_audit_golden_vector() {
+        assert_eq!(
+            erasure_evidence_key(&"a".repeat(64)),
+            "erasure:v1:60af600bf402ba1507822131764b39002f969d1fc122f1eda3e7491509505437"
+        );
+    }
+
+    #[test]
     fn stale_generation_only_rejects_older_known_generations() {
         assert!(stale_generation(Some(4), Some(5)));
         assert!(!stale_generation(Some(5), Some(5)));

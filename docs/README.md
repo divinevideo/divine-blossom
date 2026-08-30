@@ -14,6 +14,7 @@ This directory is the index for repository documentation. Current docs first, hi
 - [docs/cdn-object-storage-vendor-notes.md](cdn-object-storage-vendor-notes.md) — CDN and object-storage vendor capability notes
 - [docs/measurements/](measurements/) — synthetic CDN and delivery measurements
 - [docs/derivative-status-queue.md](derivative-status-queue.md) — Cloud Tasks rollout notes for derivative status callbacks
+- [docs/erasure-evidence.md](erasure-evidence.md) — durable vanish evidence and aggregate-only erasure audit
 
 ## Historical
 
