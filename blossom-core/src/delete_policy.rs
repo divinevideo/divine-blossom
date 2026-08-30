@@ -610,7 +610,22 @@ mod tests {
             .expect("metadata-less retry should converge");
 
         assert_eq!(retry_outcome, VanishBlobOutcome::FullyDeleted);
-        assert!(first.calls.borrow().contains(&"remove_from_user_list"));
+        assert_eq!(
+            *first.calls.borrow(),
+            vec![
+                "get_blob_metadata",
+                "remove_from_blob_refs",
+                "cleanup_derived_audio",
+                "delete_blob_from_gcs",
+                "delete_blob_from_replica",
+                "delete_blob_gcs_artifacts",
+                "purge_vcl_cache",
+                "put_erasure_evidence",
+                "delete_blob_kv_artifacts",
+                "remove_from_recent_index",
+                "remove_from_user_list",
+            ]
+        );
     }
 
     #[test]

@@ -56,10 +56,10 @@ def existing_objects(bucket, sha256: str) -> list[str]:
 
 
 def classify_erasure(evidence: Optional[dict], survivors: list[str]) -> str:
-    if evidence is None:
-        return "not_recorded"
     if survivors:
         return "incomplete"
+    if evidence is None:
+        return "not_recorded"
     return "complete"
 
 
