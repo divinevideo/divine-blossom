@@ -581,8 +581,10 @@ class ProbeTests(unittest.TestCase):
         session = Mock()
         session.get.side_effect = [
             Mock(status_code=200, json=Mock(return_value=metadata)),
+            Mock(status_code=404),
             Mock(status_code=200, json=Mock(return_value=[blob_hash])),
             Mock(status_code=200, json=Mock(return_value=metadata)),
+            Mock(status_code=404),
             Mock(status_code=404),
         ]
 
@@ -596,8 +598,146 @@ class ProbeTests(unittest.TestCase):
         )
         self.assertIn(
             MODULE.requests.utils.quote(f"list:{owner}", safe=""),
-            session.get.call_args_list[1].args[0],
+            session.get.call_args_list[2].args[0],
         )
+
+    def test_vanish_retry_probe_checks_referrer_lists(self):
+        blob_hash = "d" * 64
+        owner = "e" * 64
+        referrer = "f" * 64
+        metadata = {
+            "sha256": blob_hash,
+            "type": "video/mp4",
+            "uploaded": "2026-08-30T00:00:00Z",
+            "owner": owner,
+            "size": 1,
+            "status": "active",
+        }
+        session = Mock()
+        session.get.side_effect = [
+            Mock(status_code=200, json=Mock(return_value=metadata)),
+            Mock(status_code=200, json=Mock(return_value=[referrer])),
+            Mock(status_code=404),
+            Mock(status_code=200, json=Mock(return_value=[blob_hash])),
+        ]
+
+        self.assertEqual(
+            MODULE.probe_vanish_retry_marker(session, "store", blob_hash),
+            MODULE.VanishRetryMarker.OUTSTANDING,
+        )
+        self.assertIn(
+            MODULE.requests.utils.quote(f"list:{referrer}", safe=""),
+            session.get.call_args_list[3].args[0],
+        )
+
+    def test_vanish_retry_probe_fails_closed_on_invalid_state_or_list_error(self):
+        blob_hash = "a" * 64
+        owner = "b" * 64
+        valid_metadata = {
+            "sha256": blob_hash,
+            "type": "video/mp4",
+            "uploaded": "2026-08-30T00:00:00Z",
+            "owner": owner,
+            "size": 1,
+            "status": "active",
+        }
+        cases = [
+            [Mock(status_code=404)],
+            [Mock(status_code=200, json=Mock(return_value=[]))],
+            [
+                Mock(status_code=200, json=Mock(return_value=valid_metadata)),
+                Mock(status_code=200, json=Mock(return_value={})),
+            ],
+            [
+                Mock(status_code=200, json=Mock(return_value=valid_metadata)),
+                Mock(status_code=404),
+                Mock(status_code=200, json=Mock(return_value={})),
+            ],
+        ]
+
+        for responses in cases:
+            with self.subTest(responses=len(responses)):
+                session = Mock()
+                session.get.side_effect = responses
+                self.assertEqual(
+                    MODULE.probe_vanish_retry_marker(session, "store", blob_hash),
+                    MODULE.VanishRetryMarker.ERROR,
+                )
+
+    def test_vanish_retry_probe_refuses_status_changed_after_classification(self):
+        blob_hash = "a" * 64
+        current_metadata = {
+            "sha256": blob_hash,
+            "type": "video/mp4",
+            "uploaded": "2026-08-30T00:00:00Z",
+            "owner": "b" * 64,
+            "size": 1,
+            "status": "deleted",
+        }
+        session = Mock()
+        session.get.return_value = Mock(
+            status_code=200, json=Mock(return_value=current_metadata)
+        )
+        repaired = []
+
+        result = MODULE.scan(
+            [blob_hash],
+            lambda _value: MODULE.MetadataProbe(MODULE.Presence.PRESENT, "active"),
+            lambda _value: MODULE.Presence.MISSING,
+            lambda _value: 404,
+            repair=lambda value: repaired.append(value) is None,
+            vanish_retry_probe=lambda value: MODULE.probe_vanish_retry_marker(
+                session, "store", value
+            ),
+            max_repairs=1,
+            confirm_missing_count=1,
+            curated_input=True,
+        )
+
+        self.assertEqual(repaired, [])
+        self.assertEqual(result["repairs"], {"failed_vanish_retry_probe": 1})
+        self.assertEqual(session.get.call_count, 1)
+
+    def test_vanish_retry_probe_rechecks_shared_lists_for_each_candidate(self):
+        hashes = ["1" * 64, "2" * 64]
+        owner = "3" * 64
+        referrer = "4" * 64
+        session = Mock()
+        responses = []
+        for blob_hash in hashes:
+            responses.extend(
+                [
+                    Mock(
+                        status_code=200,
+                        json=Mock(
+                            return_value={
+                                "sha256": blob_hash,
+                                "type": "video/mp4",
+                                "uploaded": "2026-08-30T00:00:00Z",
+                                "owner": owner,
+                                "size": 1,
+                                "status": "active",
+                            }
+                        ),
+                    ),
+                    Mock(status_code=200, json=Mock(return_value=[referrer])),
+                    Mock(status_code=404),
+                    Mock(status_code=404),
+                ]
+            )
+        session.get.side_effect = responses
+
+        for blob_hash in hashes:
+            self.assertEqual(
+                MODULE.probe_vanish_retry_marker(session, "store", blob_hash),
+                MODULE.VanishRetryMarker.ABSENT,
+            )
+
+        owner_list_url = MODULE.requests.utils.quote(f"list:{owner}", safe="")
+        referrer_list_url = MODULE.requests.utils.quote(f"list:{referrer}", safe="")
+        requested_urls = [call.args[0] for call in session.get.call_args_list]
+        self.assertEqual(sum(owner_list_url in url for url in requested_urls), 2)
+        self.assertEqual(sum(referrer_list_url in url for url in requested_urls), 2)
 
 
 class InputAndCliTests(unittest.TestCase):

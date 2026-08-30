@@ -308,25 +308,30 @@ def probe_vanish_retry_marker(
     store_id: str,
     blob_hash: str,
 ) -> VanishRetryMarker:
-    # Account vanish keeps this list entry until all blob erasure work succeeds.
+    # TODO(#246): Replace list membership with a vanish-specific durable marker.
+    # Account vanish keeps these entries until all blob erasure work succeeds.
     metadata = probe_metadata(session, store_id, blob_hash)
     if (
         metadata.presence is not Presence.PRESENT
         or not metadata.consistent
         or not metadata.owner
+        or metadata.status != "active"
     ):
         return VanishRetryMarker.ERROR
 
-    list_presence, hashes = probe_json_list(
-        session, store_id, f"list:{metadata.owner}"
-    )
-    if list_presence is Presence.ERROR:
+    refs_presence, referrers = probe_json_list(session, store_id, f"refs:{blob_hash}")
+    if refs_presence is Presence.ERROR:
         return VanishRetryMarker.ERROR
-    return (
-        VanishRetryMarker.OUTSTANDING
-        if blob_hash in hashes
-        else VanishRetryMarker.ABSENT
-    )
+
+    # Do not cache lists across candidates: each repair mutates them, and a
+    # concurrent vanish must be visible to the next candidate's live probe.
+    for pubkey in dict.fromkeys([metadata.owner, *referrers]):
+        list_presence, hashes = probe_json_list(session, store_id, f"list:{pubkey}")
+        if list_presence is Presence.ERROR:
+            return VanishRetryMarker.ERROR
+        if blob_hash in hashes:
+            return VanishRetryMarker.OUTSTANDING
+    return VanishRetryMarker.ABSENT
 
 
 def get_bucket(client: object, bucket_name: str, not_found_type: type[Exception]) -> object:
