@@ -485,10 +485,15 @@ pub(crate) fn cleanup_derived_audio_for_source(source_hash: &str) -> Result<()> 
     let blob_refs = get_blob_refs(&mapping.audio_sha256)?;
 
     if should_delete_derived_audio_blob(&remaining_audio_sources, &blob_refs) {
-        storage_delete(&mapping.audio_sha256)?;
+        // Cloud Run rechecks the main object as well as every derivative, so a
+        // failed direct main-object delete is resolved only by verified cleanup.
+        let _ = storage_delete(&mapping.audio_sha256);
+        let derivative_result = delete_blob_gcs_artifacts(&mapping.audio_sha256);
         let replica_result = storage::delete_blob_from_fos(&mapping.audio_sha256);
         purge_edge_cache(&mapping.audio_sha256);
+        derivative_result?;
         replica_result?;
+        delete_blob_kv_artifacts(&mapping.audio_sha256);
         delete_blob_metadata(&mapping.audio_sha256)?;
     }
     delete_audio_source_refs(&mapping.audio_sha256)?;

@@ -1637,10 +1637,18 @@ pub fn write_audit_log(
 }
 
 /// Ask Cloud Run to delete and verify all GCS objects associated with a hash.
+fn cloud_run_delete_blob_body(hash: &str, expected_bucket: &str) -> String {
+    serde_json::json!({
+        "hash": hash,
+        "expected_bucket": expected_bucket,
+    })
+    .to_string()
+}
+
 pub fn trigger_cloud_run_delete_blob(hash: &str) -> Result<()> {
     let webhook_secret = get_secret("webhook_secret")?;
-
-    let body = format!(r#"{{"hash":"{}"}}"#, hash);
+    let expected_bucket = get_config("gcs_bucket")?;
+    let body = cloud_run_delete_blob_body(hash, &expected_bucket);
 
     const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
     let mut req = Request::new(
@@ -1895,13 +1903,22 @@ pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtracti
 #[cfg(test)]
 mod tests {
     use super::{
-        build_fos_delete_request, normalize_storage_cache_state,
+        build_fos_delete_request, cloud_run_delete_blob_body, normalize_storage_cache_state,
         parse_audio_extraction_error_response, parse_funnelcake_audio_reuse_response,
         prepare_storage_cache_miss, preserve_storage_cache_state, S3Config, FOS_BACKEND,
         STORAGE_CACHE_HEADER,
     };
     use fastly::http::header;
     use fastly::{Request, Response};
+
+    #[test]
+    fn cloud_cleanup_request_carries_the_edge_bucket() {
+        let body = cloud_run_delete_blob_body(&"a".repeat(64), "configured-bucket");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        assert_eq!(value["hash"], "a".repeat(64));
+        assert_eq!(value["expected_bucket"], "configured-bucket");
+    }
 
     #[test]
     fn fos_delete_request_uses_the_replica_backend_address_and_delete_method() {

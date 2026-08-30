@@ -228,6 +228,7 @@ struct MigrateResponse {
 #[derive(Deserialize)]
 struct DeleteBlobRequest {
     hash: String,
+    expected_bucket: String,
 }
 
 #[derive(Serialize)]
@@ -414,6 +415,10 @@ fn cleanup_response_status(status: cleanup::CleanupStatus) -> StatusCode {
     }
 }
 
+fn cleanup_bucket_matches(expected_bucket: &str, configured_bucket: &str) -> bool {
+    expected_bucket == configured_bucket
+}
+
 async fn handle_delete_blob(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -438,6 +443,13 @@ async fn handle_delete_blob(
             StatusCode::BAD_REQUEST,
             cleanup::CleanupStatus::Permanent,
             "hash must be 64 hexadecimal characters",
+        );
+    }
+    if !cleanup_bucket_matches(&request.expected_bucket, &state.config.gcs_bucket) {
+        return cleanup_error(
+            StatusCode::CONFLICT,
+            cleanup::CleanupStatus::Retryable,
+            "cleanup bucket does not match the edge configuration",
         );
     }
 
@@ -1563,8 +1575,9 @@ async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_invalid_media_signal, cleanup_response_status, media_source_candidates,
-        needs_derivative_sanitize, new_temp_media_path, validate_webhook_auth, video_thumbnail_url,
+        classify_invalid_media_signal, cleanup_bucket_matches, cleanup_response_status,
+        media_source_candidates, needs_derivative_sanitize, new_temp_media_path,
+        validate_webhook_auth, video_thumbnail_url,
     };
     use axum::http::{header, HeaderMap, HeaderValue};
 
@@ -1582,6 +1595,12 @@ mod tests {
             cleanup_response_status(crate::cleanup::CleanupStatus::Permanent),
             axum::http::StatusCode::BAD_REQUEST
         );
+    }
+
+    #[test]
+    fn cleanup_requires_the_edge_and_cloud_run_bucket_to_match() {
+        assert!(cleanup_bucket_matches("media", "media"));
+        assert!(!cleanup_bucket_matches("edge-media", "cloud-media"));
     }
 
     #[test]
