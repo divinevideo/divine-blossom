@@ -308,7 +308,7 @@ def probe_vanish_retry_marker(
     store_id: str,
     blob_hash: str,
 ) -> VanishRetryMarker:
-    # TODO(#246): Replace list membership with a vanish-specific durable marker.
+    # TODO(#256): Replace list membership with a vanish-specific durable marker.
     # Account vanish keeps these entries until all blob erasure work succeeds.
     metadata = probe_metadata(session, store_id, blob_hash)
     if (
