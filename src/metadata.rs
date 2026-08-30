@@ -8,6 +8,7 @@ use crate::error::{BlossomError, Result};
 use fastly::cache::simple as simple_cache;
 use fastly::kv_store::{KVStore, KVStoreError};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// TTL for cached metadata (5 minutes) — short because moderation status can change
@@ -205,7 +206,10 @@ pub fn add_to_user_list(pubkey: &str, hash: &str) -> Result<()> {
     for attempt in 0..5 {
         let mut hashes = get_user_blobs(pubkey)?;
 
-        if hashes.contains(&hash_lower) {
+        if hashes
+            .iter()
+            .any(|entry| entry.eq_ignore_ascii_case(&hash_lower))
+        {
             // Already in list, nothing to do
             return Ok(());
         }
@@ -240,12 +244,15 @@ pub fn remove_from_user_list(pubkey: &str, hash: &str) -> Result<()> {
     for attempt in 0..5 {
         let mut hashes = get_user_blobs(pubkey)?;
 
-        if !hashes.contains(&hash_lower) {
+        if !hashes
+            .iter()
+            .any(|entry| entry.eq_ignore_ascii_case(&hash_lower))
+        {
             // Not in list, nothing to do
             return Ok(());
         }
 
-        hashes.retain(|h| h != &hash_lower);
+        hashes.retain(|entry| !entry.eq_ignore_ascii_case(&hash_lower));
 
         match put_user_list(pubkey, &hashes) {
             Ok(()) => return Ok(()),
@@ -259,6 +266,50 @@ pub fn remove_from_user_list(pubkey: &str, hash: &str) -> Result<()> {
 
     Err(BlossomError::MetadataError(
         "Max retries exceeded for list removal".into(),
+    ))
+}
+
+fn rotate_hashes_to_end(hashes: &mut Vec<String>, retry_hashes: &HashSet<String>) {
+    let (mut ready, retry): (Vec<_>, Vec<_>) = hashes
+        .drain(..)
+        .partition(|hash| !retry_hashes.contains(&hash.to_lowercase()));
+    ready.extend(retry);
+    *hashes = ready;
+}
+
+/// Move failed vanish entries behind untouched entries so later batches can progress.
+pub fn move_user_list_entries_to_end(pubkey: &str, retry_hashes: &[String]) -> Result<()> {
+    if retry_hashes.is_empty() {
+        return Ok(());
+    }
+    let retry_hashes: HashSet<String> = retry_hashes
+        .iter()
+        .map(|hash| hash.to_lowercase())
+        .collect();
+
+    for attempt in 0..5 {
+        let mut hashes = get_user_blobs(pubkey)?;
+        let original = hashes.clone();
+        rotate_hashes_to_end(&mut hashes, &retry_hashes);
+        if hashes == original {
+            return Ok(());
+        }
+
+        match put_user_list(pubkey, &hashes) {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < 4 => {
+                eprintln!(
+                    "[KV] Retry {} for failed vanish entry rotation: {}",
+                    attempt + 1,
+                    error
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(BlossomError::MetadataError(
+        "Max retries exceeded for failed vanish entry rotation".into(),
     ))
 }
 
@@ -1415,9 +1466,21 @@ pub fn delete_audio_source_refs(audio_hash: &str) -> Result<()> {
 mod tests {
     use super::{
         duplicate_generation, edge_transcode_status_generation, edge_transcript_status_generation,
-        erasure_evidence_key, generation_rejection, stale_generation, status_generation_from_ms,
+        erasure_evidence_key, generation_rejection, rotate_hashes_to_end, stale_generation,
+        status_generation_from_ms,
         transcode_status_event_sequence, transcript_status_event_sequence, StatusUpdateOutcome,
     };
+    use std::collections::HashSet;
+
+    #[test]
+    fn failed_vanish_entries_rotate_behind_untouched_entries() {
+        let mut hashes = vec!["a".repeat(64), "b".repeat(64), "c".repeat(64)];
+        let retry = HashSet::from(["a".repeat(64), "b".repeat(64)]);
+
+        rotate_hashes_to_end(&mut hashes, &retry);
+
+        assert_eq!(hashes, vec!["c".repeat(64), "a".repeat(64), "b".repeat(64)]);
+    }
 
     #[test]
     fn erasure_evidence_key_is_deterministic_and_hides_the_content_hash() {

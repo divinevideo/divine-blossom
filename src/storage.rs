@@ -954,8 +954,8 @@ fn build_multi_delete_request(
     Ok(req)
 }
 
-fn keys_in_xml_section(xml: &str, section: &str) -> HashSet<String> {
-    let mut keys = HashSet::new();
+fn xml_section_blocks<'a>(xml: &'a str, section: &str) -> Vec<&'a str> {
+    let mut blocks = Vec::new();
     let open = format!("<{}>", section);
     let close = format!("</{}>", section);
     let mut rest = xml;
@@ -964,16 +964,24 @@ fn keys_in_xml_section(xml: &str, section: &str) -> HashSet<String> {
         let Some(end) = after_open.find(&close) else {
             break;
         };
-        let block = &after_open[..end];
-        if let Some(key_start) = block.find("<Key>") {
-            let key_value = &block[key_start + 5..];
-            if let Some(key_end) = key_value.find("</Key>") {
-                keys.insert(key_value[..key_end].to_string());
-            }
-        }
+        blocks.push(&after_open[..end]);
         rest = &after_open[end + close.len()..];
     }
-    keys
+    blocks
+}
+
+fn xml_block_value<'a>(block: &'a str, element: &str) -> Option<&'a str> {
+    let open = format!("<{}>", element);
+    let close = format!("</{}>", element);
+    let value = block.split_once(&open)?.1;
+    Some(value.split_once(&close)?.0)
+}
+
+fn keys_in_xml_section(xml: &str, section: &str) -> HashSet<String> {
+    xml_section_blocks(xml, section)
+        .into_iter()
+        .filter_map(|block| xml_block_value(block, "Key").map(str::to_string))
+        .collect()
 }
 
 fn failed_multi_delete_keys(mut response: Response, requested: &[String]) -> HashSet<String> {
@@ -983,10 +991,19 @@ fn failed_multi_delete_keys(mut response: Response, requested: &[String]) -> Has
 
     let body = response.take_body().into_string();
     let deleted = keys_in_xml_section(&body, "Deleted");
-    let errors = keys_in_xml_section(&body, "Error");
+    let already_absent: HashSet<String> = xml_section_blocks(&body, "Error")
+        .into_iter()
+        .filter(|block| {
+            matches!(
+                xml_block_value(block, "Code"),
+                Some("NoSuchKey" | "NotFound" | "NoSuchObject")
+            )
+        })
+        .filter_map(|block| xml_block_value(block, "Key").map(str::to_string))
+        .collect();
     requested
         .iter()
-        .filter(|key| errors.contains(*key) || !deleted.contains(*key))
+        .filter(|key| !deleted.contains(*key) && !already_absent.contains(*key))
         .cloned()
         .collect()
 }
@@ -1005,10 +1022,22 @@ fn elapsed_ms(started: Instant) -> u64 {
 }
 
 fn mark_failed_keys(result: &mut VanishStorageResult, keys: &HashSet<String>) {
-    result.failed_hashes.extend(
-        keys.iter()
-            .filter_map(|key| hash_for_vanish_key(key)),
-    );
+    result
+        .failed_hashes
+        .extend(keys.iter().filter_map(|key| hash_for_vanish_key(key)));
+}
+
+fn mark_failed_stage(
+    result: &mut VanishStorageResult,
+    stage_hashes: &HashMap<String, Vec<String>>,
+    stage: &str,
+    all_hashes: &[String],
+) {
+    if let Some(failed) = stage_hashes.get(stage) {
+        result.failed_hashes.extend(failed.iter().cloned());
+    } else {
+        result.failed_hashes.extend(all_hashes.iter().cloned());
+    }
 }
 
 fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) {
@@ -1027,9 +1056,9 @@ fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) {
         ("ML7R82HKfmTaqTpHExIDVN", "purge_vcl"),
         ("pOvEEWykEbpnylqst1KTrR", "purge_compute"),
     ];
-    let started = Instant::now();
     let mut pending = Vec::new();
     let mut stage_hashes = HashMap::<String, Vec<String>>::new();
+    let mut stage_started = HashMap::<String, Instant>::new();
 
     for chunk in hashes.chunks(256) {
         for (service_id, stage) in services {
@@ -1043,6 +1072,7 @@ fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) {
             req.set_header("Accept", "application/json");
             req.set_header("Surrogate-Key", chunk.join(" "));
             req.set_header("X-Divine-Vanish-Stage", &stage_id);
+            stage_started.insert(stage_id.clone(), Instant::now());
             stage_hashes.insert(stage_id, chunk.to_vec());
             match req.send_async("fastly_api") {
                 Ok(request) => pending.push(request),
@@ -1061,16 +1091,17 @@ fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) {
                     .and_then(|request| request.get_header_str("X-Divine-Vanish-Stage"))
                     .unwrap_or_default()
                     .to_string();
-                let duration = elapsed_ms(started);
-                if stage.starts_with("purge_vcl") {
-                    result.timings.purge_vcl_ms = duration;
-                } else if stage.starts_with("purge_compute") {
-                    result.timings.purge_compute_ms = duration;
+                if let Some(started) = stage_started.get(&stage) {
+                    let duration = elapsed_ms(*started);
+                    if stage.starts_with("purge_vcl") {
+                        result.timings.purge_vcl_ms = result.timings.purge_vcl_ms.max(duration);
+                    } else if stage.starts_with("purge_compute") {
+                        result.timings.purge_compute_ms =
+                            result.timings.purge_compute_ms.max(duration);
+                    }
                 }
                 if !response.get_status().is_success() {
-                    if let Some(failed) = stage_hashes.get(&stage) {
-                        result.failed_hashes.extend(failed.iter().cloned());
-                    }
+                    mark_failed_stage(result, &stage_hashes, &stage, hashes);
                 }
             }
             Err(error) => {
@@ -1079,9 +1110,7 @@ fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) {
                     .get_header_str("X-Divine-Vanish-Stage")
                     .unwrap_or_default()
                     .to_string();
-                if let Some(failed) = stage_hashes.get(&stage) {
-                    result.failed_hashes.extend(failed.iter().cloned());
-                }
+                mark_failed_stage(result, &stage_hashes, &stage, hashes);
             }
         }
     }
@@ -1122,20 +1151,20 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
         ("gcs_artifacts", &artifact_keys, &gcs, GCS_BACKEND, false),
         ("fos_main", &main_keys, &fos, FOS_BACKEND, true),
     ];
-    let started = Instant::now();
     let mut pending = Vec::new();
+    let mut stage_started = HashMap::<&str, Instant>::new();
     let requested_by_stage: HashMap<&str, &[String]> = requests
         .iter()
         .map(|(stage, keys, _, _, _)| (*stage, keys.as_slice()))
         .collect();
 
     for (stage, keys, config, backend, content_md5) in requests {
-        match build_multi_delete_request(keys, config, stage, content_md5)
-            .and_then(|request| {
-                request.send_async(backend).map_err(|error| {
-                    BlossomError::StorageError(format!("{} batch delete failed: {}", stage, error))
-                })
-            }) {
+        stage_started.insert(stage, Instant::now());
+        match build_multi_delete_request(keys, config, stage, content_md5).and_then(|request| {
+            request.send_async(backend).map_err(|error| {
+                BlossomError::StorageError(format!("{} batch delete failed: {}", stage, error))
+            })
+        }) {
             Ok(request) => pending.push(request),
             Err(_) => result.failed_hashes.extend(hashes.iter().cloned()),
         }
@@ -1151,12 +1180,14 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
                     .and_then(|request| request.get_header_str("X-Divine-Vanish-Stage"))
                     .unwrap_or_default()
                     .to_string();
-                let duration = elapsed_ms(started);
-                match stage.as_str() {
-                    "gcs_main" => result.timings.gcs_main_ms = duration,
-                    "gcs_artifacts" => result.timings.gcs_artifacts_ms = duration,
-                    "fos_main" => result.timings.fos_main_ms = duration,
-                    _ => {}
+                if let Some(started) = stage_started.get(stage.as_str()) {
+                    let duration = elapsed_ms(*started);
+                    match stage.as_str() {
+                        "gcs_main" => result.timings.gcs_main_ms = duration,
+                        "gcs_artifacts" => result.timings.gcs_artifacts_ms = duration,
+                        "fos_main" => result.timings.fos_main_ms = duration,
+                        _ => {}
+                    }
                 }
                 if let Some(requested) = requested_by_stage.get(stage.as_str()) {
                     let failed = failed_multi_delete_keys(response, requested);
@@ -2034,15 +2065,9 @@ pub fn write_vanish_timing_log(entry: &serde_json::Value) -> Result<()> {
     req.set_header("Host", CLOUD_RUN_HOST);
     req.set_header("Content-Type", "application/json");
     req.set_body(payload.to_string());
-    let response = req.send(CLOUD_RUN_BACKEND).map_err(|error| {
+    req.send_async(CLOUD_RUN_BACKEND).map_err(|error| {
         BlossomError::Internal(format!("Failed to persist vanish timing: {}", error))
     })?;
-    if !response.get_status().is_success() {
-        return Err(BlossomError::Internal(format!(
-            "Vanish timing sink returned status {}",
-            response.get_status()
-        )));
-    }
     Ok(())
 }
 
@@ -2355,13 +2380,14 @@ pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtracti
 mod tests {
     use super::{
         build_fos_delete_request, build_multi_delete_request, failed_multi_delete_keys,
-        multi_delete_body, normalize_storage_cache_state,
+        mark_failed_stage, multi_delete_body, normalize_storage_cache_state,
         parse_audio_extraction_error_response, parse_funnelcake_audio_reuse_response,
-        prepare_storage_cache_miss, preserve_storage_cache_state, S3Config, FOS_BACKEND,
-        STORAGE_CACHE_HEADER,
+        prepare_storage_cache_miss, preserve_storage_cache_state, S3Config, VanishStorageResult,
+        FOS_BACKEND, STORAGE_CACHE_HEADER,
     };
     use fastly::http::header;
     use fastly::{Request, Response};
+    use std::collections::HashMap;
 
     #[test]
     fn fos_delete_request_uses_the_replica_backend_address_and_delete_method() {
@@ -2428,6 +2454,35 @@ mod tests {
         assert!(!failures.contains(&deleted));
         assert!(failures.contains(&failed));
         assert!(failures.contains(&missing));
+    }
+
+    #[test]
+    fn multi_delete_response_treats_explicit_absence_as_success() {
+        let absent = "a".repeat(64);
+        let denied = "b".repeat(64);
+        let body = format!(
+            "<DeleteResult><Error><Key>{}</Key><Code>NoSuchKey</Code></Error><Error><Key>{}</Key><Code>Denied</Code></Error></DeleteResult>",
+            absent, denied
+        );
+        let response = Response::from_status(fastly::http::StatusCode::OK).with_body(body);
+
+        let failures = failed_multi_delete_keys(response, &[absent.clone(), denied.clone()]);
+
+        assert!(!failures.contains(&absent));
+        assert!(failures.contains(&denied));
+    }
+
+    #[test]
+    fn unattributed_failed_stage_fails_the_whole_batch_closed() {
+        let hashes = vec!["a".repeat(64), "b".repeat(64)];
+        let mut result = VanishStorageResult::default();
+
+        mark_failed_stage(&mut result, &HashMap::new(), "", &hashes);
+
+        assert_eq!(result.failed_hashes.len(), hashes.len());
+        assert!(hashes
+            .iter()
+            .all(|hash| result.failed_hashes.contains(hash)));
     }
 
     #[test]

@@ -38,11 +38,11 @@ use crate::metadata::{
     delete_blob_metadata, delete_blob_refs, delete_subtitle_data, delete_user_list,
     get_audio_mapping, get_audio_source_refs, get_auth_event, get_blob_metadata,
     get_blob_metadata_uncached, get_blob_refs, get_subtitle_job, get_subtitle_job_by_hash,
-    get_tombstone, get_user_blobs, list_blobs_with_metadata, put_audio_mapping, put_auth_event,
-    put_blob_metadata, put_subtitle_job, remove_from_audio_source_refs, remove_from_blob_refs,
-    remove_from_user_index, remove_from_user_list, set_subtitle_job_id_for_hash,
-    update_blob_status, update_stats_on_add, update_stats_on_remove, StatusUpdateOutcome,
-    TranscodeMetadataUpdate, TranscriptMetadataUpdate,
+    get_tombstone, get_user_blobs, list_blobs_with_metadata, move_user_list_entries_to_end,
+    put_audio_mapping, put_auth_event, put_blob_metadata, put_subtitle_job,
+    remove_from_audio_source_refs, remove_from_blob_refs, remove_from_user_index,
+    remove_from_user_list, set_subtitle_job_id_for_hash, update_blob_status, update_stats_on_add,
+    update_stats_on_remove, StatusUpdateOutcome, TranscodeMetadataUpdate, TranscriptMetadataUpdate,
 };
 use crate::storage::{
     blob_exists, check_funnelcake_audio_reuse, current_timestamp, delete_blob as storage_delete,
@@ -4425,6 +4425,19 @@ impl VanishExecution {
     }
 }
 
+fn select_vanish_batch(hashes: &[String]) -> (Vec<String>, u32) {
+    let selected = hashes
+        .iter()
+        .take(VANISH_BATCH_SIZE)
+        .map(|hash| hash.to_lowercase())
+        .collect();
+    let pending = hashes
+        .len()
+        .saturating_sub(VANISH_BATCH_SIZE)
+        .min(u32::MAX as usize) as u32;
+    (selected, pending)
+}
+
 #[derive(Debug)]
 struct PreparedVanishBlob {
     hash: String,
@@ -4516,11 +4529,12 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
             return execution;
         }
     };
-    let selected: Vec<String> = hashes.iter().take(VANISH_BATCH_SIZE).cloned().collect();
-    execution.pending = hashes.len().saturating_sub(selected.len()).min(u32::MAX as usize) as u32;
+    let (selected, pending) = select_vanish_batch(&hashes);
+    execution.pending = pending;
 
     let prepare_started = Instant::now();
     let mut erase = Vec::new();
+    let mut retry_hashes = Vec::new();
     for hash in &selected {
         match prepare_vanish_blob(hash, pubkey) {
             Ok(PreparedVanishBlobOrOutcome::Erase(blob)) => erase.push(*blob),
@@ -4530,6 +4544,7 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
             Err(error) => {
                 eprintln!("[VANISH] Failed to prepare blob: {}", error);
                 execution.errors += 1;
+                retry_hashes.push(hash.clone());
             }
         }
     }
@@ -4551,6 +4566,7 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     for blob in &erase {
         if storage_result.failed_hashes.contains(&blob.hash) {
             execution.errors += 1;
+            retry_hashes.push(blob.hash.clone());
             continue;
         }
         match finalize_erased_vanish_blob(blob, pubkey) {
@@ -4561,10 +4577,15 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
             Err(error) => {
                 eprintln!("[VANISH] Failed to finalize erased blob: {}", error);
                 execution.errors += 1;
+                retry_hashes.push(blob.hash.clone());
             }
         }
     }
     let kv_finalize_ms = finalize_started.elapsed().as_millis();
+
+    if let Err(error) = move_user_list_entries_to_end(pubkey, &retry_hashes) {
+        eprintln!("[VANISH] Failed to rotate retry entries: {}", error);
+    }
 
     if execution.pending == 0 && execution.errors == 0 {
         if let Err(error) = delete_user_list(pubkey) {
@@ -6383,16 +6404,16 @@ mod tests {
         decide_transcript_fetch_action, derivative_reconciliation_response, error_response,
         ignored_generation_response, is_alias_only_audio_blob,
         parse_transcode_status_webhook_payload, parse_transcript_status_webhook_payload,
-        parse_upload_service_response, should_delete_derived_audio_blob,
-        surrogate_key_hash_from_path,
+        parse_upload_service_response, select_vanish_batch, should_delete_derived_audio_blob,
         should_eagerly_trigger_transcription, should_record_upload_service_transcode_failure,
         should_record_upload_service_transcript_failure,
         should_reset_transcode_failure_on_clean_upload,
         should_reset_transcript_failure_on_clean_upload, should_set_audio_content_length,
-        trusted_upload_service_terminal_derivative_error, upload_capability_headers,
-        upload_control_host, upload_exposed_headers, upload_from_resumable_completion,
-        vanish_response_status, AudioReuseAvailability, DerivativeObservation, TranscodeFetchAction,
-        TranscriptFetchAction, TranscriptPendingState,
+        surrogate_key_hash_from_path, trusted_upload_service_terminal_derivative_error,
+        upload_capability_headers, upload_control_host, upload_exposed_headers,
+        upload_from_resumable_completion, vanish_response_status, AudioReuseAvailability,
+        DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState,
+        VANISH_BATCH_SIZE,
     };
     use crate::blossom::{
         BlobStatus, ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus,
@@ -6414,6 +6435,17 @@ mod tests {
             vanish_response_status(1, 1),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    #[test]
+    fn vanish_batch_is_bounded_and_normalizes_legacy_hashes() {
+        let hashes: Vec<String> = (0..1_015).map(|index| format!("{:064X}", index)).collect();
+
+        let (selected, pending) = select_vanish_batch(&hashes);
+
+        assert_eq!(selected.len(), VANISH_BATCH_SIZE);
+        assert_eq!(pending, 915);
+        assert!(selected.iter().all(|hash| hash == &hash.to_lowercase()));
     }
 
     #[test]
