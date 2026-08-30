@@ -4172,8 +4172,7 @@ fn handle_upload_requirements(req: Request) -> Result<Response> {
     Ok(resp)
 }
 
-/// Delete every required GCS artifact for a blob (thumbnail, HLS, VTT, and hash prefix).
-/// The main blob itself is NOT deleted here (caller handles that).
+/// Delete and verify the main GCS object plus every thumbnail, HLS, VTT, and prefix artifact.
 pub(crate) fn delete_blob_gcs_artifacts(hash: &str) -> Result<()> {
     let paths = [
         format!("{}.jpg", hash),
