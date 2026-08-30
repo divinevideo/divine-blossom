@@ -4557,8 +4557,9 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     let mut storage_result = erase_vanish_batch(&erase_hashes);
     let mut storage_attempts = u8::from(!erase_hashes.is_empty());
     while storage_attempts < VANISH_STORAGE_ATTEMPTS && !storage_result.failed_hashes.is_empty() {
-        let retry_hashes: Vec<String> = storage_result.failed_hashes.iter().cloned().collect();
-        let retry = erase_vanish_batch(&retry_hashes);
+        let storage_retry_hashes: Vec<String> =
+            storage_result.failed_hashes.iter().cloned().collect();
+        let retry = erase_vanish_batch(&storage_retry_hashes);
         storage_result.replace_failures_after_retry(retry);
         storage_attempts += 1;
     }

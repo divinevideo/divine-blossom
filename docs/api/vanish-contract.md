@@ -31,7 +31,7 @@ The admin endpoint additionally echoes its `reason`; both responses identify the
 
 Origin DELETE operations are idempotent: a 404 means that origin is already erased. If GCS succeeds and FOS fails, the response is still a retryable `5xx`; the next attempt accepts GCS's 404 and retries FOS.
 
-When any blob fails required-origin deletion, erasure-evidence persistence, or required metadata/reference cleanup, Blossom preserves that blob's account-list entry so the next request can rediscover unfinished work. Completed blobs are removed from the list individually, so a later failure elsewhere in the same account does not cause them to be processed again. Blossom does not increment `fully_deleted` or `unlinked` until that per-blob list update succeeds.
+When any blob fails required-origin deletion, erasure-evidence persistence, or required metadata/reference cleanup, Blossom preserves that blob's account-list entry so the next request can rediscover unfinished work. Failed entries move behind untouched entries, allowing subsequent calls to advance through the bounded list before cycling back to persistent failures. Completed blobs are removed from the list individually, so a later failure elsewhere in the same account does not cause them to be processed again. Blossom does not increment `fully_deleted` or `unlinked` until that per-blob list update succeeds.
 
 Each call attempts at most 100 list entries. Main GCS objects, deterministic GCS derivatives, and FOS delivery replicas are sent as independent concurrent multi-object deletes. CDN invalidation uses concurrent batch surrogate-key purges after both origins confirm deletion.
 
