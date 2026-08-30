@@ -99,14 +99,6 @@ impl VanishBlobOps for DefaultCreatorDeleteOps {
     }
 }
 
-pub(crate) fn handle_vanish_blob(
-    hash: &str,
-    pubkey: &str,
-    req_id: &str,
-) -> Result<VanishBlobOutcome> {
-    handle_vanish_blob_with_ops(hash, pubkey, req_id, &DefaultCreatorDeleteOps)
-}
-
 pub fn handle_creator_delete(
     hash: &str,
     metadata: &BlobMetadata,
