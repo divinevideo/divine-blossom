@@ -358,27 +358,39 @@ class PrivacyTests(unittest.TestCase):
         self.assertEqual(result["repairs"], {"soft_deleted": 1})
 
     def test_vanish_starting_after_scan_is_excluded_at_repair_time(self):
-        synthetic_hash = "e" * 64
-        marker_checks = []
+        synthetic_hashes = ["e" * 64, "a" * 64]
+        calls = []
         repaired = []
 
         result = MODULE.scan(
-            [synthetic_hash],
-            lambda _value: MODULE.MetadataProbe(MODULE.Presence.PRESENT, "active"),
+            synthetic_hashes,
+            lambda value: (
+                calls.append(("classify", value))
+                or MODULE.MetadataProbe(MODULE.Presence.PRESENT, "active")
+            ),
             lambda _value: MODULE.Presence.MISSING,
             lambda _value: 404,
             repair=lambda value: repaired.append(value) is None,
             vanish_retry_probe=lambda value: (
-                marker_checks.append(value) or MODULE.VanishRetryMarker.OUTSTANDING
+                calls.append(("repair_marker", value))
+                or MODULE.VanishRetryMarker.OUTSTANDING
             ),
-            max_repairs=1,
-            confirm_missing_count=1,
+            max_repairs=2,
+            confirm_missing_count=2,
             curated_input=True,
         )
 
-        self.assertEqual(marker_checks, [synthetic_hash])
+        self.assertEqual(
+            calls,
+            [
+                ("classify", synthetic_hashes[0]),
+                ("classify", synthetic_hashes[1]),
+                ("repair_marker", synthetic_hashes[0]),
+                ("repair_marker", synthetic_hashes[1]),
+            ],
+        )
         self.assertEqual(repaired, [])
-        self.assertEqual(result["repairs"], {"excluded_vanish_retry": 1})
+        self.assertEqual(result["repairs"], {"excluded_vanish_retry": 2})
 
     def test_vanish_retry_probe_failure_prevents_repair(self):
         repaired = []
