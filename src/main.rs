@@ -4413,52 +4413,108 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
     Ok(resp)
 }
 
-/// Execute vanish (GDPR right to erasure) for a given pubkey.
-/// For each blob the user owns or references:
-/// - Sole owner: full delete (GCS + KV + VCL cache purge)
-/// - Shared content: unlink (remove from refs, transfer ownership if needed)
-///
-/// Returns (fully_deleted, unlinked, errors) counts.
-fn execute_vanish(pubkey: &str) -> (u32, u32, u32) {
-    let mut fully_deleted: u32 = 0;
-    let mut unlinked: u32 = 0;
-    let mut errors: u32 = 0;
+#[derive(Debug, Default, PartialEq, Eq)]
+struct VanishCounts {
+    fully_deleted: u32,
+    unlinked: u32,
+    errors: u32,
+    malformed_hash_exceptions: u32,
+}
 
-    // Get all hashes from user's list
-    let hashes = match get_user_blobs(pubkey) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("[VANISH] Failed to get user blobs for {}: {}", pubkey, e);
-            return (0, 0, 1);
+fn is_canonical_blob_hash(hash: &str) -> bool {
+    hash.len() == 64
+        && hash
+            .chars()
+            .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+}
+
+fn process_vanish_blob_list<H, A>(
+    hashes: &[String],
+    mut handle_blob: H,
+    mut record_malformed_hash: A,
+) -> VanishCounts
+where
+    H: FnMut(&str) -> Result<VanishBlobOutcome>,
+    A: FnMut(&str),
+{
+    let mut counts = VanishCounts::default();
+
+    for hash in hashes {
+        if !is_canonical_blob_hash(hash) {
+            record_malformed_hash(hash);
+            counts.malformed_hash_exceptions += 1;
+            continue;
         }
-    };
 
-    for hash in &hashes {
-        match handle_vanish_blob(hash, pubkey, "vanish") {
-            Ok(VanishBlobOutcome::FullyDeleted) => fully_deleted += 1,
-            Ok(VanishBlobOutcome::Unlinked) => unlinked += 1,
+        match handle_blob(hash) {
+            Ok(VanishBlobOutcome::FullyDeleted) => counts.fully_deleted += 1,
+            Ok(VanishBlobOutcome::Unlinked) => counts.unlinked += 1,
             Err(e) => {
                 eprintln!(
                     "[VANISH] Failed to complete {}: {}. Retry state preserved.",
                     hash, e
                 );
-                errors += 1;
+                counts.errors += 1;
             }
         }
     }
 
+    counts
+}
+
+fn record_malformed_vanish_hash(hash: &str, pubkey: &str) {
+    let fingerprint = hex::encode(Sha256::digest(hash.as_bytes()));
+    write_audit_log(
+        &fingerprint,
+        "vanish_malformed_hash_exception",
+        pubkey,
+        None,
+        None,
+        Some("Malformed blob-list entry skipped; sha256 is a fingerprint of the invalid value"),
+    );
+    eprintln!(
+        "[VANISH] Skipped malformed blob-list entry fingerprint={}",
+        fingerprint
+    );
+}
+
+/// Execute vanish (GDPR right to erasure) for a given pubkey.
+/// For each blob the user owns or references:
+/// - Sole owner: full delete (GCS + KV + VCL cache purge)
+/// - Shared content: unlink (remove from refs, transfer ownership if needed)
+///
+/// Returns erasure, unlink, retryable-error, and audited-exception counts.
+fn execute_vanish(pubkey: &str) -> VanishCounts {
+    // Get all hashes from user's list
+    let hashes = match get_user_blobs(pubkey) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("[VANISH] Failed to get user blobs for {}: {}", pubkey, e);
+            return VanishCounts {
+                errors: 1,
+                ..VanishCounts::default()
+            };
+        }
+    };
+
+    let mut counts = process_vanish_blob_list(
+        &hashes,
+        |hash| handle_vanish_blob(hash, pubkey, "vanish"),
+        |hash| record_malformed_vanish_hash(hash, pubkey),
+    );
+
     // Preserve the list when erasure is incomplete so a retry can rediscover
     // blobs whose metadata and replica bytes still need cleanup.
-    if vanish_is_complete(errors) {
+    if vanish_is_complete(counts.errors) {
         if let Err(e) = delete_user_list(pubkey) {
             eprintln!("[VANISH] Failed to delete user list for {}: {}", pubkey, e);
-            errors += 1;
+            counts.errors += 1;
         } else if let Err(e) = remove_from_user_index(pubkey) {
             eprintln!(
                 "[VANISH] Failed to remove {} from user index: {}",
                 pubkey, e
             );
-            errors += 1;
+            counts.errors += 1;
         }
     }
 
@@ -4466,11 +4522,15 @@ fn execute_vanish(pubkey: &str) -> (u32, u32, u32) {
     trigger_audit_anonymize(pubkey);
 
     eprintln!(
-        "[VANISH] pubkey={} fully_deleted={} unlinked={} errors={}",
-        pubkey, fully_deleted, unlinked, errors
+        "[VANISH] pubkey={} fully_deleted={} unlinked={} errors={} malformed_hash_exceptions={}",
+        pubkey,
+        counts.fully_deleted,
+        counts.unlinked,
+        counts.errors,
+        counts.malformed_hash_exceptions
     );
 
-    (fully_deleted, unlinked, errors)
+    counts
 }
 
 fn vanish_response_status(errors: u32) -> StatusCode {
@@ -4497,17 +4557,18 @@ fn handle_vanish(req: Request) -> Result<Response> {
         Some("User-initiated GDPR right to erasure"),
     );
 
-    let (fully_deleted, unlinked, errors) = execute_vanish(&auth.pubkey);
+    let counts = execute_vanish(&auth.pubkey);
 
     let result = serde_json::json!({
-        "vanished": vanish_is_complete(errors),
+        "vanished": vanish_is_complete(counts.errors),
         "pubkey": auth.pubkey,
-        "fully_deleted": fully_deleted,
-        "unlinked": unlinked,
-        "errors": errors,
+        "fully_deleted": counts.fully_deleted,
+        "unlinked": counts.unlinked,
+        "errors": counts.errors,
+        "malformed_hash_exceptions": counts.malformed_hash_exceptions,
     });
 
-    let mut resp = json_response(vanish_response_status(errors), &result);
+    let mut resp = json_response(vanish_response_status(counts.errors), &result);
     add_cors_headers(&mut resp);
     Ok(resp)
 }
@@ -4539,18 +4600,19 @@ fn handle_admin_vanish(req: Request) -> Result<Response> {
     // Write audit log before erasure
     write_audit_log("all", "admin_vanish", &pubkey, None, None, Some(reason));
 
-    let (fully_deleted, unlinked, errors) = execute_vanish(&pubkey);
+    let counts = execute_vanish(&pubkey);
 
     let result = serde_json::json!({
-        "vanished": vanish_is_complete(errors),
+        "vanished": vanish_is_complete(counts.errors),
         "pubkey": pubkey,
         "reason": reason,
-        "fully_deleted": fully_deleted,
-        "unlinked": unlinked,
-        "errors": errors,
+        "fully_deleted": counts.fully_deleted,
+        "unlinked": counts.unlinked,
+        "errors": counts.errors,
+        "malformed_hash_exceptions": counts.malformed_hash_exceptions,
     });
 
-    let mut resp = json_response(vanish_response_status(errors), &result);
+    let mut resp = json_response(vanish_response_status(counts.errors), &result);
     add_cors_headers(&mut resp);
     Ok(resp)
 }
@@ -6228,16 +6290,16 @@ mod tests {
         decide_transcript_fetch_action, derivative_reconciliation_response, error_response,
         ignored_generation_response, is_alias_only_audio_blob, local_derivative_cleanup_result,
         parse_transcode_status_webhook_payload, parse_transcript_status_webhook_payload,
-        parse_upload_service_response, should_delete_derived_audio_blob,
-        surrogate_key_hash_from_path,
+        parse_upload_service_response, process_vanish_blob_list, should_delete_derived_audio_blob,
         should_eagerly_trigger_transcription, should_record_upload_service_transcode_failure,
         should_record_upload_service_transcript_failure,
         should_reset_transcode_failure_on_clean_upload,
         should_reset_transcript_failure_on_clean_upload, should_set_audio_content_length,
-        trusted_upload_service_terminal_derivative_error, upload_capability_headers,
-        upload_control_host, upload_exposed_headers, upload_from_resumable_completion,
-        vanish_response_status, AudioReuseAvailability, DerivativeObservation, TranscodeFetchAction,
-        TranscriptFetchAction, TranscriptPendingState,
+        surrogate_key_hash_from_path, trusted_upload_service_terminal_derivative_error,
+        upload_capability_headers, upload_control_host, upload_exposed_headers,
+        upload_from_resumable_completion, vanish_is_complete, vanish_response_status,
+        AudioReuseAvailability, DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction,
+        TranscriptPendingState, VanishBlobOutcome,
     };
     use crate::blossom::{
         BlobStatus, ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus,
@@ -6254,6 +6316,50 @@ mod tests {
             vanish_response_status(1),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    #[test]
+    fn malformed_hash_exception_does_not_block_completed_blob_list() {
+        let malformed = "A".repeat(64);
+        let valid = "a".repeat(64);
+        let mut handled = Vec::new();
+        let mut audited = Vec::new();
+
+        let counts = process_vanish_blob_list(
+            &[malformed.clone(), valid.clone()],
+            |hash| {
+                handled.push(hash.to_string());
+                Ok(VanishBlobOutcome::FullyDeleted)
+            },
+            |hash| audited.push(hash.to_string()),
+        );
+
+        assert_eq!(counts.fully_deleted, 1);
+        assert_eq!(counts.unlinked, 0);
+        assert_eq!(counts.errors, 0);
+        assert_eq!(counts.malformed_hash_exceptions, 1);
+        assert_eq!(handled, vec![valid]);
+        assert_eq!(audited, vec![malformed]);
+        assert!(vanish_is_complete(counts.errors));
+    }
+
+    #[test]
+    fn permanent_cleanup_failure_for_well_formed_hash_blocks_completion() {
+        let valid = "b".repeat(64);
+        let counts = process_vanish_blob_list(
+            &[valid],
+            |_| {
+                Err(BlossomError::Internal(
+                    "Cloud Run cleanup reported permanent".into(),
+                ))
+            },
+            |_| panic!("well-formed hashes must not become exceptions"),
+        );
+
+        assert_eq!(counts.fully_deleted, 0);
+        assert_eq!(counts.errors, 1);
+        assert_eq!(counts.malformed_hash_exceptions, 0);
+        assert!(!vanish_is_complete(counts.errors));
     }
 
     #[test]

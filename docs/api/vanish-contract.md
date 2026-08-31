@@ -11,7 +11,8 @@ Both endpoints return the same completion fields:
   "vanished": true,
   "fully_deleted": 2,
   "unlinked": 1,
-  "errors": 0
+  "errors": 0,
+  "malformed_hash_exceptions": 1
 }
 ```
 
@@ -21,6 +22,8 @@ The admin endpoint additionally echoes its `reason`; both responses identify the
 - HTTP `5xx`, `vanished: false`, and `errors > 0` mean at least one blob could not be completed. Callers must retry the same account.
 - `fully_deleted` counts only sole-owner blobs whose main objects were confirmed deleted or absent from both GCS and Fastly Object Storage (FOS), and whose required GCS derivatives and unshared derived audio were confirmed deleted or absent, before metadata cleanup and the final CDN purge.
 - `unlinked` counts shared blobs that remain because another account still references them.
+- `malformed_hash_exceptions` counts account-list entries that were not canonical 64-character lowercase hexadecimal hashes. Upload ingress rejects those values before storage, so they cannot address stored media. Blossom skips them before cleanup dispatch, records an audit entry with a safe fingerprint of the invalid value, and may still complete the account erasure. This exception does not increment `fully_deleted`.
+- A typed `permanent` cleanup failure for a well-formed hash remains an error and blocks completion. Only edge validation of the list entry can increment `malformed_hash_exceptions`.
 
 ## Retry behavior
 
