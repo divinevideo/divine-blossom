@@ -2139,6 +2139,13 @@ impl VanishAuditInitiator {
             Self::Admin => "admin",
         }
     }
+
+    pub fn other(self) -> Self {
+        match self {
+            Self::Account => Self::Admin,
+            Self::Admin => Self::Account,
+        }
+    }
 }
 
 fn vanish_audit_entry(
@@ -2643,6 +2650,14 @@ mod tests {
         assert_eq!(admin["action"], "admin_vanish_authorized");
         assert_eq!(admin["initiator"], "admin");
         assert!(admin.get("actor_pubkey").is_none());
+        assert_eq!(
+            VanishAuditInitiator::Account.other(),
+            VanishAuditInitiator::Admin
+        );
+        assert_eq!(
+            VanishAuditInitiator::Admin.other(),
+            VanishAuditInitiator::Account
+        );
     }
 
     #[test]

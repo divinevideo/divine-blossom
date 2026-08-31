@@ -263,6 +263,63 @@ pub fn put_vanish_audit_state(
         })
 }
 
+pub fn claim_vanish_audit_completion(
+    pubkey: &str,
+    initiator: &str,
+    completed_at: String,
+) -> Result<Option<VanishAuditState>> {
+    const MAX_ATTEMPTS: usize = 3;
+
+    let store = open_store()?;
+    let key = vanish_audit_key(pubkey, initiator);
+    for _ in 0..MAX_ATTEMPTS {
+        let mut result = match store.lookup(&key) {
+            Ok(result) => result,
+            Err(KVStoreError::ItemNotFound) => return Ok(None),
+            Err(error) => {
+                return Err(BlossomError::MetadataError(format!(
+                    "Failed to load vanish audit completion state: {error}"
+                )))
+            }
+        };
+        let generation = result.current_generation();
+        let mut state: VanishAuditState =
+            serde_json::from_str(&result.take_body().into_string()).map_err(|error| {
+                BlossomError::MetadataError(format!(
+                    "Invalid vanish audit completion state: {error}"
+                ))
+            })?;
+        if state.completed_at.is_some() {
+            return Ok(Some(state));
+        }
+
+        state.begin_completion(completed_at.clone());
+        let value = serde_json::to_string(&state).map_err(|error| {
+            BlossomError::MetadataError(format!(
+                "Failed to serialize vanish audit completion state: {error}"
+            ))
+        })?;
+        match store
+            .build_insert()
+            .if_generation_match(generation)
+            .time_to_live(VANISH_AUDIT_STATE_TTL)
+            .execute(&key, value)
+        {
+            Ok(()) => return Ok(Some(state)),
+            Err(KVStoreError::ItemPreconditionFailed) => continue,
+            Err(error) => {
+                return Err(BlossomError::MetadataError(format!(
+                    "Failed to claim vanish audit completion: {error}"
+                )))
+            }
+        }
+    }
+
+    Err(BlossomError::MetadataError(
+        "Vanish audit completion state changed too many times".into(),
+    ))
+}
+
 pub fn delete_vanish_audit_state(pubkey: &str, initiator: &str) -> Result<()> {
     let store = open_store()?;
     let key = vanish_audit_key(pubkey, initiator);
@@ -1566,8 +1623,8 @@ mod tests {
         duplicate_generation, edge_transcode_status_generation, edge_transcript_status_generation,
         erasure_evidence_key, generation_rejection, rotate_hashes_to_end, stale_generation,
         status_generation_from_ms,
-        transcode_status_event_sequence, transcript_status_event_sequence, StatusUpdateOutcome,
-        VanishAuditState,
+        transcode_status_event_sequence, transcript_status_event_sequence, vanish_audit_key,
+        StatusUpdateOutcome, VanishAuditState,
     };
     use std::collections::HashSet;
 
@@ -1797,5 +1854,15 @@ mod tests {
         assert_eq!(state.operation_id, "operation");
         assert_eq!(state.authorized_at, "authorized-at");
         assert_eq!(state.completed_at.as_deref(), Some("completed-at"));
+    }
+
+    #[test]
+    fn vanish_audit_keys_separate_account_and_admin_operations() {
+        let pubkey = "A".repeat(64);
+        assert_ne!(
+            vanish_audit_key(&pubkey, "account"),
+            vanish_audit_key(&pubkey, "admin")
+        );
+        assert!(vanish_audit_key(&pubkey, "account").contains(&pubkey.to_lowercase()));
     }
 }
