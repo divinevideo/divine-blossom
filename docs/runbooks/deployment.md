@@ -67,6 +67,126 @@ Do not put either secret value in the verification command, logs, screenshots,
 or pull-request text. Use the approved secret-injection tooling for the operator
 environment.
 
+## `webhook_secret` authority and rotation
+
+GCP Secret Manager secret `webhook_secret` in `rich-compiler-479518-d2` is the
+authoritative readable copy. Fastly Secret Store `blossom_secrets` entry
+`webhook_secret` and Cloudflare Worker `divine-moderation-service` binding
+`BLOSSOM_WEBHOOK_SECRET` are write-only copies. Never generate a replacement in
+Fastly or Cloudflare; generate a 64-character lowercase hex value directly into
+a new GCP version, without a trailing newline, and pipe that exact version to
+both write-only stores. The missing newline is required: Fastly trims the value
+it reads from its store, while the upload service compares the raw
+`WEBHOOK_SECRET` environment value. A newline in GCP would therefore make those
+copies disagree.
+
+The rotated value crosses every one of these directions:
+
+- Cloudflare moderation Worker -> Fastly `/admin/moderate`
+- Fastly -> upload service `/delete-blob`
+- Fastly -> transcoder `/audio/extract`
+- transcoder -> Fastly `/admin/transcode-status`
+- transcoder -> Fastly `/admin/transcript-status`
+
+Fastly sends the value as a bearer token to `/audio/extract`, but that handler
+does not currently validate the header. An extraction probe verifies that the
+direction still works after the Fastly update; it does not prove secret parity
+with the transcoder. The value is also admin-equivalent at the edge on routes
+protected by `validate_admin_auth`: those bearer clients may use either
+`webhook_secret` or `admin_token`. Inventory and move every client that uses
+`webhook_secret`, not only the moderation Worker.
+
+The two Fastly callback routes accept either `webhook_secret` or the separate
+`transcoder_webhook_secret`, but the transcoder sends its `WEBHOOK_SECRET` value.
+`blossom-upload-rust` and `divine-transcoder` resolve the GCP secret as
+`WEBHOOK_SECRET` when an instance starts. Updating `:latest` does not change an
+already-running instance.
+
+Rotate forward in this order:
+
+1. Record the current GCP version number. Create the new version without a
+   trailing newline, keep the old version enabled, and update the canonical
+   `blossom-webhook-secret-prod` mirror from that exact new version. Inventory
+   every bearer client using `webhook_secret`, prepare each client update, and
+   record when the moderation Worker is the only one.
+2. Schedule the rotation for a low-activity window. Before changing either
+   write-only copy, read `STATUS_QUEUE_ENABLED` from the serving transcoder
+   revision and record active derivative work. If the queue is enabled, capture
+   the [derivative-status queue](../derivative-status-queue.md) task names,
+   schedule times, depth, and oldest-task age so failures can be mapped back to
+   a job. Do not pause that queue: it continues to accept tasks while paused and
+   would accumulate rather than drain. This repository has no dispatch-pause
+   control, so running old revisions and already-created tasks can retain the
+   old credential and later receive `403` from Fastly. Record affected jobs for
+   reconciliation. Then update every caller from step 1, starting with
+   Cloudflare, and immediately update Fastly from the new GCP version. Record
+   all write times.
+3. Poll `/admin/moderate` with the new credential and a valid but incomplete
+   `{}` payload. Continue only when the edge reaches payload parsing and returns
+   `400 Missing 'sha256' field`; `403` means the new Fastly value has not
+   converged.
+4. Create fresh revisions of both Cloud Run services with a config-only
+   `gcloud run services update` that reapplies
+   `WEBHOOK_SECRET=webhook_secret:latest` and uses a unique revision suffix.
+   Do not run the source deploy scripts for this step. This preserves the
+   current images and other configuration while making each new instance
+   resolve the new value. Follow [Check live configuration before running a
+   deploy script](#check-live-configuration-before-running-a-deploy-script),
+   then confirm traffic is serving from the new revisions and is not pinned to
+   an older revision.
+5. Verify every direction above. Send a real moderation notification; run the
+   authenticated [`/delete-blob/health` parity check](#deploy-cleanup-dependencies-before-the-edge)
+   with `X-Expected-GCS-Bucket`; exercise a controlled audio extraction through
+   the edge as a reachability check, not a secret-parity check; and confirm new
+   transcode and transcript jobs on the fresh revision callback to Fastly
+   without `401` or `403`. Also verify the funnelcake janitor's separate
+   `admin_token` still authenticates an admin read route. Inspect the edge,
+   Worker, upload, and transcoder logs. When `STATUS_QUEUE_ENABLED=true`, inspect
+   Cloud Tasks logs and correlate failures with the task list captured in step
+   2. A `401` or `403` on moderation, deletion, or a direct callback from a new
+   transcoder revision is a rollback signal. A callback from an old revision or
+   a task created before the rotation can fail with the stale credential.
+   For a lost transcode callback, call the authenticated
+   `/admin/api/reset-stuck-transcodes` flow with `older_than_secs: 0`, the full
+   affected hash as `hex_prefix`, and `dry_run: true`. Paginate through
+   `next_user_offset`; then repeat the matching page with `dry_run: false` and
+   request the derivative again if the result reset it to `Pending`. For a lost
+   transcript callback, confirm the affected hash in the admin dashboard and use
+   its **Regenerate Transcript** action, which posts that exact hash with
+   `force: true`. Observe a successful fresh callback before considering either
+   job reconciled. Do not use rollback as a retry for a callback that has
+   already been lost.
+6. Disable the old GCP version only after every probe passes and every stale
+   callback observed in step 5 has been reconciled. If reconciliation is still
+   incomplete, leave the old GCP version enabled and escalate that job. Roll
+   back the rotation only when a new-credential path fails.
+
+There is no zero-mismatch order because these consumers do not all accept both
+old and new values. Cloudflare goes first so the caller stops sending the old
+value before Fastly can begin accepting the new one. This deliberately makes
+moderation fail closed until Fastly accepts the new caller; it does not promise
+a shorter outage. Moving Fastly first would instead leave an unpredictable
+window in which the edge may switch while Cloudflare still sends the old value.
+Once Fastly converges, accept a bounded edge-to-Cloud-Run mismatch while the two
+fresh revisions start; keeping the old GCP version enabled preserves rollback
+but does not make running services dual-accept both values.
+
+Rollback disables the new GCP version, re-enables the recorded old version,
+restores both write-only copies and the `blossom-webhook-secret-prod` mirror from
+that exact old version, and creates fresh revisions of both Cloud Run services
+again. Repeat the same direction checks before disabling any superseded version.
+
+The 2026-08-31 rotation's Cloudflare and Fastly API writes were 18 seconds
+apart, but the edge did not accept the new value until a probe 88 seconds after
+the Cloudflare write. Plan the mismatch window around verified edge acceptance,
+not the secret-store API completion time.
+
+Mirror the canonical value in `dv-platform-prod` Secret Manager as
+`blossom-webhook-secret-prod` for the platform secret convention. That mirror is
+not a fourth independently generated value. `admin_token`,
+`transcoder_webhook_secret`, and process-blob's `METADATA_WEBHOOK_SECRET` are
+separate credentials and must not be changed during this rotation.
+
 ## The edge Cloud Run backends are not in the production project
 
 The edge hardcodes its backends to project number `149672065768`:
