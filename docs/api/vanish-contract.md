@@ -19,7 +19,7 @@ Both endpoints return the same completion fields:
 The admin endpoint additionally echoes its `reason`; both responses identify the requested account.
 
 - HTTP `200` and `vanished: true` mean every discovered blob was either erased or safely unlinked.
-- HTTP `202`, `vanished: false`, and `pending > 0` mean the bounded call made progress but more entries remain. The response can also contain `errors > 0` for entries that were attempted and failed. Callers must retry the same account until it returns a terminal response.
+- HTTP `202`, `vanished: false`, and `pending > 0` mean the call completed within its bound but more entries remain. The response can also contain `errors > 0` for entries that were attempted and failed. Callers must retry the same account until it returns a terminal response, applying backoff and alerting when repeated responses report errors without increasing `fully_deleted` or `unlinked`.
 - HTTP `5xx`, `vanished: false`, `pending: 0`, and `errors > 0` mean the call reached a terminal server failure instead of completing the account. Callers must retry the same account.
 - `fully_deleted` counts only sole-owner blobs whose main objects were confirmed deleted or absent from both GCS and Fastly Object Storage (FOS), whose required GCS derivatives and unshared derived audio were confirmed deleted or absent, whose erasure evidence was durably recorded, and whose metadata cleanup and final CDN purge completed.
 - `unlinked` counts shared blobs that remain because another account still references them.
@@ -29,7 +29,7 @@ The admin endpoint additionally echoes its `reason`; both responses identify the
 
 ## Retry behavior
 
-Origin DELETE operations are idempotent: a 404 means that origin is already erased. If GCS succeeds and FOS fails, the response is still a retryable `5xx`; the next attempt accepts GCS's 404 and retries FOS.
+Origin DELETE operations are idempotent: a 404 means that origin is already erased. If GCS succeeds and FOS fails, the response remains retryable (`202` when bounded work is pending, otherwise `5xx`); the next attempt accepts GCS's 404 and retries FOS.
 
 When any blob fails required-origin deletion, erasure-evidence persistence, or required metadata/reference cleanup, Blossom preserves that blob's account-list entry so the next request can rediscover unfinished work. Failed entries move behind untouched entries, allowing subsequent calls to advance through the bounded list before cycling back to persistent failures. Completed blobs are removed from the list individually, so a later failure elsewhere in the same account does not cause them to be processed again. Blossom does not increment `fully_deleted` or `unlinked` until that per-blob list update succeeds.
 
