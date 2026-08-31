@@ -951,28 +951,21 @@ fn plan_vanish_delete_batches(hashes: &[String]) -> Vec<VanishDeleteBatch> {
     batches
 }
 
-fn build_multi_delete_request(
-    keys: &[String],
-    config: &S3Config,
-    stage: &str,
-    content_md5: bool,
-) -> Result<Request> {
+fn build_multi_delete_request(keys: &[String], config: &S3Config, stage: &str) -> Result<Request> {
     let body = multi_delete_body(keys);
     let payload_hash = hex::encode(Sha256::digest(body.as_bytes()));
-    let path = format!("/{}?delete=", config.bucket);
+    let path = format!("/{}?delete", config.bucket);
     let mut req = Request::new(Method::POST, format!("{}{}", config.endpoint(), path));
     req.set_header("Host", config.host());
     req.set_header("Content-Type", "application/xml");
     req.set_header("Content-Length", body.len().to_string());
     req.set_header("X-Divine-Vanish-Stage", stage);
-    if content_md5 {
-        use base64::Engine as _;
-        let checksum = Md5::digest(body.as_bytes());
-        req.set_header(
-            "Content-MD5",
-            base64::engine::general_purpose::STANDARD.encode(checksum),
-        );
-    }
+    use base64::Engine as _;
+    let checksum = Md5::digest(body.as_bytes());
+    req.set_header(
+        "Content-MD5",
+        base64::engine::general_purpose::STANDARD.encode(checksum),
+    );
     sign_request(&mut req, config, Some(payload_hash))?;
     req.set_body(body);
     Ok(req)
@@ -1167,15 +1160,15 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
     let mut requested_by_stage = HashMap::<String, Vec<String>>::new();
 
     for batch in plan_vanish_delete_batches(hashes) {
-        let (config, backend, content_md5) = match batch.target {
-            VanishDeleteTarget::GcsMain => (&gcs, GCS_BACKEND, false),
-            VanishDeleteTarget::FosMain => (&fos, FOS_BACKEND, true),
+        let (config, backend) = match batch.target {
+            VanishDeleteTarget::GcsMain => (&gcs, GCS_BACKEND),
+            VanishDeleteTarget::FosMain => (&fos, FOS_BACKEND),
         };
         let stage = batch.stage;
         let keys = batch.keys;
         stage_started.insert(stage.clone(), Instant::now());
         requested_by_stage.insert(stage.clone(), keys.clone());
-        match build_multi_delete_request(&keys, config, &stage, content_md5).and_then(|request| {
+        match build_multi_delete_request(&keys, config, &stage).and_then(|request| {
             request.send_async(backend).map_err(|error| {
                 BlossomError::StorageError(format!("{} batch delete failed: {}", stage, error))
             })
@@ -1862,6 +1855,31 @@ fn sign_request(req: &mut Request, config: &S3Config, payload_hash: Option<Strin
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
 
+    sign_request_at(req, config, payload_hash, now)
+}
+
+fn canonical_query_string(query: Option<&str>) -> String {
+    query
+        .unwrap_or_default()
+        .split('&')
+        .filter(|parameter| !parameter.is_empty())
+        .map(|parameter| {
+            if parameter.contains('=') {
+                parameter.to_string()
+            } else {
+                format!("{parameter}=")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn sign_request_at(
+    req: &mut Request,
+    config: &S3Config,
+    payload_hash: Option<String>,
+    now: Duration,
+) -> Result<()> {
     let secs = now.as_secs();
     let days_since_epoch = secs / 86400;
     let time_of_day = secs % 86400;
@@ -1887,9 +1905,12 @@ fn sign_request(req: &mut Request, config: &S3Config, payload_hash: Option<Strin
     // Create canonical request
     let method = req.get_method_str();
     let uri = req.get_path();
-    let query = req.get_query_str().unwrap_or("");
+    let query = canonical_query_string(req.get_query_str());
 
-    let host = config.host();
+    let host = req
+        .get_header_str("Host")
+        .ok_or_else(|| BlossomError::Internal("signed request is missing its Host header".into()))?
+        .to_string();
     let signed_headers = "host;x-amz-content-sha256;x-amz-date";
 
     let canonical_headers = format!(
@@ -2467,18 +2488,18 @@ pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtracti
 #[cfg(test)]
 mod tests {
     use super::{
-        build_fos_delete_request, build_multi_delete_request, classify_cloud_cleanup_response,
-        cloud_run_delete_blob_body, cloud_run_delete_blobs_body, failed_cloud_cleanup_hashes,
-        failed_multi_delete_keys, mark_failed_stage, multi_delete_body,
-        normalize_storage_cache_state, parse_audio_extraction_error_response,
+        build_fos_delete_request, build_multi_delete_request, canonical_query_string,
+        classify_cloud_cleanup_response, cloud_run_delete_blob_body, cloud_run_delete_blobs_body,
+        failed_cloud_cleanup_hashes, failed_multi_delete_keys, mark_failed_stage,
+        multi_delete_body, normalize_storage_cache_state, parse_audio_extraction_error_response,
         parse_funnelcake_audio_reuse_response, plan_vanish_delete_batches,
-        prepare_storage_cache_miss, preserve_storage_cache_state, S3Config, VanishDeleteTarget,
-        VanishStorageResult, CLOUD_RUN_DELETE_BATCH_LIMIT, FOS_BACKEND,
+        prepare_storage_cache_miss, preserve_storage_cache_state, sign_request_at, S3Config,
+        VanishDeleteTarget, VanishStorageResult, CLOUD_RUN_DELETE_BATCH_LIMIT, FOS_BACKEND,
         PROVIDER_MULTI_DELETE_LIMIT, STORAGE_CACHE_HEADER,
     };
     use fastly::http::header;
     use fastly::{Request, Response};
-    use std::collections::HashMap;
+    use std::{collections::HashMap, time::Duration};
 
     #[test]
     fn cloud_cleanup_request_carries_the_edge_bucket() {
@@ -2589,7 +2610,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_delete_request_batches_keys_and_signs_the_payload() {
+    fn fos_multi_delete_request_batches_keys_and_signs_the_payload() {
         let config = S3Config {
             access_key: "synthetic-access-key".into(),
             secret_key: "synthetic-secret-key".into(),
@@ -2599,17 +2620,98 @@ mod tests {
         };
         let keys = vec!["a".repeat(64), format!("{}.jpg", "b".repeat(64))];
 
-        let mut req = build_multi_delete_request(&keys, &config, "fos_main", true)
-            .expect("request should sign");
+        let mut req =
+            build_multi_delete_request(&keys, &config, "fos_main").expect("request should sign");
 
         assert_eq!(req.get_method(), fastly::http::Method::POST);
         assert_eq!(
             req.get_url().as_str(),
-            "https://replica.example/replica-bucket?delete="
+            "https://replica.example/replica-bucket?delete"
         );
         assert!(req.contains_header("Authorization"));
         assert!(req.contains_header("Content-MD5"));
         assert_eq!(req.take_body().into_string(), multi_delete_body(&keys));
+    }
+
+    #[test]
+    fn gcs_multi_delete_request_has_the_exact_required_shape() {
+        let config = S3Config {
+            access_key: "synthetic-access-key".into(),
+            secret_key: "synthetic-secret-key".into(),
+            bucket: "gcs-bucket".into(),
+            host: "storage.googleapis.com".into(),
+            region: "auto".into(),
+        };
+        let keys = vec!["a".repeat(64)];
+
+        let req =
+            build_multi_delete_request(&keys, &config, "gcs_main").expect("request should sign");
+
+        assert_eq!(req.get_method(), fastly::http::Method::POST);
+        assert_eq!(
+            req.get_url().as_str(),
+            "https://storage.googleapis.com/gcs-bucket?delete"
+        );
+        assert_eq!(req.get_header_str("Host"), Some("storage.googleapis.com"));
+        assert_eq!(
+            req.get_header_str("Content-MD5"),
+            Some("IqZiGqcRnGzSA6fkBIAnEQ==")
+        );
+        assert!(req
+            .get_header_str("Authorization")
+            .expect("signed authorization")
+            .contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date"));
+    }
+
+    #[test]
+    fn signer_uses_the_requests_actual_host_header() {
+        let config = S3Config {
+            access_key: "synthetic-access-key".into(),
+            secret_key: "synthetic-secret-key".into(),
+            bucket: "bucket".into(),
+            host: "configured.example".into(),
+            region: "test-region".into(),
+        };
+        let now = Duration::from_secs(1_700_000_000);
+        let mut first = Request::post("https://configured.example/bucket?delete");
+        first.set_header("Host", "first.example");
+        sign_request_at(&mut first, &config, Some("payload".into()), now)
+            .expect("first request should sign");
+        let mut second = Request::post("https://configured.example/bucket?delete");
+        second.set_header("Host", "second.example");
+        sign_request_at(&mut second, &config, Some("payload".into()), now)
+            .expect("second request should sign");
+
+        assert_ne!(
+            first.get_header_str("Authorization"),
+            second.get_header_str("Authorization")
+        );
+    }
+
+    #[test]
+    fn multi_delete_wire_query_has_a_canonical_empty_value() {
+        let config = S3Config {
+            access_key: "synthetic-access-key".into(),
+            secret_key: "synthetic-secret-key".into(),
+            bucket: "bucket".into(),
+            host: "storage.example".into(),
+            region: "test-region".into(),
+        };
+        let now = Duration::from_secs(1_700_000_000);
+        let mut wire = Request::post("https://storage.example/bucket?delete");
+        wire.set_header("Host", "storage.example");
+        sign_request_at(&mut wire, &config, Some("payload".into()), now)
+            .expect("wire request should sign");
+        let mut canonical = Request::post("https://storage.example/bucket?delete=");
+        canonical.set_header("Host", "storage.example");
+        sign_request_at(&mut canonical, &config, Some("payload".into()), now)
+            .expect("canonical request should sign");
+
+        assert_eq!(canonical_query_string(Some("delete")), "delete=");
+        assert_eq!(
+            wire.get_header_str("Authorization"),
+            canonical.get_header_str("Authorization")
+        );
     }
 
     #[test]
@@ -2666,6 +2768,19 @@ mod tests {
 
         assert!(!failures.contains(&absent));
         assert!(failures.contains(&denied));
+    }
+
+    #[test]
+    fn multi_delete_response_treats_an_active_hold_as_failure() {
+        let held = "a".repeat(64);
+        let body = format!(
+            "<DeleteResult><Error><Key>{held}</Key><Code>ObjectUnderActiveHold</Code><Message>object is held</Message></Error></DeleteResult>"
+        );
+        let response = Response::from_status(fastly::http::StatusCode::OK).with_body(body);
+
+        let failures = failed_multi_delete_keys(response, std::slice::from_ref(&held));
+
+        assert!(failures.contains(&held));
     }
 
     #[test]
