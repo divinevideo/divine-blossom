@@ -1,7 +1,11 @@
 """Regression contracts for the hand-managed outer Fastly VCL and deploy flow."""
 
 from pathlib import Path
+import os
 import re
+import subprocess
+import tempfile
+import textwrap
 import unittest
 
 
@@ -95,6 +99,183 @@ class EdgeCacheContractTests(unittest.TestCase):
                 f"unset resp.http.X-Divine-Internal-Diagnostic-{suffix};",
                 deliver_vcl,
             )
+
+    def test_private_moderation_smoke_is_excluded_from_pull_request_workflows(self):
+        workflows = ROOT / ".github" / "workflows"
+        for workflow in (*workflows.glob("*.yml"), *workflows.glob("*.yaml")):
+            self.assertNotIn(
+                "smoke-private-moderation-cache.sh",
+                workflow.read_text(),
+                workflow,
+            )
+
+    def test_private_moderation_smoke_exercises_access_matrix(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            bin_dir = Path(temp_dir)
+            fake_curl = bin_dir / "curl"
+            fake_curl.write_text(textwrap.dedent("""\
+                #!/usr/bin/env python3
+                import hashlib
+                import os
+                from pathlib import Path
+                import sys
+
+                args = sys.argv[1:]
+                if "-X" in args and args[args.index("-X") + 1] == "HEAD":
+                    raise SystemExit("HEAD must use curl -I")
+                method = "HEAD" if "-I" in args else "GET"
+                with Path(os.environ["SMOKE_FAKE_METHOD_LOG"]).open("a") as log:
+                    log.write(method + "\\n")
+                headers_path = Path(args[args.index("-D") + 1])
+                url = next(arg for arg in args if arg.startswith("https://"))
+                path = "/" + url.split("/", 3)[3]
+                fixture = path[1:65]
+                status = {
+                    "a" * 64: "Restricted",
+                    "b" * 64: "AgeRestricted",
+                    "c" * 64: "Banned",
+                    "d" * 64: "Deleted",
+                }[fixture]
+                auth = os.environ.get("SMOKE_AUTH", "anonymous")
+                if "--config" in args:
+                    auth = "admin"
+                if auth == "owner" and os.environ.get("FAKE_INVALID_OWNER_AUTH"):
+                    auth = "anonymous"
+                elif auth == "owner" and os.environ.get("FAKE_WRONG_OWNER"):
+                    auth = "stranger"
+                elif auth == "admin" and os.environ.get("FAKE_INVALID_ADMIN_AUTH"):
+                    auth = "anonymous"
+
+                state = Path(os.environ["SMOKE_FAKE_STATE"])
+                marker = state / hashlib.sha256(url.encode()).hexdigest()
+                bare_marker = state / hashlib.sha256(url.split("?", 1)[0].encode()).hexdigest()
+
+                if auth == "admin":
+                    code = "200"
+                elif auth == "owner" and status in ("Restricted", "AgeRestricted"):
+                    code = "200"
+                elif auth == "stranger" and status == "AgeRestricted":
+                    code = "200"
+                elif status == "AgeRestricted":
+                    code = "401"
+                else:
+                    code = "404"
+
+                if path.split("?", 1)[0].endswith(".audio.m4a") and code == "200":
+                    if os.environ.get("FAKE_AUDIO_REUSE_DENIED"):
+                        code = "403"
+                    elif os.environ.get("FAKE_AUDIO_LOOKUP_UNAVAILABLE"):
+                        code = "503"
+
+                if auth != "anonymous" and code == "200":
+                    marker.touch()
+                    if os.environ.get("FAKE_STRIP_QUERY_LEAK"):
+                        bare_marker.touch()
+                elif auth == "anonymous" and marker.exists() and os.environ.get("FAKE_LEAK_PRIVATE"):
+                    code = "200"
+                elif auth == "anonymous" and "?" not in url and bare_marker.exists() and os.environ.get("FAKE_STRIP_QUERY_LEAK"):
+                    code = "200"
+
+                headers = [f"HTTP/1.1 {code}"]
+                if code == "200":
+                    headers += [
+                        "Cache-Control: private, no-store",
+                        "X-Cache: " + ("HIT" if os.environ.get("FAKE_PRIVATE_HIT") else "MISS"),
+                    ]
+                    if path.split("?", 1)[0] == f"/{fixture}":
+                        headers.append(f"X-Moderation-Status: {status}")
+                elif code == "404":
+                    headers += [
+                        "Cache-Control: no-store",
+                    ]
+                else:
+                    headers.append("X-Cache: MISS")
+                headers_path.write_text("\\r\\n".join(headers) + "\\r\\n")
+                print(code, end="")
+                """))
+            fake_nak = bin_dir / "nak"
+            fake_nak.write_text(textwrap.dedent("""\
+                #!/bin/sh
+                if [ "$1" = "--help" ]; then
+                  if [ -n "${FAKE_NAK_NOT_NOSTR:-}" ]; then
+                    echo "unrelated search utility"
+                  else
+                    echo "nak: the nostr army knife"
+                  fi
+                  exit 0
+                fi
+                [ "$1" = "curl" ] || exit 2
+                shift
+                SMOKE_AUTH=owner exec curl "$@"
+                """))
+            fake_curl.chmod(0o755)
+            fake_nak.chmod(0o755)
+
+            env = os.environ.copy()
+            env.update({
+                "PATH": f"{bin_dir}:{env['PATH']}",
+                "OWNER_NSEC": "synthetic-owner-key",
+                "ADMIN_TOKEN": "synthetic-admin-token",
+                "RESTRICTED_HASH": "a" * 64,
+                "AGE_RESTRICTED_HASH": "b" * 64,
+                "BANNED_HASH": "c" * 64,
+                "DELETED_HASH": "d" * 64,
+                "SMOKE_FAKE_STATE": str(bin_dir),
+                "SMOKE_FAKE_METHOD_LOG": str(bin_dir / "methods.log"),
+            })
+            smoke = ROOT / "scripts" / "smoke-private-moderation-cache.sh"
+            result = subprocess.run(
+                [str(smoke)], env=env, text=True, capture_output=True, check=False
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "PASS: all private moderation-status routes preserved access and cache policy",
+                result.stdout,
+            )
+            self.assertEqual(
+                set((bin_dir / "methods.log").read_text().splitlines()),
+                {"GET", "HEAD"},
+            )
+
+            for flag, message in (
+                ("FAKE_NAK_NOT_NOSTR", "nak must be the Nostr army knife"),
+                ("FAKE_INVALID_OWNER_AUTH", "OWNER_NSEC did not authenticate"),
+                ("FAKE_WRONG_OWNER", "OWNER_NSEC is not the fixture owner"),
+                ("FAKE_INVALID_ADMIN_AUTH", "ADMIN_TOKEN did not authenticate"),
+                ("FAKE_AUDIO_REUSE_DENIED", "audio-reuse policy"),
+                ("FAKE_AUDIO_LOOKUP_UNAVAILABLE", "Funnelcake is unavailable"),
+            ):
+                env[flag] = "1"
+                result = subprocess.run(
+                    [str(smoke)], env=env, text=True, capture_output=True, check=False
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+                env.pop(flag)
+
+            env["FAKE_PRIVATE_HIT"] = "1"
+            result = subprocess.run(
+                [str(smoke)], env=env, text=True, capture_output=True, check=False
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("stored in the shared edge cache", result.stderr)
+
+            env.pop("FAKE_PRIVATE_HIT")
+            env["FAKE_LEAK_PRIVATE"] = "1"
+            result = subprocess.run(
+                [str(smoke)], env=env, text=True, capture_output=True, check=False
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("anonymous after", result.stderr)
+
+            env.pop("FAKE_LEAK_PRIVATE")
+            env["FAKE_STRIP_QUERY_LEAK"] = "1"
+            result = subprocess.run(
+                [str(smoke)], env=env, text=True, capture_output=True, check=False
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("returned 200", result.stderr)
 
     def test_private_edge_policy_does_not_disable_short_404_caching(self):
         fetch_vcl = (ROOT / "vcl" / "fetch.vcl").read_text()
