@@ -51,10 +51,13 @@ The edge treats Cloud Run's authenticated `/delete-blob` response as required
 erasure evidence. For changes to that contract:
 
 1. Deploy `cloud-run-upload` from the approved branch.
-2. Verify an authenticated request reaches `/delete-blob/health` and returns a typed
-   response. This verifies route availability and secret parity only; it is not
-   a storage-permission probe. A `401` means the Fastly `webhook_secret` and Cloud
-   Run `WEBHOOK_SECRET` bindings do not match; stop rather than merging the edge.
+2. Verify an authenticated request reaches `/delete-blob/health`, sends the edge
+   config store's `gcs_bucket` value in `X-Expected-GCS-Bucket`, and returns a
+   typed `completed` response. This verifies route availability, secret parity,
+   and bucket parity; it is not a storage-permission probe. A `401` means the
+   Fastly `webhook_secret` and Cloud Run `WEBHOOK_SECRET` bindings do not match;
+   a `409` means the two services name different buckets. Stop rather than
+   merging the edge in either case.
 3. Merge only after the backend route and authentication are verified. Each real
    cleanup request also asserts that Cloud Run and the edge use the same GCS
    bucket before Cloud Run may report deletion complete. The

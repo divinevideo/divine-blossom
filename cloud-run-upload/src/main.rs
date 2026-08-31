@@ -242,6 +242,8 @@ struct CleanupHealthResponse {
     status: cleanup::CleanupStatus,
 }
 
+const EXPECTED_GCS_BUCKET_HEADER: &str = "x-expected-gcs-bucket";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WebhookAuthError {
     Unavailable,
@@ -475,6 +477,27 @@ async fn handle_delete_blob_health(
                 "unauthorized",
             ),
         };
+    }
+
+    let expected_bucket = match headers
+        .get(EXPECTED_GCS_BUCKET_HEADER)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(bucket) if !bucket.is_empty() => bucket,
+        _ => {
+            return cleanup_error(
+                StatusCode::BAD_REQUEST,
+                cleanup::CleanupStatus::Permanent,
+                "expected cleanup bucket header is required",
+            )
+        }
+    };
+    if !cleanup_bucket_matches(expected_bucket, &state.config.gcs_bucket) {
+        return cleanup_error(
+            StatusCode::CONFLICT,
+            cleanup::CleanupStatus::Retryable,
+            "cleanup bucket does not match the expected edge configuration",
+        );
     }
 
     (
@@ -1577,7 +1600,7 @@ mod tests {
     use super::{
         classify_invalid_media_signal, cleanup_bucket_matches, cleanup_response_status,
         media_source_candidates, needs_derivative_sanitize, new_temp_media_path,
-        validate_webhook_auth, video_thumbnail_url,
+        validate_webhook_auth, video_thumbnail_url, EXPECTED_GCS_BUCKET_HEADER,
     };
     use axum::http::{header, HeaderMap, HeaderValue};
 
@@ -1601,6 +1624,7 @@ mod tests {
     fn cleanup_requires_the_edge_and_cloud_run_bucket_to_match() {
         assert!(cleanup_bucket_matches("media", "media"));
         assert!(!cleanup_bucket_matches("edge-media", "cloud-media"));
+        assert_eq!(EXPECTED_GCS_BUCKET_HEADER, "x-expected-gcs-bucket");
     }
 
     #[test]
