@@ -4173,6 +4173,24 @@ fn handle_upload_requirements(req: Request) -> Result<Response> {
 }
 
 /// Delete and verify the main GCS object plus every thumbnail, HLS, VTT, and prefix artifact.
+fn local_derivative_cleanup_result(
+    local_mode: bool,
+    deterministic_failures: &[String],
+) -> Option<Result<()>> {
+    if !local_mode {
+        return None;
+    }
+    Some(if deterministic_failures.is_empty() {
+        Ok(())
+    } else {
+        Err(BlossomError::StorageError(format!(
+            "{} required local derivative cleanup operation(s) failed: {}",
+            deterministic_failures.len(),
+            deterministic_failures.join("; ")
+        )))
+    })
+}
+
 pub(crate) fn delete_blob_gcs_artifacts(hash: &str) -> Result<()> {
     let paths = [
         format!("{}.jpg", hash),
@@ -4190,6 +4208,16 @@ pub(crate) fn delete_blob_gcs_artifacts(hash: &str) -> Result<()> {
         if let Err(error) = storage_delete(path) {
             deterministic_failures.push(format!("{}: {}", path, error));
         }
+    }
+
+    // Local mode only creates the deterministic MinIO derivatives above. It has
+    // no Cloud Run backend or webhook secret, so those successful deletes are
+    // the complete local cleanup contract.
+    if let Some(result) = local_derivative_cleanup_result(
+        crate::storage::is_local_mode(),
+        &deterministic_failures,
+    ) {
+        return result;
     }
 
     // Cloud Run lists and verifies the prefix, covering derivative names the
@@ -6198,7 +6226,7 @@ mod tests {
         add_audio_response_headers, add_blob_response_cache_headers, backfill_batch_cursor,
         classify_audio_reuse_availability, decide_transcode_fetch_action,
         decide_transcript_fetch_action, derivative_reconciliation_response, error_response,
-        ignored_generation_response, is_alias_only_audio_blob,
+        ignored_generation_response, is_alias_only_audio_blob, local_derivative_cleanup_result,
         parse_transcode_status_webhook_payload, parse_transcript_status_webhook_payload,
         parse_upload_service_response, should_delete_derived_audio_blob,
         surrogate_key_hash_from_path,
@@ -6226,6 +6254,17 @@ mod tests {
             vanish_response_status(1),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    #[test]
+    fn local_derivative_cleanup_skips_cloud_run_only_after_deterministic_success() {
+        assert!(local_derivative_cleanup_result(true, &[])
+            .expect("local mode should decide cleanup locally")
+            .is_ok());
+        assert!(local_derivative_cleanup_result(true, &["delete failed".into()])
+            .expect("local mode should decide cleanup locally")
+            .is_err());
+        assert!(local_derivative_cleanup_result(false, &[]).is_none());
     }
 
     #[test]
