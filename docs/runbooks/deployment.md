@@ -106,14 +106,19 @@ Rotate forward in this order:
 
 1. Record the current GCP version number. Create the new version without a
    trailing newline, keep the old version enabled, and update the canonical
-   `blossom-webhook-secret-prod` mirror from that exact new version.
-2. Before changing either write-only copy, stop new transcode and transcription
-   dispatch and wait for active derivative work, queued derivative work, and
-   derivative-status Cloud Tasks to drain. Running old revisions and
-   already-created tasks retain the old credential; after Fastly converges,
-   their callbacks would fail and direct callbacks would not be retried. Keep
-   dispatch paused, then update Cloudflare and immediately update Fastly from
-   the new GCP version. Record both write times.
+   `blossom-webhook-secret-prod` mirror from that exact new version. Inventory
+   every bearer client using `webhook_secret`, prepare each client update, and
+   record when the moderation Worker is the only one.
+2. Schedule the rotation for a low-activity window. Before changing either
+   write-only copy, record active derivative work plus the
+   [derivative-status queue](../derivative-status-queue.md) depth and oldest-task
+   age. Do not pause that queue: it continues to accept tasks while paused and
+   would accumulate rather than drain. This repository has no dispatch-pause
+   control, so running old revisions and already-created tasks can retain the
+   old credential and later receive `403` from Fastly. Record affected jobs for
+   reconciliation. Then update every caller from step 1, starting with
+   Cloudflare, and immediately update Fastly from the new GCP version. Record
+   all write times.
 3. Poll `/admin/moderate` with the new credential and a valid but incomplete
    `{}` payload. Continue only when the edge reaches payload parsing and returns
    `400 Missing 'sha256' field`; `403` means the new Fastly value has not
@@ -130,14 +135,19 @@ Rotate forward in this order:
 5. Verify every direction above. Send a real moderation notification; run the
    authenticated [`/delete-blob/health` parity check](#deploy-cleanup-dependencies-before-the-edge)
    with `X-Expected-GCS-Bucket`; exercise a controlled audio extraction through
-   the edge as a reachability check, not a secret-parity check; and confirm both
-   transcode and transcript callbacks reach Fastly without `401` or `403`. Also
-   verify the funnelcake janitor's separate `admin_token` still authenticates an
-   admin read route. After the old work and queued tasks from step 2 are drained,
-   any new `401` or `403` in the edge, Worker, upload, or transcoder logs is a
-   rollback signal rather than an expected rotation transient.
-6. Disable the old GCP version only after every probe passes, then resume
-   transcode and transcription dispatch.
+   the edge as a reachability check, not a secret-parity check; and confirm new
+   transcode and transcript jobs on the fresh revision callback to Fastly
+   without `401` or `403`. Also verify the funnelcake janitor's separate
+   `admin_token` still authenticates an admin read route. Inspect the edge,
+   Worker, upload, and transcoder logs.
+   A `401` or `403` on moderation, deletion, or a callback from a new transcoder
+   revision is a rollback signal. A callback from an old revision or a queued
+   task created before the rotation can fail with the stale credential; record
+   and reconcile that job, but do not roll back a correct new-credential path
+   solely for that expected event.
+6. Disable the old GCP version only after every probe passes and every stale
+   callback observed in step 5 has been reconciled. Roll back if an affected job
+   cannot be reconciled.
 
 There is no zero-mismatch order because these consumers do not all accept both
 old and new values. Cloudflare goes first so the caller stops sending the old
