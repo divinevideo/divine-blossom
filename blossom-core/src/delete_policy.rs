@@ -109,6 +109,7 @@ pub enum VanishBlobOutcome {
 pub trait VanishBlobOps: BlobErasureOps {
     fn get_blob_metadata(&self, hash: &str) -> Result<Option<BlobMetadata>>;
     fn remove_from_blob_refs(&self, hash: &str, pubkey: &str) -> Result<Vec<String>>;
+    fn put_erasure_evidence(&self, hash: &str) -> Result<()>;
     fn delete_blob_metadata(&self, hash: &str) -> Result<()>;
     fn delete_blob_kv_artifacts(&self, hash: &str);
     fn update_stats_on_remove(&self, metadata: &BlobMetadata);
@@ -171,6 +172,7 @@ pub fn handle_vanish_blob_with_ops<O: VanishBlobOps>(
             }
 
             erase_blob_with_ops(hash, req_id, ops)?;
+            ops.put_erasure_evidence(hash)?;
             ops.delete_blob_kv_artifacts(hash);
             ops.remove_from_recent_index(hash);
             ops.remove_from_user_list(pubkey, hash)?;
@@ -187,6 +189,7 @@ pub fn handle_vanish_blob_with_ops<O: VanishBlobOps>(
 
     if is_owner && other_refs.is_empty() {
         erase_blob_with_ops(hash, req_id, ops)?;
+        ops.put_erasure_evidence(hash)?;
         ops.delete_blob_metadata(hash)?;
         ops.delete_blob_kv_artifacts(hash);
         ops.update_stats_on_remove(&metadata);
@@ -359,6 +362,7 @@ mod tests {
         cleanup_audio_err: bool,
         delete_replica_err: bool,
         delete_artifacts_err: bool,
+        put_erasure_evidence_err: bool,
         delete_metadata_err: bool,
         remove_user_list_err: Cell<bool>,
         calls: RefCell<Vec<&'static str>>,
@@ -419,6 +423,16 @@ mod tests {
                 Ok(())
             }
         }
+        fn put_erasure_evidence(&self, _hash: &str) -> Result<()> {
+            self.calls.borrow_mut().push("put_erasure_evidence");
+            if self.put_erasure_evidence_err {
+                Err(BlossomError::MetadataError(
+                    "erasure evidence failed".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
         fn delete_blob_kv_artifacts(&self, _hash: &str) {
             self.calls.borrow_mut().push("delete_blob_kv_artifacts");
         }
@@ -469,6 +483,7 @@ mod tests {
                 "delete_blob_from_replica",
                 "delete_blob_gcs_artifacts",
                 "purge_vcl_cache",
+                "put_erasure_evidence",
                 "delete_blob_metadata",
                 "delete_blob_kv_artifacts",
                 "update_stats_on_remove",
@@ -550,6 +565,21 @@ mod tests {
     }
 
     #[test]
+    fn vanish_evidence_failure_preserves_metadata_and_list_entry() {
+        let ops = MockVanishOps {
+            put_erasure_evidence_err: true,
+            ..vanish_ops_with_owner()
+        };
+
+        let result = handle_vanish_blob_with_ops(HASH, &"1".repeat(64), REQ_ID, &ops);
+
+        assert!(matches!(result, Err(BlossomError::MetadataError(_))));
+        assert!(ops.metadata.borrow().is_some());
+        assert!(!ops.calls.borrow().contains(&"delete_blob_metadata"));
+        assert!(!ops.calls.borrow().contains(&"remove_from_user_list"));
+    }
+
+    #[test]
     fn vanish_metadata_failure_does_not_remove_list_entry() {
         let ops = MockVanishOps {
             delete_metadata_err: true,
@@ -580,7 +610,22 @@ mod tests {
             .expect("metadata-less retry should converge");
 
         assert_eq!(retry_outcome, VanishBlobOutcome::FullyDeleted);
-        assert!(first.calls.borrow().contains(&"remove_from_user_list"));
+        assert_eq!(
+            *first.calls.borrow(),
+            vec![
+                "get_blob_metadata",
+                "remove_from_blob_refs",
+                "cleanup_derived_audio",
+                "delete_blob_from_gcs",
+                "delete_blob_from_replica",
+                "delete_blob_gcs_artifacts",
+                "purge_vcl_cache",
+                "put_erasure_evidence",
+                "delete_blob_kv_artifacts",
+                "remove_from_recent_index",
+                "remove_from_user_list",
+            ]
+        );
     }
 
     #[test]

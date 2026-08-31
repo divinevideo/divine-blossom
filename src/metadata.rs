@@ -7,6 +7,7 @@ use crate::blossom::{
 use crate::error::{BlossomError, Result};
 use fastly::cache::simple as simple_cache;
 use fastly::kv_store::{KVStore, KVStoreError};
+use sha2::{Digest, Sha256};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// TTL for cached metadata (5 minutes) — short because moderation status can change
@@ -35,6 +36,11 @@ const AUTH_PREFIX: &str = "auth:";
 
 /// Key prefix for tombstones (legally removed content)
 const TOMBSTONE_PREFIX: &str = "tombstone:";
+
+/// Key prefix for non-identifying account-erasure evidence.
+const ERASURE_PREFIX: &str = "erasure:v1:";
+
+const ERASURE_DOMAIN: &str = "divine-blossom-erasure-v1:";
 
 /// Key prefix for blob references (all uploaders of same content)
 const REFS_PREFIX: &str = "refs:";
@@ -145,6 +151,27 @@ pub fn delete_blob_metadata(hash: &str) -> Result<()> {
         .map_err(|e| BlossomError::MetadataError(format!("Failed to delete metadata: {}", e)))?;
 
     invalidate_metadata_cache(hash);
+    Ok(())
+}
+
+fn erasure_evidence_key(hash: &str) -> String {
+    let digest = Sha256::digest(format!("{}{}", ERASURE_DOMAIN, hash.to_lowercase()));
+    format!("{}{}", ERASURE_PREFIX, hex::encode(digest))
+}
+
+/// Store durable evidence that the vanish erasure phase completed for a blob.
+///
+/// The key is derived from the content hash and the value contains no account,
+/// content hash, media bytes, reason, or request timestamp.
+pub fn put_erasure_evidence(hash: &str) -> Result<()> {
+    let store = open_store()?;
+    let key = erasure_evidence_key(hash);
+    let value = r#"{"version":1,"evidence":"vanish_erasure"}"#;
+
+    store.insert(&key, value).map_err(|e| {
+        BlossomError::MetadataError(format!("Failed to store erasure evidence: {}", e))
+    })?;
+
     Ok(())
 }
 
@@ -1388,9 +1415,29 @@ pub fn delete_audio_source_refs(audio_hash: &str) -> Result<()> {
 mod tests {
     use super::{
         duplicate_generation, edge_transcode_status_generation, edge_transcript_status_generation,
-        generation_rejection, stale_generation, status_generation_from_ms,
+        erasure_evidence_key, generation_rejection, stale_generation, status_generation_from_ms,
         transcode_status_event_sequence, transcript_status_event_sequence, StatusUpdateOutcome,
     };
+
+    #[test]
+    fn erasure_evidence_key_is_deterministic_and_hides_the_content_hash() {
+        let hash = "A".repeat(64);
+
+        let key = erasure_evidence_key(&hash);
+
+        assert!(key.starts_with("erasure:v1:"));
+        assert_eq!(key.len(), "erasure:v1:".len() + 64);
+        assert!(!key.contains(&hash.to_lowercase()));
+        assert_eq!(key, erasure_evidence_key(&hash.to_lowercase()));
+    }
+
+    #[test]
+    fn erasure_evidence_key_matches_audit_golden_vector() {
+        assert_eq!(
+            erasure_evidence_key(&"a".repeat(64)),
+            "erasure:v1:60af600bf402ba1507822131764b39002f969d1fc122f1eda3e7491509505437"
+        );
+    }
 
     #[test]
     fn stale_generation_only_rejects_older_known_generations() {
