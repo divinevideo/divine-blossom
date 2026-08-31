@@ -388,6 +388,11 @@ gcloud run services update-traffic divine-transcoder \
   --project rich-compiler-479518-d2 --region us-central1 --to-latest
 ```
 
+The upload service is the exception: `cloud-run-upload/deploy.sh` restores
+`--to-latest` after every successful deploy, so an upload rollback remains
+pinned only until the next upload service deploy. Transcoder rollbacks remain
+pinned until an operator restores migration explicitly.
+
 Until that runs, check where traffic actually is after every deploy:
 
 ```bash
