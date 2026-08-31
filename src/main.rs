@@ -4498,14 +4498,6 @@ fn select_vanish_batch(hashes: &[String]) -> (Vec<String>, Vec<String>, u32) {
 
 fn record_malformed_vanish_hash(hash: &str, pubkey: &str) {
     let fingerprint = hex::encode(Sha256::digest(hash.as_bytes()));
-    write_audit_log(
-        &fingerprint,
-        "vanish_malformed_hash_exception",
-        pubkey,
-        None,
-        None,
-        Some("Malformed blob-list entry skipped; sha256 is a fingerprint of the invalid value"),
-    );
     eprintln!(
         "[VANISH] pubkey={} skipped malformed blob-list entry fingerprint={}",
         pubkey, fingerprint
