@@ -43,8 +43,8 @@ use crate::metadata::{
     get_blob_metadata, get_blob_metadata_uncached, get_blob_refs, get_subtitle_job,
     get_subtitle_job_by_hash, get_tombstone, get_user_blobs, get_vanish_audit_state,
     list_blobs_with_metadata, move_user_list_entries_to_end, put_audio_mapping, put_auth_event,
-    put_blob_metadata, put_subtitle_job, put_vanish_audit_state, remove_from_audio_source_refs,
-    remove_from_blob_refs, remove_from_user_index, remove_from_user_list,
+    put_blob_metadata, put_subtitle_job, put_vanish_audit_state, refresh_vanish_audit_state,
+    remove_from_audio_source_refs, remove_from_blob_refs, remove_from_user_index, remove_from_user_list,
     set_subtitle_job_id_for_hash, update_blob_status, update_stats_on_add, StatusUpdateOutcome,
     TranscodeMetadataUpdate, TranscriptMetadataUpdate, VanishAuditState,
 };
@@ -4729,23 +4729,49 @@ fn ensure_vanish_authorization_audit(
     pubkey: &str,
     initiator: VanishAuditInitiator,
 ) -> Result<VanishAuditState> {
-    let mut state = match get_vanish_audit_state(pubkey, initiator.as_str())? {
-        Some(state) => state,
-        None => {
-            let authorized_at = current_timestamp();
-            let operation_id = hex::encode(Sha256::digest(
-                format!(
-                    "vanish-audit-operation:v1:{pubkey}:{}:{authorized_at}",
-                    initiator.as_str()
-                )
-                .as_bytes(),
-            ));
-            let state = VanishAuditState::new(operation_id, authorized_at);
-            put_vanish_audit_state(pubkey, initiator.as_str(), &state)?;
-            state
-        }
-    };
+    const MAX_ATTEMPTS: usize = 3;
 
+    for _ in 0..MAX_ATTEMPTS {
+        let mut state = match get_vanish_audit_state(pubkey, initiator.as_str())? {
+            Some(state) => state,
+            None => {
+                let authorized_at = current_timestamp();
+                let operation_id = hex::encode(Sha256::digest(
+                    format!(
+                        "vanish-audit-operation:v1:{pubkey}:{}:{authorized_at}",
+                        initiator.as_str()
+                    )
+                    .as_bytes(),
+                ));
+                let state = VanishAuditState::new(operation_id, authorized_at);
+                put_vanish_audit_state(pubkey, initiator.as_str(), &state)?;
+                state
+            }
+        };
+
+        if state.needs_authorization_delivery() {
+            deliver_vanish_authorization_audit(pubkey, initiator, &mut state)?;
+            return Ok(state);
+        }
+        if let Some(state) = refresh_vanish_audit_state(
+            pubkey,
+            initiator.as_str(),
+            &state.operation_id,
+        )? {
+            return Ok(state);
+        }
+    }
+
+    Err(BlossomError::MetadataError(
+        "Vanish audit authorization state changed too many times".into(),
+    ))
+}
+
+fn deliver_vanish_authorization_audit(
+    pubkey: &str,
+    initiator: VanishAuditInitiator,
+    state: &mut VanishAuditState,
+) -> Result<()> {
     if state.needs_authorization_delivery() {
         write_vanish_audit_log(
             pubkey,
@@ -4755,9 +4781,9 @@ fn ensure_vanish_authorization_audit(
             VanishAuditPhase::Authorized,
         )?;
         state.mark_authorized_delivered();
-        put_vanish_audit_state(pubkey, initiator.as_str(), &state)?;
+        put_vanish_audit_state(pubkey, initiator.as_str(), state)?;
     }
-    Ok(state)
+    Ok(())
 }
 
 fn complete_vanish_audit(
@@ -4795,6 +4821,7 @@ fn complete_open_vanish_audits(
 ) -> Result<()> {
     let other = initiator.other();
     if let Some(mut other_state) = get_vanish_audit_state(pubkey, other.as_str())? {
+        deliver_vanish_authorization_audit(pubkey, other, &mut other_state)?;
         complete_vanish_audit(pubkey, other, &mut other_state)?;
     }
     complete_vanish_audit(pubkey, initiator, state)

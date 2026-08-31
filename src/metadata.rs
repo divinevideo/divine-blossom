@@ -263,6 +263,59 @@ pub fn put_vanish_audit_state(
         })
 }
 
+pub fn refresh_vanish_audit_state(
+    pubkey: &str,
+    initiator: &str,
+    operation_id: &str,
+) -> Result<Option<VanishAuditState>> {
+    const MAX_ATTEMPTS: usize = 3;
+
+    let store = open_store()?;
+    let key = vanish_audit_key(pubkey, initiator);
+    for _ in 0..MAX_ATTEMPTS {
+        let mut result = match store.lookup(&key) {
+            Ok(result) => result,
+            Err(KVStoreError::ItemNotFound) => return Ok(None),
+            Err(error) => {
+                return Err(BlossomError::MetadataError(format!(
+                    "Failed to load vanish audit refresh state: {error}"
+                )))
+            }
+        };
+        let generation = result.current_generation();
+        let state: VanishAuditState =
+            serde_json::from_str(&result.take_body().into_string()).map_err(|error| {
+                BlossomError::MetadataError(format!("Invalid vanish audit refresh state: {error}"))
+            })?;
+        if state.operation_id != operation_id {
+            return Ok(None);
+        }
+        let value = serde_json::to_string(&state).map_err(|error| {
+            BlossomError::MetadataError(format!(
+                "Failed to serialize vanish audit refresh state: {error}"
+            ))
+        })?;
+        match store
+            .build_insert()
+            .if_generation_match(generation)
+            .time_to_live(VANISH_AUDIT_STATE_TTL)
+            .execute(&key, value)
+        {
+            Ok(()) => return Ok(Some(state)),
+            Err(KVStoreError::ItemPreconditionFailed) => continue,
+            Err(error) => {
+                return Err(BlossomError::MetadataError(format!(
+                    "Failed to refresh vanish audit state: {error}"
+                )))
+            }
+        }
+    }
+
+    Err(BlossomError::MetadataError(
+        "Vanish audit refresh state changed too many times".into(),
+    ))
+}
+
 pub fn claim_vanish_audit_completion(
     pubkey: &str,
     initiator: &str,
