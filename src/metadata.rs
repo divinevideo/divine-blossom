@@ -249,6 +249,10 @@ fn vanish_audit_state_ttl(state: &VanishAuditState) -> Duration {
     }
 }
 
+fn should_refresh_vanish_audit_state(state: &VanishAuditState) -> bool {
+    state.completed_at.is_none()
+}
+
 pub fn create_vanish_audit_state(
     pubkey: &str,
     initiator: &str,
@@ -361,6 +365,9 @@ pub fn refresh_vanish_audit_state(
             })?;
         if state.operation_id != operation_id {
             return Ok(None);
+        }
+        if !should_refresh_vanish_audit_state(&state) {
+            return Ok(Some(state));
         }
         let value = serde_json::to_string(&state).map_err(|error| {
             BlossomError::MetadataError(format!(
@@ -1733,10 +1740,10 @@ pub fn delete_audio_source_refs(audio_hash: &str) -> Result<()> {
 mod tests {
     use super::{
         duplicate_generation, edge_transcode_status_generation, edge_transcript_status_generation,
-        erasure_evidence_key, generation_rejection, rotate_hashes_to_end, stale_generation,
-        status_generation_from_ms, transcode_status_event_sequence,
-        transcript_status_event_sequence, vanish_audit_key, vanish_audit_state_ttl,
-        StatusUpdateOutcome, VanishAuditState,
+        erasure_evidence_key, generation_rejection, rotate_hashes_to_end,
+        should_refresh_vanish_audit_state, stale_generation, status_generation_from_ms,
+        transcode_status_event_sequence, transcript_status_event_sequence, vanish_audit_key,
+        vanish_audit_state_ttl, StatusUpdateOutcome, VanishAuditState,
     };
     use std::collections::HashSet;
 
@@ -1956,6 +1963,7 @@ mod tests {
         let mut state = VanishAuditState::new("operation".into(), "authorized-at".into());
         assert!(state.needs_authorization_delivery());
         assert_eq!(state.completed_at, None);
+        assert!(should_refresh_vanish_audit_state(&state));
 
         state.mark_authorized_delivered();
         state.begin_completion("completed-at".into());
@@ -1970,6 +1978,7 @@ mod tests {
             vanish_audit_state_ttl(&state),
             super::VANISH_AUDIT_COMPLETED_TTL
         );
+        assert!(!should_refresh_vanish_audit_state(&state));
     }
 
     #[test]
