@@ -49,8 +49,8 @@ use crate::metadata::{
 use crate::storage::{
     blob_exists, check_funnelcake_audio_reuse, current_timestamp, delete_blob as storage_delete,
     download_blob_read_through, download_blob_with_fallback, download_thumbnail,
-    erase_vanish_batch, trigger_audio_extraction, trigger_audit_anonymize,
-    trigger_cloud_run_delete_blob, upload_blob, write_audit_log, write_vanish_timing_log,
+    erase_vanish_batch, trigger_audio_extraction, trigger_cloud_run_delete_blob, upload_blob,
+    write_audit_log, write_vanish_timing_log,
 };
 use crate::viewer_auth::{ViewerAuthDiagnostics, ViewerAuthState};
 use blossom_core::cache_policy::{
@@ -4464,7 +4464,6 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
                 pubkey, error
             );
             execution.errors = 1;
-            trigger_audit_anonymize(pubkey);
             return execution;
         }
     };
@@ -4555,11 +4554,7 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         }
     }
 
-    // Audit records must be anonymized even when media erasure remains retryable.
-    trigger_audit_anonymize(pubkey);
     let timing = serde_json::json!({
-        "pubkey": pubkey,
-        "failed_hashes": retry_hashes,
         "selected": selected.len(),
         "erase_candidates": erase.len(),
         "storage_attempts": storage_attempts,
