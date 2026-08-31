@@ -24,6 +24,7 @@ const FOS_BACKEND: &str = "fos_storage";
 
 /// Cloud Run backend for uploads/migrations
 const CLOUD_RUN_BACKEND: &str = "cloud_run_upload";
+const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
 
 /// Legacy CDN runtime fallback is intentionally disabled.
 ///
@@ -2067,6 +2068,39 @@ fn hash_body_for_signing(_size: u64) -> String {
     "UNSIGNED-PAYLOAD".into()
 }
 
+fn audit_log_entry(
+    sha256: &str,
+    action: &str,
+    actor_pubkey: &str,
+    timestamp: String,
+    auth_event_json: Option<&str>,
+    metadata_snapshot: Option<&str>,
+    reason: Option<&str>,
+) -> String {
+    let mut entry = serde_json::Map::from_iter([
+        ("action".into(), serde_json::Value::String(action.into())),
+        ("sha256".into(), serde_json::Value::String(sha256.into())),
+        (
+            "actor_pubkey".into(),
+            serde_json::Value::String(actor_pubkey.into()),
+        ),
+        (
+            "timestamp".into(),
+            serde_json::Value::String(timestamp),
+        ),
+    ]);
+    if let Some(auth_event) = auth_event_json.and_then(|value| serde_json::from_str(value).ok()) {
+        entry.insert("auth_event".into(), auth_event);
+    }
+    if let Some(metadata) = metadata_snapshot.and_then(|value| serde_json::from_str(value).ok()) {
+        entry.insert("metadata_snapshot".into(), metadata);
+    }
+    if let Some(reason) = reason {
+        entry.insert("reason".into(), serde_json::Value::String(reason.into()));
+    }
+    serde_json::Value::Object(entry).to_string()
+}
+
 /// Write an audit log entry via Cloud Run (which writes structured logs to Cloud Logging).
 /// Fire-and-forget: failures are logged to stderr but never block the caller.
 ///
@@ -2081,27 +2115,18 @@ pub fn write_audit_log(
     metadata_snapshot: Option<&str>,
     reason: Option<&str>,
 ) {
-    let timestamp = current_timestamp();
-
-    let mut entry = format!(
-        r#"{{"action":"{}","sha256":"{}","actor_pubkey":"{}","timestamp":"{}""#,
-        action, sha256, actor_pubkey, timestamp
+    let entry = audit_log_entry(
+        sha256,
+        action,
+        actor_pubkey,
+        current_timestamp(),
+        auth_event_json,
+        metadata_snapshot,
+        reason,
     );
-
-    if let Some(auth) = auth_event_json {
-        entry.push_str(&format!(r#","auth_event":{}"#, auth));
-    }
-    if let Some(meta) = metadata_snapshot {
-        entry.push_str(&format!(r#","metadata_snapshot":{}"#, meta));
-    }
-    if let Some(r) = reason {
-        entry.push_str(&format!(r#","reason":"{}""#, r.replace('"', "\\\"")));
-    }
-    entry.push('}');
 
     // Fire-and-forget POST to Cloud Run /audit endpoint
     // Cloud Run prints structured JSON → auto-ingested by Cloud Logging
-    const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
     let mut req = Request::new(Method::POST, format!("https://{}/audit", CLOUD_RUN_HOST));
     req.set_header("Host", CLOUD_RUN_HOST);
     req.set_header("Content-Type", "application/json");
@@ -2302,7 +2327,6 @@ pub fn trigger_cloud_run_delete_blob(hash: &str) -> Result<()> {
     let expected_bucket = get_config("gcs_bucket")?;
     let body = cloud_run_delete_blob_body(hash, &expected_bucket);
 
-    const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
     let mut req = Request::new(
         Method::POST,
         format!("https://{}/delete-blob", CLOUD_RUN_HOST),
@@ -2410,7 +2434,6 @@ pub fn trigger_background_migration(hash: &str, source_backend: &str) -> Result<
     // was dropped immediately, causing the worker to terminate before Cloud Run
     // could process the migration. Using synchronous send ensures the migration
     // actually completes before the response goes back through VCL.
-    const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
     let mut req = Request::new(Method::POST, format!("https://{}/migrate", CLOUD_RUN_HOST));
     req.set_header("Host", CLOUD_RUN_HOST);
     req.set_header("Content-Type", "application/json");
@@ -2579,7 +2602,8 @@ pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtracti
 #[cfg(test)]
 mod tests {
     use super::{
-        build_fos_delete_request, build_multi_delete_request, canonical_query_string,
+        audit_log_entry, build_fos_delete_request, build_multi_delete_request,
+        canonical_query_string,
         classify_cloud_cleanup_response, cloud_run_delete_blob_body, cloud_run_delete_blobs_body,
         failed_cloud_cleanup_hashes, failed_multi_delete_keys, mark_failed_stage,
         multi_delete_body, normalize_storage_cache_state, parse_audio_extraction_error_response,
@@ -2592,6 +2616,24 @@ mod tests {
     use fastly::http::header;
     use fastly::{Request, Response};
     use std::{collections::HashMap, time::Duration};
+
+    #[test]
+    fn audit_log_entry_serializes_optional_fields_without_manual_escaping() {
+        let entry = audit_log_entry(
+            &"a".repeat(64),
+            "delete",
+            &"b".repeat(64),
+            "2026-08-31T00:00:00Z".into(),
+            Some(r#"{"id":"event"}"#),
+            None,
+            Some("quoted \"reason\" with \\ and\nnewline"),
+        );
+        let value: serde_json::Value = serde_json::from_str(&entry).expect("valid audit JSON");
+
+        assert_eq!(value["auth_event"]["id"], "event");
+        assert_eq!(value["reason"], "quoted \"reason\" with \\ and\nnewline");
+        assert!(value.get("metadata_snapshot").is_none());
+    }
 
     #[test]
     fn cloud_cleanup_request_carries_the_edge_bucket() {
