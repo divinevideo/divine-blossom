@@ -581,6 +581,7 @@ async fn handle_delete_blobs_ready() -> impl IntoResponse {
         "status": "ready",
         "contract": "vanish-batch-v1",
         "max_hashes": MAX_BATCH_CLEANUP_HASHES,
+        "vanish_audit": "authenticated-v1",
     }))
 }
 

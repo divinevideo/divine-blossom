@@ -2126,27 +2126,50 @@ pub enum VanishAuditPhase {
     Completed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VanishAuditInitiator {
+    Account,
+    Admin,
+}
+
+impl VanishAuditInitiator {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Account => "account",
+            Self::Admin => "admin",
+        }
+    }
+}
+
 fn vanish_audit_entry(
     pubkey: &str,
     operation_id: &str,
     timestamp: &str,
+    initiator: VanishAuditInitiator,
     phase: VanishAuditPhase,
 ) -> serde_json::Value {
-    let action = match phase {
-        VanishAuditPhase::Authorized => "vanish_authorized",
-        VanishAuditPhase::Completed => "vanish_completed",
+    let action = match (initiator, phase) {
+        (VanishAuditInitiator::Account, VanishAuditPhase::Authorized) => "vanish_authorized",
+        (VanishAuditInitiator::Account, VanishAuditPhase::Completed) => "vanish_completed",
+        (VanishAuditInitiator::Admin, VanishAuditPhase::Authorized) => "admin_vanish_authorized",
+        (VanishAuditInitiator::Admin, VanishAuditPhase::Completed) => "admin_vanish_completed",
     };
     let insert_id = hex::encode(Sha256::digest(
         format!("vanish-audit:v1:{action}:{operation_id}").as_bytes(),
     ));
-    serde_json::json!({
+    let mut entry = serde_json::json!({
         "action": action,
-        "actor_pubkey": pubkey,
+        "account_pubkey": pubkey,
         "audit_version": 1,
+        "initiator": initiator.as_str(),
         "operation_id": operation_id,
         "time": timestamp,
         "logging.googleapis.com/insertId": insert_id,
-    })
+    });
+    if initiator == VanishAuditInitiator::Account {
+        entry["actor_pubkey"] = serde_json::json!(pubkey);
+    }
+    entry
 }
 
 /// Write one idempotent account-level vanish audit record.
@@ -2154,11 +2177,12 @@ pub fn write_vanish_audit_log(
     pubkey: &str,
     operation_id: &str,
     timestamp: &str,
+    initiator: VanishAuditInitiator,
     phase: VanishAuditPhase,
 ) -> Result<()> {
     const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
     let webhook_secret = get_secret("webhook_secret")?;
-    let payload = vanish_audit_entry(pubkey, operation_id, timestamp, phase);
+    let payload = vanish_audit_entry(pubkey, operation_id, timestamp, initiator, phase);
     let mut request = Request::new(
         Method::POST,
         format!("https://{}/audit/vanish", CLOUD_RUN_HOST),
@@ -2556,7 +2580,7 @@ mod tests {
         prepare_storage_cache_miss, preserve_storage_cache_state, sign_request_at,
         vanish_audit_entry, S3Config,
         VanishDeleteTarget, VanishStorageResult, CLOUD_RUN_DELETE_BATCH_LIMIT, FOS_BACKEND,
-        PROVIDER_MULTI_DELETE_LIMIT, STORAGE_CACHE_HEADER, VanishAuditPhase,
+        PROVIDER_MULTI_DELETE_LIMIT, STORAGE_CACHE_HEADER, VanishAuditInitiator, VanishAuditPhase,
     };
     use fastly::http::header;
     use fastly::{Request, Response};
@@ -2580,18 +2604,21 @@ mod tests {
             &pubkey,
             &operation_id,
             timestamp,
+            VanishAuditInitiator::Account,
             VanishAuditPhase::Authorized,
         );
         let authorized_retry = vanish_audit_entry(
             &pubkey,
             &operation_id,
             timestamp,
+            VanishAuditInitiator::Account,
             VanishAuditPhase::Authorized,
         );
         let completed = vanish_audit_entry(
             &pubkey,
             &operation_id,
             timestamp,
+            VanishAuditInitiator::Account,
             VanishAuditPhase::Completed,
         );
 
@@ -2600,10 +2627,22 @@ mod tests {
             authorized["logging.googleapis.com/insertId"],
             completed["logging.googleapis.com/insertId"]
         );
+        assert_eq!(authorized["account_pubkey"], pubkey);
         assert_eq!(authorized["actor_pubkey"], pubkey);
         assert_eq!(authorized["time"], timestamp);
         assert!(authorized.get("auth_event").is_none());
         assert!(authorized.get("sha256").is_none());
+
+        let admin = vanish_audit_entry(
+            &pubkey,
+            &operation_id,
+            timestamp,
+            VanishAuditInitiator::Admin,
+            VanishAuditPhase::Authorized,
+        );
+        assert_eq!(admin["action"], "admin_vanish_authorized");
+        assert_eq!(admin["initiator"], "admin");
+        assert!(admin.get("actor_pubkey").is_none());
     }
 
     #[test]

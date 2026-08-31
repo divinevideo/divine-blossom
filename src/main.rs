@@ -52,7 +52,7 @@ use crate::storage::{
     download_blob_read_through, download_blob_with_fallback, download_thumbnail,
     dispatch_vanish_timing_log, erase_vanish_batch, trigger_audio_extraction,
     trigger_cloud_run_delete_blob, upload_blob, write_audit_log, write_vanish_audit_log,
-    VanishAuditPhase,
+    VanishAuditInitiator, VanishAuditPhase,
 };
 use crate::viewer_auth::{ViewerAuthDiagnostics, ViewerAuthState};
 use blossom_core::cache_policy::{
@@ -4724,42 +4724,52 @@ fn vanish_response_status(errors: u32, pending: u32) -> StatusCode {
     }
 }
 
-fn ensure_vanish_authorization_audit(pubkey: &str) -> Result<VanishAuditState> {
-    let mut state = match get_vanish_audit_state(pubkey)? {
+fn ensure_vanish_authorization_audit(
+    pubkey: &str,
+    initiator: VanishAuditInitiator,
+) -> Result<VanishAuditState> {
+    let mut state = match get_vanish_audit_state(pubkey, initiator.as_str())? {
         Some(state) => state,
         None => {
             let authorized_at = current_timestamp();
             let operation_id = hex::encode(Sha256::digest(
-                format!("vanish-audit-operation:v1:{pubkey}:{authorized_at}").as_bytes(),
+                format!(
+                    "vanish-audit-operation:v1:{pubkey}:{}:{authorized_at}",
+                    initiator.as_str()
+                )
+                .as_bytes(),
             ));
-            let state = VanishAuditState {
-                operation_id,
-                authorized_at,
-                authorized_delivered: false,
-                completed_at: None,
-            };
-            put_vanish_audit_state(pubkey, &state)?;
+            let state = VanishAuditState::new(operation_id, authorized_at);
+            put_vanish_audit_state(pubkey, initiator.as_str(), &state)?;
             state
         }
     };
 
-    if !state.authorized_delivered {
+    if state.needs_authorization_delivery() {
         write_vanish_audit_log(
             pubkey,
             &state.operation_id,
             &state.authorized_at,
+            initiator,
             VanishAuditPhase::Authorized,
         )?;
-        state.authorized_delivered = true;
-        put_vanish_audit_state(pubkey, &state)?;
+        state.mark_authorized_delivered();
+        put_vanish_audit_state(pubkey, initiator.as_str(), &state)?;
+    } else {
+        // Refresh the inactivity TTL while retries show the operation is still active.
+        put_vanish_audit_state(pubkey, initiator.as_str(), &state)?;
     }
     Ok(state)
 }
 
-fn complete_vanish_audit(pubkey: &str, state: &mut VanishAuditState) -> Result<()> {
+fn complete_vanish_audit(
+    pubkey: &str,
+    initiator: VanishAuditInitiator,
+    state: &mut VanishAuditState,
+) -> Result<()> {
     if state.completed_at.is_none() {
-        state.completed_at = Some(current_timestamp());
-        put_vanish_audit_state(pubkey, state)?;
+        state.begin_completion(current_timestamp());
+        put_vanish_audit_state(pubkey, initiator.as_str(), state)?;
     }
     let completed_at = state
         .completed_at
@@ -4769,20 +4779,23 @@ fn complete_vanish_audit(pubkey: &str, state: &mut VanishAuditState) -> Result<(
         pubkey,
         &state.operation_id,
         completed_at,
+        initiator,
         VanishAuditPhase::Completed,
     )?;
-    delete_vanish_audit_state(pubkey)
+    // Retain the identity until deletion succeeds so a retry reuses the same record.
+    delete_vanish_audit_state(pubkey, initiator.as_str())
 }
 
 /// DELETE /vanish - User-initiated GDPR right to erasure
 fn handle_vanish(req: Request) -> Result<Response> {
     // Validate Blossom delete auth.
     let auth = validate_auth(&req, AuthAction::Delete)?;
-    let mut audit_state = ensure_vanish_authorization_audit(&auth.pubkey)?;
+    let initiator = VanishAuditInitiator::Account;
+    let mut audit_state = ensure_vanish_authorization_audit(&auth.pubkey, initiator)?;
 
     let mut execution = execute_vanish(&auth.pubkey);
     if execution.vanished() {
-        if let Err(error) = complete_vanish_audit(&auth.pubkey, &mut audit_state) {
+        if let Err(error) = complete_vanish_audit(&auth.pubkey, initiator, &mut audit_state) {
             eprintln!(
                 "[VANISH] pubkey={} failed to deliver completion audit: {}",
                 auth.pubkey, error
@@ -4836,11 +4849,12 @@ fn handle_admin_vanish(req: Request) -> Result<Response> {
         return Err(BlossomError::BadRequest("Invalid pubkey format".into()));
     }
 
-    let mut audit_state = ensure_vanish_authorization_audit(&pubkey)?;
+    let initiator = VanishAuditInitiator::Admin;
+    let mut audit_state = ensure_vanish_authorization_audit(&pubkey, initiator)?;
 
     let mut execution = execute_vanish(&pubkey);
     if execution.vanished() {
-        if let Err(error) = complete_vanish_audit(&pubkey, &mut audit_state) {
+        if let Err(error) = complete_vanish_audit(&pubkey, initiator, &mut audit_state) {
             eprintln!(
                 "[VANISH] pubkey={} failed to deliver completion audit: {}",
                 pubkey, error
