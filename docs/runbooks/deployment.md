@@ -110,9 +110,11 @@ Rotate forward in this order:
    every bearer client using `webhook_secret`, prepare each client update, and
    record when the moderation Worker is the only one.
 2. Schedule the rotation for a low-activity window. Before changing either
-   write-only copy, record active derivative work plus the
-   [derivative-status queue](../derivative-status-queue.md) depth and oldest-task
-   age. Do not pause that queue: it continues to accept tasks while paused and
+   write-only copy, read `STATUS_QUEUE_ENABLED` from the serving transcoder
+   revision and record active derivative work. If the queue is enabled, capture
+   the [derivative-status queue](../derivative-status-queue.md) task names,
+   schedule times, depth, and oldest-task age so failures can be mapped back to
+   a job. Do not pause that queue: it continues to accept tasks while paused and
    would accumulate rather than drain. This repository has no dispatch-pause
    control, so running old revisions and already-created tasks can retain the
    old credential and later receive `403` from Fastly. Record affected jobs for
@@ -139,15 +141,20 @@ Rotate forward in this order:
    transcode and transcript jobs on the fresh revision callback to Fastly
    without `401` or `403`. Also verify the funnelcake janitor's separate
    `admin_token` still authenticates an admin read route. Inspect the edge,
-   Worker, upload, and transcoder logs.
-   A `401` or `403` on moderation, deletion, or a callback from a new transcoder
-   revision is a rollback signal. A callback from an old revision or a queued
-   task created before the rotation can fail with the stale credential; record
-   and reconcile that job, but do not roll back a correct new-credential path
-   solely for that expected event.
+   Worker, upload, and transcoder logs. When `STATUS_QUEUE_ENABLED=true`, inspect
+   Cloud Tasks logs and correlate failures with the task list captured in step
+   2. A `401` or `403` on moderation, deletion, or a direct callback from a new
+   transcoder revision is a rollback signal. A callback from an old revision or
+   a task created before the rotation can fail with the stale credential.
+   Reconcile a lost transcode callback with the authenticated
+   `/admin/api/reset-stuck-transcodes` flow and a lost transcript callback with
+   the authenticated `/admin/api/backfill-vtt` flow, using each flow's dry run
+   first. Do not use rollback as a retry for a callback that has already been
+   lost.
 6. Disable the old GCP version only after every probe passes and every stale
-   callback observed in step 5 has been reconciled. Roll back if an affected job
-   cannot be reconciled.
+   callback observed in step 5 has been reconciled. If reconciliation is still
+   incomplete, leave the old GCP version enabled and escalate that job. Roll
+   back the rotation only when a new-credential path fails.
 
 There is no zero-mismatch order because these consumers do not all accept both
 old and new values. Cloudflare goes first so the caller stops sending the old
