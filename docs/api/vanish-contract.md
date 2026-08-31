@@ -50,3 +50,4 @@ FOS erasure is not gated by `fos_read_enabled` or `fos_write_back_enabled`. Hist
 - Audit-log anonymization remains separate from the media-object completion counter.
 - Fire-and-forget Cloud Run cleanup calls are not completion evidence.
 - Erasure evidence is per valid blob. It does not record account-level completion or malformed-list exceptions; those are reported in the completion response, while the separate audit-log write is best-effort.
+- Vanish audit entries remain immutable in Cloud Logging and retain the account pubkey. This repository does not currently provide audit-log anonymization, so bounded retries can create multiple account-linked audit entries.
