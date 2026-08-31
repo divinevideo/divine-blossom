@@ -127,17 +127,35 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect upload service changes
+        id: upload-changes
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "$BEFORE" = "0000000000000000000000000000000000000000" ] || \
+             ! git cat-file -e "$BEFORE^{commit}" || \
+             ! git diff --quiet "$BEFORE" "$GITHUB_SHA" -- cloud-run-upload; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Authenticate to Google Cloud
+        if: steps.upload-changes.outputs.deploy == 'true'
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
       - name: Set up Cloud SDK
+        if: steps.upload-changes.outputs.deploy == 'true'
         uses: google-github-actions/setup-gcloud@v2
 
       - name: Deploy upload service before dependent edge code
+        if: steps.upload-changes.outputs.deploy == 'true'
         working-directory: cloud-run-upload
         env:
           PROJECT_ID: rich-compiler-479518-d2

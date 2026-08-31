@@ -38,13 +38,14 @@ use crate::metadata::{
     add_to_audio_source_refs, add_to_blob_refs, add_to_recent_index, add_to_user_index,
     add_to_user_list, delete_audio_mapping, delete_audio_source_refs, delete_auth_events,
     delete_blob_metadata, delete_blob_refs, delete_subtitle_data, delete_user_list,
-    get_audio_mapping, get_audio_source_refs, get_auth_event, get_blob_metadata,
-    get_blob_metadata_uncached, get_blob_refs, get_subtitle_job, get_subtitle_job_by_hash,
-    get_tombstone, get_user_blobs, list_blobs_with_metadata, move_user_list_entries_to_end,
-    put_audio_mapping, put_auth_event, put_blob_metadata, put_subtitle_job,
-    remove_from_audio_source_refs, remove_from_blob_refs, remove_from_user_index,
-    remove_from_user_list, set_subtitle_job_id_for_hash, update_blob_status, update_stats_on_add,
-    StatusUpdateOutcome, TranscodeMetadataUpdate, TranscriptMetadataUpdate,
+    delete_vanish_audit_state, get_audio_mapping, get_audio_source_refs, get_auth_event,
+    get_blob_metadata, get_blob_metadata_uncached, get_blob_refs, get_subtitle_job,
+    get_subtitle_job_by_hash, get_tombstone, get_user_blobs, get_vanish_audit_state,
+    list_blobs_with_metadata, move_user_list_entries_to_end, put_audio_mapping, put_auth_event,
+    put_blob_metadata, put_subtitle_job, put_vanish_audit_state, remove_from_audio_source_refs,
+    remove_from_blob_refs, remove_from_user_index, remove_from_user_list,
+    set_subtitle_job_id_for_hash, update_blob_status, update_stats_on_add, StatusUpdateOutcome,
+    TranscodeMetadataUpdate, TranscriptMetadataUpdate, VanishAuditState,
 };
 use crate::storage::{
     blob_exists, check_funnelcake_audio_reuse, current_timestamp, delete_blob as storage_delete,
@@ -4723,15 +4724,65 @@ fn vanish_response_status(errors: u32, pending: u32) -> StatusCode {
     }
 }
 
+fn ensure_vanish_authorization_audit(pubkey: &str) -> Result<VanishAuditState> {
+    let mut state = match get_vanish_audit_state(pubkey)? {
+        Some(state) => state,
+        None => {
+            let authorized_at = current_timestamp();
+            let operation_id = hex::encode(Sha256::digest(
+                format!("vanish-audit-operation:v1:{pubkey}:{authorized_at}").as_bytes(),
+            ));
+            let state = VanishAuditState {
+                operation_id,
+                authorized_at,
+                authorized_delivered: false,
+                completed_at: None,
+            };
+            put_vanish_audit_state(pubkey, &state)?;
+            state
+        }
+    };
+
+    if !state.authorized_delivered {
+        write_vanish_audit_log(
+            pubkey,
+            &state.operation_id,
+            &state.authorized_at,
+            VanishAuditPhase::Authorized,
+        )?;
+        state.authorized_delivered = true;
+        put_vanish_audit_state(pubkey, &state)?;
+    }
+    Ok(state)
+}
+
+fn complete_vanish_audit(pubkey: &str, state: &mut VanishAuditState) -> Result<()> {
+    if state.completed_at.is_none() {
+        state.completed_at = Some(current_timestamp());
+        put_vanish_audit_state(pubkey, state)?;
+    }
+    let completed_at = state
+        .completed_at
+        .as_deref()
+        .ok_or_else(|| BlossomError::Internal("Missing vanish completion timestamp".into()))?;
+    write_vanish_audit_log(
+        pubkey,
+        &state.operation_id,
+        completed_at,
+        VanishAuditPhase::Completed,
+    )?;
+    delete_vanish_audit_state(pubkey)
+}
+
 /// DELETE /vanish - User-initiated GDPR right to erasure
 fn handle_vanish(req: Request) -> Result<Response> {
     // Validate Blossom delete auth.
     let auth = validate_auth(&req, AuthAction::Delete)?;
-    write_vanish_audit_log(&auth.pubkey, VanishAuditPhase::Authorized)?;
+    let mut audit_state = ensure_vanish_authorization_audit(&auth.pubkey)?;
 
     let mut execution = execute_vanish(&auth.pubkey);
     if execution.vanished() {
-        if let Err(error) = write_vanish_audit_log(&auth.pubkey, VanishAuditPhase::Completed) {
+        if let Err(error) = complete_vanish_audit(&auth.pubkey, &mut audit_state) {
             eprintln!(
                 "[VANISH] pubkey={} failed to deliver completion audit: {}",
                 auth.pubkey, error
@@ -4785,11 +4836,11 @@ fn handle_admin_vanish(req: Request) -> Result<Response> {
         return Err(BlossomError::BadRequest("Invalid pubkey format".into()));
     }
 
-    write_vanish_audit_log(&pubkey, VanishAuditPhase::Authorized)?;
+    let mut audit_state = ensure_vanish_authorization_audit(&pubkey)?;
 
     let mut execution = execute_vanish(&pubkey);
     if execution.vanished() {
-        if let Err(error) = write_vanish_audit_log(&pubkey, VanishAuditPhase::Completed) {
+        if let Err(error) = complete_vanish_audit(&pubkey, &mut audit_state) {
             eprintln!(
                 "[VANISH] pubkey={} failed to deliver completion audit: {}",
                 pubkey, error

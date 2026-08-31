@@ -54,7 +54,7 @@ FOS erasure is not gated by `fos_read_enabled` or `fos_write_back_enabled`. Hist
 
 ## Audit and diagnostics
 
-Before erasure starts, Blossom synchronously delivers a minimal account-linked `vanish_authorized` record. After account-list finalization, it delivers a paired `vanish_completed` record. Each phase has a deterministic Cloud Logging insert ID, so retries reuse the same logical record. The records contain the account pubkey, action, audit version, and insert ID. They do not contain the signed authorization event, content hashes, free-text reason, or aggregate timing.
+Before erasure starts, Blossom synchronously delivers a minimal account-linked `vanish_authorized` record through the authenticated `/audit/vanish` endpoint. After account-list finalization, it delivers a paired `vanish_completed` record. Operational KV state preserves the operation ID and each phase timestamp across retries; Cloud Logging therefore receives the same insert ID and timestamp when delivery is retried and can deduplicate the entry. The KV state is removed after terminal delivery. The records contain the account pubkey, action, audit version, operation ID, timestamp, and insert ID. They do not contain the signed authorization event, content hashes, free-text reason, or aggregate timing.
 
 These account-linked records use the active Cloud Logging `_Default` bucket in project `rich-compiler-479518-d2`. Its verified retention is one day. Access is inherited from project IAM and is limited to principals holding project Owner, Editor, Viewer, or Logging Viewer roles; the bucket is not public. Changes to that retention or access policy require this contract to be updated.
 

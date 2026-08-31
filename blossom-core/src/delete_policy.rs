@@ -381,9 +381,6 @@ mod tests {
     struct MockVanishOps {
         metadata: RefCell<Option<BlobMetadata>>,
         refs: RefCell<Vec<String>>,
-        cleanup_audio_err: bool,
-        delete_replica_err: bool,
-        delete_artifacts_err: bool,
         put_erasure_evidence_err: bool,
         delete_metadata_err: bool,
         remove_user_list_err: Cell<bool>,
@@ -393,11 +390,7 @@ mod tests {
     impl BlobErasureOps for MockVanishOps {
         fn cleanup_derived_audio(&self, _hash: &str) -> Result<()> {
             self.calls.borrow_mut().push("cleanup_derived_audio");
-            if self.cleanup_audio_err {
-                Err(BlossomError::StorageError("audio cleanup failed".into()))
-            } else {
-                Ok(())
-            }
+            Ok(())
         }
         fn delete_blob_from_gcs(&self, _hash: &str) -> Result<()> {
             self.calls.borrow_mut().push("delete_blob_from_gcs");
@@ -405,19 +398,11 @@ mod tests {
         }
         fn delete_blob_from_replica(&self, _hash: &str) -> Result<()> {
             self.calls.borrow_mut().push("delete_blob_from_replica");
-            if self.delete_replica_err {
-                Err(BlossomError::StorageError("replica failed".into()))
-            } else {
-                Ok(())
-            }
+            Ok(())
         }
         fn delete_blob_gcs_artifacts(&self, _hash: &str) -> Result<()> {
             self.calls.borrow_mut().push("delete_blob_gcs_artifacts");
-            if self.delete_artifacts_err {
-                Err(BlossomError::StorageError("derivative failed".into()))
-            } else {
-                Ok(())
-            }
+            Ok(())
         }
         fn purge_vcl_cache(&self, _hash: &str) {
             self.calls.borrow_mut().push("purge_vcl_cache");

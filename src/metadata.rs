@@ -43,6 +43,9 @@ const ERASURE_PREFIX: &str = "erasure:v1:";
 
 const ERASURE_DOMAIN: &str = "divine-blossom-erasure-v1:";
 
+/// Key prefix for account-linked vanish audit retry state.
+const VANISH_AUDIT_PREFIX: &str = "vanish_audit:v1:";
+
 /// Key prefix for blob references (all uploaders of same content)
 const REFS_PREFIX: &str = "refs:";
 
@@ -174,6 +177,62 @@ pub fn put_erasure_evidence(hash: &str) -> Result<()> {
     })?;
 
     Ok(())
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VanishAuditState {
+    pub operation_id: String,
+    pub authorized_at: String,
+    pub authorized_delivered: bool,
+    pub completed_at: Option<String>,
+}
+
+fn vanish_audit_key(pubkey: &str) -> String {
+    format!("{}{}", VANISH_AUDIT_PREFIX, pubkey.to_lowercase())
+}
+
+pub fn get_vanish_audit_state(pubkey: &str) -> Result<Option<VanishAuditState>> {
+    let store = open_store()?;
+    let key = vanish_audit_key(pubkey);
+    match store.lookup(&key) {
+        Ok(mut result) => serde_json::from_str(&result.take_body().into_string())
+            .map(Some)
+            .map_err(|error| {
+                BlossomError::MetadataError(format!(
+                    "Failed to parse vanish audit retry state: {error}"
+                ))
+            }),
+        Err(KVStoreError::ItemNotFound) => Ok(None),
+        Err(error) => Err(BlossomError::MetadataError(format!(
+            "Failed to read vanish audit retry state: {error}"
+        ))),
+    }
+}
+
+pub fn put_vanish_audit_state(pubkey: &str, state: &VanishAuditState) -> Result<()> {
+    let store = open_store()?;
+    let key = vanish_audit_key(pubkey);
+    let value = serde_json::to_string(state).map_err(|error| {
+        BlossomError::MetadataError(format!(
+            "Failed to serialize vanish audit retry state: {error}"
+        ))
+    })?;
+    store.insert(&key, value).map_err(|error| {
+        BlossomError::MetadataError(format!(
+            "Failed to store vanish audit retry state: {error}"
+        ))
+    })
+}
+
+pub fn delete_vanish_audit_state(pubkey: &str) -> Result<()> {
+    let store = open_store()?;
+    let key = vanish_audit_key(pubkey);
+    match store.delete(&key) {
+        Ok(()) | Err(KVStoreError::ItemNotFound) => Ok(()),
+        Err(error) => Err(BlossomError::MetadataError(format!(
+            "Failed to delete vanish audit retry state: {error}"
+        ))),
+    }
 }
 
 /// Get list of blob hashes for a user

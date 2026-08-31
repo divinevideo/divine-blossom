@@ -358,6 +358,7 @@ async fn main() -> Result<()> {
         .route("/migrate", post(handle_migrate))
         .route("/migrate", options(handle_cors_preflight))
         .route("/audit", post(handle_audit_log))
+        .route("/audit/vanish", post(handle_vanish_audit_log))
         .route("/delete-blob", post(handle_delete_blob))
         .route("/delete-blobs", post(handle_delete_blobs))
         .route("/delete-blobs/ready", get(handle_delete_blobs_ready))
@@ -668,25 +669,37 @@ fn header_value(value: u64) -> HeaderValue {
 /// POST /audit - Receive audit log entries from Fastly edge and write as structured logs.
 /// Cloud Run structured logging: JSON on stdout is auto-ingested by Cloud Logging.
 /// This gives us: queryable logs, retention policies, export to BigQuery, alerting.
-async fn handle_audit_log(body: axum::body::Bytes) -> impl IntoResponse {
-    // Parse and re-emit as structured log with severity
-    match serde_json::from_slice::<serde_json::Value>(&body) {
+fn emit_audit_log(body: &[u8]) -> Response {
+    match serde_json::from_slice::<serde_json::Value>(body) {
         Ok(mut entry) => {
-            // Add Cloud Logging severity field for proper log level
             entry["severity"] = serde_json::json!("NOTICE");
             entry["logging.googleapis.com/labels"] = serde_json::json!({
                 "service": "divine-blossom",
                 "component": "audit"
             });
-            // Print as JSON to stdout — Cloud Run auto-ingests this into Cloud Logging
             println!("{}", entry);
-            StatusCode::OK
+            StatusCode::OK.into_response()
         }
-        Err(e) => {
-            error!("Invalid audit log entry: {}", e);
-            StatusCode::BAD_REQUEST
+        Err(error) => {
+            error!("Invalid audit log entry: {}", error);
+            StatusCode::BAD_REQUEST.into_response()
         }
     }
+}
+
+async fn handle_audit_log(body: axum::body::Bytes) -> Response {
+    emit_audit_log(&body)
+}
+
+async fn handle_vanish_audit_log(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if validate_webhook_auth(&headers, state.config.webhook_secret.as_deref()).is_err() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    emit_audit_log(&body)
 }
 
 async fn handle_upload(

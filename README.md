@@ -9,7 +9,7 @@ Content-addressed media storage for the [Divine](https://divine.video) platform,
 - **HLS transcoding** — multi-quality adaptive streaming (1080p, 720p, 480p, 360p) generated on GPU-backed Cloud Run
 - **WebVTT transcripts** — automatic speech-to-text with a stable transcript URL at `/<sha256>.vtt` and an on-demand subtitle jobs API
 - **Range requests** — native video seeking with `206 Partial Content` on blobs, quality variants, and audio
-- **Provenance & audit** — every upload and delete stores its signed auth event as cryptographic proof; actions are logged to Google Cloud Logging
+- **Provenance & audit** — uploads and object deletes retain signed-event provenance; account vanish uses minimal retry-safe authorization and completion records in Cloud Logging
 - **Moderation** — SafeSearch (Vision API) screening plus shadow restriction, so restricted content is visible only to its owner or an admin
 - **Age restriction** — `age_restricted` blobs serve to any authenticated viewer and return `401` to anonymous requests
 - **Admin soft-delete & restore** — DMCA/legal removal with a full audit trail while preserving recoverable storage, plus re-index/restore

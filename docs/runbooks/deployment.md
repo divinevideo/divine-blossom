@@ -1,9 +1,10 @@
 # Deployment
 
 Some of this repository deploys itself and some of it does not. After tests pass,
-merging to `main` deploys the upload service and verifies its batch-cleanup
-contract before publishing the Fastly edge service. Most other Cloud Run services
-do not ship that way; each one is a script someone runs by hand.
+merging upload-service changes to `main` deploys that service, and every merge
+verifies its batch-cleanup contract before publishing the Fastly edge service.
+Most other Cloud Run services do not ship that way; each one is a script someone
+runs by hand.
 
 The VCL caching layer is also manual. Files under `vcl/` are source copies of
 snippets for the outer Fastly VCL service; the Compute publish job does not
@@ -20,7 +21,8 @@ or readiness check fails, the automatic Fastly publish is skipped.
 `.github/workflows/ci.yml` runs on every push to `main`. After the `test` job
 passes, it deploys:
 
-- the upload service to Cloud Run, followed by a contract readiness check
+- the upload service to Cloud Run when its source changed
+- the upload-service contract readiness check on every edge publish
 - the edge service to Fastly (`fastly compute publish`) only after that check
 - `process-blob` to Cloud Run
 - the container image to GHCR
