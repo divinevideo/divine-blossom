@@ -36,15 +36,16 @@ use crate::error::{BlossomError, Result};
 use crate::media_auth_log::format_media_auth_log;
 use crate::metadata::{
     add_to_audio_source_refs, add_to_blob_refs, add_to_recent_index, add_to_user_index,
-    add_to_user_list, claim_vanish_audit_completion, delete_audio_mapping,
-    delete_audio_source_refs, delete_auth_events, delete_blob_metadata, delete_blob_refs,
-    delete_subtitle_data, delete_user_list, delete_vanish_audit_state, get_audio_mapping,
-    get_audio_source_refs, get_auth_event,
-    get_blob_metadata, get_blob_metadata_uncached, get_blob_refs, get_subtitle_job,
+    add_to_user_list, claim_vanish_audit_completion, create_vanish_audit_state,
+    delete_audio_mapping, delete_audio_source_refs, delete_auth_events, delete_blob_metadata,
+    delete_blob_refs,
+    delete_subtitle_data, delete_user_list, get_audio_mapping, get_audio_source_refs,
+    get_auth_event, get_blob_metadata, get_blob_metadata_uncached, get_blob_refs, get_subtitle_job,
     get_subtitle_job_by_hash, get_tombstone, get_user_blobs, get_vanish_audit_state,
-    list_blobs_with_metadata, move_user_list_entries_to_end, put_audio_mapping, put_auth_event,
-    put_blob_metadata, put_subtitle_job, put_vanish_audit_state, refresh_vanish_audit_state,
-    remove_from_audio_source_refs, remove_from_blob_refs, remove_from_user_index, remove_from_user_list,
+    list_blobs_with_metadata, mark_vanish_audit_authorized_delivered,
+    move_user_list_entries_to_end, put_audio_mapping, put_auth_event, put_blob_metadata,
+    put_subtitle_job, refresh_vanish_audit_state, remove_from_audio_source_refs,
+    remove_from_blob_refs, remove_from_user_index, remove_from_user_list,
     set_subtitle_job_id_for_hash, update_blob_status, update_stats_on_add, StatusUpdateOutcome,
     TranscodeMetadataUpdate, TranscriptMetadataUpdate, VanishAuditState,
 };
@@ -4744,8 +4745,11 @@ fn ensure_vanish_authorization_audit(
                     .as_bytes(),
                 ));
                 let state = VanishAuditState::new(operation_id, authorized_at);
-                put_vanish_audit_state(pubkey, initiator.as_str(), &state)?;
-                state
+                if create_vanish_audit_state(pubkey, initiator.as_str(), &state)? {
+                    state
+                } else {
+                    continue;
+                }
             }
         };
 
@@ -4780,8 +4784,16 @@ fn deliver_vanish_authorization_audit(
             initiator,
             VanishAuditPhase::Authorized,
         )?;
-        state.mark_authorized_delivered();
-        put_vanish_audit_state(pubkey, initiator.as_str(), state)?;
+        *state = mark_vanish_audit_authorized_delivered(
+            pubkey,
+            initiator.as_str(),
+            &state.operation_id,
+        )?
+        .ok_or_else(|| {
+            BlossomError::MetadataError(
+                "Vanish audit authorization identity changed during delivery".into(),
+            )
+        })?;
     }
     Ok(())
 }
@@ -4810,8 +4822,8 @@ fn complete_vanish_audit(
         initiator,
         VanishAuditPhase::Completed,
     )?;
-    // Retain the identity until deletion succeeds so a retry reuses the same record.
-    delete_vanish_audit_state(pubkey, initiator.as_str())
+    // The completed state keeps retries on the same insert IDs for one bounded day.
+    Ok(())
 }
 
 fn complete_open_vanish_audits(

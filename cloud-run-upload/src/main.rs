@@ -541,7 +541,7 @@ async fn handle_delete_blobs(
             return cleanup_error(
                 StatusCode::BAD_REQUEST,
                 cleanup::CleanupStatus::Permanent,
-                "hashes must contain between 1 and 200 entries",
+                "hashes must contain between 1 and 20 entries",
             );
         }
         Err(BatchCleanupValidationError::InvalidHash) => {

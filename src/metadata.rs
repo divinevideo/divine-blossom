@@ -6,7 +6,7 @@ use crate::blossom::{
 };
 use crate::error::{BlossomError, Result};
 use fastly::cache::simple as simple_cache;
-use fastly::kv_store::{KVStore, KVStoreError};
+use fastly::kv_store::{InsertMode, KVStore, KVStoreError};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -46,6 +46,7 @@ const ERASURE_DOMAIN: &str = "divine-blossom-erasure-v1:";
 /// Key prefix for account-linked vanish audit retry state.
 const VANISH_AUDIT_PREFIX: &str = "vanish_audit:v1:";
 const VANISH_AUDIT_STATE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const VANISH_AUDIT_COMPLETED_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Key prefix for blob references (all uploaders of same content)
 const REFS_PREFIX: &str = "refs:";
@@ -240,11 +241,19 @@ pub fn get_vanish_audit_state(pubkey: &str, initiator: &str) -> Result<Option<Va
     }
 }
 
-pub fn put_vanish_audit_state(
+fn vanish_audit_state_ttl(state: &VanishAuditState) -> Duration {
+    if state.completed_at.is_some() {
+        VANISH_AUDIT_COMPLETED_TTL
+    } else {
+        VANISH_AUDIT_STATE_TTL
+    }
+}
+
+pub fn create_vanish_audit_state(
     pubkey: &str,
     initiator: &str,
     state: &VanishAuditState,
-) -> Result<()> {
+) -> Result<bool> {
     let store = open_store()?;
     let key = vanish_audit_key(pubkey, initiator);
     let value = serde_json::to_string(state).map_err(|error| {
@@ -252,15 +261,78 @@ pub fn put_vanish_audit_state(
             "Failed to serialize vanish audit retry state: {error}"
         ))
     })?;
-    store
+    match store
         .build_insert()
+        .mode(InsertMode::Add)
         .time_to_live(VANISH_AUDIT_STATE_TTL)
         .execute(&key, value)
-        .map_err(|error| {
+    {
+        Ok(()) => Ok(true),
+        Err(KVStoreError::ItemPreconditionFailed) => Ok(false),
+        Err(error) => Err(BlossomError::MetadataError(format!(
+            "Failed to create vanish audit retry state: {error}"
+        ))),
+    }
+}
+
+pub fn mark_vanish_audit_authorized_delivered(
+    pubkey: &str,
+    initiator: &str,
+    operation_id: &str,
+) -> Result<Option<VanishAuditState>> {
+    const MAX_ATTEMPTS: usize = 3;
+
+    let store = open_store()?;
+    let key = vanish_audit_key(pubkey, initiator);
+    for _ in 0..MAX_ATTEMPTS {
+        let mut result = match store.lookup(&key) {
+            Ok(result) => result,
+            Err(KVStoreError::ItemNotFound) => return Ok(None),
+            Err(error) => {
+                return Err(BlossomError::MetadataError(format!(
+                    "Failed to load vanish audit authorization state: {error}"
+                )))
+            }
+        };
+        let generation = result.current_generation();
+        let mut state: VanishAuditState = serde_json::from_str(&result.take_body().into_string())
+            .map_err(|error| {
+                BlossomError::MetadataError(format!(
+                    "Invalid vanish audit authorization state: {error}"
+                ))
+            })?;
+        if state.operation_id != operation_id {
+            return Ok(None);
+        }
+        if state.authorized_delivered {
+            return Ok(Some(state));
+        }
+
+        state.mark_authorized_delivered();
+        let value = serde_json::to_string(&state).map_err(|error| {
             BlossomError::MetadataError(format!(
-                "Failed to store vanish audit retry state: {error}"
+                "Failed to serialize vanish audit authorization state: {error}"
             ))
-        })
+        })?;
+        match store
+            .build_insert()
+            .if_generation_match(generation)
+            .time_to_live(vanish_audit_state_ttl(&state))
+            .execute(&key, value)
+        {
+            Ok(()) => return Ok(Some(state)),
+            Err(KVStoreError::ItemPreconditionFailed) => continue,
+            Err(error) => {
+                return Err(BlossomError::MetadataError(format!(
+                    "Failed to mark vanish authorization delivered: {error}"
+                )))
+            }
+        }
+    }
+
+    Err(BlossomError::MetadataError(
+        "Vanish audit authorization state changed too many times".into(),
+    ))
 }
 
 pub fn refresh_vanish_audit_state(
@@ -283,8 +355,8 @@ pub fn refresh_vanish_audit_state(
             }
         };
         let generation = result.current_generation();
-        let state: VanishAuditState =
-            serde_json::from_str(&result.take_body().into_string()).map_err(|error| {
+        let state: VanishAuditState = serde_json::from_str(&result.take_body().into_string())
+            .map_err(|error| {
                 BlossomError::MetadataError(format!("Invalid vanish audit refresh state: {error}"))
             })?;
         if state.operation_id != operation_id {
@@ -298,7 +370,7 @@ pub fn refresh_vanish_audit_state(
         match store
             .build_insert()
             .if_generation_match(generation)
-            .time_to_live(VANISH_AUDIT_STATE_TTL)
+            .time_to_live(vanish_audit_state_ttl(&state))
             .execute(&key, value)
         {
             Ok(()) => return Ok(Some(state)),
@@ -336,11 +408,9 @@ pub fn claim_vanish_audit_completion(
             }
         };
         let generation = result.current_generation();
-        let mut state: VanishAuditState =
-            serde_json::from_str(&result.take_body().into_string()).map_err(|error| {
-                BlossomError::MetadataError(format!(
-                    "Invalid vanish audit completion state: {error}"
-                ))
+        let mut state: VanishAuditState = serde_json::from_str(&result.take_body().into_string())
+            .map_err(|error| {
+                BlossomError::MetadataError(format!("Invalid vanish audit completion state: {error}"))
             })?;
         if state.completed_at.is_some() {
             return Ok(Some(state));
@@ -355,7 +425,7 @@ pub fn claim_vanish_audit_completion(
         match store
             .build_insert()
             .if_generation_match(generation)
-            .time_to_live(VANISH_AUDIT_STATE_TTL)
+            .time_to_live(VANISH_AUDIT_COMPLETED_TTL)
             .execute(&key, value)
         {
             Ok(()) => return Ok(Some(state)),
@@ -371,17 +441,6 @@ pub fn claim_vanish_audit_completion(
     Err(BlossomError::MetadataError(
         "Vanish audit completion state changed too many times".into(),
     ))
-}
-
-pub fn delete_vanish_audit_state(pubkey: &str, initiator: &str) -> Result<()> {
-    let store = open_store()?;
-    let key = vanish_audit_key(pubkey, initiator);
-    match store.delete(&key) {
-        Ok(()) | Err(KVStoreError::ItemNotFound) => Ok(()),
-        Err(error) => Err(BlossomError::MetadataError(format!(
-            "Failed to delete vanish audit retry state: {error}"
-        ))),
-    }
 }
 
 /// Get list of blob hashes for a user
@@ -1675,8 +1734,8 @@ mod tests {
     use super::{
         duplicate_generation, edge_transcode_status_generation, edge_transcript_status_generation,
         erasure_evidence_key, generation_rejection, rotate_hashes_to_end, stale_generation,
-        status_generation_from_ms,
-        transcode_status_event_sequence, transcript_status_event_sequence, vanish_audit_key,
+        status_generation_from_ms, transcode_status_event_sequence,
+        transcript_status_event_sequence, vanish_audit_key, vanish_audit_state_ttl,
         StatusUpdateOutcome, VanishAuditState,
     };
     use std::collections::HashSet;
@@ -1906,6 +1965,20 @@ mod tests {
         assert!(!state.needs_authorization_delivery());
         assert_eq!(state.operation_id, "operation");
         assert_eq!(state.authorized_at, "authorized-at");
+        assert_eq!(state.completed_at.as_deref(), Some("completed-at"));
+        assert_eq!(
+            vanish_audit_state_ttl(&state),
+            super::VANISH_AUDIT_COMPLETED_TTL
+        );
+    }
+
+    #[test]
+    fn authorization_delivery_never_clears_a_concurrent_completion() {
+        let mut state = VanishAuditState::new("operation".into(), "authorized-at".into());
+        state.begin_completion("completed-at".into());
+        state.mark_authorized_delivered();
+
+        assert!(state.authorized_delivered);
         assert_eq!(state.completed_at.as_deref(), Some("completed-at"));
     }
 
