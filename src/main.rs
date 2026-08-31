@@ -527,7 +527,7 @@ fn prepare_derived_audio_cleanup(source_hash: &str) -> Result<Option<PreparedDer
 
     Ok(Some(PreparedDerivedAudioCleanup {
         source_hash: source_hash.to_string(),
-        audio_hash: mapping.audio_sha256,
+        audio_hash: mapping.audio_sha256.to_ascii_lowercase(),
     }))
 }
 
@@ -4460,6 +4460,7 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
 
 const VANISH_BATCH_SIZE: usize = 100;
 const VANISH_STORAGE_ATTEMPTS: u8 = 2;
+const _: () = assert!(VANISH_BATCH_SIZE * 2 <= storage::CLOUD_RUN_DELETE_BATCH_LIMIT);
 
 #[derive(Debug)]
 struct VanishExecution {
@@ -4684,7 +4685,7 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         "pending": execution.pending,
         "prepare_ms": prepare_ms.min(u128::from(u64::MAX)) as u64,
         "gcs_main_ms": storage_result.timings.gcs_main_ms,
-        "gcs_artifacts_ms": storage_result.timings.gcs_artifacts_ms,
+        "cloud_run_cleanup_ms": storage_result.timings.cloud_run_cleanup_ms,
         "fos_main_ms": storage_result.timings.fos_main_ms,
         "purge_vcl_ms": storage_result.timings.purge_vcl_ms,
         "purge_compute_ms": storage_result.timings.purge_compute_ms,

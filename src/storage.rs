@@ -856,6 +856,7 @@ pub fn delete_blob_from_fos(key: &str) -> Result<()> {
 }
 
 const PROVIDER_MULTI_DELETE_LIMIT: usize = 1_000;
+pub(crate) const CLOUD_RUN_DELETE_BATCH_LIMIT: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VanishDeleteTarget {
@@ -873,7 +874,7 @@ struct VanishDeleteBatch {
 #[derive(Debug, Default, serde::Serialize)]
 pub(crate) struct VanishStorageTimings {
     pub gcs_main_ms: u64,
-    pub gcs_artifacts_ms: u64,
+    pub cloud_run_cleanup_ms: u64,
     pub fos_main_ms: u64,
     pub purge_vcl_ms: u64,
     pub purge_compute_ms: u64,
@@ -892,10 +893,10 @@ impl VanishStorageResult {
             .timings
             .gcs_main_ms
             .saturating_add(retry.timings.gcs_main_ms);
-        self.timings.gcs_artifacts_ms = self
+        self.timings.cloud_run_cleanup_ms = self
             .timings
-            .gcs_artifacts_ms
-            .saturating_add(retry.timings.gcs_artifacts_ms);
+            .cloud_run_cleanup_ms
+            .saturating_add(retry.timings.cloud_run_cleanup_ms);
         self.timings.fos_main_ms = self
             .timings
             .fos_main_ms
@@ -1253,7 +1254,7 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
         Ok(failed) => result.failed_hashes.extend(failed),
         Err(_) => result.failed_hashes.extend(hashes.iter().cloned()),
     }
-    result.timings.gcs_artifacts_ms = elapsed_ms(cloud_cleanup_started);
+    result.timings.cloud_run_cleanup_ms = elapsed_ms(cloud_cleanup_started);
 
     let purgeable: Vec<String> = hashes
         .iter()
@@ -2123,6 +2124,19 @@ fn cloud_run_delete_blob_body(hash: &str, expected_bucket: &str) -> String {
     .to_string()
 }
 
+fn cloud_run_delete_blobs_body(hashes: &[String], expected_bucket: &str) -> Result<String> {
+    if hashes.len() > CLOUD_RUN_DELETE_BATCH_LIMIT {
+        return Err(BlossomError::Internal(format!(
+            "Cloud Run batch cleanup exceeds the {CLOUD_RUN_DELETE_BATCH_LIMIT}-hash contract"
+        )));
+    }
+    Ok(serde_json::json!({
+        "hashes": hashes,
+        "expected_bucket": expected_bucket,
+    })
+    .to_string())
+}
+
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum CloudCleanupStatus {
@@ -2194,11 +2208,17 @@ pub fn trigger_cloud_run_delete_blob(hash: &str) -> Result<()> {
     classify_cloud_cleanup_response(status, &body)
 }
 
-fn failed_cloud_cleanup_hashes(body: &str, requested: &[String]) -> HashSet<String> {
+fn failed_cloud_cleanup_hashes(
+    status: StatusCode,
+    body: &str,
+    requested: &[String],
+) -> HashSet<String> {
     let Ok(response) = serde_json::from_str::<BatchCleanupResponse>(body) else {
         return requested.iter().cloned().collect();
     };
-    if response.status == CloudCleanupStatus::Permanent {
+    if response.status == CloudCleanupStatus::Permanent
+        || (response.status == CloudCleanupStatus::Completed && !status.is_success())
+    {
         return requested.iter().cloned().collect();
     }
 
@@ -2225,11 +2245,7 @@ fn trigger_cloud_run_delete_blobs(hashes: &[String]) -> Result<HashSet<String>> 
     }
     let webhook_secret = get_secret("webhook_secret")?;
     let expected_bucket = get_config("gcs_bucket")?;
-    let body = serde_json::json!({
-        "hashes": hashes,
-        "expected_bucket": expected_bucket,
-    })
-    .to_string();
+    let body = cloud_run_delete_blobs_body(hashes, &expected_bucket)?;
 
     const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
     let mut request = Request::new(
@@ -2244,8 +2260,12 @@ fn trigger_cloud_run_delete_blobs(hashes: &[String]) -> Result<HashSet<String>> 
     let mut response = request.send(CLOUD_RUN_BACKEND).map_err(|error| {
         BlossomError::StorageError(format!("Cloud Run batch cleanup failed: {}", error))
     })?;
+    let status = response.get_status();
     let body = response.take_body().into_string();
-    Ok(failed_cloud_cleanup_hashes(&body, hashes))
+    if !status.is_success() {
+        eprintln!("[VANISH] Cloud Run batch cleanup returned status={status}");
+    }
+    Ok(failed_cloud_cleanup_hashes(status, &body, hashes))
 }
 
 /// Trigger synchronous migration of a blob from a fallback CDN to GCS.
@@ -2448,11 +2468,12 @@ pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtracti
 mod tests {
     use super::{
         build_fos_delete_request, build_multi_delete_request, classify_cloud_cleanup_response,
-        cloud_run_delete_blob_body, failed_cloud_cleanup_hashes, failed_multi_delete_keys,
-        mark_failed_stage, multi_delete_body, normalize_storage_cache_state,
-        parse_audio_extraction_error_response, parse_funnelcake_audio_reuse_response,
-        plan_vanish_delete_batches, prepare_storage_cache_miss, preserve_storage_cache_state,
-        S3Config, VanishDeleteTarget, VanishStorageResult, FOS_BACKEND,
+        cloud_run_delete_blob_body, cloud_run_delete_blobs_body, failed_cloud_cleanup_hashes,
+        failed_multi_delete_keys, mark_failed_stage, multi_delete_body,
+        normalize_storage_cache_state, parse_audio_extraction_error_response,
+        parse_funnelcake_audio_reuse_response, plan_vanish_delete_batches,
+        prepare_storage_cache_miss, preserve_storage_cache_state, S3Config, VanishDeleteTarget,
+        VanishStorageResult, CLOUD_RUN_DELETE_BATCH_LIMIT, FOS_BACKEND,
         PROVIDER_MULTI_DELETE_LIMIT, STORAGE_CACHE_HEADER,
     };
     use fastly::http::header;
@@ -2466,6 +2487,15 @@ mod tests {
 
         assert_eq!(value["hash"], "a".repeat(64));
         assert_eq!(value["expected_bucket"], "configured-bucket");
+    }
+
+    #[test]
+    fn cloud_cleanup_batch_body_enforces_the_cloud_run_limit() {
+        let accepted = vec!["a".repeat(64); CLOUD_RUN_DELETE_BATCH_LIMIT];
+        let rejected = vec!["a".repeat(64); CLOUD_RUN_DELETE_BATCH_LIMIT + 1];
+
+        assert!(cloud_run_delete_blobs_body(&accepted, "configured-bucket").is_ok());
+        assert!(cloud_run_delete_blobs_body(&rejected, "configured-bucket").is_err());
     }
 
     #[test]
@@ -2510,6 +2540,7 @@ mod tests {
         );
 
         let failed = failed_cloud_cleanup_hashes(
+            fastly::http::StatusCode::SERVICE_UNAVAILABLE,
             &body,
             &[completed.clone(), retryable.clone(), missing.clone()],
         );
@@ -2517,6 +2548,22 @@ mod tests {
         assert!(!failed.contains(&completed));
         assert!(failed.contains(&retryable));
         assert!(failed.contains(&missing));
+    }
+
+    #[test]
+    fn batch_cloud_cleanup_rejects_completed_body_with_error_status() {
+        let hash = "a".repeat(64);
+        let body = format!(
+            r#"{{"status":"completed","results":[{{"hash":"{hash}","status":"completed"}}]}}"#
+        );
+
+        let failed = failed_cloud_cleanup_hashes(
+            fastly::http::StatusCode::SERVICE_UNAVAILABLE,
+            &body,
+            std::slice::from_ref(&hash),
+        );
+
+        assert!(failed.contains(&hash));
     }
 
     #[test]

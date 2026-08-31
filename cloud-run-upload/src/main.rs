@@ -246,6 +246,13 @@ struct BatchCleanupResponse {
 const MAX_BATCH_CLEANUP_HASHES: usize = 200;
 const BATCH_CLEANUP_CONCURRENCY: usize = 8;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchCleanupValidationError {
+    InvalidCount,
+    InvalidHash,
+    BucketMismatch,
+}
+
 #[derive(Serialize)]
 struct CleanupErrorResponse {
     status: cleanup::CleanupStatus,
@@ -437,6 +444,37 @@ fn cleanup_bucket_matches(expected_bucket: &str, configured_bucket: &str) -> boo
     expected_bucket == configured_bucket
 }
 
+fn validate_batch_cleanup_request(
+    request: DeleteBlobsRequest,
+    configured_bucket: &str,
+) -> std::result::Result<std::collections::BTreeSet<String>, BatchCleanupValidationError> {
+    if request.hashes.is_empty() || request.hashes.len() > MAX_BATCH_CLEANUP_HASHES {
+        return Err(BatchCleanupValidationError::InvalidCount);
+    }
+    if request.hashes.iter().any(|hash| !cleanup::valid_hash(hash)) {
+        return Err(BatchCleanupValidationError::InvalidHash);
+    }
+    if !cleanup_bucket_matches(&request.expected_bucket, configured_bucket) {
+        return Err(BatchCleanupValidationError::BucketMismatch);
+    }
+    Ok(request
+        .hashes
+        .into_iter()
+        .map(|hash| hash.to_ascii_lowercase())
+        .collect())
+}
+
+fn batch_cleanup_status(results: &[cleanup::HashCleanupResult]) -> cleanup::CleanupStatus {
+    if results
+        .iter()
+        .all(|result| result.status == cleanup::CleanupStatus::Completed)
+    {
+        cleanup::CleanupStatus::Completed
+    } else {
+        cleanup::CleanupStatus::Retryable
+    }
+}
+
 async fn handle_delete_blob(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -495,33 +533,30 @@ async fn handle_delete_blobs(
             ),
         };
     }
-    if request.hashes.is_empty() || request.hashes.len() > MAX_BATCH_CLEANUP_HASHES {
-        return cleanup_error(
-            StatusCode::BAD_REQUEST,
-            cleanup::CleanupStatus::Permanent,
-            "hashes must contain between 1 and 200 entries",
-        );
-    }
-    if request.hashes.iter().any(|hash| !cleanup::valid_hash(hash)) {
-        return cleanup_error(
-            StatusCode::BAD_REQUEST,
-            cleanup::CleanupStatus::Permanent,
-            "every hash must be 64 hexadecimal characters",
-        );
-    }
-    if !cleanup_bucket_matches(&request.expected_bucket, &state.config.gcs_bucket) {
-        return cleanup_error(
-            StatusCode::CONFLICT,
-            cleanup::CleanupStatus::Retryable,
-            "cleanup bucket does not match the edge configuration",
-        );
-    }
-
-    let hashes = request
-        .hashes
-        .into_iter()
-        .map(|hash| hash.to_ascii_lowercase())
-        .collect::<std::collections::BTreeSet<_>>();
+    let hashes = match validate_batch_cleanup_request(request, &state.config.gcs_bucket) {
+        Ok(hashes) => hashes,
+        Err(BatchCleanupValidationError::InvalidCount) => {
+            return cleanup_error(
+                StatusCode::BAD_REQUEST,
+                cleanup::CleanupStatus::Permanent,
+                "hashes must contain between 1 and 200 entries",
+            );
+        }
+        Err(BatchCleanupValidationError::InvalidHash) => {
+            return cleanup_error(
+                StatusCode::BAD_REQUEST,
+                cleanup::CleanupStatus::Permanent,
+                "every hash must be 64 hexadecimal characters",
+            );
+        }
+        Err(BatchCleanupValidationError::BucketMismatch) => {
+            return cleanup_error(
+                StatusCode::CONFLICT,
+                cleanup::CleanupStatus::Retryable,
+                "cleanup bucket does not match the edge configuration",
+            );
+        }
+    };
     let backend = cleanup::GcsCleanupBackend::new(&state.gcs_client, &state.config.gcs_bucket);
     let results = stream::iter(hashes)
         .map(|hash| {
@@ -531,14 +566,7 @@ async fn handle_delete_blobs(
         .buffer_unordered(BATCH_CLEANUP_CONCURRENCY)
         .collect::<Vec<_>>()
         .await;
-    let status = if results
-        .iter()
-        .all(|result| result.status == cleanup::CleanupStatus::Completed)
-    {
-        cleanup::CleanupStatus::Completed
-    } else {
-        cleanup::CleanupStatus::Retryable
-    };
+    let status = batch_cleanup_status(&results);
     (
         cleanup_response_status(status),
         Json(BatchCleanupResponse { status, results }),
@@ -1684,9 +1712,11 @@ async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_invalid_media_signal, cleanup_bucket_matches, cleanup_response_status,
-        media_source_candidates, needs_derivative_sanitize, new_temp_media_path,
-        validate_webhook_auth, video_thumbnail_url, EXPECTED_GCS_BUCKET_HEADER,
+        batch_cleanup_status, classify_invalid_media_signal, cleanup_bucket_matches,
+        cleanup_response_status, media_source_candidates, needs_derivative_sanitize,
+        new_temp_media_path, validate_batch_cleanup_request, validate_webhook_auth,
+        video_thumbnail_url, BatchCleanupValidationError, DeleteBlobsRequest,
+        EXPECTED_GCS_BUCKET_HEADER, MAX_BATCH_CLEANUP_HASHES,
     };
     use axum::http::{header, HeaderMap, HeaderValue};
 
@@ -1735,6 +1765,90 @@ mod tests {
         );
 
         assert!(validate_webhook_auth(&headers, Some("expected")).is_ok());
+    }
+
+    #[test]
+    fn batch_cleanup_accepts_the_edge_limit_and_normalizes_hashes() {
+        let hashes = (0..MAX_BATCH_CLEANUP_HASHES)
+            .map(|index| format!("{index:064X}"))
+            .collect();
+        let validated = validate_batch_cleanup_request(
+            DeleteBlobsRequest {
+                hashes,
+                expected_bucket: "media".to_string(),
+            },
+            "media",
+        )
+        .expect("the documented edge batch must fit");
+
+        assert_eq!(validated.len(), MAX_BATCH_CLEANUP_HASHES);
+        assert!(validated
+            .iter()
+            .all(|hash| hash == &hash.to_ascii_lowercase()));
+    }
+
+    #[test]
+    fn batch_cleanup_rejects_invalid_count_hash_and_bucket() {
+        let hash = "a".repeat(64);
+        let too_many = vec![hash.clone(); MAX_BATCH_CLEANUP_HASHES + 1];
+
+        assert_eq!(
+            validate_batch_cleanup_request(
+                DeleteBlobsRequest {
+                    hashes: too_many,
+                    expected_bucket: "media".to_string(),
+                },
+                "media",
+            ),
+            Err(BatchCleanupValidationError::InvalidCount)
+        );
+        assert_eq!(
+            validate_batch_cleanup_request(
+                DeleteBlobsRequest {
+                    hashes: vec!["not-a-hash".to_string()],
+                    expected_bucket: "media".to_string(),
+                },
+                "media",
+            ),
+            Err(BatchCleanupValidationError::InvalidHash)
+        );
+        assert_eq!(
+            validate_batch_cleanup_request(
+                DeleteBlobsRequest {
+                    hashes: vec![hash],
+                    expected_bucket: "other-media".to_string(),
+                },
+                "media",
+            ),
+            Err(BatchCleanupValidationError::BucketMismatch)
+        );
+    }
+
+    #[test]
+    fn batch_cleanup_rollup_is_retryable_if_any_hash_fails() {
+        let completed = crate::cleanup::HashCleanupResult {
+            hash: "a".repeat(64),
+            status: crate::cleanup::CleanupStatus::Completed,
+            deleted: 1,
+            absent: 0,
+            failures: Vec::new(),
+        };
+        let retryable = crate::cleanup::HashCleanupResult {
+            hash: "b".repeat(64),
+            status: crate::cleanup::CleanupStatus::Retryable,
+            deleted: 0,
+            absent: 1,
+            failures: vec!["verification failed".to_string()],
+        };
+
+        assert_eq!(
+            batch_cleanup_status(&[completed]),
+            crate::cleanup::CleanupStatus::Completed
+        );
+        assert_eq!(
+            batch_cleanup_status(&[retryable]),
+            crate::cleanup::CleanupStatus::Retryable
+        );
     }
 
     #[test]
