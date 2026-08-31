@@ -67,6 +67,40 @@ Do not put either secret value in the verification command, logs, screenshots,
 or pull-request text. Use the approved secret-injection tooling for the operator
 environment.
 
+## `webhook_secret` authority and rotation
+
+GCP Secret Manager secret `webhook_secret` in `rich-compiler-479518-d2` is the
+authoritative readable copy. Fastly Secret Store `blossom_secrets` entry
+`webhook_secret` and Cloudflare Worker `divine-moderation-service` binding
+`BLOSSOM_WEBHOOK_SECRET` are write-only copies. Never generate a replacement in
+Fastly or Cloudflare; generate a 64-character lowercase hex value directly into
+a new GCP version, without a trailing newline, and pipe that exact version to
+both write-only stores.
+
+These three stores must move as one rotation. The Fastly edge validates inbound
+`/admin/moderate` requests and authenticates outbound Cloud Run requests with
+the value. The moderation Worker calls `/admin/moderate` with its copy.
+`blossom-upload-rust` and `divine-transcoder` bind the GCP secret as
+`WEBHOOK_SECRET` at instance start, so both services need fresh instances after
+the new version becomes current. Keep the previous GCP version number until the
+rotation is verified; rollback disables the new version, re-enables the old
+version, restores both write-only copies from that exact old version, and
+restarts both Cloud Run services again.
+
+Coordinate the Cloudflare and Fastly writes because `/admin/moderate` has no
+dual-acceptance period. Record the time between those writes. After all
+consumers move, verify an authenticated malformed `{}` request reaches
+`/admin/moderate` parsing rather than returning `403`, verify a real moderation
+notification succeeds, and check edge and caller logs for new `401` or `403`
+responses. Also verify the funnelcake janitor's separate `admin_token` still
+authenticates an admin read route.
+
+Mirror the canonical value in `dv-platform-prod` Secret Manager as
+`blossom-webhook-secret-prod` for the platform secret convention. That mirror is
+not a fourth independently generated value. `admin_token`,
+`transcoder_webhook_secret`, and process-blob's `METADATA_WEBHOOK_SECRET` are
+separate credentials and must not be changed during this rotation.
+
 ## The edge Cloud Run backends are not in the production project
 
 The edge hardcodes its backends to project number `149672065768`:
