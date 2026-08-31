@@ -95,6 +95,11 @@ notification succeeds, and check edge and caller logs for new `401` or `403`
 responses. Also verify the funnelcake janitor's separate `admin_token` still
 authenticates an admin read route.
 
+The 2026-08-31 rotation's Cloudflare and Fastly API writes were 18 seconds
+apart, but the edge did not accept the new value until a probe 88 seconds after
+the Cloudflare write. Plan the mismatch window around verified edge acceptance,
+not the secret-store API completion time.
+
 Mirror the canonical value in `dv-platform-prod` Secret Manager as
 `blossom-webhook-secret-prod` for the platform secret convention. That mirror is
 not a fourth independently generated value. `admin_token`,
