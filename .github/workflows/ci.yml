@@ -164,7 +164,7 @@ jobs:
       - name: Verify batch cleanup contract is active
         run: |
           curl --retry 10 --retry-all-errors --retry-delay 3 -fsS \
-            https://blossom-upload-rust-149672065768.us-central1.run.app/delete-blobs/ready \
+            https://blossom-upload-rust-149672065768.us-central1.run.app/delete-blobs-ready \
             | jq -e '.status == "ready" and .contract == "vanish-batch-v1" and .max_hashes == 20 and .vanish_audit == "authenticated-v1"'
 
   deploy:
@@ -207,7 +207,7 @@ jobs:
       - name: Verify batch cleanup contract is active
         run: |
           curl --retry 10 --retry-all-errors --retry-delay 3 -fsS \
-            https://blossom-upload-rust-149672065768.us-central1.run.app/delete-blobs/ready \
+            https://blossom-upload-rust-149672065768.us-central1.run.app/delete-blobs-ready \
             | jq -e '.status == "ready" and .contract == "vanish-batch-v1" and .max_hashes == 20 and .vanish_audit == "authenticated-v1"'
 
       - name: Deploy to Fastly
