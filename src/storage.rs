@@ -856,7 +856,7 @@ pub fn delete_blob_from_fos(key: &str) -> Result<()> {
 }
 
 const PROVIDER_MULTI_DELETE_LIMIT: usize = 1_000;
-pub(crate) const CLOUD_RUN_DELETE_BATCH_LIMIT: usize = 200;
+pub(crate) const CLOUD_RUN_DELETE_BATCH_LIMIT: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VanishDeleteTarget {
@@ -2120,8 +2120,51 @@ pub fn write_audit_log(
     }
 }
 
-/// Persist one vanish timing record through the existing Cloud Logging bridge.
-pub fn write_vanish_timing_log(entry: &serde_json::Value) -> Result<()> {
+#[derive(Debug, Clone, Copy)]
+pub enum VanishAuditPhase {
+    Authorized,
+    Completed,
+}
+
+fn vanish_audit_entry(pubkey: &str, phase: VanishAuditPhase) -> serde_json::Value {
+    let action = match phase {
+        VanishAuditPhase::Authorized => "vanish_authorized",
+        VanishAuditPhase::Completed => "vanish_completed",
+    };
+    let insert_id = hex::encode(Sha256::digest(
+        format!("vanish-audit:v1:{action}:{pubkey}").as_bytes(),
+    ));
+    serde_json::json!({
+        "action": action,
+        "actor_pubkey": pubkey,
+        "audit_version": 1,
+        "logging.googleapis.com/insertId": insert_id,
+    })
+}
+
+/// Write one idempotent account-level vanish audit record.
+pub fn write_vanish_audit_log(pubkey: &str, phase: VanishAuditPhase) -> Result<()> {
+    const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
+    let payload = vanish_audit_entry(pubkey, phase);
+    let mut request = Request::new(Method::POST, format!("https://{}/audit", CLOUD_RUN_HOST));
+    request.set_header("Host", CLOUD_RUN_HOST);
+    request.set_header("Content-Type", "application/json");
+    request.set_body(payload.to_string());
+
+    let response = request.send(CLOUD_RUN_BACKEND).map_err(|error| {
+        BlossomError::Internal(format!("Failed to deliver vanish audit: {error}"))
+    })?;
+    if !response.get_status().is_success() {
+        return Err(BlossomError::Internal(format!(
+            "Vanish audit returned status {}",
+            response.get_status()
+        )));
+    }
+    Ok(())
+}
+
+/// Dispatch one aggregate vanish timing record to the Cloud Logging bridge.
+pub fn dispatch_vanish_timing_log(entry: &serde_json::Value) -> Result<()> {
     const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
     let mut payload = entry.clone();
     payload["action"] = serde_json::json!("vanish_timing");
@@ -2132,7 +2175,7 @@ pub fn write_vanish_timing_log(entry: &serde_json::Value) -> Result<()> {
     req.set_header("Content-Type", "application/json");
     req.set_body(payload.to_string());
     req.send_async(CLOUD_RUN_BACKEND).map_err(|error| {
-        BlossomError::Internal(format!("Failed to persist vanish timing: {}", error))
+        BlossomError::Internal(format!("Failed to dispatch vanish timing: {}", error))
     })?;
     Ok(())
 }
@@ -2493,9 +2536,10 @@ mod tests {
         failed_cloud_cleanup_hashes, failed_multi_delete_keys, mark_failed_stage,
         multi_delete_body, normalize_storage_cache_state, parse_audio_extraction_error_response,
         parse_funnelcake_audio_reuse_response, plan_vanish_delete_batches,
-        prepare_storage_cache_miss, preserve_storage_cache_state, sign_request_at, S3Config,
+        prepare_storage_cache_miss, preserve_storage_cache_state, sign_request_at,
+        vanish_audit_entry, S3Config,
         VanishDeleteTarget, VanishStorageResult, CLOUD_RUN_DELETE_BATCH_LIMIT, FOS_BACKEND,
-        PROVIDER_MULTI_DELETE_LIMIT, STORAGE_CACHE_HEADER,
+        PROVIDER_MULTI_DELETE_LIMIT, STORAGE_CACHE_HEADER, VanishAuditPhase,
     };
     use fastly::http::header;
     use fastly::{Request, Response};
@@ -2508,6 +2552,23 @@ mod tests {
 
         assert_eq!(value["hash"], "a".repeat(64));
         assert_eq!(value["expected_bucket"], "configured-bucket");
+    }
+
+    #[test]
+    fn vanish_audit_is_minimal_and_idempotent_per_phase() {
+        let pubkey = "1".repeat(64);
+        let authorized = vanish_audit_entry(&pubkey, VanishAuditPhase::Authorized);
+        let authorized_retry = vanish_audit_entry(&pubkey, VanishAuditPhase::Authorized);
+        let completed = vanish_audit_entry(&pubkey, VanishAuditPhase::Completed);
+
+        assert_eq!(authorized, authorized_retry);
+        assert_ne!(
+            authorized["logging.googleapis.com/insertId"],
+            completed["logging.googleapis.com/insertId"]
+        );
+        assert_eq!(authorized["actor_pubkey"], pubkey);
+        assert!(authorized.get("auth_event").is_none());
+        assert!(authorized.get("sha256").is_none());
     }
 
     #[test]

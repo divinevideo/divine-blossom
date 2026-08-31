@@ -243,7 +243,7 @@ struct BatchCleanupResponse {
     results: Vec<cleanup::HashCleanupResult>,
 }
 
-const MAX_BATCH_CLEANUP_HASHES: usize = 200;
+const MAX_BATCH_CLEANUP_HASHES: usize = 20;
 const BATCH_CLEANUP_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -360,6 +360,7 @@ async fn main() -> Result<()> {
         .route("/audit", post(handle_audit_log))
         .route("/delete-blob", post(handle_delete_blob))
         .route("/delete-blobs", post(handle_delete_blobs))
+        .route("/delete-blobs/ready", get(handle_delete_blobs_ready))
         .route("/delete-blob/health", get(handle_delete_blob_health))
         .route("/thumbnail/:hash", get(handle_thumbnail_generate))
         .route("/thumbnail/:hash", options(handle_cors_preflight))
@@ -572,6 +573,14 @@ async fn handle_delete_blobs(
         Json(BatchCleanupResponse { status, results }),
     )
         .into_response()
+}
+
+async fn handle_delete_blobs_ready() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "status": "ready",
+        "contract": "vanish-batch-v1",
+        "max_hashes": MAX_BATCH_CLEANUP_HASHES,
+    }))
 }
 
 async fn handle_delete_blob_health(

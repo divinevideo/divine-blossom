@@ -49,8 +49,9 @@ use crate::metadata::{
 use crate::storage::{
     blob_exists, check_funnelcake_audio_reuse, current_timestamp, delete_blob as storage_delete,
     download_blob_read_through, download_blob_with_fallback, download_thumbnail,
-    erase_vanish_batch, trigger_audio_extraction, trigger_cloud_run_delete_blob, upload_blob,
-    write_audit_log, write_vanish_timing_log,
+    dispatch_vanish_timing_log, erase_vanish_batch, trigger_audio_extraction,
+    trigger_cloud_run_delete_blob, upload_blob, write_audit_log, write_vanish_audit_log,
+    VanishAuditPhase,
 };
 use crate::viewer_auth::{ViewerAuthDiagnostics, ViewerAuthState};
 use blossom_core::cache_policy::{
@@ -4458,7 +4459,7 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
     Ok(resp)
 }
 
-const VANISH_BATCH_SIZE: usize = 100;
+const VANISH_BATCH_SIZE: usize = 10;
 const VANISH_STORAGE_ATTEMPTS: u8 = 2;
 const _: () = assert!(VANISH_BATCH_SIZE * 2 <= storage::CLOUD_RUN_DELETE_BATCH_LIMIT);
 
@@ -4692,9 +4693,9 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         "kv_finalize_ms": kv_finalize_ms.min(u128::from(u64::MAX)) as u64,
         "total_ms": started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
     });
-    if let Err(error) = write_vanish_timing_log(&timing) {
+    if let Err(error) = dispatch_vanish_timing_log(&timing) {
         eprintln!(
-            "[VANISH] pubkey={} failed to persist timing: {}",
+            "[VANISH] pubkey={} failed to dispatch timing: {}",
             pubkey, error
         );
     }
@@ -4726,19 +4727,18 @@ fn vanish_response_status(errors: u32, pending: u32) -> StatusCode {
 fn handle_vanish(req: Request) -> Result<Response> {
     // Validate Blossom delete auth.
     let auth = validate_auth(&req, AuthAction::Delete)?;
-    let auth_event_json = serde_json::to_string(&auth).unwrap_or_default();
+    write_vanish_audit_log(&auth.pubkey, VanishAuditPhase::Authorized)?;
 
-    // Write audit log before erasure
-    write_audit_log(
-        "all",
-        "vanish",
-        &auth.pubkey,
-        Some(&auth_event_json),
-        None,
-        Some("User-initiated GDPR right to erasure"),
-    );
-
-    let execution = execute_vanish(&auth.pubkey);
+    let mut execution = execute_vanish(&auth.pubkey);
+    if execution.vanished() {
+        if let Err(error) = write_vanish_audit_log(&auth.pubkey, VanishAuditPhase::Completed) {
+            eprintln!(
+                "[VANISH] pubkey={} failed to deliver completion audit: {}",
+                auth.pubkey, error
+            );
+            execution.errors += 1;
+        }
+    }
 
     let result = serde_json::json!({
         "vanished": execution.vanished(),
@@ -4785,10 +4785,18 @@ fn handle_admin_vanish(req: Request) -> Result<Response> {
         return Err(BlossomError::BadRequest("Invalid pubkey format".into()));
     }
 
-    // Write audit log before erasure
-    write_audit_log("all", "admin_vanish", &pubkey, None, None, Some(reason));
+    write_vanish_audit_log(&pubkey, VanishAuditPhase::Authorized)?;
 
-    let execution = execute_vanish(&pubkey);
+    let mut execution = execute_vanish(&pubkey);
+    if execution.vanished() {
+        if let Err(error) = write_vanish_audit_log(&pubkey, VanishAuditPhase::Completed) {
+            eprintln!(
+                "[VANISH] pubkey={} failed to deliver completion audit: {}",
+                pubkey, error
+            );
+            execution.errors += 1;
+        }
+    }
 
     let result = serde_json::json!({
         "vanished": execution.vanished(),
@@ -6526,7 +6534,7 @@ mod tests {
 
         assert_eq!(selected.len(), VANISH_BATCH_SIZE);
         assert!(malformed.is_empty());
-        assert_eq!(pending, 915);
+        assert_eq!(pending, 1_005);
         assert!(selected.iter().all(|hash| hash == &hash.to_lowercase()));
     }
 

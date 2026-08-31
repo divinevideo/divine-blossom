@@ -6,6 +6,8 @@ use google_cloud_storage::{
 use serde::Serialize;
 use std::collections::BTreeSet;
 
+const MAX_PREFIX_OBJECTS_PER_ATTEMPT: usize = 25;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CleanupStatus {
@@ -31,7 +33,7 @@ enum DeleteOutcome {
 
 #[async_trait]
 trait CleanupBackend {
-    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, String>;
+    async fn list_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<String>, String>;
     async fn delete_object(&self, object: &str) -> Result<DeleteOutcome, String>;
 }
 
@@ -48,32 +50,23 @@ impl<'a> GcsCleanupBackend<'a> {
 
 #[async_trait]
 impl CleanupBackend for GcsCleanupBackend<'_> {
-    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, String> {
-        let mut objects = Vec::new();
-        let mut page_token = None;
-        loop {
-            let response = self
-                .client
-                .list_objects(&ListObjectsRequest {
-                    bucket: self.bucket.to_string(),
-                    prefix: Some(prefix.to_string()),
-                    page_token,
-                    ..Default::default()
-                })
-                .await
-                .map_err(|error| format!("failed to list derivative objects: {error}"))?;
-            objects.extend(
-                response
-                    .items
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|object| object.name),
-            );
-            page_token = response.next_page_token;
-            if page_token.is_none() {
-                return Ok(objects);
-            }
-        }
+    async fn list_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<String>, String> {
+        let response = self
+            .client
+            .list_objects(&ListObjectsRequest {
+                bucket: self.bucket.to_string(),
+                prefix: Some(prefix.to_string()),
+                max_results: Some(limit.min(i32::MAX as usize) as i32),
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| format!("failed to list derivative objects: {error}"))?;
+        Ok(response
+            .items
+            .unwrap_or_default()
+            .into_iter()
+            .map(|object| object.name)
+            .collect())
     }
 
     async fn delete_object(&self, object: &str) -> Result<DeleteOutcome, String> {
@@ -109,7 +102,10 @@ async fn cleanup_hash_with_backend<B: CleanupBackend + Sync>(
     let mut candidates = BTreeSet::from([hash.to_string(), format!("{hash}.jpg")]);
     let mut failures = Vec::new();
 
-    match backend.list_prefix(&prefix).await {
+    match backend
+        .list_prefix(&prefix, MAX_PREFIX_OBJECTS_PER_ATTEMPT)
+        .await
+    {
         Ok(objects) => candidates.extend(objects),
         Err(error) => failures.push(error),
     }
@@ -124,7 +120,7 @@ async fn cleanup_hash_with_backend<B: CleanupBackend + Sync>(
         }
     }
 
-    match backend.list_prefix(&prefix).await {
+    match backend.list_prefix(&prefix, 1).await {
         Ok(remaining) => failures.extend(
             remaining
                 .into_iter()
@@ -166,13 +162,14 @@ mod tests {
 
     #[async_trait]
     impl CleanupBackend for FakeBackend {
-        async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, String> {
+        async fn list_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<String>, String> {
             Ok(self
                 .objects
                 .lock()
                 .expect("objects lock")
                 .iter()
                 .filter(|object| object.starts_with(prefix))
+                .take(limit)
                 .cloned()
                 .collect())
         }
@@ -225,6 +222,23 @@ mod tests {
 
         assert_eq!(first.status, CleanupStatus::Retryable);
         assert_eq!(retry.status, CleanupStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn large_prefix_is_cleaned_in_bounded_retryable_slices() {
+        let backend = FakeBackend::default();
+        backend.objects.lock().expect("objects lock").extend(
+            (0..MAX_PREFIX_OBJECTS_PER_ATTEMPT + 1)
+                .map(|index| format!("{HASH_A}/hls/{index}.ts")),
+        );
+
+        let first = cleanup_hash_with_backend(&backend, HASH_A).await;
+        let second = cleanup_hash_with_backend(&backend, HASH_A).await;
+
+        assert_eq!(first.status, CleanupStatus::Retryable);
+        assert_eq!(first.deleted, MAX_PREFIX_OBJECTS_PER_ATTEMPT);
+        assert_eq!(second.status, CleanupStatus::Completed);
+        assert_eq!(second.deleted, 1);
     }
 
     #[test]

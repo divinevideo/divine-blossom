@@ -118,9 +118,45 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  deploy:
+  deploy-upload:
     needs: test
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_compute && !inputs.purge_cache))
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-16core
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy upload service before dependent edge code
+        working-directory: cloud-run-upload
+        env:
+          PROJECT_ID: rich-compiler-479518-d2
+        run: ./deploy.sh
+
+      - name: Verify batch cleanup contract is active
+        run: |
+          curl --retry 10 --retry-all-errors --retry-delay 3 -fsS \
+            https://blossom-upload-rust-149672065768.us-central1.run.app/delete-blobs/ready \
+            | jq -e '.status == "ready" and .contract == "vanish-batch-v1" and .max_hashes == 20'
+
+  deploy:
+    needs: [test, deploy-upload]
+    if: >-
+      always() &&
+      needs.test.result == 'success' &&
+      github.ref == 'refs/heads/main' &&
+      ((github.event_name == 'push' && needs.deploy-upload.result == 'success') ||
+       (github.event_name == 'workflow_dispatch' && inputs.publish_compute && !inputs.purge_cache))
     concurrency:
       group: fastly-deploy
       cancel-in-progress: false
@@ -149,6 +185,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: wasm32-wasip1
+
+      - name: Verify batch cleanup contract is active
+        run: |
+          curl --retry 10 --retry-all-errors --retry-delay 3 -fsS \
+            https://blossom-upload-rust-149672065768.us-central1.run.app/delete-blobs/ready \
+            | jq -e '.status == "ready" and .contract == "vanish-batch-v1" and .max_hashes == 20'
 
       - name: Deploy to Fastly
         env:
