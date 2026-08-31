@@ -865,6 +865,7 @@ const VANISH_ARTIFACT_SUFFIXES: &[&str] = &[
     "/hls/stream_480p.mp4",
     "/vtt/main.vtt",
 ];
+const PROVIDER_MULTI_DELETE_LIMIT: usize = 1_000;
 
 #[derive(Debug, Default, serde::Serialize)]
 pub(crate) struct VanishStorageTimings {
@@ -925,6 +926,17 @@ fn multi_delete_body(keys: &[String]) -> String {
     }
     xml.push_str("<Quiet>false</Quiet></Delete>");
     xml
+}
+
+fn vanish_artifact_keys(hashes: &[String]) -> Vec<String> {
+    hashes
+        .iter()
+        .flat_map(|hash| {
+            VANISH_ARTIFACT_SUFFIXES
+                .iter()
+                .map(move |suffix| format!("{}{}", hash, suffix))
+        })
+        .collect()
 }
 
 fn build_multi_delete_request(
@@ -1138,35 +1150,48 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
         }
     };
     let main_keys = hashes.to_vec();
-    let artifact_keys: Vec<String> = hashes
-        .iter()
-        .flat_map(|hash| {
-            VANISH_ARTIFACT_SUFFIXES
-                .iter()
-                .map(move |suffix| format!("{}{}", hash, suffix))
-        })
-        .collect();
-    let requests = [
-        ("gcs_main", &main_keys, &gcs, GCS_BACKEND, false),
-        ("gcs_artifacts", &artifact_keys, &gcs, GCS_BACKEND, false),
-        ("fos_main", &main_keys, &fos, FOS_BACKEND, true),
+    let artifact_keys = vanish_artifact_keys(hashes);
+    let mut requests = vec![
+        (
+            "gcs_main".to_string(),
+            main_keys.clone(),
+            &gcs,
+            GCS_BACKEND,
+            false,
+        ),
+        ("fos_main".to_string(), main_keys, &fos, FOS_BACKEND, true),
     ];
+    requests.extend(
+        artifact_keys
+            .chunks(PROVIDER_MULTI_DELETE_LIMIT)
+            .enumerate()
+            .map(|(index, keys)| {
+                (
+                    format!("gcs_artifacts:{}", index),
+                    keys.to_vec(),
+                    &gcs,
+                    GCS_BACKEND,
+                    false,
+                )
+            }),
+    );
     let mut pending = Vec::new();
-    let mut stage_started = HashMap::<&str, Instant>::new();
-    let requested_by_stage: HashMap<&str, &[String]> = requests
-        .iter()
-        .map(|(stage, keys, _, _, _)| (*stage, keys.as_slice()))
-        .collect();
+    let mut stage_started = HashMap::<String, Instant>::new();
+    let mut requested_by_stage = HashMap::<String, Vec<String>>::new();
 
     for (stage, keys, config, backend, content_md5) in requests {
-        stage_started.insert(stage, Instant::now());
-        match build_multi_delete_request(keys, config, stage, content_md5).and_then(|request| {
+        stage_started.insert(stage.clone(), Instant::now());
+        requested_by_stage.insert(stage.clone(), keys.clone());
+        match build_multi_delete_request(&keys, config, &stage, content_md5).and_then(|request| {
             request.send_async(backend).map_err(|error| {
                 BlossomError::StorageError(format!("{} batch delete failed: {}", stage, error))
             })
         }) {
             Ok(request) => pending.push(request),
-            Err(_) => result.failed_hashes.extend(hashes.iter().cloned()),
+            Err(_) => {
+                let failed_keys: HashSet<String> = keys.into_iter().collect();
+                mark_failed_keys(&mut result, &failed_keys);
+            }
         }
     }
 
@@ -1184,12 +1209,15 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
                     let duration = elapsed_ms(*started);
                     match stage.as_str() {
                         "gcs_main" => result.timings.gcs_main_ms = duration,
-                        "gcs_artifacts" => result.timings.gcs_artifacts_ms = duration,
+                        stage if stage.starts_with("gcs_artifacts:") => {
+                            result.timings.gcs_artifacts_ms =
+                                result.timings.gcs_artifacts_ms.max(duration);
+                        }
                         "fos_main" => result.timings.fos_main_ms = duration,
                         _ => {}
                     }
                 }
-                if let Some(requested) = requested_by_stage.get(stage.as_str()) {
+                if let Some(requested) = requested_by_stage.get(&stage) {
                     let failed = failed_multi_delete_keys(response, requested);
                     mark_failed_keys(&mut result, &failed);
                 } else {
@@ -2108,46 +2136,6 @@ pub fn trigger_cloud_run_delete_blob(hash: &str) {
     }
 }
 
-/// Fire-and-forget: ask Cloud Run to delete all GCS objects for a user (vanish).
-/// Cloud Run does prefix-based listing + deletion as a thorough safety net.
-pub fn trigger_cloud_run_bulk_delete(pubkey: &str, hashes: &[String]) {
-    let webhook_secret = match get_secret("webhook_secret") {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("[VANISH] webhook_secret not configured, skipping Cloud Run bulk delete");
-            return;
-        }
-    };
-
-    let body = serde_json::json!({
-        "pubkey": pubkey,
-        "known_hashes": hashes,
-    })
-    .to_string();
-
-    const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
-    let mut req = Request::new(
-        Method::POST,
-        format!("https://{}/delete-blobs-by-owner", CLOUD_RUN_HOST),
-    );
-    req.set_header("Host", CLOUD_RUN_HOST);
-    req.set_header("Content-Type", "application/json");
-    req.set_header("Authorization", format!("Bearer {}", webhook_secret));
-    req.set_body(Body::from(body));
-
-    match req.send_async(CLOUD_RUN_BACKEND) {
-        Ok(_) => {
-            eprintln!(
-                "[VANISH] Triggered Cloud Run bulk delete for pubkey={}",
-                pubkey
-            );
-        }
-        Err(e) => {
-            eprintln!("[VANISH] Failed to trigger Cloud Run bulk delete: {}", e);
-        }
-    }
-}
-
 /// Fire-and-forget: ask Cloud Run to mark a pubkey for audit log anonymization.
 pub fn trigger_audit_anonymize(pubkey: &str) {
     let webhook_secret = match get_secret("webhook_secret") {
@@ -2382,8 +2370,8 @@ mod tests {
         build_fos_delete_request, build_multi_delete_request, failed_multi_delete_keys,
         mark_failed_stage, multi_delete_body, normalize_storage_cache_state,
         parse_audio_extraction_error_response, parse_funnelcake_audio_reuse_response,
-        prepare_storage_cache_miss, preserve_storage_cache_state, S3Config, VanishStorageResult,
-        FOS_BACKEND, STORAGE_CACHE_HEADER,
+        prepare_storage_cache_miss, preserve_storage_cache_state, vanish_artifact_keys, S3Config,
+        VanishStorageResult, FOS_BACKEND, PROVIDER_MULTI_DELETE_LIMIT, STORAGE_CACHE_HEADER,
     };
     use fastly::http::header;
     use fastly::{Request, Response};
@@ -2433,6 +2421,21 @@ mod tests {
         assert!(req.contains_header("Authorization"));
         assert!(req.contains_header("Content-MD5"));
         assert_eq!(req.take_body().into_string(), multi_delete_body(&keys));
+    }
+
+    #[test]
+    fn vanish_artifact_deletes_chunk_at_the_provider_limit() {
+        let hashes = (0..112)
+            .map(|index| format!("{index:064x}"))
+            .collect::<Vec<_>>();
+        let keys = vanish_artifact_keys(&hashes);
+        let chunks = keys.chunks(PROVIDER_MULTI_DELETE_LIMIT).collect::<Vec<_>>();
+
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.len() <= PROVIDER_MULTI_DELETE_LIMIT));
+        assert_eq!(chunks[0].len(), PROVIDER_MULTI_DELETE_LIMIT);
     }
 
     #[test]

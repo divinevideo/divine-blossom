@@ -105,6 +105,20 @@ pub enum VanishBlobOutcome {
     Unlinked,
 }
 
+/// A vanish entry whose bytes must be erased before metadata finalization.
+#[derive(Debug)]
+pub struct PreparedVanishBlob {
+    pub hash: String,
+    pub metadata: Option<BlobMetadata>,
+}
+
+/// Result of applying the reference and ownership policy to a vanish entry.
+#[derive(Debug)]
+pub enum PreparedVanishBlobOrOutcome {
+    Erase(Box<PreparedVanishBlob>),
+    Completed(VanishBlobOutcome),
+}
+
 /// Metadata and list side effects needed to vanish one blob.
 pub trait VanishBlobOps: BlobErasureOps {
     fn get_blob_metadata(&self, hash: &str) -> Result<Option<BlobMetadata>>;
@@ -116,6 +130,75 @@ pub trait VanishBlobOps: BlobErasureOps {
     fn remove_from_recent_index(&self, hash: &str);
     fn put_blob_metadata(&self, metadata: &BlobMetadata) -> Result<()>;
     fn remove_from_user_list(&self, pubkey: &str, hash: &str) -> Result<()>;
+}
+
+/// Apply reference and ownership policy before a vanish storage erasure.
+pub fn prepare_vanish_blob_with_ops<O: VanishBlobOps>(
+    hash: &str,
+    pubkey: &str,
+    ops: &O,
+) -> Result<PreparedVanishBlobOrOutcome> {
+    let metadata = ops.get_blob_metadata(hash)?;
+    let remaining_refs = ops.remove_from_blob_refs(hash, pubkey)?;
+    let other_refs: Vec<String> = remaining_refs
+        .into_iter()
+        .filter(|reference| !reference.eq_ignore_ascii_case(pubkey))
+        .collect();
+
+    match metadata {
+        None if !other_refs.is_empty() => {
+            ops.remove_from_user_list(pubkey, hash)?;
+            Ok(PreparedVanishBlobOrOutcome::Completed(
+                VanishBlobOutcome::Unlinked,
+            ))
+        }
+        None => Ok(PreparedVanishBlobOrOutcome::Erase(Box::new(
+            PreparedVanishBlob {
+                hash: hash.to_string(),
+                metadata: None,
+            },
+        ))),
+        Some(metadata) if metadata.owner.eq_ignore_ascii_case(pubkey) && other_refs.is_empty() => {
+            Ok(PreparedVanishBlobOrOutcome::Erase(Box::new(
+                PreparedVanishBlob {
+                    hash: hash.to_string(),
+                    metadata: Some(metadata),
+                },
+            )))
+        }
+        Some(mut metadata) if metadata.owner.eq_ignore_ascii_case(pubkey) => {
+            metadata.owner = other_refs[0].clone();
+            ops.put_blob_metadata(&metadata)?;
+            ops.remove_from_user_list(pubkey, hash)?;
+            Ok(PreparedVanishBlobOrOutcome::Completed(
+                VanishBlobOutcome::Unlinked,
+            ))
+        }
+        Some(_) => {
+            ops.remove_from_user_list(pubkey, hash)?;
+            Ok(PreparedVanishBlobOrOutcome::Completed(
+                VanishBlobOutcome::Unlinked,
+            ))
+        }
+    }
+}
+
+/// Finalize metadata and list state after storage erasure succeeds.
+pub fn finalize_erased_vanish_blob_with_ops<O: VanishBlobOps>(
+    blob: &PreparedVanishBlob,
+    pubkey: &str,
+    ops: &O,
+) -> Result<()> {
+    ops.put_erasure_evidence(&blob.hash)?;
+    if let Some(metadata) = &blob.metadata {
+        ops.delete_blob_metadata(&blob.hash)?;
+        ops.delete_blob_kv_artifacts(&blob.hash);
+        ops.update_stats_on_remove(metadata);
+    } else {
+        ops.delete_blob_kv_artifacts(&blob.hash);
+    }
+    ops.remove_from_recent_index(&blob.hash);
+    ops.remove_from_user_list(pubkey, &blob.hash)
 }
 
 /// Erase a blob from every required origin before invalidating edge caches.
@@ -159,52 +242,13 @@ pub fn handle_vanish_blob_with_ops<O: VanishBlobOps>(
     req_id: &str,
     ops: &O,
 ) -> Result<VanishBlobOutcome> {
-    let metadata = match ops.get_blob_metadata(hash)? {
-        Some(metadata) => metadata,
-        None => {
-            let remaining_refs = ops.remove_from_blob_refs(hash, pubkey)?;
-            let other_refs = remaining_refs
-                .iter()
-                .any(|reference| !reference.eq_ignore_ascii_case(pubkey));
-            if other_refs {
-                ops.remove_from_user_list(pubkey, hash)?;
-                return Ok(VanishBlobOutcome::Unlinked);
-            }
-
-            erase_blob_with_ops(hash, req_id, ops)?;
-            ops.put_erasure_evidence(hash)?;
-            ops.delete_blob_kv_artifacts(hash);
-            ops.remove_from_recent_index(hash);
-            ops.remove_from_user_list(pubkey, hash)?;
-            return Ok(VanishBlobOutcome::FullyDeleted);
+    match prepare_vanish_blob_with_ops(hash, pubkey, ops)? {
+        PreparedVanishBlobOrOutcome::Completed(outcome) => Ok(outcome),
+        PreparedVanishBlobOrOutcome::Erase(blob) => {
+            erase_blob_with_ops(&blob.hash, req_id, ops)?;
+            finalize_erased_vanish_blob_with_ops(&blob, pubkey, ops)?;
+            Ok(VanishBlobOutcome::FullyDeleted)
         }
-    };
-
-    let is_owner = metadata.owner.eq_ignore_ascii_case(pubkey);
-    let remaining_refs = ops.remove_from_blob_refs(hash, pubkey)?;
-    let other_refs: Vec<String> = remaining_refs
-        .into_iter()
-        .filter(|reference| !reference.eq_ignore_ascii_case(pubkey))
-        .collect();
-
-    if is_owner && other_refs.is_empty() {
-        erase_blob_with_ops(hash, req_id, ops)?;
-        ops.put_erasure_evidence(hash)?;
-        ops.delete_blob_metadata(hash)?;
-        ops.delete_blob_kv_artifacts(hash);
-        ops.update_stats_on_remove(&metadata);
-        ops.remove_from_recent_index(hash);
-        ops.remove_from_user_list(pubkey, hash)?;
-        Ok(VanishBlobOutcome::FullyDeleted)
-    } else if is_owner {
-        let mut updated_metadata = metadata;
-        updated_metadata.owner = other_refs[0].clone();
-        ops.put_blob_metadata(&updated_metadata)?;
-        ops.remove_from_user_list(pubkey, hash)?;
-        Ok(VanishBlobOutcome::Unlinked)
-    } else {
-        ops.remove_from_user_list(pubkey, hash)?;
-        Ok(VanishBlobOutcome::Unlinked)
     }
 }
 
@@ -466,23 +510,27 @@ mod tests {
     }
 
     #[test]
-    fn vanish_sole_owner_removes_list_entry_only_after_erasure_and_metadata() {
+    fn vanish_batch_policy_prepares_then_finalizes_a_sole_owner() {
         let ops = vanish_ops_with_owner();
 
-        let outcome = handle_vanish_blob_with_ops(HASH, &"1".repeat(64), REQ_ID, &ops)
-            .expect("sole-owner vanish should succeed");
+        let blob = match prepare_vanish_blob_with_ops(HASH, &"1".repeat(64), &ops)
+            .expect("sole-owner preparation should succeed")
+        {
+            PreparedVanishBlobOrOutcome::Erase(blob) => blob,
+            PreparedVanishBlobOrOutcome::Completed(_) => panic!("sole owner must be erased"),
+        };
 
-        assert_eq!(outcome, VanishBlobOutcome::FullyDeleted);
+        assert_eq!(
+            *ops.calls.borrow(),
+            vec!["get_blob_metadata", "remove_from_blob_refs"]
+        );
+        finalize_erased_vanish_blob_with_ops(&blob, &"1".repeat(64), &ops)
+            .expect("sole-owner finalization should succeed");
         assert_eq!(
             *ops.calls.borrow(),
             vec![
                 "get_blob_metadata",
                 "remove_from_blob_refs",
-                "cleanup_derived_audio",
-                "delete_blob_from_gcs",
-                "delete_blob_from_replica",
-                "delete_blob_gcs_artifacts",
-                "purge_vcl_cache",
                 "put_erasure_evidence",
                 "delete_blob_metadata",
                 "delete_blob_kv_artifacts",
@@ -656,7 +704,10 @@ mod tests {
             .expect("shared owner should transfer the blob");
 
         assert_eq!(outcome, VanishBlobOutcome::Unlinked);
-        assert_eq!(ops.metadata.borrow().as_ref().unwrap().owner, "2".repeat(64));
+        assert_eq!(
+            ops.metadata.borrow().as_ref().unwrap().owner,
+            "2".repeat(64)
+        );
         assert_eq!(
             &ops.calls.borrow()[2..],
             &["put_blob_metadata", "remove_from_user_list"]
@@ -675,7 +726,10 @@ mod tests {
             .expect("non-owner should unlink");
 
         assert_eq!(outcome, VanishBlobOutcome::Unlinked);
-        assert_eq!(ops.metadata.borrow().as_ref().unwrap().owner, "1".repeat(64));
+        assert_eq!(
+            ops.metadata.borrow().as_ref().unwrap().owner,
+            "1".repeat(64)
+        );
         assert!(!ops.calls.borrow().contains(&"put_blob_metadata"));
         assert!(ops.calls.borrow().contains(&"remove_from_user_list"));
     }

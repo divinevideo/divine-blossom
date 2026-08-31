@@ -27,8 +27,10 @@ use crate::blossom::{
     TranscodeStatus, TranscriptStatus, UploadRequirements, QUALITY_VARIANTS,
 };
 use crate::delete_policy::{
-    build_creator_delete_response, handle_creator_delete, map_webhook_moderate_action,
-    plan_user_delete, soft_delete_blob, validate_sha256_format, DeletePlan, VanishBlobOutcome,
+    build_creator_delete_response, finalize_erased_vanish_blob_with_ops, handle_creator_delete,
+    map_webhook_moderate_action, plan_user_delete, prepare_vanish_blob_with_ops, soft_delete_blob,
+    validate_sha256_format, DefaultCreatorDeleteOps, DeletePlan, PreparedVanishBlobOrOutcome,
+    VanishBlobOutcome,
 };
 use crate::error::{BlossomError, Result};
 use crate::media_auth_log::format_media_auth_log;
@@ -42,14 +44,13 @@ use crate::metadata::{
     put_audio_mapping, put_auth_event, put_blob_metadata, put_subtitle_job,
     remove_from_audio_source_refs, remove_from_blob_refs, remove_from_user_index,
     remove_from_user_list, set_subtitle_job_id_for_hash, update_blob_status, update_stats_on_add,
-    update_stats_on_remove, StatusUpdateOutcome, TranscodeMetadataUpdate, TranscriptMetadataUpdate,
+    StatusUpdateOutcome, TranscodeMetadataUpdate, TranscriptMetadataUpdate,
 };
 use crate::storage::{
     blob_exists, check_funnelcake_audio_reuse, current_timestamp, delete_blob as storage_delete,
     download_blob_read_through, download_blob_with_fallback, download_thumbnail,
     erase_vanish_batch, trigger_audio_extraction, trigger_audit_anonymize,
-    trigger_cloud_run_bulk_delete, trigger_cloud_run_delete_blob, upload_blob, write_audit_log,
-    write_vanish_timing_log,
+    trigger_cloud_run_delete_blob, upload_blob, write_audit_log, write_vanish_timing_log,
 };
 use crate::viewer_auth::{ViewerAuthDiagnostics, ViewerAuthState};
 use blossom_core::cache_policy::{
@@ -4438,72 +4439,6 @@ fn select_vanish_batch(hashes: &[String]) -> (Vec<String>, u32) {
     (selected, pending)
 }
 
-#[derive(Debug)]
-struct PreparedVanishBlob {
-    hash: String,
-    metadata: Option<BlobMetadata>,
-}
-
-fn prepare_vanish_blob(hash: &str, pubkey: &str) -> Result<PreparedVanishBlobOrOutcome> {
-    let metadata = get_blob_metadata(hash)?;
-    let remaining_refs = remove_from_blob_refs(hash, pubkey)?;
-    let other_refs: Vec<String> = remaining_refs
-        .into_iter()
-        .filter(|reference| !reference.eq_ignore_ascii_case(pubkey))
-        .collect();
-
-    match metadata {
-        None if !other_refs.is_empty() => {
-            remove_from_user_list(pubkey, hash)?;
-            Ok(PreparedVanishBlobOrOutcome::Completed(
-                VanishBlobOutcome::Unlinked,
-            ))
-        }
-        None => Ok(PreparedVanishBlobOrOutcome::Erase(Box::new(PreparedVanishBlob {
-            hash: hash.to_string(),
-            metadata: None,
-        }))),
-        Some(metadata) if metadata.owner.eq_ignore_ascii_case(pubkey) && other_refs.is_empty() => {
-            Ok(PreparedVanishBlobOrOutcome::Erase(Box::new(PreparedVanishBlob {
-                hash: hash.to_string(),
-                metadata: Some(metadata),
-            })))
-        }
-        Some(mut metadata) if metadata.owner.eq_ignore_ascii_case(pubkey) => {
-            metadata.owner = other_refs[0].clone();
-            put_blob_metadata(&metadata)?;
-            remove_from_user_list(pubkey, hash)?;
-            Ok(PreparedVanishBlobOrOutcome::Completed(
-                VanishBlobOutcome::Unlinked,
-            ))
-        }
-        Some(_) => {
-            remove_from_user_list(pubkey, hash)?;
-            Ok(PreparedVanishBlobOrOutcome::Completed(
-                VanishBlobOutcome::Unlinked,
-            ))
-        }
-    }
-}
-
-#[derive(Debug)]
-enum PreparedVanishBlobOrOutcome {
-    Erase(Box<PreparedVanishBlob>),
-    Completed(VanishBlobOutcome),
-}
-
-fn finalize_erased_vanish_blob(blob: &PreparedVanishBlob, pubkey: &str) -> Result<()> {
-    if let Some(metadata) = &blob.metadata {
-        delete_blob_metadata(&blob.hash)?;
-        delete_blob_kv_artifacts(&blob.hash);
-        let _ = update_stats_on_remove(metadata);
-    } else {
-        delete_blob_kv_artifacts(&blob.hash);
-    }
-    let _ = crate::metadata::remove_from_recent_index(&blob.hash);
-    remove_from_user_list(pubkey, &blob.hash)
-}
-
 fn increment_vanish_outcome(execution: &mut VanishExecution, outcome: VanishBlobOutcome) {
     match outcome {
         VanishBlobOutcome::FullyDeleted => execution.fully_deleted += 1,
@@ -4524,8 +4459,12 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     let hashes = match get_user_blobs(pubkey) {
         Ok(hashes) => hashes,
         Err(error) => {
-            eprintln!("[VANISH] Failed to get user blobs: {}", error);
+            eprintln!(
+                "[VANISH] pubkey={} failed to get user blobs: {}",
+                pubkey, error
+            );
             execution.errors = 1;
+            trigger_audit_anonymize(pubkey);
             return execution;
         }
     };
@@ -4536,13 +4475,16 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     let mut erase = Vec::new();
     let mut retry_hashes = Vec::new();
     for hash in &selected {
-        match prepare_vanish_blob(hash, pubkey) {
+        match prepare_vanish_blob_with_ops(hash, pubkey, &DefaultCreatorDeleteOps) {
             Ok(PreparedVanishBlobOrOutcome::Erase(blob)) => erase.push(*blob),
             Ok(PreparedVanishBlobOrOutcome::Completed(outcome)) => {
                 increment_vanish_outcome(&mut execution, outcome);
             }
             Err(error) => {
-                eprintln!("[VANISH] Failed to prepare blob: {}", error);
+                eprintln!(
+                    "[VANISH] pubkey={} hash={} failed to prepare blob: {}",
+                    pubkey, hash, error
+                );
                 execution.errors += 1;
                 retry_hashes.push(hash.clone());
             }
@@ -4566,17 +4508,21 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     let finalize_started = Instant::now();
     for blob in &erase {
         if storage_result.failed_hashes.contains(&blob.hash) {
+            eprintln!(
+                "[VANISH] pubkey={} hash={} storage erasure failed after {} attempts",
+                pubkey, blob.hash, storage_attempts
+            );
             execution.errors += 1;
             retry_hashes.push(blob.hash.clone());
             continue;
         }
-        match finalize_erased_vanish_blob(blob, pubkey) {
-            Ok(()) => increment_vanish_outcome(
-                &mut execution,
-                VanishBlobOutcome::FullyDeleted,
-            ),
+        match finalize_erased_vanish_blob_with_ops(blob, pubkey, &DefaultCreatorDeleteOps) {
+            Ok(()) => increment_vanish_outcome(&mut execution, VanishBlobOutcome::FullyDeleted),
             Err(error) => {
-                eprintln!("[VANISH] Failed to finalize erased blob: {}", error);
+                eprintln!(
+                    "[VANISH] pubkey={} hash={} failed to finalize erased blob: {}",
+                    pubkey, blob.hash, error
+                );
                 execution.errors += 1;
                 retry_hashes.push(blob.hash.clone());
             }
@@ -4585,24 +4531,35 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     let kv_finalize_ms = finalize_started.elapsed().as_millis();
 
     if let Err(error) = move_user_list_entries_to_end(pubkey, &retry_hashes) {
-        eprintln!("[VANISH] Failed to rotate retry entries: {}", error);
+        eprintln!(
+            "[VANISH] pubkey={} failed to rotate retry entries: {}",
+            pubkey, error
+        );
     }
 
     if execution.pending == 0 && execution.errors == 0 {
         if let Err(error) = delete_user_list(pubkey) {
-            eprintln!("[VANISH] Failed to delete user list: {}", error);
+            eprintln!(
+                "[VANISH] pubkey={} failed to delete user list: {}",
+                pubkey, error
+            );
             execution.errors += 1;
         } else if let Err(error) = remove_from_user_index(pubkey) {
-            eprintln!("[VANISH] Failed to remove account from user index: {}", error);
+            eprintln!(
+                "[VANISH] pubkey={} failed to remove account from user index: {}",
+                pubkey, error
+            );
             execution.errors += 1;
         } else {
             execution.finalized = true;
-            trigger_audit_anonymize(pubkey);
         }
     }
 
-    trigger_cloud_run_bulk_delete(pubkey, &selected);
+    // Audit records must be anonymized even when media erasure remains retryable.
+    trigger_audit_anonymize(pubkey);
     let timing = serde_json::json!({
+        "pubkey": pubkey,
+        "failed_hashes": retry_hashes,
         "selected": selected.len(),
         "erase_candidates": erase.len(),
         "storage_attempts": storage_attempts,
@@ -4620,11 +4577,15 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         "total_ms": started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
     });
     if let Err(error) = write_vanish_timing_log(&timing) {
-        eprintln!("[VANISH] Failed to persist timing: {}", error);
+        eprintln!(
+            "[VANISH] pubkey={} failed to persist timing: {}",
+            pubkey, error
+        );
     }
 
     eprintln!(
-        "[VANISH] fully_deleted={} unlinked={} errors={} pending={} vanished={}",
+        "[VANISH] pubkey={} fully_deleted={} unlinked={} errors={} pending={} vanished={}",
+        pubkey,
         execution.fully_deleted,
         execution.unlinked,
         execution.errors,
