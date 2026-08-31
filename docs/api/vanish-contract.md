@@ -12,6 +12,7 @@ Both endpoints return the same completion fields:
   "fully_deleted": 2,
   "unlinked": 1,
   "errors": 0,
+  "malformed_hash_exceptions": 1,
   "pending": 0
 }
 ```
@@ -23,6 +24,7 @@ The admin endpoint additionally echoes its `reason`; both responses identify the
 - HTTP `5xx`, `vanished: false`, `pending: 0`, and `errors > 0` mean the call reached a terminal server failure instead of completing the account. Callers must retry the same account.
 - `fully_deleted` counts only sole-owner blobs whose main objects were confirmed deleted or absent from both GCS and Fastly Object Storage (FOS), whose required GCS derivatives and unshared derived audio were confirmed deleted or absent, whose erasure evidence was durably recorded, and whose metadata cleanup and final CDN purge completed.
 - `unlinked` counts shared blobs that remain because another account still references them.
+- `malformed_hash_exceptions` counts account-list entries rejected by the edge's 64-character hexadecimal hash validation. Those entries cannot address stored media, so Blossom audits a fingerprint of the invalid value, removes the entry without dispatching cleanup, and may still complete the account erasure. A cleanup failure for any valid hash remains an error and blocks completion.
 - `pending` counts entries deferred by the per-call bound. Failed attempted entries are counted in `errors`, not `pending`, and remain discoverable for retry.
 
 `vanished` is true only when `pending == 0`, `errors == 0`, and account-list finalization completed. This field, not the HTTP status, gates irreversible downstream deletion. A response never contains both `pending > 0` and `vanished: true`.

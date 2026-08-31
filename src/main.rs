@@ -465,57 +465,41 @@ fn clear_stale_audio_mapping(source_hash: &str, audio_hash: &str) {
     }
 }
 
-pub(crate) fn cleanup_derived_audio_for_source(source_hash: &str) {
+pub(crate) fn cleanup_derived_audio_for_source(source_hash: &str) -> Result<()> {
     let mapping = match get_audio_mapping(source_hash) {
         Ok(Some(mapping)) => mapping,
-        Ok(None) => return,
-        Err(e) => {
-            eprintln!(
-                "[AUDIO] Failed to load audio mapping for cleanup {}: {}",
-                source_hash, e
-            );
-            return;
-        }
+        Ok(None) => return Ok(()),
+        Err(error) => return Err(error),
     };
 
-    let remaining_audio_sources =
-        match remove_from_audio_source_refs(&mapping.audio_sha256, source_hash) {
-            Ok(remaining) => remaining,
-            Err(e) => {
-                eprintln!(
-                    "[AUDIO] Failed to remove audio ref {} <- {}: {}",
-                    mapping.audio_sha256, source_hash, e
-                );
-                let _ = delete_audio_mapping(source_hash);
-                return;
-            }
-        };
-
-    let _ = delete_audio_mapping(source_hash);
+    let remaining_audio_sources: Vec<String> = get_audio_source_refs(&mapping.audio_sha256)?
+        .into_iter()
+        .filter(|hash| !hash.eq_ignore_ascii_case(source_hash))
+        .collect();
 
     if !remaining_audio_sources.is_empty() {
-        return;
+        remove_from_audio_source_refs(&mapping.audio_sha256, source_hash)?;
+        delete_audio_mapping(source_hash)?;
+        return Ok(());
     }
 
-    let blob_refs = match get_blob_refs(&mapping.audio_sha256) {
-        Ok(refs) => refs,
-        Err(e) => {
-            eprintln!(
-                "[AUDIO] Failed to load blob refs for derived audio {}: {}",
-                mapping.audio_sha256, e
-            );
-            return;
-        }
-    };
+    let blob_refs = get_blob_refs(&mapping.audio_sha256)?;
 
     if should_delete_derived_audio_blob(&remaining_audio_sources, &blob_refs) {
+        // Cloud Run rechecks the main object and every derivative, so verified
+        // cleanup can resolve a failed direct main-object delete.
         let _ = storage_delete(&mapping.audio_sha256);
-        let _ = delete_blob_metadata(&mapping.audio_sha256);
-        let _ = delete_audio_source_refs(&mapping.audio_sha256);
+        let derivative_result = delete_blob_gcs_artifacts(&mapping.audio_sha256);
+        let replica_result = storage::delete_blob_from_fos(&mapping.audio_sha256);
         purge_edge_cache(&mapping.audio_sha256);
-    } else {
-        let _ = delete_audio_source_refs(&mapping.audio_sha256);
+        derivative_result?;
+        replica_result?;
+        delete_blob_kv_artifacts(&mapping.audio_sha256);
+        delete_blob_metadata(&mapping.audio_sha256)?;
     }
+    delete_audio_source_refs(&mapping.audio_sha256)?;
+    delete_audio_mapping(source_hash)?;
+    Ok(())
 }
 
 /// GET /<sha256>[.ext] - Retrieve blob
@@ -4202,15 +4186,28 @@ fn handle_upload_requirements(req: Request) -> Result<Response> {
     Ok(resp)
 }
 
-/// Delete all GCS artifacts for a blob (thumbnail, HLS, VTT).
-/// The main blob itself is NOT deleted here (caller handles that).
-/// Best-effort: logs errors but never fails.
-pub(crate) fn delete_blob_gcs_artifacts(hash: &str) {
-    // Thumbnail
-    let _ = storage_delete(&format!("{}.jpg", hash));
+/// Delete and verify the main GCS object plus every thumbnail, HLS, VTT, and prefix artifact.
+fn local_derivative_cleanup_result(
+    local_mode: bool,
+    deterministic_failures: &[String],
+) -> Option<Result<()>> {
+    if !local_mode {
+        return None;
+    }
+    Some(if deterministic_failures.is_empty() {
+        Ok(())
+    } else {
+        Err(BlossomError::StorageError(format!(
+            "{} required local derivative cleanup operation(s) failed: {}",
+            deterministic_failures.len(),
+            deterministic_failures.join("; ")
+        )))
+    })
+}
 
-    // HLS files (deterministic paths from transcoder using -hls_flags single_file)
-    let hls_paths = [
+pub(crate) fn delete_blob_gcs_artifacts(hash: &str) -> Result<()> {
+    let paths = [
+        format!("{}.jpg", hash),
         format!("{}/hls/master.m3u8", hash),
         format!("{}/hls/stream_720p.m3u8", hash),
         format!("{}/hls/stream_720p.ts", hash),
@@ -4218,17 +4215,33 @@ pub(crate) fn delete_blob_gcs_artifacts(hash: &str) {
         format!("{}/hls/stream_480p.ts", hash),
         format!("{}/hls/stream_720p.mp4", hash),
         format!("{}/hls/stream_480p.mp4", hash),
+        format!("{}/vtt/main.vtt", hash),
     ];
-    for path in &hls_paths {
-        let _ = storage_delete(path);
+    let mut deterministic_failures = Vec::new();
+    for path in &paths {
+        if let Err(error) = storage_delete(path) {
+            deterministic_failures.push(format!("{}: {}", path, error));
+        }
     }
 
-    // VTT transcript
-    let _ = storage_delete(&format!("{}/vtt/main.vtt", hash));
+    if let Some(result) = local_derivative_cleanup_result(
+        crate::storage::is_local_mode(),
+        &deterministic_failures,
+    ) {
+        return result;
+    }
 
-    // Fire-and-forget Cloud Run request for thorough prefix-based cleanup
-    // (catches any files we missed with deterministic paths)
-    trigger_cloud_run_delete_blob(hash);
+    match trigger_cloud_run_delete_blob(hash) {
+        Ok(()) => Ok(()),
+        Err(cloud_error) => {
+            deterministic_failures.push(format!("prefix cleanup: {}", cloud_error));
+            Err(BlossomError::StorageError(format!(
+                "{} required derivative cleanup operation(s) failed: {}",
+                deterministic_failures.len(),
+                deterministic_failures.join("; ")
+            )))
+        }
+    }
 }
 
 /// Delete all KV artifacts for a blob (refs, auth events, subtitle data).
@@ -4416,6 +4429,7 @@ struct VanishExecution {
     fully_deleted: u32,
     unlinked: u32,
     errors: u32,
+    malformed_hash_exceptions: u32,
     pending: u32,
     finalized: bool,
 }
@@ -4426,17 +4440,34 @@ impl VanishExecution {
     }
 }
 
-fn select_vanish_batch(hashes: &[String]) -> (Vec<String>, u32) {
-    let selected = hashes
+fn select_vanish_batch(hashes: &[String]) -> (Vec<String>, Vec<String>, u32) {
+    let (valid, malformed) = hashes
         .iter()
         .take(VANISH_BATCH_SIZE)
-        .map(|hash| hash.to_lowercase())
-        .collect();
+        .partition::<Vec<_>, _>(|hash| validate_sha256_format(hash).is_ok());
+    let valid = valid.into_iter().map(|hash| hash.to_lowercase()).collect();
+    let malformed = malformed.into_iter().cloned().collect();
     let pending = hashes
         .len()
         .saturating_sub(VANISH_BATCH_SIZE)
         .min(u32::MAX as usize) as u32;
-    (selected, pending)
+    (valid, malformed, pending)
+}
+
+fn record_malformed_vanish_hash(hash: &str, pubkey: &str) {
+    let fingerprint = hex::encode(Sha256::digest(hash.as_bytes()));
+    write_audit_log(
+        &fingerprint,
+        "vanish_malformed_hash_exception",
+        pubkey,
+        None,
+        None,
+        Some("Malformed blob-list entry skipped; sha256 is a fingerprint of the invalid value"),
+    );
+    eprintln!(
+        "[VANISH] pubkey={} skipped malformed blob-list entry fingerprint={}",
+        pubkey, fingerprint
+    );
 }
 
 fn increment_vanish_outcome(execution: &mut VanishExecution, outcome: VanishBlobOutcome) {
@@ -4453,6 +4484,7 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         fully_deleted: 0,
         unlinked: 0,
         errors: 0,
+        malformed_hash_exceptions: 0,
         pending: 0,
         finalized: false,
     };
@@ -4467,12 +4499,25 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
             return execution;
         }
     };
-    let (selected, pending) = select_vanish_batch(&hashes);
+    let (selected, malformed, pending) = select_vanish_batch(&hashes);
     execution.pending = pending;
 
     let prepare_started = Instant::now();
     let mut erase = Vec::new();
     let mut retry_hashes = Vec::new();
+    for hash in &malformed {
+        record_malformed_vanish_hash(hash, pubkey);
+        if let Err(error) = remove_from_user_list(pubkey, hash) {
+            eprintln!(
+                "[VANISH] pubkey={} failed to remove malformed blob-list entry: {}",
+                pubkey, error
+            );
+            execution.errors += 1;
+            retry_hashes.push(hash.clone());
+        } else {
+            execution.malformed_hash_exceptions += 1;
+        }
+    }
     for hash in &selected {
         match prepare_vanish_blob_with_ops(hash, pubkey, &DefaultCreatorDeleteOps) {
             Ok(PreparedVanishBlobOrOutcome::Erase(blob)) => erase.push(*blob),
@@ -4491,9 +4536,21 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     }
     let prepare_ms = prepare_started.elapsed().as_millis();
 
-    for blob in &erase {
-        cleanup_derived_audio_for_source(&blob.hash);
+    let mut cleanup_ready = Vec::with_capacity(erase.len());
+    for blob in erase {
+        match cleanup_derived_audio_for_source(&blob.hash) {
+            Ok(()) => cleanup_ready.push(blob),
+            Err(error) => {
+                eprintln!(
+                    "[VANISH] pubkey={} hash={} failed to clean up derived audio: {}",
+                    pubkey, blob.hash, error
+                );
+                execution.errors += 1;
+                retry_hashes.push(blob.hash);
+            }
+        }
     }
+    let erase = cleanup_ready;
     let erase_hashes: Vec<String> = erase.iter().map(|blob| blob.hash.clone()).collect();
     let mut storage_result = erase_vanish_batch(&erase_hashes);
     let mut storage_attempts = u8::from(!erase_hashes.is_empty());
@@ -4561,6 +4618,7 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         "fully_deleted": execution.fully_deleted,
         "unlinked": execution.unlinked,
         "errors": execution.errors,
+        "malformed_hash_exceptions": execution.malformed_hash_exceptions,
         "pending": execution.pending,
         "prepare_ms": prepare_ms.min(u128::from(u64::MAX)) as u64,
         "gcs_main_ms": storage_result.timings.gcs_main_ms,
@@ -4579,11 +4637,12 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     }
 
     eprintln!(
-        "[VANISH] pubkey={} fully_deleted={} unlinked={} errors={} pending={} vanished={}",
+        "[VANISH] pubkey={} fully_deleted={} unlinked={} errors={} malformed_hash_exceptions={} pending={} vanished={}",
         pubkey,
         execution.fully_deleted,
         execution.unlinked,
         execution.errors,
+        execution.malformed_hash_exceptions,
         execution.pending,
         execution.vanished()
     );
@@ -4624,6 +4683,7 @@ fn handle_vanish(req: Request) -> Result<Response> {
         "fully_deleted": execution.fully_deleted,
         "unlinked": execution.unlinked,
         "errors": execution.errors,
+        "malformed_hash_exceptions": execution.malformed_hash_exceptions,
         "pending": execution.pending,
     });
 
@@ -4674,6 +4734,7 @@ fn handle_admin_vanish(req: Request) -> Result<Response> {
         "fully_deleted": execution.fully_deleted,
         "unlinked": execution.unlinked,
         "errors": execution.errors,
+        "malformed_hash_exceptions": execution.malformed_hash_exceptions,
         "pending": execution.pending,
     });
 
@@ -6359,7 +6420,7 @@ mod tests {
         add_audio_response_headers, add_blob_response_cache_headers, backfill_batch_cursor,
         classify_audio_reuse_availability, decide_transcode_fetch_action,
         decide_transcript_fetch_action, derivative_reconciliation_response, error_response,
-        ignored_generation_response, is_alias_only_audio_blob,
+        ignored_generation_response, is_alias_only_audio_blob, local_derivative_cleanup_result,
         parse_transcode_status_webhook_payload, parse_transcript_status_webhook_payload,
         parse_upload_service_response, select_vanish_batch, should_delete_derived_audio_blob,
         should_eagerly_trigger_transcription, should_record_upload_service_transcode_failure,
@@ -6395,14 +6456,39 @@ mod tests {
     }
 
     #[test]
-    fn vanish_batch_is_bounded_and_normalizes_legacy_hashes() {
+    fn vanish_batch_is_bounded_and_normalizes_valid_legacy_hashes() {
         let hashes: Vec<String> = (0..1_015).map(|index| format!("{:064X}", index)).collect();
 
-        let (selected, pending) = select_vanish_batch(&hashes);
+        let (selected, malformed, pending) = select_vanish_batch(&hashes);
 
         assert_eq!(selected.len(), VANISH_BATCH_SIZE);
+        assert!(malformed.is_empty());
         assert_eq!(pending, 915);
         assert!(selected.iter().all(|hash| hash == &hash.to_lowercase()));
+    }
+
+    #[test]
+    fn vanish_batch_separates_malformed_entries_before_cleanup() {
+        let valid = "a".repeat(64);
+        let malformed = "not-a-hash".to_string();
+
+        let (selected, exceptions, pending) =
+            select_vanish_batch(&[malformed.clone(), valid.clone()]);
+
+        assert_eq!(selected, vec![valid]);
+        assert_eq!(exceptions, vec![malformed]);
+        assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn local_derivative_cleanup_requires_every_deterministic_delete() {
+        assert!(local_derivative_cleanup_result(true, &[])
+            .expect("local mode should decide cleanup locally")
+            .is_ok());
+        assert!(local_derivative_cleanup_result(true, &["delete failed".into()])
+            .expect("local mode should decide cleanup locally")
+            .is_err());
+        assert!(local_derivative_cleanup_result(false, &[]).is_none());
     }
 
     #[test]

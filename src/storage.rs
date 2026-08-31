@@ -11,6 +11,7 @@ use fastly::http::{Method, StatusCode};
 use fastly::{Body, Request, Response};
 use hmac::{Hmac, Mac};
 use md5::Md5;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -2125,19 +2126,54 @@ pub fn write_vanish_timing_log(entry: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-/// Fire-and-forget: ask Cloud Run to delete a blob's GCS objects (main + prefix).
-/// This is a backstop for thorough cleanup including any HLS/VTT files
-/// that might not have been caught by the deterministic path deletion.
-pub fn trigger_cloud_run_delete_blob(hash: &str) {
-    let webhook_secret = match get_secret("webhook_secret") {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("[DELETE] webhook_secret not configured, skipping Cloud Run delete");
-            return;
-        }
-    };
+fn cloud_run_delete_blob_body(hash: &str, expected_bucket: &str) -> String {
+    serde_json::json!({
+        "hash": hash,
+        "expected_bucket": expected_bucket,
+    })
+    .to_string()
+}
 
-    let body = format!(r#"{{"hash":"{}"}}"#, hash);
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CloudCleanupStatus {
+    Completed,
+    Retryable,
+    Permanent,
+}
+
+#[derive(Deserialize)]
+struct CloudCleanupResponse {
+    status: CloudCleanupStatus,
+}
+
+fn classify_cloud_cleanup_response(status: StatusCode, body: &str) -> Result<()> {
+    let cleanup = serde_json::from_str::<CloudCleanupResponse>(body).map_err(|_| {
+        BlossomError::StorageError(format!(
+            "Cloud Run derivative cleanup returned an untyped response with status {}",
+            status
+        ))
+    })?;
+
+    match cleanup.status {
+        CloudCleanupStatus::Completed if status.is_success() => Ok(()),
+        CloudCleanupStatus::Permanent => Err(BlossomError::Internal(format!(
+            "Cloud Run derivative cleanup reported a permanent contract or configuration failure with status {}",
+            status
+        ))),
+        CloudCleanupStatus::Retryable | CloudCleanupStatus::Completed => {
+            Err(BlossomError::StorageError(format!(
+                "Cloud Run derivative cleanup reported a retryable failure with status {}",
+                status
+            )))
+        }
+    }
+}
+
+pub fn trigger_cloud_run_delete_blob(hash: &str) -> Result<()> {
+    let webhook_secret = get_secret("webhook_secret")?;
+    let expected_bucket = get_config("gcs_bucket")?;
+    let body = cloud_run_delete_blob_body(hash, &expected_bucket);
 
     const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
     let mut req = Request::new(
@@ -2149,17 +2185,12 @@ pub fn trigger_cloud_run_delete_blob(hash: &str) {
     req.set_header("Authorization", format!("Bearer {}", webhook_secret));
     req.set_body(Body::from(body));
 
-    match req.send_async(CLOUD_RUN_BACKEND) {
-        Ok(_) => {
-            eprintln!("[DELETE] Triggered Cloud Run delete-blob for {}", hash);
-        }
-        Err(e) => {
-            eprintln!(
-                "[DELETE] Failed to trigger Cloud Run delete-blob for {}: {}",
-                hash, e
-            );
-        }
-    }
+    let mut response = req.send(CLOUD_RUN_BACKEND).map_err(|error| {
+        BlossomError::StorageError(format!("Cloud Run derivative cleanup failed: {}", error))
+    })?;
+    let status = response.get_status();
+    let body = response.take_body().into_string();
+    classify_cloud_cleanup_response(status, &body)
 }
 
 /// Trigger synchronous migration of a blob from a fallback CDN to GCS.
@@ -2361,8 +2392,9 @@ pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtracti
 #[cfg(test)]
 mod tests {
     use super::{
-        build_fos_delete_request, build_multi_delete_request, failed_multi_delete_keys,
-        mark_failed_stage, multi_delete_body, normalize_storage_cache_state,
+        build_fos_delete_request, build_multi_delete_request, classify_cloud_cleanup_response,
+        cloud_run_delete_blob_body, failed_multi_delete_keys, mark_failed_stage, multi_delete_body,
+        normalize_storage_cache_state,
         parse_audio_extraction_error_response, parse_funnelcake_audio_reuse_response,
         plan_vanish_delete_batches, prepare_storage_cache_miss, preserve_storage_cache_state,
         S3Config, VanishDeleteTarget, VanishStorageResult, FOS_BACKEND,
@@ -2371,6 +2403,46 @@ mod tests {
     use fastly::http::header;
     use fastly::{Request, Response};
     use std::collections::HashMap;
+
+    #[test]
+    fn cloud_cleanup_request_carries_the_edge_bucket() {
+        let body = cloud_run_delete_blob_body(&"a".repeat(64), "configured-bucket");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        assert_eq!(value["hash"], "a".repeat(64));
+        assert_eq!(value["expected_bucket"], "configured-bucket");
+    }
+
+    #[test]
+    fn cloud_cleanup_response_distinguishes_retryable_and_permanent_failures() {
+        let completed = classify_cloud_cleanup_response(
+            fastly::http::StatusCode::OK,
+            r#"{"status":"completed","deleted":1}"#,
+        );
+        let retryable = classify_cloud_cleanup_response(
+            fastly::http::StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"status":"retryable","error":"storage unavailable"}"#,
+        )
+        .expect_err("retryable cleanup must fail closed");
+        let permanent = classify_cloud_cleanup_response(
+            fastly::http::StatusCode::BAD_REQUEST,
+            r#"{"status":"permanent","error":"invalid request"}"#,
+        )
+        .expect_err("permanent cleanup must fail closed");
+
+        assert!(completed.is_ok());
+        assert!(matches!(retryable, crate::error::BlossomError::StorageError(_)));
+        assert!(matches!(permanent, crate::error::BlossomError::Internal(_)));
+    }
+
+    #[test]
+    fn cloud_cleanup_response_treats_route_absence_as_retryable() {
+        let error =
+            classify_cloud_cleanup_response(fastly::http::StatusCode::NOT_FOUND, "route not found")
+                .expect_err("an absent route must not complete erasure");
+
+        assert!(matches!(error, crate::error::BlossomError::StorageError(_)));
+    }
 
     #[test]
     fn fos_delete_request_uses_the_replica_backend_address_and_delete_method() {
