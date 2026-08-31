@@ -71,6 +71,12 @@ gcloud run deploy "${SERVICE_NAME}" \
   --update-env-vars "GCS_BUCKET=${GCS_BUCKET},CDN_BASE_URL=${CDN_BASE_URL},TRANSCODER_URL=${TRANSCODER_URL},TRANSCRIBER_URL=${TRANSCRIBER_URL},SENTRY_ENVIRONMENT=${SENTRY_ENVIRONMENT},TRANSCODE_QUEUE=${TRANSCODE_QUEUE},TRANSCODE_QUEUE_INVOKER_SA=${TRANSCODE_QUEUE_INVOKER_SA}" \
   --update-secrets "SENTRY_DSN=${SENTRY_SECRET}:latest,WEBHOOK_SECRET=${WEBHOOK_SECRET}:latest"
 
+# An explicit-revision rollback pins traffic even after a later deploy succeeds.
+gcloud run services update-traffic "${SERVICE_NAME}" \
+  --project "${PROJECT_ID}" \
+  --region "${REGION}" \
+  --to-latest
+
 echo "Done! Service URL:"
 gcloud run services describe "${SERVICE_NAME}" \
   --project "${PROJECT_ID}" \

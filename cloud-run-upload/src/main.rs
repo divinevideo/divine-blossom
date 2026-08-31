@@ -362,7 +362,6 @@ async fn main() -> Result<()> {
         .route("/delete-blob", post(handle_delete_blob))
         .route("/delete-blobs", post(handle_delete_blobs))
         .route("/delete-blobs/ready", get(handle_delete_blobs_ready))
-        .route("/delete-blobs-ready", get(handle_delete_blobs_ready))
         .route("/delete-blob/health", get(handle_delete_blob_health))
         .route("/thumbnail/:hash", get(handle_thumbnail_generate))
         .route("/thumbnail/:hash", options(handle_cors_preflight))
