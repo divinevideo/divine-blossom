@@ -88,6 +88,14 @@ The rotated value crosses every one of these directions:
 - transcoder -> Fastly `/admin/transcode-status`
 - transcoder -> Fastly `/admin/transcript-status`
 
+Fastly sends the value as a bearer token to `/audio/extract`, but that handler
+does not currently validate the header. An extraction probe verifies that the
+direction still works after the Fastly update; it does not prove secret parity
+with the transcoder. The value is also admin-equivalent at the edge on routes
+protected by `validate_admin_auth`: those bearer clients may use either
+`webhook_secret` or `admin_token`. Inventory and move every client that uses
+`webhook_secret`, not only the moderation Worker.
+
 The two Fastly callback routes accept either `webhook_secret` or the separate
 `transcoder_webhook_secret`, but the transcoder sends its `WEBHOOK_SECRET` value.
 `blossom-upload-rust` and `divine-transcoder` resolve the GCP secret as
@@ -99,36 +107,52 @@ Rotate forward in this order:
 1. Record the current GCP version number. Create the new version without a
    trailing newline, keep the old version enabled, and update the canonical
    `blossom-webhook-secret-prod` mirror from that exact new version.
-2. Update Cloudflare, then immediately update Fastly from the new GCP version.
-   Record both write times.
+2. Before changing either write-only copy, stop new transcode and transcription
+   dispatch and wait for active derivative work, queued derivative work, and
+   derivative-status Cloud Tasks to drain. Running old revisions and
+   already-created tasks retain the old credential; after Fastly converges,
+   their callbacks would fail and direct callbacks would not be retried. Keep
+   dispatch paused, then update Cloudflare and immediately update Fastly from
+   the new GCP version. Record both write times.
 3. Poll `/admin/moderate` with the new credential and a valid but incomplete
    `{}` payload. Continue only when the edge reaches payload parsing and returns
    `400 Missing 'sha256' field`; `403` means the new Fastly value has not
    converged.
-4. Create fresh revisions of both Cloud Run services, preserving their current
-   images and configuration, so each `WEBHOOK_SECRET=:latest` binding resolves
-   the new version. Confirm traffic is serving from those revisions.
+4. Create fresh revisions of both Cloud Run services with a config-only
+   `gcloud run services update` that reapplies
+   `WEBHOOK_SECRET=webhook_secret:latest` and uses a unique revision suffix.
+   Do not run the source deploy scripts for this step. This preserves the
+   current images and other configuration while making each new instance
+   resolve the new value. Follow [Check live configuration before running a
+   deploy script](#check-live-configuration-before-running-a-deploy-script),
+   then confirm traffic is serving from the new revisions and is not pinned to
+   an older revision.
 5. Verify every direction above. Send a real moderation notification; run the
    authenticated [`/delete-blob/health` parity check](#deploy-cleanup-dependencies-before-the-edge)
    with `X-Expected-GCS-Bucket`; exercise a controlled audio extraction through
-   the edge; and confirm both transcode and transcript callbacks reach Fastly
-   without `401` or `403`. Also verify the funnelcake janitor's separate
-   `admin_token` still authenticates an admin read route, and inspect the edge,
-   Worker, upload, and transcoder logs for new `401` or `403` responses.
-6. Disable the old GCP version only after every probe passes.
+   the edge as a reachability check, not a secret-parity check; and confirm both
+   transcode and transcript callbacks reach Fastly without `401` or `403`. Also
+   verify the funnelcake janitor's separate `admin_token` still authenticates an
+   admin read route. After the old work and queued tasks from step 2 are drained,
+   any new `401` or `403` in the edge, Worker, upload, or transcoder logs is a
+   rollback signal rather than an expected rotation transient.
+6. Disable the old GCP version only after every probe passes, then resume
+   transcode and transcription dispatch.
 
 There is no zero-mismatch order because these consumers do not all accept both
-old and new values. Moving Cloudflare and Fastly back-to-back minimizes the
-moderation mismatch. Moving Fastly first would instead reject the still-old
-Cloudflare caller. Once Fastly converges, accept a bounded edge-to-Cloud-Run
-mismatch while the two fresh revisions start; keeping the old GCP version
-enabled preserves rollback but does not make running services dual-accept both
-values.
+old and new values. Cloudflare goes first so the caller stops sending the old
+value before Fastly can begin accepting the new one. This deliberately makes
+moderation fail closed until Fastly accepts the new caller; it does not promise
+a shorter outage. Moving Fastly first would instead leave an unpredictable
+window in which the edge may switch while Cloudflare still sends the old value.
+Once Fastly converges, accept a bounded edge-to-Cloud-Run mismatch while the two
+fresh revisions start; keeping the old GCP version enabled preserves rollback
+but does not make running services dual-accept both values.
 
 Rollback disables the new GCP version, re-enables the recorded old version,
-restores both write-only copies from that exact old version, and creates fresh
-revisions of both Cloud Run services again. Repeat the same direction checks
-before disabling any superseded version.
+restores both write-only copies and the `blossom-webhook-secret-prod` mirror from
+that exact old version, and creates fresh revisions of both Cloud Run services
+again. Repeat the same direction checks before disabling any superseded version.
 
 The 2026-08-31 rotation's Cloudflare and Fastly API writes were 18 seconds
 apart, but the edge did not accept the new value until a probe 88 seconds after
