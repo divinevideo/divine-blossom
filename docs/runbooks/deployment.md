@@ -146,11 +146,16 @@ Rotate forward in this order:
    2. A `401` or `403` on moderation, deletion, or a direct callback from a new
    transcoder revision is a rollback signal. A callback from an old revision or
    a task created before the rotation can fail with the stale credential.
-   Reconcile a lost transcode callback with the authenticated
-   `/admin/api/reset-stuck-transcodes` flow and a lost transcript callback with
-   the authenticated `/admin/api/backfill-vtt` flow, using each flow's dry run
-   first. Do not use rollback as a retry for a callback that has already been
-   lost.
+   For a lost transcode callback, call the authenticated
+   `/admin/api/reset-stuck-transcodes` flow with `older_than_secs: 0`, the full
+   affected hash as `hex_prefix`, and `dry_run: true`. Paginate through
+   `next_user_offset`; then repeat the matching page with `dry_run: false` and
+   request the derivative again if the result reset it to `Pending`. For a lost
+   transcript callback, confirm the affected hash in the admin dashboard and use
+   its **Regenerate Transcript** action, which posts that exact hash with
+   `force: true`. Observe a successful fresh callback before considering either
+   job reconciled. Do not use rollback as a retry for a callback that has
+   already been lost.
 6. Disable the old GCP version only after every probe passes and every stale
    callback observed in step 5 has been reconciled. If reconciliation is still
    incomplete, leave the old GCP version enabled and escalate that job. Roll
