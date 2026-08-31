@@ -1,9 +1,10 @@
 # Deployment
 
 Some of this repository deploys itself and some of it does not. After tests pass,
-merging to `main` publishes the Fastly edge service to production within minutes,
-with no human step. Most Cloud Run services do not ship that way — each one is a
-script someone runs by hand.
+merging upload-service changes to `main` deploys that service, and every merge
+verifies its batch-cleanup contract before publishing the Fastly edge service.
+Most other Cloud Run services do not ship that way; each one is a script someone
+runs by hand.
 
 The VCL caching layer is also manual. Files under `vcl/` are source copies of
 snippets for the outer Fastly VCL service; the Compute publish job does not
@@ -12,16 +13,17 @@ then activate that version separately. The VCL changes themselves have no
 production effect until that activation happens. CI still republishes and purges
 the Compute service after any merge to `main`, including a VCL-only merge.
 
-That asymmetry is the thing to plan around. A merge deploys the edge before any
-manual Cloud Run step, so changes that require a new Cloud Run route must deploy
-and verify that backend from the approved branch before merging the edge change.
+The ordered upload-service job is the exception to that asymmetry. If its deploy
+or readiness check fails, the automatic Fastly publish is skipped.
 
 ## What ships automatically
 
 `.github/workflows/ci.yml` runs on every push to `main`. After the `test` job
-passes, it deploys, in parallel:
+passes, it deploys:
 
-- the edge service to Fastly (`fastly compute publish`), followed by a CDN purge
+- the upload service to Cloud Run when its source changed
+- the upload-service contract readiness check on every edge publish
+- the edge service to Fastly (`fastly compute publish`) only after that check
 - `process-blob` to Cloud Run
 - the container image to GHCR
 
@@ -37,7 +39,6 @@ These services are not deployed by CI. Each is a script you run yourself.
 | Service | Script |
 | --- | --- |
 | `divine-transcoder` | `cloud-run-transcoder/deploy.sh` |
-| upload service | `cloud-run-upload/deploy.sh` |
 | Parakeet ASR | `cloud-run-asr-parakeet/deploy.sh` |
 
 `process-blob` also has `scripts/deploy-cloud-function.sh` for manual deploys.
@@ -47,21 +48,21 @@ separate services.
 
 ## Deploy cleanup dependencies before the edge
 
-The edge treats Cloud Run's authenticated `/delete-blob` response as required
-erasure evidence. For changes to that contract:
+The edge treats Cloud Run's authenticated `/delete-blob` and `/delete-blobs`
+responses as required erasure evidence. Account vanish uses `/delete-blobs` and
+requires one typed result for every requested hash. For changes to that contract:
 
-1. Deploy `cloud-run-upload` from the approved branch.
-2. Verify an authenticated request reaches `/delete-blob/health`, sends the edge
+1. Verify an authenticated request reaches `/delete-blob/health`, sends the edge
    config store's `gcs_bucket` value in `X-Expected-GCS-Bucket`, and returns a
    typed `completed` response. This verifies route availability, secret parity,
    and bucket parity; it is not a storage-permission probe. A `401` means the
    Fastly `webhook_secret` and Cloud Run `WEBHOOK_SECRET` bindings do not match;
    a `409` means the two services name different buckets. Stop rather than
    merging the edge in either case.
-3. Merge only after the backend route and authentication are verified. Each real
+2. The `main` workflow deploys `cloud-run-upload` and verifies
+   `/delete-blobs/ready` before publishing edge code that calls it. Each real
    cleanup request also asserts that Cloud Run and the edge use the same GCS
-   bucket before Cloud Run may report deletion complete. The
-   normal `main` workflow can then publish the dependent edge code.
+   bucket before Cloud Run may report deletion complete.
 
 Do not put either secret value in the verification command, logs, screenshots,
 or pull-request text. Use the approved secret-injection tooling for the operator

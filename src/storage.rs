@@ -10,8 +10,10 @@ use blossom_core::read_through::{
 use fastly::http::{Method, StatusCode};
 use fastly::{Body, Request, Response};
 use hmac::{Hmac, Mac};
+use md5::Md5;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Backend name (must match fastly.toml)
@@ -853,6 +855,409 @@ pub fn delete_blob_from_fos(key: &str) -> Result<()> {
     }
 }
 
+const PROVIDER_MULTI_DELETE_LIMIT: usize = 1_000;
+pub(crate) const CLOUD_RUN_DELETE_BATCH_LIMIT: usize = 20;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VanishDeleteTarget {
+    GcsMain,
+    FosMain,
+}
+
+#[derive(Debug)]
+struct VanishDeleteBatch {
+    stage: String,
+    keys: Vec<String>,
+    target: VanishDeleteTarget,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub(crate) struct VanishStorageTimings {
+    pub gcs_main_ms: u64,
+    pub cloud_run_cleanup_ms: u64,
+    pub fos_main_ms: u64,
+    pub purge_vcl_ms: u64,
+    pub purge_compute_ms: u64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct VanishStorageResult {
+    pub failed_hashes: HashSet<String>,
+    pub timings: VanishStorageTimings,
+}
+
+impl VanishStorageResult {
+    pub(crate) fn replace_failures_after_retry(&mut self, retry: Self) {
+        self.failed_hashes = retry.failed_hashes;
+        self.timings.gcs_main_ms = self
+            .timings
+            .gcs_main_ms
+            .saturating_add(retry.timings.gcs_main_ms);
+        self.timings.cloud_run_cleanup_ms = self
+            .timings
+            .cloud_run_cleanup_ms
+            .saturating_add(retry.timings.cloud_run_cleanup_ms);
+        self.timings.fos_main_ms = self
+            .timings
+            .fos_main_ms
+            .saturating_add(retry.timings.fos_main_ms);
+        self.timings.purge_vcl_ms = self
+            .timings
+            .purge_vcl_ms
+            .saturating_add(retry.timings.purge_vcl_ms);
+        self.timings.purge_compute_ms = self
+            .timings
+            .purge_compute_ms
+            .saturating_add(retry.timings.purge_compute_ms);
+    }
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn multi_delete_body(keys: &[String]) -> String {
+    let mut xml = String::from("<Delete>");
+    for key in keys {
+        xml.push_str("<Object><Key>");
+        xml.push_str(&xml_escape(key));
+        xml.push_str("</Key></Object>");
+    }
+    xml.push_str("<Quiet>false</Quiet></Delete>");
+    xml
+}
+
+fn plan_vanish_delete_batches(hashes: &[String]) -> Vec<VanishDeleteBatch> {
+    let mut batches = Vec::new();
+    let targets = [
+        (VanishDeleteTarget::GcsMain, "gcs_main", hashes.to_vec()),
+        (VanishDeleteTarget::FosMain, "fos_main", hashes.to_vec()),
+    ];
+
+    for (target, stage, keys) in targets {
+        for (index, keys) in keys.chunks(PROVIDER_MULTI_DELETE_LIMIT).enumerate() {
+            batches.push(VanishDeleteBatch {
+                stage: format!("{}:{}", stage, index),
+                keys: keys.to_vec(),
+                target,
+            });
+        }
+    }
+    batches
+}
+
+fn build_multi_delete_request(keys: &[String], config: &S3Config, stage: &str) -> Result<Request> {
+    let body = multi_delete_body(keys);
+    let payload_hash = hex::encode(Sha256::digest(body.as_bytes()));
+    let path = format!("/{}?delete", config.bucket);
+    let mut req = Request::new(Method::POST, format!("{}{}", config.endpoint(), path));
+    req.set_header("Host", config.host());
+    req.set_header("Content-Type", "application/xml");
+    req.set_header("Content-Length", body.len().to_string());
+    req.set_header("X-Divine-Vanish-Stage", stage);
+    use base64::Engine as _;
+    let checksum = Md5::digest(body.as_bytes());
+    req.set_header(
+        "Content-MD5",
+        base64::engine::general_purpose::STANDARD.encode(checksum),
+    );
+    sign_request(&mut req, config, Some(payload_hash))?;
+    req.set_body(body);
+    Ok(req)
+}
+
+fn xml_section_blocks<'a>(xml: &'a str, section: &str) -> Vec<&'a str> {
+    let mut blocks = Vec::new();
+    let open = format!("<{}>", section);
+    let close = format!("</{}>", section);
+    let mut rest = xml;
+    while let Some(start) = rest.find(&open) {
+        let after_open = &rest[start + open.len()..];
+        let Some(end) = after_open.find(&close) else {
+            break;
+        };
+        blocks.push(&after_open[..end]);
+        rest = &after_open[end + close.len()..];
+    }
+    blocks
+}
+
+fn xml_block_value<'a>(block: &'a str, element: &str) -> Option<&'a str> {
+    let open = format!("<{}>", element);
+    let close = format!("</{}>", element);
+    let value = block.split_once(&open)?.1;
+    Some(value.split_once(&close)?.0)
+}
+
+fn keys_in_xml_section(xml: &str, section: &str) -> HashSet<String> {
+    xml_section_blocks(xml, section)
+        .into_iter()
+        .filter_map(|block| xml_block_value(block, "Key").map(str::to_string))
+        .collect()
+}
+
+fn failed_multi_delete_keys(mut response: Response, requested: &[String]) -> HashSet<String> {
+    if !response.get_status().is_success() {
+        return requested.iter().cloned().collect();
+    }
+
+    let body = response.take_body().into_string();
+    let deleted = keys_in_xml_section(&body, "Deleted");
+    let already_absent: HashSet<String> = xml_section_blocks(&body, "Error")
+        .into_iter()
+        .filter(|block| {
+            matches!(
+                xml_block_value(block, "Code"),
+                Some("NoSuchKey" | "NotFound" | "NoSuchObject")
+            )
+        })
+        .filter_map(|block| xml_block_value(block, "Key").map(str::to_string))
+        .collect();
+    requested
+        .iter()
+        .filter(|key| !deleted.contains(*key) && !already_absent.contains(*key))
+        .cloned()
+        .collect()
+}
+
+fn hash_for_vanish_key(key: &str) -> Option<String> {
+    let hash = key.get(..64)?;
+    if hash.chars().all(|character| character.is_ascii_hexdigit()) {
+        Some(hash.to_lowercase())
+    } else {
+        None
+    }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn mark_failed_keys(result: &mut VanishStorageResult, keys: &HashSet<String>) {
+    result
+        .failed_hashes
+        .extend(keys.iter().filter_map(|key| hash_for_vanish_key(key)));
+}
+
+fn mark_failed_stage(
+    result: &mut VanishStorageResult,
+    stage_hashes: &HashMap<String, Vec<String>>,
+    stage: &str,
+    all_hashes: &[String],
+) {
+    if let Some(failed) = stage_hashes.get(stage) {
+        result.failed_hashes.extend(failed.iter().cloned());
+    } else {
+        result.failed_hashes.extend(all_hashes.iter().cloned());
+    }
+}
+
+fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) {
+    if hashes.is_empty() {
+        return;
+    }
+
+    let api_token = match get_secret("fastly_api_token") {
+        Ok(token) if !token.is_empty() => token,
+        _ => {
+            result.failed_hashes.extend(hashes.iter().cloned());
+            return;
+        }
+    };
+    let services = [
+        ("ML7R82HKfmTaqTpHExIDVN", "purge_vcl"),
+        ("pOvEEWykEbpnylqst1KTrR", "purge_compute"),
+    ];
+    let mut pending = Vec::new();
+    let mut stage_hashes = HashMap::<String, Vec<String>>::new();
+    let mut stage_started = HashMap::<String, Instant>::new();
+
+    for chunk in hashes.chunks(256) {
+        for (service_id, stage) in services {
+            let stage_id = format!("{}:{}", stage, stage_hashes.len());
+            let mut req = Request::new(
+                Method::POST,
+                format!("https://api.fastly.com/service/{}/purge", service_id),
+            );
+            req.set_header("Host", "api.fastly.com");
+            req.set_header("Fastly-Key", &api_token);
+            req.set_header("Accept", "application/json");
+            req.set_header("Surrogate-Key", chunk.join(" "));
+            req.set_header("X-Divine-Vanish-Stage", &stage_id);
+            stage_started.insert(stage_id.clone(), Instant::now());
+            stage_hashes.insert(stage_id, chunk.to_vec());
+            match req.send_async("fastly_api") {
+                Ok(request) => pending.push(request),
+                Err(_) => result.failed_hashes.extend(chunk.iter().cloned()),
+            }
+        }
+    }
+
+    while !pending.is_empty() {
+        let (response, remaining) = fastly::http::request::select(pending);
+        pending = remaining;
+        match response {
+            Ok(response) => {
+                let stage = response
+                    .get_backend_request()
+                    .and_then(|request| request.get_header_str("X-Divine-Vanish-Stage"))
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(started) = stage_started.get(&stage) {
+                    let duration = elapsed_ms(*started);
+                    if stage.starts_with("purge_vcl") {
+                        result.timings.purge_vcl_ms = result.timings.purge_vcl_ms.max(duration);
+                    } else if stage.starts_with("purge_compute") {
+                        result.timings.purge_compute_ms =
+                            result.timings.purge_compute_ms.max(duration);
+                    }
+                }
+                if !response.get_status().is_success() {
+                    mark_failed_stage(result, &stage_hashes, &stage, hashes);
+                }
+            }
+            Err(error) => {
+                let request = error.into_sent_req();
+                let stage = request
+                    .get_header_str("X-Divine-Vanish-Stage")
+                    .unwrap_or_default()
+                    .to_string();
+                mark_failed_stage(result, &stage_hashes, &stage, hashes);
+            }
+        }
+    }
+}
+
+/// Erase one bounded vanish batch from both origins and both CDN services.
+pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
+    let mut result = VanishStorageResult::default();
+    let mut main_origin_failures = HashSet::new();
+    if hashes.is_empty() {
+        return result;
+    }
+
+    let gcs = match S3Config::load_gcs() {
+        Ok(config) => config,
+        Err(_) => {
+            result.failed_hashes.extend(hashes.iter().cloned());
+            return result;
+        }
+    };
+    let fos = match S3Config::load_fos() {
+        Ok(config) => config,
+        Err(_) => {
+            result.failed_hashes.extend(hashes.iter().cloned());
+            return result;
+        }
+    };
+    let mut pending = Vec::new();
+    let mut stage_started = HashMap::<String, Instant>::new();
+    let mut requested_by_stage = HashMap::<String, Vec<String>>::new();
+
+    for batch in plan_vanish_delete_batches(hashes) {
+        let (config, backend) = match batch.target {
+            VanishDeleteTarget::GcsMain => (&gcs, GCS_BACKEND),
+            VanishDeleteTarget::FosMain => (&fos, FOS_BACKEND),
+        };
+        let stage = batch.stage;
+        let keys = batch.keys;
+        stage_started.insert(stage.clone(), Instant::now());
+        requested_by_stage.insert(stage.clone(), keys.clone());
+        match build_multi_delete_request(&keys, config, &stage).and_then(|request| {
+            request.send_async(backend).map_err(|error| {
+                BlossomError::StorageError(format!("{} batch delete failed: {}", stage, error))
+            })
+        }) {
+            Ok(request) => pending.push(request),
+            Err(_) => {
+                let failed_keys: HashSet<String> = keys.into_iter().collect();
+                mark_failed_keys(&mut result, &failed_keys);
+                if stage.starts_with("gcs_main:") || stage.starts_with("fos_main:") {
+                    main_origin_failures.extend(
+                        failed_keys
+                            .iter()
+                            .filter_map(|key| hash_for_vanish_key(key)),
+                    );
+                }
+            }
+        }
+    }
+
+    while !pending.is_empty() {
+        let (response, remaining) = fastly::http::request::select(pending);
+        pending = remaining;
+        match response {
+            Ok(response) => {
+                let stage = response
+                    .get_backend_request()
+                    .and_then(|request| request.get_header_str("X-Divine-Vanish-Stage"))
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(started) = stage_started.get(stage.as_str()) {
+                    let duration = elapsed_ms(*started);
+                    match stage.as_str() {
+                        stage if stage.starts_with("gcs_main:") => {
+                            result.timings.gcs_main_ms = result.timings.gcs_main_ms.max(duration);
+                        }
+                        stage if stage.starts_with("fos_main:") => {
+                            result.timings.fos_main_ms = result.timings.fos_main_ms.max(duration);
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(requested) = requested_by_stage.get(&stage) {
+                    let failed = failed_multi_delete_keys(response, requested);
+                    mark_failed_keys(&mut result, &failed);
+                    if stage.starts_with("gcs_main:") || stage.starts_with("fos_main:") {
+                        main_origin_failures
+                            .extend(failed.iter().filter_map(|key| hash_for_vanish_key(key)));
+                    }
+                } else {
+                    result.failed_hashes.extend(hashes.iter().cloned());
+                    main_origin_failures.extend(hashes.iter().cloned());
+                }
+            }
+            Err(error) => {
+                let request = error.into_sent_req();
+                let stage = request
+                    .get_header_str("X-Divine-Vanish-Stage")
+                    .unwrap_or_default();
+                if let Some(requested) = requested_by_stage.get(stage) {
+                    let failed: HashSet<String> = requested.iter().cloned().collect();
+                    mark_failed_keys(&mut result, &failed);
+                    if stage.starts_with("gcs_main:") || stage.starts_with("fos_main:") {
+                        main_origin_failures
+                            .extend(failed.iter().filter_map(|key| hash_for_vanish_key(key)));
+                    }
+                } else {
+                    result.failed_hashes.extend(hashes.iter().cloned());
+                    main_origin_failures.extend(hashes.iter().cloned());
+                }
+            }
+        }
+    }
+
+    let cloud_cleanup_started = Instant::now();
+    match trigger_cloud_run_delete_blobs(hashes) {
+        Ok(failed) => result.failed_hashes.extend(failed),
+        Err(_) => result.failed_hashes.extend(hashes.iter().cloned()),
+    }
+    result.timings.cloud_run_cleanup_ms = elapsed_ms(cloud_cleanup_started);
+
+    let purgeable: Vec<String> = hashes
+        .iter()
+        .filter(|hash| !main_origin_failures.contains(*hash))
+        .cloned()
+        .collect();
+    purge_vanish_hashes(&purgeable, &mut result);
+    result
+}
+
 /// Initiate a multipart upload to GCS
 fn initiate_multipart_upload(key: &str, content_type: &str) -> Result<String> {
     let config = S3Config::load_gcs()?;
@@ -1450,6 +1855,31 @@ fn sign_request(req: &mut Request, config: &S3Config, payload_hash: Option<Strin
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
 
+    sign_request_at(req, config, payload_hash, now)
+}
+
+fn canonical_query_string(query: Option<&str>) -> String {
+    query
+        .unwrap_or_default()
+        .split('&')
+        .filter(|parameter| !parameter.is_empty())
+        .map(|parameter| {
+            if parameter.contains('=') {
+                parameter.to_string()
+            } else {
+                format!("{parameter}=")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn sign_request_at(
+    req: &mut Request,
+    config: &S3Config,
+    payload_hash: Option<String>,
+    now: Duration,
+) -> Result<()> {
     let secs = now.as_secs();
     let days_since_epoch = secs / 86400;
     let time_of_day = secs % 86400;
@@ -1475,9 +1905,12 @@ fn sign_request(req: &mut Request, config: &S3Config, payload_hash: Option<Strin
     // Create canonical request
     let method = req.get_method_str();
     let uri = req.get_path();
-    let query = req.get_query_str().unwrap_or("");
+    let query = canonical_query_string(req.get_query_str());
 
-    let host = config.host();
+    let host = req
+        .get_header_str("Host")
+        .ok_or_else(|| BlossomError::Internal("signed request is missing its Host header".into()))?
+        .to_string();
     let signed_headers = "host;x-amz-content-sha256;x-amz-date";
 
     let canonical_headers = format!(
@@ -1687,13 +2120,133 @@ pub fn write_audit_log(
     }
 }
 
-/// Ask Cloud Run to delete and verify all GCS objects associated with a hash.
+#[derive(Debug, Clone, Copy)]
+pub enum VanishAuditPhase {
+    Authorized,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VanishAuditInitiator {
+    Account,
+    Admin,
+}
+
+impl VanishAuditInitiator {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Account => "account",
+            Self::Admin => "admin",
+        }
+    }
+
+    pub fn other(self) -> Self {
+        match self {
+            Self::Account => Self::Admin,
+            Self::Admin => Self::Account,
+        }
+    }
+}
+
+fn vanish_audit_entry(
+    pubkey: &str,
+    operation_id: &str,
+    timestamp: &str,
+    initiator: VanishAuditInitiator,
+    phase: VanishAuditPhase,
+) -> serde_json::Value {
+    let action = match (initiator, phase) {
+        (VanishAuditInitiator::Account, VanishAuditPhase::Authorized) => "vanish_authorized",
+        (VanishAuditInitiator::Account, VanishAuditPhase::Completed) => "vanish_completed",
+        (VanishAuditInitiator::Admin, VanishAuditPhase::Authorized) => "admin_vanish_authorized",
+        (VanishAuditInitiator::Admin, VanishAuditPhase::Completed) => "admin_vanish_completed",
+    };
+    let insert_id = hex::encode(Sha256::digest(
+        format!("vanish-audit:v1:{action}:{operation_id}").as_bytes(),
+    ));
+    let mut entry = serde_json::json!({
+        "action": action,
+        "account_pubkey": pubkey,
+        "audit_version": 1,
+        "initiator": initiator.as_str(),
+        "operation_id": operation_id,
+        "time": timestamp,
+        "logging.googleapis.com/insertId": insert_id,
+    });
+    if initiator == VanishAuditInitiator::Account {
+        entry["actor_pubkey"] = serde_json::json!(pubkey);
+    }
+    entry
+}
+
+/// Write one idempotent account-level vanish audit record.
+pub fn write_vanish_audit_log(
+    pubkey: &str,
+    operation_id: &str,
+    timestamp: &str,
+    initiator: VanishAuditInitiator,
+    phase: VanishAuditPhase,
+) -> Result<()> {
+    const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
+    let webhook_secret = get_secret("webhook_secret")?;
+    let payload = vanish_audit_entry(pubkey, operation_id, timestamp, initiator, phase);
+    let mut request = Request::new(
+        Method::POST,
+        format!("https://{}/audit/vanish", CLOUD_RUN_HOST),
+    );
+    request.set_header("Host", CLOUD_RUN_HOST);
+    request.set_header("Content-Type", "application/json");
+    request.set_header("Authorization", format!("Bearer {webhook_secret}"));
+    request.set_body(payload.to_string());
+
+    let response = request.send(CLOUD_RUN_BACKEND).map_err(|error| {
+        BlossomError::Internal(format!("Failed to deliver vanish audit: {error}"))
+    })?;
+    if !response.get_status().is_success() {
+        return Err(BlossomError::Internal(format!(
+            "Vanish audit returned status {}",
+            response.get_status()
+        )));
+    }
+    Ok(())
+}
+
+/// Dispatch one aggregate vanish timing record to the Cloud Logging bridge.
+pub fn dispatch_vanish_timing_log(entry: &serde_json::Value) -> Result<()> {
+    const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
+    let mut payload = entry.clone();
+    payload["action"] = serde_json::json!("vanish_timing");
+    payload["timestamp"] = serde_json::json!(current_timestamp());
+
+    let mut req = Request::new(Method::POST, format!("https://{}/audit", CLOUD_RUN_HOST));
+    req.set_header("Host", CLOUD_RUN_HOST);
+    req.set_header("Content-Type", "application/json");
+    req.set_body(payload.to_string());
+    req.send_async(CLOUD_RUN_BACKEND).map_err(|error| {
+        BlossomError::Internal(format!("Failed to dispatch vanish timing: {}", error))
+    })?;
+    Ok(())
+}
+
 fn cloud_run_delete_blob_body(hash: &str, expected_bucket: &str) -> String {
     serde_json::json!({
         "hash": hash,
         "expected_bucket": expected_bucket,
     })
     .to_string()
+}
+
+fn cloud_run_delete_blobs_body(hashes: &[String], expected_bucket: &str) -> Result<String> {
+    if hashes.len() > CLOUD_RUN_DELETE_BATCH_LIMIT {
+        return Err(BlossomError::Internal(format!(
+            "Cloud Run batch cleanup exceeds the {CLOUD_RUN_DELETE_BATCH_LIMIT}-hash contract"
+        )));
+    }
+    Ok(serde_json::json!({
+        "hashes": hashes,
+        "expected_bucket": expected_bucket,
+    })
+    .to_string())
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -1707,6 +2260,18 @@ enum CloudCleanupStatus {
 #[derive(Deserialize)]
 struct CloudCleanupResponse {
     status: CloudCleanupStatus,
+}
+
+#[derive(Deserialize)]
+struct BatchHashCleanupResponse {
+    hash: String,
+    status: CloudCleanupStatus,
+}
+
+#[derive(Deserialize)]
+struct BatchCleanupResponse {
+    status: CloudCleanupStatus,
+    results: Vec<BatchHashCleanupResponse>,
 }
 
 fn classify_cloud_cleanup_response(status: StatusCode, body: &str) -> Result<()> {
@@ -1747,44 +2312,72 @@ pub fn trigger_cloud_run_delete_blob(hash: &str) -> Result<()> {
     req.set_header("Authorization", format!("Bearer {}", webhook_secret));
     req.set_body(Body::from(body));
 
-    let mut resp = req.send(CLOUD_RUN_BACKEND).map_err(|e| {
-        BlossomError::StorageError(format!("Cloud Run derivative cleanup failed: {}", e))
+    let mut response = req.send(CLOUD_RUN_BACKEND).map_err(|error| {
+        BlossomError::StorageError(format!("Cloud Run derivative cleanup failed: {}", error))
     })?;
-    let status = resp.get_status();
-    let body = resp.take_body().into_string();
+    let status = response.get_status();
+    let body = response.take_body().into_string();
     classify_cloud_cleanup_response(status, &body)
 }
 
-/// Fire-and-forget: ask Cloud Run to mark a pubkey for audit log anonymization.
-pub fn trigger_audit_anonymize(pubkey: &str) {
-    let webhook_secret = match get_secret("webhook_secret") {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("[VANISH] webhook_secret not configured, skipping audit anonymize");
-            return;
-        }
+fn failed_cloud_cleanup_hashes(
+    status: StatusCode,
+    body: &str,
+    requested: &[String],
+) -> HashSet<String> {
+    let Ok(response) = serde_json::from_str::<BatchCleanupResponse>(body) else {
+        return requested.iter().cloned().collect();
     };
+    if response.status == CloudCleanupStatus::Permanent
+        || (response.status == CloudCleanupStatus::Completed && !status.is_success())
+    {
+        return requested.iter().cloned().collect();
+    }
 
-    let body = format!(r#"{{"pubkey":"{}"}}"#, pubkey);
+    let outcomes = response
+        .results
+        .into_iter()
+        .map(|result| (result.hash.to_lowercase(), result.status))
+        .collect::<HashMap<_, _>>();
+    requested
+        .iter()
+        .filter(|hash| {
+            !matches!(
+                outcomes.get(&hash.to_lowercase()),
+                Some(CloudCleanupStatus::Completed)
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+fn trigger_cloud_run_delete_blobs(hashes: &[String]) -> Result<HashSet<String>> {
+    if hashes.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let webhook_secret = get_secret("webhook_secret")?;
+    let expected_bucket = get_config("gcs_bucket")?;
+    let body = cloud_run_delete_blobs_body(hashes, &expected_bucket)?;
 
     const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
-    let mut req = Request::new(
+    let mut request = Request::new(
         Method::POST,
-        format!("https://{}/audit/anonymize", CLOUD_RUN_HOST),
+        format!("https://{}/delete-blobs", CLOUD_RUN_HOST),
     );
-    req.set_header("Host", CLOUD_RUN_HOST);
-    req.set_header("Content-Type", "application/json");
-    req.set_header("Authorization", format!("Bearer {}", webhook_secret));
-    req.set_body(Body::from(body));
+    request.set_header("Host", CLOUD_RUN_HOST);
+    request.set_header("Content-Type", "application/json");
+    request.set_header("Authorization", format!("Bearer {}", webhook_secret));
+    request.set_body(Body::from(body));
 
-    match req.send_async(CLOUD_RUN_BACKEND) {
-        Ok(_) => {
-            eprintln!("[VANISH] Triggered audit anonymize for pubkey={}", pubkey);
-        }
-        Err(e) => {
-            eprintln!("[VANISH] Failed to trigger audit anonymize: {}", e);
-        }
+    let mut response = request.send(CLOUD_RUN_BACKEND).map_err(|error| {
+        BlossomError::StorageError(format!("Cloud Run batch cleanup failed: {}", error))
+    })?;
+    let status = response.get_status();
+    let body = response.take_body().into_string();
+    if !status.is_success() {
+        eprintln!("[VANISH] Cloud Run batch cleanup returned status={status}");
     }
+    Ok(failed_cloud_cleanup_hashes(status, &body, hashes))
 }
 
 /// Trigger synchronous migration of a blob from a fallback CDN to GCS.
@@ -1986,13 +2579,19 @@ pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtracti
 #[cfg(test)]
 mod tests {
     use super::{
-        build_fos_delete_request, classify_cloud_cleanup_response, cloud_run_delete_blob_body,
-        normalize_storage_cache_state, parse_audio_extraction_error_response,
-        parse_funnelcake_audio_reuse_response, prepare_storage_cache_miss,
-        preserve_storage_cache_state, S3Config, FOS_BACKEND, STORAGE_CACHE_HEADER,
+        build_fos_delete_request, build_multi_delete_request, canonical_query_string,
+        classify_cloud_cleanup_response, cloud_run_delete_blob_body, cloud_run_delete_blobs_body,
+        failed_cloud_cleanup_hashes, failed_multi_delete_keys, mark_failed_stage,
+        multi_delete_body, normalize_storage_cache_state, parse_audio_extraction_error_response,
+        parse_funnelcake_audio_reuse_response, plan_vanish_delete_batches,
+        prepare_storage_cache_miss, preserve_storage_cache_state, sign_request_at,
+        vanish_audit_entry, S3Config,
+        VanishDeleteTarget, VanishStorageResult, CLOUD_RUN_DELETE_BATCH_LIMIT, FOS_BACKEND,
+        PROVIDER_MULTI_DELETE_LIMIT, STORAGE_CACHE_HEADER, VanishAuditInitiator, VanishAuditPhase,
     };
     use fastly::http::header;
     use fastly::{Request, Response};
+    use std::{collections::HashMap, time::Duration};
 
     #[test]
     fn cloud_cleanup_request_carries_the_edge_bucket() {
@@ -2001,6 +2600,73 @@ mod tests {
 
         assert_eq!(value["hash"], "a".repeat(64));
         assert_eq!(value["expected_bucket"], "configured-bucket");
+    }
+
+    #[test]
+    fn vanish_audit_is_minimal_and_idempotent_per_phase() {
+        let pubkey = "1".repeat(64);
+        let operation_id = "2".repeat(64);
+        let timestamp = "2026-08-31T18:00:00Z";
+        let authorized = vanish_audit_entry(
+            &pubkey,
+            &operation_id,
+            timestamp,
+            VanishAuditInitiator::Account,
+            VanishAuditPhase::Authorized,
+        );
+        let authorized_retry = vanish_audit_entry(
+            &pubkey,
+            &operation_id,
+            timestamp,
+            VanishAuditInitiator::Account,
+            VanishAuditPhase::Authorized,
+        );
+        let completed = vanish_audit_entry(
+            &pubkey,
+            &operation_id,
+            timestamp,
+            VanishAuditInitiator::Account,
+            VanishAuditPhase::Completed,
+        );
+
+        assert_eq!(authorized, authorized_retry);
+        assert_ne!(
+            authorized["logging.googleapis.com/insertId"],
+            completed["logging.googleapis.com/insertId"]
+        );
+        assert_eq!(authorized["account_pubkey"], pubkey);
+        assert_eq!(authorized["actor_pubkey"], pubkey);
+        assert_eq!(authorized["time"], timestamp);
+        assert!(authorized.get("auth_event").is_none());
+        assert!(authorized.get("sha256").is_none());
+
+        let admin = vanish_audit_entry(
+            &pubkey,
+            &operation_id,
+            timestamp,
+            VanishAuditInitiator::Admin,
+            VanishAuditPhase::Authorized,
+        );
+        assert_eq!(admin["action"], "admin_vanish_authorized");
+        assert_eq!(admin["initiator"], "admin");
+        assert!(admin.get("actor_pubkey").is_none());
+        assert_eq!(
+            VanishAuditInitiator::Account.other(),
+            VanishAuditInitiator::Admin
+        );
+        assert_eq!(
+            VanishAuditInitiator::Admin.other(),
+            VanishAuditInitiator::Account
+        );
+    }
+
+    #[test]
+    fn cloud_cleanup_batch_body_enforces_the_cloud_run_limit() {
+        let accepted = vec!["a".repeat(64); CLOUD_RUN_DELETE_BATCH_LIMIT];
+        let rejected = vec!["a".repeat(64); CLOUD_RUN_DELETE_BATCH_LIMIT + 1];
+
+        assert!(cloud_run_delete_blobs_body(&accepted, "configured-bucket").is_ok());
+        assert!(cloud_run_delete_blobs_body(&rejected, "configured-bucket").is_err());
     }
 
     #[test]
@@ -2021,10 +2687,7 @@ mod tests {
         .expect_err("permanent cleanup must fail closed");
 
         assert!(completed.is_ok());
-        assert!(matches!(
-            retryable,
-            crate::error::BlossomError::StorageError(_)
-        ));
+        assert!(matches!(retryable, crate::error::BlossomError::StorageError(_)));
         assert!(matches!(permanent, crate::error::BlossomError::Internal(_)));
     }
 
@@ -2035,6 +2698,43 @@ mod tests {
                 .expect_err("an absent route must not complete erasure");
 
         assert!(matches!(error, crate::error::BlossomError::StorageError(_)));
+    }
+
+    #[test]
+    fn batch_cloud_cleanup_returns_only_incomplete_or_missing_hashes() {
+        let completed = "A".repeat(64);
+        let completed_result = completed.to_lowercase();
+        let retryable = "b".repeat(64);
+        let missing = "c".repeat(64);
+        let body = format!(
+            r#"{{"status":"retryable","results":[{{"hash":"{completed_result}","status":"completed"}},{{"hash":"{retryable}","status":"retryable"}}]}}"#
+        );
+
+        let failed = failed_cloud_cleanup_hashes(
+            fastly::http::StatusCode::SERVICE_UNAVAILABLE,
+            &body,
+            &[completed.clone(), retryable.clone(), missing.clone()],
+        );
+
+        assert!(!failed.contains(&completed));
+        assert!(failed.contains(&retryable));
+        assert!(failed.contains(&missing));
+    }
+
+    #[test]
+    fn batch_cloud_cleanup_rejects_completed_body_with_error_status() {
+        let hash = "a".repeat(64);
+        let body = format!(
+            r#"{{"status":"completed","results":[{{"hash":"{hash}","status":"completed"}}]}}"#
+        );
+
+        let failed = failed_cloud_cleanup_hashes(
+            fastly::http::StatusCode::SERVICE_UNAVAILABLE,
+            &body,
+            std::slice::from_ref(&hash),
+        );
+
+        assert!(failed.contains(&hash));
     }
 
     #[test]
@@ -2057,6 +2757,193 @@ mod tests {
         );
         assert_eq!(req.get_header_str("Host"), Some("replica.example"));
         assert!(req.contains_header("Authorization"));
+    }
+
+    #[test]
+    fn fos_multi_delete_request_batches_keys_and_signs_the_payload() {
+        let config = S3Config {
+            access_key: "synthetic-access-key".into(),
+            secret_key: "synthetic-secret-key".into(),
+            bucket: "replica-bucket".into(),
+            host: "replica.example".into(),
+            region: "test-region".into(),
+        };
+        let keys = vec!["a".repeat(64), format!("{}.jpg", "b".repeat(64))];
+
+        let mut req =
+            build_multi_delete_request(&keys, &config, "fos_main").expect("request should sign");
+
+        assert_eq!(req.get_method(), fastly::http::Method::POST);
+        assert_eq!(
+            req.get_url().as_str(),
+            "https://replica.example/replica-bucket?delete"
+        );
+        assert!(req.contains_header("Authorization"));
+        assert!(req.contains_header("Content-MD5"));
+        assert_eq!(req.take_body().into_string(), multi_delete_body(&keys));
+    }
+
+    #[test]
+    fn gcs_multi_delete_request_has_the_exact_required_shape() {
+        let config = S3Config {
+            access_key: "synthetic-access-key".into(),
+            secret_key: "synthetic-secret-key".into(),
+            bucket: "gcs-bucket".into(),
+            host: "storage.googleapis.com".into(),
+            region: "auto".into(),
+        };
+        let keys = vec!["a".repeat(64)];
+
+        let req =
+            build_multi_delete_request(&keys, &config, "gcs_main").expect("request should sign");
+
+        assert_eq!(req.get_method(), fastly::http::Method::POST);
+        assert_eq!(
+            req.get_url().as_str(),
+            "https://storage.googleapis.com/gcs-bucket?delete"
+        );
+        assert_eq!(req.get_header_str("Host"), Some("storage.googleapis.com"));
+        assert_eq!(
+            req.get_header_str("Content-MD5"),
+            Some("IqZiGqcRnGzSA6fkBIAnEQ==")
+        );
+        assert!(req
+            .get_header_str("Authorization")
+            .expect("signed authorization")
+            .contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date"));
+    }
+
+    #[test]
+    fn signer_uses_the_requests_actual_host_header() {
+        let config = S3Config {
+            access_key: "synthetic-access-key".into(),
+            secret_key: "synthetic-secret-key".into(),
+            bucket: "bucket".into(),
+            host: "configured.example".into(),
+            region: "test-region".into(),
+        };
+        let now = Duration::from_secs(1_700_000_000);
+        let mut first = Request::post("https://configured.example/bucket?delete");
+        first.set_header("Host", "first.example");
+        sign_request_at(&mut first, &config, Some("payload".into()), now)
+            .expect("first request should sign");
+        let mut second = Request::post("https://configured.example/bucket?delete");
+        second.set_header("Host", "second.example");
+        sign_request_at(&mut second, &config, Some("payload".into()), now)
+            .expect("second request should sign");
+
+        assert_ne!(
+            first.get_header_str("Authorization"),
+            second.get_header_str("Authorization")
+        );
+    }
+
+    #[test]
+    fn multi_delete_wire_query_has_a_canonical_empty_value() {
+        let config = S3Config {
+            access_key: "synthetic-access-key".into(),
+            secret_key: "synthetic-secret-key".into(),
+            bucket: "bucket".into(),
+            host: "storage.example".into(),
+            region: "test-region".into(),
+        };
+        let now = Duration::from_secs(1_700_000_000);
+        let mut wire = Request::post("https://storage.example/bucket?delete");
+        wire.set_header("Host", "storage.example");
+        sign_request_at(&mut wire, &config, Some("payload".into()), now)
+            .expect("wire request should sign");
+        let mut canonical = Request::post("https://storage.example/bucket?delete=");
+        canonical.set_header("Host", "storage.example");
+        sign_request_at(&mut canonical, &config, Some("payload".into()), now)
+            .expect("canonical request should sign");
+
+        assert_eq!(canonical_query_string(Some("delete")), "delete=");
+        assert_eq!(
+            wire.get_header_str("Authorization"),
+            canonical.get_header_str("Authorization")
+        );
+    }
+
+    #[test]
+    fn vanish_delete_plan_chunks_every_provider_request() {
+        let hashes = (0..1_001)
+            .map(|index| format!("{index:064x}"))
+            .collect::<Vec<_>>();
+        let batches = plan_vanish_delete_batches(&hashes);
+
+        assert!(batches
+            .iter()
+            .all(|batch| batch.keys.len() <= PROVIDER_MULTI_DELETE_LIMIT));
+        assert!(batches.iter().any(|batch| {
+            batch.target == VanishDeleteTarget::GcsMain && batch.stage == "gcs_main:1"
+        }));
+        assert!(batches.iter().any(|batch| {
+            batch.target == VanishDeleteTarget::FosMain && batch.stage == "fos_main:1"
+        }));
+        assert_eq!(batches.len(), 4);
+    }
+
+    #[test]
+    fn multi_delete_response_requires_a_result_for_every_key() {
+        let deleted = "a".repeat(64);
+        let failed = "b".repeat(64);
+        let missing = "c".repeat(64);
+        let body = format!(
+            "<DeleteResult><Deleted><Key>{}</Key></Deleted><Error><Key>{}</Key><Code>Denied</Code></Error></DeleteResult>",
+            deleted, failed
+        );
+        let response = Response::from_status(fastly::http::StatusCode::OK).with_body(body);
+
+        let failures = failed_multi_delete_keys(
+            response,
+            &[deleted.clone(), failed.clone(), missing.clone()],
+        );
+
+        assert!(!failures.contains(&deleted));
+        assert!(failures.contains(&failed));
+        assert!(failures.contains(&missing));
+    }
+
+    #[test]
+    fn multi_delete_response_treats_explicit_absence_as_success() {
+        let absent = "a".repeat(64);
+        let denied = "b".repeat(64);
+        let body = format!(
+            "<DeleteResult><Error><Key>{}</Key><Code>NoSuchKey</Code></Error><Error><Key>{}</Key><Code>Denied</Code></Error></DeleteResult>",
+            absent, denied
+        );
+        let response = Response::from_status(fastly::http::StatusCode::OK).with_body(body);
+
+        let failures = failed_multi_delete_keys(response, &[absent.clone(), denied.clone()]);
+
+        assert!(!failures.contains(&absent));
+        assert!(failures.contains(&denied));
+    }
+
+    #[test]
+    fn multi_delete_response_treats_an_active_hold_as_failure() {
+        let held = "a".repeat(64);
+        let body = format!(
+            "<DeleteResult><Error><Key>{held}</Key><Code>ObjectUnderActiveHold</Code><Message>object is held</Message></Error></DeleteResult>"
+        );
+        let response = Response::from_status(fastly::http::StatusCode::OK).with_body(body);
+
+        let failures = failed_multi_delete_keys(response, std::slice::from_ref(&held));
+
+        assert!(failures.contains(&held));
+    }
+
+    #[test]
+    fn unattributed_failed_stage_fails_the_whole_batch_closed() {
+        let hashes = vec!["a".repeat(64), "b".repeat(64)];
+        let mut result = VanishStorageResult::default();
+
+        mark_failed_stage(&mut result, &HashMap::new(), "", &hashes);
+
+        assert_eq!(result.failed_hashes.len(), hashes.len());
+        assert!(hashes
+            .iter()
+            .all(|hash| result.failed_hashes.contains(hash)));
     }
 
     #[test]

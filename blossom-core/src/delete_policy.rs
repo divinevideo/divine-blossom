@@ -7,11 +7,6 @@ pub enum DeletePlan {
     UnlinkOnly,
 }
 
-/// A vanish request is complete only when no discovered blob needs retry.
-pub fn vanish_is_complete(errors: u32) -> bool {
-    errors == 0
-}
-
 /// Validates that a SHA-256 string is exactly 64 hex characters.
 /// Used by both `/admin/moderate` and `/admin/api/moderate` before any
 /// metadata lookup.
@@ -105,6 +100,20 @@ pub enum VanishBlobOutcome {
     Unlinked,
 }
 
+/// A vanish entry whose bytes must be erased before metadata finalization.
+#[derive(Debug)]
+pub struct PreparedVanishBlob {
+    pub hash: String,
+    pub metadata: Option<BlobMetadata>,
+}
+
+/// Result of applying the reference and ownership policy to a vanish entry.
+#[derive(Debug)]
+pub enum PreparedVanishBlobOrOutcome {
+    Erase(Box<PreparedVanishBlob>),
+    Completed(VanishBlobOutcome),
+}
+
 /// Metadata and list side effects needed to vanish one blob.
 pub trait VanishBlobOps: BlobErasureOps {
     fn get_blob_metadata(&self, hash: &str) -> Result<Option<BlobMetadata>>;
@@ -116,6 +125,75 @@ pub trait VanishBlobOps: BlobErasureOps {
     fn remove_from_recent_index(&self, hash: &str);
     fn put_blob_metadata(&self, metadata: &BlobMetadata) -> Result<()>;
     fn remove_from_user_list(&self, pubkey: &str, hash: &str) -> Result<()>;
+}
+
+/// Apply reference and ownership policy before a vanish storage erasure.
+pub fn prepare_vanish_blob_with_ops<O: VanishBlobOps>(
+    hash: &str,
+    pubkey: &str,
+    ops: &O,
+) -> Result<PreparedVanishBlobOrOutcome> {
+    let metadata = ops.get_blob_metadata(hash)?;
+    let remaining_refs = ops.remove_from_blob_refs(hash, pubkey)?;
+    let other_refs: Vec<String> = remaining_refs
+        .into_iter()
+        .filter(|reference| !reference.eq_ignore_ascii_case(pubkey))
+        .collect();
+
+    match metadata {
+        None if !other_refs.is_empty() => {
+            ops.remove_from_user_list(pubkey, hash)?;
+            Ok(PreparedVanishBlobOrOutcome::Completed(
+                VanishBlobOutcome::Unlinked,
+            ))
+        }
+        None => Ok(PreparedVanishBlobOrOutcome::Erase(Box::new(
+            PreparedVanishBlob {
+                hash: hash.to_string(),
+                metadata: None,
+            },
+        ))),
+        Some(metadata) if metadata.owner.eq_ignore_ascii_case(pubkey) && other_refs.is_empty() => {
+            Ok(PreparedVanishBlobOrOutcome::Erase(Box::new(
+                PreparedVanishBlob {
+                    hash: hash.to_string(),
+                    metadata: Some(metadata),
+                },
+            )))
+        }
+        Some(mut metadata) if metadata.owner.eq_ignore_ascii_case(pubkey) => {
+            metadata.owner = other_refs[0].clone();
+            ops.put_blob_metadata(&metadata)?;
+            ops.remove_from_user_list(pubkey, hash)?;
+            Ok(PreparedVanishBlobOrOutcome::Completed(
+                VanishBlobOutcome::Unlinked,
+            ))
+        }
+        Some(_) => {
+            ops.remove_from_user_list(pubkey, hash)?;
+            Ok(PreparedVanishBlobOrOutcome::Completed(
+                VanishBlobOutcome::Unlinked,
+            ))
+        }
+    }
+}
+
+/// Finalize metadata and list state after storage erasure succeeds.
+pub fn finalize_erased_vanish_blob_with_ops<O: VanishBlobOps>(
+    blob: &PreparedVanishBlob,
+    pubkey: &str,
+    ops: &O,
+) -> Result<()> {
+    ops.put_erasure_evidence(&blob.hash)?;
+    if let Some(metadata) = &blob.metadata {
+        ops.delete_blob_metadata(&blob.hash)?;
+        ops.delete_blob_kv_artifacts(&blob.hash);
+        ops.update_stats_on_remove(metadata);
+    } else {
+        ops.delete_blob_kv_artifacts(&blob.hash);
+    }
+    ops.remove_from_recent_index(&blob.hash);
+    ops.remove_from_user_list(pubkey, &blob.hash)
 }
 
 /// Erase a blob from every required origin before invalidating edge caches.
@@ -150,62 +228,6 @@ pub fn erase_blob_with_ops<O: BlobErasureOps>(hash: &str, req_id: &str, ops: &O)
     ops.purge_vcl_cache(hash);
     derivative_result?;
     Ok(())
-}
-
-/// Complete one blob entry from an account-vanish request.
-pub fn handle_vanish_blob_with_ops<O: VanishBlobOps>(
-    hash: &str,
-    pubkey: &str,
-    req_id: &str,
-    ops: &O,
-) -> Result<VanishBlobOutcome> {
-    let metadata = match ops.get_blob_metadata(hash)? {
-        Some(metadata) => metadata,
-        None => {
-            let remaining_refs = ops.remove_from_blob_refs(hash, pubkey)?;
-            let other_refs = remaining_refs
-                .iter()
-                .any(|reference| !reference.eq_ignore_ascii_case(pubkey));
-            if other_refs {
-                ops.remove_from_user_list(pubkey, hash)?;
-                return Ok(VanishBlobOutcome::Unlinked);
-            }
-
-            erase_blob_with_ops(hash, req_id, ops)?;
-            ops.put_erasure_evidence(hash)?;
-            ops.delete_blob_kv_artifacts(hash);
-            ops.remove_from_recent_index(hash);
-            ops.remove_from_user_list(pubkey, hash)?;
-            return Ok(VanishBlobOutcome::FullyDeleted);
-        }
-    };
-
-    let is_owner = metadata.owner.eq_ignore_ascii_case(pubkey);
-    let remaining_refs = ops.remove_from_blob_refs(hash, pubkey)?;
-    let other_refs: Vec<String> = remaining_refs
-        .into_iter()
-        .filter(|reference| !reference.eq_ignore_ascii_case(pubkey))
-        .collect();
-
-    if is_owner && other_refs.is_empty() {
-        erase_blob_with_ops(hash, req_id, ops)?;
-        ops.put_erasure_evidence(hash)?;
-        ops.delete_blob_metadata(hash)?;
-        ops.delete_blob_kv_artifacts(hash);
-        ops.update_stats_on_remove(&metadata);
-        ops.remove_from_recent_index(hash);
-        ops.remove_from_user_list(pubkey, hash)?;
-        Ok(VanishBlobOutcome::FullyDeleted)
-    } else if is_owner {
-        let mut updated_metadata = metadata;
-        updated_metadata.owner = other_refs[0].clone();
-        ops.put_blob_metadata(&updated_metadata)?;
-        ops.remove_from_user_list(pubkey, hash)?;
-        Ok(VanishBlobOutcome::Unlinked)
-    } else {
-        ops.remove_from_user_list(pubkey, hash)?;
-        Ok(VanishBlobOutcome::Unlinked)
-    }
 }
 
 /// Side-effects used by `handle_creator_delete_with_ops`. The binary crate
@@ -359,9 +381,6 @@ mod tests {
     struct MockVanishOps {
         metadata: RefCell<Option<BlobMetadata>>,
         refs: RefCell<Vec<String>>,
-        cleanup_audio_err: bool,
-        delete_replica_err: bool,
-        delete_artifacts_err: bool,
         put_erasure_evidence_err: bool,
         delete_metadata_err: bool,
         remove_user_list_err: Cell<bool>,
@@ -371,11 +390,7 @@ mod tests {
     impl BlobErasureOps for MockVanishOps {
         fn cleanup_derived_audio(&self, _hash: &str) -> Result<()> {
             self.calls.borrow_mut().push("cleanup_derived_audio");
-            if self.cleanup_audio_err {
-                Err(BlossomError::StorageError("audio cleanup failed".into()))
-            } else {
-                Ok(())
-            }
+            Ok(())
         }
         fn delete_blob_from_gcs(&self, _hash: &str) -> Result<()> {
             self.calls.borrow_mut().push("delete_blob_from_gcs");
@@ -383,19 +398,11 @@ mod tests {
         }
         fn delete_blob_from_replica(&self, _hash: &str) -> Result<()> {
             self.calls.borrow_mut().push("delete_blob_from_replica");
-            if self.delete_replica_err {
-                Err(BlossomError::StorageError("replica failed".into()))
-            } else {
-                Ok(())
-            }
+            Ok(())
         }
         fn delete_blob_gcs_artifacts(&self, _hash: &str) -> Result<()> {
             self.calls.borrow_mut().push("delete_blob_gcs_artifacts");
-            if self.delete_artifacts_err {
-                Err(BlossomError::StorageError("derivative failed".into()))
-            } else {
-                Ok(())
-            }
+            Ok(())
         }
         fn purge_vcl_cache(&self, _hash: &str) {
             self.calls.borrow_mut().push("purge_vcl_cache");
@@ -466,23 +473,27 @@ mod tests {
     }
 
     #[test]
-    fn vanish_sole_owner_removes_list_entry_only_after_erasure_and_metadata() {
+    fn vanish_batch_policy_prepares_then_finalizes_a_sole_owner() {
         let ops = vanish_ops_with_owner();
 
-        let outcome = handle_vanish_blob_with_ops(HASH, &"1".repeat(64), REQ_ID, &ops)
-            .expect("sole-owner vanish should succeed");
+        let blob = match prepare_vanish_blob_with_ops(HASH, &"1".repeat(64), &ops)
+            .expect("sole-owner preparation should succeed")
+        {
+            PreparedVanishBlobOrOutcome::Erase(blob) => blob,
+            PreparedVanishBlobOrOutcome::Completed(_) => panic!("sole owner must be erased"),
+        };
 
-        assert_eq!(outcome, VanishBlobOutcome::FullyDeleted);
+        assert_eq!(
+            *ops.calls.borrow(),
+            vec!["get_blob_metadata", "remove_from_blob_refs"]
+        );
+        finalize_erased_vanish_blob_with_ops(&blob, &"1".repeat(64), &ops)
+            .expect("sole-owner finalization should succeed");
         assert_eq!(
             *ops.calls.borrow(),
             vec![
                 "get_blob_metadata",
                 "remove_from_blob_refs",
-                "cleanup_derived_audio",
-                "delete_blob_from_gcs",
-                "delete_blob_from_replica",
-                "delete_blob_gcs_artifacts",
-                "purge_vcl_cache",
                 "put_erasure_evidence",
                 "delete_blob_metadata",
                 "delete_blob_kv_artifacts",
@@ -494,84 +505,17 @@ mod tests {
     }
 
     #[test]
-    fn vanish_replica_failure_preserves_metadata_and_list_entry() {
-        let ops = MockVanishOps {
-            delete_replica_err: true,
-            ..vanish_ops_with_owner()
-        };
-
-        let result = handle_vanish_blob_with_ops(HASH, &"1".repeat(64), REQ_ID, &ops);
-
-        assert!(matches!(result, Err(BlossomError::StorageError(_))));
-        assert!(ops.metadata.borrow().is_some());
-        assert!(!ops.calls.borrow().contains(&"delete_blob_metadata"));
-        assert!(!ops.calls.borrow().contains(&"remove_from_user_list"));
-    }
-
-    #[test]
-    fn vanish_audio_cleanup_failure_preserves_metadata_and_list_entry() {
-        let ops = MockVanishOps {
-            cleanup_audio_err: true,
-            ..vanish_ops_with_owner()
-        };
-
-        let result = handle_vanish_blob_with_ops(HASH, &"1".repeat(64), REQ_ID, &ops);
-
-        assert!(matches!(result, Err(BlossomError::StorageError(_))));
-        assert!(ops.metadata.borrow().is_some());
-        assert!(!ops.calls.borrow().contains(&"delete_blob_from_gcs"));
-        assert!(!ops.calls.borrow().contains(&"remove_from_user_list"));
-    }
-
-    #[test]
-    fn vanish_derivative_failure_preserves_metadata_and_list_entry() {
-        let ops = MockVanishOps {
-            delete_artifacts_err: true,
-            ..vanish_ops_with_owner()
-        };
-
-        let result = handle_vanish_blob_with_ops(HASH, &"1".repeat(64), REQ_ID, &ops);
-
-        assert!(matches!(result, Err(BlossomError::StorageError(_))));
-        assert!(ops.metadata.borrow().is_some());
-        assert!(ops.calls.borrow().contains(&"purge_vcl_cache"));
-        assert!(!ops.calls.borrow().contains(&"delete_blob_metadata"));
-        assert!(!ops.calls.borrow().contains(&"remove_from_user_list"));
-    }
-
-    #[test]
-    fn vanish_continues_other_hashes_after_a_derivative_failure() {
-        let failed = MockVanishOps {
-            delete_artifacts_err: true,
-            ..vanish_ops_with_owner()
-        };
-        let completed = vanish_ops_with_owner();
-
-        let first = handle_vanish_blob_with_ops(HASH, &"1".repeat(64), REQ_ID, &failed);
-        let second = handle_vanish_blob_with_ops(
-            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-            &"1".repeat(64),
-            REQ_ID,
-            &completed,
-        );
-
-        assert!(first.is_err());
-        assert_eq!(
-            second.expect("absent derivatives are successful deletes"),
-            VanishBlobOutcome::FullyDeleted
-        );
-        assert!(failed.metadata.borrow().is_some());
-        assert!(completed.metadata.borrow().is_none());
-    }
-
-    #[test]
     fn vanish_evidence_failure_preserves_metadata_and_list_entry() {
         let ops = MockVanishOps {
             put_erasure_evidence_err: true,
             ..vanish_ops_with_owner()
         };
 
-        let result = handle_vanish_blob_with_ops(HASH, &"1".repeat(64), REQ_ID, &ops);
+        let blob = match prepare_vanish_blob_with_ops(HASH, &"1".repeat(64), &ops).unwrap() {
+            PreparedVanishBlobOrOutcome::Erase(blob) => blob,
+            PreparedVanishBlobOrOutcome::Completed(_) => panic!("sole owner must be erased"),
+        };
+        let result = finalize_erased_vanish_blob_with_ops(&blob, &"1".repeat(64), &ops);
 
         assert!(matches!(result, Err(BlossomError::MetadataError(_))));
         assert!(ops.metadata.borrow().is_some());
@@ -586,7 +530,11 @@ mod tests {
             ..vanish_ops_with_owner()
         };
 
-        let result = handle_vanish_blob_with_ops(HASH, &"1".repeat(64), REQ_ID, &ops);
+        let blob = match prepare_vanish_blob_with_ops(HASH, &"1".repeat(64), &ops).unwrap() {
+            PreparedVanishBlobOrOutcome::Erase(blob) => blob,
+            PreparedVanishBlobOrOutcome::Completed(_) => panic!("sole owner must be erased"),
+        };
+        let result = finalize_erased_vanish_blob_with_ops(&blob, &"1".repeat(64), &ops);
 
         assert!(matches!(result, Err(BlossomError::MetadataError(_))));
         assert!(!ops.calls.borrow().contains(&"remove_from_user_list"));
@@ -599,27 +547,31 @@ mod tests {
             ..vanish_ops_with_owner()
         };
 
-        let first_result = handle_vanish_blob_with_ops(HASH, &"1".repeat(64), REQ_ID, &first);
+        let first_blob = match prepare_vanish_blob_with_ops(HASH, &"1".repeat(64), &first).unwrap()
+        {
+            PreparedVanishBlobOrOutcome::Erase(blob) => blob,
+            PreparedVanishBlobOrOutcome::Completed(_) => panic!("sole owner must be erased"),
+        };
+        let first_result =
+            finalize_erased_vanish_blob_with_ops(&first_blob, &"1".repeat(64), &first);
         assert!(matches!(first_result, Err(BlossomError::MetadataError(_))));
         assert!(first.metadata.borrow().is_none());
         assert!(first.refs.borrow().is_empty());
 
         first.remove_user_list_err.set(false);
         first.calls.borrow_mut().clear();
-        let retry_outcome = handle_vanish_blob_with_ops(HASH, &"1".repeat(64), REQ_ID, &first)
+        let retry_blob = match prepare_vanish_blob_with_ops(HASH, &"1".repeat(64), &first).unwrap()
+        {
+            PreparedVanishBlobOrOutcome::Erase(blob) => blob,
+            PreparedVanishBlobOrOutcome::Completed(_) => panic!("dangling entry must be erased"),
+        };
+        finalize_erased_vanish_blob_with_ops(&retry_blob, &"1".repeat(64), &first)
             .expect("metadata-less retry should converge");
-
-        assert_eq!(retry_outcome, VanishBlobOutcome::FullyDeleted);
         assert_eq!(
             *first.calls.borrow(),
             vec![
                 "get_blob_metadata",
                 "remove_from_blob_refs",
-                "cleanup_derived_audio",
-                "delete_blob_from_gcs",
-                "delete_blob_from_replica",
-                "delete_blob_gcs_artifacts",
-                "purge_vcl_cache",
                 "put_erasure_evidence",
                 "delete_blob_kv_artifacts",
                 "remove_from_recent_index",
@@ -636,10 +588,13 @@ mod tests {
             ..Default::default()
         };
 
-        let outcome = handle_vanish_blob_with_ops(HASH, &"1".repeat(64), REQ_ID, &ops)
+        let outcome = prepare_vanish_blob_with_ops(HASH, &"1".repeat(64), &ops)
             .expect("shared metadata-less blob should unlink");
 
-        assert_eq!(outcome, VanishBlobOutcome::Unlinked);
+        assert!(matches!(
+            outcome,
+            PreparedVanishBlobOrOutcome::Completed(VanishBlobOutcome::Unlinked)
+        ));
         assert!(!ops.calls.borrow().contains(&"delete_blob_from_gcs"));
         assert!(ops.calls.borrow().contains(&"remove_from_user_list"));
     }
@@ -652,11 +607,17 @@ mod tests {
             ..Default::default()
         };
 
-        let outcome = handle_vanish_blob_with_ops(HASH, &"1".repeat(64), REQ_ID, &ops)
+        let outcome = prepare_vanish_blob_with_ops(HASH, &"1".repeat(64), &ops)
             .expect("shared owner should transfer the blob");
 
-        assert_eq!(outcome, VanishBlobOutcome::Unlinked);
-        assert_eq!(ops.metadata.borrow().as_ref().unwrap().owner, "2".repeat(64));
+        assert!(matches!(
+            outcome,
+            PreparedVanishBlobOrOutcome::Completed(VanishBlobOutcome::Unlinked)
+        ));
+        assert_eq!(
+            ops.metadata.borrow().as_ref().unwrap().owner,
+            "2".repeat(64)
+        );
         assert_eq!(
             &ops.calls.borrow()[2..],
             &["put_blob_metadata", "remove_from_user_list"]
@@ -671,11 +632,17 @@ mod tests {
             ..Default::default()
         };
 
-        let outcome = handle_vanish_blob_with_ops(HASH, &"2".repeat(64), REQ_ID, &ops)
+        let outcome = prepare_vanish_blob_with_ops(HASH, &"2".repeat(64), &ops)
             .expect("non-owner should unlink");
 
-        assert_eq!(outcome, VanishBlobOutcome::Unlinked);
-        assert_eq!(ops.metadata.borrow().as_ref().unwrap().owner, "1".repeat(64));
+        assert!(matches!(
+            outcome,
+            PreparedVanishBlobOrOutcome::Completed(VanishBlobOutcome::Unlinked)
+        ));
+        assert_eq!(
+            ops.metadata.borrow().as_ref().unwrap().owner,
+            "1".repeat(64)
+        );
         assert!(!ops.calls.borrow().contains(&"put_blob_metadata"));
         assert!(ops.calls.borrow().contains(&"remove_from_user_list"));
     }
@@ -814,13 +781,6 @@ mod tests {
     #[test]
     fn non_owner_delete_plan_unlinks_only() {
         assert_eq!(plan_user_delete(false), DeletePlan::UnlinkOnly);
-    }
-
-    #[test]
-    fn vanish_completion_requires_zero_errors() {
-        assert!(vanish_is_complete(0));
-        assert!(!vanish_is_complete(1));
-        assert!(!vanish_is_complete(u32::MAX));
     }
 
     #[test]

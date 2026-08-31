@@ -17,7 +17,7 @@ use axum::{
     Router,
 };
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{stream, StreamExt};
 use google_cloud_storage::{
     client::{Client as GcsClient, ClientConfig},
     http::objects::{
@@ -231,6 +231,28 @@ struct DeleteBlobRequest {
     expected_bucket: String,
 }
 
+#[derive(Deserialize)]
+struct DeleteBlobsRequest {
+    hashes: Vec<String>,
+    expected_bucket: String,
+}
+
+#[derive(Serialize)]
+struct BatchCleanupResponse {
+    status: cleanup::CleanupStatus,
+    results: Vec<cleanup::HashCleanupResult>,
+}
+
+const MAX_BATCH_CLEANUP_HASHES: usize = 20;
+const BATCH_CLEANUP_CONCURRENCY: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchCleanupValidationError {
+    InvalidCount,
+    InvalidHash,
+    BucketMismatch,
+}
+
 #[derive(Serialize)]
 struct CleanupErrorResponse {
     status: cleanup::CleanupStatus,
@@ -336,7 +358,10 @@ async fn main() -> Result<()> {
         .route("/migrate", post(handle_migrate))
         .route("/migrate", options(handle_cors_preflight))
         .route("/audit", post(handle_audit_log))
+        .route("/audit/vanish", post(handle_vanish_audit_log))
         .route("/delete-blob", post(handle_delete_blob))
+        .route("/delete-blobs", post(handle_delete_blobs))
+        .route("/delete-blobs/ready", get(handle_delete_blobs_ready))
         .route("/delete-blob/health", get(handle_delete_blob_health))
         .route("/thumbnail/:hash", get(handle_thumbnail_generate))
         .route("/thumbnail/:hash", options(handle_cors_preflight))
@@ -421,6 +446,37 @@ fn cleanup_bucket_matches(expected_bucket: &str, configured_bucket: &str) -> boo
     expected_bucket == configured_bucket
 }
 
+fn validate_batch_cleanup_request(
+    request: DeleteBlobsRequest,
+    configured_bucket: &str,
+) -> std::result::Result<std::collections::BTreeSet<String>, BatchCleanupValidationError> {
+    if request.hashes.is_empty() || request.hashes.len() > MAX_BATCH_CLEANUP_HASHES {
+        return Err(BatchCleanupValidationError::InvalidCount);
+    }
+    if request.hashes.iter().any(|hash| !cleanup::valid_hash(hash)) {
+        return Err(BatchCleanupValidationError::InvalidHash);
+    }
+    if !cleanup_bucket_matches(&request.expected_bucket, configured_bucket) {
+        return Err(BatchCleanupValidationError::BucketMismatch);
+    }
+    Ok(request
+        .hashes
+        .into_iter()
+        .map(|hash| hash.to_ascii_lowercase())
+        .collect())
+}
+
+fn batch_cleanup_status(results: &[cleanup::HashCleanupResult]) -> cleanup::CleanupStatus {
+    if results
+        .iter()
+        .all(|result| result.status == cleanup::CleanupStatus::Completed)
+    {
+        cleanup::CleanupStatus::Completed
+    } else {
+        cleanup::CleanupStatus::Retryable
+    }
+}
+
 async fn handle_delete_blob(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -458,6 +514,75 @@ async fn handle_delete_blob(
     let backend = cleanup::GcsCleanupBackend::new(&state.gcs_client, &state.config.gcs_bucket);
     let result = cleanup::cleanup_hash(&backend, &request.hash.to_ascii_lowercase()).await;
     (cleanup_response_status(result.status), Json(result)).into_response()
+}
+
+async fn handle_delete_blobs(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<DeleteBlobsRequest>,
+) -> Response {
+    if let Err(error) = validate_webhook_auth(&headers, state.config.webhook_secret.as_deref()) {
+        return match error {
+            WebhookAuthError::Unavailable => cleanup_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                cleanup::CleanupStatus::Retryable,
+                "cleanup authentication unavailable",
+            ),
+            WebhookAuthError::Unauthorized => cleanup_error(
+                StatusCode::UNAUTHORIZED,
+                cleanup::CleanupStatus::Permanent,
+                "unauthorized",
+            ),
+        };
+    }
+    let hashes = match validate_batch_cleanup_request(request, &state.config.gcs_bucket) {
+        Ok(hashes) => hashes,
+        Err(BatchCleanupValidationError::InvalidCount) => {
+            return cleanup_error(
+                StatusCode::BAD_REQUEST,
+                cleanup::CleanupStatus::Permanent,
+                "hashes must contain between 1 and 20 entries",
+            );
+        }
+        Err(BatchCleanupValidationError::InvalidHash) => {
+            return cleanup_error(
+                StatusCode::BAD_REQUEST,
+                cleanup::CleanupStatus::Permanent,
+                "every hash must be 64 hexadecimal characters",
+            );
+        }
+        Err(BatchCleanupValidationError::BucketMismatch) => {
+            return cleanup_error(
+                StatusCode::CONFLICT,
+                cleanup::CleanupStatus::Retryable,
+                "cleanup bucket does not match the edge configuration",
+            );
+        }
+    };
+    let backend = cleanup::GcsCleanupBackend::new(&state.gcs_client, &state.config.gcs_bucket);
+    let results = stream::iter(hashes)
+        .map(|hash| {
+            let backend = &backend;
+            async move { cleanup::cleanup_hash(backend, &hash).await }
+        })
+        .buffer_unordered(BATCH_CLEANUP_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    let status = batch_cleanup_status(&results);
+    (
+        cleanup_response_status(status),
+        Json(BatchCleanupResponse { status, results }),
+    )
+        .into_response()
+}
+
+async fn handle_delete_blobs_ready() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "status": "ready",
+        "contract": "vanish-batch-v1",
+        "max_hashes": MAX_BATCH_CLEANUP_HASHES,
+        "vanish_audit": "authenticated-v1",
+    }))
 }
 
 async fn handle_delete_blob_health(
@@ -545,25 +670,37 @@ fn header_value(value: u64) -> HeaderValue {
 /// POST /audit - Receive audit log entries from Fastly edge and write as structured logs.
 /// Cloud Run structured logging: JSON on stdout is auto-ingested by Cloud Logging.
 /// This gives us: queryable logs, retention policies, export to BigQuery, alerting.
-async fn handle_audit_log(body: axum::body::Bytes) -> impl IntoResponse {
-    // Parse and re-emit as structured log with severity
-    match serde_json::from_slice::<serde_json::Value>(&body) {
+fn emit_audit_log(body: &[u8]) -> Response {
+    match serde_json::from_slice::<serde_json::Value>(body) {
         Ok(mut entry) => {
-            // Add Cloud Logging severity field for proper log level
             entry["severity"] = serde_json::json!("NOTICE");
             entry["logging.googleapis.com/labels"] = serde_json::json!({
                 "service": "divine-blossom",
                 "component": "audit"
             });
-            // Print as JSON to stdout — Cloud Run auto-ingests this into Cloud Logging
             println!("{}", entry);
-            StatusCode::OK
+            StatusCode::OK.into_response()
         }
-        Err(e) => {
-            error!("Invalid audit log entry: {}", e);
-            StatusCode::BAD_REQUEST
+        Err(error) => {
+            error!("Invalid audit log entry: {}", error);
+            StatusCode::BAD_REQUEST.into_response()
         }
     }
+}
+
+async fn handle_audit_log(body: axum::body::Bytes) -> Response {
+    emit_audit_log(&body)
+}
+
+async fn handle_vanish_audit_log(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if validate_webhook_auth(&headers, state.config.webhook_secret.as_deref()).is_err() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    emit_audit_log(&body)
 }
 
 async fn handle_upload(
@@ -1598,9 +1735,11 @@ async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_invalid_media_signal, cleanup_bucket_matches, cleanup_response_status,
-        media_source_candidates, needs_derivative_sanitize, new_temp_media_path,
-        validate_webhook_auth, video_thumbnail_url, EXPECTED_GCS_BUCKET_HEADER,
+        batch_cleanup_status, classify_invalid_media_signal, cleanup_bucket_matches,
+        cleanup_response_status, media_source_candidates, needs_derivative_sanitize,
+        new_temp_media_path, validate_batch_cleanup_request, validate_webhook_auth,
+        video_thumbnail_url, BatchCleanupValidationError, DeleteBlobsRequest,
+        EXPECTED_GCS_BUCKET_HEADER, MAX_BATCH_CLEANUP_HASHES,
     };
     use axum::http::{header, HeaderMap, HeaderValue};
 
@@ -1649,6 +1788,90 @@ mod tests {
         );
 
         assert!(validate_webhook_auth(&headers, Some("expected")).is_ok());
+    }
+
+    #[test]
+    fn batch_cleanup_accepts_the_edge_limit_and_normalizes_hashes() {
+        let hashes = (0..MAX_BATCH_CLEANUP_HASHES)
+            .map(|index| format!("{index:064X}"))
+            .collect();
+        let validated = validate_batch_cleanup_request(
+            DeleteBlobsRequest {
+                hashes,
+                expected_bucket: "media".to_string(),
+            },
+            "media",
+        )
+        .expect("the documented edge batch must fit");
+
+        assert_eq!(validated.len(), MAX_BATCH_CLEANUP_HASHES);
+        assert!(validated
+            .iter()
+            .all(|hash| hash == &hash.to_ascii_lowercase()));
+    }
+
+    #[test]
+    fn batch_cleanup_rejects_invalid_count_hash_and_bucket() {
+        let hash = "a".repeat(64);
+        let too_many = vec![hash.clone(); MAX_BATCH_CLEANUP_HASHES + 1];
+
+        assert_eq!(
+            validate_batch_cleanup_request(
+                DeleteBlobsRequest {
+                    hashes: too_many,
+                    expected_bucket: "media".to_string(),
+                },
+                "media",
+            ),
+            Err(BatchCleanupValidationError::InvalidCount)
+        );
+        assert_eq!(
+            validate_batch_cleanup_request(
+                DeleteBlobsRequest {
+                    hashes: vec!["not-a-hash".to_string()],
+                    expected_bucket: "media".to_string(),
+                },
+                "media",
+            ),
+            Err(BatchCleanupValidationError::InvalidHash)
+        );
+        assert_eq!(
+            validate_batch_cleanup_request(
+                DeleteBlobsRequest {
+                    hashes: vec![hash],
+                    expected_bucket: "other-media".to_string(),
+                },
+                "media",
+            ),
+            Err(BatchCleanupValidationError::BucketMismatch)
+        );
+    }
+
+    #[test]
+    fn batch_cleanup_rollup_is_retryable_if_any_hash_fails() {
+        let completed = crate::cleanup::HashCleanupResult {
+            hash: "a".repeat(64),
+            status: crate::cleanup::CleanupStatus::Completed,
+            deleted: 1,
+            absent: 0,
+            failures: Vec::new(),
+        };
+        let retryable = crate::cleanup::HashCleanupResult {
+            hash: "b".repeat(64),
+            status: crate::cleanup::CleanupStatus::Retryable,
+            deleted: 0,
+            absent: 1,
+            failures: vec!["verification failed".to_string()],
+        };
+
+        assert_eq!(
+            batch_cleanup_status(&[completed]),
+            crate::cleanup::CleanupStatus::Completed
+        );
+        assert_eq!(
+            batch_cleanup_status(&[retryable]),
+            crate::cleanup::CleanupStatus::Retryable
+        );
     }
 
     #[test]
