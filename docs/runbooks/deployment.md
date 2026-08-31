@@ -47,8 +47,9 @@ separate services.
 
 ## Deploy cleanup dependencies before the edge
 
-The edge treats Cloud Run's authenticated `/delete-blob` response as required
-erasure evidence. For changes to that contract:
+The edge treats Cloud Run's authenticated `/delete-blob` and `/delete-blobs`
+responses as required erasure evidence. Account vanish uses `/delete-blobs` and
+requires one typed result for every requested hash. For changes to that contract:
 
 1. Deploy `cloud-run-upload` from the approved branch.
 2. Verify an authenticated request reaches `/delete-blob/health`, sends the edge
@@ -58,9 +59,10 @@ erasure evidence. For changes to that contract:
    Fastly `webhook_secret` and Cloud Run `WEBHOOK_SECRET` bindings do not match;
    a `409` means the two services name different buckets. Stop rather than
    merging the edge in either case.
-3. Merge only after the backend route and authentication are verified. Each real
-   cleanup request also asserts that Cloud Run and the edge use the same GCS
-   bucket before Cloud Run may report deletion complete. The
+3. Verify `/delete-blobs` is deployed before publishing edge code that calls it.
+   Merge only after the backend routes and authentication are verified. Each
+   real cleanup request also asserts that Cloud Run and the edge use the same
+   GCS bucket before Cloud Run may report deletion complete. The
    normal `main` workflow can then publish the dependent edge code.
 
 Do not put either secret value in the verification command, logs, screenshots,

@@ -855,23 +855,11 @@ pub fn delete_blob_from_fos(key: &str) -> Result<()> {
     }
 }
 
-const VANISH_ARTIFACT_SUFFIXES: &[&str] = &[
-    ".jpg",
-    "/hls/master.m3u8",
-    "/hls/stream_720p.m3u8",
-    "/hls/stream_720p.ts",
-    "/hls/stream_480p.m3u8",
-    "/hls/stream_480p.ts",
-    "/hls/stream_720p.mp4",
-    "/hls/stream_480p.mp4",
-    "/vtt/main.vtt",
-];
 const PROVIDER_MULTI_DELETE_LIMIT: usize = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VanishDeleteTarget {
     GcsMain,
-    GcsArtifacts,
     FosMain,
 }
 
@@ -943,39 +931,21 @@ fn multi_delete_body(keys: &[String]) -> String {
     xml
 }
 
-fn vanish_artifact_keys(hashes: &[String]) -> Vec<String> {
-    hashes
-        .iter()
-        .flat_map(|hash| {
-            VANISH_ARTIFACT_SUFFIXES
-                .iter()
-                .map(move |suffix| format!("{}{}", hash, suffix))
-        })
-        .collect()
-}
-
 fn plan_vanish_delete_batches(hashes: &[String]) -> Vec<VanishDeleteBatch> {
     let mut batches = Vec::new();
     let targets = [
         (VanishDeleteTarget::GcsMain, "gcs_main", hashes.to_vec()),
-        (
-            VanishDeleteTarget::GcsArtifacts,
-            "gcs_artifacts",
-            vanish_artifact_keys(hashes),
-        ),
         (VanishDeleteTarget::FosMain, "fos_main", hashes.to_vec()),
     ];
 
     for (target, stage, keys) in targets {
-        batches.extend(
-            keys.chunks(PROVIDER_MULTI_DELETE_LIMIT)
-                .enumerate()
-                .map(|(index, keys)| VanishDeleteBatch {
-                    stage: format!("{}:{}", stage, index),
-                    keys: keys.to_vec(),
-                    target,
-                }),
-        );
+        for (index, keys) in keys.chunks(PROVIDER_MULTI_DELETE_LIMIT).enumerate() {
+            batches.push(VanishDeleteBatch {
+                stage: format!("{}:{}", stage, index),
+                keys: keys.to_vec(),
+                target,
+            });
+        }
     }
     batches
 }
@@ -1172,6 +1142,7 @@ fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) {
 /// Erase one bounded vanish batch from both origins and both CDN services.
 pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
     let mut result = VanishStorageResult::default();
+    let mut main_origin_failures = HashSet::new();
     if hashes.is_empty() {
         return result;
     }
@@ -1196,9 +1167,7 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
 
     for batch in plan_vanish_delete_batches(hashes) {
         let (config, backend, content_md5) = match batch.target {
-            VanishDeleteTarget::GcsMain | VanishDeleteTarget::GcsArtifacts => {
-                (&gcs, GCS_BACKEND, false)
-            }
+            VanishDeleteTarget::GcsMain => (&gcs, GCS_BACKEND, false),
             VanishDeleteTarget::FosMain => (&fos, FOS_BACKEND, true),
         };
         let stage = batch.stage;
@@ -1214,6 +1183,13 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
             Err(_) => {
                 let failed_keys: HashSet<String> = keys.into_iter().collect();
                 mark_failed_keys(&mut result, &failed_keys);
+                if stage.starts_with("gcs_main:") || stage.starts_with("fos_main:") {
+                    main_origin_failures.extend(
+                        failed_keys
+                            .iter()
+                            .filter_map(|key| hash_for_vanish_key(key)),
+                    );
+                }
             }
         }
     }
@@ -1234,10 +1210,6 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
                         stage if stage.starts_with("gcs_main:") => {
                             result.timings.gcs_main_ms = result.timings.gcs_main_ms.max(duration);
                         }
-                        stage if stage.starts_with("gcs_artifacts:") => {
-                            result.timings.gcs_artifacts_ms =
-                                result.timings.gcs_artifacts_ms.max(duration);
-                        }
                         stage if stage.starts_with("fos_main:") => {
                             result.timings.fos_main_ms = result.timings.fos_main_ms.max(duration);
                         }
@@ -1247,8 +1219,13 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
                 if let Some(requested) = requested_by_stage.get(&stage) {
                     let failed = failed_multi_delete_keys(response, requested);
                     mark_failed_keys(&mut result, &failed);
+                    if stage.starts_with("gcs_main:") || stage.starts_with("fos_main:") {
+                        main_origin_failures
+                            .extend(failed.iter().filter_map(|key| hash_for_vanish_key(key)));
+                    }
                 } else {
                     result.failed_hashes.extend(hashes.iter().cloned());
+                    main_origin_failures.extend(hashes.iter().cloned());
                 }
             }
             Err(error) => {
@@ -1259,16 +1236,28 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
                 if let Some(requested) = requested_by_stage.get(stage) {
                     let failed: HashSet<String> = requested.iter().cloned().collect();
                     mark_failed_keys(&mut result, &failed);
+                    if stage.starts_with("gcs_main:") || stage.starts_with("fos_main:") {
+                        main_origin_failures
+                            .extend(failed.iter().filter_map(|key| hash_for_vanish_key(key)));
+                    }
                 } else {
                     result.failed_hashes.extend(hashes.iter().cloned());
+                    main_origin_failures.extend(hashes.iter().cloned());
                 }
             }
         }
     }
 
+    let cloud_cleanup_started = Instant::now();
+    match trigger_cloud_run_delete_blobs(hashes) {
+        Ok(failed) => result.failed_hashes.extend(failed),
+        Err(_) => result.failed_hashes.extend(hashes.iter().cloned()),
+    }
+    result.timings.gcs_artifacts_ms = elapsed_ms(cloud_cleanup_started);
+
     let purgeable: Vec<String> = hashes
         .iter()
-        .filter(|hash| !result.failed_hashes.contains(*hash))
+        .filter(|hash| !main_origin_failures.contains(*hash))
         .cloned()
         .collect();
     purge_vanish_hashes(&purgeable, &mut result);
@@ -2147,6 +2136,18 @@ struct CloudCleanupResponse {
     status: CloudCleanupStatus,
 }
 
+#[derive(Deserialize)]
+struct BatchHashCleanupResponse {
+    hash: String,
+    status: CloudCleanupStatus,
+}
+
+#[derive(Deserialize)]
+struct BatchCleanupResponse {
+    status: CloudCleanupStatus,
+    results: Vec<BatchHashCleanupResponse>,
+}
+
 fn classify_cloud_cleanup_response(status: StatusCode, body: &str) -> Result<()> {
     let cleanup = serde_json::from_str::<CloudCleanupResponse>(body).map_err(|_| {
         BlossomError::StorageError(format!(
@@ -2191,6 +2192,60 @@ pub fn trigger_cloud_run_delete_blob(hash: &str) -> Result<()> {
     let status = response.get_status();
     let body = response.take_body().into_string();
     classify_cloud_cleanup_response(status, &body)
+}
+
+fn failed_cloud_cleanup_hashes(body: &str, requested: &[String]) -> HashSet<String> {
+    let Ok(response) = serde_json::from_str::<BatchCleanupResponse>(body) else {
+        return requested.iter().cloned().collect();
+    };
+    if response.status == CloudCleanupStatus::Permanent {
+        return requested.iter().cloned().collect();
+    }
+
+    let outcomes = response
+        .results
+        .into_iter()
+        .map(|result| (result.hash.to_lowercase(), result.status))
+        .collect::<HashMap<_, _>>();
+    requested
+        .iter()
+        .filter(|hash| {
+            !matches!(
+                outcomes.get(&hash.to_lowercase()),
+                Some(CloudCleanupStatus::Completed)
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+fn trigger_cloud_run_delete_blobs(hashes: &[String]) -> Result<HashSet<String>> {
+    if hashes.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let webhook_secret = get_secret("webhook_secret")?;
+    let expected_bucket = get_config("gcs_bucket")?;
+    let body = serde_json::json!({
+        "hashes": hashes,
+        "expected_bucket": expected_bucket,
+    })
+    .to_string();
+
+    const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
+    let mut request = Request::new(
+        Method::POST,
+        format!("https://{}/delete-blobs", CLOUD_RUN_HOST),
+    );
+    request.set_header("Host", CLOUD_RUN_HOST);
+    request.set_header("Content-Type", "application/json");
+    request.set_header("Authorization", format!("Bearer {}", webhook_secret));
+    request.set_body(Body::from(body));
+
+    let mut response = request.send(CLOUD_RUN_BACKEND).map_err(|error| {
+        BlossomError::StorageError(format!("Cloud Run batch cleanup failed: {}", error))
+    })?;
+    let body = response.take_body().into_string();
+    Ok(failed_cloud_cleanup_hashes(&body, hashes))
 }
 
 /// Trigger synchronous migration of a blob from a fallback CDN to GCS.
@@ -2393,8 +2448,8 @@ pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtracti
 mod tests {
     use super::{
         build_fos_delete_request, build_multi_delete_request, classify_cloud_cleanup_response,
-        cloud_run_delete_blob_body, failed_multi_delete_keys, mark_failed_stage, multi_delete_body,
-        normalize_storage_cache_state,
+        cloud_run_delete_blob_body, failed_cloud_cleanup_hashes, failed_multi_delete_keys,
+        mark_failed_stage, multi_delete_body, normalize_storage_cache_state,
         parse_audio_extraction_error_response, parse_funnelcake_audio_reuse_response,
         plan_vanish_delete_batches, prepare_storage_cache_miss, preserve_storage_cache_state,
         S3Config, VanishDeleteTarget, VanishStorageResult, FOS_BACKEND,
@@ -2442,6 +2497,26 @@ mod tests {
                 .expect_err("an absent route must not complete erasure");
 
         assert!(matches!(error, crate::error::BlossomError::StorageError(_)));
+    }
+
+    #[test]
+    fn batch_cloud_cleanup_returns_only_incomplete_or_missing_hashes() {
+        let completed = "A".repeat(64);
+        let completed_result = completed.to_lowercase();
+        let retryable = "b".repeat(64);
+        let missing = "c".repeat(64);
+        let body = format!(
+            r#"{{"status":"retryable","results":[{{"hash":"{completed_result}","status":"completed"}},{{"hash":"{retryable}","status":"retryable"}}]}}"#
+        );
+
+        let failed = failed_cloud_cleanup_hashes(
+            &body,
+            &[completed.clone(), retryable.clone(), missing.clone()],
+        );
+
+        assert!(!failed.contains(&completed));
+        assert!(failed.contains(&retryable));
+        assert!(failed.contains(&missing));
     }
 
     #[test]
@@ -2504,12 +2579,9 @@ mod tests {
             batch.target == VanishDeleteTarget::GcsMain && batch.stage == "gcs_main:1"
         }));
         assert!(batches.iter().any(|batch| {
-            batch.target == VanishDeleteTarget::GcsArtifacts
-                && batch.stage == "gcs_artifacts:9"
-        }));
-        assert!(batches.iter().any(|batch| {
             batch.target == VanishDeleteTarget::FosMain && batch.stage == "fos_main:1"
         }));
+        assert_eq!(batches.len(), 4);
     }
 
     #[test]

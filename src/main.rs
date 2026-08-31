@@ -69,6 +69,7 @@ use fastly::http::{header, Method, StatusCode};
 use fastly::kv_store::KVStore;
 use fastly::{Error, Request, Response};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::time::Duration;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -499,6 +500,42 @@ pub(crate) fn cleanup_derived_audio_for_source(source_hash: &str) -> Result<()> 
     }
     delete_audio_source_refs(&mapping.audio_sha256)?;
     delete_audio_mapping(source_hash)?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct PreparedDerivedAudioCleanup {
+    source_hash: String,
+    audio_hash: String,
+}
+
+fn prepare_derived_audio_cleanup(source_hash: &str) -> Result<Option<PreparedDerivedAudioCleanup>> {
+    let Some(mapping) = get_audio_mapping(source_hash)? else {
+        return Ok(None);
+    };
+
+    let remaining_audio_sources: Vec<String> = get_audio_source_refs(&mapping.audio_sha256)?
+        .into_iter()
+        .filter(|hash| !hash.eq_ignore_ascii_case(source_hash))
+        .collect();
+    let blob_refs = get_blob_refs(&mapping.audio_sha256)?;
+    if !should_delete_derived_audio_blob(&remaining_audio_sources, &blob_refs) {
+        remove_from_audio_source_refs(&mapping.audio_sha256, source_hash)?;
+        delete_audio_mapping(source_hash)?;
+        return Ok(None);
+    }
+
+    Ok(Some(PreparedDerivedAudioCleanup {
+        source_hash: source_hash.to_string(),
+        audio_hash: mapping.audio_sha256,
+    }))
+}
+
+fn finalize_derived_audio_cleanup(plan: &PreparedDerivedAudioCleanup) -> Result<()> {
+    delete_blob_kv_artifacts(&plan.audio_hash);
+    delete_blob_metadata(&plan.audio_hash)?;
+    delete_audio_source_refs(&plan.audio_hash)?;
+    delete_audio_mapping(&plan.source_hash)?;
     Ok(())
 }
 
@@ -4537,9 +4574,15 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     let prepare_ms = prepare_started.elapsed().as_millis();
 
     let mut cleanup_ready = Vec::with_capacity(erase.len());
+    let mut derived_cleanup = Vec::new();
     for blob in erase {
-        match cleanup_derived_audio_for_source(&blob.hash) {
-            Ok(()) => cleanup_ready.push(blob),
+        match prepare_derived_audio_cleanup(&blob.hash) {
+            Ok(plan) => {
+                if let Some(plan) = plan {
+                    derived_cleanup.push(plan);
+                }
+                cleanup_ready.push(blob);
+            }
             Err(error) => {
                 eprintln!(
                     "[VANISH] pubkey={} hash={} failed to clean up derived audio: {}",
@@ -4551,7 +4594,10 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         }
     }
     let erase = cleanup_ready;
-    let erase_hashes: Vec<String> = erase.iter().map(|blob| blob.hash.clone()).collect();
+    let mut erase_hashes: Vec<String> = erase.iter().map(|blob| blob.hash.clone()).collect();
+    erase_hashes.extend(derived_cleanup.iter().map(|plan| plan.audio_hash.clone()));
+    erase_hashes.sort();
+    erase_hashes.dedup();
     let mut storage_result = erase_vanish_batch(&erase_hashes);
     let mut storage_attempts = u8::from(!erase_hashes.is_empty());
     while storage_attempts < VANISH_STORAGE_ATTEMPTS && !storage_result.failed_hashes.is_empty() {
@@ -4562,10 +4608,26 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         storage_attempts += 1;
     }
     let finalize_started = Instant::now();
-    for blob in &erase {
-        if storage_result.failed_hashes.contains(&blob.hash) {
+    let mut failed_derived_sources = HashSet::new();
+    for plan in &derived_cleanup {
+        if storage_result.failed_hashes.contains(&plan.audio_hash) {
+            failed_derived_sources.insert(plan.source_hash.clone());
+            continue;
+        }
+        if let Err(error) = finalize_derived_audio_cleanup(plan) {
             eprintln!(
-                "[VANISH] pubkey={} hash={} storage erasure failed after {} attempts",
+                "[VANISH] pubkey={} hash={} failed to finalize derived audio: {}",
+                pubkey, plan.source_hash, error
+            );
+            failed_derived_sources.insert(plan.source_hash.clone());
+        }
+    }
+    for blob in &erase {
+        if storage_result.failed_hashes.contains(&blob.hash)
+            || failed_derived_sources.contains(&blob.hash)
+        {
+            eprintln!(
+                "[VANISH] pubkey={} hash={} required storage erasure failed after {} attempts",
                 pubkey, blob.hash, storage_attempts
             );
             execution.errors += 1;

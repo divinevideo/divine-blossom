@@ -17,7 +17,7 @@ use axum::{
     Router,
 };
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{stream, StreamExt};
 use google_cloud_storage::{
     client::{Client as GcsClient, ClientConfig},
     http::objects::{
@@ -231,6 +231,21 @@ struct DeleteBlobRequest {
     expected_bucket: String,
 }
 
+#[derive(Deserialize)]
+struct DeleteBlobsRequest {
+    hashes: Vec<String>,
+    expected_bucket: String,
+}
+
+#[derive(Serialize)]
+struct BatchCleanupResponse {
+    status: cleanup::CleanupStatus,
+    results: Vec<cleanup::HashCleanupResult>,
+}
+
+const MAX_BATCH_CLEANUP_HASHES: usize = 200;
+const BATCH_CLEANUP_CONCURRENCY: usize = 8;
+
 #[derive(Serialize)]
 struct CleanupErrorResponse {
     status: cleanup::CleanupStatus,
@@ -337,6 +352,7 @@ async fn main() -> Result<()> {
         .route("/migrate", options(handle_cors_preflight))
         .route("/audit", post(handle_audit_log))
         .route("/delete-blob", post(handle_delete_blob))
+        .route("/delete-blobs", post(handle_delete_blobs))
         .route("/delete-blob/health", get(handle_delete_blob_health))
         .route("/thumbnail/:hash", get(handle_thumbnail_generate))
         .route("/thumbnail/:hash", options(handle_cors_preflight))
@@ -458,6 +474,76 @@ async fn handle_delete_blob(
     let backend = cleanup::GcsCleanupBackend::new(&state.gcs_client, &state.config.gcs_bucket);
     let result = cleanup::cleanup_hash(&backend, &request.hash.to_ascii_lowercase()).await;
     (cleanup_response_status(result.status), Json(result)).into_response()
+}
+
+async fn handle_delete_blobs(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<DeleteBlobsRequest>,
+) -> Response {
+    if let Err(error) = validate_webhook_auth(&headers, state.config.webhook_secret.as_deref()) {
+        return match error {
+            WebhookAuthError::Unavailable => cleanup_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                cleanup::CleanupStatus::Retryable,
+                "cleanup authentication unavailable",
+            ),
+            WebhookAuthError::Unauthorized => cleanup_error(
+                StatusCode::UNAUTHORIZED,
+                cleanup::CleanupStatus::Permanent,
+                "unauthorized",
+            ),
+        };
+    }
+    if request.hashes.is_empty() || request.hashes.len() > MAX_BATCH_CLEANUP_HASHES {
+        return cleanup_error(
+            StatusCode::BAD_REQUEST,
+            cleanup::CleanupStatus::Permanent,
+            "hashes must contain between 1 and 200 entries",
+        );
+    }
+    if request.hashes.iter().any(|hash| !cleanup::valid_hash(hash)) {
+        return cleanup_error(
+            StatusCode::BAD_REQUEST,
+            cleanup::CleanupStatus::Permanent,
+            "every hash must be 64 hexadecimal characters",
+        );
+    }
+    if !cleanup_bucket_matches(&request.expected_bucket, &state.config.gcs_bucket) {
+        return cleanup_error(
+            StatusCode::CONFLICT,
+            cleanup::CleanupStatus::Retryable,
+            "cleanup bucket does not match the edge configuration",
+        );
+    }
+
+    let hashes = request
+        .hashes
+        .into_iter()
+        .map(|hash| hash.to_ascii_lowercase())
+        .collect::<std::collections::BTreeSet<_>>();
+    let backend = cleanup::GcsCleanupBackend::new(&state.gcs_client, &state.config.gcs_bucket);
+    let results = stream::iter(hashes)
+        .map(|hash| {
+            let backend = &backend;
+            async move { cleanup::cleanup_hash(backend, &hash).await }
+        })
+        .buffer_unordered(BATCH_CLEANUP_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    let status = if results
+        .iter()
+        .all(|result| result.status == cleanup::CleanupStatus::Completed)
+    {
+        cleanup::CleanupStatus::Completed
+    } else {
+        cleanup::CleanupStatus::Retryable
+    };
+    (
+        cleanup_response_status(status),
+        Json(BatchCleanupResponse { status, results }),
+    )
+        .into_response()
 }
 
 async fn handle_delete_blob_health(
