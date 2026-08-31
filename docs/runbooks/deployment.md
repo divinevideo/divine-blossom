@@ -12,9 +12,9 @@ then activate that version separately. The VCL changes themselves have no
 production effect until that activation happens. CI still republishes and purges
 the Compute service after any merge to `main`, including a VCL-only merge.
 
-That asymmetry is the thing to plan around. Any change that spans the edge and a
-Cloud Run service goes out in two stages, the edge first, and there is a window
-where new edge code is talking to an old backend.
+That asymmetry is the thing to plan around. A merge deploys the edge before any
+manual Cloud Run step, so changes that require a new Cloud Run route must deploy
+and verify that backend from the approved branch before merging the edge change.
 
 ## What ships automatically
 
@@ -44,6 +44,28 @@ These services are not deployed by CI. Each is a script you run yourself.
 It targets the same Cloud Run service that CI deploys on merge, so treat the CI
 job and the manual script as competing deploy paths for one service, not two
 separate services.
+
+## Deploy cleanup dependencies before the edge
+
+The edge treats Cloud Run's authenticated `/delete-blob` response as required
+erasure evidence. For changes to that contract:
+
+1. Deploy `cloud-run-upload` from the approved branch.
+2. Verify an authenticated request reaches `/delete-blob/health`, sends the edge
+   config store's `gcs_bucket` value in `X-Expected-GCS-Bucket`, and returns a
+   typed `completed` response. This verifies route availability, secret parity,
+   and bucket parity; it is not a storage-permission probe. A `401` means the
+   Fastly `webhook_secret` and Cloud Run `WEBHOOK_SECRET` bindings do not match;
+   a `409` means the two services name different buckets. Stop rather than
+   merging the edge in either case.
+3. Merge only after the backend route and authentication are verified. Each real
+   cleanup request also asserts that Cloud Run and the edge use the same GCS
+   bucket before Cloud Run may report deletion complete. The
+   normal `main` workflow can then publish the dependent edge code.
+
+Do not put either secret value in the verification command, logs, screenshots,
+or pull-request text. Use the approved secret-injection tooling for the operator
+environment.
 
 ## The edge Cloud Run backends are not in the production project
 
@@ -77,10 +99,11 @@ GCP_PROJECT_ID=rich-compiler-479518-d2 ./scripts/deploy-cloud-function.sh
 
 ## Check live configuration before running a deploy script
 
-`cloud-run-transcoder/deploy.sh` and the CI `process-blob` job use
-`--update-env-vars`; the transcoder script also uses `--update-secrets`. Unnamed
-keys are therefore preserved for those deploys. Keys they *do* name are
-overwritten with the deploy path's values, which may not match what is running.
+`cloud-run-transcoder/deploy.sh`, `cloud-run-upload/deploy.sh`, and the CI
+`process-blob` job use `--update-env-vars`; the service scripts also use
+`--update-secrets`. Unnamed keys are therefore preserved for those deploys.
+Keys they *do* name are overwritten with the deploy path's values, which may
+not match what is running.
 
 `gcloud run deploy` creates or updates the *service*, and `--update-env-vars`
 merges its pairs onto the service's `spec.template`. The template is therefore
@@ -107,7 +130,7 @@ than what the next deploy will merge onto.
 
 Current configuration-preservation status by deploy path:
 
-- `cloud-run-upload/deploy.sh` still uses `--set-env-vars` and `--set-secrets`.
+- `cloud-run-upload/deploy.sh` uses `--update-env-vars` and `--update-secrets`.
 - `cloud-run-asr-parakeet/deploy.sh` still uses `--set-env-vars`.
 - `scripts/deploy-cloud-function.sh` still uses `--set-env-vars`.
 - `.github/workflows/ci.yml` deploys `process-blob` with `--update-env-vars`,

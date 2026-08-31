@@ -38,8 +38,8 @@ pub fn soft_delete_blob(
 pub(crate) struct DefaultCreatorDeleteOps;
 
 impl BlobErasureOps for DefaultCreatorDeleteOps {
-    fn cleanup_derived_audio(&self, hash: &str) {
-        crate::cleanup_derived_audio_for_source(hash);
+    fn cleanup_derived_audio(&self, hash: &str) -> Result<()> {
+        crate::cleanup_derived_audio_for_source(hash)
     }
     fn delete_blob_from_gcs(&self, hash: &str) -> Result<()> {
         crate::storage::delete_blob(hash)
@@ -47,8 +47,8 @@ impl BlobErasureOps for DefaultCreatorDeleteOps {
     fn delete_blob_from_replica(&self, hash: &str) -> Result<()> {
         crate::storage::delete_blob_from_fos(hash)
     }
-    fn delete_blob_gcs_artifacts(&self, hash: &str) {
-        crate::delete_blob_gcs_artifacts(hash);
+    fn delete_blob_gcs_artifacts(&self, hash: &str) -> Result<()> {
+        crate::delete_blob_gcs_artifacts(hash)
     }
     fn purge_vcl_cache(&self, hash: &str) {
         crate::purge_edge_cache(hash);

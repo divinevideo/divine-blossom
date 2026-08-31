@@ -1,6 +1,7 @@
 // ABOUTME: Rust Cloud Run service for Blossom blob uploads
 // ABOUTME: Handles Nostr auth validation, streaming upload to GCS, and SHA-256 hashing
 
+mod cleanup;
 mod mp4;
 mod resumable;
 mod tasks;
@@ -10,7 +11,7 @@ use anyhow::{anyhow, Result};
 use axum::{
     body::Body,
     extract::{Path, State},
-    http::{header, HeaderName, HeaderValue, Method, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{delete, get, head, options, post, put},
     Router,
@@ -39,6 +40,7 @@ use std::{
     sync::{Arc, LazyLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use subtle::ConstantTimeEq;
 use tempfile::NamedTempFile;
 use tokio::sync::{Mutex, Semaphore};
 use tower::Service;
@@ -53,6 +55,7 @@ struct Config {
     upload_base_url: String,
     port: u16,
     migration_nsec: Option<String>,
+    webhook_secret: Option<String>,
     transcoder_url: Option<String>,
     transcriber_url: Option<String>,
     resumable_session_ttl_secs: u64,
@@ -76,6 +79,7 @@ impl Config {
                 .parse()
                 .unwrap_or(8080),
             migration_nsec: env::var("MIGRATION_NSEC").ok(),
+            webhook_secret: env::var("WEBHOOK_SECRET").ok(),
             transcode_queue: tasks::TaskQueueConfig::from_env(),
             // URL of the divine-transcoder service for HLS generation
             transcoder_url: env::var("TRANSCODER_URL").ok(),
@@ -221,6 +225,31 @@ struct MigrateResponse {
     source_url: String,
 }
 
+#[derive(Deserialize)]
+struct DeleteBlobRequest {
+    hash: String,
+    expected_bucket: String,
+}
+
+#[derive(Serialize)]
+struct CleanupErrorResponse {
+    status: cleanup::CleanupStatus,
+    error: String,
+}
+
+#[derive(Serialize)]
+struct CleanupHealthResponse {
+    status: cleanup::CleanupStatus,
+}
+
+const EXPECTED_GCS_BUCKET_HEADER: &str = "x-expected-gcs-bucket";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebhookAuthError {
+    Unavailable,
+    Unauthorized,
+}
+
 // Error response
 #[derive(Serialize)]
 struct ErrorResponse {
@@ -307,6 +336,8 @@ async fn main() -> Result<()> {
         .route("/migrate", post(handle_migrate))
         .route("/migrate", options(handle_cors_preflight))
         .route("/audit", post(handle_audit_log))
+        .route("/delete-blob", post(handle_delete_blob))
+        .route("/delete-blob/health", get(handle_delete_blob_health))
         .route("/thumbnail/:hash", get(handle_thumbnail_generate))
         .route("/thumbnail/:hash", options(handle_cors_preflight))
         .route("/", put(handle_upload))
@@ -345,6 +376,137 @@ async fn main() -> Result<()> {
 
 async fn handle_cors_preflight() -> impl IntoResponse {
     StatusCode::NO_CONTENT
+}
+
+fn validate_webhook_auth(
+    headers: &HeaderMap,
+    expected_secret: Option<&str>,
+) -> std::result::Result<(), WebhookAuthError> {
+    let expected_secret = expected_secret.ok_or(WebhookAuthError::Unavailable)?;
+    let provided = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or(WebhookAuthError::Unauthorized)?;
+    if !bool::from(provided.as_bytes().ct_eq(expected_secret.as_bytes())) {
+        return Err(WebhookAuthError::Unauthorized);
+    }
+    Ok(())
+}
+
+fn cleanup_error(
+    status: StatusCode,
+    cleanup_status: cleanup::CleanupStatus,
+    error: &str,
+) -> Response {
+    (
+        status,
+        Json(CleanupErrorResponse {
+            status: cleanup_status,
+            error: error.to_string(),
+        }),
+    )
+        .into_response()
+}
+
+fn cleanup_response_status(status: cleanup::CleanupStatus) -> StatusCode {
+    match status {
+        cleanup::CleanupStatus::Completed => StatusCode::OK,
+        cleanup::CleanupStatus::Retryable => StatusCode::SERVICE_UNAVAILABLE,
+        cleanup::CleanupStatus::Permanent => StatusCode::BAD_REQUEST,
+    }
+}
+
+fn cleanup_bucket_matches(expected_bucket: &str, configured_bucket: &str) -> bool {
+    expected_bucket == configured_bucket
+}
+
+async fn handle_delete_blob(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<DeleteBlobRequest>,
+) -> Response {
+    if let Err(error) = validate_webhook_auth(&headers, state.config.webhook_secret.as_deref()) {
+        return match error {
+            WebhookAuthError::Unavailable => cleanup_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                cleanup::CleanupStatus::Retryable,
+                "cleanup authentication unavailable",
+            ),
+            WebhookAuthError::Unauthorized => cleanup_error(
+                StatusCode::UNAUTHORIZED,
+                cleanup::CleanupStatus::Permanent,
+                "unauthorized",
+            ),
+        };
+    }
+    if !cleanup::valid_hash(&request.hash) {
+        return cleanup_error(
+            StatusCode::BAD_REQUEST,
+            cleanup::CleanupStatus::Permanent,
+            "hash must be 64 hexadecimal characters",
+        );
+    }
+    if !cleanup_bucket_matches(&request.expected_bucket, &state.config.gcs_bucket) {
+        return cleanup_error(
+            StatusCode::CONFLICT,
+            cleanup::CleanupStatus::Retryable,
+            "cleanup bucket does not match the edge configuration",
+        );
+    }
+
+    let backend = cleanup::GcsCleanupBackend::new(&state.gcs_client, &state.config.gcs_bucket);
+    let result = cleanup::cleanup_hash(&backend, &request.hash.to_ascii_lowercase()).await;
+    (cleanup_response_status(result.status), Json(result)).into_response()
+}
+
+async fn handle_delete_blob_health(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(error) = validate_webhook_auth(&headers, state.config.webhook_secret.as_deref()) {
+        return match error {
+            WebhookAuthError::Unavailable => cleanup_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                cleanup::CleanupStatus::Retryable,
+                "cleanup authentication unavailable",
+            ),
+            WebhookAuthError::Unauthorized => cleanup_error(
+                StatusCode::UNAUTHORIZED,
+                cleanup::CleanupStatus::Permanent,
+                "unauthorized",
+            ),
+        };
+    }
+
+    let expected_bucket = match headers
+        .get(EXPECTED_GCS_BUCKET_HEADER)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(bucket) if !bucket.is_empty() => bucket,
+        _ => {
+            return cleanup_error(
+                StatusCode::BAD_REQUEST,
+                cleanup::CleanupStatus::Permanent,
+                "expected cleanup bucket header is required",
+            )
+        }
+    };
+    if !cleanup_bucket_matches(expected_bucket, &state.config.gcs_bucket) {
+        return cleanup_error(
+            StatusCode::CONFLICT,
+            cleanup::CleanupStatus::Retryable,
+            "cleanup bucket does not match the expected edge configuration",
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(CleanupHealthResponse {
+            status: cleanup::CleanupStatus::Completed,
+        }),
+    )
+        .into_response()
 }
 
 fn auth_error_response(error: anyhow::Error) -> Response {
@@ -1436,9 +1598,58 @@ async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_invalid_media_signal, media_source_candidates, needs_derivative_sanitize,
-        new_temp_media_path, video_thumbnail_url,
+        classify_invalid_media_signal, cleanup_bucket_matches, cleanup_response_status,
+        media_source_candidates, needs_derivative_sanitize, new_temp_media_path,
+        validate_webhook_auth, video_thumbnail_url, EXPECTED_GCS_BUCKET_HEADER,
     };
+    use axum::http::{header, HeaderMap, HeaderValue};
+
+    #[test]
+    fn cleanup_outcomes_have_distinct_http_classes() {
+        assert_eq!(
+            cleanup_response_status(crate::cleanup::CleanupStatus::Completed),
+            axum::http::StatusCode::OK
+        );
+        assert_eq!(
+            cleanup_response_status(crate::cleanup::CleanupStatus::Retryable),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            cleanup_response_status(crate::cleanup::CleanupStatus::Permanent),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn cleanup_requires_the_edge_and_cloud_run_bucket_to_match() {
+        assert!(cleanup_bucket_matches("media", "media"));
+        assert!(!cleanup_bucket_matches("edge-media", "cloud-media"));
+        assert_eq!(EXPECTED_GCS_BUCKET_HEADER, "x-expected-gcs-bucket");
+    }
+
+    #[test]
+    fn cleanup_authorization_rejects_missing_and_wrong_bearer_tokens() {
+        let mut headers = HeaderMap::new();
+        assert!(validate_webhook_auth(&headers, Some("expected")).is_err());
+
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer wrong"),
+        );
+        assert!(validate_webhook_auth(&headers, Some("expected")).is_err());
+        assert!(validate_webhook_auth(&headers, None).is_err());
+    }
+
+    #[test]
+    fn cleanup_authorization_accepts_matching_bearer_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer expected"),
+        );
+
+        assert!(validate_webhook_auth(&headers, Some("expected")).is_ok());
+    }
 
     #[test]
     fn temp_media_paths_are_unique_per_request() {

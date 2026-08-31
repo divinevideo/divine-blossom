@@ -49,6 +49,7 @@ url = "2"
 anyhow = "1"
 thiserror = "1"
 async-trait = "0.1"
+subtle = "2"
 rand = "0.8"
 
 # Temp files for thumbnail extraction
