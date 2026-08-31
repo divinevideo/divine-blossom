@@ -4635,10 +4635,10 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
 }
 
 fn vanish_response_status(errors: u32, pending: u32) -> StatusCode {
-    if errors > 0 {
-        StatusCode::INTERNAL_SERVER_ERROR
-    } else if pending > 0 {
+    if pending > 0 {
         StatusCode::ACCEPTED
+    } else if errors > 0 {
+        StatusCode::INTERNAL_SERVER_ERROR
     } else {
         StatusCode::OK
     }
@@ -6425,7 +6425,7 @@ mod tests {
     use fastly::Response;
 
     #[test]
-    fn vanish_response_is_retryable_when_any_blob_failed() {
+    fn vanish_response_distinguishes_continuation_from_terminal_failure() {
         assert_eq!(vanish_response_status(0, 0), StatusCode::OK);
         assert_eq!(vanish_response_status(0, 1), StatusCode::ACCEPTED);
         assert_eq!(
@@ -6434,7 +6434,7 @@ mod tests {
         );
         assert_eq!(
             vanish_response_status(1, 1),
-            StatusCode::INTERNAL_SERVER_ERROR
+            StatusCode::ACCEPTED
         );
     }
 

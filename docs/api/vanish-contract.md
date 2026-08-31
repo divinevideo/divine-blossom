@@ -19,13 +19,13 @@ Both endpoints return the same completion fields:
 The admin endpoint additionally echoes its `reason`; both responses identify the requested account.
 
 - HTTP `200` and `vanished: true` mean every discovered blob was either erased or safely unlinked.
-- HTTP `202`, `vanished: false`, `pending > 0`, and `errors: 0` mean the bounded call completed successfully but more entries remain. Callers must retry the same account until it returns a terminal response.
-- HTTP `5xx`, `vanished: false`, and `errors > 0` mean at least one blob could not be completed. Callers must retry the same account.
+- HTTP `202`, `vanished: false`, and `pending > 0` mean the bounded call made progress but more entries remain. The response can also contain `errors > 0` for entries that were attempted and failed. Callers must retry the same account until it returns a terminal response.
+- HTTP `5xx`, `vanished: false`, `pending: 0`, and `errors > 0` mean the call reached a terminal server failure instead of completing the account. Callers must retry the same account.
 - `fully_deleted` counts only sole-owner blobs whose main objects were confirmed deleted or absent from both GCS and Fastly Object Storage (FOS), whose required GCS derivatives and unshared derived audio were confirmed deleted or absent, whose erasure evidence was durably recorded, and whose metadata cleanup and final CDN purge completed.
 - `unlinked` counts shared blobs that remain because another account still references them.
 - `pending` counts entries deferred by the per-call bound. Failed attempted entries are counted in `errors`, not `pending`, and remain discoverable for retry.
 
-`vanished` is true only when `pending == 0`, `errors == 0`, and account-list finalization completed. A response never contains both `pending > 0` and `vanished: true`.
+`vanished` is true only when `pending == 0`, `errors == 0`, and account-list finalization completed. This field, not the HTTP status, gates irreversible downstream deletion. A response never contains both `pending > 0` and `vanished: true`.
 
 ## Retry behavior
 
