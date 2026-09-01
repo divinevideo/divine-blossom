@@ -608,8 +608,17 @@ mod tests {
         }
         let ops = MockSharedKeyOps::default();
 
-        apply_vanish_shared_updates_with_ops(&updates, &"1".repeat(64), &[], true, &ops)
+        apply_vanish_shared_updates_with_ops(&updates, &"1".repeat(64), &[], false, &ops)
             .expect("shared updates should flush");
+
+        assert_eq!(
+            *ops.calls.borrow(),
+            vec![("stats", 10), ("recent", 10), ("list", 10)]
+        );
+
+        ops.calls.borrow_mut().clear();
+        apply_vanish_shared_updates_with_ops(&updates, &"1".repeat(64), &[], true, &ops)
+            .expect("completing shared updates should flush");
 
         assert_eq!(
             *ops.calls.borrow(),
