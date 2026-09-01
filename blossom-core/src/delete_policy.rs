@@ -135,13 +135,12 @@ impl VanishSharedUpdates {
 pub trait VanishSharedKeyOps {
     fn update_stats_on_remove_batch(&self, metadata: &[BlobMetadata]);
     fn remove_from_recent_index_batch(&self, hashes: &[String]);
-    fn delete_user_list(&self, pubkey: &str) -> Result<()>;
     fn update_user_list_for_vanish(
         &self,
         pubkey: &str,
         removals: &[String],
         retry_hashes: &[String],
-    ) -> Result<()>;
+    ) -> Result<bool>;
 }
 
 /// Apply each account-wide KV mutation at most once for one vanish call.
@@ -151,20 +150,22 @@ pub fn apply_vanish_shared_updates_with_ops<O: VanishSharedKeyOps>(
     retry_hashes: &[String],
     account_complete: bool,
     ops: &O,
-) -> Result<()> {
+) -> Result<bool> {
     if !updates.stats_removals.is_empty() {
         ops.update_stats_on_remove_batch(&updates.stats_removals);
     }
     if !updates.recent_index_removals.is_empty() {
         ops.remove_from_recent_index_batch(&updates.recent_index_removals);
     }
-    if account_complete {
-        return ops.delete_user_list(pubkey);
+    if !account_complete && updates.user_list_removals.is_empty() && retry_hashes.is_empty() {
+        return Ok(false);
     }
-    if updates.user_list_removals.is_empty() && retry_hashes.is_empty() {
-        return Ok(());
-    }
-    ops.update_user_list_for_vanish(pubkey, &updates.user_list_removals, retry_hashes)
+    let list_empty = ops.update_user_list_for_vanish(
+        pubkey,
+        &updates.user_list_removals,
+        retry_hashes,
+    )?;
+    Ok(account_complete && list_empty)
 }
 
 /// Result of applying the reference and ownership policy to a vanish entry.
@@ -572,6 +573,7 @@ mod tests {
         #[derive(Default)]
         struct MockSharedKeyOps {
             calls: RefCell<Vec<(&'static str, usize)>>,
+            list_empty: bool,
         }
 
         impl VanishSharedKeyOps for MockSharedKeyOps {
@@ -583,19 +585,14 @@ mod tests {
                 self.calls.borrow_mut().push(("recent", hashes.len()));
             }
 
-            fn delete_user_list(&self, _pubkey: &str) -> Result<()> {
-                self.calls.borrow_mut().push(("list-delete", 0));
-                Ok(())
-            }
-
             fn update_user_list_for_vanish(
                 &self,
                 _pubkey: &str,
                 removals: &[String],
                 _retry_hashes: &[String],
-            ) -> Result<()> {
+            ) -> Result<bool> {
                 self.calls.borrow_mut().push(("list", removals.len()));
-                Ok(())
+                Ok(self.list_empty)
             }
         }
 
@@ -606,23 +603,56 @@ mod tests {
                 metadata: Some(sample_metadata(BlobStatus::Active)),
             });
         }
-        let ops = MockSharedKeyOps::default();
+        let ops = MockSharedKeyOps {
+            list_empty: true,
+            ..Default::default()
+        };
 
-        apply_vanish_shared_updates_with_ops(&updates, &"1".repeat(64), &[], false, &ops)
+        let account_complete = apply_vanish_shared_updates_with_ops(
+            &updates,
+            &"1".repeat(64),
+            &[],
+            false,
+            &ops,
+        )
             .expect("shared updates should flush");
 
+        assert!(!account_complete);
         assert_eq!(
             *ops.calls.borrow(),
             vec![("stats", 10), ("recent", 10), ("list", 10)]
         );
 
+        let concurrent_upload_ops = MockSharedKeyOps::default();
+        let account_complete = apply_vanish_shared_updates_with_ops(
+            &updates,
+            &"1".repeat(64),
+            &[],
+            true,
+            &concurrent_upload_ops,
+        )
+        .expect("concurrent upload should preserve the list");
+
+        assert!(!account_complete);
+        assert_eq!(
+            *concurrent_upload_ops.calls.borrow(),
+            vec![("stats", 10), ("recent", 10), ("list", 10)]
+        );
+
         ops.calls.borrow_mut().clear();
-        apply_vanish_shared_updates_with_ops(&updates, &"1".repeat(64), &[], true, &ops)
+        let account_complete = apply_vanish_shared_updates_with_ops(
+            &updates,
+            &"1".repeat(64),
+            &[],
+            true,
+            &ops,
+        )
             .expect("completing shared updates should flush");
 
+        assert!(account_complete);
         assert_eq!(
             *ops.calls.borrow(),
-            vec![("stats", 10), ("recent", 10), ("list-delete", 0)]
+            vec![("stats", 10), ("recent", 10), ("list", 10)]
         );
     }
 

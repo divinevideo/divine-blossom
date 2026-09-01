@@ -23,6 +23,9 @@ const BLOB_PREFIX: &str = "blob:";
 /// Key prefix for user blob lists
 const LIST_PREFIX: &str = "list:";
 
+/// Expire an emptied vanish list without a second write to its rate-limited key.
+const VANISH_EMPTY_LIST_TTL: Duration = Duration::from_secs(1);
+
 /// Key for global statistics
 const STATS_KEY: &str = "stats:global";
 
@@ -571,19 +574,15 @@ pub fn update_user_list_for_vanish(
     pubkey: &str,
     removals: &[String],
     retry_hashes: &[String],
-) -> Result<()> {
+) -> Result<bool> {
     const MAX_ATTEMPTS: usize = 5;
-
-    if removals.is_empty() && retry_hashes.is_empty() {
-        return Ok(());
-    }
 
     let store = open_store()?;
     let key = format!("{}{}", LIST_PREFIX, pubkey.to_lowercase());
     for _ in 0..MAX_ATTEMPTS {
         let mut result = match store.lookup(&key) {
             Ok(result) => result,
-            Err(KVStoreError::ItemNotFound) => return Ok(()),
+            Err(KVStoreError::ItemNotFound) => return Ok(true),
             Err(error) => {
                 return Err(BlossomError::MetadataError(format!(
                     "Failed to load list for vanish update: {error}"
@@ -599,8 +598,8 @@ pub fn update_user_list_for_vanish(
             })?;
         let original = hashes.clone();
         apply_vanish_user_list_update(&mut hashes, removals, retry_hashes);
-        if hashes == original {
-            return Ok(());
+        if hashes == original && !hashes.is_empty() {
+            return Ok(false);
         }
         let value = serde_json::to_string(&hashes).map_err(|error| {
             BlossomError::MetadataError(format!(
@@ -608,12 +607,14 @@ pub fn update_user_list_for_vanish(
             ))
         })?;
 
-        match store
-            .build_insert()
-            .if_generation_match(generation)
-            .execute(&key, value)
-        {
-            Ok(()) => return Ok(()),
+        let insert = store.build_insert().if_generation_match(generation);
+        let insert = if hashes.is_empty() {
+            insert.time_to_live(VANISH_EMPTY_LIST_TTL)
+        } else {
+            insert
+        };
+        match insert.execute(&key, value) {
+            Ok(()) => return Ok(hashes.is_empty()),
             Err(KVStoreError::ItemPreconditionFailed) => continue,
             Err(error) => {
                 return Err(BlossomError::MetadataError(format!(
@@ -1624,21 +1625,6 @@ pub fn delete_subtitle_data(hash: &str) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Delete a user's entire blob list
-pub fn delete_user_list(pubkey: &str) -> Result<()> {
-    let store = open_store()?;
-    let key = format!("{}{}", LIST_PREFIX, pubkey.to_lowercase());
-
-    match store.delete(&key) {
-        Ok(()) => Ok(()),
-        Err(KVStoreError::ItemNotFound) => Ok(()),
-        Err(e) => Err(BlossomError::MetadataError(format!(
-            "Failed to delete user list: {}",
-            e
-        ))),
-    }
 }
 
 /// Remove a pubkey from the user index (with retry for concurrent writes)

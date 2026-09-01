@@ -4511,6 +4511,13 @@ fn increment_vanish_outcome(execution: &mut VanishExecution, outcome: VanishBlob
     }
 }
 
+fn vanish_shared_update_error_count(completed_outcomes: usize, completed_malformed: u32) -> u32 {
+    u32::try_from(completed_outcomes)
+        .unwrap_or(u32::MAX)
+        .saturating_add(completed_malformed)
+        .max(1)
+}
+
 /// Execute one bounded account-erasure batch.
 fn execute_vanish(pubkey: &str) -> VanishExecution {
     let started = Instant::now();
@@ -4642,30 +4649,33 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
             }
         }
     }
-    let account_complete = execution.pending == 0 && execution.errors == 0;
-    match apply_vanish_shared_updates_with_ops(
+    let expected_account_complete = execution.pending == 0 && execution.errors == 0;
+    let account_complete = match apply_vanish_shared_updates_with_ops(
         &shared_updates,
         pubkey,
         &retry_hashes,
-        account_complete,
+        expected_account_complete,
         &DefaultVanishSharedKeyOps,
     ) {
-        Ok(()) => {
+        Ok(list_empty) => {
             for outcome in completed_outcomes {
                 increment_vanish_outcome(&mut execution, outcome);
             }
             execution.malformed_hash_exceptions += completed_malformed;
+            expected_account_complete && list_empty
         }
         Err(error) => {
             eprintln!(
                 "[VANISH] pubkey={} failed shared KV update: {}",
                 pubkey, error
             );
-            execution.errors += u32::try_from(completed_outcomes.len())
-                .unwrap_or(u32::MAX)
-                .saturating_add(completed_malformed);
+            execution.errors += vanish_shared_update_error_count(
+                completed_outcomes.len(),
+                completed_malformed,
+            );
+            false
         }
-    }
+    };
     let kv_finalize_ms = finalize_started.elapsed().as_millis();
 
     if account_complete && execution.errors == 0 {
@@ -6620,9 +6630,9 @@ mod tests {
         should_reset_transcript_failure_on_clean_upload, should_set_audio_content_length,
         surrogate_key_hash_from_path, trusted_upload_service_terminal_derivative_error,
         upload_capability_headers, upload_control_host, upload_exposed_headers,
-        upload_from_resumable_completion, vanish_response_status, AudioReuseAvailability,
-        DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState,
-        VANISH_BATCH_SIZE,
+        upload_from_resumable_completion, vanish_response_status,
+        vanish_shared_update_error_count, AudioReuseAvailability, DerivativeObservation,
+        TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState, VANISH_BATCH_SIZE,
     };
     use crate::blossom::{
         BlobStatus, ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus,
@@ -6644,6 +6654,12 @@ mod tests {
             vanish_response_status(1, 1),
             StatusCode::ACCEPTED
         );
+    }
+
+    #[test]
+    fn vanish_shared_update_failure_always_records_an_error() {
+        assert_eq!(vanish_shared_update_error_count(0, 0), 1);
+        assert_eq!(vanish_shared_update_error_count(10, 0), 10);
     }
 
     #[test]
