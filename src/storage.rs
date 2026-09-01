@@ -1231,6 +1231,11 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
                             .extend(failed.iter().filter_map(|key| hash_for_vanish_key(key)));
                     }
                 } else {
+                    eprintln!(
+                        "[VANISH] multi-delete unmatched_stage={} expected_stages={:?}",
+                        stage,
+                        requested_by_stage.keys().collect::<Vec<_>>()
+                    );
                     result.failed_hashes.extend(hashes.iter().cloned());
                     main_origin_failures.extend(hashes.iter().cloned());
                 }
