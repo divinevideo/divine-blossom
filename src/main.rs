@@ -4521,13 +4521,13 @@ fn vanish_shared_update_error_count(completed_outcomes: usize, completed_malform
 fn reconcile_vanish_list_completion(
     execution: &mut VanishExecution,
     expected_account_complete: bool,
-    list_empty: bool,
+    shared_updates_complete: bool,
 ) -> bool {
-    if expected_account_complete && !list_empty {
+    if expected_account_complete && !shared_updates_complete {
         // A concurrent addition is pending work even though it was absent from this batch.
         execution.pending = execution.pending.max(1);
     }
-    expected_account_complete && list_empty
+    shared_updates_complete
 }
 
 /// Execute one bounded account-erasure batch.
@@ -4662,14 +4662,14 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         }
     }
     let expected_account_complete = execution.pending == 0 && execution.errors == 0;
-    let account_complete = match apply_vanish_shared_updates_with_ops(
+    let shared_updates_complete = match apply_vanish_shared_updates_with_ops(
         &shared_updates,
         pubkey,
         &retry_hashes,
         expected_account_complete,
-        &DefaultVanishSharedKeyOps,
+        &DefaultVanishSharedKeyOps::new(pubkey),
     ) {
-        Ok(list_empty) => {
+        Ok(shared_updates_complete) => {
             for outcome in completed_outcomes {
                 increment_vanish_outcome(&mut execution, outcome);
             }
@@ -4677,7 +4677,7 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
             reconcile_vanish_list_completion(
                 &mut execution,
                 expected_account_complete,
-                list_empty,
+                shared_updates_complete,
             )
         }
         Err(error) => {
@@ -4694,7 +4694,7 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     };
     let kv_finalize_ms = finalize_started.elapsed().as_millis();
 
-    if account_complete && execution.errors == 0 {
+    if shared_updates_complete {
         if let Err(error) = remove_from_user_index(pubkey) {
             eprintln!(
                 "[VANISH] pubkey={} failed to remove account from user index: {}",

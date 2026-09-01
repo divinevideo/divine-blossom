@@ -5,8 +5,13 @@ use crate::blossom::{
     AudioMapping, BlobMetadata, BlobStatus, GlobalStats, RecentIndex, SubtitleJob, UserIndex,
 };
 use crate::error::{BlossomError, Result};
+use blossom_core::conditional_update::{
+    update_json_conditionally_with_io, ConditionalJsonMutation,
+};
 use fastly::cache::simple as simple_cache;
 use fastly::kv_store::{InsertMode, KVStore, KVStoreError};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -23,7 +28,9 @@ const BLOB_PREFIX: &str = "blob:";
 /// Key prefix for user blob lists
 const LIST_PREFIX: &str = "list:";
 
-/// Expire an emptied vanish list without a second write to its rate-limited key.
+/// Fastly deletes cannot carry a generation precondition, so expire the empty
+/// value written by the guarded update instead of risking deletion of a list
+/// concurrently changed by an upload.
 const VANISH_EMPTY_LIST_TTL: Duration = Duration::from_secs(1);
 
 /// Key for global statistics
@@ -31,6 +38,52 @@ const STATS_KEY: &str = "stats:global";
 
 /// Key for recent uploads index
 const RECENT_INDEX_KEY: &str = "index:recent";
+
+/// Mutate one JSON KV value without overwriting a concurrent writer.
+///
+/// Existing values use their generation as a precondition. Missing values use
+/// add-only insertion, so a concurrent creator also forces a fresh read.
+fn update_json_conditionally<T, R, F>(
+    key: &str,
+    max_attempts: usize,
+    operation: &str,
+    mutate: F,
+) -> Result<R>
+where
+    T: DeserializeOwned + Serialize,
+    F: FnMut(Option<T>) -> std::result::Result<ConditionalJsonMutation<T, R>, String>,
+{
+    let store = open_store()?;
+    update_json_conditionally_with_io(
+        max_attempts,
+        operation,
+        mutate,
+        || match store.lookup(key) {
+            Ok(mut lookup) => {
+                let generation = lookup.current_generation();
+                Ok(Some((lookup.take_body().into_string(), generation)))
+            }
+            Err(KVStoreError::ItemNotFound) => Ok(None),
+            Err(error) => Err(format!("Failed to load {operation}: {error}")),
+        },
+        |value, generation, time_to_live| {
+            let insert = match generation {
+                Some(generation) => store.build_insert().if_generation_match(generation),
+                None => store.build_insert().mode(InsertMode::Add),
+            };
+            let insert = match time_to_live {
+                Some(ttl) => insert.time_to_live(ttl),
+                None => insert,
+            };
+            match insert.execute(key, value) {
+                Ok(()) => Ok(true),
+                Err(KVStoreError::ItemPreconditionFailed) => Ok(false),
+                Err(error) => Err(format!("Failed to store {operation}: {error}")),
+            }
+        },
+    )
+    .map_err(BlossomError::MetadataError)
+}
 
 /// Key for user index (list of all uploaders)
 const USER_INDEX_KEY: &str = "index:users";
@@ -478,72 +531,45 @@ pub fn get_user_blobs(pubkey: &str) -> Result<Vec<String>> {
 /// Add a blob hash to user's list with retry for concurrent writes
 pub fn add_to_user_list(pubkey: &str, hash: &str) -> Result<()> {
     let hash_lower = hash.to_lowercase();
-
-    // Retry up to 5 times with increasing delay for concurrent write conflicts
-    for attempt in 0..5 {
-        let mut hashes = get_user_blobs(pubkey)?;
-
+    let key = format!("{}{}", LIST_PREFIX, pubkey.to_lowercase());
+    update_json_conditionally(&key, 5, "user list update", |current| {
+        let mut hashes: Vec<String> = current.unwrap_or_default();
         if hashes
             .iter()
             .any(|entry| entry.eq_ignore_ascii_case(&hash_lower))
         {
-            // Already in list, nothing to do
-            return Ok(());
+            return Ok(ConditionalJsonMutation::Complete(()));
         }
-
         hashes.push(hash_lower.clone());
-
-        match put_user_list(pubkey, &hashes) {
-            Ok(()) => return Ok(()),
-            Err(e) if attempt < 4 => {
-                // Log retry and continue
-                eprintln!("[KV] Retry {} for user list update: {}", attempt + 1, e);
-                // Small delay before retry (10ms, 20ms, 40ms, 80ms)
-                // Note: Fastly Compute doesn't have sleep, so we just retry immediately
-                // The re-read of the list should pick up concurrent writes
-                continue;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-
-    // Should never reach here, but just in case
-    Err(BlossomError::MetadataError(
-        "Max retries exceeded for list update".into(),
-    ))
+        Ok(ConditionalJsonMutation::Write {
+            value: hashes,
+            result: (),
+            time_to_live: None,
+        })
+    })
 }
 
 /// Remove a blob hash from user's list with retry for concurrent writes
 pub fn remove_from_user_list(pubkey: &str, hash: &str) -> Result<()> {
     let hash_lower = hash.to_lowercase();
-
-    // Retry up to 5 times for concurrent write conflicts
-    for attempt in 0..5 {
-        let mut hashes = get_user_blobs(pubkey)?;
-
+    let key = format!("{}{}", LIST_PREFIX, pubkey.to_lowercase());
+    update_json_conditionally(&key, 5, "user list removal", |current| {
+        let Some(mut hashes): Option<Vec<String>> = current else {
+            return Ok(ConditionalJsonMutation::Complete(()));
+        };
         if !hashes
             .iter()
             .any(|entry| entry.eq_ignore_ascii_case(&hash_lower))
         {
-            // Not in list, nothing to do
-            return Ok(());
+            return Ok(ConditionalJsonMutation::Complete(()));
         }
-
         hashes.retain(|entry| !entry.eq_ignore_ascii_case(&hash_lower));
-
-        match put_user_list(pubkey, &hashes) {
-            Ok(()) => return Ok(()),
-            Err(e) if attempt < 4 => {
-                eprintln!("[KV] Retry {} for user list removal: {}", attempt + 1, e);
-                continue;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-
-    Err(BlossomError::MetadataError(
-        "Max retries exceeded for list removal".into(),
-    ))
+        Ok(ConditionalJsonMutation::Write {
+            value: hashes,
+            result: (),
+            time_to_live: None,
+        })
+    })
 }
 
 fn rotate_hashes_to_end(hashes: &mut Vec<String>, retry_hashes: &HashSet<String>) {
@@ -577,71 +603,28 @@ pub fn update_user_list_for_vanish(
 ) -> Result<bool> {
     const MAX_ATTEMPTS: usize = 5;
 
-    let store = open_store()?;
     let key = format!("{}{}", LIST_PREFIX, pubkey.to_lowercase());
-    for _ in 0..MAX_ATTEMPTS {
-        let mut result = match store.lookup(&key) {
-            Ok(result) => result,
-            Err(KVStoreError::ItemNotFound) => return Ok(true),
-            Err(error) => {
-                return Err(BlossomError::MetadataError(format!(
-                    "Failed to load list for vanish update: {error}"
-                )))
+    update_json_conditionally(
+        &key,
+        MAX_ATTEMPTS,
+        "list for vanish update",
+        |current: Option<Vec<String>>| {
+            let Some(mut hashes) = current else {
+                return Ok(ConditionalJsonMutation::Complete(true));
+            };
+            let original = hashes.clone();
+            apply_vanish_user_list_update(&mut hashes, removals, retry_hashes);
+            if hashes == original && !hashes.is_empty() {
+                return Ok(ConditionalJsonMutation::Complete(false));
             }
-        };
-        let generation = result.current_generation();
-        let mut hashes: Vec<String> = serde_json::from_str(&result.take_body().into_string())
-            .map_err(|error| {
-                BlossomError::MetadataError(format!(
-                    "Failed to parse list for vanish update: {error}"
-                ))
-            })?;
-        let original = hashes.clone();
-        apply_vanish_user_list_update(&mut hashes, removals, retry_hashes);
-        if hashes == original && !hashes.is_empty() {
-            return Ok(false);
-        }
-        let value = serde_json::to_string(&hashes).map_err(|error| {
-            BlossomError::MetadataError(format!(
-                "Failed to serialize list for vanish update: {error}"
-            ))
-        })?;
-
-        let insert = store.build_insert().if_generation_match(generation);
-        let insert = if hashes.is_empty() {
-            insert.time_to_live(VANISH_EMPTY_LIST_TTL)
-        } else {
-            insert
-        };
-        match insert.execute(&key, value) {
-            Ok(()) => return Ok(hashes.is_empty()),
-            Err(KVStoreError::ItemPreconditionFailed) => continue,
-            Err(error) => {
-                return Err(BlossomError::MetadataError(format!(
-                    "Failed to store list for vanish update: {error}"
-                )))
-            }
-        }
-    }
-
-    Err(BlossomError::MetadataError(
-        "Vanish list changed too many times".into(),
-    ))
-}
-
-/// Store user's blob list
-fn put_user_list(pubkey: &str, hashes: &[String]) -> Result<()> {
-    let store = open_store()?;
-    let key = format!("{}{}", LIST_PREFIX, pubkey.to_lowercase());
-
-    let json = serde_json::to_string(hashes)
-        .map_err(|e| BlossomError::MetadataError(format!("Failed to serialize list: {}", e)))?;
-
-    store
-        .insert(&key, json)
-        .map_err(|e| BlossomError::MetadataError(format!("Failed to store list: {}", e)))?;
-
-    Ok(())
+            let list_empty = hashes.is_empty();
+            Ok(ConditionalJsonMutation::Write {
+                value: hashes,
+                result: list_empty,
+                time_to_live: list_empty.then_some(VANISH_EMPTY_LIST_TTL),
+            })
+        },
+    )
 }
 
 /// Update blob status (for moderation)
@@ -1081,22 +1064,15 @@ fn put_global_stats(stats: &GlobalStats) -> Result<()> {
 
 /// Update global stats when a blob is added (with retry for concurrent writes)
 pub fn update_stats_on_add(metadata: &BlobMetadata) -> Result<()> {
-    for attempt in 0..5 {
-        let mut stats = get_global_stats()?;
+    update_json_conditionally(STATS_KEY, 5, "stats add", |current| {
+        let mut stats: GlobalStats = current.unwrap_or_default();
         stats.add_blob(metadata);
-
-        match put_global_stats(&stats) {
-            Ok(()) => return Ok(()),
-            Err(e) if attempt < 4 => {
-                eprintln!("[KV] Retry {} for stats add: {}", attempt + 1, e);
-                continue;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Err(BlossomError::MetadataError(
-        "Max retries exceeded for stats update".into(),
-    ))
+        Ok(ConditionalJsonMutation::Write {
+            value: stats,
+            result: (),
+            time_to_live: None,
+        })
+    })
 }
 
 /// Remove a vanish batch from global stats with one conditional write.
@@ -1107,91 +1083,50 @@ pub fn update_stats_on_remove_batch(metadata: &[BlobMetadata]) -> Result<()> {
         return Ok(());
     }
 
-    let store = open_store()?;
-    for _ in 0..MAX_ATTEMPTS {
-        let mut result = match store.lookup(STATS_KEY) {
-            Ok(result) => result,
-            Err(KVStoreError::ItemNotFound) => return Ok(()),
-            Err(error) => {
-                return Err(BlossomError::MetadataError(format!(
-                    "Failed to load stats for vanish update: {error}"
-                )))
+    update_json_conditionally(
+        STATS_KEY,
+        MAX_ATTEMPTS,
+        "stats for vanish update",
+        |current: Option<GlobalStats>| {
+            let Some(mut stats) = current else {
+                return Ok(ConditionalJsonMutation::Complete(()));
+            };
+            for blob in metadata {
+                stats.remove_blob(blob);
             }
-        };
-        let generation = result.current_generation();
-        let mut stats: GlobalStats = serde_json::from_str(&result.take_body().into_string())
-            .map_err(|error| {
-                BlossomError::MetadataError(format!(
-                    "Failed to parse stats for vanish update: {error}"
-                ))
-            })?;
-        for blob in metadata {
-            stats.remove_blob(blob);
-        }
-        let value = serde_json::to_string(&stats).map_err(|error| {
-            BlossomError::MetadataError(format!(
-                "Failed to serialize stats for vanish update: {error}"
-            ))
-        })?;
-
-        match store
-            .build_insert()
-            .if_generation_match(generation)
-            .execute(STATS_KEY, value)
-        {
-            Ok(()) => return Ok(()),
-            Err(KVStoreError::ItemPreconditionFailed) => continue,
-            Err(error) => {
-                return Err(BlossomError::MetadataError(format!(
-                    "Failed to store stats for vanish update: {error}"
-                )))
-            }
-        }
-    }
-
-    Err(BlossomError::MetadataError(
-        "Vanish stats changed too many times".into(),
-    ))
+            Ok(ConditionalJsonMutation::Write {
+                value: stats,
+                result: (),
+                time_to_live: None,
+            })
+        },
+    )
 }
 
 /// Update global stats when blob status changes (with retry for concurrent writes)
 pub fn update_stats_on_status_change(old_status: BlobStatus, new_status: BlobStatus) -> Result<()> {
-    for attempt in 0..5 {
-        let mut stats = get_global_stats()?;
+    update_json_conditionally(STATS_KEY, 5, "stats status change", |current| {
+        let mut stats: GlobalStats = current.unwrap_or_default();
         stats.update_status(old_status, new_status);
-
-        match put_global_stats(&stats) {
-            Ok(()) => return Ok(()),
-            Err(e) if attempt < 4 => {
-                eprintln!("[KV] Retry {} for status change: {}", attempt + 1, e);
-                continue;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Err(BlossomError::MetadataError(
-        "Max retries exceeded for stats update".into(),
-    ))
+        Ok(ConditionalJsonMutation::Write {
+            value: stats,
+            result: (),
+            time_to_live: None,
+        })
+    })
 }
 
 /// Increment unique uploaders count (with retry for concurrent writes)
 pub fn increment_unique_uploaders() -> Result<()> {
-    for attempt in 0..5 {
-        let mut stats = get_global_stats()?;
+    update_json_conditionally(STATS_KEY, 5, "unique uploaders increment", |current| {
+        let mut stats: GlobalStats = current.unwrap_or_default();
         stats.unique_uploaders += 1;
-
-        match put_global_stats(&stats) {
-            Ok(()) => return Ok(()),
-            Err(e) if attempt < 4 => {
-                eprintln!("[KV] Retry {} for uploaders increment: {}", attempt + 1, e);
-                continue;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Err(BlossomError::MetadataError(
-        "Max retries exceeded for stats update".into(),
-    ))
+        Ok(ConditionalJsonMutation::Write {
+            value: stats,
+            result: (),
+            time_to_live: None,
+        })
+    })
 }
 
 /// Replace global stats entirely (used for backfill)
@@ -1240,45 +1175,35 @@ fn put_recent_index(index: &RecentIndex) -> Result<()> {
 /// Add a hash to the recent index (with retry for concurrent writes)
 pub fn add_to_recent_index(hash: &str) -> Result<()> {
     let hash_lower = hash.to_lowercase();
-
-    for attempt in 0..5 {
-        let mut index = get_recent_index()?;
+    update_json_conditionally(RECENT_INDEX_KEY, 5, "recent index add", |current| {
+        let mut index: RecentIndex = current.unwrap_or_default();
         index.add(hash_lower.clone());
-
-        match put_recent_index(&index) {
-            Ok(()) => return Ok(()),
-            Err(e) if attempt < 4 => {
-                eprintln!("[KV] Retry {} for recent index add: {}", attempt + 1, e);
-                continue;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Err(BlossomError::MetadataError(
-        "Max retries exceeded for recent index update".into(),
-    ))
+        Ok(ConditionalJsonMutation::Write {
+            value: index,
+            result: (),
+            time_to_live: None,
+        })
+    })
 }
 
 /// Remove a hash from the recent index (with retry for concurrent writes)
 pub fn remove_from_recent_index(hash: &str) -> Result<()> {
     let hash_lower = hash.to_lowercase();
-
-    for attempt in 0..5 {
-        let mut index = get_recent_index()?;
+    update_json_conditionally(RECENT_INDEX_KEY, 5, "recent index removal", |current| {
+        let Some(mut index): Option<RecentIndex> = current else {
+            return Ok(ConditionalJsonMutation::Complete(()));
+        };
+        let original_len = index.hashes.len();
         index.remove(&hash_lower);
-
-        match put_recent_index(&index) {
-            Ok(()) => return Ok(()),
-            Err(e) if attempt < 4 => {
-                eprintln!("[KV] Retry {} for recent index remove: {}", attempt + 1, e);
-                continue;
-            }
-            Err(e) => return Err(e),
+        if index.hashes.len() == original_len {
+            return Ok(ConditionalJsonMutation::Complete(()));
         }
-    }
-    Err(BlossomError::MetadataError(
-        "Max retries exceeded for recent index update".into(),
-    ))
+        Ok(ConditionalJsonMutation::Write {
+            value: index,
+            result: (),
+            time_to_live: None,
+        })
+    })
 }
 
 /// Remove a vanish batch from the recent index with one conditional write.
@@ -1290,55 +1215,28 @@ pub fn remove_from_recent_index_batch(hashes: &[String]) -> Result<()> {
     }
 
     let removals: HashSet<String> = hashes.iter().map(|hash| hash.to_lowercase()).collect();
-    let store = open_store()?;
-    for _ in 0..MAX_ATTEMPTS {
-        let mut result = match store.lookup(RECENT_INDEX_KEY) {
-            Ok(result) => result,
-            Err(KVStoreError::ItemNotFound) => return Ok(()),
-            Err(error) => {
-                return Err(BlossomError::MetadataError(format!(
-                    "Failed to load recent index for vanish update: {error}"
-                )))
+    update_json_conditionally(
+        RECENT_INDEX_KEY,
+        MAX_ATTEMPTS,
+        "recent index for vanish update",
+        |current: Option<RecentIndex>| {
+            let Some(mut index) = current else {
+                return Ok(ConditionalJsonMutation::Complete(()));
+            };
+            let original_len = index.hashes.len();
+            index
+                .hashes
+                .retain(|hash| !removals.contains(&hash.to_lowercase()));
+            if index.hashes.len() == original_len {
+                return Ok(ConditionalJsonMutation::Complete(()));
             }
-        };
-        let generation = result.current_generation();
-        let mut index: RecentIndex = serde_json::from_str(&result.take_body().into_string())
-            .map_err(|error| {
-                BlossomError::MetadataError(format!(
-                    "Failed to parse recent index for vanish update: {error}"
-                ))
-            })?;
-        let original_len = index.hashes.len();
-        index
-            .hashes
-            .retain(|hash| !removals.contains(&hash.to_lowercase()));
-        if index.hashes.len() == original_len {
-            return Ok(());
-        }
-        let value = serde_json::to_string(&index).map_err(|error| {
-            BlossomError::MetadataError(format!(
-                "Failed to serialize recent index for vanish update: {error}"
-            ))
-        })?;
-
-        match store
-            .build_insert()
-            .if_generation_match(generation)
-            .execute(RECENT_INDEX_KEY, value)
-        {
-            Ok(()) => return Ok(()),
-            Err(KVStoreError::ItemPreconditionFailed) => continue,
-            Err(error) => {
-                return Err(BlossomError::MetadataError(format!(
-                    "Failed to store recent index for vanish update: {error}"
-                )))
-            }
-        }
-    }
-
-    Err(BlossomError::MetadataError(
-        "Vanish recent index changed too many times".into(),
-    ))
+            Ok(ConditionalJsonMutation::Write {
+                value: index,
+                result: (),
+                time_to_live: None,
+            })
+        },
+    )
 }
 
 /// Replace recent index entirely (used for backfill)

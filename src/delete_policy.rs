@@ -88,18 +88,34 @@ impl VanishBlobOps for DefaultCreatorDeleteOps {
     }
 }
 
-pub(crate) struct DefaultVanishSharedKeyOps;
+pub(crate) struct DefaultVanishSharedKeyOps<'a> {
+    pubkey: &'a str,
+}
 
-impl VanishSharedKeyOps for DefaultVanishSharedKeyOps {
+impl<'a> DefaultVanishSharedKeyOps<'a> {
+    pub(crate) fn new(pubkey: &'a str) -> Self {
+        Self { pubkey }
+    }
+}
+
+impl VanishSharedKeyOps for DefaultVanishSharedKeyOps<'_> {
     fn update_stats_on_remove_batch(&self, metadata: &[BlobMetadata]) {
         if let Err(error) = update_stats_on_remove_batch(metadata) {
-            eprintln!("[VANISH] failed to update global stats batch: {error}");
+            eprintln!(
+                "[VANISH] pubkey={} failed to update global stats batch count={}: {error}",
+                self.pubkey,
+                metadata.len()
+            );
         }
     }
 
     fn remove_from_recent_index_batch(&self, hashes: &[String]) {
         if let Err(error) = remove_from_recent_index_batch(hashes) {
-            eprintln!("[VANISH] failed to update recent index batch: {error}");
+            eprintln!(
+                "[VANISH] pubkey={} failed to update recent index batch count={}: {error}",
+                self.pubkey,
+                hashes.len()
+            );
         }
     }
 

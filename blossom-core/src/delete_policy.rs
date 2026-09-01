@@ -160,11 +160,8 @@ pub fn apply_vanish_shared_updates_with_ops<O: VanishSharedKeyOps>(
     if !account_complete && updates.user_list_removals.is_empty() && retry_hashes.is_empty() {
         return Ok(false);
     }
-    let list_empty = ops.update_user_list_for_vanish(
-        pubkey,
-        &updates.user_list_removals,
-        retry_hashes,
-    )?;
+    let list_empty =
+        ops.update_user_list_for_vanish(pubkey, &updates.user_list_removals, retry_hashes)?;
     Ok(account_complete && list_empty)
 }
 
@@ -237,10 +234,8 @@ pub fn finalize_erased_vanish_blob_with_ops<O: VanishBlobOps>(
     ops.put_erasure_evidence(&blob.hash)?;
     if blob.metadata.is_some() {
         ops.delete_blob_metadata(&blob.hash)?;
-        ops.delete_blob_kv_artifacts(&blob.hash);
-    } else {
-        ops.delete_blob_kv_artifacts(&blob.hash);
     }
+    ops.delete_blob_kv_artifacts(&blob.hash);
     Ok(())
 }
 
@@ -569,6 +564,40 @@ mod tests {
     }
 
     #[test]
+    fn vanish_stale_list_entry_retries_as_metadata_less_erasure() {
+        let ops = vanish_ops_with_owner();
+
+        let first_blob = match prepare_vanish_blob_with_ops(HASH, &"1".repeat(64), &ops).unwrap() {
+            PreparedVanishBlobOrOutcome::Erase(blob) => blob,
+            PreparedVanishBlobOrOutcome::Completed(_) => panic!("sole owner must be erased"),
+        };
+        finalize_erased_vanish_blob_with_ops(&first_blob, &ops)
+            .expect("first erasure should remove metadata");
+        assert!(ops.metadata.borrow().is_none());
+        assert!(ops.refs.borrow().is_empty());
+
+        ops.calls.borrow_mut().clear();
+        let retry_blob = match prepare_vanish_blob_with_ops(HASH, &"1".repeat(64), &ops).unwrap() {
+            PreparedVanishBlobOrOutcome::Erase(blob) => blob,
+            PreparedVanishBlobOrOutcome::Completed(_) => {
+                panic!("stale list entry must retry erasure")
+            }
+        };
+        assert!(retry_blob.metadata.is_none());
+        finalize_erased_vanish_blob_with_ops(&retry_blob, &ops)
+            .expect("metadata-less retry should converge");
+        assert_eq!(
+            *ops.calls.borrow(),
+            vec![
+                "get_blob_metadata",
+                "remove_from_blob_refs",
+                "put_erasure_evidence",
+                "delete_blob_kv_artifacts",
+            ]
+        );
+    }
+
+    #[test]
     fn vanish_shared_keys_are_flushed_once_for_ten_blobs() {
         #[derive(Default)]
         struct MockSharedKeyOps {
@@ -608,14 +637,9 @@ mod tests {
             ..Default::default()
         };
 
-        let account_complete = apply_vanish_shared_updates_with_ops(
-            &updates,
-            &"1".repeat(64),
-            &[],
-            false,
-            &ops,
-        )
-            .expect("shared updates should flush");
+        let account_complete =
+            apply_vanish_shared_updates_with_ops(&updates, &"1".repeat(64), &[], false, &ops)
+                .expect("shared updates should flush");
 
         assert!(!account_complete);
         assert_eq!(
@@ -623,31 +647,26 @@ mod tests {
             vec![("stats", 10), ("recent", 10), ("list", 10)]
         );
 
-        let concurrent_upload_ops = MockSharedKeyOps::default();
+        let nonempty_list_ops = MockSharedKeyOps::default();
         let account_complete = apply_vanish_shared_updates_with_ops(
             &updates,
             &"1".repeat(64),
             &[],
             true,
-            &concurrent_upload_ops,
+            &nonempty_list_ops,
         )
-        .expect("concurrent upload should preserve the list");
+        .expect("a nonempty list should remain pending");
 
         assert!(!account_complete);
         assert_eq!(
-            *concurrent_upload_ops.calls.borrow(),
+            *nonempty_list_ops.calls.borrow(),
             vec![("stats", 10), ("recent", 10), ("list", 10)]
         );
 
         ops.calls.borrow_mut().clear();
-        let account_complete = apply_vanish_shared_updates_with_ops(
-            &updates,
-            &"1".repeat(64),
-            &[],
-            true,
-            &ops,
-        )
-            .expect("completing shared updates should flush");
+        let account_complete =
+            apply_vanish_shared_updates_with_ops(&updates, &"1".repeat(64), &[], true, &ops)
+                .expect("completing shared updates should flush");
 
         assert!(account_complete);
         assert_eq!(
