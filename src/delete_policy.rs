@@ -4,9 +4,10 @@ use crate::blossom::BlobMetadata;
 use crate::blossom::BlobStatus;
 use crate::error::Result;
 use crate::metadata::{
-    add_to_recent_index, add_to_user_list, get_blob_refs, put_tombstone, remove_from_recent_index,
-    remove_from_recent_index_batch, remove_from_user_list, update_blob_status,
-    update_stats_on_remove_batch, update_stats_on_status_change, update_user_list_for_vanish,
+    add_to_recent_index, add_to_user_list, delete_user_list, get_blob_refs, put_tombstone,
+    remove_from_recent_index, remove_from_recent_index_batch, remove_from_user_list,
+    update_blob_status, update_stats_on_remove_batch, update_stats_on_status_change,
+    update_user_list_for_vanish,
 };
 
 pub fn soft_delete_blob(
@@ -101,6 +102,10 @@ impl VanishSharedKeyOps for DefaultVanishSharedKeyOps {
         if let Err(error) = remove_from_recent_index_batch(hashes) {
             eprintln!("[VANISH] failed to update recent index batch: {error}");
         }
+    }
+
+    fn delete_user_list(&self, pubkey: &str) -> Result<()> {
+        delete_user_list(pubkey)
     }
 
     fn update_user_list_for_vanish(

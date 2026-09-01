@@ -135,6 +135,7 @@ impl VanishSharedUpdates {
 pub trait VanishSharedKeyOps {
     fn update_stats_on_remove_batch(&self, metadata: &[BlobMetadata]);
     fn remove_from_recent_index_batch(&self, hashes: &[String]);
+    fn delete_user_list(&self, pubkey: &str) -> Result<()>;
     fn update_user_list_for_vanish(
         &self,
         pubkey: &str,
@@ -148,6 +149,7 @@ pub fn apply_vanish_shared_updates_with_ops<O: VanishSharedKeyOps>(
     updates: &VanishSharedUpdates,
     pubkey: &str,
     retry_hashes: &[String],
+    account_complete: bool,
     ops: &O,
 ) -> Result<()> {
     if !updates.stats_removals.is_empty() {
@@ -155,6 +157,9 @@ pub fn apply_vanish_shared_updates_with_ops<O: VanishSharedKeyOps>(
     }
     if !updates.recent_index_removals.is_empty() {
         ops.remove_from_recent_index_batch(&updates.recent_index_removals);
+    }
+    if account_complete {
+        return ops.delete_user_list(pubkey);
     }
     if updates.user_list_removals.is_empty() && retry_hashes.is_empty() {
         return Ok(());
@@ -578,6 +583,11 @@ mod tests {
                 self.calls.borrow_mut().push(("recent", hashes.len()));
             }
 
+            fn delete_user_list(&self, _pubkey: &str) -> Result<()> {
+                self.calls.borrow_mut().push(("list-delete", 0));
+                Ok(())
+            }
+
             fn update_user_list_for_vanish(
                 &self,
                 _pubkey: &str,
@@ -598,12 +608,12 @@ mod tests {
         }
         let ops = MockSharedKeyOps::default();
 
-        apply_vanish_shared_updates_with_ops(&updates, &"1".repeat(64), &[], &ops)
+        apply_vanish_shared_updates_with_ops(&updates, &"1".repeat(64), &[], true, &ops)
             .expect("shared updates should flush");
 
         assert_eq!(
             *ops.calls.borrow(),
-            vec![("stats", 10), ("recent", 10), ("list", 10)]
+            vec![("stats", 10), ("recent", 10), ("list-delete", 0)]
         );
     }
 

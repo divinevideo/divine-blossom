@@ -40,7 +40,7 @@ use crate::metadata::{
     add_to_user_list, claim_vanish_audit_completion, create_vanish_audit_state,
     delete_audio_mapping, delete_audio_source_refs, delete_auth_events, delete_blob_metadata,
     delete_blob_refs,
-    delete_subtitle_data, delete_user_list, get_audio_mapping, get_audio_source_refs,
+    delete_subtitle_data, get_audio_mapping, get_audio_source_refs,
     get_auth_event, get_blob_metadata, get_blob_metadata_uncached, get_blob_refs, get_subtitle_job,
     get_subtitle_job_by_hash, get_tombstone, get_user_blobs, get_vanish_audit_state,
     list_blobs_with_metadata, mark_vanish_audit_authorized_delivered, put_audio_mapping,
@@ -4642,10 +4642,12 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
             }
         }
     }
+    let account_complete = execution.pending == 0 && execution.errors == 0;
     match apply_vanish_shared_updates_with_ops(
         &shared_updates,
         pubkey,
         &retry_hashes,
+        account_complete,
         &DefaultVanishSharedKeyOps,
     ) {
         Ok(()) => {
@@ -4666,14 +4668,8 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     }
     let kv_finalize_ms = finalize_started.elapsed().as_millis();
 
-    if execution.pending == 0 && execution.errors == 0 {
-        if let Err(error) = delete_user_list(pubkey) {
-            eprintln!(
-                "[VANISH] pubkey={} failed to delete user list: {}",
-                pubkey, error
-            );
-            execution.errors += 1;
-        } else if let Err(error) = remove_from_user_index(pubkey) {
+    if account_complete && execution.errors == 0 {
+        if let Err(error) = remove_from_user_index(pubkey) {
             eprintln!(
                 "[VANISH] pubkey={} failed to remove account from user index: {}",
                 pubkey, error
