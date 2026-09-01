@@ -1199,6 +1199,18 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
                     .and_then(|request| request.get_header_str("X-Divine-Vanish-Stage"))
                     .unwrap_or_default()
                     .to_string();
+                let status = response.get_status();
+                if !status.is_success() {
+                    let key_count = requested_by_stage
+                        .get(&stage)
+                        .map_or(hashes.len(), Vec::len);
+                    eprintln!(
+                        "[VANISH] multi-delete stage={} status={} key_count={}",
+                        stage,
+                        status.as_u16(),
+                        key_count
+                    );
+                }
                 if let Some(started) = stage_started.get(stage.as_str()) {
                     let duration = elapsed_ms(*started);
                     match stage.as_str() {
@@ -1224,10 +1236,16 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
                 }
             }
             Err(error) => {
+                let transport_error = error.to_string();
                 let request = error.into_sent_req();
                 let stage = request
                     .get_header_str("X-Divine-Vanish-Stage")
                     .unwrap_or_default();
+                let key_count = requested_by_stage.get(stage).map_or(hashes.len(), Vec::len);
+                eprintln!(
+                    "[VANISH] multi-delete stage={} error={} key_count={}",
+                    stage, transport_error, key_count
+                );
                 if let Some(requested) = requested_by_stage.get(stage) {
                     let failed: HashSet<String> = requested.iter().cloned().collect();
                     mark_failed_keys(&mut result, &failed);
