@@ -1002,12 +1002,17 @@ fn keys_in_xml_section(xml: &str, section: &str) -> HashSet<String> {
         .collect()
 }
 
-fn failed_multi_delete_keys(mut response: Response, requested: &[String]) -> HashSet<String> {
+fn failed_multi_delete_keys(
+    mut response: Response,
+    requested: &[String],
+    stage: &str,
+) -> HashSet<String> {
     if !response.get_status().is_success() {
         return requested.iter().cloned().collect();
     }
 
     let body = response.take_body().into_string();
+    let body_len = body.len();
     let deleted = keys_in_xml_section(&body, "Deleted");
     let already_absent: HashSet<String> = xml_section_blocks(&body, "Error")
         .into_iter()
@@ -1019,11 +1024,21 @@ fn failed_multi_delete_keys(mut response: Response, requested: &[String]) -> Has
         })
         .filter_map(|block| xml_block_value(block, "Key").map(str::to_string))
         .collect();
-    requested
+    let failed = requested
         .iter()
         .filter(|key| !deleted.contains(*key) && !already_absent.contains(*key))
         .cloned()
-        .collect()
+        .collect::<HashSet<_>>();
+    eprintln!(
+        "[VANISH] multi-delete stage={} requested={} body_len={} deleted={} absent={} failed={}",
+        stage,
+        requested.len(),
+        body_len,
+        deleted.len(),
+        already_absent.len(),
+        failed.len()
+    );
+    failed
 }
 
 fn hash_for_vanish_key(key: &str) -> Option<String> {
@@ -1224,7 +1239,7 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
                     }
                 }
                 if let Some(requested) = requested_by_stage.get(&stage) {
-                    let failed = failed_multi_delete_keys(response, requested);
+                    let failed = failed_multi_delete_keys(response, requested, &stage);
                     mark_failed_keys(&mut result, &failed);
                     if stage.starts_with("gcs_main:") || stage.starts_with("fos_main:") {
                         main_origin_failures
@@ -2962,6 +2977,7 @@ mod tests {
         let failures = failed_multi_delete_keys(
             response,
             &[deleted.clone(), failed.clone(), missing.clone()],
+            "test",
         );
 
         assert!(!failures.contains(&deleted));
@@ -2979,7 +2995,8 @@ mod tests {
         );
         let response = Response::from_status(fastly::http::StatusCode::OK).with_body(body);
 
-        let failures = failed_multi_delete_keys(response, &[absent.clone(), denied.clone()]);
+        let failures =
+            failed_multi_delete_keys(response, &[absent.clone(), denied.clone()], "test");
 
         assert!(!failures.contains(&absent));
         assert!(failures.contains(&denied));
@@ -2993,7 +3010,7 @@ mod tests {
         );
         let response = Response::from_status(fastly::http::StatusCode::OK).with_body(body);
 
-        let failures = failed_multi_delete_keys(response, std::slice::from_ref(&held));
+        let failures = failed_multi_delete_keys(response, std::slice::from_ref(&held), "test");
 
         assert!(failures.contains(&held));
     }
