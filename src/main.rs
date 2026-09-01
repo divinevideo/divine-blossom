@@ -4518,6 +4518,18 @@ fn vanish_shared_update_error_count(completed_outcomes: usize, completed_malform
         .max(1)
 }
 
+fn reconcile_vanish_list_completion(
+    execution: &mut VanishExecution,
+    expected_account_complete: bool,
+    list_empty: bool,
+) -> bool {
+    if expected_account_complete && !list_empty {
+        // A concurrent addition is pending work even though it was absent from this batch.
+        execution.pending = execution.pending.max(1);
+    }
+    expected_account_complete && list_empty
+}
+
 /// Execute one bounded account-erasure batch.
 fn execute_vanish(pubkey: &str) -> VanishExecution {
     let started = Instant::now();
@@ -4662,7 +4674,11 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
                 increment_vanish_outcome(&mut execution, outcome);
             }
             execution.malformed_hash_exceptions += completed_malformed;
-            expected_account_complete && list_empty
+            reconcile_vanish_list_completion(
+                &mut execution,
+                expected_account_complete,
+                list_empty,
+            )
         }
         Err(error) => {
             eprintln!(
@@ -6630,9 +6646,10 @@ mod tests {
         should_reset_transcript_failure_on_clean_upload, should_set_audio_content_length,
         surrogate_key_hash_from_path, trusted_upload_service_terminal_derivative_error,
         upload_capability_headers, upload_control_host, upload_exposed_headers,
-        upload_from_resumable_completion, vanish_response_status,
-        vanish_shared_update_error_count, AudioReuseAvailability, DerivativeObservation,
-        TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState, VANISH_BATCH_SIZE,
+        reconcile_vanish_list_completion, upload_from_resumable_completion,
+        vanish_response_status, vanish_shared_update_error_count, AudioReuseAvailability,
+        DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction,
+        TranscriptPendingState, VanishExecution, VANISH_BATCH_SIZE,
     };
     use crate::blossom::{
         BlobStatus, ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus,
@@ -6660,6 +6677,29 @@ mod tests {
     fn vanish_shared_update_failure_always_records_an_error() {
         assert_eq!(vanish_shared_update_error_count(0, 0), 1);
         assert_eq!(vanish_shared_update_error_count(10, 0), 10);
+    }
+
+    #[test]
+    fn concurrent_vanish_addition_is_reported_as_pending() {
+        let mut execution = VanishExecution {
+            fully_deleted: 10,
+            unlinked: 0,
+            errors: 0,
+            malformed_hash_exceptions: 0,
+            pending: 0,
+            finalized: false,
+        };
+
+        assert!(!reconcile_vanish_list_completion(
+            &mut execution,
+            true,
+            false,
+        ));
+        assert_eq!(execution.pending, 1);
+        assert_eq!(
+            vanish_response_status(execution.errors, execution.pending),
+            StatusCode::ACCEPTED
+        );
     }
 
     #[test]
