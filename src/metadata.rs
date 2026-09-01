@@ -551,39 +551,80 @@ fn rotate_hashes_to_end(hashes: &mut Vec<String>, retry_hashes: &HashSet<String>
     *hashes = ready;
 }
 
-/// Move failed vanish entries behind untouched entries so later batches can progress.
-pub fn move_user_list_entries_to_end(pubkey: &str, retry_hashes: &[String]) -> Result<()> {
-    if retry_hashes.is_empty() {
-        return Ok(());
-    }
+fn apply_vanish_user_list_update(
+    hashes: &mut Vec<String>,
+    removals: &[String],
+    retry_hashes: &[String],
+) {
+    let removals: HashSet<String> = removals.iter().map(|hash| hash.to_lowercase()).collect();
+    hashes.retain(|hash| !removals.contains(&hash.to_lowercase()));
+
     let retry_hashes: HashSet<String> = retry_hashes
         .iter()
         .map(|hash| hash.to_lowercase())
         .collect();
+    rotate_hashes_to_end(hashes, &retry_hashes);
+}
 
-    for attempt in 0..5 {
-        let mut hashes = get_user_blobs(pubkey)?;
+/// Remove completed entries and rotate failed entries with one conditional write.
+pub fn update_user_list_for_vanish(
+    pubkey: &str,
+    removals: &[String],
+    retry_hashes: &[String],
+) -> Result<()> {
+    const MAX_ATTEMPTS: usize = 5;
+
+    if removals.is_empty() && retry_hashes.is_empty() {
+        return Ok(());
+    }
+
+    let store = open_store()?;
+    let key = format!("{}{}", LIST_PREFIX, pubkey.to_lowercase());
+    for _ in 0..MAX_ATTEMPTS {
+        let mut result = match store.lookup(&key) {
+            Ok(result) => result,
+            Err(KVStoreError::ItemNotFound) => return Ok(()),
+            Err(error) => {
+                return Err(BlossomError::MetadataError(format!(
+                    "Failed to load list for vanish update: {error}"
+                )))
+            }
+        };
+        let generation = result.current_generation();
+        let mut hashes: Vec<String> = serde_json::from_str(&result.take_body().into_string())
+            .map_err(|error| {
+                BlossomError::MetadataError(format!(
+                    "Failed to parse list for vanish update: {error}"
+                ))
+            })?;
         let original = hashes.clone();
-        rotate_hashes_to_end(&mut hashes, &retry_hashes);
+        apply_vanish_user_list_update(&mut hashes, removals, retry_hashes);
         if hashes == original {
             return Ok(());
         }
+        let value = serde_json::to_string(&hashes).map_err(|error| {
+            BlossomError::MetadataError(format!(
+                "Failed to serialize list for vanish update: {error}"
+            ))
+        })?;
 
-        match put_user_list(pubkey, &hashes) {
+        match store
+            .build_insert()
+            .if_generation_match(generation)
+            .execute(&key, value)
+        {
             Ok(()) => return Ok(()),
-            Err(error) if attempt < 4 => {
-                eprintln!(
-                    "[KV] Retry {} for failed vanish entry rotation: {}",
-                    attempt + 1,
-                    error
-                );
+            Err(KVStoreError::ItemPreconditionFailed) => continue,
+            Err(error) => {
+                return Err(BlossomError::MetadataError(format!(
+                    "Failed to store list for vanish update: {error}"
+                )))
             }
-            Err(error) => return Err(error),
         }
     }
 
     Err(BlossomError::MetadataError(
-        "Max retries exceeded for failed vanish entry rotation".into(),
+        "Vanish list changed too many times".into(),
     ))
 }
 
@@ -1057,23 +1098,58 @@ pub fn update_stats_on_add(metadata: &BlobMetadata) -> Result<()> {
     ))
 }
 
-/// Update global stats when a blob is removed (with retry for concurrent writes)
-pub fn update_stats_on_remove(metadata: &BlobMetadata) -> Result<()> {
-    for attempt in 0..5 {
-        let mut stats = get_global_stats()?;
-        stats.remove_blob(metadata);
+/// Remove a vanish batch from global stats with one conditional write.
+pub fn update_stats_on_remove_batch(metadata: &[BlobMetadata]) -> Result<()> {
+    const MAX_ATTEMPTS: usize = 5;
 
-        match put_global_stats(&stats) {
-            Ok(()) => return Ok(()),
-            Err(e) if attempt < 4 => {
-                eprintln!("[KV] Retry {} for stats remove: {}", attempt + 1, e);
-                continue;
+    if metadata.is_empty() {
+        return Ok(());
+    }
+
+    let store = open_store()?;
+    for _ in 0..MAX_ATTEMPTS {
+        let mut result = match store.lookup(STATS_KEY) {
+            Ok(result) => result,
+            Err(KVStoreError::ItemNotFound) => return Ok(()),
+            Err(error) => {
+                return Err(BlossomError::MetadataError(format!(
+                    "Failed to load stats for vanish update: {error}"
+                )))
             }
-            Err(e) => return Err(e),
+        };
+        let generation = result.current_generation();
+        let mut stats: GlobalStats = serde_json::from_str(&result.take_body().into_string())
+            .map_err(|error| {
+                BlossomError::MetadataError(format!(
+                    "Failed to parse stats for vanish update: {error}"
+                ))
+            })?;
+        for blob in metadata {
+            stats.remove_blob(blob);
+        }
+        let value = serde_json::to_string(&stats).map_err(|error| {
+            BlossomError::MetadataError(format!(
+                "Failed to serialize stats for vanish update: {error}"
+            ))
+        })?;
+
+        match store
+            .build_insert()
+            .if_generation_match(generation)
+            .execute(STATS_KEY, value)
+        {
+            Ok(()) => return Ok(()),
+            Err(KVStoreError::ItemPreconditionFailed) => continue,
+            Err(error) => {
+                return Err(BlossomError::MetadataError(format!(
+                    "Failed to store stats for vanish update: {error}"
+                )))
+            }
         }
     }
+
     Err(BlossomError::MetadataError(
-        "Max retries exceeded for stats update".into(),
+        "Vanish stats changed too many times".into(),
     ))
 }
 
@@ -1201,6 +1277,66 @@ pub fn remove_from_recent_index(hash: &str) -> Result<()> {
     }
     Err(BlossomError::MetadataError(
         "Max retries exceeded for recent index update".into(),
+    ))
+}
+
+/// Remove a vanish batch from the recent index with one conditional write.
+pub fn remove_from_recent_index_batch(hashes: &[String]) -> Result<()> {
+    const MAX_ATTEMPTS: usize = 5;
+
+    if hashes.is_empty() {
+        return Ok(());
+    }
+
+    let removals: HashSet<String> = hashes.iter().map(|hash| hash.to_lowercase()).collect();
+    let store = open_store()?;
+    for _ in 0..MAX_ATTEMPTS {
+        let mut result = match store.lookup(RECENT_INDEX_KEY) {
+            Ok(result) => result,
+            Err(KVStoreError::ItemNotFound) => return Ok(()),
+            Err(error) => {
+                return Err(BlossomError::MetadataError(format!(
+                    "Failed to load recent index for vanish update: {error}"
+                )))
+            }
+        };
+        let generation = result.current_generation();
+        let mut index: RecentIndex = serde_json::from_str(&result.take_body().into_string())
+            .map_err(|error| {
+                BlossomError::MetadataError(format!(
+                    "Failed to parse recent index for vanish update: {error}"
+                ))
+            })?;
+        let original_len = index.hashes.len();
+        index
+            .hashes
+            .retain(|hash| !removals.contains(&hash.to_lowercase()));
+        if index.hashes.len() == original_len {
+            return Ok(());
+        }
+        let value = serde_json::to_string(&index).map_err(|error| {
+            BlossomError::MetadataError(format!(
+                "Failed to serialize recent index for vanish update: {error}"
+            ))
+        })?;
+
+        match store
+            .build_insert()
+            .if_generation_match(generation)
+            .execute(RECENT_INDEX_KEY, value)
+        {
+            Ok(()) => return Ok(()),
+            Err(KVStoreError::ItemPreconditionFailed) => continue,
+            Err(error) => {
+                return Err(BlossomError::MetadataError(format!(
+                    "Failed to store recent index for vanish update: {error}"
+                )))
+            }
+        }
+    }
+
+    Err(BlossomError::MetadataError(
+        "Vanish recent index changed too many times".into(),
     ))
 }
 
@@ -1739,11 +1875,12 @@ pub fn delete_audio_source_refs(audio_hash: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        duplicate_generation, edge_transcode_status_generation, edge_transcript_status_generation,
-        erasure_evidence_key, generation_rejection, rotate_hashes_to_end,
-        should_refresh_vanish_audit_state, stale_generation, status_generation_from_ms,
-        transcode_status_event_sequence, transcript_status_event_sequence, vanish_audit_key,
-        vanish_audit_state_ttl, StatusUpdateOutcome, VanishAuditState,
+        apply_vanish_user_list_update, duplicate_generation, edge_transcode_status_generation,
+        edge_transcript_status_generation, erasure_evidence_key, generation_rejection,
+        rotate_hashes_to_end, should_refresh_vanish_audit_state, stale_generation,
+        status_generation_from_ms, transcode_status_event_sequence,
+        transcript_status_event_sequence, vanish_audit_key, vanish_audit_state_ttl,
+        StatusUpdateOutcome, VanishAuditState,
     };
     use std::collections::HashSet;
 
@@ -1755,6 +1892,24 @@ mod tests {
         rotate_hashes_to_end(&mut hashes, &retry);
 
         assert_eq!(hashes, vec!["c".repeat(64), "a".repeat(64), "b".repeat(64)]);
+    }
+
+    #[test]
+    fn vanish_list_batch_removes_completed_and_rotates_retries_together() {
+        let mut hashes = vec![
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64),
+            "d".repeat(64),
+        ];
+
+        apply_vanish_user_list_update(
+            &mut hashes,
+            &["a".repeat(64), "c".repeat(64)],
+            &["b".repeat(64)],
+        );
+
+        assert_eq!(hashes, vec!["d".repeat(64), "b".repeat(64)]);
     }
 
     #[test]
