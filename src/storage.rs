@@ -1081,6 +1081,10 @@ fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) {
     let api_token = match get_secret("fastly_api_token") {
         Ok(token) if !token.is_empty() => token,
         _ => {
+            eprintln!(
+                "[VANISH] purge stage=setup error=missing_or_empty_token key_count={}",
+                hashes.len()
+            );
             result.failed_hashes.extend(hashes.iter().cloned());
             return;
         }
@@ -1106,10 +1110,18 @@ fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) {
             req.set_header("Surrogate-Key", chunk.join(" "));
             req.set_header("X-Divine-Vanish-Stage", &stage_id);
             stage_started.insert(stage_id.clone(), Instant::now());
-            stage_hashes.insert(stage_id, chunk.to_vec());
+            stage_hashes.insert(stage_id.clone(), chunk.to_vec());
             match req.send_async("fastly_api") {
                 Ok(request) => pending.push(request),
-                Err(_) => result.failed_hashes.extend(chunk.iter().cloned()),
+                Err(error) => {
+                    eprintln!(
+                        "[VANISH] purge stage={} error=request_start:{} key_count={}",
+                        stage_id,
+                        error,
+                        chunk.len()
+                    );
+                    result.failed_hashes.extend(chunk.iter().cloned());
+                }
             }
         }
     }
@@ -1134,15 +1146,28 @@ fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) {
                     }
                 }
                 if !response.get_status().is_success() {
+                    eprintln!(
+                        "[VANISH] purge stage={} status={} key_count={}",
+                        stage,
+                        response.get_status().as_u16(),
+                        stage_hashes.get(&stage).map_or(hashes.len(), Vec::len)
+                    );
                     mark_failed_stage(result, &stage_hashes, &stage, hashes);
                 }
             }
             Err(error) => {
+                let transport_error = error.to_string();
                 let request = error.into_sent_req();
                 let stage = request
                     .get_header_str("X-Divine-Vanish-Stage")
                     .unwrap_or_default()
                     .to_string();
+                eprintln!(
+                    "[VANISH] purge stage={} error={} key_count={}",
+                    stage,
+                    transport_error,
+                    stage_hashes.get(&stage).map_or(hashes.len(), Vec::len)
+                );
                 mark_failed_stage(result, &stage_hashes, &stage, hashes);
             }
         }
