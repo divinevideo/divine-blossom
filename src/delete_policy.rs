@@ -5,7 +5,8 @@ use crate::blossom::BlobStatus;
 use crate::error::Result;
 use crate::metadata::{
     add_to_recent_index, add_to_user_list, get_blob_refs, put_tombstone, remove_from_recent_index,
-    remove_from_user_list, update_blob_status, update_stats_on_status_change,
+    remove_from_recent_index_batch, remove_from_user_list, update_blob_status,
+    update_stats_on_remove_batch, update_stats_on_status_change, update_user_list_for_vanish,
 };
 
 pub fn soft_delete_blob(
@@ -82,20 +83,49 @@ impl VanishBlobOps for DefaultCreatorDeleteOps {
         crate::delete_blob_kv_artifacts(hash);
     }
 
-    fn update_stats_on_remove(&self, metadata: &BlobMetadata) {
-        let _ = crate::metadata::update_stats_on_remove(metadata);
-    }
-
-    fn remove_from_recent_index(&self, hash: &str) {
-        let _ = crate::metadata::remove_from_recent_index(hash);
-    }
-
     fn put_blob_metadata(&self, metadata: &BlobMetadata) -> Result<()> {
         crate::metadata::put_blob_metadata(metadata)
     }
+}
 
-    fn remove_from_user_list(&self, pubkey: &str, hash: &str) -> Result<()> {
-        crate::metadata::remove_from_user_list(pubkey, hash)
+pub(crate) struct DefaultVanishSharedKeyOps<'a> {
+    pubkey: &'a str,
+}
+
+impl<'a> DefaultVanishSharedKeyOps<'a> {
+    pub(crate) fn new(pubkey: &'a str) -> Self {
+        Self { pubkey }
+    }
+}
+
+impl VanishSharedKeyOps for DefaultVanishSharedKeyOps<'_> {
+    fn update_stats_on_remove_batch(&self, metadata: &[BlobMetadata]) {
+        if let Err(error) = update_stats_on_remove_batch(metadata) {
+            eprintln!(
+                "[VANISH] pubkey={} failed to update global stats batch count={}: {error}",
+                self.pubkey,
+                metadata.len()
+            );
+        }
+    }
+
+    fn remove_from_recent_index_batch(&self, hashes: &[String]) {
+        if let Err(error) = remove_from_recent_index_batch(hashes) {
+            eprintln!(
+                "[VANISH] pubkey={} failed to update recent index batch count={}: {error}",
+                self.pubkey,
+                hashes.len()
+            );
+        }
+    }
+
+    fn update_user_list_for_vanish(
+        &self,
+        pubkey: &str,
+        removals: &[String],
+        retry_hashes: &[String],
+    ) -> Result<bool> {
+        update_user_list_for_vanish(pubkey, removals, retry_hashes)
     }
 }
 

@@ -1,4 +1,5 @@
 pub mod cache_policy;
+pub mod conditional_update;
 pub mod delete_policy;
 pub mod error;
 pub mod rate_limit;

@@ -27,10 +27,11 @@ use crate::blossom::{
     TranscodeStatus, TranscriptStatus, UploadRequirements, QUALITY_VARIANTS,
 };
 use crate::delete_policy::{
-    build_creator_delete_response, finalize_erased_vanish_blob_with_ops, handle_creator_delete,
-    map_webhook_moderate_action, plan_user_delete, prepare_vanish_blob_with_ops, soft_delete_blob,
-    validate_sha256_format, DefaultCreatorDeleteOps, DeletePlan, PreparedVanishBlobOrOutcome,
-    VanishBlobOutcome,
+    apply_vanish_shared_updates_with_ops, build_creator_delete_response,
+    finalize_erased_vanish_blob_with_ops, handle_creator_delete, map_webhook_moderate_action,
+    plan_user_delete, prepare_vanish_blob_with_ops, soft_delete_blob, validate_sha256_format,
+    DefaultCreatorDeleteOps, DefaultVanishSharedKeyOps, DeletePlan, PreparedVanishBlobOrOutcome,
+    VanishBlobOutcome, VanishSharedUpdates,
 };
 use crate::error::{BlossomError, Result};
 use crate::media_auth_log::format_media_auth_log;
@@ -39,15 +40,14 @@ use crate::metadata::{
     add_to_user_list, claim_vanish_audit_completion, create_vanish_audit_state,
     delete_audio_mapping, delete_audio_source_refs, delete_auth_events, delete_blob_metadata,
     delete_blob_refs,
-    delete_subtitle_data, delete_user_list, get_audio_mapping, get_audio_source_refs,
+    delete_subtitle_data, get_audio_mapping, get_audio_source_refs,
     get_auth_event, get_blob_metadata, get_blob_metadata_uncached, get_blob_refs, get_subtitle_job,
     get_subtitle_job_by_hash, get_tombstone, get_user_blobs, get_vanish_audit_state,
-    list_blobs_with_metadata, mark_vanish_audit_authorized_delivered,
-    move_user_list_entries_to_end, put_audio_mapping, put_auth_event, put_blob_metadata,
-    put_subtitle_job, refresh_vanish_audit_state, remove_from_audio_source_refs,
-    remove_from_blob_refs, remove_from_user_index, remove_from_user_list,
-    set_subtitle_job_id_for_hash, update_blob_status, update_stats_on_add, StatusUpdateOutcome,
-    TranscodeMetadataUpdate, TranscriptMetadataUpdate, VanishAuditState,
+    list_blobs_with_metadata, mark_vanish_audit_authorized_delivered, put_audio_mapping,
+    put_auth_event, put_blob_metadata, put_subtitle_job, refresh_vanish_audit_state,
+    remove_from_audio_source_refs, remove_from_blob_refs, remove_from_user_index,
+    remove_from_user_list, set_subtitle_job_id_for_hash, update_blob_status, update_stats_on_add,
+    StatusUpdateOutcome, TranscodeMetadataUpdate, TranscriptMetadataUpdate, VanishAuditState,
 };
 use crate::storage::{
     blob_exists, check_funnelcake_audio_reuse, current_timestamp, delete_blob as storage_delete,
@@ -4511,6 +4511,25 @@ fn increment_vanish_outcome(execution: &mut VanishExecution, outcome: VanishBlob
     }
 }
 
+fn vanish_shared_update_error_count(completed_outcomes: usize, completed_malformed: u32) -> u32 {
+    u32::try_from(completed_outcomes)
+        .unwrap_or(u32::MAX)
+        .saturating_add(completed_malformed)
+        .max(1)
+}
+
+fn reconcile_vanish_list_completion(
+    execution: &mut VanishExecution,
+    expected_account_complete: bool,
+    shared_updates_complete: bool,
+) -> bool {
+    if expected_account_complete && !shared_updates_complete {
+        // A concurrent addition is pending work even though it was absent from this batch.
+        execution.pending = execution.pending.max(1);
+    }
+    shared_updates_complete
+}
+
 /// Execute one bounded account-erasure batch.
 fn execute_vanish(pubkey: &str) -> VanishExecution {
     let started = Instant::now();
@@ -4539,24 +4558,20 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     let prepare_started = Instant::now();
     let mut erase = Vec::new();
     let mut retry_hashes = Vec::new();
+    let mut shared_updates = VanishSharedUpdates::default();
+    let mut completed_outcomes = Vec::new();
+    let mut completed_malformed = 0u32;
     for hash in &malformed {
         record_malformed_vanish_hash(hash, pubkey);
-        if let Err(error) = remove_from_user_list(pubkey, hash) {
-            eprintln!(
-                "[VANISH] pubkey={} failed to remove malformed blob-list entry: {}",
-                pubkey, error
-            );
-            execution.errors += 1;
-            retry_hashes.push(hash.clone());
-        } else {
-            execution.malformed_hash_exceptions += 1;
-        }
+        shared_updates.record_unlinked(hash);
+        completed_malformed += 1;
     }
     for hash in &selected {
         match prepare_vanish_blob_with_ops(hash, pubkey, &DefaultCreatorDeleteOps) {
             Ok(PreparedVanishBlobOrOutcome::Erase(blob)) => erase.push(*blob),
             Ok(PreparedVanishBlobOrOutcome::Completed(outcome)) => {
-                increment_vanish_outcome(&mut execution, outcome);
+                shared_updates.record_unlinked(hash);
+                completed_outcomes.push(outcome);
             }
             Err(error) => {
                 eprintln!(
@@ -4631,8 +4646,11 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
             retry_hashes.push(blob.hash.clone());
             continue;
         }
-        match finalize_erased_vanish_blob_with_ops(blob, pubkey, &DefaultCreatorDeleteOps) {
-            Ok(()) => increment_vanish_outcome(&mut execution, VanishBlobOutcome::FullyDeleted),
+        match finalize_erased_vanish_blob_with_ops(blob, &DefaultCreatorDeleteOps) {
+            Ok(()) => {
+                shared_updates.record_erased(blob);
+                completed_outcomes.push(VanishBlobOutcome::FullyDeleted);
+            }
             Err(error) => {
                 eprintln!(
                     "[VANISH] pubkey={} hash={} failed to finalize erased blob: {}",
@@ -4643,23 +4661,41 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
             }
         }
     }
-    let kv_finalize_ms = finalize_started.elapsed().as_millis();
-
-    if let Err(error) = move_user_list_entries_to_end(pubkey, &retry_hashes) {
-        eprintln!(
-            "[VANISH] pubkey={} failed to rotate retry entries: {}",
-            pubkey, error
-        );
-    }
-
-    if execution.pending == 0 && execution.errors == 0 {
-        if let Err(error) = delete_user_list(pubkey) {
+    let expected_account_complete = execution.pending == 0 && execution.errors == 0;
+    let shared_updates_complete = match apply_vanish_shared_updates_with_ops(
+        &shared_updates,
+        pubkey,
+        &retry_hashes,
+        expected_account_complete,
+        &DefaultVanishSharedKeyOps::new(pubkey),
+    ) {
+        Ok(shared_updates_complete) => {
+            for outcome in completed_outcomes {
+                increment_vanish_outcome(&mut execution, outcome);
+            }
+            execution.malformed_hash_exceptions += completed_malformed;
+            reconcile_vanish_list_completion(
+                &mut execution,
+                expected_account_complete,
+                shared_updates_complete,
+            )
+        }
+        Err(error) => {
             eprintln!(
-                "[VANISH] pubkey={} failed to delete user list: {}",
+                "[VANISH] pubkey={} failed shared KV update: {}",
                 pubkey, error
             );
-            execution.errors += 1;
-        } else if let Err(error) = remove_from_user_index(pubkey) {
+            execution.errors += vanish_shared_update_error_count(
+                completed_outcomes.len(),
+                completed_malformed,
+            );
+            false
+        }
+    };
+    let kv_finalize_ms = finalize_started.elapsed().as_millis();
+
+    if shared_updates_complete {
+        if let Err(error) = remove_from_user_index(pubkey) {
             eprintln!(
                 "[VANISH] pubkey={} failed to remove account from user index: {}",
                 pubkey, error
@@ -6610,9 +6646,10 @@ mod tests {
         should_reset_transcript_failure_on_clean_upload, should_set_audio_content_length,
         surrogate_key_hash_from_path, trusted_upload_service_terminal_derivative_error,
         upload_capability_headers, upload_control_host, upload_exposed_headers,
-        upload_from_resumable_completion, vanish_response_status, AudioReuseAvailability,
-        DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState,
-        VANISH_BATCH_SIZE,
+        reconcile_vanish_list_completion, upload_from_resumable_completion,
+        vanish_response_status, vanish_shared_update_error_count, AudioReuseAvailability,
+        DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction,
+        TranscriptPendingState, VanishExecution, VANISH_BATCH_SIZE,
     };
     use crate::blossom::{
         BlobStatus, ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus,
@@ -6632,6 +6669,35 @@ mod tests {
         );
         assert_eq!(
             vanish_response_status(1, 1),
+            StatusCode::ACCEPTED
+        );
+    }
+
+    #[test]
+    fn vanish_shared_update_failure_always_records_an_error() {
+        assert_eq!(vanish_shared_update_error_count(0, 0), 1);
+        assert_eq!(vanish_shared_update_error_count(10, 0), 10);
+    }
+
+    #[test]
+    fn concurrent_vanish_addition_is_reported_as_pending() {
+        let mut execution = VanishExecution {
+            fully_deleted: 10,
+            unlinked: 0,
+            errors: 0,
+            malformed_hash_exceptions: 0,
+            pending: 0,
+            finalized: false,
+        };
+
+        assert!(!reconcile_vanish_list_completion(
+            &mut execution,
+            true,
+            false,
+        ));
+        assert_eq!(execution.pending, 1);
+        assert_eq!(
+            vanish_response_status(execution.errors, execution.pending),
             StatusCode::ACCEPTED
         );
     }
