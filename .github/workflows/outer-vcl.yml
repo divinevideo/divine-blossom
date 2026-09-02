@@ -1,0 +1,26 @@
+name: Outer VCL
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply_draft:
+        description: Clone the active outer VCL version, apply git snippets, and validate. Does not make the draft live.
+        type: boolean
+        default: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Diff git snippets against the active outer version
+        env:
+          FASTLY_API_TOKEN: ${{ secrets.FASTLY_API_TOKEN }}
+        run: python3 scripts/sync_outer_vcl.py diff
+
+      - name: Apply git snippets to a cloned draft
+        if: inputs.apply_draft
+        env:
+          FASTLY_API_TOKEN: ${{ secrets.FASTLY_API_TOKEN }}
+        run: python3 scripts/sync_outer_vcl.py apply
