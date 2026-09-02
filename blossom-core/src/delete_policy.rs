@@ -107,7 +107,10 @@ pub struct PreparedVanishBlob {
     pub metadata: Option<BlobMetadata>,
 }
 
-/// Shared-key updates accumulated across one account-vanish call.
+/// Shared-key updates accumulated across every wave of one vanish call.
+///
+/// Flush once after the last wave. Fastly KV allows one write per second per
+/// key, so a per-wave flush would serialize those waits and increase latency.
 #[derive(Debug, Default)]
 pub struct VanishSharedUpdates {
     user_list_removals: Vec<String>,
@@ -143,7 +146,12 @@ pub trait VanishSharedKeyOps {
     ) -> Result<bool>;
 }
 
-/// Apply each account-wide KV mutation at most once for one vanish call.
+/// Apply each account-wide KV mutation at most once after the last vanish wave.
+///
+/// A crash before this flush leaves unique-key erasure in place and keeps the
+/// completed hashes on `list:<pubkey>`, so the next call rediscovers them.
+/// `stats:global` decrements for those blobs are lost: blob metadata is already
+/// deleted, so retry cannot subtract them. `index:recent` still keys on hash.
 pub fn apply_vanish_shared_updates_with_ops<O: VanishSharedKeyOps>(
     updates: &VanishSharedUpdates,
     pubkey: &str,
@@ -597,40 +605,44 @@ mod tests {
         );
     }
 
+    #[derive(Default)]
+    struct MockSharedKeyOps {
+        calls: RefCell<Vec<(&'static str, usize)>>,
+        list_empty: bool,
+    }
+
+    impl VanishSharedKeyOps for MockSharedKeyOps {
+        fn update_stats_on_remove_batch(&self, metadata: &[BlobMetadata]) {
+            self.calls.borrow_mut().push(("stats", metadata.len()));
+        }
+
+        fn remove_from_recent_index_batch(&self, hashes: &[String]) {
+            self.calls.borrow_mut().push(("recent", hashes.len()));
+        }
+
+        fn update_user_list_for_vanish(
+            &self,
+            _pubkey: &str,
+            removals: &[String],
+            _retry_hashes: &[String],
+        ) -> Result<bool> {
+            self.calls.borrow_mut().push(("list", removals.len()));
+            Ok(self.list_empty)
+        }
+    }
+
+    fn erased_blob(index: usize) -> PreparedVanishBlob {
+        PreparedVanishBlob {
+            hash: format!("{index:064x}"),
+            metadata: Some(sample_metadata(BlobStatus::Active)),
+        }
+    }
+
     #[test]
     fn vanish_shared_keys_are_flushed_once_for_ten_blobs() {
-        #[derive(Default)]
-        struct MockSharedKeyOps {
-            calls: RefCell<Vec<(&'static str, usize)>>,
-            list_empty: bool,
-        }
-
-        impl VanishSharedKeyOps for MockSharedKeyOps {
-            fn update_stats_on_remove_batch(&self, metadata: &[BlobMetadata]) {
-                self.calls.borrow_mut().push(("stats", metadata.len()));
-            }
-
-            fn remove_from_recent_index_batch(&self, hashes: &[String]) {
-                self.calls.borrow_mut().push(("recent", hashes.len()));
-            }
-
-            fn update_user_list_for_vanish(
-                &self,
-                _pubkey: &str,
-                removals: &[String],
-                _retry_hashes: &[String],
-            ) -> Result<bool> {
-                self.calls.borrow_mut().push(("list", removals.len()));
-                Ok(self.list_empty)
-            }
-        }
-
         let mut updates = VanishSharedUpdates::default();
         for index in 0..10 {
-            updates.record_erased(&PreparedVanishBlob {
-                hash: format!("{index:064x}"),
-                metadata: Some(sample_metadata(BlobStatus::Active)),
-            });
+            updates.record_erased(&erased_blob(index));
         }
         let ops = MockSharedKeyOps {
             list_empty: true,

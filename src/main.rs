@@ -4788,6 +4788,11 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     execution.pending = hashes.len().saturating_sub(offset).min(u32::MAX as usize) as u32;
     let expected_account_complete = execution.pending == 0 && execution.errors == 0;
     let shared_started = Instant::now();
+    // One write per hot key per call, once after the last wave. Unique-key work
+    // already ran per wave. A crash here leaves completed hashes on the account
+    // list so the next vanish rediscovers them as metadata-less erasure.
+    // stats:global decrements for those blobs are lost: metadata is already
+    // gone, so retry cannot subtract them. index:recent still keys on hash.
     let shared_updates_complete = match apply_vanish_shared_updates_with_ops(
         &shared_updates,
         pubkey,

@@ -1247,6 +1247,14 @@ pub fn remove_from_recent_index(hash: &str) -> Result<()> {
     })
 }
 
+fn apply_vanish_recent_index_update(index: &mut RecentIndex, removals: &HashSet<String>) -> bool {
+    let original_len = index.hashes.len();
+    index
+        .hashes
+        .retain(|hash| !removals.contains(&hash.to_lowercase()));
+    index.hashes.len() != original_len
+}
+
 /// Remove a vanish batch from the recent index with one conditional write.
 pub fn remove_from_recent_index_batch(hashes: &[String]) -> Result<()> {
     const MAX_ATTEMPTS: usize = 5;
@@ -1264,11 +1272,7 @@ pub fn remove_from_recent_index_batch(hashes: &[String]) -> Result<()> {
             let Some(mut index) = current else {
                 return Ok(ConditionalJsonMutation::Complete(()));
             };
-            let original_len = index.hashes.len();
-            index
-                .hashes
-                .retain(|hash| !removals.contains(&hash.to_lowercase()));
-            if index.hashes.len() == original_len {
+            if !apply_vanish_recent_index_update(&mut index, &removals) {
                 return Ok(ConditionalJsonMutation::Complete(()));
             }
             Ok(ConditionalJsonMutation::Write {
@@ -1787,10 +1791,10 @@ pub fn delete_audio_source_refs(audio_hash: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_vanish_user_list_update, duplicate_generation, edge_transcode_status_generation,
-        edge_transcript_status_generation, erasure_evidence_key, generation_rejection,
-        rotate_hashes_to_end, should_refresh_vanish_audit_state, stale_generation,
-        status_generation_from_ms, transcode_status_event_sequence,
+        apply_vanish_recent_index_update, apply_vanish_user_list_update, duplicate_generation,
+        edge_transcode_status_generation, edge_transcript_status_generation, erasure_evidence_key,
+        generation_rejection, rotate_hashes_to_end, should_refresh_vanish_audit_state,
+        stale_generation, status_generation_from_ms, transcode_status_event_sequence,
         transcript_status_event_sequence, vanish_audit_key, vanish_audit_state_ttl,
         StatusUpdateOutcome, VanishAuditState,
     };
@@ -1822,6 +1826,17 @@ mod tests {
         );
 
         assert_eq!(hashes, vec!["d".repeat(64), "b".repeat(64)]);
+    }
+
+    #[test]
+    fn vanish_recent_index_batch_keeps_other_account_hashes() {
+        let mut index = crate::blossom::RecentIndex {
+            hashes: vec!["a".repeat(64), "b".repeat(64), "c".repeat(64)],
+        };
+        let removals = HashSet::from(["a".repeat(64), "c".repeat(64)]);
+
+        assert!(apply_vanish_recent_index_update(&mut index, &removals));
+        assert_eq!(index.hashes, vec!["b".repeat(64)]);
     }
 
     #[test]
