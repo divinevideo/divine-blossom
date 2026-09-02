@@ -4625,13 +4625,13 @@ fn fail_vanish_blob_finalize(
 fn finish_vanish_best_effort_deletes(
     store: &fastly::kv_store::KVStore,
     pubkey: &str,
-    pending: Vec<fastly::kv_store::PendingDeleteHandle>,
+    pending: Vec<(String, String, fastly::kv_store::PendingDeleteHandle)>,
 ) {
-    for handle in pending {
+    for (hash, key, handle) in pending {
         if let Err(error) = finish_vanish_best_effort_delete(store, handle) {
             eprintln!(
-                "[VANISH] pubkey={} failed vanish artifact delete: {}",
-                pubkey, error
+                "[VANISH] pubkey={} hash={} key={} failed vanish artifact delete: {}",
+                pubkey, hash, key, error
             );
         }
     }
@@ -4699,7 +4699,7 @@ fn finalize_erased_vanish_wave(
     for blob in &metadata_ok {
         for key in vanish_blob_artifact_delete_keys(&blob.hash) {
             match start_vanish_best_effort_delete(&store, &key) {
-                Ok(handle) => artifact_deletes.push(handle),
+                Ok(handle) => artifact_deletes.push((blob.hash.clone(), key, handle)),
                 Err(error) => eprintln!(
                     "[VANISH] pubkey={} hash={} failed to start artifact delete: {}",
                     pubkey, blob.hash, error
@@ -4723,7 +4723,7 @@ fn finalize_erased_vanish_wave(
                 for key in [vanish_subtitle_job_key(&job_id), vanish_subtitle_hash_key(&hash)]
                 {
                     match start_vanish_best_effort_delete(&store, &key) {
-                        Ok(pending) => subtitle_deletes.push(pending),
+                        Ok(pending) => subtitle_deletes.push((hash.clone(), key, pending)),
                         Err(error) => eprintln!(
                             "[VANISH] pubkey={} hash={} failed to start subtitle delete: {}",
                             pubkey, hash, error
