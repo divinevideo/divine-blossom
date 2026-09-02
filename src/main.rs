@@ -39,14 +39,14 @@ use crate::metadata::{
     add_to_audio_source_refs, add_to_blob_refs, add_to_recent_index, add_to_user_index,
     add_to_user_list, claim_vanish_audit_completion, create_vanish_audit_state,
     delete_audio_mapping, delete_audio_source_refs, delete_auth_events, delete_blob_metadata,
-    delete_blob_refs, delete_subtitle_data, finish_vanish_blob_lookups, get_audio_mapping,
+    delete_blob_refs, delete_subtitle_data, finish_vanish_blob_lookup, get_audio_mapping,
     get_audio_source_refs, get_auth_event, get_blob_metadata, get_blob_metadata_uncached,
     get_blob_refs, get_subtitle_job, get_subtitle_job_by_hash, get_tombstone, get_user_blobs,
     get_vanish_audit_state, list_blobs_with_metadata, mark_vanish_audit_authorized_delivered,
     open_store, put_audio_mapping, put_auth_event, put_blob_metadata, put_subtitle_job,
     refresh_vanish_audit_state, remove_from_audio_source_refs, remove_from_blob_refs,
     remove_from_user_index, remove_from_user_list, set_subtitle_job_id_for_hash,
-    start_vanish_blob_lookups, update_blob_status, update_stats_on_add, StatusUpdateOutcome,
+    start_vanish_blob_lookup, update_blob_status, update_stats_on_add, StatusUpdateOutcome,
     TranscodeMetadataUpdate, TranscriptMetadataUpdate, VanishAuditState,
 };
 use crate::storage::{
@@ -74,6 +74,7 @@ use fastly::kv_store::KVStore;
 use fastly::{Error, Request, Response};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::time::Duration;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -4512,6 +4513,19 @@ fn should_start_vanish_wave(
     elapsed.saturating_add(last_wave) < budget
 }
 
+fn next_vanish_wave_range(
+    total: usize,
+    offset: usize,
+    elapsed: Duration,
+    last_wave: Duration,
+    budget: Duration,
+) -> Option<Range<usize>> {
+    if offset >= total || !should_start_vanish_wave(offset > 0, elapsed, last_wave, budget) {
+        return None;
+    }
+    Some(offset..offset.saturating_add(VANISH_KV_LOOKUP_FANOUT).min(total))
+}
+
 fn add_vanish_storage_timings(total: &mut VanishStorageTimings, wave: &VanishStorageTimings) {
     total.gcs_main_ms = total.gcs_main_ms.saturating_add(wave.gcs_main_ms);
     total.cloud_run_cleanup_ms = total
@@ -4529,7 +4543,7 @@ fn prefetch_vanish_blob_lookups(hashes: &[String]) -> HashMap<String, Option<Blo
     };
     let mut pending = Vec::new();
     for hash in hashes {
-        match start_vanish_blob_lookups(&store, hash) {
+        match start_vanish_blob_lookup(&store, hash) {
             Ok(handle) => pending.push((hash.clone(), handle)),
             Err(error) => {
                 eprintln!(
@@ -4540,7 +4554,7 @@ fn prefetch_vanish_blob_lookups(hashes: &[String]) -> HashMap<String, Option<Blo
         }
     }
     for (hash, metadata_handle) in pending {
-        match finish_vanish_blob_lookups(&store, metadata_handle) {
+        match finish_vanish_blob_lookup(&store, metadata_handle) {
             Ok(blob_metadata) => {
                 metadata.insert(hash.to_lowercase(), blob_metadata);
             }
@@ -4646,44 +4660,37 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
             return execution;
         }
     };
-    let (valid, malformed) = classify_vanish_hashes(&hashes);
-
     let mut retry_hashes = Vec::new();
     let mut shared_updates = VanishSharedUpdates::default();
     let mut completed_outcomes = Vec::new();
     let mut completed_malformed = 0u32;
-    for hash in &malformed {
-        record_malformed_vanish_hash(hash, pubkey);
-        shared_updates.record_unlinked(hash);
-        completed_malformed += 1;
-    }
-
-    let mut selected = Vec::new();
+    let mut selected = 0usize;
     let mut erase_candidates = 0usize;
-    let mut storage_attempts = 0u8;
+    let mut storage_attempts = 0u32;
     let mut storage_timings = VanishStorageTimings::default();
     let mut prepare_ms = 0u128;
     let mut kv_finalize_ms = 0u128;
     let mut last_wave = Duration::ZERO;
     let mut offset = 0usize;
-    while offset < valid.len() {
-        if !should_start_vanish_wave(
-            offset > 0,
-            started.elapsed(),
-            last_wave,
-            VANISH_TIME_BUDGET,
-        ) {
-            break;
-        }
+    while let Some(wave_range) = next_vanish_wave_range(
+        hashes.len(),
+        offset,
+        started.elapsed(),
+        last_wave,
+        VANISH_TIME_BUDGET,
+    ) {
         let wave_started = Instant::now();
-        let wave_end = offset
-            .saturating_add(VANISH_KV_LOOKUP_FANOUT)
-            .min(valid.len());
-        let wave = &valid[offset..wave_end];
-        selected.extend(wave.iter().cloned());
+        let wave_end = wave_range.end;
+        let (valid, malformed) = classify_vanish_hashes(&hashes[wave_range]);
+        selected = selected.saturating_add(valid.len());
+        for hash in &malformed {
+            record_malformed_vanish_hash(hash, pubkey);
+            shared_updates.record_unlinked(hash);
+            completed_malformed = completed_malformed.saturating_add(1);
+        }
 
         let prepare_started = Instant::now();
-        let prepared = prepare_vanish_wave(pubkey, wave);
+        let prepared = prepare_vanish_wave(pubkey, &valid);
         prepare_ms = prepare_ms.saturating_add(prepare_started.elapsed().as_millis());
         execution.errors = execution.errors.saturating_add(prepared.errors);
         retry_hashes.extend(prepared.retry_hashes);
@@ -4729,7 +4736,7 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
             storage_result.replace_failures_after_retry(retry);
             wave_storage_attempts += 1;
         }
-        storage_attempts = storage_attempts.saturating_add(wave_storage_attempts);
+        storage_attempts = storage_attempts.saturating_add(u32::from(wave_storage_attempts));
         add_vanish_storage_timings(&mut storage_timings, &storage_result.timings);
 
         let finalize_started = Instant::now();
@@ -4778,7 +4785,7 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         last_wave = wave_started.elapsed();
         offset = wave_end;
     }
-    execution.pending = valid.len().saturating_sub(offset).min(u32::MAX as usize) as u32;
+    execution.pending = hashes.len().saturating_sub(offset).min(u32::MAX as usize) as u32;
     let expected_account_complete = execution.pending == 0 && execution.errors == 0;
     let shared_started = Instant::now();
     let shared_updates_complete = match apply_vanish_shared_updates_with_ops(
@@ -4824,7 +4831,7 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     }
 
     let timing = serde_json::json!({
-        "selected": selected.len(),
+        "selected": selected,
         "erase_candidates": erase_candidates,
         "storage_attempts": storage_attempts,
         "fully_deleted": execution.fully_deleted,
@@ -6756,7 +6763,7 @@ mod tests {
         decide_transcript_fetch_action, derivative_reconciliation_response, error_response,
         ignored_generation_response, is_alias_only_audio_blob, local_derivative_cleanup_result,
         parse_transcode_status_webhook_payload, parse_transcript_status_webhook_payload,
-        parse_upload_service_response, reconcile_vanish_list_completion,
+        next_vanish_wave_range, parse_upload_service_response, reconcile_vanish_list_completion,
         should_delete_derived_audio_blob, should_eagerly_trigger_transcription,
         should_record_upload_service_transcode_failure,
         should_record_upload_service_transcript_failure,
@@ -6863,6 +6870,61 @@ mod tests {
             Duration::from_millis(2_000),
             VANISH_TIME_BUDGET,
         ));
+    }
+
+    #[test]
+    fn vanish_wave_ranges_advance_by_fanout_and_leave_pending_entries() {
+        let budget = Duration::from_millis(10_000);
+        let first = next_vanish_wave_range(
+            25,
+            0,
+            Duration::from_millis(12_000),
+            Duration::from_millis(12_000),
+            budget,
+        )
+        .expect("the first wave must always start");
+        assert_eq!(first, 0..10);
+
+        let second = next_vanish_wave_range(
+            25,
+            first.end,
+            Duration::from_millis(3_000),
+            Duration::from_millis(2_000),
+            budget,
+        )
+        .expect("a wave that fits the budget should start");
+        assert_eq!(second, 10..20);
+
+        assert_eq!(25usize.saturating_sub(second.end), 5);
+        assert!(next_vanish_wave_range(
+            25,
+            second.end,
+            Duration::from_millis(8_000),
+            Duration::from_millis(2_000),
+            budget,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn vanish_wave_ranges_bound_malformed_entry_classification() {
+        let hashes = (0..25)
+            .map(|index| format!("malformed-{index}"))
+            .collect::<Vec<_>>();
+        let first = next_vanish_wave_range(
+            hashes.len(),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+            VANISH_TIME_BUDGET,
+        )
+        .expect("the first wave must start");
+
+        let (valid, malformed) = classify_vanish_hashes(&hashes[first.clone()]);
+
+        assert!(valid.is_empty());
+        assert_eq!(malformed.len(), 10);
+        assert_eq!(hashes.len().saturating_sub(first.end), 15);
     }
 
     #[test]

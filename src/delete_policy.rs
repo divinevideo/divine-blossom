@@ -4,9 +4,10 @@ use crate::blossom::BlobMetadata;
 use crate::blossom::BlobStatus;
 use crate::error::Result;
 use crate::metadata::{
-    add_to_recent_index, add_to_user_list, get_blob_refs, put_tombstone, remove_from_recent_index,
-    remove_from_recent_index_batch, remove_from_user_list, update_blob_status,
-    update_stats_on_remove_batch, update_stats_on_status_change, update_user_list_for_vanish,
+    add_to_recent_index, add_to_user_list, get_blob_metadata_uncached, get_blob_refs, put_tombstone,
+    remove_from_recent_index, remove_from_recent_index_batch, remove_from_user_list,
+    update_blob_status, update_stats_on_remove_batch, update_stats_on_status_change,
+    update_user_list_for_vanish,
 };
 use std::collections::HashMap;
 
@@ -121,7 +122,7 @@ impl VanishBlobOps for PrefetchedVanishOps<'_> {
     fn get_blob_metadata(&self, hash: &str) -> Result<Option<BlobMetadata>> {
         match self.metadata.get(&hash.to_lowercase()) {
             Some(metadata) => Ok(metadata.clone()),
-            None => DefaultCreatorDeleteOps.get_blob_metadata(hash),
+            None => get_blob_metadata_uncached(hash),
         }
     }
 

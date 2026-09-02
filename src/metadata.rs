@@ -202,7 +202,7 @@ pub fn get_blob_metadata_uncached(hash: &str) -> Result<Option<BlobMetadata>> {
     parse_blob_metadata_lookup(store.lookup(&key))
 }
 
-pub(crate) fn start_vanish_blob_lookups(
+pub(crate) fn start_vanish_blob_lookup(
     store: &KVStore,
     hash: &str,
 ) -> Result<PendingLookupHandle> {
@@ -215,7 +215,7 @@ pub(crate) fn start_vanish_blob_lookups(
         })
 }
 
-pub(crate) fn finish_vanish_blob_lookups(
+pub(crate) fn finish_vanish_blob_lookup(
     store: &KVStore,
     metadata_handle: PendingLookupHandle,
 ) -> Result<Option<BlobMetadata>> {
