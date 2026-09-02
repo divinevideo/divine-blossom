@@ -4,10 +4,12 @@ use crate::blossom::BlobMetadata;
 use crate::blossom::BlobStatus;
 use crate::error::Result;
 use crate::metadata::{
-    add_to_recent_index, add_to_user_list, get_blob_refs, put_tombstone, remove_from_recent_index,
-    remove_from_recent_index_batch, remove_from_user_list, update_blob_status,
-    update_stats_on_remove_batch, update_stats_on_status_change, update_user_list_for_vanish,
+    add_to_recent_index, add_to_user_list, get_blob_metadata_uncached, get_blob_refs, put_tombstone,
+    remove_from_recent_index, remove_from_recent_index_batch, remove_from_user_list,
+    update_blob_status, update_stats_on_remove_batch, update_stats_on_status_change,
+    update_user_list_for_vanish,
 };
+use std::collections::HashMap;
 
 pub fn soft_delete_blob(
     hash: &str,
@@ -85,6 +87,63 @@ impl VanishBlobOps for DefaultCreatorDeleteOps {
 
     fn put_blob_metadata(&self, metadata: &BlobMetadata) -> Result<()> {
         crate::metadata::put_blob_metadata(metadata)
+    }
+}
+
+pub(crate) struct PrefetchedVanishOps<'a> {
+    metadata: &'a HashMap<String, Option<BlobMetadata>>,
+}
+
+impl<'a> PrefetchedVanishOps<'a> {
+    pub(crate) fn new(metadata: &'a HashMap<String, Option<BlobMetadata>>) -> Self {
+        Self { metadata }
+    }
+}
+
+impl BlobErasureOps for PrefetchedVanishOps<'_> {
+    fn cleanup_derived_audio(&self, hash: &str) -> Result<()> {
+        DefaultCreatorDeleteOps.cleanup_derived_audio(hash)
+    }
+    fn delete_blob_from_gcs(&self, hash: &str) -> Result<()> {
+        DefaultCreatorDeleteOps.delete_blob_from_gcs(hash)
+    }
+    fn delete_blob_from_replica(&self, hash: &str) -> Result<()> {
+        DefaultCreatorDeleteOps.delete_blob_from_replica(hash)
+    }
+    fn delete_blob_gcs_artifacts(&self, hash: &str) -> Result<()> {
+        DefaultCreatorDeleteOps.delete_blob_gcs_artifacts(hash)
+    }
+    fn purge_vcl_cache(&self, hash: &str) {
+        DefaultCreatorDeleteOps.purge_vcl_cache(hash);
+    }
+}
+
+impl VanishBlobOps for PrefetchedVanishOps<'_> {
+    fn get_blob_metadata(&self, hash: &str) -> Result<Option<BlobMetadata>> {
+        match self.metadata.get(&hash.to_lowercase()) {
+            Some(metadata) => Ok(metadata.clone()),
+            None => get_blob_metadata_uncached(hash),
+        }
+    }
+
+    fn remove_from_blob_refs(&self, hash: &str, pubkey: &str) -> Result<Vec<String>> {
+        DefaultCreatorDeleteOps.remove_from_blob_refs(hash, pubkey)
+    }
+
+    fn put_erasure_evidence(&self, hash: &str) -> Result<()> {
+        DefaultCreatorDeleteOps.put_erasure_evidence(hash)
+    }
+
+    fn delete_blob_metadata(&self, hash: &str) -> Result<()> {
+        DefaultCreatorDeleteOps.delete_blob_metadata(hash)
+    }
+
+    fn delete_blob_kv_artifacts(&self, hash: &str) {
+        DefaultCreatorDeleteOps.delete_blob_kv_artifacts(hash);
+    }
+
+    fn put_blob_metadata(&self, metadata: &BlobMetadata) -> Result<()> {
+        DefaultCreatorDeleteOps.put_blob_metadata(metadata)
     }
 }
 

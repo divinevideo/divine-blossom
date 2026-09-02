@@ -9,7 +9,7 @@ use blossom_core::conditional_update::{
     update_json_conditionally_with_io, ConditionalJsonMutation,
 };
 use fastly::cache::simple as simple_cache;
-use fastly::kv_store::{InsertMode, KVStore, KVStoreError};
+use fastly::kv_store::{InsertMode, KVStore, KVStoreError, LookupResponse, PendingLookupHandle};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -120,7 +120,7 @@ const AUDIO_MAP_PREFIX: &str = "audio_map:";
 const AUDIO_REFS_PREFIX: &str = "audio_refs:";
 
 /// Open the metadata KV store
-fn open_store() -> Result<KVStore> {
+pub(crate) fn open_store() -> Result<KVStore> {
     KVStore::open(KV_STORE_NAME)
         .map_err(|e| BlossomError::MetadataError(format!("Failed to open KV store: {}", e)))?
         .ok_or_else(|| BlossomError::MetadataError("KV store not found".into()))
@@ -158,19 +158,15 @@ pub fn get_blob_metadata(hash: &str) -> Result<Option<BlobMetadata>> {
     Ok(result)
 }
 
-/// Get blob metadata directly from KV store (bypasses cache)
-pub fn get_blob_metadata_uncached(hash: &str) -> Result<Option<BlobMetadata>> {
-    let store = open_store()?;
-    let key = format!("{}{}", BLOB_PREFIX, hash.to_lowercase());
-
-    match store.lookup(&key) {
+fn parse_blob_metadata_lookup(
+    lookup: std::result::Result<LookupResponse, KVStoreError>,
+) -> Result<Option<BlobMetadata>> {
+    match lookup {
         Ok(mut lookup_result) => {
             let body = lookup_result.take_body().into_string();
-
             let metadata: BlobMetadata = serde_json::from_str(&body).map_err(|e| {
                 BlossomError::MetadataError(format!("Failed to parse metadata: {}", e))
             })?;
-
             Ok(Some(metadata))
         }
         Err(KVStoreError::ItemNotFound) => Ok(None),
@@ -179,6 +175,51 @@ pub fn get_blob_metadata_uncached(hash: &str) -> Result<Option<BlobMetadata>> {
             e
         ))),
     }
+}
+
+fn parse_blob_refs_lookup(
+    lookup: std::result::Result<LookupResponse, KVStoreError>,
+) -> Result<Vec<String>> {
+    match lookup {
+        Ok(mut lookup_result) => {
+            let body = lookup_result.take_body().into_string();
+            let refs: Vec<String> = serde_json::from_str(&body)
+                .map_err(|e| BlossomError::MetadataError(format!("Failed to parse refs: {}", e)))?;
+            Ok(refs)
+        }
+        Err(KVStoreError::ItemNotFound) => Ok(Vec::new()),
+        Err(e) => Err(BlossomError::MetadataError(format!(
+            "Failed to lookup refs: {}",
+            e
+        ))),
+    }
+}
+
+/// Get blob metadata directly from KV store (bypasses cache)
+pub fn get_blob_metadata_uncached(hash: &str) -> Result<Option<BlobMetadata>> {
+    let store = open_store()?;
+    let key = format!("{}{}", BLOB_PREFIX, hash.to_lowercase());
+    parse_blob_metadata_lookup(store.lookup(&key))
+}
+
+pub(crate) fn start_vanish_blob_lookup(
+    store: &KVStore,
+    hash: &str,
+) -> Result<PendingLookupHandle> {
+    let metadata_key = format!("{}{}", BLOB_PREFIX, hash.to_lowercase());
+    store
+        .build_lookup()
+        .execute_async(&metadata_key)
+        .map_err(|error| {
+            BlossomError::MetadataError(format!("Failed to start metadata lookup: {error}"))
+        })
+}
+
+pub(crate) fn finish_vanish_blob_lookup(
+    store: &KVStore,
+    metadata_handle: PendingLookupHandle,
+) -> Result<Option<BlobMetadata>> {
+    parse_blob_metadata_lookup(store.pending_lookup_wait(metadata_handle))
 }
 
 /// Invalidate cached metadata for a hash
@@ -1399,20 +1440,7 @@ pub fn get_tombstone(hash: &str) -> Result<Option<String>> {
 pub fn get_blob_refs(hash: &str) -> Result<Vec<String>> {
     let store = open_store()?;
     let key = format!("{}{}", REFS_PREFIX, hash.to_lowercase());
-
-    match store.lookup(&key) {
-        Ok(mut lookup_result) => {
-            let body = lookup_result.take_body().into_string();
-            let refs: Vec<String> = serde_json::from_str(&body)
-                .map_err(|e| BlossomError::MetadataError(format!("Failed to parse refs: {}", e)))?;
-            Ok(refs)
-        }
-        Err(KVStoreError::ItemNotFound) => Ok(Vec::new()),
-        Err(e) => Err(BlossomError::MetadataError(format!(
-            "Failed to lookup refs: {}",
-            e
-        ))),
-    }
+    parse_blob_refs_lookup(store.lookup(&key))
 }
 
 /// Remove a pubkey from the blob's references list. Returns the remaining refs.
