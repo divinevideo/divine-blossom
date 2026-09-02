@@ -4,10 +4,9 @@ use crate::blossom::BlobMetadata;
 use crate::blossom::BlobStatus;
 use crate::error::Result;
 use crate::metadata::{
-    add_to_recent_index, add_to_user_list, get_blob_refs, put_tombstone,
-    remove_from_blob_refs_from, remove_from_recent_index, remove_from_recent_index_batch,
-    remove_from_user_list, update_blob_status, update_stats_on_remove_batch,
-    update_stats_on_status_change, update_user_list_for_vanish,
+    add_to_recent_index, add_to_user_list, get_blob_refs, put_tombstone, remove_from_recent_index,
+    remove_from_recent_index_batch, remove_from_user_list, update_blob_status,
+    update_stats_on_remove_batch, update_stats_on_status_change, update_user_list_for_vanish,
 };
 use std::collections::HashMap;
 
@@ -92,15 +91,11 @@ impl VanishBlobOps for DefaultCreatorDeleteOps {
 
 pub(crate) struct PrefetchedVanishOps<'a> {
     metadata: &'a HashMap<String, Option<BlobMetadata>>,
-    refs: &'a HashMap<String, Vec<String>>,
 }
 
 impl<'a> PrefetchedVanishOps<'a> {
-    pub(crate) fn new(
-        metadata: &'a HashMap<String, Option<BlobMetadata>>,
-        refs: &'a HashMap<String, Vec<String>>,
-    ) -> Self {
-        Self { metadata, refs }
+    pub(crate) fn new(metadata: &'a HashMap<String, Option<BlobMetadata>>) -> Self {
+        Self { metadata }
     }
 }
 
@@ -131,7 +126,7 @@ impl VanishBlobOps for PrefetchedVanishOps<'_> {
     }
 
     fn remove_from_blob_refs(&self, hash: &str, pubkey: &str) -> Result<Vec<String>> {
-        remove_from_blob_refs_from(hash, pubkey, self.refs.get(&hash.to_lowercase()).cloned())
+        DefaultCreatorDeleteOps.remove_from_blob_refs(hash, pubkey)
     }
 
     fn put_erasure_evidence(&self, hash: &str) -> Result<()> {

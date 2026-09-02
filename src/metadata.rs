@@ -205,35 +205,21 @@ pub fn get_blob_metadata_uncached(hash: &str) -> Result<Option<BlobMetadata>> {
 pub(crate) fn start_vanish_blob_lookups(
     store: &KVStore,
     hash: &str,
-) -> Result<(PendingLookupHandle, PendingLookupHandle)> {
-    let hash = hash.to_lowercase();
-    let metadata_key = format!("{}{}", BLOB_PREFIX, hash);
-    let refs_key = format!("{}{}", REFS_PREFIX, hash);
-    let metadata = store
+) -> Result<PendingLookupHandle> {
+    let metadata_key = format!("{}{}", BLOB_PREFIX, hash.to_lowercase());
+    store
         .build_lookup()
         .execute_async(&metadata_key)
         .map_err(|error| {
             BlossomError::MetadataError(format!("Failed to start metadata lookup: {error}"))
-        })?;
-    match store.build_lookup().execute_async(&refs_key) {
-        Ok(refs) => Ok((metadata, refs)),
-        Err(error) => {
-            let _ = store.pending_lookup_wait(metadata);
-            Err(BlossomError::MetadataError(format!(
-                "Failed to start refs lookup: {error}"
-            )))
-        }
-    }
+        })
 }
 
 pub(crate) fn finish_vanish_blob_lookups(
     store: &KVStore,
     metadata_handle: PendingLookupHandle,
-    refs_handle: PendingLookupHandle,
-) -> Result<(Option<BlobMetadata>, Vec<String>)> {
-    let metadata = parse_blob_metadata_lookup(store.pending_lookup_wait(metadata_handle))?;
-    let refs = parse_blob_refs_lookup(store.pending_lookup_wait(refs_handle))?;
-    Ok((metadata, refs))
+) -> Result<Option<BlobMetadata>> {
+    parse_blob_metadata_lookup(store.pending_lookup_wait(metadata_handle))
 }
 
 /// Invalidate cached metadata for a hash
@@ -1459,22 +1445,10 @@ pub fn get_blob_refs(hash: &str) -> Result<Vec<String>> {
 
 /// Remove a pubkey from the blob's references list. Returns the remaining refs.
 pub fn remove_from_blob_refs(hash: &str, pubkey: &str) -> Result<Vec<String>> {
-    remove_from_blob_refs_from(hash, pubkey, None)
-}
-
-pub(crate) fn remove_from_blob_refs_from(
-    hash: &str,
-    pubkey: &str,
-    loaded: Option<Vec<String>>,
-) -> Result<Vec<String>> {
     let pubkey_lower = pubkey.to_lowercase();
-    let mut loaded = loaded;
 
     for attempt in 0..5 {
-        let mut refs = match loaded.take() {
-            Some(refs) => refs,
-            None => get_blob_refs(hash)?,
-        };
+        let mut refs = get_blob_refs(hash)?;
 
         if !refs.contains(&pubkey_lower) {
             return Ok(refs);

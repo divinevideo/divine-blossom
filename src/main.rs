@@ -4462,16 +4462,16 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
     Ok(resp)
 }
 
-// Fastly Compute instances hard-stop at 120s. Vanish's VCL first_byte_timeout
-// is ~15s and is a separate Fastly config change. Stop starting another prepare
-// wave once elapsed plus the last wave would meet this budget, so storage,
-// shared KV, and the HTTP response still fit under that outer timeout.
+// Fastly Compute instances hard-stop at 120s. Stop starting another wave once
+// elapsed plus the last observed wave would meet this budget. The first wave
+// always runs. A later wave can still overshoot if it is slower than the last
+// one, and shared KV plus the HTTP response sit outside the last-wave estimate.
 const VANISH_TIME_BUDGET: Duration = Duration::from_millis(10_000);
 // Fastly does not document a KV pending-handle ceiling. Compute allows 1,000
-// concurrent backend requests. This is per-wave lookup width, not an operation
-// cap. Two unique-key lookups run per hash. Keep one wave at the previously
-// safe working set while per-blob kv_finalize remains serial; extra waves
-// start only when the last wave still fits in VANISH_TIME_BUDGET.
+// concurrent backend requests. This is per-wave metadata-lookup width, not an
+// operation cap. Keep one wave at the previously safe working set while
+// per-blob kv_finalize remains serial; extra waves start only when the last
+// wave still fits in VANISH_TIME_BUDGET.
 const VANISH_KV_LOOKUP_FANOUT: usize = 10;
 const VANISH_STORAGE_ATTEMPTS: u8 = 2;
 
@@ -4522,21 +4522,15 @@ fn add_vanish_storage_timings(total: &mut VanishStorageTimings, wave: &VanishSto
     total.purge_compute_ms = total.purge_compute_ms.saturating_add(wave.purge_compute_ms);
 }
 
-fn prefetch_vanish_blob_lookups(
-    hashes: &[String],
-) -> (
-    HashMap<String, Option<BlobMetadata>>,
-    HashMap<String, Vec<String>>,
-) {
+fn prefetch_vanish_blob_lookups(hashes: &[String]) -> HashMap<String, Option<BlobMetadata>> {
     let mut metadata = HashMap::new();
-    let mut refs = HashMap::new();
     let Ok(store) = open_store() else {
-        return (metadata, refs);
+        return metadata;
     };
     let mut pending = Vec::new();
     for hash in hashes {
         match start_vanish_blob_lookups(&store, hash) {
-            Ok(handles) => pending.push((hash.clone(), handles)),
+            Ok(handle) => pending.push((hash.clone(), handle)),
             Err(error) => {
                 eprintln!(
                     "[VANISH] hash={} failed to start parallel blob lookups: {}",
@@ -4545,11 +4539,10 @@ fn prefetch_vanish_blob_lookups(
             }
         }
     }
-    for (hash, (metadata_handle, refs_handle)) in pending {
-        match finish_vanish_blob_lookups(&store, metadata_handle, refs_handle) {
-            Ok((blob_metadata, blob_refs)) => {
+    for (hash, metadata_handle) in pending {
+        match finish_vanish_blob_lookups(&store, metadata_handle) {
+            Ok(blob_metadata) => {
                 metadata.insert(hash.to_lowercase(), blob_metadata);
-                refs.insert(hash.to_lowercase(), blob_refs);
             }
             Err(error) => {
                 eprintln!(
@@ -4559,7 +4552,7 @@ fn prefetch_vanish_blob_lookups(
             }
         }
     }
-    (metadata, refs)
+    metadata
 }
 
 struct VanishWavePrepare {
@@ -4570,8 +4563,8 @@ struct VanishWavePrepare {
 }
 
 fn prepare_vanish_wave(pubkey: &str, hashes: &[String]) -> VanishWavePrepare {
-    let (metadata, refs) = prefetch_vanish_blob_lookups(hashes);
-    let ops = PrefetchedVanishOps::new(&metadata, &refs);
+    let metadata = prefetch_vanish_blob_lookups(hashes);
+    let ops = PrefetchedVanishOps::new(&metadata);
     let mut prepared = VanishWavePrepare {
         erase: Vec::new(),
         completed: Vec::new(),
@@ -4673,11 +4666,10 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     let mut kv_finalize_ms = 0u128;
     let mut last_wave = Duration::ZERO;
     let mut offset = 0usize;
-    let waves_started = Instant::now();
     while offset < valid.len() {
         if !should_start_vanish_wave(
             offset > 0,
-            waves_started.elapsed(),
+            started.elapsed(),
             last_wave,
             VANISH_TIME_BUDGET,
         ) {
