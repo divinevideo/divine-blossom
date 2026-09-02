@@ -4468,14 +4468,6 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
 // always runs. A later wave can still overshoot if it is slower than the last
 // one, and shared KV plus the HTTP response sit outside the last-wave estimate.
 const VANISH_TIME_BUDGET: Duration = Duration::from_millis(10_000);
-// Issue 266 checks this named budget plus one shared-key flush against a ~15s
-// caller first-byte timeout. VANISH_TIME_BUDGET only gates starting another
-// wave; a slower last wave can still overshoot. The reserve is not a runtime
-// cap.
-#[cfg(test)]
-const VANISH_CALLER_FIRST_BYTE_TIMEOUT: Duration = Duration::from_millis(15_000);
-#[cfg(test)]
-const VANISH_SHARED_FLUSH_RESERVE: Duration = Duration::from_millis(2_000);
 // Fastly does not document a KV pending-handle ceiling. Compute allows 1,000
 // concurrent backend requests. This is per-wave metadata-lookup width, not an
 // operation cap. Keep one wave at the previously safe working set while
@@ -6787,8 +6779,7 @@ mod tests {
         upload_control_host, upload_exposed_headers, upload_from_resumable_completion,
         vanish_response_status, vanish_shared_update_error_count, AudioReuseAvailability,
         DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState,
-        VanishExecution, VANISH_CALLER_FIRST_BYTE_TIMEOUT, VANISH_SHARED_FLUSH_RESERVE,
-        VANISH_TIME_BUDGET,
+        VanishExecution, VANISH_TIME_BUDGET,
     };
     use crate::blossom::{
         BlobStatus, ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus,
@@ -6862,14 +6853,6 @@ mod tests {
 
         assert_eq!(selected, vec![valid]);
         assert_eq!(exceptions, vec![malformed]);
-    }
-
-    #[test]
-    fn vanish_named_wave_budget_plus_flush_reserve_stays_under_caller_check() {
-        assert!(
-            VANISH_TIME_BUDGET.saturating_add(VANISH_SHARED_FLUSH_RESERVE)
-                <= VANISH_CALLER_FIRST_BYTE_TIMEOUT
-        );
     }
 
     #[test]

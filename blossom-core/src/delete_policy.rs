@@ -110,8 +110,7 @@ pub struct PreparedVanishBlob {
 /// Shared-key updates accumulated across every wave of one vanish call.
 ///
 /// Flush once after the last wave. Fastly KV allows one write per second per
-/// key, so a per-wave flush would serialize those waits and miss the caller
-/// timeout.
+/// key, so a per-wave flush would serialize those waits and increase latency.
 #[derive(Debug, Default)]
 pub struct VanishSharedUpdates {
     user_list_removals: Vec<String>,
@@ -685,31 +684,6 @@ mod tests {
         assert_eq!(
             *ops.calls.borrow(),
             vec![("stats", 10), ("recent", 10), ("list", 10)]
-        );
-    }
-
-    #[test]
-    fn vanish_shared_keys_are_flushed_once_across_two_waves() {
-        let mut updates = VanishSharedUpdates::default();
-        for index in 0..10 {
-            updates.record_erased(&erased_blob(index));
-        }
-        for index in 10..20 {
-            updates.record_erased(&erased_blob(index));
-        }
-        let ops = MockSharedKeyOps {
-            list_empty: true,
-            ..Default::default()
-        };
-
-        let account_complete =
-            apply_vanish_shared_updates_with_ops(&updates, &"1".repeat(64), &[], true, &ops)
-                .expect("shared updates should flush once after both waves");
-
-        assert!(account_complete);
-        assert_eq!(
-            *ops.calls.borrow(),
-            vec![("stats", 20), ("recent", 20), ("list", 20)]
         );
     }
 

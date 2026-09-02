@@ -1792,10 +1792,9 @@ pub fn delete_audio_source_refs(audio_hash: &str) -> Result<()> {
 mod tests {
     use super::{
         apply_vanish_recent_index_update, apply_vanish_user_list_update, duplicate_generation,
-        edge_transcode_status_generation,
-        edge_transcript_status_generation, erasure_evidence_key, generation_rejection,
-        rotate_hashes_to_end, should_refresh_vanish_audit_state, stale_generation,
-        status_generation_from_ms, transcode_status_event_sequence,
+        edge_transcode_status_generation, edge_transcript_status_generation, erasure_evidence_key,
+        generation_rejection, rotate_hashes_to_end, should_refresh_vanish_audit_state,
+        stale_generation, status_generation_from_ms, transcode_status_event_sequence,
         transcript_status_event_sequence, vanish_audit_key, vanish_audit_state_ttl,
         StatusUpdateOutcome, VanishAuditState,
     };
