@@ -43,7 +43,10 @@ Measured on 2026-09-02:
 
 - Outer VCL version 24 has been active since about 2026-08-31T00:55Z, with the
   `vcl-error-diagnostics` Google Pub/Sub endpoint (`placement` none) and the
-  repository's `recv`, `error`, `deliver`, `miss`, `fetch`, and `pass` snippets.
+  repository-backed `recv`, `error`, `deliver`, `miss`, and `fetch` snippets.
+  It also has a `pass` snippet whose source is not stored in this repository;
+  preserve and review that live-only configuration separately when cloning or
+  reconstructing the service.
 - Compute version 372 has the `compute-diagnostics` Google Pub/Sub endpoint
   active.
 - Both topics and their pull subscriptions are in
@@ -127,12 +130,13 @@ following:
    set the GitHub Actions repository variable
    `FASTLY_OUTER_DIAGNOSTICS_ACTIVE=true`; it is absent/off by default and gates
    both automatic and manually requested Compute publishes. A missing or false
-   value makes the deploy job fail visibly without publishing. If the merge
-   happened while the gate was off, run the `CI` workflow with
-   `publish_compute` enabled after setting the variable. This order is
-   required because Compute may emit internal response metadata that the deliver
-   snippet strips; publishing Compute first can expose those headers until the
-   outer version is active.
+   value makes the deploy job fail visibly without publishing. If the original
+   push workflow failed only at this gate, set the variable and rerun its failed
+   jobs as described in [Fastly deploy and rollback](rollback.md#publish-compute-through-ci).
+   Do not dispatch `publish_compute` from the current `main`: it may have
+   advanced to a different commit. This order is required because Compute may
+   emit internal response metadata that the deliver snippet strips; publishing
+   Compute first can expose those headers until the outer version is active.
 5. Validate each failure stage separately with approved, controlled requests.
    Confirm a Compute 5xx preserves its supplied request ID (verbatim for
    IDs up to 64 characters after sanitization; longer IDs keep a 64-character

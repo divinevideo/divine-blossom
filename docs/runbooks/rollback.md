@@ -8,8 +8,23 @@ The outer VCL service caches responses and forwards misses to the Compute servic
 | Outer VCL | `Divine.Video's website` | `ML7R82HKfmTaqTpHExIDVN` |
 | Compute | `fastly-blossom` | `pOvEEWykEbpnylqst1KTrR` |
 
-Run read-only commands with `envchain fastly-readonly`. Run write commands with
-`envchain fastly-global` only after the operator approves the exact change.
+`envchain` is an operator-workstation prerequisite; this repository does not
+install it or create its namespaces. Before an incident, install it through the
+approved workstation setup and create the two namespaces interactively:
+
+```bash
+envchain --set fastly-readonly FASTLY_API_TOKEN
+envchain --set fastly-global FASTLY_API_TOKEN
+```
+
+Store a Fastly read-only token in `fastly-readonly` and a global-scope token in
+`fastly-global`. `envchain --set` prompts for each value; never append a token to
+either command. Run read-only commands with `envchain fastly-readonly`. Run
+write commands with `envchain fastly-global` only after the operator approves
+the exact change. If those namespaces are unavailable, stop and establish an
+equivalent separately reviewed credential wrapper before continuing; do not
+silently fall back to an ambient write-capable `FASTLY_API_TOKEN`.
+
 The `fastly service version validate` command requires Fastly CLI 14.1 or newer;
 the first recorded exercise used CLI 15.4.0. Check `fastly version` before
 starting and upgrade only through the separately reviewed CLI upgrade process.

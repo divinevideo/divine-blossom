@@ -133,7 +133,9 @@ to this one topic.
 - **Do not use the CLI's `--secret-key` flag.** It has no file or stdin form, so
   the private key would be visible in process metadata.
 - **`fastly logging googlepubsub describe` and `list --json` print `SecretKey`.**
-  Confirm the endpoint in the Fastly dashboard instead.
+  Confirm the endpoint in the Fastly dashboard instead. Do not try to strip the
+  credential from JSON output: the field is `SecretKey`, not `secret_key`, and
+  a deny-list using the latter succeeds while leaving the credential intact.
 - **Activate the endpoint's version before `fastly compute publish`.**
   `publish` clones the *active* version. Creating the endpoint with `--autoclone`
   leaves it on a draft version; publishing before activating that draft clones
