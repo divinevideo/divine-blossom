@@ -27,9 +27,11 @@ The repository contains, but does not activate or configure:
   normal response, so those never enter `vcl_error`. The fetch snippet still
   `return(pass)` on them; it does not convert them into synthetic errors.
 - `vcl/log_5xx.vcl`, a `vcl_log` snippet that writes the same schema with
-  `"phase":"log"` for client-facing 5xx whose `fastly_info.state` does not
-  match `ERROR`. That is the complement of the `vcl_error` stream. It logs
-  only the edge hop (`fastly.ff.visits_this_service == 0`).
+  `"phase":"log"` for client-facing 5xx whose `fastly_info.state` is not a
+  `vcl_error` transit (`ERROR` with only CLUSTER/WAIT/REFRESH suffixes). That
+  is the complement of the `vcl_error` stream. It logs only the client-facing
+  edge hop (`fastly.ff.visits_this_service == 0` in `vcl_log`). It still logs
+  `ERROR-LOSTHDR`, `ERROR-DISCONNECT`, and `BG-ERROR-*`.
 - Error-only Compute request logging to the endpoint named
   `compute-diagnostics` with the sanitized request ID, method, normalized route,
   final status, available error category, and duration. Routine successful and
@@ -89,16 +91,23 @@ can have logged.
 use the same endpoint as `vcl_error.v1`. Fields: `phase` (`fetch` or `log`),
 request start timestamp, sanitized request ID, service ID, method, URL (path
 and query, capped at 256 characters, JSON-escaped), status, origin or response
-reason phrase, POP, backend, cache state, `ff_visits`, restart count, and
+reason phrase, POP, backend, `backend_hop` (`origin` or `shield` from
+`req.backend.is_origin`), cache state, `ff_visits`, restart count, and
 elapsed milliseconds. The `log` phase also records `body_bytes_written`.
+`cache_state` is final only in the `log` phase; the fetch-phase value is
+provisional. `ff_visits` is not an edge/shield discriminator in `vcl_fetch`
+(clustering makes it 1 at the edge fetch node). Use `backend_hop` for that.
 Headers, client address, authorization, cookies, and bodies are not logged.
 
 How to split a `status_503` minute after both snippets are active:
 
 - A `vcl_error.v1` record: Fastly generated the 503 and `vcl_error` ran
   (`error_sub_time` is the matching stats signal).
-- A `vcl_5xx.v1` `phase=fetch` record: Compute or the shield returned a
-  syntactically valid 5xx. `vcl_fetch` passed it through.
+- A `vcl_5xx.v1` `phase=fetch` record: a syntactically valid origin 5xx reached
+  `vcl_fetch`. Fetch has no hop filter on purpose. A shielded request can emit
+  two fetch records (edge and shield). `backend_hop` says which. A fetch record
+  can also exist without a client-facing 5xx, for example a background
+  revalidation that got 5xx while the client still received stale 200.
 - A `vcl_5xx.v1` `phase=log` record without a matching `vcl_error.v1`: the
   client received a 5xx that never entered `vcl_error`.
 - `status_503` with neither schema: the request never entered VCL (platform
@@ -106,7 +115,8 @@ How to split a `status_503` minute after both snippets are active:
   remain unobservable from snippets.
 - Streamed cache-fill failures after `vcl_deliver` has started (`beresp.do_stream`
   on 200/206) cannot enter `vcl_error` and typically cannot change the status
-  already sent, so they show up as truncated 200s, not as `status_503`.
+  already sent, so they show up as truncated 200s, not as `status_503`. This
+  change does not instrument truncated 200s.
 
 The outer service copies the selected caller/generated ID to the private
 `X-Divine-Edge-Request-Id` request header before chaining so a later Compute
@@ -203,9 +213,9 @@ cross-service production correlation remain operator validation.
   record at all). Do not treat a missing Compute record as proof the request
   never reached Compute.
 - A `vcl_5xx.v1` fetch record with a Compute 5xx at the same request ID is
-  origin-generated. A fetch record with no Compute record is a 5xx from the
-  shield hop or another syntactically valid backend response, not a Fastly
-  synthetic.
+  origin-generated. A fetch record with `backend_hop=origin` and no Compute
+  record is still a syntactically valid backend 5xx, not a Fastly synthetic.
+  `backend_hop=shield` is the shield POP's response to the edge.
 - A matching Compute 5xx identifies an application or origin-side failure; use
   its normalized error category without assuming the VCL record is a second
   independent request.

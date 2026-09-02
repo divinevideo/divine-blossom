@@ -8,6 +8,11 @@ unset beresp.http.Pragma;
 # the ones Fastly status_503 counts while error_sub_time stays 0 (see #271).
 # Do not return(error) here: that would replace the origin body.
 if (beresp.status >= 500 && beresp.status < 600) {
+  if (req.backend.is_origin) {
+    set req.http.X-Divine-Backend-Hop = "origin";
+  } else {
+    set req.http.X-Divine-Backend-Hop = "shield";
+  }
   log {"syslog "} req.service_id {" vcl-error-diagnostics :: "}
     {"{"}
       {""schema":"divine.blossom.vcl_5xx.v1","}
@@ -21,11 +26,13 @@ if (beresp.status >= 500 && beresp.status < 600) {
       {""reason":""} json.escape(beresp.response) {"","}
       {""pop":""} json.escape(server.datacenter) {"","}
       {""backend":""} json.escape(req.backend.name) {"","}
+      {""backend_hop":""} json.escape(req.http.X-Divine-Backend-Hop) {"","}
       {""cache_state":""} json.escape(fastly_info.state) {"","}
       {""ff_visits":"} fastly.ff.visits_this_service {","}
       {""restart_count":"} req.restarts {","}
       {""elapsed_ms":"} time.elapsed.msec
     {"}"};
+  unset req.http.X-Divine-Backend-Hop;
 }
 
 # Origin owns the edge-cache decision through Surrogate-Control. Compute marks

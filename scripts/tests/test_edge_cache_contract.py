@@ -401,6 +401,33 @@ class EdgeCacheContractTests(unittest.TestCase):
             self.assertNotIn("fastly purge --all", contents, relative_path)
 
 
+class Vcl5xxSkipErrorContractTests(unittest.TestCase):
+    def test_origin_5xx_logs_do_not_use_the_view_endpoint(self):
+        fetch_vcl = (ROOT / "vcl" / "fetch.vcl").read_text()
+        log_vcl = (ROOT / "vcl" / "log_5xx.vcl").read_text()
+        runbook = (ROOT / "docs" / "runbooks" / "fastly-5xx.md").read_text()
+
+        for source in (fetch_vcl, log_vcl):
+            self.assertIn("vcl-error-diagnostics", source)
+            self.assertNotIn("cdn-view-logs", source)
+            self.assertIn("divine.blossom.vcl_5xx.v1", source)
+            self.assertIn('"backend_hop":', source)
+
+        self.assertIn("beresp.status >= 500", fetch_vcl)
+        self.assertLess(
+            fetch_vcl.index("divine.blossom.vcl_5xx.v1"),
+            fetch_vcl.index("return(pass)"),
+        )
+        self.assertIn(
+            'fastly_info.state !~ "^ERROR(-(CLUSTER|WAIT|REFRESH))*$"',
+            log_vcl,
+        )
+        self.assertNotIn('fastly_info.state !~ "(?i)ERROR"', log_vcl)
+        self.assertIn("divine.blossom.vcl_5xx.v1", runbook)
+        self.assertIn("backend_hop", runbook)
+        self.assertIn("vcl/log_5xx.vcl", runbook)
+
+
 class ShieldSelectionContractTests(unittest.TestCase):
     def test_hash_paths_fall_through_to_generated_shield_selection(self):
         recv_vcl = (ROOT / "vcl" / "recv.vcl").read_text()
