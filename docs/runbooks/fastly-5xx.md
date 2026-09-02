@@ -66,14 +66,16 @@ census of the backlog.
 ## Log Schemas
 
 `divine.blossom.vcl_error.v1` records the request start timestamp, sanitized
-request ID, service ID, status, original `obj.response`, POP, selected backend,
-cache state, restart count, and elapsed milliseconds for every Fastly-generated
-5xx that reaches `vcl_error`. It does not record a URL, query string, client
-address, authorization, cookies, or body. Fastly `status_503` stats also count
-responses that never enter `vcl_error` — origin 5xx passed through `vcl_fetch`,
-and failures after `vcl_deliver` has started (including streamed cache fills).
-Those will not appear in this sink. Minutes with `error_sub_time > 0` are the
-ones the snippet can have logged.
+request ID, service ID, method, URL (path and query, UTF-8 capped at 256
+characters), status, original `obj.response`, POP, selected backend, cache
+state, restart count, and elapsed milliseconds for every Fastly-generated 5xx
+that reaches `vcl_error`. It does not record client address, authorization
+headers, cookies, or body. Derive a route category from the URL downstream if
+needed. Fastly `status_503` stats also count responses that never enter
+`vcl_error` — origin 5xx passed through `vcl_fetch`, and failures after
+`vcl_deliver` has started (including streamed cache fills). Those will not
+appear in this sink. Minutes with `error_sub_time > 0` are the ones the snippet
+can have logged.
 
 The outer service copies the selected caller/generated ID to the private
 `X-Divine-Edge-Request-Id` request header before chaining so a later Compute
@@ -117,14 +119,15 @@ following:
    `vcl-error-diagnostics` on the outer service and `compute-diagnostics` on the
    Compute service through the Fastly dashboard, then delete the temporary local
    key files. Do not pass a private key in a CLI argument.
-2. Add `vcl/recv.vcl` as a `recv` snippet, `vcl/error.vcl` as an `error`
-   snippet, and `vcl/deliver.vcl` as a `deliver` snippet on a cloned
-   outer-service version. Each file is the body Fastly inserts into the
-   corresponding subroutine. Keep automatic log placement disabled for
+2. Clone the active outer version so live-only configuration is copied,
+   including the `pass` snippet whose source is not in this repository. Update
+   `vcl/error.vcl` as the `error` snippet on that draft. Do not delete the
+   `pass` snippet. Keep automatic log placement disabled for
    `vcl-error-diagnostics`; the error snippet emits only the selected failures.
-3. Compile the cloned version, confirm the generated VCL contains all three
-   snippets once in their named subroutines, and review the diff before
-   activation.
+3. Run `fastly service version validate` on the draft. Confirm it returns
+   valid, that `vcl_error` contains the repository snippet once, and that the
+   live-only `pass` snippet is still present. Review the diff before
+   activation. CI does not compile this snippet.
 4. Activate the separately validated outer VCL version first, then publish the
    Compute package through the repository deployment path. After activation,
    set the GitHub Actions repository variable
