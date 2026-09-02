@@ -36,10 +36,12 @@ A push to `main` runs `diff` only. The same apply is available as a manual
 `Outer VCL` workflow with `apply_draft`, which does not run `diff` as a
 blocking prior step. CI never makes a draft live.
 
-A `vcl/` merge to `main` is expected to leave that `diff` job red until the
-matching draft is live: git is ahead of the active version on purpose. Re-run
-the workflow after activation to clear it. A red `diff` after an unrelated
-merge is a dashboard edit, not a pending deploy.
+A merge that changes a managed snippet leaves the `diff` job red until that
+content is live. Re-run the workflow after making the draft live to clear it.
+Read the job log, not which merge triggered it: `DRIFT` or `MISSING_LIVE` on a
+managed name means git is ahead of the active version (pending deploy or a
+rollback); `EXTRA_LIVE` or `META` is a dashboard change; a Fastly API error is
+neither.
 
 ## Making a draft live
 
