@@ -688,6 +688,37 @@ mod tests {
     }
 
     #[test]
+    fn vanish_shared_keys_are_flushed_once_across_two_waves() {
+        let mut updates = VanishSharedUpdates::default();
+        for index in 0..10 {
+            updates.record_erased(&PreparedVanishBlob {
+                hash: format!("{index:064x}"),
+                metadata: Some(sample_metadata(BlobStatus::Active)),
+            });
+        }
+        for index in 10..20 {
+            updates.record_erased(&PreparedVanishBlob {
+                hash: format!("{index:064x}"),
+                metadata: Some(sample_metadata(BlobStatus::Active)),
+            });
+        }
+        let ops = MockSharedKeyOps {
+            list_empty: true,
+            ..Default::default()
+        };
+
+        let account_complete =
+            apply_vanish_shared_updates_with_ops(&updates, &"1".repeat(64), &[], true, &ops)
+                .expect("shared updates should flush once after both waves");
+
+        assert!(account_complete);
+        assert_eq!(
+            *ops.calls.borrow(),
+            vec![("stats", 20), ("recent", 20), ("list", 20)]
+        );
+    }
+
+    #[test]
     fn vanish_metadata_less_shared_blob_unlinks_without_erasing() {
         let ops = MockVanishOps {
             metadata: RefCell::new(None),

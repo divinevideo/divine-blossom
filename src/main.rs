@@ -27,10 +27,9 @@ use crate::blossom::{
     TranscodeStatus, TranscriptStatus, UploadRequirements, QUALITY_VARIANTS,
 };
 use crate::delete_policy::{
-    apply_vanish_shared_updates_with_ops, build_creator_delete_response,
-    finalize_erased_vanish_blob_with_ops, handle_creator_delete, map_webhook_moderate_action,
-    plan_user_delete, prepare_vanish_blob_with_ops, soft_delete_blob, validate_sha256_format,
-    DefaultCreatorDeleteOps, DefaultVanishSharedKeyOps, DeletePlan, PrefetchedVanishOps,
+    apply_vanish_shared_updates_with_ops, build_creator_delete_response, handle_creator_delete,
+    map_webhook_moderate_action, plan_user_delete, prepare_vanish_blob_with_ops, soft_delete_blob,
+    validate_sha256_format, DefaultVanishSharedKeyOps, DeletePlan, PrefetchedVanishOps,
     PreparedVanishBlob, PreparedVanishBlobOrOutcome, VanishBlobOutcome, VanishSharedUpdates,
 };
 use crate::error::{BlossomError, Result};
@@ -39,15 +38,17 @@ use crate::metadata::{
     add_to_audio_source_refs, add_to_blob_refs, add_to_recent_index, add_to_user_index,
     add_to_user_list, claim_vanish_audit_completion, create_vanish_audit_state,
     delete_audio_mapping, delete_audio_source_refs, delete_auth_events, delete_blob_metadata,
-    delete_blob_refs, delete_subtitle_data, finish_vanish_blob_lookup, get_audio_mapping,
+    delete_blob_refs, delete_subtitle_data, finish_vanish_blob_lookup,
+    finish_vanish_erasure_evidence, finish_vanish_metadata_delete, get_audio_mapping,
     get_audio_source_refs, get_auth_event, get_blob_metadata, get_blob_metadata_uncached,
     get_blob_refs, get_subtitle_job, get_subtitle_job_by_hash, get_tombstone, get_user_blobs,
     get_vanish_audit_state, list_blobs_with_metadata, mark_vanish_audit_authorized_delivered,
     open_store, put_audio_mapping, put_auth_event, put_blob_metadata, put_subtitle_job,
     refresh_vanish_audit_state, remove_from_audio_source_refs, remove_from_blob_refs,
     remove_from_user_index, remove_from_user_list, set_subtitle_job_id_for_hash,
-    start_vanish_blob_lookup, update_blob_status, update_stats_on_add, StatusUpdateOutcome,
-    TranscodeMetadataUpdate, TranscriptMetadataUpdate, VanishAuditState,
+    start_vanish_blob_lookup, start_vanish_erasure_evidence, start_vanish_metadata_delete,
+    update_blob_status, update_stats_on_add, StatusUpdateOutcome, TranscodeMetadataUpdate,
+    TranscriptMetadataUpdate, VanishAuditState,
 };
 use crate::storage::{
     blob_exists, check_funnelcake_audio_reuse, current_timestamp, delete_blob as storage_delete,
@@ -575,10 +576,16 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
             }
             None => {
                 if !is_admin {
-                    eprintln!("[ACCESS] thumbnail hash={} metadata=None denied (non-admin)", video_hash);
+                    eprintln!(
+                        "[ACCESS] thumbnail hash={} metadata=None denied (non-admin)",
+                        video_hash
+                    );
                     return Err(BlossomError::NotFound("Blob not found".into()));
                 }
-                eprintln!("[ACCESS] thumbnail hash={} metadata=None allowed (admin bypass)", video_hash);
+                eprintln!(
+                    "[ACCESS] thumbnail hash={} metadata=None allowed (admin bypass)",
+                    video_hash
+                );
             }
         }
 
@@ -650,10 +657,16 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         }
         None => {
             if !is_admin {
-                eprintln!("[ACCESS] hash={} metadata=None denied (no metadata, non-admin)", hash);
+                eprintln!(
+                    "[ACCESS] hash={} metadata=None denied (no metadata, non-admin)",
+                    hash
+                );
                 return Err(BlossomError::NotFound("Blob not found".into()));
             }
-            eprintln!("[ACCESS] hash={} metadata=None allowed (admin bypass)", hash);
+            eprintln!(
+                "[ACCESS] hash={} metadata=None allowed (admin bypass)",
+                hash
+            );
         }
     }
 
@@ -2177,10 +2190,16 @@ fn handle_get_subtitle_by_hash(req: Request, path: &str) -> Result<Response> {
         }
         None => {
             if !is_admin {
-                eprintln!("[ACCESS] subtitle hash={} metadata=None denied (non-admin)", hash);
+                eprintln!(
+                    "[ACCESS] subtitle hash={} metadata=None denied (non-admin)",
+                    hash
+                );
                 return Err(BlossomError::NotFound("Video hash not found".into()));
             }
-            eprintln!("[ACCESS] subtitle hash={} metadata=None allowed (admin bypass)", hash);
+            eprintln!(
+                "[ACCESS] subtitle hash={} metadata=None allowed (admin bypass)",
+                hash
+            );
         }
     }
 
@@ -3884,8 +3903,8 @@ fn handle_upload_init(mut req: Request, record: &mut UploadLogRecord) -> Result<
     }
 
     let response_body = proxy_resp.take_body().into_string();
-    let init_response: ResumableUploadInitResponse = serde_json::from_str(&response_body)
-        .map_err(|e| {
+    let init_response: ResumableUploadInitResponse =
+        serde_json::from_str(&response_body).map_err(|e| {
             BlossomError::Internal(format!("Invalid upload service init response: {}", e))
         })?;
 
@@ -4266,10 +4285,9 @@ pub(crate) fn delete_blob_gcs_artifacts(hash: &str) -> Result<()> {
         }
     }
 
-    if let Some(result) = local_derivative_cleanup_result(
-        crate::storage::is_local_mode(),
-        &deterministic_failures,
-    ) {
+    if let Some(result) =
+        local_derivative_cleanup_result(crate::storage::is_local_mode(), &deterministic_failures)
+    {
         return result;
     }
 
@@ -4469,11 +4487,10 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
 // one, and shared KV plus the HTTP response sit outside the last-wave estimate.
 const VANISH_TIME_BUDGET: Duration = Duration::from_millis(10_000);
 // Fastly does not document a KV pending-handle ceiling. Compute allows 1,000
-// concurrent backend requests. This is per-wave metadata-lookup width, not an
-// operation cap. Keep one wave at the previously safe working set while
-// per-blob kv_finalize remains serial; extra waves start only when the last
-// wave still fits in VANISH_TIME_BUDGET.
-const VANISH_KV_LOOKUP_FANOUT: usize = 10;
+// concurrent backend requests. This is per-wave unique-key width for both
+// metadata lookups and per-blob finalization, not an operation cap. Extra
+// waves start only when the last wave still fits in VANISH_TIME_BUDGET.
+const VANISH_KV_FANOUT: usize = 10;
 const VANISH_STORAGE_ATTEMPTS: u8 = 2;
 
 #[derive(Debug)]
@@ -4523,7 +4540,7 @@ fn next_vanish_wave_range(
     if offset >= total || !should_start_vanish_wave(offset > 0, elapsed, last_wave, budget) {
         return None;
     }
-    Some(offset..offset.saturating_add(VANISH_KV_LOOKUP_FANOUT).min(total))
+    Some(offset..offset.saturating_add(VANISH_KV_FANOUT).min(total))
 }
 
 fn add_vanish_storage_timings(total: &mut VanishStorageTimings, wave: &VanishStorageTimings) {
@@ -4602,6 +4619,108 @@ fn prepare_vanish_wave(pubkey: &str, hashes: &[String]) -> VanishWavePrepare {
         }
     }
     prepared
+}
+
+fn record_vanish_blob_finalize(
+    blob: &PreparedVanishBlob,
+    succeeded: bool,
+    shared_updates: &mut VanishSharedUpdates,
+    completed_outcomes: &mut Vec<VanishBlobOutcome>,
+    retry_hashes: &mut Vec<String>,
+    errors: &mut u32,
+) {
+    if succeeded {
+        shared_updates.record_erased(blob);
+        completed_outcomes.push(VanishBlobOutcome::FullyDeleted);
+        return;
+    }
+    *errors = errors.saturating_add(1);
+    retry_hashes.push(blob.hash.clone());
+}
+
+fn fail_vanish_blob_finalize(
+    pubkey: &str,
+    blob: PreparedVanishBlob,
+    error: impl std::fmt::Display,
+    retry_hashes: &mut Vec<String>,
+    errors: &mut u32,
+) {
+    eprintln!(
+        "[VANISH] pubkey={} hash={} failed to finalize erased blob: {}",
+        pubkey, blob.hash, error
+    );
+    *errors = errors.saturating_add(1);
+    retry_hashes.push(blob.hash);
+}
+
+fn finalize_erased_vanish_wave(
+    pubkey: &str,
+    blobs: Vec<PreparedVanishBlob>,
+    shared_updates: &mut VanishSharedUpdates,
+    completed_outcomes: &mut Vec<VanishBlobOutcome>,
+    retry_hashes: &mut Vec<String>,
+    errors: &mut u32,
+) {
+    if blobs.is_empty() {
+        return;
+    }
+    let store = match open_store() {
+        Ok(store) => store,
+        Err(error) => {
+            for blob in blobs {
+                fail_vanish_blob_finalize(pubkey, blob, &error, retry_hashes, errors);
+            }
+            return;
+        }
+    };
+
+    let mut evidence_pending = Vec::new();
+    for blob in blobs {
+        match start_vanish_erasure_evidence(&store, &blob.hash) {
+            Ok(handle) => evidence_pending.push((blob, handle)),
+            Err(error) => fail_vanish_blob_finalize(pubkey, blob, error, retry_hashes, errors),
+        }
+    }
+
+    let mut evidence_ok = Vec::new();
+    for (blob, handle) in evidence_pending {
+        match finish_vanish_erasure_evidence(&store, handle) {
+            Ok(()) => evidence_ok.push(blob),
+            Err(error) => fail_vanish_blob_finalize(pubkey, blob, error, retry_hashes, errors),
+        }
+    }
+
+    let mut metadata_pending = Vec::new();
+    let mut metadata_ok = Vec::new();
+    for blob in evidence_ok {
+        if blob.metadata.is_none() {
+            metadata_ok.push(blob);
+            continue;
+        }
+        match start_vanish_metadata_delete(&store, &blob.hash) {
+            Ok(handle) => metadata_pending.push((blob, handle)),
+            Err(error) => fail_vanish_blob_finalize(pubkey, blob, error, retry_hashes, errors),
+        }
+    }
+
+    for (blob, handle) in metadata_pending {
+        match finish_vanish_metadata_delete(&store, &blob.hash, handle) {
+            Ok(()) => metadata_ok.push(blob),
+            Err(error) => fail_vanish_blob_finalize(pubkey, blob, error, retry_hashes, errors),
+        }
+    }
+
+    for blob in metadata_ok {
+        delete_blob_kv_artifacts(&blob.hash);
+        record_vanish_blob_finalize(
+            &blob,
+            true,
+            shared_updates,
+            completed_outcomes,
+            retry_hashes,
+            errors,
+        );
+    }
 }
 
 fn record_malformed_vanish_hash(hash: &str, pubkey: &str) {
@@ -4754,7 +4873,8 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
                 failed_derived_sources.insert(plan.source_hash.clone());
             }
         }
-        for blob in &erase {
+        let mut finalize_blobs = Vec::new();
+        for blob in erase {
             if storage_result.failed_hashes.contains(&blob.hash)
                 || failed_derived_sources.contains(&blob.hash)
             {
@@ -4763,24 +4883,19 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
                     pubkey, blob.hash, wave_storage_attempts
                 );
                 execution.errors += 1;
-                retry_hashes.push(blob.hash.clone());
+                retry_hashes.push(blob.hash);
                 continue;
             }
-            match finalize_erased_vanish_blob_with_ops(blob, &DefaultCreatorDeleteOps) {
-                Ok(()) => {
-                    shared_updates.record_erased(blob);
-                    completed_outcomes.push(VanishBlobOutcome::FullyDeleted);
-                }
-                Err(error) => {
-                    eprintln!(
-                        "[VANISH] pubkey={} hash={} failed to finalize erased blob: {}",
-                        pubkey, blob.hash, error
-                    );
-                    execution.errors += 1;
-                    retry_hashes.push(blob.hash.clone());
-                }
-            }
+            finalize_blobs.push(blob);
         }
+        finalize_erased_vanish_wave(
+            pubkey,
+            finalize_blobs,
+            &mut shared_updates,
+            &mut completed_outcomes,
+            &mut retry_hashes,
+            &mut execution.errors,
+        );
         kv_finalize_ms = kv_finalize_ms.saturating_add(finalize_started.elapsed().as_millis());
         last_wave = wave_started.elapsed();
         offset = wave_end;
@@ -4914,11 +5029,9 @@ fn ensure_vanish_authorization_audit(
             deliver_vanish_authorization_audit(pubkey, initiator, &mut state)?;
             return Ok(state);
         }
-        if let Some(state) = refresh_vanish_audit_state(
-            pubkey,
-            initiator.as_str(),
-            &state.operation_id,
-        )? {
+        if let Some(state) =
+            refresh_vanish_audit_state(pubkey, initiator.as_str(), &state.operation_id)?
+        {
             return Ok(state);
         }
     }
@@ -4960,11 +5073,9 @@ fn complete_vanish_audit(
     initiator: VanishAuditInitiator,
     state: &mut VanishAuditState,
 ) -> Result<()> {
-    let Some(claimed) = claim_vanish_audit_completion(
-        pubkey,
-        initiator.as_str(),
-        current_timestamp(),
-    )? else {
+    let Some(claimed) =
+        claim_vanish_audit_completion(pubkey, initiator.as_str(), current_timestamp())?
+    else {
         return Ok(());
     };
     *state = claimed;
@@ -6589,7 +6700,7 @@ pub(crate) fn purge_edge_cache(surrogate_key: &str) {
 
     let services: &[(&str, &str)] = &[
         ("ML7R82HKfmTaqTpHExIDVN", "VCL"),     // divine.video website
-        ("pOvEEWykEbpnylqst1KTrR", "Compute"),  // media.divine.video (Blossom)
+        ("pOvEEWykEbpnylqst1KTrR", "Compute"), // media.divine.video (Blossom)
     ];
 
     for &(service_id, label) in services {
@@ -6611,7 +6722,9 @@ pub(crate) fn purge_edge_cache(surrogate_key: &str) {
                 } else {
                     eprintln!(
                         "[PURGE] {} purge failed for key={}: HTTP {}",
-                        label, surrogate_key, status.as_u16()
+                        label,
+                        surrogate_key,
+                        status.as_u16()
                     );
                 }
             }
@@ -6767,8 +6880,9 @@ mod tests {
         classify_audio_reuse_availability, classify_vanish_hashes, decide_transcode_fetch_action,
         decide_transcript_fetch_action, derivative_reconciliation_response, error_response,
         ignored_generation_response, is_alias_only_audio_blob, local_derivative_cleanup_result,
-        parse_transcode_status_webhook_payload, parse_transcript_status_webhook_payload,
-        next_vanish_wave_range, parse_upload_service_response, reconcile_vanish_list_completion,
+        next_vanish_wave_range, parse_transcode_status_webhook_payload,
+        parse_transcript_status_webhook_payload, parse_upload_service_response,
+        reconcile_vanish_list_completion, record_vanish_blob_finalize,
         should_delete_derived_audio_blob, should_eagerly_trigger_transcription,
         should_record_upload_service_transcode_failure,
         should_record_upload_service_transcript_failure,
@@ -6778,8 +6892,9 @@ mod tests {
         trusted_upload_service_terminal_derivative_error, upload_capability_headers,
         upload_control_host, upload_exposed_headers, upload_from_resumable_completion,
         vanish_response_status, vanish_shared_update_error_count, AudioReuseAvailability,
-        DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState,
-        VanishExecution, VANISH_TIME_BUDGET,
+        DerivativeObservation, PreparedVanishBlob, TranscodeFetchAction, TranscriptFetchAction,
+        TranscriptPendingState, VanishBlobOutcome, VanishExecution, VanishSharedUpdates,
+        VANISH_KV_FANOUT, VANISH_TIME_BUDGET,
     };
     use crate::blossom::{
         BlobStatus, ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus,
@@ -6798,10 +6913,7 @@ mod tests {
             vanish_response_status(1, 0),
             StatusCode::INTERNAL_SERVER_ERROR
         );
-        assert_eq!(
-            vanish_response_status(1, 1),
-            StatusCode::ACCEPTED
-        );
+        assert_eq!(vanish_response_status(1, 1), StatusCode::ACCEPTED);
     }
 
     #[test]
@@ -6888,7 +7000,7 @@ mod tests {
             budget,
         )
         .expect("the first wave must always start");
-        assert_eq!(first, 0..10);
+        assert_eq!(first, 0..VANISH_KV_FANOUT);
 
         let second = next_vanish_wave_range(
             25,
@@ -6898,7 +7010,7 @@ mod tests {
             budget,
         )
         .expect("a wave that fits the budget should start");
-        assert_eq!(second, 10..20);
+        assert_eq!(second, VANISH_KV_FANOUT..(VANISH_KV_FANOUT * 2));
 
         assert_eq!(25usize.saturating_sub(second.end), 5);
         assert!(next_vanish_wave_range(
@@ -6928,8 +7040,44 @@ mod tests {
         let (valid, malformed) = classify_vanish_hashes(&hashes[first.clone()]);
 
         assert!(valid.is_empty());
-        assert_eq!(malformed.len(), 10);
+        assert_eq!(malformed.len(), VANISH_KV_FANOUT);
         assert_eq!(hashes.len().saturating_sub(first.end), 15);
+    }
+
+    #[test]
+    fn vanish_finalize_failure_does_not_drop_sibling_successes() {
+        let blobs = (0..3)
+            .map(|index| PreparedVanishBlob {
+                hash: format!("{index:064x}"),
+                metadata: None,
+            })
+            .collect::<Vec<_>>();
+        let results = [true, false, true];
+        let mut shared_updates = VanishSharedUpdates::default();
+        let mut completed_outcomes = Vec::new();
+        let mut retry_hashes = Vec::new();
+        let mut errors = 0u32;
+
+        for (blob, succeeded) in blobs.iter().zip(results) {
+            record_vanish_blob_finalize(
+                blob,
+                succeeded,
+                &mut shared_updates,
+                &mut completed_outcomes,
+                &mut retry_hashes,
+                &mut errors,
+            );
+        }
+
+        assert_eq!(errors, 1);
+        assert_eq!(retry_hashes, vec![blobs[1].hash.clone()]);
+        assert_eq!(
+            completed_outcomes,
+            vec![
+                VanishBlobOutcome::FullyDeleted,
+                VanishBlobOutcome::FullyDeleted
+            ]
+        );
     }
 
     #[test]
@@ -6937,9 +7085,11 @@ mod tests {
         assert!(local_derivative_cleanup_result(true, &[])
             .expect("local mode should decide cleanup locally")
             .is_ok());
-        assert!(local_derivative_cleanup_result(true, &["delete failed".into()])
-            .expect("local mode should decide cleanup locally")
-            .is_err());
+        assert!(
+            local_derivative_cleanup_result(true, &["delete failed".into()])
+                .expect("local mode should decide cleanup locally")
+                .is_err()
+        );
         assert!(local_derivative_cleanup_result(false, &[]).is_none());
     }
 
@@ -7653,14 +7803,8 @@ mod tests {
         let resp = error_response(&BlossomError::NotFound("Blob not found".into()));
 
         assert_eq!(resp.get_status(), StatusCode::NOT_FOUND);
-        assert_eq!(
-            resp.get_header_str("Cache-Control"),
-            Some("no-store"),
-        );
-        assert_eq!(
-            resp.get_header_str("Surrogate-Control"),
-            Some("max-age=60"),
-        );
+        assert_eq!(resp.get_header_str("Cache-Control"), Some("no-store"),);
+        assert_eq!(resp.get_header_str("Surrogate-Control"), Some("max-age=60"),);
     }
 
     #[test]

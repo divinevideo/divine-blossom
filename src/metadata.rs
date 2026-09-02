@@ -9,7 +9,10 @@ use blossom_core::conditional_update::{
     update_json_conditionally_with_io, ConditionalJsonMutation,
 };
 use fastly::cache::simple as simple_cache;
-use fastly::kv_store::{InsertMode, KVStore, KVStoreError, LookupResponse, PendingLookupHandle};
+use fastly::kv_store::{
+    InsertMode, KVStore, KVStoreError, LookupResponse, PendingDeleteHandle, PendingInsertHandle,
+    PendingLookupHandle,
+};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -202,10 +205,7 @@ pub fn get_blob_metadata_uncached(hash: &str) -> Result<Option<BlobMetadata>> {
     parse_blob_metadata_lookup(store.lookup(&key))
 }
 
-pub(crate) fn start_vanish_blob_lookup(
-    store: &KVStore,
-    hash: &str,
-) -> Result<PendingLookupHandle> {
+pub(crate) fn start_vanish_blob_lookup(store: &KVStore, hash: &str) -> Result<PendingLookupHandle> {
     let metadata_key = format!("{}{}", BLOB_PREFIX, hash.to_lowercase());
     store
         .build_lookup()
@@ -247,19 +247,58 @@ pub fn put_blob_metadata(metadata: &BlobMetadata) -> Result<()> {
 /// Delete blob metadata
 pub fn delete_blob_metadata(hash: &str) -> Result<()> {
     let store = open_store()?;
-    let key = format!("{}{}", BLOB_PREFIX, hash.to_lowercase());
-
-    store
-        .delete(&key)
-        .map_err(|e| BlossomError::MetadataError(format!("Failed to delete metadata: {}", e)))?;
-
-    invalidate_metadata_cache(hash);
-    Ok(())
+    let handle = start_vanish_metadata_delete(&store, hash)?;
+    finish_vanish_metadata_delete(&store, hash, handle)
 }
 
 fn erasure_evidence_key(hash: &str) -> String {
     let digest = Sha256::digest(format!("{}{}", ERASURE_DOMAIN, hash.to_lowercase()));
     format!("{}{}", ERASURE_PREFIX, hex::encode(digest))
+}
+
+const ERASURE_EVIDENCE_VALUE: &str = r#"{"version":1,"evidence":"vanish_erasure"}"#;
+
+pub(crate) fn start_vanish_erasure_evidence(
+    store: &KVStore,
+    hash: &str,
+) -> Result<PendingInsertHandle> {
+    store
+        .build_insert()
+        .execute_async(&erasure_evidence_key(hash), ERASURE_EVIDENCE_VALUE)
+        .map_err(|error| {
+            BlossomError::MetadataError(format!("Failed to start erasure evidence insert: {error}"))
+        })
+}
+
+pub(crate) fn finish_vanish_erasure_evidence(
+    store: &KVStore,
+    handle: PendingInsertHandle,
+) -> Result<()> {
+    store.pending_insert_wait(handle).map_err(|error| {
+        BlossomError::MetadataError(format!("Failed to store erasure evidence: {error}"))
+    })
+}
+
+pub(crate) fn start_vanish_metadata_delete(
+    store: &KVStore,
+    hash: &str,
+) -> Result<PendingDeleteHandle> {
+    let key = format!("{}{}", BLOB_PREFIX, hash.to_lowercase());
+    store.build_delete().execute_async(&key).map_err(|error| {
+        BlossomError::MetadataError(format!("Failed to start metadata delete: {error}"))
+    })
+}
+
+pub(crate) fn finish_vanish_metadata_delete(
+    store: &KVStore,
+    hash: &str,
+    handle: PendingDeleteHandle,
+) -> Result<()> {
+    store.pending_delete_wait(handle).map_err(|error| {
+        BlossomError::MetadataError(format!("Failed to delete metadata: {error}"))
+    })?;
+    invalidate_metadata_cache(hash);
+    Ok(())
 }
 
 /// Store durable evidence that the vanish erasure phase completed for a blob.
@@ -268,14 +307,8 @@ fn erasure_evidence_key(hash: &str) -> String {
 /// content hash, media bytes, reason, or request timestamp.
 pub fn put_erasure_evidence(hash: &str) -> Result<()> {
     let store = open_store()?;
-    let key = erasure_evidence_key(hash);
-    let value = r#"{"version":1,"evidence":"vanish_erasure"}"#;
-
-    store.insert(&key, value).map_err(|e| {
-        BlossomError::MetadataError(format!("Failed to store erasure evidence: {}", e))
-    })?;
-
-    Ok(())
+    let handle = start_vanish_erasure_evidence(&store, hash)?;
+    finish_vanish_erasure_evidence(&store, handle)
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -398,10 +431,10 @@ pub fn mark_vanish_audit_authorized_delivered(
         let generation = result.current_generation();
         let mut state: VanishAuditState = serde_json::from_str(&result.take_body().into_string())
             .map_err(|error| {
-                BlossomError::MetadataError(format!(
-                    "Invalid vanish audit authorization state: {error}"
-                ))
-            })?;
+            BlossomError::MetadataError(format!(
+                "Invalid vanish audit authorization state: {error}"
+            ))
+        })?;
         if state.operation_id != operation_id {
             return Ok(None);
         }
@@ -514,8 +547,8 @@ pub fn claim_vanish_audit_completion(
         let generation = result.current_generation();
         let mut state: VanishAuditState = serde_json::from_str(&result.take_body().into_string())
             .map_err(|error| {
-                BlossomError::MetadataError(format!("Invalid vanish audit completion state: {error}"))
-            })?;
+            BlossomError::MetadataError(format!("Invalid vanish audit completion state: {error}"))
+        })?;
         if state.completed_at.is_some() {
             return Ok(Some(state));
         }
@@ -734,8 +767,7 @@ fn stale_generation(incoming: Option<u64>, stored: Option<u64>) -> bool {
 
 fn transcode_status_event_sequence(status: crate::blossom::TranscodeStatus) -> u64 {
     match status {
-        crate::blossom::TranscodeStatus::Pending
-        | crate::blossom::TranscodeStatus::Processing => 0,
+        crate::blossom::TranscodeStatus::Pending | crate::blossom::TranscodeStatus::Processing => 0,
         crate::blossom::TranscodeStatus::Complete | crate::blossom::TranscodeStatus::Failed => 1,
     }
 }
@@ -1712,8 +1744,9 @@ pub fn add_to_audio_source_refs(audio_hash: &str, source_hash: &str) -> Result<(
 
         let store = open_store()?;
         let key = format!("{}{}", AUDIO_REFS_PREFIX, audio_hash.to_lowercase());
-        let json = serde_json::to_string(&refs)
-            .map_err(|e| BlossomError::MetadataError(format!("Failed to serialize audio refs: {}", e)))?;
+        let json = serde_json::to_string(&refs).map_err(|e| {
+            BlossomError::MetadataError(format!("Failed to serialize audio refs: {}", e))
+        })?;
 
         match store.insert(&key, json) {
             Ok(()) => return Ok(()),
@@ -1750,8 +1783,9 @@ pub fn remove_from_audio_source_refs(audio_hash: &str, source_hash: &str) -> Res
 
         let store = open_store()?;
         let key = format!("{}{}", AUDIO_REFS_PREFIX, audio_hash.to_lowercase());
-        let json = serde_json::to_string(&refs)
-            .map_err(|e| BlossomError::MetadataError(format!("Failed to serialize audio refs: {}", e)))?;
+        let json = serde_json::to_string(&refs).map_err(|e| {
+            BlossomError::MetadataError(format!("Failed to serialize audio refs: {}", e))
+        })?;
 
         match store.insert(&key, json) {
             Ok(()) => return Ok(refs),
@@ -1929,10 +1963,7 @@ mod tests {
             Some(StatusUpdateOutcome::MissingGeneration { stored: Some(5) })
         );
         assert_eq!(generation_rejection(None, None, true, false), None);
-        assert_eq!(
-            generation_rejection(None, Some(5), false, false),
-            None
-        );
+        assert_eq!(generation_rejection(None, Some(5), false, false), None);
     }
 
     #[test]
