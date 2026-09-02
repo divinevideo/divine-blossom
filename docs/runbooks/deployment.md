@@ -10,8 +10,9 @@ The VCL caching layer is also manual. Files under `vcl/` are source copies of
 snippets for the outer Fastly VCL service; the Compute publish job does not
 activate them. Apply and validate those snippets in a cloned VCL service version,
 then activate that version separately. The VCL changes themselves have no
-production effect until that activation happens. CI still republishes and purges
-the Compute service after any merge to `main`, including a VCL-only merge.
+production effect until that activation happens. CI still republishes the
+Compute service after any merge to `main`, including a VCL-only merge. It does
+not purge after a routine publish.
 
 The ordered upload-service job is the exception to that asymmetry. If its deploy
 or readiness check fails, the automatic Fastly publish is skipped.
@@ -27,10 +28,11 @@ passes, it deploys:
 - `process-blob` to Cloud Run
 - the container image to GHCR
 
-The Fastly publish and purge target the Compute service. They do not deploy or
-purge the outer VCL caching service. See [Fastly 5xx
-diagnostics](fastly-5xx.md) for the separate logging endpoint and VCL activation
-work required by the diagnostic sources in this repository.
+The Fastly publish targets the Compute service. It does not deploy or purge the
+outer VCL caching service. A full purge is a separate manual workflow input.
+See [Fastly 5xx diagnostics](fastly-5xx.md) for the separate logging endpoint
+and VCL activation work required by the diagnostic sources in this repository.
+See [Fastly deploy and rollback](rollback.md) for the two-layer procedure.
 
 ## What ships by hand
 

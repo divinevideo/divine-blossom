@@ -37,13 +37,43 @@ Neither endpoint is created by repository code. Compute logging fails open when
 `compute-diagnostics` is unavailable. The outer VCL source is not deployed by
 the Compute publish workflow and has no effect until an operator activates it.
 
+## Live Configuration
+
+Measured on 2026-09-02:
+
+- Outer VCL version 24 has been active since about 2026-08-31T00:55Z, with the
+  `vcl-error-diagnostics` Google Pub/Sub endpoint (`placement` none) and the
+  repository-backed `recv`, `error`, `deliver`, `miss`, and `fetch` snippets.
+  It also has a `pass` snippet whose source is not stored in this repository;
+  preserve and review that live-only configuration separately when cloning or
+  reconstructing the service.
+- Compute version 372 has the `compute-diagnostics` Google Pub/Sub endpoint
+  active.
+- Both topics and their pull subscriptions are in
+  `rich-compiler-479518-d2`. Subscription message retention is seven days.
+- Each endpoint uses a dedicated service account with
+  `roles/pubsub.publisher` only on its assigned topic and no project-level IAM
+  role.
+- GitHub Actions repository variable `FASTLY_OUTER_DIAGNOSTICS_ACTIVE` is
+  `true`.
+
+This is measured state, not an invariant. Confirm endpoint existence in the
+Fastly dashboard. Do not use `fastly logging googlepubsub list --json` or
+`describe`: both print the stored `SecretKey`. A single
+`scripts/tail-edge-errors.sh` or `gcloud pubsub subscriptions pull` is not a
+census of the backlog.
+
 ## Log Schemas
 
 `divine.blossom.vcl_error.v1` records the request start timestamp, sanitized
 request ID, service ID, status, original `obj.response`, POP, selected backend,
 cache state, restart count, and elapsed milliseconds for every Fastly-generated
 5xx that reaches `vcl_error`. It does not record a URL, query string, client
-address, authorization, cookies, or body.
+address, authorization, cookies, or body. Fastly `status_503` stats also count
+responses that never enter `vcl_error` — origin 5xx passed through `vcl_fetch`,
+and failures after `vcl_deliver` has started (including streamed cache fills).
+Those will not appear in this sink. Minutes with `error_sub_time > 0` are the
+ones the snippet can have logged.
 
 The outer service copies the selected caller/generated ID to the private
 `X-Divine-Edge-Request-Id` request header before chaining so a later Compute
@@ -74,14 +104,19 @@ longer have it at any status.
 Do not point either schema at `cdn-view-logs`; that stream has a separate
 view-counting contract.
 
-## Later Fastly Configuration
+## Activation And Recreation
 
-An operator must complete all of the following before persistent diagnostics can
-work:
+To create or reconstruct the persistent diagnostic path, complete all of the
+following:
 
-1. Create restricted real-time logging endpoints named exactly
+1. Create Google Pub/Sub topics and pull subscriptions named
+   `vcl-error-diagnostics` and `compute-diagnostics` in
+   `rich-compiler-479518-d2`, with seven-day subscription message retention.
+   Give each Fastly endpoint a separate service account that can only publish to
+   its assigned topic. Configure endpoints named exactly
    `vcl-error-diagnostics` on the outer service and `compute-diagnostics` on the
-   Compute service. Set retention and access ownership in the destination.
+   Compute service through the Fastly dashboard, then delete the temporary local
+   key files. Do not pass a private key in a CLI argument.
 2. Add `vcl/recv.vcl` as a `recv` snippet, `vcl/error.vcl` as an `error`
    snippet, and `vcl/deliver.vcl` as a `deliver` snippet on a cloned
    outer-service version. Each file is the body Fastly inserts into the
@@ -95,12 +130,13 @@ work:
    set the GitHub Actions repository variable
    `FASTLY_OUTER_DIAGNOSTICS_ACTIVE=true`; it is absent/off by default and gates
    both automatic and manually requested Compute publishes. A missing or false
-   value makes the deploy job fail visibly without publishing. If the merge
-   happened while the gate was off, run the `CI` workflow with
-   `publish_compute` enabled after setting the variable. This order is
-   required because Compute may emit internal response metadata that the deliver
-   snippet strips; publishing Compute first can expose those headers until the
-   outer version is active.
+   value makes the deploy job fail visibly without publishing. If the original
+   push workflow failed only at this gate, set the variable and rerun its failed
+   jobs as described in [Fastly deploy and rollback](rollback.md#publish-compute-through-ci).
+   Do not dispatch `publish_compute` from the current `main`: it may have
+   advanced to a different commit. This order is required because Compute may
+   emit internal response metadata that the deliver snippet strips; publishing
+   Compute first can expose those headers until the outer version is active.
 5. Validate each failure stage separately with approved, controlled requests.
    Confirm a Compute 5xx preserves its supplied request ID (verbatim for
    IDs up to 64 characters after sanitization; longer IDs keep a 64-character

@@ -36,12 +36,15 @@ It never globally purges a cache and does not print the object hash.
 - Confirm the outer service has already activated this revision's
   `vcl/deliver.vcl` before publishing the Compute package. Then set the GitHub
   Actions repository variable `FASTLY_OUTER_DIAGNOSTICS_ACTIVE` to `true` and
-  either merge to trigger the normal publish or run the `CI` workflow manually
-  with `publish_compute` enabled after merge. The variable is absent/off by
-  default, so the deploy job cannot publish Compute first. Compute emits cached
-  `X-Divine-Probe-*` metadata; publishing it before the delivery-time stripping
-  logic creates a window where those internal headers can reach clients. Do not
-  send any probe request until both versions are active.
+  merge to trigger the normal publish. If the original push workflow failed
+  only at this gate, rerun that workflow's failed jobs as described in the
+  [Fastly deploy and rollback runbook](rollback.md#publish-compute-through-ci);
+  do not dispatch `publish_compute` from a later `main` checkout. The variable
+  is absent/off by default, so the deploy job cannot publish Compute first.
+  Compute emits cached `X-Divine-Probe-*` metadata; publishing it before the
+  delivery-time stripping logic creates a window where those internal headers
+  can reach clients. Do not send any probe request until both versions are
+  active.
 - Check the outer Fastly service configuration read-only and confirm shielding
   is disabled for the bare-blob path. If shielding is enabled, stop and escalate
   rather than changing delivery topology for the probe. A shield delivery strips
