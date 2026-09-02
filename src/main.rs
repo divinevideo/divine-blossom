@@ -4468,9 +4468,10 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
 // always runs. A later wave can still overshoot if it is slower than the last
 // one, and shared KV plus the HTTP response sit outside the last-wave estimate.
 const VANISH_TIME_BUDGET: Duration = Duration::from_millis(10_000);
-// Funnelcake janitor first-byte timeout is ~15s. Shared flush is one write per
-// hot key after every wave; keys are independent, so the per-second limit is
-// not multiplied by wave count. Keep this reserve inside the caller timeout.
+// Issue 266 checks this named budget plus one shared-key flush against a ~15s
+// caller first-byte timeout. VANISH_TIME_BUDGET only gates starting another
+// wave; a slower last wave can still overshoot. The reserve is not a runtime
+// cap.
 #[cfg(test)]
 const VANISH_CALLER_FIRST_BYTE_TIMEOUT: Duration = Duration::from_millis(15_000);
 #[cfg(test)]
@@ -4795,9 +4796,11 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     execution.pending = hashes.len().saturating_sub(offset).min(u32::MAX as usize) as u32;
     let expected_account_complete = execution.pending == 0 && execution.errors == 0;
     let shared_started = Instant::now();
-    // One write per hot key per call, after every wave. Unique-key work already
-    // ran per wave; a crash here leaves those hashes on the account list so the
-    // next vanish rediscovers them as metadata-less erasure.
+    // One write per hot key per call, once after the last wave. Unique-key work
+    // already ran per wave. A crash here leaves completed hashes on the account
+    // list so the next vanish rediscovers them as metadata-less erasure.
+    // stats:global decrements for those blobs are lost: metadata is already
+    // gone, so retry cannot subtract them. index:recent still keys on hash.
     let shared_updates_complete = match apply_vanish_shared_updates_with_ops(
         &shared_updates,
         pubkey,
@@ -6862,7 +6865,7 @@ mod tests {
     }
 
     #[test]
-    fn vanish_shared_flush_fits_inside_caller_first_byte_timeout() {
+    fn vanish_named_wave_budget_plus_flush_reserve_stays_under_caller_check() {
         assert!(
             VANISH_TIME_BUDGET.saturating_add(VANISH_SHARED_FLUSH_RESERVE)
                 <= VANISH_CALLER_FIRST_BYTE_TIMEOUT

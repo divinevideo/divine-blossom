@@ -147,10 +147,12 @@ pub trait VanishSharedKeyOps {
     ) -> Result<bool>;
 }
 
-/// Apply each account-wide KV mutation at most once after every vanish wave.
+/// Apply each account-wide KV mutation at most once after the last vanish wave.
 ///
 /// A crash before this flush leaves unique-key erasure in place and keeps the
 /// completed hashes on `list:<pubkey>`, so the next call rediscovers them.
+/// `stats:global` decrements for those blobs are lost: blob metadata is already
+/// deleted, so retry cannot subtract them. `index:recent` still keys on hash.
 pub fn apply_vanish_shared_updates_with_ops<O: VanishSharedKeyOps>(
     updates: &VanishSharedUpdates,
     pubkey: &str,
