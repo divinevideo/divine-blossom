@@ -205,7 +205,10 @@ pub fn get_blob_metadata_uncached(hash: &str) -> Result<Option<BlobMetadata>> {
     parse_blob_metadata_lookup(store.lookup(&key))
 }
 
-pub(crate) fn start_vanish_blob_lookup(store: &KVStore, hash: &str) -> Result<PendingLookupHandle> {
+pub(crate) fn start_vanish_blob_lookup(
+    store: &KVStore,
+    hash: &str,
+) -> Result<PendingLookupHandle> {
     let metadata_key = format!("{}{}", BLOB_PREFIX, hash.to_lowercase());
     store
         .build_lookup()
@@ -299,6 +302,76 @@ pub(crate) fn finish_vanish_metadata_delete(
     })?;
     invalidate_metadata_cache(hash);
     Ok(())
+}
+
+pub(crate) fn vanish_blob_artifact_delete_keys(hash: &str) -> Vec<String> {
+    let hash = hash.to_lowercase();
+    vec![
+        format!("{}{}", REFS_PREFIX, hash),
+        format!("{}{}:upload", AUTH_PREFIX, hash),
+        format!("{}{}:delete", AUTH_PREFIX, hash),
+    ]
+}
+
+pub(crate) fn vanish_subtitle_hash_key(hash: &str) -> String {
+    format!("{}{}", SUBTITLE_HASH_PREFIX, hash.to_lowercase())
+}
+
+pub(crate) fn vanish_subtitle_job_key(job_id: &str) -> String {
+    format!("{}{}", SUBTITLE_JOB_PREFIX, job_id)
+}
+
+pub(crate) fn start_vanish_best_effort_delete(
+    store: &KVStore,
+    key: &str,
+) -> Result<PendingDeleteHandle> {
+    store.build_delete().execute_async(key).map_err(|error| {
+        BlossomError::MetadataError(format!("Failed to start artifact delete: {error}"))
+    })
+}
+
+pub(crate) fn finish_vanish_best_effort_delete(
+    store: &KVStore,
+    handle: PendingDeleteHandle,
+) -> Result<()> {
+    match store.pending_delete_wait(handle) {
+        Ok(()) | Err(KVStoreError::ItemNotFound) => Ok(()),
+        Err(error) => Err(BlossomError::MetadataError(format!(
+            "Failed to delete vanish artifact: {error}"
+        ))),
+    }
+}
+
+pub(crate) fn start_vanish_subtitle_job_lookup(
+    store: &KVStore,
+    hash: &str,
+) -> Result<PendingLookupHandle> {
+    store
+        .build_lookup()
+        .execute_async(&vanish_subtitle_hash_key(hash))
+        .map_err(|error| {
+            BlossomError::MetadataError(format!("Failed to start subtitle job lookup: {error}"))
+        })
+}
+
+pub(crate) fn finish_vanish_subtitle_job_lookup(
+    store: &KVStore,
+    handle: PendingLookupHandle,
+) -> Result<Option<String>> {
+    match store.pending_lookup_wait(handle) {
+        Ok(mut lookup_result) => {
+            let job_id = lookup_result.take_body().into_string().trim().to_string();
+            if job_id.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(job_id))
+            }
+        }
+        Err(KVStoreError::ItemNotFound) => Ok(None),
+        Err(error) => Err(BlossomError::MetadataError(format!(
+            "Failed to lookup subtitle job by hash: {error}"
+        ))),
+    }
 }
 
 /// Store durable evidence that the vanish erasure phase completed for a blob.
@@ -431,10 +504,10 @@ pub fn mark_vanish_audit_authorized_delivered(
         let generation = result.current_generation();
         let mut state: VanishAuditState = serde_json::from_str(&result.take_body().into_string())
             .map_err(|error| {
-            BlossomError::MetadataError(format!(
-                "Invalid vanish audit authorization state: {error}"
-            ))
-        })?;
+                BlossomError::MetadataError(format!(
+                    "Invalid vanish audit authorization state: {error}"
+                ))
+            })?;
         if state.operation_id != operation_id {
             return Ok(None);
         }
@@ -547,8 +620,8 @@ pub fn claim_vanish_audit_completion(
         let generation = result.current_generation();
         let mut state: VanishAuditState = serde_json::from_str(&result.take_body().into_string())
             .map_err(|error| {
-            BlossomError::MetadataError(format!("Invalid vanish audit completion state: {error}"))
-        })?;
+                BlossomError::MetadataError(format!("Invalid vanish audit completion state: {error}"))
+            })?;
         if state.completed_at.is_some() {
             return Ok(Some(state));
         }
@@ -767,7 +840,8 @@ fn stale_generation(incoming: Option<u64>, stored: Option<u64>) -> bool {
 
 fn transcode_status_event_sequence(status: crate::blossom::TranscodeStatus) -> u64 {
     match status {
-        crate::blossom::TranscodeStatus::Pending | crate::blossom::TranscodeStatus::Processing => 0,
+        crate::blossom::TranscodeStatus::Pending
+        | crate::blossom::TranscodeStatus::Processing => 0,
         crate::blossom::TranscodeStatus::Complete | crate::blossom::TranscodeStatus::Failed => 1,
     }
 }
@@ -1744,9 +1818,8 @@ pub fn add_to_audio_source_refs(audio_hash: &str, source_hash: &str) -> Result<(
 
         let store = open_store()?;
         let key = format!("{}{}", AUDIO_REFS_PREFIX, audio_hash.to_lowercase());
-        let json = serde_json::to_string(&refs).map_err(|e| {
-            BlossomError::MetadataError(format!("Failed to serialize audio refs: {}", e))
-        })?;
+        let json = serde_json::to_string(&refs)
+            .map_err(|e| BlossomError::MetadataError(format!("Failed to serialize audio refs: {}", e)))?;
 
         match store.insert(&key, json) {
             Ok(()) => return Ok(()),
@@ -1783,9 +1856,8 @@ pub fn remove_from_audio_source_refs(audio_hash: &str, source_hash: &str) -> Res
 
         let store = open_store()?;
         let key = format!("{}{}", AUDIO_REFS_PREFIX, audio_hash.to_lowercase());
-        let json = serde_json::to_string(&refs).map_err(|e| {
-            BlossomError::MetadataError(format!("Failed to serialize audio refs: {}", e))
-        })?;
+        let json = serde_json::to_string(&refs)
+            .map_err(|e| BlossomError::MetadataError(format!("Failed to serialize audio refs: {}", e)))?;
 
         match store.insert(&key, json) {
             Ok(()) => return Ok(refs),
@@ -1963,7 +2035,10 @@ mod tests {
             Some(StatusUpdateOutcome::MissingGeneration { stored: Some(5) })
         );
         assert_eq!(generation_rejection(None, None, true, false), None);
-        assert_eq!(generation_rejection(None, Some(5), false, false), None);
+        assert_eq!(
+            generation_rejection(None, Some(5), false, false),
+            None
+        );
     }
 
     #[test]
