@@ -32,8 +32,9 @@ If the active version already matches git, apply does not clone. If Fastly has
 a snippet that is not in `vcl/snippets.json`, apply refuses rather than
 deleting it.
 
-The same apply is available as a manual `Outer VCL` workflow with `apply_draft`.
-CI never makes a draft live.
+A push to `main` runs `diff` only. The same apply is available as a manual
+`Outer VCL` workflow with `apply_draft`, which does not run `diff` as a
+blocking prior step. CI never makes a draft live.
 
 ## Making a draft live
 

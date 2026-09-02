@@ -1,6 +1,8 @@
 name: Outer VCL
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       apply_draft:
@@ -9,7 +11,8 @@ on:
         default: false
 
 jobs:
-  sync:
+  diff:
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.apply_draft)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -19,8 +22,13 @@ jobs:
           FASTLY_API_TOKEN: ${{ secrets.FASTLY_API_TOKEN }}
         run: python3 scripts/sync_outer_vcl.py diff
 
+  apply:
+    if: github.event_name == 'workflow_dispatch' && inputs.apply_draft
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Apply git snippets to a cloned draft
-        if: inputs.apply_draft
         env:
           FASTLY_API_TOKEN: ${{ secrets.FASTLY_API_TOKEN }}
         run: python3 scripts/sync_outer_vcl.py apply
