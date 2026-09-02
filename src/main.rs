@@ -27,9 +27,10 @@ use crate::blossom::{
     TranscodeStatus, TranscriptStatus, UploadRequirements, QUALITY_VARIANTS,
 };
 use crate::delete_policy::{
-    apply_vanish_shared_updates_with_ops, build_creator_delete_response, handle_creator_delete,
-    map_webhook_moderate_action, plan_user_delete, prepare_vanish_blob_with_ops, soft_delete_blob,
-    validate_sha256_format, DefaultVanishSharedKeyOps, DeletePlan, PrefetchedVanishOps,
+    apply_vanish_shared_updates_with_ops, build_creator_delete_response,
+    finalize_erased_vanish_wave_with_ops, handle_creator_delete, map_webhook_moderate_action,
+    plan_user_delete, prepare_vanish_blob_with_ops, soft_delete_blob, validate_sha256_format,
+    DefaultVanishSharedKeyOps, DefaultVanishWaveOps, DeletePlan, PrefetchedVanishOps,
     PreparedVanishBlob, PreparedVanishBlobOrOutcome, VanishBlobOutcome, VanishSharedUpdates,
 };
 use crate::error::{BlossomError, Result};
@@ -38,19 +39,14 @@ use crate::metadata::{
     add_to_audio_source_refs, add_to_blob_refs, add_to_recent_index, add_to_user_index,
     add_to_user_list, claim_vanish_audit_completion, create_vanish_audit_state,
     delete_audio_mapping, delete_audio_source_refs, delete_auth_events, delete_blob_metadata,
-    delete_blob_refs, delete_subtitle_data, finish_vanish_best_effort_delete,
-    finish_vanish_blob_lookup, finish_vanish_erasure_evidence, finish_vanish_metadata_delete,
-    finish_vanish_subtitle_job_lookup, get_audio_mapping,
+    delete_blob_refs, delete_subtitle_data, finish_vanish_blob_lookup, get_audio_mapping,
     get_audio_source_refs, get_auth_event, get_blob_metadata, get_blob_metadata_uncached,
     get_blob_refs, get_subtitle_job, get_subtitle_job_by_hash, get_tombstone, get_user_blobs,
     get_vanish_audit_state, list_blobs_with_metadata, mark_vanish_audit_authorized_delivered,
     open_store, put_audio_mapping, put_auth_event, put_blob_metadata, put_subtitle_job,
     refresh_vanish_audit_state, remove_from_audio_source_refs, remove_from_blob_refs,
     remove_from_user_index, remove_from_user_list, set_subtitle_job_id_for_hash,
-    start_vanish_best_effort_delete, start_vanish_blob_lookup, start_vanish_erasure_evidence,
-    start_vanish_metadata_delete, start_vanish_subtitle_job_lookup, update_blob_status,
-    update_stats_on_add, vanish_blob_artifact_delete_keys, vanish_subtitle_hash_key,
-    vanish_subtitle_job_key, StatusUpdateOutcome,
+    start_vanish_blob_lookup, update_blob_status, update_stats_on_add, StatusUpdateOutcome,
     TranscodeMetadataUpdate, TranscriptMetadataUpdate, VanishAuditState,
 };
 use crate::storage::{
@@ -579,10 +575,16 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
             }
             None => {
                 if !is_admin {
-                    eprintln!("[ACCESS] thumbnail hash={} metadata=None denied (non-admin)", video_hash);
+                    eprintln!(
+                        "[ACCESS] thumbnail hash={} metadata=None denied (non-admin)",
+                        video_hash
+                    );
                     return Err(BlossomError::NotFound("Blob not found".into()));
                 }
-                eprintln!("[ACCESS] thumbnail hash={} metadata=None allowed (admin bypass)", video_hash);
+                eprintln!(
+                    "[ACCESS] thumbnail hash={} metadata=None allowed (admin bypass)",
+                    video_hash
+                );
             }
         }
 
@@ -654,10 +656,16 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         }
         None => {
             if !is_admin {
-                eprintln!("[ACCESS] hash={} metadata=None denied (no metadata, non-admin)", hash);
+                eprintln!(
+                    "[ACCESS] hash={} metadata=None denied (no metadata, non-admin)",
+                    hash
+                );
                 return Err(BlossomError::NotFound("Blob not found".into()));
             }
-            eprintln!("[ACCESS] hash={} metadata=None allowed (admin bypass)", hash);
+            eprintln!(
+                "[ACCESS] hash={} metadata=None allowed (admin bypass)",
+                hash
+            );
         }
     }
 
@@ -2181,10 +2189,16 @@ fn handle_get_subtitle_by_hash(req: Request, path: &str) -> Result<Response> {
         }
         None => {
             if !is_admin {
-                eprintln!("[ACCESS] subtitle hash={} metadata=None denied (non-admin)", hash);
+                eprintln!(
+                    "[ACCESS] subtitle hash={} metadata=None denied (non-admin)",
+                    hash
+                );
                 return Err(BlossomError::NotFound("Video hash not found".into()));
             }
-            eprintln!("[ACCESS] subtitle hash={} metadata=None allowed (admin bypass)", hash);
+            eprintln!(
+                "[ACCESS] subtitle hash={} metadata=None allowed (admin bypass)",
+                hash
+            );
         }
     }
 
@@ -3888,8 +3902,8 @@ fn handle_upload_init(mut req: Request, record: &mut UploadLogRecord) -> Result<
     }
 
     let response_body = proxy_resp.take_body().into_string();
-    let init_response: ResumableUploadInitResponse = serde_json::from_str(&response_body)
-        .map_err(|e| {
+    let init_response: ResumableUploadInitResponse =
+        serde_json::from_str(&response_body).map_err(|e| {
             BlossomError::Internal(format!("Invalid upload service init response: {}", e))
         })?;
 
@@ -4270,10 +4284,9 @@ pub(crate) fn delete_blob_gcs_artifacts(hash: &str) -> Result<()> {
         }
     }
 
-    if let Some(result) = local_derivative_cleanup_result(
-        crate::storage::is_local_mode(),
-        &deterministic_failures,
-    ) {
+    if let Some(result) =
+        local_derivative_cleanup_result(crate::storage::is_local_mode(), &deterministic_failures)
+    {
         return result;
     }
 
@@ -4473,9 +4486,10 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
 // one, and shared KV plus the HTTP response sit outside the last-wave estimate.
 const VANISH_TIME_BUDGET: Duration = Duration::from_millis(10_000);
 // Fastly does not document a KV pending-handle ceiling. Compute allows 1,000
-// concurrent backend requests. This is per-wave unique-key width for both
-// metadata lookups and per-blob finalization, not an operation cap. Extra
-// waves start only when the last wave still fits in VANISH_TIME_BUDGET.
+// concurrent backend requests. A ten-blob wave holds at most 40 pending KV
+// operations during artifact cleanup (three deletes and one subtitle lookup
+// per blob), then at most 20 subtitle deletes. Extra waves start only when the
+// last wave still fits in VANISH_TIME_BUDGET.
 const VANISH_KV_FANOUT: usize = 10;
 const VANISH_STORAGE_ATTEMPTS: u8 = 2;
 
@@ -4607,36 +4621,6 @@ fn prepare_vanish_wave(pubkey: &str, hashes: &[String]) -> VanishWavePrepare {
     prepared
 }
 
-fn fail_vanish_blob_finalize(
-    pubkey: &str,
-    blob: PreparedVanishBlob,
-    error: impl std::fmt::Display,
-    retry_hashes: &mut Vec<String>,
-    errors: &mut u32,
-) {
-    eprintln!(
-        "[VANISH] pubkey={} hash={} failed to finalize erased blob: {}",
-        pubkey, blob.hash, error
-    );
-    *errors = errors.saturating_add(1);
-    retry_hashes.push(blob.hash);
-}
-
-fn finish_vanish_best_effort_deletes(
-    store: &fastly::kv_store::KVStore,
-    pubkey: &str,
-    pending: Vec<(String, String, fastly::kv_store::PendingDeleteHandle)>,
-) {
-    for (hash, key, handle) in pending {
-        if let Err(error) = finish_vanish_best_effort_delete(store, handle) {
-            eprintln!(
-                "[VANISH] pubkey={} hash={} key={} failed vanish artifact delete: {}",
-                pubkey, hash, key, error
-            );
-        }
-    }
-}
-
 fn finalize_erased_vanish_wave(
     pubkey: &str,
     blobs: Vec<PreparedVanishBlob>,
@@ -4645,105 +4629,33 @@ fn finalize_erased_vanish_wave(
     retry_hashes: &mut Vec<String>,
     errors: &mut u32,
 ) {
-    if blobs.is_empty() {
-        return;
-    }
-    let store = match open_store() {
-        Ok(store) => store,
+    let ops = match DefaultVanishWaveOps::new() {
+        Ok(ops) => ops,
         Err(error) => {
             for blob in blobs {
-                fail_vanish_blob_finalize(pubkey, blob, &error, retry_hashes, errors);
+                eprintln!(
+                    "[VANISH] pubkey={} hash={} failed to finalize erased blob: {}",
+                    pubkey, blob.hash, error
+                );
+                *errors = errors.saturating_add(1);
+                retry_hashes.push(blob.hash);
             }
             return;
         }
     };
-
-    let mut evidence_pending = Vec::new();
-    for blob in blobs {
-        match start_vanish_erasure_evidence(&store, &blob.hash) {
-            Ok(handle) => evidence_pending.push((blob, handle)),
-            Err(error) => fail_vanish_blob_finalize(pubkey, blob, error, retry_hashes, errors),
-        }
+    let result = finalize_erased_vanish_wave_with_ops(blobs, &ops);
+    for (hash, key, error) in result.diagnostics {
+        eprintln!(
+            "[VANISH] pubkey={} hash={} key={} failed vanish finalization: {}",
+            pubkey, hash, key, error
+        );
     }
-
-    let mut evidence_ok = Vec::new();
-    for (blob, handle) in evidence_pending {
-        match finish_vanish_erasure_evidence(&store, handle) {
-            Ok(()) => evidence_ok.push(blob),
-            Err(error) => fail_vanish_blob_finalize(pubkey, blob, error, retry_hashes, errors),
-        }
-    }
-
-    let mut metadata_pending = Vec::new();
-    let mut metadata_ok = Vec::new();
-    for blob in evidence_ok {
-        if blob.metadata.is_none() {
-            metadata_ok.push(blob);
-            continue;
-        }
-        match start_vanish_metadata_delete(&store, &blob.hash) {
-            Ok(handle) => metadata_pending.push((blob, handle)),
-            Err(error) => fail_vanish_blob_finalize(pubkey, blob, error, retry_hashes, errors),
-        }
-    }
-
-    for (blob, handle) in metadata_pending {
-        match finish_vanish_metadata_delete(&store, &blob.hash, handle) {
-            Ok(()) => metadata_ok.push(blob),
-            Err(error) => fail_vanish_blob_finalize(pubkey, blob, error, retry_hashes, errors),
-        }
-    }
-
-    let mut artifact_deletes = Vec::new();
-    let mut subtitle_lookups = Vec::new();
-    for blob in &metadata_ok {
-        for key in vanish_blob_artifact_delete_keys(&blob.hash) {
-            match start_vanish_best_effort_delete(&store, &key) {
-                Ok(handle) => artifact_deletes.push((blob.hash.clone(), key, handle)),
-                Err(error) => eprintln!(
-                    "[VANISH] pubkey={} hash={} failed to start artifact delete: {}",
-                    pubkey, blob.hash, error
-                ),
-            }
-        }
-        match start_vanish_subtitle_job_lookup(&store, &blob.hash) {
-            Ok(handle) => subtitle_lookups.push((blob.hash.clone(), handle)),
-            Err(error) => eprintln!(
-                "[VANISH] pubkey={} hash={} failed to start subtitle lookup: {}",
-                pubkey, blob.hash, error
-            ),
-        }
-    }
-    finish_vanish_best_effort_deletes(&store, pubkey, artifact_deletes);
-
-    let mut subtitle_deletes = Vec::new();
-    for (hash, handle) in subtitle_lookups {
-        match finish_vanish_subtitle_job_lookup(&store, handle) {
-            Ok(Some(job_id)) => {
-                for key in [vanish_subtitle_job_key(&job_id), vanish_subtitle_hash_key(&hash)]
-                {
-                    match start_vanish_best_effort_delete(&store, &key) {
-                        Ok(pending) => subtitle_deletes.push((hash.clone(), key, pending)),
-                        Err(error) => eprintln!(
-                            "[VANISH] pubkey={} hash={} failed to start subtitle delete: {}",
-                            pubkey, hash, error
-                        ),
-                    }
-                }
-            }
-            Ok(None) => {}
-            Err(error) => eprintln!(
-                "[VANISH] pubkey={} hash={} failed to finish subtitle lookup: {}",
-                pubkey, hash, error
-            ),
-        }
-    }
-    finish_vanish_best_effort_deletes(&store, pubkey, subtitle_deletes);
-
-    for blob in metadata_ok {
+    for blob in result.completed {
         shared_updates.record_erased(&blob);
         completed_outcomes.push(VanishBlobOutcome::FullyDeleted);
     }
+    *errors = errors.saturating_add(result.errors);
+    retry_hashes.extend(result.retry_hashes);
 }
 
 fn record_malformed_vanish_hash(hash: &str, pubkey: &str) {
@@ -5052,11 +4964,9 @@ fn ensure_vanish_authorization_audit(
             deliver_vanish_authorization_audit(pubkey, initiator, &mut state)?;
             return Ok(state);
         }
-        if let Some(state) = refresh_vanish_audit_state(
-            pubkey,
-            initiator.as_str(),
-            &state.operation_id,
-        )? {
+        if let Some(state) =
+            refresh_vanish_audit_state(pubkey, initiator.as_str(), &state.operation_id)?
+        {
             return Ok(state);
         }
     }
@@ -5098,11 +5008,9 @@ fn complete_vanish_audit(
     initiator: VanishAuditInitiator,
     state: &mut VanishAuditState,
 ) -> Result<()> {
-    let Some(claimed) = claim_vanish_audit_completion(
-        pubkey,
-        initiator.as_str(),
-        current_timestamp(),
-    )? else {
+    let Some(claimed) =
+        claim_vanish_audit_completion(pubkey, initiator.as_str(), current_timestamp())?
+    else {
         return Ok(());
     };
     *state = claimed;
@@ -6727,7 +6635,7 @@ pub(crate) fn purge_edge_cache(surrogate_key: &str) {
 
     let services: &[(&str, &str)] = &[
         ("ML7R82HKfmTaqTpHExIDVN", "VCL"),     // divine.video website
-        ("pOvEEWykEbpnylqst1KTrR", "Compute"),  // media.divine.video (Blossom)
+        ("pOvEEWykEbpnylqst1KTrR", "Compute"), // media.divine.video (Blossom)
     ];
 
     for &(service_id, label) in services {
@@ -6749,7 +6657,9 @@ pub(crate) fn purge_edge_cache(surrogate_key: &str) {
                 } else {
                     eprintln!(
                         "[PURGE] {} purge failed for key={}: HTTP {}",
-                        label, surrogate_key, status.as_u16()
+                        label,
+                        surrogate_key,
+                        status.as_u16()
                     );
                 }
             }
@@ -6905,10 +6815,10 @@ mod tests {
         classify_audio_reuse_availability, classify_vanish_hashes, decide_transcode_fetch_action,
         decide_transcript_fetch_action, derivative_reconciliation_response, error_response,
         ignored_generation_response, is_alias_only_audio_blob, local_derivative_cleanup_result,
-        parse_transcode_status_webhook_payload, parse_transcript_status_webhook_payload,
-        next_vanish_wave_range, parse_upload_service_response, reconcile_vanish_list_completion,
-        should_delete_derived_audio_blob, should_eagerly_trigger_transcription,
-        should_record_upload_service_transcode_failure,
+        next_vanish_wave_range, parse_transcode_status_webhook_payload,
+        parse_transcript_status_webhook_payload, parse_upload_service_response,
+        reconcile_vanish_list_completion, should_delete_derived_audio_blob,
+        should_eagerly_trigger_transcription, should_record_upload_service_transcode_failure,
         should_record_upload_service_transcript_failure,
         should_reset_transcode_failure_on_clean_upload,
         should_reset_transcript_failure_on_clean_upload, should_set_audio_content_length,
@@ -6936,10 +6846,7 @@ mod tests {
             vanish_response_status(1, 0),
             StatusCode::INTERNAL_SERVER_ERROR
         );
-        assert_eq!(
-            vanish_response_status(1, 1),
-            StatusCode::ACCEPTED
-        );
+        assert_eq!(vanish_response_status(1, 1), StatusCode::ACCEPTED);
     }
 
     #[test]
@@ -7075,9 +6982,11 @@ mod tests {
         assert!(local_derivative_cleanup_result(true, &[])
             .expect("local mode should decide cleanup locally")
             .is_ok());
-        assert!(local_derivative_cleanup_result(true, &["delete failed".into()])
-            .expect("local mode should decide cleanup locally")
-            .is_err());
+        assert!(
+            local_derivative_cleanup_result(true, &["delete failed".into()])
+                .expect("local mode should decide cleanup locally")
+                .is_err()
+        );
         assert!(local_derivative_cleanup_result(false, &[]).is_none());
     }
 
@@ -7791,14 +7700,8 @@ mod tests {
         let resp = error_response(&BlossomError::NotFound("Blob not found".into()));
 
         assert_eq!(resp.get_status(), StatusCode::NOT_FOUND);
-        assert_eq!(
-            resp.get_header_str("Cache-Control"),
-            Some("no-store"),
-        );
-        assert_eq!(
-            resp.get_header_str("Surrogate-Control"),
-            Some("max-age=60"),
-        );
+        assert_eq!(resp.get_header_str("Cache-Control"), Some("no-store"),);
+        assert_eq!(resp.get_header_str("Surrogate-Control"), Some("max-age=60"),);
     }
 
     #[test]

@@ -184,9 +184,6 @@ pub enum PreparedVanishBlobOrOutcome {
 pub trait VanishBlobOps: BlobErasureOps {
     fn get_blob_metadata(&self, hash: &str) -> Result<Option<BlobMetadata>>;
     fn remove_from_blob_refs(&self, hash: &str, pubkey: &str) -> Result<Vec<String>>;
-    fn put_erasure_evidence(&self, hash: &str) -> Result<()>;
-    fn delete_blob_metadata(&self, hash: &str) -> Result<()>;
-    fn delete_blob_kv_artifacts(&self, hash: &str);
     fn put_blob_metadata(&self, metadata: &BlobMetadata) -> Result<()>;
 }
 
@@ -234,17 +231,151 @@ pub fn prepare_vanish_blob_with_ops<O: VanishBlobOps>(
     }
 }
 
-/// Finalize metadata and list state after storage erasure succeeds.
-pub fn finalize_erased_vanish_blob_with_ops<O: VanishBlobOps>(
-    blob: &PreparedVanishBlob,
+/// Asynchronous unique-key operations used to finalize one vanish wave.
+pub trait VanishWaveOps {
+    type EvidenceHandle;
+    type MetadataHandle;
+    type ArtifactHandle;
+    type SubtitleLookupHandle;
+
+    fn start_evidence(&self, hash: &str) -> Result<Self::EvidenceHandle>;
+    fn finish_evidence(&self, handle: Self::EvidenceHandle) -> Result<()>;
+    fn start_metadata_delete(&self, hash: &str) -> Result<Self::MetadataHandle>;
+    fn finish_metadata_delete(&self, hash: &str, handle: Self::MetadataHandle) -> Result<()>;
+    fn start_artifact_deletes(&self, hash: &str) -> Vec<(String, Result<Self::ArtifactHandle>)>;
+    fn finish_artifact_delete(&self, handle: Self::ArtifactHandle) -> Result<()>;
+    fn start_subtitle_lookup(&self, hash: &str) -> Result<Self::SubtitleLookupHandle>;
+    fn finish_subtitle_lookup(&self, handle: Self::SubtitleLookupHandle) -> Result<Option<String>>;
+    fn start_subtitle_deletes(
+        &self,
+        hash: &str,
+        job_id: &str,
+    ) -> Vec<(String, Result<Self::ArtifactHandle>)>;
+}
+
+pub struct VanishWaveFinalize {
+    pub completed: Vec<PreparedVanishBlob>,
+    pub retry_hashes: Vec<String>,
+    pub errors: u32,
+    pub diagnostics: Vec<(String, String, String)>,
+}
+
+fn record_vanish_finalize_failure(
+    blob: PreparedVanishBlob,
+    error: BlossomError,
+    result: &mut VanishWaveFinalize,
+) {
+    result.errors = result.errors.saturating_add(1);
+    result.retry_hashes.push(blob.hash.clone());
+    result
+        .diagnostics
+        .push((blob.hash, "required finalization".into(), error.to_string()));
+}
+
+/// Finalize a wave while preserving phase ordering and per-blob failure isolation.
+pub fn finalize_erased_vanish_wave_with_ops<O: VanishWaveOps>(
+    blobs: Vec<PreparedVanishBlob>,
     ops: &O,
-) -> Result<()> {
-    ops.put_erasure_evidence(&blob.hash)?;
-    if blob.metadata.is_some() {
-        ops.delete_blob_metadata(&blob.hash)?;
+) -> VanishWaveFinalize {
+    let mut result = VanishWaveFinalize {
+        completed: Vec::new(),
+        retry_hashes: Vec::new(),
+        errors: 0,
+        diagnostics: Vec::new(),
+    };
+
+    let mut evidence_pending = Vec::new();
+    for blob in blobs {
+        match ops.start_evidence(&blob.hash) {
+            Ok(handle) => evidence_pending.push((blob, handle)),
+            Err(error) => record_vanish_finalize_failure(blob, error, &mut result),
+        }
     }
-    ops.delete_blob_kv_artifacts(&blob.hash);
-    Ok(())
+
+    let mut evidence_ok = Vec::new();
+    for (blob, handle) in evidence_pending {
+        match ops.finish_evidence(handle) {
+            Ok(()) => evidence_ok.push(blob),
+            Err(error) => record_vanish_finalize_failure(blob, error, &mut result),
+        }
+    }
+
+    let mut metadata_pending = Vec::new();
+    let mut metadata_ok = Vec::new();
+    for blob in evidence_ok {
+        if blob.metadata.is_none() {
+            metadata_ok.push(blob);
+        } else {
+            match ops.start_metadata_delete(&blob.hash) {
+                Ok(handle) => metadata_pending.push((blob, handle)),
+                Err(error) => record_vanish_finalize_failure(blob, error, &mut result),
+            }
+        }
+    }
+    for (blob, handle) in metadata_pending {
+        match ops.finish_metadata_delete(&blob.hash, handle) {
+            Ok(()) => metadata_ok.push(blob),
+            Err(error) => record_vanish_finalize_failure(blob, error, &mut result),
+        }
+    }
+
+    let mut artifact_pending = Vec::new();
+    let mut subtitle_pending = Vec::new();
+    for blob in &metadata_ok {
+        for (key, pending) in ops.start_artifact_deletes(&blob.hash) {
+            match pending {
+                Ok(handle) => artifact_pending.push((blob.hash.clone(), key, handle)),
+                Err(error) => result
+                    .diagnostics
+                    .push((blob.hash.clone(), key, error.to_string())),
+            }
+        }
+        match ops.start_subtitle_lookup(&blob.hash) {
+            Ok(handle) => subtitle_pending.push((blob.hash.clone(), handle)),
+            Err(error) => result.diagnostics.push((
+                blob.hash.clone(),
+                "subtitle lookup".into(),
+                error.to_string(),
+            )),
+        }
+    }
+    for (hash, key, handle) in artifact_pending {
+        if let Err(error) = ops.finish_artifact_delete(handle) {
+            result.diagnostics.push((hash, key, error.to_string()));
+        }
+    }
+
+    let mut subtitle_deletes = Vec::new();
+    for (hash, handle) in subtitle_pending {
+        match ops.finish_subtitle_lookup(handle) {
+            Ok(Some(job_id)) => {
+                for (key, pending) in ops.start_subtitle_deletes(&hash, &job_id) {
+                    match pending {
+                        Ok(handle) => subtitle_deletes.push((hash.clone(), key, handle)),
+                        Err(error) => {
+                            result
+                                .diagnostics
+                                .push((hash.clone(), key, error.to_string()))
+                        }
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                result
+                    .diagnostics
+                    .push((hash, "subtitle lookup".into(), error.to_string()))
+            }
+        }
+    }
+    for (hash, key, handle) in subtitle_deletes {
+        if let Err(error) = ops.finish_artifact_delete(handle) {
+            result.diagnostics.push((hash, key, error.to_string()));
+        }
+    }
+
+    result.completed = metadata_ok;
+    result
 }
 
 /// Erase a blob from every required origin before invalidating edge caches.
@@ -432,8 +563,6 @@ mod tests {
     struct MockVanishOps {
         metadata: RefCell<Option<BlobMetadata>>,
         refs: RefCell<Vec<String>>,
-        put_erasure_evidence_err: bool,
-        delete_metadata_err: bool,
         calls: RefCell<Vec<&'static str>>,
     }
 
@@ -471,32 +600,86 @@ mod tests {
                 .retain(|reference| !reference.eq_ignore_ascii_case(pubkey));
             Ok(self.refs.borrow().clone())
         }
-        fn delete_blob_metadata(&self, _hash: &str) -> Result<()> {
-            self.calls.borrow_mut().push("delete_blob_metadata");
-            if self.delete_metadata_err {
-                Err(BlossomError::MetadataError("metadata failed".into()))
-            } else {
-                self.metadata.borrow_mut().take();
-                Ok(())
-            }
-        }
-        fn put_erasure_evidence(&self, _hash: &str) -> Result<()> {
-            self.calls.borrow_mut().push("put_erasure_evidence");
-            if self.put_erasure_evidence_err {
-                Err(BlossomError::MetadataError(
-                    "erasure evidence failed".into(),
-                ))
-            } else {
-                Ok(())
-            }
-        }
-        fn delete_blob_kv_artifacts(&self, _hash: &str) {
-            self.calls.borrow_mut().push("delete_blob_kv_artifacts");
-        }
         fn put_blob_metadata(&self, metadata: &BlobMetadata) -> Result<()> {
             self.calls.borrow_mut().push("put_blob_metadata");
             *self.metadata.borrow_mut() = Some(metadata.clone());
             Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct MockVanishWaveOps {
+        calls: RefCell<Vec<String>>,
+        fail_evidence_hash: Option<String>,
+        fail_metadata_hash: Option<String>,
+    }
+
+    impl MockVanishWaveOps {
+        fn record(&self, phase: &str, value: &str) {
+            self.calls.borrow_mut().push(format!("{phase}:{value}"));
+        }
+    }
+
+    impl VanishWaveOps for MockVanishWaveOps {
+        type EvidenceHandle = String;
+        type MetadataHandle = String;
+        type ArtifactHandle = String;
+        type SubtitleLookupHandle = String;
+
+        fn start_evidence(&self, hash: &str) -> Result<String> {
+            self.record("start_evidence", hash);
+            if self.fail_evidence_hash.as_deref() == Some(hash) {
+                Err(BlossomError::MetadataError("evidence failed".into()))
+            } else {
+                Ok(hash.into())
+            }
+        }
+        fn finish_evidence(&self, hash: String) -> Result<()> {
+            self.record("finish_evidence", &hash);
+            Ok(())
+        }
+        fn start_metadata_delete(&self, hash: &str) -> Result<String> {
+            self.record("start_metadata", hash);
+            Ok(hash.into())
+        }
+        fn finish_metadata_delete(&self, hash: &str, _handle: String) -> Result<()> {
+            self.record("finish_metadata", hash);
+            if self.fail_metadata_hash.as_deref() == Some(hash) {
+                Err(BlossomError::MetadataError("metadata failed".into()))
+            } else {
+                Ok(())
+            }
+        }
+        fn start_artifact_deletes(&self, hash: &str) -> Vec<(String, Result<String>)> {
+            self.record("start_artifacts", hash);
+            vec![(format!("refs:{hash}"), Ok(hash.into()))]
+        }
+        fn finish_artifact_delete(&self, hash: String) -> Result<()> {
+            self.record("finish_artifact", &hash);
+            Ok(())
+        }
+        fn start_subtitle_lookup(&self, hash: &str) -> Result<String> {
+            self.record("start_subtitle_lookup", hash);
+            Ok(hash.into())
+        }
+        fn finish_subtitle_lookup(&self, hash: String) -> Result<Option<String>> {
+            self.record("finish_subtitle_lookup", &hash);
+            Ok(Some(format!("job-{hash}")))
+        }
+        fn start_subtitle_deletes(
+            &self,
+            hash: &str,
+            _job_id: &str,
+        ) -> Vec<(String, Result<String>)> {
+            self.record("start_subtitle_deletes", hash);
+            vec![(format!("subtitle:{hash}"), Ok(hash.into()))]
+        }
+    }
+
+    fn prepared_blob(hash: &str, has_metadata: bool) -> PreparedVanishBlob {
+        PreparedVanishBlob {
+            hash: hash.into(),
+            metadata: has_metadata.then(|| sample_metadata(BlobStatus::Active)),
         }
     }
 
@@ -523,112 +706,77 @@ mod tests {
             *ops.calls.borrow(),
             vec!["get_blob_metadata", "remove_from_blob_refs"]
         );
-        finalize_erased_vanish_blob_with_ops(&blob, &ops)
-            .expect("sole-owner finalization should succeed");
-        assert_eq!(
-            *ops.calls.borrow(),
-            vec![
-                "get_blob_metadata",
-                "remove_from_blob_refs",
-                "put_erasure_evidence",
-                "delete_blob_metadata",
-                "delete_blob_kv_artifacts",
-            ]
-        );
+        let wave_ops = MockVanishWaveOps::default();
+        let result = finalize_erased_vanish_wave_with_ops(vec![*blob], &wave_ops);
+        assert_eq!(result.completed.len(), 1);
+        assert_eq!(result.errors, 0);
+        let calls = wave_ops.calls.borrow();
+        let finish_evidence = calls
+            .iter()
+            .position(|call| call.starts_with("finish_evidence"));
+        let start_metadata = calls
+            .iter()
+            .position(|call| call.starts_with("start_metadata"));
+        let finish_metadata = calls
+            .iter()
+            .position(|call| call.starts_with("finish_metadata"));
+        let start_artifacts = calls
+            .iter()
+            .position(|call| call.starts_with("start_artifacts"));
+        assert!(finish_evidence < start_metadata);
+        assert!(finish_metadata < start_artifacts);
     }
 
     #[test]
     fn vanish_evidence_failure_preserves_metadata() {
-        let ops = MockVanishOps {
-            put_erasure_evidence_err: true,
-            ..vanish_ops_with_owner()
+        let failed = "a".repeat(64);
+        let sibling = "b".repeat(64);
+        let ops = MockVanishWaveOps {
+            fail_evidence_hash: Some(failed.clone()),
+            ..Default::default()
         };
-
-        let blob = match prepare_vanish_blob_with_ops(HASH, &"1".repeat(64), &ops).unwrap() {
-            PreparedVanishBlobOrOutcome::Erase(blob) => blob,
-            PreparedVanishBlobOrOutcome::Completed(_) => panic!("sole owner must be erased"),
-        };
-        let result = finalize_erased_vanish_blob_with_ops(&blob, &ops);
-
-        assert!(matches!(result, Err(BlossomError::MetadataError(_))));
-        assert!(ops.metadata.borrow().is_some());
-        assert!(!ops.calls.borrow().contains(&"delete_blob_metadata"));
+        let result = finalize_erased_vanish_wave_with_ops(
+            vec![prepared_blob(&failed, true), prepared_blob(&sibling, true)],
+            &ops,
+        );
+        assert_eq!(result.errors, 1);
+        assert_eq!(result.retry_hashes, vec![failed]);
+        assert_eq!(result.completed[0].hash, sibling);
+        assert!(!ops
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call == &format!("start_metadata:{}", result.retry_hashes[0])));
     }
 
     #[test]
     fn vanish_metadata_failure_stops_unique_finalization() {
-        let ops = MockVanishOps {
-            delete_metadata_err: true,
-            ..vanish_ops_with_owner()
+        let failed = "c".repeat(64);
+        let sibling = "d".repeat(64);
+        let ops = MockVanishWaveOps {
+            fail_metadata_hash: Some(failed.clone()),
+            ..Default::default()
         };
-
-        let blob = match prepare_vanish_blob_with_ops(HASH, &"1".repeat(64), &ops).unwrap() {
-            PreparedVanishBlobOrOutcome::Erase(blob) => blob,
-            PreparedVanishBlobOrOutcome::Completed(_) => panic!("sole owner must be erased"),
-        };
-        let result = finalize_erased_vanish_blob_with_ops(&blob, &ops);
-
-        assert!(matches!(result, Err(BlossomError::MetadataError(_))));
+        let result = finalize_erased_vanish_wave_with_ops(
+            vec![prepared_blob(&failed, true), prepared_blob(&sibling, true)],
+            &ops,
+        );
+        assert_eq!(result.errors, 1);
+        assert_eq!(result.retry_hashes, vec![failed]);
+        assert_eq!(result.completed[0].hash, sibling);
     }
 
     #[test]
     fn vanish_stale_list_entry_retries_as_metadata_less_erasure() {
-        let ops = vanish_ops_with_owner();
-
-        let first_blob = match prepare_vanish_blob_with_ops(HASH, &"1".repeat(64), &ops).unwrap() {
-            PreparedVanishBlobOrOutcome::Erase(blob) => blob,
-            PreparedVanishBlobOrOutcome::Completed(_) => panic!("sole owner must be erased"),
-        };
-        finalize_erased_vanish_blob_with_ops(&first_blob, &ops)
-            .expect("first erasure should remove metadata");
-        assert!(ops.metadata.borrow().is_none());
-        assert!(ops.refs.borrow().is_empty());
-
-        ops.calls.borrow_mut().clear();
-        let retry_blob = match prepare_vanish_blob_with_ops(HASH, &"1".repeat(64), &ops).unwrap() {
-            PreparedVanishBlobOrOutcome::Erase(blob) => blob,
-            PreparedVanishBlobOrOutcome::Completed(_) => {
-                panic!("stale list entry must retry erasure")
-            }
-        };
-        assert!(retry_blob.metadata.is_none());
-        finalize_erased_vanish_blob_with_ops(&retry_blob, &ops)
-            .expect("metadata-less retry should converge");
-        assert_eq!(
-            *ops.calls.borrow(),
-            vec![
-                "get_blob_metadata",
-                "remove_from_blob_refs",
-                "put_erasure_evidence",
-                "delete_blob_kv_artifacts",
-            ]
-        );
-    }
-
-    #[derive(Default)]
-    struct MockSharedKeyOps {
-        calls: RefCell<Vec<(&'static str, usize)>>,
-        list_empty: bool,
-    }
-
-    impl VanishSharedKeyOps for MockSharedKeyOps {
-        fn update_stats_on_remove_batch(&self, metadata: &[BlobMetadata]) {
-            self.calls.borrow_mut().push(("stats", metadata.len()));
-        }
-
-        fn remove_from_recent_index_batch(&self, hashes: &[String]) {
-            self.calls.borrow_mut().push(("recent", hashes.len()));
-        }
-
-        fn update_user_list_for_vanish(
-            &self,
-            _pubkey: &str,
-            removals: &[String],
-            _retry_hashes: &[String],
-        ) -> Result<bool> {
-            self.calls.borrow_mut().push(("list", removals.len()));
-            Ok(self.list_empty)
-        }
+        let ops = MockVanishWaveOps::default();
+        let result = finalize_erased_vanish_wave_with_ops(vec![prepared_blob(HASH, false)], &ops);
+        assert_eq!(result.completed.len(), 1);
+        assert_eq!(result.errors, 0);
+        assert!(!ops
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call.starts_with("start_metadata")));
     }
 
     fn erased_blob(index: usize) -> PreparedVanishBlob {
@@ -640,6 +788,32 @@ mod tests {
 
     #[test]
     fn vanish_shared_keys_are_flushed_once_for_ten_blobs() {
+        #[derive(Default)]
+        struct MockSharedKeyOps {
+            calls: RefCell<Vec<(&'static str, usize)>>,
+            list_empty: bool,
+        }
+
+        impl VanishSharedKeyOps for MockSharedKeyOps {
+            fn update_stats_on_remove_batch(&self, metadata: &[BlobMetadata]) {
+                self.calls.borrow_mut().push(("stats", metadata.len()));
+            }
+
+            fn remove_from_recent_index_batch(&self, hashes: &[String]) {
+                self.calls.borrow_mut().push(("recent", hashes.len()));
+            }
+
+            fn update_user_list_for_vanish(
+                &self,
+                _pubkey: &str,
+                removals: &[String],
+                _retry_hashes: &[String],
+            ) -> Result<bool> {
+                self.calls.borrow_mut().push(("list", removals.len()));
+                Ok(self.list_empty)
+            }
+        }
+
         let mut updates = VanishSharedUpdates::default();
         for index in 0..10 {
             updates.record_erased(&erased_blob(index));
@@ -684,37 +858,6 @@ mod tests {
         assert_eq!(
             *ops.calls.borrow(),
             vec![("stats", 10), ("recent", 10), ("list", 10)]
-        );
-    }
-
-    #[test]
-    fn vanish_shared_keys_are_flushed_once_across_two_waves() {
-        let mut updates = VanishSharedUpdates::default();
-        for index in 0..10 {
-            updates.record_erased(&PreparedVanishBlob {
-                hash: format!("{index:064x}"),
-                metadata: Some(sample_metadata(BlobStatus::Active)),
-            });
-        }
-        for index in 10..20 {
-            updates.record_erased(&PreparedVanishBlob {
-                hash: format!("{index:064x}"),
-                metadata: Some(sample_metadata(BlobStatus::Active)),
-            });
-        }
-        let ops = MockSharedKeyOps {
-            list_empty: true,
-            ..Default::default()
-        };
-
-        let account_complete =
-            apply_vanish_shared_updates_with_ops(&updates, &"1".repeat(64), &[], true, &ops)
-                .expect("shared updates should flush once after both waves");
-
-        assert!(account_complete);
-        assert_eq!(
-            *ops.calls.borrow(),
-            vec![("stats", 20), ("recent", 20), ("list", 20)]
         );
     }
 

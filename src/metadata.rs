@@ -205,10 +205,7 @@ pub fn get_blob_metadata_uncached(hash: &str) -> Result<Option<BlobMetadata>> {
     parse_blob_metadata_lookup(store.lookup(&key))
 }
 
-pub(crate) fn start_vanish_blob_lookup(
-    store: &KVStore,
-    hash: &str,
-) -> Result<PendingLookupHandle> {
+pub(crate) fn start_vanish_blob_lookup(store: &KVStore, hash: &str) -> Result<PendingLookupHandle> {
     let metadata_key = format!("{}{}", BLOB_PREFIX, hash.to_lowercase());
     store
         .build_lookup()
@@ -304,21 +301,34 @@ pub(crate) fn finish_vanish_metadata_delete(
     Ok(())
 }
 
-pub(crate) fn vanish_blob_artifact_delete_keys(hash: &str) -> Vec<String> {
+fn blob_refs_key(hash: &str) -> String {
+    format!("{}{}", REFS_PREFIX, hash.to_lowercase())
+}
+
+fn auth_event_keys(hash: &str) -> [String; 2] {
     let hash = hash.to_lowercase();
-    vec![
-        format!("{}{}", REFS_PREFIX, hash),
+    [
         format!("{}{}:upload", AUTH_PREFIX, hash),
         format!("{}{}:delete", AUTH_PREFIX, hash),
     ]
 }
 
-pub(crate) fn vanish_subtitle_hash_key(hash: &str) -> String {
+pub(crate) fn vanish_blob_artifact_delete_keys(hash: &str) -> Vec<String> {
+    let mut keys = vec![blob_refs_key(hash)];
+    keys.extend(auth_event_keys(hash));
+    keys
+}
+
+fn subtitle_hash_key(hash: &str) -> String {
     format!("{}{}", SUBTITLE_HASH_PREFIX, hash.to_lowercase())
 }
 
-pub(crate) fn vanish_subtitle_job_key(job_id: &str) -> String {
+fn subtitle_job_key(job_id: &str) -> String {
     format!("{}{}", SUBTITLE_JOB_PREFIX, job_id)
+}
+
+pub(crate) fn vanish_subtitle_delete_keys(hash: &str, job_id: &str) -> [String; 2] {
+    [subtitle_job_key(job_id), subtitle_hash_key(hash)]
 }
 
 pub(crate) fn start_vanish_best_effort_delete(
@@ -348,7 +358,7 @@ pub(crate) fn start_vanish_subtitle_job_lookup(
 ) -> Result<PendingLookupHandle> {
     store
         .build_lookup()
-        .execute_async(&vanish_subtitle_hash_key(hash))
+        .execute_async(&subtitle_hash_key(hash))
         .map_err(|error| {
             BlossomError::MetadataError(format!("Failed to start subtitle job lookup: {error}"))
         })
@@ -358,7 +368,13 @@ pub(crate) fn finish_vanish_subtitle_job_lookup(
     store: &KVStore,
     handle: PendingLookupHandle,
 ) -> Result<Option<String>> {
-    match store.pending_lookup_wait(handle) {
+    parse_subtitle_job_lookup(store.pending_lookup_wait(handle))
+}
+
+fn parse_subtitle_job_lookup(
+    lookup: std::result::Result<LookupResponse, KVStoreError>,
+) -> Result<Option<String>> {
+    match lookup {
         Ok(mut lookup_result) => {
             let job_id = lookup_result.take_body().into_string().trim().to_string();
             if job_id.is_empty() {
@@ -372,16 +388,6 @@ pub(crate) fn finish_vanish_subtitle_job_lookup(
             "Failed to lookup subtitle job by hash: {error}"
         ))),
     }
-}
-
-/// Store durable evidence that the vanish erasure phase completed for a blob.
-///
-/// The key is derived from the content hash and the value contains no account,
-/// content hash, media bytes, reason, or request timestamp.
-pub fn put_erasure_evidence(hash: &str) -> Result<()> {
-    let store = open_store()?;
-    let handle = start_vanish_erasure_evidence(&store, hash)?;
-    finish_vanish_erasure_evidence(&store, handle)
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -504,10 +510,10 @@ pub fn mark_vanish_audit_authorized_delivered(
         let generation = result.current_generation();
         let mut state: VanishAuditState = serde_json::from_str(&result.take_body().into_string())
             .map_err(|error| {
-                BlossomError::MetadataError(format!(
-                    "Invalid vanish audit authorization state: {error}"
-                ))
-            })?;
+            BlossomError::MetadataError(format!(
+                "Invalid vanish audit authorization state: {error}"
+            ))
+        })?;
         if state.operation_id != operation_id {
             return Ok(None);
         }
@@ -620,8 +626,8 @@ pub fn claim_vanish_audit_completion(
         let generation = result.current_generation();
         let mut state: VanishAuditState = serde_json::from_str(&result.take_body().into_string())
             .map_err(|error| {
-                BlossomError::MetadataError(format!("Invalid vanish audit completion state: {error}"))
-            })?;
+            BlossomError::MetadataError(format!("Invalid vanish audit completion state: {error}"))
+        })?;
         if state.completed_at.is_some() {
             return Ok(Some(state));
         }
@@ -840,8 +846,7 @@ fn stale_generation(incoming: Option<u64>, stored: Option<u64>) -> bool {
 
 fn transcode_status_event_sequence(status: crate::blossom::TranscodeStatus) -> u64 {
     match status {
-        crate::blossom::TranscodeStatus::Pending
-        | crate::blossom::TranscodeStatus::Processing => 0,
+        crate::blossom::TranscodeStatus::Pending | crate::blossom::TranscodeStatus::Processing => 0,
         crate::blossom::TranscodeStatus::Complete | crate::blossom::TranscodeStatus::Failed => 1,
     }
 }
@@ -1106,24 +1111,8 @@ pub fn put_subtitle_job(job: &SubtitleJob) -> Result<()> {
 /// Get subtitle job id by media hash
 pub fn get_subtitle_job_id_by_hash(hash: &str) -> Result<Option<String>> {
     let store = open_store()?;
-    let key = format!("{}{}", SUBTITLE_HASH_PREFIX, hash.to_lowercase());
-
-    match store.lookup(&key) {
-        Ok(mut lookup_result) => {
-            let body = lookup_result.take_body().into_string();
-            let job_id = body.trim().to_string();
-            if job_id.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(job_id))
-            }
-        }
-        Err(KVStoreError::ItemNotFound) => Ok(None),
-        Err(e) => Err(BlossomError::MetadataError(format!(
-            "Failed to lookup subtitle job by hash: {}",
-            e
-        ))),
-    }
+    let key = subtitle_hash_key(hash);
+    parse_subtitle_job_lookup(store.lookup(&key))
 }
 
 /// Set subtitle job id mapping for a media hash
@@ -1594,7 +1583,7 @@ pub fn remove_from_blob_refs(hash: &str, pubkey: &str) -> Result<Vec<String>> {
 /// Delete the entire blob refs entry
 pub fn delete_blob_refs(hash: &str) -> Result<()> {
     let store = open_store()?;
-    let key = format!("{}{}", REFS_PREFIX, hash.to_lowercase());
+    let key = blob_refs_key(hash);
 
     match store.delete(&key) {
         Ok(()) => Ok(()),
@@ -1609,18 +1598,12 @@ pub fn delete_blob_refs(hash: &str) -> Result<()> {
 /// Delete auth events for a hash (both upload and delete provenance)
 pub fn delete_auth_events(hash: &str) -> Result<()> {
     let store = open_store()?;
-    let hash_lower = hash.to_lowercase();
-
-    for action in &["upload", "delete"] {
-        let key = format!("{}{}:{}", AUTH_PREFIX, hash_lower, action);
+    for key in auth_event_keys(hash) {
         match store.delete(&key) {
             Ok(()) => {}
             Err(KVStoreError::ItemNotFound) => {}
             Err(e) => {
-                eprintln!(
-                    "[KV] Failed to delete auth event {}:{}: {}",
-                    hash_lower, action, e
-                );
+                eprintln!("[KV] Failed to delete auth event {}: {}", key, e);
             }
         }
     }
@@ -1637,7 +1620,7 @@ pub fn delete_subtitle_data(hash: &str) -> Result<()> {
         let store = open_store()?;
 
         // Delete the job record
-        let job_key = format!("{}{}", SUBTITLE_JOB_PREFIX, job_id);
+        let job_key = subtitle_job_key(&job_id);
         match store.delete(&job_key) {
             Ok(()) => {}
             Err(KVStoreError::ItemNotFound) => {}
@@ -1647,7 +1630,7 @@ pub fn delete_subtitle_data(hash: &str) -> Result<()> {
         }
 
         // Delete the hash -> job_id mapping
-        let hash_key = format!("{}{}", SUBTITLE_HASH_PREFIX, hash_lower);
+        let hash_key = subtitle_hash_key(&hash_lower);
         match store.delete(&hash_key) {
             Ok(()) => {}
             Err(KVStoreError::ItemNotFound) => {}
@@ -1818,8 +1801,9 @@ pub fn add_to_audio_source_refs(audio_hash: &str, source_hash: &str) -> Result<(
 
         let store = open_store()?;
         let key = format!("{}{}", AUDIO_REFS_PREFIX, audio_hash.to_lowercase());
-        let json = serde_json::to_string(&refs)
-            .map_err(|e| BlossomError::MetadataError(format!("Failed to serialize audio refs: {}", e)))?;
+        let json = serde_json::to_string(&refs).map_err(|e| {
+            BlossomError::MetadataError(format!("Failed to serialize audio refs: {}", e))
+        })?;
 
         match store.insert(&key, json) {
             Ok(()) => return Ok(()),
@@ -1856,8 +1840,9 @@ pub fn remove_from_audio_source_refs(audio_hash: &str, source_hash: &str) -> Res
 
         let store = open_store()?;
         let key = format!("{}{}", AUDIO_REFS_PREFIX, audio_hash.to_lowercase());
-        let json = serde_json::to_string(&refs)
-            .map_err(|e| BlossomError::MetadataError(format!("Failed to serialize audio refs: {}", e)))?;
+        let json = serde_json::to_string(&refs).map_err(|e| {
+            BlossomError::MetadataError(format!("Failed to serialize audio refs: {}", e))
+        })?;
 
         match store.insert(&key, json) {
             Ok(()) => return Ok(refs),
@@ -2035,10 +2020,7 @@ mod tests {
             Some(StatusUpdateOutcome::MissingGeneration { stored: Some(5) })
         );
         assert_eq!(generation_rejection(None, None, true, false), None);
-        assert_eq!(
-            generation_rejection(None, Some(5), false, false),
-            None
-        );
+        assert_eq!(generation_rejection(None, Some(5), false, false), None);
     }
 
     #[test]

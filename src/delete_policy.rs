@@ -4,11 +4,12 @@ use crate::blossom::BlobMetadata;
 use crate::blossom::BlobStatus;
 use crate::error::Result;
 use crate::metadata::{
-    add_to_recent_index, add_to_user_list, get_blob_metadata_uncached, get_blob_refs, put_tombstone,
-    remove_from_recent_index, remove_from_recent_index_batch, remove_from_user_list,
+    add_to_recent_index, add_to_user_list, get_blob_metadata_uncached, get_blob_refs,
+    put_tombstone, remove_from_recent_index, remove_from_recent_index_batch, remove_from_user_list,
     update_blob_status, update_stats_on_remove_batch, update_stats_on_status_change,
     update_user_list_for_vanish,
 };
+use fastly::kv_store::{KVStore, PendingDeleteHandle, PendingInsertHandle, PendingLookupHandle};
 use std::collections::HashMap;
 
 pub fn soft_delete_blob(
@@ -73,18 +74,6 @@ impl VanishBlobOps for DefaultCreatorDeleteOps {
         crate::metadata::remove_from_blob_refs(hash, pubkey)
     }
 
-    fn put_erasure_evidence(&self, hash: &str) -> Result<()> {
-        crate::metadata::put_erasure_evidence(hash)
-    }
-
-    fn delete_blob_metadata(&self, hash: &str) -> Result<()> {
-        crate::metadata::delete_blob_metadata(hash)
-    }
-
-    fn delete_blob_kv_artifacts(&self, hash: &str) {
-        crate::delete_blob_kv_artifacts(hash);
-    }
-
     fn put_blob_metadata(&self, metadata: &BlobMetadata) -> Result<()> {
         crate::metadata::put_blob_metadata(metadata)
     }
@@ -130,20 +119,79 @@ impl VanishBlobOps for PrefetchedVanishOps<'_> {
         DefaultCreatorDeleteOps.remove_from_blob_refs(hash, pubkey)
     }
 
-    fn put_erasure_evidence(&self, hash: &str) -> Result<()> {
-        DefaultCreatorDeleteOps.put_erasure_evidence(hash)
-    }
-
-    fn delete_blob_metadata(&self, hash: &str) -> Result<()> {
-        DefaultCreatorDeleteOps.delete_blob_metadata(hash)
-    }
-
-    fn delete_blob_kv_artifacts(&self, hash: &str) {
-        DefaultCreatorDeleteOps.delete_blob_kv_artifacts(hash);
-    }
-
     fn put_blob_metadata(&self, metadata: &BlobMetadata) -> Result<()> {
         DefaultCreatorDeleteOps.put_blob_metadata(metadata)
+    }
+}
+
+pub(crate) struct DefaultVanishWaveOps {
+    store: KVStore,
+}
+
+impl DefaultVanishWaveOps {
+    pub(crate) fn new() -> Result<Self> {
+        Ok(Self {
+            store: crate::metadata::open_store()?,
+        })
+    }
+}
+
+impl VanishWaveOps for DefaultVanishWaveOps {
+    type EvidenceHandle = PendingInsertHandle;
+    type MetadataHandle = PendingDeleteHandle;
+    type ArtifactHandle = PendingDeleteHandle;
+    type SubtitleLookupHandle = PendingLookupHandle;
+
+    fn start_evidence(&self, hash: &str) -> Result<Self::EvidenceHandle> {
+        crate::metadata::start_vanish_erasure_evidence(&self.store, hash)
+    }
+
+    fn finish_evidence(&self, handle: Self::EvidenceHandle) -> Result<()> {
+        crate::metadata::finish_vanish_erasure_evidence(&self.store, handle)
+    }
+
+    fn start_metadata_delete(&self, hash: &str) -> Result<Self::MetadataHandle> {
+        crate::metadata::start_vanish_metadata_delete(&self.store, hash)
+    }
+
+    fn finish_metadata_delete(&self, hash: &str, handle: Self::MetadataHandle) -> Result<()> {
+        crate::metadata::finish_vanish_metadata_delete(&self.store, hash, handle)
+    }
+
+    fn start_artifact_deletes(&self, hash: &str) -> Vec<(String, Result<Self::ArtifactHandle>)> {
+        crate::metadata::vanish_blob_artifact_delete_keys(hash)
+            .into_iter()
+            .map(|key| {
+                let pending = crate::metadata::start_vanish_best_effort_delete(&self.store, &key);
+                (key, pending)
+            })
+            .collect()
+    }
+
+    fn finish_artifact_delete(&self, handle: Self::ArtifactHandle) -> Result<()> {
+        crate::metadata::finish_vanish_best_effort_delete(&self.store, handle)
+    }
+
+    fn start_subtitle_lookup(&self, hash: &str) -> Result<Self::SubtitleLookupHandle> {
+        crate::metadata::start_vanish_subtitle_job_lookup(&self.store, hash)
+    }
+
+    fn finish_subtitle_lookup(&self, handle: Self::SubtitleLookupHandle) -> Result<Option<String>> {
+        crate::metadata::finish_vanish_subtitle_job_lookup(&self.store, handle)
+    }
+
+    fn start_subtitle_deletes(
+        &self,
+        hash: &str,
+        job_id: &str,
+    ) -> Vec<(String, Result<Self::ArtifactHandle>)> {
+        crate::metadata::vanish_subtitle_delete_keys(hash, job_id)
+            .into_iter()
+            .map(|key| {
+                let pending = crate::metadata::start_vanish_best_effort_delete(&self.store, &key);
+                (key, pending)
+            })
+            .collect()
     }
 }
 
