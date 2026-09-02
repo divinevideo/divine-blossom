@@ -22,6 +22,14 @@ The repository contains, but does not activate or configure:
   5xx (`obj.status` 500–599) to the endpoint named `vcl-error-diagnostics`.
   The client-facing synthetic JSON response remains 503-only; other 5xx
   statuses keep Fastly's default error delivery.
+- `vcl/fetch.vcl`, which writes `divine.blossom.vcl_5xx.v1` with `"phase":"fetch"`
+  for every origin 5xx. Fastly treats a syntactically valid HTTP 5xx as a
+  normal response, so those never enter `vcl_error`. The fetch snippet still
+  `return(pass)` on them; it does not convert them into synthetic errors.
+- `vcl/log_5xx.vcl`, a `vcl_log` snippet that writes the same schema with
+  `"phase":"log"` for client-facing 5xx whose `fastly_info.state` does not
+  match `ERROR`. That is the complement of the `vcl_error` stream. It logs
+  only the edge hop (`fastly.ff.visits_this_service == 0`).
 - Error-only Compute request logging to the endpoint named
   `compute-diagnostics` with the sanitized request ID, method, normalized route,
   final status, available error category, and duration. Routine successful and
@@ -77,6 +85,29 @@ needed. Fastly `status_503` stats also count responses that never enter
 appear in this sink. Minutes with `error_sub_time > 0` are the ones the snippet
 can have logged.
 
+`divine.blossom.vcl_5xx.v1` records the 5xx that skip `vcl_error`. Both phases
+use the same endpoint as `vcl_error.v1`. Fields: `phase` (`fetch` or `log`),
+request start timestamp, sanitized request ID, service ID, method, URL (path
+and query, capped at 256 characters, JSON-escaped), status, origin or response
+reason phrase, POP, backend, cache state, `ff_visits`, restart count, and
+elapsed milliseconds. The `log` phase also records `body_bytes_written`.
+Headers, client address, authorization, cookies, and bodies are not logged.
+
+How to split a `status_503` minute after both snippets are active:
+
+- A `vcl_error.v1` record: Fastly generated the 503 and `vcl_error` ran
+  (`error_sub_time` is the matching stats signal).
+- A `vcl_5xx.v1` `phase=fetch` record: Compute or the shield returned a
+  syntactically valid 5xx. `vcl_fetch` passed it through.
+- A `vcl_5xx.v1` `phase=log` record without a matching `vcl_error.v1`: the
+  client received a 5xx that never entered `vcl_error`.
+- `status_503` with neither schema: the request never entered VCL (platform
+  or routing-stage 503, including loop detection before service code). Those
+  remain unobservable from snippets.
+- Streamed cache-fill failures after `vcl_deliver` has started (`beresp.do_stream`
+  on 200/206) cannot enter `vcl_error` and typically cannot change the status
+  already sent, so they show up as truncated 200s, not as `status_503`.
+
 The outer service copies the selected caller/generated ID to the private
 `X-Divine-Edge-Request-Id` request header before chaining so a later Compute
 sanitization cannot change the VCL-side correlation value. Both services cap
@@ -103,7 +134,7 @@ in persisted 5xx records; routine traffic writes no per-request route log.
 Operators who relied on `[BLOSSOM ROUTE]` in `log-tail` for live debugging no
 longer have it at any status.
 
-Do not point either schema at `cdn-view-logs`; that stream has a separate
+Do not point these schemas at `cdn-view-logs`; that stream has a separate
 view-counting contract.
 
 ## Activation And Recreation
@@ -121,13 +152,15 @@ following:
    key files. Do not pass a private key in a CLI argument.
 2. Clone the active outer version so live-only configuration is copied,
    including the `pass` snippet whose source is not in this repository. Update
-   `vcl/error.vcl` as the `error` snippet on that draft. Do not delete the
-   `pass` snippet. Keep automatic log placement disabled for
-   `vcl-error-diagnostics`; the error snippet emits only the selected failures.
+   the existing `fetch` snippet from `vcl/fetch.vcl`, and add
+   `vcl/log_5xx.vcl` as a `log` snippet on that draft. Do not delete the `pass`
+   snippet. Keep automatic log placement disabled for
+   `vcl-error-diagnostics`; the error, fetch, and log snippets emit only the
+   selected failures.
 3. Run `fastly service version validate` on the draft. Confirm it returns
-   valid, that `vcl_error` contains the repository snippet once, and that the
-   live-only `pass` snippet is still present. Review the diff before
-   activation. CI does not compile this snippet.
+   valid, that `vcl_fetch` and `vcl_log` contain the repository snippets once,
+   and that the live-only `pass` snippet is still present. Review the diff
+   before activation. CI does not compile these snippets.
 4. Activate the separately validated outer VCL version first, then publish the
    Compute package through the repository deployment path. After activation,
    set the GitHub Actions repository variable
@@ -146,8 +179,10 @@ following:
    prefix). Confirm an all-filtered request ID generates one shared fallback ID
    in both `X-Request-Id` and `X-Divine-Edge-Request-Id`. Confirm an outer
    backend failure preserves its supplied request ID and `obj.response` without
-   producing a matching Compute record. Confirm the existing 503 status, JSON
-   body, content type, and CORS header remain unchanged.
+    producing a matching Compute record. Confirm a Compute-origin 5xx produces
+    `vcl_5xx.v1` fetch and log records, not `vcl_error.v1`, and that the origin
+    status and body are unchanged. Confirm the existing Fastly-generated 503
+    status, JSON body, content type, and CORS header remain unchanged.
 6. Create separate outer `status_5xx_rate` and inner
    `compute_resp_status_5xx_rate` alerts with minimum request thresholds. Add a
    low-volume absolute 5xx alert only if sustained small failures require it.
@@ -167,6 +202,10 @@ cross-service production correlation remain operator validation.
   guest trap or OOM, or a wall-clock timeout (which may leave no Compute
   record at all). Do not treat a missing Compute record as proof the request
   never reached Compute.
+- A `vcl_5xx.v1` fetch record with a Compute 5xx at the same request ID is
+  origin-generated. A fetch record with no Compute record is a 5xx from the
+  shield hop or another syntactically valid backend response, not a Fastly
+  synthetic.
 - A matching Compute 5xx identifies an application or origin-side failure; use
   its normalized error category without assuming the VCL record is a second
   independent request.

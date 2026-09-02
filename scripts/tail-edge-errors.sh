@@ -6,8 +6,9 @@
 # sit unread for the 7-day retention and then expire. This makes reading them a
 # single command instead of a research exercise.
 #
-#   vcl-error-diagnostics  Fastly-generated 5xx -- backend timeouts, unreachable
-#                          origin. These never reached Compute.
+#   vcl-error-diagnostics  Fastly-generated 5xx (schema vcl_error.v1) plus
+#                          origin/delivered 5xx that skipped vcl_error
+#                          (schema vcl_5xx.v1, phase fetch or log).
 #   compute-diagnostics    Errors Compute returned itself, with a route and an
 #                          error category.
 #
