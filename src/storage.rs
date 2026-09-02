@@ -2438,13 +2438,33 @@ fn failed_cloud_cleanup_hashes(
         .collect()
 }
 
+fn plan_cloud_run_delete_chunks(hashes: &[String]) -> Vec<&[String]> {
+    hashes.chunks(CLOUD_RUN_DELETE_BATCH_LIMIT).collect()
+}
+
 fn trigger_cloud_run_delete_blobs(hashes: &[String]) -> Result<HashSet<String>> {
     if hashes.is_empty() {
         return Ok(HashSet::new());
     }
     let webhook_secret = get_secret("webhook_secret")?;
     let expected_bucket = get_config("gcs_bucket")?;
-    let body = cloud_run_delete_blobs_body(hashes, &expected_bucket)?;
+    let mut failed = HashSet::new();
+    for chunk in plan_cloud_run_delete_chunks(hashes) {
+        failed.extend(trigger_cloud_run_delete_blobs_chunk(
+            chunk,
+            &webhook_secret,
+            &expected_bucket,
+        )?);
+    }
+    Ok(failed)
+}
+
+fn trigger_cloud_run_delete_blobs_chunk(
+    hashes: &[String],
+    webhook_secret: &str,
+    expected_bucket: &str,
+) -> Result<HashSet<String>> {
+    let body = cloud_run_delete_blobs_body(hashes, expected_bucket)?;
 
     const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
     let mut request = Request::new(
@@ -2670,7 +2690,8 @@ mod tests {
         classify_cloud_cleanup_response, cloud_run_delete_blob_body, cloud_run_delete_blobs_body,
         failed_cloud_cleanup_hashes, failed_multi_delete_keys, mark_failed_stage,
         multi_delete_body, normalize_storage_cache_state, parse_audio_extraction_error_response,
-        parse_funnelcake_audio_reuse_response, plan_vanish_delete_batches,
+        parse_funnelcake_audio_reuse_response, plan_cloud_run_delete_chunks,
+        plan_vanish_delete_batches,
         prepare_storage_cache_miss, preserve_storage_cache_state, sign_request_at,
         vanish_audit_entry, S3Config,
         VanishDeleteTarget, VanishStorageResult, CLOUD_RUN_DELETE_BATCH_LIMIT, FOS_BACKEND,
@@ -2772,6 +2793,33 @@ mod tests {
 
         assert!(cloud_run_delete_blobs_body(&accepted, "configured-bucket").is_ok());
         assert!(cloud_run_delete_blobs_body(&rejected, "configured-bucket").is_err());
+    }
+
+    #[test]
+    fn cloud_cleanup_chunks_above_the_request_contract() {
+        let hashes = (0..CLOUD_RUN_DELETE_BATCH_LIMIT + 1)
+            .map(|index| format!("{index:064x}"))
+            .collect::<Vec<_>>();
+        let derived_audio = hashes
+            .iter()
+            .map(|hash| format!("{:064x}", hash.bytes().next().unwrap_or(0) as u16 + 1_000))
+            .collect::<Vec<_>>();
+        let mut erase_hashes = hashes.clone();
+        erase_hashes.extend(derived_audio);
+        erase_hashes.sort();
+        erase_hashes.dedup();
+
+        let chunks = plan_cloud_run_delete_chunks(&erase_hashes);
+
+        assert!(erase_hashes.len() > CLOUD_RUN_DELETE_BATCH_LIMIT);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.len() <= CLOUD_RUN_DELETE_BATCH_LIMIT));
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.len()).sum::<usize>(),
+            erase_hashes.len()
+        );
+        assert!(cloud_run_delete_blobs_body(chunks[0], "configured-bucket").is_ok());
     }
 
     #[test]

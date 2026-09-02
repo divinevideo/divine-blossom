@@ -30,8 +30,8 @@ use crate::delete_policy::{
     apply_vanish_shared_updates_with_ops, build_creator_delete_response,
     finalize_erased_vanish_blob_with_ops, handle_creator_delete, map_webhook_moderate_action,
     plan_user_delete, prepare_vanish_blob_with_ops, soft_delete_blob, validate_sha256_format,
-    DefaultCreatorDeleteOps, DefaultVanishSharedKeyOps, DeletePlan, PreparedVanishBlobOrOutcome,
-    VanishBlobOutcome, VanishSharedUpdates,
+    DefaultCreatorDeleteOps, DefaultVanishSharedKeyOps, DeletePlan, PrefetchedVanishOps,
+    PreparedVanishBlob, PreparedVanishBlobOrOutcome, VanishBlobOutcome, VanishSharedUpdates,
 };
 use crate::error::{BlossomError, Result};
 use crate::media_auth_log::format_media_auth_log;
@@ -39,22 +39,22 @@ use crate::metadata::{
     add_to_audio_source_refs, add_to_blob_refs, add_to_recent_index, add_to_user_index,
     add_to_user_list, claim_vanish_audit_completion, create_vanish_audit_state,
     delete_audio_mapping, delete_audio_source_refs, delete_auth_events, delete_blob_metadata,
-    delete_blob_refs,
-    delete_subtitle_data, get_audio_mapping, get_audio_source_refs,
-    get_auth_event, get_blob_metadata, get_blob_metadata_uncached, get_blob_refs, get_subtitle_job,
-    get_subtitle_job_by_hash, get_tombstone, get_user_blobs, get_vanish_audit_state,
-    list_blobs_with_metadata, mark_vanish_audit_authorized_delivered, put_audio_mapping,
-    put_auth_event, put_blob_metadata, put_subtitle_job, refresh_vanish_audit_state,
-    remove_from_audio_source_refs, remove_from_blob_refs, remove_from_user_index,
-    remove_from_user_list, set_subtitle_job_id_for_hash, update_blob_status, update_stats_on_add,
-    StatusUpdateOutcome, TranscodeMetadataUpdate, TranscriptMetadataUpdate, VanishAuditState,
+    delete_blob_refs, delete_subtitle_data, finish_vanish_blob_lookups, get_audio_mapping,
+    get_audio_source_refs, get_auth_event, get_blob_metadata, get_blob_metadata_uncached,
+    get_blob_refs, get_subtitle_job, get_subtitle_job_by_hash, get_tombstone, get_user_blobs,
+    get_vanish_audit_state, list_blobs_with_metadata, mark_vanish_audit_authorized_delivered,
+    open_store, put_audio_mapping, put_auth_event, put_blob_metadata, put_subtitle_job,
+    refresh_vanish_audit_state, remove_from_audio_source_refs, remove_from_blob_refs,
+    remove_from_user_index, remove_from_user_list, set_subtitle_job_id_for_hash,
+    start_vanish_blob_lookups, update_blob_status, update_stats_on_add, StatusUpdateOutcome,
+    TranscodeMetadataUpdate, TranscriptMetadataUpdate, VanishAuditState,
 };
 use crate::storage::{
     blob_exists, check_funnelcake_audio_reuse, current_timestamp, delete_blob as storage_delete,
-    download_blob_read_through, download_blob_with_fallback, download_thumbnail,
-    dispatch_vanish_timing_log, erase_vanish_batch, trigger_audio_extraction,
+    dispatch_vanish_timing_log, download_blob_read_through, download_blob_with_fallback,
+    download_thumbnail, erase_vanish_batch, trigger_audio_extraction,
     trigger_cloud_run_delete_blob, upload_blob, write_audit_log, write_vanish_audit_log,
-    VanishAuditInitiator, VanishAuditPhase,
+    VanishAuditInitiator, VanishAuditPhase, VanishStorageTimings,
 };
 use crate::viewer_auth::{ViewerAuthDiagnostics, ViewerAuthState};
 use blossom_core::cache_policy::{
@@ -73,7 +73,7 @@ use fastly::http::{header, Method, StatusCode};
 use fastly::kv_store::KVStore;
 use fastly::{Error, Request, Response};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -4462,9 +4462,18 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
     Ok(resp)
 }
 
-const VANISH_BATCH_SIZE: usize = 10;
+// Fastly Compute instances hard-stop at 120s. Vanish's VCL first_byte_timeout
+// is ~15s and is a separate Fastly config change. Stop starting another prepare
+// wave once elapsed plus the last wave would meet this budget, so storage,
+// shared KV, and the HTTP response still fit under that outer timeout.
+const VANISH_TIME_BUDGET: Duration = Duration::from_millis(10_000);
+// Fastly does not document a KV pending-handle ceiling. Compute allows 1,000
+// concurrent backend requests. This is per-wave lookup width, not an operation
+// cap. Two unique-key lookups run per hash. Keep one wave at the previously
+// safe working set while per-blob kv_finalize remains serial; extra waves
+// start only when the last wave still fits in VANISH_TIME_BUDGET.
+const VANISH_KV_LOOKUP_FANOUT: usize = 10;
 const VANISH_STORAGE_ATTEMPTS: u8 = 2;
-const _: () = assert!(VANISH_BATCH_SIZE * 2 <= storage::CLOUD_RUN_DELETE_BATCH_LIMIT);
 
 #[derive(Debug)]
 struct VanishExecution {
@@ -4482,18 +4491,110 @@ impl VanishExecution {
     }
 }
 
-fn select_vanish_batch(hashes: &[String]) -> (Vec<String>, Vec<String>, u32) {
+fn classify_vanish_hashes(hashes: &[String]) -> (Vec<String>, Vec<String>) {
     let (valid, malformed) = hashes
         .iter()
-        .take(VANISH_BATCH_SIZE)
         .partition::<Vec<_>, _>(|hash| validate_sha256_format(hash).is_ok());
     let valid = valid.into_iter().map(|hash| hash.to_lowercase()).collect();
     let malformed = malformed.into_iter().cloned().collect();
-    let pending = hashes
-        .len()
-        .saturating_sub(VANISH_BATCH_SIZE)
-        .min(u32::MAX as usize) as u32;
-    (valid, malformed, pending)
+    (valid, malformed)
+}
+
+fn should_start_vanish_wave(
+    already_started: bool,
+    elapsed: Duration,
+    last_wave: Duration,
+    budget: Duration,
+) -> bool {
+    if !already_started {
+        return true;
+    }
+    elapsed.saturating_add(last_wave) < budget
+}
+
+fn add_vanish_storage_timings(total: &mut VanishStorageTimings, wave: &VanishStorageTimings) {
+    total.gcs_main_ms = total.gcs_main_ms.saturating_add(wave.gcs_main_ms);
+    total.cloud_run_cleanup_ms = total
+        .cloud_run_cleanup_ms
+        .saturating_add(wave.cloud_run_cleanup_ms);
+    total.fos_main_ms = total.fos_main_ms.saturating_add(wave.fos_main_ms);
+    total.purge_vcl_ms = total.purge_vcl_ms.saturating_add(wave.purge_vcl_ms);
+    total.purge_compute_ms = total.purge_compute_ms.saturating_add(wave.purge_compute_ms);
+}
+
+fn prefetch_vanish_blob_lookups(
+    hashes: &[String],
+) -> (
+    HashMap<String, Option<BlobMetadata>>,
+    HashMap<String, Vec<String>>,
+) {
+    let mut metadata = HashMap::new();
+    let mut refs = HashMap::new();
+    let Ok(store) = open_store() else {
+        return (metadata, refs);
+    };
+    let mut pending = Vec::new();
+    for hash in hashes {
+        match start_vanish_blob_lookups(&store, hash) {
+            Ok(handles) => pending.push((hash.clone(), handles)),
+            Err(error) => {
+                eprintln!(
+                    "[VANISH] hash={} failed to start parallel blob lookups: {}",
+                    hash, error
+                );
+            }
+        }
+    }
+    for (hash, (metadata_handle, refs_handle)) in pending {
+        match finish_vanish_blob_lookups(&store, metadata_handle, refs_handle) {
+            Ok((blob_metadata, blob_refs)) => {
+                metadata.insert(hash.to_lowercase(), blob_metadata);
+                refs.insert(hash.to_lowercase(), blob_refs);
+            }
+            Err(error) => {
+                eprintln!(
+                    "[VANISH] hash={} failed to finish parallel blob lookups: {}",
+                    hash, error
+                );
+            }
+        }
+    }
+    (metadata, refs)
+}
+
+struct VanishWavePrepare {
+    erase: Vec<PreparedVanishBlob>,
+    completed: Vec<(String, VanishBlobOutcome)>,
+    retry_hashes: Vec<String>,
+    errors: u32,
+}
+
+fn prepare_vanish_wave(pubkey: &str, hashes: &[String]) -> VanishWavePrepare {
+    let (metadata, refs) = prefetch_vanish_blob_lookups(hashes);
+    let ops = PrefetchedVanishOps::new(&metadata, &refs);
+    let mut prepared = VanishWavePrepare {
+        erase: Vec::new(),
+        completed: Vec::new(),
+        retry_hashes: Vec::new(),
+        errors: 0,
+    };
+    for hash in hashes {
+        match prepare_vanish_blob_with_ops(hash, pubkey, &ops) {
+            Ok(PreparedVanishBlobOrOutcome::Erase(blob)) => prepared.erase.push(*blob),
+            Ok(PreparedVanishBlobOrOutcome::Completed(outcome)) => {
+                prepared.completed.push((hash.clone(), outcome));
+            }
+            Err(error) => {
+                eprintln!(
+                    "[VANISH] pubkey={} hash={} failed to prepare blob: {}",
+                    pubkey, hash, error
+                );
+                prepared.errors += 1;
+                prepared.retry_hashes.push(hash.clone());
+            }
+        }
+    }
+    prepared
 }
 
 fn record_malformed_vanish_hash(hash: &str, pubkey: &str) {
@@ -4552,11 +4653,8 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
             return execution;
         }
     };
-    let (selected, malformed, pending) = select_vanish_batch(&hashes);
-    execution.pending = pending;
+    let (valid, malformed) = classify_vanish_hashes(&hashes);
 
-    let prepare_started = Instant::now();
-    let mut erase = Vec::new();
     let mut retry_hashes = Vec::new();
     let mut shared_updates = VanishSharedUpdates::default();
     let mut completed_outcomes = Vec::new();
@@ -4566,102 +4664,131 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         shared_updates.record_unlinked(hash);
         completed_malformed += 1;
     }
-    for hash in &selected {
-        match prepare_vanish_blob_with_ops(hash, pubkey, &DefaultCreatorDeleteOps) {
-            Ok(PreparedVanishBlobOrOutcome::Erase(blob)) => erase.push(*blob),
-            Ok(PreparedVanishBlobOrOutcome::Completed(outcome)) => {
-                shared_updates.record_unlinked(hash);
-                completed_outcomes.push(outcome);
-            }
-            Err(error) => {
-                eprintln!(
-                    "[VANISH] pubkey={} hash={} failed to prepare blob: {}",
-                    pubkey, hash, error
-                );
-                execution.errors += 1;
-                retry_hashes.push(hash.clone());
-            }
-        }
-    }
-    let prepare_ms = prepare_started.elapsed().as_millis();
 
-    let mut cleanup_ready = Vec::with_capacity(erase.len());
-    let mut derived_cleanup = Vec::new();
-    for blob in erase {
-        match prepare_derived_audio_cleanup(&blob.hash) {
-            Ok(plan) => {
-                if let Some(plan) = plan {
-                    derived_cleanup.push(plan);
+    let mut selected = Vec::new();
+    let mut erase_candidates = 0usize;
+    let mut storage_attempts = 0u8;
+    let mut storage_timings = VanishStorageTimings::default();
+    let mut prepare_ms = 0u128;
+    let mut kv_finalize_ms = 0u128;
+    let mut last_wave = Duration::ZERO;
+    let mut offset = 0usize;
+    let waves_started = Instant::now();
+    while offset < valid.len() {
+        if !should_start_vanish_wave(
+            offset > 0,
+            waves_started.elapsed(),
+            last_wave,
+            VANISH_TIME_BUDGET,
+        ) {
+            break;
+        }
+        let wave_started = Instant::now();
+        let wave_end = offset
+            .saturating_add(VANISH_KV_LOOKUP_FANOUT)
+            .min(valid.len());
+        let wave = &valid[offset..wave_end];
+        selected.extend(wave.iter().cloned());
+
+        let prepare_started = Instant::now();
+        let prepared = prepare_vanish_wave(pubkey, wave);
+        prepare_ms = prepare_ms.saturating_add(prepare_started.elapsed().as_millis());
+        execution.errors = execution.errors.saturating_add(prepared.errors);
+        retry_hashes.extend(prepared.retry_hashes);
+        for (hash, outcome) in prepared.completed {
+            shared_updates.record_unlinked(&hash);
+            completed_outcomes.push(outcome);
+        }
+
+        let mut cleanup_ready = Vec::with_capacity(prepared.erase.len());
+        let mut derived_cleanup = Vec::new();
+        for blob in prepared.erase {
+            match prepare_derived_audio_cleanup(&blob.hash) {
+                Ok(plan) => {
+                    if let Some(plan) = plan {
+                        derived_cleanup.push(plan);
+                    }
+                    cleanup_ready.push(blob);
                 }
-                cleanup_ready.push(blob);
+                Err(error) => {
+                    eprintln!(
+                        "[VANISH] pubkey={} hash={} failed to clean up derived audio: {}",
+                        pubkey, blob.hash, error
+                    );
+                    execution.errors += 1;
+                    retry_hashes.push(blob.hash);
+                }
             }
-            Err(error) => {
-                eprintln!(
-                    "[VANISH] pubkey={} hash={} failed to clean up derived audio: {}",
-                    pubkey, blob.hash, error
-                );
-                execution.errors += 1;
-                retry_hashes.push(blob.hash);
-            }
         }
-    }
-    let erase = cleanup_ready;
-    let mut erase_hashes: Vec<String> = erase.iter().map(|blob| blob.hash.clone()).collect();
-    erase_hashes.extend(derived_cleanup.iter().map(|plan| plan.audio_hash.clone()));
-    erase_hashes.sort();
-    erase_hashes.dedup();
-    let mut storage_result = erase_vanish_batch(&erase_hashes);
-    let mut storage_attempts = u8::from(!erase_hashes.is_empty());
-    while storage_attempts < VANISH_STORAGE_ATTEMPTS && !storage_result.failed_hashes.is_empty() {
-        let storage_retry_hashes: Vec<String> =
-            storage_result.failed_hashes.iter().cloned().collect();
-        let retry = erase_vanish_batch(&storage_retry_hashes);
-        storage_result.replace_failures_after_retry(retry);
-        storage_attempts += 1;
-    }
-    let finalize_started = Instant::now();
-    let mut failed_derived_sources = HashSet::new();
-    for plan in &derived_cleanup {
-        if storage_result.failed_hashes.contains(&plan.audio_hash) {
-            failed_derived_sources.insert(plan.source_hash.clone());
-            continue;
-        }
-        if let Err(error) = finalize_derived_audio_cleanup(plan) {
-            eprintln!(
-                "[VANISH] pubkey={} hash={} failed to finalize derived audio: {}",
-                pubkey, plan.source_hash, error
-            );
-            failed_derived_sources.insert(plan.source_hash.clone());
-        }
-    }
-    for blob in &erase {
-        if storage_result.failed_hashes.contains(&blob.hash)
-            || failed_derived_sources.contains(&blob.hash)
+        let erase = cleanup_ready;
+        erase_candidates = erase_candidates.saturating_add(erase.len());
+        let mut erase_hashes: Vec<String> = erase.iter().map(|blob| blob.hash.clone()).collect();
+        erase_hashes.extend(derived_cleanup.iter().map(|plan| plan.audio_hash.clone()));
+        erase_hashes.sort();
+        erase_hashes.dedup();
+        let mut storage_result = erase_vanish_batch(&erase_hashes);
+        let mut wave_storage_attempts = u8::from(!erase_hashes.is_empty());
+        while wave_storage_attempts < VANISH_STORAGE_ATTEMPTS
+            && !storage_result.failed_hashes.is_empty()
         {
-            eprintln!(
-                "[VANISH] pubkey={} hash={} required storage erasure failed after {} attempts",
-                pubkey, blob.hash, storage_attempts
-            );
-            execution.errors += 1;
-            retry_hashes.push(blob.hash.clone());
-            continue;
+            let storage_retry_hashes: Vec<String> =
+                storage_result.failed_hashes.iter().cloned().collect();
+            let retry = erase_vanish_batch(&storage_retry_hashes);
+            storage_result.replace_failures_after_retry(retry);
+            wave_storage_attempts += 1;
         }
-        match finalize_erased_vanish_blob_with_ops(blob, &DefaultCreatorDeleteOps) {
-            Ok(()) => {
-                shared_updates.record_erased(blob);
-                completed_outcomes.push(VanishBlobOutcome::FullyDeleted);
+        storage_attempts = storage_attempts.saturating_add(wave_storage_attempts);
+        add_vanish_storage_timings(&mut storage_timings, &storage_result.timings);
+
+        let finalize_started = Instant::now();
+        let mut failed_derived_sources = HashSet::new();
+        for plan in &derived_cleanup {
+            if storage_result.failed_hashes.contains(&plan.audio_hash) {
+                failed_derived_sources.insert(plan.source_hash.clone());
+                continue;
             }
-            Err(error) => {
+            if let Err(error) = finalize_derived_audio_cleanup(plan) {
                 eprintln!(
-                    "[VANISH] pubkey={} hash={} failed to finalize erased blob: {}",
-                    pubkey, blob.hash, error
+                    "[VANISH] pubkey={} hash={} failed to finalize derived audio: {}",
+                    pubkey, plan.source_hash, error
+                );
+                failed_derived_sources.insert(plan.source_hash.clone());
+            }
+        }
+        for blob in &erase {
+            if storage_result.failed_hashes.contains(&blob.hash)
+                || failed_derived_sources.contains(&blob.hash)
+            {
+                eprintln!(
+                    "[VANISH] pubkey={} hash={} required storage erasure failed after {} attempts",
+                    pubkey, blob.hash, wave_storage_attempts
                 );
                 execution.errors += 1;
                 retry_hashes.push(blob.hash.clone());
+                continue;
+            }
+            match finalize_erased_vanish_blob_with_ops(blob, &DefaultCreatorDeleteOps) {
+                Ok(()) => {
+                    shared_updates.record_erased(blob);
+                    completed_outcomes.push(VanishBlobOutcome::FullyDeleted);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[VANISH] pubkey={} hash={} failed to finalize erased blob: {}",
+                        pubkey, blob.hash, error
+                    );
+                    execution.errors += 1;
+                    retry_hashes.push(blob.hash.clone());
+                }
             }
         }
+        kv_finalize_ms = kv_finalize_ms.saturating_add(finalize_started.elapsed().as_millis());
+        last_wave = wave_started.elapsed();
+        offset = wave_end;
     }
+    execution.pending = valid.len().saturating_sub(offset).min(u32::MAX as usize) as u32;
     let expected_account_complete = execution.pending == 0 && execution.errors == 0;
+    let shared_started = Instant::now();
     let shared_updates_complete = match apply_vanish_shared_updates_with_ops(
         &shared_updates,
         pubkey,
@@ -4685,14 +4812,12 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
                 "[VANISH] pubkey={} failed shared KV update: {}",
                 pubkey, error
             );
-            execution.errors += vanish_shared_update_error_count(
-                completed_outcomes.len(),
-                completed_malformed,
-            );
+            execution.errors +=
+                vanish_shared_update_error_count(completed_outcomes.len(), completed_malformed);
             false
         }
     };
-    let kv_finalize_ms = finalize_started.elapsed().as_millis();
+    kv_finalize_ms = kv_finalize_ms.saturating_add(shared_started.elapsed().as_millis());
 
     if shared_updates_complete {
         if let Err(error) = remove_from_user_index(pubkey) {
@@ -4708,7 +4833,7 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
 
     let timing = serde_json::json!({
         "selected": selected.len(),
-        "erase_candidates": erase.len(),
+        "erase_candidates": erase_candidates,
         "storage_attempts": storage_attempts,
         "fully_deleted": execution.fully_deleted,
         "unlinked": execution.unlinked,
@@ -4716,11 +4841,11 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         "malformed_hash_exceptions": execution.malformed_hash_exceptions,
         "pending": execution.pending,
         "prepare_ms": prepare_ms.min(u128::from(u64::MAX)) as u64,
-        "gcs_main_ms": storage_result.timings.gcs_main_ms,
-        "cloud_run_cleanup_ms": storage_result.timings.cloud_run_cleanup_ms,
-        "fos_main_ms": storage_result.timings.fos_main_ms,
-        "purge_vcl_ms": storage_result.timings.purge_vcl_ms,
-        "purge_compute_ms": storage_result.timings.purge_compute_ms,
+        "gcs_main_ms": storage_timings.gcs_main_ms,
+        "cloud_run_cleanup_ms": storage_timings.cloud_run_cleanup_ms,
+        "fos_main_ms": storage_timings.fos_main_ms,
+        "purge_vcl_ms": storage_timings.purge_vcl_ms,
+        "purge_compute_ms": storage_timings.purge_compute_ms,
         "kv_finalize_ms": kv_finalize_ms.min(u128::from(u64::MAX)) as u64,
         "total_ms": started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
     });
@@ -6635,21 +6760,22 @@ fn infer_mime_from_path(path: &str) -> Option<&'static str> {
 mod tests {
     use super::{
         add_audio_response_headers, add_blob_response_cache_headers, backfill_batch_cursor,
-        classify_audio_reuse_availability, decide_transcode_fetch_action,
+        classify_audio_reuse_availability, classify_vanish_hashes, decide_transcode_fetch_action,
         decide_transcript_fetch_action, derivative_reconciliation_response, error_response,
         ignored_generation_response, is_alias_only_audio_blob, local_derivative_cleanup_result,
         parse_transcode_status_webhook_payload, parse_transcript_status_webhook_payload,
-        parse_upload_service_response, select_vanish_batch, should_delete_derived_audio_blob,
-        should_eagerly_trigger_transcription, should_record_upload_service_transcode_failure,
+        parse_upload_service_response, reconcile_vanish_list_completion,
+        should_delete_derived_audio_blob, should_eagerly_trigger_transcription,
+        should_record_upload_service_transcode_failure,
         should_record_upload_service_transcript_failure,
         should_reset_transcode_failure_on_clean_upload,
         should_reset_transcript_failure_on_clean_upload, should_set_audio_content_length,
-        surrogate_key_hash_from_path, trusted_upload_service_terminal_derivative_error,
-        upload_capability_headers, upload_control_host, upload_exposed_headers,
-        reconcile_vanish_list_completion, upload_from_resumable_completion,
+        should_start_vanish_wave, surrogate_key_hash_from_path,
+        trusted_upload_service_terminal_derivative_error, upload_capability_headers,
+        upload_control_host, upload_exposed_headers, upload_from_resumable_completion,
         vanish_response_status, vanish_shared_update_error_count, AudioReuseAvailability,
-        DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction,
-        TranscriptPendingState, VanishExecution, VANISH_BATCH_SIZE,
+        DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState,
+        VanishExecution, VANISH_TIME_BUDGET,
     };
     use crate::blossom::{
         BlobStatus, ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus,
@@ -6658,6 +6784,7 @@ mod tests {
     use blossom_core::cache_policy::BlobCachePolicy;
     use fastly::http::StatusCode;
     use fastly::Response;
+    use std::time::Duration;
 
     #[test]
     fn vanish_response_distinguishes_continuation_from_terminal_failure() {
@@ -6703,14 +6830,13 @@ mod tests {
     }
 
     #[test]
-    fn vanish_batch_is_bounded_and_normalizes_valid_legacy_hashes() {
-        let hashes: Vec<String> = (0..1_015).map(|index| format!("{:064X}", index)).collect();
+    fn vanish_hashes_are_classified_without_a_blob_cap() {
+        let hashes: Vec<String> = (0..21).map(|index| format!("{:064X}", index)).collect();
 
-        let (selected, malformed, pending) = select_vanish_batch(&hashes);
+        let (selected, malformed) = classify_vanish_hashes(&hashes);
 
-        assert_eq!(selected.len(), VANISH_BATCH_SIZE);
+        assert_eq!(selected.len(), 21);
         assert!(malformed.is_empty());
-        assert_eq!(pending, 1_005);
         assert!(selected.iter().all(|hash| hash == &hash.to_lowercase()));
     }
 
@@ -6719,12 +6845,32 @@ mod tests {
         let valid = "a".repeat(64);
         let malformed = "not-a-hash".to_string();
 
-        let (selected, exceptions, pending) =
-            select_vanish_batch(&[malformed.clone(), valid.clone()]);
+        let (selected, exceptions) = classify_vanish_hashes(&[malformed.clone(), valid.clone()]);
 
         assert_eq!(selected, vec![valid]);
         assert_eq!(exceptions, vec![malformed]);
-        assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn vanish_waves_always_start_the_first_and_stop_on_budget() {
+        assert!(should_start_vanish_wave(
+            false,
+            VANISH_TIME_BUDGET,
+            VANISH_TIME_BUDGET,
+            VANISH_TIME_BUDGET,
+        ));
+        assert!(!should_start_vanish_wave(
+            true,
+            Duration::from_millis(6_000),
+            Duration::from_millis(5_000),
+            VANISH_TIME_BUDGET,
+        ));
+        assert!(should_start_vanish_wave(
+            true,
+            Duration::from_millis(3_000),
+            Duration::from_millis(2_000),
+            VANISH_TIME_BUDGET,
+        ));
     }
 
     #[test]
