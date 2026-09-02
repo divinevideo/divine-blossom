@@ -91,12 +91,14 @@ can have logged.
 use the same endpoint as `vcl_error.v1`. Fields: `phase` (`fetch` or `log`),
 request start timestamp, sanitized request ID, service ID, method, URL (path
 and query, capped at 256 characters, JSON-escaped), status, origin or response
-reason phrase, POP, backend, `backend_hop` (`origin` or `shield` from
-`req.backend.is_origin`), cache state, `ff_visits`, restart count, and
-elapsed milliseconds. The `log` phase also records `body_bytes_written`.
-`cache_state` is final only in the `log` phase; the fetch-phase value is
-provisional. `ff_visits` is not an edge/shield discriminator in `vcl_fetch`
-(clustering makes it 1 at the edge fetch node). Use `backend_hop` for that.
+reason phrase, POP, backend, cache state, `ff_visits`, restart count, and
+elapsed milliseconds. The fetch phase also records `backend_hop` (`origin` or
+`shield` from `req.backend.is_origin`, which is only available in miss/pass/fetch).
+The log phase also records `body_bytes_written` and omits `backend_hop` (the
+log snippet is already edge-only). `cache_state` is final only in the `log`
+phase; the fetch-phase value is provisional. `ff_visits` is not an edge/shield
+discriminator in `vcl_fetch` (clustering makes it 1 at the edge fetch node).
+Use fetch-phase `backend_hop` for that.
 Headers, client address, authorization, cookies, and bodies are not logged.
 
 How to split a `status_503` minute after both snippets are active:

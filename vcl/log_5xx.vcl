@@ -19,11 +19,6 @@ if (fastly.ff.visits_this_service == 0
     && resp.status >= 500
     && resp.status < 600
     && fastly_info.state !~ "^ERROR(-(CLUSTER|WAIT|REFRESH))*$") {
-  if (req.backend.is_origin) {
-    set req.http.X-Divine-Backend-Hop = "origin";
-  } else {
-    set req.http.X-Divine-Backend-Hop = "shield";
-  }
   log {"syslog "} req.service_id {" vcl-error-diagnostics :: "}
     {"{"}
       {""schema":"divine.blossom.vcl_5xx.v1","}
@@ -37,12 +32,10 @@ if (fastly.ff.visits_this_service == 0
       {""reason":""} json.escape(resp.response) {"","}
       {""pop":""} json.escape(server.datacenter) {"","}
       {""backend":""} json.escape(req.backend.name) {"","}
-      {""backend_hop":""} json.escape(req.http.X-Divine-Backend-Hop) {"","}
       {""cache_state":""} json.escape(fastly_info.state) {"","}
       {""ff_visits":"} fastly.ff.visits_this_service {","}
       {""restart_count":"} req.restarts {","}
       {""elapsed_ms":"} time.elapsed.msec {","}
       {""body_bytes_written":"} resp.body_bytes_written
     {"}"};
-  unset req.http.X-Divine-Backend-Hop;
 }

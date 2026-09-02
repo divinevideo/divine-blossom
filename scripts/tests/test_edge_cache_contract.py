@@ -411,13 +411,14 @@ class Vcl5xxSkipErrorContractTests(unittest.TestCase):
             self.assertIn("vcl-error-diagnostics", source)
             self.assertNotIn("cdn-view-logs", source)
             self.assertIn("divine.blossom.vcl_5xx.v1", source)
-            self.assertIn('"backend_hop":', source)
 
-        self.assertIn("beresp.status >= 500", fetch_vcl)
-        self.assertLess(
-            fetch_vcl.index("divine.blossom.vcl_5xx.v1"),
-            fetch_vcl.index("return(pass)"),
-        )
+        fivexx = fetch_vcl.index("beresp.status >= 500")
+        fivexx_block = fetch_vcl[fivexx : fivexx + 1500]
+        self.assertIn("divine.blossom.vcl_5xx.v1", fivexx_block)
+        self.assertIn("req.backend.is_origin", fivexx_block)
+        self.assertIn('"backend_hop":', fivexx_block)
+        self.assertNotIn("req.backend.is_origin", log_vcl)
+        self.assertNotIn('"backend_hop":', log_vcl)
         self.assertIn(
             'fastly_info.state !~ "^ERROR(-(CLUSTER|WAIT|REFRESH))*$"',
             log_vcl,
