@@ -36,6 +36,11 @@ A push to `main` runs `diff` only. The same apply is available as a manual
 `Outer VCL` workflow with `apply_draft`, which does not run `diff` as a
 blocking prior step. CI never makes a draft live.
 
+A `vcl/` merge to `main` is expected to leave that `diff` job red until the
+matching draft is live: git is ahead of the active version on purpose. Re-run
+the workflow after activation to clear it. A red `diff` after an unrelated
+merge is a dashboard edit, not a pending deploy.
+
 ## Making a draft live
 
 That step is an operator action, not a repository job. Review the Fastly version
