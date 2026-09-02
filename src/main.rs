@@ -4468,6 +4468,13 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
 // always runs. A later wave can still overshoot if it is slower than the last
 // one, and shared KV plus the HTTP response sit outside the last-wave estimate.
 const VANISH_TIME_BUDGET: Duration = Duration::from_millis(10_000);
+// Funnelcake janitor first-byte timeout is ~15s. Shared flush is one write per
+// hot key after every wave; keys are independent, so the per-second limit is
+// not multiplied by wave count. Keep this reserve inside the caller timeout.
+#[cfg(test)]
+const VANISH_CALLER_FIRST_BYTE_TIMEOUT: Duration = Duration::from_millis(15_000);
+#[cfg(test)]
+const VANISH_SHARED_FLUSH_RESERVE: Duration = Duration::from_millis(2_000);
 // Fastly does not document a KV pending-handle ceiling. Compute allows 1,000
 // concurrent backend requests. This is per-wave metadata-lookup width, not an
 // operation cap. Keep one wave at the previously safe working set while
@@ -4788,6 +4795,9 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     execution.pending = hashes.len().saturating_sub(offset).min(u32::MAX as usize) as u32;
     let expected_account_complete = execution.pending == 0 && execution.errors == 0;
     let shared_started = Instant::now();
+    // One write per hot key per call, after every wave. Unique-key work already
+    // ran per wave; a crash here leaves those hashes on the account list so the
+    // next vanish rediscovers them as metadata-less erasure.
     let shared_updates_complete = match apply_vanish_shared_updates_with_ops(
         &shared_updates,
         pubkey,
@@ -6774,7 +6784,8 @@ mod tests {
         upload_control_host, upload_exposed_headers, upload_from_resumable_completion,
         vanish_response_status, vanish_shared_update_error_count, AudioReuseAvailability,
         DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState,
-        VanishExecution, VANISH_TIME_BUDGET,
+        VanishExecution, VANISH_CALLER_FIRST_BYTE_TIMEOUT, VANISH_SHARED_FLUSH_RESERVE,
+        VANISH_TIME_BUDGET,
     };
     use crate::blossom::{
         BlobStatus, ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus,
@@ -6848,6 +6859,14 @@ mod tests {
 
         assert_eq!(selected, vec![valid]);
         assert_eq!(exceptions, vec![malformed]);
+    }
+
+    #[test]
+    fn vanish_shared_flush_fits_inside_caller_first_byte_timeout() {
+        assert!(
+            VANISH_TIME_BUDGET.saturating_add(VANISH_SHARED_FLUSH_RESERVE)
+                <= VANISH_CALLER_FIRST_BYTE_TIMEOUT
+        );
     }
 
     #[test]
