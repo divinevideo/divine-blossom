@@ -76,3 +76,10 @@ fastly compute publish --comment "description"
 - UI, API, or externally visible behavior changes should include screenshots, sample payloads, or an explicit note that there is no visual change.
 - PR descriptions must include a summary, motivation, linked issue, and manual validation plan.
 - Before requesting review, run the relevant checks for the files you changed, or note what you could not run.
+
+## Topic files
+
+- Before Fastly 5xx diagnosis, Pub/Sub diagnostics, or logging-endpoint work, read `docs/runbooks/fastly-5xx.md`.
+- Before a Compute publish, outer VCL activate, or cache purge, read `docs/runbooks/rollback.md`.
+- Before creating or inspecting a Fastly Google Pub/Sub logging endpoint, read `docs/runbooks/edge-upload-observability.md`. Do not run `fastly logging googlepubsub list --json` or `describe`.
+- Before `gcloud run deploy`, read `docs/runbooks/deployment.md`.

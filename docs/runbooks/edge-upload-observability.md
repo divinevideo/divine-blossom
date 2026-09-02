@@ -71,11 +71,8 @@ endpoint is deleted, the realistic detection path is someone querying the sink
 and finding a gap, which is exactly the delayed, manual detection this warning
 exists to flag.
 
-To check the endpoint still exists on the active version:
-
-```bash
-fastly logging googlepubsub list --service-id pOvEEWykEbpnylqst1KTrR --version active
-```
+Check endpoint existence on the active version in the Fastly dashboard. Do not
+use `fastly logging googlepubsub list --json` or `describe`.
 
 ### Recreating it from scratch
 
@@ -135,22 +132,8 @@ to this one topic.
 
 - **Do not use the CLI's `--secret-key` flag.** It has no file or stdin form, so
   the private key would be visible in process metadata.
-- **`fastly logging googlepubsub describe` prints the full private key** to
-  stdout, in both the default and `--json` output. Never paste its output into a
-  PR, an issue, a ticket, or a shared transcript. Use `list` when you only need
-  to confirm the endpoint exists.
-
-  Filtering the output is easy to get wrong: the JSON field is `SecretKey`, not
-  `secret_key`, so a filter keyed on the snake_case name strips nothing and
-  succeeds silently. This has already caused one key rotation. If you must
-  inspect the config, allow-list the fields you want rather than deny-listing
-  the one you don't:
-
-  ```bash
-  fastly logging googlepubsub describe --service-id "$SERVICE" \
-    --version active --name edge_upload_logs --json \
-  | python3 -c "import json,sys;d=json.load(sys.stdin);print(json.dumps({k:d[k] for k in ('Name','Topic','ProjectID','User','Placement','ResponseCondition','ServiceVersion')},indent=2))"
-  ```
+- **`fastly logging googlepubsub describe` and `list --json` print `SecretKey`.**
+  Confirm the endpoint in the Fastly dashboard instead.
 - **Activate the endpoint's version before `fastly compute publish`.**
   `publish` clones the *active* version. Creating the endpoint with `--autoclone`
   leaves it on a draft version; publishing before activating that draft clones
