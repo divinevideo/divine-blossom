@@ -36,12 +36,13 @@ A push to `main` runs `diff` only. The same apply is available as a manual
 `Outer VCL` workflow with `apply_draft`, which does not run `diff` as a
 blocking prior step. CI never makes a draft live.
 
-A merge that changes a managed snippet leaves the `diff` job red until that
-content is live. Re-run the workflow after making the draft live to clear it.
-Read the job log, not which merge triggered it: `DRIFT` or `MISSING_LIVE` on a
-managed name means git is ahead of the active version (pending deploy or a
-rollback); `EXTRA_LIVE` or `META` is a dashboard change; a Fastly API error is
-neither.
+A merge that changes a managed snippet leaves the `diff` job red until git and
+the active version agree again. Re-run the workflow after making a matching
+draft live to clear a pending deploy. The log lines say what disagrees, not
+which side moved: `DRIFT` is content, `MISSING_LIVE` is a managed name absent
+on Fastly, `EXTRA_LIVE` is a Fastly name absent from the manifest, `META` is
+type, priority, or dynamic. Use `git log -- vcl/` and the Fastly version
+history to see who moved. A Fastly API error prints none of those lines.
 
 ## Making a draft live
 
