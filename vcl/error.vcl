@@ -6,7 +6,7 @@
 # scoped to 503; other 5xx statuses keep Fastly's default error delivery.
 if (obj.status >= 500 && obj.status < 600) {
   # Closed route class matching blossom-core request_diagnostics::route_category.
-  # Path only. Never log req.url: blob hashes are account-linkable.
+  # url is path plus query, capped and JSON-escaped. Do not log Authorization.
   set req.http.X-Divine-Route-Class = "other";
   if (req.url.path == "/") {
     set req.http.X-Divine-Route-Class = "landing";
@@ -54,6 +54,7 @@ if (obj.status >= 500 && obj.status < 600) {
       {""service_id":""} json.escape(req.service_id) {"","}
       {""method":""} json.escape(req.method) {"","}
       {""route":""} json.escape(req.http.X-Divine-Route-Class) {"","}
+      {""url":""} json.escape(substr(req.url, 0, 256)) {"","}
       {""status":"} obj.status {","}
       {""error_reason":""} json.escape(obj.response) {"","}
       {""pop":""} json.escape(server.datacenter) {"","}
