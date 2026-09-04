@@ -142,11 +142,11 @@ curl -sS -o /dev/null -D - \
   "https://media.divine.video/${SMOKE_BLOB_HASH}?deploy-smoke=${MARKER}"
 ```
 
-Do not use a marked response as collapse evidence until the outer backend's
-shield configuration has been checked. A shield delivery strips the metadata
-before edge delivery and prevents the fixed leader/follower labels from being
-produced. Follow [Cold-fill validation](cold-fill-validation.md) and stop rather
-than changing shielding during a deploy.
+Do not use a marked response as collapse evidence until the active outer
+`Client-facing headers` snippet matches this revision's `vcl/deliver.vcl`.
+Earlier revisions stripped the metadata at the shield before edge delivery and
+could not produce fixed leader/follower labels. Follow
+[Cold-fill validation](cold-fill-validation.md) and stop if the snippet is stale.
 
 ## Activate outer VCL
 
@@ -252,10 +252,11 @@ This procedure was first exercised while deploying commit `47d7101`:
   marked and unmarked responses exposed no raw probe headers.
 - Direct Compute verification established that version 362 emitted the expected
   probe metadata. The public outer service removed it.
-- The outer backend was found to have shield `iad-va-us` enabled. This conflicts
-  with the cold-fill collapse test prerequisite, so fixed leader/follower labels
-  did not appear. Observed public responses remained leak-safe and healthy; the
-  collapse test was left blocked rather than changing delivery topology.
+- The outer backend was found to have shield `iad-va-us` enabled. The then-active
+  delivery snippet stripped probe metadata at the shield, so fixed
+  leader/follower labels did not appear. Observed public responses remained
+  leak-safe and healthy; this revision guards the probe handling so a future
+  activation can validate collapse without changing delivery topology.
 - Exact global POP convergence time was not measured. The checks prove the
   observed POPs and active-version API state, not every POP worldwide.
 - A follow-up docs-, scripts-, and tests-only merge (`a25cf75`) started CI at
