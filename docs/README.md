@@ -9,7 +9,7 @@ This directory is the index for repository documentation. Current docs first, hi
 - [OAUTH_SETUP.md](../OAUTH_SETUP.md) — OAuth configuration for admin UI
 - [CHANGELOG.md](../CHANGELOG.md) — release history
 - [docs/api/](api/) — cross-service API contracts (creator delete, vanish, etc.)
-- [docs/runbooks/](runbooks/) — operational runbooks, including blob reconciliation, deployment and rollback, authenticated storage caching, private moderation cache smoke coverage, CDN view counting, edge upload observability, and Fastly 5xx diagnostics
+- [docs/runbooks/](runbooks/) — operational runbooks, including blob reconciliation, deployment and rollback, authenticated storage caching, private moderation cache smoke coverage, CDN view counting, edge upload observability, Fastly 5xx diagnostics, and cleanup of erased media at edge POPs
 - [docs/cdn-evaluation-status.md](cdn-evaluation-status.md) — **start here** for the CDN and delivery-origin evaluation: current state, results, open questions
 - [docs/cdn-object-storage-vendor-notes.md](cdn-object-storage-vendor-notes.md) — CDN and object-storage vendor capability notes
 - [docs/measurements/](measurements/) — synthetic CDN and delivery measurements

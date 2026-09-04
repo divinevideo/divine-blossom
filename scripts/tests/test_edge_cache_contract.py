@@ -65,6 +65,24 @@ class EdgeCacheContractTests(unittest.TestCase):
                 deliver_vcl.index(f"unset resp.http.{header};"),
             )
 
+    def test_surrogate_headers_are_stripped_only_on_client_facing_delivery(self):
+        # The outer backend shields through one POP, so vcl_deliver also runs
+        # on the shield hop. An unconditional strip there stores edge copies
+        # without their Surrogate-Key, and a purge by key never reaches them
+        # (#279). The strip must sit inside the visits_this_service == 0 guard.
+        deliver_vcl = (ROOT / "vcl" / "deliver.vcl").read_text()
+
+        guard = "if (fastly.ff.visits_this_service == 0) {"
+        self.assertEqual(deliver_vcl.count(guard), 1)
+        guard_start = deliver_vcl.index(guard)
+        guard_end = deliver_vcl.index("}", guard_start)
+        guarded_block = deliver_vcl[guard_start:guard_end]
+
+        for header in ("Surrogate-Key", "Surrogate-Control"):
+            unset = f"unset resp.http.{header};"
+            self.assertEqual(deliver_vcl.count(unset), 1, header)
+            self.assertIn(unset, guarded_block, header)
+
     def test_cached_probe_labels_are_cleared_before_delivery_evidence(self):
         deliver_vcl = (ROOT / "vcl" / "deliver.vcl").read_text()
         evidence_guard = deliver_vcl.index(

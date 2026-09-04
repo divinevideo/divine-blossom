@@ -1,9 +1,20 @@
 # ABOUTME: VCL deliver snippet for Divine Blossom VCL caching layer
 # ABOUTME: Strips internal headers and adds cache debug info before sending to client
 
-# Strip internal headers that should not reach clients
-unset resp.http.Surrogate-Key;
-unset resp.http.Surrogate-Control;
+# Strip internal headers that should not reach clients.
+#
+# Surrogate-Key and Surrogate-Control are stripped only on client-facing
+# delivery. The compute_origin backend shields through one POP, and this
+# snippet also runs there when an edge POP fetches through it. Stripping on
+# that hop stores the edge copy without its key, so a purge by key evicts the
+# shield's copy and leaves every edge copy serving until its TTL expires (#279).
+# fastly.ff.visits_this_service is 0 on the client-facing hop and 1 on the
+# shield hop. Fastly also removes Surrogate-Key from client responses on its
+# own unless the request carries Fastly-Debug.
+if (fastly.ff.visits_this_service == 0) {
+  unset resp.http.Surrogate-Key;
+  unset resp.http.Surrogate-Control;
+}
 unset resp.http.X-Divine-Edge-Request-Id;
 unset resp.http.X-Divine-Internal-Diagnostic-Authorization-Present;
 unset resp.http.X-Divine-Internal-Diagnostic-Source;
