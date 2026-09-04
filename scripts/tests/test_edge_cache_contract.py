@@ -73,8 +73,8 @@ class EdgeCacheContractTests(unittest.TestCase):
         deliver_vcl = (ROOT / "vcl" / "deliver.vcl").read_text()
 
         guard = "if (fastly.ff.visits_this_service == 0) {"
-        self.assertEqual(deliver_vcl.count(guard), 1)
-        guard_start = deliver_vcl.index(guard)
+        surrogate_comment = deliver_vcl.index("# Surrogate-Key and Surrogate-Control")
+        guard_start = deliver_vcl.index(guard, surrogate_comment)
         guard_end = deliver_vcl.index("}", guard_start)
         guarded_block = deliver_vcl[guard_start:guard_end]
 
@@ -82,6 +82,28 @@ class EdgeCacheContractTests(unittest.TestCase):
             unset = f"unset resp.http.{header};"
             self.assertEqual(deliver_vcl.count(unset), 1, header)
             self.assertIn(unset, guarded_block, header)
+
+    def test_probe_metadata_crosses_the_shield_and_is_stripped_at_the_edge(self):
+        deliver_vcl = (ROOT / "vcl" / "deliver.vcl").read_text()
+        probe_comment = deliver_vcl.index("# Probe metadata must also cross the shield hop")
+        probe_guard = deliver_vcl.index(
+            "if (fastly.ff.visits_this_service == 0) {", probe_comment
+        )
+        evidence_guard = deliver_vcl.index(
+            'if (req.http.X-Divine-Diagnostic-Probe ~ "^coldfill-', probe_guard
+        )
+
+        self.assertLess(probe_guard, evidence_guard)
+        for header in (
+            "X-Divine-Probe-Id",
+            "X-Divine-Probe-Source",
+            "X-Divine-Probe-FOS-Outcome",
+            "X-Divine-Probe-Buffer",
+            "X-Divine-Probe-Write-Back",
+        ):
+            self.assertGreater(
+                deliver_vcl.index(f"unset resp.http.{header};"), probe_guard
+            )
 
     def test_cached_probe_labels_are_cleared_before_delivery_evidence(self):
         deliver_vcl = (ROOT / "vcl" / "deliver.vcl").read_text()

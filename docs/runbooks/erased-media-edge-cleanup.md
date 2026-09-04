@@ -80,9 +80,13 @@ envchain fastly-global scripts/purge-erased-edge-copies.sh \
   --hash-file /secure/path/erased-hashes.txt
 ```
 
-For each hash the script purges the bare, `.mp4`, and `.jpg` URL forms, then
-fetches the bare URL once and requires `404`. It exits non-zero when any purge
-or probe fails. `--probe-only` repeats the probe without purging.
+For each hash the script purges and then probes every enumerable public URL
+form currently produced by this repository: the bare blob and its `.mp4` and
+`.jpg` aliases; four quality variants; both HLS master aliases, the two media
+playlists, and their four single-file media objects; both transcript aliases;
+and extracted audio. The list in the script is the operational source of truth.
+Every probe must return `404` or the run exits non-zero. `--probe-only` repeats
+all probes without purging.
 
 The probe observes one POP: the one that answers this machine. It cannot see
 copies held by other POPs, so a clean run is evidence for that POP only. The
@@ -100,10 +104,11 @@ then run the cleanup above over that file.
 
 ## Known residuals
 
-- Derivative URL forms under the same hash (`.hls`, `/hls/*`, `.vtt`, quality
-  variants) that were filled before activation are also untagged. They are not
-  enumerable from a hash alone, so they age out at their TTL unless the
-  operator knows a specific URL was fetched and purges it by URL.
+- Historical or otherwise unknown aliases are not enumerable from a hash alone.
+  In particular, the bare-blob parser accepts an arbitrary extension. The
+  script covers every documented form currently produced by this repository,
+  but an operator who knows another alias was fetched must purge and probe that
+  exact URL too.
 - A URL purge matches the exact cache key. A copy filled with a query string
   is a different key and is not covered.
 - Issue #279 also asks for an automated post-purge probe in the vanish path
@@ -115,3 +120,17 @@ then run the cleanup above over that file.
 - A single-POP probe, whether run here or from that future automated check,
   cannot see other POPs' copies. Global evidence would need a probe from every
   POP or Fastly-side reporting; neither exists today.
+
+## Cache-policy behavior after activation
+
+Forwarding `Surrogate-Control` through the shield is also a deliberate behavior
+change for responses that Compute marks `private` or `no-store`. Before this
+fix, the shield stripped that policy and an edge POP could apply its generic
+365-day success TTL. After activation, `vcl/fetch.vcl` sees the policy and
+passes the response instead of storing it. This closes the shared-cache gap but
+can increase shield-to-edge traffic for those responses.
+
+In addition to the public purge-by-key smoke above, run the existing
+[private moderation cache smoke](private-moderation-cache-smoke.md). It covers
+restricted, age-restricted, banned, deleted, and authenticated/admin responses,
+including repeated requests that would expose an accidental shared-cache hit.

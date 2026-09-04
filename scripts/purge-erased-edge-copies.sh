@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ABOUTME: One-time cleanup for erased media that edge POPs stored without a Surrogate-Key
-# ABOUTME: Purges each hash's public URL forms by URL, then probes the bare URL and requires 404
+# ABOUTME: Purges and probes each hash's enumerable public URL forms by URL
 #
 # Usage:
 #   envchain fastly-global scripts/purge-erased-edge-copies.sh --hash-file <path> [--domain <host>] [--dry-run] [--probe-only]
@@ -10,21 +10,40 @@
 # commit the file, or paste its contents into an issue; see
 # docs/runbooks/erased-media-edge-cleanup.md.
 #
-# For each hash the bare, .mp4, and .jpg forms are purged by URL. A URL purge
+# For each hash every enumerable public form below is purged by URL. A URL purge
 # reaches every POP, including copies that were stored without a Surrogate-Key
 # before the guarded vcl/deliver.vcl was activated (#279). A purge by key
 # cannot reach those copies, which is why this script exists.
 #
-# After purging, the bare URL is fetched once and must return 404. That probe
-# sees only the POP that answers this machine; copies held by other POPs are
-# not observable from here.
+# After purging, every form is fetched once and must return 404. Those probes
+# see only the POP that answers this machine; copies held by other POPs are not
+# observable from here.
 set -euo pipefail
 
 DOMAIN="media.divine.video"
 HASH_FILE=""
 DRY_RUN=0
 PROBE_ONLY=0
-URL_SUFFIXES=("" ".mp4" ".jpg")
+URL_SUFFIXES=(
+  ""
+  ".mp4"
+  ".jpg"
+  "/720p"
+  "/480p"
+  "/720p.mp4"
+  "/480p.mp4"
+  ".hls"
+  "/hls/master.m3u8"
+  "/hls/stream_720p.m3u8"
+  "/hls/stream_480p.m3u8"
+  "/hls/stream_720p.ts"
+  "/hls/stream_480p.ts"
+  "/hls/stream_720p.mp4"
+  "/hls/stream_480p.mp4"
+  ".vtt"
+  "/vtt"
+  ".audio.m4a"
+)
 
 usage() {
   cat <<'USAGE'
@@ -32,8 +51,8 @@ Usage: envchain fastly-global scripts/purge-erased-edge-copies.sh --hash-file <p
 
 Reads one 64-hex content hash per line from --hash-file (blank lines and
 # comments ignored). Never pass hashes on the command line. For each hash the
-bare, .mp4, and .jpg URL forms are purged by URL, then the bare URL is fetched
-once and must return 404. The probe sees one POP only.
+enumerable public URL forms are purged by URL, then each form is fetched once
+and must return 404. The probes see one POP only.
 See docs/runbooks/erased-media-edge-cleanup.md.
 USAGE
 }
@@ -79,6 +98,10 @@ if [ ! -r "$HASH_FILE" ]; then
   echo "error: cannot read hash file" >&2
   exit 2
 fi
+if [ "$DRY_RUN" -eq 1 ] && [ "$PROBE_ONLY" -eq 1 ]; then
+  echo "error: --dry-run and --probe-only cannot be combined" >&2
+  exit 2
+fi
 
 HASHES=()
 line_no=0
@@ -110,7 +133,7 @@ echo "hashes=${#HASHES[@]} domain=${DOMAIN} dry_run=${DRY_RUN} probe_only=${PROB
 index=0
 for hash in "${HASHES[@]}"; do
   index=$((index + 1))
-  label="${index}/${#HASHES[@]} ${hash:0:12}"
+  label="${index}/${#HASHES[@]}"
 
   if [ "$PROBE_ONLY" -eq 0 ]; then
     for suffix in "${URL_SUFFIXES[@]}"; do
@@ -128,19 +151,24 @@ for hash in "${HASHES[@]}"; do
     done
   fi
 
-  if [ "$DRY_RUN" -eq 1 ]; then
-    echo "[$label] would probe bare url and require 404"
-    continue
-  fi
+  for suffix in "${URL_SUFFIXES[@]}"; do
+    if [ "$DRY_RUN" -eq 1 ]; then
+      echo "[$label] would probe url form '${suffix:-bare}' and require 404"
+      continue
+    fi
 
-  status=$(curl -sS -o /dev/null -D "$HEADERS_TMP" -w '%{http_code}' "https://${DOMAIN}/${hash}" || echo "000")
-  served_by=$(grep -i '^x-served-by:' "$HEADERS_TMP" | tr -d '\r' | cut -d' ' -f2- || true)
-  if [ "$status" = "404" ]; then
-    echo "[$label] probe 404 served_by='${served_by}'"
-  else
-    echo "[$label] PROBE FAIL status=${status} served_by='${served_by}'"
-    PROBE_FAIL=$((PROBE_FAIL + 1))
-  fi
+    : > "$HEADERS_TMP"
+    status=$(curl --max-time 20 -sS -o /dev/null -D "$HEADERS_TMP" -w '%{http_code}' \
+      "https://${DOMAIN}/${hash}${suffix}" || true)
+    [ -n "$status" ] || status="000"
+    served_by=$(grep -i '^x-served-by:' "$HEADERS_TMP" | tr -d '\r' | cut -d' ' -f2- || true)
+    if [ "$status" = "404" ]; then
+      echo "[$label] probe 404 url form '${suffix:-bare}' served_by='${served_by}'"
+    else
+      echo "[$label] PROBE FAIL url form '${suffix:-bare}' status=${status} served_by='${served_by}'"
+      PROBE_FAIL=$((PROBE_FAIL + 1))
+    fi
+  done
 done
 
 echo "purge_failures=${PURGE_FAIL} probe_failures=${PROBE_FAIL}"

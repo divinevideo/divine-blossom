@@ -26,43 +26,41 @@ unset resp.http.X-Divine-Internal-Diagnostic-Buffer-Ms;
 unset resp.http.X-Divine-Internal-Diagnostic-Write-Back-Ms;
 unset resp.http.X-Divine-Internal-Diagnostic-Probe-Id;
 
-# A shield delivery may have added fixed labels to the response before it
-# reached this cache tier. Clear them so they cannot be delivered or mistaken
-# for evidence from this delivery.
-unset resp.http.X-Divine-Diagnostic-Role;
-unset resp.http.X-Divine-Diagnostic-Source;
-unset resp.http.X-Divine-Diagnostic-FOS-Outcome;
-unset resp.http.X-Divine-Diagnostic-Buffer;
-unset resp.http.X-Divine-Diagnostic-Write-Back;
+# Probe metadata must also cross the shield hop. Compare and strip it only on
+# client-facing delivery so shielding does not erase the evidence before the
+# edge POP can classify the response.
+if (fastly.ff.visits_this_service == 0) {
+  unset resp.http.X-Divine-Diagnostic-Role;
+  unset resp.http.X-Divine-Diagnostic-Source;
+  unset resp.http.X-Divine-Diagnostic-FOS-Outcome;
+  unset resp.http.X-Divine-Diagnostic-Buffer;
+  unset resp.http.X-Divine-Diagnostic-Write-Back;
 
-# Compare the request's bounded probe marker with the marker stored in the
-# shared backend response. Only fixed Diagnostic headers are added during this
-# delivery. The caller-controlled marker and all cached probe metadata are
-# always stripped before a response reaches a client.
-if (req.http.X-Divine-Diagnostic-Probe ~ "^coldfill-[a-z0-9-]{1,55}$" && resp.http.X-Divine-Probe-Id) {
-  if (req.http.X-Divine-Diagnostic-Probe == resp.http.X-Divine-Probe-Id) {
-    set resp.http.X-Divine-Diagnostic-Role = "leader";
-  } else {
-    set resp.http.X-Divine-Diagnostic-Role = "follower";
+  if (req.http.X-Divine-Diagnostic-Probe ~ "^coldfill-[a-z0-9-]{1,55}$" && resp.http.X-Divine-Probe-Id) {
+    if (req.http.X-Divine-Diagnostic-Probe == resp.http.X-Divine-Probe-Id) {
+      set resp.http.X-Divine-Diagnostic-Role = "leader";
+    } else {
+      set resp.http.X-Divine-Diagnostic-Role = "follower";
+    }
+    if (resp.http.X-Divine-Probe-Source ~ "^(gcs|fos|fallback)$") {
+      set resp.http.X-Divine-Diagnostic-Source = resp.http.X-Divine-Probe-Source;
+    }
+    if (resp.http.X-Divine-Probe-FOS-Outcome ~ "^(hit|miss|disabled)$") {
+      set resp.http.X-Divine-Diagnostic-FOS-Outcome = resp.http.X-Divine-Probe-FOS-Outcome;
+    }
+    if (resp.http.X-Divine-Probe-Buffer ~ "^(present|absent)$") {
+      set resp.http.X-Divine-Diagnostic-Buffer = resp.http.X-Divine-Probe-Buffer;
+    }
+    if (resp.http.X-Divine-Probe-Write-Back ~ "^(present|absent)$") {
+      set resp.http.X-Divine-Diagnostic-Write-Back = resp.http.X-Divine-Probe-Write-Back;
+    }
   }
-  if (resp.http.X-Divine-Probe-Source ~ "^(gcs|fos|fallback)$") {
-    set resp.http.X-Divine-Diagnostic-Source = resp.http.X-Divine-Probe-Source;
-  }
-  if (resp.http.X-Divine-Probe-FOS-Outcome ~ "^(hit|miss|disabled)$") {
-    set resp.http.X-Divine-Diagnostic-FOS-Outcome = resp.http.X-Divine-Probe-FOS-Outcome;
-  }
-  if (resp.http.X-Divine-Probe-Buffer ~ "^(present|absent)$") {
-    set resp.http.X-Divine-Diagnostic-Buffer = resp.http.X-Divine-Probe-Buffer;
-  }
-  if (resp.http.X-Divine-Probe-Write-Back ~ "^(present|absent)$") {
-    set resp.http.X-Divine-Diagnostic-Write-Back = resp.http.X-Divine-Probe-Write-Back;
-  }
+  unset resp.http.X-Divine-Probe-Id;
+  unset resp.http.X-Divine-Probe-Source;
+  unset resp.http.X-Divine-Probe-FOS-Outcome;
+  unset resp.http.X-Divine-Probe-Buffer;
+  unset resp.http.X-Divine-Probe-Write-Back;
 }
-unset resp.http.X-Divine-Probe-Id;
-unset resp.http.X-Divine-Probe-Source;
-unset resp.http.X-Divine-Probe-FOS-Outcome;
-unset resp.http.X-Divine-Probe-Buffer;
-unset resp.http.X-Divine-Probe-Write-Back;
 
 # Strip GCS/S3 backend headers that leak through Compute
 unset resp.http.x-guploader-uploadid;

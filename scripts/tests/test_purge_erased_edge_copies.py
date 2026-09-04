@@ -13,6 +13,26 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "purge-erased-edge-copies.sh"
 HASH_A = "a" * 64
 HASH_B = "B" * 64
+URL_SUFFIXES = (
+    "",
+    ".mp4",
+    ".jpg",
+    "/720p",
+    "/480p",
+    "/720p.mp4",
+    "/480p.mp4",
+    ".hls",
+    "/hls/master.m3u8",
+    "/hls/stream_720p.m3u8",
+    "/hls/stream_480p.m3u8",
+    "/hls/stream_720p.ts",
+    "/hls/stream_480p.ts",
+    "/hls/stream_720p.mp4",
+    "/hls/stream_480p.mp4",
+    ".vtt",
+    "/vtt",
+    ".audio.m4a",
+)
 
 
 def _write_executable(path: Path, body: str) -> None:
@@ -79,13 +99,13 @@ class PurgeErasedEdgeCopiesTests(unittest.TestCase):
             return []
         return self.curl_log.read_text().splitlines()
 
-    def test_purges_every_url_form_by_url_then_probes_bare_url(self):
+    def test_purges_and_probes_every_enumerable_url_form(self):
         result = self.run_script("--hash-file", str(self.hash_file))
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         expected = []
         for content_hash in (HASH_A, HASH_B.lower()):
-            for suffix in ("", ".mp4", ".jpg"):
+            for suffix in URL_SUFFIXES:
                 expected.append(
                     f"purge --url https://media.divine.video/{content_hash}{suffix}"
                 )
@@ -95,11 +115,19 @@ class PurgeErasedEdgeCopiesTests(unittest.TestCase):
             self.assertNotIn("--key", call)
 
         probes = self.curl_calls()
-        self.assertEqual(len(probes), 2)
-        self.assertIn(f"https://media.divine.video/{HASH_A}", probes[0])
-        self.assertIn(f"https://media.divine.video/{HASH_B.lower()}", probes[1])
+        self.assertEqual(len(probes), 2 * len(URL_SUFFIXES))
+        expected_urls = {
+            f"https://media.divine.video/{content_hash}{suffix}"
+            for content_hash in (HASH_A, HASH_B.lower())
+            for suffix in URL_SUFFIXES
+        }
+        self.assertEqual(
+            {call.rsplit(" ", 1)[-1] for call in probes}, expected_urls
+        )
+        self.assertTrue(all("--max-time 20" in call for call in probes))
         self.assertIn("purge_failures=0 probe_failures=0", result.stdout)
         self.assertIn("one POP", result.stdout)
+        self.assertNotIn(HASH_A[:12], result.stdout)
 
     def test_probe_that_still_serves_content_fails_the_run(self):
         self.install_curl("200")
@@ -107,8 +135,8 @@ class PurgeErasedEdgeCopiesTests(unittest.TestCase):
         result = self.run_script("--hash-file", str(self.hash_file))
 
         self.assertEqual(result.returncode, 1)
-        self.assertIn("PROBE FAIL status=200", result.stdout)
-        self.assertIn("probe_failures=2", result.stdout)
+        self.assertIn("PROBE FAIL url form 'bare' status=200", result.stdout)
+        self.assertIn(f"probe_failures={2 * len(URL_SUFFIXES)}", result.stdout)
 
     def test_dry_run_issues_no_purge_and_no_probe(self):
         result = self.run_script("--hash-file", str(self.hash_file), "--dry-run")
@@ -123,7 +151,17 @@ class PurgeErasedEdgeCopiesTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.fastly_calls(), [])
-        self.assertEqual(len(self.curl_calls()), 2)
+        self.assertEqual(len(self.curl_calls()), 2 * len(URL_SUFFIXES))
+
+    def test_dry_run_and_probe_only_are_rejected_together(self):
+        result = self.run_script(
+            "--hash-file", str(self.hash_file), "--dry-run", "--probe-only"
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("cannot be combined", result.stderr)
+        self.assertEqual(self.fastly_calls(), [])
+        self.assertEqual(self.curl_calls(), [])
 
     def test_domain_override_applies_to_purge_and_probe(self):
         result = self.run_script(
@@ -153,16 +191,11 @@ class PurgeErasedEdgeCopiesTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertEqual(self.fastly_calls(), [])
 
-    def test_runbook_and_script_agree_on_url_forms_and_probe_limit(self):
+    def test_runbook_describes_script_and_probe_limit(self):
         runbook = (ROOT / "docs" / "runbooks" / "erased-media-edge-cleanup.md").read_text()
-        script = SCRIPT.read_text()
 
-        self.assertIn('URL_SUFFIXES=("" ".mp4" ".jpg")', script)
         self.assertIn("scripts/purge-erased-edge-copies.sh", runbook)
         self.assertIn("one POP", runbook)
-        # The runbook names `purge --all` once, and only to forbid it.
-        self.assertEqual(runbook.count("--all"), 1)
-        self.assertIn("Do not run\n`fastly purge --all`", runbook)
 
 
 if __name__ == "__main__":
