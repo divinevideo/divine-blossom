@@ -92,7 +92,7 @@ while IFS= read -r raw || [ -n "$raw" ]; do
     echo "error: line $line_no is not a 64-hex content hash" >&2
     exit 2
   fi
-  HASHES+=("${line,,}")
+  HASHES+=("$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')")
 done < "$HASH_FILE"
 
 if [ "${#HASHES[@]}" -eq 0 ]; then

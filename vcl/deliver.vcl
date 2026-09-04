@@ -8,8 +8,8 @@
 # snippet also runs there when an edge POP fetches through it. Stripping on
 # that hop stores the edge copy without its key, so a purge by key evicts the
 # shield's copy and leaves every edge copy serving until its TTL expires (#279).
-# fastly.ff.visits_this_service is 0 on the client-facing hop and 1 on the
-# shield hop. Fastly also removes Surrogate-Key from client responses on its
+# fastly.ff.visits_this_service is 0 on the client-facing hop and at least 1
+# on the shield hop. Fastly also removes Surrogate-Key from client responses on its
 # own unless the request carries Fastly-Debug.
 if (fastly.ff.visits_this_service == 0) {
   unset resp.http.Surrogate-Key;

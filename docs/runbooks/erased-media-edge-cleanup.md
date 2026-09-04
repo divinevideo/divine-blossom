@@ -106,6 +106,12 @@ then run the cleanup above over that file.
   operator knows a specific URL was fetched and purges it by URL.
 - A URL purge matches the exact cache key. A copy filled with a query string
   is a different key and is not covered.
-- A single-POP probe, whether run here or from a future automated check in the
-  vanish path, cannot see other POPs' copies. Global evidence would need a
-  probe from every POP or Fastly-side reporting; neither exists today.
+- Issue #279 also asks for an automated post-purge probe in the vanish path
+  that surfaces in `vanish_timing`. This change does not deliver it: the
+  Compute service declares no backend for the public host, and one has to be
+  created on the live service before such a probe can run. That outcome stays
+  open on #279 until it lands or is split out. Until then the script above is
+  the only probe, run by hand.
+- A single-POP probe, whether run here or from that future automated check,
+  cannot see other POPs' copies. Global evidence would need a probe from every
+  POP or Fastly-side reporting; neither exists today.
