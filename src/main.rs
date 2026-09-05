@@ -54,7 +54,7 @@ use crate::storage::{
     dispatch_vanish_timing_log, download_blob_read_through, download_blob_with_fallback,
     download_thumbnail, erase_vanish_batch, trigger_audio_extraction,
     trigger_cloud_run_delete_blob, upload_blob, write_audit_log, write_vanish_audit_log,
-    VanishAuditInitiator, VanishAuditPhase, VanishStorageTimings,
+    VanishAuditInitiator, VanishAuditPhase, VanishStorageTimings, CLOUD_RUN_CLEANUP_DEADLINE,
 };
 use crate::viewer_auth::{ViewerAuthDiagnostics, ViewerAuthState};
 use blossom_core::cache_policy::{
@@ -542,6 +542,25 @@ fn finalize_derived_audio_cleanup(plan: &PreparedDerivedAudioCleanup) -> Result<
     delete_audio_source_refs(&plan.audio_hash)?;
     delete_audio_mapping(&plan.source_hash)?;
     Ok(())
+}
+
+fn vanish_storage_hashes(
+    blobs: &[PreparedVanishBlob],
+    derived_cleanup: &[PreparedDerivedAudioCleanup],
+) -> Vec<String> {
+    let mut hashes = Vec::with_capacity(blobs.len() + derived_cleanup.len());
+    for blob in blobs {
+        hashes.push(blob.hash.clone());
+        hashes.extend(
+            derived_cleanup
+                .iter()
+                .filter(|plan| plan.source_hash.eq_ignore_ascii_case(&blob.hash))
+                .map(|plan| plan.audio_hash.clone()),
+        );
+    }
+    let mut seen = HashSet::new();
+    hashes.retain(|hash| seen.insert(hash.to_ascii_lowercase()));
+    hashes
 }
 
 /// GET /<sha256>[.ext] - Retrieve blob
@@ -4530,6 +4549,10 @@ fn should_start_vanish_wave(
     elapsed.saturating_add(last_wave) < budget
 }
 
+fn should_retry_vanish_storage(elapsed: Duration) -> bool {
+    elapsed.saturating_add(CLOUD_RUN_CLEANUP_DEADLINE) < VANISH_TIME_BUDGET
+}
+
 fn next_vanish_wave_range(
     total: usize,
     offset: usize,
@@ -4544,7 +4567,6 @@ fn next_vanish_wave_range(
 }
 
 fn add_vanish_storage_timings(total: &mut VanishStorageTimings, wave: &VanishStorageTimings) {
-    total.gcs_main_ms = total.gcs_main_ms.saturating_add(wave.gcs_main_ms);
     total.cloud_run_cleanup_ms = total
         .cloud_run_cleanup_ms
         .saturating_add(wave.cloud_run_cleanup_ms);
@@ -4775,14 +4797,12 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         }
         let erase = cleanup_ready;
         erase_candidates = erase_candidates.saturating_add(erase.len());
-        let mut erase_hashes: Vec<String> = erase.iter().map(|blob| blob.hash.clone()).collect();
-        erase_hashes.extend(derived_cleanup.iter().map(|plan| plan.audio_hash.clone()));
-        erase_hashes.sort();
-        erase_hashes.dedup();
+        let erase_hashes = vanish_storage_hashes(&erase, &derived_cleanup);
         let mut storage_result = erase_vanish_batch(&erase_hashes);
         let mut wave_storage_attempts = u8::from(!erase_hashes.is_empty());
         while wave_storage_attempts < VANISH_STORAGE_ATTEMPTS
             && !storage_result.failed_hashes.is_empty()
+            && should_retry_vanish_storage(started.elapsed())
         {
             let storage_retry_hashes: Vec<String> =
                 storage_result.failed_hashes.iter().cloned().collect();
@@ -4895,7 +4915,6 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         "malformed_hash_exceptions": execution.malformed_hash_exceptions,
         "pending": execution.pending,
         "prepare_ms": prepare_ms.min(u128::from(u64::MAX)) as u64,
-        "gcs_main_ms": storage_timings.gcs_main_ms,
         "cloud_run_cleanup_ms": storage_timings.cloud_run_cleanup_ms,
         "fos_main_ms": storage_timings.fos_main_ms,
         "purge_vcl_ms": storage_timings.purge_vcl_ms,
@@ -6821,13 +6840,14 @@ mod tests {
         should_eagerly_trigger_transcription, should_record_upload_service_transcode_failure,
         should_record_upload_service_transcript_failure,
         should_reset_transcode_failure_on_clean_upload,
-        should_reset_transcript_failure_on_clean_upload, should_set_audio_content_length,
-        should_start_vanish_wave, surrogate_key_hash_from_path,
+        should_reset_transcript_failure_on_clean_upload, should_retry_vanish_storage,
+        should_set_audio_content_length, should_start_vanish_wave, surrogate_key_hash_from_path,
         trusted_upload_service_terminal_derivative_error, upload_capability_headers,
         upload_control_host, upload_exposed_headers, upload_from_resumable_completion,
-        vanish_response_status, vanish_shared_update_error_count, AudioReuseAvailability,
-        DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState,
-        VanishExecution, VANISH_TIME_BUDGET,
+        vanish_response_status, vanish_shared_update_error_count, vanish_storage_hashes,
+        AudioReuseAvailability, DerivativeObservation, PreparedDerivedAudioCleanup,
+        TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState, VanishExecution,
+        VANISH_TIME_BUDGET,
     };
     use crate::blossom::{
         BlobStatus, ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus,
@@ -6847,6 +6867,38 @@ mod tests {
             StatusCode::INTERNAL_SERVER_ERROR
         );
         assert_eq!(vanish_response_status(1, 1), StatusCode::ACCEPTED);
+    }
+
+    #[test]
+    fn vanish_storage_hashes_interleave_sources_and_derived_audio() {
+        let first = "a".repeat(64);
+        let first_audio = "b".repeat(64);
+        let second = "c".repeat(64);
+        let blobs = vec![
+            blossom_core::delete_policy::PreparedVanishBlob {
+                hash: first.clone(),
+                metadata: None,
+            },
+            blossom_core::delete_policy::PreparedVanishBlob {
+                hash: second.clone(),
+                metadata: None,
+            },
+        ];
+        let derived = vec![PreparedDerivedAudioCleanup {
+            source_hash: first.clone(),
+            audio_hash: first_audio.clone(),
+        }];
+
+        assert_eq!(
+            vanish_storage_hashes(&blobs, &derived),
+            vec![first, first_audio, second]
+        );
+    }
+
+    #[test]
+    fn vanish_storage_retry_requires_the_cloud_deadline_to_fit() {
+        assert!(should_retry_vanish_storage(Duration::from_secs(1)));
+        assert!(!should_retry_vanish_storage(Duration::from_secs(2)));
     }
 
     #[test]

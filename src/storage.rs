@@ -858,6 +858,7 @@ pub fn delete_blob_from_fos(key: &str) -> Result<()> {
 
 const PROVIDER_MULTI_DELETE_LIMIT: usize = 1_000;
 pub(crate) const CLOUD_RUN_DELETE_BATCH_LIMIT: usize = 20;
+pub(crate) const CLOUD_RUN_CLEANUP_DEADLINE: Duration = Duration::from_secs(8);
 
 #[derive(Debug)]
 struct VanishDeleteBatch {
@@ -867,7 +868,6 @@ struct VanishDeleteBatch {
 
 #[derive(Debug, Default, serde::Serialize)]
 pub(crate) struct VanishStorageTimings {
-    pub gcs_main_ms: u64,
     pub cloud_run_cleanup_ms: u64,
     pub fos_main_ms: u64,
     pub purge_vcl_ms: u64,
@@ -883,10 +883,6 @@ pub(crate) struct VanishStorageResult {
 impl VanishStorageResult {
     pub(crate) fn replace_failures_after_retry(&mut self, retry: Self) {
         self.failed_hashes = retry.failed_hashes;
-        self.timings.gcs_main_ms = self
-            .timings
-            .gcs_main_ms
-            .saturating_add(retry.timings.gcs_main_ms);
         self.timings.cloud_run_cleanup_ms = self
             .timings
             .cloud_run_cleanup_ms
@@ -928,10 +924,10 @@ fn multi_delete_body(keys: &[String]) -> String {
 
 fn plan_vanish_delete_batches(
     hashes: &[String],
-    include_local_gcs: bool,
+    local_mode: bool,
 ) -> Vec<VanishDeleteBatch> {
     let mut batches = Vec::new();
-    let stage = if include_local_gcs {
+    let stage = if local_mode {
         "gcs_main"
     } else {
         "fos_main"
@@ -1263,14 +1259,8 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
                 }
                 if let Some(started) = stage_started.get(stage.as_str()) {
                     let duration = elapsed_ms(*started);
-                    match stage.as_str() {
-                        stage if stage.starts_with("gcs_main:") => {
-                            result.timings.gcs_main_ms = result.timings.gcs_main_ms.max(duration);
-                        }
-                        stage if stage.starts_with("fos_main:") => {
-                            result.timings.fos_main_ms = result.timings.fos_main_ms.max(duration);
-                        }
-                        _ => {}
+                    if stage.starts_with("fos_main:") {
+                        result.timings.fos_main_ms = result.timings.fos_main_ms.max(duration);
                     }
                 }
                 if let Some(requested) = requested_by_stage.get(&stage) {
