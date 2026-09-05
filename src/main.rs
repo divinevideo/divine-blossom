@@ -54,7 +54,7 @@ use crate::storage::{
     dispatch_vanish_timing_log, download_blob_read_through, download_blob_with_fallback,
     download_thumbnail, erase_vanish_batch, trigger_audio_extraction,
     trigger_cloud_run_delete_blob, upload_blob, write_audit_log, write_vanish_audit_log,
-    VanishAuditInitiator, VanishAuditPhase, VanishStorageTimings, CLOUD_RUN_CLEANUP_DEADLINE,
+    VanishAuditInitiator, VanishAuditPhase, VanishStorageTimings,
 };
 use crate::viewer_auth::{ViewerAuthDiagnostics, ViewerAuthState};
 use blossom_core::cache_policy::{
@@ -4510,7 +4510,6 @@ const VANISH_TIME_BUDGET: Duration = Duration::from_millis(10_000);
 // per blob), then at most 20 subtitle deletes. Extra waves start only when the
 // last wave still fits in VANISH_TIME_BUDGET.
 const VANISH_KV_FANOUT: usize = 10;
-const VANISH_STORAGE_ATTEMPTS: u8 = 2;
 
 #[derive(Debug)]
 struct VanishExecution {
@@ -4547,10 +4546,6 @@ fn should_start_vanish_wave(
         return true;
     }
     elapsed.saturating_add(last_wave) < budget
-}
-
-fn should_retry_vanish_storage(elapsed: Duration) -> bool {
-    elapsed.saturating_add(CLOUD_RUN_CLEANUP_DEADLINE) < VANISH_TIME_BUDGET
 }
 
 fn next_vanish_wave_range(
@@ -4798,18 +4793,8 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         let erase = cleanup_ready;
         erase_candidates = erase_candidates.saturating_add(erase.len());
         let erase_hashes = vanish_storage_hashes(&erase, &derived_cleanup);
-        let mut storage_result = erase_vanish_batch(&erase_hashes);
-        let mut wave_storage_attempts = u8::from(!erase_hashes.is_empty());
-        while wave_storage_attempts < VANISH_STORAGE_ATTEMPTS
-            && !storage_result.failed_hashes.is_empty()
-            && should_retry_vanish_storage(started.elapsed())
-        {
-            let storage_retry_hashes: Vec<String> =
-                storage_result.failed_hashes.iter().cloned().collect();
-            let retry = erase_vanish_batch(&storage_retry_hashes);
-            storage_result.replace_failures_after_retry(retry);
-            wave_storage_attempts += 1;
-        }
+        let storage_result = erase_vanish_batch(&erase_hashes);
+        let wave_storage_attempts = u8::from(!erase_hashes.is_empty());
         storage_attempts = storage_attempts.saturating_add(u32::from(wave_storage_attempts));
         add_vanish_storage_timings(&mut storage_timings, &storage_result.timings);
 
@@ -6840,8 +6825,8 @@ mod tests {
         should_eagerly_trigger_transcription, should_record_upload_service_transcode_failure,
         should_record_upload_service_transcript_failure,
         should_reset_transcode_failure_on_clean_upload,
-        should_reset_transcript_failure_on_clean_upload, should_retry_vanish_storage,
-        should_set_audio_content_length, should_start_vanish_wave, surrogate_key_hash_from_path,
+        should_reset_transcript_failure_on_clean_upload, should_set_audio_content_length,
+        should_start_vanish_wave, surrogate_key_hash_from_path,
         trusted_upload_service_terminal_derivative_error, upload_capability_headers,
         upload_control_host, upload_exposed_headers, upload_from_resumable_completion,
         vanish_response_status, vanish_shared_update_error_count, vanish_storage_hashes,
@@ -6893,12 +6878,6 @@ mod tests {
             vanish_storage_hashes(&blobs, &derived),
             vec![first, first_audio, second]
         );
-    }
-
-    #[test]
-    fn vanish_storage_retry_requires_the_cloud_deadline_to_fit() {
-        assert!(should_retry_vanish_storage(Duration::from_secs(1)));
-        assert!(!should_retry_vanish_storage(Duration::from_secs(2)));
     }
 
     #[test]

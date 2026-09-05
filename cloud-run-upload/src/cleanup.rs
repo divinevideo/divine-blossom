@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::time::{timeout_at, Instant};
 
 const MAX_PREFIX_OBJECTS_PER_ATTEMPT: usize = 25;
-pub const CLEANUP_REQUEST_DEADLINE: Duration = Duration::from_secs(8);
+pub const CLEANUP_REQUEST_DEADLINE: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]

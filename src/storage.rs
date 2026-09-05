@@ -858,7 +858,6 @@ pub fn delete_blob_from_fos(key: &str) -> Result<()> {
 
 const PROVIDER_MULTI_DELETE_LIMIT: usize = 1_000;
 pub(crate) const CLOUD_RUN_DELETE_BATCH_LIMIT: usize = 20;
-pub(crate) const CLOUD_RUN_CLEANUP_DEADLINE: Duration = Duration::from_secs(8);
 
 #[derive(Debug)]
 struct VanishDeleteBatch {
@@ -878,28 +877,6 @@ pub(crate) struct VanishStorageTimings {
 pub(crate) struct VanishStorageResult {
     pub failed_hashes: HashSet<String>,
     pub timings: VanishStorageTimings,
-}
-
-impl VanishStorageResult {
-    pub(crate) fn replace_failures_after_retry(&mut self, retry: Self) {
-        self.failed_hashes = retry.failed_hashes;
-        self.timings.cloud_run_cleanup_ms = self
-            .timings
-            .cloud_run_cleanup_ms
-            .saturating_add(retry.timings.cloud_run_cleanup_ms);
-        self.timings.fos_main_ms = self
-            .timings
-            .fos_main_ms
-            .saturating_add(retry.timings.fos_main_ms);
-        self.timings.purge_vcl_ms = self
-            .timings
-            .purge_vcl_ms
-            .saturating_add(retry.timings.purge_vcl_ms);
-        self.timings.purge_compute_ms = self
-            .timings
-            .purge_compute_ms
-            .saturating_add(retry.timings.purge_compute_ms);
-    }
 }
 
 fn xml_escape(value: &str) -> String {
