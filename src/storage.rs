@@ -67,7 +67,7 @@ const FOS_BUCKET: &str = "divine-media-delivery";
 const FOS_READ_FLAG: &str = "fos_read_enabled";
 const FOS_WRITE_BACK_FLAG: &str = "fos_write_back_enabled";
 const B2_REPLICA_FLAG: &str = "b2_replica_enabled";
-const B2_LIST_PAGE_SIZE: usize = 100;
+const B2_LIST_PAGE_SIZE: usize = 1_000;
 
 /// Header copied from the storage subrequest before the outer VCL service
 /// replaces `X-Cache` with its own cache result. This is intentionally only a
@@ -940,34 +940,53 @@ struct B2ErrorResponse {
     code: String,
 }
 
-fn b2_pagination_cursor(
-    next_file_name: Option<String>,
-    next_file_id: Option<String>,
-) -> Result<Option<(String, String)>> {
-    match (next_file_name, next_file_id) {
-        (Some(file_name), Some(file_id)) => Ok(Some((file_name, file_id))),
-        (None, None) => Ok(None),
-        _ => Err(BlossomError::StorageError(
-            "B2 version listing returned an incomplete pagination cursor".into(),
-        )),
-    }
-}
+type B2PageCursor = Option<(String, Option<String>)>;
 
-fn validate_b2_version_page(prefix: &str, versions: &[B2FileVersion]) -> Result<()> {
-    if versions
+fn b2_prefix_page<'a>(
+    prefix: &str,
+    page: &'a B2ListFileVersionsResponse,
+) -> Result<(&'a [B2FileVersion], B2PageCursor)> {
+    let matching = page
+        .files
         .iter()
-        .any(|version| !version.file_name.starts_with(prefix) || version.file_id.is_none())
+        .take_while(|version| version.file_name.starts_with(prefix))
+        .count();
+    if page.files[..matching]
+        .iter()
+        .any(|version| version.file_id.is_none())
+        || page.files[matching..].iter().any(|version| {
+            version.file_name.starts_with(prefix) || version.file_name.as_str() < prefix
+        })
     {
-        Err(BlossomError::StorageError(
+        return Err(BlossomError::StorageError(
             "B2 version listing returned an invalid file entry".into(),
-        ))
-    } else {
-        Ok(())
+        ));
     }
-}
-
-fn b2_prefix_is_absent(page: &B2ListFileVersionsResponse) -> bool {
-    page.files.is_empty() && page.next_file_name.is_none() && page.next_file_id.is_none()
+    if matching < page.files.len() {
+        return Ok((&page.files[..matching], None));
+    }
+    let cursor = match (&page.next_file_name, &page.next_file_id) {
+        (Some(file_name), Some(file_id)) if file_name.starts_with(prefix) => {
+            Some((file_name.clone(), Some(file_id.clone())))
+        }
+        (Some(file_name), None) if file_name.starts_with(prefix) => {
+            return Err(BlossomError::StorageError(
+                "B2 version listing returned an incomplete pagination cursor".into(),
+            ))
+        }
+        (Some(file_name), _) if file_name.as_str() < prefix => {
+            return Err(BlossomError::StorageError(
+                "B2 version listing cursor moved before the requested prefix".into(),
+            ))
+        }
+        (None, Some(_)) => {
+            return Err(BlossomError::StorageError(
+                "B2 version listing returned an incomplete pagination cursor".into(),
+            ))
+        }
+        _ => None,
+    };
+    Ok((&page.files[..matching], cursor))
 }
 
 #[derive(Debug)]
@@ -1145,7 +1164,7 @@ fn authorize_b2_vanish() -> Result<B2Authorization> {
 fn build_b2_list_versions_request(
     authorization: &B2Authorization,
     prefix: &str,
-    start: Option<(&str, &str)>,
+    start: Option<(&str, Option<&str>)>,
 ) -> Result<Request> {
     let host = b2_api_host(&authorization.api_url)?;
     let mut body = serde_json::json!({
@@ -1155,7 +1174,9 @@ fn build_b2_list_versions_request(
     });
     if let Some((file_name, file_id)) = start {
         body["startFileName"] = serde_json::json!(file_name);
-        body["startFileId"] = serde_json::json!(file_id);
+        if let Some(file_id) = file_id {
+            body["startFileId"] = serde_json::json!(file_id);
+        }
     }
     let body = body.to_string();
     let mut request = Request::post(format!(
@@ -1173,7 +1194,7 @@ fn build_b2_list_versions_request(
 fn list_b2_file_versions(
     authorization: &B2Authorization,
     prefix: &str,
-    start: Option<(&str, &str)>,
+    start: Option<(&str, Option<&str>)>,
 ) -> Result<B2ListFileVersionsResponse> {
     let request = build_b2_list_versions_request(authorization, prefix, start)?;
     let mut response = request.send(authorization.backend.clone()).map_err(|error| {
@@ -1226,10 +1247,8 @@ fn b2_delete_version_succeeded(mut response: Response) -> bool {
 
 fn delete_b2_version_page(
     authorization: &B2Authorization,
-    prefix: &str,
     versions: &[B2FileVersion],
 ) -> Result<()> {
-    validate_b2_version_page(prefix, versions)?;
     let mut pending = Vec::with_capacity(versions.len());
     for version in versions {
         let request = build_b2_delete_version_request(authorization, version)?;
@@ -1265,27 +1284,42 @@ fn delete_b2_version_page(
 }
 
 fn erase_b2_hash_versions(authorization: &B2Authorization, hash: &str) -> Result<()> {
-    let mut start: Option<(String, String)> = None;
+    let mut start = Some((hash.to_string(), None));
     loop {
         let page = list_b2_file_versions(
             authorization,
             hash,
             start
                 .as_ref()
-                .map(|(file_name, file_id)| (file_name.as_str(), file_id.as_str())),
+                .map(|(file_name, file_id)| (file_name.as_str(), file_id.as_deref())),
         )?;
-        delete_b2_version_page(authorization, hash, &page.files)?;
-        start = b2_pagination_cursor(page.next_file_name, page.next_file_id)?;
-        if start.is_none() {
-            break;
+        let (versions, next) = b2_prefix_page(hash, &page)?;
+        delete_b2_version_page(authorization, versions)?;
+        match next {
+            Some(next) => start = Some(next),
+            None => break,
         }
     }
-    if b2_prefix_is_absent(&list_b2_file_versions(authorization, hash, None)?) {
-        Ok(())
-    } else {
-        Err(BlossomError::StorageError(
-            "B2 replica still contains versions after deletion".into(),
-        ))
+
+    let mut start = Some((hash.to_string(), None));
+    loop {
+        let page = list_b2_file_versions(
+            authorization,
+            hash,
+            start
+                .as_ref()
+                .map(|(file_name, file_id)| (file_name.as_str(), file_id.as_deref())),
+        )?;
+        let (versions, next) = b2_prefix_page(hash, &page)?;
+        if !versions.is_empty() {
+            return Err(BlossomError::StorageError(
+                "B2 replica still contains versions after deletion".into(),
+            ));
+        }
+        match next {
+            Some(next) => start = Some(next),
+            None => return Ok(()),
+        }
     }
 }
 
@@ -3201,7 +3235,7 @@ pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtracti
 mod tests {
     use super::{
         audit_log_entry, b2_api_host, b2_delete_version_succeeded, b2_dynamic_backend_name,
-        b2_pagination_cursor, b2_prefix_is_absent, build_b2_delete_version_request,
+        b2_prefix_page, build_b2_delete_version_request,
         build_b2_list_versions_request, build_bunny_purge_request, build_fos_delete_request,
         build_multi_delete_request, canonical_query_string, classify_cloud_cleanup_response,
         cloud_run_delete_blob_body, cloud_run_delete_blobs_body, failed_cloud_cleanup_hashes,
@@ -3209,8 +3243,8 @@ mod tests {
         normalize_storage_cache_state, parse_audio_extraction_error_response,
         parse_funnelcake_audio_reuse_response, plan_cloud_run_delete_chunks,
         plan_vanish_delete_batches, prepare_storage_cache_miss, preserve_storage_cache_state,
-        sign_request_at, validate_b2_authorization_scope, validate_b2_version_page,
-        vanish_audit_entry, B2Authorization, B2AuthorizeResponse, B2FileVersion,
+        sign_request_at, validate_b2_authorization_scope, vanish_audit_entry, B2Authorization,
+        B2AuthorizeResponse, B2FileVersion,
         B2ListFileVersionsResponse, S3Config,
         VanishAuditInitiator, VanishAuditPhase, VanishDeleteTarget, VanishStorageResult,
         CLOUD_RUN_DELETE_BATCH_LIMIT, FOS_BACKEND, PROVIDER_MULTI_DELETE_LIMIT,
@@ -3504,45 +3538,70 @@ mod tests {
     }
 
     #[test]
-    fn b2_page_validation_rejects_prefix_escape_and_incomplete_cursors() {
+    fn b2_prefix_page_stops_after_the_prefix_and_rejects_backtracking() {
         let hash = "a".repeat(64);
-        let escaped = B2FileVersion {
-            file_name: "different-prefix/file.mp4".into(),
-            file_id: Some("version-id".into()),
+        let page = B2ListFileVersionsResponse {
+            files: vec![
+                B2FileVersion {
+                    file_name: format!("{hash}/720p.mp4"),
+                    file_id: Some("version-id".into()),
+                },
+                B2FileVersion {
+                    file_name: "beyond-prefix".into(),
+                    file_id: Some("other-id".into()),
+                },
+            ],
+            next_file_name: Some("later".into()),
+            next_file_id: Some("later-id".into()),
         };
-        assert!(validate_b2_version_page(&hash, &[escaped]).is_err());
-        assert!(b2_pagination_cursor(Some("next".into()), None).is_err());
-        assert_eq!(
-            b2_pagination_cursor(Some("next".into()), Some("id".into()))
-                .expect("complete cursor"),
-            Some(("next".into(), "id".into()))
-        );
-    }
+        let (matching, next) = b2_prefix_page(&hash, &page).expect("ordered prefix page");
+        assert_eq!(matching.len(), 1);
+        assert!(next.is_none());
 
-    #[test]
-    fn b2_absence_requires_an_empty_terminal_page() {
-        let remaining = B2ListFileVersionsResponse {
+        let backtracking = B2ListFileVersionsResponse {
             files: vec![B2FileVersion {
-                file_name: "a".repeat(64),
+                file_name: "0-before-prefix".into(),
                 file_id: Some("version-id".into()),
             }],
             next_file_name: None,
             next_file_id: None,
         };
-        let malformed_empty = B2ListFileVersionsResponse {
-            files: vec![],
-            next_file_name: Some("next".into()),
-            next_file_id: Some("id".into()),
-        };
-        let absent = B2ListFileVersionsResponse {
-            files: vec![],
+        assert!(b2_prefix_page(&hash, &backtracking).is_err());
+    }
+
+    #[test]
+    fn b2_prefix_page_distinguishes_remaining_versions_from_terminal_absence() {
+        let hash = "a".repeat(64);
+        let remaining = B2ListFileVersionsResponse {
+            files: vec![B2FileVersion {
+                file_name: hash.clone(),
+                file_id: Some("version-id".into()),
+            }],
             next_file_name: None,
             next_file_id: None,
         };
+        let scanning = B2ListFileVersionsResponse {
+            files: vec![],
+            next_file_name: Some(format!("{hash}/next")),
+            next_file_id: Some("id".into()),
+        };
+        let absent = B2ListFileVersionsResponse {
+            files: vec![B2FileVersion {
+                file_name: "beyond-prefix".into(),
+                file_id: Some("other-id".into()),
+            }],
+            next_file_name: Some("later".into()),
+            next_file_id: Some("later-id".into()),
+        };
 
-        assert!(!b2_prefix_is_absent(&remaining));
-        assert!(!b2_prefix_is_absent(&malformed_empty));
-        assert!(b2_prefix_is_absent(&absent));
+        let (versions, _) = b2_prefix_page(&hash, &remaining).expect("remaining page");
+        assert_eq!(versions.len(), 1);
+        let (versions, next) = b2_prefix_page(&hash, &scanning).expect("scanning page");
+        assert!(versions.is_empty());
+        assert!(next.is_some());
+        let (versions, next) = b2_prefix_page(&hash, &absent).expect("terminal page");
+        assert!(versions.is_empty());
+        assert!(next.is_none());
     }
 
     #[test]
@@ -3554,9 +3613,12 @@ mod tests {
             backend: fastly::Backend::from_name("b2_api").expect("backend name"),
         };
         let hash = "a".repeat(64);
-        let mut list =
-            build_b2_list_versions_request(&authorization, &hash, Some(("next-name", "next-id")))
-                .expect("list request");
+        let mut list = build_b2_list_versions_request(
+            &authorization,
+            &hash,
+            Some(("next-name", Some("next-id"))),
+        )
+        .expect("list request");
         assert_eq!(
             list.get_url().as_str(),
             "https://api001.backblazeb2.com/b2api/v4/b2_list_file_versions"
@@ -3567,6 +3629,18 @@ mod tests {
         assert_eq!(list_body["prefix"], hash);
         assert_eq!(list_body["startFileName"], "next-name");
         assert_eq!(list_body["startFileId"], "next-id");
+
+        let mut initial = build_b2_list_versions_request(
+            &authorization,
+            &hash,
+            Some((&hash, None)),
+        )
+        .expect("initial list request");
+        let initial_body: serde_json::Value =
+            serde_json::from_str(&initial.take_body().into_string()).expect("initial list JSON");
+        assert_eq!(initial_body["startFileName"], hash);
+        assert!(initial_body.get("startFileId").is_none());
+        assert_eq!(initial_body["maxFileCount"], 1_000);
 
         let version = B2FileVersion {
             file_name: format!("{hash}/720p.mp4"),
