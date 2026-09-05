@@ -12,7 +12,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "purge-erased-edge-copies.sh"
 HASH_A = "a" * 64
-HASH_B = "B" * 64
+HASH_B = "b" * 64
 ADDRESSES = (
     HASH_A,
     f"/{HASH_A}.jpg",
@@ -184,6 +184,15 @@ class PurgeErasedEdgeCopiesTests(unittest.TestCase):
 
     def test_malformed_address_stops_before_any_request(self):
         self.address_file.write_text(f"{HASH_A}\nhttps://example.test/{HASH_B}\n")
+
+        result = self.run_script("--address-file", str(self.address_file))
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("line 2", result.stderr)
+        self.assertEqual(self.curl_calls(), [])
+
+    def test_uppercase_hash_stops_before_any_request(self):
+        self.address_file.write_text(f"{HASH_A}\n{'B' * 64}.jpg\n")
 
         result = self.run_script("--address-file", str(self.address_file))
 

@@ -73,7 +73,8 @@ Create a private address file outside the repository with one exact request path
 per line, following the same handling as [erasure evidence](../erasure-evidence.md):
 never pass addresses on the command line, commit the file, or paste identifiers
 into an issue or pull request. Paths may have one leading slash and must begin
-with the content hash. Build this list only from objects confirmed absent at
+with the lowercase content hash so they match the case-sensitive cache key.
+Build this list only from objects confirmed absent at
 Compute; an erasure record alone is not sufficient because another account may
 still own or have re-uploaded the same content-addressed blob.
 

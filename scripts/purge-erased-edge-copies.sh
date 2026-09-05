@@ -78,7 +78,7 @@ while IFS= read -r raw || [ -n "$raw" ]; do
   case "$address" in
     ""|"#"*) continue ;;
   esac
-  if ! [[ "$address" =~ ^[0-9a-fA-F]{64}($|[./]) ]] \
+  if ! [[ "$address" =~ ^[0-9a-f]{64}($|[./]) ]] \
     || [[ "$address" =~ [[:space:]] ]] \
     || [[ "$address" == *"?"* ]] \
     || [[ "$address" == *"#"* ]]; then
