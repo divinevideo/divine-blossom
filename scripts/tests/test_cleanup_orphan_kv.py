@@ -990,6 +990,17 @@ class InputAndCliTests(unittest.TestCase):
             ["--all", "--confirm-missing-count", "1"],
             ["--all", "--confirm-pre-marker-vanish-retries-cleared"],
             [
+                "--hash-file",
+                "private.txt",
+                "--repair-missing-bytes",
+                "--public-endpoint",
+                "https://media.example",
+                "--max-repairs",
+                "1",
+                "--confirm-missing-count",
+                "1",
+            ],
+            [
                 "--all",
                 "--repair-missing-bytes",
                 "--public-endpoint",

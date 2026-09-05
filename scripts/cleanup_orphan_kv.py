@@ -575,6 +575,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         type=int,
         help="Exact missing_bytes count from a prior read-only scan",
     )
+    # TODO(#246): Remove this confirmation with the legacy audit fallback.
     parser.add_argument(
         "--confirm-pre-marker-vanish-retries-cleared",
         action="store_true",
