@@ -47,6 +47,9 @@ class VanishRetryMarker(Enum):
     ERROR = "error"
 
 
+VANISH_IN_PROGRESS_VALUE = {"version": 1, "state": "in_progress"}
+
+
 @dataclass(frozen=True)
 class MetadataProbe:
     presence: Presence
@@ -308,8 +311,6 @@ def probe_vanish_retry_marker(
     store_id: str,
     blob_hash: str,
 ) -> VanishRetryMarker:
-    # TODO(#256): Replace list membership with a vanish-specific durable marker.
-    # Account vanish keeps these entries until all blob erasure work succeeds.
     metadata = probe_metadata(session, store_id, blob_hash)
     if (
         metadata.presence is not Presence.PRESENT
@@ -323,15 +324,39 @@ def probe_vanish_retry_marker(
     if refs_presence is Presence.ERROR:
         return VanishRetryMarker.ERROR
 
-    # Do not cache lists across candidates: each repair mutates them, and a
-    # concurrent vanish must be visible to the next candidate's live probe.
+    # Do not cache markers across candidates. A concurrent vanish must be
+    # visible immediately before each metadata mutation.
     for pubkey in dict.fromkeys([metadata.owner, *referrers]):
-        list_presence, hashes = probe_json_list(session, store_id, f"list:{pubkey}")
-        if list_presence is Presence.ERROR:
+        first = probe_vanish_in_progress(session, store_id, pubkey)
+        second = probe_vanish_in_progress(session, store_id, pubkey)
+        if first is VanishRetryMarker.ERROR or second is VanishRetryMarker.ERROR:
             return VanishRetryMarker.ERROR
-        if blob_hash in hashes:
+        if first is not second:
+            return VanishRetryMarker.ERROR
+        if first is VanishRetryMarker.OUTSTANDING:
             return VanishRetryMarker.OUTSTANDING
     return VanishRetryMarker.ABSENT
+
+
+def probe_vanish_in_progress(
+    session: requests.Session,
+    store_id: str,
+    pubkey: str,
+) -> VanishRetryMarker:
+    encoded_key = requests.utils.quote(f"vanish_in_progress:v1:{pubkey}", safe="")
+    try:
+        response = session.get(
+            f"https://api.fastly.com/resources/stores/kv/{store_id}/keys/{encoded_key}",
+            timeout=15,
+        )
+        if response.status_code == 404:
+            return VanishRetryMarker.ABSENT
+        response.raise_for_status()
+        if response.json() != VANISH_IN_PROGRESS_VALUE:
+            return VanishRetryMarker.ERROR
+        return VanishRetryMarker.OUTSTANDING
+    except (requests.RequestException, ValueError):
+        return VanishRetryMarker.ERROR
 
 
 def get_bucket(client: object, bucket_name: str, not_found_type: type[Exception]) -> object:

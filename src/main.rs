@@ -37,17 +37,18 @@ use crate::error::{BlossomError, Result};
 use crate::media_auth_log::format_media_auth_log;
 use crate::metadata::{
     add_to_audio_source_refs, add_to_blob_refs, add_to_recent_index, add_to_user_index,
-    add_to_user_list, claim_vanish_audit_completion, create_vanish_audit_state,
-    delete_audio_mapping, delete_audio_source_refs, delete_auth_events, delete_blob_metadata,
-    delete_blob_refs, delete_subtitle_data, finish_vanish_blob_lookup, get_audio_mapping,
-    get_audio_source_refs, get_auth_event, get_blob_metadata, get_blob_metadata_uncached,
-    get_blob_refs, get_subtitle_job, get_subtitle_job_by_hash, get_tombstone, get_user_blobs,
-    get_vanish_audit_state, list_blobs_with_metadata, mark_vanish_audit_authorized_delivered,
-    open_store, put_audio_mapping, put_auth_event, put_blob_metadata, put_subtitle_job,
-    refresh_vanish_audit_state, remove_from_audio_source_refs, remove_from_blob_refs,
-    remove_from_user_index, remove_from_user_list, set_subtitle_job_id_for_hash,
-    start_vanish_blob_lookup, update_blob_status, update_stats_on_add, StatusUpdateOutcome,
-    TranscodeMetadataUpdate, TranscriptMetadataUpdate, VanishAuditState,
+    add_to_user_list, claim_vanish_audit_completion, clear_vanish_in_progress,
+    create_vanish_audit_state, delete_audio_mapping, delete_audio_source_refs, delete_auth_events,
+    delete_blob_metadata, delete_blob_refs, delete_subtitle_data, finish_vanish_blob_lookup,
+    get_audio_mapping, get_audio_source_refs, get_auth_event, get_blob_metadata,
+    get_blob_metadata_uncached, get_blob_refs, get_subtitle_job, get_subtitle_job_by_hash,
+    get_tombstone, get_user_blobs, get_vanish_audit_state, list_blobs_with_metadata,
+    mark_vanish_audit_authorized_delivered, mark_vanish_in_progress, open_store, put_audio_mapping,
+    put_auth_event, put_blob_metadata, put_subtitle_job, refresh_vanish_audit_state,
+    remove_from_audio_source_refs, remove_from_blob_refs, remove_from_user_index,
+    remove_from_user_list, set_subtitle_job_id_for_hash, start_vanish_blob_lookup,
+    update_blob_status, update_stats_on_add, StatusUpdateOutcome, TranscodeMetadataUpdate,
+    TranscriptMetadataUpdate, VanishAuditState,
 };
 use crate::storage::{
     blob_exists, check_funnelcake_audio_reuse, current_timestamp, delete_blob as storage_delete,
@@ -5042,23 +5043,84 @@ fn complete_open_vanish_audits(
     complete_vanish_audit(pubkey, initiator, state)
 }
 
+trait VanishRequestOps {
+    fn mark_in_progress(&self, pubkey: &str) -> Result<()>;
+    fn execute(&self, pubkey: &str) -> VanishExecution;
+    fn complete_audits(
+        &self,
+        pubkey: &str,
+        initiator: VanishAuditInitiator,
+        state: &mut VanishAuditState,
+    ) -> Result<()>;
+    fn clear_in_progress(&self, pubkey: &str) -> Result<()>;
+}
+
+struct DefaultVanishRequestOps;
+
+impl VanishRequestOps for DefaultVanishRequestOps {
+    fn mark_in_progress(&self, pubkey: &str) -> Result<()> {
+        mark_vanish_in_progress(pubkey)
+    }
+
+    fn execute(&self, pubkey: &str) -> VanishExecution {
+        execute_vanish(pubkey)
+    }
+
+    fn complete_audits(
+        &self,
+        pubkey: &str,
+        initiator: VanishAuditInitiator,
+        state: &mut VanishAuditState,
+    ) -> Result<()> {
+        complete_open_vanish_audits(pubkey, initiator, state)
+    }
+
+    fn clear_in_progress(&self, pubkey: &str) -> Result<()> {
+        clear_vanish_in_progress(pubkey)
+    }
+}
+
+fn run_vanish_request_with_ops(
+    pubkey: &str,
+    initiator: VanishAuditInitiator,
+    audit_state: &mut VanishAuditState,
+    ops: &impl VanishRequestOps,
+) -> Result<VanishExecution> {
+    ops.mark_in_progress(pubkey)?;
+    let mut execution = ops.execute(pubkey);
+    if execution.vanished() {
+        if let Err(error) = ops.complete_audits(pubkey, initiator, audit_state) {
+            eprintln!(
+                "[VANISH] pubkey={} failed to deliver completion audit: {}",
+                pubkey, error
+            );
+            execution.errors += 1;
+        }
+    }
+    if execution.vanished() {
+        if let Err(error) = ops.clear_in_progress(pubkey) {
+            eprintln!(
+                "[VANISH] pubkey={} failed to clear in-progress state: {}",
+                pubkey, error
+            );
+            execution.errors += 1;
+        }
+    }
+    Ok(execution)
+}
+
 /// DELETE /vanish - User-initiated GDPR right to erasure
 fn handle_vanish(req: Request) -> Result<Response> {
     // Validate Blossom delete auth.
     let auth = validate_auth(&req, AuthAction::Delete)?;
     let initiator = VanishAuditInitiator::Account;
     let mut audit_state = ensure_vanish_authorization_audit(&auth.pubkey, initiator)?;
-
-    let mut execution = execute_vanish(&auth.pubkey);
-    if execution.vanished() {
-        if let Err(error) = complete_open_vanish_audits(&auth.pubkey, initiator, &mut audit_state) {
-            eprintln!(
-                "[VANISH] pubkey={} failed to deliver completion audit: {}",
-                auth.pubkey, error
-            );
-            execution.errors += 1;
-        }
-    }
+    let execution = run_vanish_request_with_ops(
+        &auth.pubkey,
+        initiator,
+        &mut audit_state,
+        &DefaultVanishRequestOps,
+    )?;
 
     let result = serde_json::json!({
         "vanished": execution.vanished(),
@@ -5107,17 +5169,12 @@ fn handle_admin_vanish(req: Request) -> Result<Response> {
 
     let initiator = VanishAuditInitiator::Admin;
     let mut audit_state = ensure_vanish_authorization_audit(&pubkey, initiator)?;
-
-    let mut execution = execute_vanish(&pubkey);
-    if execution.vanished() {
-        if let Err(error) = complete_open_vanish_audits(&pubkey, initiator, &mut audit_state) {
-            eprintln!(
-                "[VANISH] pubkey={} failed to deliver completion audit: {}",
-                pubkey, error
-            );
-            execution.errors += 1;
-        }
-    }
+    let execution = run_vanish_request_with_ops(
+        &pubkey,
+        initiator,
+        &mut audit_state,
+        &DefaultVanishRequestOps,
+    )?;
 
     let result = serde_json::json!({
         "vanished": execution.vanished(),
@@ -6817,8 +6874,9 @@ mod tests {
         ignored_generation_response, is_alias_only_audio_blob, local_derivative_cleanup_result,
         next_vanish_wave_range, parse_transcode_status_webhook_payload,
         parse_transcript_status_webhook_payload, parse_upload_service_response,
-        reconcile_vanish_list_completion, should_delete_derived_audio_blob,
-        should_eagerly_trigger_transcription, should_record_upload_service_transcode_failure,
+        reconcile_vanish_list_completion, run_vanish_request_with_ops,
+        should_delete_derived_audio_blob, should_eagerly_trigger_transcription,
+        should_record_upload_service_transcode_failure,
         should_record_upload_service_transcript_failure,
         should_reset_transcode_failure_on_clean_upload,
         should_reset_transcript_failure_on_clean_upload, should_set_audio_content_length,
@@ -6827,7 +6885,7 @@ mod tests {
         upload_control_host, upload_exposed_headers, upload_from_resumable_completion,
         vanish_response_status, vanish_shared_update_error_count, AudioReuseAvailability,
         DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState,
-        VanishExecution, VANISH_TIME_BUDGET,
+        VanishExecution, VanishRequestOps, VANISH_TIME_BUDGET,
     };
     use crate::blossom::{
         BlobStatus, ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus,
@@ -6836,7 +6894,82 @@ mod tests {
     use blossom_core::cache_policy::BlobCachePolicy;
     use fastly::http::StatusCode;
     use fastly::Response;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
     use std::time::Duration;
+
+    struct TestVanishRequestOps {
+        calls: RefCell<Vec<&'static str>>,
+        executions: RefCell<VecDeque<VanishExecution>>,
+        mark_fails: bool,
+        audit_fails: bool,
+        clear_fails: bool,
+    }
+
+    impl TestVanishRequestOps {
+        fn new(executions: Vec<VanishExecution>) -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                executions: RefCell::new(executions.into()),
+                mark_fails: false,
+                audit_fails: false,
+                clear_fails: false,
+            }
+        }
+    }
+
+    impl VanishRequestOps for TestVanishRequestOps {
+        fn mark_in_progress(&self, _pubkey: &str) -> BlossomResult<()> {
+            self.calls.borrow_mut().push("mark");
+            if self.mark_fails {
+                Err(BlossomError::MetadataError("mark failed".into()))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn execute(&self, _pubkey: &str) -> VanishExecution {
+            self.calls.borrow_mut().push("execute");
+            self.executions
+                .borrow_mut()
+                .pop_front()
+                .expect("test execution must be configured")
+        }
+
+        fn complete_audits(
+            &self,
+            _pubkey: &str,
+            _initiator: crate::storage::VanishAuditInitiator,
+            _state: &mut crate::metadata::VanishAuditState,
+        ) -> BlossomResult<()> {
+            self.calls.borrow_mut().push("complete_audits");
+            if self.audit_fails {
+                Err(BlossomError::MetadataError("audit failed".into()))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn clear_in_progress(&self, _pubkey: &str) -> BlossomResult<()> {
+            self.calls.borrow_mut().push("clear");
+            if self.clear_fails {
+                Err(BlossomError::MetadataError("clear failed".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn vanish_execution(errors: u32, pending: u32, finalized: bool) -> VanishExecution {
+        VanishExecution {
+            fully_deleted: 0,
+            unlinked: 0,
+            errors,
+            malformed_hash_exceptions: 0,
+            pending,
+            finalized,
+        }
+    }
 
     #[test]
     fn vanish_response_distinguishes_continuation_from_terminal_failure() {
@@ -6847,6 +6980,95 @@ mod tests {
             StatusCode::INTERNAL_SERVER_ERROR
         );
         assert_eq!(vanish_response_status(1, 1), StatusCode::ACCEPTED);
+    }
+
+    #[test]
+    fn vanish_marker_precedes_mutation_and_survives_interruption_until_retry_completes() {
+        let ops = TestVanishRequestOps::new(vec![
+            vanish_execution(1, 0, false),
+            vanish_execution(0, 0, true),
+        ]);
+        let mut audit_state =
+            crate::metadata::VanishAuditState::new("operation".into(), "authorized-at".into());
+
+        let interrupted = run_vanish_request_with_ops(
+            &"a".repeat(64),
+            crate::storage::VanishAuditInitiator::Account,
+            &mut audit_state,
+            &ops,
+        )
+        .expect("interrupted execution is a retryable response");
+        assert!(!interrupted.vanished());
+        assert_eq!(*ops.calls.borrow(), vec!["mark", "execute"]);
+
+        let completed = run_vanish_request_with_ops(
+            &"a".repeat(64),
+            crate::storage::VanishAuditInitiator::Account,
+            &mut audit_state,
+            &ops,
+        )
+        .expect("retry should complete");
+        assert!(completed.vanished());
+        assert_eq!(
+            *ops.calls.borrow(),
+            vec![
+                "mark",
+                "execute",
+                "mark",
+                "execute",
+                "complete_audits",
+                "clear"
+            ]
+        );
+    }
+
+    #[test]
+    fn vanish_marker_write_failure_prevents_blob_mutation() {
+        let mut ops = TestVanishRequestOps::new(vec![vanish_execution(0, 0, true)]);
+        ops.mark_fails = true;
+        let mut audit_state =
+            crate::metadata::VanishAuditState::new("operation".into(), "authorized-at".into());
+
+        assert!(run_vanish_request_with_ops(
+            &"b".repeat(64),
+            crate::storage::VanishAuditInitiator::Admin,
+            &mut audit_state,
+            &ops,
+        )
+        .is_err());
+        assert_eq!(*ops.calls.borrow(), vec!["mark"]);
+    }
+
+    #[test]
+    fn vanish_completion_failure_keeps_the_request_retryable() {
+        for failure in ["audit", "clear"] {
+            let mut ops = TestVanishRequestOps::new(vec![vanish_execution(0, 0, true)]);
+            ops.audit_fails = failure == "audit";
+            ops.clear_fails = failure == "clear";
+            let mut audit_state =
+                crate::metadata::VanishAuditState::new("operation".into(), "authorized-at".into());
+
+            let execution = run_vanish_request_with_ops(
+                &"c".repeat(64),
+                crate::storage::VanishAuditInitiator::Account,
+                &mut audit_state,
+                &ops,
+            )
+            .expect("completion failures become retryable responses");
+
+            assert!(!execution.vanished());
+            if failure == "audit" {
+                assert_eq!(
+                    *ops.calls.borrow(),
+                    vec!["mark", "execute", "complete_audits"]
+                );
+            } else {
+                assert_eq!(
+                    *ops.calls.borrow(),
+                    vec!["mark", "execute", "complete_audits", "clear"]
+                );
+            }
+        }
     }
 
     #[test]
