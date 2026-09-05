@@ -588,6 +588,10 @@ class ProbeTests(unittest.TestCase):
             Mock(status_code=404),
             Mock(status_code=404),
             Mock(status_code=404),
+            Mock(status_code=404),
+            Mock(status_code=404),
+            Mock(status_code=404),
+            Mock(status_code=404),
         ]
 
         self.assertEqual(
@@ -730,6 +734,14 @@ class ProbeTests(unittest.TestCase):
                     Mock(status_code=404),
                     Mock(status_code=404),
                     Mock(status_code=404),
+                    Mock(status_code=404),
+                    Mock(status_code=404),
+                    Mock(status_code=404),
+                    Mock(status_code=404),
+                    Mock(status_code=404),
+                    Mock(status_code=404),
+                    Mock(status_code=404),
+                    Mock(status_code=404),
                 ]
             )
         session.get.side_effect = responses
@@ -780,6 +792,88 @@ class ProbeTests(unittest.TestCase):
         session.get.side_effect = MODULE.requests.RequestException("rate limited")
         self.assertEqual(
             MODULE.probe_vanish_in_progress(session, "store", pubkey),
+            MODULE.VanishRetryMarker.ERROR,
+        )
+
+    def test_predeployment_interruption_is_found_in_legacy_audit_state(self):
+        pubkey = "8" * 64
+        incomplete = {
+            "operation_id": "operation",
+            "authorized_at": "2026-08-30T00:00:00Z",
+            "authorized_delivered": True,
+            "completed_at": None,
+        }
+        complete = {**incomplete, "completed_at": "2026-08-30T00:01:00Z"}
+
+        for payload, expected in [
+            (incomplete, MODULE.VanishRetryMarker.OUTSTANDING),
+            (complete, MODULE.VanishRetryMarker.ABSENT),
+        ]:
+            with self.subTest(completed_at=payload["completed_at"]):
+                session = Mock()
+                session.get.return_value = Mock(
+                    status_code=200, json=Mock(return_value=payload)
+                )
+                self.assertEqual(
+                    MODULE.probe_legacy_vanish_audit(
+                        session, "store", pubkey, "account"
+                    ),
+                    expected,
+                )
+
+    def test_legacy_audit_fallback_blocks_repair_after_markerless_interruption(self):
+        blob_hash = "9" * 64
+        owner = "a" * 64
+        metadata = {
+            "sha256": blob_hash,
+            "type": "video/mp4",
+            "uploaded": "2026-08-30T00:00:00Z",
+            "owner": owner,
+            "size": 1,
+            "status": "active",
+        }
+        incomplete = {
+            "operation_id": "operation",
+            "authorized_at": "2026-08-30T00:00:00Z",
+            "authorized_delivered": True,
+            "completed_at": None,
+        }
+        session = Mock()
+        session.get.side_effect = [
+            Mock(status_code=200, json=Mock(return_value=metadata)),
+            Mock(status_code=404),
+            Mock(status_code=404),
+            Mock(status_code=404),
+            Mock(status_code=200, json=Mock(return_value=incomplete)),
+            Mock(status_code=200, json=Mock(return_value=incomplete)),
+        ]
+
+        self.assertEqual(
+            MODULE.probe_vanish_retry_marker(session, "store", blob_hash),
+            MODULE.VanishRetryMarker.OUTSTANDING,
+        )
+
+    def test_legacy_audit_fallback_fails_closed_on_inconsistent_reads(self):
+        pubkey = "b" * 64
+        incomplete = {
+            "operation_id": "operation",
+            "authorized_at": "2026-08-30T00:00:00Z",
+            "authorized_delivered": True,
+            "completed_at": None,
+        }
+        complete = {**incomplete, "completed_at": "2026-08-30T00:01:00Z"}
+        session = Mock()
+        session.get.side_effect = [
+            Mock(status_code=200, json=Mock(return_value=incomplete)),
+            Mock(status_code=200, json=Mock(return_value=complete)),
+        ]
+
+        self.assertEqual(
+            MODULE.probe_consistently(
+                lambda: MODULE.probe_legacy_vanish_audit(
+                    session, "store", pubkey, "admin"
+                )
+            ),
             MODULE.VanishRetryMarker.ERROR,
         )
 

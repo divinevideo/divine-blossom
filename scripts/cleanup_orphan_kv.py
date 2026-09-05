@@ -326,16 +326,34 @@ def probe_vanish_retry_marker(
 
     # Do not cache markers across candidates. A concurrent vanish must be
     # visible immediately before each metadata mutation.
-    for pubkey in dict.fromkeys([metadata.owner, *referrers]):
-        first = probe_vanish_in_progress(session, store_id, pubkey)
-        second = probe_vanish_in_progress(session, store_id, pubkey)
-        if first is VanishRetryMarker.ERROR or second is VanishRetryMarker.ERROR:
-            return VanishRetryMarker.ERROR
-        if first is not second:
-            return VanishRetryMarker.ERROR
-        if first is VanishRetryMarker.OUTSTANDING:
-            return VanishRetryMarker.OUTSTANDING
+    pubkeys = list(dict.fromkeys([metadata.owner, *referrers]))
+    for pubkey in pubkeys:
+        marker = probe_consistently(
+            lambda: probe_vanish_in_progress(session, store_id, pubkey)
+        )
+        if marker is not VanishRetryMarker.ABSENT:
+            return marker
+
+    # TODO(#246): Remove this fallback after all audit state created before the
+    # dedicated marker deployment has aged out.
+    for pubkey in pubkeys:
+        for initiator in ("account", "admin"):
+            marker = probe_consistently(
+                lambda: probe_legacy_vanish_audit(session, store_id, pubkey, initiator)
+            )
+            if marker is not VanishRetryMarker.ABSENT:
+                return marker
     return VanishRetryMarker.ABSENT
+
+
+def probe_consistently(probe: Callable[[], VanishRetryMarker]) -> VanishRetryMarker:
+    first = probe()
+    second = probe()
+    if first is VanishRetryMarker.ERROR or second is VanishRetryMarker.ERROR:
+        return VanishRetryMarker.ERROR
+    if first is not second:
+        return VanishRetryMarker.ERROR
+    return first
 
 
 def probe_vanish_in_progress(
@@ -356,6 +374,47 @@ def probe_vanish_in_progress(
             return VanishRetryMarker.ERROR
         return VanishRetryMarker.OUTSTANDING
     except (requests.RequestException, ValueError):
+        return VanishRetryMarker.ERROR
+
+
+def probe_legacy_vanish_audit(
+    session: requests.Session,
+    store_id: str,
+    pubkey: str,
+    initiator: str,
+) -> VanishRetryMarker:
+    encoded_key = requests.utils.quote(
+        f"vanish_audit:v1:{pubkey}:{initiator}", safe=""
+    )
+    try:
+        response = session.get(
+            f"https://api.fastly.com/resources/stores/kv/{store_id}/keys/{encoded_key}",
+            timeout=15,
+        )
+        if response.status_code == 404:
+            return VanishRetryMarker.ABSENT
+        response.raise_for_status()
+        payload = response.json()
+        completed_at = payload.get("completed_at") if isinstance(payload, dict) else False
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("operation_id"), str)
+            or not payload["operation_id"]
+            or not isinstance(payload.get("authorized_at"), str)
+            or not payload["authorized_at"]
+            or not isinstance(payload.get("authorized_delivered"), bool)
+            or not (
+                completed_at is None
+                or (isinstance(completed_at, str) and bool(completed_at))
+            )
+        ):
+            return VanishRetryMarker.ERROR
+        return (
+            VanishRetryMarker.OUTSTANDING
+            if completed_at is None
+            else VanishRetryMarker.ABSENT
+        )
+    except (requests.RequestException, ValueError, KeyError):
         return VanishRetryMarker.ERROR
 
 
