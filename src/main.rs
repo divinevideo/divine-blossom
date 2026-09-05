@@ -4737,7 +4737,6 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     let mut completed_malformed = 0u32;
     let mut selected = 0usize;
     let mut erase_candidates = 0usize;
-    let mut storage_attempts = 0u32;
     let mut storage_timings = VanishStorageTimings::default();
     let mut prepare_ms = 0u128;
     let mut kv_finalize_ms = 0u128;
@@ -4794,8 +4793,6 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         erase_candidates = erase_candidates.saturating_add(erase.len());
         let erase_hashes = vanish_storage_hashes(&erase, &derived_cleanup);
         let storage_result = erase_vanish_batch(&erase_hashes);
-        let wave_storage_attempts = u8::from(!erase_hashes.is_empty());
-        storage_attempts = storage_attempts.saturating_add(u32::from(wave_storage_attempts));
         add_vanish_storage_timings(&mut storage_timings, &storage_result.timings);
 
         let finalize_started = Instant::now();
@@ -4819,8 +4816,8 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
                 || failed_derived_sources.contains(&blob.hash)
             {
                 eprintln!(
-                    "[VANISH] pubkey={} hash={} required storage erasure failed after {} attempts",
-                    pubkey, blob.hash, wave_storage_attempts
+                    "[VANISH] pubkey={} hash={} required storage erasure failed",
+                    pubkey, blob.hash
                 );
                 execution.errors += 1;
                 retry_hashes.push(blob.hash);
@@ -4893,7 +4890,6 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     let timing = serde_json::json!({
         "selected": selected,
         "erase_candidates": erase_candidates,
-        "storage_attempts": storage_attempts,
         "fully_deleted": execution.fully_deleted,
         "unlinked": execution.unlinked,
         "errors": execution.errors,
