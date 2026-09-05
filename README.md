@@ -115,6 +115,9 @@ Configuration is split across the Fastly config store (non-secret) and secret st
 | `gcs_bucket` | GCS bucket name (`divine-blossom-media`) |
 | `gcs_project_id` | GCP project ID |
 | `funnelcake_api_url` | Funnelcake permission API base URL |
+| `b2_replica_enabled` | Enables the approved-only B2 replica and makes Native API version erasure plus bunny cache purge mandatory for vanish. Defaults off. |
+| `b2_bucket_id` | Bucket ID for the approved-only B2 replica. |
+| `bunny_delivery_zones` | Comma-separated delivery hostnames that must be purged when B2 replica content is erased. |
 | `ENABLE_PHYSICAL_DELETE` | When `"true"`, creator-delete via `/admin/api/moderate` physically removes bytes from GCS and purges edge caches; when `"false"` (default), it flips status only. Admin DMCA via `/admin/api/delete` is always a soft-delete regardless of this flag. |
 | `REQUIRE_DERIVATIVE_STATUS_GENERATION` | Set to `"false"` only during rollback to a transcoder image that does not send derivative status `generation` values. Defaults to required once a blob has versioned derivative state. |
 
@@ -125,10 +128,13 @@ Configuration is split across the Fastly config store (non-secret) and secret st
 | `gcs_access_key` | GCS HMAC access key |
 | `gcs_secret_key` | GCS HMAC secret key |
 | `moderation_api_token` | Bearer token for the Divine moderation API |
+| `b2_vanish_application_key_id` | Dedicated B2 application key ID restricted to `b2_bucket_id` with exactly `listFiles` and `deleteFiles`. |
+| `b2_vanish_application_key` | Secret for the dedicated B2 vanish application key. |
+| `bunny_api_key` | bunny control-plane key used to purge B2-backed delivery zones. |
 
 ### Backends
 
-Registered in Fastly and mirrored in `fastly.toml.example`: `gcs_storage` (GCS), the CDN fallback chain (`cdn_divine`, `blossom_divine`, `cdn_satellite`, `nostr_build`), `upload_service` (large-upload/resumable control plane), `moderation_api`, and `funnelcake_api`.
+Required backend names are mirrored in `fastly.toml.example`: `gcs_storage` (GCS), `b2_api` (Backblaze Native API), `bunny_api` (delivery-zone purge API), the CDN fallback chain (`cdn_divine`, `blossom_divine`, `cdn_satellite`, `nostr_build`), `upload_service` (large-upload/resumable control plane), `moderation_api`, and `funnelcake_api`.
 
 ### Process-Blob (Cloud Run) environment
 

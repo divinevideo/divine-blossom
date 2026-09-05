@@ -4549,8 +4549,10 @@ fn add_vanish_storage_timings(total: &mut VanishStorageTimings, wave: &VanishSto
         .cloud_run_cleanup_ms
         .saturating_add(wave.cloud_run_cleanup_ms);
     total.fos_main_ms = total.fos_main_ms.saturating_add(wave.fos_main_ms);
+    total.b2_replica_ms = total.b2_replica_ms.saturating_add(wave.b2_replica_ms);
     total.purge_vcl_ms = total.purge_vcl_ms.saturating_add(wave.purge_vcl_ms);
     total.purge_compute_ms = total.purge_compute_ms.saturating_add(wave.purge_compute_ms);
+    total.purge_bunny_ms = total.purge_bunny_ms.saturating_add(wave.purge_bunny_ms);
 }
 
 fn prefetch_vanish_blob_lookups(hashes: &[String]) -> HashMap<String, Option<BlobMetadata>> {
@@ -4898,8 +4900,10 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         "gcs_main_ms": storage_timings.gcs_main_ms,
         "cloud_run_cleanup_ms": storage_timings.cloud_run_cleanup_ms,
         "fos_main_ms": storage_timings.fos_main_ms,
+        "b2_replica_ms": storage_timings.b2_replica_ms,
         "purge_vcl_ms": storage_timings.purge_vcl_ms,
         "purge_compute_ms": storage_timings.purge_compute_ms,
+        "purge_bunny_ms": storage_timings.purge_bunny_ms,
         "kv_finalize_ms": kv_finalize_ms.min(u128::from(u64::MAX)) as u64,
         "total_ms": started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
     });
