@@ -795,6 +795,15 @@ class ProbeTests(unittest.TestCase):
             MODULE.VanishRetryMarker.ERROR,
         )
 
+        session = Mock()
+        session.get.return_value = Mock(
+            status_code=200, json=Mock(return_value={"version": 2})
+        )
+        self.assertEqual(
+            MODULE.probe_vanish_in_progress(session, "store", pubkey),
+            MODULE.VanishRetryMarker.ERROR,
+        )
+
     def test_predeployment_interruption_is_found_in_legacy_audit_state(self):
         pubkey = "8" * 64
         incomplete = {
@@ -877,14 +886,43 @@ class ProbeTests(unittest.TestCase):
             MODULE.VanishRetryMarker.ERROR,
         )
 
+    def test_legacy_audit_probe_fails_closed_on_read_or_schema_error(self):
+        pubkey = "c" * 64
         session = Mock()
-        session.get.return_value = Mock(
-            status_code=200, json=Mock(return_value={"version": 2})
-        )
+        session.get.side_effect = MODULE.requests.RequestException("rate limited")
         self.assertEqual(
-            MODULE.probe_vanish_in_progress(session, "store", pubkey),
+            MODULE.probe_legacy_vanish_audit(session, "store", pubkey, "account"),
             MODULE.VanishRetryMarker.ERROR,
         )
+
+        malformed_payloads = [
+            [],
+            {},
+            {
+                "operation_id": "operation",
+                "authorized_at": "2026-08-30T00:00:00Z",
+                "authorized_delivered": "yes",
+                "completed_at": None,
+            },
+            {
+                "operation_id": "operation",
+                "authorized_at": "2026-08-30T00:00:00Z",
+                "authorized_delivered": True,
+                "completed_at": "",
+            },
+        ]
+        for payload in malformed_payloads:
+            with self.subTest(payload=payload):
+                session = Mock()
+                session.get.return_value = Mock(
+                    status_code=200, json=Mock(return_value=payload)
+                )
+                self.assertEqual(
+                    MODULE.probe_legacy_vanish_audit(
+                        session, "store", pubkey, "account"
+                    ),
+                    MODULE.VanishRetryMarker.ERROR,
+                )
 
 
 class InputAndCliTests(unittest.TestCase):
@@ -950,6 +988,7 @@ class InputAndCliTests(unittest.TestCase):
             ["--hash-file", "private.txt", "--hex-prefix", "ab"],
             ["--all", "--max-repairs", "1"],
             ["--all", "--confirm-missing-count", "1"],
+            ["--all", "--confirm-pre-marker-vanish-retries-cleared"],
             [
                 "--all",
                 "--repair-missing-bytes",
@@ -959,6 +998,7 @@ class InputAndCliTests(unittest.TestCase):
                 "1",
                 "--confirm-missing-count",
                 "1",
+                "--confirm-pre-marker-vanish-retries-cleared",
             ],
             [
                 "--hash-file",
@@ -972,6 +1012,7 @@ class InputAndCliTests(unittest.TestCase):
                 "1",
                 "--confirm-missing-count",
                 "1",
+                "--confirm-pre-marker-vanish-retries-cleared",
             ],
         ]
 
@@ -992,6 +1033,7 @@ class MainExitCodeTests(unittest.TestCase):
             repair_missing_bytes=repair,
             max_repairs=1 if repair else None,
             confirm_missing_count=1 if repair else None,
+            confirm_pre_marker_vanish_retries_cleared=repair,
         )
 
     @staticmethod

@@ -575,6 +575,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         type=int,
         help="Exact missing_bytes count from a prior read-only scan",
     )
+    parser.add_argument(
+        "--confirm-pre-marker-vanish-retries-cleared",
+        action="store_true",
+        help="Confirm all erasures started before marker deployment were retried",
+    )
     return parser.parse_args(argv)
 
 
@@ -595,6 +600,8 @@ def validate_cli_request(args: argparse.Namespace) -> Optional[str]:
             return "--max-repairs requires --repair-missing-bytes"
         if args.confirm_missing_count is not None:
             return "--confirm-missing-count requires --repair-missing-bytes"
+        if args.confirm_pre_marker_vanish_retries_cleared:
+            return "--confirm-pre-marker-vanish-retries-cleared requires --repair-missing-bytes"
     else:
         if not args.hash_file:
             return "--repair-missing-bytes requires --hash-file; --all is read-only"
@@ -602,6 +609,11 @@ def validate_cli_request(args: argparse.Namespace) -> Optional[str]:
             return "--limit cannot be used with --repair-missing-bytes"
         if not args.public_endpoint:
             return "--repair-missing-bytes requires --public-endpoint"
+        if not args.confirm_pre_marker_vanish_retries_cleared:
+            return (
+                "--repair-missing-bytes requires "
+                "--confirm-pre-marker-vanish-retries-cleared"
+            )
         repair_error = validate_repair_parameters(
             args.max_repairs, args.confirm_missing_count
         )

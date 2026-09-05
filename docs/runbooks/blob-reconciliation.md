@@ -56,7 +56,8 @@ A catalogue scan makes several service requests per blob. Start with `--hex-pref
 2. Run the file read-only with the public endpoint and record only its aggregate `missing_bytes` count.
 3. Investigate every other class. Do not broaden the file to make the count match an expectation.
 4. Wait at least 61 seconds after the read-only public probes so the edge's known 60-second negative-cache TTL has expired.
-5. Run the same file again with repair enabled, the prior count, and a hard cap no lower than that count.
+5. Before the first repair after the in-progress marker deployment, retry every account erasure first attempted by older code until each either completes or has a live `vanish_in_progress:v1:<pubkey>` marker. Verify no pre-marker erasure remains only in the upstream retry queue or account blob list. The seven-day legacy audit fallback narrows the rollout gap but cannot prove that older expired state is absent.
+6. Run the same file again with repair enabled, the prior count, a hard cap no lower than that count, and the explicit cutover confirmation.
 
 ```bash
 python3 scripts/cleanup_orphan_kv.py \
@@ -68,6 +69,7 @@ python3 scripts/cleanup_orphan_kv.py \
   --public-endpoint https://media.example \
   --repair-missing-bytes \
   --confirm-missing-count COUNT_FROM_FIRST_RUN \
+  --confirm-pre-marker-vanish-retries-cleared \
   --max-repairs APPROVED_CAP
 ```
 
@@ -96,4 +98,4 @@ Public probes stream and close the response without retaining the body, but the 
 - Exit `2`: configuration, input, dependency, bucket validation, or CLI validation failed. No repair scan started.
 - Exit `3`: repair was skipped, excluded an in-progress account erasure, partially failed, or did not complete. Some earlier candidates may already have been soft-deleted.
 
-On exit `3`, retain the private file and inspect the aggregate `repairs` counters. `excluded_vanish_retry` means an affected account still has in-progress erasure state and the hash must not be repaired here. Retry account erasure instead. Because the dedicated marker has no TTL, a permanently failing erasure intentionally remains excluded rather than allowing reconciliation to discard its retry state. Delete `vanish_in_progress:v1:<pubkey>` manually only after a terminal vanish response has been independently verified and only to recover from a failed marker cleanup; never delete it to make a nonterminal account eligible for reconciliation. `failed_vanish_retry_probe` means the safety check found changed or inconsistent metadata, malformed or inconsistent marker state, or could not read current metadata, reverse-reference, or marker state. Correct any service or authorization failure, then start again with a new read-only count-confirmation run. If current metadata remains non-active, investigate that lifecycle state separately; repeating reconciliation cannot make the candidate eligible. Repeating the repair command without a fresh first run is not recovery. Soft deletion is idempotent only through the admin API's current contract; verify the live aggregate result rather than assuming a retry completed previous work.
+On exit `3`, retain the private file and inspect the aggregate `repairs` counters. `excluded_vanish_retry` means an affected account still has in-progress erasure state and the hash must not be repaired here. Retry account erasure instead. Because the dedicated marker has no TTL, a permanently failing erasure intentionally remains excluded rather than allowing reconciliation to discard its retry state. A request whose only failure is marker cleanup safely repeats the already-idempotent completion path and retries that cleanup; do not delete an in-progress marker manually. `failed_vanish_retry_probe` means the safety check found changed or inconsistent metadata, malformed or inconsistent marker state, or could not read current metadata, reverse-reference, or marker state. Correct any service or authorization failure, then start again with a new read-only count-confirmation run. If current metadata remains non-active, investigate that lifecycle state separately; repeating reconciliation cannot make the candidate eligible. Repeating the repair command without a fresh first run is not recovery. Soft deletion is idempotent only through the admin API's current contract; verify the live aggregate result rather than assuming a retry completed previous work.
