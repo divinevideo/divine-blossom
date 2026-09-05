@@ -13,25 +13,10 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "purge-erased-edge-copies.sh"
 HASH_A = "a" * 64
 HASH_B = "B" * 64
-URL_SUFFIXES = (
-    "",
-    ".mp4",
-    ".jpg",
-    "/720p",
-    "/480p",
-    "/720p.mp4",
-    "/480p.mp4",
-    ".hls",
-    "/hls/master.m3u8",
-    "/hls/stream_720p.m3u8",
-    "/hls/stream_480p.m3u8",
-    "/hls/stream_720p.ts",
-    "/hls/stream_480p.ts",
-    "/hls/stream_720p.mp4",
-    "/hls/stream_480p.mp4",
-    ".vtt",
-    "/vtt",
-    ".audio.m4a",
+ADDRESSES = (
+    HASH_A,
+    f"/{HASH_A}.jpg",
+    f"{HASH_B}/hls/chunk-free-form_001@2x.m4s",
 )
 
 
@@ -46,41 +31,52 @@ class PurgeErasedEdgeCopiesTests(unittest.TestCase):
         self.dir = Path(self.tmp.name)
         self.bin = self.dir / "bin"
         self.bin.mkdir()
-        self.fastly_log = self.dir / "fastly.log"
         self.curl_log = self.dir / "curl.log"
-        self.hash_file = self.dir / "hashes.txt"
-        self.hash_file.write_text(f"# comment\n{HASH_A}\n\n  {HASH_B}  \n")
+        self.sleep_log = self.dir / "sleep.log"
+        self.address_file = self.dir / "addresses.txt"
+        self.address_file.write_text(
+            f"# private remediation set\n{ADDRESSES[0]}\n\n{ADDRESSES[1]}\n{ADDRESSES[2]}\n"
+        )
+        self.install_curl(
+            status="200", body='{"status": "ok", "id": "purge-receipt-1"}'
+        )
         _write_executable(
-            self.bin / "fastly",
+            self.bin / "sleep",
             f"""\
             #!/usr/bin/env bash
-            echo "$*" >> "{self.fastly_log}"
+            echo "$*" >> "{self.sleep_log}"
             """,
         )
-        self.install_curl("404")
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def install_curl(self, status: str) -> None:
+    def install_curl(self, status: str, body: str, exit_code: int = 0) -> None:
         _write_executable(
             self.bin / "curl",
             f"""\
             #!/usr/bin/env bash
             echo "$*" >> "{self.curl_log}"
+            output=""
             while [ $# -gt 0 ]; do
-              if [ "$1" = "-D" ]; then
-                printf 'HTTP/2 {status}\\r\\nx-served-by: cache-test-1\\r\\n\\r\\n' > "$2"
+              if [ "$1" = "--output" ]; then
+                output="$2"
                 shift
               fi
               shift
             done
-            printf '{status}'
+            printf '%s' '{body}' > "$output"
+            printf '%s' '{status}'
+            exit {exit_code}
             """,
         )
 
     def run_script(self, *args):
-        env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}")
+        env = dict(
+            os.environ,
+            PATH=f"{self.bin}:{os.environ['PATH']}",
+            FASTLY_API_TOKEN="test-token",
+        )
         return subprocess.run(
             [str(SCRIPT), *args],
             env=env,
@@ -89,113 +85,128 @@ class PurgeErasedEdgeCopiesTests(unittest.TestCase):
             check=False,
         )
 
-    def fastly_calls(self):
-        if not self.fastly_log.exists():
-            return []
-        return self.fastly_log.read_text().splitlines()
-
     def curl_calls(self):
         if not self.curl_log.exists():
             return []
         return self.curl_log.read_text().splitlines()
 
-    def test_purges_and_probes_every_enumerable_url_form(self):
-        result = self.run_script("--hash-file", str(self.hash_file))
+    def sleep_calls(self):
+        if not self.sleep_log.exists():
+            return []
+        return self.sleep_log.read_text().splitlines()
+
+    def test_purges_each_exact_address_with_purge_method_and_rate_limit(self):
+        result = self.run_script("--address-file", str(self.address_file))
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        expected = []
-        for content_hash in (HASH_A, HASH_B.lower()):
-            for suffix in URL_SUFFIXES:
-                expected.append(
-                    f"purge --url https://media.divine.video/{content_hash}{suffix}"
-                )
-        self.assertEqual(self.fastly_calls(), expected)
-        for call in self.fastly_calls():
-            self.assertNotIn("--all", call)
-            self.assertNotIn("--key", call)
-
-        probes = self.curl_calls()
-        self.assertEqual(len(probes), 2 * len(URL_SUFFIXES))
+        calls = self.curl_calls()
+        self.assertEqual(len(calls), len(ADDRESSES))
         expected_urls = {
-            f"https://media.divine.video/{content_hash}{suffix}"
-            for content_hash in (HASH_A, HASH_B.lower())
-            for suffix in URL_SUFFIXES
+            f"https://media.divine.video/{address.lstrip('/')}"
+            for address in ADDRESSES
         }
+        self.assertEqual({call.rsplit(" ", 1)[-1] for call in calls}, expected_urls)
+        self.assertTrue(all("--request PURGE" in call for call in calls))
+        self.assertTrue(all("--config" in call for call in calls))
+        self.assertTrue(all("--globoff" in call for call in calls))
+        self.assertTrue(all("--max-time 20" in call for call in calls))
+        self.assertTrue(all("test-token" not in call for call in calls))
+        self.assertEqual(self.sleep_calls(), ["0.084"] * len(ADDRESSES))
+        self.assertIn("rate_limit=12/s", result.stdout)
+        self.assertIn(f"purged={len(ADDRESSES)} failures=0", result.stdout)
         self.assertEqual(
-            {call.rsplit(" ", 1)[-1] for call in probes}, expected_urls
+            result.stdout.count("purge_id=purge-receipt-1"), len(ADDRESSES)
         )
-        self.assertTrue(all("--max-time 20" in call for call in probes))
-        self.assertIn("purge_failures=0 probe_failures=0", result.stdout)
-        self.assertIn("one POP", result.stdout)
         self.assertNotIn(HASH_A[:12], result.stdout)
 
-    def test_probe_that_still_serves_content_fails_the_run(self):
-        self.install_curl("200")
+    def test_non_ok_body_fails_fast_without_purging_later_addresses(self):
+        self.install_curl(
+            status="200", body='{"status": "error", "id": "purge-receipt-1"}'
+        )
 
-        result = self.run_script("--hash-file", str(self.hash_file))
+        result = self.run_script("--address-file", str(self.address_file))
 
         self.assertEqual(result.returncode, 1)
-        self.assertIn("PROBE FAIL url form 'bare' status=200", result.stdout)
-        self.assertIn(f"probe_failures={2 * len(URL_SUFFIXES)}", result.stdout)
+        self.assertEqual(len(self.curl_calls()), 1)
+        self.assertEqual(self.sleep_calls(), [])
+        self.assertIn("unexpected response status=200", result.stderr)
 
-    def test_dry_run_issues_no_purge_and_no_probe(self):
-        result = self.run_script("--hash-file", str(self.hash_file), "--dry-run")
+    def test_non_200_response_fails_fast(self):
+        self.install_curl(
+            status="503", body='{"status": "ok", "id": "purge-receipt-1"}'
+        )
 
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.fastly_calls(), [])
-        self.assertEqual(self.curl_calls(), [])
-        self.assertIn("would purge", result.stdout)
+        result = self.run_script("--address-file", str(self.address_file))
 
-    def test_probe_only_skips_purging(self):
-        result = self.run_script("--hash-file", str(self.hash_file), "--probe-only")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(len(self.curl_calls()), 1)
 
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.fastly_calls(), [])
-        self.assertEqual(len(self.curl_calls()), 2 * len(URL_SUFFIXES))
+    def test_curl_error_fails_fast(self):
+        self.install_curl(status="000", body="", exit_code=28)
 
-    def test_dry_run_and_probe_only_are_rejected_together(self):
+        result = self.run_script("--address-file", str(self.address_file))
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(len(self.curl_calls()), 1)
+        self.assertIn("request error", result.stderr)
+
+    def test_missing_purge_id_fails_fast(self):
+        self.install_curl(status="200", body='{"status": "ok"}')
+
+        result = self.run_script("--address-file", str(self.address_file))
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(len(self.curl_calls()), 1)
+        self.assertIn("omitted purge id", result.stderr)
+
+    def test_dry_run_issues_no_requests(self):
         result = self.run_script(
-            "--hash-file", str(self.hash_file), "--dry-run", "--probe-only"
-        )
-
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("cannot be combined", result.stderr)
-        self.assertEqual(self.fastly_calls(), [])
-        self.assertEqual(self.curl_calls(), [])
-
-    def test_domain_override_applies_to_purge_and_probe(self):
-        result = self.run_script(
-            "--hash-file", str(self.hash_file), "--domain", "staging.example.test"
+            "--address-file", str(self.address_file), "--dry-run"
         )
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertTrue(
-            all("https://staging.example.test/" in call for call in self.fastly_calls())
+        self.assertEqual(self.curl_calls(), [])
+        self.assertEqual(self.sleep_calls(), [])
+        self.assertEqual(result.stdout.count("would purge address"), len(ADDRESSES))
+
+    def test_domain_override_applies_to_each_request(self):
+        result = self.run_script(
+            "--address-file",
+            str(self.address_file),
+            "--domain",
+            "staging.example.test",
         )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(
             all("https://staging.example.test/" in call for call in self.curl_calls())
         )
 
-    def test_malformed_hash_line_stops_before_any_purge(self):
-        self.hash_file.write_text(f"{HASH_A}\nnot-a-hash\n")
+    def test_malformed_address_stops_before_any_request(self):
+        self.address_file.write_text(f"{HASH_A}\nhttps://example.test/{HASH_B}\n")
 
-        result = self.run_script("--hash-file", str(self.hash_file))
+        result = self.run_script("--address-file", str(self.address_file))
 
         self.assertEqual(result.returncode, 2)
         self.assertIn("line 2", result.stderr)
-        self.assertEqual(self.fastly_calls(), [])
+        self.assertEqual(self.curl_calls(), [])
 
-    def test_hashes_never_come_from_the_command_line(self):
+    def test_addresses_never_come_from_the_command_line(self):
         result = self.run_script(HASH_A)
 
         self.assertEqual(result.returncode, 2)
-        self.assertEqual(self.fastly_calls(), [])
+        self.assertEqual(self.curl_calls(), [])
 
-    def test_runbook_describes_script_and_probe_limit(self):
-        runbook = (ROOT / "docs" / "runbooks" / "erased-media-edge-cleanup.md").read_text()
+    def test_runbook_describes_exact_addresses_and_purge_contract(self):
+        runbook = (
+            ROOT / "docs" / "runbooks" / "erased-media-edge-cleanup.md"
+        ).read_text()
 
-        self.assertIn("scripts/purge-erased-edge-copies.sh", runbook)
-        self.assertIn("one POP", runbook)
+        self.assertIn("--address-file", runbook)
+        self.assertIn("`PURGE` method", runbook)
+        self.assertIn('`{"status": "ok"}`', runbook)
+        self.assertIn("purge ID", runbook)
+        self.assertIn("12 requests per second", runbook)
 
 
 if __name__ == "__main__":

@@ -1,67 +1,38 @@
 #!/usr/bin/env bash
 # ABOUTME: One-time cleanup for erased media that edge POPs stored without a Surrogate-Key
-# ABOUTME: Purges and probes each hash's enumerable public URL forms by URL
+# ABOUTME: Purges an exact private address list with rate-limited PURGE requests
 #
 # Usage:
-#   envchain fastly-global scripts/purge-erased-edge-copies.sh --hash-file <path> [--domain <host>] [--dry-run] [--probe-only]
+#   envchain fastly-global scripts/purge-erased-edge-copies.sh --address-file <path> [--domain <host>] [--dry-run]
 #
-# Reads one 64-hex content hash per line from --hash-file. Blank lines and
-# lines starting with # are ignored. Never pass hashes on the command line,
-# commit the file, or paste its contents into an issue; see
+# Reads one exact URL path per line from --address-file. Blank lines and lines
+# starting with # are ignored. Never pass addresses on the command line, commit
+# the file, or paste its contents into an issue; see
 # docs/runbooks/erased-media-edge-cleanup.md.
-#
-# For each hash every enumerable public form below is purged by URL. A URL purge
-# reaches every POP, including copies that were stored without a Surrogate-Key
-# before the guarded vcl/deliver.vcl was activated (#279). A purge by key
-# cannot reach those copies, which is why this script exists.
-#
-# After purging, every form is fetched once and must return 404. Those probes
-# see only the POP that answers this machine; copies held by other POPs are not
-# observable from here.
 set -euo pipefail
 
 DOMAIN="media.divine.video"
-HASH_FILE=""
+ADDRESS_FILE=""
 DRY_RUN=0
-PROBE_ONLY=0
-URL_SUFFIXES=(
-  ""
-  ".mp4"
-  ".jpg"
-  "/720p"
-  "/480p"
-  "/720p.mp4"
-  "/480p.mp4"
-  ".hls"
-  "/hls/master.m3u8"
-  "/hls/stream_720p.m3u8"
-  "/hls/stream_480p.m3u8"
-  "/hls/stream_720p.ts"
-  "/hls/stream_480p.ts"
-  "/hls/stream_720p.mp4"
-  "/hls/stream_480p.mp4"
-  ".vtt"
-  "/vtt"
-  ".audio.m4a"
-)
+REQUEST_DELAY="0.084"
 
 usage() {
   cat <<'USAGE'
-Usage: envchain fastly-global scripts/purge-erased-edge-copies.sh --hash-file <path> [--domain <host>] [--dry-run] [--probe-only]
+Usage: envchain fastly-global scripts/purge-erased-edge-copies.sh --address-file <path> [--domain <host>] [--dry-run]
 
-Reads one 64-hex content hash per line from --hash-file (blank lines and
-# comments ignored). Never pass hashes on the command line. For each hash the
-enumerable public URL forms are purged by URL, then each form is fetched once
-and must return 404. The probes see one POP only.
+Reads one exact URL path per line from --address-file (blank lines and comments
+ignored). Paths may have one leading slash and must begin with a 64-hex content
+hash. Never pass addresses on the command line. Each address is purged with the
+PURGE method at no more than 12 requests per second.
 See docs/runbooks/erased-media-edge-cleanup.md.
 USAGE
 }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --hash-file)
-      [ $# -ge 2 ] || { echo "error: --hash-file needs a path" >&2; exit 2; }
-      HASH_FILE="$2"
+    --address-file)
+      [ $# -ge 2 ] || { echo "error: --address-file needs a path" >&2; exit 2; }
+      ADDRESS_FILE="$2"
       shift 2
       ;;
     --domain)
@@ -71,10 +42,6 @@ while [ $# -gt 0 ]; do
       ;;
     --dry-run)
       DRY_RUN=1
-      shift
-      ;;
-    --probe-only)
-      PROBE_ONLY=1
       shift
       ;;
     -h|--help)
@@ -89,90 +56,90 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if [ -z "$HASH_FILE" ]; then
-  echo "error: --hash-file is required" >&2
+if [ -z "$ADDRESS_FILE" ]; then
+  echo "error: --address-file is required" >&2
   usage >&2
   exit 2
 fi
-if [ ! -r "$HASH_FILE" ]; then
-  echo "error: cannot read hash file" >&2
+if [ ! -r "$ADDRESS_FILE" ]; then
+  echo "error: cannot read address file" >&2
   exit 2
 fi
-if [ "$DRY_RUN" -eq 1 ] && [ "$PROBE_ONLY" -eq 1 ]; then
-  echo "error: --dry-run and --probe-only cannot be combined" >&2
+if ! [[ "$DOMAIN" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; then
+  echo "error: --domain must be a host name with an optional port" >&2
   exit 2
 fi
 
-HASHES=()
+ADDRESSES=()
 line_no=0
 while IFS= read -r raw || [ -n "$raw" ]; do
   line_no=$((line_no + 1))
-  line="${raw//[[:space:]]/}"
-  case "$line" in
+  address="${raw#/}"
+  case "$address" in
     ""|"#"*) continue ;;
   esac
-  if ! [[ "$line" =~ ^[0-9a-fA-F]{64}$ ]]; then
-    echo "error: line $line_no is not a 64-hex content hash" >&2
+  if ! [[ "$address" =~ ^[0-9a-fA-F]{64}($|[./]) ]] \
+    || [[ "$address" =~ [[:space:]] ]] \
+    || [[ "$address" == *"?"* ]] \
+    || [[ "$address" == *"#"* ]]; then
+    echo "error: line $line_no is not a safe erased-media address" >&2
     exit 2
   fi
-  HASHES+=("$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')")
-done < "$HASH_FILE"
+  ADDRESSES+=("$address")
+done < "$ADDRESS_FILE"
 
-if [ "${#HASHES[@]}" -eq 0 ]; then
-  echo "error: hash file holds no hashes" >&2
+if [ "${#ADDRESSES[@]}" -eq 0 ]; then
+  echo "error: address file holds no addresses" >&2
+  exit 2
+fi
+if [ "$DRY_RUN" -eq 0 ] && [ -z "${FASTLY_API_TOKEN:-}" ]; then
+  echo "error: FASTLY_API_TOKEN is required (run through envchain fastly-global)" >&2
+  exit 2
+fi
+if [ "$DRY_RUN" -eq 0 ] && ! command -v jq >/dev/null 2>&1; then
+  echo "error: jq is required to validate purge receipts" >&2
   exit 2
 fi
 
-PURGE_FAIL=0
-PROBE_FAIL=0
-HEADERS_TMP=$(mktemp "${TMPDIR:-/tmp}/purge-erased-edge-copies.XXXXXX")
-trap 'rm -f "$HEADERS_TMP"' EXIT
+umask 077
+BODY_TMP=$(mktemp "${TMPDIR:-/tmp}/purge-erased-edge-copies.XXXXXX")
+CURL_CONFIG_TMP=$(mktemp "${TMPDIR:-/tmp}/purge-erased-edge-curl.XXXXXX")
+trap 'rm -f "$BODY_TMP" "$CURL_CONFIG_TMP"' EXIT
+if [ "$DRY_RUN" -eq 0 ]; then
+  printf 'header = "Fastly-Key: %s"\n' "$FASTLY_API_TOKEN" > "$CURL_CONFIG_TMP"
+fi
 
-echo "hashes=${#HASHES[@]} domain=${DOMAIN} dry_run=${DRY_RUN} probe_only=${PROBE_ONLY}"
+echo "addresses=${#ADDRESSES[@]} domain=${DOMAIN} dry_run=${DRY_RUN} rate_limit=12/s"
 
 index=0
-for hash in "${HASHES[@]}"; do
+for address in "${ADDRESSES[@]}"; do
   index=$((index + 1))
-  label="${index}/${#HASHES[@]}"
-
-  if [ "$PROBE_ONLY" -eq 0 ]; then
-    for suffix in "${URL_SUFFIXES[@]}"; do
-      url="https://${DOMAIN}/${hash}${suffix}"
-      if [ "$DRY_RUN" -eq 1 ]; then
-        echo "[$label] would purge url form '${suffix:-bare}'"
-        continue
-      fi
-      if fastly purge --url "$url" >/dev/null; then
-        echo "[$label] purged url form '${suffix:-bare}'"
-      else
-        echo "[$label] PURGE FAIL url form '${suffix:-bare}'"
-        PURGE_FAIL=$((PURGE_FAIL + 1))
-      fi
-    done
+  label="${index}/${#ADDRESSES[@]}"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "[$label] would purge address"
+    continue
   fi
 
-  for suffix in "${URL_SUFFIXES[@]}"; do
-    if [ "$DRY_RUN" -eq 1 ]; then
-      echo "[$label] would probe url form '${suffix:-bare}' and require 404"
-      continue
-    fi
+  : > "$BODY_TMP"
+  if ! status=$(curl --config "$CURL_CONFIG_TMP" --globoff --max-time 20 \
+    --silent --show-error --output "$BODY_TMP" \
+    --write-out '%{http_code}' --request PURGE \
+    "https://${DOMAIN}/${address}"); then
+    echo "[$label] PURGE FAIL request error" >&2
+    exit 1
+  fi
+  if [ "$status" != "200" ] || ! jq -e '.status == "ok"' "$BODY_TMP" >/dev/null; then
+    echo "[$label] PURGE FAIL unexpected response status=${status}" >&2
+    exit 1
+  fi
+  purge_id=$(jq -r '.id // empty' "$BODY_TMP")
+  if [ -z "$purge_id" ]; then
+    echo "[$label] PURGE FAIL response omitted purge id" >&2
+    exit 1
+  fi
 
-    : > "$HEADERS_TMP"
-    status=$(curl --max-time 20 -sS -o /dev/null -D "$HEADERS_TMP" -w '%{http_code}' \
-      "https://${DOMAIN}/${hash}${suffix}" || true)
-    [ -n "$status" ] || status="000"
-    served_by=$(grep -i '^x-served-by:' "$HEADERS_TMP" | tr -d '\r' | cut -d' ' -f2- || true)
-    if [ "$status" = "404" ]; then
-      echo "[$label] probe 404 url form '${suffix:-bare}' served_by='${served_by}'"
-    else
-      echo "[$label] PROBE FAIL url form '${suffix:-bare}' status=${status} served_by='${served_by}'"
-      PROBE_FAIL=$((PROBE_FAIL + 1))
-    fi
-  done
+  echo "[$label] purged_at=$(date -u +%Y-%m-%dT%H:%M:%SZ) purge_id=${purge_id}"
+  sleep "$REQUEST_DELAY"
 done
 
-echo "purge_failures=${PURGE_FAIL} probe_failures=${PROBE_FAIL}"
-echo "note: the probe observed one POP; other POPs' copies are not visible from here"
-if [ "$PURGE_FAIL" -gt 0 ] || [ "$PROBE_FAIL" -gt 0 ]; then
-  exit 1
-fi
+echo "purged=${#ADDRESSES[@]} failures=0"
