@@ -5,8 +5,11 @@ use google_cloud_storage::{
 };
 use serde::Serialize;
 use std::collections::BTreeSet;
+use std::time::Duration;
+use tokio::time::{timeout_at, Instant};
 
 const MAX_PREFIX_OBJECTS_PER_ATTEMPT: usize = 25;
+pub const CLEANUP_REQUEST_DEADLINE: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -20,6 +23,7 @@ pub enum CleanupStatus {
 pub struct HashCleanupResult {
     pub hash: String,
     pub status: CleanupStatus,
+    pub main_deleted_or_absent: bool,
     pub deleted: usize,
     pub absent: usize,
     pub failures: Vec<String>,
@@ -91,42 +95,79 @@ pub fn valid_hash(hash: &str) -> bool {
 }
 
 pub async fn cleanup_hash(backend: &GcsCleanupBackend<'_>, hash: &str) -> HashCleanupResult {
-    cleanup_hash_with_backend(backend, hash).await
+    cleanup_hash_before(backend, hash, Instant::now() + CLEANUP_REQUEST_DEADLINE).await
+}
+
+pub async fn cleanup_hash_before(
+    backend: &GcsCleanupBackend<'_>,
+    hash: &str,
+    deadline: Instant,
+) -> HashCleanupResult {
+    cleanup_hash_with_backend(backend, hash, deadline).await
 }
 
 async fn cleanup_hash_with_backend<B: CleanupBackend + Sync>(
     backend: &B,
     hash: &str,
+    deadline: Instant,
 ) -> HashCleanupResult {
     let prefix = format!("{hash}/");
     let mut candidates = BTreeSet::from([hash.to_string(), format!("{hash}.jpg")]);
     let mut failures = Vec::new();
 
-    match backend
-        .list_prefix(&prefix, MAX_PREFIX_OBJECTS_PER_ATTEMPT)
+    if Instant::now() >= deadline {
+        failures.push("deadline exceeded while listing derivative objects".to_string());
+    } else {
+        match timeout_at(
+            deadline,
+            backend.list_prefix(&prefix, MAX_PREFIX_OBJECTS_PER_ATTEMPT),
+        )
         .await
-    {
-        Ok(objects) => candidates.extend(objects),
-        Err(error) => failures.push(error),
+        {
+            Err(_) => {
+                failures.push("deadline exceeded while listing derivative objects".to_string())
+            }
+            Ok(result) => match result {
+                Ok(objects) => candidates.extend(objects),
+                Err(error) => failures.push(error),
+            },
+        }
     }
 
     let mut deleted = 0;
     let mut absent = 0;
+    let mut main_deleted_or_absent = false;
     for object in candidates {
-        match backend.delete_object(&object).await {
-            Ok(DeleteOutcome::Deleted) => deleted += 1,
-            Ok(DeleteOutcome::Absent) => absent += 1,
-            Err(error) => failures.push(format!("{object}: {error}")),
+        if Instant::now() >= deadline {
+            failures.push(format!("{object}: cleanup deadline exceeded"));
+            continue;
+        }
+        match timeout_at(deadline, backend.delete_object(&object)).await {
+            Err(_) => failures.push(format!("{object}: cleanup deadline exceeded")),
+            Ok(Ok(DeleteOutcome::Deleted)) => {
+                deleted += 1;
+                main_deleted_or_absent |= object == hash;
+            }
+            Ok(Ok(DeleteOutcome::Absent)) => {
+                absent += 1;
+                main_deleted_or_absent |= object == hash;
+            }
+            Ok(Err(error)) => failures.push(format!("{object}: {error}")),
         }
     }
 
-    match backend.list_prefix(&prefix, 1).await {
-        Ok(remaining) => failures.extend(
-            remaining
-                .into_iter()
-                .map(|object| format!("{object}: remained after cleanup")),
-        ),
-        Err(error) => failures.push(format!("verification {error}")),
+    if Instant::now() >= deadline {
+        failures.push("cleanup deadline exceeded during verification".to_string());
+    } else {
+        match timeout_at(deadline, backend.list_prefix(&prefix, 1)).await {
+            Err(_) => failures.push("cleanup deadline exceeded during verification".to_string()),
+            Ok(Ok(remaining)) => failures.extend(
+                remaining
+                    .into_iter()
+                    .map(|object| format!("{object}: remained after cleanup")),
+            ),
+            Ok(Err(error)) => failures.push(format!("verification {error}")),
+        }
     }
 
     HashCleanupResult {
@@ -136,6 +177,7 @@ async fn cleanup_hash_with_backend<B: CleanupBackend + Sync>(
         } else {
             CleanupStatus::Retryable
         },
+        main_deleted_or_absent,
         deleted,
         absent,
         failures,
@@ -152,6 +194,7 @@ mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
         sync::Mutex,
+        time::Duration,
     };
 
     #[derive(Default)]
@@ -194,9 +237,15 @@ mod tests {
 
     #[tokio::test]
     async fn missing_objects_are_confirmed_absent() {
-        let result = cleanup_hash_with_backend(&FakeBackend::default(), HASH_A).await;
+        let result = cleanup_hash_with_backend(
+            &FakeBackend::default(),
+            HASH_A,
+            Instant::now() + CLEANUP_REQUEST_DEADLINE,
+        )
+        .await;
 
         assert_eq!(result.status, CleanupStatus::Completed);
+        assert!(result.main_deleted_or_absent);
         assert_eq!(result.deleted, 0);
         assert_eq!(result.absent, 2);
         assert!(result.failures.is_empty());
@@ -217,10 +266,15 @@ mod tests {
             .expect("failures lock")
             .insert(object, 1);
 
-        let first = cleanup_hash_with_backend(&backend, HASH_A).await;
-        let retry = cleanup_hash_with_backend(&backend, HASH_A).await;
+        let first =
+            cleanup_hash_with_backend(&backend, HASH_A, Instant::now() + CLEANUP_REQUEST_DEADLINE)
+                .await;
+        let retry =
+            cleanup_hash_with_backend(&backend, HASH_A, Instant::now() + CLEANUP_REQUEST_DEADLINE)
+                .await;
 
         assert_eq!(first.status, CleanupStatus::Retryable);
+        assert!(first.main_deleted_or_absent);
         assert_eq!(retry.status, CleanupStatus::Completed);
     }
 
@@ -228,17 +282,70 @@ mod tests {
     async fn large_prefix_is_cleaned_in_bounded_retryable_slices() {
         let backend = FakeBackend::default();
         backend.objects.lock().expect("objects lock").extend(
-            (0..MAX_PREFIX_OBJECTS_PER_ATTEMPT + 1)
-                .map(|index| format!("{HASH_A}/hls/{index}.ts")),
+            (0..MAX_PREFIX_OBJECTS_PER_ATTEMPT + 1).map(|index| format!("{HASH_A}/hls/{index}.ts")),
         );
 
-        let first = cleanup_hash_with_backend(&backend, HASH_A).await;
-        let second = cleanup_hash_with_backend(&backend, HASH_A).await;
+        let first =
+            cleanup_hash_with_backend(&backend, HASH_A, Instant::now() + CLEANUP_REQUEST_DEADLINE)
+                .await;
+        let second =
+            cleanup_hash_with_backend(&backend, HASH_A, Instant::now() + CLEANUP_REQUEST_DEADLINE)
+                .await;
 
         assert_eq!(first.status, CleanupStatus::Retryable);
         assert_eq!(first.deleted, MAX_PREFIX_OBJECTS_PER_ATTEMPT);
         assert_eq!(second.status, CleanupStatus::Completed);
         assert_eq!(second.deleted, 1);
+    }
+
+    #[tokio::test]
+    async fn main_outcome_is_preserved_when_a_derivative_fails() {
+        let backend = FakeBackend::default();
+        let derivative = format!("{HASH_A}.jpg");
+        backend
+            .failures
+            .lock()
+            .expect("failures lock")
+            .insert(derivative, 1);
+
+        let result =
+            cleanup_hash_with_backend(&backend, HASH_A, Instant::now() + CLEANUP_REQUEST_DEADLINE)
+                .await;
+
+        assert_eq!(result.status, CleanupStatus::Retryable);
+        assert!(result.main_deleted_or_absent);
+    }
+
+    struct SlowBackend;
+
+    #[async_trait]
+    impl CleanupBackend for SlowBackend {
+        async fn list_prefix(&self, _prefix: &str, _limit: usize) -> Result<Vec<String>, String> {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok(Vec::new())
+        }
+
+        async fn delete_object(&self, _object: &str) -> Result<DeleteOutcome, String> {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok(DeleteOutcome::Deleted)
+        }
+    }
+
+    #[tokio::test]
+    async fn deadline_returns_a_fail_closed_per_hash_result() {
+        let result = cleanup_hash_with_backend(
+            &SlowBackend,
+            HASH_A,
+            Instant::now() + Duration::from_millis(1),
+        )
+        .await;
+
+        assert_eq!(result.status, CleanupStatus::Retryable);
+        assert!(!result.main_deleted_or_absent);
+        assert!(result
+            .failures
+            .iter()
+            .any(|failure| failure.contains("deadline exceeded")));
     }
 
     #[test]

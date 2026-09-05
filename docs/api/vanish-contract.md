@@ -35,7 +35,7 @@ Origin DELETE operations are idempotent: a 404 means that origin is already eras
 
 When any blob fails required-origin deletion, erasure-evidence persistence, or required metadata/reference cleanup, Blossom preserves that blob's account-list entry so the next request can rediscover unfinished work. Failed entries move behind untouched entries, allowing subsequent calls to advance through the bounded list before cycling back to persistent failures. Completed blobs are removed from the list individually, so a later failure elsewhere in the same account does not cause them to be processed again. Blossom does not increment `fully_deleted` or `unlinked` until that per-blob list update succeeds.
 
-Each call attempts at most 10 list entries. The edge batches the main GCS objects and FOS delivery replicas into concurrent multi-object deletes. It sends one authenticated Cloud Run request containing the source hashes and any unreferenced derived-audio hashes, up to 20 hashes total. Cloud Run handles eight hashes concurrently and deletes at most 25 prefix objects per hash in one pass. If more objects remain, that hash returns `retryable`; later edge or caller retries continue the same idempotent cleanup. One slow or unexpectedly large prefix therefore cannot make a Cloud Run request unbounded.
+Each call attempts at most 10 list entries. The edge batches only the FOS delivery replicas into multi-object deletes. It sends one authenticated Cloud Run request containing the source hashes and any unreferenced derived-audio hashes, up to 20 hashes total; Cloud Run owns all GCS deletion through Google's client. Cloud Run handles eight hashes concurrently, deletes at most 25 prefix objects per hash in one pass, and applies one 60-second deadline to the batch. If more objects remain or the deadline expires, that hash returns `retryable`; later edge or caller retries continue the same idempotent cleanup. One slow or unexpectedly large prefix therefore cannot make a Cloud Run request unbounded. Local mode has no Cloud Run dependency and retains direct MinIO cleanup.
 
 CDN invalidation uses concurrent batch surrogate-key purges as soon as both main origins confirm deletion. A derivative cleanup failure still blocks `fully_deleted` and remains retryable, but it does not leave a successfully deleted main object available from CDN cache. Failed storage hashes are retried once within the call. `errors` counts source hashes still failed after both attempts, never individual provider attempts or derived-audio hashes.
 
@@ -50,7 +50,7 @@ FOS erasure is not gated by `fos_read_enabled` or `fos_write_back_enabled`. Hist
 - Reversible moderation bans do not use this physical-erasure contract.
 - Legal `/admin/api/delete` remains a soft-delete path that may preserve evidence.
 - Erasure evidence is per valid blob. It does not record account-level completion or malformed-list exceptions; those are reported in the completion response.
-- A Cloud Run transport failure, malformed response, missing per-hash result, or non-completed per-hash result is not completion evidence.
+- A Cloud Run transport failure, malformed response, missing per-hash result, false or missing `main_deleted_or_absent`, or non-completed per-hash result is not completion evidence. A retryable per-hash result may still carry `main_deleted_or_absent: true`, allowing cache purge after the FOS main object is also confirmed deleted or absent while derivative cleanup remains retryable.
 
 ## Audit and diagnostics
 
