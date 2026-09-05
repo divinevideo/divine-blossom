@@ -134,7 +134,7 @@ Configuration is split across the Fastly config store (non-secret) and secret st
 
 ### Backends
 
-Required backend names are mirrored in `fastly.toml.example`: `gcs_storage` (GCS), `b2_api` (Backblaze Native API), `bunny_api` (delivery-zone purge API), the CDN fallback chain (`cdn_divine`, `blossom_divine`, `cdn_satellite`, `nostr_build`), `upload_service` (large-upload/resumable control plane), `moderation_api`, and `funnelcake_api`.
+Required backend names are mirrored in `fastly.toml.example`: `gcs_storage` (GCS), `b2_api` (Backblaze account authorization), `bunny_api` (delivery-zone purge API), the CDN fallback chain (`cdn_divine`, `blossom_divine`, `cdn_satellite`, `nostr_build`), `upload_service` (large-upload/resumable control plane), `moderation_api`, and `funnelcake_api`. The service must permit dynamic backends before `b2_replica_enabled` is turned on because Backblaze returns a per-account API host for version listing and deletion.
 
 ### Process-Blob (Cloud Run) environment
 

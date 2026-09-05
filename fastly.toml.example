@@ -96,7 +96,7 @@ language = "rust"
     port = 443
 
     [setup.backends.b2_api]
-    description = "Backblaze B2 Native API"
+    description = "Backblaze B2 account authorization (storage calls use dynamic backends)"
     address = "api.backblazeb2.com"
     port = 443
 
