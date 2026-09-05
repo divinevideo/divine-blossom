@@ -942,6 +942,16 @@ struct B2ErrorResponse {
 
 type B2PageCursor = Option<(String, Option<String>)>;
 
+fn advance_b2_cursor(current: &B2PageCursor, next: B2PageCursor) -> Result<B2PageCursor> {
+    if next.is_some() && next.as_ref() == current.as_ref() {
+        Err(BlossomError::StorageError(
+            "B2 version listing returned a non-advancing cursor".into(),
+        ))
+    } else {
+        Ok(next)
+    }
+}
+
 fn b2_prefix_page<'a>(
     prefix: &str,
     page: &'a B2ListFileVersionsResponse,
@@ -1295,7 +1305,7 @@ fn erase_b2_hash_versions(authorization: &B2Authorization, hash: &str) -> Result
         )?;
         let (versions, next) = b2_prefix_page(hash, &page)?;
         delete_b2_version_page(authorization, versions)?;
-        match next {
+        match advance_b2_cursor(&start, next)? {
             Some(next) => start = Some(next),
             None => break,
         }
@@ -1316,7 +1326,7 @@ fn erase_b2_hash_versions(authorization: &B2Authorization, hash: &str) -> Result
                 "B2 replica still contains versions after deletion".into(),
             ));
         }
-        match next {
+        match advance_b2_cursor(&start, next)? {
             Some(next) => start = Some(next),
             None => return Ok(()),
         }
@@ -3234,8 +3244,8 @@ pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtracti
 #[cfg(test)]
 mod tests {
     use super::{
-        audit_log_entry, b2_api_host, b2_delete_version_succeeded, b2_dynamic_backend_name,
-        b2_prefix_page, build_b2_delete_version_request,
+        advance_b2_cursor, audit_log_entry, b2_api_host, b2_delete_version_succeeded,
+        b2_dynamic_backend_name, b2_prefix_page, build_b2_delete_version_request,
         build_b2_list_versions_request, build_bunny_purge_request, build_fos_delete_request,
         build_multi_delete_request, canonical_query_string, classify_cloud_cleanup_response,
         cloud_run_delete_blob_body, cloud_run_delete_blobs_body, failed_cloud_cleanup_hashes,
@@ -3602,6 +3612,18 @@ mod tests {
         let (versions, next) = b2_prefix_page(&hash, &absent).expect("terminal page");
         assert!(versions.is_empty());
         assert!(next.is_none());
+    }
+
+    #[test]
+    fn b2_cursor_must_advance_by_name_or_version_id() {
+        let current = Some(("same-name".into(), Some("version-2".into())));
+        assert!(advance_b2_cursor(&current, current.clone()).is_err());
+        assert!(advance_b2_cursor(
+            &current,
+            Some(("same-name".into(), Some("version-1".into())))
+        )
+        .is_ok());
+        assert!(advance_b2_cursor(&current, Some(("next-name".into(), None))).is_ok());
     }
 
     #[test]
