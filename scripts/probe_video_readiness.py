@@ -247,6 +247,9 @@ def probe_once(
                 result = results.get(timeout=max(0.0, min(request_timeout, deadline - clock())))
             except queue.Empty:
                 result = FetchResult(0, network_error="request deadline expired")
+            if result.status == 0 and clock() >= deadline:
+                observation[f"{key}_error"] = "readiness deadline expired before response"
+                break
         observation[key] = result.status
         if result.network_error:
             observation[f"{key}_error"] = result.network_error
@@ -281,8 +284,8 @@ def _status(value: int | str | float | None) -> int | None:
 
 
 def _terminal_reason(observation: dict[str, int | str | float]) -> str | None:
-    # The deployed HLS master route is the canonical transcode-state sentinel.
-    # MP4 and variant-manifest HEAD routes can still return 404 for a terminal job.
+    # HLS master is the reliable sentinel, but any observed 422 is terminal,
+    # including on a non-required endpoint; --require narrows readiness only.
     for key in ENDPOINT_ORDER:
         if observation.get(key) in TERMINAL_STATUSES:
             code = str(observation.get(f"{key}_error_code") or "derivative_failed")
@@ -361,7 +364,10 @@ def _deadline_failure(
         for key in reported
     )
     exit_code = EXIT_USAGE_OR_NETWORK if has_network_error else EXIT_NOT_READY
-    return AssertionResult(exit_code, f"deadline expired; {states}", tuple(observations))
+    reason = "deadline expired"
+    if all(resolve_endpoint_state(_status(observation.get(key))) == "Ready" for key in required):
+        reason = "readiness observed after the deadline"
+    return AssertionResult(exit_code, f"{reason}; {states}", tuple(observations))
 
 
 def _format_endpoint_result(

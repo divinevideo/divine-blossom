@@ -317,7 +317,8 @@ class VideoReadinessProbeTests(unittest.TestCase):
                 start = time.monotonic()
                 result = module.assert_readiness(urls, deadline_seconds=0.1)
                 elapsed = time.monotonic() - start
-            self.assertEqual(result.exit_code, module.EXIT_USAGE_OR_NETWORK)
+            self.assertEqual(result.exit_code, module.EXIT_NOT_READY)
+            self.assertNotIn("NetworkError", result.reason)
             self.assertLess(elapsed, 1)
         finally:
             release.set()
@@ -332,6 +333,27 @@ class VideoReadinessProbeTests(unittest.TestCase):
             clock=clock, sleep=clock.sleep,
         )
         self.assertEqual(result.exit_code, module.EXIT_NOT_READY)
+        self.assertIn("readiness observed after the deadline", result.reason)
+
+    def test_terminal_on_nonrequired_endpoint_overrides_readiness(self):
+        module = load_script_module(self)
+        clock = FakeClock()
+        result = module.assert_readiness(
+            {}, required_endpoints=("mp4_720", "hls_master"),
+            probe=sequence_probe(clock, [observation(200, 200, 422)]),
+            clock=clock, sleep=clock.sleep,
+        )
+        self.assertEqual(result.exit_code, module.EXIT_TERMINAL)
+
+    def test_request_timeout_before_global_deadline_remains_network_error(self):
+        module = load_script_module(self)
+        clock = FakeClock()
+        urls = {key: f"https://example.test/{key}" for key in module.ENDPOINT_ORDER}
+        with mock.patch.object(module, "fetch_endpoint", return_value=module.FetchResult(
+            0, network_error="TimeoutError"
+        )):
+            observed = module.probe_once(urls, deadline=10, timeout_seconds=1, clock=clock)
+        self.assertEqual(module.resolve_endpoint_state(observed["hls_master"]), "NetworkError")
 
     def test_nonfinite_timings_are_usage_errors(self):
         module = load_script_module(self)

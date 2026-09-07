@@ -40,13 +40,17 @@ python3 scripts/probe_video_readiness.py \
 ```
 
 The authorization value is accepted only in assertion mode and is never
-printed. Do not store it in source, shell history, fixtures, logs, or PR output.
+printed to stdout. As a command-line argument it is visible to local process
+inspection; use this interface only where that exposure is acceptable.
+Do not store it in source, shell history, fixtures, logs, or PR output.
 Follow the precomputed-header convention used by `debug_upload_harness.py`.
 
 Use `--require` to narrow the pass condition, for example
 `--require mp4_720 hls_master`. The probe always checks the HLS master because
 it is the deployed terminal-state sentinel: MP4 and variant-manifest routes can
 still return 404 after a terminal transcode.
+Any observed 422 overrides readiness, even on an endpoint excluded by `--require`.
+This option narrows the positive pass condition, not terminal-failure detection.
 
 ## Exit contract
 
@@ -55,7 +59,7 @@ still return 404 after a terminal transcode.
 | 0 | Every required endpoint became ready. |
 | 1 | Readiness was not reached before the deadline. |
 | 2 | An endpoint reported terminal derivative failure. |
-| 3 | Invalid usage, or the deadline ended with a required endpoint in network error. |
+| 3 | Invalid usage, or the last response from a required endpoint or HLS sentinel was a network error before the overall deadline. |
 
 The last observation reports `Ready`, `Pending`, `Terminal`, `Unavailable`,
 `Blocked`, `NetworkError`, or `Unknown` for each required endpoint. Public edge
@@ -67,8 +71,10 @@ Each request wait and sleep is capped to the remaining wall-clock budget,
 including DNS, redirects, and error-body reads. An in-flight read can finish in a
 daemon thread after its wait expires; it cannot delay the assertion's return or
 process exit. Timing arguments must be finite.
-The assertion stops immediately when all required endpoints are ready or the
+Exhausting the overall budget before a response is exit 1, not a network error.
+The assertion stops when all required endpoints are ready before the deadline or the
 first endpoint reports 422. It checks the HLS master first in assertion mode.
+If readiness is observed too late, the reason explicitly says so and exits 1.
 
 ## Production validation
 
@@ -87,3 +93,5 @@ moov-stripped fixture remained `202/202/404` through a 180-second assertion and
 a separate 60-second assertion at one-second cadence, so production did not
 surface the expected terminal state. That is evidence about the deployed
 failure pipeline, not a reason to weaken this assertion's first-422 contract.
+TODO(#283): complete the controlled terminal-failure acceptance against the
+deployed pipeline. That issue remains open until this production check succeeds.
