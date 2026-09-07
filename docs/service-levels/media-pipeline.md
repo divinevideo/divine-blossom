@@ -174,6 +174,12 @@ failure signals. The MP4 and variant-manifest HEAD endpoints can return `404`
 while processing; that status alone does not distinguish pending, missing, or
 terminally failed media. Issue #283 must define how it correlates these results
 with the master response and derivative status before asserting terminal failure.
+HLS can also complete with only transport-stream media when MP4 remuxing fails:
+a healthy master and non-terminal complete status do not prove MP4 readiness
+or that MP4 processing is still underway. Classify a missing MP4 in that state
+as a separate incomplete-derivative outcome; HEAD polling does not initiate
+the GET-only MP4 backfill. It remains a progressive readiness failure if the
+observation window expires without the MP4 completion boundary being reached.
 A confirmed terminal derivative failure must fail acceptance immediately;
 pending or unresolved readiness may be polled only inside the agreed observation
 window. Do not silently switch to GET: it can initiate on-demand transcoding
