@@ -42,7 +42,7 @@ issue assignment is not sign-off.
 | Event publish acknowledgement | Client sends the already-signed kind-34236 event to the required relay | The required relay returns a positive Nostr `OK` acknowledgement for the event id | `wss://relay.divine.video` publish | `divine-funnelcake` | Unconfirmed | Unset — cross-repository indicator and sign-off required |
 | Relay indexing and query visibility | Positive publish acknowledgement is received | A new relay subscription for the exact synthetic event coordinate returns the expected event | `wss://relay.divine.video` `REQ` against Funnelcake Relay and ClickHouse | `divine-funnelcake` | Unconfirmed | Unset — cross-repository instrumentation and sign-off required |
 | Canonical REST read-back | Positive publish acknowledgement is received | The canonical REST API returns the expected event for the exact synthetic coordinate | `https://api.divine.video` through `divine-router` to `funnelcake-api` and ClickHouse | `divine-router` and `divine-funnelcake` | Unconfirmed | Unset — cross-repository instrumentation and sign-off required |
-| Warm media response | Request headers are completely written on an established connection after warmup | Response headers arrive and prove a cache hit | Anonymous and credentialed bare-blob and derivative paths on `https://media.divine.video` | `divine-blossom` / platform | Unconfirmed | Unset — current evidence is a baseline, not an objective |
+| Warm media response | Client begins writing the request on an established connection after warmup | Response headers arrive and prove a cache hit | Anonymous and credentialed bare-blob and derivative paths on `https://media.divine.video` | `divine-blossom` / platform | Unconfirmed | Unset — current evidence is a baseline, not an objective |
 | Cold media response | Request headers are completely written after targeted invalidation proves the synthetic object cold | Response headers arrive; full-body completion is recorded separately | Anonymous and credentialed bare-blob and derivative paths on `https://media.divine.video` | `divine-blossom` / platform | Unconfirmed | Unset — pending #217 US run and sign-off |
 | Media delivery throughput | First response byte arrives | The complete response body arrives | Same routes and cache states as the response-latency rows | `divine-blossom` / platform | Unconfirmed | Unset — representative client-network evidence and sign-off required |
 
@@ -153,8 +153,15 @@ origin-log correlation before resumable end-to-end objectives can be set.
 ### Progressive and HLS readiness
 
 Use [`scripts/probe_video_readiness.py`](../../scripts/probe_video_readiness.py).
-It records elapsed seconds for `720p.mp4`, the HLS master, and the 720p variant
-manifest independently. A terminal derivative failure must fail the eventual
+It records separate statuses for `720p.mp4`, the HLS master, and the 720p variant
+manifest, but one elapsed time per polling round, measured from probe startup
+after all three sequential requests finish. It does not measure the
+upload-completion-to-readiness durations defined above. Issue #283 must retain
+the upload completion timestamp and timestamp each endpoint result separately;
+report the polling interval and request duration as observation uncertainty.
+HLS completion requires both manifests to be ready, not merely the probe's
+classification that either HLS endpoint was ready first.
+A terminal derivative failure must fail the eventual
 acceptance check immediately; pending `202` responses may be retried only
 inside the agreed observation window. Issue #283 owns the assertion mode and
 representative production evidence.
@@ -177,7 +184,11 @@ separate Keycast-owned indicator with its own start and completion boundaries.
 Use [`scripts/probe_cdn_delivery.py`](../../scripts/probe_cdn_delivery.py).
 Its default warmup requests are unmeasured. It reports DNS/TCP/TLS connection
 setup separately from time to response headers on an established connection,
-then reports full-response throughput. Candidate comparison failures require
+then reports full-response throughput. Its response timer starts before the
+request write, and its throughput denominator includes that write and the wait
+for headers, not just body transfer. Do not use this aggregate as the
+first-byte-to-body-completion throughput indicator in the table; that indicator
+needs separate boundary timestamps before sign-off. Candidate comparison failures require
 both the configured relative regression and the default 10 ms absolute floor;
 request errors bypass that floor.
 
