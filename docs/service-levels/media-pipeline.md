@@ -35,7 +35,7 @@ issue assignment is not sign-off.
 
 | Stage | Start boundary | Completion boundary | Representative request path | Owning repository or team | Named approver | Objective status |
 | --- | --- | --- | --- | --- | --- | --- |
-| Direct upload completion | Client begins the authenticated `PUT /upload` request | Client receives the successful Blossom descriptor after the body is accepted, stored, and the transcode request is initiated | `PUT https://media.divine.video/upload` through Fastly to the upload service | `divine-blossom` / platform | Unconfirmed | Unset — production distribution and owner sign-off required |
+| Direct upload completion | Client begins the authenticated `PUT /upload` request | Client receives the successful Blossom descriptor after the body is accepted and stored; asynchronous transcode dispatch is not confirmed by this response | `PUT https://media.divine.video/upload` through Fastly to the upload service | `divine-blossom` / platform | Unconfirmed | Unset — production distribution and owner sign-off required |
 | Resumable upload completion | Client begins `POST /upload/init` | Client receives a successful response from `POST /upload/<session-id>/complete` after all origin chunks have been committed | Control requests through Fastly; chunk appends directly to `upload.divine.video`; completion through Fastly | `divine-blossom` / platform | Unconfirmed | Unset — origin correlation for chunk appends is missing |
 | Progressive readiness | Successful upload completion is observed | `HEAD /<hash>/720p.mp4` first returns `200` or `206` | Fastly media route backed by the deployed transcoder | `divine-blossom` / platform | Unconfirmed | Unset — pending #283 representative run and sign-off |
 | HLS readiness | Successful upload completion is observed | Both `HEAD /<hash>.hls` and `HEAD /<hash>/hls/stream_720p.m3u8` first return `200` or `206` | Fastly media routes backed by the deployed transcoder | `divine-blossom` / platform | Unconfirmed | Unset — pending #283 representative run and sign-off |
@@ -150,6 +150,13 @@ Edge logs cover direct uploads and resumable control requests. Resumable chunk
 appends go from the client to `upload.divine.video` and therefore require
 origin-log correlation before resumable end-to-end objectives can be set.
 
+For both upload flows, derivative dispatch is asynchronous and can fail after
+storage succeeds. The descriptor is not proof that a transcode job was accepted.
+Keep dispatch delay and failure inside the upload-to-readiness measurement:
+an eligible upload that never becomes ready remains a readiness failure, not
+an exclusion. Record dispatch outcome as a separate internal indicator when
+available to distinguish dispatch failures from processing failures.
+
 ### Progressive and HLS readiness
 
 Use [`scripts/probe_video_readiness.py`](../../scripts/probe_video_readiness.py).
@@ -161,9 +168,16 @@ the upload completion timestamp and timestamp each endpoint result separately;
 report the polling interval and request duration as observation uncertainty.
 HLS completion requires both manifests to be ready, not merely the probe's
 classification that either HLS endpoint was ready first.
-A terminal derivative failure must fail the eventual
-acceptance check immediately; pending `202` responses may be retried only
-inside the agreed observation window. Issue #283 owns the assertion mode and
+
+Use the HLS master HEAD response for the existing pending `202` and terminal
+failure signals. The MP4 and variant-manifest HEAD endpoints can return `404`
+while processing; that status alone does not distinguish pending, missing, or
+terminally failed media. Issue #283 must define how it correlates these results
+with the master response and derivative status before asserting terminal failure.
+A confirmed terminal derivative failure must fail acceptance immediately;
+pending or unresolved readiness may be polled only inside the agreed observation
+window. Do not silently switch to GET: it can initiate on-demand transcoding
+and would measure a different path. Issue #283 owns the assertion mode and
 representative production evidence.
 
 ### Publish, indexing, and REST visibility
@@ -195,7 +209,10 @@ request errors bypass that floor.
 The current observed US cache-hit baseline is **13 ms established-connection
 response latency** from a GCE `us-central1` vantage point, with Fastly connection
 setup measured separately at 29 ms. The run used warm objects and datacenter
-networking, so it is optimistic and is not an objective. The earlier 49 ms p50 /
+networking, so it is optimistic and is not an objective. The probe aggregates
+per edge rather than per path and sends anonymous requests; this baseline does
+not satisfy the route and authentication segmentation required for sign-off.
+The earlier 49 ms p50 /
 53 ms p95 values included a fresh TLS handshake per request and are superseded.
 
 ### Cold delivery
@@ -206,6 +223,13 @@ uses targeted surrogate-key invalidation of fresh synthetic objects, covers
 anonymous and ephemeral-credential paths, and correlates client results with
 privacy-safe phase diagnostics: FOS lookup, GCS fetch, body buffering, and
 write-back. Never globally purge the cache to collect a baseline.
+
+The current script emits curl `time_starttransfer` and `time_total`, measured
+from transfer start including connection setup and the request write. It does
+not isolate the cold response boundary in the table or emit separate setup
+timings. Before sign-off, #217 needs instrumentation that records those
+boundaries separately; do not compare its raw time-to-first-byte value directly
+with the established-connection warm baseline.
 
 The Christchurch baseline recorded six successful anonymous bare-blob fills
 with a median of 1.744 seconds and a range of 0.757–5.836 seconds. It did not
@@ -221,7 +245,11 @@ does not establish which pipeline stage consumed the time.
 ## Existing sampling control
 
 `blossom-core/src/request_diagnostics.rs` persists successful bare-blob
-diagnostics at or above `SLOW_BLOB_THRESHOLD_MS = 750`. This value controls
+requests with phase diagnostics at or above `SLOW_BLOB_THRESHOLD_MS = 750`.
+Marked cold fills with phase diagnostics can also be recorded below that value
+when the default-off probe flag is enabled, as described in the
+[cold-fill runbook](../runbooks/cold-fill-validation.md#diagnostic-interpretation).
+This value controls
 diagnostic sampling only. It is not an agreed latency objective, alert
 threshold, or evidence that a 749 ms response is acceptable.
 
