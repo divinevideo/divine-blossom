@@ -1,6 +1,8 @@
 import importlib.util
 import io
 import sys
+import threading
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -278,6 +280,89 @@ class VideoReadinessProbeTests(unittest.TestCase):
     def test_unknown_status_is_reported_explicitly(self):
         module = load_script_module(self)
         self.assertEqual(module.resolve_endpoint_state(500), "Unknown")
+
+    def test_assertion_stops_requests_on_first_terminal_response(self):
+        module = load_script_module(self)
+        urls = {key: f"https://example.test/{key}" for key in module.ENDPOINT_ORDER}
+        for terminal_key in ("hls_master", "mp4_720"):
+            with self.subTest(terminal_key=terminal_key):
+                calls = []
+
+                def fetch(url, *_args):
+                    key = url.rsplit("/", 1)[1]
+                    calls.append(key)
+                    return module.FetchResult(422 if key == terminal_key else 200)
+
+                with mock.patch.object(module, "fetch_endpoint", side_effect=fetch):
+                    result = module.assert_readiness(urls)
+                self.assertEqual(result.exit_code, module.EXIT_TERMINAL)
+                self.assertEqual(calls[-1], terminal_key)
+                self.assertNotIn("hls_variant_manifest", calls)
+
+    def test_assertion_bounds_blocked_io_by_wall_clock(self):
+        module = load_script_module(self)
+        release = threading.Event()
+        finished = threading.Event()
+
+        def blocked_fetch(*_args):
+            try:
+                release.wait(5)
+                return module.FetchResult(200)
+            finally:
+                finished.set()
+
+        urls = {key: f"https://example.test/{key}" for key in module.ENDPOINT_ORDER}
+        try:
+            with mock.patch.object(module, "fetch_endpoint", side_effect=blocked_fetch):
+                start = time.monotonic()
+                result = module.assert_readiness(urls, deadline_seconds=0.1)
+                elapsed = time.monotonic() - start
+            self.assertEqual(result.exit_code, module.EXIT_USAGE_OR_NETWORK)
+            self.assertLess(elapsed, 1)
+        finally:
+            release.set()
+            self.assertTrue(finished.wait(1))
+
+    def test_late_ready_response_does_not_pass(self):
+        module = load_script_module(self)
+        clock = FakeClock()
+        result = module.assert_readiness(
+            {}, deadline_seconds=1,
+            probe=sequence_probe(clock, [observation(200, 200, 200)], duration=2),
+            clock=clock, sleep=clock.sleep,
+        )
+        self.assertEqual(result.exit_code, module.EXIT_NOT_READY)
+
+    def test_nonfinite_timings_are_usage_errors(self):
+        module = load_script_module(self)
+        for name in ("deadline_seconds", "timeout_seconds", "interval_seconds"):
+            for value in (float("nan"), float("inf"), float("-inf")):
+                with self.subTest(name=name, value=value), self.assertRaises(ValueError):
+                    module.assert_readiness({}, **{name: value})
+
+    def test_terminal_body_read_failure_preserves_status(self):
+        module = load_script_module(self)
+        for failure in (TimeoutError(), module.http.client.IncompleteRead(b"partial")):
+            body = mock.Mock()
+            body.read.side_effect = failure
+            error = urllib.error.HTTPError(
+                "https://example.test/media", 422, "unprocessable",
+                {"X-Error-Code": "invalid_media"}, body,
+            )
+            with mock.patch.object(module.urllib.request, "urlopen", side_effect=error):
+                result = module.fetch_endpoint("https://example.test/media", "GET", 1)
+            self.assertEqual(result.status, 422)
+            self.assertEqual(result.error_code, "invalid_media")
+            body.close.assert_called_once()
+
+    def test_invalid_auth_header_is_not_in_network_error(self):
+        module = load_script_module(self)
+        with mock.patch.object(module.urllib.request, "urlopen", side_effect=ValueError(
+            "Invalid header value b'Nostr synthetic-secret\\n'"
+        )):
+            result = module.fetch_endpoint("https://example.test/media", "GET", 1)
+        self.assertEqual(result.status, 0)
+        self.assertNotIn("synthetic-secret", result.network_error)
 
     def test_get_terminal_response_extracts_error_details_and_auth(self):
         module = load_script_module(self)

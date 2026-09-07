@@ -54,7 +54,7 @@ still return 404 after a terminal transcode.
 | ---: | --- |
 | 0 | Every required endpoint became ready. |
 | 1 | Readiness was not reached before the deadline. |
-| 2 | The HLS master reported terminal derivative failure. |
+| 2 | An endpoint reported terminal derivative failure. |
 | 3 | Invalid usage, or the deadline ended with a required endpoint in network error. |
 
 The last observation reports `Ready`, `Pending`, `Terminal`, `Unavailable`,
@@ -63,9 +63,12 @@ routes deliberately return the same 404 for absent and moderation-hidden blobs,
 so `Unavailable` must not be interpreted as proof that metadata is absent.
 Age-gated unauthenticated requests return 401; 403 is also reported as blocked.
 
-Each request timeout and sleep is capped to the remaining wall-clock budget.
+Each request wait and sleep is capped to the remaining wall-clock budget,
+including DNS, redirects, and error-body reads. An in-flight read can finish in a
+daemon thread after its wait expires; it cannot delay the assertion's return or
+process exit. Timing arguments must be finite.
 The assertion stops immediately when all required endpoints are ready or the
-HLS master first reports 422.
+first endpoint reports 422. It checks the HLS master first in assertion mode.
 
 ## Production validation
 

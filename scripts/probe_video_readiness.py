@@ -4,9 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
+import math
+import queue
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -191,7 +195,7 @@ def fetch_endpoint(
                             error_code = body_error_code
                         if isinstance(body_message, str):
                             message = body_message
-                except (UnicodeDecodeError, json.JSONDecodeError):
+                except (ValueError, OSError, http.client.HTTPException):
                     pass
         finally:
             exc.close()
@@ -199,7 +203,7 @@ def fetch_endpoint(
     except urllib.error.URLError as exc:
         return FetchResult(0, network_error=str(exc.reason))
     except Exception as exc:  # pragma: no cover - defensive
-        return FetchResult(0, network_error=str(exc))
+        return FetchResult(0, network_error=type(exc).__name__)
 
 
 def fetch_status(url: str, method: str, timeout_seconds: float) -> tuple[int, str]:
@@ -217,21 +221,32 @@ def probe_once(
     clock: Callable[[], float] = time.monotonic,
 ) -> dict[str, int | str | float]:
     observation: dict[str, int | str | float] = {}
-    for key in ENDPOINT_ORDER:
+    keys = ("hls_master", "mp4_720", "hls_variant_manifest") if deadline is not None else ENDPOINT_ORDER
+    for key in keys:
         request_timeout = timeout_seconds
         if deadline is not None:
             remaining = deadline - clock()
             if remaining <= 0:
-                observation[key] = 0
-                observation[f"{key}_error"] = "readiness deadline expired before request"
-                continue
+                break
             request_timeout = min(request_timeout, remaining)
-        result = fetch_endpoint(
-            urls[key],
-            method=method,
-            timeout_seconds=request_timeout,
-            auth_header=auth_header,
-        )
+        if deadline is None:
+            result = fetch_endpoint(urls[key], method, request_timeout, auth_header)
+        else:
+            # Socket timeouts do not bound DNS, redirects, or trickling bodies.
+            # A daemon lets assertion callers return without waiting for that I/O.
+            results: queue.Queue[FetchResult] = queue.Queue(maxsize=1)
+
+            def fetch(url=urls[key], timeout=request_timeout, output=results):
+                try:
+                    output.put(fetch_endpoint(url, method, timeout, auth_header))
+                except Exception as exc:
+                    output.put(FetchResult(0, network_error=type(exc).__name__))
+
+            threading.Thread(target=fetch, daemon=True).start()
+            try:
+                result = results.get(timeout=max(0.0, min(request_timeout, deadline - clock())))
+            except queue.Empty:
+                result = FetchResult(0, network_error="request deadline expired")
         observation[key] = result.status
         if result.network_error:
             observation[f"{key}_error"] = result.network_error
@@ -239,6 +254,8 @@ def probe_once(
             observation[f"{key}_error_code"] = result.error_code
         if result.message:
             observation[f"{key}_message"] = result.message
+        if deadline is not None and result.status in TERMINAL_STATUSES:
+            break
     observation["observed_at"] = datetime.now(timezone.utc).isoformat()
     return observation
 
@@ -266,11 +283,12 @@ def _status(value: int | str | float | None) -> int | None:
 def _terminal_reason(observation: dict[str, int | str | float]) -> str | None:
     # The deployed HLS master route is the canonical transcode-state sentinel.
     # MP4 and variant-manifest HEAD routes can still return 404 for a terminal job.
-    if observation.get("hls_master") not in TERMINAL_STATUSES:
-        return None
-    code = str(observation.get("hls_master_error_code") or "derivative_failed")
-    message = str(observation.get("hls_master_message") or "terminal derivative failure")
-    return f"hls_master: {code}: {message}"
+    for key in ENDPOINT_ORDER:
+        if observation.get(key) in TERMINAL_STATUSES:
+            code = str(observation.get(f"{key}_error_code") or "derivative_failed")
+            message = str(observation.get(f"{key}_message") or "terminal derivative failure")
+            return f"{key}: {code}: {message}"
+    return None
 
 
 def assert_readiness(
@@ -289,8 +307,11 @@ def assert_readiness(
     invalid = set(required) - set(ENDPOINT_ORDER)
     if not required or invalid:
         raise ValueError(f"invalid required endpoints: {sorted(invalid) if invalid else 'none'}")
-    if deadline_seconds <= 0 or interval_seconds < 0 or timeout_seconds <= 0:
-        raise ValueError("deadline and timeout must be positive; interval must be non-negative")
+    if (
+        not all(math.isfinite(value) for value in (deadline_seconds, interval_seconds, timeout_seconds))
+        or deadline_seconds <= 0 or interval_seconds < 0 or timeout_seconds <= 0
+    ):
+        raise ValueError("timings must be finite; deadline and timeout positive; interval non-negative")
 
     deadline = clock() + deadline_seconds
     observations: list[dict[str, int | str | float]] = []
@@ -311,12 +332,12 @@ def assert_readiness(
         if terminal_reason:
             return AssertionResult(EXIT_TERMINAL, terminal_reason, tuple(observations))
 
-        if all(resolve_endpoint_state(_status(observation.get(key))) == "Ready" for key in required):
-            return AssertionResult(EXIT_READY, "all required endpoints are ready", tuple(observations))
-
         remaining = deadline - clock()
         if remaining <= 0:
             return _deadline_failure(required, observation, observations)
+
+        if all(resolve_endpoint_state(_status(observation.get(key))) == "Ready" for key in required):
+            return AssertionResult(EXIT_READY, "all required endpoints are ready", tuple(observations))
 
         sleep(min(interval_seconds, remaining))
         if clock() >= deadline:
