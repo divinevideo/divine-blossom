@@ -74,7 +74,9 @@ process exit. Timing arguments must be finite.
 Exhausting the overall budget before a response is exit 1, not a network error.
 The assertion stops when all required endpoints are ready before the deadline or the
 first endpoint reports 422. It checks the HLS master first in assertion mode.
-If readiness is observed too late, the reason explicitly says so and exits 1.
+If readiness is observed too late, the reason explicitly says so. The exit code
+is 1 unless a network error on a required endpoint or the HLS sentinel takes
+precedence (exit 3).
 
 ## Production validation
 
