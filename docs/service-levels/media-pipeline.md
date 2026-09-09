@@ -37,8 +37,8 @@ issue assignment is not sign-off.
 | --- | --- | --- | --- | --- | --- | --- |
 | Direct upload completion | Client begins the authenticated `PUT /upload` request | Client receives the successful Blossom descriptor after the body is accepted and stored; asynchronous transcode dispatch is not confirmed by this response | `PUT https://media.divine.video/upload` through Fastly to the upload service | `divine-blossom` / platform | Unconfirmed | Unset — production distribution and owner sign-off required |
 | Resumable upload completion | Client begins `POST /upload/init` | Client receives a successful response from `POST /upload/<session-id>/complete` after all origin chunks have been committed | Control requests through Fastly; chunk appends directly to `upload.divine.video`; completion through Fastly | `divine-blossom` / platform | Unconfirmed | Unset — origin correlation for chunk appends is missing |
-| Progressive readiness | Successful upload completion is observed | `HEAD /<hash>/720p.mp4` first returns `200` or `206` | Fastly media route backed by the deployed transcoder | `divine-blossom` / platform | Unconfirmed | Unset — pending #283 representative run and sign-off |
-| HLS readiness | Successful upload completion is observed | Both `HEAD /<hash>.hls` and `HEAD /<hash>/hls/stream_720p.m3u8` first return `200` or `206` | Fastly media routes backed by the deployed transcoder | `divine-blossom` / platform | Unconfirmed | Unset — pending #283 representative run and sign-off |
+| Progressive readiness | Successful upload completion is observed | `HEAD /<hash>/720p.mp4` first returns `200` or `206` | Fastly media route backed by the deployed transcoder | `divine-blossom` / platform | Unconfirmed | Unset — pending #284 representative run and sign-off |
+| HLS readiness | Successful upload completion is observed | Both `HEAD /<hash>.hls` and `HEAD /<hash>/hls/stream_720p.m3u8` first return `200` or `206` | Fastly media routes backed by the deployed transcoder | `divine-blossom` / platform | Unconfirmed | Unset — pending #284 representative run and sign-off |
 | Event publish acknowledgement | Client sends the already-signed kind-34236 event to the required relay | The required relay returns a positive Nostr `OK` acknowledgement for the event id | `wss://relay.divine.video` publish | `divine-funnelcake` | Unconfirmed | Unset — cross-repository indicator and sign-off required |
 | Relay indexing and query visibility | Positive publish acknowledgement is received | A new relay subscription for the exact synthetic event coordinate returns the expected event | `wss://relay.divine.video` `REQ` against Funnelcake Relay and ClickHouse | `divine-funnelcake` | Unconfirmed | Unset — cross-repository instrumentation and sign-off required |
 | Canonical REST read-back | Positive publish acknowledgement is received | The canonical REST API returns the expected event for the exact synthetic coordinate | `https://api.divine.video` through `divine-router` to `funnelcake-api` and ClickHouse | `divine-router` and `divine-funnelcake` | Unconfirmed | Unset — cross-repository instrumentation and sign-off required |
@@ -163,7 +163,7 @@ Use [`scripts/probe_video_readiness.py`](../../scripts/probe_video_readiness.py)
 It records separate statuses for `720p.mp4`, the HLS master, and the 720p variant
 manifest, but one elapsed time per polling round, measured from probe startup
 after all three sequential requests finish. It does not measure the
-upload-completion-to-readiness durations defined above. Issue #283 must retain
+upload-completion-to-readiness durations defined above. Issue #284 must retain
 the upload completion timestamp and timestamp each endpoint result separately;
 report the polling interval and request duration as observation uncertainty.
 HLS completion requires both manifests to be ready, not merely the probe's
@@ -183,8 +183,8 @@ observation window expires without the MP4 completion boundary being reached.
 A confirmed terminal derivative failure must fail acceptance immediately;
 pending or unresolved readiness may be polled only inside the agreed observation
 window. Do not silently switch to GET: it can initiate on-demand transcoding
-and would measure a different path. Issue #283 owns the assertion mode and
-representative production evidence.
+and would measure a different path. Issue #283 owns the assertion mode and its
+acceptance evidence; #284 owns the representative service-level run.
 
 ### Publish, indexing, and REST visibility
 
