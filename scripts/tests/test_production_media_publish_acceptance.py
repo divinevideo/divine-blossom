@@ -197,9 +197,10 @@ class ProductionMediaPublishAcceptanceTests(unittest.TestCase):
 
     def test_poll_uses_bounded_deadline(self) -> None:
         clock = FakeClock()
-        with self.assertRaisesRegex(AcceptanceError, "bounded poll expired"):
+        with self.assertRaisesRegex(AcceptanceError, "relay read-back bounded poll expired"):
             poll_until(
                 lambda: False,
+                stage="relay read-back",
                 deadline_seconds=5,
                 interval_seconds=2,
                 clock=clock,

@@ -279,7 +279,7 @@ def anonymous_head_status(url: str, timeout_seconds: float) -> int:
 
 
 def poll_until(
-    check: Callable[[], bool], *, deadline_seconds: float, interval_seconds: float,
+    check: Callable[[], bool], *, stage: str, deadline_seconds: float, interval_seconds: float,
     clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
 ) -> None:
     deadline = clock() + deadline_seconds
@@ -288,7 +288,7 @@ def poll_until(
             return
         remaining = deadline - clock()
         if remaining <= 0:
-            raise AcceptanceError("bounded poll expired")
+            raise AcceptanceError(f"{stage} bounded poll expired")
         sleep(min(interval_seconds, remaining))
 
 
@@ -395,7 +395,7 @@ def run_acceptance(args: argparse.Namespace, environment: dict[str, str]) -> Acc
             return False
         matched = matches[0]
         return True
-    poll_until(relay_check, deadline_seconds=args.stage_deadline_seconds,
+    poll_until(relay_check, stage="relay read-back", deadline_seconds=args.stage_deadline_seconds,
                interval_seconds=args.poll_interval_seconds)
     validate_signed_event(matched, d_tag=args.d_tag, media_hash=fixture.file_hash)
     stages.append(StageResult("relay_read", time.monotonic() - started, "exact event returned"))
@@ -403,6 +403,7 @@ def run_acceptance(args: argparse.Namespace, environment: dict[str, str]) -> Acc
     started = time.monotonic()
     poll_until(
         lambda: rest_event_matches(args.api_url, event_id, args.request_timeout_seconds),
+        stage="REST read-back",
         deadline_seconds=args.stage_deadline_seconds,
         interval_seconds=args.poll_interval_seconds,
     )

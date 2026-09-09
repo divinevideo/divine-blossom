@@ -26,7 +26,9 @@ harness rejects unrelated executables named `nak`. Supply the dedicated
 synthetic identity outside the repository:
 
 ```bash
-export DIVINE_ACCEPTANCE_NSEC='<dedicated synthetic nsec>'
+read -rsp 'Dedicated synthetic nsec: ' DIVINE_ACCEPTANCE_NSEC
+printf '\n'
+export DIVINE_ACCEPTANCE_NSEC
 export DIVINE_ACCEPTANCE_FEED_EXCLUSION_CONFIRMED=1
 
 python3 scripts/production_media_publish_acceptance.py --json
