@@ -142,7 +142,9 @@ class ProductionMediaPublishAcceptanceTests(unittest.TestCase):
 
         client = NakClient("nak-nostr", "nsec-secret", 10, runner=runner)
 
-        event = client.sign_event(34236, "Synthetic acceptance", tags)
+        event = client.sign_event(
+            34236, "Synthetic acceptance", tags, stage="video event signing"
+        )
 
         self.assertEqual(event["tags"], tags)
 
@@ -180,6 +182,7 @@ class ProductionMediaPublishAcceptanceTests(unittest.TestCase):
         client = NakClient("nak-nostr", "nsec-secret", 10, runner=runner)
         with self.assertRaises(AcceptanceError) as raised:
             client.validate_binary()
+        self.assertIn("Nostr binary validation exited 1", str(raised.exception))
         self.assertNotIn("nsec-secret", str(raised.exception))
 
     def test_coordinate_query_requires_exact_event_id(self) -> None:

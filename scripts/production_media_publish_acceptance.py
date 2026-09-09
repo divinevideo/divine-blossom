@@ -169,7 +169,9 @@ class NakClient:
         self.timeout_seconds = timeout_seconds
         self.runner = runner
 
-    def _run(self, arguments: list[str], input_text: str | None = None) -> str:
+    def _run(
+        self, arguments: list[str], *, stage: str, input_text: str | None = None
+    ) -> str:
         environment = os.environ.copy()
         environment["NOSTR_SECRET_KEY"] = self.secret_key
         try:
@@ -183,27 +185,33 @@ class NakClient:
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            raise AcceptanceError(f"Nostr command failed: {type(exc).__name__}") from exc
+            raise AcceptanceError(f"{stage} failed: {type(exc).__name__}") from exc
         if completed.returncode != 0:
             raise AcceptanceError(
-                f"Nostr command exited {completed.returncode}; verify the official nak binary and endpoints"
+                f"{stage} exited {completed.returncode}; verify the official nak binary and endpoints"
             )
         return completed.stdout.strip()
 
     def validate_binary(self) -> None:
-        output = self._run(["--help"])
+        output = self._run(["--help"], stage="Nostr binary validation")
         if "nostr army knife" not in output.lower():
             raise AcceptanceError("nak executable is not fiatjaf/nak (the Nostr Army Knife)")
 
-    def sign_event(self, kind: int, content: str, tags: Iterable[Iterable[str]]) -> dict[str, object]:
+    def sign_event(
+        self, kind: int, content: str, tags: Iterable[Iterable[str]], *, stage: str
+    ) -> dict[str, object]:
         partial_event = {
             "kind": kind,
             "content": content,
             "tags": [list(tag) for tag in tags],
         }
         return parse_json_object(
-            self._run(["event"], json.dumps(partial_event, separators=(",", ":"))),
-            "nak event",
+            self._run(
+                ["event"],
+                stage=stage,
+                input_text=json.dumps(partial_event, separators=(",", ":")),
+            ),
+            f"{stage} response",
         )
 
     def blossom_upload_auth(self, media_hash: str, expiration: int) -> tuple[str, str]:
@@ -211,6 +219,7 @@ class NakClient:
             24242,
             "Upload synthetic production acceptance fixture",
             (("t", "upload"), ("x", media_hash), ("expiration", str(expiration))),
+            stage="upload authorization signing",
         )
         pubkey = event.get("pubkey")
         if not isinstance(pubkey, str) or len(pubkey) != 64:
@@ -219,13 +228,18 @@ class NakClient:
         return f"Nostr {base64.b64encode(compact).decode('ascii')}", pubkey
 
     def publish(self, event: dict[str, object], relay_url: str) -> None:
-        self._run(["event", relay_url], json.dumps(event, separators=(",", ":")))
+        self._run(
+            ["event", relay_url],
+            stage="relay publish",
+            input_text=json.dumps(event, separators=(",", ":")),
+        )
 
     def query_coordinate(
         self, relay_url: str, pubkey: str, d_tag: str
     ) -> list[dict[str, object]]:
         output = self._run(
-            ["req", "--kind", "34236", "--author", pubkey, "--tag", f"d={d_tag}", relay_url]
+            ["req", "--kind", "34236", "--author", pubkey, "--tag", f"d={d_tag}", relay_url],
+            stage="relay query",
         )
         events: list[dict[str, object]] = []
         for line in output.splitlines():
@@ -379,7 +393,7 @@ def run_acceptance(args: argparse.Namespace, environment: dict[str, str]) -> Acc
         mime_type=fixture.content_type, dimensions=dimensions, title=args.title,
         run_nonce=secrets.token_hex(16),
     )
-    event = nak.sign_event(34236, args.content, tags)
+    event = nak.sign_event(34236, args.content, tags, stage="video event signing")
     validate_signed_event(event, d_tag=args.d_tag, media_hash=fixture.file_hash)
     if event["pubkey"] != pubkey:
         raise AcceptanceError("upload and event signing identities differ")
