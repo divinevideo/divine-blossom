@@ -90,10 +90,14 @@ processing callback clears the terminal flag; see #179. Failing on the first
 422 avoids that race. Audio-only input is not a reliable terminal fixture
 because its stream-map failure is not classified as terminal; see #230.
 
-The 2026-09-06 production run confirmed exit 0 for the good fixture. The
-moov-stripped fixture remained `202/202/404` through a 180-second assertion and
-a separate 60-second assertion at one-second cadence, so production did not
-surface the expected terminal state. That is evidence about the deployed
-failure pipeline, not a reason to weaken this assertion's first-422 contract.
-TODO(#283): complete the controlled terminal-failure acceptance against the
-deployed pipeline. That issue remains open until this production check succeeds.
+The 2026-09-06 production run confirmed exit 0 for the good fixture within 35
+seconds of upload start. During that run the moov-stripped fixture remained
+`202/202/404`, so #283 stayed open pending a deployed terminal-state recheck.
+
+On 2026-09-09, the assertion was rerun against the same content-addressed
+terminal fixture with `GET`, a 60-second deadline, and `mp4_720` plus
+`hls_master` required. The first HLS-master observation returned 422 with
+`invalid_media` and an FFmpeg `moov atom not found` diagnostic. The assertion
+exited 2 immediately without requesting the remaining endpoints. Together,
+the two production runs prove the supported-ready and controlled-terminal
+outcomes without assigning a performance objective to either duration.
