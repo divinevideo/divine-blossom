@@ -4,11 +4,13 @@ from pathlib import Path
 import subprocess
 import unittest
 from unittest import mock
+import urllib.error
 
 from scripts.production_media_publish_acceptance import (
     AcceptanceError,
     FEED_EXCLUSION_ENV,
     NakClient,
+    anonymous_head_status,
     build_parser,
     build_video_tags,
     main,
@@ -207,6 +209,15 @@ class ProductionMediaPublishAcceptanceTests(unittest.TestCase):
                 sleep=clock.sleep,
             )
         self.assertEqual(clock.now, 5)
+
+    def test_anonymous_media_network_failure_names_stage(self) -> None:
+        with mock.patch(
+            "urllib.request.urlopen", side_effect=urllib.error.URLError("offline")
+        ):
+            with self.assertRaisesRegex(AcceptanceError, "pre-upload media check failed"):
+                anonymous_head_status("https://media.example/hash", 10, "pre-upload media check")
+            with self.assertRaisesRegex(AcceptanceError, "uploaded media check failed"):
+                anonymous_head_status("https://media.example/hash", 10, "uploaded media check")
 
     def test_cli_failure_does_not_print_secret(self) -> None:
         output = io.StringIO()

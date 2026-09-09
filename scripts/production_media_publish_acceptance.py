@@ -266,7 +266,7 @@ def rest_event_matches(api_url: str, event_id: str, timeout_seconds: float) -> b
         raise AcceptanceError(f"REST event lookup failed: {type(exc.reason).__name__}") from exc
 
 
-def anonymous_head_status(url: str, timeout_seconds: float) -> int:
+def anonymous_head_status(url: str, timeout_seconds: float, stage: str) -> int:
     request = urllib.request.Request(url, method="HEAD")
     try:
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
@@ -275,7 +275,7 @@ def anonymous_head_status(url: str, timeout_seconds: float) -> int:
         exc.close()
         return exc.code
     except urllib.error.URLError as exc:
-        raise AcceptanceError(f"anonymous media check failed: {type(exc.reason).__name__}") from exc
+        raise AcceptanceError(f"{stage} failed: {type(exc.reason).__name__}") from exc
 
 
 def poll_until(
@@ -321,7 +321,9 @@ def run_acceptance(args: argparse.Namespace, environment: dict[str, str]) -> Acc
 
     started = time.monotonic()
     direct_url = f"{args.media_url.rstrip('/')}/{fixture.file_hash}"
-    preupload_status = anonymous_head_status(direct_url, args.request_timeout_seconds)
+    preupload_status = anonymous_head_status(
+        direct_url, args.request_timeout_seconds, "pre-upload media check"
+    )
     if preupload_status not in {200, 401, 404}:
         raise AcceptanceError(f"pre-upload media check returned HTTP {preupload_status}")
     preupload_detail = (
@@ -352,7 +354,9 @@ def run_acceptance(args: argparse.Namespace, environment: dict[str, str]) -> Acc
     stages.append(StageResult("upload", time.monotonic() - started, "descriptor validated"))
 
     started = time.monotonic()
-    direct_status = anonymous_head_status(str(descriptor["url"]), args.request_timeout_seconds)
+    direct_status = anonymous_head_status(
+        str(descriptor["url"]), args.request_timeout_seconds, "uploaded media check"
+    )
     if direct_status != 200:
         raise AcceptanceError(f"uploaded media is not anonymously servable: HTTP {direct_status}")
     stages.append(StageResult("direct_media", time.monotonic() - started, "HTTP 200"))
