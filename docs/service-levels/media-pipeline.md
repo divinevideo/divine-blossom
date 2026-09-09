@@ -288,7 +288,7 @@ alerts, or acceptance-test failures.
 - [ ] Divine Router owners approve the canonical REST edge boundary.
 - [ ] #217 records the representative US anonymous, credentialed, and
   concurrent cold-fill run.
-- [ ] #283 records a supported production upload reaching progressive and HLS
+- [x] #283 records a supported production upload reaching progressive and HLS
   readiness and a controlled terminal-failure result.
 - [ ] #282 runs the exact-coordinate production pipeline twice without
   accumulating unbounded artifacts.
