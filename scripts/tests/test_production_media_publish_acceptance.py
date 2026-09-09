@@ -9,10 +9,12 @@ from scripts.production_media_publish_acceptance import (
     AcceptanceError,
     FEED_EXCLUSION_ENV,
     NakClient,
+    build_parser,
     build_video_tags,
     main,
     poll_until,
     require_feed_exclusion,
+    run_acceptance,
     validate_signed_event,
     validate_upload_descriptor,
 )
@@ -120,6 +122,52 @@ class ProductionMediaPublishAcceptanceTests(unittest.TestCase):
         self.assertNotIn("nsec-secret", command)
         self.assertNotIn("nsec-secret", kwargs.get("input") or "")
         self.assertEqual(kwargs["env"]["NOSTR_SECRET_KEY"], "nsec-secret")
+
+    def test_nak_sign_event_preserves_multivalue_tags(self) -> None:
+        tags = [["d", "stable"], ["imeta", "url https://media.example/video", "m video/mp4"]]
+
+        def runner(command, **kwargs):
+            partial_event = json.loads(kwargs["input"])
+            self.assertEqual(command, ["nak-nostr", "event"])
+            self.assertEqual(partial_event["tags"], tags)
+            event = {
+                **partial_event,
+                "id": EVENT_ID,
+                "pubkey": PUBKEY,
+                "sig": SIGNATURE,
+            }
+            return subprocess.CompletedProcess(command, 0, stdout=json.dumps(event), stderr="")
+
+        client = NakClient("nak-nostr", "nsec-secret", 10, runner=runner)
+
+        event = client.sign_event(34236, "Synthetic acceptance", tags)
+
+        self.assertEqual(event["tags"], tags)
+
+    def test_acceptance_suppresses_upload_harness_trace(self) -> None:
+        args = build_parser().parse_args([])
+        environment = {
+            FEED_EXCLUSION_ENV: "1",
+            "DIVINE_ACCEPTANCE_NSEC": "nsec-secret",
+        }
+        with mock.patch(
+            "scripts.production_media_publish_acceptance.anonymous_head_status",
+            return_value=200,
+        ), mock.patch(
+            "scripts.production_media_publish_acceptance.NakClient"
+        ) as nak_class, mock.patch(
+            "scripts.production_media_publish_acceptance.UploadHttpClient"
+        ) as upload_client_class, mock.patch(
+            "scripts.production_media_publish_acceptance.run_legacy_upload",
+            side_effect=AcceptanceError("stop after client construction"),
+        ):
+            nak_class.return_value.blossom_upload_auth.return_value = ("Nostr auth", PUBKEY)
+
+            with self.assertRaisesRegex(AcceptanceError, "stop after client construction"):
+                run_acceptance(args, environment)
+
+        output_stream = upload_client_class.call_args.kwargs["output_stream"]
+        self.assertIsInstance(output_stream, io.StringIO)
 
     def test_nak_failure_does_not_echo_secret_or_stderr(self) -> None:
         def runner(command, **_kwargs):

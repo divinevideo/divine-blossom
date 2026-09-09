@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 from dataclasses import asdict, dataclass
+import io
 import json
 import math
 import os
@@ -195,11 +196,15 @@ class NakClient:
             raise AcceptanceError("nak executable is not fiatjaf/nak (the Nostr Army Knife)")
 
     def sign_event(self, kind: int, content: str, tags: Iterable[Iterable[str]]) -> dict[str, object]:
-        arguments = ["event", "--kind", str(kind), "--content", content]
-        for tag in tags:
-            values = list(tag)
-            arguments.extend(["--tag", "=".join(values)])
-        return parse_json_object(self._run(arguments), "nak event")
+        partial_event = {
+            "kind": kind,
+            "content": content,
+            "tags": [list(tag) for tag in tags],
+        }
+        return parse_json_object(
+            self._run(["event"], json.dumps(partial_event, separators=(",", ":"))),
+            "nak event",
+        )
 
     def blossom_upload_auth(self, media_hash: str, expiration: int) -> tuple[str, str]:
         event = self.sign_event(
@@ -331,7 +336,9 @@ def run_acceptance(args: argparse.Namespace, environment: dict[str, str]) -> Acc
         fixture.file_hash, int(time.time() + args.stage_deadline_seconds)
     )
     upload = run_legacy_upload(
-        client=UploadHttpClient(timeout_seconds=int(args.stage_deadline_seconds)),
+        client=UploadHttpClient(
+            timeout_seconds=int(args.stage_deadline_seconds), output_stream=io.StringIO()
+        ),
         server_url=args.media_url.rstrip("/"), file_context=fixture,
         auth_header=auth_header, proof_headers=None,
     )
