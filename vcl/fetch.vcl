@@ -1,15 +1,47 @@
 # ABOUTME: VCL fetch snippet for Divine Blossom VCL caching layer
 # ABOUTME: Enforces long edge caching while preserving explicit browser cache policy
 
+declare local var.backend_hop STRING;
+
 # Strip any anti-caching headers leaked from GCS through Compute
 unset beresp.http.Pragma;
+
+# A syntactically valid origin 5xx does not enter vcl_error. These records are
+# the ones Fastly status_503 counts while error_sub_time stays 0 (see #271).
+# Do not return(error) here: that would replace the origin body.
+if (beresp.status >= 500 && beresp.status < 600) {
+  if (req.backend.is_origin) {
+    set var.backend_hop = "origin";
+  } else {
+    set var.backend_hop = "shield";
+  }
+  log {"syslog "} req.service_id {" vcl-error-diagnostics :: "}
+    {"{"}
+      {""schema":"divine.blossom.vcl_5xx.v1","}
+      {""phase":"fetch","}
+      {""timestamp":"} time.start.sec {","}
+      {""request_id":""} json.escape(substr(regsuball(req.http.X-Divine-Edge-Request-Id, "[^A-Za-z0-9_-]", ""), 0, 64)) {"","}
+      {""service_id":""} json.escape(req.service_id) {"","}
+      {""method":""} json.escape(req.method) {"","}
+      {""url":""} json.escape(utf8.substr(req.url, 0, 256)) {"","}
+      {""status":"} beresp.status {","}
+      {""error_reason":""} json.escape(beresp.response) {"","}
+      {""pop":""} json.escape(server.datacenter) {"","}
+      {""backend":""} json.escape(req.backend.name) {"","}
+      {""backend_hop":""} json.escape(var.backend_hop) {"","}
+      {""cache_state":""} json.escape(fastly_info.state) {"","}
+      {""ff_visits":"} fastly.ff.visits_this_service {","}
+      {""restart_count":"} req.restarts {","}
+      {""elapsed_ms":"} time.elapsed.msec
+    {"}"};
+}
 
 # Origin owns the edge-cache decision through Surrogate-Control. Compute marks
 # restricted and admin content `no-store` there, and that must win over the long
 # TTL set below -- otherwise a credentialed fetch of restricted content would be
 # stored at the edge for a year. Cache-Control is deliberately not consulted:
 # 404 responses use browser `no-store` together with an edge `max-age=60` policy.
-# This check must come first because the 200/206 branch sets a 365-day TTL.
+# This check must stay ahead of the 200/206 branch, which sets a 365-day TTL.
 #
 # This is the origin-policy enforcement layer that keeps explicitly non-public
 # responses out of the shared edge cache, so it must stay first and stay broad.
