@@ -29,11 +29,10 @@ if (fastly.ff.visits_this_service == 0
       {""method":""} json.escape(req.method) {"","}
       {""url":""} json.escape(utf8.substr(req.url, 0, 256)) {"","}
       {""status":"} resp.status {","}
-      {""reason":""} json.escape(resp.response) {"","}
+      {""error_reason":""} json.escape(resp.response) {"","}
       {""pop":""} json.escape(server.datacenter) {"","}
       {""backend":""} json.escape(req.backend.name) {"","}
       {""cache_state":""} json.escape(fastly_info.state) {"","}
-      {""ff_visits":"} fastly.ff.visits_this_service {","}
       {""restart_count":"} req.restarts {","}
       {""elapsed_ms":"} time.elapsed.msec {","}
       {""body_bytes_written":"} resp.body_bytes_written

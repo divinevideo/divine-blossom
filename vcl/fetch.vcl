@@ -1,6 +1,8 @@
 # ABOUTME: VCL fetch snippet for Divine Blossom VCL caching layer
 # ABOUTME: Enforces long edge caching while preserving explicit browser cache policy
 
+declare local var.backend_hop STRING;
+
 # Strip any anti-caching headers leaked from GCS through Compute
 unset beresp.http.Pragma;
 
@@ -9,9 +11,9 @@ unset beresp.http.Pragma;
 # Do not return(error) here: that would replace the origin body.
 if (beresp.status >= 500 && beresp.status < 600) {
   if (req.backend.is_origin) {
-    set req.http.X-Divine-Backend-Hop = "origin";
+    set var.backend_hop = "origin";
   } else {
-    set req.http.X-Divine-Backend-Hop = "shield";
+    set var.backend_hop = "shield";
   }
   log {"syslog "} req.service_id {" vcl-error-diagnostics :: "}
     {"{"}
@@ -23,16 +25,15 @@ if (beresp.status >= 500 && beresp.status < 600) {
       {""method":""} json.escape(req.method) {"","}
       {""url":""} json.escape(utf8.substr(req.url, 0, 256)) {"","}
       {""status":"} beresp.status {","}
-      {""reason":""} json.escape(beresp.response) {"","}
+      {""error_reason":""} json.escape(beresp.response) {"","}
       {""pop":""} json.escape(server.datacenter) {"","}
       {""backend":""} json.escape(req.backend.name) {"","}
-      {""backend_hop":""} json.escape(req.http.X-Divine-Backend-Hop) {"","}
+      {""backend_hop":""} json.escape(var.backend_hop) {"","}
       {""cache_state":""} json.escape(fastly_info.state) {"","}
       {""ff_visits":"} fastly.ff.visits_this_service {","}
       {""restart_count":"} req.restarts {","}
       {""elapsed_ms":"} time.elapsed.msec
     {"}"};
-  unset req.http.X-Divine-Backend-Hop;
 }
 
 # Origin owns the edge-cache decision through Surrogate-Control. Compute marks

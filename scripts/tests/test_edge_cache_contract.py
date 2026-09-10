@@ -402,7 +402,7 @@ class EdgeCacheContractTests(unittest.TestCase):
 
 
 class Vcl5xxSkipErrorContractTests(unittest.TestCase):
-    def test_origin_5xx_logs_do_not_use_the_view_endpoint(self):
+    def test_skip_error_logs_use_the_diagnostics_endpoint(self):
         fetch_vcl = (ROOT / "vcl" / "fetch.vcl").read_text()
         log_vcl = (ROOT / "vcl" / "log_5xx.vcl").read_text()
         runbook = (ROOT / "docs" / "runbooks" / "fastly-5xx.md").read_text()
@@ -429,10 +429,27 @@ class Vcl5xxSkipErrorContractTests(unittest.TestCase):
         self.assertIn("backend_hop", runbook)
         self.assertIn("vcl/log_5xx.vcl", runbook)
 
+    def test_log_phase_is_edge_only(self):
+        log_vcl = (ROOT / "vcl" / "log_5xx.vcl").read_text()
+
+        self.assertIn("fastly.ff.visits_this_service == 0", log_vcl)
+        self.assertNotIn('"ff_visits":', log_vcl)
+
+    def test_skip_error_schema_uses_the_existing_vcl_reason_field(self):
+        fetch_vcl = (ROOT / "vcl" / "fetch.vcl").read_text()
+        log_vcl = (ROOT / "vcl" / "log_5xx.vcl").read_text()
+
+        for source in (fetch_vcl, log_vcl):
+            self.assertIn('"error_reason":', source)
+            self.assertNotIn('"reason":', source)
+
     def test_tail_summary_splits_the_skip_error_phases(self):
         tail_script = (ROOT / "scripts" / "tail-edge-errors.sh").read_text()
 
-        self.assertIn("'schema','phase','status'", tail_script)
+        self.assertIn("'schema','phase','status','error_reason'", tail_script)
+        self.assertIn("'backend_hop','backend'", tail_script)
+        self.assertIn("r.get('request_id','')", tail_script)
+        self.assertIn("r.get('probe_id','')", tail_script)
         self.assertIn('"Outer VCL 5xx diagnostics"', tail_script)
         self.assertNotIn("Fastly-generated 5xx (never reached Compute)", tail_script)
 

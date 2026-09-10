@@ -28,10 +28,12 @@ The repository contains, but does not activate or configure:
   `return(pass)` on them; it does not convert them into synthetic errors.
 - `vcl/log_5xx.vcl`, a `vcl_log` snippet that writes the same schema with
   `"phase":"log"` for client-facing 5xx whose `fastly_info.state` is not a
-  `vcl_error` transit (`ERROR` with only CLUSTER/WAIT/REFRESH suffixes). That
-  is the complement of the `vcl_error` stream. It logs only the client-facing
-  edge hop (`fastly.ff.visits_this_service == 0` in `vcl_log`). It still logs
-  `ERROR-LOSTHDR`, `ERROR-DISCONNECT`, and `BG-ERROR-*`.
+  `vcl_error` transit on that hop (`ERROR` with only CLUSTER/WAIT/REFRESH
+  suffixes). It logs only the client-facing edge hop
+  (`fastly.ff.visits_this_service == 0` in `vcl_log`). A shield-generated
+  synthetic 5xx can therefore have both a shield `vcl_error.v1` record and an
+  edge `vcl_5xx.v1` log record. The snippet also logs `ERROR-LOSTHDR`,
+  `ERROR-DISCONNECT`, and `BG-ERROR-*`.
 - Error-only Compute request logging to the endpoint named
   `compute-diagnostics` with the sanitized request ID, method, normalized route,
   final status, available error category, and duration. Routine successful and
@@ -90,10 +92,10 @@ can have logged.
 `divine.blossom.vcl_5xx.v1` records the 5xx that skip `vcl_error`. Both phases
 use the same endpoint as `vcl_error.v1`. Fields: `phase` (`fetch` or `log`),
 request start timestamp, sanitized request ID, service ID, method, URL (path
-and query, UTF-8 capped at 256 characters and JSON-escaped), status, origin or
-response reason phrase, POP, backend, cache state, `ff_visits`, restart count,
-and elapsed milliseconds. The fetch phase also records `backend_hop` (`origin`
-or `shield` from `req.backend.is_origin`, which is only available in
+and query, UTF-8 capped at 256 characters and JSON-escaped), status,
+`error_reason`, POP, backend, cache state, restart count, and elapsed
+milliseconds. The fetch phase also records `ff_visits` and `backend_hop`
+(`origin` or `shield` from `req.backend.is_origin`, which is only available in
 miss/pass/fetch).
 The log phase also records `body_bytes_written` and omits `backend_hop` (the
 log snippet is already edge-only). `cache_state` is final only in the `log`
@@ -111,8 +113,11 @@ How to split a `status_503` minute after both snippets are active:
   two fetch records (edge and shield). `backend_hop` says which. A fetch record
   can also exist without a client-facing 5xx, for example a background
   revalidation that got 5xx while the client still received stale 200.
-- A `vcl_5xx.v1` `phase=log` record without a matching `vcl_error.v1`: the
-  client received a 5xx that never entered `vcl_error`.
+- A `vcl_5xx.v1` `phase=log` record: the client received a 5xx that did not
+  enter `vcl_error` on the edge hop. If the request used a shield, correlate by
+  request ID before treating this as complementary to `vcl_error.v1`: a
+  synthetic shield error reaches the edge as a backend 5xx and produces both
+  schemas for one client response.
 - `status_503` with neither schema: the request never entered VCL (platform
   or routing-stage 503, including loop detection before service code). Those
   remain unobservable from snippets.
@@ -198,8 +203,11 @@ following:
    backend failure preserves its supplied request ID and `obj.response` without
    producing a matching Compute record. Confirm a Compute-origin 5xx produces
    `vcl_5xx.v1` fetch and log records, not `vcl_error.v1`, and that the origin
-   status and body are unchanged. Confirm a Fastly-generated 503 produces a
-   `vcl_error.v1` record and no duplicate `vcl_5xx.v1` `phase=log` record.
+   status and body are unchanged. Confirm a Fastly-generated 503 without a
+   shield produces a `vcl_error.v1` record and no `vcl_5xx.v1` `phase=log`
+   record. On a shielded path, confirm a shield-generated 503 produces a shield
+   `vcl_error.v1` record plus edge `vcl_5xx.v1` fetch and log records with the
+   same request ID, and count them as one client response.
    Confirm the existing Fastly-generated 503 status, JSON body, content type,
    and CORS header remain unchanged.
 6. Create separate outer `status_5xx_rate` and inner
