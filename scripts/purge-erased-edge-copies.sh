@@ -80,6 +80,7 @@ while IFS= read -r raw || [ -n "$raw" ]; do
   esac
   if ! [[ "$address" =~ ^[0-9a-f]{64}($|[./]) ]] \
     || [[ "$address" =~ [[:space:]] ]] \
+    || [[ "$address" =~ (^|/)\.{1,2}(/|$) ]] \
     || [[ "$address" == *"?"* ]] \
     || [[ "$address" == *"#"* ]]; then
     echo "error: line $line_no is not a safe erased-media address" >&2
@@ -105,6 +106,9 @@ umask 077
 BODY_TMP=$(mktemp "${TMPDIR:-/tmp}/purge-erased-edge-copies.XXXXXX")
 CURL_CONFIG_TMP=$(mktemp "${TMPDIR:-/tmp}/purge-erased-edge-curl.XXXXXX")
 trap 'rm -f "$BODY_TMP" "$CURL_CONFIG_TMP"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 if [ "$DRY_RUN" -eq 0 ]; then
   printf 'header = "Fastly-Key: %s"\n' "$FASTLY_API_TOKEN" > "$CURL_CONFIG_TMP"
 fi

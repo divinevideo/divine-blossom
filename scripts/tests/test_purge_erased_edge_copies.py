@@ -2,10 +2,12 @@
 
 from pathlib import Path
 import os
+import signal
 import stat
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 
 
@@ -199,6 +201,53 @@ class PurgeErasedEdgeCopiesTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("line 2", result.stderr)
         self.assertEqual(self.curl_calls(), [])
+
+    def test_dot_segments_stop_before_any_request(self):
+        for segment in (".", ".."):
+            with self.subTest(segment=segment):
+                self.address_file.write_text(f"{HASH_A}/hls/{segment}/chunk.m4s\n")
+
+                result = self.run_script("--address-file", str(self.address_file))
+
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("line 1", result.stderr)
+                self.assertEqual(self.curl_calls(), [])
+
+    def test_interrupt_removes_token_config(self):
+        _write_executable(
+            self.bin / "curl",
+            """\
+            #!/usr/bin/env bash
+            /bin/sleep 60
+            """,
+        )
+        env = dict(
+            os.environ,
+            PATH=f"{self.bin}:{os.environ['PATH']}",
+            FASTLY_API_TOKEN="test-token",
+            TMPDIR=str(self.dir),
+        )
+        process = subprocess.Popen(
+            [str(SCRIPT), "--address-file", str(self.address_file)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        for _ in range(100):
+            if list(self.dir.glob("purge-erased-edge-curl.*")):
+                break
+            time.sleep(0.01)
+        else:
+            process.kill()
+            self.fail("script did not create the curl config")
+
+        os.killpg(process.pid, signal.SIGINT)
+        process.communicate(timeout=5)
+
+        self.assertEqual(process.returncode, 130)
+        self.assertEqual(list(self.dir.glob("purge-erased-edge-curl.*")), [])
 
     def test_addresses_never_come_from_the_command_line(self):
         result = self.run_script(HASH_A)
