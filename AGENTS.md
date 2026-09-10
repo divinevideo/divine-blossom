@@ -77,6 +77,10 @@ fastly compute publish --comment "description"
 - **Propagation can be SLOW** — Compute package propagation to all POPs can take several minutes after a publish. The version may show as "active" in the API while edge POPs still serve old code. Be patient.
 - Remember it takes a few minutes for Fastly deploys to roll out; relax and let it happen.
 
+### Outer VCL service
+
+Snippets in `vcl/` (except `log_cdn_views.vcl`) belong to service `ML7R82HKfmTaqTpHExIDVN`. Use `python3 scripts/sync_outer_vcl.py diff` and `apply`. `apply` clones and validates a draft. Do not make that draft live from CI or without an explicit operator step. See `docs/runbooks/outer-vcl.md`.
+
 ## Pull Request Guardrails
 - PR titles must use Conventional Commit format: `type(scope): summary` or `type: summary`.
 - Set the correct PR title when opening the PR. Do not rely on fixing it later.
@@ -90,6 +94,7 @@ fastly compute publish --comment "description"
 ## Topic files
 
 - Before Fastly 5xx diagnosis, Pub/Sub diagnostics, or logging-endpoint work, read `docs/runbooks/fastly-5xx.md`.
+- Before comparing or preparing outer VCL, read `docs/runbooks/outer-vcl.md`.
 - Before a Compute publish, outer VCL activate, or cache purge, read `docs/runbooks/rollback.md`.
 - Before purging erased media that a POP still serves after a vanish, read `docs/runbooks/erased-media-edge-cleanup.md`. Purge by URL for the known hashes, never `--all`.
 - Before creating or inspecting a Fastly Google Pub/Sub logging endpoint, read `docs/runbooks/edge-upload-observability.md`. Do not run `fastly logging googlepubsub list --json` or `describe`.

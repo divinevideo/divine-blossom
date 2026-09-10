@@ -1,0 +1,47 @@
+{
+  "service_id": "ML7R82HKfmTaqTpHExIDVN",
+  "snippets": [
+    {
+      "file": "recv.vcl",
+      "name": "Route cacheable vs pass",
+      "type": "recv",
+      "priority": 100
+    },
+    {
+      "file": "miss.vcl",
+      "name": "Cache full objects for range requests",
+      "type": "miss",
+      "priority": 100
+    },
+    {
+      "file": "pass.vcl",
+      "name": "Upload origin timeout",
+      "type": "pass",
+      "priority": 100
+    },
+    {
+      "file": "fetch.vcl",
+      "name": "Override backend cache headers",
+      "type": "fetch",
+      "priority": 100
+    },
+    {
+      "file": "error.vcl",
+      "name": "Synthetic error responses",
+      "type": "error",
+      "priority": 100
+    },
+    {
+      "file": "deliver.vcl",
+      "name": "Client-facing headers",
+      "type": "deliver",
+      "priority": 100
+    }
+  ],
+  "unmanaged_files": [
+    {
+      "file": "log_cdn_views.vcl",
+      "reason": "Production uses a dashboard logging endpoint format, not this snippet."
+    }
+  ]
+}
