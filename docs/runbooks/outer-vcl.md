@@ -30,15 +30,19 @@ python3 scripts/sync_outer_vcl.py apply
 
 If the active version already matches git, apply does not clone. If Fastly has
 a snippet that is not in `vcl/snippets.json`, apply refuses rather than
-deleting it.
+deleting it. Apply reconciles every snippet in the manifest, not one selected
+snippet. Review the complete Fastly version diff before activation and do not
+activate a draft that contains an unrelated change.
 
 A push to `main` runs `diff` only. The same apply is available as a manual
 `Outer VCL` workflow with `apply_draft`, which does not run `diff` as a
-blocking prior step. CI never makes a draft live.
+blocking prior step. Draft creation is restricted to `main` and serialized so
+two workflow runs cannot update drafts concurrently. CI never makes a draft
+live.
 
-A merge that changes a managed snippet leaves the `diff` job red until git and
-the active version agree again. Re-run the workflow after making a matching
-draft live to clear a pending deploy. The log lines say what disagrees, not
+A merge that changes a managed snippet leaves the path-scoped `diff` job red
+until git and the active version agree again. Re-run the workflow after making
+a matching draft live to clear that run. The log lines say what disagrees, not
 which side moved: `DRIFT` is content, `MISSING_LIVE` is a managed name absent
 on Fastly, `EXTRA_LIVE` is a Fastly name absent from the manifest, `META` is
 type, priority, or dynamic. Use `git log -- vcl/` and the Fastly version
@@ -46,8 +50,9 @@ history to see who moved. A Fastly API error prints none of those lines.
 
 ## Making a draft live
 
-That step is an operator action, not a repository job. Review the Fastly version
-diff, then:
+That step is an operator action, not a repository job. Follow the smoke-test and
+approval gates in [Fastly deploy and rollback](rollback.md), review the complete
+Fastly version diff, then:
 
 ```bash
 fastly service-version activate --service-id ML7R82HKfmTaqTpHExIDVN --version <DRAFT_VERSION>

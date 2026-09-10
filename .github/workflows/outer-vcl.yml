@@ -3,6 +3,10 @@ name: Outer VCL
 on:
   push:
     branches: [main]
+    paths:
+      - .github/workflows/outer-vcl.yml
+      - scripts/sync_outer_vcl.py
+      - vcl/**
   workflow_dispatch:
     inputs:
       apply_draft:
@@ -23,7 +27,10 @@ jobs:
         run: python3 scripts/sync_outer_vcl.py diff
 
   apply:
-    if: github.event_name == 'workflow_dispatch' && inputs.apply_draft
+    if: github.event_name == 'workflow_dispatch' && inputs.apply_draft && github.ref == 'refs/heads/main'
+    concurrency:
+      group: outer-vcl-draft
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4

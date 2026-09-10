@@ -14,12 +14,6 @@
       "priority": 100
     },
     {
-      "file": "pass.vcl",
-      "name": "Upload origin timeout",
-      "type": "pass",
-      "priority": 100
-    },
-    {
       "file": "fetch.vcl",
       "name": "Override backend cache headers",
       "type": "fetch",

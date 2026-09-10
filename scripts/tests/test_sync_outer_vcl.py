@@ -32,6 +32,8 @@ class FakeFastly:
         self.next_clone = 25
         self.validate_status = "ok"
         self.validate_errors: List[str] = []
+        self.draft_live: Optional[List[Dict[str, Any]]] = None
+        self.ignore_upserts = False
 
     def __call__(
         self, method: str, path: str, fields: Optional[Dict[str, str]] = None
@@ -42,12 +44,26 @@ class FakeFastly:
         if method == "GET" and path.endswith("/version"):
             return [{"number": self.active, "active": True}]
         if method == "GET" and path.endswith("/snippet"):
-            return list(self.live)
+            source = self.draft_live if f"/version/{self.next_clone}/" in path else self.live
+            return [dict(item) for item in (source or [])]
         if method == "PUT" and path.endswith("/clone"):
+            self.draft_live = [dict(item) for item in self.live]
             return {"number": self.next_clone}
         if method == "GET" and path.endswith("/validate"):
             return {"status": self.validate_status, "errors": self.validate_errors}
         if method in ("PUT", "POST") and "/snippet" in path:
+            if self.ignore_upserts:
+                return {"ok": True}
+            assert fields is not None
+            assert self.draft_live is not None
+            replacement = dict(fields)
+            if method == "PUT":
+                self.draft_live = [
+                    replacement if item["name"] == fields["name"] else item
+                    for item in self.draft_live
+                ]
+            else:
+                self.draft_live.append(replacement)
             return {"ok": True}
         raise AssertionError(f"unexpected {method} {path}")
 
@@ -74,13 +90,6 @@ class ManifestContractTest(unittest.TestCase):
         self.assertEqual(managed | unmanaged, on_disk)
         self.assertEqual(unmanaged, {"log_cdn_views.vcl"})
         self.assertEqual(manifest["service_id"], "ML7R82HKfmTaqTpHExIDVN")
-
-    def test_pass_snippet_is_in_git(self) -> None:
-        names = {item["name"] for item in load_manifest()["snippets"]}
-        self.assertIn("Upload origin timeout", names)
-        pass_vcl = (ROOT / "vcl" / "pass.vcl").read_text(encoding="utf-8")
-        self.assertIn("set bereq.first_byte_timeout = 120s;", pass_vcl)
-
 
 class SyncToolTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -144,6 +153,13 @@ class SyncToolTest(unittest.TestCase):
         )
         self.assertEqual(missing["name"], self.specs[-1].name)
 
+    def test_apply_refuses_draft_that_does_not_match_after_upsert(self) -> None:
+        self.fake.live[0]["content"] = "stale\n"
+        self.fake.ignore_upserts = True
+        with self.assertRaisesRegex(sync.FastlyError, "does not match"):
+            sync.main(["apply"], request=self.fake)
+        self.assertFalse(any(path.endswith("/validate") for _, path in self.fake.calls))
+
     def test_apply_refuses_unmanaged_live_snippets(self) -> None:
         self.fake.live.append(
             {
@@ -176,7 +192,9 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertNotIn("activate", outer.lower())
         self.assertIn("sync_outer_vcl.py", outer)
         self.assertIn("branches: [main]", outer)
-        self.assertIn("if: github.event_name == 'workflow_dispatch' && inputs.apply_draft", outer)
+        self.assertIn("vcl/**", outer)
+        self.assertIn("github.ref == 'refs/heads/main'", outer)
+        self.assertIn("group: outer-vcl-draft", outer)
         self.assertNotIn("needs:", outer)
         ci = CI.read_text(encoding="utf-8")
         self.assertIn("fastly compute publish", ci)

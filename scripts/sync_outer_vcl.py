@@ -229,6 +229,10 @@ def cmd_apply(request: RequestFn, service_id: str, specs: List[SnippetSpec]) -> 
         upsert_snippet(request, service_id, draft, spec, spec.name in live_names)
         action = "updated" if spec.name in live_names else "created"
         print(f"{action} {spec.name}")
+    draft_drift = compare(specs, list_snippets(request, service_id, draft))
+    if not draft_drift.clean():
+        print_drift(draft_drift, draft)
+        raise FastlyError(f"draft {draft} does not match vcl/snippets.json after apply")
     validate_version(request, service_id, draft)
     print(f"validated {draft} ok")
     print(f"DRAFT_VERSION={draft}")

@@ -63,49 +63,18 @@ deploy and verify the backward-compatible backend first. See
 
 ## Prepare an outer VCL version
 
-Clone the active version. Substitute the active version recorded above rather
-than copying the example number:
+For snippets managed in `vcl/snippets.json`, use the repository sync tool. It
+clones the active version, reconciles every managed snippet, reads the draft
+back, and validates it without activation:
 
 ```bash
-envchain fastly-global fastly service version clone \
-  --service-id ML7R82HKfmTaqTpHExIDVN \
-  --version <active-outer-version> \
-  --json
+python3 scripts/sync_outer_vcl.py apply
 ```
 
-Record the returned draft version, then update only the intended snippet. For
-the repository's delivery snippet:
-
-```bash
-envchain fastly-global fastly service vcl snippet update \
-  --service-id ML7R82HKfmTaqTpHExIDVN \
-  --version <draft-outer-version> \
-  --name "Client-facing headers" \
-  --content vcl/deliver.vcl
-```
-
-Read the draft back and compare it with the source file:
-
-```bash
-envchain fastly-readonly fastly --quiet service vcl snippet describe \
-  --service-id ML7R82HKfmTaqTpHExIDVN \
-  --version <draft-outer-version> \
-  --name "Client-facing headers" --json \
-  | jq -j '.Content' | sha256sum
-
-sha256sum vcl/deliver.vcl
-```
-
-Validate the complete draft in the service's Fastly configuration context:
-
-```bash
-envchain fastly-readonly fastly service version validate \
-  --service-id ML7R82HKfmTaqTpHExIDVN \
-  --version <draft-outer-version> \
-  --json
-```
-
-Stop unless the hashes match and validation returns `"valid": true`.
+Record the printed `DRAFT_VERSION`. Review the complete Fastly version diff,
+not only the snippet that prompted the rollout. Stop if the draft contains an
+unrelated change. See [Outer VCL snippets](outer-vcl.md) for drift output and
+the manual workflow route.
 
 ## Define smoke checks before activation
 
