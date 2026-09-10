@@ -94,6 +94,7 @@ Snippets in `vcl/` (except `log_cdn_views.vcl`) belong to service `ML7R82HKfmTaq
 ## Topic files
 
 - Before Fastly 5xx diagnosis, Pub/Sub diagnostics, or logging-endpoint work, read `docs/runbooks/fastly-5xx.md`.
+- Before comparing or preparing outer VCL, read `docs/runbooks/outer-vcl.md`.
 - Before a Compute publish, outer VCL activate, or cache purge, read `docs/runbooks/rollback.md`.
 - Before purging erased media that a POP still serves after a vanish, read `docs/runbooks/erased-media-edge-cleanup.md`. Purge by URL for the known hashes, never `--all`.
 - Before creating or inspecting a Fastly Google Pub/Sub logging endpoint, read `docs/runbooks/edge-upload-observability.md`. Do not run `fastly logging googlepubsub list --json` or `describe`.

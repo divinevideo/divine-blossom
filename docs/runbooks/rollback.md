@@ -71,11 +71,17 @@ back, and validates it without activation:
 envchain fastly-global python3 scripts/sync_outer_vcl.py apply
 ```
 
-Record the printed `DRAFT_VERSION`. Review the complete Fastly version diff,
-not only the snippet that prompted the rollout. Stop if the draft contains an
-unrelated change. See [Outer VCL snippets](outer-vcl.md) for drift output and
-the manual workflow route. An untracked live snippet or a read-back mismatch is
-a stop condition, not a reason to bypass the tool with a hand-built draft.
+If the tool prints `already in sync with active VERSION`, it did not create a
+draft. For a Compute-only deployment or rollback, continue without an outer VCL
+activation. If this operation was supposed to change outer VCL, stop: the
+intended change is not present in the checkout.
+
+Otherwise, record the printed `DRAFT_VERSION`. Review the complete Fastly
+version diff, not only the snippet that prompted the rollout. Stop if the draft
+contains an unrelated change. See [Outer VCL snippets](outer-vcl.md) for drift
+output and the manual workflow route. An untracked live snippet or a read-back
+mismatch is a stop condition, not a reason to bypass the tool with a hand-built
+draft.
 
 ## Define smoke checks before activation
 
