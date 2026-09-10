@@ -55,7 +55,7 @@ print(f'  {len(recs)} record(s)')
 def tally(field):
     c=collections.Counter(r.get(field) for r in recs if r.get(field) is not None)
     return ', '.join(f'{k}={v}' for k,v in c.most_common()) or '-'
-for f in ('schema','status','sample_reason','error_category','route','backend','pop','method'):
+for f in ('schema','phase','status','sample_reason','error_category','route','backend','pop','method'):
     if any(f in r for r in recs):
         print(f'  {f:<15}{tally(f)}')
 durs=sorted(int(r[k]) for r in recs for k in ('elapsed_ms','duration_ms') if str(r.get(k,'')).isdigit())
@@ -78,5 +78,5 @@ echo "project ${PROJECT}, up to ${LIMIT} records per sink"
 echo "records are NOT acked -- they remain available for the next reader"
 [ -z "$REQUEST_PREFIX" ] || echo "request prefix filter: $REQUEST_PREFIX"
 echo
-summarise vcl-error-diagnostics-sub "Fastly-generated 5xx (never reached Compute)"
+summarise vcl-error-diagnostics-sub "Outer VCL 5xx diagnostics"
 summarise compute-diagnostics-sub   "Compute errors and sampled blob fetches"

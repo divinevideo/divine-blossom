@@ -90,10 +90,11 @@ can have logged.
 `divine.blossom.vcl_5xx.v1` records the 5xx that skip `vcl_error`. Both phases
 use the same endpoint as `vcl_error.v1`. Fields: `phase` (`fetch` or `log`),
 request start timestamp, sanitized request ID, service ID, method, URL (path
-and query, capped at 256 characters, JSON-escaped), status, origin or response
-reason phrase, POP, backend, cache state, `ff_visits`, restart count, and
-elapsed milliseconds. The fetch phase also records `backend_hop` (`origin` or
-`shield` from `req.backend.is_origin`, which is only available in miss/pass/fetch).
+and query, UTF-8 capped at 256 characters and JSON-escaped), status, origin or
+response reason phrase, POP, backend, cache state, `ff_visits`, restart count,
+and elapsed milliseconds. The fetch phase also records `backend_hop` (`origin`
+or `shield` from `req.backend.is_origin`, which is only available in
+miss/pass/fetch).
 The log phase also records `body_bytes_written` and omits `backend_hop` (the
 log snippet is already edge-only). `cache_state` is final only in the `log`
 phase; the fetch-phase value is provisional. `ff_visits` is not an edge/shield
@@ -119,6 +120,10 @@ How to split a `status_503` minute after both snippets are active:
   on 200/206) cannot enter `vcl_error` and typically cannot change the status
   already sent, so they show up as truncated 200s, not as `status_503`. This
   change does not instrument truncated 200s.
+
+During an origin outage, unsampled fetch records from both edge and shield can
+dominate a bounded subscription pull. Increase the pull limit or filter by
+`schema` and `phase` before concluding that a record type is absent.
 
 The outer service copies the selected caller/generated ID to the private
 `X-Divine-Edge-Request-Id` request header before chaining so a later Compute
@@ -164,15 +169,15 @@ following:
    key files. Do not pass a private key in a CLI argument.
 2. Clone the active outer version so live-only configuration is copied,
    including the `pass` snippet whose source is not in this repository. Update
-   the existing `fetch` snippet from `vcl/fetch.vcl`, and add
-   `vcl/log_5xx.vcl` as a `log` snippet on that draft. Do not delete the `pass`
-   snippet. Keep automatic log placement disabled for
-   `vcl-error-diagnostics`; the error, fetch, and log snippets emit only the
-   selected failures.
+   the existing `error` snippet from `vcl/error.vcl`, update the existing
+   `fetch` snippet from `vcl/fetch.vcl`, and add `vcl/log_5xx.vcl` as a `log`
+   snippet on that draft. Do not delete the `pass` snippet. Keep automatic log
+   placement disabled for `vcl-error-diagnostics`; the error, fetch, and log
+   snippets emit only the selected failures.
 3. Run `fastly service version validate` on the draft. Confirm it returns
-   valid, that `vcl_fetch` and `vcl_log` contain the repository snippets once,
-   and that the live-only `pass` snippet is still present. Review the diff
-   before activation. CI does not compile these snippets.
+   valid, that `vcl_error`, `vcl_fetch`, and `vcl_log` contain the repository
+   snippets once, and that the live-only `pass` snippet is still present. Review
+   the diff before activation. CI does not compile these snippets.
 4. Activate the separately validated outer VCL version first, then publish the
    Compute package through the repository deployment path. After activation,
    set the GitHub Actions repository variable
@@ -191,10 +196,12 @@ following:
    prefix). Confirm an all-filtered request ID generates one shared fallback ID
    in both `X-Request-Id` and `X-Divine-Edge-Request-Id`. Confirm an outer
    backend failure preserves its supplied request ID and `obj.response` without
-    producing a matching Compute record. Confirm a Compute-origin 5xx produces
-    `vcl_5xx.v1` fetch and log records, not `vcl_error.v1`, and that the origin
-    status and body are unchanged. Confirm the existing Fastly-generated 503
-    status, JSON body, content type, and CORS header remain unchanged.
+   producing a matching Compute record. Confirm a Compute-origin 5xx produces
+   `vcl_5xx.v1` fetch and log records, not `vcl_error.v1`, and that the origin
+   status and body are unchanged. Confirm a Fastly-generated 503 produces a
+   `vcl_error.v1` record and no duplicate `vcl_5xx.v1` `phase=log` record.
+   Confirm the existing Fastly-generated 503 status, JSON body, content type,
+   and CORS header remain unchanged.
 6. Create separate outer `status_5xx_rate` and inner
    `compute_resp_status_5xx_rate` alerts with minimum request thresholds. Add a
    low-volume absolute 5xx alert only if sustained small failures require it.

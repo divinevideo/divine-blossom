@@ -27,7 +27,7 @@ if (fastly.ff.visits_this_service == 0
       {""request_id":""} json.escape(substr(regsuball(req.http.X-Divine-Edge-Request-Id, "[^A-Za-z0-9_-]", ""), 0, 64)) {"","}
       {""service_id":""} json.escape(req.service_id) {"","}
       {""method":""} json.escape(req.method) {"","}
-      {""url":""} json.escape(substr(req.url, 0, 256)) {"","}
+      {""url":""} json.escape(utf8.substr(req.url, 0, 256)) {"","}
       {""status":"} resp.status {","}
       {""reason":""} json.escape(resp.response) {"","}
       {""pop":""} json.escape(server.datacenter) {"","}

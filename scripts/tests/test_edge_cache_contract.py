@@ -411,6 +411,7 @@ class Vcl5xxSkipErrorContractTests(unittest.TestCase):
             self.assertIn("vcl-error-diagnostics", source)
             self.assertNotIn("cdn-view-logs", source)
             self.assertIn("divine.blossom.vcl_5xx.v1", source)
+            self.assertIn("utf8.substr(req.url, 0, 256)", source)
 
         fivexx = fetch_vcl.index("beresp.status >= 500")
         fivexx_block = fetch_vcl[fivexx : fivexx + 1500]
@@ -427,6 +428,13 @@ class Vcl5xxSkipErrorContractTests(unittest.TestCase):
         self.assertIn("divine.blossom.vcl_5xx.v1", runbook)
         self.assertIn("backend_hop", runbook)
         self.assertIn("vcl/log_5xx.vcl", runbook)
+
+    def test_tail_summary_splits_the_skip_error_phases(self):
+        tail_script = (ROOT / "scripts" / "tail-edge-errors.sh").read_text()
+
+        self.assertIn("'schema','phase','status'", tail_script)
+        self.assertIn('"Outer VCL 5xx diagnostics"', tail_script)
+        self.assertNotIn("Fastly-generated 5xx (never reached Compute)", tail_script)
 
 
 class ShieldSelectionContractTests(unittest.TestCase):
