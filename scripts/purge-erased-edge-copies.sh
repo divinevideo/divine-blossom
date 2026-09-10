@@ -81,6 +81,7 @@ while IFS= read -r raw || [ -n "$raw" ]; do
   if ! [[ "$address" =~ ^[0-9a-f]{64}($|[./]) ]] \
     || [[ "$address" =~ [[:space:]] ]] \
     || [[ "$address" =~ (^|/)\.{1,2}(/|$) ]] \
+    || [[ "$address" == *"%"* ]] \
     || [[ "$address" == *"?"* ]] \
     || [[ "$address" == *"#"* ]]; then
     echo "error: line $line_no is not a safe erased-media address" >&2

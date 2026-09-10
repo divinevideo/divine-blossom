@@ -213,6 +213,17 @@ class PurgeErasedEdgeCopiesTests(unittest.TestCase):
                 self.assertIn("line 1", result.stderr)
                 self.assertEqual(self.curl_calls(), [])
 
+    def test_percent_escapes_stop_before_any_request(self):
+        for suffix in ("/hls/%2e%2e/chunk.m4s", "/hls/chunk%2ename.m4s"):
+            with self.subTest(suffix=suffix):
+                self.address_file.write_text(f"{HASH_A}{suffix}\n")
+
+                result = self.run_script("--address-file", str(self.address_file))
+
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("line 1", result.stderr)
+                self.assertEqual(self.curl_calls(), [])
+
     def test_interrupt_removes_token_config(self):
         _write_executable(
             self.bin / "curl",
