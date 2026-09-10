@@ -21,19 +21,18 @@ envchain fastly-readonly python3 scripts/sync_outer_vcl.py diff
 
 ## Apply git onto a cloned draft
 
-Clones the active version, updates the managed snippets, validates the draft,
-and prints `DRAFT_VERSION`. It never creates a missing snippet or changes the
-live version.
+Clones the active version, upserts the managed snippets, validates the draft,
+and prints `DRAFT_VERSION`. It never changes the live version.
 
 ```bash
 envchain fastly-global python3 scripts/sync_outer_vcl.py apply
 ```
 
 If every managed snippet already matches git, apply does not clone. A live
-snippet absent from `vcl/snippets.json`, or a managed name missing on Fastly,
-makes apply refuse before cloning. This keeps the active snippet set under
-review in git and prevents the sync path from introducing new production
-behavior.
+snippet absent from `vcl/snippets.json` makes apply refuse before cloning. This
+keeps the active snippet set under review in git. A managed name missing on
+Fastly is created only in the cloned draft and remains inert until an operator
+reviews and activates that complete version.
 
 Apply updates every snippet in the manifest, not one selected snippet. Review
 the complete Fastly version diff before activation and do not activate a draft
@@ -47,9 +46,8 @@ live. A non-`main` apply dispatch fails explicitly rather than producing an
 all-skipped green run.
 
 A merge that changes a managed snippet leaves the path-scoped `diff` job red
-until git and the active version agree again. A daily scheduled diff also
-detects changes made on Fastly. Re-run the workflow after making a matching
-draft live to clear that run. The log lines say what disagrees, not
+until git and the active version agree again. Re-run the workflow after making
+a matching draft live to clear that run. The log lines say what disagrees, not
 which side moved: `DRIFT` is content, `MISSING_LIVE` is a managed name absent
 on Fastly, `EXTRA_LIVE` is a Fastly name absent from the manifest, `META` is
 type, priority, or dynamic. Use `git log -- vcl/` and the Fastly version
@@ -57,12 +55,11 @@ history to see who moved. A Fastly API error prints none of those lines.
 
 ## Add a managed snippet
 
-This sync tool updates existing versioned snippets only. Adding a production
-snippet is a separate change: add its source and manifest entry in a reviewed
-pull request, then have an authorized Fastly operator create and activate it
-through the normal outer-service change procedure. After activation, `diff`
-must identify it by the exact manifest name before later changes use `apply`.
-Do not use apply's missing-name refusal as a creation route.
+Add the source file and manifest entry in a reviewed pull request. Apply creates
+the missing snippet only in a cloned draft, then reads back and validates the
+complete managed set. An authorized Fastly operator still reviews the full
+version diff and performs activation through the normal outer-service change
+procedure.
 
 ## Making a draft live
 

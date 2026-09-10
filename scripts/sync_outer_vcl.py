@@ -2,7 +2,7 @@
 """Compare and apply outer Fastly VCL snippets from git without activating.
 
 `diff` is read-only against the active version. `apply` clones that version,
-updates the snippets listed in vcl/snippets.json, and validates the draft.
+upserts the snippets listed in vcl/snippets.json, and validates the draft.
 This program never activates a Fastly service version.
 """
 
@@ -171,11 +171,12 @@ def clone_version(request: RequestFn, service_id: str, version: int) -> int:
     return int(cloned["number"])
 
 
-def update_snippet(
+def upsert_snippet(
     request: RequestFn,
     service_id: str,
     version: int,
     spec: SnippetSpec,
+    exists: bool,
 ) -> None:
     fields = {
         "name": spec.name,
@@ -184,12 +185,15 @@ def update_snippet(
         "priority": str(spec.priority),
         "dynamic": "0",
     }
-    encoded = urllib.parse.quote(spec.name, safe="")
-    request(
-        "PUT",
-        f"/service/{service_id}/version/{version}/snippet/{encoded}",
-        fields,
-    )
+    if exists:
+        encoded = urllib.parse.quote(spec.name, safe="")
+        request(
+            "PUT",
+            f"/service/{service_id}/version/{version}/snippet/{encoded}",
+            fields,
+        )
+        return
+    request("POST", f"/service/{service_id}/version/{version}/snippet", fields)
 
 
 def validate_version(request: RequestFn, service_id: str, version: int) -> None:
@@ -215,17 +219,16 @@ def cmd_apply(request: RequestFn, service_id: str, specs: List[SnippetSpec]) -> 
     if drift.extra_live:
         print("apply refused: live has snippets not listed in vcl/snippets.json")
         return 1
-    if drift.missing_live:
-        print("apply refused: managed snippets are missing from the active version")
-        return 1
-    if not (drift.content or drift.meta):
-        print(f"managed snippets already in sync with active {version}")
+    if drift.clean():
+        print(f"already in sync with active {version}")
         return 0
     draft = clone_version(request, service_id, version)
     print(f"cloned {version} -> {draft}")
+    live_names = {item["name"] for item in live}
     for spec in specs:
-        update_snippet(request, service_id, draft, spec)
-        print(f"updated {spec.name}")
+        upsert_snippet(request, service_id, draft, spec, spec.name in live_names)
+        action = "updated" if spec.name in live_names else "created"
+        print(f"{action} {spec.name}")
     draft_drift = compare(specs, list_snippets(request, service_id, draft))
     if not draft_drift.clean():
         print_drift(draft_drift, draft)
@@ -240,14 +243,14 @@ def cmd_apply(request: RequestFn, service_id: str, specs: List[SnippetSpec]) -> 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Diff or update outer Fastly VCL snippets without activating."
+        description="Diff or apply outer Fastly VCL snippets without activating."
     )
     parser.add_argument("--root", type=Path, default=None)
     parser.add_argument("--manifest", type=Path, default=None)
     parser.add_argument("--service-id", default=None)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("diff", help="compare git snippets to the active Fastly version")
-    sub.add_parser("apply", help="clone active, update git snippets, validate; do not activate")
+    sub.add_parser("apply", help="clone active, upsert git snippets, validate; do not activate")
     return parser
 
 

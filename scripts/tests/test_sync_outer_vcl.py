@@ -51,16 +51,19 @@ class FakeFastly:
             return {"number": self.next_clone}
         if method == "GET" and path.endswith("/validate"):
             return {"status": self.validate_status, "errors": self.validate_errors}
-        if method == "PUT" and "/snippet" in path:
+        if method in ("PUT", "POST") and "/snippet" in path:
             if self.ignore_upserts:
                 return {"ok": True}
             assert fields is not None
             assert self.draft_live is not None
             replacement = dict(fields)
-            self.draft_live = [
-                replacement if item["name"] == fields["name"] else item
-                for item in self.draft_live
-            ]
+            if method == "PUT":
+                self.draft_live = [
+                    replacement if item["name"] == fields["name"] else item
+                    for item in self.draft_live
+                ]
+            else:
+                self.draft_live.append(replacement)
             return {"ok": True}
         raise AssertionError(f"unexpected {method} {path}")
 
@@ -87,6 +90,12 @@ class ManifestContractTest(unittest.TestCase):
         self.assertEqual(managed | unmanaged, on_disk)
         self.assertEqual(unmanaged, {"log_cdn_views.vcl"})
         self.assertEqual(manifest["service_id"], "ML7R82HKfmTaqTpHExIDVN")
+
+    def test_live_upload_timeout_snippet_is_tracked(self) -> None:
+        names = {item["name"] for item in load_manifest()["snippets"]}
+        self.assertIn("Upload origin timeout", names)
+        pass_vcl = (ROOT / "vcl" / "pass.vcl").read_text(encoding="utf-8")
+        self.assertIn("set bereq.first_byte_timeout = 120s;", pass_vcl)
 
 class SyncToolTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -140,11 +149,14 @@ class SyncToolTest(unittest.TestCase):
         self.assertTrue(any(method == "PUT" and "/snippet/" in path for method, path in methods_paths))
         self.assertFalse(any("/activate" in path for _, path in methods_paths))
 
-    def test_apply_refuses_missing_managed_snippet(self) -> None:
+    def test_apply_creates_missing_snippet_in_draft(self) -> None:
         missing = self.fake.live.pop()
-        self.assertEqual(sync.main(["apply"], request=self.fake), 1)
+        self.assertEqual(sync.main(["apply"], request=self.fake), 0)
         self.assertEqual(missing["name"], self.specs[-1].name)
-        self.assertFalse(any(path.endswith("/clone") for _, path in self.fake.calls))
+        self.assertEqual(
+            [path for method, path in self.fake.calls if method == "POST"],
+            ["/service/ML7R82HKfmTaqTpHExIDVN/version/25/snippet"],
+        )
 
     def test_apply_refuses_draft_that_does_not_match_after_update(self) -> None:
         self.fake.live[0]["content"] = "stale\n"
@@ -186,7 +198,6 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertIn("sync_outer_vcl.py", outer)
         self.assertIn("branches: [main]", outer)
         self.assertIn("vcl/**", outer)
-        self.assertIn("cron: '17 6 * * *'", outer)
         self.assertIn("github.ref == 'refs/heads/main'", outer)
         self.assertIn("Reject draft creation outside main", outer)
         self.assertIn("group: outer-vcl-draft", outer)

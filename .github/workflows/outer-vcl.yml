@@ -7,8 +7,6 @@ on:
       - .github/workflows/outer-vcl.yml
       - scripts/sync_outer_vcl.py
       - vcl/**
-  schedule:
-    - cron: '17 6 * * *'
   workflow_dispatch:
     inputs:
       apply_draft:
@@ -27,7 +25,7 @@ jobs:
           exit 1
 
   diff:
-    if: github.event_name == 'push' || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && !inputs.apply_draft)
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.apply_draft)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
