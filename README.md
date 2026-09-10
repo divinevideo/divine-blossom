@@ -226,6 +226,12 @@ Admin and moderation endpoints accept an `X-Request-Id` header and echo it into 
 
 ## Deployment
 
+The production upload → readiness → publish → relay/REST acceptance workflow is
+documented in
+[`docs/runbooks/production-media-publishing-acceptance.md`](docs/runbooks/production-media-publishing-acceptance.md).
+Run it manually only after confirming the dedicated synthetic publisher is
+excluded from discovery; it is not part of pull-request CI.
+
 Deploys go to Fastly Compute with a single atomic command:
 
 ```bash
