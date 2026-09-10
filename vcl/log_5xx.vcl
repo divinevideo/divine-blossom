@@ -10,7 +10,7 @@
 # entered vcl_error and are part of the #271 population.
 #
 # Shield hops run the full VCL flow. Log only the client-facing edge hop
-# (fastly.ff.visits_this_service == 0) so counts line up with status_503.
+# (fastly.ff.visits_this_service == 0) for one record per client-facing 5xx.
 #
 # A mid-stream failure after vcl_deliver has started still cannot change the
 # status already sent; those stay 200 and will not appear here.

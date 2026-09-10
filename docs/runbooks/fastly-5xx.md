@@ -106,21 +106,28 @@ Headers, client address, authorization, cookies, and bodies are not logged.
 
 How to split a `status_503` minute after both snippets are active:
 
+`status_503` counts POP-hop responses, not unique client responses. A shielded
+failure can add two to that counter while producing one client response, so
+correlate records by request ID before comparing schema counts with the metric.
+
 - A `vcl_error.v1` record: Fastly generated the 503 and `vcl_error` ran
   (`error_sub_time` is the matching stats signal).
 - A `vcl_5xx.v1` `phase=fetch` record: a syntactically valid origin 5xx reached
   `vcl_fetch`. Fetch has no hop filter on purpose. A shielded request can emit
-  two fetch records (edge and shield). `backend_hop` says which. A fetch record
-  can also exist without a client-facing 5xx, for example a background
-  revalidation that got 5xx while the client still received stale 200.
+  two fetch records: `backend_hop=origin` is the shield POP fetching from the
+  origin, while `backend_hop=shield` is the edge POP fetching from the shield.
+  A fetch record can also exist without a client-facing 5xx, for example a
+  background revalidation that got 5xx while the client still received stale
+  200.
 - A `vcl_5xx.v1` `phase=log` record: the client received a 5xx that did not
   enter `vcl_error` on the edge hop. If the request used a shield, correlate by
   request ID before treating this as complementary to `vcl_error.v1`: a
   synthetic shield error reaches the edge as a backend 5xx and produces both
   schemas for one client response.
-- `status_503` with neither schema: the request never entered VCL (platform
-  or routing-stage 503, including loop detection before service code). Those
-  remain unobservable from snippets.
+- After accounting for correlated shield-hop records, `status_503` with neither
+  schema means the request never entered VCL (platform or routing-stage 503,
+  including loop detection before service code). Those remain unobservable
+  from snippets.
 - Streamed cache-fill failures after `vcl_deliver` has started (`beresp.do_stream`
   on 200/206) cannot enter `vcl_error` and typically cannot change the status
   already sent, so they show up as truncated 200s, not as `status_503`. This
