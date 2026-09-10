@@ -27,6 +27,22 @@ python3 scripts/probe_video_readiness.py \
   --deadline-seconds 180
 ```
 
+For the controlled terminal fixture, explicitly exercise the deployed
+on-demand transcode path with GET:
+
+```bash
+python3 scripts/probe_video_readiness.py \
+  --hash <sha256> \
+  --assert \
+  --method GET \
+  --deadline-seconds 60 \
+  --require mp4_720 hls_master
+```
+
+Unlike HEAD, GET can initiate on-demand transcoding. Use this command only for
+the controlled terminal case; it verifies the deployed GET-triggered failure
+path, not whether upload processing reaches terminal state without a read.
+
 For an age-restricted fixture, pass a precomputed authorization value. The
 script switches to GET because deployed HEAD handlers cannot evaluate viewer
 authentication:
@@ -90,10 +106,15 @@ processing callback clears the terminal flag; see #179. Failing on the first
 422 avoids that race. Audio-only input is not a reliable terminal fixture
 because its stream-map failure is not classified as terminal; see #230.
 
-The 2026-09-06 production run confirmed exit 0 for the good fixture. The
-moov-stripped fixture remained `202/202/404` through a 180-second assertion and
-a separate 60-second assertion at one-second cadence, so production did not
-surface the expected terminal state. That is evidence about the deployed
-failure pipeline, not a reason to weaken this assertion's first-422 contract.
-TODO(#283): complete the controlled terminal-failure acceptance against the
-deployed pipeline. That issue remains open until this production check succeeds.
+The 2026-09-06 production run confirmed exit 0 for the good fixture within 35
+seconds of upload start. During that run the moov-stripped fixture remained
+`202/202/404`, so #283 stayed open pending a deployed terminal-state recheck.
+
+On 2026-09-09, the terminal command above was run against the same
+content-addressed fixture. The first HLS-master observation returned 422 with
+`invalid_media` and an FFmpeg `moov atom not found` diagnostic. The assertion
+exited 2 immediately without requesting the remaining endpoints. Together,
+the two production runs prove the supported-ready outcome and the controlled
+GET-triggered terminal outcome without assigning a performance objective to
+either duration. They do not prove that upload processing alone marks invalid
+media terminal before a GET request.
