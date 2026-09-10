@@ -68,13 +68,14 @@ clones the active version, reconciles every managed snippet, reads the draft
 back, and validates it without activation:
 
 ```bash
-python3 scripts/sync_outer_vcl.py apply
+envchain fastly-global python3 scripts/sync_outer_vcl.py apply
 ```
 
 Record the printed `DRAFT_VERSION`. Review the complete Fastly version diff,
 not only the snippet that prompted the rollout. Stop if the draft contains an
 unrelated change. See [Outer VCL snippets](outer-vcl.md) for drift output and
-the manual workflow route.
+the manual workflow route. A missing managed name or a read-back mismatch is a
+stop condition, not a reason to bypass the tool with a hand-built draft.
 
 ## Define smoke checks before activation
 
@@ -111,8 +112,10 @@ curl -sS -o /dev/null -D - \
   "https://media.divine.video/${SMOKE_BLOB_HASH}?deploy-smoke=${MARKER}"
 ```
 
-Do not use a marked response as collapse evidence until the active outer
-`Client-facing headers` snippet matches this revision's `vcl/deliver.vcl`.
+Do not use a marked response as collapse evidence until
+`envchain fastly-readonly python3 scripts/sync_outer_vcl.py diff` confirms the
+active outer `Client-facing headers` snippet matches this revision's
+`vcl/deliver.vcl`.
 Earlier revisions stripped the metadata at the shield before edge delivery and
 could not produce fixed leader/follower labels. Follow
 [Cold-fill validation](cold-fill-validation.md) and stop if the snippet is stale.

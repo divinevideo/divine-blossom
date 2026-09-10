@@ -51,19 +51,16 @@ class FakeFastly:
             return {"number": self.next_clone}
         if method == "GET" and path.endswith("/validate"):
             return {"status": self.validate_status, "errors": self.validate_errors}
-        if method in ("PUT", "POST") and "/snippet" in path:
+        if method == "PUT" and "/snippet" in path:
             if self.ignore_upserts:
                 return {"ok": True}
             assert fields is not None
             assert self.draft_live is not None
             replacement = dict(fields)
-            if method == "PUT":
-                self.draft_live = [
-                    replacement if item["name"] == fields["name"] else item
-                    for item in self.draft_live
-                ]
-            else:
-                self.draft_live.append(replacement)
+            self.draft_live = [
+                replacement if item["name"] == fields["name"] else item
+                for item in self.draft_live
+            ]
             return {"ok": True}
         raise AssertionError(f"unexpected {method} {path}")
 
@@ -143,24 +140,21 @@ class SyncToolTest(unittest.TestCase):
         self.assertTrue(any(method == "PUT" and "/snippet/" in path for method, path in methods_paths))
         self.assertFalse(any("/activate" in path for _, path in methods_paths))
 
-    def test_apply_creates_missing_snippet(self) -> None:
+    def test_apply_refuses_missing_managed_snippet(self) -> None:
         missing = self.fake.live.pop()
-        self.assertEqual(sync.main(["apply"], request=self.fake), 0)
-        posts = [path for method, path in self.fake.calls if method == "POST"]
-        self.assertEqual(
-            posts,
-            ["/service/ML7R82HKfmTaqTpHExIDVN/version/25/snippet"],
-        )
+        self.assertEqual(sync.main(["apply"], request=self.fake), 1)
         self.assertEqual(missing["name"], self.specs[-1].name)
+        self.assertFalse(any(path.endswith("/clone") for _, path in self.fake.calls))
 
-    def test_apply_refuses_draft_that_does_not_match_after_upsert(self) -> None:
+    def test_apply_refuses_draft_that_does_not_match_after_update(self) -> None:
         self.fake.live[0]["content"] = "stale\n"
         self.fake.ignore_upserts = True
         with self.assertRaisesRegex(sync.FastlyError, "does not match"):
             sync.main(["apply"], request=self.fake)
         self.assertFalse(any(path.endswith("/validate") for _, path in self.fake.calls))
 
-    def test_apply_refuses_unmanaged_live_snippets(self) -> None:
+    def test_apply_preserves_unmanaged_live_snippets_while_updating_managed(self) -> None:
+        self.fake.live[0]["content"] = "stale\n"
         self.fake.live.append(
             {
                 "name": "mystery",
@@ -170,8 +164,9 @@ class SyncToolTest(unittest.TestCase):
                 "content": "log {\"x\"};\n",
             }
         )
-        self.assertEqual(sync.main(["apply"], request=self.fake), 1)
-        self.assertFalse(any(path.endswith("/clone") for _, path in self.fake.calls))
+        self.assertEqual(sync.main(["apply"], request=self.fake), 0)
+        self.assertIsNotNone(self.fake.draft_live)
+        self.assertIn("mystery", {item["name"] for item in self.fake.draft_live or []})
 
     def test_activate_argument_is_rejected(self) -> None:
         self.assertEqual(sync.main(["apply", "--activate"], request=self.fake), 2)
@@ -193,7 +188,9 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertIn("sync_outer_vcl.py", outer)
         self.assertIn("branches: [main]", outer)
         self.assertIn("vcl/**", outer)
+        self.assertIn("cron: '17 6 * * *'", outer)
         self.assertIn("github.ref == 'refs/heads/main'", outer)
+        self.assertIn("Reject draft creation outside main", outer)
         self.assertIn("group: outer-vcl-draft", outer)
         self.assertNotIn("needs:", outer)
         ci = CI.read_text(encoding="utf-8")
