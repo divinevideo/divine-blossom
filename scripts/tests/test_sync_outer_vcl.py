@@ -153,8 +153,7 @@ class SyncToolTest(unittest.TestCase):
             sync.main(["apply"], request=self.fake)
         self.assertFalse(any(path.endswith("/validate") for _, path in self.fake.calls))
 
-    def test_apply_preserves_unmanaged_live_snippets_while_updating_managed(self) -> None:
-        self.fake.live[0]["content"] = "stale\n"
+    def test_apply_refuses_unmanaged_live_snippets(self) -> None:
         self.fake.live.append(
             {
                 "name": "mystery",
@@ -164,9 +163,8 @@ class SyncToolTest(unittest.TestCase):
                 "content": "log {\"x\"};\n",
             }
         )
-        self.assertEqual(sync.main(["apply"], request=self.fake), 0)
-        self.assertIsNotNone(self.fake.draft_live)
-        self.assertIn("mystery", {item["name"] for item in self.fake.draft_live or []})
+        self.assertEqual(sync.main(["apply"], request=self.fake), 1)
+        self.assertFalse(any(path.endswith("/clone") for _, path in self.fake.calls))
 
     def test_activate_argument_is_rejected(self) -> None:
         self.assertEqual(sync.main(["apply", "--activate"], request=self.fake), 2)

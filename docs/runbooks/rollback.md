@@ -74,8 +74,9 @@ envchain fastly-global python3 scripts/sync_outer_vcl.py apply
 Record the printed `DRAFT_VERSION`. Review the complete Fastly version diff,
 not only the snippet that prompted the rollout. Stop if the draft contains an
 unrelated change. See [Outer VCL snippets](outer-vcl.md) for drift output and
-the manual workflow route. A missing managed name or a read-back mismatch is a
-stop condition, not a reason to bypass the tool with a hand-built draft.
+the manual workflow route. A missing managed name, an untracked live snippet,
+or a read-back mismatch is a stop condition, not a reason to bypass the tool
+with a hand-built draft.
 
 ## Define smoke checks before activation
 

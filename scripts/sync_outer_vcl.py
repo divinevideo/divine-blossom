@@ -212,6 +212,9 @@ def cmd_apply(request: RequestFn, service_id: str, specs: List[SnippetSpec]) -> 
     live = list_snippets(request, service_id, version)
     drift = compare(specs, live)
     print_drift(drift, version)
+    if drift.extra_live:
+        print("apply refused: live has snippets not listed in vcl/snippets.json")
+        return 1
     if drift.missing_live:
         print("apply refused: managed snippets are missing from the active version")
         return 1
@@ -224,7 +227,7 @@ def cmd_apply(request: RequestFn, service_id: str, specs: List[SnippetSpec]) -> 
         update_snippet(request, service_id, draft, spec)
         print(f"updated {spec.name}")
     draft_drift = compare(specs, list_snippets(request, service_id, draft))
-    if draft_drift.content or draft_drift.meta or draft_drift.missing_live:
+    if not draft_drift.clean():
         print_drift(draft_drift, draft)
         print(f"draft {draft} is incomplete; do not activate it")
         raise FastlyError(f"draft {draft} does not match vcl/snippets.json after apply")

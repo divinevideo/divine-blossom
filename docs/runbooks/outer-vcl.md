@@ -29,15 +29,24 @@ live version.
 envchain fastly-global python3 scripts/sync_outer_vcl.py apply
 ```
 
-If every managed snippet already matches git, apply does not clone. Live
-snippets absent from `vcl/snippets.json` are reported and preserved. A managed
-name missing on Fastly makes apply refuse before cloning so this sync path
-cannot introduce new production behavior. Reconcile the name in git and Fastly
-rather than working around the refusal.
+If every managed snippet already matches git, apply does not clone. A live
+snippet absent from `vcl/snippets.json`, or a managed name missing on Fastly,
+makes apply refuse before cloning. This keeps the active snippet set under
+review in git and prevents the sync path from introducing new production
+behavior.
 
 Apply updates every snippet in the manifest, not one selected snippet. Review
 the complete Fastly version diff before activation and do not activate a draft
 that contains an unrelated change.
+
+## Add a managed snippet
+
+This sync tool updates existing versioned snippets only. Adding a production
+snippet is a separate change: add its source and manifest entry in a reviewed
+pull request, then have an authorized Fastly operator create and activate it
+through the normal outer-service change procedure. After activation, `diff`
+must identify it by the exact manifest name before later changes use `apply`.
+Do not use apply's missing-name refusal as a creation route.
 
 A push to `main` runs `diff` only. The same apply is available as a manual
 `Outer VCL` workflow with `apply_draft`, which does not run `diff` as a
