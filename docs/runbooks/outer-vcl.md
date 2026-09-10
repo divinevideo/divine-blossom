@@ -39,15 +39,6 @@ Apply updates every snippet in the manifest, not one selected snippet. Review
 the complete Fastly version diff before activation and do not activate a draft
 that contains an unrelated change.
 
-## Add a managed snippet
-
-This sync tool updates existing versioned snippets only. Adding a production
-snippet is a separate change: add its source and manifest entry in a reviewed
-pull request, then have an authorized Fastly operator create and activate it
-through the normal outer-service change procedure. After activation, `diff`
-must identify it by the exact manifest name before later changes use `apply`.
-Do not use apply's missing-name refusal as a creation route.
-
 A push to `main` runs `diff` only. The same apply is available as a manual
 `Outer VCL` workflow with `apply_draft`, which does not run `diff` as a
 blocking prior step. Draft creation is restricted to `main` and serialized so
@@ -63,6 +54,15 @@ which side moved: `DRIFT` is content, `MISSING_LIVE` is a managed name absent
 on Fastly, `EXTRA_LIVE` is a Fastly name absent from the manifest, `META` is
 type, priority, or dynamic. Use `git log -- vcl/` and the Fastly version
 history to see who moved. A Fastly API error prints none of those lines.
+
+## Add a managed snippet
+
+This sync tool updates existing versioned snippets only. Adding a production
+snippet is a separate change: add its source and manifest entry in a reviewed
+pull request, then have an authorized Fastly operator create and activate it
+through the normal outer-service change procedure. After activation, `diff`
+must identify it by the exact manifest name before later changes use `apply`.
+Do not use apply's missing-name refusal as a creation route.
 
 ## Making a draft live
 
