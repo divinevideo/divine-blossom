@@ -1191,27 +1191,6 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
         }
     }
 
-    let cloud_cleanup_started = Instant::now();
-    if local_mode {
-        for hash in hashes {
-            if crate::delete_blob_gcs_artifacts(hash).is_err() {
-                result.failed_hashes.insert(hash.clone());
-            }
-        }
-    } else {
-        match trigger_cloud_run_delete_blobs(hashes) {
-            Ok(outcome) => {
-                result.failed_hashes.extend(outcome.failed_hashes);
-                main_origin_failures.extend(outcome.main_failures);
-            }
-            Err(_) => {
-                result.failed_hashes.extend(hashes.iter().cloned());
-                main_origin_failures.extend(hashes.iter().cloned());
-            }
-        }
-    }
-    result.timings.cloud_run_cleanup_ms = elapsed_ms(cloud_cleanup_started);
-
     while !pending.is_empty() {
         let (response, remaining) = fastly::http::request::select(pending);
         pending = remaining;
@@ -1282,6 +1261,29 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
             }
         }
     }
+
+    // Run after the provider responses are drained so `fos_main_ms` measures
+    // provider completion instead of the Cloud Run wait.
+    let cloud_cleanup_started = Instant::now();
+    if local_mode {
+        for hash in hashes {
+            if crate::delete_blob_gcs_artifacts(hash).is_err() {
+                result.failed_hashes.insert(hash.clone());
+            }
+        }
+    } else {
+        match trigger_cloud_run_delete_blobs(hashes) {
+            Ok(outcome) => {
+                result.failed_hashes.extend(outcome.failed_hashes);
+                main_origin_failures.extend(outcome.main_failures);
+            }
+            Err(_) => {
+                result.failed_hashes.extend(hashes.iter().cloned());
+                main_origin_failures.extend(hashes.iter().cloned());
+            }
+        }
+    }
+    result.timings.cloud_run_cleanup_ms = elapsed_ms(cloud_cleanup_started);
 
     let purgeable: Vec<String> = hashes
         .iter()
