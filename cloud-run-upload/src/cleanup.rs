@@ -9,7 +9,11 @@ use std::time::Duration;
 use tokio::time::{timeout_at, Instant};
 
 const MAX_PREFIX_OBJECTS_PER_ATTEMPT: usize = 25;
-pub const CLEANUP_REQUEST_DEADLINE: Duration = Duration::from_secs(60);
+// Half of the 60-second production caller timeout for this route. The handler
+// deadline starts after cold start, and the caller still needs time for the
+// edge work and response travel that follow it, so the ceiling must leave a
+// margin rather than match the caller's budget.
+pub const CLEANUP_REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
