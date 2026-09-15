@@ -107,6 +107,10 @@ const VANISH_AUDIT_PREFIX: &str = "vanish_audit:v1:";
 const VANISH_AUDIT_STATE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const VANISH_AUDIT_COMPLETED_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Key prefix for durable account-erasure in-progress state.
+const VANISH_IN_PROGRESS_PREFIX: &str = "vanish_in_progress:v1:";
+const VANISH_IN_PROGRESS_VALUE: &str = r#"{"version":1,"state":"in_progress"}"#;
+
 /// Key prefix for blob references (all uploaders of same content)
 const REFS_PREFIX: &str = "refs:";
 
@@ -430,6 +434,33 @@ fn vanish_audit_key(pubkey: &str, initiator: &str) -> String {
         pubkey.to_lowercase(),
         initiator
     )
+}
+
+fn vanish_in_progress_key(pubkey: &str) -> String {
+    format!("{}{}", VANISH_IN_PROGRESS_PREFIX, pubkey.to_lowercase())
+}
+
+/// Persist account-erasure state before any blob metadata is mutated.
+pub fn mark_vanish_in_progress(pubkey: &str) -> Result<()> {
+    let store = open_store()?;
+    store
+        .insert(&vanish_in_progress_key(pubkey), VANISH_IN_PROGRESS_VALUE)
+        .map_err(|error| {
+            BlossomError::MetadataError(format!(
+                "Failed to store vanish in-progress state: {error}"
+            ))
+        })
+}
+
+/// Clear account-erasure state after the complete operation has succeeded.
+pub fn clear_vanish_in_progress(pubkey: &str) -> Result<()> {
+    let store = open_store()?;
+    match store.delete(&vanish_in_progress_key(pubkey)) {
+        Ok(()) | Err(KVStoreError::ItemNotFound) => Ok(()),
+        Err(error) => Err(BlossomError::MetadataError(format!(
+            "Failed to clear vanish in-progress state: {error}"
+        ))),
+    }
 }
 
 pub fn get_vanish_audit_state(pubkey: &str, initiator: &str) -> Result<Option<VanishAuditState>> {
@@ -1887,7 +1918,7 @@ mod tests {
         generation_rejection, rotate_hashes_to_end, should_refresh_vanish_audit_state,
         stale_generation, status_generation_from_ms, transcode_status_event_sequence,
         transcript_status_event_sequence, vanish_audit_key, vanish_audit_state_ttl,
-        StatusUpdateOutcome, VanishAuditState,
+        vanish_in_progress_key, StatusUpdateOutcome, VanishAuditState,
     };
     use std::collections::HashSet;
 
@@ -2169,5 +2200,19 @@ mod tests {
             vanish_audit_key(&pubkey, "admin")
         );
         assert!(vanish_audit_key(&pubkey, "account").contains(&pubkey.to_lowercase()));
+    }
+
+    #[test]
+    fn vanish_in_progress_key_is_account_scoped_and_case_insensitive() {
+        let pubkey = "A".repeat(64);
+
+        assert_eq!(
+            vanish_in_progress_key(&pubkey),
+            format!("vanish_in_progress:v1:{}", pubkey.to_lowercase())
+        );
+        assert_eq!(
+            vanish_in_progress_key(&pubkey),
+            vanish_in_progress_key(&pubkey.to_lowercase())
+        );
     }
 }

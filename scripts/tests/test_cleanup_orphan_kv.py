@@ -567,7 +567,7 @@ class ProbeTests(unittest.TestCase):
 
         self.assertEqual(route, MODULE.DeliveryRoute.ALIAS_ONLY_DERIVED_AUDIO)
 
-    def test_vanish_retry_probe_checks_current_owner_list(self):
+    def test_vanish_retry_probe_checks_current_owner_marker(self):
         blob_hash = "b" * 64
         owner = "c" * 64
         metadata = {
@@ -582,8 +582,15 @@ class ProbeTests(unittest.TestCase):
         session.get.side_effect = [
             Mock(status_code=200, json=Mock(return_value=metadata)),
             Mock(status_code=404),
-            Mock(status_code=200, json=Mock(return_value=[blob_hash])),
+            Mock(status_code=200, json=Mock(return_value=MODULE.VANISH_IN_PROGRESS_VALUE)),
+            Mock(status_code=200, json=Mock(return_value=MODULE.VANISH_IN_PROGRESS_VALUE)),
             Mock(status_code=200, json=Mock(return_value=metadata)),
+            Mock(status_code=404),
+            Mock(status_code=404),
+            Mock(status_code=404),
+            Mock(status_code=404),
+            Mock(status_code=404),
+            Mock(status_code=404),
             Mock(status_code=404),
             Mock(status_code=404),
         ]
@@ -597,11 +604,11 @@ class ProbeTests(unittest.TestCase):
             MODULE.VanishRetryMarker.ABSENT,
         )
         self.assertIn(
-            MODULE.requests.utils.quote(f"list:{owner}", safe=""),
+            MODULE.requests.utils.quote(f"vanish_in_progress:v1:{owner}", safe=""),
             session.get.call_args_list[2].args[0],
         )
 
-    def test_vanish_retry_probe_checks_referrer_lists(self):
+    def test_vanish_retry_probe_checks_referrer_markers(self):
         blob_hash = "d" * 64
         owner = "e" * 64
         referrer = "f" * 64
@@ -618,7 +625,9 @@ class ProbeTests(unittest.TestCase):
             Mock(status_code=200, json=Mock(return_value=metadata)),
             Mock(status_code=200, json=Mock(return_value=[referrer])),
             Mock(status_code=404),
-            Mock(status_code=200, json=Mock(return_value=[blob_hash])),
+            Mock(status_code=404),
+            Mock(status_code=200, json=Mock(return_value=MODULE.VANISH_IN_PROGRESS_VALUE)),
+            Mock(status_code=200, json=Mock(return_value=MODULE.VANISH_IN_PROGRESS_VALUE)),
         ]
 
         self.assertEqual(
@@ -626,8 +635,8 @@ class ProbeTests(unittest.TestCase):
             MODULE.VanishRetryMarker.OUTSTANDING,
         )
         self.assertIn(
-            MODULE.requests.utils.quote(f"list:{referrer}", safe=""),
-            session.get.call_args_list[3].args[0],
+            MODULE.requests.utils.quote(f"vanish_in_progress:v1:{referrer}", safe=""),
+            session.get.call_args_list[4].args[0],
         )
 
     def test_vanish_retry_probe_fails_closed_on_invalid_state_or_list_error(self):
@@ -651,6 +660,7 @@ class ProbeTests(unittest.TestCase):
             [
                 Mock(status_code=200, json=Mock(return_value=valid_metadata)),
                 Mock(status_code=404),
+                Mock(status_code=200, json=Mock(return_value={})),
                 Mock(status_code=200, json=Mock(return_value={})),
             ],
         ]
@@ -698,7 +708,7 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(result["repairs"], {"failed_vanish_retry_probe": 1})
         self.assertEqual(session.get.call_count, 1)
 
-    def test_vanish_retry_probe_rechecks_shared_lists_for_each_candidate(self):
+    def test_vanish_retry_probe_rechecks_shared_markers_for_each_candidate(self):
         hashes = ["1" * 64, "2" * 64]
         owner = "3" * 64
         referrer = "4" * 64
@@ -723,6 +733,18 @@ class ProbeTests(unittest.TestCase):
                     Mock(status_code=200, json=Mock(return_value=[referrer])),
                     Mock(status_code=404),
                     Mock(status_code=404),
+                    Mock(status_code=404),
+                    Mock(status_code=404),
+                    Mock(status_code=404),
+                    Mock(status_code=404),
+                    Mock(status_code=404),
+                    Mock(status_code=404),
+                    Mock(status_code=404),
+                    Mock(status_code=404),
+                    Mock(status_code=404),
+                    Mock(status_code=404),
+                    Mock(status_code=404),
+                    Mock(status_code=404),
                 ]
             )
         session.get.side_effect = responses
@@ -733,11 +755,223 @@ class ProbeTests(unittest.TestCase):
                 MODULE.VanishRetryMarker.ABSENT,
             )
 
-        owner_list_url = MODULE.requests.utils.quote(f"list:{owner}", safe="")
-        referrer_list_url = MODULE.requests.utils.quote(f"list:{referrer}", safe="")
+        owner_marker_url = MODULE.requests.utils.quote(
+            f"vanish_in_progress:v1:{owner}", safe=""
+        )
+        referrer_marker_url = MODULE.requests.utils.quote(
+            f"vanish_in_progress:v1:{referrer}", safe=""
+        )
         requested_urls = [call.args[0] for call in session.get.call_args_list]
-        self.assertEqual(sum(owner_list_url in url for url in requested_urls), 2)
-        self.assertEqual(sum(referrer_list_url in url for url in requested_urls), 2)
+        self.assertEqual(sum(owner_marker_url in url for url in requested_urls), 4)
+        self.assertEqual(sum(referrer_marker_url in url for url in requested_urls), 4)
+
+    def test_account_list_blocks_repair_after_all_marker_reads_are_absent(self):
+        blob_hash = "5" * 64
+        owner = "6" * 64
+        metadata = {
+            "sha256": blob_hash,
+            "type": "video/mp4",
+            "uploaded": "2026-08-30T00:00:00Z",
+            "owner": owner,
+            "size": 1,
+            "status": "active",
+        }
+        session = Mock()
+        session.get.side_effect = [
+            Mock(status_code=200, json=Mock(return_value=metadata)),
+            Mock(status_code=404),
+            Mock(status_code=404),
+            Mock(status_code=404),
+            Mock(status_code=404),
+            Mock(status_code=404),
+            Mock(status_code=404),
+            Mock(status_code=404),
+            Mock(status_code=200, json=Mock(return_value=[blob_hash])),
+        ]
+        repaired = []
+
+        result = MODULE.scan(
+            [blob_hash],
+            lambda _value: MODULE.MetadataProbe(MODULE.Presence.PRESENT, "active"),
+            lambda _value: MODULE.Presence.MISSING,
+            lambda _value: 404,
+            repair=lambda value: repaired.append(value) is None,
+            vanish_retry_probe=lambda value: MODULE.probe_vanish_retry_marker(
+                session, "store", value
+            ),
+            max_repairs=1,
+            confirm_missing_count=1,
+            curated_input=True,
+        )
+
+        self.assertEqual(repaired, [])
+        self.assertEqual(result["repairs"], {"excluded_vanish_retry": 1})
+        self.assertIn(
+            MODULE.requests.utils.quote(f"list:{owner}", safe=""),
+            session.get.call_args_list[-1].args[0],
+        )
+
+    def test_vanish_retry_probe_fails_closed_when_marker_changes_between_reads(self):
+        blob_hash = "5" * 64
+        owner = "6" * 64
+        metadata = {
+            "sha256": blob_hash,
+            "type": "video/mp4",
+            "uploaded": "2026-08-30T00:00:00Z",
+            "owner": owner,
+            "size": 1,
+            "status": "active",
+        }
+        session = Mock()
+        session.get.side_effect = [
+            Mock(status_code=200, json=Mock(return_value=metadata)),
+            Mock(status_code=404),
+            Mock(status_code=404),
+            Mock(status_code=200, json=Mock(return_value=MODULE.VANISH_IN_PROGRESS_VALUE)),
+        ]
+
+        self.assertEqual(
+            MODULE.probe_vanish_retry_marker(session, "store", blob_hash),
+            MODULE.VanishRetryMarker.ERROR,
+        )
+
+    def test_vanish_retry_probe_fails_closed_on_marker_read_or_schema_error(self):
+        pubkey = "7" * 64
+        session = Mock()
+        session.get.side_effect = MODULE.requests.RequestException("rate limited")
+        self.assertEqual(
+            MODULE.probe_vanish_in_progress(session, "store", pubkey),
+            MODULE.VanishRetryMarker.ERROR,
+        )
+
+        session = Mock()
+        session.get.return_value = Mock(
+            status_code=200, json=Mock(return_value={"version": 2})
+        )
+        self.assertEqual(
+            MODULE.probe_vanish_in_progress(session, "store", pubkey),
+            MODULE.VanishRetryMarker.ERROR,
+        )
+
+    def test_predeployment_interruption_is_found_in_legacy_audit_state(self):
+        pubkey = "8" * 64
+        incomplete = {
+            "operation_id": "operation",
+            "authorized_at": "2026-08-30T00:00:00Z",
+            "authorized_delivered": True,
+            "completed_at": None,
+        }
+        complete = {**incomplete, "completed_at": "2026-08-30T00:01:00Z"}
+
+        for payload, expected in [
+            (incomplete, MODULE.VanishRetryMarker.OUTSTANDING),
+            (complete, MODULE.VanishRetryMarker.ABSENT),
+        ]:
+            with self.subTest(completed_at=payload["completed_at"]):
+                session = Mock()
+                session.get.return_value = Mock(
+                    status_code=200, json=Mock(return_value=payload)
+                )
+                self.assertEqual(
+                    MODULE.probe_legacy_vanish_audit(
+                        session, "store", pubkey, "account"
+                    ),
+                    expected,
+                )
+
+    def test_legacy_audit_fallback_blocks_repair_after_markerless_interruption(self):
+        blob_hash = "9" * 64
+        owner = "a" * 64
+        metadata = {
+            "sha256": blob_hash,
+            "type": "video/mp4",
+            "uploaded": "2026-08-30T00:00:00Z",
+            "owner": owner,
+            "size": 1,
+            "status": "active",
+        }
+        incomplete = {
+            "operation_id": "operation",
+            "authorized_at": "2026-08-30T00:00:00Z",
+            "authorized_delivered": True,
+            "completed_at": None,
+        }
+        session = Mock()
+        session.get.side_effect = [
+            Mock(status_code=200, json=Mock(return_value=metadata)),
+            Mock(status_code=404),
+            Mock(status_code=404),
+            Mock(status_code=404),
+            Mock(status_code=200, json=Mock(return_value=incomplete)),
+            Mock(status_code=200, json=Mock(return_value=incomplete)),
+        ]
+
+        self.assertEqual(
+            MODULE.probe_vanish_retry_marker(session, "store", blob_hash),
+            MODULE.VanishRetryMarker.OUTSTANDING,
+        )
+
+    def test_legacy_audit_fallback_fails_closed_on_inconsistent_reads(self):
+        pubkey = "b" * 64
+        incomplete = {
+            "operation_id": "operation",
+            "authorized_at": "2026-08-30T00:00:00Z",
+            "authorized_delivered": True,
+            "completed_at": None,
+        }
+        complete = {**incomplete, "completed_at": "2026-08-30T00:01:00Z"}
+        session = Mock()
+        session.get.side_effect = [
+            Mock(status_code=200, json=Mock(return_value=incomplete)),
+            Mock(status_code=200, json=Mock(return_value=complete)),
+        ]
+
+        self.assertEqual(
+            MODULE.probe_consistently(
+                lambda: MODULE.probe_legacy_vanish_audit(
+                    session, "store", pubkey, "admin"
+                )
+            ),
+            MODULE.VanishRetryMarker.ERROR,
+        )
+
+    def test_legacy_audit_probe_fails_closed_on_read_or_schema_error(self):
+        pubkey = "c" * 64
+        session = Mock()
+        session.get.side_effect = MODULE.requests.RequestException("rate limited")
+        self.assertEqual(
+            MODULE.probe_legacy_vanish_audit(session, "store", pubkey, "account"),
+            MODULE.VanishRetryMarker.ERROR,
+        )
+
+        malformed_payloads = [
+            [],
+            {},
+            {
+                "operation_id": "operation",
+                "authorized_at": "2026-08-30T00:00:00Z",
+                "authorized_delivered": "yes",
+                "completed_at": None,
+            },
+            {
+                "operation_id": "operation",
+                "authorized_at": "2026-08-30T00:00:00Z",
+                "authorized_delivered": True,
+                "completed_at": "",
+            },
+        ]
+        for payload in malformed_payloads:
+            with self.subTest(payload=payload):
+                session = Mock()
+                session.get.return_value = Mock(
+                    status_code=200, json=Mock(return_value=payload)
+                )
+                self.assertEqual(
+                    MODULE.probe_legacy_vanish_audit(
+                        session, "store", pubkey, "account"
+                    ),
+                    MODULE.VanishRetryMarker.ERROR,
+                )
 
 
 class InputAndCliTests(unittest.TestCase):
@@ -803,6 +1037,18 @@ class InputAndCliTests(unittest.TestCase):
             ["--hash-file", "private.txt", "--hex-prefix", "ab"],
             ["--all", "--max-repairs", "1"],
             ["--all", "--confirm-missing-count", "1"],
+            ["--all", "--confirm-pre-marker-vanish-retries-cleared"],
+            [
+                "--hash-file",
+                "private.txt",
+                "--repair-missing-bytes",
+                "--public-endpoint",
+                "https://media.example",
+                "--max-repairs",
+                "1",
+                "--confirm-missing-count",
+                "1",
+            ],
             [
                 "--all",
                 "--repair-missing-bytes",
@@ -812,6 +1058,7 @@ class InputAndCliTests(unittest.TestCase):
                 "1",
                 "--confirm-missing-count",
                 "1",
+                "--confirm-pre-marker-vanish-retries-cleared",
             ],
             [
                 "--hash-file",
@@ -825,6 +1072,7 @@ class InputAndCliTests(unittest.TestCase):
                 "1",
                 "--confirm-missing-count",
                 "1",
+                "--confirm-pre-marker-vanish-retries-cleared",
             ],
         ]
 
@@ -845,6 +1093,7 @@ class MainExitCodeTests(unittest.TestCase):
             repair_missing_bytes=repair,
             max_repairs=1 if repair else None,
             confirm_missing_count=1 if repair else None,
+            confirm_pre_marker_vanish_retries_cleared=repair,
         )
 
     @staticmethod
