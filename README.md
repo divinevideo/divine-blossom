@@ -117,7 +117,7 @@ Configuration is split across the Fastly config store (non-secret) and secret st
 | `funnelcake_api_url` | Funnelcake permission API base URL |
 | `b2_replica_enabled` | Enables the approved-only B2 replica and makes Native API version erasure plus bunny cache purge mandatory for vanish. Defaults off. |
 | `b2_bucket_id` | Bucket ID for the approved-only B2 replica. |
-| `bunny_delivery_zones` | Comma-separated delivery hostnames that must be purged when B2 replica content is erased. |
+| `bunny_delivery_zones` | One or two comma-separated delivery hostnames that must be purged when B2 replica content is erased. |
 | `ENABLE_PHYSICAL_DELETE` | When `"true"`, creator-delete via `/admin/api/moderate` physically removes bytes from GCS and purges edge caches; when `"false"` (default), it flips status only. Admin DMCA via `/admin/api/delete` is always a soft-delete regardless of this flag. |
 | `REQUIRE_DERIVATIVE_STATUS_GENERATION` | Set to `"false"` only during rollback to a transcoder image that does not send derivative status `generation` values. Defaults to required once a blob has versioned derivative state. |
 

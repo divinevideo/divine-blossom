@@ -156,7 +156,7 @@ language = "rust"
       { key = "funnelcake_api_url", description = "Funnelcake API base URL" },
       { key = "b2_replica_enabled", description = "Enable B2 erasure and bunny purge requirements" },
       { key = "b2_bucket_id", description = "Approved-only B2 replica bucket ID" },
-      { key = "bunny_delivery_zones", description = "Comma-separated B2-backed delivery hostnames" },
+      { key = "bunny_delivery_zones", description = "One or two comma-separated B2-backed delivery hostnames" },
     ]
 
   [setup.secret_stores]

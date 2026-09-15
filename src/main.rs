@@ -52,7 +52,7 @@ use crate::metadata::{
 use crate::storage::{
     blob_exists, check_funnelcake_audio_reuse, current_timestamp, delete_blob as storage_delete,
     dispatch_vanish_timing_log, download_blob_read_through, download_blob_with_fallback,
-    download_thumbnail, erase_vanish_batch, trigger_audio_extraction,
+    b2_replica_enabled, download_thumbnail, erase_vanish_batch, trigger_audio_extraction,
     trigger_cloud_run_delete_blob, upload_blob, write_audit_log, write_vanish_audit_log,
     VanishAuditInitiator, VanishAuditPhase, VanishStorageTimings,
 };
@@ -4485,13 +4485,15 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
 // always runs. A later wave can still overshoot if it is slower than the last
 // one, and shared KV plus the HTTP response sit outside the last-wave estimate.
 const VANISH_TIME_BUDGET: Duration = Duration::from_millis(10_000);
-// Fastly does not document a KV pending-handle ceiling. Compute allows 1,000
-// concurrent backend requests. A ten-blob wave holds at most 40 pending KV
-// operations during artifact cleanup (three deletes and one subtitle lookup
-// per blob), then at most 20 subtitle deletes. Extra waves start only when the
-// last wave still fits in VANISH_TIME_BUDGET.
+// Fastly does not document a KV pending-handle ceiling. A ten-blob wave holds
+// at most 40 pending KV operations during artifact cleanup (three deletes and
+// one subtitle lookup per blob), then at most 20 subtitle deletes. B2-enabled
+// storage uses one source blob per wave because derived audio can add a second
+// hash and Compute permits only 32 backend requests per execution.
 const VANISH_KV_FANOUT: usize = 10;
+const B2_VANISH_KV_FANOUT: usize = 1;
 const VANISH_STORAGE_ATTEMPTS: u8 = 2;
+const B2_VANISH_STORAGE_ATTEMPTS: u8 = 1;
 
 #[derive(Debug)]
 struct VanishExecution {
@@ -4533,6 +4535,7 @@ fn should_start_vanish_wave(
 fn next_vanish_wave_range(
     total: usize,
     offset: usize,
+    fanout: usize,
     elapsed: Duration,
     last_wave: Duration,
     budget: Duration,
@@ -4540,7 +4543,7 @@ fn next_vanish_wave_range(
     if offset >= total || !should_start_vanish_wave(offset > 0, elapsed, last_wave, budget) {
         return None;
     }
-    Some(offset..offset.saturating_add(VANISH_KV_FANOUT).min(total))
+    Some(offset..offset.saturating_add(fanout).min(total))
 }
 
 fn add_vanish_storage_timings(total: &mut VanishStorageTimings, wave: &VanishStorageTimings) {
@@ -4728,9 +4731,21 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     let mut kv_finalize_ms = 0u128;
     let mut last_wave = Duration::ZERO;
     let mut offset = 0usize;
+    let b2_enabled = b2_replica_enabled();
+    let wave_fanout = if b2_enabled {
+        B2_VANISH_KV_FANOUT
+    } else {
+        VANISH_KV_FANOUT
+    };
+    let storage_attempt_limit = if b2_enabled {
+        B2_VANISH_STORAGE_ATTEMPTS
+    } else {
+        VANISH_STORAGE_ATTEMPTS
+    };
     while let Some(wave_range) = next_vanish_wave_range(
         hashes.len(),
         offset,
+        wave_fanout,
         started.elapsed(),
         last_wave,
         VANISH_TIME_BUDGET,
@@ -4783,7 +4798,7 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         erase_hashes.dedup();
         let mut storage_result = erase_vanish_batch(&erase_hashes);
         let mut wave_storage_attempts = u8::from(!erase_hashes.is_empty());
-        while wave_storage_attempts < VANISH_STORAGE_ATTEMPTS
+        while wave_storage_attempts < storage_attempt_limit
             && !storage_result.failed_hashes.is_empty()
         {
             let storage_retry_hashes: Vec<String> =
@@ -6831,7 +6846,7 @@ mod tests {
         upload_control_host, upload_exposed_headers, upload_from_resumable_completion,
         vanish_response_status, vanish_shared_update_error_count, AudioReuseAvailability,
         DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState,
-        VanishExecution, VANISH_TIME_BUDGET,
+        VanishExecution, B2_VANISH_KV_FANOUT, VANISH_KV_FANOUT, VANISH_TIME_BUDGET,
     };
     use crate::blossom::{
         BlobStatus, ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus,
@@ -6932,6 +6947,7 @@ mod tests {
         let first = next_vanish_wave_range(
             25,
             0,
+            VANISH_KV_FANOUT,
             Duration::from_millis(12_000),
             Duration::from_millis(12_000),
             budget,
@@ -6942,6 +6958,7 @@ mod tests {
         let second = next_vanish_wave_range(
             25,
             first.end,
+            VANISH_KV_FANOUT,
             Duration::from_millis(3_000),
             Duration::from_millis(2_000),
             budget,
@@ -6953,6 +6970,7 @@ mod tests {
         assert!(next_vanish_wave_range(
             25,
             second.end,
+            VANISH_KV_FANOUT,
             Duration::from_millis(8_000),
             Duration::from_millis(2_000),
             budget,
@@ -6968,6 +6986,7 @@ mod tests {
         let first = next_vanish_wave_range(
             hashes.len(),
             0,
+            VANISH_KV_FANOUT,
             Duration::ZERO,
             Duration::ZERO,
             VANISH_TIME_BUDGET,
@@ -6979,6 +6998,21 @@ mod tests {
         assert!(valid.is_empty());
         assert_eq!(malformed.len(), 10);
         assert_eq!(hashes.len().saturating_sub(first.end), 15);
+    }
+
+    #[test]
+    fn b2_vanish_wave_limits_storage_to_one_source_blob() {
+        let first = next_vanish_wave_range(
+            10,
+            0,
+            B2_VANISH_KV_FANOUT,
+            Duration::ZERO,
+            Duration::ZERO,
+            VANISH_TIME_BUDGET,
+        )
+        .expect("the first wave must start");
+
+        assert_eq!(first, 0..1);
     }
 
     #[test]

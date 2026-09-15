@@ -67,7 +67,22 @@ const FOS_BUCKET: &str = "divine-media-delivery";
 const FOS_READ_FLAG: &str = "fos_read_enabled";
 const FOS_WRITE_BACK_FLAG: &str = "fos_write_back_enabled";
 const B2_REPLICA_FLAG: &str = "b2_replica_enabled";
-const B2_LIST_PAGE_SIZE: usize = 1_000;
+// Leave enough of Compute's 32 backend-request budget for the two main-origin
+// deletes, authorization, confirmation listing, Cloud Run cleanup, Fastly
+// purges, and two delivery-zone purges. A larger prefix is drained across
+// caller retries instead of exhausting the current execution.
+const B2_LIST_PAGE_SIZE: usize = 8;
+const MAX_BUNNY_DELIVERY_ZONES: usize = 2;
+const COMPUTE_BACKEND_REQUEST_LIMIT: usize = 32;
+const B2_VANISH_MAX_HASHES_PER_WAVE: usize = 2;
+const B2_VANISH_MAX_STORAGE_BACKEND_REQUESTS: usize =
+    2 // GCS and FOS multi-delete
+    + 1 // B2 authorization
+    + B2_VANISH_MAX_HASHES_PER_WAVE * (2 + B2_LIST_PAGE_SIZE) // list, deletes, confirm
+    + 1 // Cloud Run derivative cleanup
+    + 2 // Fastly VCL and Compute purges
+    + B2_VANISH_MAX_HASHES_PER_WAVE * MAX_BUNNY_DELIVERY_ZONES;
+const _: () = assert!(B2_VANISH_MAX_STORAGE_BACKEND_REQUESTS <= COMPUTE_BACKEND_REQUEST_LIMIT);
 
 /// Header copied from the storage subrequest before the outer VCL service
 /// replaces `X-Cache` with its own cache result. This is intentionally only a
@@ -942,16 +957,6 @@ struct B2ErrorResponse {
 
 type B2PageCursor = Option<(String, Option<String>)>;
 
-fn advance_b2_cursor(current: &B2PageCursor, next: B2PageCursor) -> Result<B2PageCursor> {
-    if next.is_some() && next.as_ref() == current.as_ref() {
-        Err(BlossomError::StorageError(
-            "B2 version listing returned a non-advancing cursor".into(),
-        ))
-    } else {
-        Ok(next)
-    }
-}
-
 fn b2_prefix_page<'a>(
     prefix: &str,
     page: &'a B2ListFileVersionsResponse,
@@ -1294,43 +1299,23 @@ fn delete_b2_version_page(
 }
 
 fn erase_b2_hash_versions(authorization: &B2Authorization, hash: &str) -> Result<()> {
-    let mut start = Some((hash.to_string(), None));
-    loop {
-        let page = list_b2_file_versions(
-            authorization,
-            hash,
-            start
-                .as_ref()
-                .map(|(file_name, file_id)| (file_name.as_str(), file_id.as_deref())),
-        )?;
-        let (versions, next) = b2_prefix_page(hash, &page)?;
-        delete_b2_version_page(authorization, versions)?;
-        match advance_b2_cursor(&start, next)? {
-            Some(next) => start = Some(next),
-            None => break,
-        }
+    let page = list_b2_file_versions(authorization, hash, Some((hash, None)))?;
+    let (versions, next) = b2_prefix_page(hash, &page)?;
+    delete_b2_version_page(authorization, versions)?;
+    if next.is_some() {
+        return Err(BlossomError::StorageError(
+            "B2 replica has more versions to delete in a later vanish attempt".into(),
+        ));
     }
 
-    let mut start = Some((hash.to_string(), None));
-    loop {
-        let page = list_b2_file_versions(
-            authorization,
-            hash,
-            start
-                .as_ref()
-                .map(|(file_name, file_id)| (file_name.as_str(), file_id.as_deref())),
-        )?;
-        let (versions, next) = b2_prefix_page(hash, &page)?;
-        if !versions.is_empty() {
-            return Err(BlossomError::StorageError(
-                "B2 replica still contains versions after deletion".into(),
-            ));
-        }
-        match advance_b2_cursor(&start, next)? {
-            Some(next) => start = Some(next),
-            None => return Ok(()),
-        }
+    let confirmation = list_b2_file_versions(authorization, hash, Some((hash, None)))?;
+    let (versions, next) = b2_prefix_page(hash, &confirmation)?;
+    if !versions.is_empty() || next.is_some() {
+        return Err(BlossomError::StorageError(
+            "B2 replica still contains versions after deletion".into(),
+        ));
     }
+    Ok(())
 }
 
 fn erase_b2_replica_hashes(hashes: &[String]) -> HashSet<String> {
@@ -1364,6 +1349,7 @@ fn bunny_delivery_zones() -> Result<Vec<String>> {
         .map(str::to_string)
         .collect::<Vec<_>>();
     if zones.is_empty()
+        || zones.len() > MAX_BUNNY_DELIVERY_ZONES
         || zones.iter().any(|zone| {
             zone.starts_with('.')
                 || zone.ends_with('.')
@@ -1373,7 +1359,10 @@ fn bunny_delivery_zones() -> Result<Vec<String>> {
         })
     {
         return Err(BlossomError::StorageError(
-            "bunny_delivery_zones must contain comma-separated hostnames".into(),
+            format!(
+                "bunny_delivery_zones must contain one or two comma-separated hostnames (got {})",
+                zones.len()
+            ),
         ));
     }
     Ok(zones)
@@ -3244,8 +3233,8 @@ pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtracti
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_b2_cursor, audit_log_entry, b2_api_host, b2_delete_version_succeeded,
-        b2_dynamic_backend_name, b2_prefix_page, build_b2_delete_version_request,
+        audit_log_entry, b2_api_host, b2_delete_version_succeeded, b2_dynamic_backend_name,
+        b2_prefix_page, build_b2_delete_version_request,
         build_b2_list_versions_request, build_bunny_purge_request, build_fos_delete_request,
         build_multi_delete_request, canonical_query_string, classify_cloud_cleanup_response,
         cloud_run_delete_blob_body, cloud_run_delete_blobs_body, failed_cloud_cleanup_hashes,
@@ -3257,7 +3246,8 @@ mod tests {
         B2AuthorizeResponse, B2FileVersion,
         B2ListFileVersionsResponse, S3Config,
         VanishAuditInitiator, VanishAuditPhase, VanishDeleteTarget, VanishStorageResult,
-        CLOUD_RUN_DELETE_BATCH_LIMIT, FOS_BACKEND, PROVIDER_MULTI_DELETE_LIMIT,
+        B2_LIST_PAGE_SIZE, CLOUD_RUN_DELETE_BATCH_LIMIT, FOS_BACKEND,
+        PROVIDER_MULTI_DELETE_LIMIT,
         STORAGE_CACHE_HEADER,
     };
     use fastly::http::header;
@@ -3615,18 +3605,6 @@ mod tests {
     }
 
     #[test]
-    fn b2_cursor_must_advance_by_name_or_version_id() {
-        let current = Some(("same-name".into(), Some("version-2".into())));
-        assert!(advance_b2_cursor(&current, current.clone()).is_err());
-        assert!(advance_b2_cursor(
-            &current,
-            Some(("same-name".into(), Some("version-1".into())))
-        )
-        .is_ok());
-        assert!(advance_b2_cursor(&current, Some(("next-name".into(), None))).is_ok());
-    }
-
-    #[test]
     fn b2_version_requests_use_native_version_apis() {
         let authorization = B2Authorization {
             api_url: "https://api001.backblazeb2.com".into(),
@@ -3662,7 +3640,7 @@ mod tests {
             serde_json::from_str(&initial.take_body().into_string()).expect("initial list JSON");
         assert_eq!(initial_body["startFileName"], hash);
         assert!(initial_body.get("startFileId").is_none());
-        assert_eq!(initial_body["maxFileCount"], 1_000);
+        assert_eq!(initial_body["maxFileCount"], B2_LIST_PAGE_SIZE);
 
         let version = B2FileVersion {
             file_name: format!("{hash}/720p.mp4"),
