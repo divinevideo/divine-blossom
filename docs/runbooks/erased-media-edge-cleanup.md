@@ -37,9 +37,14 @@ there.
 
 ```bash
 SMOKE_BLOB_HASH=<known-public-video-hash>
+SMOKE_ADDRESS_FILE=/secure/path/smoke-address.txt
 
-# Drop any copy stored before activation at this POP and at the shield.
-envchain fastly-global fastly purge --url "https://media.divine.video/${SMOKE_BLOB_HASH}"
+# Drop any copy stored before activation at this POP and at the shield. The
+# Fastly CLI's `purge --url` path does not evict this service's URL cache key.
+printf '%s\n' "$SMOKE_BLOB_HASH" > "$SMOKE_ADDRESS_FILE"
+chmod 600 "$SMOKE_ADDRESS_FILE"
+envchain fastly-global scripts/purge-erased-edge-copies.sh \
+  --address-file "$SMOKE_ADDRESS_FILE"
 
 # Fill through the shield (MISS), then confirm the edge holds it (HIT).
 curl -sSI "https://media.divine.video/${SMOKE_BLOB_HASH}" | grep -iE '^(x-cache|x-served-by|age):'
@@ -64,34 +69,42 @@ them. Purge them by URL, which reaches every POP regardless of tags. Do not run
 `fastly purge --all` on the outer service for this: it drops the whole
 catalogue and refetches every video through Compute and GCS at once.
 
-Create a private hash file outside the repository with one erased content hash
-per line, following the same handling as
-[erasure evidence](../erasure-evidence.md): never pass hashes on the command
-line, commit the file, or paste identifiers into an issue or pull request.
+Create a private address file outside the repository with one exact request path
+per line, following the same handling as [erasure evidence](../erasure-evidence.md):
+never pass addresses on the command line, commit the file, or paste identifiers
+into an issue or pull request. Paths may have one leading slash and must begin
+with the lowercase content hash so they match the case-sensitive cache key.
+Build this list only from objects confirmed absent at
+Compute; an erasure record alone is not sufficient because another account may
+still own or have re-uploaded the same content-addressed blob.
 
 ```bash
-touch /secure/path/erased-hashes.txt
-chmod 600 /secure/path/erased-hashes.txt
+touch /secure/path/erased-addresses.txt
+chmod 600 /secure/path/erased-addresses.txt
 
 envchain fastly-global scripts/purge-erased-edge-copies.sh \
-  --hash-file /secure/path/erased-hashes.txt --dry-run
+  --address-file /secure/path/erased-addresses.txt --dry-run
 
 envchain fastly-global scripts/purge-erased-edge-copies.sh \
-  --hash-file /secure/path/erased-hashes.txt
+  --address-file /secure/path/erased-addresses.txt \
+  > /secure/path/erased-address-purge-receipts.log
 ```
 
-For each hash the script purges and then probes every enumerable public URL
-form currently produced by this repository: the bare blob and its `.mp4` and
-`.jpg` aliases; four quality variants; both HLS master aliases, the two media
-playlists, and their four single-file media objects; both transcript aliases;
-and extracted audio. The list in the script is the operational source of truth.
-Every probe must return `404` or the run exits non-zero. `--probe-only` repeats
-all probes without purging.
+The script sends the `PURGE` method directly to each exact URL. It does not use
+`fastly purge --url`, which can report success without evicting this host's
+cached object. Every request must return HTTP 200 with a `{"status": "ok"}`
+body; the first request or response failure stops the sweep. Requests are capped
+at 12 requests per second to stay within the purge budget. Keep the script's
+output as the private receipt log: it records a UTC timestamp and Fastly purge ID
+for every address without printing the address itself. The script passes the
+token to curl through a mode-0600 temporary config rather than a command-line
+argument.
 
-The probe observes one POP: the one that answers this machine. It cannot see
-copies held by other POPs, so a clean run is evidence for that POP only. The
-URL purge itself is global; the probe is a spot check, not proof of global
-eviction.
+The address list is the operational source of truth. Do not expand hashes into
+guessed aliases: HLS filenames are free-form, and guessed current forms can miss
+real cached addresses while purging unrelated live aliases. A follow-up probe
+from one machine would observe only its answering POP, so a clean result would
+not prove global eviction and is not part of the sweep.
 
 ## Retro-check of accounts vanished before the fix
 
@@ -99,27 +112,25 @@ Every account vanished while the unguarded snippet was active may have edge
 copies of its media. After a vanish this service holds no account-to-hash
 mapping: the owner list and blob metadata are gone, and the durable
 `erasure:v1` evidence can only be derived from a hash you already hold. Build
-the hash file from the caller's own records of the vanish requests it issued,
-then run the cleanup above over that file.
+the address file from durable object-name evidence and confirm each hash is
+absent through Compute before running the cleanup.
 
 ## Known residuals
 
 - Historical or otherwise unknown aliases are not enumerable from a hash alone.
-  In particular, the bare-blob parser accepts an arbitrary extension. The
-  script covers every documented form currently produced by this repository,
-  but an operator who knows another alias was fetched must purge and probe that
-  exact URL too.
+  The address-list workflow reaches only exact paths backed by retained object
+  names or other durable evidence.
 - A URL purge matches the exact cache key. A copy filled with a query string
   is a different key and is not covered.
 - Issue #279 also asks for an automated post-purge probe in the vanish path
   that surfaces in `vanish_timing`. This change does not deliver it: the
   Compute service declares no backend for the public host, and one has to be
   created on the live service before such a probe can run. That outcome stays
-  open on #279 until it lands or is split out. Until then the script above is
-  the only probe, run by hand.
-- A single-POP probe, whether run here or from that future automated check,
-  cannot see other POPs' copies. Global evidence would need a probe from every
-  POP or Fastly-side reporting; neither exists today.
+  open on #279 until it lands or is split out. Until then any probe must be run
+  by an operator and interpreted as POP-local evidence only.
+- A single-POP probe, whether run by an operator or from that future automated
+  check, cannot see other POPs' copies. Global evidence would need a probe from
+  every POP or Fastly-side reporting; neither exists today.
 
 ## Cache-policy behavior after activation
 
