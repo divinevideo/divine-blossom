@@ -62,7 +62,8 @@ requires one typed result for every requested hash. For changes to that contract
    a `409` means the two services name different buckets. Stop rather than
    merging the edge in either case.
 2. The `main` workflow deploys `cloud-run-upload` and verifies
-   `/delete-blobs/ready` before publishing edge code that calls it. Each real
+   `/delete-blobs/ready` for the `vanish-batch-v2` contract before publishing
+   edge code that calls it. Each real
    cleanup request also asserts that Cloud Run and the edge use the same GCS
    bucket before Cloud Run may report deletion complete.
 

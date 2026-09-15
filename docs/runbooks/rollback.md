@@ -60,6 +60,10 @@ acknowledgement. CI does not inspect the live outer service.
 For an edge change that depends on a new Cloud Run route or response contract,
 deploy and verify the backward-compatible backend first. See
 [Deployment](deployment.md#deploy-cleanup-dependencies-before-the-edge).
+Rollback runs in reverse: activate an edge version that accepts the old contract
+before rolling Cloud Run back. The vanish batch v2 edge requires the
+`main_deleted_or_absent` result field and fails erasure closed if a v1 backend is
+restored beneath it.
 
 ## Prepare an outer VCL version
 
