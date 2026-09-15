@@ -343,6 +343,18 @@ def probe_vanish_retry_marker(
             )
             if marker is not VanishRetryMarker.ABSENT:
                 return marker
+
+    # Marker reads cannot reserve absent state until the later repair request.
+    # Keep list membership as the final fail-closed boundary: account erasure
+    # discovers retry work through these lists, so reconciliation must not
+    # remove an entry that erasure can still depend on.
+    for pubkey in pubkeys:
+        list_presence, hashes = probe_json_list(session, store_id, f"list:{pubkey}")
+        if list_presence is Presence.ERROR:
+            return VanishRetryMarker.ERROR
+        if blob_hash in hashes:
+            return VanishRetryMarker.OUTSTANDING
+
     return VanishRetryMarker.ABSENT
 
 

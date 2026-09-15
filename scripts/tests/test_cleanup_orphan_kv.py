@@ -592,6 +592,7 @@ class ProbeTests(unittest.TestCase):
             Mock(status_code=404),
             Mock(status_code=404),
             Mock(status_code=404),
+            Mock(status_code=404),
         ]
 
         self.assertEqual(
@@ -742,6 +743,8 @@ class ProbeTests(unittest.TestCase):
                     Mock(status_code=404),
                     Mock(status_code=404),
                     Mock(status_code=404),
+                    Mock(status_code=404),
+                    Mock(status_code=404),
                 ]
             )
         session.get.side_effect = responses
@@ -761,6 +764,52 @@ class ProbeTests(unittest.TestCase):
         requested_urls = [call.args[0] for call in session.get.call_args_list]
         self.assertEqual(sum(owner_marker_url in url for url in requested_urls), 4)
         self.assertEqual(sum(referrer_marker_url in url for url in requested_urls), 4)
+
+    def test_account_list_blocks_repair_after_all_marker_reads_are_absent(self):
+        blob_hash = "5" * 64
+        owner = "6" * 64
+        metadata = {
+            "sha256": blob_hash,
+            "type": "video/mp4",
+            "uploaded": "2026-08-30T00:00:00Z",
+            "owner": owner,
+            "size": 1,
+            "status": "active",
+        }
+        session = Mock()
+        session.get.side_effect = [
+            Mock(status_code=200, json=Mock(return_value=metadata)),
+            Mock(status_code=404),
+            Mock(status_code=404),
+            Mock(status_code=404),
+            Mock(status_code=404),
+            Mock(status_code=404),
+            Mock(status_code=404),
+            Mock(status_code=404),
+            Mock(status_code=200, json=Mock(return_value=[blob_hash])),
+        ]
+        repaired = []
+
+        result = MODULE.scan(
+            [blob_hash],
+            lambda _value: MODULE.MetadataProbe(MODULE.Presence.PRESENT, "active"),
+            lambda _value: MODULE.Presence.MISSING,
+            lambda _value: 404,
+            repair=lambda value: repaired.append(value) is None,
+            vanish_retry_probe=lambda value: MODULE.probe_vanish_retry_marker(
+                session, "store", value
+            ),
+            max_repairs=1,
+            confirm_missing_count=1,
+            curated_input=True,
+        )
+
+        self.assertEqual(repaired, [])
+        self.assertEqual(result["repairs"], {"excluded_vanish_retry": 1})
+        self.assertIn(
+            MODULE.requests.utils.quote(f"list:{owner}", safe=""),
+            session.get.call_args_list[-1].args[0],
+        )
 
     def test_vanish_retry_probe_fails_closed_when_marker_changes_between_reads(self):
         blob_hash = "5" * 64
