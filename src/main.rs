@@ -4510,6 +4510,10 @@ const VANISH_TIME_BUDGET: Duration = Duration::from_millis(10_000);
 // per blob), then at most 20 subtitle deletes. Extra waves start only when the
 // last wave still fits in VANISH_TIME_BUDGET.
 const VANISH_KV_FANOUT: usize = 10;
+// A wave holds at most VANISH_KV_FANOUT sources with at most one derived-audio
+// hash each, so its storage batch must stay inside one Cloud Run cleanup chunk.
+// A second serial chunk would double the caller's worst-case Cloud Run wait.
+const _: () = assert!(VANISH_KV_FANOUT * 2 <= crate::storage::CLOUD_RUN_DELETE_BATCH_LIMIT);
 
 #[derive(Debug)]
 struct VanishExecution {
