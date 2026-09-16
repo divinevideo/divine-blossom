@@ -544,6 +544,25 @@ fn finalize_derived_audio_cleanup(plan: &PreparedDerivedAudioCleanup) -> Result<
     Ok(())
 }
 
+fn vanish_storage_hashes(
+    blobs: &[PreparedVanishBlob],
+    derived_cleanup: &[PreparedDerivedAudioCleanup],
+) -> Vec<String> {
+    let mut hashes = Vec::with_capacity(blobs.len() + derived_cleanup.len());
+    for blob in blobs {
+        hashes.push(blob.hash.clone());
+        hashes.extend(
+            derived_cleanup
+                .iter()
+                .filter(|plan| plan.source_hash.eq_ignore_ascii_case(&blob.hash))
+                .map(|plan| plan.audio_hash.clone()),
+        );
+    }
+    let mut seen = HashSet::new();
+    hashes.retain(|hash| seen.insert(hash.to_ascii_lowercase()));
+    hashes
+}
+
 /// GET /<sha256>[.ext] - Retrieve blob
 fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
     // Check if this is a thumbnail request ({hash}.jpg)
@@ -4491,7 +4510,10 @@ const VANISH_TIME_BUDGET: Duration = Duration::from_millis(10_000);
 // per blob), then at most 20 subtitle deletes. Extra waves start only when the
 // last wave still fits in VANISH_TIME_BUDGET.
 const VANISH_KV_FANOUT: usize = 10;
-const VANISH_STORAGE_ATTEMPTS: u8 = 2;
+// A wave holds at most VANISH_KV_FANOUT sources with at most one derived-audio
+// hash each, so its storage batch must stay inside one Cloud Run cleanup chunk.
+// A second serial chunk would double the caller's worst-case Cloud Run wait.
+const _: () = assert!(VANISH_KV_FANOUT * 2 <= crate::storage::CLOUD_RUN_DELETE_BATCH_LIMIT);
 
 #[derive(Debug)]
 struct VanishExecution {
@@ -4544,7 +4566,6 @@ fn next_vanish_wave_range(
 }
 
 fn add_vanish_storage_timings(total: &mut VanishStorageTimings, wave: &VanishStorageTimings) {
-    total.gcs_main_ms = total.gcs_main_ms.saturating_add(wave.gcs_main_ms);
     total.cloud_run_cleanup_ms = total
         .cloud_run_cleanup_ms
         .saturating_add(wave.cloud_run_cleanup_ms);
@@ -4775,22 +4796,9 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         }
         let erase = cleanup_ready;
         erase_candidates = erase_candidates.saturating_add(erase.len());
-        let mut erase_hashes: Vec<String> = erase.iter().map(|blob| blob.hash.clone()).collect();
-        erase_hashes.extend(derived_cleanup.iter().map(|plan| plan.audio_hash.clone()));
-        erase_hashes.sort();
-        erase_hashes.dedup();
-        let mut storage_result = erase_vanish_batch(&erase_hashes);
-        let mut wave_storage_attempts = u8::from(!erase_hashes.is_empty());
-        while wave_storage_attempts < VANISH_STORAGE_ATTEMPTS
-            && !storage_result.failed_hashes.is_empty()
-        {
-            let storage_retry_hashes: Vec<String> =
-                storage_result.failed_hashes.iter().cloned().collect();
-            let retry = erase_vanish_batch(&storage_retry_hashes);
-            storage_result.replace_failures_after_retry(retry);
-            wave_storage_attempts += 1;
-        }
-        storage_attempts = storage_attempts.saturating_add(u32::from(wave_storage_attempts));
+        let erase_hashes = vanish_storage_hashes(&erase, &derived_cleanup);
+        let storage_result = erase_vanish_batch(&erase_hashes);
+        storage_attempts = storage_attempts.saturating_add(u32::from(!erase_hashes.is_empty()));
         add_vanish_storage_timings(&mut storage_timings, &storage_result.timings);
 
         let finalize_started = Instant::now();
@@ -4814,8 +4822,8 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
                 || failed_derived_sources.contains(&blob.hash)
             {
                 eprintln!(
-                    "[VANISH] pubkey={} hash={} required storage erasure failed after {} attempts",
-                    pubkey, blob.hash, wave_storage_attempts
+                    "[VANISH] pubkey={} hash={} required storage erasure failed",
+                    pubkey, blob.hash
                 );
                 execution.errors += 1;
                 retry_hashes.push(blob.hash);
@@ -4895,7 +4903,6 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         "malformed_hash_exceptions": execution.malformed_hash_exceptions,
         "pending": execution.pending,
         "prepare_ms": prepare_ms.min(u128::from(u64::MAX)) as u64,
-        "gcs_main_ms": storage_timings.gcs_main_ms,
         "cloud_run_cleanup_ms": storage_timings.cloud_run_cleanup_ms,
         "fos_main_ms": storage_timings.fos_main_ms,
         "purge_vcl_ms": storage_timings.purge_vcl_ms,
@@ -6825,9 +6832,10 @@ mod tests {
         should_start_vanish_wave, surrogate_key_hash_from_path,
         trusted_upload_service_terminal_derivative_error, upload_capability_headers,
         upload_control_host, upload_exposed_headers, upload_from_resumable_completion,
-        vanish_response_status, vanish_shared_update_error_count, AudioReuseAvailability,
-        DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState,
-        VanishExecution, VANISH_TIME_BUDGET,
+        vanish_response_status, vanish_shared_update_error_count, vanish_storage_hashes,
+        AudioReuseAvailability, DerivativeObservation, PreparedDerivedAudioCleanup,
+        TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState, VanishExecution,
+        VANISH_TIME_BUDGET,
     };
     use crate::blossom::{
         BlobStatus, ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus,
@@ -6847,6 +6855,32 @@ mod tests {
             StatusCode::INTERNAL_SERVER_ERROR
         );
         assert_eq!(vanish_response_status(1, 1), StatusCode::ACCEPTED);
+    }
+
+    #[test]
+    fn vanish_storage_hashes_interleave_sources_and_derived_audio() {
+        let first = "a".repeat(64);
+        let first_audio = "b".repeat(64);
+        let second = "c".repeat(64);
+        let blobs = vec![
+            blossom_core::delete_policy::PreparedVanishBlob {
+                hash: first.clone(),
+                metadata: None,
+            },
+            blossom_core::delete_policy::PreparedVanishBlob {
+                hash: second.clone(),
+                metadata: None,
+            },
+        ];
+        let derived = vec![PreparedDerivedAudioCleanup {
+            source_hash: first.clone(),
+            audio_hash: first_audio.clone(),
+        }];
+
+        assert_eq!(
+            vanish_storage_hashes(&blobs, &derived),
+            vec![first, first_audio, second]
+        );
     }
 
     #[test]
