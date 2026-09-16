@@ -67,22 +67,21 @@ const FOS_BUCKET: &str = "divine-media-delivery";
 const FOS_READ_FLAG: &str = "fos_read_enabled";
 const FOS_WRITE_BACK_FLAG: &str = "fos_write_back_enabled";
 const B2_REPLICA_FLAG: &str = "b2_replica_enabled";
-// Leave enough of Compute's 32 backend-request budget for the two main-origin
-// deletes, authorization, confirmation listing, Cloud Run cleanup, Fastly
-// purges, and two delivery-zone purges. A larger prefix is drained across
-// caller retries instead of exhausting the current execution.
-const B2_LIST_PAGE_SIZE: usize = 8;
+// One B2-enabled vanish wave covers at most a source blob and its derived
+// audio, each listing one bounded page of versions, deleting them, and
+// confirming absence. The vanish wave loop in main.rs asserts that this whole
+// wave plus the execution's audit and timing requests fits Fastly Compute's
+// 32-backend-request per-execution limit. A larger version set is drained
+// across caller retries as pending work instead of exhausting the execution.
+const B2_LIST_PAGE_SIZE: usize = 6;
 const MAX_BUNNY_DELIVERY_ZONES: usize = 2;
-const COMPUTE_BACKEND_REQUEST_LIMIT: usize = 32;
-const B2_VANISH_MAX_HASHES_PER_WAVE: usize = 2;
-const B2_VANISH_MAX_STORAGE_BACKEND_REQUESTS: usize =
-    2 // GCS and FOS multi-delete
+pub(crate) const B2_VANISH_MAX_HASHES_PER_WAVE: usize = 2;
+pub(crate) const B2_VANISH_MAX_STORAGE_BACKEND_REQUESTS: usize = 2 // GCS and FOS multi-delete
     + 1 // B2 authorization
     + B2_VANISH_MAX_HASHES_PER_WAVE * (2 + B2_LIST_PAGE_SIZE) // list, deletes, confirm
     + 1 // Cloud Run derivative cleanup
     + 2 // Fastly VCL and Compute purges
     + B2_VANISH_MAX_HASHES_PER_WAVE * MAX_BUNNY_DELIVERY_ZONES;
-const _: () = assert!(B2_VANISH_MAX_STORAGE_BACKEND_REQUESTS <= COMPUTE_BACKEND_REQUEST_LIMIT);
 
 /// Header copied from the storage subrequest before the outer VCL service
 /// replaces `X-Cache` with its own cache result. This is intentionally only a
@@ -1025,12 +1024,16 @@ pub(crate) struct VanishStorageTimings {
 #[derive(Debug, Default)]
 pub(crate) struct VanishStorageResult {
     pub failed_hashes: HashSet<String>,
+    /// Hashes whose B2 version set exceeded one bounded page. Their deletion is
+    /// progressing, so they are pending work rather than failures.
+    pub remaining_hashes: HashSet<String>,
     pub timings: VanishStorageTimings,
 }
 
 impl VanishStorageResult {
     pub(crate) fn replace_failures_after_retry(&mut self, retry: Self) {
         self.failed_hashes = retry.failed_hashes;
+        self.remaining_hashes = retry.remaining_hashes;
         self.timings.gcs_main_ms = self
             .timings
             .gcs_main_ms
@@ -1298,14 +1301,21 @@ fn delete_b2_version_page(
     }
 }
 
-fn erase_b2_hash_versions(authorization: &B2Authorization, hash: &str) -> Result<()> {
+/// Outcome of one bounded B2 hash erasure attempt.
+enum B2HashErasure {
+    /// Every listed version was deleted and absence was confirmed.
+    Erased,
+    /// The prefix holds more versions than one bounded page. The page was
+    /// deleted, and the next attempt continues the drain as pending work.
+    MoreRemaining,
+}
+
+fn erase_b2_hash_versions(authorization: &B2Authorization, hash: &str) -> Result<B2HashErasure> {
     let page = list_b2_file_versions(authorization, hash, Some((hash, None)))?;
     let (versions, next) = b2_prefix_page(hash, &page)?;
     delete_b2_version_page(authorization, versions)?;
     if next.is_some() {
-        return Err(BlossomError::StorageError(
-            "B2 replica has more versions to delete in a later vanish attempt".into(),
-        ));
+        return Ok(B2HashErasure::MoreRemaining);
     }
 
     let confirmation = list_b2_file_versions(authorization, hash, Some((hash, None)))?;
@@ -1315,30 +1325,37 @@ fn erase_b2_hash_versions(authorization: &B2Authorization, hash: &str) -> Result
             "B2 replica still contains versions after deletion".into(),
         ));
     }
-    Ok(())
+    Ok(B2HashErasure::Erased)
 }
 
-fn erase_b2_replica_hashes(hashes: &[String]) -> HashSet<String> {
+/// Returns `(failed, remaining)` hashes. `remaining` hashes made bounded
+/// progress and are counted as pending, not failed.
+fn erase_b2_replica_hashes(hashes: &[String]) -> (HashSet<String>, HashSet<String>) {
     if !b2_replica_enabled() || hashes.is_empty() {
-        return HashSet::new();
+        return (HashSet::new(), HashSet::new());
     }
     let authorization = match authorize_b2_vanish() {
         Ok(authorization) => authorization,
         Err(error) => {
             eprintln!("[VANISH] B2 setup failed error={error}");
-            return hashes.iter().cloned().collect();
+            return (hashes.iter().cloned().collect(), HashSet::new());
         }
     };
-    hashes
-        .iter()
-        .filter_map(|hash| match erase_b2_hash_versions(&authorization, hash) {
-            Ok(()) => None,
+    let mut failed = HashSet::new();
+    let mut remaining = HashSet::new();
+    for hash in hashes {
+        match erase_b2_hash_versions(&authorization, hash) {
+            Ok(B2HashErasure::Erased) => {}
+            Ok(B2HashErasure::MoreRemaining) => {
+                remaining.insert(hash.clone());
+            }
             Err(error) => {
                 eprintln!("[VANISH] B2 erase failed hash={hash} error={error}");
-                Some(hash.clone())
+                failed.insert(hash.clone());
             }
-        })
-        .collect()
+        }
+    }
+    (failed, remaining)
 }
 
 fn bunny_delivery_zones() -> Result<Vec<String>> {
@@ -1846,10 +1863,12 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
     }
 
     let b2_started = Instant::now();
-    let b2_failures = erase_b2_replica_hashes(hashes);
+    let (b2_failures, b2_remaining) = erase_b2_replica_hashes(hashes);
     result.timings.b2_replica_ms = elapsed_ms(b2_started);
     result.failed_hashes.extend(b2_failures.iter().cloned());
     main_origin_failures.extend(b2_failures);
+    main_origin_failures.extend(b2_remaining.iter().cloned());
+    result.remaining_hashes.extend(b2_remaining);
 
     let cloud_cleanup_started = Instant::now();
     match trigger_cloud_run_delete_blobs(hashes) {

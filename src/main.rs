@@ -54,6 +54,7 @@ use crate::storage::{
     dispatch_vanish_timing_log, download_blob_read_through, download_blob_with_fallback,
     b2_replica_enabled, download_thumbnail, erase_vanish_batch, trigger_audio_extraction,
     trigger_cloud_run_delete_blob, upload_blob, write_audit_log, write_vanish_audit_log,
+    B2_VANISH_MAX_HASHES_PER_WAVE, B2_VANISH_MAX_STORAGE_BACKEND_REQUESTS,
     VanishAuditInitiator, VanishAuditPhase, VanishStorageTimings,
 };
 use crate::viewer_auth::{ViewerAuthDiagnostics, ViewerAuthState};
@@ -4494,6 +4495,22 @@ const VANISH_KV_FANOUT: usize = 10;
 const B2_VANISH_KV_FANOUT: usize = 1;
 const VANISH_STORAGE_ATTEMPTS: u8 = 2;
 const B2_VANISH_STORAGE_ATTEMPTS: u8 = 1;
+// Fastly Compute permits 32 backend requests per execution. A B2-enabled wave
+// spends nearly all of that budget, so the wave loop starts only as many B2
+// waves as the remaining execution budget covers and leaves the rest of the
+// list pending for the caller's next attempt. The reserve covers the
+// execution's authorization audit, the completion audits for both initiators,
+// and the timing log.
+const COMPUTE_BACKEND_REQUEST_LIMIT: usize = 32;
+const VANISH_NON_STORAGE_BACKEND_REQUESTS: usize = 5;
+const VANISH_B2_WAVES_PER_EXECUTION: usize = (COMPUTE_BACKEND_REQUEST_LIMIT
+    - VANISH_NON_STORAGE_BACKEND_REQUESTS)
+    / B2_VANISH_MAX_STORAGE_BACKEND_REQUESTS;
+const _: () = assert!(VANISH_B2_WAVES_PER_EXECUTION >= 1);
+// The storage budget's hashes per wave are B2_VANISH_KV_FANOUT source blobs
+// plus at most one derived-audio hash per source (prepare_derived_audio_cleanup
+// returns at most one plan per blob). Keep both halves linked at compile time.
+const _: () = assert!(B2_VANISH_KV_FANOUT * 2 <= B2_VANISH_MAX_HASHES_PER_WAVE);
 
 #[derive(Debug)]
 struct VanishExecution {
@@ -4685,6 +4702,15 @@ fn vanish_shared_update_error_count(completed_outcomes: usize, completed_malform
         .max(1)
 }
 
+/// Entries this call deferred: list entries it never attempted plus hashes
+/// whose B2 version set exceeded one bounded page and continues on the next
+/// attempt. Deferred work keeps `vanished` false without reporting an error.
+fn vanish_pending_count(total: usize, offset: usize, deferred: u32) -> u32 {
+    u32::try_from(total.saturating_sub(offset))
+        .unwrap_or(u32::MAX)
+        .saturating_add(deferred)
+}
+
 fn reconcile_vanish_list_completion(
     execution: &mut VanishExecution,
     expected_account_complete: bool,
@@ -4731,6 +4757,8 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     let mut kv_finalize_ms = 0u128;
     let mut last_wave = Duration::ZERO;
     let mut offset = 0usize;
+    let mut deferred_pending = 0u32;
+    let mut b2_waves_started = 0usize;
     let b2_enabled = b2_replica_enabled();
     let wave_fanout = if b2_enabled {
         B2_VANISH_KV_FANOUT
@@ -4812,9 +4840,14 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
 
         let finalize_started = Instant::now();
         let mut failed_derived_sources = HashSet::new();
+        let mut deferred_derived_sources = HashSet::new();
         for plan in &derived_cleanup {
             if storage_result.failed_hashes.contains(&plan.audio_hash) {
                 failed_derived_sources.insert(plan.source_hash.clone());
+                continue;
+            }
+            if storage_result.remaining_hashes.contains(&plan.audio_hash) {
+                deferred_derived_sources.insert(plan.source_hash.clone());
                 continue;
             }
             if let Err(error) = finalize_derived_audio_cleanup(plan) {
@@ -4838,6 +4871,16 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
                 retry_hashes.push(blob.hash);
                 continue;
             }
+            if storage_result.remaining_hashes.contains(&blob.hash)
+                || deferred_derived_sources.contains(&blob.hash)
+            {
+                // The hash or its derived audio still has B2 versions beyond
+                // this call's bounded page. That is progress, not failure, so
+                // it counts as pending work rather than an error.
+                retry_hashes.push(blob.hash);
+                deferred_pending = deferred_pending.saturating_add(1);
+                continue;
+            }
             finalize_blobs.push(blob);
         }
         finalize_erased_vanish_wave(
@@ -4851,8 +4894,17 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         kv_finalize_ms = kv_finalize_ms.saturating_add(finalize_started.elapsed().as_millis());
         last_wave = wave_started.elapsed();
         offset = wave_end;
+        if b2_enabled {
+            b2_waves_started += 1;
+            if b2_waves_started >= VANISH_B2_WAVES_PER_EXECUTION {
+                // The started B2 waves now cover the execution's backend-request
+                // budget. Entries that did not run stay pending for the
+                // caller's next attempt.
+                break;
+            }
+        }
     }
-    execution.pending = hashes.len().saturating_sub(offset).min(u32::MAX as usize) as u32;
+    execution.pending = vanish_pending_count(hashes.len(), offset, deferred_pending);
     let expected_account_complete = execution.pending == 0 && execution.errors == 0;
     let shared_started = Instant::now();
     // One write per hot key per call, once after the last wave. Unique-key work
@@ -6844,9 +6896,10 @@ mod tests {
         should_start_vanish_wave, surrogate_key_hash_from_path,
         trusted_upload_service_terminal_derivative_error, upload_capability_headers,
         upload_control_host, upload_exposed_headers, upload_from_resumable_completion,
-        vanish_response_status, vanish_shared_update_error_count, AudioReuseAvailability,
-        DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState,
-        VanishExecution, B2_VANISH_KV_FANOUT, VANISH_KV_FANOUT, VANISH_TIME_BUDGET,
+        vanish_pending_count, vanish_response_status, vanish_shared_update_error_count,
+        AudioReuseAvailability, DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction,
+        TranscriptPendingState, VanishExecution, B2_VANISH_KV_FANOUT, VANISH_KV_FANOUT,
+        VANISH_TIME_BUDGET,
     };
     use crate::blossom::{
         BlobStatus, ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus,
@@ -6998,6 +7051,14 @@ mod tests {
         assert!(valid.is_empty());
         assert_eq!(malformed.len(), 10);
         assert_eq!(hashes.len().saturating_sub(first.end), 15);
+    }
+
+    #[test]
+    fn deferred_b2_version_drains_count_as_pending_not_errors() {
+        assert_eq!(vanish_pending_count(5, 1, 0), 4);
+        assert_eq!(vanish_pending_count(5, 1, 1), 5);
+        assert_eq!(vanish_pending_count(1, 1, 1), 1);
+        assert_eq!(vanish_pending_count(0, 0, 0), 0);
     }
 
     #[test]
