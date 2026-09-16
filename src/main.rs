@@ -51,10 +51,11 @@ use crate::metadata::{
 };
 use crate::storage::{
     blob_exists, check_funnelcake_audio_reuse, current_timestamp, delete_blob as storage_delete,
-    dispatch_vanish_timing_log, download_blob_read_through, download_blob_with_fallback,
-    download_thumbnail, erase_vanish_batch, trigger_audio_extraction,
-    trigger_cloud_run_delete_blob, upload_blob, write_audit_log, write_vanish_audit_log,
-    VanishAuditInitiator, VanishAuditPhase, VanishStorageTimings,
+    delivery_probe_sample, dispatch_vanish_timing_log, download_blob_read_through,
+    download_blob_with_fallback, download_thumbnail, erase_vanish_batch, probe_erased_delivery,
+    trigger_audio_extraction, trigger_cloud_run_delete_blob, upload_blob, write_audit_log,
+    write_vanish_audit_log, VanishAuditInitiator, VanishAuditPhase, VanishStorageTimings,
+    DELIVERY_PROBE_LIMIT,
 };
 use crate::viewer_auth::{ViewerAuthDiagnostics, ViewerAuthState};
 use blossom_core::cache_policy::{
@@ -4722,6 +4723,8 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     let mut erase_candidates = 0usize;
     let mut storage_attempts = 0u32;
     let mut storage_timings = VanishStorageTimings::default();
+    let mut erase_main_candidates: HashSet<String> = HashSet::new();
+    let mut purged_main_hashes: HashSet<String> = HashSet::new();
     let mut prepare_ms = 0u128;
     let mut kv_finalize_ms = 0u128;
     let mut last_wave = Duration::ZERO;
@@ -4776,6 +4779,7 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         let erase = cleanup_ready;
         erase_candidates = erase_candidates.saturating_add(erase.len());
         let mut erase_hashes: Vec<String> = erase.iter().map(|blob| blob.hash.clone()).collect();
+        erase_main_candidates.extend(erase_hashes.iter().cloned());
         erase_hashes.extend(derived_cleanup.iter().map(|plan| plan.audio_hash.clone()));
         erase_hashes.sort();
         erase_hashes.dedup();
@@ -4792,6 +4796,13 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         }
         storage_attempts = storage_attempts.saturating_add(u32::from(wave_storage_attempts));
         add_vanish_storage_timings(&mut storage_timings, &storage_result.timings);
+        purged_main_hashes.extend(
+            storage_result
+                .purged_hashes
+                .iter()
+                .filter(|hash| erase_main_candidates.contains(*hash))
+                .cloned(),
+        );
 
         let finalize_started = Instant::now();
         let mut failed_derived_sources = HashSet::new();
@@ -4885,6 +4896,19 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         }
     }
 
+    // Post-purge probe (#279): check a bounded sample of just-purged main blobs
+    // through the public media host. Aggregate counters only; a 2xx records a
+    // `present` failure signal without gating erasure completion, because a
+    // residual edge copy cannot be repaired by retrying the vanish.
+    let delivery_probe = {
+        let sample = delivery_probe_sample(
+            &purged_main_hashes,
+            &erase_main_candidates,
+            DELIVERY_PROBE_LIMIT,
+        );
+        probe_erased_delivery(&sample)
+    };
+
     let timing = serde_json::json!({
         "selected": selected,
         "erase_candidates": erase_candidates,
@@ -4900,6 +4924,10 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         "fos_main_ms": storage_timings.fos_main_ms,
         "purge_vcl_ms": storage_timings.purge_vcl_ms,
         "purge_compute_ms": storage_timings.purge_compute_ms,
+        "delivery_probe_ms": delivery_probe.ms,
+        "delivery_probe_checked": delivery_probe.checked,
+        "delivery_probe_present": delivery_probe.present,
+        "delivery_probe_inconclusive": delivery_probe.inconclusive,
         "kv_finalize_ms": kv_finalize_ms.min(u128::from(u64::MAX)) as u64,
         "total_ms": started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
     });

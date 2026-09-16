@@ -25,6 +25,12 @@ const FOS_BACKEND: &str = "fos_storage";
 /// Cloud Run backend for uploads/migrations
 const CLOUD_RUN_BACKEND: &str = "cloud_run_upload";
 const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
+const CLOUD_RUN_DELIVERY_PROBE_PATH: &str = "/probe-delivery";
+
+/// Bounded sample size for the post-purge delivery probe. One probe origin
+/// observes only the POP serving it, so more samples add latency without
+/// meaningfully widening coverage.
+pub(crate) const DELIVERY_PROBE_LIMIT: usize = 3;
 
 /// Legacy CDN runtime fallback is intentionally disabled.
 ///
@@ -881,15 +887,30 @@ pub(crate) struct VanishStorageTimings {
     pub purge_compute_ms: u64,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DeliveryProbeCounts {
+    pub checked: u32,
+    /// 2xx responses: an edge cache still serves an erased object.
+    pub present: u32,
+    /// Non-2xx, non-404 responses and transport failures.
+    pub inconclusive: u32,
+    pub ms: u64,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct VanishStorageResult {
     pub failed_hashes: HashSet<String>,
+    /// Hashes whose surrogate-key purge was accepted by both CDN services in
+    /// this batch. The post-purge delivery probe samples only these, because a
+    /// hash the purge could not reach is not expected to be absent yet.
+    pub purged_hashes: HashSet<String>,
     pub timings: VanishStorageTimings,
 }
 
 impl VanishStorageResult {
     pub(crate) fn replace_failures_after_retry(&mut self, retry: Self) {
         self.failed_hashes = retry.failed_hashes;
+        self.purged_hashes.extend(retry.purged_hashes);
         self.timings.gcs_main_ms = self
             .timings
             .gcs_main_ms
@@ -1073,9 +1094,12 @@ fn mark_failed_stage(
     }
 }
 
-fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) {
+/// Purge the given hashes by surrogate key from both CDN services and return
+/// the hashes whose purge request both services accepted.
+fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) -> HashSet<String> {
+    let mut purged = HashSet::new();
     if hashes.is_empty() {
-        return;
+        return purged;
     }
 
     let api_token = match get_secret("fastly_api_token") {
@@ -1086,7 +1110,7 @@ fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) {
                 hashes.len()
             );
             result.failed_hashes.extend(hashes.iter().cloned());
-            return;
+            return purged;
         }
     };
     let services = [
@@ -1153,6 +1177,8 @@ fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) {
                         stage_hashes.get(&stage).map_or(hashes.len(), Vec::len)
                     );
                     mark_failed_stage(result, &stage_hashes, &stage, hashes);
+                } else if let Some(stage_keys) = stage_hashes.get(&stage) {
+                    purged.extend(stage_keys.iter().cloned());
                 }
             }
             Err(error) => {
@@ -1172,6 +1198,7 @@ fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) {
             }
         }
     }
+    purged
 }
 
 /// Erase one bounded vanish batch from both origins and both CDN services.
@@ -1318,7 +1345,12 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
         .filter(|hash| !main_origin_failures.contains(*hash))
         .cloned()
         .collect();
-    purge_vanish_hashes(&purgeable, &mut result);
+    let purged = purge_vanish_hashes(&purgeable, &mut result);
+    let purged: HashSet<String> = purged
+        .into_iter()
+        .filter(|hash| !result.failed_hashes.contains(hash))
+        .collect();
+    result.purged_hashes.extend(purged);
     result
 }
 
@@ -2487,6 +2519,156 @@ fn trigger_cloud_run_delete_blobs_chunk(
     Ok(failed_cloud_cleanup_hashes(status, &body, hashes))
 }
 
+/// Pick the bounded post-purge probe sample: main source hashes whose purge
+/// succeeded, sorted so the same batch always probes the same hashes.
+pub(crate) fn delivery_probe_sample(
+    purged_hashes: &HashSet<String>,
+    main_candidates: &HashSet<String>,
+    limit: usize,
+) -> Vec<String> {
+    let mut sample: Vec<String> = purged_hashes
+        .iter()
+        .filter(|hash| main_candidates.contains(*hash))
+        .cloned()
+        .collect();
+    sample.sort();
+    sample.truncate(limit);
+    sample
+}
+
+struct DeliveryProbeReport {
+    counts: DeliveryProbeCounts,
+    present_hashes: Vec<(String, Option<u16>)>,
+}
+
+fn delivery_probe_report_from_body(body: &str) -> Option<DeliveryProbeReport> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let checked = value.get("checked")?.as_u64()? as u32;
+    let present = value
+        .get("present")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as u32;
+    let inconclusive = value
+        .get("inconclusive")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as u32;
+    let present_hashes = value
+        .get("results")
+        .and_then(|value| value.as_array())
+        .map(|results| {
+            results
+                .iter()
+                .filter_map(|result| {
+                    if result.get("outcome")?.as_str()? != "present" {
+                        return None;
+                    }
+                    let hash = result.get("hash")?.as_str()?.to_string();
+                    let status = result
+                        .get("status")
+                        .and_then(|value| value.as_u64())
+                        .map(|value| value.min(u64::from(u16::MAX)) as u16);
+                    Some((hash, status))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(DeliveryProbeReport {
+        counts: DeliveryProbeCounts {
+            checked,
+            present,
+            inconclusive,
+            ms: 0,
+        },
+        present_hashes,
+    })
+}
+
+/// Fetch a bounded sample of just-erased blobs through the public media host
+/// and report whether an edge cache still serves them.
+///
+/// Best-effort: this never changes the erase result. A 2xx is a failure signal
+/// for `vanish_timing` (`present`), any other status is inconclusive, and a
+/// transport or parse failure reports zero checked probes.
+pub(crate) fn probe_erased_delivery(hashes: &[String]) -> DeliveryProbeCounts {
+    let mut counts = DeliveryProbeCounts::default();
+    if hashes.is_empty() {
+        return counts;
+    }
+    let started = Instant::now();
+    let webhook_secret = match get_secret("webhook_secret") {
+        Ok(secret) if !secret.is_empty() => secret,
+        _ => {
+            eprintln!(
+                "[VANISH] delivery_probe stage=setup error=missing_or_empty_webhook_secret key_count={}",
+                hashes.len()
+            );
+            counts.ms = elapsed_ms(started);
+            return counts;
+        }
+    };
+    let body = match serde_json::to_string(&serde_json::json!({ "hashes": hashes })) {
+        Ok(body) => body,
+        Err(error) => {
+            eprintln!(
+                "[VANISH] delivery_probe stage=setup error={} key_count={}",
+                error,
+                hashes.len()
+            );
+            counts.ms = elapsed_ms(started);
+            return counts;
+        }
+    };
+
+    let mut request = Request::new(
+        Method::POST,
+        format!(
+            "https://{}{}",
+            CLOUD_RUN_HOST, CLOUD_RUN_DELIVERY_PROBE_PATH
+        ),
+    );
+    request.set_header("Host", CLOUD_RUN_HOST);
+    request.set_header("Content-Type", "application/json");
+    request.set_header("Authorization", format!("Bearer {}", webhook_secret));
+    request.set_body(Body::from(body));
+
+    match request.send(CLOUD_RUN_BACKEND) {
+        Ok(mut response) => {
+            let status = response.get_status();
+            let body = response.take_body().into_string();
+            if !status.is_success() {
+                eprintln!(
+                    "[VANISH] delivery_probe stage=request status={} key_count={}",
+                    status.as_u16(),
+                    hashes.len()
+                );
+            } else if let Some(report) = delivery_probe_report_from_body(&body) {
+                for (hash, status) in &report.present_hashes {
+                    eprintln!(
+                        "[VANISH] delivery_probe hash={} outcome=present status={}",
+                        hash,
+                        status.unwrap_or(0)
+                    );
+                }
+                counts = report.counts;
+            } else {
+                eprintln!(
+                    "[VANISH] delivery_probe stage=parse error=invalid_body key_count={}",
+                    hashes.len()
+                );
+            }
+        }
+        Err(error) => {
+            eprintln!(
+                "[VANISH] delivery_probe stage=request error={} key_count={}",
+                error,
+                hashes.len()
+            );
+        }
+    }
+    counts.ms = elapsed_ms(started);
+    counts
+}
+
 /// Trigger synchronous migration of a blob from a fallback CDN to GCS.
 /// Sends the request to Cloud Run and waits for completion (up to timeout).
 /// With VCL caching in front, this only runs once per blob on cache miss,
@@ -2686,20 +2868,22 @@ pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtracti
 mod tests {
     use super::{
         audit_log_entry, build_fos_delete_request, build_multi_delete_request,
-        canonical_query_string,
-        classify_cloud_cleanup_response, cloud_run_delete_blob_body, cloud_run_delete_blobs_body,
+        canonical_query_string, classify_cloud_cleanup_response, cloud_run_delete_blob_body,
+        cloud_run_delete_blobs_body, delivery_probe_report_from_body, delivery_probe_sample,
         failed_cloud_cleanup_hashes, failed_multi_delete_keys, mark_failed_stage,
         multi_delete_body, normalize_storage_cache_state, parse_audio_extraction_error_response,
         parse_funnelcake_audio_reuse_response, plan_cloud_run_delete_chunks,
-        plan_vanish_delete_batches,
-        prepare_storage_cache_miss, preserve_storage_cache_state, sign_request_at,
-        vanish_audit_entry, S3Config,
-        VanishDeleteTarget, VanishStorageResult, CLOUD_RUN_DELETE_BATCH_LIMIT, FOS_BACKEND,
-        PROVIDER_MULTI_DELETE_LIMIT, STORAGE_CACHE_HEADER, VanishAuditInitiator, VanishAuditPhase,
+        plan_vanish_delete_batches, prepare_storage_cache_miss, preserve_storage_cache_state,
+        sign_request_at, vanish_audit_entry, DeliveryProbeCounts, S3Config, VanishAuditInitiator,
+        VanishAuditPhase, VanishDeleteTarget, VanishStorageResult, CLOUD_RUN_DELETE_BATCH_LIMIT,
+        FOS_BACKEND, PROVIDER_MULTI_DELETE_LIMIT, STORAGE_CACHE_HEADER,
     };
     use fastly::http::header;
     use fastly::{Request, Response};
-    use std::{collections::HashMap, time::Duration};
+    use std::{
+        collections::{HashMap, HashSet},
+        time::Duration,
+    };
 
     #[test]
     fn audit_log_entry_serializes_optional_fields_without_manual_escaping() {
@@ -3164,5 +3348,81 @@ mod tests {
             Some("no_audio_track".to_string())
         );
         assert_eq!(parse_audio_extraction_error_response("not json"), None);
+    }
+
+    #[test]
+    fn delivery_probe_samples_only_purged_main_hashes_in_stable_order() {
+        let main_a = "a".repeat(64);
+        let main_b = "b".repeat(64);
+        let main_c = "c".repeat(64);
+        let main_d = "d".repeat(64);
+        let audio = "e".repeat(64);
+
+        let purged: HashSet<String> = [&main_c, &main_a, &main_b, &audio, &main_d]
+            .into_iter()
+            .cloned()
+            .collect();
+        let candidates: HashSet<String> = [&main_a, &main_b, &main_c, &main_d]
+            .into_iter()
+            .cloned()
+            .collect();
+
+        assert_eq!(
+            delivery_probe_sample(&purged, &candidates, 3),
+            vec![main_a.clone(), main_b.clone(), main_c.clone()]
+        );
+        assert!(delivery_probe_sample(&purged, &candidates, 0).is_empty());
+    }
+
+    #[test]
+    fn delivery_probe_report_extracts_counts_and_present_hashes() {
+        let body = format!(
+            r#"{{"checked":3,"absent":1,"present":1,"inconclusive":1,"results":[{{"hash":"{}","outcome":"absent","status":404}},{{"hash":"{}","outcome":"present","status":200}},{{"hash":"{}","outcome":"inconclusive"}}]}}"#,
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64),
+        );
+
+        let report = delivery_probe_report_from_body(&body).expect("valid report");
+        assert_eq!(
+            report.counts,
+            DeliveryProbeCounts {
+                checked: 3,
+                present: 1,
+                inconclusive: 1,
+                ms: 0,
+            }
+        );
+        assert_eq!(report.present_hashes, vec![("b".repeat(64), Some(200))]);
+    }
+
+    #[test]
+    fn delivery_probe_report_rejects_a_body_without_counts() {
+        assert!(delivery_probe_report_from_body("not json").is_none());
+        assert!(delivery_probe_report_from_body(r#"{"present":1}"#).is_none());
+    }
+
+    #[test]
+    fn vanish_storage_retry_keeps_purged_hashes_and_replaces_failures() {
+        let mut first = VanishStorageResult::default();
+        first.failed_hashes.insert("a".repeat(64));
+        first.purged_hashes.insert("b".repeat(64));
+
+        let mut retry = VanishStorageResult::default();
+        retry.failed_hashes.insert("c".repeat(64));
+        retry.purged_hashes.insert("a".repeat(64));
+
+        first.replace_failures_after_retry(retry);
+
+        assert_eq!(
+            first.failed_hashes,
+            ["c".repeat(64)].into_iter().collect::<HashSet<_>>()
+        );
+        assert_eq!(
+            first.purged_hashes,
+            ["a".repeat(64), "b".repeat(64)]
+                .into_iter()
+                .collect::<HashSet<_>>()
+        );
     }
 }

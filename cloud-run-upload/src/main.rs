@@ -246,6 +246,50 @@ struct BatchCleanupResponse {
 const MAX_BATCH_CLEANUP_HASHES: usize = 20;
 const BATCH_CLEANUP_CONCURRENCY: usize = 8;
 
+#[derive(Deserialize)]
+struct DeliveryProbeRequest {
+    hashes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DeliveryProbeOutcome {
+    Absent,
+    Present,
+    Inconclusive,
+}
+
+#[derive(Serialize)]
+struct DeliveryProbeResult {
+    hash: String,
+    outcome: DeliveryProbeOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<u16>,
+}
+
+#[derive(Serialize)]
+struct DeliveryProbeResponse {
+    checked: u32,
+    absent: u32,
+    present: u32,
+    inconclusive: u32,
+    results: Vec<DeliveryProbeResult>,
+}
+
+/// The edge probes one small sample per erase batch, so the cap bounds how
+/// much latency this endpoint can add to a single vanish call. The vanish call
+/// has a 10s edge budget and the janitor a 10s client timeout, so the probe
+/// must not consume seconds of that on its own.
+const MAX_DELIVERY_PROBE_HASHES: usize = 3;
+const DELIVERY_PROBE_REQUEST_TIMEOUT: Duration = Duration::from_millis(1_500);
+const DELIVERY_PROBE_TOTAL_TIMEOUT: Duration = Duration::from_millis(2_500);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryProbeValidationError {
+    InvalidCount,
+    InvalidHash,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BatchCleanupValidationError {
     InvalidCount,
@@ -362,6 +406,7 @@ async fn main() -> Result<()> {
         .route("/delete-blob", post(handle_delete_blob))
         .route("/delete-blobs", post(handle_delete_blobs))
         .route("/delete-blobs/ready", get(handle_delete_blobs_ready))
+        .route("/probe-delivery", post(handle_probe_delivery))
         .route("/delete-blob/health", get(handle_delete_blob_health))
         .route("/thumbnail/:hash", get(handle_thumbnail_generate))
         .route("/thumbnail/:hash", options(handle_cors_preflight))
@@ -576,12 +621,195 @@ async fn handle_delete_blobs(
         .into_response()
 }
 
+fn validate_delivery_probe_request(
+    request: DeliveryProbeRequest,
+) -> std::result::Result<Vec<String>, DeliveryProbeValidationError> {
+    if request.hashes.is_empty() || request.hashes.len() > MAX_DELIVERY_PROBE_HASHES {
+        return Err(DeliveryProbeValidationError::InvalidCount);
+    }
+    if request.hashes.iter().any(|hash| !cleanup::valid_hash(hash)) {
+        return Err(DeliveryProbeValidationError::InvalidHash);
+    }
+    Ok(request
+        .hashes
+        .into_iter()
+        .map(|hash| hash.to_ascii_lowercase())
+        .collect())
+}
+
+fn delivery_probe_url(base_url: &str, hash: &str) -> String {
+    format!("{}/{}", base_url.trim_end_matches('/'), hash)
+}
+
+/// A 2xx means an edge cache still serves the erased object, which is the
+/// failure this probe exists to surface. 404 is the expected absent answer;
+/// every other status and transport failure is inconclusive, never a failure.
+fn classify_delivery_probe_status(status: reqwest::StatusCode) -> DeliveryProbeOutcome {
+    if status == reqwest::StatusCode::NOT_FOUND {
+        DeliveryProbeOutcome::Absent
+    } else if status.is_success() {
+        DeliveryProbeOutcome::Present
+    } else {
+        DeliveryProbeOutcome::Inconclusive
+    }
+}
+
+fn delivery_probe_response(results: Vec<DeliveryProbeResult>) -> DeliveryProbeResponse {
+    let checked = results.len() as u32;
+    let absent = results
+        .iter()
+        .filter(|result| result.outcome == DeliveryProbeOutcome::Absent)
+        .count() as u32;
+    let present = results
+        .iter()
+        .filter(|result| result.outcome == DeliveryProbeOutcome::Present)
+        .count() as u32;
+    let inconclusive = results
+        .iter()
+        .filter(|result| result.outcome == DeliveryProbeOutcome::Inconclusive)
+        .count() as u32;
+    DeliveryProbeResponse {
+        checked,
+        absent,
+        present,
+        inconclusive,
+        results,
+    }
+}
+
+async fn probe_delivery_url(
+    client: &reqwest::Client,
+    base_url: &str,
+    hash: &str,
+) -> DeliveryProbeResult {
+    let url = delivery_probe_url(base_url, hash);
+    match client.get(&url).send().await {
+        Ok(response) => {
+            let status = response.status();
+            DeliveryProbeResult {
+                hash: hash.to_string(),
+                outcome: classify_delivery_probe_status(status),
+                status: Some(status.as_u16()),
+            }
+        }
+        Err(error) => {
+            warn!(hash = %hash, error = %error, "delivery probe request failed");
+            DeliveryProbeResult {
+                hash: hash.to_string(),
+                outcome: DeliveryProbeOutcome::Inconclusive,
+                status: None,
+            }
+        }
+    }
+}
+
+/// Post-purge check for the vanish path: fetch the erased blobs through the
+/// public media host and report whether an edge cache still serves them.
+async fn handle_probe_delivery(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<DeliveryProbeRequest>,
+) -> Response {
+    if let Err(error) = validate_webhook_auth(&headers, state.config.webhook_secret.as_deref()) {
+        return match error {
+            WebhookAuthError::Unavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "delivery probe authentication unavailable".to_string(),
+                }),
+            )
+                .into_response(),
+            WebhookAuthError::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "unauthorized".to_string(),
+                }),
+            )
+                .into_response(),
+        };
+    }
+    let hashes = match validate_delivery_probe_request(request) {
+        Ok(hashes) => hashes,
+        Err(DeliveryProbeValidationError::InvalidCount) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!(
+                        "hashes must contain between 1 and {MAX_DELIVERY_PROBE_HASHES} entries"
+                    ),
+                }),
+            )
+                .into_response();
+        }
+        Err(DeliveryProbeValidationError::InvalidHash) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "every hash must be 64 hexadecimal characters".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(DELIVERY_PROBE_REQUEST_TIMEOUT)
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            error!(error = %error, "failed to build delivery probe client");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "delivery probe unavailable".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let base_url = &state.config.cdn_base_url;
+    let probes = hashes
+        .iter()
+        .map(|hash| probe_delivery_url(&client, base_url, hash));
+    let results = match tokio::time::timeout(
+        DELIVERY_PROBE_TOTAL_TIMEOUT,
+        futures::future::join_all(probes),
+    )
+    .await
+    {
+        Ok(results) => results,
+        Err(_) => {
+            warn!(hashes = hashes.len(), "delivery probe timed out");
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ErrorResponse {
+                    error: "delivery probe timed out".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let response = delivery_probe_response(results);
+    info!(
+        checked = response.checked,
+        absent = response.absent,
+        present = response.present,
+        inconclusive = response.inconclusive,
+        "delivery probe completed"
+    );
+    (StatusCode::OK, Json(response)).into_response()
+}
+
 async fn handle_delete_blobs_ready() -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "ready",
         "contract": "vanish-batch-v1",
         "max_hashes": MAX_BATCH_CLEANUP_HASHES,
         "vanish_audit": "authenticated-v1",
+        "delivery_probe": "authenticated-v1",
     }))
 }
 
@@ -1735,11 +1963,14 @@ async fn probe_video_dimensions(video_bytes: &[u8]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        batch_cleanup_status, classify_invalid_media_signal, cleanup_bucket_matches,
-        cleanup_response_status, media_source_candidates, needs_derivative_sanitize,
-        new_temp_media_path, validate_batch_cleanup_request, validate_webhook_auth,
-        video_thumbnail_url, BatchCleanupValidationError, DeleteBlobsRequest,
-        EXPECTED_GCS_BUCKET_HEADER, MAX_BATCH_CLEANUP_HASHES,
+        batch_cleanup_status, classify_delivery_probe_status, classify_invalid_media_signal,
+        cleanup_bucket_matches, cleanup_response_status, delivery_probe_response,
+        delivery_probe_url, media_source_candidates, needs_derivative_sanitize,
+        new_temp_media_path, validate_batch_cleanup_request, validate_delivery_probe_request,
+        validate_webhook_auth, video_thumbnail_url, BatchCleanupValidationError,
+        DeleteBlobsRequest, DeliveryProbeOutcome, DeliveryProbeRequest, DeliveryProbeResult,
+        DeliveryProbeValidationError, EXPECTED_GCS_BUCKET_HEADER, MAX_BATCH_CLEANUP_HASHES,
+        MAX_DELIVERY_PROBE_HASHES,
     };
     use axum::http::{header, HeaderMap, HeaderValue};
 
@@ -1998,6 +2229,105 @@ mod tests {
         assert_eq!(
             video_thumbnail_url("https://cdn.example.com", "image/jpeg", hash),
             None
+        );
+    }
+
+    #[test]
+    fn delivery_probe_accepts_a_bounded_sample_and_normalizes_hashes() {
+        let upper = "0A828BD76EB27C56DEE1E970A2E73FE2B2E1CA4443550BBF6E0EE3AA9273E421";
+        let request = DeliveryProbeRequest {
+            hashes: vec![upper.to_string()],
+        };
+
+        let hashes = validate_delivery_probe_request(request).expect("bounded sample accepted");
+        assert_eq!(hashes, vec![upper.to_ascii_lowercase()]);
+
+        let too_many = DeliveryProbeRequest {
+            hashes: vec!["ab".repeat(32); MAX_DELIVERY_PROBE_HASHES + 1],
+        };
+        assert_eq!(
+            validate_delivery_probe_request(too_many),
+            Err(DeliveryProbeValidationError::InvalidCount)
+        );
+
+        let empty = DeliveryProbeRequest { hashes: vec![] };
+        assert_eq!(
+            validate_delivery_probe_request(empty),
+            Err(DeliveryProbeValidationError::InvalidCount)
+        );
+    }
+
+    #[test]
+    fn delivery_probe_rejects_anything_that_is_not_a_full_hex_hash() {
+        for bad in ["", "abc", &"g".repeat(64), &"a".repeat(63), &"a".repeat(65)] {
+            let request = DeliveryProbeRequest {
+                hashes: vec![bad.to_string()],
+            };
+            assert_eq!(
+                validate_delivery_probe_request(request),
+                Err(DeliveryProbeValidationError::InvalidHash),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn delivery_probe_classifies_only_2xx_as_present() {
+        assert_eq!(
+            classify_delivery_probe_status(reqwest::StatusCode::OK),
+            DeliveryProbeOutcome::Present
+        );
+        assert_eq!(
+            classify_delivery_probe_status(reqwest::StatusCode::NO_CONTENT),
+            DeliveryProbeOutcome::Present
+        );
+        assert_eq!(
+            classify_delivery_probe_status(reqwest::StatusCode::NOT_FOUND),
+            DeliveryProbeOutcome::Absent
+        );
+        for status in [
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert_eq!(
+                classify_delivery_probe_status(status),
+                DeliveryProbeOutcome::Inconclusive
+            );
+        }
+    }
+
+    #[test]
+    fn delivery_probe_response_counts_every_outcome() {
+        let result = |outcome, status: Option<u16>| DeliveryProbeResult {
+            hash: "ab".repeat(32),
+            outcome,
+            status,
+        };
+        let response = delivery_probe_response(vec![
+            result(DeliveryProbeOutcome::Absent, Some(404)),
+            result(DeliveryProbeOutcome::Present, Some(200)),
+            result(DeliveryProbeOutcome::Inconclusive, None),
+        ]);
+
+        assert_eq!(response.checked, 3);
+        assert_eq!(response.absent, 1);
+        assert_eq!(response.present, 1);
+        assert_eq!(response.inconclusive, 1);
+        assert_eq!(response.results.len(), 3);
+    }
+
+    #[test]
+    fn delivery_probe_url_normalizes_the_base_and_preserves_the_hash_case() {
+        let hash = "0a828bd76eb27c56dee1e970a2e73fe2b2e1ca4443550bbf6e0ee3aa9273e421";
+
+        assert_eq!(
+            delivery_probe_url("https://media.divine.video", hash),
+            format!("https://media.divine.video/{hash}")
+        );
+        assert_eq!(
+            delivery_probe_url("https://media.divine.video/", hash),
+            format!("https://media.divine.video/{hash}")
         );
     }
 }

@@ -122,15 +122,19 @@ absent through Compute before running the cleanup.
   names or other durable evidence.
 - A URL purge matches the exact cache key. A copy filled with a query string
   is a different key and is not covered.
-- Issue #279 also asks for an automated post-purge probe in the vanish path
-  that surfaces in `vanish_timing`. This change does not deliver it: the
-  Compute service declares no backend for the public host, and one has to be
-  created on the live service before such a probe can run. That outcome stays
-  open on #279 until it lands or is split out. Until then any probe must be run
-  by an operator and interpreted as POP-local evidence only.
-- A single-POP probe, whether run by an operator or from that future automated
-  check, cannot see other POPs' copies. Global evidence would need a probe from
-  every POP or Fastly-side reporting; neither exists today.
+- The vanish path now runs an automated post-purge probe (#279 item 3): after a
+  successful key purge it asks the upload service to fetch a bounded sample of
+  the just-erased main blob URLs through `media.divine.video` and records
+  `delivery_probe_checked`, `delivery_probe_present`, `delivery_probe_inconclusive`,
+  and `delivery_probe_ms` in `vanish_timing`. A `2xx` is a failure signal and
+  appears in the `[VANISH] delivery_probe` operational log with its hash; `404`
+  is the expected absent result. The probe does not gate erasure completion, so
+  a `present` sample needs a follow-up check from another POP.
+- A single-POP probe, whether run by an operator or by the automated check,
+  cannot see other POPs' copies. Global evidence would need a probe from every
+  POP or Fastly-side reporting; neither exists today. A clean automated probe
+  is therefore weak evidence, while a `present` sample is strong evidence and
+  always a failure.
 
 ## Cache-policy behavior after activation
 
