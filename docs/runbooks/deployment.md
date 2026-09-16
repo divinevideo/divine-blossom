@@ -62,9 +62,13 @@ requires one typed result for every requested hash. For changes to that contract
    a `409` means the two services name different buckets. Stop rather than
    merging the edge in either case.
 2. The `main` workflow deploys `cloud-run-upload` and verifies
-   `/delete-blobs/ready` before publishing edge code that calls it. Each real
-   cleanup request also asserts that Cloud Run and the edge use the same GCS
-   bucket before Cloud Run may report deletion complete.
+   `/delete-blobs/ready` before publishing edge code that calls it. The same
+   readiness body advertises the authenticated `/probe-delivery` endpoint the
+   vanish path calls after a purge (`delivery_probe:
+   authenticated-v1`); the workflow asserts it before publishing the edge so
+   the probe never calls a missing route. Each real cleanup request also
+   asserts that Cloud Run and the edge use the same GCS bucket before Cloud
+   Run may report deletion complete.
 
 Do not put either secret value in the verification command, logs, screenshots,
 or pull-request text. Use the approved secret-injection tooling for the operator
