@@ -892,8 +892,11 @@ pub(crate) struct DeliveryProbeCounts {
     pub checked: u32,
     /// 2xx responses: an edge cache still serves an erased object.
     pub present: u32,
-    /// Non-2xx, non-404 responses and transport failures.
+    /// Non-2xx, non-404 responses from completed probes.
     pub inconclusive: u32,
+    /// 1 when the probe could not complete at all: missing credential,
+    /// transport failure, non-2xx response, or malformed response body.
+    pub errors: u32,
     pub ms: u64,
 }
 
@@ -2577,6 +2580,7 @@ fn delivery_probe_report_from_body(body: &str) -> Option<DeliveryProbeReport> {
             checked,
             present,
             inconclusive,
+            errors: 0,
             ms: 0,
         },
         present_hashes,
@@ -2588,7 +2592,8 @@ fn delivery_probe_report_from_body(body: &str) -> Option<DeliveryProbeReport> {
 ///
 /// Best-effort: this never changes the erase result. A 2xx is a failure signal
 /// for `vanish_timing` (`present`), any other status is inconclusive, and a
-/// transport or parse failure reports zero checked probes.
+/// probe that cannot run to completion sets `errors` so an all-zero result is
+/// not mistaken for a probe that simply had nothing to check.
 pub(crate) fn probe_erased_delivery(hashes: &[String]) -> DeliveryProbeCounts {
     let mut counts = DeliveryProbeCounts::default();
     if hashes.is_empty() {
@@ -2602,6 +2607,7 @@ pub(crate) fn probe_erased_delivery(hashes: &[String]) -> DeliveryProbeCounts {
                 "[VANISH] delivery_probe stage=setup error=missing_or_empty_webhook_secret key_count={}",
                 hashes.len()
             );
+            counts.errors = 1;
             counts.ms = elapsed_ms(started);
             return counts;
         }
@@ -2614,6 +2620,7 @@ pub(crate) fn probe_erased_delivery(hashes: &[String]) -> DeliveryProbeCounts {
                 error,
                 hashes.len()
             );
+            counts.errors = 1;
             counts.ms = elapsed_ms(started);
             return counts;
         }
@@ -2641,6 +2648,7 @@ pub(crate) fn probe_erased_delivery(hashes: &[String]) -> DeliveryProbeCounts {
                     status.as_u16(),
                     hashes.len()
                 );
+                counts.errors = 1;
             } else if let Some(report) = delivery_probe_report_from_body(&body) {
                 for (hash, status) in &report.present_hashes {
                     eprintln!(
@@ -2655,6 +2663,7 @@ pub(crate) fn probe_erased_delivery(hashes: &[String]) -> DeliveryProbeCounts {
                     "[VANISH] delivery_probe stage=parse error=invalid_body key_count={}",
                     hashes.len()
                 );
+                counts.errors = 1;
             }
         }
         Err(error) => {
@@ -2663,6 +2672,7 @@ pub(crate) fn probe_erased_delivery(hashes: &[String]) -> DeliveryProbeCounts {
                 error,
                 hashes.len()
             );
+            counts.errors = 1;
         }
     }
     counts.ms = elapsed_ms(started);
@@ -3390,6 +3400,7 @@ mod tests {
                 checked: 3,
                 present: 1,
                 inconclusive: 1,
+                errors: 0,
                 ms: 0,
             }
         );

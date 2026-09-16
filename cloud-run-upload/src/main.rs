@@ -710,7 +710,24 @@ async fn handle_probe_delivery(
     headers: HeaderMap,
     Json(request): Json<DeliveryProbeRequest>,
 ) -> Response {
-    if let Err(error) = validate_webhook_auth(&headers, state.config.webhook_secret.as_deref()) {
+    probe_delivery(
+        state.config.webhook_secret.as_deref(),
+        &state.config.cdn_base_url,
+        headers,
+        request,
+    )
+    .await
+}
+
+/// The route body, split out so tests can exercise authentication and request
+/// validation without building the full application state.
+async fn probe_delivery(
+    webhook_secret: Option<&str>,
+    cdn_base_url: &str,
+    headers: HeaderMap,
+    request: DeliveryProbeRequest,
+) -> Response {
+    if let Err(error) = validate_webhook_auth(&headers, webhook_secret) {
         return match error {
             WebhookAuthError::Unavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -769,10 +786,9 @@ async fn handle_probe_delivery(
         }
     };
 
-    let base_url = &state.config.cdn_base_url;
     let probes = hashes
         .iter()
-        .map(|hash| probe_delivery_url(&client, base_url, hash));
+        .map(|hash| probe_delivery_url(&client, cdn_base_url, hash));
     let results = match tokio::time::timeout(
         DELIVERY_PROBE_TOTAL_TIMEOUT,
         futures::future::join_all(probes),
@@ -1966,13 +1982,13 @@ mod tests {
         batch_cleanup_status, classify_delivery_probe_status, classify_invalid_media_signal,
         cleanup_bucket_matches, cleanup_response_status, delivery_probe_response,
         delivery_probe_url, media_source_candidates, needs_derivative_sanitize,
-        new_temp_media_path, validate_batch_cleanup_request, validate_delivery_probe_request,
-        validate_webhook_auth, video_thumbnail_url, BatchCleanupValidationError,
-        DeleteBlobsRequest, DeliveryProbeOutcome, DeliveryProbeRequest, DeliveryProbeResult,
-        DeliveryProbeValidationError, EXPECTED_GCS_BUCKET_HEADER, MAX_BATCH_CLEANUP_HASHES,
-        MAX_DELIVERY_PROBE_HASHES,
+        new_temp_media_path, probe_delivery, validate_batch_cleanup_request,
+        validate_delivery_probe_request, validate_webhook_auth, video_thumbnail_url,
+        BatchCleanupValidationError, DeleteBlobsRequest, DeliveryProbeOutcome,
+        DeliveryProbeRequest, DeliveryProbeResult, DeliveryProbeValidationError,
+        EXPECTED_GCS_BUCKET_HEADER, MAX_BATCH_CLEANUP_HASHES, MAX_DELIVERY_PROBE_HASHES,
     };
-    use axum::http::{header, HeaderMap, HeaderValue};
+    use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 
     #[test]
     fn cleanup_outcomes_have_distinct_http_classes() {
@@ -2329,6 +2345,87 @@ mod tests {
             delivery_probe_url("https://media.divine.video/", hash),
             format!("https://media.divine.video/{hash}")
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delivery_probe_route_requires_the_webhook_bearer() {
+        let hash = "ab".repeat(32);
+
+        let unconfigured = probe_delivery(
+            None,
+            "https://media.divine.video",
+            HeaderMap::new(),
+            DeliveryProbeRequest {
+                hashes: vec![hash.clone()],
+            },
+        )
+        .await;
+        assert_eq!(unconfigured.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let missing = probe_delivery(
+            Some("expected"),
+            "https://media.divine.video",
+            HeaderMap::new(),
+            DeliveryProbeRequest {
+                hashes: vec![hash.clone()],
+            },
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer wrong"),
+        );
+        let wrong = probe_delivery(
+            Some("expected"),
+            "https://media.divine.video",
+            headers,
+            DeliveryProbeRequest { hashes: vec![hash] },
+        )
+        .await;
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delivery_probe_route_rejects_a_bad_sample_before_probing() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer expected"),
+        );
+
+        let empty = probe_delivery(
+            Some("expected"),
+            "https://media.divine.video",
+            headers.clone(),
+            DeliveryProbeRequest { hashes: vec![] },
+        )
+        .await;
+        assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+
+        let invalid = probe_delivery(
+            Some("expected"),
+            "https://media.divine.video",
+            headers.clone(),
+            DeliveryProbeRequest {
+                hashes: vec!["not-a-hash".to_string()],
+            },
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+        let too_many = probe_delivery(
+            Some("expected"),
+            "https://media.divine.video",
+            headers,
+            DeliveryProbeRequest {
+                hashes: vec!["ab".repeat(32); MAX_DELIVERY_PROBE_HASHES + 1],
+            },
+        )
+        .await;
+        assert_eq!(too_many.status(), StatusCode::BAD_REQUEST);
     }
 }
 

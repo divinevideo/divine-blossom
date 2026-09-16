@@ -126,10 +126,14 @@ absent through Compute before running the cleanup.
   successful key purge it asks the upload service to fetch a bounded sample of
   the just-erased main blob URLs through `media.divine.video` and records
   `delivery_probe_checked`, `delivery_probe_present`, `delivery_probe_inconclusive`,
-  and `delivery_probe_ms` in `vanish_timing`. A `2xx` is a failure signal and
-  appears in the `[VANISH] delivery_probe` operational log with its hash; `404`
-  is the expected absent result. The probe does not gate erasure completion, so
-  a `present` sample needs a follow-up check from another POP.
+  `delivery_probe_errors`, `delivery_probe_skipped`, and `delivery_probe_ms` in
+  `vanish_timing`. A `2xx` is a failure signal and appears in the
+  `[VANISH] delivery_probe` operational log with its hash; `404` is the expected
+  absent result; `errors=1` means the probe could not run to completion and
+  `skipped=1` means the call was already too close to its time budget to try.
+  The probe does not gate erasure completion, so a `present` sample needs a
+  follow-up check from another POP, and a `present` immediately after a purge
+  can also mean propagation to that POP was still in flight.
 - A single-POP probe, whether run by an operator or by the automated check,
   cannot see other POPs' copies. Global evidence would need a probe from every
   POP or Fastly-side reporting; neither exists today. A clean automated probe
