@@ -4535,6 +4535,12 @@ fn should_start_vanish_wave(
     elapsed.saturating_add(last_wave) < budget
 }
 
+/// The post-purge delivery probe is observability, not erasure: run it only
+/// while the call still has the reserve left inside its time budget.
+fn should_probe_delivery(elapsed: Duration, reserve: Duration, budget: Duration) -> bool {
+    elapsed.saturating_add(reserve) <= budget
+}
+
 fn next_vanish_wave_range(
     total: usize,
     offset: usize,
@@ -4952,7 +4958,11 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     // `present` failure signal without gating erasure completion, because a
     // residual edge copy cannot be repaired by retrying the vanish.
     let (delivery_probe, delivery_probe_skipped) =
-        if started.elapsed() + DELIVERY_PROBE_BUDGET_RESERVE <= VANISH_TIME_BUDGET {
+        if should_probe_delivery(
+            started.elapsed(),
+            DELIVERY_PROBE_BUDGET_RESERVE,
+            VANISH_TIME_BUDGET,
+        ) {
             let sample = delivery_probe_sample(
                 &purged_main_hashes,
                 &erase_main_candidates,
@@ -6903,8 +6913,8 @@ mod tests {
         should_eagerly_trigger_transcription, should_record_upload_service_transcode_failure,
         should_record_upload_service_transcript_failure,
         should_reset_transcode_failure_on_clean_upload,
-        should_reset_transcript_failure_on_clean_upload, should_set_audio_content_length,
-        should_start_vanish_wave, surrogate_key_hash_from_path,
+        should_probe_delivery, should_reset_transcript_failure_on_clean_upload,
+        should_set_audio_content_length, should_start_vanish_wave, surrogate_key_hash_from_path,
         trusted_upload_service_terminal_derivative_error, upload_capability_headers,
         upload_control_host, upload_exposed_headers, upload_from_resumable_completion,
         vanish_response_status, vanish_shared_update_error_count, vanish_timing_record,
@@ -7001,6 +7011,32 @@ mod tests {
             true,
             Duration::from_millis(3_000),
             Duration::from_millis(2_000),
+            VANISH_TIME_BUDGET,
+        ));
+    }
+
+    #[test]
+    fn delivery_probe_runs_only_while_the_budget_has_room() {
+        let reserve = Duration::from_millis(2_000);
+
+        assert!(should_probe_delivery(
+            Duration::from_millis(0),
+            reserve,
+            VANISH_TIME_BUDGET,
+        ));
+        assert!(should_probe_delivery(
+            Duration::from_millis(8_000),
+            reserve,
+            VANISH_TIME_BUDGET,
+        ));
+        assert!(!should_probe_delivery(
+            Duration::from_millis(8_001),
+            reserve,
+            VANISH_TIME_BUDGET,
+        ));
+        assert!(!should_probe_delivery(
+            VANISH_TIME_BUDGET,
+            reserve,
             VANISH_TIME_BUDGET,
         ));
     }

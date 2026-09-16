@@ -133,7 +133,11 @@ absent through Compute before running the cleanup.
   `skipped=1` means the call was already too close to its time budget to try.
   The probe does not gate erasure completion, so a `present` sample needs a
   follow-up check from another POP, and a `present` immediately after a purge
-  can also mean propagation to that POP was still in flight.
+  can also mean propagation to that POP was still in flight. The probe only runs
+  while the call is under its effective 8s cutoff (a 2s reserve against the 10s
+  vanish budget), so after rollout compare `delivery_probe_skipped` against
+  `delivery_probe_checked`; a high skip share means the reserve is costing
+  coverage and should be revisited.
 - A single-POP probe, whether run by an operator or by the automated check,
   cannot see other POPs' copies. Global evidence would need a probe from every
   POP or Fastly-side reporting; neither exists today. A clean automated probe
