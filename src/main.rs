@@ -4957,25 +4957,24 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     // through the public media host. Aggregate counters only; a 2xx records a
     // `present` failure signal without gating erasure completion, because a
     // residual edge copy cannot be repaired by retrying the vanish.
-    let (delivery_probe, delivery_probe_skipped) =
-        if should_probe_delivery(
-            started.elapsed(),
-            DELIVERY_PROBE_BUDGET_RESERVE,
-            VANISH_TIME_BUDGET,
-        ) {
-            let sample = delivery_probe_sample(
-                &purged_main_hashes,
-                &erase_main_candidates,
-                DELIVERY_PROBE_LIMIT,
-            );
-            (probe_erased_delivery(&sample), 0u32)
-        } else {
-            eprintln!(
-                "[VANISH] delivery_probe stage=budget skipped elapsed_ms={}",
-                started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
-            );
-            (DeliveryProbeCounts::default(), 1u32)
-        };
+    let (delivery_probe, delivery_probe_skipped) = if should_probe_delivery(
+        started.elapsed(),
+        DELIVERY_PROBE_BUDGET_RESERVE,
+        VANISH_TIME_BUDGET,
+    ) {
+        let sample = delivery_probe_sample(
+            &purged_main_hashes,
+            &erase_main_candidates,
+            DELIVERY_PROBE_LIMIT,
+        );
+        (probe_erased_delivery(&sample), 0u32)
+    } else {
+        eprintln!(
+            "[VANISH] delivery_probe stage=budget skipped elapsed_ms={}",
+            started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+        );
+        (DeliveryProbeCounts::default(), 1u32)
+    };
 
     let timing = vanish_timing_record(
         &VanishTimingCounters {
@@ -6910,16 +6909,18 @@ mod tests {
         next_vanish_wave_range, parse_transcode_status_webhook_payload,
         parse_transcript_status_webhook_payload, parse_upload_service_response,
         reconcile_vanish_list_completion, should_delete_derived_audio_blob,
-        should_eagerly_trigger_transcription, should_record_upload_service_transcode_failure,
+        should_eagerly_trigger_transcription, should_probe_delivery,
+        should_record_upload_service_transcode_failure,
         should_record_upload_service_transcript_failure,
         should_reset_transcode_failure_on_clean_upload,
-        should_probe_delivery, should_reset_transcript_failure_on_clean_upload,
-        should_set_audio_content_length, should_start_vanish_wave, surrogate_key_hash_from_path,
+        should_reset_transcript_failure_on_clean_upload, should_set_audio_content_length,
+        should_start_vanish_wave, surrogate_key_hash_from_path,
         trusted_upload_service_terminal_derivative_error, upload_capability_headers,
         upload_control_host, upload_exposed_headers, upload_from_resumable_completion,
         vanish_response_status, vanish_shared_update_error_count, vanish_timing_record,
         AudioReuseAvailability, DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction,
-        TranscriptPendingState, VanishExecution, VanishTimingCounters, VANISH_TIME_BUDGET,
+        TranscriptPendingState, VanishExecution, VanishTimingCounters,
+        DELIVERY_PROBE_BUDGET_RESERVE, VANISH_TIME_BUDGET,
     };
     use crate::blossom::{
         BlobStatus, ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus,
@@ -7017,7 +7018,7 @@ mod tests {
 
     #[test]
     fn delivery_probe_runs_only_while_the_budget_has_room() {
-        let reserve = Duration::from_millis(2_000);
+        let reserve = DELIVERY_PROBE_BUDGET_RESERVE;
 
         assert!(should_probe_delivery(
             Duration::from_millis(0),
