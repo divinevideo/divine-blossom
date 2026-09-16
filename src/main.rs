@@ -4702,6 +4702,33 @@ fn vanish_shared_update_error_count(completed_outcomes: usize, completed_malform
         .max(1)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum VanishBlobDisposition {
+    Finalize,
+    Failed,
+    Deferred,
+}
+
+/// Decide what happens to one prepared blob after its storage attempt. A blob
+/// is finalized only when neither it nor its derived audio still has B2
+/// versions beyond the attempt's bounded page; deferred work must never reach
+/// finalization while replica bytes survive.
+fn vanish_blob_disposition(
+    hash: &str,
+    failed_hashes: &HashSet<String>,
+    remaining_hashes: &HashSet<String>,
+    failed_derived_sources: &HashSet<String>,
+    deferred_derived_sources: &HashSet<String>,
+) -> VanishBlobDisposition {
+    if failed_hashes.contains(hash) || failed_derived_sources.contains(hash) {
+        VanishBlobDisposition::Failed
+    } else if remaining_hashes.contains(hash) || deferred_derived_sources.contains(hash) {
+        VanishBlobDisposition::Deferred
+    } else {
+        VanishBlobDisposition::Finalize
+    }
+}
+
 /// Entries this call deferred: list entries it never attempted plus hashes
 /// whose B2 version set exceeded one bounded page and continues on the next
 /// attempt. Deferred work keeps `vanished` false without reporting an error.
@@ -4860,28 +4887,31 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         }
         let mut finalize_blobs = Vec::new();
         for blob in erase {
-            if storage_result.failed_hashes.contains(&blob.hash)
-                || failed_derived_sources.contains(&blob.hash)
-            {
-                eprintln!(
-                    "[VANISH] pubkey={} hash={} required storage erasure failed after {} attempts",
-                    pubkey, blob.hash, wave_storage_attempts
-                );
-                execution.errors += 1;
-                retry_hashes.push(blob.hash);
-                continue;
+            match vanish_blob_disposition(
+                &blob.hash,
+                &storage_result.failed_hashes,
+                &storage_result.remaining_hashes,
+                &failed_derived_sources,
+                &deferred_derived_sources,
+            ) {
+                VanishBlobDisposition::Failed => {
+                    eprintln!(
+                        "[VANISH] pubkey={} hash={} required storage erasure failed after {} attempts",
+                        pubkey, blob.hash, wave_storage_attempts
+                    );
+                    execution.errors += 1;
+                    retry_hashes.push(blob.hash);
+                }
+                VanishBlobDisposition::Deferred => {
+                    // The hash or its derived audio still has B2 versions
+                    // beyond this call's bounded page. That is progress, not
+                    // failure, so it counts as pending work rather than an
+                    // error.
+                    retry_hashes.push(blob.hash);
+                    deferred_pending = deferred_pending.saturating_add(1);
+                }
+                VanishBlobDisposition::Finalize => finalize_blobs.push(blob),
             }
-            if storage_result.remaining_hashes.contains(&blob.hash)
-                || deferred_derived_sources.contains(&blob.hash)
-            {
-                // The hash or its derived audio still has B2 versions beyond
-                // this call's bounded page. That is progress, not failure, so
-                // it counts as pending work rather than an error.
-                retry_hashes.push(blob.hash);
-                deferred_pending = deferred_pending.saturating_add(1);
-                continue;
-            }
-            finalize_blobs.push(blob);
         }
         finalize_erased_vanish_wave(
             pubkey,
@@ -6896,10 +6926,10 @@ mod tests {
         should_start_vanish_wave, surrogate_key_hash_from_path,
         trusted_upload_service_terminal_derivative_error, upload_capability_headers,
         upload_control_host, upload_exposed_headers, upload_from_resumable_completion,
-        vanish_pending_count, vanish_response_status, vanish_shared_update_error_count,
-        AudioReuseAvailability, DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction,
-        TranscriptPendingState, VanishExecution, B2_VANISH_KV_FANOUT, VANISH_KV_FANOUT,
-        VANISH_TIME_BUDGET,
+        vanish_blob_disposition, vanish_pending_count, vanish_response_status,
+        vanish_shared_update_error_count, AudioReuseAvailability, DerivativeObservation,
+        TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState, VanishBlobDisposition,
+        VanishExecution, B2_VANISH_KV_FANOUT, VANISH_KV_FANOUT, VANISH_TIME_BUDGET,
     };
     use crate::blossom::{
         BlobStatus, ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus,
@@ -6908,6 +6938,7 @@ mod tests {
     use blossom_core::cache_policy::BlobCachePolicy;
     use fastly::http::StatusCode;
     use fastly::Response;
+    use std::collections::HashSet;
     use std::time::Duration;
 
     #[test]
@@ -7059,6 +7090,35 @@ mod tests {
         assert_eq!(vanish_pending_count(5, 1, 1), 5);
         assert_eq!(vanish_pending_count(1, 1, 1), 1);
         assert_eq!(vanish_pending_count(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn vanish_finalizes_only_after_b2_versions_are_gone() {
+        let hash = "a".repeat(64);
+        let empty: HashSet<String> = HashSet::new();
+        let failed = HashSet::from([hash.clone()]);
+        let remaining = HashSet::from([hash.clone()]);
+
+        assert_eq!(
+            vanish_blob_disposition(&hash, &failed, &remaining, &empty, &empty),
+            VanishBlobDisposition::Failed
+        );
+        assert_eq!(
+            vanish_blob_disposition(&hash, &empty, &remaining, &empty, &empty),
+            VanishBlobDisposition::Deferred
+        );
+        assert_eq!(
+            vanish_blob_disposition(&hash, &empty, &empty, &empty, &remaining),
+            VanishBlobDisposition::Deferred
+        );
+        assert_eq!(
+            vanish_blob_disposition(&hash, &empty, &empty, &remaining, &empty),
+            VanishBlobDisposition::Failed
+        );
+        assert_eq!(
+            vanish_blob_disposition(&hash, &empty, &empty, &empty, &empty),
+            VanishBlobDisposition::Finalize
+        );
     }
 
     #[test]
