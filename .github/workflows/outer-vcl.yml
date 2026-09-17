@@ -1,0 +1,50 @@
+name: Outer VCL
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/outer-vcl.yml
+      - scripts/sync_outer_vcl.py
+      - vcl/**
+  workflow_dispatch:
+    inputs:
+      apply_draft:
+        description: Clone the active outer VCL version, apply git snippets, and validate. Does not make the draft live.
+        type: boolean
+        default: false
+
+jobs:
+  reject-non-main-apply:
+    if: github.event_name == 'workflow_dispatch' && inputs.apply_draft && github.ref != 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Reject draft creation outside main
+        run: |
+          echo "Draft creation must run from main." >&2
+          exit 1
+
+  diff:
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.apply_draft)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Diff git snippets against the active outer version
+        env:
+          FASTLY_API_TOKEN: ${{ secrets.FASTLY_API_TOKEN }}
+        run: python3 scripts/sync_outer_vcl.py diff
+
+  apply:
+    if: github.event_name == 'workflow_dispatch' && inputs.apply_draft && github.ref == 'refs/heads/main'
+    concurrency:
+      group: outer-vcl-draft
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply git snippets to a cloned draft
+        env:
+          FASTLY_API_TOKEN: ${{ secrets.FASTLY_API_TOKEN }}
+        run: python3 scripts/sync_outer_vcl.py apply
