@@ -1,5 +1,5 @@
-// ABOUTME: Object storage operations against S3-compatible origins (GCS and Fastly Object Storage)
-// ABOUTME: Implements AWS v4 signing plus read-through delivery from the FOS mirror
+// ABOUTME: Object storage operations against GCS, Fastly Object Storage, and the gated B2 replica
+// ABOUTME: Implements signed delivery, read-through mirroring, and fail-closed vanish erasure
 
 use crate::error::{BlossomError, Result};
 use blossom_core::cache_policy::{immutable_storage_cache_policy, ImmutableStorageCachePolicy};
@@ -8,7 +8,7 @@ use blossom_core::read_through::{
     write_back_decision, ReplicaDeleteOutcome, MAX_WRITE_BACK_BYTES, SOURCE_FOS, SOURCE_GCS,
 };
 use fastly::http::{Method, StatusCode};
-use fastly::{Body, Request, Response};
+use fastly::{Backend, Body, Request, Response};
 use hmac::{Hmac, Mac};
 use md5::Md5;
 use serde::Deserialize;
@@ -22,6 +22,10 @@ const GCS_BACKEND: &str = "gcs_storage";
 
 /// Fastly Object Storage backend name (must exist on the service).
 const FOS_BACKEND: &str = "fos_storage";
+
+/// Backblaze Native API and bunny control-plane backends.
+const B2_API_BACKEND: &str = "b2_api";
+const BUNNY_API_BACKEND: &str = "bunny_api";
 
 /// Cloud Run backend for uploads/migrations
 const CLOUD_RUN_BACKEND: &str = "cloud_run_upload";
@@ -69,6 +73,22 @@ const FOS_BUCKET: &str = "divine-media-delivery";
 /// Config keys for the two independent read-through feature flags.
 const FOS_READ_FLAG: &str = "fos_read_enabled";
 const FOS_WRITE_BACK_FLAG: &str = "fos_write_back_enabled";
+const B2_REPLICA_FLAG: &str = "b2_replica_enabled";
+// One B2-enabled vanish wave covers at most a source blob and its derived
+// audio, each listing one bounded page of versions, deleting them, and
+// confirming absence. The vanish wave loop in main.rs asserts that this whole
+// wave plus the execution's audit and timing requests fits Fastly Compute's
+// 32-backend-request per-execution limit. A larger version set is drained
+// across caller retries as pending work instead of exhausting the execution.
+const B2_LIST_PAGE_SIZE: usize = 6;
+const MAX_BUNNY_DELIVERY_ZONES: usize = 2;
+pub(crate) const B2_VANISH_MAX_HASHES_PER_WAVE: usize = 2;
+pub(crate) const B2_VANISH_MAX_STORAGE_BACKEND_REQUESTS: usize = 2 // GCS and FOS multi-delete
+    + 1 // B2 authorization
+    + B2_VANISH_MAX_HASHES_PER_WAVE * (2 + B2_LIST_PAGE_SIZE) // list, deletes, confirm
+    + 1 // Cloud Run derivative cleanup
+    + 2 // Fastly VCL and Compute purges
+    + B2_VANISH_MAX_HASHES_PER_WAVE * MAX_BUNNY_DELIVERY_ZONES;
 
 /// Header copied from the storage subrequest before the outer VCL service
 /// replaces `X-Cache` with its own cache result. This is intentionally only a
@@ -453,6 +473,11 @@ pub fn fos_read_enabled() -> bool {
 /// Whether to copy GCS-served objects into the FOS mirror.
 pub fn fos_write_back_enabled() -> bool {
     config_flag(FOS_WRITE_BACK_FLAG)
+}
+
+/// Whether the approved-only B2 delivery replica participates in storage.
+pub fn b2_replica_enabled() -> bool {
+    config_flag(B2_REPLICA_FLAG)
 }
 
 /// Fallible FOS GET. Private: callers must go through `try_download_blob_from_fos`.
@@ -872,6 +897,119 @@ enum VanishDeleteTarget {
     FosMain,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct B2AuthorizeResponse {
+    authorization_token: String,
+    api_info: B2ApiInfo,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct B2ApiInfo {
+    storage_api: B2StorageApi,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct B2StorageApi {
+    api_url: String,
+    allowed: B2Allowed,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct B2Allowed {
+    #[serde(default)]
+    buckets: Vec<B2AllowedBucket>,
+    #[serde(default)]
+    capabilities: Vec<String>,
+    name_prefix: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct B2AllowedBucket {
+    id: String,
+}
+
+#[derive(Debug)]
+struct B2Authorization {
+    api_url: String,
+    authorization_token: String,
+    bucket_id: String,
+    backend: Backend,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct B2ListFileVersionsResponse {
+    #[serde(default)]
+    files: Vec<B2FileVersion>,
+    next_file_name: Option<String>,
+    next_file_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct B2FileVersion {
+    file_name: String,
+    file_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct B2ErrorResponse {
+    code: String,
+}
+
+type B2PageCursor = Option<(String, Option<String>)>;
+
+fn b2_prefix_page<'a>(
+    prefix: &str,
+    page: &'a B2ListFileVersionsResponse,
+) -> Result<(&'a [B2FileVersion], B2PageCursor)> {
+    let matching = page
+        .files
+        .iter()
+        .take_while(|version| version.file_name.starts_with(prefix))
+        .count();
+    if page.files[..matching]
+        .iter()
+        .any(|version| version.file_id.is_none())
+        || page.files[matching..].iter().any(|version| {
+            version.file_name.starts_with(prefix) || version.file_name.as_str() < prefix
+        })
+    {
+        return Err(BlossomError::StorageError(
+            "B2 version listing returned an invalid file entry".into(),
+        ));
+    }
+    if matching < page.files.len() {
+        return Ok((&page.files[..matching], None));
+    }
+    let cursor = match (&page.next_file_name, &page.next_file_id) {
+        (Some(file_name), Some(file_id)) if file_name.starts_with(prefix) => {
+            Some((file_name.clone(), Some(file_id.clone())))
+        }
+        (Some(file_name), None) if file_name.starts_with(prefix) => {
+            return Err(BlossomError::StorageError(
+                "B2 version listing returned an incomplete pagination cursor".into(),
+            ))
+        }
+        (Some(file_name), _) if file_name.as_str() < prefix => {
+            return Err(BlossomError::StorageError(
+                "B2 version listing cursor moved before the requested prefix".into(),
+            ))
+        }
+        (None, Some(_)) => {
+            return Err(BlossomError::StorageError(
+                "B2 version listing returned an incomplete pagination cursor".into(),
+            ))
+        }
+        _ => None,
+    };
+    Ok((&page.files[..matching], cursor))
+}
+
 #[derive(Debug)]
 struct VanishDeleteBatch {
     stage: String,
@@ -884,8 +1022,10 @@ pub(crate) struct VanishStorageTimings {
     pub gcs_main_ms: u64,
     pub cloud_run_cleanup_ms: u64,
     pub fos_main_ms: u64,
+    pub b2_replica_ms: u64,
     pub purge_vcl_ms: u64,
     pub purge_compute_ms: u64,
+    pub purge_bunny_ms: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -908,6 +1048,9 @@ pub(crate) struct VanishStorageResult {
     /// this batch. The post-purge delivery probe samples only these, because a
     /// hash the purge could not reach is not expected to be absent yet.
     pub purged_hashes: HashSet<String>,
+    /// Hashes whose B2 version set exceeded one bounded page. Their deletion is
+    /// progressing, so they are pending work rather than failures.
+    pub remaining_hashes: HashSet<String>,
     pub timings: VanishStorageTimings,
 }
 
@@ -915,6 +1058,7 @@ impl VanishStorageResult {
     pub(crate) fn replace_failures_after_retry(&mut self, retry: Self) {
         self.failed_hashes = retry.failed_hashes;
         self.purged_hashes.extend(retry.purged_hashes);
+        self.remaining_hashes = retry.remaining_hashes;
         self.timings.gcs_main_ms = self
             .timings
             .gcs_main_ms
@@ -927,6 +1071,10 @@ impl VanishStorageResult {
             .timings
             .fos_main_ms
             .saturating_add(retry.timings.fos_main_ms);
+        self.timings.b2_replica_ms = self
+            .timings
+            .b2_replica_ms
+            .saturating_add(retry.timings.b2_replica_ms);
         self.timings.purge_vcl_ms = self
             .timings
             .purge_vcl_ms
@@ -935,6 +1083,414 @@ impl VanishStorageResult {
             .timings
             .purge_compute_ms
             .saturating_add(retry.timings.purge_compute_ms);
+        self.timings.purge_bunny_ms = self
+            .timings
+            .purge_bunny_ms
+            .saturating_add(retry.timings.purge_bunny_ms);
+    }
+}
+
+fn b2_api_host(api_url: &str) -> Result<&str> {
+    let host = api_url.strip_prefix("https://").ok_or_else(|| {
+        BlossomError::StorageError("B2 authorization returned a non-HTTPS API URL".into())
+    })?;
+    if host.is_empty()
+        || host.contains('/')
+        || (!host.eq("api.backblazeb2.com") && !host.ends_with(".backblazeb2.com"))
+    {
+        return Err(BlossomError::StorageError(
+            "B2 authorization returned an invalid API host".into(),
+        ));
+    }
+    Ok(host)
+}
+
+fn b2_dynamic_backend_name(host: &str) -> String {
+    format!("b2-api-{}", &hex::encode(Sha256::digest(host.as_bytes()))[..16])
+}
+
+fn b2_storage_backend(host: &str) -> Result<Backend> {
+    use fastly::backend::BackendCreationError;
+
+    let name = b2_dynamic_backend_name(host);
+    match Backend::builder(&name, host)
+        .override_host(host)
+        .enable_ssl()
+        .check_certificate(host)
+        .sni_hostname(host)
+        .finish()
+    {
+        Ok(backend) => Ok(backend),
+        Err(BackendCreationError::NameInUse) => Backend::from_name(&name).map_err(|error| {
+            BlossomError::StorageError(format!("Failed to reuse B2 API backend: {error}"))
+        }),
+        Err(error) => Err(BlossomError::StorageError(format!(
+            "Failed to create B2 API backend: {error}"
+        ))),
+    }
+}
+
+fn validate_b2_authorization_scope(
+    response: &B2AuthorizeResponse,
+    expected_bucket_id: &str,
+) -> Result<()> {
+    let storage = &response.api_info.storage_api;
+    b2_api_host(&storage.api_url)?;
+    let expected_capabilities = ["deleteFiles", "listFiles"];
+    if storage.allowed.buckets.len() != 1
+        || storage.allowed.buckets[0].id != expected_bucket_id
+        || storage.allowed.name_prefix.is_some()
+        || storage.allowed.capabilities.len() != expected_capabilities.len()
+        || !expected_capabilities.iter().all(|required| {
+            storage
+                .allowed
+                .capabilities
+                .iter()
+                .any(|actual| actual == required)
+        })
+    {
+        return Err(BlossomError::StorageError(
+            "B2 vanish credential is not restricted to the configured bucket and required capabilities"
+                .into(),
+        ));
+    }
+    if response.authorization_token.is_empty() {
+        return Err(BlossomError::StorageError(
+            "B2 authorization returned an empty token".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_b2_authorization(
+    response: B2AuthorizeResponse,
+    expected_bucket_id: &str,
+) -> Result<B2Authorization> {
+    validate_b2_authorization_scope(&response, expected_bucket_id)?;
+    let storage = response.api_info.storage_api;
+    let host = b2_api_host(&storage.api_url)?;
+    let backend = b2_storage_backend(host)?;
+    Ok(B2Authorization {
+        api_url: storage.api_url,
+        authorization_token: response.authorization_token,
+        bucket_id: expected_bucket_id.to_string(),
+        backend,
+    })
+}
+
+fn authorize_b2_vanish() -> Result<B2Authorization> {
+    let key_id = get_secret("b2_vanish_application_key_id")?;
+    let application_key = get_secret("b2_vanish_application_key")?;
+    let bucket_id = get_config("b2_bucket_id")?;
+    use base64::Engine as _;
+    let basic =
+        base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", key_id, application_key));
+    let mut request = Request::get("https://api.backblazeb2.com/b2api/v4/b2_authorize_account");
+    request.set_header("Host", "api.backblazeb2.com");
+    request.set_header("Authorization", format!("Basic {}", basic));
+    let mut response = request
+        .send(B2_API_BACKEND)
+        .map_err(|error| BlossomError::StorageError(format!("B2 authorization failed: {error}")))?;
+    if !response.get_status().is_success() {
+        return Err(BlossomError::StorageError(format!(
+            "B2 authorization failed with status: {}",
+            response.get_status()
+        )));
+    }
+    let authorization =
+        serde_json::from_str(&response.take_body().into_string()).map_err(|error| {
+            BlossomError::StorageError(format!("Invalid B2 authorization response: {error}"))
+        })?;
+    validate_b2_authorization(authorization, &bucket_id)
+}
+
+fn build_b2_list_versions_request(
+    authorization: &B2Authorization,
+    prefix: &str,
+    start: Option<(&str, Option<&str>)>,
+) -> Result<Request> {
+    let host = b2_api_host(&authorization.api_url)?;
+    let mut body = serde_json::json!({
+        "bucketId": authorization.bucket_id,
+        "prefix": prefix,
+        "maxFileCount": B2_LIST_PAGE_SIZE,
+    });
+    if let Some((file_name, file_id)) = start {
+        body["startFileName"] = serde_json::json!(file_name);
+        if let Some(file_id) = file_id {
+            body["startFileId"] = serde_json::json!(file_id);
+        }
+    }
+    let body = body.to_string();
+    let mut request = Request::post(format!(
+        "{}/b2api/v4/b2_list_file_versions",
+        authorization.api_url
+    ));
+    request.set_header("Host", host);
+    request.set_header("Authorization", &authorization.authorization_token);
+    request.set_header("Content-Type", "application/json");
+    request.set_header("Content-Length", body.len().to_string());
+    request.set_body(body);
+    Ok(request)
+}
+
+fn list_b2_file_versions(
+    authorization: &B2Authorization,
+    prefix: &str,
+    start: Option<(&str, Option<&str>)>,
+) -> Result<B2ListFileVersionsResponse> {
+    let request = build_b2_list_versions_request(authorization, prefix, start)?;
+    let mut response = request.send(authorization.backend.clone()).map_err(|error| {
+        BlossomError::StorageError(format!("B2 version listing failed: {error}"))
+    })?;
+    if !response.get_status().is_success() {
+        return Err(BlossomError::StorageError(format!(
+            "B2 version listing failed with status: {}",
+            response.get_status()
+        )));
+    }
+    serde_json::from_str(&response.take_body().into_string()).map_err(|error| {
+        BlossomError::StorageError(format!("Invalid B2 version listing response: {error}"))
+    })
+}
+
+fn build_b2_delete_version_request(
+    authorization: &B2Authorization,
+    version: &B2FileVersion,
+) -> Result<Request> {
+    let file_id = version.file_id.as_deref().ok_or_else(|| {
+        BlossomError::StorageError("B2 version listing returned a file without an ID".into())
+    })?;
+    let host = b2_api_host(&authorization.api_url)?;
+    let body = serde_json::json!({
+        "fileName": version.file_name,
+        "fileId": file_id,
+    })
+    .to_string();
+    let mut request = Request::post(format!(
+        "{}/b2api/v4/b2_delete_file_version",
+        authorization.api_url
+    ));
+    request.set_header("Host", host);
+    request.set_header("Authorization", &authorization.authorization_token);
+    request.set_header("Content-Type", "application/json");
+    request.set_header("Content-Length", body.len().to_string());
+    request.set_body(body);
+    Ok(request)
+}
+
+fn b2_delete_version_succeeded(mut response: Response) -> bool {
+    if response.get_status().is_success() {
+        return true;
+    }
+    response.get_status() == StatusCode::BAD_REQUEST
+        && serde_json::from_str::<B2ErrorResponse>(&response.take_body().into_string())
+            .is_ok_and(|error| error.code == "file_not_present")
+}
+
+fn delete_b2_version_page(
+    authorization: &B2Authorization,
+    versions: &[B2FileVersion],
+) -> Result<()> {
+    let mut pending = Vec::with_capacity(versions.len());
+    for version in versions {
+        let request = build_b2_delete_version_request(authorization, version)?;
+        pending.push(request.send_async(authorization.backend.clone()).map_err(|error| {
+            BlossomError::StorageError(format!("B2 version delete failed to start: {error}"))
+        })?);
+    }
+    let mut failed = false;
+    while !pending.is_empty() {
+        let (response, remaining) = fastly::http::request::select(pending);
+        pending = remaining;
+        match response {
+            Ok(response) => {
+                let status = response.get_status();
+                if !b2_delete_version_succeeded(response) {
+                    eprintln!("[VANISH] B2 version delete failed status={status}");
+                    failed = true;
+                }
+            }
+            Err(error) => {
+                eprintln!("[VANISH] B2 version delete failed error={error}");
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        Err(BlossomError::StorageError(
+            "One or more B2 version deletes failed".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Outcome of one bounded B2 hash erasure attempt.
+enum B2HashErasure {
+    /// Every listed version was deleted and absence was confirmed.
+    Erased,
+    /// The prefix holds more versions than one bounded page. The page was
+    /// deleted, and the next attempt continues the drain as pending work.
+    MoreRemaining,
+}
+
+fn erase_b2_hash_versions(authorization: &B2Authorization, hash: &str) -> Result<B2HashErasure> {
+    let page = list_b2_file_versions(authorization, hash, Some((hash, None)))?;
+    let (versions, next) = b2_prefix_page(hash, &page)?;
+    delete_b2_version_page(authorization, versions)?;
+    if next.is_some() {
+        return Ok(B2HashErasure::MoreRemaining);
+    }
+
+    let confirmation = list_b2_file_versions(authorization, hash, Some((hash, None)))?;
+    let (versions, next) = b2_prefix_page(hash, &confirmation)?;
+    if !versions.is_empty() || next.is_some() {
+        return Err(BlossomError::StorageError(
+            "B2 replica still contains versions after deletion".into(),
+        ));
+    }
+    Ok(B2HashErasure::Erased)
+}
+
+/// Returns `(failed, remaining)` hashes. `remaining` hashes made bounded
+/// progress and are counted as pending, not failed.
+fn erase_b2_replica_hashes(hashes: &[String]) -> (HashSet<String>, HashSet<String>) {
+    if !b2_replica_enabled() || hashes.is_empty() {
+        return (HashSet::new(), HashSet::new());
+    }
+    let authorization = match authorize_b2_vanish() {
+        Ok(authorization) => authorization,
+        Err(error) => {
+            eprintln!("[VANISH] B2 setup failed error={error}");
+            return (hashes.iter().cloned().collect(), HashSet::new());
+        }
+    };
+    let mut failed = HashSet::new();
+    let mut remaining = HashSet::new();
+    for hash in hashes {
+        match erase_b2_hash_versions(&authorization, hash) {
+            Ok(B2HashErasure::Erased) => {}
+            Ok(B2HashErasure::MoreRemaining) => {
+                remaining.insert(hash.clone());
+            }
+            Err(error) => {
+                eprintln!("[VANISH] B2 erase failed hash={hash} error={error}");
+                failed.insert(hash.clone());
+            }
+        }
+    }
+    (failed, remaining)
+}
+
+fn bunny_delivery_zones() -> Result<Vec<String>> {
+    let zones = get_config("bunny_delivery_zones")?
+        .split(',')
+        .map(str::trim)
+        .filter(|zone| !zone.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if zones.is_empty()
+        || zones.len() > MAX_BUNNY_DELIVERY_ZONES
+        || zones.iter().any(|zone| {
+            zone.starts_with('.')
+                || zone.ends_with('.')
+                || !zone
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+        })
+    {
+        return Err(BlossomError::StorageError(
+            format!(
+                "bunny_delivery_zones must contain one or two comma-separated hostnames (got {})",
+                zones.len()
+            ),
+        ));
+    }
+    Ok(zones)
+}
+
+fn build_bunny_purge_request(zone: &str, hash: &str, api_key: &str, stage: &str) -> Request {
+    let purge_url = format!("https%3A%2F%2F{zone}%2F{hash}%2A");
+    let mut request = Request::post(format!(
+        "https://api.bunny.net/purge?url={purge_url}&async=false"
+    ));
+    request.set_header("Host", "api.bunny.net");
+    request.set_header("AccessKey", api_key);
+    request.set_header("X-Divine-Vanish-Stage", stage);
+    request
+}
+
+fn purge_bunny_hashes(hashes: &[String], result: &mut VanishStorageResult) {
+    if !b2_replica_enabled() || hashes.is_empty() {
+        return;
+    }
+    let zones = match bunny_delivery_zones() {
+        Ok(zones) => zones,
+        Err(error) => {
+            eprintln!("[VANISH] bunny purge setup failed error={error}");
+            result.failed_hashes.extend(hashes.iter().cloned());
+            return;
+        }
+    };
+    let api_key = match get_secret("bunny_api_key") {
+        Ok(api_key) if !api_key.is_empty() => api_key,
+        _ => {
+            eprintln!("[VANISH] bunny purge setup failed error=missing_api_key");
+            result.failed_hashes.extend(hashes.iter().cloned());
+            return;
+        }
+    };
+    let mut pending = Vec::new();
+    let mut stage_hashes = HashMap::<String, String>::new();
+    for hash in hashes {
+        for (zone_index, zone) in zones.iter().enumerate() {
+            let stage = format!("purge_bunny:{zone_index}:{hash}");
+            let request = build_bunny_purge_request(zone, hash, &api_key, &stage);
+            stage_hashes.insert(stage.clone(), hash.clone());
+            match request.send_async(BUNNY_API_BACKEND) {
+                Ok(request) => pending.push(request),
+                Err(error) => {
+                    eprintln!("[VANISH] bunny purge failed hash={hash} error={error}");
+                    result.failed_hashes.insert(hash.clone());
+                }
+            }
+        }
+    }
+    while !pending.is_empty() {
+        let (response, remaining) = fastly::http::request::select(pending);
+        pending = remaining;
+        match response {
+            Ok(response) => {
+                let stage = response
+                    .get_backend_request()
+                    .and_then(|request| request.get_header_str("X-Divine-Vanish-Stage"))
+                    .unwrap_or_default();
+                if !response.get_status().is_success() {
+                    eprintln!(
+                        "[VANISH] bunny purge failed stage={} status={}",
+                        stage,
+                        response.get_status()
+                    );
+                    if let Some(hash) = stage_hashes.get(stage) {
+                        result.failed_hashes.insert(hash.clone());
+                    } else {
+                        result.failed_hashes.extend(hashes.iter().cloned());
+                    }
+                }
+            }
+            Err(error) => {
+                let request = error.into_sent_req();
+                let stage = request
+                    .get_header_str("X-Divine-Vanish-Stage")
+                    .unwrap_or_default();
+                if let Some(hash) = stage_hashes.get(stage) {
+                    result.failed_hashes.insert(hash.clone());
+                } else {
+                    result.failed_hashes.extend(hashes.iter().cloned());
+                }
+            }
+        }
     }
 }
 
@@ -1205,7 +1761,7 @@ fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) -> H
     purged
 }
 
-/// Erase one bounded vanish batch from both origins and both CDN services.
+/// Erase one bounded vanish batch from every enabled origin and CDN service.
 pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
     let mut result = VanishStorageResult::default();
     let mut main_origin_failures = HashSet::new();
@@ -1337,6 +1893,14 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
         }
     }
 
+    let b2_started = Instant::now();
+    let (b2_failures, b2_remaining) = erase_b2_replica_hashes(hashes);
+    result.timings.b2_replica_ms = elapsed_ms(b2_started);
+    result.failed_hashes.extend(b2_failures.iter().cloned());
+    main_origin_failures.extend(b2_failures);
+    main_origin_failures.extend(b2_remaining.iter().cloned());
+    result.remaining_hashes.extend(b2_remaining);
+
     let cloud_cleanup_started = Instant::now();
     match trigger_cloud_run_delete_blobs(hashes) {
         Ok(failed) => result.failed_hashes.extend(failed),
@@ -1350,6 +1914,9 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
         .cloned()
         .collect();
     let purged = purge_vanish_hashes(&purgeable, &mut result);
+    let bunny_started = Instant::now();
+    purge_bunny_hashes(&purgeable, &mut result);
+    result.timings.purge_bunny_ms = elapsed_ms(bunny_started);
     let purged: HashSet<String> = purged
         .into_iter()
         .filter(|hash| !result.failed_hashes.contains(hash))
@@ -2939,16 +3506,20 @@ pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtracti
 #[cfg(test)]
 mod tests {
     use super::{
-        audit_log_entry, build_fos_delete_request, build_multi_delete_request,
+        audit_log_entry, b2_api_host, b2_delete_version_succeeded, b2_dynamic_backend_name,
+        b2_prefix_page, build_b2_delete_version_request, build_b2_list_versions_request,
+        build_bunny_purge_request, build_fos_delete_request, build_multi_delete_request,
         canonical_query_string, classify_cloud_cleanup_response, cloud_run_delete_blob_body,
         cloud_run_delete_blobs_body, delivery_probe_report_from_body, delivery_probe_sample,
         failed_cloud_cleanup_hashes, failed_multi_delete_keys, mark_failed_stage,
         multi_delete_body, normalize_storage_cache_state, parse_audio_extraction_error_response,
         parse_funnelcake_audio_reuse_response, plan_cloud_run_delete_chunks,
         plan_vanish_delete_batches, prepare_storage_cache_miss, preserve_storage_cache_state,
-        sign_request_at, vanish_audit_entry, DeliveryProbeCounts, S3Config, VanishAuditInitiator,
-        VanishAuditPhase, VanishDeleteTarget, VanishStorageResult, CLOUD_RUN_DELETE_BATCH_LIMIT,
-        FOS_BACKEND, PROVIDER_MULTI_DELETE_LIMIT, STORAGE_CACHE_HEADER,
+        sign_request_at, validate_b2_authorization_scope, vanish_audit_entry, B2Authorization,
+        B2AuthorizeResponse, B2FileVersion, B2ListFileVersionsResponse, DeliveryProbeCounts,
+        S3Config, VanishAuditInitiator, VanishAuditPhase, VanishDeleteTarget, VanishStorageResult,
+        B2_LIST_PAGE_SIZE, CLOUD_RUN_DELETE_BATCH_LIMIT, FOS_BACKEND, PROVIDER_MULTI_DELETE_LIMIT,
+        STORAGE_CACHE_HEADER,
     };
     use fastly::http::header;
     use fastly::{Request, Response};
@@ -3190,6 +3761,221 @@ mod tests {
         assert!(req.contains_header("Authorization"));
         assert!(req.contains_header("Content-MD5"));
         assert_eq!(req.take_body().into_string(), multi_delete_body(&keys));
+    }
+
+    fn b2_authorize_response(capabilities: &[&str], buckets: &[&str]) -> B2AuthorizeResponse {
+        serde_json::from_value(serde_json::json!({
+            "authorizationToken": "account-token",
+            "apiInfo": {
+                "storageApi": {
+                    "apiUrl": "https://api001.backblazeb2.com",
+                    "allowed": {
+                        "buckets": buckets
+                            .iter()
+                            .map(|id| serde_json::json!({"id": id, "name": "replica"}))
+                            .collect::<Vec<_>>(),
+                        "capabilities": capabilities,
+                        "namePrefix": null
+                    }
+                }
+            }
+        }))
+        .expect("valid authorization response")
+    }
+
+    #[test]
+    fn b2_vanish_authorization_requires_one_bucket_and_exact_capabilities() {
+        let accepted = b2_authorize_response(&["listFiles", "deleteFiles"], &["bucket-id"]);
+        assert!(validate_b2_authorization_scope(&accepted, "bucket-id").is_ok());
+
+        let broad = b2_authorize_response(
+            &["listFiles", "deleteFiles", "deleteBuckets"],
+            &["bucket-id"],
+        );
+        assert!(validate_b2_authorization_scope(&broad, "bucket-id").is_err());
+        let all_buckets = b2_authorize_response(&["listFiles", "deleteFiles"], &[]);
+        assert!(validate_b2_authorization_scope(&all_buckets, "bucket-id").is_err());
+    }
+
+    #[test]
+    fn b2_api_host_rejects_redirects_outside_backblaze() {
+        assert_eq!(
+            b2_api_host("https://api001.backblazeb2.com").expect("B2 API host"),
+            "api001.backblazeb2.com"
+        );
+        assert!(b2_api_host("http://api001.backblazeb2.com").is_err());
+        assert!(b2_api_host("https://backblazeb2.com.example").is_err());
+        assert_ne!(
+            b2_dynamic_backend_name("api001.backblazeb2.com"),
+            b2_dynamic_backend_name("api002.backblazeb2.com")
+        );
+    }
+
+    #[test]
+    fn b2_prefix_page_stops_after_the_prefix_and_rejects_backtracking() {
+        let hash = "a".repeat(64);
+        let page = B2ListFileVersionsResponse {
+            files: vec![
+                B2FileVersion {
+                    file_name: format!("{hash}/720p.mp4"),
+                    file_id: Some("version-id".into()),
+                },
+                B2FileVersion {
+                    file_name: "beyond-prefix".into(),
+                    file_id: Some("other-id".into()),
+                },
+            ],
+            next_file_name: Some("later".into()),
+            next_file_id: Some("later-id".into()),
+        };
+        let (matching, next) = b2_prefix_page(&hash, &page).expect("ordered prefix page");
+        assert_eq!(matching.len(), 1);
+        assert!(next.is_none());
+
+        let backtracking = B2ListFileVersionsResponse {
+            files: vec![B2FileVersion {
+                file_name: "0-before-prefix".into(),
+                file_id: Some("version-id".into()),
+            }],
+            next_file_name: None,
+            next_file_id: None,
+        };
+        assert!(b2_prefix_page(&hash, &backtracking).is_err());
+    }
+
+    #[test]
+    fn b2_prefix_page_distinguishes_remaining_versions_from_terminal_absence() {
+        let hash = "a".repeat(64);
+        let remaining = B2ListFileVersionsResponse {
+            files: vec![B2FileVersion {
+                file_name: hash.clone(),
+                file_id: Some("version-id".into()),
+            }],
+            next_file_name: None,
+            next_file_id: None,
+        };
+        let scanning = B2ListFileVersionsResponse {
+            files: vec![],
+            next_file_name: Some(format!("{hash}/next")),
+            next_file_id: Some("id".into()),
+        };
+        let absent = B2ListFileVersionsResponse {
+            files: vec![B2FileVersion {
+                file_name: "beyond-prefix".into(),
+                file_id: Some("other-id".into()),
+            }],
+            next_file_name: Some("later".into()),
+            next_file_id: Some("later-id".into()),
+        };
+
+        let (versions, _) = b2_prefix_page(&hash, &remaining).expect("remaining page");
+        assert_eq!(versions.len(), 1);
+        let (versions, next) = b2_prefix_page(&hash, &scanning).expect("scanning page");
+        assert!(versions.is_empty());
+        assert!(next.is_some());
+        let (versions, next) = b2_prefix_page(&hash, &absent).expect("terminal page");
+        assert!(versions.is_empty());
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn b2_version_requests_use_native_version_apis() {
+        let authorization = B2Authorization {
+            api_url: "https://api001.backblazeb2.com".into(),
+            authorization_token: "account-token".into(),
+            bucket_id: "bucket-id".into(),
+            backend: fastly::Backend::from_name("b2_api").expect("backend name"),
+        };
+        let hash = "a".repeat(64);
+        let mut list = build_b2_list_versions_request(
+            &authorization,
+            &hash,
+            Some(("next-name", Some("next-id"))),
+        )
+        .expect("list request");
+        assert_eq!(
+            list.get_url().as_str(),
+            "https://api001.backblazeb2.com/b2api/v4/b2_list_file_versions"
+        );
+        let list_body: serde_json::Value =
+            serde_json::from_str(&list.take_body().into_string()).expect("list JSON");
+        assert_eq!(list_body["bucketId"], "bucket-id");
+        assert_eq!(list_body["prefix"], hash);
+        assert_eq!(list_body["startFileName"], "next-name");
+        assert_eq!(list_body["startFileId"], "next-id");
+
+        let mut initial = build_b2_list_versions_request(
+            &authorization,
+            &hash,
+            Some((&hash, None)),
+        )
+        .expect("initial list request");
+        let initial_body: serde_json::Value =
+            serde_json::from_str(&initial.take_body().into_string()).expect("initial list JSON");
+        assert_eq!(initial_body["startFileName"], hash);
+        assert!(initial_body.get("startFileId").is_none());
+        assert_eq!(initial_body["maxFileCount"], B2_LIST_PAGE_SIZE);
+
+        let version = B2FileVersion {
+            file_name: format!("{hash}/720p.mp4"),
+            file_id: Some("version-id".into()),
+        };
+        let mut delete =
+            build_b2_delete_version_request(&authorization, &version).expect("delete request");
+        assert_eq!(
+            delete.get_url().as_str(),
+            "https://api001.backblazeb2.com/b2api/v4/b2_delete_file_version"
+        );
+        let delete_body: serde_json::Value =
+            serde_json::from_str(&delete.take_body().into_string()).expect("delete JSON");
+        assert_eq!(delete_body["fileName"], version.file_name);
+        assert_eq!(delete_body["fileId"], "version-id");
+    }
+
+    #[test]
+    fn b2_version_listing_keeps_uploads_and_hide_markers_for_deletion() {
+        let hash = "a".repeat(64);
+        let body = format!(
+            r#"{{"files":[{{"action":"upload","fileName":"{hash}","fileId":"upload-id"}},{{"action":"hide","fileName":"{hash}","fileId":"hide-id"}}],"nextFileName":null,"nextFileId":null}}"#
+        );
+
+        let page: B2ListFileVersionsResponse =
+            serde_json::from_str(&body).expect("version listing");
+
+        assert_eq!(page.files.len(), 2);
+        assert_eq!(page.files[0].file_id.as_deref(), Some("upload-id"));
+        assert_eq!(page.files[1].file_id.as_deref(), Some("hide-id"));
+    }
+
+    #[test]
+    fn b2_version_delete_is_idempotent_only_for_file_not_present() {
+        let absent = Response::from_status(fastly::http::StatusCode::BAD_REQUEST)
+            .with_body(r#"{"code":"file_not_present"}"#);
+        let denied = Response::from_status(fastly::http::StatusCode::BAD_REQUEST)
+            .with_body(r#"{"code":"access_denied"}"#);
+
+        assert!(b2_delete_version_succeeded(absent));
+        assert!(!b2_delete_version_succeeded(denied));
+    }
+
+    #[test]
+    fn bunny_purge_uses_the_bare_hash_wildcard() {
+        let hash = "a".repeat(64);
+        let request = build_bunny_purge_request(
+            "v-a.divine.video",
+            &hash,
+            "synthetic-api-key",
+            "purge_bunny:0",
+        );
+
+        assert_eq!(
+            request.get_url().as_str(),
+            format!("https://api.bunny.net/purge?url=https%3A%2F%2Fv-a.divine.video%2F{hash}%2A&async=false")
+        );
+        assert_eq!(
+            request.get_header_str("AccessKey"),
+            Some("synthetic-api-key")
+        );
     }
 
     #[test]

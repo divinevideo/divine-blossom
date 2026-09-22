@@ -50,12 +50,13 @@ use crate::metadata::{
     TranscodeMetadataUpdate, TranscriptMetadataUpdate, VanishAuditState,
 };
 use crate::storage::{
-    blob_exists, check_funnelcake_audio_reuse, current_timestamp, delete_blob as storage_delete,
-    delivery_probe_sample, dispatch_vanish_timing_log, download_blob_read_through,
-    download_blob_with_fallback, download_thumbnail, erase_vanish_batch, probe_erased_delivery,
-    trigger_audio_extraction, trigger_cloud_run_delete_blob, upload_blob, write_audit_log,
-    write_vanish_audit_log, DeliveryProbeCounts, VanishAuditInitiator, VanishAuditPhase,
-    VanishStorageTimings, DELIVERY_PROBE_LIMIT,
+    b2_replica_enabled, blob_exists, check_funnelcake_audio_reuse, current_timestamp,
+    delete_blob as storage_delete, delivery_probe_sample, dispatch_vanish_timing_log,
+    download_blob_read_through, download_blob_with_fallback, download_thumbnail,
+    erase_vanish_batch, probe_erased_delivery, trigger_audio_extraction,
+    trigger_cloud_run_delete_blob, upload_blob, write_audit_log, write_vanish_audit_log,
+    DeliveryProbeCounts, VanishAuditInitiator, VanishAuditPhase, VanishStorageTimings,
+    B2_VANISH_MAX_HASHES_PER_WAVE, B2_VANISH_MAX_STORAGE_BACKEND_REQUESTS, DELIVERY_PROBE_LIMIT,
 };
 use crate::viewer_auth::{ViewerAuthDiagnostics, ViewerAuthState};
 use blossom_core::cache_policy::{
@@ -4486,17 +4487,35 @@ fn handle_admin_force_delete(req: Request) -> Result<Response> {
 // always runs. A later wave can still overshoot if it is slower than the last
 // one, and shared KV plus the HTTP response sit outside the last-wave estimate.
 const VANISH_TIME_BUDGET: Duration = Duration::from_millis(10_000);
-// Fastly does not document a KV pending-handle ceiling. Compute allows 1,000
-// concurrent backend requests. A ten-blob wave holds at most 40 pending KV
-// operations during artifact cleanup (three deletes and one subtitle lookup
-// per blob), then at most 20 subtitle deletes. Extra waves start only when the
-// last wave still fits in VANISH_TIME_BUDGET.
+// Fastly does not document a KV pending-handle ceiling. A ten-blob wave holds
+// at most 40 pending KV operations during artifact cleanup (three deletes and
+// one subtitle lookup per blob), then at most 20 subtitle deletes. B2-enabled
+// storage uses one source blob per wave because derived audio can add a second
+// hash and Compute permits only 32 backend requests per execution.
 const VANISH_KV_FANOUT: usize = 10;
+const B2_VANISH_KV_FANOUT: usize = 1;
 const VANISH_STORAGE_ATTEMPTS: u8 = 2;
 // The post-purge delivery probe is observability, not erasure. Skip it when the
 // call is already this close to its internal budget, so a slow account never
 // waits on the probe.
 const DELIVERY_PROBE_BUDGET_RESERVE: Duration = Duration::from_millis(2_000);
+const B2_VANISH_STORAGE_ATTEMPTS: u8 = 1;
+// Fastly Compute permits 32 backend requests per execution. A B2-enabled wave
+// spends nearly all of that budget, so the wave loop starts only as many B2
+// waves as the remaining execution budget covers and leaves the rest of the
+// list pending for the caller's next attempt. The reserve covers the
+// execution's authorization audit, the completion audits for both initiators,
+// the timing log, and the optional delivery probe.
+const COMPUTE_BACKEND_REQUEST_LIMIT: usize = 32;
+const VANISH_NON_STORAGE_BACKEND_REQUESTS: usize = 6;
+const VANISH_B2_WAVES_PER_EXECUTION: usize = (COMPUTE_BACKEND_REQUEST_LIMIT
+    - VANISH_NON_STORAGE_BACKEND_REQUESTS)
+    / B2_VANISH_MAX_STORAGE_BACKEND_REQUESTS;
+const _: () = assert!(VANISH_B2_WAVES_PER_EXECUTION >= 1);
+// The storage budget's hashes per wave are B2_VANISH_KV_FANOUT source blobs
+// plus at most one derived-audio hash per source (prepare_derived_audio_cleanup
+// returns at most one plan per blob). Keep both halves linked at compile time.
+const _: () = assert!(B2_VANISH_KV_FANOUT * 2 <= B2_VANISH_MAX_HASHES_PER_WAVE);
 
 #[derive(Debug)]
 struct VanishExecution {
@@ -4544,6 +4563,7 @@ fn should_probe_delivery(elapsed: Duration, reserve: Duration, budget: Duration)
 fn next_vanish_wave_range(
     total: usize,
     offset: usize,
+    fanout: usize,
     elapsed: Duration,
     last_wave: Duration,
     budget: Duration,
@@ -4551,7 +4571,7 @@ fn next_vanish_wave_range(
     if offset >= total || !should_start_vanish_wave(offset > 0, elapsed, last_wave, budget) {
         return None;
     }
-    Some(offset..offset.saturating_add(VANISH_KV_FANOUT).min(total))
+    Some(offset..offset.saturating_add(fanout).min(total))
 }
 
 fn add_vanish_storage_timings(total: &mut VanishStorageTimings, wave: &VanishStorageTimings) {
@@ -4560,8 +4580,10 @@ fn add_vanish_storage_timings(total: &mut VanishStorageTimings, wave: &VanishSto
         .cloud_run_cleanup_ms
         .saturating_add(wave.cloud_run_cleanup_ms);
     total.fos_main_ms = total.fos_main_ms.saturating_add(wave.fos_main_ms);
+    total.b2_replica_ms = total.b2_replica_ms.saturating_add(wave.b2_replica_ms);
     total.purge_vcl_ms = total.purge_vcl_ms.saturating_add(wave.purge_vcl_ms);
     total.purge_compute_ms = total.purge_compute_ms.saturating_add(wave.purge_compute_ms);
+    total.purge_bunny_ms = total.purge_bunny_ms.saturating_add(wave.purge_bunny_ms);
 }
 
 fn prefetch_vanish_blob_lookups(hashes: &[String]) -> HashMap<String, Option<BlobMetadata>> {
@@ -4691,6 +4713,42 @@ fn vanish_shared_update_error_count(completed_outcomes: usize, completed_malform
         .max(1)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum VanishBlobDisposition {
+    Finalize,
+    Failed,
+    Deferred,
+}
+
+/// Decide what happens to one prepared blob after its storage attempt. A blob
+/// is finalized only when neither it nor its derived audio still has B2
+/// versions beyond the attempt's bounded page; deferred work must never reach
+/// finalization while replica bytes survive.
+fn vanish_blob_disposition(
+    hash: &str,
+    failed_hashes: &HashSet<String>,
+    remaining_hashes: &HashSet<String>,
+    failed_derived_sources: &HashSet<String>,
+    deferred_derived_sources: &HashSet<String>,
+) -> VanishBlobDisposition {
+    if failed_hashes.contains(hash) || failed_derived_sources.contains(hash) {
+        VanishBlobDisposition::Failed
+    } else if remaining_hashes.contains(hash) || deferred_derived_sources.contains(hash) {
+        VanishBlobDisposition::Deferred
+    } else {
+        VanishBlobDisposition::Finalize
+    }
+}
+
+/// Entries this call deferred: list entries it never attempted plus hashes
+/// whose B2 version set exceeded one bounded page and continues on the next
+/// attempt. Deferred work keeps `vanished` false without reporting an error.
+fn vanish_pending_count(total: usize, offset: usize, deferred: u32) -> u32 {
+    u32::try_from(total.saturating_sub(offset))
+        .unwrap_or(u32::MAX)
+        .saturating_add(deferred)
+}
+
 fn reconcile_vanish_list_completion(
     execution: &mut VanishExecution,
     expected_account_complete: bool,
@@ -4737,8 +4795,10 @@ fn vanish_timing_record(
         "gcs_main_ms": storage_timings.gcs_main_ms,
         "cloud_run_cleanup_ms": storage_timings.cloud_run_cleanup_ms,
         "fos_main_ms": storage_timings.fos_main_ms,
+        "b2_replica_ms": storage_timings.b2_replica_ms,
         "purge_vcl_ms": storage_timings.purge_vcl_ms,
         "purge_compute_ms": storage_timings.purge_compute_ms,
+        "purge_bunny_ms": storage_timings.purge_bunny_ms,
         "delivery_probe_ms": delivery_probe.ms,
         "delivery_probe_checked": delivery_probe.checked,
         "delivery_probe_present": delivery_probe.present,
@@ -4786,9 +4846,23 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     let mut kv_finalize_ms = 0u128;
     let mut last_wave = Duration::ZERO;
     let mut offset = 0usize;
+    let mut deferred_pending = 0u32;
+    let mut b2_waves_started = 0usize;
+    let b2_enabled = b2_replica_enabled();
+    let wave_fanout = if b2_enabled {
+        B2_VANISH_KV_FANOUT
+    } else {
+        VANISH_KV_FANOUT
+    };
+    let storage_attempt_limit = if b2_enabled {
+        B2_VANISH_STORAGE_ATTEMPTS
+    } else {
+        VANISH_STORAGE_ATTEMPTS
+    };
     while let Some(wave_range) = next_vanish_wave_range(
         hashes.len(),
         offset,
+        wave_fanout,
         started.elapsed(),
         last_wave,
         VANISH_TIME_BUDGET,
@@ -4842,7 +4916,7 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         erase_hashes.dedup();
         let mut storage_result = erase_vanish_batch(&erase_hashes);
         let mut wave_storage_attempts = u8::from(!erase_hashes.is_empty());
-        while wave_storage_attempts < VANISH_STORAGE_ATTEMPTS
+        while wave_storage_attempts < storage_attempt_limit
             && !storage_result.failed_hashes.is_empty()
         {
             let storage_retry_hashes: Vec<String> =
@@ -4863,9 +4937,14 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
 
         let finalize_started = Instant::now();
         let mut failed_derived_sources = HashSet::new();
+        let mut deferred_derived_sources = HashSet::new();
         for plan in &derived_cleanup {
             if storage_result.failed_hashes.contains(&plan.audio_hash) {
                 failed_derived_sources.insert(plan.source_hash.clone());
+                continue;
+            }
+            if storage_result.remaining_hashes.contains(&plan.audio_hash) {
+                deferred_derived_sources.insert(plan.source_hash.clone());
                 continue;
             }
             if let Err(error) = finalize_derived_audio_cleanup(plan) {
@@ -4878,18 +4957,31 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         }
         let mut finalize_blobs = Vec::new();
         for blob in erase {
-            if storage_result.failed_hashes.contains(&blob.hash)
-                || failed_derived_sources.contains(&blob.hash)
-            {
-                eprintln!(
-                    "[VANISH] pubkey={} hash={} required storage erasure failed after {} attempts",
-                    pubkey, blob.hash, wave_storage_attempts
-                );
-                execution.errors += 1;
-                retry_hashes.push(blob.hash);
-                continue;
+            match vanish_blob_disposition(
+                &blob.hash,
+                &storage_result.failed_hashes,
+                &storage_result.remaining_hashes,
+                &failed_derived_sources,
+                &deferred_derived_sources,
+            ) {
+                VanishBlobDisposition::Failed => {
+                    eprintln!(
+                        "[VANISH] pubkey={} hash={} required storage erasure failed after {} attempts",
+                        pubkey, blob.hash, wave_storage_attempts
+                    );
+                    execution.errors += 1;
+                    retry_hashes.push(blob.hash);
+                }
+                VanishBlobDisposition::Deferred => {
+                    // The hash or its derived audio still has B2 versions
+                    // beyond this call's bounded page. That is progress, not
+                    // failure, so it counts as pending work rather than an
+                    // error.
+                    retry_hashes.push(blob.hash);
+                    deferred_pending = deferred_pending.saturating_add(1);
+                }
+                VanishBlobDisposition::Finalize => finalize_blobs.push(blob),
             }
-            finalize_blobs.push(blob);
         }
         finalize_erased_vanish_wave(
             pubkey,
@@ -4902,8 +4994,17 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         kv_finalize_ms = kv_finalize_ms.saturating_add(finalize_started.elapsed().as_millis());
         last_wave = wave_started.elapsed();
         offset = wave_end;
+        if b2_enabled {
+            b2_waves_started += 1;
+            if b2_waves_started >= VANISH_B2_WAVES_PER_EXECUTION {
+                // The started B2 waves now cover the execution's backend-request
+                // budget. Entries that did not run stay pending for the
+                // caller's next attempt.
+                break;
+            }
+        }
     }
-    execution.pending = hashes.len().saturating_sub(offset).min(u32::MAX as usize) as u32;
+    execution.pending = vanish_pending_count(hashes.len(), offset, deferred_pending);
     let expected_account_complete = execution.pending == 0 && execution.errors == 0;
     let shared_started = Instant::now();
     // One write per hot key per call, once after the last wave. Unique-key work
@@ -6920,10 +7021,11 @@ mod tests {
         should_start_vanish_wave, surrogate_key_hash_from_path,
         trusted_upload_service_terminal_derivative_error, upload_capability_headers,
         upload_control_host, upload_exposed_headers, upload_from_resumable_completion,
-        vanish_response_status, vanish_shared_update_error_count, vanish_timing_record,
-        AudioReuseAvailability, DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction,
-        TranscriptPendingState, VanishExecution, VanishTimingCounters,
-        DELIVERY_PROBE_BUDGET_RESERVE, VANISH_TIME_BUDGET,
+        vanish_blob_disposition, vanish_pending_count, vanish_response_status,
+        vanish_shared_update_error_count, vanish_timing_record, AudioReuseAvailability,
+        DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState,
+        VanishBlobDisposition, VanishExecution, VanishTimingCounters, B2_VANISH_KV_FANOUT,
+        DELIVERY_PROBE_BUDGET_RESERVE, VANISH_KV_FANOUT, VANISH_TIME_BUDGET,
     };
     use crate::blossom::{
         BlobStatus, ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus,
@@ -6933,6 +7035,7 @@ mod tests {
     use blossom_core::cache_policy::BlobCachePolicy;
     use fastly::http::StatusCode;
     use fastly::Response;
+    use std::collections::HashSet;
     use std::time::Duration;
 
     #[test]
@@ -7051,6 +7154,7 @@ mod tests {
         let first = next_vanish_wave_range(
             25,
             0,
+            VANISH_KV_FANOUT,
             Duration::from_millis(12_000),
             Duration::from_millis(12_000),
             budget,
@@ -7061,6 +7165,7 @@ mod tests {
         let second = next_vanish_wave_range(
             25,
             first.end,
+            VANISH_KV_FANOUT,
             Duration::from_millis(3_000),
             Duration::from_millis(2_000),
             budget,
@@ -7072,6 +7177,7 @@ mod tests {
         assert!(next_vanish_wave_range(
             25,
             second.end,
+            VANISH_KV_FANOUT,
             Duration::from_millis(8_000),
             Duration::from_millis(2_000),
             budget,
@@ -7087,6 +7193,7 @@ mod tests {
         let first = next_vanish_wave_range(
             hashes.len(),
             0,
+            VANISH_KV_FANOUT,
             Duration::ZERO,
             Duration::ZERO,
             VANISH_TIME_BUDGET,
@@ -7098,6 +7205,58 @@ mod tests {
         assert!(valid.is_empty());
         assert_eq!(malformed.len(), 10);
         assert_eq!(hashes.len().saturating_sub(first.end), 15);
+    }
+
+    #[test]
+    fn deferred_b2_version_drains_count_as_pending_not_errors() {
+        assert_eq!(vanish_pending_count(5, 1, 0), 4);
+        assert_eq!(vanish_pending_count(5, 1, 1), 5);
+        assert_eq!(vanish_pending_count(1, 1, 1), 1);
+        assert_eq!(vanish_pending_count(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn vanish_finalizes_only_after_b2_versions_are_gone() {
+        let hash = "a".repeat(64);
+        let empty: HashSet<String> = HashSet::new();
+        let failed = HashSet::from([hash.clone()]);
+        let remaining = HashSet::from([hash.clone()]);
+
+        assert_eq!(
+            vanish_blob_disposition(&hash, &failed, &remaining, &empty, &empty),
+            VanishBlobDisposition::Failed
+        );
+        assert_eq!(
+            vanish_blob_disposition(&hash, &empty, &remaining, &empty, &empty),
+            VanishBlobDisposition::Deferred
+        );
+        assert_eq!(
+            vanish_blob_disposition(&hash, &empty, &empty, &empty, &remaining),
+            VanishBlobDisposition::Deferred
+        );
+        assert_eq!(
+            vanish_blob_disposition(&hash, &empty, &empty, &remaining, &empty),
+            VanishBlobDisposition::Failed
+        );
+        assert_eq!(
+            vanish_blob_disposition(&hash, &empty, &empty, &empty, &empty),
+            VanishBlobDisposition::Finalize
+        );
+    }
+
+    #[test]
+    fn b2_vanish_wave_limits_storage_to_one_source_blob() {
+        let first = next_vanish_wave_range(
+            10,
+            0,
+            B2_VANISH_KV_FANOUT,
+            Duration::ZERO,
+            Duration::ZERO,
+            VANISH_TIME_BUDGET,
+        )
+        .expect("the first wave must start");
+
+        assert_eq!(first, 0..1);
     }
 
     #[test]
@@ -7888,7 +8047,11 @@ mod tests {
         };
         let record = vanish_timing_record(
             &counters,
-            &VanishStorageTimings::default(),
+            &VanishStorageTimings {
+                b2_replica_ms: 17,
+                purge_bunny_ms: 19,
+                ..VanishStorageTimings::default()
+            },
             DeliveryProbeCounts {
                 checked: 2,
                 present: 1,
@@ -7899,6 +8062,8 @@ mod tests {
             0,
         );
 
+        assert_eq!(record["b2_replica_ms"], 17);
+        assert_eq!(record["purge_bunny_ms"], 19);
         assert_eq!(record["delivery_probe_ms"], 9);
         assert_eq!(record["delivery_probe_checked"], 2);
         assert_eq!(record["delivery_probe_present"], 1);
