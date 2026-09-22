@@ -135,7 +135,9 @@ absent through Compute before running the cleanup.
   follow-up check from another POP, and a `present` immediately after a purge
   can also mean propagation to that POP was still in flight. The probe only runs
   while the call is under its effective 8s cutoff (a 2s reserve against the 10s
-  vanish budget), so after rollout compare `delivery_probe_skipped` against
+  vanish budget). The edge enforces that absolute budget across the upload
+  response headers and body; an expired probe records `errors=1` without changing
+  erasure completion. After rollout compare `delivery_probe_skipped` against
   `delivery_probe_checked`; a high skip share means the reserve is costing
   coverage and should be revisited.
 - A single-POP probe, whether run by an operator or by the automated check,

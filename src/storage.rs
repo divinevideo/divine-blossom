@@ -14,6 +14,7 @@ use md5::Md5;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::io::{self, Read};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Backend name (must match fastly.toml)
@@ -2587,6 +2588,69 @@ fn delivery_probe_report_from_body(body: &str) -> Option<DeliveryProbeReport> {
     })
 }
 
+/// Wait on a borrowed pending-request or body handle without extending the
+/// caller's absolute deadline. The host API treats a zero timeout as infinite.
+fn wait_for_probe_io(handle: u32, deadline: Instant) -> io::Result<()> {
+    let timeout_ms = deadline
+        .saturating_duration_since(Instant::now())
+        .as_millis()
+        .min(u128::from(u32::MAX)) as u32;
+    if timeout_ms == 0 {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    let mut ready_index = u32::MAX;
+    // SAFETY: both pointers are valid for the duration of the hostcall. The
+    // caller retains ownership of the live handle; select only checks readiness.
+    let status =
+        unsafe { fastly_sys::fastly_async_io::select(&handle, 1, timeout_ms, &mut ready_index) };
+    if status.is_err() {
+        return Err(io::Error::other(format!("probe readiness: {status:?}")));
+    }
+    if ready_index != 0 || Instant::now() >= deadline {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    Ok(())
+}
+
+/// Bound both response headers and each body read to the same erase deadline.
+#[allow(deprecated)] // The pinned SDK exposes raw handles for the WASI p1 ABI.
+fn send_delivery_probe(request: Request, deadline: Instant) -> io::Result<(StatusCode, String)> {
+    if Instant::now() >= deadline {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    let (request, body) = request.into_handles();
+    let pending = request
+        .send_async(
+            body.unwrap_or_else(fastly::handle::BodyHandle::new),
+            CLOUD_RUN_BACKEND,
+        )
+        .map_err(|error| io::Error::other(format!("probe send: {error}")))?;
+    wait_for_probe_io(pending.as_u32(), deadline)?;
+    let (response, mut body) = pending
+        .wait()
+        .map_err(|error| io::Error::other(format!("probe response: {error}")))?;
+    let status = response.get_status();
+    if !status.is_success() {
+        return Ok((status, String::new()));
+    }
+    let mut bytes = Vec::new();
+    let mut chunk = [0; 4096];
+    loop {
+        // SAFETY: borrow this owned body handle only for the readiness check.
+        wait_for_probe_io(unsafe { body.as_u32() }, deadline)?;
+        // BodyHandle is unbuffered. Read only once per readiness notification:
+        // read_to_end/into_string could block again after consuming ready bytes.
+        let read = body.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    String::from_utf8(bytes)
+        .map(|body| (status, body))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
 /// Fetch a bounded sample of just-erased blobs through the public media host
 /// and report whether an edge cache still serves them.
 ///
@@ -2594,7 +2658,7 @@ fn delivery_probe_report_from_body(body: &str) -> Option<DeliveryProbeReport> {
 /// for `vanish_timing` (`present`), any other status is inconclusive, and a
 /// probe that cannot run to completion sets `errors` so an all-zero result is
 /// not mistaken for a probe that simply had nothing to check.
-pub(crate) fn probe_erased_delivery(hashes: &[String]) -> DeliveryProbeCounts {
+pub(crate) fn probe_erased_delivery(hashes: &[String], deadline: Instant) -> DeliveryProbeCounts {
     let mut counts = DeliveryProbeCounts::default();
     if hashes.is_empty() {
         return counts;
@@ -2638,10 +2702,8 @@ pub(crate) fn probe_erased_delivery(hashes: &[String]) -> DeliveryProbeCounts {
     request.set_header("Authorization", format!("Bearer {}", webhook_secret));
     request.set_body(Body::from(body));
 
-    match request.send(CLOUD_RUN_BACKEND) {
-        Ok(mut response) => {
-            let status = response.get_status();
-            let body = response.take_body().into_string();
+    match send_delivery_probe(request, deadline) {
+        Ok((status, body)) => {
             if !status.is_success() {
                 eprintln!(
                     "[VANISH] delivery_probe stage=request status={} key_count={}",
@@ -3358,6 +3420,63 @@ mod tests {
             Some("no_audio_track".to_string())
         );
         assert_eq!(parse_audio_extraction_error_response("not json"), None);
+    }
+
+    // These use a loopback upload stub supplied by the deadline test runner.
+    #[test]
+    #[ignore = "requires scripts/run-probe-deadline-tests.py"]
+    fn delivery_probe_deadline_bounds_headers_and_body() {
+        for marker in ['a', 'b', 'c', 'd'] {
+            let started = std::time::Instant::now();
+            let counts = super::probe_erased_delivery(
+                &[marker.to_string().repeat(64)],
+                started + Duration::from_millis(400),
+            );
+            eprintln!(
+                "deadline case {marker}: completed in {:?}",
+                started.elapsed()
+            );
+            assert_eq!(
+                counts.errors, 1,
+                "{marker}: incomplete probe must be recorded"
+            );
+            assert_eq!(
+                counts.checked, 0,
+                "{marker}: incomplete report is not a clean probe"
+            );
+            assert!(
+                started.elapsed() < Duration::from_millis(550),
+                "{marker}: probe outlived its 400ms budget: {:?}",
+                started.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires scripts/run-probe-deadline-tests.py"]
+    fn delivery_probe_deadline_preserves_completed_results() {
+        let counts = super::probe_erased_delivery(
+            &["e".repeat(64)],
+            std::time::Instant::now() + Duration::from_millis(400),
+        );
+        assert_eq!(counts.errors, 0);
+        assert_eq!(counts.checked, 1);
+        assert_eq!(counts.present, 1);
+    }
+
+    #[test]
+    fn delivery_probe_deadline_never_waits_indefinitely_for_zero_budget() {
+        let now = std::time::Instant::now();
+        // A zero host timeout means infinite wait, so reject before touching
+        // even a ready handle. An invalid handle proves no hostcall is made.
+        for deadline in [now, now + Duration::from_nanos(1)] {
+            assert_eq!(
+                super::wait_for_probe_io(u32::MAX, deadline)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::TimedOut
+            );
+        }
     }
 
     #[test]

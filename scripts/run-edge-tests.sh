@@ -60,3 +60,6 @@ if [ "$passed" -eq 0 ]; then
   echo "error: no edge tests executed" >&2
   exit 1
 fi
+
+# These exercise actual asynchronous host I/O against a delayed loopback backend.
+VICEROY="$VICEROY" python3 scripts/run-probe-deadline-tests.py

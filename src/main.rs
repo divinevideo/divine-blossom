@@ -4967,7 +4967,10 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
             &erase_main_candidates,
             DELIVERY_PROBE_LIMIT,
         );
-        (probe_erased_delivery(&sample), 0u32)
+        (
+            probe_erased_delivery(&sample, started + VANISH_TIME_BUDGET),
+            0u32,
+        )
     } else {
         eprintln!(
             "[VANISH] delivery_probe stage=budget skipped elapsed_ms={}",

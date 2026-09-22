@@ -264,6 +264,7 @@ dependencies = [
  "base64ct",
  "blossom-core",
  "fastly",
+ "fastly-sys",
  "hex",
  "hmac",
  "k256",
