@@ -1044,7 +1044,7 @@ pub(crate) struct DeliveryProbeCounts {
 #[derive(Debug, Default)]
 pub(crate) struct VanishStorageResult {
     pub failed_hashes: HashSet<String>,
-    /// Hashes whose surrogate-key purge was accepted by both CDN services in
+    /// Hashes whose purge was accepted by every enabled CDN service in
     /// this batch. The post-purge delivery probe samples only these, because a
     /// hash the purge could not reach is not expected to be absent yet.
     pub purged_hashes: HashSet<String>,
