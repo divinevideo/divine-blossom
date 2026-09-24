@@ -6,13 +6,14 @@ verifies its batch-cleanup contract before publishing the Fastly edge service.
 Most other Cloud Run services do not ship that way; each one is a script someone
 runs by hand.
 
-The VCL caching layer is also manual. Files under `vcl/` are source copies of
-snippets for the outer Fastly VCL service; the Compute publish job does not
-activate them. Apply and validate those snippets in a cloned VCL service version,
-then activate that version separately. The VCL changes themselves have no
-production effect until that activation happens. CI still republishes the
-Compute service after any merge to `main`, including a VCL-only merge. It does
-not purge after a routine publish.
+The VCL caching layer is not Compute. Files under `vcl/` are the source for
+snippets on the outer Fastly VCL service; the Compute publish job does not
+update them. `python3 scripts/sync_outer_vcl.py diff` compares git to the
+active version. `python3 scripts/sync_outer_vcl.py apply` clones that version,
+upserts the snippets in `vcl/snippets.json`, and validates the draft. Making
+the draft live is a separate operator step; see [Outer VCL snippets](outer-vcl.md).
+CI still republishes the Compute service after any merge to `main`, including a
+VCL-only merge. It does not purge after a routine publish.
 
 The ordered upload-service job is the exception to that asymmetry. If its deploy
 or readiness check fails, the automatic Fastly publish is skipped.

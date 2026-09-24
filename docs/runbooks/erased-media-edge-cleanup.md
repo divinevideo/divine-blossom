@@ -21,11 +21,14 @@ unless the request carries `Fastly-Debug`.
 
 ## Activate the guarded deliver snippet
 
-The outer VCL is not deployed from git. Follow
-[Fastly deploy and rollback](rollback.md): record the active outer version,
-clone it, update the `Client-facing headers` snippet from `vcl/deliver.vcl`,
-compare hashes, validate, then activate after approval. No Compute publish is
-involved, and no cache purge is part of activation.
+The outer VCL is not deployed by a Compute publish. Follow
+[Outer VCL snippets](outer-vcl.md) to compare the active version with git and
+prepare a validated draft with `scripts/sync_outer_vcl.py apply`. Review the
+complete version diff, then follow
+[Fastly deploy and rollback](rollback.md#activate-outer-vcl) to activate it after
+approval. If apply reports that the active version is already in sync, it
+creates no draft and no activation is needed. No Compute publish or cache purge
+is part of this procedure.
 
 ### Verify from a non-shield POP
 
