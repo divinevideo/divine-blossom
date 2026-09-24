@@ -50,12 +50,13 @@ use crate::metadata::{
     TranscodeMetadataUpdate, TranscriptMetadataUpdate, VanishAuditState,
 };
 use crate::storage::{
-    blob_exists, check_funnelcake_audio_reuse, current_timestamp, delete_blob as storage_delete,
-    dispatch_vanish_timing_log, download_blob_read_through, download_blob_with_fallback,
-    b2_replica_enabled, download_thumbnail, erase_vanish_batch, trigger_audio_extraction,
+    b2_replica_enabled, blob_exists, check_funnelcake_audio_reuse, current_timestamp,
+    delete_blob as storage_delete, delivery_probe_sample, dispatch_vanish_timing_log,
+    download_blob_read_through, download_blob_with_fallback, download_thumbnail,
+    erase_vanish_batch, probe_erased_delivery, trigger_audio_extraction,
     trigger_cloud_run_delete_blob, upload_blob, write_audit_log, write_vanish_audit_log,
-    B2_VANISH_MAX_HASHES_PER_WAVE, B2_VANISH_MAX_STORAGE_BACKEND_REQUESTS,
-    VanishAuditInitiator, VanishAuditPhase, VanishStorageTimings,
+    DeliveryProbeCounts, VanishAuditInitiator, VanishAuditPhase, VanishStorageTimings,
+    B2_VANISH_MAX_HASHES_PER_WAVE, B2_VANISH_MAX_STORAGE_BACKEND_REQUESTS, DELIVERY_PROBE_LIMIT,
 };
 use crate::viewer_auth::{ViewerAuthDiagnostics, ViewerAuthState};
 use blossom_core::cache_policy::{
@@ -4494,15 +4495,19 @@ const VANISH_TIME_BUDGET: Duration = Duration::from_millis(10_000);
 const VANISH_KV_FANOUT: usize = 10;
 const B2_VANISH_KV_FANOUT: usize = 1;
 const VANISH_STORAGE_ATTEMPTS: u8 = 2;
+// The post-purge delivery probe is observability, not erasure. Skip it when the
+// call is already this close to its internal budget, so a slow account never
+// waits on the probe.
+const DELIVERY_PROBE_BUDGET_RESERVE: Duration = Duration::from_millis(2_000);
 const B2_VANISH_STORAGE_ATTEMPTS: u8 = 1;
 // Fastly Compute permits 32 backend requests per execution. A B2-enabled wave
 // spends nearly all of that budget, so the wave loop starts only as many B2
 // waves as the remaining execution budget covers and leaves the rest of the
 // list pending for the caller's next attempt. The reserve covers the
 // execution's authorization audit, the completion audits for both initiators,
-// and the timing log.
+// the timing log, and the optional delivery probe.
 const COMPUTE_BACKEND_REQUEST_LIMIT: usize = 32;
-const VANISH_NON_STORAGE_BACKEND_REQUESTS: usize = 5;
+const VANISH_NON_STORAGE_BACKEND_REQUESTS: usize = 6;
 const VANISH_B2_WAVES_PER_EXECUTION: usize = (COMPUTE_BACKEND_REQUEST_LIMIT
     - VANISH_NON_STORAGE_BACKEND_REQUESTS)
     / B2_VANISH_MAX_STORAGE_BACKEND_REQUESTS;
@@ -4547,6 +4552,12 @@ fn should_start_vanish_wave(
         return true;
     }
     elapsed.saturating_add(last_wave) < budget
+}
+
+/// The post-purge delivery probe is observability, not erasure: run it only
+/// while the call still has the reserve left inside its time budget.
+fn should_probe_delivery(elapsed: Duration, reserve: Duration, budget: Duration) -> bool {
+    elapsed.saturating_add(reserve) <= budget
 }
 
 fn next_vanish_wave_range(
@@ -4750,6 +4761,55 @@ fn reconcile_vanish_list_completion(
     shared_updates_complete
 }
 
+#[derive(Debug, Default)]
+struct VanishTimingCounters {
+    selected: usize,
+    erase_candidates: usize,
+    storage_attempts: u32,
+    fully_deleted: u32,
+    unlinked: u32,
+    errors: u32,
+    malformed_hash_exceptions: u32,
+    pending: u32,
+    prepare_ms: u128,
+    kv_finalize_ms: u128,
+    total_ms: u128,
+}
+
+fn vanish_timing_record(
+    counters: &VanishTimingCounters,
+    storage_timings: &VanishStorageTimings,
+    delivery_probe: DeliveryProbeCounts,
+    delivery_probe_skipped: u32,
+) -> serde_json::Value {
+    serde_json::json!({
+        "selected": counters.selected,
+        "erase_candidates": counters.erase_candidates,
+        "storage_attempts": counters.storage_attempts,
+        "fully_deleted": counters.fully_deleted,
+        "unlinked": counters.unlinked,
+        "errors": counters.errors,
+        "malformed_hash_exceptions": counters.malformed_hash_exceptions,
+        "pending": counters.pending,
+        "prepare_ms": counters.prepare_ms.min(u128::from(u64::MAX)) as u64,
+        "gcs_main_ms": storage_timings.gcs_main_ms,
+        "cloud_run_cleanup_ms": storage_timings.cloud_run_cleanup_ms,
+        "fos_main_ms": storage_timings.fos_main_ms,
+        "b2_replica_ms": storage_timings.b2_replica_ms,
+        "purge_vcl_ms": storage_timings.purge_vcl_ms,
+        "purge_compute_ms": storage_timings.purge_compute_ms,
+        "purge_bunny_ms": storage_timings.purge_bunny_ms,
+        "delivery_probe_ms": delivery_probe.ms,
+        "delivery_probe_checked": delivery_probe.checked,
+        "delivery_probe_present": delivery_probe.present,
+        "delivery_probe_inconclusive": delivery_probe.inconclusive,
+        "delivery_probe_errors": delivery_probe.errors,
+        "delivery_probe_skipped": delivery_probe_skipped,
+        "kv_finalize_ms": counters.kv_finalize_ms.min(u128::from(u64::MAX)) as u64,
+        "total_ms": counters.total_ms.min(u128::from(u64::MAX)) as u64,
+    })
+}
+
 /// Execute one bounded account-erasure batch.
 fn execute_vanish(pubkey: &str) -> VanishExecution {
     let started = Instant::now();
@@ -4780,6 +4840,8 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     let mut erase_candidates = 0usize;
     let mut storage_attempts = 0u32;
     let mut storage_timings = VanishStorageTimings::default();
+    let mut erase_main_candidates: HashSet<String> = HashSet::new();
+    let mut purged_main_hashes: HashSet<String> = HashSet::new();
     let mut prepare_ms = 0u128;
     let mut kv_finalize_ms = 0u128;
     let mut last_wave = Duration::ZERO;
@@ -4848,6 +4910,7 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         let erase = cleanup_ready;
         erase_candidates = erase_candidates.saturating_add(erase.len());
         let mut erase_hashes: Vec<String> = erase.iter().map(|blob| blob.hash.clone()).collect();
+        erase_main_candidates.extend(erase_hashes.iter().cloned());
         erase_hashes.extend(derived_cleanup.iter().map(|plan| plan.audio_hash.clone()));
         erase_hashes.sort();
         erase_hashes.dedup();
@@ -4864,6 +4927,13 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         }
         storage_attempts = storage_attempts.saturating_add(u32::from(wave_storage_attempts));
         add_vanish_storage_timings(&mut storage_timings, &storage_result.timings);
+        purged_main_hashes.extend(
+            storage_result
+                .purged_hashes
+                .iter()
+                .filter(|hash| erase_main_candidates.contains(*hash))
+                .cloned(),
+        );
 
         let finalize_started = Instant::now();
         let mut failed_derived_sources = HashSet::new();
@@ -4984,26 +5054,50 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         }
     }
 
-    let timing = serde_json::json!({
-        "selected": selected,
-        "erase_candidates": erase_candidates,
-        "storage_attempts": storage_attempts,
-        "fully_deleted": execution.fully_deleted,
-        "unlinked": execution.unlinked,
-        "errors": execution.errors,
-        "malformed_hash_exceptions": execution.malformed_hash_exceptions,
-        "pending": execution.pending,
-        "prepare_ms": prepare_ms.min(u128::from(u64::MAX)) as u64,
-        "gcs_main_ms": storage_timings.gcs_main_ms,
-        "cloud_run_cleanup_ms": storage_timings.cloud_run_cleanup_ms,
-        "fos_main_ms": storage_timings.fos_main_ms,
-        "b2_replica_ms": storage_timings.b2_replica_ms,
-        "purge_vcl_ms": storage_timings.purge_vcl_ms,
-        "purge_compute_ms": storage_timings.purge_compute_ms,
-        "purge_bunny_ms": storage_timings.purge_bunny_ms,
-        "kv_finalize_ms": kv_finalize_ms.min(u128::from(u64::MAX)) as u64,
-        "total_ms": started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-    });
+    // Post-purge probe (#279): check a bounded sample of just-purged main blobs
+    // through the public media host. Aggregate counters only; a 2xx records a
+    // `present` failure signal without gating erasure completion, because a
+    // residual edge copy cannot be repaired by retrying the vanish.
+    let (delivery_probe, delivery_probe_skipped) = if should_probe_delivery(
+        started.elapsed(),
+        DELIVERY_PROBE_BUDGET_RESERVE,
+        VANISH_TIME_BUDGET,
+    ) {
+        let sample = delivery_probe_sample(
+            &purged_main_hashes,
+            &erase_main_candidates,
+            DELIVERY_PROBE_LIMIT,
+        );
+        (
+            probe_erased_delivery(&sample, started + VANISH_TIME_BUDGET),
+            0u32,
+        )
+    } else {
+        eprintln!(
+            "[VANISH] delivery_probe stage=budget skipped elapsed_ms={}",
+            started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+        );
+        (DeliveryProbeCounts::default(), 1u32)
+    };
+
+    let timing = vanish_timing_record(
+        &VanishTimingCounters {
+            selected,
+            erase_candidates,
+            storage_attempts,
+            fully_deleted: execution.fully_deleted,
+            unlinked: execution.unlinked,
+            errors: execution.errors,
+            malformed_hash_exceptions: execution.malformed_hash_exceptions,
+            pending: execution.pending,
+            prepare_ms,
+            kv_finalize_ms,
+            total_ms: started.elapsed().as_millis(),
+        },
+        &storage_timings,
+        delivery_probe,
+        delivery_probe_skipped,
+    );
     if let Err(error) = dispatch_vanish_timing_log(&timing) {
         eprintln!(
             "[VANISH] pubkey={} failed to dispatch timing: {}",
@@ -6919,7 +7013,8 @@ mod tests {
         next_vanish_wave_range, parse_transcode_status_webhook_payload,
         parse_transcript_status_webhook_payload, parse_upload_service_response,
         reconcile_vanish_list_completion, should_delete_derived_audio_blob,
-        should_eagerly_trigger_transcription, should_record_upload_service_transcode_failure,
+        should_eagerly_trigger_transcription, should_probe_delivery,
+        should_record_upload_service_transcode_failure,
         should_record_upload_service_transcript_failure,
         should_reset_transcode_failure_on_clean_upload,
         should_reset_transcript_failure_on_clean_upload, should_set_audio_content_length,
@@ -6927,14 +7022,16 @@ mod tests {
         trusted_upload_service_terminal_derivative_error, upload_capability_headers,
         upload_control_host, upload_exposed_headers, upload_from_resumable_completion,
         vanish_blob_disposition, vanish_pending_count, vanish_response_status,
-        vanish_shared_update_error_count, AudioReuseAvailability, DerivativeObservation,
-        TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState, VanishBlobDisposition,
-        VanishExecution, B2_VANISH_KV_FANOUT, VANISH_KV_FANOUT, VANISH_TIME_BUDGET,
+        vanish_shared_update_error_count, vanish_timing_record, AudioReuseAvailability,
+        DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState,
+        VanishBlobDisposition, VanishExecution, VanishTimingCounters, B2_VANISH_KV_FANOUT,
+        DELIVERY_PROBE_BUDGET_RESERVE, VANISH_KV_FANOUT, VANISH_TIME_BUDGET,
     };
     use crate::blossom::{
         BlobStatus, ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus,
     };
     use crate::error::{BlossomError, Result as BlossomResult};
+    use crate::storage::{DeliveryProbeCounts, VanishStorageTimings};
     use blossom_core::cache_policy::BlobCachePolicy;
     use fastly::http::StatusCode;
     use fastly::Response;
@@ -7021,6 +7118,32 @@ mod tests {
             true,
             Duration::from_millis(3_000),
             Duration::from_millis(2_000),
+            VANISH_TIME_BUDGET,
+        ));
+    }
+
+    #[test]
+    fn delivery_probe_runs_only_while_the_budget_has_room() {
+        let reserve = DELIVERY_PROBE_BUDGET_RESERVE;
+
+        assert!(should_probe_delivery(
+            Duration::from_millis(0),
+            reserve,
+            VANISH_TIME_BUDGET,
+        ));
+        assert!(should_probe_delivery(
+            Duration::from_millis(8_000),
+            reserve,
+            VANISH_TIME_BUDGET,
+        ));
+        assert!(!should_probe_delivery(
+            Duration::from_millis(8_001),
+            reserve,
+            VANISH_TIME_BUDGET,
+        ));
+        assert!(!should_probe_delivery(
+            VANISH_TIME_BUDGET,
+            reserve,
             VANISH_TIME_BUDGET,
         ));
     }
@@ -7905,5 +8028,65 @@ mod tests {
             surrogate_key_hash_from_path(&format!("/{}z", "a".repeat(63))),
             None
         );
+    }
+
+    #[test]
+    fn vanish_timing_record_carries_the_delivery_probe_counters() {
+        let counters = VanishTimingCounters {
+            selected: 4,
+            erase_candidates: 2,
+            storage_attempts: 1,
+            fully_deleted: 2,
+            unlinked: 1,
+            errors: 0,
+            malformed_hash_exceptions: 0,
+            pending: 0,
+            prepare_ms: 12,
+            kv_finalize_ms: 34,
+            total_ms: 56,
+        };
+        let record = vanish_timing_record(
+            &counters,
+            &VanishStorageTimings {
+                b2_replica_ms: 17,
+                purge_bunny_ms: 19,
+                ..VanishStorageTimings::default()
+            },
+            DeliveryProbeCounts {
+                checked: 2,
+                present: 1,
+                inconclusive: 0,
+                errors: 0,
+                ms: 9,
+            },
+            0,
+        );
+
+        assert_eq!(record["b2_replica_ms"], 17);
+        assert_eq!(record["purge_bunny_ms"], 19);
+        assert_eq!(record["delivery_probe_ms"], 9);
+        assert_eq!(record["delivery_probe_checked"], 2);
+        assert_eq!(record["delivery_probe_present"], 1);
+        assert_eq!(record["delivery_probe_inconclusive"], 0);
+        assert_eq!(record["delivery_probe_errors"], 0);
+        assert_eq!(record["delivery_probe_skipped"], 0);
+        assert_eq!(record["selected"], 4);
+        assert_eq!(record["fully_deleted"], 2);
+        assert_eq!(record["total_ms"], 56);
+    }
+
+    #[test]
+    fn vanish_timing_record_marks_a_skipped_delivery_probe() {
+        let record = vanish_timing_record(
+            &VanishTimingCounters::default(),
+            &VanishStorageTimings::default(),
+            DeliveryProbeCounts::default(),
+            1,
+        );
+
+        assert_eq!(record["delivery_probe_skipped"], 1);
+        assert_eq!(record["delivery_probe_checked"], 0);
+        assert_eq!(record["delivery_probe_errors"], 0);
+        assert_eq!(record["total_ms"], 0);
     }
 }

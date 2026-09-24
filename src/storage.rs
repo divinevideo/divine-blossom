@@ -14,6 +14,7 @@ use md5::Md5;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::io::{self, Read};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Backend name (must match fastly.toml)
@@ -29,6 +30,12 @@ const BUNNY_API_BACKEND: &str = "bunny_api";
 /// Cloud Run backend for uploads/migrations
 const CLOUD_RUN_BACKEND: &str = "cloud_run_upload";
 const CLOUD_RUN_HOST: &str = "blossom-upload-rust-149672065768.us-central1.run.app";
+const CLOUD_RUN_DELIVERY_PROBE_PATH: &str = "/probe-delivery";
+
+/// Bounded sample size for the post-purge delivery probe. One probe origin
+/// observes only the POP serving it, so more samples add latency without
+/// meaningfully widening coverage.
+pub(crate) const DELIVERY_PROBE_LIMIT: usize = 3;
 
 /// Legacy CDN runtime fallback is intentionally disabled.
 ///
@@ -1021,9 +1028,26 @@ pub(crate) struct VanishStorageTimings {
     pub purge_bunny_ms: u64,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DeliveryProbeCounts {
+    pub checked: u32,
+    /// 2xx responses: an edge cache still serves an erased object.
+    pub present: u32,
+    /// Non-2xx, non-404 responses from completed probes.
+    pub inconclusive: u32,
+    /// 1 when the probe could not complete at all: missing credential,
+    /// transport failure, non-2xx response, or malformed response body.
+    pub errors: u32,
+    pub ms: u64,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct VanishStorageResult {
     pub failed_hashes: HashSet<String>,
+    /// Hashes whose purge was accepted by every enabled CDN service in
+    /// this batch. The post-purge delivery probe samples only these, because a
+    /// hash the purge could not reach is not expected to be absent yet.
+    pub purged_hashes: HashSet<String>,
     /// Hashes whose B2 version set exceeded one bounded page. Their deletion is
     /// progressing, so they are pending work rather than failures.
     pub remaining_hashes: HashSet<String>,
@@ -1033,6 +1057,7 @@ pub(crate) struct VanishStorageResult {
 impl VanishStorageResult {
     pub(crate) fn replace_failures_after_retry(&mut self, retry: Self) {
         self.failed_hashes = retry.failed_hashes;
+        self.purged_hashes.extend(retry.purged_hashes);
         self.remaining_hashes = retry.remaining_hashes;
         self.timings.gcs_main_ms = self
             .timings
@@ -1629,9 +1654,12 @@ fn mark_failed_stage(
     }
 }
 
-fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) {
+/// Purge the given hashes by surrogate key from both CDN services and return
+/// the hashes whose purge request both services accepted.
+fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) -> HashSet<String> {
+    let mut purged = HashSet::new();
     if hashes.is_empty() {
-        return;
+        return purged;
     }
 
     let api_token = match get_secret("fastly_api_token") {
@@ -1642,7 +1670,7 @@ fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) {
                 hashes.len()
             );
             result.failed_hashes.extend(hashes.iter().cloned());
-            return;
+            return purged;
         }
     };
     let services = [
@@ -1709,6 +1737,8 @@ fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) {
                         stage_hashes.get(&stage).map_or(hashes.len(), Vec::len)
                     );
                     mark_failed_stage(result, &stage_hashes, &stage, hashes);
+                } else if let Some(stage_keys) = stage_hashes.get(&stage) {
+                    purged.extend(stage_keys.iter().cloned());
                 }
             }
             Err(error) => {
@@ -1728,6 +1758,7 @@ fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) {
             }
         }
     }
+    purged
 }
 
 /// Erase one bounded vanish batch from every enabled origin and CDN service.
@@ -1882,10 +1913,15 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
         .filter(|hash| !main_origin_failures.contains(*hash))
         .cloned()
         .collect();
-    purge_vanish_hashes(&purgeable, &mut result);
+    let purged = purge_vanish_hashes(&purgeable, &mut result);
     let bunny_started = Instant::now();
     purge_bunny_hashes(&purgeable, &mut result);
     result.timings.purge_bunny_ms = elapsed_ms(bunny_started);
+    let purged: HashSet<String> = purged
+        .into_iter()
+        .filter(|hash| !result.failed_hashes.contains(hash))
+        .collect();
+    result.purged_hashes.extend(purged);
     result
 }
 
@@ -3054,6 +3090,224 @@ fn trigger_cloud_run_delete_blobs_chunk(
     Ok(failed_cloud_cleanup_hashes(status, &body, hashes))
 }
 
+/// Pick the bounded post-purge probe sample: main source hashes whose purge
+/// succeeded, sorted so the same batch always probes the same hashes.
+pub(crate) fn delivery_probe_sample(
+    purged_hashes: &HashSet<String>,
+    main_candidates: &HashSet<String>,
+    limit: usize,
+) -> Vec<String> {
+    let mut sample: Vec<String> = purged_hashes
+        .iter()
+        .filter(|hash| main_candidates.contains(*hash))
+        .cloned()
+        .collect();
+    sample.sort();
+    sample.truncate(limit);
+    sample
+}
+
+struct DeliveryProbeReport {
+    counts: DeliveryProbeCounts,
+    present_hashes: Vec<(String, Option<u16>)>,
+}
+
+fn delivery_probe_report_from_body(body: &str) -> Option<DeliveryProbeReport> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let checked = value.get("checked")?.as_u64()? as u32;
+    let present = value
+        .get("present")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as u32;
+    let inconclusive = value
+        .get("inconclusive")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as u32;
+    let present_hashes = value
+        .get("results")
+        .and_then(|value| value.as_array())
+        .map(|results| {
+            results
+                .iter()
+                .filter_map(|result| {
+                    if result.get("outcome")?.as_str()? != "present" {
+                        return None;
+                    }
+                    let hash = result.get("hash")?.as_str()?.to_string();
+                    let status = result
+                        .get("status")
+                        .and_then(|value| value.as_u64())
+                        .map(|value| value.min(u64::from(u16::MAX)) as u16);
+                    Some((hash, status))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(DeliveryProbeReport {
+        counts: DeliveryProbeCounts {
+            checked,
+            present,
+            inconclusive,
+            errors: 0,
+            ms: 0,
+        },
+        present_hashes,
+    })
+}
+
+/// Wait on a borrowed pending-request or body handle without extending the
+/// caller's absolute deadline. The host API treats a zero timeout as infinite.
+fn wait_for_probe_io(handle: u32, deadline: Instant) -> io::Result<()> {
+    let timeout_ms = deadline
+        .saturating_duration_since(Instant::now())
+        .as_millis()
+        .min(u128::from(u32::MAX)) as u32;
+    if timeout_ms == 0 {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    let mut ready_index = u32::MAX;
+    // SAFETY: both pointers are valid for the duration of the hostcall. The
+    // caller retains ownership of the live handle; select only checks readiness.
+    let status =
+        unsafe { fastly_sys::fastly_async_io::select(&handle, 1, timeout_ms, &mut ready_index) };
+    if status.is_err() {
+        return Err(io::Error::other(format!("probe readiness: {status:?}")));
+    }
+    if ready_index != 0 || Instant::now() >= deadline {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    Ok(())
+}
+
+/// Bound both response headers and each body read to the same erase deadline.
+#[allow(deprecated)] // The pinned SDK exposes raw handles for the WASI p1 ABI.
+fn send_delivery_probe(request: Request, deadline: Instant) -> io::Result<(StatusCode, String)> {
+    if Instant::now() >= deadline {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    let (request, body) = request.into_handles();
+    let pending = request
+        .send_async(
+            body.unwrap_or_else(fastly::handle::BodyHandle::new),
+            CLOUD_RUN_BACKEND,
+        )
+        .map_err(|error| io::Error::other(format!("probe send: {error}")))?;
+    wait_for_probe_io(pending.as_u32(), deadline)?;
+    let (response, mut body) = pending
+        .wait()
+        .map_err(|error| io::Error::other(format!("probe response: {error}")))?;
+    let status = response.get_status();
+    if !status.is_success() {
+        return Ok((status, String::new()));
+    }
+    let mut bytes = Vec::new();
+    let mut chunk = [0; 4096];
+    loop {
+        // SAFETY: borrow this owned body handle only for the readiness check.
+        wait_for_probe_io(unsafe { body.as_u32() }, deadline)?;
+        // BodyHandle is unbuffered. Read only once per readiness notification:
+        // read_to_end/into_string could block again after consuming ready bytes.
+        let read = body.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    String::from_utf8(bytes)
+        .map(|body| (status, body))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+/// Fetch a bounded sample of just-erased blobs through the public media host
+/// and report whether an edge cache still serves them.
+///
+/// Best-effort: this never changes the erase result. A 2xx is a failure signal
+/// for `vanish_timing` (`present`), any other status is inconclusive, and a
+/// probe that cannot run to completion sets `errors` so an all-zero result is
+/// not mistaken for a probe that simply had nothing to check.
+pub(crate) fn probe_erased_delivery(hashes: &[String], deadline: Instant) -> DeliveryProbeCounts {
+    let mut counts = DeliveryProbeCounts::default();
+    if hashes.is_empty() {
+        return counts;
+    }
+    let started = Instant::now();
+    let webhook_secret = match get_secret("webhook_secret") {
+        Ok(secret) if !secret.is_empty() => secret,
+        _ => {
+            eprintln!(
+                "[VANISH] delivery_probe stage=setup error=missing_or_empty_webhook_secret key_count={}",
+                hashes.len()
+            );
+            counts.errors = 1;
+            counts.ms = elapsed_ms(started);
+            return counts;
+        }
+    };
+    let body = match serde_json::to_string(&serde_json::json!({ "hashes": hashes })) {
+        Ok(body) => body,
+        Err(error) => {
+            eprintln!(
+                "[VANISH] delivery_probe stage=setup error={} key_count={}",
+                error,
+                hashes.len()
+            );
+            counts.errors = 1;
+            counts.ms = elapsed_ms(started);
+            return counts;
+        }
+    };
+
+    let mut request = Request::new(
+        Method::POST,
+        format!(
+            "https://{}{}",
+            CLOUD_RUN_HOST, CLOUD_RUN_DELIVERY_PROBE_PATH
+        ),
+    );
+    request.set_header("Host", CLOUD_RUN_HOST);
+    request.set_header("Content-Type", "application/json");
+    request.set_header("Authorization", format!("Bearer {}", webhook_secret));
+    request.set_body(Body::from(body));
+
+    match send_delivery_probe(request, deadline) {
+        Ok((status, body)) => {
+            if !status.is_success() {
+                eprintln!(
+                    "[VANISH] delivery_probe stage=request status={} key_count={}",
+                    status.as_u16(),
+                    hashes.len()
+                );
+                counts.errors = 1;
+            } else if let Some(report) = delivery_probe_report_from_body(&body) {
+                for (hash, status) in &report.present_hashes {
+                    eprintln!(
+                        "[VANISH] delivery_probe hash={} outcome=present status={}",
+                        hash,
+                        status.unwrap_or(0)
+                    );
+                }
+                counts = report.counts;
+            } else {
+                eprintln!(
+                    "[VANISH] delivery_probe stage=parse error=invalid_body key_count={}",
+                    hashes.len()
+                );
+                counts.errors = 1;
+            }
+        }
+        Err(error) => {
+            eprintln!(
+                "[VANISH] delivery_probe stage=request error={} key_count={}",
+                error,
+                hashes.len()
+            );
+            counts.errors = 1;
+        }
+    }
+    counts.ms = elapsed_ms(started);
+    counts
+}
+
 /// Trigger synchronous migration of a blob from a fallback CDN to GCS.
 /// Sends the request to Cloud Run and waits for completion (up to timeout).
 /// With VCL caching in front, this only runs once per blob on cache miss,
@@ -3253,25 +3507,26 @@ pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtracti
 mod tests {
     use super::{
         audit_log_entry, b2_api_host, b2_delete_version_succeeded, b2_dynamic_backend_name,
-        b2_prefix_page, build_b2_delete_version_request,
-        build_b2_list_versions_request, build_bunny_purge_request, build_fos_delete_request,
-        build_multi_delete_request, canonical_query_string, classify_cloud_cleanup_response,
-        cloud_run_delete_blob_body, cloud_run_delete_blobs_body, failed_cloud_cleanup_hashes,
-        failed_multi_delete_keys, mark_failed_stage, multi_delete_body,
-        normalize_storage_cache_state, parse_audio_extraction_error_response,
+        b2_prefix_page, build_b2_delete_version_request, build_b2_list_versions_request,
+        build_bunny_purge_request, build_fos_delete_request, build_multi_delete_request,
+        canonical_query_string, classify_cloud_cleanup_response, cloud_run_delete_blob_body,
+        cloud_run_delete_blobs_body, delivery_probe_report_from_body, delivery_probe_sample,
+        failed_cloud_cleanup_hashes, failed_multi_delete_keys, mark_failed_stage,
+        multi_delete_body, normalize_storage_cache_state, parse_audio_extraction_error_response,
         parse_funnelcake_audio_reuse_response, plan_cloud_run_delete_chunks,
         plan_vanish_delete_batches, prepare_storage_cache_miss, preserve_storage_cache_state,
         sign_request_at, validate_b2_authorization_scope, vanish_audit_entry, B2Authorization,
-        B2AuthorizeResponse, B2FileVersion,
-        B2ListFileVersionsResponse, S3Config,
-        VanishAuditInitiator, VanishAuditPhase, VanishDeleteTarget, VanishStorageResult,
-        B2_LIST_PAGE_SIZE, CLOUD_RUN_DELETE_BATCH_LIMIT, FOS_BACKEND,
-        PROVIDER_MULTI_DELETE_LIMIT,
+        B2AuthorizeResponse, B2FileVersion, B2ListFileVersionsResponse, DeliveryProbeCounts,
+        S3Config, VanishAuditInitiator, VanishAuditPhase, VanishDeleteTarget, VanishStorageResult,
+        B2_LIST_PAGE_SIZE, CLOUD_RUN_DELETE_BATCH_LIMIT, FOS_BACKEND, PROVIDER_MULTI_DELETE_LIMIT,
         STORAGE_CACHE_HEADER,
     };
     use fastly::http::header;
     use fastly::{Request, Response};
-    use std::{collections::HashMap, time::Duration};
+    use std::{
+        collections::{HashMap, HashSet},
+        time::Duration,
+    };
 
     #[test]
     fn audit_log_entry_serializes_optional_fields_without_manual_escaping() {
@@ -3951,5 +4206,139 @@ mod tests {
             Some("no_audio_track".to_string())
         );
         assert_eq!(parse_audio_extraction_error_response("not json"), None);
+    }
+
+    // These use a loopback upload stub supplied by the deadline test runner.
+    #[test]
+    #[ignore = "requires scripts/run-probe-deadline-tests.py"]
+    fn delivery_probe_deadline_bounds_headers_and_body() {
+        for marker in ['a', 'b', 'c', 'd'] {
+            let started = std::time::Instant::now();
+            let counts = super::probe_erased_delivery(
+                &[marker.to_string().repeat(64)],
+                started + Duration::from_millis(400),
+            );
+            eprintln!(
+                "deadline case {marker}: completed in {:?}",
+                started.elapsed()
+            );
+            assert_eq!(
+                counts.errors, 1,
+                "{marker}: incomplete probe must be recorded"
+            );
+            assert_eq!(
+                counts.checked, 0,
+                "{marker}: incomplete report is not a clean probe"
+            );
+            assert!(
+                started.elapsed() < Duration::from_millis(550),
+                "{marker}: probe outlived its 400ms budget: {:?}",
+                started.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires scripts/run-probe-deadline-tests.py"]
+    fn delivery_probe_deadline_preserves_completed_results() {
+        let counts = super::probe_erased_delivery(
+            &["e".repeat(64)],
+            std::time::Instant::now() + Duration::from_millis(400),
+        );
+        assert_eq!(counts.errors, 0);
+        assert_eq!(counts.checked, 1);
+        assert_eq!(counts.present, 1);
+    }
+
+    #[test]
+    fn delivery_probe_deadline_never_waits_indefinitely_for_zero_budget() {
+        let now = std::time::Instant::now();
+        // A zero host timeout means infinite wait, so reject before touching
+        // even a ready handle. An invalid handle proves no hostcall is made.
+        for deadline in [now, now + Duration::from_nanos(1)] {
+            assert_eq!(
+                super::wait_for_probe_io(u32::MAX, deadline)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::TimedOut
+            );
+        }
+    }
+
+    #[test]
+    fn delivery_probe_samples_only_purged_main_hashes_in_stable_order() {
+        let main_a = "a".repeat(64);
+        let main_b = "b".repeat(64);
+        let main_c = "c".repeat(64);
+        let main_d = "d".repeat(64);
+        let audio = "e".repeat(64);
+
+        let purged: HashSet<String> = [&main_c, &main_a, &main_b, &audio, &main_d]
+            .into_iter()
+            .cloned()
+            .collect();
+        let candidates: HashSet<String> = [&main_a, &main_b, &main_c, &main_d]
+            .into_iter()
+            .cloned()
+            .collect();
+
+        assert_eq!(
+            delivery_probe_sample(&purged, &candidates, 3),
+            vec![main_a.clone(), main_b.clone(), main_c.clone()]
+        );
+        assert!(delivery_probe_sample(&purged, &candidates, 0).is_empty());
+    }
+
+    #[test]
+    fn delivery_probe_report_extracts_counts_and_present_hashes() {
+        let body = format!(
+            r#"{{"checked":3,"absent":1,"present":1,"inconclusive":1,"results":[{{"hash":"{}","outcome":"absent","status":404}},{{"hash":"{}","outcome":"present","status":200}},{{"hash":"{}","outcome":"inconclusive"}}]}}"#,
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64),
+        );
+
+        let report = delivery_probe_report_from_body(&body).expect("valid report");
+        assert_eq!(
+            report.counts,
+            DeliveryProbeCounts {
+                checked: 3,
+                present: 1,
+                inconclusive: 1,
+                errors: 0,
+                ms: 0,
+            }
+        );
+        assert_eq!(report.present_hashes, vec![("b".repeat(64), Some(200))]);
+    }
+
+    #[test]
+    fn delivery_probe_report_rejects_a_body_without_counts() {
+        assert!(delivery_probe_report_from_body("not json").is_none());
+        assert!(delivery_probe_report_from_body(r#"{"present":1}"#).is_none());
+    }
+
+    #[test]
+    fn vanish_storage_retry_keeps_purged_hashes_and_replaces_failures() {
+        let mut first = VanishStorageResult::default();
+        first.failed_hashes.insert("a".repeat(64));
+        first.purged_hashes.insert("b".repeat(64));
+
+        let mut retry = VanishStorageResult::default();
+        retry.failed_hashes.insert("c".repeat(64));
+        retry.purged_hashes.insert("a".repeat(64));
+
+        first.replace_failures_after_retry(retry);
+
+        assert_eq!(
+            first.failed_hashes,
+            ["c".repeat(64)].into_iter().collect::<HashSet<_>>()
+        );
+        assert_eq!(
+            first.purged_hashes,
+            ["a".repeat(64), "b".repeat(64)]
+                .into_iter()
+                .collect::<HashSet<_>>()
+        );
     }
 }
