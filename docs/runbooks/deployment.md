@@ -78,12 +78,22 @@ environment.
 ## `webhook_secret` authority and rotation
 
 GCP Secret Manager secret `webhook_secret` in `rich-compiler-479518-d2` is the
-authoritative readable copy. Fastly Secret Store `blossom_secrets` entry
-`webhook_secret` and Cloudflare Worker `divine-moderation-service` binding
-`BLOSSOM_WEBHOOK_SECRET` are write-only copies. Never generate a replacement in
+authoritative readable copy. There are three write-only copies:
+
+| Copy | Consumer | Mechanism |
+| --- | --- | --- |
+| Fastly Secret Store `blossom_secrets` entry `webhook_secret` | the edge itself, which compares against this value | Fastly secret store |
+| Cloudflare Worker `divine-moderation-service` binding `BLOSSOM_WEBHOOK_SECRET` | that Worker only | per-Worker secret (`wrangler secret put`) |
+| Cloudflare Secrets Store `ef490704b12a4feb91c7feb51229c364` entry `BLOSSOM_WEBHOOK_SECRET` | Worker `divine-relay-manager`, prod and staging | account-level Secrets Store, bound in `worker/wrangler.prod.toml` and `worker/wrangler.staging.toml` |
+
+The two Cloudflare Workers hold the value by *different* mechanisms, so updating
+one does not update the other. Read that table before assuming a Cloudflare
+update is a single step; it is two, in two different places.
+
+Never generate a replacement in
 Fastly or Cloudflare; generate a 64-character lowercase hex value directly into
 a new GCP version, without a trailing newline, and pipe that exact version to
-both write-only stores. The missing newline is required: Fastly trims the value
+every write-only store. The missing newline is required: Fastly trims the value
 it reads from its store, while the upload service compares the raw
 `WEBHOOK_SECRET` environment value. A newline in GCP would therefore make those
 copies disagree.
@@ -91,6 +101,9 @@ copies disagree.
 The rotated value crosses every one of these directions:
 
 - Cloudflare moderation Worker -> Fastly `/admin/moderate`
+- Cloudflare `divine-relay-manager` -> Fastly `/admin/api/blob/{sha256}/content`,
+  which proxies blocked media to moderators. A stale copy here does not raise an
+  alert; it silently breaks moderator preview of blocked media.
 - Fastly -> upload service `/delete-blob`
 - Fastly -> transcoder `/audio/extract`
 - transcoder -> Fastly `/admin/transcode-status`
@@ -115,8 +128,10 @@ Rotate forward in this order:
 1. Record the current GCP version number. Create the new version without a
    trailing newline, keep the old version enabled, and update the canonical
    `blossom-webhook-secret-prod` mirror from that exact new version. Inventory
-   every bearer client using `webhook_secret`, prepare each client update, and
-   record when the moderation Worker is the only one.
+   every bearer client using `webhook_secret` and prepare each client update.
+   The known clients are the two Cloudflare Workers in the table above plus the
+   Fastly store; confirm that list against the repositories rather than assuming
+   the moderation Worker is the only Cloudflare consumer. It never has been.
 2. Schedule the rotation for a low-activity window. Before changing either
    write-only copy, read `STATUS_QUEUE_ENABLED` from the serving transcoder
    revision and record active derivative work. If the queue is enabled, capture
@@ -188,6 +203,30 @@ The 2026-08-31 rotation's Cloudflare and Fastly API writes were 18 seconds
 apart, but the edge did not accept the new value until a probe 88 seconds after
 the Cloudflare write. Plan the mismatch window around verified edge acceptance,
 not the secret-store API completion time.
+
+On 2026-09-30 `divine-relay-manager` was found holding a stale copy. It has
+bound the Cloudflare Secrets Store entry since 2026-05-13
+(divinevideo/divine-relay-manager#63) and was missed by both the 2026-07-24 and
+2026-08-31 rotations, so its moderator media preview had been failing
+authentication for roughly ten weeks with no alert. The cause was the inventory
+above naming only one Cloudflare consumer. That is why the copy table is now
+explicit about mechanism, and why step 1 says to confirm the list against the
+repositories.
+
+## Do not create a readable copy for humans
+
+Requests to put this value in a password manager, a shared vault, or a document
+are reasonable-sounding and must be declined. `validate_bearer_token`
+(`src/admin.rs`) accepts either `admin_token` or `webhook_secret`, so this value
+is admin-equivalent on every route behind `validate_admin_auth`. A vault item is
+readable by everyone in the vault, whereas the design above keeps exactly one
+readable copy, in GCP Secret Manager, and makes every other copy write-only.
+
+A human-readable copy also becomes another thing each rotation has to chase,
+which is the failure this section exists to prevent. When someone needs to set a
+downstream copy, give them write access to that specific store and have them
+pipe the value straight out of GCP Secret Manager; do not stage it anywhere in
+between, including a clipboard.
 
 Mirror the canonical value in `dv-platform-prod` Secret Manager as
 `blossom-webhook-secret-prod` for the platform secret convention. That mirror is
