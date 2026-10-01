@@ -78,12 +78,22 @@ environment.
 ## `webhook_secret` authority and rotation
 
 GCP Secret Manager secret `webhook_secret` in `rich-compiler-479518-d2` is the
-authoritative readable copy. Fastly Secret Store `blossom_secrets` entry
-`webhook_secret` and Cloudflare Worker `divine-moderation-service` binding
-`BLOSSOM_WEBHOOK_SECRET` are write-only copies. Never generate a replacement in
+authoritative readable copy. There are three write-only copies:
+
+| Copy | Consumer | Mechanism |
+| --- | --- | --- |
+| Fastly Secret Store `blossom_secrets` entry `webhook_secret` | the edge itself, which compares against this value | Fastly secret store |
+| Cloudflare Worker `divine-moderation-service` binding `BLOSSOM_WEBHOOK_SECRET` | that Worker only | per-Worker secret (`wrangler secret put`) |
+| Cloudflare Secrets Store `ef490704b12a4feb91c7feb51229c364` entry `BLOSSOM_WEBHOOK_SECRET` | Worker `divine-relay-manager`, prod and staging | account-level Secrets Store, bound in `worker/wrangler.prod.toml` and `worker/wrangler.staging.toml` |
+
+The two Cloudflare Workers hold the value by *different* mechanisms, so updating
+one does not update the other. Read that table before assuming a Cloudflare
+update is a single step; it is two, in two different places.
+
+Never generate a replacement in
 Fastly or Cloudflare; generate a 64-character lowercase hex value directly into
 a new GCP version, without a trailing newline, and pipe that exact version to
-both write-only stores. The missing newline is required: Fastly trims the value
+every write-only store. The missing newline is required: Fastly trims the value
 it reads from its store, while the upload service compares the raw
 `WEBHOOK_SECRET` environment value. A newline in GCP would therefore make those
 copies disagree.
@@ -91,6 +101,9 @@ copies disagree.
 The rotated value crosses every one of these directions:
 
 - Cloudflare moderation Worker -> Fastly `/admin/moderate`
+- Cloudflare `divine-relay-manager` -> Fastly `/admin/api/blob/{sha256}/content`,
+  which proxies blocked media to moderators. A stale copy here does not raise an
+  alert; it silently breaks moderator preview of blocked media.
 - Fastly -> upload service `/delete-blob`
 - Fastly -> transcoder `/audio/extract`
 - transcoder -> Fastly `/admin/transcode-status`
@@ -115,9 +128,14 @@ Rotate forward in this order:
 1. Record the current GCP version number. Create the new version without a
    trailing newline, keep the old version enabled, and update the canonical
    `blossom-webhook-secret-prod` mirror from that exact new version. Inventory
-   every bearer client using `webhook_secret`, prepare each client update, and
-   record when the moderation Worker is the only one.
-2. Schedule the rotation for a low-activity window. Before changing either
+   every bearer client using `webhook_secret` and prepare each client update.
+   Confirm the client list against the repositories, including both Cloudflare
+   Workers in the table above and the service callers in the directions list;
+   do not assume the moderation Worker is the only Cloudflare consumer.
+   Search across the organization's repositories for `BLOSSOM_WEBHOOK_SECRET`,
+   `webhook_secret`, and the Cloudflare Secrets Store id in the table, rather
+   than limiting the inventory to the already-known Workers.
+2. Schedule the rotation for a low-activity window. Before changing any
    write-only copy, read `STATUS_QUEUE_ENABLED` from the serving transcoder
    revision and record active derivative work. If the queue is enabled, capture
    the [derivative-status queue](../derivative-status-queue.md) task names,
@@ -142,7 +160,9 @@ Rotate forward in this order:
    deploy script](#check-live-configuration-before-running-a-deploy-script),
    then confirm traffic is serving from the new revisions and is not pinned to
    an older revision.
-5. Verify every direction above. Send a real moderation notification; run the
+5. Verify every direction above. Send a real moderation notification; verify
+   moderator preview through `divine-relay-manager` exercises the edge's
+   `/admin/api/blob/{sha256}/content` route successfully; run the
    authenticated [`/delete-blob/health` parity check](#deploy-cleanup-dependencies-before-the-edge)
    with `X-Expected-GCS-Bucket`; exercise a controlled audio extraction through
    the edge as a reachability check, not a secret-parity check; and confirm new
@@ -170,17 +190,18 @@ Rotate forward in this order:
    back the rotation only when a new-credential path fails.
 
 There is no zero-mismatch order because these consumers do not all accept both
-old and new values. Cloudflare goes first so the caller stops sending the old
+old and new values. Cloudflare goes first so both callers stop sending the old
 value before Fastly can begin accepting the new one. This deliberately makes
-moderation fail closed until Fastly accepts the new caller; it does not promise
-a shorter outage. Moving Fastly first would instead leave an unpredictable
-window in which the edge may switch while Cloudflare still sends the old value.
+moderation and relay-manager's moderator media preview fail closed until Fastly
+accepts the new callers; it does not promise a shorter outage. Moving Fastly
+first would instead leave an unpredictable
+window in which the edge may switch while a Cloudflare caller still sends the old value.
 Once Fastly converges, accept a bounded edge-to-Cloud-Run mismatch while the two
 fresh revisions start; keeping the old GCP version enabled preserves rollback
 but does not make running services dual-accept both values.
 
 Rollback disables the new GCP version, re-enables the recorded old version,
-restores both write-only copies and the `blossom-webhook-secret-prod` mirror from
+restores all three write-only copies and the `blossom-webhook-secret-prod` mirror from
 that exact old version, and creates fresh revisions of both Cloud Run services
 again. Repeat the same direction checks before disabling any superseded version.
 
@@ -189,11 +210,40 @@ apart, but the edge did not accept the new value until a probe 88 seconds after
 the Cloudflare write. Plan the mismatch window around verified edge acceptance,
 not the secret-store API completion time.
 
+On 2026-09-30 `divine-relay-manager` was found holding a stale copy. It has
+bound the Cloudflare Secrets Store entry since 2026-05-13
+(divinevideo/divine-relay-manager#63) and was missed by both the 2026-07-24 and
+2026-08-31 rotations, so its moderator media preview had been failing
+authentication for roughly ten weeks with no alert. The cause was the inventory
+above naming only one Cloudflare consumer. That is why the copy table is now
+explicit about mechanism, and why step 1 says to confirm the list against the
+repositories.
+
 Mirror the canonical value in `dv-platform-prod` Secret Manager as
 `blossom-webhook-secret-prod` for the platform secret convention. That mirror is
 not a fourth independently generated value. `admin_token`,
 `transcoder_webhook_secret`, and process-blob's `METADATA_WEBHOOK_SECRET` are
 separate credentials and must not be changed during this rotation.
+
+## Do not create a readable copy for humans
+
+Do not put this value in a password manager, a shared vault, or a document.
+`validate_bearer_token`
+(`src/admin.rs`) accepts either `admin_token` or `webhook_secret`, so this value
+is admin-equivalent on every route behind `validate_admin_auth`. A vault item is
+readable by everyone granted access to that vault item, whereas the design above
+keeps GCP Secret Manager as the authoritative readable source, with the canonical
+platform mirror described above, and makes the downstream store copies
+write-only. Do not add an independently maintained human-readable copy.
+
+A human-readable copy also becomes another thing each rotation has to chase,
+which is the failure this section exists to prevent. When someone needs to set a
+downstream copy, ask the downstream store owner to approve write access to that
+specific store rather than distributing the value. An operator who already has
+authorized GCP Secret Manager read access and destination write access should
+pipe the value straight into the downstream store; do not stage it anywhere in
+between, including a clipboard. Do not grant the requester additional GCP
+Secret Manager read access merely to set a downstream copy.
 
 ## The edge Cloud Run backends are not in the production project
 
