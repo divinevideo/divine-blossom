@@ -227,8 +227,8 @@ separate credentials and must not be changed during this rotation.
 
 ## Do not create a readable copy for humans
 
-Requests to put this value in a password manager, a shared vault, or a document
-are reasonable-sounding and must be declined. `validate_bearer_token`
+Do not put this value in a password manager, a shared vault, or a document.
+`validate_bearer_token`
 (`src/admin.rs`) accepts either `admin_token` or `webhook_secret`, so this value
 is admin-equivalent on every route behind `validate_admin_auth`. A vault item is
 readable by everyone granted access to that vault item, whereas the design above
