@@ -129,10 +129,10 @@ Rotate forward in this order:
    trailing newline, keep the old version enabled, and update the canonical
    `blossom-webhook-secret-prod` mirror from that exact new version. Inventory
    every bearer client using `webhook_secret` and prepare each client update.
-   The known clients are the two Cloudflare Workers in the table above plus the
-   Fastly store; confirm that list against the repositories rather than assuming
-   the moderation Worker is the only Cloudflare consumer. It never has been.
-2. Schedule the rotation for a low-activity window. Before changing either
+   Confirm the client list against the repositories, including both Cloudflare
+   Workers in the table above and the service callers in the directions list;
+   do not assume the moderation Worker is the only Cloudflare consumer.
+2. Schedule the rotation for a low-activity window. Before changing any
    write-only copy, read `STATUS_QUEUE_ENABLED` from the serving transcoder
    revision and record active derivative work. If the queue is enabled, capture
    the [derivative-status queue](../derivative-status-queue.md) task names,
@@ -157,7 +157,9 @@ Rotate forward in this order:
    deploy script](#check-live-configuration-before-running-a-deploy-script),
    then confirm traffic is serving from the new revisions and is not pinned to
    an older revision.
-5. Verify every direction above. Send a real moderation notification; run the
+5. Verify every direction above. Send a real moderation notification; verify
+   moderator preview through `divine-relay-manager` exercises the edge's
+   `/admin/api/blob/{sha256}/content` route successfully; run the
    authenticated [`/delete-blob/health` parity check](#deploy-cleanup-dependencies-before-the-edge)
    with `X-Expected-GCS-Bucket`; exercise a controlled audio extraction through
    the edge as a reachability check, not a secret-parity check; and confirm new
@@ -195,7 +197,7 @@ fresh revisions start; keeping the old GCP version enabled preserves rollback
 but does not make running services dual-accept both values.
 
 Rollback disables the new GCP version, re-enables the recorded old version,
-restores both write-only copies and the `blossom-webhook-secret-prod` mirror from
+restores all three write-only copies and the `blossom-webhook-secret-prod` mirror from
 that exact old version, and creates fresh revisions of both Cloud Run services
 again. Repeat the same direction checks before disabling any superseded version.
 
@@ -219,14 +221,17 @@ Requests to put this value in a password manager, a shared vault, or a document
 are reasonable-sounding and must be declined. `validate_bearer_token`
 (`src/admin.rs`) accepts either `admin_token` or `webhook_secret`, so this value
 is admin-equivalent on every route behind `validate_admin_auth`. A vault item is
-readable by everyone in the vault, whereas the design above keeps exactly one
-readable copy, in GCP Secret Manager, and makes every other copy write-only.
+readable by everyone granted access to that vault item, whereas the design above
+keeps GCP Secret Manager as the authoritative readable source, with the canonical
+platform mirror described below, and makes the downstream store copies
+write-only. Do not add an independently maintained human-readable copy.
 
 A human-readable copy also becomes another thing each rotation has to chase,
 which is the failure this section exists to prevent. When someone needs to set a
-downstream copy, give them write access to that specific store and have them
-pipe the value straight out of GCP Secret Manager; do not stage it anywhere in
-between, including a clipboard.
+downstream copy, use the normal access-approval process for write access to that
+specific store and the necessary GCP Secret Manager access. An authorized
+operator should pipe the value straight out of GCP Secret Manager; do not stage
+it anywhere in between, including a clipboard.
 
 Mirror the canonical value in `dv-platform-prod` Secret Manager as
 `blossom-webhook-secret-prod` for the platform secret convention. That mirror is
