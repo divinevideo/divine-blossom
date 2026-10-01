@@ -132,6 +132,9 @@ Rotate forward in this order:
    Confirm the client list against the repositories, including both Cloudflare
    Workers in the table above and the service callers in the directions list;
    do not assume the moderation Worker is the only Cloudflare consumer.
+   Search across the organization's repositories for `BLOSSOM_WEBHOOK_SECRET`,
+   `webhook_secret`, and the Cloudflare Secrets Store id in the table, rather
+   than limiting the inventory to the already-known Workers.
 2. Schedule the rotation for a low-activity window. Before changing any
    write-only copy, read `STATUS_QUEUE_ENABLED` from the serving transcoder
    revision and record active derivative work. If the queue is enabled, capture
@@ -187,11 +190,12 @@ Rotate forward in this order:
    back the rotation only when a new-credential path fails.
 
 There is no zero-mismatch order because these consumers do not all accept both
-old and new values. Cloudflare goes first so the caller stops sending the old
+old and new values. Cloudflare goes first so both callers stop sending the old
 value before Fastly can begin accepting the new one. This deliberately makes
-moderation fail closed until Fastly accepts the new caller; it does not promise
-a shorter outage. Moving Fastly first would instead leave an unpredictable
-window in which the edge may switch while Cloudflare still sends the old value.
+moderation and relay-manager's moderator media preview fail closed until Fastly
+accepts the new callers; it does not promise a shorter outage. Moving Fastly
+first would instead leave an unpredictable
+window in which the edge may switch while a Cloudflare caller still sends the old value.
 Once Fastly converges, accept a bounded edge-to-Cloud-Run mismatch while the two
 fresh revisions start; keeping the old GCP version enabled preserves rollback
 but does not make running services dual-accept both values.
@@ -215,6 +219,12 @@ above naming only one Cloudflare consumer. That is why the copy table is now
 explicit about mechanism, and why step 1 says to confirm the list against the
 repositories.
 
+Mirror the canonical value in `dv-platform-prod` Secret Manager as
+`blossom-webhook-secret-prod` for the platform secret convention. That mirror is
+not a fourth independently generated value. `admin_token`,
+`transcoder_webhook_secret`, and process-blob's `METADATA_WEBHOOK_SECRET` are
+separate credentials and must not be changed during this rotation.
+
 ## Do not create a readable copy for humans
 
 Requests to put this value in a password manager, a shared vault, or a document
@@ -223,21 +233,17 @@ are reasonable-sounding and must be declined. `validate_bearer_token`
 is admin-equivalent on every route behind `validate_admin_auth`. A vault item is
 readable by everyone granted access to that vault item, whereas the design above
 keeps GCP Secret Manager as the authoritative readable source, with the canonical
-platform mirror described below, and makes the downstream store copies
+platform mirror described above, and makes the downstream store copies
 write-only. Do not add an independently maintained human-readable copy.
 
 A human-readable copy also becomes another thing each rotation has to chase,
 which is the failure this section exists to prevent. When someone needs to set a
-downstream copy, use the normal access-approval process for write access to that
-specific store and the necessary GCP Secret Manager access. An authorized
-operator should pipe the value straight out of GCP Secret Manager; do not stage
-it anywhere in between, including a clipboard.
-
-Mirror the canonical value in `dv-platform-prod` Secret Manager as
-`blossom-webhook-secret-prod` for the platform secret convention. That mirror is
-not a fourth independently generated value. `admin_token`,
-`transcoder_webhook_secret`, and process-blob's `METADATA_WEBHOOK_SECRET` are
-separate credentials and must not be changed during this rotation.
+downstream copy, ask the downstream store owner to approve write access to that
+specific store rather than distributing the value. An operator who already has
+authorized GCP Secret Manager read access and destination write access should
+pipe the value straight into the downstream store; do not stage it anywhere in
+between, including a clipboard. Do not grant the requester additional GCP
+Secret Manager read access merely to set a downstream copy.
 
 ## The edge Cloud Run backends are not in the production project
 
