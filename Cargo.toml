@@ -15,6 +15,8 @@ description = "Blossom media server for Nostr running on Fastly Compute"
 [dependencies]
 # Fastly Compute SDK - pin to avoid edition2024 dependencies
 fastly = "=0.11.12"
+# Timed readiness waits for the optional delivery probe (same SDK host ABI).
+fastly-sys = "=0.11.12"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

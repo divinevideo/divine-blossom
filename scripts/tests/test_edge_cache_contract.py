@@ -401,6 +401,59 @@ class EdgeCacheContractTests(unittest.TestCase):
             self.assertNotIn("fastly purge --all", contents, relative_path)
 
 
+class Vcl5xxSkipErrorContractTests(unittest.TestCase):
+    def test_skip_error_logs_use_the_diagnostics_endpoint(self):
+        fetch_vcl = (ROOT / "vcl" / "fetch.vcl").read_text()
+        log_vcl = (ROOT / "vcl" / "log_5xx.vcl").read_text()
+        runbook = (ROOT / "docs" / "runbooks" / "fastly-5xx.md").read_text()
+
+        for source in (fetch_vcl, log_vcl):
+            self.assertIn("vcl-error-diagnostics", source)
+            self.assertNotIn("cdn-view-logs", source)
+            self.assertIn("divine.blossom.vcl_5xx.v1", source)
+            self.assertIn("utf8.substr(req.url, 0, 256)", source)
+
+        fivexx = fetch_vcl.index("beresp.status >= 500")
+        fivexx_block = fetch_vcl[fivexx : fivexx + 1500]
+        self.assertIn("divine.blossom.vcl_5xx.v1", fivexx_block)
+        self.assertIn("req.backend.is_origin", fivexx_block)
+        self.assertIn('"backend_hop":', fivexx_block)
+        self.assertNotIn("req.backend.is_origin", log_vcl)
+        self.assertNotIn('"backend_hop":', log_vcl)
+        self.assertIn(
+            'fastly_info.state !~ "^ERROR(-(CLUSTER|WAIT|REFRESH))*$"',
+            log_vcl,
+        )
+        self.assertNotIn('fastly_info.state !~ "(?i)ERROR"', log_vcl)
+        self.assertIn("divine.blossom.vcl_5xx.v1", runbook)
+        self.assertIn("backend_hop", runbook)
+        self.assertIn("vcl/log_5xx.vcl", runbook)
+
+    def test_log_phase_is_edge_only(self):
+        log_vcl = (ROOT / "vcl" / "log_5xx.vcl").read_text()
+
+        self.assertIn("fastly.ff.visits_this_service == 0", log_vcl)
+        self.assertNotIn('"ff_visits":', log_vcl)
+
+    def test_skip_error_schema_uses_the_existing_vcl_reason_field(self):
+        fetch_vcl = (ROOT / "vcl" / "fetch.vcl").read_text()
+        log_vcl = (ROOT / "vcl" / "log_5xx.vcl").read_text()
+
+        for source in (fetch_vcl, log_vcl):
+            self.assertIn('"error_reason":', source)
+            self.assertNotIn('"reason":', source)
+
+    def test_tail_summary_splits_the_skip_error_phases(self):
+        tail_script = (ROOT / "scripts" / "tail-edge-errors.sh").read_text()
+
+        self.assertIn("'schema','phase','status','error_reason'", tail_script)
+        self.assertIn("'backend_hop','backend'", tail_script)
+        self.assertIn("r.get('request_id','')", tail_script)
+        self.assertIn("r.get('probe_id','')", tail_script)
+        self.assertIn('"Outer VCL 5xx diagnostics"', tail_script)
+        self.assertNotIn("Fastly-generated 5xx (never reached Compute)", tail_script)
+
+
 class ShieldSelectionContractTests(unittest.TestCase):
     def test_hash_paths_fall_through_to_generated_shield_selection(self):
         recv_vcl = (ROOT / "vcl" / "recv.vcl").read_text()

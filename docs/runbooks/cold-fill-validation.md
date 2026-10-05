@@ -46,10 +46,11 @@ It never globally purges a cache and does not print the object hash.
   can reach clients. Do not send any probe request until both versions are
   active.
 - Confirm the active outer `Client-facing headers` snippet matches this
-  revision's `vcl/deliver.vcl`. Its client-facing guard preserves probe metadata
-  across a shield hop so the edge can compare and strip it. If the active
-  snippet predates that guard, stop rather than interpreting missing role
-  evidence as a collapse result.
+  revision's `vcl/deliver.vcl` with
+  `envchain fastly-readonly python3 scripts/sync_outer_vcl.py diff`. Its
+  client-facing guard preserves probe metadata across a shield hop so the edge
+  can compare and strip it. If the active snippet predates that guard, stop
+  rather than interpreting missing role evidence as a collapse result.
 
 ## Run
 

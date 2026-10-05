@@ -63,49 +63,25 @@ deploy and verify the backward-compatible backend first. See
 
 ## Prepare an outer VCL version
 
-Clone the active version. Substitute the active version recorded above rather
-than copying the example number:
+For snippets managed in `vcl/snippets.json`, use the repository sync tool. It
+clones the active version, reconciles every managed snippet, reads the draft
+back, and validates it without activation:
 
 ```bash
-envchain fastly-global fastly service version clone \
-  --service-id ML7R82HKfmTaqTpHExIDVN \
-  --version <active-outer-version> \
-  --json
+envchain fastly-global python3 scripts/sync_outer_vcl.py apply
 ```
 
-Record the returned draft version, then update only the intended snippet. For
-the repository's delivery snippet:
+If the tool prints `already in sync with active VERSION`, it did not create a
+draft. For a Compute-only deployment or rollback, continue without an outer VCL
+activation. If this operation was supposed to change outer VCL, stop: the
+intended change is not present in the checkout.
 
-```bash
-envchain fastly-global fastly service vcl snippet update \
-  --service-id ML7R82HKfmTaqTpHExIDVN \
-  --version <draft-outer-version> \
-  --name "Client-facing headers" \
-  --content vcl/deliver.vcl
-```
-
-Read the draft back and compare it with the source file:
-
-```bash
-envchain fastly-readonly fastly --quiet service vcl snippet describe \
-  --service-id ML7R82HKfmTaqTpHExIDVN \
-  --version <draft-outer-version> \
-  --name "Client-facing headers" --json \
-  | jq -j '.Content' | sha256sum
-
-sha256sum vcl/deliver.vcl
-```
-
-Validate the complete draft in the service's Fastly configuration context:
-
-```bash
-envchain fastly-readonly fastly service version validate \
-  --service-id ML7R82HKfmTaqTpHExIDVN \
-  --version <draft-outer-version> \
-  --json
-```
-
-Stop unless the hashes match and validation returns `"valid": true`.
+Otherwise, record the printed `DRAFT_VERSION`. Review the complete Fastly
+version diff, not only the snippet that prompted the rollout. Stop if the draft
+contains an unrelated change. See [Outer VCL snippets](outer-vcl.md) for drift
+output and the manual workflow route. An untracked live snippet or a read-back
+mismatch is a stop condition, not a reason to bypass the tool with a hand-built
+draft.
 
 ## Define smoke checks before activation
 
@@ -142,8 +118,10 @@ curl -sS -o /dev/null -D - \
   "https://media.divine.video/${SMOKE_BLOB_HASH}?deploy-smoke=${MARKER}"
 ```
 
-Do not use a marked response as collapse evidence until the active outer
-`Client-facing headers` snippet matches this revision's `vcl/deliver.vcl`.
+Do not use a marked response as collapse evidence until
+`envchain fastly-readonly python3 scripts/sync_outer_vcl.py diff` confirms the
+active outer `Client-facing headers` snippet matches this revision's
+`vcl/deliver.vcl`.
 Earlier revisions stripped the metadata at the shield before edge delivery and
 could not produce fixed leader/follower labels. Follow
 [Cold-fill validation](cold-fill-validation.md) and stop if the snippet is stale.
