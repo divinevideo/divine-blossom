@@ -352,6 +352,9 @@ struct AppState {
 struct TranscodeRequest {
     /// SHA256 hash of the original video
     hash: String,
+    /// Regenerate derivatives even when an HLS master already exists.
+    #[serde(default)]
+    force: bool,
     /// Optional owner pubkey for metadata
     #[serde(default)]
     owner: Option<String>,
@@ -1260,9 +1263,11 @@ async fn process_transcode(
     let attempt_generation = next_status_generation();
     info!("Starting transcode for {}", hash);
 
-    // Check if HLS already exists
+    // Ordinary requests remain idempotent; repairs can replace existing derivatives.
     let master_path = format!("{}/hls/master.m3u8", hash);
-    if check_gcs_exists(&state.gcs_client, &state.config.gcs_bucket, &master_path).await? {
+    if !request.force
+        && check_gcs_exists(&state.gcs_client, &state.config.gcs_bucket, &master_path).await?
+    {
         info!("HLS already exists for {}, skipping transcode", hash);
         // Still update status to complete in case it was pending (no size change for already-transcoded)
         send_status_webhook(
@@ -1371,6 +1376,23 @@ async fn process_transcode(
     // Probe video to get dimensions and rotation metadata
     let video_info = match probe_video(&input_path).await {
         Ok(info) => info,
+        Err(e) if request.force => {
+            // A repair must not bake guessed landscape dimensions into the replacement.
+            send_status_webhook(
+                &state.config,
+                &hash,
+                "failed",
+                None,
+                None,
+                Some("probe_failed"),
+                Some(&e.to_string()),
+                None,
+                status_event_generation(attempt_generation, STATUS_EVENT_TERMINAL),
+                false,
+            )
+            .await;
+            return Err(e);
+        }
         Err(e) => {
             warn!(
                 "Failed to probe video, using default landscape dimensions: {}",
@@ -1438,7 +1460,31 @@ async fn process_transcode(
 
     info!("Generated HLS with {} variants", variants.len());
 
-    if let Err(e) = remux_ts_to_fmp4(&output_dir).await {
+    let remux_result = remux_ts_to_fmp4(&output_dir).await;
+    // The best-effort remuxer can skip failed variants and still return Ok.
+    let remux_result = if request.force && remux_result.is_ok() {
+        require_progressive_outputs(&output_dir).await
+    } else {
+        remux_result
+    };
+    if let Err(e) = remux_result {
+        if request.force {
+            // Repairs must replace the progressive MP4 aliases as well as HLS.
+            send_status_webhook(
+                &state.config,
+                &hash,
+                "failed",
+                None,
+                Some(&video_info),
+                Some("remux_failed"),
+                Some(&e.to_string()),
+                None,
+                status_event_generation(attempt_generation, STATUS_EVENT_TERMINAL),
+                false,
+            )
+            .await;
+            return Err(e);
+        }
         warn!("fMP4 remux step failed: {} (continuing with .ts only)", e);
     }
 
@@ -4149,6 +4195,40 @@ async fn finalize_transcript(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn forced_repair_requires_both_nonempty_progressive_outputs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(super::require_progressive_outputs(dir.path())
+            .await
+            .is_err());
+        tokio::fs::write(dir.path().join("stream_720p.mp4"), b"mp4")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("stream_480p.mp4"), b"")
+            .await
+            .unwrap();
+        assert!(super::require_progressive_outputs(dir.path())
+            .await
+            .is_err());
+        tokio::fs::write(dir.path().join("stream_480p.mp4"), b"mp4")
+            .await
+            .unwrap();
+        assert!(super::require_progressive_outputs(dir.path()).await.is_ok());
+    }
+
+    #[test]
+    fn transcode_force_is_opt_in() {
+        let ordinary: super::TranscodeRequest = serde_json::from_str(r#"{"hash":"test"}"#).unwrap();
+        assert!(!ordinary.force);
+        let repair: super::TranscodeRequest =
+            serde_json::from_str(r#"{"hash":"test","force":true}"#).unwrap();
+        assert!(repair.force);
+        assert!(serde_json::from_str::<super::TranscodeRequest>(
+            r#"{"hash":"test","force":"true"}"#
+        )
+        .is_err());
+    }
+
     use super::{
         access_token_cache, attach_generation, build_cloud_tasks_task_body, build_gemini_prompt,
         build_transcode_status_webhook_payload, classify_audio_extract_error, constant_time_eq,
@@ -6607,6 +6687,19 @@ impl AudioRemux {
             Self::Reencode => &["-c:a", "aac", "-b:a", "128k"],
         }
     }
+}
+
+/// Require both progressive variants before replacing repaired derivatives.
+async fn require_progressive_outputs(hls_dir: &Path) -> Result<()> {
+    for variant in ["stream_720p.mp4", "stream_480p.mp4"] {
+        let metadata = tokio::fs::metadata(hls_dir.join(variant))
+            .await
+            .map_err(|e| anyhow!("Repair requires {}: {}", variant, e))?;
+        if !metadata.is_file() || metadata.len() == 0 {
+            return Err(anyhow!("Repair requires nonempty {}", variant));
+        }
+    }
+    Ok(())
 }
 
 /// Remux HLS .ts files to regular MP4 with faststart for progressive download.
