@@ -43,11 +43,15 @@ Forced requests require the dedicated `TRANSCODE_REPAIR_SECRET` binding and
 provisioning and service configuration are separate operator-authorized work,
 not performed by this change. Do not reuse transcription credentials or put
 credentials in audit files, shell arguments, or logs. Submit only reviewed
-candidates serially and inspect the completed response before advancing.
+candidates serially and inspect the completed response before advancing. Repairs
+require an existing HLS master. Confirm that initial generation has fully
+completed at origin before submitting one; do not repair an in-progress upload.
 
-Ordinary and forced transcodes acquire a generation-conditional GCS lock at
-`{hash}/transcode.lock` and release only their own generation. Overlapping requests
-fail rather than overwrite each other. A crash can leave a lock: an operator must
+Forced transcodes acquire a generation-conditional GCS lock at
+`{hash}/transcode.lock` and release only their own generation. Overlapping repairs
+fail rather than overwrite each other. Normal requests do not take this lock and
+retain their existing-master shortcut, so a failed repair cannot lock the normal
+upload pipeline. A crash can leave a repair lock: an operator must
 confirm no writer remains before removing that specific lock. Do not expire locks
 by elapsed time alone. Avoid simultaneous fMP4 backfills during the repair.
 

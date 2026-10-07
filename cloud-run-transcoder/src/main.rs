@@ -1288,8 +1288,23 @@ async fn process_transcode(
     if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(anyhow!("Invalid hash format: must be 64 hex characters"));
     }
-    // Serialize ordinary and forced transcodes across instances. Do not expire
-    // a lock automatically: its writer might still be uploading derivatives.
+    // Keep the ordinary upload pipeline independent of operator repair locks.
+    if !request.force {
+        return process_transcode_inner(state, request).await;
+    }
+    // Repairs operate only on existing HLS, never race initial generation.
+    // Operators must verify the original job completed before submitting a repair.
+    if !check_gcs_exists(
+        &state.gcs_client,
+        &state.config.gcs_bucket,
+        &format!("{}/hls/master.m3u8", hash),
+    )
+    .await?
+    {
+        return Err(anyhow!("Repair requires an existing HLS master"));
+    }
+    // Serialize operator repairs across instances. Do not expire a lock
+    // automatically: its writer might still be uploading derivatives.
     let path = format!("{}/transcode.lock", hash);
     let mut media = Media::new(path.clone());
     media.content_type = "text/plain".into();
@@ -1306,7 +1321,7 @@ async fn process_transcode(
         )
         .await
         .map_err(|e| anyhow!("Could not acquire transcode lock: {}", e))?;
-    let result = process_transcode_locked(state.clone(), request).await;
+    let result = process_transcode_inner(state.clone(), request).await;
     let release = state
         .gcs_client
         .delete_object(&DeleteObjectRequest {
@@ -1322,7 +1337,7 @@ async fn process_transcode(
     result
 }
 
-async fn process_transcode_locked(
+async fn process_transcode_inner(
     state: Arc<AppState>,
     request: TranscodeRequest,
 ) -> Result<TranscodeResponse> {
