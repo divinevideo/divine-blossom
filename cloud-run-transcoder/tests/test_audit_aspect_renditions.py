@@ -1,6 +1,8 @@
 import importlib.util
 from pathlib import Path
 import unittest
+from unittest.mock import patch
+import subprocess
 
 SPEC = importlib.util.spec_from_file_location(
     "audit_aspect_renditions", Path(__file__).resolve().parents[1] / "audit_aspect_renditions.py"
@@ -14,6 +16,13 @@ def geometry(width, height, **fields):
 
 
 class AspectAuditTests(unittest.TestCase):
+    def test_probe_disables_network_protocols(self):
+        output = subprocess.CompletedProcess([], 0, '{"streams":[{"width":480,"height":480}]}', "")
+        with patch.object(audit.subprocess, "run", return_value=output) as run:
+            audit.probe("/export/derivatives/hash/hls/stream_720p.m3u8")
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-protocol_whitelist") + 1], "file,crypto,data")
+
     def test_square_and_portrait_sources_are_selected(self):
         for source in (geometry(480, 480), geometry(480, 720)):
             for rendition in (geometry(1280, 720), geometry(854, 480)):
@@ -45,7 +54,7 @@ class AspectAuditTests(unittest.TestCase):
 
         def probe(url):
             calls.append(url)
-            if url.endswith("/480p.mp4"):
+            if url.endswith("/stream_480p.mp4"):
                 raise ValueError("missing")
             return geometry(480, 480) if url.endswith("/hash") else geometry(1280, 720)
 

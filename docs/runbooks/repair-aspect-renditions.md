@@ -7,12 +7,16 @@ operator. The original content-addressed blob must never be changed or deleted.
 ## Read-only selection
 
 Prepare a private file containing one lowercase SHA256 per line from the archive
-inventory. Keep inventory and audit output outside Git. With `ffprobe` installed,
-run the read-only audit against the verified media host:
+inventory. Keep inventory and audit output outside Git. Export originals and
+derivative objects through an authorized storage read, not through the public
+media edge (missing derivatives there can trigger generation). Store originals
+at `originals/{hash}` and derivatives at `derivatives/{hash}/hls/` beneath a local
+directory. Include both stream MP4s, both stream playlists, and their referenced
+TS segments. With `ffprobe` installed, audit that local export:
 
 ```sh
 python3 cloud-run-transcoder/audit_aspect_renditions.py \
-  --hash-file /path/to/hashes.txt --media-base https://media.divine.video \
+  --hash-file /path/to/hashes.txt --media-root /path/to/export \
   > /path/to/aspect-audit.jsonl
 ```
 
@@ -21,7 +25,8 @@ It selects 1280x720 or 854x480 landscape renditions whose display aspect differs
 from the original by more than 1%, accounting for rotation and sample aspect
 ratio. This includes square originals, not just portrait sources. It emits a
 `request` object only for candidates. It never submits requests, deletes objects,
-changes access, or purges caches. Probe errors are recorded and produce exit 1;
+changes access, or purges caches. FFprobe network protocols are disabled, including
+for URLs embedded in playlists. Probe errors are recorded and produce exit 1;
 they are not evidence that a video is correct. Resolve/retry them before claiming
 inventory coverage. Non-right-angle rotations require manual investigation.
 
@@ -33,9 +38,18 @@ Confirm that the deployed transcoder supports `force` before proceeding. Normal
 and replaces generated HLS derivatives without deleting the prefix first.
 Forced repairs abort on an original probe failure rather than guessing 16:9,
 and abort before uploading if the progressive MP4 remux fails.
-Use the service's existing authenticated access route; do not put credentials
-in audit files or logs. Submit only reviewed candidates, serially, and inspect
-the completed response before advancing. Avoid concurrent transcodes of a hash.
+Forced requests require the dedicated `TRANSCODE_REPAIR_SECRET` binding and
+`X-Divine-Repair-Secret` header. They fail closed when unconfigured. Secret
+provisioning and service configuration are separate operator-authorized work,
+not performed by this change. Do not reuse transcription credentials or put
+credentials in audit files, shell arguments, or logs. Submit only reviewed
+candidates serially and inspect the completed response before advancing.
+
+Ordinary and forced transcodes acquire a generation-conditional GCS lock at
+`{hash}/transcode.lock` and release only their own generation. Overlapping requests
+fail rather than overwrite each other. A crash can leave a lock: an operator must
+confirm no writer remains before removing that specific lock. Do not expire locks
+by elapsed time alone. Avoid simultaneous fMP4 backfills during the repair.
 
 The edge's progressive aliases read `hls/stream_720p.mp4` and
 `hls/stream_480p.mp4`; both must be regenerated successfully along with HLS.
@@ -51,7 +65,7 @@ display ratios with the unchanged original. Confirm that the forced request
 completed successfully. Cache invalidation is a
 separate operator effect: follow `docs/runbooks/rollback.md` and purge only the
 known repaired hash's surrogate key, never the whole cache. Verify the public
-paths after propagation; a CDN-only re-audit before purge can still see old data.
+paths after propagation; CDN reads before purge can still see old data.
 
 No visual UI change is included; sample request behavior changes only for the
 explicit `force` option. Manual validation: audit a synthetic square original

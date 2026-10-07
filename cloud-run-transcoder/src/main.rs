@@ -111,6 +111,8 @@ struct Config {
     /// proxy injects it; the service is `--allow-unauthenticated`, so when this
     /// is unset the route fails closed (503).
     transcribe_shared_secret: Option<String>,
+    /// Dedicated operator credential for explicit derivative regeneration.
+    transcode_repair_secret: Option<String>,
     /// When true, status callbacks are enqueued to Cloud Tasks instead of sent
     /// directly. Default false keeps direct POST as the rollback path.
     status_queue_enabled: bool,
@@ -253,6 +255,9 @@ impl Config {
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty()),
             transcribe_shared_secret: lookup("TRANSCRIBE_SHARED_SECRET")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
+            transcode_repair_secret: lookup("TRANSCODE_REPAIR_SECRET")
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty()),
             status_queue_enabled: parse_bool(&mut lookup, "STATUS_QUEUE_ENABLED", false),
@@ -789,8 +794,12 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 
 async fn handle_transcode(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<TranscodeRequest>,
 ) -> Response {
+    if let Err(rejection) = authorize_transcode_repair(&state.config, &headers, request.force) {
+        return rejection;
+    }
     match process_transcode(state, request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => {
@@ -803,6 +812,28 @@ async fn handle_transcode(
             )
                 .into_response()
         }
+    }
+}
+
+fn authorize_transcode_repair(
+    config: &Config,
+    headers: &axum::http::HeaderMap,
+    force: bool,
+) -> std::result::Result<(), Response> {
+    if !force {
+        return Ok(());
+    }
+    let Some(expected) = config.transcode_repair_secret.as_deref() else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "repair not configured").into_response());
+    };
+    let provided = headers
+        .get("x-divine-repair-secret")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+        Ok(())
+    } else {
+        Err((StatusCode::UNAUTHORIZED, "invalid repair credential").into_response())
     }
 }
 
@@ -1250,6 +1281,48 @@ async fn process_audio_extract(
 }
 
 async fn process_transcode(
+    state: Arc<AppState>,
+    request: TranscodeRequest,
+) -> Result<TranscodeResponse> {
+    let hash = request.hash.to_lowercase();
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(anyhow!("Invalid hash format: must be 64 hex characters"));
+    }
+    // Serialize ordinary and forced transcodes across instances. Do not expire
+    // a lock automatically: its writer might still be uploading derivatives.
+    let path = format!("{}/transcode.lock", hash);
+    let mut media = Media::new(path.clone());
+    media.content_type = "text/plain".into();
+    let object = state
+        .gcs_client
+        .upload_object(
+            &UploadObjectRequest {
+                bucket: state.config.gcs_bucket.clone(),
+                if_generation_match: Some(0),
+                ..Default::default()
+            },
+            Bytes::from(current_epoch_secs().to_string()),
+            &UploadType::Simple(media),
+        )
+        .await
+        .map_err(|e| anyhow!("Could not acquire transcode lock: {}", e))?;
+    let result = process_transcode_locked(state.clone(), request).await;
+    let release = state
+        .gcs_client
+        .delete_object(&DeleteObjectRequest {
+            bucket: state.config.gcs_bucket.clone(),
+            object: path,
+            if_generation_match: Some(object.generation),
+            ..Default::default()
+        })
+        .await;
+    if let Err(e) = release {
+        return Err(anyhow!("Could not release transcode lock: {}", e));
+    }
+    result
+}
+
+async fn process_transcode_locked(
     state: Arc<AppState>,
     request: TranscodeRequest,
 ) -> Result<TranscodeResponse> {
@@ -4195,6 +4268,33 @@ async fn finalize_transcript(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn force_requires_dedicated_repair_credential() {
+        let mut config = super::Config::from_lookup(|_| None);
+        let mut headers = axum::http::HeaderMap::new();
+        assert!(super::authorize_transcode_repair(&config, &headers, false).is_ok());
+        assert_eq!(
+            super::authorize_transcode_repair(&config, &headers, true)
+                .unwrap_err()
+                .status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        config.transcode_repair_secret = Some("synthetic-repair-credential".into());
+        assert_eq!(
+            super::authorize_transcode_repair(&config, &headers, true)
+                .unwrap_err()
+                .status(),
+            axum::http::StatusCode::UNAUTHORIZED
+        );
+        headers.insert("x-divine-repair-secret", "incorrect".parse().unwrap());
+        assert!(super::authorize_transcode_repair(&config, &headers, true).is_err());
+        headers.insert(
+            "x-divine-repair-secret",
+            "synthetic-repair-credential".parse().unwrap(),
+        );
+        assert!(super::authorize_transcode_repair(&config, &headers, true).is_ok());
+    }
+
     #[tokio::test]
     async fn forced_repair_requires_both_nonempty_progressive_outputs() {
         let dir = tempfile::TempDir::new().unwrap();

@@ -8,7 +8,6 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-from urllib.parse import urlsplit
 
 
 RENDITIONS = ("720p.mp4", "480p.mp4", "hls/stream_720p.m3u8", "hls/stream_480p.m3u8")
@@ -52,19 +51,21 @@ def is_stretched(source, rendition):
 
 def probe(url):
     result = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_streams",
+        ["ffprobe", "-v", "error", "-protocol_whitelist", "file,crypto,data",
+         "-select_streams", "v:0", "-show_streams",
          "-of", "json", url],
         capture_output=True, text=True, check=True, timeout=60,
     )
     return geometry(json.loads(result.stdout))
 
 
-def audit_hash(hash_value, media_base, probe_fn=probe):
-    source = probe_fn(f"{media_base}/{hash_value}")
+def audit_hash(hash_value, media_root, probe_fn=probe):
+    source = probe_fn(f"{media_root}/originals/{hash_value}")
     affected, errors = [], []
     for rendition in RENDITIONS:
         try:
-            if is_stretched(source, probe_fn(f"{media_base}/{hash_value}/{rendition}")):
+            object_path = {"720p.mp4": "hls/stream_720p.mp4", "480p.mp4": "hls/stream_480p.mp4"}.get(rendition, rendition)
+            if is_stretched(source, probe_fn(f"{media_root}/derivatives/{hash_value}/{object_path}")):
                 affected.append(rendition)
         except (ValueError, KeyError, IndexError, TypeError, ZeroDivisionError,
                 subprocess.SubprocessError, OSError):
@@ -78,13 +79,11 @@ def audit_hash(hash_value, media_base, probe_fn=probe):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hash-file", required=True, type=Path, help="one SHA256 per line")
-    parser.add_argument("--media-base", required=True, help="verified HTTPS media origin")
+    parser.add_argument("--media-root", required=True, type=Path, help="local read-only object export")
     args = parser.parse_args()
-    base = args.media_base.rstrip("/")
-    parsed = urlsplit(base)
-    if (parsed.scheme != "https" or not parsed.hostname or parsed.username
-            or parsed.password or parsed.query or parsed.fragment):
-        parser.error("media base must be an HTTPS URL without credentials, query or fragment")
+    base = args.media_root.resolve()
+    if not base.is_dir():
+        parser.error("media root must be a local directory")
     hashes = list(dict.fromkeys(args.hash_file.read_text().split()))
     if not hashes or any(not re.fullmatch(r"[0-9a-f]{64}", value) for value in hashes):
         parser.error("hash file must contain only lowercase 64-character SHA256 values")
