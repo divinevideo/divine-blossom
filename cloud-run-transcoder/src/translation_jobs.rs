@@ -266,23 +266,23 @@ where
             Ok(text) => text,
             Err(failure) => {
                 // Store only safe, stable codes; provider bodies may contain transcript text.
-                let terminal = failure.status_code == Some(400);
-                let code = if terminal {
+                let rejected = failure.status_code == Some(400);
+                let code = if rejected {
                     "translation_rejected"
                 } else {
                     "provider_unavailable"
                 };
-                let retry_at = if terminal {
-                    None
+                // A 400 can be a repaired configuration or request-size problem.
+                // Retry after an hour instead of permanently poisoning this source.
+                let cooldown = if rejected {
+                    3600
                 } else {
-                    Some(
-                        current_epoch_secs()
-                            + failure
-                                .retry_after
-                                .map(|d| d.as_secs())
-                                .unwrap_or(TRANSLATION_RETRY_SECS),
-                    )
+                    failure
+                        .retry_after
+                        .map(|d| d.as_secs())
+                        .unwrap_or(TRANSLATION_RETRY_SECS)
                 };
+                let retry_at = Some(current_epoch_secs().saturating_add(cooldown));
                 write_translation_job(
                     &state,
                     &job_path,
@@ -296,10 +296,7 @@ where
                 return Ok(response("failed", 0));
             }
         };
-        if translated.len() != cues.len() {
-            return Err(anyhow!("invalid_provider_response"));
-        }
-        let rendered = translation_google_v3::render_vtt(&cues, &translated, &lang);
+        let rendered = translation_google_v3::render_vtt(&cues, &translated, &lang)?;
         upload_transcript_variant_to_gcs(
             &state.gcs_client,
             &state.config.gcs_bucket,

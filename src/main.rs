@@ -1769,6 +1769,20 @@ fn serve_transcript_by_hash(
         ));
     }
 
+    // Check the rollback switch before any source, translation, or job storage read.
+    let translation_secret = if lang.is_some() {
+        match subtitle_translation::translation_dispatch_secret() {
+            Some(secret) => Some(secret),
+            None => {
+                return Ok(subtitle_translation::translation_unavailable_response(
+                    "translation_disabled",
+                ))
+            }
+        }
+    } else {
+        None
+    };
+
     let gcs_path = format!("{hash}/vtt/main.vtt");
     // A translated request must first establish the current source. Bypass the
     // source content cache here so even an out-of-band repair changes the key.
@@ -1779,9 +1793,10 @@ fn serve_transcript_by_hash(
     };
     match source {
         Ok(mut resp) => {
-            if let Some(target) = lang {
+            if let (Some(target), Some(secret)) = (lang, translation_secret.as_deref()) {
                 let source_bytes = resp.take_body().into_bytes();
-                let mut translated = serve_translated_transcript(hash, target, &source_bytes)?;
+                let mut translated =
+                    serve_translated_transcript(req, hash, target, &source_bytes, secret)?;
                 if translated.get_status() == StatusCode::OK {
                     if is_admin || status_requires_private_response(metadata.status) {
                         add_private_cache_headers(&mut translated, hash);

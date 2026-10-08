@@ -193,8 +193,8 @@ async fn translation_source_repair_uses_new_artifact_and_rejects_old_request() {
 }
 
 #[tokio::test]
-async fn translation_provider_rejection_is_terminal_and_transient_failure_cools_down() {
-    for (status, terminal) in [(400, true), (503, false)] {
+async fn translation_provider_failures_expire_and_cool_down() {
+    for status in [400, 503] {
         let storage = StorageDouble::new().await;
         storage.source(SOURCE).await;
         let result = process_translate_with(
@@ -215,15 +215,34 @@ async fn translation_provider_rejection_is_terminal_and_transient_failure_cools_
         let objects = storage.objects.lock().await;
         let job: TranslationJob =
             serde_json::from_slice(&objects[&format!("{}.json", result.vtt_path)].0).unwrap();
-        assert!(
-            matches!(job, TranslationJob::Failed { retry_at, .. } if retry_at.is_none() == terminal)
-        );
+        assert!(matches!(job, TranslationJob::Failed { retry_at, .. } if retry_at.is_some()));
+        assert!(!job.can_start(current_epoch_secs()));
+        assert!(job.can_start(current_epoch_secs() + 3600));
         drop(objects);
         process_translate_with(storage.state.clone(), request(SOURCE), |_, _| async {
             panic!("failure retried before allowed")
         })
         .await
         .unwrap();
+        // Simulate the cooldown expiring: a repaired provider can complete the same job.
+        storage.objects.lock().await.insert(
+            format!("{}.json", result.vtt_path),
+            (
+                serde_json::to_vec(&TranslationJob::Failed {
+                    code: "translation_rejected".into(),
+                    retry_at: Some(0),
+                })
+                .unwrap(),
+                3,
+            ),
+        );
+        let recovered =
+            process_translate_with(storage.state.clone(), request(SOURCE), |_, _| async {
+                Ok(vec!["Olá".into()])
+            })
+            .await
+            .unwrap();
+        assert_eq!(recovered.status, "complete");
     }
 }
 
@@ -353,5 +372,20 @@ async fn translation_route_auth_runs_before_json_extraction() {
         .unwrap();
     assert_eq!(response.status().as_u16(), 400);
     server.abort();
+    assert!(storage.objects.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn translation_unsupported_language_never_creates_job_or_calls_provider() {
+    let storage = StorageDouble::new().await;
+    let mut unsupported = request(SOURCE);
+    unsupported.lang = "zz".into();
+    let error = process_translate_with(storage.state.clone(), unsupported, |_, _| async {
+        panic!("unsupported language reached provider")
+    })
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(error.to_string(), "Invalid target language");
     assert!(storage.objects.lock().await.is_empty());
 }

@@ -1,10 +1,30 @@
 // ABOUTME: Pure helpers for the `?lang=` subtitle-translation query parameter.
 // ABOUTME: Lives here (not the Fastly edge) so it can be unit-tested natively.
 
+// Cloud Translation's default NMT model language codes, checked 2026-10-08.
+// https://docs.cloud.google.com/translate/docs/languages#neural_machine_translation_model
+// Keep this shared by edge and worker; unsupported targets never dispatch work.
+const SUPPORTED_TRANSLATION_LANGUAGES: &[&str] = &[
+    "ab", "ace", "ach", "af", "sq", "alz", "am", "ar", "hy", "as", "awa", "ay", "az", "ban", "bm",
+    "ba", "eu", "btx", "bts", "bbc", "be", "bem", "bn", "bew", "bho", "bik", "bs", "br", "bg",
+    "bua", "yue", "ca", "ceb", "ny", "zh-CN", "zh", "zh-TW", "cv", "co", "crh", "hr", "cs", "da",
+    "din", "dv", "doi", "dov", "nl", "dz", "en", "eo", "et", "ee", "fj", "fil", "tl", "fi", "fr",
+    "fr-FR", "fr-CA", "fy", "ff", "gaa", "gl", "lg", "ka", "de", "el", "gn", "gu", "ht", "cnh",
+    "ha", "haw", "iw", "he", "hil", "hi", "hmn", "hu", "hrx", "is", "ig", "ilo", "id", "ga", "it",
+    "ja", "jw", "jv", "kn", "pam", "kk", "km", "cgg", "rw", "ktu", "gom", "ko", "kri", "ku", "ckb",
+    "ky", "lo", "ltg", "la", "lv", "lij", "li", "ln", "lt", "lmo", "luo", "lb", "mk", "mai", "mak",
+    "mg", "ms", "ms-Arab", "ml", "mt", "mi", "mr", "chm", "mni-Mtei", "min", "lus", "mn", "my",
+    "nr", "new", "ne", "nso", "no", "nus", "oc", "or", "om", "pag", "pap", "ps", "fa", "pl", "pt",
+    "pt-PT", "pt-BR", "pa", "pa-Arab", "qu", "rom", "ro", "rn", "ru", "sm", "sg", "sa", "gd", "sr",
+    "st", "crs", "shn", "sn", "scn", "szl", "sd", "si", "sk", "sl", "so", "es", "su", "sw", "ss",
+    "sv", "tg", "ta", "tt", "te", "tet", "th", "ti", "ts", "tn", "tr", "tk", "ak", "uk", "ur",
+    "ug", "uz", "vi", "cy", "xh", "yi", "yo", "yua", "zu",
+];
+
 /// Canonicalize a target language for both the edge and the translation worker.
-/// Preserve provider-supported Chinese scripts and Portuguese regions. Other
+/// Preserve provider-supported script and regional codes. Other
 /// well-formed locale hints fall back to their primary language. Provider support
-/// is checked by the translation API; a rejection becomes a terminal job failure.
+/// is checked against the default NMT model before any storage or provider work.
 pub fn sanitize_subtitle_lang(raw: Option<String>) -> Option<String> {
     let lang = raw?.trim().to_ascii_lowercase();
     if lang.len() > 35 {
@@ -26,16 +46,18 @@ pub fn sanitize_subtitle_lang(raw: Option<String>) -> Option<String> {
     {
         return None;
     }
-    Some(
-        match lang.as_str() {
-            "zh-tw" | "zh-hant" | "zh-hk" => "zh-TW",
-            "zh-cn" | "zh-hans" => "zh-CN",
-            "pt-br" => "pt-BR",
-            "pt-pt" => "pt-PT",
-            _ => primary,
-        }
-        .to_string(),
-    )
+    let canonical = match lang.as_str() {
+        "zh-tw" | "zh-hant" | "zh-hk" => "zh-TW",
+        "zh-cn" | "zh-hans" => "zh-CN",
+        _ => SUPPORTED_TRANSLATION_LANGUAGES
+            .iter()
+            .copied()
+            .find(|code| code.eq_ignore_ascii_case(&lang))
+            .unwrap_or(primary),
+    };
+    SUPPORTED_TRANSLATION_LANGUAGES
+        .contains(&canonical)
+        .then(|| canonical.to_string())
 }
 
 /// Paths contain the source content digest, so a rewrite cannot reuse old text.
@@ -70,6 +92,23 @@ impl TranslationJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_unsupported_provider_languages() {
+        for input in ["zz", "zzz", "abc", "zz-US"] {
+            assert_eq!(sanitize_subtitle_lang(Some(input.into())), None, "{input}");
+        }
+    }
+
+    #[test]
+    fn every_supported_provider_code_round_trips() {
+        for code in SUPPORTED_TRANSLATION_LANGUAGES {
+            assert_eq!(
+                sanitize_subtitle_lang(Some(code.to_string())),
+                Some(code.to_string())
+            );
+        }
+    }
 
     #[test]
     fn accepts_and_normalizes_plain_codes() {

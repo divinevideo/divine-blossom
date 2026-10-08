@@ -93,10 +93,19 @@ blossom_secrets = [{{ key = "gcs_access_key", data = "synthetic-key" }}, {{ key 
                 print(result.stdout, end="")
                 if not re.search(r"test result: ok\. 1 passed; 0 failed; 0 ignored;", result.stdout):
                     raise RuntimeError("expected the subtitle routing test to execute")
+                config.write_text(config.read_text().replace(f', {{ key = "translate_shared_secret", data = "{SECRET}" }}', ""))
+                reads_before = len(server.reads)
+                posts_before = len(server.posts)
+                disabled = subprocess.run(["cargo", "test", "--locked", "--target", "wasm32-wasip1", "--bin", "fastly-blossom", "subtitle_translation_disabled", "--", "--ignored", "--nocapture"], cwd=repo, env=env, check=True, timeout=180, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                print(disabled.stdout, end="")
+                assert "test result: ok. 1 passed; 0 failed; 0 ignored;" in disabled.stdout
+                assert len(server.reads) == reads_before, server.reads[reads_before:]
+                assert len(server.posts) == posts_before, server.posts[posts_before:]
                 transcription = [body for path, body, _ in server.posts if path == "/transcribe"]
                 translation = [(body, secret) for path, body, secret in server.posts if path == "/translate" and body["hash"][0] == "1"]
                 rejected = [body for path, body, _ in server.posts if path == "/translate" and body["hash"][0] == "2"]
                 assert len(rejected) == 1, server.posts
+                assert not any(body["hash"][0] == "5" for _, body, _ in server.posts)
                 assert not any(path.split("/")[2][0] == "3" for path in server.reads)
                 assert len(transcription) == 1 and transcription[0]["hash"] == "a" * 64, server.posts
                 assert len(translation) == 1, server.posts

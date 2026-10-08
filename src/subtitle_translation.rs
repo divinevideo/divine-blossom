@@ -41,9 +41,11 @@ pub(super) fn finish_subtitle_translation() {
 
 /// Translation cache keys follow the source bytes, rather than mutable main status.
 pub(super) fn serve_translated_transcript(
+    req: Option<&Request>,
     hash: &str,
     lang: &str,
     source: &[u8],
+    secret_value: &str,
 ) -> Result<Response> {
     let digest = hex::encode(Sha256::digest(source));
     let path = translated_vtt_path(hash, &digest, lang);
@@ -107,7 +109,15 @@ pub(super) fn serve_translated_transcript(
         add_cors_headers(&mut response);
         return Ok(response);
     }
-    trigger_subtitle_translation(hash, &digest, lang)?;
+    if let Some(req) = req {
+        let auth_header = req.get_header_str("Authorization").unwrap_or_default();
+        if let Some(response) = enforce_transcribe_rate_limit(req, auth_header) {
+            return Ok(response);
+        }
+    }
+    if trigger_subtitle_translation(hash, &digest, lang, secret_value).is_err() {
+        return Ok(translation_unavailable_response("dispatch_unavailable"));
+    }
     Ok(translation_pending_response())
 }
 
@@ -124,18 +134,37 @@ fn translation_pending_response() -> Response {
     response
 }
 
-/// The worker persists its claim and failures; later polls observe their state.
-fn trigger_subtitle_translation(hash: &str, source_digest: &str, lang: &str) -> Result<()> {
+/// Absence, empty values, and inaccessible stores all disable translation.
+pub(super) fn translation_dispatch_secret() -> Option<String> {
     let secret = fastly::secret_store::SecretStore::open("blossom_secrets")
-        .map_err(|_| BlossomError::Internal("Translation secret store unavailable".into()))?
-        .get("translate_shared_secret")
-        .ok_or_else(|| BlossomError::Internal("Translation is not enabled".into()))?;
-    let secret_bytes = secret.plaintext();
-    let secret_value = std::str::from_utf8(&secret_bytes)
-        .map_err(|_| BlossomError::Internal("Invalid translation secret".into()))?;
-    if secret_value.is_empty() {
-        return Err(BlossomError::Internal("Translation is not enabled".into()));
-    }
+        .ok()?
+        .try_get("translate_shared_secret")
+        .ok()??;
+    let value = String::from_utf8(secret.try_plaintext().ok()?.to_vec()).ok()?;
+    (!value.trim().is_empty()).then_some(value)
+}
+
+pub(super) fn translation_unavailable_response(code: &str) -> Response {
+    let mut response = json_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &serde_json::json!({
+            "status": "translation_unavailable", "error_code": code, "terminal": false,
+            "message": "Translation unavailable; use the original transcript"
+        }),
+    );
+    response.set_header("Retry-After", "60");
+    add_no_cache_headers(&mut response);
+    add_cors_headers(&mut response);
+    response
+}
+
+/// The worker persists its claim and failures; later polls observe their state.
+fn trigger_subtitle_translation(
+    hash: &str,
+    source_digest: &str,
+    lang: &str,
+    secret_value: &str,
+) -> Result<()> {
     let url = format!("https://{}/translate", CLOUD_RUN_TRANSCODER_HOST);
     let mut proxy_req = Request::new(Method::POST, &url);
     proxy_req.set_header("Host", CLOUD_RUN_TRANSCODER_HOST);

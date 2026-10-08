@@ -49,13 +49,17 @@ pub(crate) fn parse_vtt_cues(vtt: &str) -> Vec<VttCue> {
     cues
 }
 
-/// Render cues as WebVTT, replacing each cue's text with `translated` (by
-/// index). A missing translation falls back to the original text, so a provider
-/// that returns fewer results than cues can never produce a blank track.
-pub(crate) fn render_vtt(cues: &[VttCue], translated: &[String], target_lang: &str) -> String {
+/// Render a complete translated track, preserving cue timings.
+/// Missing or extra provider results must never produce mixed-language cues.
+pub(crate) fn render_vtt(
+    cues: &[VttCue],
+    translated: &[String],
+    target_lang: &str,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(cues.len() == translated.len(), "invalid_provider_response");
     let mut out = format!("WEBVTT\n\nNOTE\nMachine-translated by Google Cloud Translation\nTarget-Language: {target_lang}\n\n");
     for (index, cue) in cues.iter().enumerate() {
-        let text = translated.get(index).unwrap_or(&cue.text);
+        let text = &translated[index];
         out.push_str(&format!(
             "{}\n{}\n{}\n\n",
             index + 1,
@@ -63,7 +67,7 @@ pub(crate) fn render_vtt(cues: &[VttCue], translated: &[String], target_lang: &s
             escape_vtt_text(text),
         ));
     }
-    out
+    Ok(out)
 }
 
 /// Build the Cloud Translation v3 `translateText` request body.
@@ -206,7 +210,7 @@ mod tests {
     #[test]
     fn render_replaces_text_and_keeps_timings() {
         let cues = parse_vtt_cues(SAMPLE_VTT);
-        let rendered = render_vtt(&cues, &["Hola mundo".into(), "Segunda".into()], "es");
+        let rendered = render_vtt(&cues, &["Hola mundo".into(), "Segunda".into()], "es").unwrap();
         assert!(rendered.starts_with("WEBVTT"));
         assert!(rendered.contains("00:00:00.500 --> 00:00:03.200\nHola mundo"));
         assert!(rendered.contains("00:00:03.500 --> 00:00:06.000\nSegunda"));
@@ -214,14 +218,15 @@ mod tests {
     }
 
     #[test]
-    fn render_falls_back_to_original_when_translation_missing() {
+    fn render_rejects_missing_or_extra_translations() {
         let cues = parse_vtt_cues(SAMPLE_VTT);
-        let rendered = render_vtt(&cues, &["Hola mundo".into()], "es");
-        assert!(rendered.contains("Hola mundo"));
-        assert!(
-            rendered.contains("Second cue"),
-            "a missing translation must not blank the cue"
-        );
+        assert!(render_vtt(&cues, &["Hola mundo".into()], "es").is_err());
+        assert!(render_vtt(
+            &cues,
+            &["Hola".into(), "Segunda".into(), "Extra".into()],
+            "es"
+        )
+        .is_err());
     }
 
     #[test]
@@ -279,7 +284,8 @@ mod tests {
             &cues,
             &["<test> & literal &lt;".into(), "Second".into()],
             "es",
-        );
+        )
+        .unwrap();
         assert!(rendered.contains("NOTE\nMachine-translated"));
         assert!(rendered.contains("&lt;test&gt; &amp; literal &amp;lt;"));
     }
