@@ -111,6 +111,8 @@ struct Config {
     /// proxy injects it; the service is `--allow-unauthenticated`, so when this
     /// is unset the route fails closed (503).
     transcribe_shared_secret: Option<String>,
+    /// Dedicated operator credential for explicit derivative regeneration.
+    transcode_repair_secret: Option<String>,
     /// When true, status callbacks are enqueued to Cloud Tasks instead of sent
     /// directly. Default false keeps direct POST as the rollback path.
     status_queue_enabled: bool,
@@ -255,6 +257,9 @@ impl Config {
             transcribe_shared_secret: lookup("TRANSCRIBE_SHARED_SECRET")
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty()),
+            transcode_repair_secret: lookup("TRANSCODE_REPAIR_SECRET")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
             status_queue_enabled: parse_bool(&mut lookup, "STATUS_QUEUE_ENABLED", false),
             status_queue_location: lookup("STATUS_QUEUE_LOCATION")
                 .or_else(|| lookup("GCP_REGION"))
@@ -352,6 +357,9 @@ struct AppState {
 struct TranscodeRequest {
     /// SHA256 hash of the original video
     hash: String,
+    /// Regenerate derivatives even when an HLS master already exists.
+    #[serde(default)]
+    force: bool,
     /// Optional owner pubkey for metadata
     #[serde(default)]
     owner: Option<String>,
@@ -411,6 +419,9 @@ struct TranscodeResponse {
     /// Display height after rotation (visual height)
     #[serde(skip_serializing_if = "Option::is_none")]
     display_height: Option<u32>,
+    /// Repair completed, but its lock needs operator investigation before retrying.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repair_lock_warning: Option<String>,
 }
 
 // Transcript response
@@ -786,9 +797,18 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 
 async fn handle_transcode(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<TranscodeRequest>,
 ) -> Response {
-    match process_transcode(state, request).await {
+    if let Err(rejection) = authorize_transcode_repair(&state.config, &headers, request.force) {
+        return rejection;
+    }
+    let result = if request.force {
+        await_repair(process_transcode(state, request)).await
+    } else {
+        process_transcode(state, request).await
+    };
+    match result {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => {
             error!("Transcode error: {}", e);
@@ -799,6 +819,61 @@ async fn handle_transcode(
                 }),
             )
                 .into_response()
+        }
+    }
+}
+
+fn authorize_transcode_repair(
+    config: &Config,
+    headers: &axum::http::HeaderMap,
+    force: bool,
+) -> std::result::Result<(), Response> {
+    if !force {
+        return Ok(());
+    }
+    let Some(expected) = config.transcode_repair_secret.as_deref() else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "repair not configured").into_response());
+    };
+    let provided = headers
+        .get("x-divine-repair-secret")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+        Ok(())
+    } else {
+        Err((StatusCode::UNAUTHORIZED, "invalid repair credential").into_response())
+    }
+}
+
+// Keep repair ownership independent of the HTTP response waiter.
+async fn await_repair<F, T>(repair: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    // Dropping a JoinHandle detaches the task rather than aborting it. The task
+    // owns lock acquisition, all uploads, and release, even if the caller leaves.
+    tokio::spawn(repair).await.map_err(|e| {
+        anyhow!(
+            "Repair task stopped; inspect derivatives and lock before retrying: {}",
+            e
+        )
+    })?
+}
+
+fn repair_outcome<T>(result: Result<T>, release: Result<()>) -> Result<(T, Option<String>)> {
+    match release {
+        Ok(()) => result.map(|value| (value, None)),
+        Err(error) => {
+            let warning = format!(
+                "Could not release transcode lock: {}. Confirm no writer remains before removing the lock",
+                error
+            );
+            warn!("{}", warning);
+            match result {
+                Ok(value) => Ok((value, Some(warning))),
+                Err(error) => Err(anyhow!("Repair failed: {:#}; {}", error, warning)),
+            }
         }
     }
 }
@@ -1251,18 +1326,72 @@ async fn process_transcode(
     request: TranscodeRequest,
 ) -> Result<TranscodeResponse> {
     let hash = request.hash.to_lowercase();
-
-    // Validate hash format
     if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(anyhow!("Invalid hash format: must be 64 hex characters"));
     }
+    // Keep the ordinary upload pipeline independent of operator repair locks.
+    if !request.force {
+        return process_transcode_inner(state, request).await;
+    }
+    // Repairs operate only on existing HLS, never race initial generation.
+    // Operators must verify the original job completed before submitting a repair.
+    if !check_gcs_exists(
+        &state.gcs_client,
+        &state.config.gcs_bucket,
+        &format!("{}/hls/master.m3u8", hash),
+    )
+    .await?
+    {
+        return Err(anyhow!("Repair requires an existing HLS master"));
+    }
+    // Serialize operator repairs across instances. Do not expire a lock
+    // automatically: its writer might still be uploading derivatives.
+    let path = format!("{}/transcode.lock", hash);
+    let mut media = Media::new(path.clone());
+    media.content_type = "text/plain".into();
+    let object = state
+        .gcs_client
+        .upload_object(
+            &UploadObjectRequest {
+                bucket: state.config.gcs_bucket.clone(),
+                if_generation_match: Some(0),
+                ..Default::default()
+            },
+            Bytes::from(current_epoch_secs().to_string()),
+            &UploadType::Simple(media),
+        )
+        .await
+        .map_err(|e| anyhow!("Could not acquire transcode lock: {}", e))?;
+    let result = process_transcode_inner(state.clone(), request).await;
+    let release = state
+        .gcs_client
+        .delete_object(&DeleteObjectRequest {
+            bucket: state.config.gcs_bucket.clone(),
+            object: path,
+            if_generation_match: Some(object.generation),
+            ..Default::default()
+        })
+        .await;
+    let (mut response, warning) = repair_outcome(result, release.map_err(anyhow::Error::from))?;
+    response.repair_lock_warning = warning;
+    Ok(response)
+}
 
+async fn process_transcode_inner(
+    state: Arc<AppState>,
+    request: TranscodeRequest,
+) -> Result<TranscodeResponse> {
+    let hash = request.hash.to_lowercase();
+
+    // The outer function validates before either ordinary work or repair locking.
     let attempt_generation = next_status_generation();
     info!("Starting transcode for {}", hash);
 
-    // Check if HLS already exists
+    // Ordinary requests remain idempotent; repairs can replace existing derivatives.
     let master_path = format!("{}/hls/master.m3u8", hash);
-    if check_gcs_exists(&state.gcs_client, &state.config.gcs_bucket, &master_path).await? {
+    if !request.force
+        && check_gcs_exists(&state.gcs_client, &state.config.gcs_bucket, &master_path).await?
+    {
         info!("HLS already exists for {}, skipping transcode", hash);
         // Still update status to complete in case it was pending (no size change for already-transcoded)
         send_status_webhook(
@@ -1296,6 +1425,7 @@ async fn process_transcode(
             ],
             display_width: None,
             display_height: None,
+            repair_lock_warning: None,
         });
     }
 
@@ -1371,6 +1501,23 @@ async fn process_transcode(
     // Probe video to get dimensions and rotation metadata
     let video_info = match probe_video(&input_path).await {
         Ok(info) => info,
+        Err(e) if request.force => {
+            // A repair must not bake guessed landscape dimensions into the replacement.
+            send_status_webhook(
+                &state.config,
+                &hash,
+                "failed",
+                None,
+                None,
+                Some("probe_failed"),
+                Some(&e.to_string()),
+                None,
+                status_event_generation(attempt_generation, STATUS_EVENT_TERMINAL),
+                false,
+            )
+            .await;
+            return Err(e);
+        }
         Err(e) => {
             warn!(
                 "Failed to probe video, using default landscape dimensions: {}",
@@ -1438,7 +1585,31 @@ async fn process_transcode(
 
     info!("Generated HLS with {} variants", variants.len());
 
-    if let Err(e) = remux_ts_to_fmp4(&output_dir).await {
+    let remux_result = remux_ts_to_fmp4(&output_dir).await;
+    // The best-effort remuxer can skip failed variants and still return Ok.
+    let remux_result = if request.force && remux_result.is_ok() {
+        require_progressive_outputs(&output_dir).await
+    } else {
+        remux_result
+    };
+    if let Err(e) = remux_result {
+        if request.force {
+            // Repairs must replace the progressive MP4 aliases as well as HLS.
+            send_status_webhook(
+                &state.config,
+                &hash,
+                "failed",
+                None,
+                Some(&video_info),
+                Some("remux_failed"),
+                Some(&e.to_string()),
+                None,
+                status_event_generation(attempt_generation, STATUS_EVENT_TERMINAL),
+                false,
+            )
+            .await;
+            return Err(e);
+        }
         warn!("fMP4 remux step failed: {} (continuing with .ts only)", e);
     }
 
@@ -1493,6 +1664,7 @@ async fn process_transcode(
         variants,
         display_width: Some(video_info.display_width),
         display_height: Some(video_info.display_height),
+        repair_lock_warning: None,
     })
 }
 
@@ -4149,6 +4321,120 @@ async fn finalize_transcript(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn cancelling_repair_waiter_does_not_cancel_job_or_cleanup() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+        let (released_tx, released_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(super::await_repair(async move {
+            started_tx.send(()).unwrap();
+            continue_rx.await.unwrap();
+            // Represents the cleanup after work finishes, owned by the repair task.
+            released_tx.send(()).unwrap();
+            Ok(())
+        }));
+        started_rx.await.unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(continue_tx.send(()).is_ok());
+        tokio::time::timeout(std::time::Duration::from_secs(1), released_rx)
+            .await
+            .expect("repair must finish cleanup after its waiter is cancelled")
+            .unwrap();
+    }
+
+    #[test]
+    fn repair_cleanup_preserves_success_and_reports_remaining_lock() {
+        let (value, warning) =
+            super::repair_outcome(Ok(42), Err(anyhow::anyhow!("delete denied"))).unwrap();
+        assert_eq!(value, 42);
+        assert!(warning.unwrap().contains("delete denied"));
+    }
+
+    #[test]
+    fn repair_cleanup_preserves_both_errors() {
+        let error = super::repair_outcome::<()>(
+            Err(anyhow::anyhow!("probe failed")),
+            Err(anyhow::anyhow!("delete denied")),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("probe failed"));
+        assert!(message.contains("delete denied"));
+    }
+
+    #[test]
+    fn repair_cleanup_success_preserves_original_outcome() {
+        assert_eq!(super::repair_outcome(Ok(42), Ok(())).unwrap(), (42, None));
+        assert_eq!(
+            super::repair_outcome::<()>(Err(anyhow::anyhow!("probe failed")), Ok(()))
+                .unwrap_err()
+                .to_string(),
+            "probe failed"
+        );
+    }
+
+    #[test]
+    fn force_requires_dedicated_repair_credential() {
+        let mut config = super::Config::from_lookup(|_| None);
+        let mut headers = axum::http::HeaderMap::new();
+        assert!(super::authorize_transcode_repair(&config, &headers, false).is_ok());
+        assert_eq!(
+            super::authorize_transcode_repair(&config, &headers, true)
+                .unwrap_err()
+                .status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        config.transcode_repair_secret = Some("synthetic-repair-credential".into());
+        assert_eq!(
+            super::authorize_transcode_repair(&config, &headers, true)
+                .unwrap_err()
+                .status(),
+            axum::http::StatusCode::UNAUTHORIZED
+        );
+        headers.insert("x-divine-repair-secret", "incorrect".parse().unwrap());
+        assert!(super::authorize_transcode_repair(&config, &headers, true).is_err());
+        headers.insert(
+            "x-divine-repair-secret",
+            "synthetic-repair-credential".parse().unwrap(),
+        );
+        assert!(super::authorize_transcode_repair(&config, &headers, true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn forced_repair_requires_both_nonempty_progressive_outputs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(super::require_progressive_outputs(dir.path())
+            .await
+            .is_err());
+        tokio::fs::write(dir.path().join("stream_720p.mp4"), b"mp4")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("stream_480p.mp4"), b"")
+            .await
+            .unwrap();
+        assert!(super::require_progressive_outputs(dir.path())
+            .await
+            .is_err());
+        tokio::fs::write(dir.path().join("stream_480p.mp4"), b"mp4")
+            .await
+            .unwrap();
+        assert!(super::require_progressive_outputs(dir.path()).await.is_ok());
+    }
+
+    #[test]
+    fn transcode_force_is_opt_in() {
+        let ordinary: super::TranscodeRequest = serde_json::from_str(r#"{"hash":"test"}"#).unwrap();
+        assert!(!ordinary.force);
+        let repair: super::TranscodeRequest =
+            serde_json::from_str(r#"{"hash":"test","force":true}"#).unwrap();
+        assert!(repair.force);
+        assert!(serde_json::from_str::<super::TranscodeRequest>(
+            r#"{"hash":"test","force":"true"}"#
+        )
+        .is_err());
+    }
+
     use super::{
         access_token_cache, attach_generation, build_cloud_tasks_task_body, build_gemini_prompt,
         build_transcode_status_webhook_payload, classify_audio_extract_error, constant_time_eq,
@@ -6607,6 +6893,19 @@ impl AudioRemux {
             Self::Reencode => &["-c:a", "aac", "-b:a", "128k"],
         }
     }
+}
+
+/// Require both progressive variants before replacing repaired derivatives.
+async fn require_progressive_outputs(hls_dir: &Path) -> Result<()> {
+    for variant in ["stream_720p.mp4", "stream_480p.mp4"] {
+        let metadata = tokio::fs::metadata(hls_dir.join(variant))
+            .await
+            .map_err(|e| anyhow!("Repair requires {}: {}", variant, e))?;
+        if !metadata.is_file() || metadata.len() == 0 {
+            return Err(anyhow!("Repair requires nonempty {}", variant));
+        }
+    }
+    Ok(())
 }
 
 /// Remux HLS .ts files to regular MP4 with faststart for progressive download.

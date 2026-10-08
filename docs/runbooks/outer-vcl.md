@@ -6,7 +6,8 @@ The service in front of `media.divine.video` is Fastly VCL
 snippets; nothing else deploys them.
 
 `vcl/snippets.json` lists the snippets this repository owns, including the
-Fastly snippet name, type, and priority. `vcl/log_cdn_views.vcl` is not a live
+Fastly snippet name, type, and priority, including `log_5xx.vcl` as the `log`
+snippet named `Log client-facing 5xx`. `vcl/log_cdn_views.vcl` is not a live
 snippet; production uses a dashboard logging endpoint. See
 [CDN view counting](cdn-view-counting.md).
 
