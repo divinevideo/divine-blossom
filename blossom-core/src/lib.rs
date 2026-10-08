@@ -5,6 +5,7 @@ pub mod error;
 pub mod rate_limit;
 pub mod read_through;
 pub mod request_diagnostics;
+pub mod subtitle_lang;
 pub mod transcribe;
 pub mod types;
 pub mod upload_log;

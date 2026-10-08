@@ -64,6 +64,7 @@ use blossom_core::cache_policy::{
     status_requires_private_response, BlobCachePolicy, CacheHeaders,
 };
 use blossom_core::request_diagnostics::{diagnostic_probe_id, route_category};
+use blossom_core::subtitle_lang::sanitize_subtitle_lang;
 use blossom_core::upload_log::{
     record_failure, record_response, record_send_attempt, OriginSendResult, UploadLogRecord,
     UploadRoute,
@@ -1715,6 +1716,7 @@ fn serve_transcript_by_hash(
     route: &str,
     hash: &str,
     can_trigger: bool,
+    lang: Option<&str>,
 ) -> Result<Response> {
     let metadata = get_blob_metadata(hash)?
         .ok_or_else(|| BlossomError::NotFound("Content not found".into()))?;
@@ -1757,7 +1759,12 @@ fn serve_transcript_by_hash(
         ));
     }
 
-    let gcs_path = format!("{}/vtt/main.vtt", hash);
+    // A translated track is a derived cache at `{hash}/vtt/{lang}.vtt`; the
+    // source transcript stays at `{hash}/vtt/main.vtt`.
+    let gcs_path = match lang {
+        Some(l) => format!("{}/vtt/{}.vtt", hash, l),
+        None => format!("{}/vtt/main.vtt", hash),
+    };
 
     match download_transcript_content(&gcs_path) {
         Ok(mut resp) => {
@@ -1775,6 +1782,22 @@ fn serve_transcript_by_hash(
             } else {
                 add_derivative_cache_headers(&mut resp, hash);
             }
+            add_cors_headers(&mut resp);
+            Ok(resp)
+        }
+        Err(BlossomError::NotFound(_)) if can_trigger && lang.is_some() => {
+            // The translated track is a cache. Kick off generation and tell
+            // the client to retry; there is no transcript-status bookkeeping
+            // for per-language derivatives.
+            let target = lang.unwrap_or_default();
+            let _ = trigger_subtitle_translation(hash, &metadata.owner, target);
+            let mut resp = Response::from_status(StatusCode::ACCEPTED);
+            resp.set_header("Retry-After", SUBTITLE_TRANSLATION_RETRY_AFTER.to_string());
+            resp.set_header("Content-Type", "application/json");
+            resp.set_body(
+                r#"{"status":"translating","message":"Subtitle translation in progress, please retry soon"}"#,
+            );
+            add_no_cache_headers(&mut resp);
             add_cors_headers(&mut resp);
             Ok(resp)
         }
@@ -1850,7 +1873,8 @@ fn serve_transcript_by_hash(
 fn handle_get_transcript(req: Request, path: &str) -> Result<Response> {
     let hash = parse_transcript_path(path)
         .ok_or_else(|| BlossomError::BadRequest("Invalid transcript path".into()))?;
-    serve_transcript_by_hash(Some(&req), "transcript_file", &hash, true)
+    let lang = sanitize_subtitle_lang(query_parameter(&req, "lang"));
+    serve_transcript_by_hash(Some(&req), "transcript_file", &hash, true, lang.as_deref())
 }
 
 /// HEAD /<sha256>/VTT - Check transcript existence/status
@@ -1864,7 +1888,8 @@ fn handle_head_transcript(path: &str) -> Result<Response> {
 fn handle_get_transcript_file(req: Request, path: &str) -> Result<Response> {
     let hash = parse_vtt_file_path(path)
         .ok_or_else(|| BlossomError::BadRequest("Invalid VTT path".into()))?;
-    serve_transcript_by_hash(Some(&req), "transcript", &hash, true)
+    let lang = sanitize_subtitle_lang(query_parameter(&req, "lang"));
+    serve_transcript_by_hash(Some(&req), "transcript", &hash, true, lang.as_deref())
 }
 
 /// HEAD /<sha256>.vtt - Check transcript file URL status
@@ -3075,6 +3100,55 @@ fn trigger_fmp4_backfill(hash: &str) -> Result<()> {
                 e
             )))
         }
+    }
+}
+
+/// Retry-After advertised while a subtitle translation is being generated.
+const SUBTITLE_TRANSLATION_RETRY_AFTER: u64 = 15;
+
+/// Read a raw (undecoded) query parameter value from the request URL.
+fn query_parameter(req: &Request, name: &str) -> Option<String> {
+    let query = req.get_query_str()?;
+    for pair in query.split('&') {
+        let mut parts = pair.splitn(2, '=');
+        if parts.next() == Some(name) {
+            return parts.next().map(str::to_string);
+        }
+    }
+    None
+}
+
+/// Trigger on-demand subtitle translation into `lang` via the Cloud Run
+/// transcoder's `/translate` route. Fire-and-forget: the translated track is a
+/// derived cache the edge serves on a later request.
+fn trigger_subtitle_translation(hash: &str, owner: &str, lang: &str) -> Result<()> {
+    if crate::storage::is_local_mode() {
+        return Ok(());
+    }
+    let url = format!("https://{}/translate", CLOUD_RUN_TRANSCODER_HOST);
+    let payload = serde_json::json!({
+        "hash": hash,
+        "owner": owner,
+        "lang": lang,
+    });
+
+    let mut proxy_req = Request::new(Method::POST, &url);
+    proxy_req.set_header("Host", CLOUD_RUN_TRANSCODER_HOST);
+    proxy_req.set_header("Content-Type", "application/json");
+    proxy_req.set_body(payload.to_string());
+
+    match proxy_req.send_async(TRANSCODER_BACKEND) {
+        Ok(_) => {
+            eprintln!(
+                "[VTT] Triggered subtitle translation for {} -> {}",
+                hash, lang
+            );
+            Ok(())
+        }
+        Err(e) => Err(BlossomError::Internal(format!(
+            "Failed to trigger subtitle translation: {}",
+            e
+        ))),
     }
 }
 
