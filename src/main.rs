@@ -95,9 +95,19 @@ const SUBTITLE_MAX_ATTEMPTS: u32 = 3;
 /// Max derivative failures before public endpoints stop re-triggering work.
 const DERIVATIVE_MAX_ATTEMPTS: u32 = 3;
 
-/// Entry point
-#[fastly::main]
-fn main(mut req: Request) -> std::result::Result<Response, Error> {
+mod subtitle_translation;
+use subtitle_translation::{finish_subtitle_translation, serve_translated_transcript};
+
+/// Send the client response before waiting for translation I/O. Dropping an
+/// outstanding backend request at guest exit can cancel the worker request.
+fn main() -> std::result::Result<(), Error> {
+    fastly::init();
+    handle_main(Request::from_client())?.send_to_client();
+    finish_subtitle_translation();
+    Ok(())
+}
+
+fn handle_main(mut req: Request) -> std::result::Result<Response, Error> {
     // Route Rust panics to the persistent diagnostics endpoint so a
     // non-returning guest failure still leaves a record. The message is the
     // panic text, not the compute_request JSON schema. Fails open when the
@@ -1759,15 +1769,28 @@ fn serve_transcript_by_hash(
         ));
     }
 
-    // A translated track is a derived cache at `{hash}/vtt/{lang}.vtt`; the
-    // source transcript stays at `{hash}/vtt/main.vtt`.
-    let gcs_path = match lang {
-        Some(l) => format!("{}/vtt/{}.vtt", hash, l),
-        None => format!("{}/vtt/main.vtt", hash),
+    let gcs_path = format!("{hash}/vtt/main.vtt");
+    // A translated request must first establish the current source. Bypass the
+    // source content cache here so even an out-of-band repair changes the key.
+    let source = if lang.is_some() {
+        crate::storage::download_transcript_uncached_from_gcs(&gcs_path)
+    } else {
+        download_transcript_content(&gcs_path)
     };
-
-    match download_transcript_content(&gcs_path) {
+    match source {
         Ok(mut resp) => {
+            if let Some(target) = lang {
+                let source_bytes = resp.take_body().into_bytes();
+                let mut translated = serve_translated_transcript(hash, target, &source_bytes)?;
+                if translated.get_status() == StatusCode::OK {
+                    if is_admin || status_requires_private_response(metadata.status) {
+                        add_private_cache_headers(&mut translated, hash);
+                    } else {
+                        add_derivative_cache_headers(&mut translated, hash);
+                    }
+                }
+                return Ok(translated);
+            }
             if metadata.transcript_status != Some(TranscriptStatus::Complete) {
                 use crate::metadata::update_transcript_status;
                 let _ = update_transcript_status(
@@ -1782,22 +1805,6 @@ fn serve_transcript_by_hash(
             } else {
                 add_derivative_cache_headers(&mut resp, hash);
             }
-            add_cors_headers(&mut resp);
-            Ok(resp)
-        }
-        Err(BlossomError::NotFound(_)) if can_trigger && lang.is_some() => {
-            // The translated track is a cache. Kick off generation and tell
-            // the client to retry; there is no transcript-status bookkeeping
-            // for per-language derivatives.
-            let target = lang.unwrap_or_default();
-            let _ = trigger_subtitle_translation(hash, &metadata.owner, target);
-            let mut resp = Response::from_status(StatusCode::ACCEPTED);
-            resp.set_header("Retry-After", SUBTITLE_TRANSLATION_RETRY_AFTER.to_string());
-            resp.set_header("Content-Type", "application/json");
-            resp.set_body(
-                r#"{"status":"translating","message":"Subtitle translation in progress, please retry soon"}"#,
-            );
-            add_no_cache_headers(&mut resp);
             add_cors_headers(&mut resp);
             Ok(resp)
         }
@@ -3116,40 +3123,6 @@ fn query_parameter(req: &Request, name: &str) -> Option<String> {
         }
     }
     None
-}
-
-/// Trigger on-demand subtitle translation into `lang` via the Cloud Run
-/// transcoder's `/translate` route. Fire-and-forget: the translated track is a
-/// derived cache the edge serves on a later request.
-fn trigger_subtitle_translation(hash: &str, owner: &str, lang: &str) -> Result<()> {
-    if crate::storage::is_local_mode() {
-        return Ok(());
-    }
-    let url = format!("https://{}/translate", CLOUD_RUN_TRANSCODER_HOST);
-    let payload = serde_json::json!({
-        "hash": hash,
-        "owner": owner,
-        "lang": lang,
-    });
-
-    let mut proxy_req = Request::new(Method::POST, &url);
-    proxy_req.set_header("Host", CLOUD_RUN_TRANSCODER_HOST);
-    proxy_req.set_header("Content-Type", "application/json");
-    proxy_req.set_body(payload.to_string());
-
-    match proxy_req.send_async(TRANSCODER_BACKEND) {
-        Ok(_) => {
-            eprintln!(
-                "[VTT] Triggered subtitle translation for {} -> {}",
-                hash, lang
-            );
-            Ok(())
-        }
-        Err(e) => Err(BlossomError::Internal(format!(
-            "Failed to trigger subtitle translation: {}",
-            e
-        ))),
-    }
 }
 
 /// Trigger on-demand transcript generation via Cloud Run transcoder service.
@@ -6964,7 +6937,7 @@ struct UploadCapabilityHeaders {
 
 fn upload_exposed_headers() -> &'static str {
     // Retry-After lets a browser client read the throttle backoff on a 429.
-    "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256, X-Content-SHA256, X-Audio-Duration, X-Audio-Size, X-Divine-Upload-Extensions, X-Divine-Upload-Control-Host, X-Divine-Upload-Data-Host, Retry-After"
+    "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256, X-Content-SHA256, X-Audio-Duration, X-Audio-Size, X-Divine-Upload-Extensions, X-Divine-Upload-Control-Host, X-Divine-Upload-Data-Host, Retry-After, Content-Language, X-Divine-Machine-Translated"
 }
 
 fn upload_control_host(public_host: Option<&str>) -> String {
@@ -8164,3 +8137,6 @@ mod tests {
         assert_eq!(record["total_ms"], 0);
     }
 }
+
+#[cfg(test)]
+mod subtitle_translation_tests;
