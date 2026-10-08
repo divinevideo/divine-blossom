@@ -52,15 +52,15 @@ pub(crate) fn parse_vtt_cues(vtt: &str) -> Vec<VttCue> {
 /// Render cues as WebVTT, replacing each cue's text with `translated` (by
 /// index). A missing translation falls back to the original text, so a provider
 /// that returns fewer results than cues can never produce a blank track.
-pub(crate) fn render_vtt(cues: &[VttCue], translated: &[String]) -> String {
-    let mut out = String::from("WEBVTT\n\n");
+pub(crate) fn render_vtt(cues: &[VttCue], translated: &[String], target_lang: &str) -> String {
+    let mut out = format!("WEBVTT\n\nNOTE\nMachine-translated by Google Cloud Translation\nTarget-Language: {target_lang}\n\n");
     for (index, cue) in cues.iter().enumerate() {
         let text = translated.get(index).unwrap_or(&cue.text);
         out.push_str(&format!(
             "{}\n{}\n{}\n\n",
             index + 1,
             cue.timing,
-            text,
+            escape_vtt_text(text),
         ));
     }
     out
@@ -81,7 +81,11 @@ pub(crate) fn build_translate_request(contents: &[String], target_lang: &str) ->
 /// The Cloud Translation v3 endpoint for the configured location.
 pub(crate) fn translate_url(config: &Config) -> String {
     let location = config.google_translate_location.trim();
-    let location = if location.is_empty() { "global" } else { location };
+    let location = if location.is_empty() {
+        "global"
+    } else {
+        location
+    };
     format!(
         "https://translation.googleapis.com/v3/projects/{}/locations/{}:translateText",
         config.gcp_project_id, location,
@@ -90,7 +94,9 @@ pub(crate) fn translate_url(config: &Config) -> String {
 
 /// Parse a `translateText` response into one translated string per input,
 /// in order. Returns an empty vec when the response carries no translations.
-pub(crate) fn parse_translate_response(raw: &str) -> std::result::Result<Vec<String>, anyhow::Error> {
+pub(crate) fn parse_translate_response(
+    raw: &str,
+) -> std::result::Result<Vec<String>, anyhow::Error> {
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| anyhow::anyhow!("Invalid translate JSON: {}", e))?;
     let Some(arr) = value.get("translations").and_then(|t| t.as_array()) else {
@@ -109,9 +115,16 @@ pub(crate) fn parse_translate_response(raw: &str) -> std::result::Result<Vec<Str
 fn unescape_html_entities(text: &str) -> String {
     text.replace("&#39;", "'")
         .replace("&quot;", "\"")
-        .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// Cue text is plain text, never WebVTT markup. Escape after decoding once.
+fn escape_vtt_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Translate `texts` into `target_lang` in a single v3 call.
@@ -169,8 +182,9 @@ pub(crate) async fn translate_texts(
         ));
     }
 
-    parse_translate_response(&resp_body)
-        .map_err(|e| crate::parse_provider_status(Some(status.as_u16()), None, &e.to_string(), false))
+    parse_translate_response(&resp_body).map_err(|e| {
+        crate::parse_provider_status(Some(status.as_u16()), None, &e.to_string(), false)
+    })
 }
 
 #[cfg(test)]
@@ -192,7 +206,7 @@ mod tests {
     #[test]
     fn render_replaces_text_and_keeps_timings() {
         let cues = parse_vtt_cues(SAMPLE_VTT);
-        let rendered = render_vtt(&cues, &["Hola mundo".into(), "Segunda".into()]);
+        let rendered = render_vtt(&cues, &["Hola mundo".into(), "Segunda".into()], "es");
         assert!(rendered.starts_with("WEBVTT"));
         assert!(rendered.contains("00:00:00.500 --> 00:00:03.200\nHola mundo"));
         assert!(rendered.contains("00:00:03.500 --> 00:00:06.000\nSegunda"));
@@ -202,7 +216,7 @@ mod tests {
     #[test]
     fn render_falls_back_to_original_when_translation_missing() {
         let cues = parse_vtt_cues(SAMPLE_VTT);
-        let rendered = render_vtt(&cues, &["Hola mundo".into()]);
+        let rendered = render_vtt(&cues, &["Hola mundo".into()], "es");
         assert!(rendered.contains("Hola mundo"));
         assert!(
             rendered.contains("Second cue"),
@@ -257,5 +271,21 @@ mod tests {
         let url = translate_url(&cfg);
         assert!(url.starts_with("https://translation.googleapis.com/v3/projects/"));
         assert!(url.ends_with("/locations/global:translateText"));
+    }
+    #[test]
+    fn renders_machine_translation_marker_and_escapes_text() {
+        let cues = parse_vtt_cues(SAMPLE_VTT);
+        let rendered = render_vtt(
+            &cues,
+            &["<test> & literal &lt;".into(), "Second".into()],
+            "es",
+        );
+        assert!(rendered.contains("NOTE\nMachine-translated"));
+        assert!(rendered.contains("&lt;test&gt; &amp; literal &amp;lt;"));
+    }
+
+    #[test]
+    fn does_not_double_decode_entities() {
+        assert_eq!(unescape_html_entities("&amp;lt;"), "&lt;");
     }
 }

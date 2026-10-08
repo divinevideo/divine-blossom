@@ -46,6 +46,8 @@ use tracing::{error, info, warn};
 mod mp4;
 mod transcription_google_stt_v2;
 mod translation_google_v3;
+mod translation_jobs;
+use translation_jobs::{handle_translate, require_translate_secret};
 
 // Configuration
 struct Config {
@@ -115,6 +117,8 @@ struct Config {
     /// proxy injects it; the service is `--allow-unauthenticated`, so when this
     /// is unset the route fails closed (503).
     transcribe_shared_secret: Option<String>,
+    /// Edge-to-worker authentication; leave unset until disclosure and client labeling ship.
+    translate_shared_secret: Option<String>,
     /// When true, status callbacks are enqueued to Cloud Tasks instead of sent
     /// directly. Default false keeps direct POST as the rollback path.
     status_queue_enabled: bool,
@@ -240,6 +244,9 @@ impl Config {
                 1u32,
             )
             .max(1),
+            translate_shared_secret: lookup("TRANSLATE_SHARED_SECRET")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
             google_translate_location: lookup("GOOGLE_TRANSLATE_LOCATION")
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty())
@@ -429,28 +436,6 @@ struct TranscribeResponse {
     vtt_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     transcript_confidence: Option<TranscriptConfidence>,
-}
-
-// Translation request: translate a blob's source transcript into `lang`.
-#[derive(Debug, Deserialize)]
-struct TranslateRequest {
-    /// SHA256 hash of the original video whose `main.vtt` is the source.
-    hash: String,
-    /// Optional owner pubkey for logging.
-    #[serde(default)]
-    owner: Option<String>,
-    /// Target language code (BCP-47 primary subtag, e.g. `es`).
-    lang: String,
-}
-
-// Translation response
-#[derive(Serialize)]
-struct TranslateResponse {
-    hash: String,
-    lang: String,
-    status: String,
-    vtt_path: String,
-    cue_count: u32,
 }
 
 struct ParsedVtt {
@@ -756,7 +741,13 @@ async fn main() -> Result<()> {
         .route("/transcode", options(handle_cors_preflight))
         .route("/transcribe", post(handle_transcribe))
         .route("/transcribe", options(handle_cors_preflight))
-        .route("/translate", post(handle_translate))
+        .route(
+            "/translate",
+            post(handle_translate).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_translate_secret,
+            )),
+        )
         .route("/translate", options(handle_cors_preflight))
         .route(
             "/transcribe/audio",
@@ -852,123 +843,6 @@ async fn handle_transcribe(
                 .into_response()
         }
     }
-}
-
-async fn handle_translate(
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<TranslateRequest>,
-) -> Response {
-    match process_translate(state, request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
-        Err(e) => {
-            error!("Translate error: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: e.to_string(),
-                }),
-            )
-                .into_response()
-        }
-    }
-}
-
-/// Validate a target-language tag: non-empty, primary subtag shape, and not a
-/// language-detection sentinel. Restricts to letters, digits and hyphen so a
-/// caller can never steer the GCS object path.
-fn validate_target_lang(lang: &str) -> Result<String> {
-    let lang = lang.trim().to_ascii_lowercase();
-    if lang.is_empty() || lang == "auto" || lang == "und" {
-        return Err(anyhow!("Invalid target language: {:?}", lang));
-    }
-    if !lang.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') || lang.len() > 35 {
-        return Err(anyhow!("Invalid target language: {:?}", lang));
-    }
-    Ok(lang)
-}
-
-/// Translate a blob's `main.vtt` into `request.lang` and store it at
-/// `{hash}/vtt/{lang}.vtt`. Idempotent: an existing translated track is
-/// returned as-is.
-async fn process_translate(
-    state: Arc<AppState>,
-    request: TranslateRequest,
-) -> Result<TranslateResponse> {
-    let hash = request.hash.to_lowercase();
-    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(anyhow!("Invalid hash format: must be 64 hex characters"));
-    }
-    let owner = request.owner.as_deref().unwrap_or("-");
-    let lang = validate_target_lang(&request.lang)?;
-    let target_path = format!("{}/vtt/{}.vtt", hash, lang);
-
-    if check_gcs_exists(&state.gcs_client, &state.config.gcs_bucket, &target_path).await? {
-        return Ok(TranslateResponse {
-            hash,
-            lang,
-            status: "already_exists".to_string(),
-            vtt_path: target_path,
-            cue_count: 0,
-        });
-    }
-
-    let source_path = format!("{}/vtt/main.vtt", hash);
-    let source = match read_gcs_object(&state.gcs_client, &state.config.gcs_bucket, &source_path)
-        .await
-    {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(_) => {
-            return Ok(TranslateResponse {
-                hash,
-                lang,
-                status: "no_source".to_string(),
-                vtt_path: target_path,
-                cue_count: 0,
-            });
-        }
-    };
-
-    let cues = translation_google_v3::parse_vtt_cues(&source);
-    if cues.is_empty() {
-        return Ok(TranslateResponse {
-            hash,
-            lang,
-            status: "empty".to_string(),
-            vtt_path: target_path,
-            cue_count: 0,
-        });
-    }
-
-    let texts: Vec<String> = cues.iter().map(|cue| cue.text.clone()).collect();
-    let translated = translation_google_v3::translate_texts(&state.config, &lang, &texts)
-        .await
-        .map_err(|e| anyhow!("Translation provider failed: {}", e.body))?;
-
-    let rendered = translation_google_v3::render_vtt(&cues, &translated);
-    upload_transcript_variant_to_gcs(
-        &state.gcs_client,
-        &state.config.gcs_bucket,
-        &hash,
-        &lang,
-        &rendered,
-    )
-    .await?;
-
-    info!(
-        "Translated transcript for {} -> {} ({} cues, owner {})",
-        hash,
-        lang,
-        cues.len(),
-        owner
-    );
-
-    Ok(TranslateResponse {
-        hash,
-        lang,
-        status: "complete".to_string(),
-        vtt_path: target_path,
-        cue_count: cues.len() as u32,
-    })
 }
 
 /// Max audio body accepted by `POST /transcribe/audio`. ffmpeg-normalized
@@ -6267,53 +6141,6 @@ async fn upload_transcript_to_gcs(
 
     info!("Uploaded transcript {}", gcs_path);
     Ok(())
-}
-
-/// Upload a translated VTT to `{hash}/vtt/{lang}.vtt`.
-async fn upload_transcript_variant_to_gcs(
-    client: &GcsClient,
-    bucket: &str,
-    hash: &str,
-    lang: &str,
-    vtt_content: &str,
-) -> Result<()> {
-    let gcs_path = format!("{}/vtt/{}.vtt", hash, lang);
-    let mut media = Media::new(gcs_path.clone());
-    media.content_type = "text/vtt".into();
-    let upload_type = UploadType::Simple(media);
-
-    let req = UploadObjectRequest {
-        bucket: bucket.to_string(),
-        ..Default::default()
-    };
-
-    client
-        .upload_object(
-            &req,
-            Bytes::from(vtt_content.as_bytes().to_vec()),
-            &upload_type,
-        )
-        .await
-        .map_err(|e| anyhow!("Failed to upload transcript {}: {}", gcs_path, e))?;
-
-    info!("Uploaded transcript {}", gcs_path);
-    Ok(())
-}
-
-/// Read a GCS object fully into memory.
-async fn read_gcs_object(client: &GcsClient, bucket: &str, object: &str) -> Result<Vec<u8>> {
-    client
-        .download_object(
-            &GetObjectRequest {
-                bucket: bucket.to_string(),
-                object: object.to_string(),
-                ..Default::default()
-            },
-            &DownloadRange::default(),
-        )
-        .await
-        .map(|data| data.to_vec())
-        .map_err(|e| anyhow!("Failed to read {}: {}", object, e))
 }
 
 /// How far the guessed frame rate may run ahead of the measured average before
