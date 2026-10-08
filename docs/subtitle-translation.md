@@ -4,34 +4,18 @@ Translation is a derived track requested with `GET /{hash}.vtt?lang=es` or
 `GET /{hash}/VTT?lang=es`. The original URL without `lang` remains available.
 `HEAD` reports the original transcript's existence/status and ignores `lang`.
 
-## Product decision: option (b)
+## Product decision
 
 Translation is default-on once enabled, initiated by a viewer's language request.
-Before public enablement, disclose that transcript text is processed by Google
-Cloud Translation and display machine-translation attribution in the client.
-There is no automatic translation fan-out. Creator opt-out is follow-up product
-work, to be delivered before broad rollout; this backend PR does not implement
-an account preference or claim to enforce one.
+Use the existing disclosure and permissions. The client displays machine-translation
+attribution and offers the original track; no additional disclosure flow or
+creator opt-out is required for day one. There is no automatic translation fan-out.
 
 The backend sends cue text and the target language to the provider. It does not
 send the creator's pubkey, the video's hash, or the original media to the
 translation API. Translations may contain mistakes and are not statements
-signed or approved by the creator.
-
-Suggested disclosure for the privacy owner's review and publication:
-
-> When a viewer requests subtitles in another language, Divine sends the
-> video's transcript text to Google Cloud Translation to generate a machine
-> translation. Divine stores the translated subtitles to serve later viewers.
-> Machine translations may contain errors; the original subtitles remain
-> available.
-
-Publishing that disclosure belongs to the canonical privacy policy in
-`divine-web/src/pages/PrivacyPage.tsx`. This document is rollout guidance, not a
-replacement for the published policy. Client work is tracked in
-[divine-mobile#9937](https://github.com/divinevideo/divine-mobile/pull/9937),
-with implementation tracking in
-[divine-mobile#9938](https://github.com/divinevideo/divine-mobile/issues/9938).
+signed or approved by the creator. Client work is tracked in
+[divine-mobile#9937](https://github.com/divinevideo/divine-mobile/pull/9937).
 
 ## Client contract
 
@@ -68,8 +52,11 @@ the source exists. Translation pending returns `202` and `Retry-After: 15`.
 A recorded translation failure returns `503`, `status: translation_unavailable`,
 a safe `error_code`, and `terminal`. Retryable failures also include
 `Retry-After`; clients should offer the original rather than poll indefinitely.
-Malformed language values fall back to the original. Unsupported languages
-rejected by the provider produce a terminal failure for that source version.
+Malformed or unsupported language values fall back to the original without
+dispatching translation. Both edge and worker use the supported NMT language
+allowlist from [Google Cloud Translation](https://docs.cloud.google.com/translate/docs/languages#neural_machine_translation_model).
+When translation is disabled, language requests return the same uncached `503`
+contract before reading transcript storage; the original URL remains available.
 
 ## Storage and concurrency
 
@@ -95,20 +82,33 @@ and cause a short POP-local `503` cooldown on subsequent polls.
 An adjacent `.vtt.json` object records a distributed claim or failure. GCS
 generation preconditions allow one worker per source/language, across instances.
 A claim expires after 120 seconds; active work is bounded to 100 seconds.
-Transient failures cool down before another claim. Empty sources and provider
-request rejections are terminal for that source/language. Old revisions and job
-objects remain under the blob prefix and are removed by existing blob cleanup.
+Transient failures cool down before another claim. Provider request rejections
+(HTTP 400) cool down for one hour so configuration repairs can recover without
+deleting job files. Empty sources are terminal for that source version. Old
+revisions and job objects remain under the blob prefix and are removed by existing
+blob cleanup.
 
 Both services use the same language canonicalizer. Chinese script aliases map
-to `zh-CN` or `zh-TW`; `pt-BR` and `pt-PT` remain distinct. Other accepted locale
-hints normalize to the primary language. This is not a promise of support for
+to `zh-CN` or `zh-TW`; provider-supported script and regional codes, including
+`pt-BR` and `pt-PT`, remain distinct. Other accepted locale hints normalize to the
+primary language. This is not a promise of support for
 every BCP-47 tag or regional dialect.
+
+Translation dispatches share the existing transcription rate limiter: per-IP
+for all requests, plus a pubkey budget for validated transcription authorization. Cached translations, active jobs, and failures in cooldown do not spend
+that budget. The limiter remains best-effort when KV is unavailable, matching
+transcription. Translation also uses the same `provider_semaphore` as speech-to-text
+on each transcoder instance: viewer requests compete with creator transcription
+for those permits. Capacity planning must account for both workloads.
+
+The existing blob access checks and ban/delete controls cover translated tracks;
+a ban invalidates them through the shared hash surrogate key. There is no separate
+per-video translation switch. Attribution stays in response metadata and the
+client label, without adding words to the creator's subtitle cues.
 
 ## Rollout and rollback
 
-1. Publish the privacy disclosure and verify the client displays attribution
-   and can return to the original. Keep creator opt-out tracked before broad
-   rollout.
+1. Verify the client displays attribution and can return to the original.
 2. Enable the Cloud Translation API and grant the transcoder runtime service
    account `roles/cloudtranslate.user`. `GOOGLE_TRANSLATE_LOCATION` defaults to
    `global` and can select another supported location.
@@ -119,7 +119,7 @@ every BCP-47 tag or regional dialect.
 4. Configure `TRANSLATE_SHARED_SECRET` on the transcoder and the matching
    `translate_shared_secret` in Fastly's `blossom_secrets` store. Use a dedicated
    translation secret. Until configured, the worker fails closed; do not enable
-   the edge secret until the disclosure/client prerequisites are satisfied.
+   the edge secret until the client prerequisites are satisfied.
 5. Verify the authenticated worker contract with a synthetic source, then verify
    both public URL forms: pending, translated, failed, and repaired source.
    Confirm only one provider request runs for simultaneous misses.
@@ -128,8 +128,8 @@ No deploy, API enablement, permission grant, or secret provisioning is performed
 by this PR. The deployment script preserves bindings it does not own, including
 the optional translation secret. To stop new translation dispatch, remove the
 edge translation secret; the original transcript remains available. Existing
-translated tracks remain readable. To withdraw those tracks too, roll back the
-edge package following `docs/runbooks/rollback.md` and purge affected URLs.
+CDN-cached tracks may remain readable until their cache expires. To withdraw
+those tracks too, roll back the edge package following `docs/runbooks/rollback.md` and purge affected URLs.
 
 ## Validation
 
