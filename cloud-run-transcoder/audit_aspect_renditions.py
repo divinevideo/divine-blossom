@@ -10,7 +10,12 @@ import subprocess
 import sys
 
 
-RENDITIONS = ("720p.mp4", "480p.mp4", "hls/stream_720p.m3u8", "hls/stream_480p.m3u8")
+RENDITIONS = {
+    "720p.mp4": "hls/stream_720p.mp4",
+    "480p.mp4": "hls/stream_480p.mp4",
+    "hls/stream_720p.m3u8": "hls/stream_720p.m3u8",
+    "hls/stream_480p.m3u8": "hls/stream_480p.m3u8",
+}
 LEGACY_SIZES = {(1280, 720), (854, 480)}
 
 
@@ -62,9 +67,8 @@ def probe(url):
 def audit_hash(hash_value, media_root, probe_fn=probe):
     source = probe_fn(f"{media_root}/originals/{hash_value}")
     affected, errors = [], []
-    for rendition in RENDITIONS:
+    for rendition, object_path in RENDITIONS.items():
         try:
-            object_path = {"720p.mp4": "hls/stream_720p.mp4", "480p.mp4": "hls/stream_480p.mp4"}.get(rendition, rendition)
             if is_stretched(source, probe_fn(f"{media_root}/derivatives/{hash_value}/{object_path}")):
                 affected.append(rendition)
         except (ValueError, KeyError, IndexError, TypeError, ZeroDivisionError,

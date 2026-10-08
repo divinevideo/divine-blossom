@@ -51,9 +51,23 @@ Forced transcodes acquire a generation-conditional GCS lock at
 `{hash}/transcode.lock` and release only their own generation. Overlapping repairs
 fail rather than overwrite each other. Normal requests do not take this lock and
 retain their existing-master shortcut, so a failed repair cannot lock the normal
-upload pipeline. A crash can leave a repair lock: an operator must
+upload pipeline. Forced jobs run in a separate task so cancellation of the HTTP
+response waiter does not cancel their work or lock release. This is not durable
+execution: instance termination or a task panic can still leave a repair lock.
+A disconnected client, Ctrl-C, or a request timeout gives an unknown outcome;
+the writer may still be active. Do not immediately retry or remove its lock.
+Inspect service logs and outputs at origin, and an operator must
 confirm no writer remains before removing that specific lock. Do not expire locks
 by elapsed time alone. Avoid simultaneous fMP4 backfills during the repair.
+
+A successful response may include `repair_lock_warning`: the derivatives were
+uploaded, but lock cleanup failed. Investigate that specific lock before the
+next repair. If repair and cleanup both fail, the error reports both failures.
+Failure callbacks also update the existing video's transcode status and attempt
+count even when the old derivatives remain available. A HEAD of the existing
+master playlist through the edge reconciles status to complete and resets the
+attempt count; verify origin outputs first, since existence does not prove that
+a partial repair produced a consistent set.
 
 The edge's progressive aliases read `hls/stream_720p.mp4` and
 `hls/stream_480p.mp4`; both must be regenerated successfully along with HLS.

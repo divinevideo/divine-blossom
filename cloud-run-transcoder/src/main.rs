@@ -419,6 +419,9 @@ struct TranscodeResponse {
     /// Display height after rotation (visual height)
     #[serde(skip_serializing_if = "Option::is_none")]
     display_height: Option<u32>,
+    /// Repair completed, but its lock needs operator investigation before retrying.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repair_lock_warning: Option<String>,
 }
 
 // Transcript response
@@ -800,7 +803,12 @@ async fn handle_transcode(
     if let Err(rejection) = authorize_transcode_repair(&state.config, &headers, request.force) {
         return rejection;
     }
-    match process_transcode(state, request).await {
+    let result = if request.force {
+        await_repair(process_transcode(state, request)).await
+    } else {
+        process_transcode(state, request).await
+    };
+    match result {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => {
             error!("Transcode error: {}", e);
@@ -834,6 +842,39 @@ fn authorize_transcode_repair(
         Ok(())
     } else {
         Err((StatusCode::UNAUTHORIZED, "invalid repair credential").into_response())
+    }
+}
+
+// Keep repair ownership independent of the HTTP response waiter.
+async fn await_repair<F, T>(repair: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    // Dropping a JoinHandle detaches the task rather than aborting it. The task
+    // owns lock acquisition, all uploads, and release, even if the caller leaves.
+    tokio::spawn(repair).await.map_err(|e| {
+        anyhow!(
+            "Repair task stopped; inspect derivatives and lock before retrying: {}",
+            e
+        )
+    })?
+}
+
+fn repair_outcome<T>(result: Result<T>, release: Result<()>) -> Result<(T, Option<String>)> {
+    match release {
+        Ok(()) => result.map(|value| (value, None)),
+        Err(error) => {
+            let warning = format!(
+                "Could not release transcode lock: {}. Confirm no writer remains before removing the lock",
+                error
+            );
+            warn!("{}", warning);
+            match result {
+                Ok(value) => Ok((value, Some(warning))),
+                Err(error) => Err(anyhow!("Repair failed: {:#}; {}", error, warning)),
+            }
+        }
     }
 }
 
@@ -1331,10 +1372,9 @@ async fn process_transcode(
             ..Default::default()
         })
         .await;
-    if let Err(e) = release {
-        return Err(anyhow!("Could not release transcode lock: {}", e));
-    }
-    result
+    let (mut response, warning) = repair_outcome(result, release.map_err(anyhow::Error::from))?;
+    response.repair_lock_warning = warning;
+    Ok(response)
 }
 
 async fn process_transcode_inner(
@@ -1343,11 +1383,7 @@ async fn process_transcode_inner(
 ) -> Result<TranscodeResponse> {
     let hash = request.hash.to_lowercase();
 
-    // Validate hash format
-    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(anyhow!("Invalid hash format: must be 64 hex characters"));
-    }
-
+    // The outer function validates before either ordinary work or repair locking.
     let attempt_generation = next_status_generation();
     info!("Starting transcode for {}", hash);
 
@@ -1389,6 +1425,7 @@ async fn process_transcode_inner(
             ],
             display_width: None,
             display_height: None,
+            repair_lock_warning: None,
         });
     }
 
@@ -1627,6 +1664,7 @@ async fn process_transcode_inner(
         variants,
         display_width: Some(video_info.display_width),
         display_height: Some(video_info.display_height),
+        repair_lock_warning: None,
     })
 }
 
@@ -4283,6 +4321,59 @@ async fn finalize_transcript(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn cancelling_repair_waiter_does_not_cancel_job_or_cleanup() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+        let (released_tx, released_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(super::await_repair(async move {
+            started_tx.send(()).unwrap();
+            continue_rx.await.unwrap();
+            // Represents the cleanup after work finishes, owned by the repair task.
+            released_tx.send(()).unwrap();
+            Ok(())
+        }));
+        started_rx.await.unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(continue_tx.send(()).is_ok());
+        tokio::time::timeout(std::time::Duration::from_secs(1), released_rx)
+            .await
+            .expect("repair must finish cleanup after its waiter is cancelled")
+            .unwrap();
+    }
+
+    #[test]
+    fn repair_cleanup_preserves_success_and_reports_remaining_lock() {
+        let (value, warning) =
+            super::repair_outcome(Ok(42), Err(anyhow::anyhow!("delete denied"))).unwrap();
+        assert_eq!(value, 42);
+        assert!(warning.unwrap().contains("delete denied"));
+    }
+
+    #[test]
+    fn repair_cleanup_preserves_both_errors() {
+        let error = super::repair_outcome::<()>(
+            Err(anyhow::anyhow!("probe failed")),
+            Err(anyhow::anyhow!("delete denied")),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("probe failed"));
+        assert!(message.contains("delete denied"));
+    }
+
+    #[test]
+    fn repair_cleanup_success_preserves_original_outcome() {
+        assert_eq!(super::repair_outcome(Ok(42), Ok(())).unwrap(), (42, None));
+        assert_eq!(
+            super::repair_outcome::<()>(Err(anyhow::anyhow!("probe failed")), Ok(()))
+                .unwrap_err()
+                .to_string(),
+            "probe failed"
+        );
+    }
+
     #[test]
     fn force_requires_dedicated_repair_credential() {
         let mut config = super::Config::from_lookup(|_| None);

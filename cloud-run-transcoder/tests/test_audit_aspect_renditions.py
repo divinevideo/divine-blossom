@@ -58,12 +58,12 @@ class AspectAuditTests(unittest.TestCase):
                 raise ValueError("missing")
             return geometry(480, 480) if url.endswith("/hash") else geometry(1280, 720)
 
-        record = audit.audit_hash("hash", "https://media.example", probe)
+        record = audit.audit_hash("hash", "/export", probe)
         self.assertEqual(len(calls), 5)
         self.assertEqual(record["probe_errors"], ["480p.mp4"])
         self.assertEqual(record["affected"], ["720p.mp4", "hls/stream_720p.m3u8", "hls/stream_480p.m3u8"])
         self.assertEqual(record["request"], {"hash": "hash", "force": True})
 
     def test_no_candidate_request_for_correct_video(self):
-        record = audit.audit_hash("hash", "https://media.example", lambda _: geometry(480, 480))
+        record = audit.audit_hash("hash", "/export", lambda _: geometry(480, 480))
         self.assertNotIn("request", record)
