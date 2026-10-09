@@ -97,6 +97,18 @@ class ManifestContractTest(unittest.TestCase):
         pass_vcl = (ROOT / "vcl" / "pass.vcl").read_text(encoding="utf-8")
         self.assertIn("set bereq.first_byte_timeout = 120s;", pass_vcl)
 
+    def test_skipped_5xx_log_snippet_is_managed(self) -> None:
+        entries = [
+            item for item in load_manifest()["snippets"]
+            if item["file"] == "log_5xx.vcl"
+        ]
+        self.assertEqual(entries, [{
+            "file": "log_5xx.vcl",
+            "name": "Client-facing skipped 5xx diagnostics",
+            "type": "log",
+            "priority": 100,
+        }])
+
 class SyncToolTest(unittest.TestCase):
     def setUp(self) -> None:
         self.manifest = load_manifest()
