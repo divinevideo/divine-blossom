@@ -288,6 +288,15 @@ pub fn download_hls_from_gcs(gcs_key: &str, range: Option<&str>) -> Result<Respo
 /// Download transcript content from GCS (WebVTT files)
 /// gcs_key format: {hash}/vtt/{filename}
 pub fn download_transcript_from_gcs(gcs_key: &str) -> Result<Response> {
+    download_transcript_object_from_gcs(gcs_key, false)
+}
+
+/// Mutable sources and job states must bypass the backend cache as well as Simple Cache.
+pub fn download_transcript_uncached_from_gcs(gcs_key: &str) -> Result<Response> {
+    download_transcript_object_from_gcs(gcs_key, true)
+}
+
+fn download_transcript_object_from_gcs(gcs_key: &str, uncached: bool) -> Result<Response> {
     let config = S3Config::load_gcs()?;
     let path = format!("/{}/{}", config.bucket, gcs_key);
     let url = format!("{}{}", config.endpoint(), path);
@@ -296,6 +305,10 @@ pub fn download_transcript_from_gcs(gcs_key: &str) -> Result<Response> {
     req.set_header("Host", config.host());
 
     sign_request(&mut req, &config, Some("UNSIGNED-PAYLOAD".into()))?;
+
+    if uncached {
+        req.set_pass(true);
+    }
 
     let resp = req.send(GCS_BACKEND).map_err(|e| {
         BlossomError::StorageError(format!("Failed to download transcript content: {}", e))

@@ -63,3 +63,6 @@ fi
 
 # These exercise actual asynchronous host I/O against a delayed loopback backend.
 VICEROY="$VICEROY" python3 scripts/run-probe-deadline-tests.py
+
+# Exercise translated VTT routing against synthetic storage and worker backends.
+VICEROY="$VICEROY" python3 scripts/run-subtitle-translation-tests.py
