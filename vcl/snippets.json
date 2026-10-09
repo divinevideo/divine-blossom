@@ -36,6 +36,12 @@
       "name": "Client-facing headers",
       "type": "deliver",
       "priority": 100
+    },
+    {
+      "file": "log_5xx.vcl",
+      "name": "Client-facing skipped 5xx diagnostics",
+      "type": "log",
+      "priority": 100
     }
   ],
   "unmanaged_files": [
