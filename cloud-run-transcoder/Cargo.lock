@@ -211,6 +211,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "blossom-core"
+version = "0.1.0"
+dependencies = [
+ "http 1.4.0",
+ "serde",
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -355,6 +365,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "base64ct",
+ "blossom-core",
  "bytes",
  "futures",
  "google-cloud-auth 0.12.0",
