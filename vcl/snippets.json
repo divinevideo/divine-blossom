@@ -39,7 +39,7 @@
     },
     {
       "file": "log_5xx.vcl",
-      "name": "Log client-facing 5xx",
+      "name": "Client-facing skipped 5xx diagnostics",
       "type": "log",
       "priority": 100
     }

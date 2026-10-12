@@ -64,6 +64,7 @@ use blossom_core::cache_policy::{
     status_requires_private_response, BlobCachePolicy, CacheHeaders,
 };
 use blossom_core::request_diagnostics::{diagnostic_probe_id, route_category};
+use blossom_core::subtitle_lang::sanitize_subtitle_lang;
 use blossom_core::upload_log::{
     record_failure, record_response, record_send_attempt, OriginSendResult, UploadLogRecord,
     UploadRoute,
@@ -94,9 +95,19 @@ const SUBTITLE_MAX_ATTEMPTS: u32 = 3;
 /// Max derivative failures before public endpoints stop re-triggering work.
 const DERIVATIVE_MAX_ATTEMPTS: u32 = 3;
 
-/// Entry point
-#[fastly::main]
-fn main(mut req: Request) -> std::result::Result<Response, Error> {
+mod subtitle_translation;
+use subtitle_translation::{finish_subtitle_translation, serve_translated_transcript};
+
+/// Send the client response before waiting for translation I/O. Dropping an
+/// outstanding backend request at guest exit can cancel the worker request.
+fn main() -> std::result::Result<(), Error> {
+    fastly::init();
+    handle_main(Request::from_client())?.send_to_client();
+    finish_subtitle_translation();
+    Ok(())
+}
+
+fn handle_main(mut req: Request) -> std::result::Result<Response, Error> {
     // Route Rust panics to the persistent diagnostics endpoint so a
     // non-returning guest failure still leaves a record. The message is the
     // panic text, not the compute_request JSON schema. Fails open when the
@@ -1715,6 +1726,7 @@ fn serve_transcript_by_hash(
     route: &str,
     hash: &str,
     can_trigger: bool,
+    lang: Option<&str>,
 ) -> Result<Response> {
     let metadata = get_blob_metadata(hash)?
         .ok_or_else(|| BlossomError::NotFound("Content not found".into()))?;
@@ -1757,10 +1769,43 @@ fn serve_transcript_by_hash(
         ));
     }
 
-    let gcs_path = format!("{}/vtt/main.vtt", hash);
+    // Check the rollback switch before any source, translation, or job storage read.
+    let translation_secret = if lang.is_some() {
+        match subtitle_translation::translation_dispatch_secret() {
+            Some(secret) => Some(secret),
+            None => {
+                return Ok(subtitle_translation::translation_unavailable_response(
+                    "translation_disabled",
+                ))
+            }
+        }
+    } else {
+        None
+    };
 
-    match download_transcript_content(&gcs_path) {
+    let gcs_path = format!("{hash}/vtt/main.vtt");
+    // A translated request must first establish the current source. Bypass the
+    // source content cache here so even an out-of-band repair changes the key.
+    let source = if lang.is_some() {
+        crate::storage::download_transcript_uncached_from_gcs(&gcs_path)
+    } else {
+        download_transcript_content(&gcs_path)
+    };
+    match source {
         Ok(mut resp) => {
+            if let (Some(target), Some(secret)) = (lang, translation_secret.as_deref()) {
+                let source_bytes = resp.take_body().into_bytes();
+                let mut translated =
+                    serve_translated_transcript(req, hash, target, &source_bytes, secret)?;
+                if translated.get_status() == StatusCode::OK {
+                    if is_admin || status_requires_private_response(metadata.status) {
+                        add_private_cache_headers(&mut translated, hash);
+                    } else {
+                        add_derivative_cache_headers(&mut translated, hash);
+                    }
+                }
+                return Ok(translated);
+            }
             if metadata.transcript_status != Some(TranscriptStatus::Complete) {
                 use crate::metadata::update_transcript_status;
                 let _ = update_transcript_status(
@@ -1850,7 +1895,8 @@ fn serve_transcript_by_hash(
 fn handle_get_transcript(req: Request, path: &str) -> Result<Response> {
     let hash = parse_transcript_path(path)
         .ok_or_else(|| BlossomError::BadRequest("Invalid transcript path".into()))?;
-    serve_transcript_by_hash(Some(&req), "transcript_file", &hash, true)
+    let lang = sanitize_subtitle_lang(query_parameter(&req, "lang"));
+    serve_transcript_by_hash(Some(&req), "transcript_file", &hash, true, lang.as_deref())
 }
 
 /// HEAD /<sha256>/VTT - Check transcript existence/status
@@ -1864,7 +1910,8 @@ fn handle_head_transcript(path: &str) -> Result<Response> {
 fn handle_get_transcript_file(req: Request, path: &str) -> Result<Response> {
     let hash = parse_vtt_file_path(path)
         .ok_or_else(|| BlossomError::BadRequest("Invalid VTT path".into()))?;
-    serve_transcript_by_hash(Some(&req), "transcript", &hash, true)
+    let lang = sanitize_subtitle_lang(query_parameter(&req, "lang"));
+    serve_transcript_by_hash(Some(&req), "transcript", &hash, true, lang.as_deref())
 }
 
 /// HEAD /<sha256>.vtt - Check transcript file URL status
@@ -3076,6 +3123,21 @@ fn trigger_fmp4_backfill(hash: &str) -> Result<()> {
             )))
         }
     }
+}
+
+/// Retry-After advertised while a subtitle translation is being generated.
+const SUBTITLE_TRANSLATION_RETRY_AFTER: u64 = 15;
+
+/// Read a raw (undecoded) query parameter value from the request URL.
+fn query_parameter(req: &Request, name: &str) -> Option<String> {
+    let query = req.get_query_str()?;
+    for pair in query.split('&') {
+        let mut parts = pair.splitn(2, '=');
+        if parts.next() == Some(name) {
+            return parts.next().map(str::to_string);
+        }
+    }
+    None
 }
 
 /// Trigger on-demand transcript generation via Cloud Run transcoder service.
@@ -6890,7 +6952,7 @@ struct UploadCapabilityHeaders {
 
 fn upload_exposed_headers() -> &'static str {
     // Retry-After lets a browser client read the throttle backoff on a 429.
-    "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256, X-Content-SHA256, X-Audio-Duration, X-Audio-Size, X-Divine-Upload-Extensions, X-Divine-Upload-Control-Host, X-Divine-Upload-Data-Host, Retry-After"
+    "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256, X-Content-SHA256, X-Audio-Duration, X-Audio-Size, X-Divine-Upload-Extensions, X-Divine-Upload-Control-Host, X-Divine-Upload-Data-Host, Retry-After, Content-Language, X-Divine-Machine-Translated"
 }
 
 fn upload_control_host(public_host: Option<&str>) -> String {
@@ -8090,3 +8152,6 @@ mod tests {
         assert_eq!(record["total_ms"], 0);
     }
 }
+
+#[cfg(test)]
+mod subtitle_translation_tests;
