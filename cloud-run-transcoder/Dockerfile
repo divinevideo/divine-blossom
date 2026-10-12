@@ -9,19 +9,23 @@ WORKDIR /app
 # Install build dependencies
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 
+# The build context is prepared by prepare-build-context.sh.
+# The service manifest resolves its shared dependency at ../blossom-core.
+COPY blossom-core /blossom-core
+
 # Copy manifests
 COPY Cargo.toml Cargo.lock* ./
 
 # Create dummy source to cache dependencies
 RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release
+RUN cargo build --release --locked
 RUN rm -rf src
 
 # Copy actual source
 COPY src ./src
 
 # Build for release (touch to force rebuild)
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs && cargo build --release --locked
 
 # Runtime stage - NVIDIA CUDA with FFmpeg
 # Use the official NVIDIA L4-compatible CUDA runtime image
