@@ -45,6 +45,9 @@ use tracing::{error, info, warn};
 
 mod mp4;
 mod transcription_google_stt_v2;
+mod translation_google_v3;
+mod translation_jobs;
+use translation_jobs::{handle_translate, require_translate_secret};
 
 // Configuration
 struct Config {
@@ -87,6 +90,9 @@ struct Config {
     google_stt_enable_automatic_punctuation: bool,
     google_stt_enable_word_time_offsets: bool,
     google_stt_max_alternatives: u32,
+    /// Cloud Translation v3 location for subtitle translation (default
+    /// `global`). Independent of the STT location.
+    google_translate_location: String,
     /// If set and the primary provider returns a `ProviderError`, retry once
     /// with this provider (subject to `transcription_fallback_on_provider_error`).
     transcription_fallback_provider: Option<String>,
@@ -111,6 +117,8 @@ struct Config {
     /// proxy injects it; the service is `--allow-unauthenticated`, so when this
     /// is unset the route fails closed (503).
     transcribe_shared_secret: Option<String>,
+    /// Edge-to-worker authentication; leave unset until disclosure and client labeling ship.
+    translate_shared_secret: Option<String>,
     /// When true, status callbacks are enqueued to Cloud Tasks instead of sent
     /// directly. Default false keeps direct POST as the rollback path.
     status_queue_enabled: bool,
@@ -236,6 +244,13 @@ impl Config {
                 1u32,
             )
             .max(1),
+            translate_shared_secret: lookup("TRANSLATE_SHARED_SECRET")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
+            google_translate_location: lookup("GOOGLE_TRANSLATE_LOCATION")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "global".to_string()),
             transcription_fallback_provider: lookup("TRANSCRIPTION_FALLBACK_PROVIDER")
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty()),
@@ -726,6 +741,14 @@ async fn main() -> Result<()> {
         .route("/transcode", options(handle_cors_preflight))
         .route("/transcribe", post(handle_transcribe))
         .route("/transcribe", options(handle_cors_preflight))
+        .route(
+            "/translate",
+            post(handle_translate).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_translate_secret,
+            )),
+        )
+        .route("/translate", options(handle_cors_preflight))
         .route(
             "/transcribe/audio",
             post(handle_transcribe_audio)

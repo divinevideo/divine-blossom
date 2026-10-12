@@ -106,8 +106,12 @@ STATUS_QUEUE_LOCATION="${STATUS_QUEUE_LOCATION:-${REGION}}"
 STATUS_QUEUE_NAME="${STATUS_QUEUE_NAME:-derivative-status}"
 SENTRY_SECRET="${SENTRY_SECRET:-sentry_dsn}"
 
+# Stage an explicit source allowlist, including the shared language/job contract.
+BUILD_CONTEXT="$(mktemp -d)"
+trap 'rm -rf "${BUILD_CONTEXT}"' EXIT
+bash "${SCRIPT_DIR}/prepare-build-context.sh" "${BUILD_CONTEXT}"
 echo "Building ${IMAGE} in Cloud Build..."
-gcloud builds submit "${SCRIPT_DIR}" \
+gcloud builds submit "${BUILD_CONTEXT}" \
   --project "${PROJECT_ID}" \
   --region "${REGION}" \
   --tag "${IMAGE}"
