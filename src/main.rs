@@ -558,6 +558,25 @@ fn finalize_derived_audio_cleanup(plan: &PreparedDerivedAudioCleanup) -> Result<
     Ok(())
 }
 
+fn vanish_storage_hashes(
+    blobs: &[PreparedVanishBlob],
+    derived_cleanup: &[PreparedDerivedAudioCleanup],
+) -> Vec<String> {
+    let mut hashes = Vec::with_capacity(blobs.len() + derived_cleanup.len());
+    for blob in blobs {
+        hashes.push(blob.hash.clone());
+        hashes.extend(
+            derived_cleanup
+                .iter()
+                .filter(|plan| plan.source_hash.eq_ignore_ascii_case(&blob.hash))
+                .map(|plan| plan.audio_hash.clone()),
+        );
+    }
+    let mut seen = HashSet::new();
+    hashes.retain(|hash| seen.insert(hash.to_ascii_lowercase()));
+    hashes
+}
+
 /// GET /<sha256>[.ext] - Retrieve blob
 fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
     // Check if this is a thumbnail request ({hash}.jpg)
@@ -4556,13 +4575,15 @@ const VANISH_TIME_BUDGET: Duration = Duration::from_millis(10_000);
 // storage uses one source blob per wave because derived audio can add a second
 // hash and Compute permits only 32 backend requests per execution.
 const VANISH_KV_FANOUT: usize = 10;
+// A wave holds at most VANISH_KV_FANOUT sources with at most one derived-audio
+// hash each, so its storage batch must stay inside one Cloud Run cleanup chunk.
+// A second serial chunk would double the caller's worst-case Cloud Run wait.
+const _: () = assert!(VANISH_KV_FANOUT * 2 <= crate::storage::CLOUD_RUN_DELETE_BATCH_LIMIT);
 const B2_VANISH_KV_FANOUT: usize = 1;
-const VANISH_STORAGE_ATTEMPTS: u8 = 2;
 // The post-purge delivery probe is observability, not erasure. Skip it when the
 // call is already this close to its internal budget, so a slow account never
 // waits on the probe.
 const DELIVERY_PROBE_BUDGET_RESERVE: Duration = Duration::from_millis(2_000);
-const B2_VANISH_STORAGE_ATTEMPTS: u8 = 1;
 // Fastly Compute permits 32 backend requests per execution. A B2-enabled wave
 // spends nearly all of that budget, so the wave loop starts only as many B2
 // waves as the remaining execution budget covers and leaves the rest of the
@@ -4638,7 +4659,6 @@ fn next_vanish_wave_range(
 }
 
 fn add_vanish_storage_timings(total: &mut VanishStorageTimings, wave: &VanishStorageTimings) {
-    total.gcs_main_ms = total.gcs_main_ms.saturating_add(wave.gcs_main_ms);
     total.cloud_run_cleanup_ms = total
         .cloud_run_cleanup_ms
         .saturating_add(wave.cloud_run_cleanup_ms);
@@ -4855,7 +4875,6 @@ fn vanish_timing_record(
         "malformed_hash_exceptions": counters.malformed_hash_exceptions,
         "pending": counters.pending,
         "prepare_ms": counters.prepare_ms.min(u128::from(u64::MAX)) as u64,
-        "gcs_main_ms": storage_timings.gcs_main_ms,
         "cloud_run_cleanup_ms": storage_timings.cloud_run_cleanup_ms,
         "fos_main_ms": storage_timings.fos_main_ms,
         "b2_replica_ms": storage_timings.b2_replica_ms,
@@ -4917,11 +4936,6 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     } else {
         VANISH_KV_FANOUT
     };
-    let storage_attempt_limit = if b2_enabled {
-        B2_VANISH_STORAGE_ATTEMPTS
-    } else {
-        VANISH_STORAGE_ATTEMPTS
-    };
     while let Some(wave_range) = next_vanish_wave_range(
         hashes.len(),
         offset,
@@ -4972,23 +4986,10 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         }
         let erase = cleanup_ready;
         erase_candidates = erase_candidates.saturating_add(erase.len());
-        let mut erase_hashes: Vec<String> = erase.iter().map(|blob| blob.hash.clone()).collect();
-        erase_main_candidates.extend(erase_hashes.iter().cloned());
-        erase_hashes.extend(derived_cleanup.iter().map(|plan| plan.audio_hash.clone()));
-        erase_hashes.sort();
-        erase_hashes.dedup();
-        let mut storage_result = erase_vanish_batch(&erase_hashes);
-        let mut wave_storage_attempts = u8::from(!erase_hashes.is_empty());
-        while wave_storage_attempts < storage_attempt_limit
-            && !storage_result.failed_hashes.is_empty()
-        {
-            let storage_retry_hashes: Vec<String> =
-                storage_result.failed_hashes.iter().cloned().collect();
-            let retry = erase_vanish_batch(&storage_retry_hashes);
-            storage_result.replace_failures_after_retry(retry);
-            wave_storage_attempts += 1;
-        }
-        storage_attempts = storage_attempts.saturating_add(u32::from(wave_storage_attempts));
+        erase_main_candidates.extend(erase.iter().map(|blob| blob.hash.clone()));
+        let erase_hashes = vanish_storage_hashes(&erase, &derived_cleanup);
+        let storage_result = erase_vanish_batch(&erase_hashes);
+        storage_attempts = storage_attempts.saturating_add(u32::from(!erase_hashes.is_empty()));
         add_vanish_storage_timings(&mut storage_timings, &storage_result.timings);
         purged_main_hashes.extend(
             storage_result
@@ -5029,8 +5030,8 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
             ) {
                 VanishBlobDisposition::Failed => {
                     eprintln!(
-                        "[VANISH] pubkey={} hash={} required storage erasure failed after {} attempts",
-                        pubkey, blob.hash, wave_storage_attempts
+                        "[VANISH] pubkey={} hash={} required storage erasure failed",
+                        pubkey, blob.hash
                     );
                     execution.errors += 1;
                     retry_hashes.push(blob.hash);
@@ -7141,8 +7142,9 @@ mod tests {
         trusted_upload_service_terminal_derivative_error, upload_capability_headers,
         upload_control_host, upload_exposed_headers, upload_from_resumable_completion,
         vanish_blob_disposition, vanish_pending_count, vanish_response_status,
-        vanish_shared_update_error_count, vanish_timing_record, AudioReuseAvailability,
-        DerivativeObservation, TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState,
+        vanish_shared_update_error_count, vanish_storage_hashes, vanish_timing_record,
+        AudioReuseAvailability, DerivativeObservation, PreparedDerivedAudioCleanup,
+        TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState,
         VanishBlobDisposition, VanishExecution, VanishRequestOps, VanishTimingCounters,
         B2_VANISH_KV_FANOUT, DELIVERY_PROBE_BUDGET_RESERVE, VANISH_KV_FANOUT, VANISH_TIME_BUDGET,
     };
@@ -7240,6 +7242,32 @@ mod tests {
             StatusCode::INTERNAL_SERVER_ERROR
         );
         assert_eq!(vanish_response_status(1, 1), StatusCode::ACCEPTED);
+    }
+
+    #[test]
+    fn vanish_storage_hashes_interleave_sources_and_derived_audio() {
+        let first = "a".repeat(64);
+        let first_audio = "b".repeat(64);
+        let second = "c".repeat(64);
+        let blobs = vec![
+            blossom_core::delete_policy::PreparedVanishBlob {
+                hash: first.clone(),
+                metadata: None,
+            },
+            blossom_core::delete_policy::PreparedVanishBlob {
+                hash: second.clone(),
+                metadata: None,
+            },
+        ];
+        let derived = vec![PreparedDerivedAudioCleanup {
+            source_hash: first.clone(),
+            audio_hash: first_audio.clone(),
+        }];
+
+        assert_eq!(
+            vanish_storage_hashes(&blobs, &derived),
+            vec![first, first_audio, second]
+        );
     }
 
     #[test]

@@ -63,7 +63,8 @@ requires one typed result for every requested hash. For changes to that contract
    a `409` means the two services name different buckets. Stop rather than
    merging the edge in either case.
 2. The `main` workflow deploys `cloud-run-upload` and verifies
-   `/delete-blobs/ready` before publishing edge code that calls it. The same
+   `/delete-blobs/ready` for the `vanish-batch-v2` contract before publishing
+   edge code that calls it. The same
    readiness body advertises the authenticated `/probe-delivery` endpoint the
    vanish path calls after a purge (`delivery_probe:
    authenticated-v1`); the workflow asserts it before publishing the edge so

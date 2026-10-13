@@ -605,10 +605,11 @@ async fn handle_delete_blobs(
         }
     };
     let backend = cleanup::GcsCleanupBackend::new(&state.gcs_client, &state.config.gcs_bucket);
+    let deadline = tokio::time::Instant::now() + cleanup::CLEANUP_REQUEST_DEADLINE;
     let results = stream::iter(hashes)
         .map(|hash| {
             let backend = &backend;
-            async move { cleanup::cleanup_hash(backend, &hash).await }
+            async move { cleanup::cleanup_hash_before(backend, &hash, deadline).await }
         })
         .buffer_unordered(BATCH_CLEANUP_CONCURRENCY)
         .collect::<Vec<_>>()
@@ -822,8 +823,9 @@ async fn probe_delivery(
 async fn handle_delete_blobs_ready() -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "ready",
-        "contract": "vanish-batch-v1",
+        "contract": "vanish-batch-v2",
         "max_hashes": MAX_BATCH_CLEANUP_HASHES,
+        "deadline_seconds": cleanup::CLEANUP_REQUEST_DEADLINE.as_secs(),
         "vanish_audit": "authenticated-v1",
         "delivery_probe": "authenticated-v1",
     }))
@@ -2099,6 +2101,7 @@ mod tests {
         let completed = crate::cleanup::HashCleanupResult {
             hash: "a".repeat(64),
             status: crate::cleanup::CleanupStatus::Completed,
+            main_deleted_or_absent: true,
             deleted: 1,
             absent: 0,
             failures: Vec::new(),
@@ -2106,6 +2109,7 @@ mod tests {
         let retryable = crate::cleanup::HashCleanupResult {
             hash: "b".repeat(64),
             status: crate::cleanup::CleanupStatus::Retryable,
+            main_deleted_or_absent: true,
             deleted: 0,
             absent: 1,
             failures: vec!["verification failed".to_string()],
