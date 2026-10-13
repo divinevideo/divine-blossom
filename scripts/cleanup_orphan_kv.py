@@ -47,6 +47,9 @@ class VanishRetryMarker(Enum):
     ERROR = "error"
 
 
+VANISH_IN_PROGRESS_VALUE = {"version": 1, "state": "in_progress"}
+
+
 @dataclass(frozen=True)
 class MetadataProbe:
     presence: Presence
@@ -308,8 +311,6 @@ def probe_vanish_retry_marker(
     store_id: str,
     blob_hash: str,
 ) -> VanishRetryMarker:
-    # TODO(#256): Replace list membership with a vanish-specific durable marker.
-    # Account vanish keeps these entries until all blob erasure work succeeds.
     metadata = probe_metadata(session, store_id, blob_hash)
     if (
         metadata.presence is not Presence.PRESENT
@@ -323,15 +324,110 @@ def probe_vanish_retry_marker(
     if refs_presence is Presence.ERROR:
         return VanishRetryMarker.ERROR
 
-    # Do not cache lists across candidates: each repair mutates them, and a
-    # concurrent vanish must be visible to the next candidate's live probe.
-    for pubkey in dict.fromkeys([metadata.owner, *referrers]):
+    # Do not cache markers across candidates. A concurrent vanish must be
+    # visible immediately before each metadata mutation.
+    pubkeys = list(dict.fromkeys([metadata.owner, *referrers]))
+    for pubkey in pubkeys:
+        marker = probe_consistently(
+            lambda: probe_vanish_in_progress(session, store_id, pubkey)
+        )
+        if marker is not VanishRetryMarker.ABSENT:
+            return marker
+
+    # TODO(#246): Remove this fallback after all audit state created before the
+    # dedicated marker deployment has aged out.
+    for pubkey in pubkeys:
+        for initiator in ("account", "admin"):
+            marker = probe_consistently(
+                lambda: probe_legacy_vanish_audit(session, store_id, pubkey, initiator)
+            )
+            if marker is not VanishRetryMarker.ABSENT:
+                return marker
+
+    # Marker reads cannot reserve absent state until the later repair request.
+    # Keep list membership as the final fail-closed boundary: account erasure
+    # discovers retry work through these lists, so reconciliation must not
+    # remove an entry that erasure can still depend on.
+    for pubkey in pubkeys:
         list_presence, hashes = probe_json_list(session, store_id, f"list:{pubkey}")
         if list_presence is Presence.ERROR:
             return VanishRetryMarker.ERROR
         if blob_hash in hashes:
             return VanishRetryMarker.OUTSTANDING
+
     return VanishRetryMarker.ABSENT
+
+
+def probe_consistently(probe: Callable[[], VanishRetryMarker]) -> VanishRetryMarker:
+    first = probe()
+    second = probe()
+    if first is VanishRetryMarker.ERROR or second is VanishRetryMarker.ERROR:
+        return VanishRetryMarker.ERROR
+    if first is not second:
+        return VanishRetryMarker.ERROR
+    return first
+
+
+def probe_vanish_in_progress(
+    session: requests.Session,
+    store_id: str,
+    pubkey: str,
+) -> VanishRetryMarker:
+    encoded_key = requests.utils.quote(f"vanish_in_progress:v1:{pubkey}", safe="")
+    try:
+        response = session.get(
+            f"https://api.fastly.com/resources/stores/kv/{store_id}/keys/{encoded_key}",
+            timeout=15,
+        )
+        if response.status_code == 404:
+            return VanishRetryMarker.ABSENT
+        response.raise_for_status()
+        if response.json() != VANISH_IN_PROGRESS_VALUE:
+            return VanishRetryMarker.ERROR
+        return VanishRetryMarker.OUTSTANDING
+    except (requests.RequestException, ValueError):
+        return VanishRetryMarker.ERROR
+
+
+def probe_legacy_vanish_audit(
+    session: requests.Session,
+    store_id: str,
+    pubkey: str,
+    initiator: str,
+) -> VanishRetryMarker:
+    encoded_key = requests.utils.quote(
+        f"vanish_audit:v1:{pubkey}:{initiator}", safe=""
+    )
+    try:
+        response = session.get(
+            f"https://api.fastly.com/resources/stores/kv/{store_id}/keys/{encoded_key}",
+            timeout=15,
+        )
+        if response.status_code == 404:
+            return VanishRetryMarker.ABSENT
+        response.raise_for_status()
+        payload = response.json()
+        completed_at = payload.get("completed_at") if isinstance(payload, dict) else False
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("operation_id"), str)
+            or not payload["operation_id"]
+            or not isinstance(payload.get("authorized_at"), str)
+            or not payload["authorized_at"]
+            or not isinstance(payload.get("authorized_delivered"), bool)
+            or not (
+                completed_at is None
+                or (isinstance(completed_at, str) and bool(completed_at))
+            )
+        ):
+            return VanishRetryMarker.ERROR
+        return (
+            VanishRetryMarker.OUTSTANDING
+            if completed_at is None
+            else VanishRetryMarker.ABSENT
+        )
+    except (requests.RequestException, ValueError, KeyError):
+        return VanishRetryMarker.ERROR
 
 
 def get_bucket(client: object, bucket_name: str, not_found_type: type[Exception]) -> object:
@@ -491,6 +587,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         type=int,
         help="Exact missing_bytes count from a prior read-only scan",
     )
+    # TODO(#246): Remove this confirmation with the legacy audit fallback.
+    parser.add_argument(
+        "--confirm-pre-marker-vanish-retries-cleared",
+        action="store_true",
+        help="Confirm all erasures started before marker deployment were retried",
+    )
     return parser.parse_args(argv)
 
 
@@ -511,6 +613,8 @@ def validate_cli_request(args: argparse.Namespace) -> Optional[str]:
             return "--max-repairs requires --repair-missing-bytes"
         if args.confirm_missing_count is not None:
             return "--confirm-missing-count requires --repair-missing-bytes"
+        if args.confirm_pre_marker_vanish_retries_cleared:
+            return "--confirm-pre-marker-vanish-retries-cleared requires --repair-missing-bytes"
     else:
         if not args.hash_file:
             return "--repair-missing-bytes requires --hash-file; --all is read-only"
@@ -518,6 +622,11 @@ def validate_cli_request(args: argparse.Namespace) -> Optional[str]:
             return "--limit cannot be used with --repair-missing-bytes"
         if not args.public_endpoint:
             return "--repair-missing-bytes requires --public-endpoint"
+        if not args.confirm_pre_marker_vanish_retries_cleared:
+            return (
+                "--repair-missing-bytes requires "
+                "--confirm-pre-marker-vanish-retries-cleared"
+            )
         repair_error = validate_repair_parameters(
             args.max_repairs, args.confirm_missing_count
         )
