@@ -7,6 +7,7 @@ use blossom_core::read_through::{
     check_mirror_response, object_path, parse_bool_flag, replica_delete_outcome,
     write_back_decision, ReplicaDeleteOutcome, MAX_WRITE_BACK_BYTES, SOURCE_FOS, SOURCE_GCS,
 };
+use blossom_core::storage_origin::{MediaReadPolicy, StorageProvider};
 use fastly::http::{Method, StatusCode};
 use fastly::{Backend, Body, Request, Response};
 use hmac::{Hmac, Mac};
@@ -19,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Backend name (must match fastly.toml)
 const GCS_BACKEND: &str = "gcs_storage";
+const B2_MEDIA_BACKEND: &str = "b2_storage";
 
 /// Fastly Object Storage backend name (must exist on the service).
 const FOS_BACKEND: &str = "fos_storage";
@@ -145,6 +147,19 @@ struct S3Config {
 }
 
 impl S3Config {
+    fn load_b2_media() -> Result<Self> {
+        let region = get_config("b2_media_region")?;
+        let host =
+            StorageProvider::b2_host(&region).map_err(|e| BlossomError::StorageError(e.into()))?;
+        Ok(Self {
+            access_key: get_secret("b2_media_access_key")?,
+            secret_key: get_secret("b2_media_secret_key")?,
+            bucket: get_config("b2_media_bucket")?,
+            host,
+            region,
+        })
+    }
+
     fn load_gcs() -> Result<Self> {
         Ok(S3Config {
             access_key: get_secret("gcs_access_key")?,
@@ -184,6 +199,95 @@ impl S3Config {
     fn object_path(&self, key: &str) -> String {
         object_path(&self.bucket, key)
     }
+}
+
+fn media_read_policy() -> Result<MediaReadPolicy> {
+    MediaReadPolicy::parse(
+        get_config("media_read_primary").ok().as_deref(),
+        get_config("gcs_fallback_enabled").ok().as_deref(),
+    )
+    .map_err(|e| BlossomError::StorageError(e.into()))
+}
+
+fn build_media_read_request(
+    config: &S3Config,
+    key: &str,
+    range: Option<&str>,
+    immutable: bool,
+    uncached: bool,
+) -> Result<Request> {
+    let mut req = Request::get(format!("{}{}", config.endpoint(), config.object_path(key)));
+    req.set_header("Host", config.host());
+    if let Some(range) = range {
+        req.set_header("Range", range);
+    }
+    sign_request(&mut req, config, Some("UNSIGNED-PAYLOAD".into()))?;
+    if uncached {
+        req.set_pass(true);
+    } else if immutable {
+        enable_immutable_storage_cache(&mut req, key);
+    }
+    Ok(req)
+}
+
+enum MediaFetchError {
+    Configuration(BlossomError),
+    Transport,
+}
+
+impl MediaFetchError {
+    fn into_storage_error(self) -> BlossomError {
+        match self {
+            Self::Configuration(error) => error,
+            Self::Transport => BlossomError::StorageError("media origin request failed".into()),
+        }
+    }
+}
+
+fn fetch_media_origin(
+    provider: StorageProvider,
+    key: &str,
+    range: Option<&str>,
+    immutable: bool,
+    uncached: bool,
+) -> std::result::Result<Response, MediaFetchError> {
+    let (config, backend) = match provider {
+        StorageProvider::Gcs => (S3Config::load_gcs(), GCS_BACKEND),
+        StorageProvider::B2 => (S3Config::load_b2_media(), B2_MEDIA_BACKEND),
+    };
+    let config = config.map_err(MediaFetchError::Configuration)?;
+    let req = build_media_read_request(&config, key, range, immutable, uncached)
+        .map_err(MediaFetchError::Configuration)?;
+    let mut response = req.send(backend).map_err(|_| MediaFetchError::Transport)?;
+    if immutable {
+        preserve_storage_cache_state(&mut response);
+    }
+    Ok(response)
+}
+
+/// Callers enforce viewer policy before entering this provider-only boundary.
+/// Configuration/auth failures are not interpreted as an object being absent.
+fn download_media_object(
+    key: &str,
+    range: Option<&str>,
+    immutable: bool,
+    uncached: bool,
+) -> Result<(Response, &'static str)> {
+    let policy = media_read_policy()?;
+    let response = fetch_media_origin(policy.primary, key, range, immutable, uncached);
+    let should_fallback = match &response {
+        Ok(resp) => policy.should_fallback(resp.get_status().as_u16()),
+        Err(MediaFetchError::Transport) => policy.should_fallback(503),
+        Err(MediaFetchError::Configuration(_)) => false,
+    };
+    if should_fallback {
+        let resp = fetch_media_origin(StorageProvider::Gcs, key, range, immutable, uncached)
+            .map_err(MediaFetchError::into_storage_error)?;
+        return Ok((resp, SOURCE_GCS));
+    }
+    response
+        .map(|resp| (resp, policy.primary.name()))
+        .map_err(MediaFetchError::into_storage_error)
 }
 
 /// Upload a blob to GCS (simple PUT for small files)
@@ -230,20 +334,11 @@ pub fn upload_blob(
     Ok(())
 }
 
-/// Download a thumbnail from GCS (stored as {hash}.jpg)
+/// Derivatives stay on the writer's origin until derivative replication ships.
+/// Download a thumbnail from GCS (stored as {hash}.jpg).
 pub fn download_thumbnail(gcs_key: &str) -> Result<Response> {
-    let config = S3Config::load_gcs()?;
-    let path = format!("/{}/{}", config.bucket, gcs_key);
-    let url = format!("{}{}", config.endpoint(), path);
-
-    let mut req = Request::new(Method::GET, &url);
-    req.set_header("Host", config.host());
-
-    sign_request(&mut req, &config, Some("UNSIGNED-PAYLOAD".into()))?;
-
-    let resp = req
-        .send(GCS_BACKEND)
-        .map_err(|e| BlossomError::StorageError(format!("Failed to download thumbnail: {}", e)))?;
+    let resp = fetch_media_origin(StorageProvider::Gcs, gcs_key, None, false, false)
+        .map_err(MediaFetchError::into_storage_error)?;
 
     match resp.get_status() {
         StatusCode::OK => Ok(resp),
@@ -258,22 +353,8 @@ pub fn download_thumbnail(gcs_key: &str) -> Result<Response> {
 /// Download HLS content from GCS (manifests and segments)
 /// gcs_key format: {hash}/hls/{filename}
 pub fn download_hls_from_gcs(gcs_key: &str, range: Option<&str>) -> Result<Response> {
-    let config = S3Config::load_gcs()?;
-    let path = format!("/{}/{}", config.bucket, gcs_key);
-    let url = format!("{}{}", config.endpoint(), path);
-
-    let mut req = Request::new(Method::GET, &url);
-    req.set_header("Host", config.host());
-
-    if let Some(range_value) = range {
-        req.set_header("Range", range_value);
-    }
-
-    sign_request(&mut req, &config, Some("UNSIGNED-PAYLOAD".into()))?;
-
-    let resp = req.send(GCS_BACKEND).map_err(|e| {
-        BlossomError::StorageError(format!("Failed to download HLS content: {}", e))
-    })?;
+    let resp = fetch_media_origin(StorageProvider::Gcs, gcs_key, range, false, false)
+        .map_err(MediaFetchError::into_storage_error)?;
 
     match resp.get_status() {
         StatusCode::OK | StatusCode::PARTIAL_CONTENT => Ok(resp),
@@ -297,22 +378,8 @@ pub fn download_transcript_uncached_from_gcs(gcs_key: &str) -> Result<Response> 
 }
 
 fn download_transcript_object_from_gcs(gcs_key: &str, uncached: bool) -> Result<Response> {
-    let config = S3Config::load_gcs()?;
-    let path = format!("/{}/{}", config.bucket, gcs_key);
-    let url = format!("{}{}", config.endpoint(), path);
-
-    let mut req = Request::new(Method::GET, &url);
-    req.set_header("Host", config.host());
-
-    sign_request(&mut req, &config, Some("UNSIGNED-PAYLOAD".into()))?;
-
-    if uncached {
-        req.set_pass(true);
-    }
-
-    let resp = req.send(GCS_BACKEND).map_err(|e| {
-        BlossomError::StorageError(format!("Failed to download transcript content: {}", e))
-    })?;
+    let resp = fetch_media_origin(StorageProvider::Gcs, gcs_key, None, false, uncached)
+        .map_err(MediaFetchError::into_storage_error)?;
 
     match resp.get_status() {
         StatusCode::OK => Ok(resp),
@@ -328,25 +395,11 @@ fn download_transcript_object_from_gcs(gcs_key: &str, uncached: bool) -> Result<
 
 /// Download a blob from GCS (returns the response to stream back)
 pub fn download_blob(hash: &str, range: Option<&str>) -> Result<Response> {
-    let config = S3Config::load_gcs()?;
-    let url = format!("{}{}", config.endpoint(), config.object_path(hash));
+    let (resp, _) = download_media_object(hash, range, true, false)?;
+    blob_download_response(resp)
+}
 
-    let mut req = Request::new(Method::GET, &url);
-    req.set_header("Host", config.host());
-
-    if let Some(range_value) = range {
-        req.set_header("Range", range_value);
-    }
-
-    // Sign the request
-    sign_request(&mut req, &config, Some("UNSIGNED-PAYLOAD".into()))?;
-    enable_immutable_storage_cache(&mut req, hash);
-
-    let mut resp = req
-        .send(GCS_BACKEND)
-        .map_err(|e| BlossomError::StorageError(format!("Failed to download: {}", e)))?;
-    preserve_storage_cache_state(&mut resp);
-
+fn blob_download_response(resp: Response) -> Result<Response> {
     let status = resp.get_status();
     match status {
         StatusCode::OK | StatusCode::PARTIAL_CONTENT => Ok(resp),
@@ -384,19 +437,23 @@ pub fn download_blob_with_fallback(
     hash: &str,
     range: Option<&str>,
 ) -> Result<FallbackDownloadResult> {
-    // Try GCS first
-    match download_blob(hash, range) {
-        Ok(resp) => {
+    match download_media_object(hash, range, true, false)
+        .and_then(|(resp, source)| blob_download_response(resp).map(|resp| (resp, source)))
+    {
+        Ok((resp, source)) => {
             return Ok(FallbackDownloadResult {
                 response: resp,
-                source: SOURCE_GCS.to_string(),
+                source: source.to_string(),
                 diagnostics: None,
             });
         }
         Err(BlossomError::NotFound(_)) => {
             // Continue to fallback
         }
-        Err(_e) => {
+        Err(error) => {
+            if FALLBACK_BACKENDS.is_empty() {
+                return Err(error);
+            }
             // For non-404 errors, still try fallbacks
             // This handles cases where GCS is temporarily unavailable
         }
@@ -762,6 +819,8 @@ pub fn download_blob_read_through(
     if result.source == SOURCE_GCS {
         diagnostics.gcs_fetch_ms = Some(started.elapsed().as_millis());
         diagnostics.source = Some(SOURCE_GCS);
+    } else if result.source == "b2" {
+        diagnostics.source = Some("b2");
     } else {
         diagnostics.source = Some("fallback");
     }
@@ -1296,9 +1355,15 @@ fn delete_b2_version_page(
     let mut pending = Vec::with_capacity(versions.len());
     for version in versions {
         let request = build_b2_delete_version_request(authorization, version)?;
-        pending.push(request.send_async(authorization.backend.clone()).map_err(|error| {
-            BlossomError::StorageError(format!("B2 version delete failed to start: {error}"))
-        })?);
+        pending.push(
+            request
+                .send_async(authorization.backend.clone())
+                .map_err(|error| {
+                    BlossomError::StorageError(format!(
+                        "B2 version delete failed to start: {error}"
+                    ))
+                })?,
+        );
     }
     let mut failed = false;
     while !pending.is_empty() {
@@ -1401,12 +1466,10 @@ fn bunny_delivery_zones() -> Result<Vec<String>> {
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
         })
     {
-        return Err(BlossomError::StorageError(
-            format!(
-                "bunny_delivery_zones must contain one or two comma-separated hostnames (got {})",
-                zones.len()
-            ),
-        ));
+        return Err(BlossomError::StorageError(format!(
+            "bunny_delivery_zones must contain one or two comma-separated hostnames (got {})",
+            zones.len()
+        )));
     }
     Ok(zones)
 }
@@ -1515,10 +1578,7 @@ fn multi_delete_body(keys: &[String]) -> String {
     xml
 }
 
-fn plan_vanish_delete_batches(
-    hashes: &[String],
-    local_mode: bool,
-) -> Vec<VanishDeleteBatch> {
+fn plan_vanish_delete_batches(hashes: &[String], local_mode: bool) -> Vec<VanishDeleteBatch> {
     let mut batches = Vec::new();
     let stage = if local_mode {
         "gcs_main"
@@ -2757,10 +2817,7 @@ fn audit_log_entry(
             "actor_pubkey".into(),
             serde_json::Value::String(actor_pubkey.into()),
         ),
-        (
-            "timestamp".into(),
-            serde_json::Value::String(timestamp),
-        ),
+        ("timestamp".into(), serde_json::Value::String(timestamp)),
     ]);
     if let Some(auth_event) = auth_event_json.and_then(|value| serde_json::from_str(value).ok()) {
         entry.insert("auth_event".into(), auth_event);
@@ -3101,11 +3158,8 @@ fn trigger_cloud_run_delete_blobs(hashes: &[String]) -> Result<CloudBatchCleanup
     let expected_bucket = get_config("gcs_bucket")?;
     let mut outcome = CloudBatchCleanupOutcome::default();
     for chunk in plan_cloud_run_delete_chunks(hashes) {
-        let chunk_outcome = trigger_cloud_run_delete_blobs_chunk(
-            chunk,
-            &webhook_secret,
-            &expected_bucket,
-        )?;
+        let chunk_outcome =
+            trigger_cloud_run_delete_blobs_chunk(chunk, &webhook_secret, &expected_bucket)?;
         outcome.failed_hashes.extend(chunk_outcome.failed_hashes);
         outcome.main_failures.extend(chunk_outcome.main_failures);
     }
@@ -3465,9 +3519,8 @@ pub fn check_funnelcake_audio_reuse(hash: &str) -> Result<bool> {
         return Ok(true);
     }
 
-    let funnelcake_url = get_config("funnelcake_api_url").map_err(|_| {
-        BlossomError::Internal("Funnelcake API URL not configured".into())
-    })?;
+    let funnelcake_url = get_config("funnelcake_api_url")
+        .map_err(|_| BlossomError::Internal("Funnelcake API URL not configured".into()))?;
 
     let url = format!(
         "{}/api/videos/by-sha256/{}/audio-reuse",
@@ -3484,9 +3537,9 @@ pub fn check_funnelcake_audio_reuse(hash: &str) -> Result<bool> {
         req.set_header("Host", host);
     }
 
-    let mut resp = req.send(FUNNELCAKE_BACKEND).map_err(|e| {
-        BlossomError::Internal(format!("Funnelcake unavailable: {}", e))
-    })?;
+    let mut resp = req
+        .send(FUNNELCAKE_BACKEND)
+        .map_err(|e| BlossomError::Internal(format!("Funnelcake unavailable: {}", e)))?;
 
     match resp.get_status() {
         StatusCode::OK => {
@@ -3504,9 +3557,8 @@ pub fn check_funnelcake_audio_reuse(hash: &str) -> Result<bool> {
 /// Trigger Cloud Run audio extraction endpoint (synchronous - waits for result).
 /// Returns the audio extraction response from Cloud Run.
 pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtractionResponse> {
-    let webhook_secret = get_secret("webhook_secret").map_err(|_| {
-        BlossomError::Internal("webhook_secret not configured".into())
-    })?;
+    let webhook_secret = get_secret("webhook_secret")
+        .map_err(|_| BlossomError::Internal("webhook_secret not configured".into()))?;
 
     let body = serde_json::json!({
         "sha256": hash,
@@ -3528,13 +3580,11 @@ pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtracti
     let resp_body = resp.take_body().into_string();
 
     match status {
-        StatusCode::OK => serde_json::from_str::<AudioExtractionResponse>(&resp_body)
-            .map_err(|e| {
-                BlossomError::Internal(format!(
-                    "Failed to parse audio extraction response: {}",
-                    e
-                ))
-            }),
+        StatusCode::OK => {
+            serde_json::from_str::<AudioExtractionResponse>(&resp_body).map_err(|e| {
+                BlossomError::Internal(format!("Failed to parse audio extraction response: {}", e))
+            })
+        }
         StatusCode::UNPROCESSABLE_ENTITY => {
             let error = parse_audio_extraction_error_response(&resp_body)
                 .unwrap_or_else(|| "extraction_failed".to_string());
@@ -3555,6 +3605,65 @@ pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtracti
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires synthetic storage backends; run-media-origin-tests.py"]
+    fn media_origin_routing_contract() {
+        let (mut response, source) = super::download_media_object("hit", None, false, false).unwrap();
+        assert_eq!(source, "b2");
+        assert_eq!(response.take_body().into_string(), "b2 bytes");
+        let (mut response, source) = super::download_media_object("missing", None, false, false).unwrap();
+        assert_eq!(source, "gcs");
+        assert_eq!(response.take_body().into_string(), "gcs bytes");
+        let (response, source) = super::download_media_object("transient", Some("bytes=1-3"), false, false).unwrap();
+        assert_eq!(source, "gcs");
+        assert_eq!(response.get_status(), fastly::http::StatusCode::PARTIAL_CONTENT);
+        let (response, source) = super::download_media_object("forbidden", None, false, false).unwrap();
+        assert_eq!(source, "b2");
+        assert_eq!(response.get_status(), fastly::http::StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    #[ignore = "requires synthetic storage backends; run-media-origin-tests.py"]
+    fn media_origin_disabled_fallback_contract() {
+        let (response, source) = super::download_media_object("missing", None, false, false).unwrap();
+        assert_eq!(source, "b2");
+        assert_eq!(response.get_status(), fastly::http::StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    #[ignore = "requires synthetic config store; run-media-origin-tests.py"]
+    fn media_origin_invalid_config_contract() {
+        assert!(super::download_media_object("hit", None, false, false).is_err());
+    }
+
+    #[test]
+    fn b2_media_read_signs_region_and_preserves_range() {
+        let config = super::S3Config {
+            access_key: "synthetic-access".into(),
+            secret_key: "synthetic-secret".into(),
+            bucket: "synthetic-authority".into(),
+            host: "s3.us-west-004.backblazeb2.com".into(),
+            region: "us-west-004".into(),
+        };
+        let req = super::build_media_read_request(
+            &config,
+            "abc/hls/main.ts",
+            Some("bytes=1-3"),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            req.get_url().as_str(),
+            "https://s3.us-west-004.backblazeb2.com/synthetic-authority/abc/hls/main.ts"
+        );
+        assert_eq!(req.get_header_str("Range"), Some("bytes=1-3"));
+        assert!(req
+            .get_header_str("Authorization")
+            .unwrap()
+            .contains("/us-west-004/s3/aws4_request"));
+    }
+
     use super::{
         audit_log_entry, b2_api_host, b2_delete_version_succeeded, b2_dynamic_backend_name,
         b2_prefix_page, build_b2_delete_version_request, build_b2_list_versions_request,
@@ -3991,12 +4100,9 @@ mod tests {
         assert_eq!(list_body["startFileName"], "next-name");
         assert_eq!(list_body["startFileId"], "next-id");
 
-        let mut initial = build_b2_list_versions_request(
-            &authorization,
-            &hash,
-            Some((&hash, None)),
-        )
-        .expect("initial list request");
+        let mut initial =
+            build_b2_list_versions_request(&authorization, &hash, Some((&hash, None)))
+                .expect("initial list request");
         let initial_body: serde_json::Value =
             serde_json::from_str(&initial.take_body().into_string()).expect("initial list JSON");
         assert_eq!(initial_body["startFileName"], hash);

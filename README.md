@@ -114,6 +114,10 @@ Configuration is split across the Fastly config store (non-secret) and secret st
 |-----|-------------|
 | `gcs_bucket` | GCS bucket name (`divine-blossom-media`) |
 | `gcs_project_id` | GCP project ID |
+| `media_read_primary` | `gcs` (default) or `b2`. Controls immutable original reads only; does not move writes, derivatives, or coordination. |
+| `gcs_fallback_enabled` | `true` (default) or `false`. With B2 reads, permit GCS fallback on 404, 5xx, or transport failure. Authentication failures do not fall back. |
+| `b2_media_bucket` | Private authoritative B2 bucket for migrated Blossom media; separate from the approved-only delivery replica. |
+| `b2_media_region` | Verified account region used for B2 S3 signing and its endpoint. The `b2_storage` backend must target that endpoint with matching TLS/SNI. |
 | `funnelcake_api_url` | Funnelcake permission API base URL |
 | `b2_replica_enabled` | Enables the approved-only B2 replica and makes Native API version erasure plus bunny cache purge mandatory for vanish. Defaults off. |
 | `b2_bucket_id` | Bucket ID for the approved-only B2 replica. |
@@ -127,12 +131,32 @@ Configuration is split across the Fastly config store (non-secret) and secret st
 |-----|-------------|
 | `gcs_access_key` | GCS HMAC access key |
 | `gcs_secret_key` | GCS HMAC secret key |
+| `b2_media_access_key` | Bucket-scoped, read-only S3 application key ID for the authoritative media bucket. |
+| `b2_media_secret_key` | Secret for the read-only B2 media key. Never use the broad development key. |
 | `moderation_api_token` | Bearer token for the Divine moderation API |
 | `b2_vanish_application_key_id` | Dedicated B2 application key ID restricted to `b2_bucket_id` with exactly `listFiles` and `deleteFiles`. |
 | `b2_vanish_application_key` | Secret for the dedicated B2 vanish application key. |
 | `bunny_api_key` | bunny control-plane key used to purge B2-backed delivery zones. |
 
 ### Backends
+
+The optional `b2_storage` backend is needed only when `media_read_primary=b2`.
+Keep rollout on GCS until the target inventory, checksum-verified copies,
+all-version authoritative-bucket erasure, and rollback drills are complete.
+The existing `b2_replica_enabled` gate covers the delivery replica; it does not
+establish erasure coverage for a separate authoritative bucket. Do not enable
+the read switch until that independent coverage is verified. Turning reads back
+to GCS never removes the obligation to erase copies already stored in B2.
+HLS, thumbnails and transcripts continue reading GCS while their writers remain
+there. Moving mutable derivative reads requires replication on every update;
+copying them once and preferring B2 would serve stale edits after a purge.
+
+For a read-only account inventory, run `python3 scripts/storage_inventory.py`
+through the approved credential wrapper. It reads `B2_APPLICATION_KEY_ID`,
+`B2_APPLICATION_KEY`, and `BUNNY_API_KEY` from its environment and emits only
+selected resource metadata. Missing provider access is reported explicitly and
+exits nonzero. Never redirect full provider API responses into review artifacts.
+Optional `--gcs-bucket` arguments inspect metadata using existing gcloud access.
 
 Required backend names are mirrored in `fastly.toml.example`: `gcs_storage` (GCS), `b2_api` (Backblaze account authorization), `bunny_api` (delivery-zone purge API), the CDN fallback chain (`cdn_divine`, `blossom_divine`, `cdn_satellite`, `nostr_build`), `upload_service` (large-upload/resumable control plane), `moderation_api`, and `funnelcake_api`. The service must permit dynamic backends before `b2_replica_enabled` is turned on because Backblaze returns a per-account API host for version listing and deletion.
 
