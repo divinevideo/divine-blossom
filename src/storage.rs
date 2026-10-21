@@ -281,6 +281,11 @@ fn download_media_object(
         Err(MediaFetchError::Configuration(_)) => false,
     };
     if should_fallback {
+        let cause = match &response {
+            Ok(response) => format!("http_{}", response.get_status().as_u16()),
+            Err(_) => "transport".to_string(),
+        };
+        eprintln!("[MEDIA_ORIGIN] primary=b2 fallback=gcs cause={cause}");
         let resp = fetch_media_origin(StorageProvider::Gcs, key, range, immutable, uncached)
             .map_err(MediaFetchError::into_storage_error)?;
         return Ok((resp, SOURCE_GCS));
@@ -437,7 +442,16 @@ pub fn download_blob_with_fallback(
     hash: &str,
     range: Option<&str>,
 ) -> Result<FallbackDownloadResult> {
-    match download_media_object(hash, range, true, false)
+    download_blob_with_fallback_impl(hash, range, true)
+}
+
+fn download_blob_with_fallback_impl(
+    hash: &str,
+    range: Option<&str>,
+    immutable: bool,
+) -> Result<FallbackDownloadResult> {
+    let primary = media_read_policy()?.primary;
+    match download_media_object(hash, range, immutable, false)
         .and_then(|(resp, source)| blob_download_response(resp).map(|resp| (resp, source)))
     {
         Ok((resp, source)) => {
@@ -451,11 +465,12 @@ pub fn download_blob_with_fallback(
             // Continue to fallback
         }
         Err(error) => {
-            if FALLBACK_BACKENDS.is_empty() {
+            if primary != StorageProvider::Gcs && FALLBACK_BACKENDS.is_empty() {
                 return Err(error);
             }
-            // For non-404 errors, still try fallbacks
-            // This handles cases where GCS is temporarily unavailable
+            // Preserve the existing GCS error-to-not-found mapping while B2 is
+            // inactive. B2 errors retain their status instead of masking setup
+            // and authentication failures as an absent object.
         }
     }
 
@@ -1355,15 +1370,9 @@ fn delete_b2_version_page(
     let mut pending = Vec::with_capacity(versions.len());
     for version in versions {
         let request = build_b2_delete_version_request(authorization, version)?;
-        pending.push(
-            request
-                .send_async(authorization.backend.clone())
-                .map_err(|error| {
-                    BlossomError::StorageError(format!(
-                        "B2 version delete failed to start: {error}"
-                    ))
-                })?,
-        );
+        pending.push(request.send_async(authorization.backend.clone()).map_err(|error| {
+            BlossomError::StorageError(format!("B2 version delete failed to start: {error}"))
+        })?);
     }
     let mut failed = false;
     while !pending.is_empty() {
@@ -1466,10 +1475,12 @@ fn bunny_delivery_zones() -> Result<Vec<String>> {
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
         })
     {
-        return Err(BlossomError::StorageError(format!(
-            "bunny_delivery_zones must contain one or two comma-separated hostnames (got {})",
-            zones.len()
-        )));
+        return Err(BlossomError::StorageError(
+            format!(
+                "bunny_delivery_zones must contain one or two comma-separated hostnames (got {})",
+                zones.len()
+            ),
+        ));
     }
     Ok(zones)
 }
@@ -1578,7 +1589,10 @@ fn multi_delete_body(keys: &[String]) -> String {
     xml
 }
 
-fn plan_vanish_delete_batches(hashes: &[String], local_mode: bool) -> Vec<VanishDeleteBatch> {
+fn plan_vanish_delete_batches(
+    hashes: &[String],
+    local_mode: bool,
+) -> Vec<VanishDeleteBatch> {
     let mut batches = Vec::new();
     let stage = if local_mode {
         "gcs_main"
@@ -2817,7 +2831,10 @@ fn audit_log_entry(
             "actor_pubkey".into(),
             serde_json::Value::String(actor_pubkey.into()),
         ),
-        ("timestamp".into(), serde_json::Value::String(timestamp)),
+        (
+            "timestamp".into(),
+            serde_json::Value::String(timestamp),
+        ),
     ]);
     if let Some(auth_event) = auth_event_json.and_then(|value| serde_json::from_str(value).ok()) {
         entry.insert("auth_event".into(), auth_event);
@@ -3158,8 +3175,11 @@ fn trigger_cloud_run_delete_blobs(hashes: &[String]) -> Result<CloudBatchCleanup
     let expected_bucket = get_config("gcs_bucket")?;
     let mut outcome = CloudBatchCleanupOutcome::default();
     for chunk in plan_cloud_run_delete_chunks(hashes) {
-        let chunk_outcome =
-            trigger_cloud_run_delete_blobs_chunk(chunk, &webhook_secret, &expected_bucket)?;
+        let chunk_outcome = trigger_cloud_run_delete_blobs_chunk(
+            chunk,
+            &webhook_secret,
+            &expected_bucket,
+        )?;
         outcome.failed_hashes.extend(chunk_outcome.failed_hashes);
         outcome.main_failures.extend(chunk_outcome.main_failures);
     }
@@ -3519,8 +3539,9 @@ pub fn check_funnelcake_audio_reuse(hash: &str) -> Result<bool> {
         return Ok(true);
     }
 
-    let funnelcake_url = get_config("funnelcake_api_url")
-        .map_err(|_| BlossomError::Internal("Funnelcake API URL not configured".into()))?;
+    let funnelcake_url = get_config("funnelcake_api_url").map_err(|_| {
+        BlossomError::Internal("Funnelcake API URL not configured".into())
+    })?;
 
     let url = format!(
         "{}/api/videos/by-sha256/{}/audio-reuse",
@@ -3537,9 +3558,9 @@ pub fn check_funnelcake_audio_reuse(hash: &str) -> Result<bool> {
         req.set_header("Host", host);
     }
 
-    let mut resp = req
-        .send(FUNNELCAKE_BACKEND)
-        .map_err(|e| BlossomError::Internal(format!("Funnelcake unavailable: {}", e)))?;
+    let mut resp = req.send(FUNNELCAKE_BACKEND).map_err(|e| {
+        BlossomError::Internal(format!("Funnelcake unavailable: {}", e))
+    })?;
 
     match resp.get_status() {
         StatusCode::OK => {
@@ -3557,8 +3578,9 @@ pub fn check_funnelcake_audio_reuse(hash: &str) -> Result<bool> {
 /// Trigger Cloud Run audio extraction endpoint (synchronous - waits for result).
 /// Returns the audio extraction response from Cloud Run.
 pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtractionResponse> {
-    let webhook_secret = get_secret("webhook_secret")
-        .map_err(|_| BlossomError::Internal("webhook_secret not configured".into()))?;
+    let webhook_secret = get_secret("webhook_secret").map_err(|_| {
+        BlossomError::Internal("webhook_secret not configured".into())
+    })?;
 
     let body = serde_json::json!({
         "sha256": hash,
@@ -3580,11 +3602,13 @@ pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtracti
     let resp_body = resp.take_body().into_string();
 
     match status {
-        StatusCode::OK => {
-            serde_json::from_str::<AudioExtractionResponse>(&resp_body).map_err(|e| {
-                BlossomError::Internal(format!("Failed to parse audio extraction response: {}", e))
-            })
-        }
+        StatusCode::OK => serde_json::from_str::<AudioExtractionResponse>(&resp_body)
+            .map_err(|e| {
+                BlossomError::Internal(format!(
+                    "Failed to parse audio extraction response: {}",
+                    e
+                ))
+            }),
         StatusCode::UNPROCESSABLE_ENTITY => {
             let error = parse_audio_extraction_error_response(&resp_body)
                 .unwrap_or_else(|| "extraction_failed".to_string());
@@ -3617,9 +3641,14 @@ mod tests {
         let (response, source) = super::download_media_object("transient", Some("bytes=1-3"), false, false).unwrap();
         assert_eq!(source, "gcs");
         assert_eq!(response.get_status(), fastly::http::StatusCode::PARTIAL_CONTENT);
-        let (response, source) = super::download_media_object("forbidden", None, false, false).unwrap();
-        assert_eq!(source, "b2");
-        assert_eq!(response.get_status(), fastly::http::StatusCode::FORBIDDEN);
+        let error = match super::download_blob_with_fallback_impl("forbidden", None, false) {
+            Ok(_) => panic!("B2 authentication failure must not fall back"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status_code().as_u16(), 502);
+        let (mut response, source) = super::download_media_object("transport", None, false, false).unwrap();
+        assert_eq!(source, "gcs");
+        assert_eq!(response.take_body().into_string(), "gcs bytes");
     }
 
     #[test]
@@ -3634,6 +3663,28 @@ mod tests {
     #[ignore = "requires synthetic config store; run-media-origin-tests.py"]
     fn media_origin_invalid_config_contract() {
         assert!(super::download_media_object("hit", None, false, false).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires synthetic storage backends; run-media-origin-tests.py"]
+    fn media_origin_gcs_errors_contract() {
+        for key in ["forbidden", "unavailable", "invalid-range", "disconnect"] {
+            let error = match super::download_blob_with_fallback_impl(key, None, false) {
+                Ok(_) => panic!("expected legacy GCS failure"),
+                Err(error) => error,
+            };
+            assert_eq!(error.status_code().as_u16(), 404, "{key}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires synthetic config store; run-media-origin-tests.py"]
+    fn media_origin_gcs_missing_config_contract() {
+        let error = match super::download_blob_with_fallback_impl("hit", None, false) {
+            Ok(_) => panic!("expected missing GCS configuration"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status_code().as_u16(), 404);
     }
 
     #[test]
@@ -4100,9 +4151,12 @@ mod tests {
         assert_eq!(list_body["startFileName"], "next-name");
         assert_eq!(list_body["startFileId"], "next-id");
 
-        let mut initial =
-            build_b2_list_versions_request(&authorization, &hash, Some((&hash, None)))
-                .expect("initial list request");
+        let mut initial = build_b2_list_versions_request(
+            &authorization,
+            &hash,
+            Some((&hash, None)),
+        )
+        .expect("initial list request");
         let initial_body: serde_json::Value =
             serde_json::from_str(&initial.take_body().into_string()).expect("initial list JSON");
         assert_eq!(initial_body["startFileName"], hash);

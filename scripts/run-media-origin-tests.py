@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import socket
 import subprocess
 import tempfile
 import threading
@@ -19,11 +20,17 @@ class Storage(BaseHTTPRequestHandler):
         self.server.reads.append((bucket, key, self.headers.get("Range")))
         scope = "/us-west-004/s3/aws4_request" if bucket == "b2" else "/auto/s3/aws4_request"
         assert scope in self.headers.get("Authorization", "")
+        if key == "disconnect" or (bucket == "b2" and key == "transport"):
+            self.connection.shutdown(socket.SHUT_RDWR)
+            self.connection.close()
+            return
         status = 200
         if bucket == "b2":
             status = {"missing": 404, "transient": 503, "forbidden": 403}.get(key, 200)
         elif key == "transient":
             status = 206
+        else:
+            status = {"forbidden": 403, "unavailable": 503, "invalid-range": 416}.get(key, 200)
         body = f"{bucket} bytes".encode()
         self.send_response(status)
         self.send_header("Content-Length", str(len(body)))
@@ -65,13 +72,20 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                     ("media_origin_routing_contract", "b2", "true"),
                     ("media_origin_disabled_fallback_contract", "b2", "false"),
                     ("media_origin_invalid_config_contract", "invalid", "true"),
+                    ("media_origin_gcs_errors_contract", None, "true"),
+                    ("media_origin_gcs_missing_config_contract", None, "true"),
                 ]
                 for test, primary, fallback in cases:
-                    settings.write_text(json.dumps({
+                    values = {
                         "media_read_primary": primary, "gcs_fallback_enabled": fallback,
                         "gcs_bucket": "gcs", "b2_media_bucket": "b2",
                         "b2_media_region": "us-west-004",
-                    }))
+                    }
+                    if primary is None:
+                        del values["media_read_primary"]
+                    if test == "media_origin_gcs_missing_config_contract":
+                        del values["gcs_bucket"]
+                    settings.write_text(json.dumps(values))
                     before = len(server.reads)
                     result = subprocess.run([
                         "cargo", "test", "--locked", "--target", "wasm32-wasip1",
@@ -79,15 +93,21 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                     ], cwd=repo, env=env, capture_output=True, text=True, timeout=180)
                     if result.returncode or "test result: ok. 1 passed; 0 failed; 0 ignored;" not in result.stdout:
                         raise RuntimeError(result.stdout + result.stderr)
+                    if test == "media_origin_routing_contract":
+                        assert "primary=b2 fallback=gcs cause=transport" in result.stdout + result.stderr
                     reads = server.reads[before:]
                     if test == "media_origin_routing_contract":
                         assert reads == [
                             ("b2", "hit", None), ("b2", "missing", None), ("gcs", "missing", None),
                             ("b2", "transient", "bytes=1-3"), ("gcs", "transient", "bytes=1-3"),
                             ("b2", "forbidden", None),
+                            ("b2", "transport", None), ("gcs", "transport", None),
                         ], reads
                     elif test == "media_origin_disabled_fallback_contract":
                         assert reads == [("b2", "missing", None)], reads
+                    elif test == "media_origin_gcs_errors_contract":
+                        assert reads == [("gcs", key, None) for key in
+                                         ("forbidden", "unavailable", "invalid-range", "disconnect")], reads
                     else:
                         assert reads == [], reads
                     print(f"PASS {test}")
