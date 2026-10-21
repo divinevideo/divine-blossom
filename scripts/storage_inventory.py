@@ -125,7 +125,9 @@ def main():
         except (InventoryError, OSError, ValueError, subprocess.TimeoutExpired):
             result["gcs"].append({"name": bucket, "status": "unavailable"})
     print(json.dumps(result, indent=2, sort_keys=True))
-    return 0 if any(result[provider]["status"] == "ok" for provider in ("b2", "bunny")) else 2
+    complete = all(result[provider]["status"] == "ok" for provider in ("b2", "bunny"))
+    complete = complete and all(bucket.get("status") != "unavailable" for bucket in result["gcs"])
+    return 0 if complete else 2
 
 
 if __name__ == "__main__":

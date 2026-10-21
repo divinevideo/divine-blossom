@@ -1,6 +1,9 @@
 import importlib.util
 from pathlib import Path
 import unittest
+import contextlib
+import io
+from types import SimpleNamespace
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("storage_inventory", Path(__file__).resolve().parents[1] / "storage_inventory.py")
@@ -9,6 +12,22 @@ spec.loader.exec_module(inventory)
 
 
 class InventoryTest(unittest.TestCase):
+    def test_partial_provider_inventory_is_not_success(self):
+        for missing in ["not_configured", "unavailable"]:
+            data = {"b2": {"status": missing}, "bunny": {"status": "ok", "zones": []}}
+            with patch.object(inventory, "collect_inventory", return_value=data), patch("sys.argv", ["storage_inventory.py"]), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(inventory.main(), 2)
+
+    def test_requested_gcs_failure_is_not_success(self):
+        data = {"b2": {"status": "ok"}, "bunny": {"status": "ok"}}
+        with patch.object(inventory, "collect_inventory", return_value=data), patch("sys.argv", ["storage_inventory.py", "--gcs-bucket", "synthetic-bucket"]), patch.object(inventory.subprocess, "run", return_value=SimpleNamespace(returncode=1, stdout="")), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(inventory.main(), 2)
+
+    def test_complete_inventory_succeeds(self):
+        data = {"b2": {"status": "ok"}, "bunny": {"status": "ok"}}
+        with patch.object(inventory, "collect_inventory", return_value=data), patch("sys.argv", ["storage_inventory.py"]), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(inventory.main(), 0)
+
     def test_cdn_inventory_never_returns_signing_keys_or_signed_query(self):
         zone = {"Id": 1, "Name": "synthetic", "OriginUrl": "https://user:secret@origin.invalid/private?signature=secret", "AWSSigningKey": "secret", "AWSSigningSecret": "secret", "Hostnames": [{"Value": "media.example", "Token": "secret"}], "AWSSigningEnabled": True, "AWSSigningRegionName": "test"}
         result = inventory.summarize_bunny_zone(zone)
