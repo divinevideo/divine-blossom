@@ -66,3 +66,6 @@ VICEROY="$VICEROY" python3 scripts/run-probe-deadline-tests.py
 
 # Exercise translated VTT routing against synthetic storage and worker backends.
 VICEROY="$VICEROY" python3 scripts/run-subtitle-translation-tests.py
+
+# Verify private origin selection, signed requests, and bounded migration fallback.
+VICEROY="$VICEROY" python3 scripts/run-media-origin-tests.py
