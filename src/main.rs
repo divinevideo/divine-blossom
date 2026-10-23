@@ -140,7 +140,9 @@ fn handle_main(mut req: Request) -> std::result::Result<Response, Error> {
 
     if is_canary {
         canary::no_store(&mut response);
-        if method == "HEAD" { response.take_body(); }
+        if method == "HEAD" {
+            response.take_body();
+        }
     }
     let status = response.get_status().as_u16();
     request_log::emit(
@@ -159,7 +161,9 @@ fn handle_main(mut req: Request) -> std::result::Result<Response, Error> {
 fn handle_request(req: Request) -> Result<Response> {
     match canary::route(&req) {
         blossom_core::canary::CanaryRoute::Canary => return canary::handle(req),
-        blossom_core::canary::CanaryRoute::Denied => return Err(BlossomError::NotFound("Not found".into())),
+        blossom_core::canary::CanaryRoute::Denied => {
+            return Err(BlossomError::NotFound("Not found".into()));
+        }
         blossom_core::canary::CanaryRoute::Canonical => {}
     }
     let method = req.get_method().clone();

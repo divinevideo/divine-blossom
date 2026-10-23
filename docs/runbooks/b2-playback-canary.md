@@ -67,7 +67,9 @@ B2. There is no FOS, GCS, legacy origin, or per-play copy fallback inside Comput
 
 A policy denial returns 404 without revealing existence. An approved video
 without valid readiness or verified origin bytes returns 503, allowing the
-client's canonical source. B2 auth/config or unexpected origin responses return
+client's canonical source. A valid copying intent also returns 503 after
+checking public policy; erasing or malformed intent remains a terminal 404.
+A restricted video with a copying intent still returns 404. B2 auth/config or unexpected origin responses return
 an error (normally 502), preventing fallback that hides broken configuration.
 Range success preserves 206, Content-Range and partial Content-Length. Invalid
 ranges retain 416 and Content-Range with an empty body. Origin error bodies

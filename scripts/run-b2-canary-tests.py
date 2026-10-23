@@ -22,6 +22,13 @@ class Origin(BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.do_GET()
 
+    def do_POST(self):
+        # No all-version listing/deletion may start while a copy lock exists.
+        self.server.requests.append((self.command, self.path, None))
+        self.send_response(500)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
         self.server.requests.append((self.command, self.path, self.headers.get("Range")))
         if self.path == "/b2api/v4/b2_authorize_account":
@@ -101,7 +108,7 @@ blossom_secrets = [{{key="b2_media_access_key",data="synthetic"}},{{key="b2_medi
                 cases = [("valid", 200), ("disabled", 404), ("pending", 404), ("restricted", 404),
                          ("banned", 404), ("deleted", 404), ("age_restricted", 404),
                          ("missing_metadata", 404), ("tombstone", 404), ("vanish_owner", 404),
-                         ("vanish_ref", 404), ("copying", 404), ("erasing", 404),
+                         ("vanish_ref", 404), ("copying", 503), ("copying_restricted", 404), ("malformed_gate", 404), ("erasing", 404),
                          ("missing_ready", 503), ("invalid_ready", 503), ("wrong_ready_bucket", 503),
                          ("wrong_ready_hash", 503), ("no_version", 503), ("erasure_disabled", 502),
                          ("wrong_erasure_name", 502), ("wrong_erasure_id", 502),
@@ -126,8 +133,14 @@ blossom_secrets = [{{key="b2_media_access_key",data="synthetic"}},{{key="b2_medi
                     if case == "vanish_ref":
                         data[f"refs:{HASH}"] = ["c" * 64]
                         data[f"vanish_in_progress:v1:{'c' * 64}"] = {}
-                    if case in ("copying", "erasing"):
-                        data[f"b2-sync:v1:{HASH}"] = {"state": case}
+                    if case in ("copying", "copying_restricted"):
+                        data[f"b2-sync:v1:{HASH}"] = {"state": "copying", "attempt_id": "synthetic"}
+                    if case == "copying_restricted":
+                        meta["status"] = "restricted"
+                    if case == "erasing":
+                        data[f"b2-sync:v1:{HASH}"] = {"state": "erasing"}
+                    if case == "malformed_gate":
+                        data[f"b2-sync:v1:{HASH}"] = {"state": "copying"}
                     if case == "missing_ready":
                         del data[f"b2-ready:{HASH}"]
                     if case == "invalid_ready":
@@ -168,8 +181,10 @@ blossom_secrets = [{{key="b2_media_access_key",data="synthetic"}},{{key="b2_medi
                         assert len(server.requests) == 2, server.requests
                         print("PASS live policy/readiness revocation bypass warm canonical metadata")
                 kv.write_text("{}")
+                server.requests = []
                 run(repo, env, "canary_sync_erasure_mutex")
-                print("PASS crashed copy blocks erasure and erasing blocks late copy")
+                assert server.requests == [("GET", "/b2api/v4/b2_authorize_account", None)], server.requests
+                print("PASS crashed copy blocks all-version erasure and erasing blocks late copy")
         finally:
             server.shutdown()
             thread.join()

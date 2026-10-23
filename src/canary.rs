@@ -43,7 +43,6 @@ fn approved_metadata(hash: &str) -> Result<BlobMetadata> {
         || metadata.owner.len() != 64
         || !metadata.owner.bytes().all(|b| b.is_ascii_hexdigit())
         || get_tombstone(hash)?.is_some()
-        || exists(&format!("b2-sync:v1:{hash}"))?
     {
         return Err(denied());
     }
@@ -62,6 +61,33 @@ fn approved_metadata(hash: &str) -> Result<BlobMetadata> {
     }
     Ok(metadata)
 }
+/// Known copy intent means temporary unavailability, after policy is approved.
+/// Erasing or malformed intent remains a terminal denial.
+fn copy_in_progress(hash: &str) -> Result<bool> {
+    let mut lookup = match open_store()?.lookup(&format!("b2-sync:v1:{hash}")) {
+        Ok(lookup) => lookup,
+        Err(KVStoreError::ItemNotFound) => return Ok(false),
+        Err(_) => {
+            return Err(BlossomError::MetadataError(
+                "Canary copy intent unavailable".into(),
+            ))
+        }
+    };
+    let denied = || BlossomError::NotFound("Blob not found".into());
+    let gate: serde_json::Value =
+        serde_json::from_str(&lookup.take_body().into_string()).map_err(|_| denied())?;
+    if gate.get("state").and_then(serde_json::Value::as_str) == Some("copying")
+        && gate
+            .get("attempt_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| !id.is_empty() && id.len() <= 128)
+    {
+        Ok(true)
+    } else {
+        Err(denied())
+    }
+}
+
 pub(crate) fn unavailable() -> Response {
     let mut response = Response::from_status(fastly::http::StatusCode::SERVICE_UNAVAILABLE);
     response.set_header("Retry-After", "30");
@@ -73,6 +99,9 @@ pub(crate) fn handle(req: Request) -> Result<Response> {
     let hash = canary::original_hash(req.get_method_str(), req.get_path())
         .ok_or_else(|| BlossomError::NotFound("Not found".into()))?;
     let metadata = approved_metadata(&hash)?;
+    if copy_in_progress(&hash)? {
+        return Ok(unavailable());
+    }
     let mut lookup = match open_store()?.lookup(&format!("b2-ready:{hash}")) {
         Ok(lookup) => lookup,
         Err(KVStoreError::ItemNotFound) => return Ok(unavailable()),
@@ -97,6 +126,9 @@ pub(crate) fn handle(req: Request) -> Result<Response> {
     )?;
     // A revocation during origin I/O wins over the fetched body.
     let current = approved_metadata(&hash)?;
+    if copy_in_progress(&hash)? {
+        return Ok(unavailable());
+    }
     if current.size != metadata.size || current.mime_type != metadata.mime_type {
         return Err(BlossomError::NotFound("Blob not found".into()));
     }
@@ -277,6 +309,10 @@ mod tests {
         assert!(
             crate::metadata::claim_b2_erasure(&hash).is_err(),
             "live or crashed copy blocks erasure"
+        );
+        assert!(
+            crate::storage::erase_b2_creator_replica(&hash).is_err(),
+            "creator erasure must not reach B2 listing/deletion while copy may commit"
         );
         store.delete(&key).unwrap(); // Operator drained original writer.
         crate::metadata::claim_b2_erasure(&hash).unwrap();

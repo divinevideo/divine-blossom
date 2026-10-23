@@ -1,4 +1,5 @@
 pub mod cache_policy;
+pub mod canary;
 pub mod conditional_update;
 pub mod delete_policy;
 pub mod error;
@@ -10,5 +11,3 @@ pub mod subtitle_lang;
 pub mod transcribe;
 pub mod types;
 pub mod upload_log;
-
-pub mod canary;

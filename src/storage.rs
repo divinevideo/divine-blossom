@@ -309,41 +309,81 @@ pub(crate) fn download_canary_original(
     let config = S3Config::load_b2_media()?;
     let authorization = authorize_b2_vanish()?;
     if authorization.bucket_name.as_deref() != Some(config.bucket.as_str()) {
-        return Err(BlossomError::StorageError("B2 read and erasure buckets do not match".into()));
+        return Err(BlossomError::StorageError(
+            "B2 read and erasure buckets do not match".into(),
+        ));
     }
-    let version = ready.destination_version_id.bytes().map(|byte| {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            (byte as char).to_string()
-        } else { format!("%{byte:02X}") }
-    }).collect::<String>();
-    let mut request = Request::new(method.clone(), format!("{}{}?versionId={version}", config.endpoint(), config.object_path(&ready.key)));
+    let version = ready
+        .destination_version_id
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                (byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect::<String>();
+    let mut request = Request::new(
+        method.clone(),
+        format!(
+            "{}{}?versionId={version}",
+            config.endpoint(),
+            config.object_path(&ready.key)
+        ),
+    );
     request.set_header("Host", config.host());
-    if let Some(range) = range { request.set_header("Range", range); }
+    if let Some(range) = range {
+        request.set_header("Range", range);
+    }
     request.set_pass(true);
     sign_request(&mut request, &config, Some("UNSIGNED-PAYLOAD".into()))?;
-    let mut response = request.send(B2_MEDIA_BACKEND)
+    let mut response = request
+        .send(B2_MEDIA_BACKEND)
         .map_err(|_| BlossomError::StorageError("B2 canary origin unavailable".into()))?;
     let status = response.get_status();
-    if status == StatusCode::NOT_FOUND { return Ok(crate::canary::unavailable()); }
-    if status != StatusCode::OK && status != StatusCode::PARTIAL_CONTENT && status != StatusCode::RANGE_NOT_SATISFIABLE {
-        return Err(BlossomError::StorageError("B2 canary origin rejected read".into()));
+    if status == StatusCode::NOT_FOUND {
+        return Ok(crate::canary::unavailable());
+    }
+    if status != StatusCode::OK
+        && status != StatusCode::PARTIAL_CONTENT
+        && status != StatusCode::RANGE_NOT_SATISFIABLE
+    {
+        return Err(BlossomError::StorageError(
+            "B2 canary origin rejected read".into(),
+        ));
     }
     if status != StatusCode::RANGE_NOT_SATISFIABLE {
-        if response.get_header_str("x-amz-version-id") != Some(ready.destination_version_id.as_str()) {
-            return Err(BlossomError::StorageError("B2 canary version verification failed".into()));
+        if response.get_header_str("x-amz-version-id")
+            != Some(ready.destination_version_id.as_str())
+        {
+            return Err(BlossomError::StorageError(
+                "B2 canary version verification failed".into(),
+            ));
         }
-        if !blossom_core::canary::origin_size_matches(status.as_u16(), response.get_header_str("Content-Length"), response.get_header_str("Content-Range"), ready.size) {
-            return Err(BlossomError::StorageError("B2 canary size verification failed".into()));
+        if !blossom_core::canary::origin_size_matches(
+            status.as_u16(),
+            response.get_header_str("Content-Length"),
+            response.get_header_str("Content-Range"),
+            ready.size,
+        ) {
+            return Err(BlossomError::StorageError(
+                "B2 canary size verification failed".into(),
+            ));
         }
     }
     // Forward delivery headers only; origin error/authentication details stay private.
     let mut delivery = Response::from_status(status);
     for name in ["Content-Length", "Content-Range", "ETag", "Last-Modified"] {
-        if let Some(value) = response.get_header(name) { delivery.set_header(name, value); }
+        if let Some(value) = response.get_header(name) {
+            delivery.set_header(name, value);
+        }
     }
     if status == StatusCode::RANGE_NOT_SATISFIABLE {
         delivery.set_header("Content-Length", "0");
-    } else if *method != Method::HEAD { delivery.set_body(response.take_body()); }
+    } else if *method != Method::HEAD {
+        delivery.set_body(response.take_body());
+    }
     Ok(delivery)
 }
 
@@ -1520,8 +1560,13 @@ fn erase_b2_replica_hashes(hashes: &[String]) -> (HashSet<String>, HashSet<Strin
 /// Creator deletion must erase the same B2 version set as account vanish.
 pub(crate) fn erase_b2_creator_replica(hash: &str) -> Result<()> {
     let (failed, remaining) = erase_b2_replica_hashes(&[hash.to_string()]);
-    if failed.is_empty() && remaining.is_empty() { Ok(()) }
-    else { Err(BlossomError::StorageError("B2 replica erasure incomplete; retry required".into())) }
+    if failed.is_empty() && remaining.is_empty() {
+        Ok(())
+    } else {
+        Err(BlossomError::StorageError(
+            "B2 replica erasure incomplete; retry required".into(),
+        ))
+    }
 }
 
 fn bunny_delivery_zones() -> Result<Vec<String>> {
