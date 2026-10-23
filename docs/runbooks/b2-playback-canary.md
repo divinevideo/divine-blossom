@@ -69,7 +69,10 @@ A policy denial returns 404 without revealing existence. An approved video
 without valid readiness or verified origin bytes returns 503, allowing the
 client's canonical source. A valid copying intent also returns 503 after
 checking public policy; erasing or malformed intent remains a terminal 404.
-A restricted video with a copying intent still returns 404. B2 auth/config or unexpected origin responses return
+A restricted video with a copying intent still returns 404. B2 origin transport
+failures and HTTP 5xx also return 503 after rechecking policy, allowing canonical
+fallback during transient outages. Revocation during origin I/O remains a
+terminal 404. B2 auth/config or unexpected origin responses return
 an error (normally 502), preventing fallback that hides broken configuration.
 Range success preserves 206, Content-Range and partial Content-Length. Invalid
 ranges retain 416 and Content-Range with an empty body. Origin error bodies

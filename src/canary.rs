@@ -96,6 +96,13 @@ pub(crate) fn unavailable() -> Response {
     response
 }
 pub(crate) fn handle(req: Request) -> Result<Response> {
+    handle_with_origin(req, crate::storage::download_canary_original)
+}
+
+fn handle_with_origin(
+    req: Request,
+    fetch: impl FnOnce(&Readiness, &fastly::http::Method, Option<&str>) -> Result<Response>,
+) -> Result<Response> {
     let hash = canary::original_hash(req.get_method_str(), req.get_path())
         .ok_or_else(|| BlossomError::NotFound("Not found".into()))?;
     let metadata = approved_metadata(&hash)?;
@@ -115,15 +122,12 @@ pub(crate) fn handle(req: Request) -> Result<Response> {
         Ok(ready) => ready,
         Err(_) => return Ok(unavailable()),
     };
-    let bucket = crate::storage::get_config("b2_media_bucket")?;
+    let bucket = crate::storage::get_config("b2_media_bucket")
+        .map_err(|_| BlossomError::StorageError("B2 canary configuration unavailable".into()))?;
     if !ready.matches(&hash, &bucket, metadata.size) {
         return Ok(unavailable());
     }
-    let response = crate::storage::download_canary_original(
-        &ready,
-        req.get_method(),
-        req.get_header_str("Range"),
-    )?;
+    let response = fetch(&ready, req.get_method(), req.get_header_str("Range"))?;
     // A revocation during origin I/O wins over the fetched body.
     let current = approved_metadata(&hash)?;
     if copy_in_progress(&hash)? {
@@ -175,6 +179,35 @@ mod tests {
             );
         }
     }
+    #[test]
+    #[ignore = "requires synthetic B2 outage fixtures; scripts/run-b2-canary-tests.py"]
+    fn canary_origin_outage_during_revocation_is_terminal() {
+        let hash = "a".repeat(64);
+        let request = Request::get(format!("https://media-b2.divine.video/{hash}"));
+        let result = super::handle_with_origin(request, |ready, method, range| {
+            // The real origin produces an outage response. Revoke permission at
+            // this I/O boundary before the handler can decide to allow fallback.
+            let response = crate::storage::download_canary_original(ready, method, range)?;
+            assert_eq!(response.get_status(), StatusCode::SERVICE_UNAVAILABLE);
+            let mut meta = crate::metadata::get_blob_metadata_uncached(&hash)?.unwrap();
+            meta.status = crate::blossom::BlobStatus::Restricted;
+            crate::metadata::open_store()?
+                .insert(
+                    &format!("blob:{hash}"),
+                    serde_json::to_string(&meta).unwrap(),
+                )
+                .unwrap();
+            Ok(response)
+        });
+        assert_eq!(
+            result
+                .expect_err("revocation must prevent canonical fallback")
+                .status_code()
+                .as_u16(),
+            404
+        );
+    }
+
     #[test]
     #[ignore = "requires synthetic Viceroy fixtures; scripts/run-b2-canary-tests.py"]
     fn canary_revocation_bypasses_warm_metadata_and_readiness() {
@@ -240,6 +273,9 @@ mod tests {
             response.get_header_str("Surrogate-Control"),
             Some("no-store")
         );
+        if expected != 200 {
+            assert_eq!(response.get_header_str("X-Divine-Source"), None);
+        }
         if expected == 200 {
             assert_eq!(response.get_header_str("X-Divine-Source"), Some("b2"));
             assert_eq!(response.take_body().into_string(), "b2 bytes!");

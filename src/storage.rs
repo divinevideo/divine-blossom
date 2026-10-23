@@ -296,6 +296,24 @@ fn download_media_object(
         .map_err(MediaFetchError::into_storage_error)
 }
 
+fn transient_canary_origin_error(cause: &fastly::http::request::SendErrorCause) -> bool {
+    use fastly::http::request::SendErrorCause;
+    matches!(
+        cause,
+        SendErrorCause::DnsTimeout
+            | SendErrorCause::DnsError { .. }
+            | SendErrorCause::DestinationUnavailable
+            | SendErrorCause::DestinationIpUnroutable
+            | SendErrorCause::ConnectionRefused
+            | SendErrorCause::ConnectionTerminated
+            | SendErrorCause::ConnectionTimeout
+            | SendErrorCause::ConnectionLimitReached
+            | SendErrorCause::HttpIncompleteResponse
+            | SendErrorCause::HttpResponseTimeout
+            | SendErrorCause::IoError(_)
+    )
+}
+
 /// Strict canary reads bypass FOS, GCS fallback, and storage caches.
 /// Native erasure auth proves read bucket membership in the erasure mapping.
 pub(crate) fn download_canary_original(
@@ -306,8 +324,11 @@ pub(crate) fn download_canary_original(
     if !b2_replica_enabled() {
         return Err(BlossomError::StorageError("B2 erasure is disabled".into()));
     }
-    let config = S3Config::load_b2_media()?;
-    let authorization = authorize_b2_vanish()?;
+    let config = S3Config::load_b2_media()
+        .map_err(|_| BlossomError::StorageError("B2 canary configuration unavailable".into()))?;
+    let authorization = authorize_b2_vanish().map_err(|_| {
+        BlossomError::StorageError("B2 canary erasure authorization unavailable".into())
+    })?;
     if authorization.bucket_name.as_deref() != Some(config.bucket.as_str()) {
         return Err(BlossomError::StorageError(
             "B2 read and erasure buckets do not match".into(),
@@ -338,11 +359,19 @@ pub(crate) fn download_canary_original(
     }
     request.set_pass(true);
     sign_request(&mut request, &config, Some("UNSIGNED-PAYLOAD".into()))?;
-    let mut response = request
-        .send(B2_MEDIA_BACKEND)
-        .map_err(|_| BlossomError::StorageError("B2 canary origin unavailable".into()))?;
+    let mut response = match request.send(B2_MEDIA_BACKEND) {
+        Ok(response) => response,
+        Err(error) if transient_canary_origin_error(error.root_cause()) => {
+            return Ok(crate::canary::unavailable());
+        }
+        Err(_) => {
+            return Err(BlossomError::StorageError(
+                "B2 canary origin setup or protocol failure".into(),
+            ))
+        }
+    };
     let status = response.get_status();
-    if status == StatusCode::NOT_FOUND {
+    if status == StatusCode::NOT_FOUND || status.is_server_error() {
         return Ok(crate::canary::unavailable());
     }
     if status != StatusCode::OK
@@ -3740,6 +3769,29 @@ pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtracti
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn canary_transient_transport_classification_preserves_setup_failures() {
+        use fastly::http::request::SendErrorCause;
+        for cause in [
+            SendErrorCause::ConnectionTerminated,
+            SendErrorCause::ConnectionTimeout,
+            SendErrorCause::HttpResponseTimeout,
+            SendErrorCause::HttpIncompleteResponse,
+        ] {
+            assert!(super::transient_canary_origin_error(&cause));
+        }
+        for cause in [
+            SendErrorCause::DestinationNotFound,
+            SendErrorCause::TlsConfigurationError,
+            SendErrorCause::TlsCertificateError,
+            SendErrorCause::HttpRequestUriInvalid,
+            SendErrorCause::HttpResponseStatusInvalid,
+            SendErrorCause::InternalError(None),
+        ] {
+            assert!(!super::transient_canary_origin_error(&cause));
+        }
+    }
+
     #[test]
     #[ignore = "requires synthetic storage backends; run-media-origin-tests.py"]
     fn media_origin_routing_contract() {

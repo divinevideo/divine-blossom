@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import socket
 import subprocess
 import tempfile
 import threading
@@ -37,13 +38,17 @@ class Origin(BaseHTTPRequestHandler):
                        "capabilities": ["listFiles", "deleteFiles"], "namePrefix": None}
             body = json.dumps({"authorizationToken": "synthetic-token", "apiInfo": {"storageApi": {
                 "apiUrl": "https://api.backblazeb2.com", "allowed": allowed}}}).encode()
-            self.send_response(200)
+            self.send_response(self.server.auth_status)
         else:
             parsed = urlparse(self.path)
             assert parsed.path == f"/private-test/{HASH}", self.path
             assert parse_qs(parsed.query) == {"versionId": [VERSION]}, self.path
             assert "/us-west-004/s3/aws4_request" in self.headers.get("Authorization", "")
             assert self.headers.get("Host") == "s3.us-west-004.backblazeb2.com"
+            if self.server.status == "disconnect":
+                self.connection.shutdown(socket.SHUT_RDWR)
+                self.connection.close()
+                return
             status, body = self.server.status, BODY
             if self.headers.get("Range") == "bytes=99-":
                 status, body = 416, b"range error"
@@ -94,6 +99,7 @@ format = "json"
 [local_server.secret_stores]
 blossom_secrets = [{{key="b2_media_access_key",data="synthetic"}},{{key="b2_media_secret_key",data="synthetic"}},{{key="b2_vanish_application_key_id",data="synthetic"}},{{key="b2_vanish_application_key",data="synthetic"}}]
 ''')
+                manifest = config.read_text()
                 env = os.environ.copy()
                 env["CARGO_TARGET_WASM32_WASIP1_RUNNER"] = shlex.join([
                     env.get("VICEROY", "viceroy"), "run", "-C", str(config), "--"])
@@ -112,12 +118,13 @@ blossom_secrets = [{{key="b2_media_access_key",data="synthetic"}},{{key="b2_medi
                          ("missing_ready", 503), ("invalid_ready", 503), ("wrong_ready_bucket", 503),
                          ("wrong_ready_hash", 503), ("no_version", 503), ("erasure_disabled", 502),
                          ("wrong_erasure_name", 502), ("wrong_erasure_id", 502),
+                         ("missing_region", 502), ("missing_read_bucket", 502), ("missing_backend", 502), ("erasure_auth_failed", 502),
                          ("wrong_origin_version", 502), ("origin_missing", 503),
-                         ("origin_forbidden", 502), ("origin_failed", 502)]
+                         ("origin_forbidden", 502), ("origin_unauthorized", 502), ("origin_failed", 503), ("origin_disconnect", 503)]
                 for case, expected in cases:
                     server.requests = []
                     server.bucket_name, server.bucket_id = "private-test", "synthetic-bucket-id"
-                    server.status, server.version = 200, VERSION
+                    server.status, server.version, server.auth_status = 200, VERSION, 200
                     values, meta, readiness = copy.deepcopy(base), copy.deepcopy(metadata), copy.deepcopy(ready)
                     data = {f"blob:{HASH}": meta, f"b2-ready:{HASH}": readiness}
                     if case == "disabled":
@@ -157,10 +164,19 @@ blossom_secrets = [{{key="b2_media_access_key",data="synthetic"}},{{key="b2_medi
                         server.bucket_name = "other"
                     if case == "wrong_erasure_id":
                         server.bucket_id = "other"
+                    if case == "missing_region":
+                        del values["b2_media_region"]
+                    if case == "missing_read_bucket":
+                        del values["b2_media_bucket"]
+                    if case == "erasure_auth_failed":
+                        server.auth_status = 503
                     if case == "wrong_origin_version":
                         server.version = "unverified"
                     if case.startswith("origin_"):
-                        server.status = {"origin_missing": 404, "origin_forbidden": 403, "origin_failed": 503}[case]
+                        server.status = {"origin_missing": 404, "origin_forbidden": 403, "origin_unauthorized": 401, "origin_failed": 503, "origin_disconnect": "disconnect"}[case]
+                    config.write_text(manifest.replace(
+                        f'[local_server.backends.b2_storage]\nurl = "http://127.0.0.1:{server.server_port}"\n', ""
+                    ) if case == "missing_backend" else manifest)
                     values["test_expected_status"] = str(expected)
                     settings.write_text(json.dumps(values))
                     kv.write_text(json.dumps({k: json.dumps(v) for k, v in data.items()}))
@@ -170,11 +186,16 @@ blossom_secrets = [{{key="b2_media_access_key",data="synthetic"}},{{key="b2_medi
                         assert [r[0] for r in storage] == ["GET", "GET", "GET", "HEAD"], storage
                         assert storage[1][2] == "bytes=1-3"
                         assert len(server.requests) == 8, server.requests
-                    elif case in ("wrong_origin_version", "origin_missing", "origin_forbidden", "origin_failed"):
+                    elif case in ("wrong_origin_version", "origin_missing", "origin_forbidden", "origin_unauthorized", "origin_failed", "origin_disconnect"):
                         assert len(storage) == 1, server.requests
                     else:
                         assert not storage, server.requests
                     print(f"PASS canary {case}")
+                    if case in ("origin_failed", "origin_disconnect"):
+                        server.requests = []
+                        run(repo, env, "canary_origin_outage_during_revocation_is_terminal")
+                        assert len(server.requests) == 2, server.requests
+                        print(f"PASS {case} with policy revoked during origin I/O remains terminal")
                     if case == "valid":
                         server.requests = []
                         run(repo, env, "canary_revocation_bypasses_warm_metadata_and_readiness")
