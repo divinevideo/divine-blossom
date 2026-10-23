@@ -104,10 +104,11 @@ const MULTIPART_THRESHOLD: u64 = 5 * 1024 * 1024;
 const PART_SIZE: u64 = 5 * 1024 * 1024;
 
 /// Get config value
-fn get_config(key: &str) -> Result<String> {
-    let store = fastly::config_store::ConfigStore::open(CONFIG_STORE);
-    store
-        .get(key)
+pub(crate) fn get_config(key: &str) -> Result<String> {
+    let store = fastly::config_store::ConfigStore::try_open(CONFIG_STORE)
+        .map_err(|_| BlossomError::Internal("Config store unavailable".into()))?;
+    store.try_get(key)
+        .map_err(|_| BlossomError::Internal("Config lookup unavailable".into()))?
         .ok_or_else(|| BlossomError::Internal(format!("Missing config: {}", key)))
 }
 
@@ -293,6 +294,126 @@ fn download_media_object(
     response
         .map(|resp| (resp, policy.primary.name()))
         .map_err(MediaFetchError::into_storage_error)
+}
+
+fn transient_canary_origin_error(cause: &fastly::http::request::SendErrorCause) -> bool {
+    use fastly::http::request::SendErrorCause;
+    matches!(
+        cause,
+        SendErrorCause::DnsTimeout
+            | SendErrorCause::DnsError { .. }
+            | SendErrorCause::DestinationUnavailable
+            | SendErrorCause::DestinationIpUnroutable
+            | SendErrorCause::ConnectionRefused
+            | SendErrorCause::ConnectionTerminated
+            | SendErrorCause::ConnectionTimeout
+            | SendErrorCause::ConnectionLimitReached
+            | SendErrorCause::HttpIncompleteResponse
+            | SendErrorCause::HttpResponseTimeout
+            | SendErrorCause::IoError(_)
+    )
+}
+
+/// Strict canary reads bypass FOS, GCS fallback, and storage caches.
+/// Native erasure auth proves read bucket membership in the erasure mapping.
+pub(crate) fn download_canary_original(
+    ready: &blossom_core::canary::Readiness,
+    method: &Method,
+    range: Option<&str>,
+) -> Result<Response> {
+    if !b2_replica_enabled() {
+        return Err(BlossomError::StorageError("B2 erasure is disabled".into()));
+    }
+    let config = S3Config::load_b2_media()
+        .map_err(|_| BlossomError::StorageError("B2 canary configuration unavailable".into()))?;
+    let authorization = authorize_b2_vanish().map_err(|_| {
+        BlossomError::StorageError("B2 canary erasure authorization unavailable".into())
+    })?;
+    if authorization.bucket_name.as_deref() != Some(config.bucket.as_str()) {
+        return Err(BlossomError::StorageError(
+            "B2 read and erasure buckets do not match".into(),
+        ));
+    }
+    let version = ready
+        .destination_version_id
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                (byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect::<String>();
+    let mut request = Request::new(
+        method.clone(),
+        format!(
+            "{}{}?versionId={version}",
+            config.endpoint(),
+            config.object_path(&ready.key)
+        ),
+    );
+    request.set_header("Host", config.host());
+    if let Some(range) = range {
+        request.set_header("Range", range);
+    }
+    request.set_pass(true);
+    sign_request(&mut request, &config, Some("UNSIGNED-PAYLOAD".into()))?;
+    let mut response = match request.send(B2_MEDIA_BACKEND) {
+        Ok(response) => response,
+        Err(error) if transient_canary_origin_error(error.root_cause()) => {
+            return Ok(crate::canary::unavailable());
+        }
+        Err(_) => {
+            return Err(BlossomError::StorageError(
+                "B2 canary origin setup or protocol failure".into(),
+            ))
+        }
+    };
+    let status = response.get_status();
+    if status == StatusCode::NOT_FOUND || status.is_server_error() {
+        return Ok(crate::canary::unavailable());
+    }
+    if status != StatusCode::OK
+        && status != StatusCode::PARTIAL_CONTENT
+        && status != StatusCode::RANGE_NOT_SATISFIABLE
+    {
+        return Err(BlossomError::StorageError(
+            "B2 canary origin rejected read".into(),
+        ));
+    }
+    if status != StatusCode::RANGE_NOT_SATISFIABLE {
+        if response.get_header_str("x-amz-version-id")
+            != Some(ready.destination_version_id.as_str())
+        {
+            return Err(BlossomError::StorageError(
+                "B2 canary version verification failed".into(),
+            ));
+        }
+        if !blossom_core::canary::origin_size_matches(
+            status.as_u16(),
+            response.get_header_str("Content-Length"),
+            response.get_header_str("Content-Range"),
+            ready.size,
+        ) {
+            return Err(BlossomError::StorageError(
+                "B2 canary size verification failed".into(),
+            ));
+        }
+    }
+    // Forward delivery headers only; origin error/authentication details stay private.
+    let mut delivery = Response::from_status(status);
+    for name in ["Content-Length", "Content-Range", "ETag", "Last-Modified"] {
+        if let Some(value) = response.get_header(name) {
+            delivery.set_header(name, value);
+        }
+    }
+    if status == StatusCode::RANGE_NOT_SATISFIABLE {
+        delivery.set_header("Content-Length", "0");
+    } else if *method != Method::HEAD {
+        delivery.set_body(response.take_body());
+    }
+    Ok(delivery)
 }
 
 /// Upload a blob to GCS (simple PUT for small files)
@@ -1011,6 +1132,8 @@ struct B2Allowed {
 #[derive(Debug, Deserialize)]
 struct B2AllowedBucket {
     id: String,
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1018,6 +1141,7 @@ struct B2Authorization {
     api_url: String,
     authorization_token: String,
     bucket_id: String,
+    bucket_name: Option<String>,
     backend: Backend,
 }
 
@@ -1245,10 +1369,12 @@ fn validate_b2_authorization(
     let storage = response.api_info.storage_api;
     let host = b2_api_host(&storage.api_url)?;
     let backend = b2_storage_backend(host)?;
+    let bucket_name = storage.allowed.buckets[0].name.clone();
     Ok(B2Authorization {
         api_url: storage.api_url,
         authorization_token: response.authorization_token,
         bucket_id: expected_bucket_id.to_string(),
+        bucket_name,
         backend,
     })
 }
@@ -1263,6 +1389,7 @@ fn authorize_b2_vanish() -> Result<B2Authorization> {
     let mut request = Request::get("https://api.backblazeb2.com/b2api/v4/b2_authorize_account");
     request.set_header("Host", "api.backblazeb2.com");
     request.set_header("Authorization", format!("Basic {}", basic));
+    request.set_pass(true);
     let mut response = request
         .send(B2_API_BACKEND)
         .map_err(|error| BlossomError::StorageError(format!("B2 authorization failed: {error}")))?;
@@ -1411,6 +1538,7 @@ enum B2HashErasure {
 }
 
 fn erase_b2_hash_versions(authorization: &B2Authorization, hash: &str) -> Result<B2HashErasure> {
+    crate::metadata::claim_b2_erasure(hash)?;
     let page = list_b2_file_versions(authorization, hash, Some((hash, None)))?;
     let (versions, next) = b2_prefix_page(hash, &page)?;
     delete_b2_version_page(authorization, versions)?;
@@ -1456,6 +1584,18 @@ fn erase_b2_replica_hashes(hashes: &[String]) -> (HashSet<String>, HashSet<Strin
         }
     }
     (failed, remaining)
+}
+
+/// Creator deletion must erase the same B2 version set as account vanish.
+pub(crate) fn erase_b2_creator_replica(hash: &str) -> Result<()> {
+    let (failed, remaining) = erase_b2_replica_hashes(&[hash.to_string()]);
+    if failed.is_empty() && remaining.is_empty() {
+        Ok(())
+    } else {
+        Err(BlossomError::StorageError(
+            "B2 replica erasure incomplete; retry required".into(),
+        ))
+    }
 }
 
 fn bunny_delivery_zones() -> Result<Vec<String>> {
@@ -3630,6 +3770,29 @@ pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtracti
 #[cfg(test)]
 mod tests {
     #[test]
+    fn canary_transient_transport_classification_preserves_setup_failures() {
+        use fastly::http::request::SendErrorCause;
+        for cause in [
+            SendErrorCause::ConnectionTerminated,
+            SendErrorCause::ConnectionTimeout,
+            SendErrorCause::HttpResponseTimeout,
+            SendErrorCause::HttpIncompleteResponse,
+        ] {
+            assert!(super::transient_canary_origin_error(&cause));
+        }
+        for cause in [
+            SendErrorCause::DestinationNotFound,
+            SendErrorCause::TlsConfigurationError,
+            SendErrorCause::TlsCertificateError,
+            SendErrorCause::HttpRequestUriInvalid,
+            SendErrorCause::HttpResponseStatusInvalid,
+            SendErrorCause::InternalError(None),
+        ] {
+            assert!(!super::transient_canary_origin_error(&cause));
+        }
+    }
+
+    #[test]
     #[ignore = "requires synthetic storage backends; run-media-origin-tests.py"]
     fn media_origin_routing_contract() {
         let (mut response, source) = super::download_media_object("hit", None, false, false).unwrap();
@@ -4131,6 +4294,7 @@ mod tests {
             api_url: "https://api001.backblazeb2.com".into(),
             authorization_token: "account-token".into(),
             bucket_id: "bucket-id".into(),
+            bucket_name: Some("private-test".into()),
             backend: fastly::Backend::from_name("b2_api").expect("backend name"),
         };
         let hash = "a".repeat(64);

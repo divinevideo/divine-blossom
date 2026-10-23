@@ -5,6 +5,7 @@ mod admin;
 mod admin_sweep;
 mod auth;
 mod blossom;
+mod canary;
 mod delete_policy;
 mod error;
 mod media_auth_log;
@@ -120,6 +121,7 @@ fn handle_main(mut req: Request) -> std::result::Result<Response, Error> {
     let method = req.get_method().as_str().to_string();
     let route = route_category(req.get_path());
     let path = req.get_path().to_string();
+    let is_canary = canary::route(&req) != blossom_core::canary::CanaryRoute::Canonical;
     let result = handle_request(req);
     let (mut response, error) = match result {
         Ok(response) => (response, None),
@@ -136,6 +138,12 @@ fn handle_main(mut req: Request) -> std::result::Result<Response, Error> {
         }
     }
 
+    if is_canary {
+        canary::no_store(&mut response);
+        if method == "HEAD" {
+            response.take_body();
+        }
+    }
     let status = response.get_status().as_u16();
     request_log::emit(
         &mut response,
@@ -151,6 +159,13 @@ fn handle_main(mut req: Request) -> std::result::Result<Response, Error> {
 
 /// Route and handle the request
 fn handle_request(req: Request) -> Result<Response> {
+    match canary::route(&req) {
+        blossom_core::canary::CanaryRoute::Canary => return canary::handle(req),
+        blossom_core::canary::CanaryRoute::Denied => {
+            return Err(BlossomError::NotFound("Not found".into()));
+        }
+        blossom_core::canary::CanaryRoute::Canonical => {}
+    }
     let method = req.get_method().clone();
     let path = req.get_path().to_string();
     match (method, path.as_str()) {

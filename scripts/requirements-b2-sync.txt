@@ -1,0 +1,3 @@
+# Isolated operator environment; no change to edge/runtime dependencies.
+boto3>=1.36,<2
+google-cloud-storage>=3,<4
