@@ -2216,3 +2216,21 @@ mod tests {
         );
     }
 }
+
+/// Serialize mirror PUT with all-version erasure. No TTL: an uncertain writer
+/// must keep erasure pending until it is drained. Erasing remains permanent.
+pub(crate) fn claim_b2_erasure(hash: &str) -> Result<()> {
+    let store = open_store()?;
+    let key = format!("b2-sync:v1:{}", hash.to_lowercase());
+    match store.build_insert().mode(InsertMode::Add).execute(&key, r#"{"state":"erasing"}"#) {
+        Ok(()) => Ok(()),
+        Err(KVStoreError::ItemPreconditionFailed) => {
+            let mut existing = store.lookup(&key).map_err(|_| BlossomError::MetadataError("B2 erasure intent unavailable".into()))?;
+            let value: serde_json::Value = serde_json::from_str(&existing.take_body().into_string())
+                .map_err(|_| BlossomError::MetadataError("B2 erasure intent invalid".into()))?;
+            if value.get("state").and_then(serde_json::Value::as_str) == Some("erasing") { Ok(()) }
+            else { Err(BlossomError::StorageError("B2 mirror upload pending; erasure must retry after writer drains".into())) }
+        }
+        Err(_) => Err(BlossomError::MetadataError("B2 erasure intent unavailable".into())),
+    }
+}

@@ -49,7 +49,8 @@ impl BlobErasureOps for DefaultCreatorDeleteOps {
         crate::storage::delete_blob(hash)
     }
     fn delete_blob_from_replica(&self, hash: &str) -> Result<()> {
-        crate::storage::delete_blob_from_fos(hash)
+        crate::storage::delete_blob_from_fos(hash)?;
+        crate::storage::erase_b2_creator_replica(hash)
     }
     fn delete_blob_gcs_artifacts(&self, hash: &str) -> Result<()> {
         crate::delete_blob_gcs_artifacts(hash)
