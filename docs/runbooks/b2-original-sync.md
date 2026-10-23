@@ -91,6 +91,8 @@ Output is aggregate JSON counts, including `errors`, `locked`, `pending`, and
 Provider exceptions are intentionally suppressed because they can contain signed
 URLs, account identifiers, or credentials. `locked` requires investigation of the
 shared gate; repeated retries will never steal an existing gate.
+Control API redirects fail closed without forwarding authentication headers, and
+the worker's HTTP client does not change the process-wide urllib opener.
 
 ## Policy and readiness contract
 
@@ -141,7 +143,10 @@ all-version erase, beyond the endpoint's independent delivery gate.
 
 The copying gate has **no TTL**. A successful, definitively completed PUT can
 release its owned gate after verification/publication or a definitive failure
-later in the process. A crash or uncertain PUT response keeps the gate closed
+later in the process. Release requires a matching attempt ID and the generation
+marker returned with that ownership read; a concurrent replacement rejects the
+conditional delete. Missing or malformed generation markers also block release.
+A crash or uncertain PUT response keeps the gate closed
 indefinitely. No scheduled task or retry is allowed to expire or steal it.
 
 For a stuck gate, stop and drain every writer for that destination and hash,
@@ -174,3 +179,5 @@ References: [GCS generation-pinned downloads](https://docs.cloud.google.com/pyth
 [version-pinned S3 reads](https://docs.aws.amazon.com/boto3/latest/reference/services/s3/client/get_object.html),
 [B2 bucket privacy and retention metadata](https://www.backblaze.com/apidocs/b2-list-buckets),
 and [Fastly atomic add-only operations](https://www.fastly.com/blog/beyond-crud-advanced-features-of-fastlys-kv-store).
+Fastly's [official client implementation](https://github.com/fastly/go-fastly/blob/main/fastly/kv_store.go)
+documents the `generation` response header and `if-generation-match` delete header.

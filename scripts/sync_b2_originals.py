@@ -273,20 +273,27 @@ class Worker:
         return dict(report)
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, message, headers, new_url):
+        return None
+
+
 class JsonHTTP:
     def __init__(self, headers=None):
         self.headers = headers or {}
+        self.opener = urllib.request.build_opener(NoRedirect)
 
-    def request(self, url, method="GET", value=None, missing=False, conflict=False, headers=None):
+    def request(self, url, method="GET", value=None, missing=False, conflict=False, headers=None, include_headers=False):
         body = json.dumps(value).encode() if value is not None else None
         request = urllib.request.Request(url, data=body, method=method,
                                          headers={**self.headers, "Content-Type": "application/json", **(headers or {})})
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with self.opener.open(request, timeout=30) as response:
                 data = response.read(MIB + 1)
                 if len(data) > MIB:
                     raise ValueError("control response too large")
-                return json.loads(data) if data else None
+                value = json.loads(data) if data else None
+                return (value, response.headers) if include_headers else value
         except urllib.error.HTTPError as error:
             try:
                 if missing and error.code == 404:
@@ -333,12 +340,16 @@ class FastlyKV:
         return True
 
     def release_copy(self, key, attempt):
-        # Erasure only inserts add-only, never overwrites another holder. No TTL
-        # or automated stale-gate remover may run concurrently with a writer.
+        if not HEX.fullmatch(key):
+            raise ValueError("invalid copy gate hash")
         gate = "b2-sync:v1:" + key
-        if self.get(gate) != {"state": "copying", "attempt_id": attempt}:
+        value, headers = self.http.request(self.url(gate), include_headers=True)
+        if value != {"state": "copying", "attempt_id": attempt}:
             raise ValueError("copy gate ownership lost")
-        self.http.request(self.url(gate), "DELETE")
+        generation = headers.get("generation")
+        if not isinstance(generation, str) or not re.fullmatch(r"[0-9]+", generation) or not 0 < int(generation) < 2 ** 64:
+            raise ValueError("copy gate generation unavailable")
+        self.http.request(self.url(gate), "DELETE", headers={"if-generation-match": generation})
 
 
 class GCSSource:

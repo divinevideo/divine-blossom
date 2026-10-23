@@ -8,6 +8,7 @@ import unittest
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
+import urllib.request
 from urllib.parse import parse_qs, urlsplit
 
 try:
@@ -309,6 +310,48 @@ class PreflightTests(unittest.TestCase):
 
 
 class FastlyHTTPTests(unittest.TestCase):
+    def test_redirects_fail_without_forwarding_credentials_or_changing_global_opener(self):
+        received = []
+        redirect = {"status": 302}
+
+        class DestinationHandler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_GET(self):
+                received.append(dict(self.headers))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+        destination = ThreadingHTTPServer(("127.0.0.1", 0), DestinationHandler)
+
+        class RedirectHandler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_GET(self):
+                self.send_response(redirect["status"])
+                self.send_header("Location", f"http://127.0.0.1:{destination.server_port}/capture")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        source = ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+        for server in (destination, source):
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+        original_opener = urllib.request._opener
+        http = mirror.JsonHTTP({"Authorization": "synthetic-private-token", "Fastly-Key": "synthetic-fastly-token"})
+        for status in (301, 302, 303, 307, 308):
+            with self.subTest(status=status):
+                redirect["status"] = status
+                with self.assertRaises(RuntimeError):
+                    http.request(f"http://127.0.0.1:{source.server_port}/redirect")
+                self.assertEqual(received, [])
+                self.assertIs(urllib.request._opener, original_opener)
+
     def test_atomic_add_gate_and_readiness_over_real_http(self):
         values = {}
         requests = []
@@ -321,6 +364,7 @@ class FastlyHTTPTests(unittest.TestCase):
                 data = json.dumps(value).encode() if value is not None else b""
                 self.send_response(status)
                 self.send_header("Content-Length", str(len(data)))
+                self.send_header("generation", "1")
                 self.end_headers()
                 self.wfile.write(data)
 
@@ -363,6 +407,61 @@ class FastlyHTTPTests(unittest.TestCase):
                 kv.put(key, {})
             with self.assertRaises(ValueError):
                 kv.delete(key)
+
+    def test_generation_matched_release_preserves_a_replacement_erasure_gate(self):
+        value = {"state": "copying", "attempt_id": "synthetic-attempt"}
+        state = {"value": value, "generation": "7", "replace_on_read": True}
+        deletes = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_GET(self):
+                data = json.dumps(state["value"]).encode()
+                generation = state["generation"]
+                if state["replace_on_read"]:
+                    state.update(value={"state": "erasing"}, generation="8")
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                if generation is not None:
+                    self.send_header("generation", generation)
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_DELETE(self):
+                generation = self.headers.get("if-generation-match")
+                deletes.append(generation)
+                # Fastly supports unconditional DELETE too; the caller must send
+                # a precondition to protect a newer value after the ownership read.
+                if generation is not None and generation != state["generation"]:
+                    self.send_response(412)
+                else:
+                    state["value"] = None
+                    self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        kv = mirror.FastlyKV("synthetic", "synthetic-token")
+        kv.base = f"http://127.0.0.1:{server.server_port}/keys/"
+        with self.assertRaises(RuntimeError):
+            kv.release_copy(HASH, "synthetic-attempt")
+        self.assertEqual(state["value"], {"state": "erasing"})
+        self.assertEqual(deletes, ["7"])
+        state["replace_on_read"] = False
+        for generation in (None, "invalid", "0", str(2 ** 64)):
+            state.update(value=value, generation=generation)
+            with self.subTest(generation=generation), self.assertRaises(ValueError):
+                kv.release_copy(HASH, "synthetic-attempt")
+        self.assertEqual(deletes, ["7"])
+        state.update(value=value, generation="9")
+        kv.release_copy(HASH, "synthetic-attempt")
+        self.assertIsNone(state["value"])
+        self.assertEqual(deletes, ["7", "9"])
 
 
 @unittest.skipIf(boto3 is None, "install scripts/requirements-b2-sync.txt for real SDK HTTP integration")
