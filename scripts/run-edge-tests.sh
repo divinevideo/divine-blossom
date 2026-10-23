@@ -69,3 +69,6 @@ VICEROY="$VICEROY" python3 scripts/run-subtitle-translation-tests.py
 
 # Verify private origin selection, signed requests, and bounded migration fallback.
 VICEROY="$VICEROY" python3 scripts/run-media-origin-tests.py
+
+# Canary policy/readiness runs before every uncached pinned-version read.
+VICEROY="$VICEROY" python3 scripts/run-b2-canary-tests.py
