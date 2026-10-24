@@ -2697,6 +2697,13 @@ fn parse_provider_request_error(
     failure
 }
 
+fn provider_credential_failure(body: &str) -> ProviderFailure {
+    ProviderFailure {
+        kind: ProviderFailureKind::CredentialUnavailable,
+        ..parse_provider_status(None, None, body, false)
+    }
+}
+
 fn is_retryable_provider_failure(failure: &ProviderFailure) -> bool {
     matches!(
         failure.kind,
@@ -3305,7 +3312,7 @@ async fn fetch_gcp_access_token() -> std::result::Result<String, ProviderFailure
     let metadata_summary =
         last_metadata_error.unwrap_or_else(|| "metadata server unreachable".to_string());
 
-    let outcome = match tokio::process::Command::new("gcloud")
+    match tokio::process::Command::new("gcloud")
         .args(["auth", "print-access-token"])
         .output()
         .await
@@ -3313,31 +3320,15 @@ async fn fetch_gcp_access_token() -> std::result::Result<String, ProviderFailure
         Ok(output) if output.status.success() => {
             Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
         }
-        Ok(_) => Err(parse_provider_status(
-            None,
-            None,
-            &format!(
-                "Failed to get GCP access token: metadata exhausted ({}); gcloud returned non-zero",
-                metadata_summary
-            ),
-            true,
-        )),
-        Err(e) => Err(parse_provider_status(
-            None,
-            None,
-            &format!(
-                "Failed to get GCP access token: metadata exhausted ({}); gcloud unavailable: {}",
-                metadata_summary, e
-            ),
-            true,
-        )),
-    };
-    outcome.map_err(|mut failure| {
-        // Credential lookup exhaustion is retryable, but is not evidence of
-        // either a provider timeout or an HTTP rate limit.
-        failure.kind = ProviderFailureKind::CredentialUnavailable;
-        failure
-    })
+        Ok(_) => Err(provider_credential_failure(&format!(
+            "Failed to get GCP access token: metadata exhausted ({}); gcloud returned non-zero",
+            metadata_summary
+        ))),
+        Err(e) => Err(provider_credential_failure(&format!(
+            "Failed to get GCP access token: metadata exhausted ({}); gcloud unavailable: {}",
+            metadata_summary, e
+        ))),
+    }
 }
 
 /// One round-trip to the GCE/Cloud Run metadata server. Returns both the token
@@ -3580,16 +3571,11 @@ async fn fetch_gcp_identity_token(audience: &str) -> std::result::Result<String,
         }
     }
 
-    Err(parse_provider_status(
-        None,
-        None,
-        &format!(
-            "Failed to get GCP identity token (audience={}): {}",
-            audience,
-            last_metadata_error.unwrap_or_else(|| "metadata server unreachable".to_string())
-        ),
-        true,
-    ))
+    Err(provider_credential_failure(&format!(
+        "Failed to get GCP identity token (audience={}): {}",
+        audience,
+        last_metadata_error.unwrap_or_else(|| "metadata server unreachable".to_string())
+    )))
 }
 
 /// One round-trip to the metadata server's identity-token endpoint.
@@ -6357,9 +6343,20 @@ mod tests {
         // Credential exhaustion remains transient without claiming a timeout.
         // Otherwise a single metadata-server hiccup falls straight through to
         // the Gemini fallback.
-        let mut failure = parse_provider_status(None, None, "metadata server unavailable", false);
-        failure.kind = super::ProviderFailureKind::CredentialUnavailable;
-        assert!(is_retryable_provider_failure(&failure));
+        for message in ["access token unavailable", "identity token unavailable"] {
+            let failure = super::provider_credential_failure(message);
+            assert!(is_retryable_provider_failure(&failure));
+            assert_eq!(
+                failure.kind,
+                super::ProviderFailureKind::CredentialUnavailable
+            );
+            let error = super::ProviderError {
+                failure,
+                exhausted_retryable: true,
+                attempts: 2,
+            };
+            assert_eq!(error.error_code(), "provider_failed");
+        }
     }
 
     // --- Parakeet sidecar provider ---
