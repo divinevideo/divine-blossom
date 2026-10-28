@@ -4,7 +4,8 @@
 use std::path::Path;
 
 use crate::{
-    gcp_provider_response_outcome, parse_provider_status, Config, ParsedVtt, ProviderFailure,
+    gcp_provider_response_outcome, parse_provider_request_error, parse_provider_status, Config,
+    ParsedVtt, ProviderFailure,
 };
 use base64::Engine as _;
 
@@ -638,14 +639,7 @@ pub(crate) async fn transcribe(
         .timeout(std::time::Duration::from_secs(120))
         .send()
         .await
-        .map_err(|e| {
-            parse_provider_status(
-                None,
-                None,
-                &format!("Failed to call STT V2: {}", e),
-                e.is_timeout(),
-            )
-        })?;
+        .map_err(|e| parse_provider_request_error(None, None, "Failed to call STT V2", &e))?;
 
     let status = response.status();
     let retry_after = response
@@ -654,11 +648,11 @@ pub(crate) async fn transcribe(
         .and_then(|v| v.to_str().ok())
         .map(|v| v.to_string());
     let resp_body = response.text().await.map_err(|e| {
-        parse_provider_status(
+        parse_provider_request_error(
             Some(status.as_u16()),
             retry_after.as_deref(),
-            &format!("Failed to read STT V2 response: {}", e),
-            e.is_timeout(),
+            "Failed to read STT V2 response",
+            &e,
         )
     })?;
 

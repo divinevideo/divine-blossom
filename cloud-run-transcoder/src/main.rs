@@ -480,11 +480,19 @@ struct TranscriptConfidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum ProviderFailureKind {
+    Other,
+    Timeout,
+    Transport,
+    CredentialUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ProviderFailure {
     status_code: Option<u16>,
     retry_after: Option<Duration>,
     body: String,
-    timed_out: bool,
+    kind: ProviderFailureKind,
 }
 
 #[derive(Debug, Clone)]
@@ -525,8 +533,12 @@ struct TranscriptLockHandle {
 
 impl ProviderError {
     fn error_code(&self) -> &'static str {
-        if self.exhausted_retryable {
+        if self.failure.status_code == Some(429) {
             "provider_rate_limited"
+        } else if self.failure.kind == ProviderFailureKind::Timeout {
+            "provider_timeout"
+        } else if self.failure.kind == ProviderFailureKind::Transport {
+            "provider_transport_failed"
         } else {
             "provider_failed"
         }
@@ -2123,12 +2135,13 @@ async fn process_transcribe(
             Ok(pair) => pair,
             Err(e) => {
                 drop(provider_permit);
+                let error_code = e.error_code();
                 if e.exhausted_retryable {
                     report_derivative_failure_to_sentry(
                         "divine-transcoder",
                         "transcript",
                         &hash,
-                        e.error_code(),
+                        error_code,
                         &e.to_string(),
                         false,
                         None,
@@ -2146,7 +2159,7 @@ async fn process_transcribe(
                         &hash,
                         &transcript_lock,
                         retry_after,
-                        e.error_code(),
+                        error_code,
                     )
                     .await
                     {
@@ -2177,7 +2190,7 @@ async fn process_transcribe(
                     None,
                     None,
                     e.retry_after().map(|duration| duration.as_secs().max(1)),
-                    Some(e.error_code()),
+                    Some(error_code),
                     Some(&e.to_string()),
                     status_event_generation(attempt_generation, STATUS_EVENT_TERMINAL),
                     false,
@@ -2658,13 +2671,44 @@ fn parse_provider_status(
         status_code,
         retry_after: parse_retry_after_header(retry_after_header),
         body: body.to_string(),
-        timed_out,
+        kind: if timed_out {
+            ProviderFailureKind::Timeout
+        } else {
+            ProviderFailureKind::Other
+        },
+    }
+}
+
+fn parse_provider_request_error(
+    status_code: Option<u16>,
+    retry_after_header: Option<&str>,
+    context: &str,
+    error: &reqwest::Error,
+) -> ProviderFailure {
+    let mut failure = parse_provider_status(
+        status_code,
+        retry_after_header,
+        &format!("{}: {}", context, error),
+        error.is_timeout(),
+    );
+    if !error.is_timeout() && (error.is_connect() || error.is_request() || error.is_body()) {
+        failure.kind = ProviderFailureKind::Transport;
+    }
+    failure
+}
+
+fn provider_credential_failure(body: &str) -> ProviderFailure {
+    ProviderFailure {
+        kind: ProviderFailureKind::CredentialUnavailable,
+        ..parse_provider_status(None, None, body, false)
     }
 }
 
 fn is_retryable_provider_failure(failure: &ProviderFailure) -> bool {
-    failure.timed_out
-        || matches!(failure.status_code, Some(429 | 500 | 502 | 503 | 504))
+    matches!(
+        failure.kind,
+        ProviderFailureKind::Timeout | ProviderFailureKind::CredentialUnavailable
+    ) || matches!(failure.status_code, Some(429 | 500 | 502 | 503 | 504))
         || is_expired_gcp_access_token_response(failure.status_code, &failure.body)
 }
 
@@ -2978,12 +3022,7 @@ async fn transcribe_audio_via_provider_once(
     }
 
     let response = request.send().await.map_err(|e| {
-        parse_provider_status(
-            None,
-            None,
-            &format!("Failed to call transcription provider: {}", e),
-            e.is_timeout(),
-        )
+        parse_provider_request_error(None, None, "Failed to call transcription provider", &e)
     })?;
 
     let status = response.status();
@@ -2993,11 +3032,11 @@ async fn transcribe_audio_via_provider_once(
         .and_then(|value| value.to_str().ok())
         .map(|value| value.to_string());
     let body = response.text().await.map_err(|e| {
-        parse_provider_status(
+        parse_provider_request_error(
             Some(status.as_u16()),
             retry_after_header.as_deref(),
-            &format!("Failed to read transcription response: {}", e),
-            e.is_timeout(),
+            "Failed to read transcription response",
+            &e,
         )
     })?;
 
@@ -3101,7 +3140,7 @@ async fn transcribe_audio_via_provider(
                         .retry_after
                         .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64),
                     status_code = failure.status_code,
-                    timed_out = failure.timed_out,
+                    timed_out = (failure.kind == ProviderFailureKind::Timeout),
                     "Retrying transcription provider call"
                 );
                 tokio::time::sleep(delay).await;
@@ -3267,7 +3306,7 @@ async fn fetch_gcp_access_token() -> std::result::Result<String, ProviderFailure
     }
 
     // Metadata path exhausted. Try `gcloud` for local dev. If both fail,
-    // surface a `timed_out=true` failure so the per-provider retry loop
+    // surface a transient credential failure so the per-provider retry loop
     // in `transcribe_audio_via_provider` treats it as transient — a
     // metadata blip should not collapse straight into the Gemini fallback.
     let metadata_summary =
@@ -3281,24 +3320,14 @@ async fn fetch_gcp_access_token() -> std::result::Result<String, ProviderFailure
         Ok(output) if output.status.success() => {
             Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
         }
-        Ok(_) => Err(parse_provider_status(
-            None,
-            None,
-            &format!(
-                "Failed to get GCP access token: metadata exhausted ({}); gcloud returned non-zero",
-                metadata_summary
-            ),
-            true,
-        )),
-        Err(e) => Err(parse_provider_status(
-            None,
-            None,
-            &format!(
-                "Failed to get GCP access token: metadata exhausted ({}); gcloud unavailable: {}",
-                metadata_summary, e
-            ),
-            true,
-        )),
+        Ok(_) => Err(provider_credential_failure(&format!(
+            "Failed to get GCP access token: metadata exhausted ({}); gcloud returned non-zero",
+            metadata_summary
+        ))),
+        Err(e) => Err(provider_credential_failure(&format!(
+            "Failed to get GCP access token: metadata exhausted ({}); gcloud unavailable: {}",
+            metadata_summary, e
+        ))),
     }
 }
 
@@ -3442,14 +3471,7 @@ async fn transcribe_via_gemini(
         .timeout(std::time::Duration::from_secs(120))
         .send()
         .await
-        .map_err(|e| {
-            parse_provider_status(
-                None,
-                None,
-                &format!("Failed to call Vertex AI: {}", e),
-                e.is_timeout(),
-            )
-        })?;
+        .map_err(|e| parse_provider_request_error(None, None, "Failed to call Vertex AI", &e))?;
 
     let status = response.status();
     let retry_after_header = response
@@ -3458,11 +3480,11 @@ async fn transcribe_via_gemini(
         .and_then(|v| v.to_str().ok())
         .map(|v| v.to_string());
     let resp_body = response.text().await.map_err(|e| {
-        parse_provider_status(
+        parse_provider_request_error(
             Some(status.as_u16()),
             retry_after_header.as_deref(),
-            &format!("Failed to read Vertex AI response: {}", e),
-            e.is_timeout(),
+            "Failed to read Vertex AI response",
+            &e,
         )
     })?;
 
@@ -3549,16 +3571,11 @@ async fn fetch_gcp_identity_token(audience: &str) -> std::result::Result<String,
         }
     }
 
-    Err(parse_provider_status(
-        None,
-        None,
-        &format!(
-            "Failed to get GCP identity token (audience={}): {}",
-            audience,
-            last_metadata_error.unwrap_or_else(|| "metadata server unreachable".to_string())
-        ),
-        true,
-    ))
+    Err(provider_credential_failure(&format!(
+        "Failed to get GCP identity token (audience={}): {}",
+        audience,
+        last_metadata_error.unwrap_or_else(|| "metadata server unreachable".to_string())
+    )))
 }
 
 /// One round-trip to the metadata server's identity-token endpoint.
@@ -3639,12 +3656,7 @@ async fn transcribe_via_parakeet(
         .send()
         .await
         .map_err(|e| {
-            parse_provider_status(
-                None,
-                None,
-                &format!("Failed to call Parakeet sidecar: {}", e),
-                e.is_timeout(),
-            )
+            parse_provider_request_error(None, None, "Failed to call Parakeet sidecar", &e)
         })?;
 
     let status = response.status();
@@ -3654,11 +3666,11 @@ async fn transcribe_via_parakeet(
         .and_then(|v| v.to_str().ok())
         .map(|v| v.to_string());
     let body = response.text().await.map_err(|e| {
-        parse_provider_status(
+        parse_provider_request_error(
             Some(status.as_u16()),
             retry_after.as_deref(),
-            &format!("Failed to read Parakeet response: {}", e),
-            e.is_timeout(),
+            "Failed to read Parakeet response",
+            &e,
         )
     })?;
 
@@ -5263,6 +5275,137 @@ mod tests {
     }
 
     #[test]
+    fn provider_error_codes_describe_the_failure_not_retry_exhaustion() {
+        use super::{ProviderError, ProviderFailureKind};
+
+        let cases = [
+            (None, ProviderFailureKind::Timeout, "provider_timeout"),
+            (Some(200), ProviderFailureKind::Timeout, "provider_timeout"),
+            (
+                Some(429),
+                ProviderFailureKind::Other,
+                "provider_rate_limited",
+            ),
+            // An explicit 429 remains authoritative even if reading its body times out.
+            (
+                Some(429),
+                ProviderFailureKind::Timeout,
+                "provider_rate_limited",
+            ),
+            (
+                None,
+                ProviderFailureKind::Transport,
+                "provider_transport_failed",
+            ),
+            (Some(503), ProviderFailureKind::Other, "provider_failed"),
+            (Some(401), ProviderFailureKind::Other, "provider_failed"),
+            (Some(400), ProviderFailureKind::Other, "provider_failed"),
+            (None, ProviderFailureKind::Other, "provider_failed"),
+            (
+                None,
+                ProviderFailureKind::CredentialUnavailable,
+                "provider_failed",
+            ),
+        ];
+        for (status, kind, expected) in cases {
+            for exhausted_retryable in [false, true] {
+                let mut failure = parse_provider_status(status, Some("12"), "failure", false);
+                failure.kind = kind.clone();
+                let error = ProviderError {
+                    failure,
+                    exhausted_retryable,
+                    attempts: 2,
+                };
+                assert_eq!(error.error_code(), expected, "{error:?}");
+                assert_eq!(error.retry_after(), Some(Duration::from_secs(12)));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_provider_request_classifier_uses_structured_network_errors() {
+        use super::{parse_provider_request_error, ProviderError, ProviderFailureKind};
+
+        for timed_out in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                if timed_out {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                drop(stream);
+            });
+            let error = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .get(format!("http://{address}"))
+                .timeout(Duration::from_millis(30))
+                .send()
+                .await
+                .unwrap_err();
+            let failure = parse_provider_request_error(None, None, "provider request", &error);
+            assert_eq!(
+                failure.kind,
+                if timed_out {
+                    ProviderFailureKind::Timeout
+                } else {
+                    ProviderFailureKind::Transport
+                }
+            );
+            assert_eq!(is_retryable_provider_failure(&failure), timed_out);
+            let error = ProviderError {
+                failure,
+                exhausted_retryable: timed_out,
+                attempts: 2,
+            };
+            assert_eq!(
+                error.error_code(),
+                if timed_out {
+                    "provider_timeout"
+                } else {
+                    "provider_transport_failed"
+                }
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_provider_preserves_bounded_http_retries_and_final_classification() {
+        for (status, expected) in [
+            (429, "provider_rate_limited"),
+            (503, "provider_failed"),
+            (400, "provider_failed"),
+        ] {
+            let responses = if status == 400 {
+                vec![status]
+            } else {
+                vec![status, status]
+            };
+            let expected_attempts = responses.len() as u32;
+            let (url, count, server) = spawn_status_server(responses);
+            let mut config = Config::from_lookup(|_| None);
+            config.transcription_provider = "openai".to_string();
+            config.transcription_api_url = Some(url);
+            config.transcription_max_retries = 1;
+            config.transcription_retry_base_ms = 1;
+            config.transcription_retry_max_ms = 1;
+            let audio = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(audio.path(), b"test audio").unwrap();
+            let error = super::transcribe_audio_via_provider(&config, audio.path(), None, None)
+                .await
+                .unwrap_err();
+            assert_eq!(error.error_code(), expected);
+            assert_eq!(error.attempts, expected_attempts);
+            assert_eq!(error.exhausted_retryable, status != 400);
+            server.join().unwrap();
+            assert_eq!(count.load(Ordering::SeqCst), expected_attempts as usize);
+        }
+    }
+
+    #[test]
     fn classifies_transient_5xx_provider_responses_as_retryable() {
         for status in [500, 502, 503, 504] {
             let failure = parse_provider_status(Some(status), None, "temporary failure", false);
@@ -6197,12 +6340,23 @@ mod tests {
 
     #[test]
     fn token_fetch_failures_are_retryable_for_provider_loop() {
-        // The token-fetch path now flags failures as `timed_out=true` so
-        // the per-provider retry loop treats them as transient. Without
-        // this, a single metadata-server hiccup falls straight through to
+        // Credential exhaustion remains transient without claiming a timeout.
+        // Otherwise a single metadata-server hiccup falls straight through to
         // the Gemini fallback.
-        let failure = parse_provider_status(None, None, "metadata server unavailable", true);
-        assert!(is_retryable_provider_failure(&failure));
+        for message in ["access token unavailable", "identity token unavailable"] {
+            let failure = super::provider_credential_failure(message);
+            assert!(is_retryable_provider_failure(&failure));
+            assert_eq!(
+                failure.kind,
+                super::ProviderFailureKind::CredentialUnavailable
+            );
+            let error = super::ProviderError {
+                failure,
+                exhausted_retryable: true,
+                attempts: 2,
+            };
+            assert_eq!(error.error_code(), "provider_failed");
+        }
     }
 
     // --- Parakeet sidecar provider ---
