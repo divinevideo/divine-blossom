@@ -74,6 +74,7 @@ class State:
         self.db.execute("CREATE TABLE IF NOT EXISTS objects (hash TEXT PRIMARY KEY, generation TEXT, size INTEGER, checked INTEGER DEFAULT 0, ready TEXT)")
         self.db.execute("CREATE INDEX IF NOT EXISTS objects_checked ON objects(checked,hash)")
         self.db.execute("CREATE TABLE IF NOT EXISTS upload_queue (hash TEXT PRIMARY KEY, generation TEXT NOT NULL, available_at INTEGER NOT NULL DEFAULT 0)")
+        self.db.execute("UPDATE upload_queue SET available_at=? WHERE available_at=0",(int(time.time()),))
         self.db.execute("CREATE INDEX IF NOT EXISTS uploads_due ON upload_queue(available_at,hash)")
         self.db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
         self.db.commit()
@@ -105,16 +106,17 @@ class State:
         self.db.execute("INSERT OR IGNORE INTO objects(hash) VALUES (?)", (key,))
         self.db.commit()
 
-    def queue_upload(self, key, generation):
+    def queue_upload(self, key, generation, now=None):
         if not HEX.fullmatch(key) or not re.fullmatch(r"[1-9][0-9]{0,29}", generation):
             raise ValueError("invalid upload notification identity")
+        due = int(time.time()) if now is None else now
         with self.db:
             self.db.execute("INSERT OR IGNORE INTO objects(hash) VALUES (?)", (key,))
             old = self.db.execute("SELECT generation FROM upload_queue WHERE hash=?", (key,)).fetchone()
             if old is None:
-                self.db.execute("INSERT INTO upload_queue(hash,generation) VALUES (?,?)", (key,generation))
+                self.db.execute("INSERT INTO upload_queue(hash,generation,available_at) VALUES (?,?,?)", (key,generation,due))
             elif int(generation) > int(old[0]):
-                self.db.execute("UPDATE upload_queue SET generation=?,available_at=0 WHERE hash=?", (generation,key))
+                self.db.execute("UPDATE upload_queue SET generation=?,available_at=? WHERE hash=?", (generation,due,key))
 
     def queued_uploads(self, limit, now=None):
         return self.db.execute("SELECT hash,generation FROM upload_queue WHERE available_at<=? ORDER BY available_at,hash LIMIT ?",
@@ -282,7 +284,13 @@ class Worker:
             raise ValueError("notification scheduling needs at least two object slots")
         report = Counter()
         if notifications is not None:
-            report.update(notifications.ingest(self.state, min(max_objects,1000)))
+            try:
+                report.update(notifications.ingest(self.state, min(max_objects,1000)))
+            except Exception:
+                # Intake failure must alert without stopping already durable copies.
+                # An uncertain acknowledgement can safely redeliver committed work.
+                report["notification_errors"] += 1
+                report["errors"] += 1
         keys, cursor = self.source.page(self.state.setting("cursor"), discovery_limit or max_objects)
         for key in keys:
             if HEX.fullmatch(key):

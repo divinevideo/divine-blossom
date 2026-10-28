@@ -137,7 +137,9 @@ An hourly ten-object canary is a small test, not a catalogue-scale migration;
 choose cadence, object and byte budgets from measured backlog, capacity and cost.
 
 Aggregate reports include notifications_received, notifications_enqueued,
-notifications_ignored and notification_pending. Enqueued counts include safe
+notifications_ignored, notification_errors and notification_pending. Intake
+failures increment errors for alerting while already-durable queued work and
+historical reconciliation continue. Enqueued counts include safe
 duplicate deliveries. Monitor both Pub/Sub oldest unacknowledged age and SQLite
 pending work: acknowledging into SQLite moves responsibility out of Pub/Sub.
 The 64 MiB per-original canary limit remains; thumbnails/HLS/transcripts and

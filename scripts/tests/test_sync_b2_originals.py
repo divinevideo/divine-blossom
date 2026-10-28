@@ -112,15 +112,15 @@ class UploadQueueTests(unittest.TestCase):
         self.addCleanup(lambda: self.state.close())
 
     def test_queue_survives_restart_and_older_duplicate_does_not_reset_retry(self):
-        self.state.queue_upload(HASH, '7')
+        self.state.queue_upload(HASH, '7', now=100)
         self.state.defer_upload(HASH, '7', now=100)
         self.state.queue_upload(HASH, '6')
-        self.state.queue_upload(HASH, '7')
+        self.state.queue_upload(HASH, '7', now=100)
         self.assertEqual(self.state.queued_uploads(10, now=101), [])
         self.state.close()
         self.state = mirror.State(Path(self.temp.name))
         self.assertEqual(self.state.queued_uploads(10, now=401), [(HASH, '7')])
-        self.state.queue_upload(HASH, '8')
+        self.state.queue_upload(HASH, '8', now=100)
         self.assertEqual(self.state.queued_uploads(10, now=101), [(HASH, '8')])
         self.state.finish_upload(HASH, '7')
         self.assertEqual(self.state.queued_uploads(10, now=101), [(HASH, '8')])
@@ -207,6 +207,32 @@ class UploadQueueTests(unittest.TestCase):
         self.state.db.commit()
         worker.cycle(max_objects=2,max_bytes=200)
         self.assertEqual(orders,[HASH,historical,historical,HASH])
+
+    def test_due_retry_precedes_newer_arrivals(self):
+        from unittest.mock import patch
+        with patch.object(mirror.time,'time',return_value=100):
+            self.state.queue_upload(HASH,'7')
+            self.state.defer_upload(HASH,'7')
+        newer='0'*64
+        with patch.object(mirror.time,'time',return_value=500):
+            self.state.queue_upload(newer,'8')
+            self.assertEqual(self.state.queued_uploads(1),[(HASH,'7')])
+
+    def test_notification_outage_does_not_stop_durable_work_or_history(self):
+        self.state.queue_upload(HASH,'7')
+        historical='f'*64
+        self.state.remember(historical)
+        source=Source()
+        source.page=lambda cursor,limit:([],None)
+        worker=mirror.Worker(source,None,None,self.state,max_object_bytes=100,chunk_bytes=5,max_spool_bytes=100)
+        processed=[]
+        worker.process=lambda key,budget:processed.append(key) or 'ready'
+        class Outage:
+            def ingest(self,state,limit):raise OSError('synthetic unavailable control service')
+        report=worker.cycle(max_objects=2,max_bytes=200,notifications=Outage())
+        self.assertEqual(set(processed),{HASH,historical})
+        self.assertEqual(report['notification_errors'],1)
+        self.assertEqual(report['errors'],1)
 
     def test_pending_approval_is_deferred_and_retried(self):
         self.state.queue_upload(HASH,'7')
