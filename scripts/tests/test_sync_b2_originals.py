@@ -104,6 +104,127 @@ class KV:
         self.values.pop(gate)
 
 
+class UploadQueueTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.state = mirror.State(Path(self.temp.name))
+        self.addCleanup(lambda: self.state.close())
+
+    def test_queue_survives_restart_and_older_duplicate_does_not_reset_retry(self):
+        self.state.queue_upload(HASH, '7')
+        self.state.defer_upload(HASH, '7', now=100)
+        self.state.queue_upload(HASH, '6')
+        self.state.queue_upload(HASH, '7')
+        self.assertEqual(self.state.queued_uploads(10, now=101), [])
+        self.state.close()
+        self.state = mirror.State(Path(self.temp.name))
+        self.assertEqual(self.state.queued_uploads(10, now=401), [(HASH, '7')])
+        self.state.queue_upload(HASH, '8')
+        self.assertEqual(self.state.queued_uploads(10, now=101), [(HASH, '8')])
+        self.state.finish_upload(HASH, '7')
+        self.assertEqual(self.state.queued_uploads(10, now=101), [(HASH, '8')])
+
+    def test_ack_follows_durable_ingest_and_invalid_events_are_ignored(self):
+        state, calls = self.state, []
+        valid = {'eventType':'OBJECT_FINALIZE','bucketId':'synthetic-gcs','objectId':HASH,'objectGeneration':'7'}
+        messages = [{'ackId':'synthetic-ack-' + str(i), 'message':{'attributes':attrs}} for i,attrs in enumerate([valid,dict(valid,objectId='thumb.jpg'),dict(valid,bucketId='foreign')])]
+        class HTTP:
+            def request(self,url,method,value,**kwargs):
+                calls.append((url,value))
+                if url.endswith(':pull'): return {'receivedMessages':messages}
+                self_check = state.queued_uploads(10)
+                if self_check != [(HASH,'7')]: raise AssertionError('ack before durable queue')
+                return {}
+        class Credentials:
+            valid=True
+            token='synthetic-token'
+        queue = mirror.PubSubNotifications('projects/synthetic/subscriptions/uploads', 'synthetic-gcs', Credentials(), http=HTTP())
+        report=queue.ingest(state, 3)
+        self.assertEqual(report, {'notifications_received':3,'notifications_enqueued':1,'notifications_ignored':2})
+        self.assertEqual(calls[-1][1], {'ackIds':['synthetic-ack-0','synthetic-ack-1','synthetic-ack-2']})
+        self.assertTrue(all(url.startswith('https://pubsub.googleapis.com/v1/projects/synthetic/subscriptions/uploads:') for url,_ in calls))
+
+    def test_failed_commit_never_acknowledges(self):
+        class HTTP:
+            def __init__(self): self.calls=[]
+            def request(self,url,method,value,**kwargs):
+                self.calls.append(url)
+                return {'receivedMessages':[{'ackId':'synthetic','message':{'attributes':{'eventType':'OBJECT_FINALIZE','bucketId':'synthetic-gcs','objectId':HASH,'objectGeneration':'7'}}}]}
+        class Credentials:
+            valid=True
+            token='synthetic-token'
+        http=HTTP()
+        queue=mirror.PubSubNotifications('projects/synthetic/subscriptions/uploads','synthetic-gcs',Credentials(),http=http)
+        self.state.db.close()
+        try:
+            with self.assertRaises(Exception): queue.ingest(self.state,1)
+        finally:
+            self.state = mirror.State(Path(self.temp.name))
+        self.assertEqual(len(http.calls),1)
+
+    def test_notification_work_does_not_starve_historical_candidates(self):
+        for number in range(4):
+            key=('%064x' % number)
+            self.state.remember(key)
+            self.state.queue_upload(key,'7')
+        history='f'*64
+        self.state.remember(history)
+        self.state.remember('e'*64)
+        class EmptySource:
+            def page(self,cursor,limit):return [],None
+        worker=mirror.Worker(EmptySource(),None,None,self.state,max_object_bytes=100,chunk_bytes=5,max_spool_bytes=100)
+        processed=[]
+        def process(key,budget):processed.append(key);return 'ready'
+        worker.process=process
+        worker.cycle(max_objects=4,max_bytes=100)
+        # Notification scheduling is enabled by the presence of queued events.
+        self.assertEqual(len(processed),4)
+        self.assertEqual(len(set(processed)),4)
+        self.assertIn(history,processed)
+        self.assertEqual(len(self.state.queued_uploads(10)),2)
+
+    def test_image_notification_leaves_video_priority_queue(self):
+        self.state.queue_upload(HASH,'7')
+        kv=KV()
+        kv.values['blob:'+HASH]['type']='image/jpeg'
+        worker=mirror.Worker(Source(),Destination(),kv,self.state,max_object_bytes=100,chunk_bytes=5,max_spool_bytes=100)
+        worker.cycle(max_objects=2,max_bytes=200)
+        self.assertEqual(self.state.db.execute('SELECT COUNT(*) FROM upload_queue').fetchone()[0],0)
+
+    def test_first_byte_budget_opportunity_alternates_between_uploads_and_history(self):
+        self.state.queue_upload(HASH,'7')
+        historical='f'*64
+        self.state.remember(historical)
+        source=Source()
+        source.page=lambda cursor,limit:([],None)
+        worker=mirror.Worker(source,None,None,self.state,max_object_bytes=100,chunk_bytes=5,max_spool_bytes=100)
+        orders=[]
+        def process(key,budget):orders.append(key);return 'pending'
+        worker.process=process
+        worker.cycle(max_objects=2,max_bytes=200)
+        self.state.db.execute('UPDATE upload_queue SET available_at=0')
+        self.state.db.commit()
+        worker.cycle(max_objects=2,max_bytes=200)
+        self.assertEqual(orders,[HASH,historical,historical,HASH])
+
+    def test_pending_approval_is_deferred_and_retried(self):
+        self.state.queue_upload(HASH,'7')
+        source=Source()
+        source.page=lambda cursor,limit:([],None)
+        kv=KV()
+        kv.values['blob:'+HASH]['status']='pending'
+        worker=mirror.Worker(source,Destination(),kv,self.state,max_object_bytes=100,chunk_bytes=5,max_spool_bytes=100)
+        worker.cycle(max_objects=2,max_bytes=200)
+        self.assertEqual(self.state.queued_uploads(10,now=0),[])
+        self.assertEqual(self.state.db.execute('SELECT COUNT(*) FROM upload_queue').fetchone()[0],1)
+        self.state.db.execute('UPDATE upload_queue SET available_at=0')
+        self.state.db.commit()
+        kv.values['blob:'+HASH]['status']='active'
+        worker.cycle(max_objects=2,max_bytes=200)
+        self.assertEqual(self.state.db.execute('SELECT COUNT(*) FROM upload_queue').fetchone()[0],0)
+        self.assertIsNotNone(kv.get('b2-ready:'+HASH))
+
 class WorkerTests(unittest.TestCase):
     def setUp(self):
         self.assertTrue(hasattr(mirror, "State"), "durable mirror state is not implemented")

@@ -72,6 +72,9 @@ class State:
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.directory / "state.sqlite3")
         self.db.execute("CREATE TABLE IF NOT EXISTS objects (hash TEXT PRIMARY KEY, generation TEXT, size INTEGER, checked INTEGER DEFAULT 0, ready TEXT)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS objects_checked ON objects(checked,hash)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS upload_queue (hash TEXT PRIMARY KEY, generation TEXT NOT NULL, available_at INTEGER NOT NULL DEFAULT 0)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS uploads_due ON upload_queue(available_at,hash)")
         self.db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
         self.db.commit()
 
@@ -101,6 +104,30 @@ class State:
     def remember(self, key):
         self.db.execute("INSERT OR IGNORE INTO objects(hash) VALUES (?)", (key,))
         self.db.commit()
+
+    def queue_upload(self, key, generation):
+        if not HEX.fullmatch(key) or not re.fullmatch(r"[1-9][0-9]{0,29}", generation):
+            raise ValueError("invalid upload notification identity")
+        with self.db:
+            self.db.execute("INSERT OR IGNORE INTO objects(hash) VALUES (?)", (key,))
+            old = self.db.execute("SELECT generation FROM upload_queue WHERE hash=?", (key,)).fetchone()
+            if old is None:
+                self.db.execute("INSERT INTO upload_queue(hash,generation) VALUES (?,?)", (key,generation))
+            elif int(generation) > int(old[0]):
+                self.db.execute("UPDATE upload_queue SET generation=?,available_at=0 WHERE hash=?", (generation,key))
+
+    def queued_uploads(self, limit, now=None):
+        return self.db.execute("SELECT hash,generation FROM upload_queue WHERE available_at<=? ORDER BY available_at,hash LIMIT ?",
+                               (int(time.time()) if now is None else now,limit)).fetchall()
+
+    def defer_upload(self, key, generation, now=None):
+        with self.db:
+            self.db.execute("UPDATE upload_queue SET available_at=? WHERE hash=? AND generation=?",
+                            ((int(time.time()) if now is None else now)+300,key,generation))
+
+    def finish_upload(self, key, generation):
+        with self.db:
+            self.db.execute("DELETE FROM upload_queue WHERE hash=? AND generation=?", (key,generation))
 
     def row(self, key):
         self.remember(key)
@@ -250,25 +277,54 @@ class Worker:
         self.state.ready(key, record)
         return "ready"
 
-    def cycle(self, *, max_objects, max_bytes):
-        keys, cursor = self.source.page(self.state.setting("cursor"), max_objects)
+    def cycle(self, *, max_objects, max_bytes, discovery_limit=None, notifications=None):
+        if max_objects < 2 and (notifications is not None or self.state.db.execute("SELECT 1 FROM upload_queue LIMIT 1").fetchone()):
+            raise ValueError("notification scheduling needs at least two object slots")
+        report = Counter()
+        if notifications is not None:
+            report.update(notifications.ingest(self.state, min(max_objects,1000)))
+        keys, cursor = self.source.page(self.state.setting("cursor"), discovery_limit or max_objects)
         for key in keys:
             if HEX.fullmatch(key):
                 self.state.remember(key)
         self.state.set_setting("cursor", cursor)
-        # Oldest checked first: persisted objects remain eligible for reconciliation
-        # after disappearing from listings; repeated passes discover new originals.
-        candidates = self.state.db.execute("SELECT hash FROM objects ORDER BY checked,hash LIMIT ?", (max_objects,)).fetchall()
-        budget, report = Budget(max_bytes), Counter()
-        for (key,) in candidates:
+        # Separate capacity prevents a growing upload stream from starving backfill.
+        uploads = self.state.queued_uploads(max_objects//2)
+        historical = self.state.db.execute("SELECT hash FROM objects WHERE NOT EXISTS (SELECT 1 FROM upload_queue WHERE upload_queue.hash=objects.hash) ORDER BY checked,hash LIMIT ?",
+                                           (max_objects-len(uploads),)).fetchall()
+        groups = [uploads, [(key,None) for (key,) in historical]]
+        if uploads and historical:
+            turn = self.state.setting("budget_turn") or "uploads"
+            self.state.set_setting("budget_turn", "history" if turn=="uploads" else "uploads")
+            if turn=="history":
+                groups.reverse()
+        candidates = [group[index] for index in range(max(map(len,groups))) for group in groups if index<len(group)]
+        budget = Budget(max_bytes)
+        for key, generation in candidates:
+            result = "errors"
             try:
-                report[self.process(key, budget)] += 1
+                # Source finalization also includes images. Do not let them occupy
+                # the video-only priority queue forever. Policy remains authoritative.
+                metadata = self.kv.get("blob:"+key) if generation is not None and self.kv is not None else None
+                mime = metadata.get("type") if isinstance(metadata,dict) else None
+                if isinstance(mime,str) and "/" in mime and not mime.startswith("video/"):
+                    self.invalidate(key)
+                    result = "ignored"
+                else:
+                    result = self.process(key, budget)
+                report[result] += 1
             except Exception:
-                # SDK exceptions may include signed URLs, headers or identifiers.
-                # Record an aggregate count only; retry from durable state next cycle.
+                # SDK exceptions may contain signed URLs, headers or identifiers.
                 report["errors"] += 1
             finally:
+                if generation is not None:
+                    if result in ("ready","missing","oversized","ignored"):
+                        self.state.finish_upload(key,generation)
+                    else:
+                        self.state.defer_upload(key,generation)
                 self.state.checked(key)
+        if notifications is not None or uploads:
+            report["notification_pending"] = self.state.db.execute("SELECT COUNT(*) FROM upload_queue").fetchone()[0]
         report["transfer_bytes_reserved"] = budget.used
         return dict(report)
 
@@ -303,6 +359,54 @@ class JsonHTTP:
                 raise RuntimeError("control API HTTP failure") from None
             finally:
                 error.close()
+
+
+class PubSubNotifications:
+    """At-least-once hints; only SQLite commit permits acknowledgement."""
+    def __init__(self, subscription, source_bucket, credentials, http=None):
+        if not re.fullmatch(r"projects/[A-Za-z0-9][A-Za-z0-9._:-]*/subscriptions/[A-Za-z][A-Za-z0-9._~-]*", subscription):
+            raise ValueError("invalid notification subscription")
+        self.subscription, self.source_bucket = subscription, source_bucket
+        self.credentials, self.http = credentials, http or JsonHTTP()
+
+    def request(self, operation, value):
+        if operation not in ("pull","acknowledge"):
+            raise ValueError("unsupported notification operation")
+        if not self.credentials.valid:
+            from google.auth.transport.requests import Request
+            self.credentials.refresh(Request())
+        return self.http.request("https://pubsub.googleapis.com/v1/"+self.subscription+":"+operation,
+                                 "POST",value,headers={"Authorization":"Bearer "+self.credentials.token})
+
+    def ingest(self, state, limit):
+        if type(limit) is not int or not 1<=limit<=1000:
+            raise ValueError("invalid notification pull limit")
+        reply = self.request("pull", {"maxMessages":limit,"returnImmediately":True})
+        messages = reply.get("receivedMessages",[]) if isinstance(reply,dict) else None
+        if not isinstance(messages,list) or len(messages)>limit:
+            raise ValueError("invalid notification response")
+        ack_ids, enqueued, ignored = [],0,0
+        for message in messages:
+            ack = message.get("ackId") if isinstance(message,dict) else None
+            if not isinstance(ack,str) or not 1<=len(ack)<=4096:
+                raise ValueError("missing notification acknowledgement")
+            ack_ids.append(ack)
+            envelope = message.get("message",{})
+            attributes = envelope.get("attributes",{}) if isinstance(envelope,dict) else {}
+            if not isinstance(attributes,dict):
+                attributes = {}
+            key, generation = attributes.get("objectId"), attributes.get("objectGeneration")
+            if (attributes.get("eventType")=="OBJECT_FINALIZE" and attributes.get("bucketId")==self.source_bucket
+                and isinstance(key,str) and HEX.fullmatch(key) and isinstance(generation,str)
+                and re.fullmatch(r"[1-9][0-9]{0,29}",generation)):
+                state.queue_upload(key,generation)
+                enqueued += 1
+            else:
+                ignored += 1
+        # Every queued item is committed before any message can leave Pub/Sub.
+        if ack_ids:
+            self.request("acknowledge", {"ackIds":ack_ids})
+        return {"notifications_received":len(messages),"notifications_enqueued":enqueued,"notifications_ignored":ignored}
 
 
 class FastlyKV:
@@ -437,6 +541,8 @@ def main(argv=None):
     parser.add_argument("--erasure-bucket-id", required=True)
     parser.add_argument("--kv-store-id", required=True)
     parser.add_argument("--state-dir", required=True, type=Path)
+    parser.add_argument("--notification-subscription", help="Dedicated GCS OBJECT_FINALIZE subscription; disabled by default")
+    parser.add_argument("--discovery-limit", type=int, help="Source names discovered per pass (1..1000); defaults to max-objects")
     parser.add_argument("--max-objects", type=int, default=10)
     parser.add_argument("--max-bytes", type=int, default=256 * MIB)
     parser.add_argument("--max-object-bytes", type=int, default=64 * MIB)
@@ -451,6 +557,10 @@ def main(argv=None):
         parser.error("canary ceiling is 64 MiB per original and 1 MiB per chunk")
     if args.max_bytes < 2 * args.max_object_bytes or args.max_spool_bytes < args.max_object_bytes:
         parser.error("budgets must permit upload plus verification of one maximum-sized object")
+    if args.discovery_limit is not None and not 1<=args.discovery_limit<=1000:
+        parser.error("discovery limit must be between 1 and 1000")
+    if args.notification_subscription and args.max_objects<2:
+        parser.error("notification scheduling requires at least two object slots")
     os.umask(0o077)
     args.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     with (args.state_dir / "worker.lock").open("a") as lock:
@@ -475,7 +585,17 @@ def main(argv=None):
                         FastlyKV(args.kv_store_id, os.environ["FASTLY_API_TOKEN"]), state,
                         max_object_bytes=args.max_object_bytes, chunk_bytes=args.chunk_bytes,
                         max_spool_bytes=args.max_spool_bytes)
-            report = worker.cycle(max_objects=args.max_objects, max_bytes=args.max_bytes)
+            notifications = None
+            if args.notification_subscription:
+                bound = state.setting("notification_subscription")
+                if bound is not None and bound != args.notification_subscription:
+                    raise ValueError("state belongs to another notification subscription")
+                state.set_setting("notification_subscription",args.notification_subscription)
+                import google.auth
+                credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/pubsub"])
+                notifications = PubSubNotifications(args.notification_subscription,args.source_bucket,credentials)
+            report = worker.cycle(max_objects=args.max_objects, max_bytes=args.max_bytes,
+                                  discovery_limit=args.discovery_limit, notifications=notifications)
             print(json.dumps(report, sort_keys=True))
             return 1 if report.get("errors") else 0
         finally:
