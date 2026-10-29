@@ -368,6 +368,32 @@ fn quarantine_hold_http_contract() {
     assert!(absent["base_status"].is_null());
     assert_eq!(absent["effective_status"], "quarantined");
 
+    let full_hash = "e".repeat(64);
+    let full_key = format!("quarantine:v1:{full_hash}");
+    let entries: serde_json::Map<String, serde_json::Value> = (0..128)
+        .map(|index| {
+            (
+                format!("review:{index}"),
+                serde_json::json!({"version": 2, "active": false}),
+            )
+        })
+        .collect();
+    let full_record = serde_json::json!({"version": 1, "holds": entries}).to_string();
+    store.insert(&full_key, full_record.clone()).unwrap();
+    let mut overflow = request(Method::POST, "/admin/api/quarantine", true);
+    overflow.set_body(serde_json::json!({"sha256": full_hash, "hold_id": "review:new", "version": 1, "action": "hold"}).to_string());
+    assert_eq!(call(overflow).get_status(), StatusCode::CONFLICT);
+    assert_eq!(
+        store.lookup(&full_key).unwrap().take_body().into_string(),
+        full_record
+    );
+    let mut existing = request(Method::POST, "/admin/api/quarantine", true);
+    existing.set_body(serde_json::json!({"sha256": full_hash, "hold_id": "review:0", "version": 3, "action": "hold"}).to_string());
+    let mut existing = call(existing);
+    assert_eq!(existing.get_status(), StatusCode::OK);
+    let existing: serde_json::Value = serde_json::from_str(&existing.take_body_str()).unwrap();
+    assert_eq!(existing["hold_ids"], serde_json::json!(["review:0"]));
+
     let holds_key = format!("quarantine:v1:{}", hash());
     store.insert(&holds_key, "malformed".to_string()).unwrap();
     assert!(

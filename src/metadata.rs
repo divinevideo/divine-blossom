@@ -9,7 +9,7 @@ use blossom_core::conditional_update::{
     update_json_conditionally_with_io, ConditionalJsonMutation,
 };
 use blossom_core::quarantine::{
-    mutate_holds, QuarantineAction, QuarantineHolds, HOLD_VERSION_CONFLICT,
+    mutate_holds, QuarantineAction, QuarantineHolds, HOLD_CAPACITY_EXCEEDED, HOLD_VERSION_CONFLICT,
 };
 use fastly::cache::simple as simple_cache;
 use fastly::kv_store::{
@@ -257,7 +257,9 @@ pub fn update_quarantine_holds(
     })
     .map(|_| ())
     .map_err(|error| match error {
-        BlossomError::MetadataError(message) if message == HOLD_VERSION_CONFLICT => {
+        BlossomError::MetadataError(message)
+            if message == HOLD_VERSION_CONFLICT || message == HOLD_CAPACITY_EXCEEDED =>
+        {
             BlossomError::Conflict(message)
         }
         other => other,

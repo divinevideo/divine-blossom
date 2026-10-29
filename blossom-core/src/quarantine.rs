@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 const MAX_HOLDS: usize = 128;
 pub const HOLD_VERSION_CONFLICT: &str =
     "A quarantine hold version cannot represent conflicting actions";
+pub const HOLD_CAPACITY_EXCEEDED: &str =
+    "The quarantine hold record already contains 128 distinct hold IDs";
 const MAX_SAFE_VERSION: u64 = 9_007_199_254_740_991;
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -99,6 +101,8 @@ pub fn mutate_holds(
         if version == current.version {
             return Err(HOLD_VERSION_CONFLICT.into());
         }
+    } else if holds.holds.len() == MAX_HOLDS {
+        return Err(HOLD_CAPACITY_EXCEEDED.into());
     }
     // Inactive entries retain ordering so a delayed hold cannot undo a release.
     holds

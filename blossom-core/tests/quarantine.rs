@@ -219,3 +219,29 @@ fn mutation_versions_are_positive_javascript_safe_integers() {
     )
     .is_ok());
 }
+
+#[test]
+fn capacity_rejects_new_ids_but_preserves_updates_and_release_ordering() {
+    let mut holds = QuarantineHolds::default();
+    for index in 0..128 {
+        holds = apply(
+            Some(holds),
+            &format!("review:{index}"),
+            QuarantineAction::Hold,
+        );
+    }
+    holds = apply(Some(holds), "review:0", QuarantineAction::Release);
+    for action in [QuarantineAction::Hold, QuarantineAction::Release] {
+        let error = mutate_holds(Some(holds.clone()), "review:new", 1, action)
+            .err()
+            .expect("new IDs must not evict retained ordering records");
+        assert_eq!(error, blossom_core::quarantine::HOLD_CAPACITY_EXCEEDED);
+    }
+    holds = apply(Some(holds), "review:1", QuarantineAction::Release);
+    assert_eq!(holds.holds.len(), 128);
+    assert_eq!(holds.active_ids().len(), 126);
+    assert!(matches!(
+        mutate_holds(Some(holds), "review:0", 1, QuarantineAction::Hold).unwrap(),
+        ConditionalJsonMutation::Complete(_)
+    ));
+}
