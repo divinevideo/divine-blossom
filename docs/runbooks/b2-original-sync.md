@@ -94,6 +94,64 @@ shared gate; repeated retries will never steal an existing gate.
 Control API redirects fail closed without forwarding authentication headers, and
 the worker's HTTP client does not change the process-wide urllib opener.
 
+## Keep new uploads mirrored while backfilling
+
+Both Blossom and the upload data plane currently finalize canonical bytes in GCS.
+A dedicated OBJECT_FINALIZE notification subscription can feed this same verified
+worker. No synchronous B2 write is added to upload responses: B2 outages leave
+uploads successful in GCS and queued for retry. Notifications do not authorize
+copying; authoritative moderation and erasure checks still run for every copy.
+
+Add these optional arguments to a bounded scheduled invocation:
+
+```sh
+--notification-subscription "projects/$MIRROR_PROJECT/subscriptions/$MIRROR_UPLOAD_SUBSCRIPTION" \
+--discovery-limit 1000
+```
+
+The source bucket must publish OBJECT_FINALIZE events to that dedicated topic.
+The GCS service agent needs publisher permission only on that topic; the worker
+needs subscriber permission only on its subscription. Event payloads may be NONE:
+only bucketId, objectId, objectGeneration and eventType attributes are consumed.
+This covers direct, resumable and migrated canonical uploads without separate
+upload-service B2 credentials. Non-original keys and foreign events are ignored.
+Canonical non-video metadata removes an item from the video priority queue.
+
+Each pass makes one bounded immediate REST pull, commits valid upload identities
+to SQLite, and only then acknowledges the batch. A failed commit leaves messages
+unacknowledged. Lost acknowledgements and duplicate/out-of-order generations are
+safe. Pending moderation, transfer budgets and transient errors defer the queued
+video for five minutes; no successful copy is required to acknowledge Pub/Sub
+because SQLite now owns the durable retry. Preserve/back up this database.
+Changing subscription identity on existing state is rejected. Disabling event
+intake does not discard previously queued work.
+
+At most half of the copy-object slots are used for queued uploads. Historical
+candidates exclude the priority queue, and the first group to use the shared byte
+budget alternates across persisted passes, so large new uploads cannot always
+consume transfer capacity first. Unused slots do not increase the byte ceiling.
+Notification mode requires at least two object slots. Discovery may list up to
+1000 names per pass independently of the copy-object bound; no listing argument
+increases media transfer limits. The old discovery default remains unchanged.
+An hourly ten-object canary is a small test, not a catalogue-scale migration;
+choose cadence, object and byte budgets from measured backlog, capacity and cost.
+
+Aggregate reports include notifications_received, notifications_enqueued,
+notifications_ignored, notification_errors and notification_pending. Intake
+failures increment errors for alerting while already-durable queued work and
+historical reconciliation continue. Enqueued counts include safe
+duplicate deliveries. Monitor both Pub/Sub oldest unacknowledged age and SQLite
+pending work: acknowledging into SQLite moves responsibility out of Pub/Sub.
+The 64 MiB per-original canary limit remains; thumbnails/HLS/transcripts and
+B2-authoritative upload sessions still need later migration work.
+
+A scheduled bounded pull uses the supported returnImmediately option to avoid
+holding an idle CronJob in a long poll. This API option is deprecated and
+Google discourages it for high-throughput subscribers; a continuously running
+subscriber should use streaming pull rather than increasing polling frequency.
+See [Pub/Sub pull semantics](https://docs.cloud.google.com/pubsub/docs/reference/rest/v1/projects.subscriptions/pull)
+and [GCS notification attributes](https://docs.cloud.google.com/storage/docs/pubsub-notifications).
+
 ## Policy and readiness contract
 
 All policy comes from uncached Fastly metadata, never from GCS object metadata.

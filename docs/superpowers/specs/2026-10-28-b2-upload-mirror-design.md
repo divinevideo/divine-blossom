@@ -1,0 +1,13 @@
+# Keep new uploads and historical originals mirrored to B2
+
+The existing approved plan requires a verified backfill and a staged migration that preserves GCS. New uploads through both Blossom and the upload data plane must join the mirror without waiting for a full bucket scan.
+
+Use a dedicated durable Pub/Sub subscription fed by GCS OBJECT_FINALIZE notifications. This covers every successful canonical write, including direct upload, resumable finalization and migration. Upload success remains tied to durable GCS storage; a B2 outage cannot fail the upload. Events are hints, never public-policy or readiness authority. The existing worker performs the copy only after authoritative moderation approves the video, using its current checksum, generation and erasure-gate checks.
+
+Acknowledge an event only after its hash and generation have been committed to the worker's persistent SQLite queue. Duplicate delivery is idempotent. Malformed, foreign-bucket and non-original events are counted and discarded. A missing acknowledgement ID or failed durable write aborts without acknowledging the batch. Retry pending moderation and transient copy failures; do not drop queued work until a verified ready copy or a terminal unsupported/missing source result. Preserve work across process restarts.
+
+Reserve at most half of a bounded pass for notification work, leaving capacity for historical backfill/reconciliation. Make listing-page size independent of copy-object limits so inventory discovery can progress without increasing transfer budgets. Keep aggregate-only reports and unchanged defaults when no subscription is configured. Existing SQLite state remains compatible; bind the subscription separately to avoid silently switching consumers.
+
+Alternatives considered: synchronous dual writes in every uploader couple upload availability to B2 and duplicate policy/race logic; periodic scans alone provide poor new-upload latency at catalogue scale. This event-driven mirror plus reconciliation is the implementation choice for the already-authorized mirroring work. Direct B2-authoritative multipart uploads and derived-media migration remain later stages of the original plan.
+
+Infrastructure must create a dedicated topic/subscription, grant only the source bucket's GCS service agent publish permission and only the worker GSA subscription-consume permission, and install only OBJECT_FINALIZE notifications. Expose queue configuration through the suspended runner renderer. No environment is automatically enabled and no GCS read/write default changes. Production activation still requires credential delivery, state recovery, erasure and playback drills.
