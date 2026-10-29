@@ -51,6 +51,25 @@ const CONFIG_STORE: &str = "blossom_config";
 /// Secret store name
 const SECRET_STORE: &str = "blossom_secrets";
 
+#[cfg(test)]
+std::thread_local! {
+    static TEST_STORAGE_CACHE_BYPASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Viceroy does not implement the HTTP cache host calls used for originals.
+/// Keep that unsupported transport isolated from exact-route policy tests.
+#[cfg(test)]
+pub(crate) fn with_uncached_storage_for_test<T>(operation: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_STORAGE_CACHE_BYPASS.with(|value| value.set(self.0));
+        }
+    }
+    let _reset = Reset(TEST_STORAGE_CACHE_BYPASS.with(|value| value.replace(true)));
+    operation()
+}
+
 /// AWS signature version (works with GCS HMAC)
 const AWS_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 
@@ -217,6 +236,8 @@ fn build_media_read_request(
     immutable: bool,
     uncached: bool,
 ) -> Result<Request> {
+    #[cfg(test)]
+    let uncached = uncached || TEST_STORAGE_CACHE_BYPASS.with(|value| value.get());
     let mut req = Request::get(format!("{}{}", config.endpoint(), config.object_path(key)));
     req.set_header("Host", config.host());
     if let Some(range) = range {

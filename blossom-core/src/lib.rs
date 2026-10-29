@@ -3,6 +3,7 @@ pub mod canary;
 pub mod conditional_update;
 pub mod delete_policy;
 pub mod error;
+pub mod quarantine;
 pub mod rate_limit;
 pub mod read_through;
 pub mod request_diagnostics;

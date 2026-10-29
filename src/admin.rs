@@ -8,10 +8,12 @@ use crate::delete_policy::{
 };
 use crate::error::{BlossomError, Result};
 use crate::metadata::{
-    get_blob_metadata, get_global_stats, get_recent_index, get_user_blobs, get_user_index,
-    replace_global_stats, replace_recent_index, update_blob_status, update_stats_on_status_change,
+    get_blob_metadata, get_blob_metadata_uncached, get_global_stats, get_quarantine_holds,
+    get_recent_index, get_user_blobs, get_user_index, replace_global_stats, replace_recent_index,
+    update_blob_status, update_quarantine_holds, update_stats_on_status_change,
 };
 use crate::storage::{download_blob_with_fallback, write_audit_log};
+use blossom_core::quarantine::{validate_hold_id, validate_hold_version, QuarantineAction};
 use fastly::http::{header, Method, StatusCode};
 use fastly::kv_store::KVStore;
 use fastly::{Request, Response};
@@ -175,6 +177,7 @@ mod tests {
             uploaded: "2026-04-14T00:00:00Z".to_string(),
             owner: "c".repeat(64),
             status: BlobStatus::AgeRestricted,
+            quarantine_hold_ids: Vec::new(),
             thumbnail: None,
             moderation: None,
             transcode_status: None,
@@ -866,6 +869,64 @@ struct RestoreRequest {
     sha256: String,
     #[serde(default)]
     status: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuarantineRequest {
+    sha256: String,
+    hold_id: String,
+    version: u64,
+    action: QuarantineAction,
+}
+
+fn quarantine_status_response(hash: &str) -> Result<Response> {
+    let metadata = get_blob_metadata_uncached(hash)?;
+    let holds = get_quarantine_holds(hash)?;
+    let hold_ids = holds.active_ids();
+    let quarantined = !hold_ids.is_empty();
+    let base_status = metadata.map(|metadata| metadata.status.as_api_str());
+    let entries: Vec<_> = holds
+        .holds
+        .iter()
+        .map(|(id, hold)| {
+            serde_json::json!({
+                "hold_id": id, "version": hold.version, "active": hold.active,
+            })
+        })
+        .collect();
+    let body = serde_json::json!({
+        "sha256": hash,
+        "base_status": base_status,
+        "effective_status": if quarantined { "quarantined" } else { base_status.unwrap_or("not_found") },
+        "quarantined": quarantined,
+        "hold_ids": hold_ids,
+        "holds": entries,
+    });
+    let mut response = json_response(StatusCode::OK, &body)?;
+    crate::add_private_cache_headers(&mut response, hash);
+    Ok(response)
+}
+
+/// Add/release only the named versioned review hold; base policy is untouched.
+pub fn handle_admin_quarantine_action(mut req: Request) -> Result<Response> {
+    validate_admin_auth(&req)?;
+    let payload: QuarantineRequest = serde_json::from_str(&req.take_body().into_string())
+        .map_err(|error| BlossomError::BadRequest(format!("Invalid JSON: {error}")))?;
+    validate_sha256_format(&payload.sha256)?;
+    validate_hold_id(&payload.hold_id).map_err(BlossomError::BadRequest)?;
+    validate_hold_version(payload.version).map_err(BlossomError::BadRequest)?;
+    let hash = payload.sha256.to_lowercase();
+    update_quarantine_holds(&hash, &payload.hold_id, payload.version, payload.action)?;
+    // Retry this targeted purge even after idempotent or stale mutations.
+    crate::purge_edge_cache(&hash);
+    quarantine_status_response(&hash)
+}
+
+pub fn handle_admin_quarantine_status(req: Request, hash: &str) -> Result<Response> {
+    validate_admin_auth(&req)?;
+    validate_sha256_format(hash)?;
+    quarantine_status_response(&hash.to_lowercase())
 }
 
 pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
