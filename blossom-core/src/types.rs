@@ -49,6 +49,10 @@ pub struct BlobMetadata {
     pub owner: String,
     /// Content status for moderation
     pub status: BlobStatus,
+    /// Authoritative review holds loaded separately from base blob metadata.
+    /// Never accept or persist this overlay through ordinary metadata writes.
+    #[serde(skip)]
+    pub quarantine_hold_ids: Vec<String>,
     /// Path to thumbnail for videos
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumbnail: Option<String>,
@@ -178,6 +182,10 @@ impl BlobMetadata {
     pub fn access_for(&self, requester_pubkey: Option<&str>, is_admin: bool) -> BlobAccess {
         if is_admin {
             return BlobAccess::Allowed;
+        }
+
+        if !self.quarantine_hold_ids.is_empty() {
+            return BlobAccess::NotFound;
         }
 
         let is_owner = requester_pubkey
@@ -886,6 +894,7 @@ mod tests {
             uploaded: "2026-01-01T00:00:00Z".to_string(),
             owner: "b".repeat(64),
             status: BlobStatus::Active,
+            quarantine_hold_ids: Vec::new(),
             thumbnail: None,
             moderation: None,
             transcode_status: None,
@@ -1067,6 +1076,7 @@ mod tests {
             uploaded: "2026-04-10T00:00:00Z".into(),
             owner: owner.into(),
             status,
+            quarantine_hold_ids: Vec::new(),
             thumbnail: None,
             moderation: None,
             transcode_status: None,

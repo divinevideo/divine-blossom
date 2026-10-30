@@ -17,6 +17,9 @@ mod storage;
 mod upload_log;
 mod viewer_auth;
 
+#[cfg(test)]
+mod quarantine_tests;
+
 use crate::auth::{diagnose_viewer_auth, validate_auth, validate_hash_match, viewer_pubkey};
 use crate::blossom::{
     is_audio_path, is_hash_path, is_quality_variant_path, is_transcribable_mime_type,
@@ -42,14 +45,14 @@ use crate::metadata::{
     create_vanish_audit_state, delete_audio_mapping, delete_audio_source_refs, delete_auth_events,
     delete_blob_metadata, delete_blob_refs, delete_subtitle_data, finish_vanish_blob_lookup,
     get_audio_mapping, get_audio_source_refs, get_auth_event, get_blob_metadata,
-    get_blob_metadata_uncached, get_blob_refs, get_subtitle_job, get_subtitle_job_by_hash,
-    get_tombstone, get_user_blobs, get_vanish_audit_state, list_blobs_with_metadata,
-    mark_vanish_audit_authorized_delivered, mark_vanish_in_progress, open_store, put_audio_mapping,
-    put_auth_event, put_blob_metadata, put_subtitle_job, refresh_vanish_audit_state,
-    remove_from_audio_source_refs, remove_from_blob_refs, remove_from_user_index,
-    remove_from_user_list, set_subtitle_job_id_for_hash, start_vanish_blob_lookup,
-    update_blob_status, update_stats_on_add, StatusUpdateOutcome, TranscodeMetadataUpdate,
-    TranscriptMetadataUpdate, VanishAuditState,
+    get_blob_metadata_uncached, get_blob_refs, get_quarantine_holds, get_subtitle_job,
+    get_subtitle_job_by_hash, get_tombstone, get_user_blobs, get_vanish_audit_state,
+    list_blobs_with_metadata, mark_vanish_audit_authorized_delivered, mark_vanish_in_progress,
+    open_store, put_audio_mapping, put_auth_event, put_blob_metadata, put_subtitle_job,
+    refresh_vanish_audit_state, remove_from_audio_source_refs, remove_from_blob_refs,
+    remove_from_user_index, remove_from_user_list, set_subtitle_job_id_for_hash,
+    start_vanish_blob_lookup, update_blob_status, update_stats_on_add, StatusUpdateOutcome,
+    TranscodeMetadataUpdate, TranscriptMetadataUpdate, VanishAuditState,
 };
 use crate::storage::{
     b2_replica_enabled, blob_exists, check_funnelcake_audio_reuse, current_timestamp,
@@ -159,6 +162,61 @@ fn handle_main(mut req: Request) -> std::result::Result<Response, Error> {
 
 /// Route and handle the request
 fn handle_request(req: Request) -> Result<Response> {
+    with_quarantine_response_guard(req, route_request)
+}
+
+/// Resolve the source whose policy governs a public media response. Derived
+/// audio and thumbnails belong to the source video, not a separate blob ID.
+fn quarantine_source_hash(path: &str) -> Option<String> {
+    if let Some(thumbnail) = parse_thumbnail_path(path) {
+        return Some(thumbnail.trim_end_matches(".jpg").to_string());
+    }
+    parse_audio_path(path)
+        .or_else(|| parse_transcript_path(path))
+        .or_else(|| parse_vtt_file_path(path))
+        .or_else(|| parse_quality_variant_path(path).map(|(hash, _, _)| hash))
+        .or_else(|| {
+            path.strip_prefix('/')
+                .and_then(|path| path.split_once("/hls/"))
+                .and_then(|(hash, _)| parse_hash_from_path(hash))
+        })
+        .or_else(|| {
+            path.strip_prefix("/v1/subtitles/by-hash/")
+                .and_then(parse_hash_from_path)
+        })
+        .or_else(|| parse_hash_from_path(path))
+}
+
+/// An origin read may finish after a hold mutation and its purge. Recheck the
+/// authoritative hold record after routing/origin work, before emitting any
+/// outer response headers, so that request cannot refill a public CDN entry.
+/// A failed final read drops the prepared response and fails closed as well.
+fn with_quarantine_response_guard<F>(req: Request, handler: F) -> Result<Response>
+where
+    F: FnOnce(Request) -> Result<Response>,
+{
+    let hash = if matches!(*req.get_method(), Method::GET | Method::HEAD) {
+        quarantine_source_hash(req.get_path())
+    } else {
+        None
+    };
+    let is_admin = hash.is_some() && admin::validate_bearer_token(&req).is_ok();
+    let response = handler(req)?;
+    if let Some(hash) = hash {
+        // Some public HEAD handlers do not consume auth and still produce public
+        // cache headers. A token alone must not exempt such a response: only an
+        // actual private reviewer response may bypass the final policy read.
+        let private_review = is_admin
+            && response.get_header_str("Cache-Control") == Some("private, no-store")
+            && response.get_header_str("Surrogate-Control") == Some("no-store");
+        if !private_review && !get_quarantine_holds(&hash)?.active_ids().is_empty() {
+            return Err(BlossomError::NotFound("Content not found".into()));
+        }
+    }
+    Ok(response)
+}
+
+fn route_request(req: Request) -> Result<Response> {
     match canary::route(&req) {
         blossom_core::canary::CanaryRoute::Canary => return canary::handle(req),
         blossom_core::canary::CanaryRoute::Denied => {
@@ -294,6 +352,13 @@ fn handle_request(req: Request) -> Result<Response> {
             admin::handle_admin_blob_detail(req, hash)
         }
         (Method::POST, "/admin/api/moderate") => admin::handle_admin_moderate_action(req),
+        (Method::POST, "/admin/api/quarantine") => admin::handle_admin_quarantine_action(req),
+        (Method::GET, p) if p.starts_with("/admin/api/quarantine/") => {
+            admin::handle_admin_quarantine_status(
+                req,
+                p.strip_prefix("/admin/api/quarantine/").unwrap_or(""),
+            )
+        }
         (Method::POST, "/admin/api/bulk-approve") => admin::handle_admin_bulk_approve(req),
         (Method::POST, "/admin/api/scan-flagged") => admin::handle_admin_scan_flagged(req),
         (Method::POST, "/admin/api/delete") => handle_admin_force_delete(req),
@@ -2454,6 +2519,7 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
         uploaded: current_timestamp(),
         owner: metadata.owner.clone(),
         status: BlobStatus::Active,
+        quarantine_hold_ids: Vec::new(),
         thumbnail: None,
         moderation: None,
         transcode_status: None,
@@ -3445,6 +3511,7 @@ fn handle_upload(mut req: Request, record: &mut UploadLogRecord) -> Result<Respo
         uploaded: current_timestamp(),
         owner: auth.pubkey.clone(),
         status: BlobStatus::Pending, // Start as pending for moderation
+        quarantine_hold_ids: Vec::new(),
         thumbnail: None,
         moderation: None,
         transcode_status: if is_video_mime_type(&content_type) {
@@ -3819,6 +3886,7 @@ fn publish_upload_service_upload(
         uploaded: current_timestamp(),
         owner: auth.pubkey.clone(),
         status: BlobStatus::Pending,
+        quarantine_hold_ids: Vec::new(),
         thumbnail: thumbnail_url,
         moderation: None,
         transcode_status: if is_video_mime_type(&content_type) {
@@ -5705,6 +5773,7 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
         uploaded: current_timestamp(),
         owner: auth.pubkey.clone(),
         status: BlobStatus::Pending,
+        quarantine_hold_ids: Vec::new(),
         thumbnail: None,
         moderation: None,
         transcode_status: if is_video_mime_type(&content_type) {
@@ -7159,9 +7228,9 @@ mod tests {
         vanish_blob_disposition, vanish_pending_count, vanish_response_status,
         vanish_shared_update_error_count, vanish_storage_hashes, vanish_timing_record,
         AudioReuseAvailability, DerivativeObservation, PreparedDerivedAudioCleanup,
-        TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState,
-        VanishBlobDisposition, VanishExecution, VanishRequestOps, VanishTimingCounters,
-        B2_VANISH_KV_FANOUT, DELIVERY_PROBE_BUDGET_RESERVE, VANISH_KV_FANOUT, VANISH_TIME_BUDGET,
+        TranscodeFetchAction, TranscriptFetchAction, TranscriptPendingState, VanishBlobDisposition,
+        VanishExecution, VanishRequestOps, VanishTimingCounters, B2_VANISH_KV_FANOUT,
+        DELIVERY_PROBE_BUDGET_RESERVE, VANISH_KV_FANOUT, VANISH_TIME_BUDGET,
     };
     use crate::blossom::{
         BlobStatus, ResumableUploadCompleteResponse, TranscodeStatus, TranscriptStatus,

@@ -8,6 +8,9 @@ use crate::error::{BlossomError, Result};
 use blossom_core::conditional_update::{
     update_json_conditionally_with_io, ConditionalJsonMutation,
 };
+use blossom_core::quarantine::{
+    mutate_holds, QuarantineAction, QuarantineHolds, HOLD_CAPACITY_EXCEEDED, HOLD_VERSION_CONFLICT,
+};
 use fastly::cache::simple as simple_cache;
 use fastly::kv_store::{
     InsertMode, KVStore, KVStoreError, LookupResponse, PendingDeleteHandle, PendingInsertHandle,
@@ -27,6 +30,7 @@ const KV_STORE_NAME: &str = "blossom_metadata";
 
 /// Key prefix for blob metadata
 const BLOB_PREFIX: &str = "blob:";
+const QUARANTINE_PREFIX: &str = "quarantine:v1:";
 
 /// Key prefix for user blob lists
 const LIST_PREFIX: &str = "list:";
@@ -142,10 +146,10 @@ pub fn get_blob_metadata(hash: &str) -> Result<Option<BlobMetadata>> {
     if let Ok(Some(body)) = simple_cache::get(cache_key.clone()) {
         let json = body.into_string();
         if json == "null" {
-            return Ok(None);
+            return overlay_quarantine_holds(&hash_lower, None);
         }
         if let Ok(metadata) = serde_json::from_str::<BlobMetadata>(&json) {
-            return Ok(Some(metadata));
+            return overlay_quarantine_holds(&hash_lower, Some(metadata));
         }
         // Cache had invalid data — fall through to KV
     }
@@ -206,7 +210,60 @@ fn parse_blob_refs_lookup(
 pub fn get_blob_metadata_uncached(hash: &str) -> Result<Option<BlobMetadata>> {
     let store = open_store()?;
     let key = format!("{}{}", BLOB_PREFIX, hash.to_lowercase());
-    parse_blob_metadata_lookup(store.lookup(&key))
+    let metadata = parse_blob_metadata_lookup(store.lookup(&key))?;
+    overlay_quarantine_holds(hash, metadata)
+}
+
+/// Review holds are never read through the POP-local metadata cache.
+pub fn get_quarantine_holds(hash: &str) -> Result<QuarantineHolds> {
+    let key = format!("{}{}", QUARANTINE_PREFIX, hash.to_lowercase());
+    let holds: QuarantineHolds = match open_store()?.lookup(&key) {
+        Ok(mut lookup) => {
+            serde_json::from_str(&lookup.take_body().into_string()).map_err(|error| {
+                BlossomError::MetadataError(format!("Invalid quarantine holds: {error}"))
+            })?
+        }
+        Err(KVStoreError::ItemNotFound) => QuarantineHolds::default(),
+        Err(error) => {
+            return Err(BlossomError::MetadataError(format!(
+                "Quarantine holds unavailable: {error}"
+            )))
+        }
+    };
+    holds.validate().map_err(BlossomError::MetadataError)?;
+    Ok(holds)
+}
+
+fn overlay_quarantine_holds(
+    hash: &str,
+    mut metadata: Option<BlobMetadata>,
+) -> Result<Option<BlobMetadata>> {
+    let holds = get_quarantine_holds(hash)?;
+    if let Some(metadata) = metadata.as_mut() {
+        metadata.quarantine_hold_ids = holds.active_ids();
+    }
+    Ok(metadata)
+}
+
+pub fn update_quarantine_holds(
+    hash: &str,
+    hold_id: &str,
+    version: u64,
+    action: QuarantineAction,
+) -> Result<()> {
+    let key = format!("{}{}", QUARANTINE_PREFIX, hash.to_lowercase());
+    update_json_conditionally(&key, 5, "quarantine holds", |current| {
+        mutate_holds(current, hold_id, version, action)
+    })
+    .map(|_| ())
+    .map_err(|error| match error {
+        BlossomError::MetadataError(message)
+            if message == HOLD_VERSION_CONFLICT || message == HOLD_CAPACITY_EXCEEDED =>
+        {
+            BlossomError::Conflict(message)
+        }
+        other => other,
+    })
 }
 
 pub(crate) fn start_vanish_blob_lookup(store: &KVStore, hash: &str) -> Result<PendingLookupHandle> {
@@ -1182,6 +1239,9 @@ pub fn list_blobs_with_metadata(
 
     for hash in hashes {
         if let Some(metadata) = get_blob_metadata(&hash)? {
+            if !metadata.quarantine_hold_ids.is_empty() {
+                continue;
+            }
             // Include if active, or if include_restricted is true
             if metadata.status == BlobStatus::Active || include_restricted {
                 results.push(metadata);

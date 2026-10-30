@@ -217,7 +217,12 @@ Admin routes require an admin session (Google or GitHub OAuth; see `OAUTH_SETUP.
 | `POST` | `/admin/api/delete` | Soft-delete a blob, remove it from public serving/indexes, optionally set legal hold |
 | `POST` | `/admin/api/restore` | Restore a soft-deleted blob to `active`, `pending`, or `restricted` |
 | `POST` | `/admin/api/moderate` | Creator/moderation action (respects `ENABLE_PHYSICAL_DELETE`) |
+| `POST` | `/admin/api/quarantine` | Add or release one independent, reversible media review hold |
+| `GET` | `/admin/api/quarantine/<sha256>` | Read base status and active review holds |
 | `GET` | `/admin/api/stats`, `/admin/api/recent`, `/admin/api/users` | Dashboard data |
+
+See the [review hold API contract](docs/api/quarantine-holds.md) for versioned
+hold/release requests and status readback.
 
 Example soft-delete:
 

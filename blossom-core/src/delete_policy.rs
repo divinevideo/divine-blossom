@@ -534,6 +534,7 @@ mod tests {
             uploaded: "2026-04-22T00:00:00Z".into(),
             owner: "1".repeat(64),
             status,
+            quarantine_hold_ids: Vec::new(),
             thumbnail: None,
             moderation: None::<ModerationResult>,
             transcode_status: None,
