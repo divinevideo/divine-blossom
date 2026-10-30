@@ -252,6 +252,61 @@ class UploadQueueTests(unittest.TestCase):
         self.assertIsNotNone(kv.get('b2-ready:'+HASH))
 
 class WorkerTests(unittest.TestCase):
+    def test_quarantine_hold_blocks_copy_and_revokes_existing_readiness(self):
+        self.assertEqual(self.copy(), "ready")
+        versions = dict(self.dest.versions)
+        self.kv.values["quarantine:v1:" + HASH] = {
+            "version": 1, "holds": {"review:synthetic": {"version": 1, "active": True}}}
+        self.assertEqual(self.copy(), "blocked")
+        self.assertIsNone(self.ready())
+        self.assertEqual(self.dest.versions, versions)
+
+    def test_released_quarantine_hold_allows_copy(self):
+        self.kv.values["quarantine:v1:" + HASH] = {
+            "version": 1, "holds": {"review:synthetic": {"version": 2, "active": False}}}
+        self.assertEqual(self.copy(), "ready")
+
+    def test_quarantine_during_upload_prevents_readiness(self):
+        upload = self.dest.upload
+        def hold_during_upload(*args):
+            version = upload(*args)
+            self.kv.values["quarantine:v1:" + HASH] = {
+                "version": 1, "holds": {"review:synthetic": {"version": 1, "active": True}}}
+            return version
+        self.dest.upload = hold_during_upload
+        self.assertEqual(self.copy(), "blocked")
+        self.assertIsNone(self.ready())
+
+    def test_malformed_quarantine_state_cannot_authorize_copy(self):
+        for record in [[], {}, {"version": True, "holds": {}}, {"version": 2, "holds": {}},
+                       {"version": 1, "holds": {}, "extra": True},
+                       {"version": 1, "holds": []},
+                       {"version": 1, "holds": {"": {"version": 1, "active": False}}},
+                       {"version": 1, "holds": {"bad/id": {"version": 1, "active": False}}},
+                       {"version": 1, "holds": {"x" * 129: {"version": 1, "active": False}}},
+                       {"version": 1, "holds": {"x": {"version": 0, "active": False}}},
+                       {"version": 1, "holds": {"x": {"version": True, "active": False}}},
+                       {"version": 1, "holds": {"x": {"version": 9007199254740992, "active": False}}},
+                       {"version": 1, "holds": {"x": {"version": 1, "active": 0}}},
+                       {"version": 1, "holds": {"x": {"version": 1, "active": False, "extra": 1}}},
+                       {"version": 1, "holds": {str(i): {"version": 1, "active": False} for i in range(129)}}]:
+            with self.subTest(record=record):
+                self.kv.values["quarantine:v1:" + HASH] = record
+                self.assertEqual(self.copy(), "blocked")
+                self.assertIsNone(self.ready())
+        self.assertFalse(self.dest.versions)
+
+    def test_unavailable_quarantine_lookup_cannot_publish_readiness(self):
+        lookup = self.kv.get
+        def unavailable(key):
+            if key == "quarantine:v1:" + HASH:
+                raise OSError("synthetic unavailable quarantine state")
+            return lookup(key)
+        self.kv.get = unavailable
+        with self.assertRaises(OSError):
+            self.copy()
+        self.assertFalse(self.dest.versions)
+
     def setUp(self):
         self.assertTrue(hasattr(mirror, "State"), "durable mirror state is not implemented")
         self.temp = tempfile.TemporaryDirectory()
@@ -516,6 +571,20 @@ class PreflightTests(unittest.TestCase):
 
 
 class FastlyHTTPTests(unittest.TestCase):
+    def test_present_null_quarantine_is_not_a_missing_record(self):
+        class HTTP:
+            absent = False
+            def request(self, url, **kwargs):
+                if self.absent:
+                    return None
+                return (None, {"generation": "1"}) if kwargs.get("include_headers") else None
+        http = HTTP()
+        kv = mirror.FastlyKV("synthetic-store", "synthetic-token", http=http)
+        self.assertIsNotNone(kv.get("quarantine:v1:" + HASH))
+        self.assertFalse(mirror.quarantine_allows_copy(kv.get("quarantine:v1:" + HASH)))
+        http.absent = True
+        self.assertIsNone(kv.get("quarantine:v1:" + HASH))
+
     def test_redirects_fail_without_forwarding_credentials_or_changing_global_opener(self):
         received = []
         redirect = {"status": 302}

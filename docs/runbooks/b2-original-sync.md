@@ -159,6 +159,10 @@ and [GCS notification attributes](https://docs.cloud.google.com/storage/docs/pub
 ## Policy and readiness contract
 
 All policy comes from uncached Fastly metadata, never from GCS object metadata.
+The independent `quarantine:v1:{hash}` record is checked on every policy read.
+An active review hold, malformed hold state, or failed lookup cannot authorize
+copying or readiness. Released holds permit only what the current base policy
+allows; they never override a ban or deletion.
 An original needs `blob:{hash}` with matching hash/size, `status: active`, a video
 MIME type, a valid owner, no `tombstone:{hash}`, and no
 `vanish_in_progress:v1:{uploader}` for the owner or any known uploader in

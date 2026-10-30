@@ -40,12 +40,31 @@ class Budget:
         self.used += size
 
 
+def quarantine_allows_copy(record):
+    """Match the independent review-hold schema; malformed state fails closed."""
+    if record is None:
+        return True
+    if (not isinstance(record, dict) or set(record) != {"version", "holds"}
+            or type(record["version"]) is not int or record["version"] != 1
+            or not isinstance(record["holds"], dict) or len(record["holds"]) > 128):
+        return False
+    for hold_id, hold in record["holds"].items():
+        if (not isinstance(hold_id, str) or not re.fullmatch(r"[A-Za-z0-9:_-]{1,128}", hold_id)
+                or not isinstance(hold, dict) or set(hold) != {"version", "active"}
+                or type(hold["version"]) is not int or not 0 < hold["version"] <= 9007199254740991
+                or type(hold["active"]) is not bool or hold["active"]):
+            return False
+    return True
+
+
 def approved_metadata(kv, key):
     """Uncached authoritative policy; errors propagate and cannot grant readiness."""
     meta = kv.get("blob:" + key)
     if not isinstance(meta, dict) or meta.get("sha256") != key:
         return None
     if meta.get("status") != "active" or not str(meta.get("type", "")).startswith("video/"):
+        return None
+    if not quarantine_allows_copy(kv.get("quarantine:v1:" + key)):
         return None
     owner = meta.get("owner")
     if not isinstance(owner, str) or not HEX.fullmatch(owner.lower()):
@@ -428,6 +447,13 @@ class FastlyKV:
         return self.base + urllib.parse.quote(key, safe="")
 
     def get(self, key):
+        if key.startswith("quarantine:v1:"):
+            # HTTP 404 means no holds; a present JSON null is malformed, not absent.
+            result = self.http.request(self.url(key), missing=True, include_headers=True)
+            if result is None:
+                return None
+            record, _ = result
+            return {} if record is None else record
         return self.http.request(self.url(key), missing=True)
 
     def put(self, key, value):
