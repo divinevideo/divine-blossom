@@ -39,6 +39,7 @@ fn approved_metadata(hash: &str) -> Result<BlobMetadata> {
     let metadata = get_blob_metadata_uncached(hash)?.ok_or_else(denied)?;
     if metadata.sha256 != hash
         || metadata.status != BlobStatus::Active
+        || !metadata.quarantine_hold_ids.is_empty()
         || !metadata.mime_type.starts_with("video/")
         || metadata.owner.len() != 64
         || !metadata.owner.bytes().all(|b| b.is_ascii_hexdigit())

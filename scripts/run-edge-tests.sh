@@ -72,3 +72,9 @@ VICEROY="$VICEROY" python3 scripts/run-media-origin-tests.py
 
 # Canary policy/readiness runs before every uncached pinned-version read.
 VICEROY="$VICEROY" python3 scripts/run-b2-canary-tests.py
+
+# Named media holds preserve base policy and enforce every derived route.
+VICEROY="$VICEROY" python3 scripts/run-quarantine-tests.py
+
+# A slow public origin read must not refill the CDN after a concurrent hold.
+VICEROY="$VICEROY" python3 scripts/run-quarantine-race-tests.py
