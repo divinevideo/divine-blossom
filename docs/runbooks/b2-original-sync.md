@@ -24,6 +24,10 @@ is installed by this change.
   configured metadata store. Its implementation permits writes only to
   `b2-ready:*` and owned `b2-sync:v1:*` copy gates; the token may have broader
   provider permissions, so use an approved restricted operator environment.
+- The native preflight uses API v4. Keys created with the v4 `bucketIds`
+  restriction require v4 authorization even when restricted to one bucket;
+  older authorization endpoints reject them. Do not widen or replace a scoped
+  key to work around an API-version mismatch.
 - The native B2 preflight verifies exact name/ID, `allPrivate`, visible retention
   configuration, Object Lock disabled, and no default retention. Missing visibility
   fails closed. Every upload must return a nonempty immutable version ID.
@@ -155,6 +159,10 @@ and [GCS notification attributes](https://docs.cloud.google.com/storage/docs/pub
 ## Policy and readiness contract
 
 All policy comes from uncached Fastly metadata, never from GCS object metadata.
+The independent `quarantine:v1:{hash}` record is checked on every policy read.
+An active review hold, malformed hold state, or failed lookup cannot authorize
+copying or readiness. Released holds permit only what the current base policy
+allows; they never override a ban or deletion.
 An original needs `blob:{hash}` with matching hash/size, `status: active`, a video
 MIME type, a valid owner, no `tombstone:{hash}`, and no
 `vanish_in_progress:v1:{uploader}` for the owner or any known uploader in

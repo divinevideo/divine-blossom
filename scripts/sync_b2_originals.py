@@ -40,12 +40,31 @@ class Budget:
         self.used += size
 
 
+def quarantine_allows_copy(record):
+    """Match the independent review-hold schema; malformed state fails closed."""
+    if record is None:
+        return True
+    if (not isinstance(record, dict) or set(record) != {"version", "holds"}
+            or type(record["version"]) is not int or record["version"] != 1
+            or not isinstance(record["holds"], dict) or len(record["holds"]) > 128):
+        return False
+    for hold_id, hold in record["holds"].items():
+        if (not isinstance(hold_id, str) or not re.fullmatch(r"[A-Za-z0-9:_-]{1,128}", hold_id)
+                or not isinstance(hold, dict) or set(hold) != {"version", "active"}
+                or type(hold["version"]) is not int or not 0 < hold["version"] <= 9007199254740991
+                or type(hold["active"]) is not bool or hold["active"]):
+            return False
+    return True
+
+
 def approved_metadata(kv, key):
     """Uncached authoritative policy; errors propagate and cannot grant readiness."""
     meta = kv.get("blob:" + key)
     if not isinstance(meta, dict) or meta.get("sha256") != key:
         return None
     if meta.get("status") != "active" or not str(meta.get("type", "")).startswith("video/"):
+        return None
+    if not quarantine_allows_copy(kv.get("quarantine:v1:" + key)):
         return None
     owner = meta.get("owner")
     if not isinstance(owner, str) or not HEX.fullmatch(owner.lower()):
@@ -342,6 +361,15 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def unambiguous_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object member")
+        result[key] = value
+    return result
+
+
 class JsonHTTP:
     def __init__(self, headers=None):
         self.headers = headers or {}
@@ -356,7 +384,7 @@ class JsonHTTP:
                 data = response.read(MIB + 1)
                 if len(data) > MIB:
                     raise ValueError("control response too large")
-                value = json.loads(data) if data else None
+                value = json.loads(data, object_pairs_hook=unambiguous_json_object) if data else None
                 return (value, response.headers) if include_headers else value
         except urllib.error.HTTPError as error:
             try:
@@ -428,6 +456,13 @@ class FastlyKV:
         return self.base + urllib.parse.quote(key, safe="")
 
     def get(self, key):
+        if key.startswith("quarantine:v1:"):
+            # HTTP 404 means no holds; a present JSON null is malformed, not absent.
+            result = self.http.request(self.url(key), missing=True, include_headers=True)
+            if result is None:
+                return None
+            record, _ = result
+            return {} if record is None else record
         return self.http.request(self.url(key), missing=True)
 
     def put(self, key, value):
@@ -519,7 +554,7 @@ def private_b2_endpoint(bucket, bucket_id, key_id, key, http_factory=JsonHTTP):
     """Verify actual private bucket identity and obtain its S3 endpoint, read-only."""
     auth_header = base64.b64encode((key_id + ":" + key).encode()).decode()
     auth = http_factory({"Authorization": "Basic " + auth_header}).request(
-        "https://api.backblazeb2.com/b2api/v3/b2_authorize_account")
+        "https://api.backblazeb2.com/b2api/v4/b2_authorize_account")
     storage = auth["apiInfo"]["storageApi"]
     endpoint = storage["s3ApiUrl"]
     if not re.fullmatch(r"https://s3\.[a-z0-9-]+\.backblazeb2\.com", endpoint):
@@ -527,7 +562,7 @@ def private_b2_endpoint(bucket, bucket_id, key_id, key, http_factory=JsonHTTP):
     if not re.fullmatch(r"https://api[0-9]+\.backblazeb2\.com", storage["apiUrl"]):
         raise ValueError("unexpected B2 control endpoint")
     result = http_factory({"Authorization": auth["authorizationToken"]}).request(
-        storage["apiUrl"] + "/b2api/v3/b2_list_buckets", "POST",
+        storage["apiUrl"] + "/b2api/v4/b2_list_buckets", "POST",
         {"accountId": auth["accountId"], "bucketId": bucket_id})
     buckets = result.get("buckets", [])
     if len(buckets) != 1 or buckets[0].get("bucketName") != bucket or buckets[0].get("bucketId") != bucket_id or buckets[0].get("bucketType") != "allPrivate":

@@ -252,6 +252,61 @@ class UploadQueueTests(unittest.TestCase):
         self.assertIsNotNone(kv.get('b2-ready:'+HASH))
 
 class WorkerTests(unittest.TestCase):
+    def test_quarantine_hold_blocks_copy_and_revokes_existing_readiness(self):
+        self.assertEqual(self.copy(), "ready")
+        versions = dict(self.dest.versions)
+        self.kv.values["quarantine:v1:" + HASH] = {
+            "version": 1, "holds": {"review:synthetic": {"version": 1, "active": True}}}
+        self.assertEqual(self.copy(), "blocked")
+        self.assertIsNone(self.ready())
+        self.assertEqual(self.dest.versions, versions)
+
+    def test_released_quarantine_hold_allows_copy(self):
+        self.kv.values["quarantine:v1:" + HASH] = {
+            "version": 1, "holds": {"review:synthetic": {"version": 2, "active": False}}}
+        self.assertEqual(self.copy(), "ready")
+
+    def test_quarantine_during_upload_prevents_readiness(self):
+        upload = self.dest.upload
+        def hold_during_upload(*args):
+            version = upload(*args)
+            self.kv.values["quarantine:v1:" + HASH] = {
+                "version": 1, "holds": {"review:synthetic": {"version": 1, "active": True}}}
+            return version
+        self.dest.upload = hold_during_upload
+        self.assertEqual(self.copy(), "blocked")
+        self.assertIsNone(self.ready())
+
+    def test_malformed_quarantine_state_cannot_authorize_copy(self):
+        for record in [[], {}, {"version": True, "holds": {}}, {"version": 2, "holds": {}},
+                       {"version": 1, "holds": {}, "extra": True},
+                       {"version": 1, "holds": []},
+                       {"version": 1, "holds": {"": {"version": 1, "active": False}}},
+                       {"version": 1, "holds": {"bad/id": {"version": 1, "active": False}}},
+                       {"version": 1, "holds": {"x" * 129: {"version": 1, "active": False}}},
+                       {"version": 1, "holds": {"x": {"version": 0, "active": False}}},
+                       {"version": 1, "holds": {"x": {"version": True, "active": False}}},
+                       {"version": 1, "holds": {"x": {"version": 9007199254740992, "active": False}}},
+                       {"version": 1, "holds": {"x": {"version": 1, "active": 0}}},
+                       {"version": 1, "holds": {"x": {"version": 1, "active": False, "extra": 1}}},
+                       {"version": 1, "holds": {str(i): {"version": 1, "active": False} for i in range(129)}}]:
+            with self.subTest(record=record):
+                self.kv.values["quarantine:v1:" + HASH] = record
+                self.assertEqual(self.copy(), "blocked")
+                self.assertIsNone(self.ready())
+        self.assertFalse(self.dest.versions)
+
+    def test_unavailable_quarantine_lookup_cannot_publish_readiness(self):
+        lookup = self.kv.get
+        def unavailable(key):
+            if key == "quarantine:v1:" + HASH:
+                raise OSError("synthetic unavailable quarantine state")
+            return lookup(key)
+        self.kv.get = unavailable
+        with self.assertRaises(OSError):
+            self.copy()
+        self.assertFalse(self.dest.versions)
+
     def setUp(self):
         self.assertTrue(hasattr(mirror, "State"), "durable mirror state is not implemented")
         self.temp = tempfile.TemporaryDirectory()
@@ -431,6 +486,65 @@ class WorkerTests(unittest.TestCase):
 
 
 class PreflightTests(unittest.TestCase):
+    def test_bucket_scoped_key_uses_v4_native_api(self):
+        bucket = self.bucket()
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_GET(self):
+                requests.append((self.command, self.path))
+                if self.path != "/b2api/v4/b2_authorize_account":
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+                body = {"accountId": "synthetic-account", "authorizationToken": "synthetic-token",
+                        "apiInfo": {"storageApi": {
+                            "apiUrl": "https://api005.backblazeb2.com",
+                            "s3ApiUrl": "https://s3.us-east-005.backblazeb2.com"}}}
+                self.respond(body)
+
+            def do_POST(self):
+                requests.append((self.command, self.path))
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if self.path != "/b2api/v4/b2_list_buckets" or body != {
+                        "accountId": "synthetic-account", "bucketId": "bucket-id"}:
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+                self.respond({"buckets": [bucket]})
+
+            def respond(self, value):
+                data = json.dumps(value).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_port}"
+
+            class HTTP(mirror.JsonHTTP):
+                def request(self, url, *args, **kwargs):
+                    origin = urlsplit(url).netloc
+                    if origin not in ("api.backblazeb2.com", "api005.backblazeb2.com"):
+                        raise ValueError("unexpected control origin")
+                    return super().request(base + urlsplit(url).path, *args, **kwargs)
+
+            try:
+                endpoint = mirror.private_b2_endpoint(
+                    "synthetic", "bucket-id", "synthetic-id", "synthetic-key", http_factory=HTTP)
+                self.assertEqual(endpoint, "https://s3.us-east-005.backblazeb2.com")
+                self.assertEqual(requests, [("GET", "/b2api/v4/b2_authorize_account"),
+                                            ("POST", "/b2api/v4/b2_list_buckets")])
+            finally:
+                server.shutdown()
+                thread.join()
+
     def bucket(self):
         return {"bucketName": "synthetic", "bucketId": "bucket-id", "bucketType": "allPrivate",
                 "fileLockConfiguration": {"isClientAuthorizedToRead": True,
@@ -457,6 +571,49 @@ class PreflightTests(unittest.TestCase):
 
 
 class FastlyHTTPTests(unittest.TestCase):
+    def test_control_json_rejects_duplicate_quarantine_fields(self):
+        class Handler(BaseHTTPRequestHandler):
+            body = b"{}"
+            def log_message(self, *_):
+                pass
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(self.body)))
+                self.end_headers()
+                self.wfile.write(self.body)
+        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            http = mirror.JsonHTTP()
+            url = f"http://127.0.0.1:{server.server_port}/quarantine"
+            try:
+                for body in [b'{"version":2,"version":1,"holds":{}}',
+                             b'{"version":1,"holds":{},"holds":{}}',
+                             b'{"version":1,"holds":{"x":{"version":0,"version":1,"active":false}}}',
+                             b'{"version":1,"holds":{"x":{"version":1,"active":true,"active":false}}}']:
+                    with self.subTest(body=body), self.assertRaises(ValueError):
+                        Handler.body = body
+                        http.request(url)
+                Handler.body = b'{"version":1,"holds":{"x":{"version":2,"active":false}}}'
+                self.assertTrue(mirror.quarantine_allows_copy(http.request(url)))
+            finally:
+                server.shutdown()
+                thread.join()
+
+    def test_present_null_quarantine_is_not_a_missing_record(self):
+        class HTTP:
+            absent = False
+            def request(self, url, **kwargs):
+                if self.absent:
+                    return None
+                return (None, {"generation": "1"}) if kwargs.get("include_headers") else None
+        http = HTTP()
+        kv = mirror.FastlyKV("synthetic-store", "synthetic-token", http=http)
+        self.assertIsNotNone(kv.get("quarantine:v1:" + HASH))
+        self.assertFalse(mirror.quarantine_allows_copy(kv.get("quarantine:v1:" + HASH)))
+        http.absent = True
+        self.assertIsNone(kv.get("quarantine:v1:" + HASH))
+
     def test_redirects_fail_without_forwarding_credentials_or_changing_global_opener(self):
         received = []
         redirect = {"status": 302}
