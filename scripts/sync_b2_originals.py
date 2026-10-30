@@ -361,6 +361,15 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def unambiguous_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object member")
+        result[key] = value
+    return result
+
+
 class JsonHTTP:
     def __init__(self, headers=None):
         self.headers = headers or {}
@@ -375,7 +384,7 @@ class JsonHTTP:
                 data = response.read(MIB + 1)
                 if len(data) > MIB:
                     raise ValueError("control response too large")
-                value = json.loads(data) if data else None
+                value = json.loads(data, object_pairs_hook=unambiguous_json_object) if data else None
                 return (value, response.headers) if include_headers else value
         except urllib.error.HTTPError as error:
             try:

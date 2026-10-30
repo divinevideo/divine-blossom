@@ -571,6 +571,35 @@ class PreflightTests(unittest.TestCase):
 
 
 class FastlyHTTPTests(unittest.TestCase):
+    def test_control_json_rejects_duplicate_quarantine_fields(self):
+        class Handler(BaseHTTPRequestHandler):
+            body = b"{}"
+            def log_message(self, *_):
+                pass
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(self.body)))
+                self.end_headers()
+                self.wfile.write(self.body)
+        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            http = mirror.JsonHTTP()
+            url = f"http://127.0.0.1:{server.server_port}/quarantine"
+            try:
+                for body in [b'{"version":2,"version":1,"holds":{}}',
+                             b'{"version":1,"holds":{},"holds":{}}',
+                             b'{"version":1,"holds":{"x":{"version":0,"version":1,"active":false}}}',
+                             b'{"version":1,"holds":{"x":{"version":1,"active":true,"active":false}}}']:
+                    with self.subTest(body=body), self.assertRaises(ValueError):
+                        Handler.body = body
+                        http.request(url)
+                Handler.body = b'{"version":1,"holds":{"x":{"version":2,"active":false}}}'
+                self.assertTrue(mirror.quarantine_allows_copy(http.request(url)))
+            finally:
+                server.shutdown()
+                thread.join()
+
     def test_present_null_quarantine_is_not_a_missing_record(self):
         class HTTP:
             absent = False
