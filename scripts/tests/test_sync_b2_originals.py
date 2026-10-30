@@ -431,6 +431,65 @@ class WorkerTests(unittest.TestCase):
 
 
 class PreflightTests(unittest.TestCase):
+    def test_bucket_scoped_key_uses_v4_native_api(self):
+        bucket = self.bucket()
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_GET(self):
+                requests.append((self.command, self.path))
+                if self.path != "/b2api/v4/b2_authorize_account":
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+                body = {"accountId": "synthetic-account", "authorizationToken": "synthetic-token",
+                        "apiInfo": {"storageApi": {
+                            "apiUrl": "https://api005.backblazeb2.com",
+                            "s3ApiUrl": "https://s3.us-east-005.backblazeb2.com"}}}
+                self.respond(body)
+
+            def do_POST(self):
+                requests.append((self.command, self.path))
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if self.path != "/b2api/v4/b2_list_buckets" or body != {
+                        "accountId": "synthetic-account", "bucketId": "bucket-id"}:
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+                self.respond({"buckets": [bucket]})
+
+            def respond(self, value):
+                data = json.dumps(value).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_port}"
+
+            class HTTP(mirror.JsonHTTP):
+                def request(self, url, *args, **kwargs):
+                    origin = urlsplit(url).netloc
+                    if origin not in ("api.backblazeb2.com", "api005.backblazeb2.com"):
+                        raise ValueError("unexpected control origin")
+                    return super().request(base + urlsplit(url).path, *args, **kwargs)
+
+            try:
+                endpoint = mirror.private_b2_endpoint(
+                    "synthetic", "bucket-id", "synthetic-id", "synthetic-key", http_factory=HTTP)
+                self.assertEqual(endpoint, "https://s3.us-east-005.backblazeb2.com")
+                self.assertEqual(requests, [("GET", "/b2api/v4/b2_authorize_account"),
+                                            ("POST", "/b2api/v4/b2_list_buckets")])
+            finally:
+                server.shutdown()
+                thread.join()
+
     def bucket(self):
         return {"bucketName": "synthetic", "bucketId": "bucket-id", "bucketType": "allPrivate",
                 "fileLockConfiguration": {"isClientAuthorizedToRead": True,

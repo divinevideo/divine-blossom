@@ -24,6 +24,10 @@ is installed by this change.
   configured metadata store. Its implementation permits writes only to
   `b2-ready:*` and owned `b2-sync:v1:*` copy gates; the token may have broader
   provider permissions, so use an approved restricted operator environment.
+- The native preflight uses API v4. Keys created with the v4 `bucketIds`
+  restriction require v4 authorization even when restricted to one bucket;
+  older authorization endpoints reject them. Do not widen or replace a scoped
+  key to work around an API-version mismatch.
 - The native B2 preflight verifies exact name/ID, `allPrivate`, visible retention
   configuration, Object Lock disabled, and no default retention. Missing visibility
   fails closed. Every upload must return a nonempty immutable version ID.

@@ -519,7 +519,7 @@ def private_b2_endpoint(bucket, bucket_id, key_id, key, http_factory=JsonHTTP):
     """Verify actual private bucket identity and obtain its S3 endpoint, read-only."""
     auth_header = base64.b64encode((key_id + ":" + key).encode()).decode()
     auth = http_factory({"Authorization": "Basic " + auth_header}).request(
-        "https://api.backblazeb2.com/b2api/v3/b2_authorize_account")
+        "https://api.backblazeb2.com/b2api/v4/b2_authorize_account")
     storage = auth["apiInfo"]["storageApi"]
     endpoint = storage["s3ApiUrl"]
     if not re.fullmatch(r"https://s3\.[a-z0-9-]+\.backblazeb2\.com", endpoint):
@@ -527,7 +527,7 @@ def private_b2_endpoint(bucket, bucket_id, key_id, key, http_factory=JsonHTTP):
     if not re.fullmatch(r"https://api[0-9]+\.backblazeb2\.com", storage["apiUrl"]):
         raise ValueError("unexpected B2 control endpoint")
     result = http_factory({"Authorization": auth["authorizationToken"]}).request(
-        storage["apiUrl"] + "/b2api/v3/b2_list_buckets", "POST",
+        storage["apiUrl"] + "/b2api/v4/b2_list_buckets", "POST",
         {"accountId": auth["accountId"], "bucketId": bucket_id})
     buckets = result.get("buckets", [])
     if len(buckets) != 1 or buckets[0].get("bucketName") != bucket or buckets[0].get("bucketId") != bucket_id or buckets[0].get("bucketType") != "allPrivate":
