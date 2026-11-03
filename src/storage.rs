@@ -540,6 +540,21 @@ fn download_transcript_object_from_gcs(gcs_key: &str, uncached: bool) -> Result<
     }
 }
 
+/// Download a stored sound classification (`{hash}/audio/analysis.json`).
+pub fn download_sound_analysis_from_gcs(gcs_key: &str) -> Result<Response> {
+    let resp = fetch_media_origin(StorageProvider::Gcs, gcs_key, None, false, false)
+        .map_err(MediaFetchError::into_storage_error)?;
+
+    match resp.get_status() {
+        StatusCode::OK => Ok(resp),
+        StatusCode::NOT_FOUND => Err(BlossomError::NotFound("Sound analysis not found".into())),
+        status => Err(BlossomError::StorageError(format!(
+            "Sound analysis download failed with status: {}",
+            status
+        ))),
+    }
+}
+
 /// Download a blob from GCS (returns the response to stream back)
 pub fn download_blob(hash: &str, range: Option<&str>) -> Result<Response> {
     let (resp, _) = download_media_object(hash, range, true, false)?;

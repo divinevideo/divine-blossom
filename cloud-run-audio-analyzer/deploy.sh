@@ -1,6 +1,6 @@
 #!/bin/bash
 # ABOUTME: Deploy divine-audio-analyzer (PANNs CNN14 AudioSet tagger) to Cloud Run on CPU.
-# ABOUTME: Service is private — grant run.invoker to whichever service calls it.
+# ABOUTME: Service is private — only the transcoder service account may invoke it.
 #
 # The script owns this service's whole configuration. max-instances is the
 # cost ceiling: one instance busy for a whole month costs about $76 at
@@ -15,6 +15,7 @@ REGION="${REGION:-us-central1}"
 SERVICE_NAME="${SERVICE_NAME:-divine-audio-analyzer}"
 SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-149672065768-compute@developer.gserviceaccount.com}"
 MAX_INSTANCES="${MAX_INSTANCES:-2}"
+TRANSCODER_SA="${TRANSCODER_SA:-149672065768-compute@developer.gserviceaccount.com}"
 IMAGE_TAG="${IMAGE_TAG:-$(git -C "${SCRIPT_DIR}" rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M%S)}"
 IMAGE="gcr.io/${PROJECT_ID}/${SERVICE_NAME}:${IMAGE_TAG}"
 
@@ -45,7 +46,10 @@ URL=$(gcloud run services describe "${SERVICE_NAME}" \
 
 echo "Done. Service URL: ${URL}"
 echo
-echo "Next: grant the calling service's runtime SA invoker on this service ↓"
+echo "Next: let the transcoder call it, then point the transcoder at it ↓"
 echo "  gcloud run services add-iam-policy-binding ${SERVICE_NAME} \\"
 echo "    --project ${PROJECT_ID} --region ${REGION} \\"
-echo "    --member=serviceAccount:<caller-sa> --role=roles/run.invoker"
+echo "    --member=serviceAccount:${TRANSCODER_SA} --role=roles/run.invoker"
+echo "  gcloud run services update divine-transcoder \\"
+echo "    --project ${PROJECT_ID} --region ${REGION} \\"
+echo "    --update-env-vars AUDIO_ANALYZER_URL=${URL}"

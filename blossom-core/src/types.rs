@@ -810,6 +810,21 @@ pub fn is_vtt_file_path(path: &str) -> bool {
     parse_vtt_file_path(path).is_some()
 }
 
+/// Parse sound classification path: /{sha256}/sound.
+pub fn parse_sound_analysis_path(path: &str) -> Option<String> {
+    let hash = path.trim_start_matches('/').strip_suffix("/sound")?;
+    if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(hash.to_lowercase())
+    } else {
+        None
+    }
+}
+
+/// Check if a path is a sound classification request path.
+pub fn is_sound_analysis_path(path: &str) -> bool {
+    parse_sound_analysis_path(path).is_some()
+}
+
 /// Valid quality variant suffixes: (url_suffix, gcs_filename, content_type).
 /// Shared by the Compute router and request_diagnostics::route_category so the
 /// diagnostic category cannot drift from actual routing.
@@ -1339,6 +1354,23 @@ mod tests {
         // .ts variants have different content type — backfill path won't trigger
         let (_, _, ct) = parse_quality_variant_path(&format!("/{}/720p", hash)).unwrap();
         assert_eq!(ct, "video/mp2t");
+    }
+
+    #[test]
+    fn sound_analysis_paths_need_a_hash_and_the_sound_segment() {
+        let hash = "a".repeat(64);
+        assert_eq!(
+            parse_sound_analysis_path(&format!("/{hash}/sound")),
+            Some(hash.clone())
+        );
+        assert_eq!(
+            parse_sound_analysis_path(&format!("/{}/sound", "A".repeat(64))),
+            Some(hash.clone())
+        );
+        assert_eq!(parse_sound_analysis_path("/not-a-hash/sound"), None);
+        assert_eq!(parse_sound_analysis_path(&format!("/{hash}/sound/x")), None);
+        assert_eq!(parse_sound_analysis_path(&format!("/{hash}/sounds")), None);
+        assert_eq!(parse_sound_analysis_path(&format!("/{hash}")), None);
     }
 
     #[test]

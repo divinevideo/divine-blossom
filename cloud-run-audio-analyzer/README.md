@@ -132,8 +132,18 @@ Deploy by hand, like the other sidecars (see `docs/runbooks/deployment.md`):
 PROJECT_ID=rich-compiler-479518-d2 ./deploy.sh
 ```
 
-Then grant the calling service's runtime service account `roles/run.invoker`.
-Nothing calls this service yet. Choosing the trigger (divine-transcoder for `audio/*` uploads, or Funnelcake when it ingests a published Kind 1063 sound) and where results are stored are follow-ups on #319.
+The script prints the two commands that wire it up. The first grants the transcoder's runtime service account `roles/run.invoker`. The second sets `AUDIO_ANALYZER_URL` on `divine-transcoder`.
+
+## How it is wired
+
+1. Every audio upload reaches divine-transcoder's `POST /transcribe` (from the upload service, or from the edge for small uploads). The transcoder also starts a classification in the background.
+2. The classification skips blobs that are not `audio/*` or exceed 50 MB. It also skips sounds that already have a verdict.
+3. Otherwise it sends the original blob to this service and stores the JSON beside the transcript as `{sha256}/audio/analysis.json`.
+4. The edge serves that file at `GET /<sha256>/sound`, with the same moderation gate as transcripts. Until the verdict exists the route returns `404`. Funnelcake reads it from there for its sound index (divinevideo/divine-funnelcake#1422).
+5. `POST /analyze-sound {"hash": "<sha256>"}` on the transcoder runs the same step for one stored sound. It is idempotent.
+6. `scripts/backfill_sound_analysis.py` calls it for every Blossom-hosted sound that Funnelcake's `/api/sounds` lists, to classify sounds published before this shipped.
+
+A failed classification is only logged; re-running the backfill script retries it.
 
 ## Licence
 
