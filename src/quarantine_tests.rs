@@ -62,6 +62,7 @@ fn quarantine_response_source_hashes_cover_public_media_only() {
         format!("/{sha}.vtt"),
         format!("/{sha}/VTT"),
         format!("/{sha}.audio.m4a"),
+        format!("/{sha}/sound"),
         format!("/v1/subtitles/by-hash/{sha}"),
     ] {
         assert_eq!(quarantine_source_hash(&path), Some(sha.clone()), "{path}");

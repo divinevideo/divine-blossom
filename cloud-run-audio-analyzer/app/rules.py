@@ -61,6 +61,9 @@ class Thresholds:
     short_speech_max_s: float = field(
         default_factory=lambda: _env_float("ANALYZER_SHORT_SPEECH_MAX_S", 2.5)
     )
+    # Below this the top genre is noise; 0.01 drops 7 of 87 music clips' genre
+    # tags and kept 27 of 28 known genres in the evaluation.
+    genre_min: float = field(default_factory=lambda: _env_float("ANALYZER_GENRE_MIN", 0.01))
     instrument_min: float = field(
         default_factory=lambda: _env_float("ANALYZER_INSTRUMENT_MIN", 0.2)
     )
@@ -107,7 +110,7 @@ def analyze_scores(
 
     - Pure speech gets no kind; it is listed only under "All".
     - Speech shorter than `short_speech_max_s` is a sound bite and counts as `sfx`.
-    - Genre is only reported for music; mood is returned as scores but never
+    - Genre is only reported for music, and only above `genre_min`; mood is returned as scores but never
       becomes a tag, because AudioSet mood scores are too low on 6-second clips
       to threshold reliably.
     """
@@ -137,7 +140,9 @@ def analyze_scores(
 
     tags: List[str] = [kind] if kind else []
     if kind == "music":
-        tags.append(max(genres, key=genres.get))
+        top_genre = max(genres, key=genres.get)
+        if genres[top_genre] >= t.genre_min:
+            tags.append(top_genre)
         tags += [i for i, v in sorted(instruments.items(), key=lambda kv: -kv[1])
                  if v >= t.instrument_min]
 

@@ -82,6 +82,12 @@ def _analyze(body: bytes) -> dict:
 async def analyze(request: Request) -> JSONResponse:
     if _tagger is None:
         raise HTTPException(status_code=503, detail="model not loaded")
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > MAX_AUDIO_BYTES:
+        # Refuse before buffering when the client says up front it is too big.
+        raise HTTPException(
+            status_code=413, detail=f"audio too large: {declared} bytes > {MAX_AUDIO_BYTES}"
+        )
     body = await request.body()
     if not body:
         raise HTTPException(status_code=400, detail="empty body")

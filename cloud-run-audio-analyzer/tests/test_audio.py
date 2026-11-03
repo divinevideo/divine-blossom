@@ -63,6 +63,22 @@ class TestDecode(unittest.TestCase):
             audio.decode(b"definitely not audio")
 
 
+class TestWindows(unittest.TestCase):
+    def test_short_clips_are_padded_to_a_second(self):
+        (w,) = audio.analysis_windows(np.ones(3200, dtype=np.float32))
+        self.assertEqual(len(w), audio.SAMPLE_RATE)
+        self.assertEqual(float(w[:3200].sum()), 3200.0)
+        self.assertEqual(float(w[3200:].sum()), 0.0)
+
+    def test_long_clips_split_into_ten_second_windows(self):
+        ws = audio.analysis_windows(np.zeros(25 * audio.SAMPLE_RATE, dtype=np.float32))
+        self.assertEqual([len(w) // audio.SAMPLE_RATE for w in ws], [10, 10, 5])
+
+    def test_a_trailing_scrap_under_a_second_is_dropped(self):
+        ws = audio.analysis_windows(np.zeros(10 * audio.SAMPLE_RATE + 100, dtype=np.float32))
+        self.assertEqual(len(ws), 1)
+
+
 class TestSilence(unittest.TestCase):
     def test_digital_silence_is_silent(self):
         self.assertTrue(audio.is_silent(np.zeros(32000, dtype=np.float32)))

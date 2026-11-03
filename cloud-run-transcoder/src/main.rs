@@ -774,7 +774,9 @@ async fn main() -> Result<()> {
         .route("/transcribe", options(handle_cors_preflight))
         .route(
             "/analyze-sound",
-            post(sound_classification::handle_analyze_sound),
+            post(sound_classification::handle_analyze_sound).route_layer(
+                middleware::from_fn_with_state(state.clone(), require_transcribe_secret),
+            ),
         )
         .route(
             "/translate",

@@ -8,13 +8,18 @@ New audio uploads are classified when they reach the transcoder's
 `POST /analyze-sound` on the transcoder, which skips any sound that already
 has a stored verdict, so the script can be stopped and re-run.
 
+`/analyze-sound` takes the transcoder's `X-Divine-Transcribe-Secret`; pass it
+in TRANSCRIBE_SHARED_SECRET (Secret Manager: transcribe_shared_secret).
+
 Examples:
   python3 scripts/backfill_sound_analysis.py --transcoder-url https://<transcoder> --dry-run
-  python3 scripts/backfill_sound_analysis.py --transcoder-url https://<transcoder> --concurrency 2
+  TRANSCRIBE_SHARED_SECRET=... python3 scripts/backfill_sound_analysis.py \
+      --transcoder-url https://<transcoder> --concurrency 2
 """
 
 import argparse
 import json
+import os
 import sys
 import urllib.parse
 import urllib.request
@@ -25,6 +30,9 @@ from typing import Iterable, Iterator, List, Optional
 DEFAULT_API_BASE = "https://api.divine.video"
 BLOSSOM_HOSTS = {"media.divine.video"}
 PAGE_SIZE = 100
+SECRET_HEADER = "X-Divine-Transcribe-Secret"
+# Outcomes that need no operator action. `missing` means the sound's blob is gone.
+SETTLED = {"classified", "already_exists", "not_audio", "too_large", "missing", "in_progress"}
 
 
 def is_sha256(value: str) -> bool:
@@ -70,11 +78,11 @@ def iter_sound_hashes(api_base: str, max_sounds: Optional[int]) -> Iterator[str]
                 return
 
 
-def analyze(transcoder_url: str, sha: str) -> str:
+def analyze(transcoder_url: str, secret: str, sha: str) -> str:
     request = urllib.request.Request(
         f"{transcoder_url.rstrip('/')}/analyze-sound",
         data=json.dumps({"hash": sha}).encode(),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", SECRET_HEADER: secret},
         method="POST",
     )
     try:
@@ -106,15 +114,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         for sha in hashes:
             print(sha)
         return 0
+    secret = os.environ.get("TRANSCRIBE_SHARED_SECRET", "").strip()
+    if not secret:
+        print("TRANSCRIBE_SHARED_SECRET is not set", file=sys.stderr)
+        return 2
 
     outcomes: Counter = Counter()
+    failed: List[str] = []
     with ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as pool:
-        for i, status in enumerate(pool.map(lambda sha: analyze(args.transcoder_url, sha), hashes), 1):
+        results = pool.map(lambda sha: (sha, analyze(args.transcoder_url, secret, sha)), hashes)
+        for i, (sha, status) in enumerate(results, 1):
             outcomes[status] += 1
+            if status not in SETTLED:
+                failed.append(sha)
+                print(f"failed {sha}: {status}", file=sys.stderr)
             if i % 100 == 0:
                 print(f"{i}/{len(hashes)} {dict(outcomes)}", file=sys.stderr)
     print(json.dumps(dict(outcomes), sort_keys=True))
-    return 0 if all(s in {"classified", "already_exists", "not_audio", "too_large"} for s in outcomes) else 1
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

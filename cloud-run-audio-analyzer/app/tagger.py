@@ -10,7 +10,7 @@ from typing import Dict
 import numpy as np
 import torch
 
-from .audio import SAMPLE_RATE
+from .audio import analysis_windows
 from .rules import GENRES, INSTRUMENTS, MOODS, MUSIC_CLASSES, NOT_EFFECT_CLASSES, SPEECH_CLASSES
 
 logger = logging.getLogger(__name__)
@@ -43,10 +43,7 @@ class PannsTagger:
 
     def scores(self, samples: np.ndarray) -> Dict[str, float]:
         """Clip-level score per AudioSet class: the max over 10 s windows."""
-        n = WINDOW_SECONDS * SAMPLE_RATE
-        windows = [samples[i:i + n] for i in range(0, len(samples), n)]
-        # Drop a trailing scrap shorter than a second unless it is the whole clip.
-        windows = [w for w in windows if len(w) >= SAMPLE_RATE] or windows[:1]
+        windows = analysis_windows(samples, WINDOW_SECONDS)
         with torch.no_grad():
             out = [
                 self._model(torch.from_numpy(np.ascontiguousarray(w)[None, :]))["clipwise_output"][0].numpy()

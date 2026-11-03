@@ -50,5 +50,28 @@ class IterSoundHashesTest(unittest.TestCase):
             self.assertEqual(list(backfill.iter_sound_hashes("https://api.example", 1)), [SHA_A])
 
 
+class MainTest(unittest.TestCase):
+    def run_main(self, statuses, env=None):
+        with mock.patch.object(backfill, "iter_sound_hashes", return_value=[SHA_A, SHA_B]), \
+                mock.patch.object(backfill, "analyze", side_effect=lambda url, secret, sha: statuses[sha]), \
+                mock.patch.dict(backfill.os.environ, {"TRANSCRIBE_SHARED_SECRET": "s"} if env is None else env, clear=True), \
+                mock.patch("sys.stdout"), mock.patch("sys.stderr") as err:
+            code = backfill.main(["--transcoder-url", "https://t.example"])
+        return code, "".join(str(c.args[0]) for c in err.write.call_args_list)
+
+    def test_settled_outcomes_exit_zero(self):
+        code, _ = self.run_main({SHA_A: "classified", SHA_B: "missing"})
+        self.assertEqual(code, 0)
+
+    def test_failures_exit_one_and_name_the_hash(self):
+        code, err = self.run_main({SHA_A: "classified", SHA_B: "http_502"})
+        self.assertEqual(code, 1)
+        self.assertIn(f"failed {SHA_B}: http_502", err)
+
+    def test_refuses_to_run_without_the_secret(self):
+        code, _ = self.run_main({SHA_A: "classified", SHA_B: "classified"}, env={})
+        self.assertEqual(code, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

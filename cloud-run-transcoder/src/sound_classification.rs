@@ -6,9 +6,14 @@
 //! instrument tags, scores) beside the transcript as
 //! `{hash}/audio/analysis.json`. The edge serves it at `/<hash>/sound`.
 //! `POST /analyze-sound` runs the same step for one hash, which is how
-//! existing sounds are backfilled.
+//! existing sounds are backfilled. The service is public, so that route takes
+//! the same `X-Divine-Transcribe-Secret` header as `/transcribe/audio`.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex, OnceLock},
+    time::Duration,
+};
 
 use anyhow::{anyhow, Result};
 use axum::{
@@ -40,6 +45,37 @@ pub(crate) enum ClassifyOutcome {
     NotAudio,
     TooLarge,
     NotConfigured,
+    /// No source blob under this hash (deleted, or never stored).
+    Missing,
+    /// Another request on this instance is classifying the same hash.
+    InProgress,
+}
+
+/// Hashes being classified on this instance. `/transcribe` is called several
+/// times for one upload within seconds (upload service, edge, subtitle jobs),
+/// and each call would otherwise download the blob and queue on the analyzer.
+fn in_flight() -> &'static Mutex<HashSet<String>> {
+    static IN_FLIGHT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    IN_FLIGHT.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Holds a hash in the in-flight set until dropped.
+pub(crate) struct InFlightClaim(String);
+
+impl InFlightClaim {
+    pub(crate) fn try_claim(hash: &str) -> Option<Self> {
+        let mut set = in_flight().lock().expect("in-flight set poisoned");
+        set.insert(hash.to_string())
+            .then(|| InFlightClaim(hash.to_string()))
+    }
+}
+
+impl Drop for InFlightClaim {
+    fn drop(&mut self) {
+        if let Ok(mut set) = in_flight().lock() {
+            set.remove(&self.0);
+        }
+    }
 }
 
 pub(crate) fn analysis_object_path(hash: &str) -> String {
@@ -88,17 +124,22 @@ pub(crate) async fn classify_sound(state: &AppState, hash: &str) -> Result<Class
     let Some(base_url) = state.config.audio_analyzer_url.as_deref() else {
         return Ok(ClassifyOutcome::NotConfigured);
     };
+    let Some(_claim) = InFlightClaim::try_claim(hash) else {
+        return Ok(ClassifyOutcome::InProgress);
+    };
     let bucket = &state.config.gcs_bucket;
     let source = GetObjectRequest {
         bucket: bucket.clone(),
         object: hash.to_string(),
         ..Default::default()
     };
-    let object = state
-        .gcs_client
-        .get_object(&source)
-        .await
-        .map_err(|e| anyhow!("Failed to read source object metadata: {}", e))?;
+    let object = match state.gcs_client.get_object(&source).await {
+        Ok(object) => object,
+        Err(google_cloud_storage::http::Error::Response(e)) if e.code == 404 => {
+            return Ok(ClassifyOutcome::Missing);
+        }
+        Err(e) => return Err(anyhow!("Failed to read source object metadata: {}", e)),
+    };
     let content_type = object.content_type.unwrap_or_default();
     if let Some(skip) = skip_reason(&content_type, object.size) {
         return Ok(skip);
@@ -191,6 +232,7 @@ struct AnalyzeSoundResponse {
 
 /// `POST /analyze-sound {"hash": "<sha256>"}`: classify one stored sound now.
 /// Idempotent: a stored verdict is kept and reported as `already_exists`.
+/// Guarded by `require_transcribe_secret` in the router.
 pub(crate) async fn handle_analyze_sound(
     State(state): State<Arc<AppState>>,
     Json(request): Json<AnalyzeSoundRequest>,
@@ -268,6 +310,16 @@ mod tests {
         assert!(validate_verdict(br#"{"kind":null,"tags":[]}"#).is_ok());
         assert!(validate_verdict(br#"{"kind":"music"}"#).is_err());
         assert!(validate_verdict(b"<html>502</html>").is_err());
+    }
+
+    #[test]
+    fn a_hash_is_classified_once_at_a_time_per_instance() {
+        let hash = "c".repeat(64);
+        let first = InFlightClaim::try_claim(&hash).expect("first claim");
+        assert!(InFlightClaim::try_claim(&hash).is_none());
+        assert!(InFlightClaim::try_claim(&"d".repeat(64)).is_some());
+        drop(first);
+        assert!(InFlightClaim::try_claim(&hash).is_some());
     }
 
     #[test]

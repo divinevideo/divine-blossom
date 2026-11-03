@@ -174,6 +174,7 @@ fn quarantine_source_hash(path: &str) -> Option<String> {
     parse_audio_path(path)
         .or_else(|| parse_transcript_path(path))
         .or_else(|| parse_vtt_file_path(path))
+        .or_else(|| parse_sound_analysis_path(path))
         .or_else(|| parse_quality_variant_path(path).map(|(hash, _, _)| hash))
         .or_else(|| {
             path.strip_prefix('/')
@@ -2063,7 +2064,13 @@ fn serve_sound_analysis(req: Option<&Request>, hash: &str) -> Result<Response> {
     let mut resp = Response::from_status(StatusCode::OK);
     resp.set_header("Content-Type", "application/json");
     resp.set_body(stored.take_body());
-    add_derivative_cache_headers(&mut resp, hash);
+    // An owner or admin may read a restricted blob's verdict; never let a
+    // shared cache keep that copy, as for transcripts.
+    if is_admin || status_requires_private_response(metadata.status) {
+        add_private_cache_headers(&mut resp, hash);
+    } else {
+        add_derivative_cache_headers(&mut resp, hash);
+    }
     add_cors_headers(&mut resp);
     Ok(resp)
 }

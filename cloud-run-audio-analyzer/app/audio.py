@@ -16,6 +16,19 @@ MAX_SECONDS = 30.0
 SILENCE_DBFS = -70.0
 
 
+def analysis_windows(samples: np.ndarray, window_seconds: int = 10) -> list:
+    """Split into `window_seconds` windows and zero-pad any window under a second.
+
+    CNN14 halves the time axis five times, so a window shorter than ~0.35 s
+    leaves a pooling layer with no frames and the model raises.
+    """
+    n = window_seconds * SAMPLE_RATE
+    windows = [samples[i:i + n] for i in range(0, len(samples), n)]
+    # Drop a trailing scrap shorter than a second unless it is the whole clip.
+    windows = [w for w in windows if len(w) >= SAMPLE_RATE] or windows[:1]
+    return [np.pad(w, (0, max(0, SAMPLE_RATE - len(w)))) for w in windows]
+
+
 class DecodeError(Exception):
     """ffmpeg could not decode the body as audio."""
 

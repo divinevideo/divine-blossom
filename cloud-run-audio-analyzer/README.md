@@ -27,7 +27,7 @@ Errors:
 | `422` | the body is not decodable audio |
 | `503` | the model is still loading |
 
-Only the first 30 s are analyzed. A 6-second piano clip returns:
+Only the first 30 s are analyzed. Clips shorter than a second are padded with silence to one second, because the model cannot take less than about 0.35 s. A 6-second piano clip returns:
 
 ```json
 {
@@ -71,7 +71,7 @@ A silent upload (digital silence or below −70 dBFS) returns `"silent": true`, 
 | `sfx` when an effect is the top group | no threshold | – |
 | Pure speech gets no kind, so the sound is listed only under All | – | – |
 | …unless it is shorter than this; short sound bites such as "bruh" are `sfx` | 2.5 s | `ANALYZER_SHORT_SPEECH_MAX_S` |
-| Music gets its top genre as a tag | – | – |
+| Music gets its top genre as a tag if it scores at least this | 0.01 | `ANALYZER_GENRE_MIN` |
 | Music gets every instrument scoring at least this | 0.2 | `ANALYZER_INSTRUMENT_MIN` |
 | Mood is returned as scores but never as a tag | – | – |
 
@@ -87,7 +87,7 @@ Measured on 213 hand-labelled Divine sounds (the evaluation in #319: real relay 
 |---|---:|---:|
 | `music` tag | 95% | 85% of music |
 | `sfx` tag (effects and short sound bites) | 98% | 77% of effects |
-| Genre on sounds tagged `music` | 25 of 28 correct | – |
+| Genre on sounds tagged `music` | 24 of 27 correct (one known genre falls below the 0.01 floor) | – |
 
 The acoustic kind (`detected`) was right for 84% of clips, or 92% when a clip mixing speech and music counts as either. Pop is the weakest genre; classical, rock and jazz were reliable.
 
@@ -140,8 +140,8 @@ The script prints the two commands that wire it up. The first grants the transco
 2. The classification skips blobs that are not `audio/*` or exceed 50 MB. It also skips sounds that already have a verdict.
 3. Otherwise it sends the original blob to this service and stores the JSON beside the transcript as `{sha256}/audio/analysis.json`.
 4. The edge serves that file at `GET /<sha256>/sound`, with the same moderation gate as transcripts. Until the verdict exists the route returns `404`. Funnelcake reads it from there for its sound index (divinevideo/divine-funnelcake#1422).
-5. `POST /analyze-sound {"hash": "<sha256>"}` on the transcoder runs the same step for one stored sound. It is idempotent.
-6. `scripts/backfill_sound_analysis.py` calls it for every Blossom-hosted sound that Funnelcake's `/api/sounds` lists, to classify sounds published before this shipped.
+5. `POST /analyze-sound {"hash": "<sha256>"}` on the transcoder runs the same step for one stored sound. It needs the `X-Divine-Transcribe-Secret` header, like `/transcribe/audio`. It is idempotent, and an instance never analyzes the same hash twice at once. It answers with a `status`: `classified`, `already_exists`, `not_audio`, `too_large`, `missing` (no such blob), `in_progress` or `not_configured`.
+6. `scripts/backfill_sound_analysis.py` calls it for every Blossom-hosted sound that Funnelcake's `/api/sounds` lists, to classify sounds published before this shipped. It reads the secret from `TRANSCRIBE_SHARED_SECRET` and prints every hash that failed.
 
 A failed classification is only logged; re-running the backfill script retries it.
 

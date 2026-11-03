@@ -12,7 +12,7 @@ from app.rules import (  # noqa: E402
     Thresholds, analyze_scores,
 )
 
-T = Thresholds(music_min=0.5, short_speech_max_s=2.5, instrument_min=0.2,
+T = Thresholds(music_min=0.5, short_speech_max_s=2.5, genre_min=0.01, instrument_min=0.2,
                audioset_tag_min=0.1, audioset_tag_count=10)
 
 
@@ -65,6 +65,10 @@ class TestTags(unittest.TestCase):
         a = analyze_scores({"Music": 0.95, "Classical music": 0.3, "Jazz": 0.1,
                             "Piano": 0.7, "Violin, fiddle": 0.25, "Guitar": 0.1}, 6.3, T)
         self.assertEqual(a.tags, ["music", "classical", "piano", "violin"])
+
+    def test_a_near_zero_genre_is_not_tagged(self):
+        a = analyze_scores({"Music": 0.9, "Rock music": 0.0006, "Piano": 0.6}, 6.3, T)
+        self.assertEqual(a.tags, ["music", "piano"])
 
     def test_effects_never_get_genre_or_instrument_tags(self):
         a = analyze_scores({"Explosion": 0.6, "Piano": 0.3, "Rock music": 0.2}, 3.0, T)

@@ -50,7 +50,7 @@ Sound classification only starts once all three of its parts are live:
 1. Deploy the analyzer. Then run the two commands its script prints: the first grants the transcoder invoker, the second sets `AUDIO_ANALYZER_URL` on `divine-transcoder`.
 2. Deploy the transcoder build that contains `/analyze-sound`. Its deploy script uses `--update-env-vars`, so the URL from step 1 survives later deploys.
 3. The edge route `/<sha256>/sound` ships with the normal Compute publish on merge.
-4. Classify existing sounds once with `python3 scripts/backfill_sound_analysis.py --transcoder-url <url> --dry-run`, then again without `--dry-run`.
+4. Classify existing sounds once. First run `python3 scripts/backfill_sound_analysis.py --transcoder-url <url> --dry-run`. Then run it without `--dry-run`, with `TRANSCRIBE_SHARED_SECRET` set to the `transcribe_shared_secret` secret, which `/analyze-sound` requires.
 
 Without `AUDIO_ANALYZER_URL` the transcoder skips classification and `/analyze-sound` answers `not_configured`.
 
