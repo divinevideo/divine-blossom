@@ -43,6 +43,7 @@ These services are not deployed by CI. Each is a script you run yourself.
 | --- | --- |
 | `divine-transcoder` | `cloud-run-transcoder/deploy.sh` |
 | Parakeet ASR | `cloud-run-asr-parakeet/deploy.sh` |
+| Audio analyzer (`divine-audio-analyzer`) | `cloud-run-audio-analyzer/deploy.sh` |
 
 `process-blob` also has `scripts/deploy-cloud-function.sh` for manual deploys.
 It targets the same Cloud Run service that CI deploys on merge, so treat the CI

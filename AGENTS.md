@@ -134,7 +134,7 @@ results influence work.
 
 ## Project Structure & Module Organization
 - Fastly Compute edge service code lives under `src/`.
-- Cloud Run services live under `cloud-run-upload/` and `cloud-run-transcoder/`.
+- Cloud Run services live under `cloud-run-upload/` and `cloud-run-transcoder/`; the private sidecars are `cloud-run-asr-parakeet/` (speech to text, GPU) and `cloud-run-audio-analyzer/` (sound classification, CPU).
 - Blob processing and moderation webhook code lives under `cloud-functions/process-blob/`.
 - Operational docs and rollout notes live in `README.md`, `OAUTH_SETUP.md`, and `docs/`.
 - Deployment and environment config lives in `fastly.toml*`, `Dockerfile.local`, and service-specific config files. Verify current config before changing domains, buckets, or service bindings.
