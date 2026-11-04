@@ -1,0 +1,4 @@
+# Test-only dependencies. The rule tests need nothing but the standard library;
+# the HTTP and decode tests also need these plus ffmpeg on PATH.
+-r requirements.txt
+httpx==0.28.1

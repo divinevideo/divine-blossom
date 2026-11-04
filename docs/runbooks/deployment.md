@@ -43,6 +43,16 @@ These services are not deployed by CI. Each is a script you run yourself.
 | --- | --- |
 | `divine-transcoder` | `cloud-run-transcoder/deploy.sh` |
 | Parakeet ASR | `cloud-run-asr-parakeet/deploy.sh` |
+| Audio analyzer (`divine-audio-analyzer`) | `cloud-run-audio-analyzer/deploy.sh` |
+
+Sound classification only starts once all three of its parts are live:
+
+1. Deploy the analyzer. Then run the two commands its script prints: the first grants the transcoder invoker, the second sets `AUDIO_ANALYZER_URL` on `divine-transcoder`.
+2. Deploy the transcoder build that contains `/analyze-sound`. Its deploy script uses `--update-env-vars`, so the URL from step 1 survives later deploys.
+3. The edge route `/<sha256>/sound` ships with the normal Compute publish on merge.
+4. Classify existing sounds once. First run `python3 scripts/backfill_sound_analysis.py --transcoder-url <url> --dry-run`. Then run it without `--dry-run`, with `TRANSCRIBE_SHARED_SECRET` set to the `transcribe_shared_secret` secret, which `/analyze-sound` requires. Add `--silent-out silent.txt` to keep the list of sounds found silent: Funnelcake hides those from its sound lists once its `sound-analysis-sync` job has read them.
+
+Without `AUDIO_ANALYZER_URL` the transcoder skips classification and `/analyze-sound` answers `not_configured`.
 
 `process-blob` also has `scripts/deploy-cloud-function.sh` for manual deploys.
 It targets the same Cloud Run service that CI deploys on merge, so treat the CI

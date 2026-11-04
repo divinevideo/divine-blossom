@@ -22,13 +22,13 @@ mod quarantine_tests;
 
 use crate::auth::{diagnose_viewer_auth, validate_auth, validate_hash_match, viewer_pubkey};
 use crate::blossom::{
-    is_audio_path, is_hash_path, is_quality_variant_path, is_transcribable_mime_type,
-    is_transcript_path, is_video_mime_type, is_vtt_file_path, parse_audio_path,
-    parse_hash_from_path, parse_quality_variant_path, parse_thumbnail_path, parse_transcript_path,
-    parse_vtt_file_path, AudioMapping, AuthAction, BlobAccess, BlobDescriptor, BlobMetadata,
-    BlobStatus, ResumableUploadCompleteResponse, ResumableUploadInitRequest,
-    ResumableUploadInitResponse, SubtitleJob, SubtitleJobCreateRequest, SubtitleJobStatus,
-    TranscodeStatus, TranscriptStatus, UploadRequirements, QUALITY_VARIANTS,
+    is_audio_path, is_hash_path, is_quality_variant_path, is_sound_analysis_path,
+    is_transcribable_mime_type, is_transcript_path, is_video_mime_type, is_vtt_file_path,
+    parse_audio_path, parse_hash_from_path, parse_quality_variant_path, parse_sound_analysis_path,
+    parse_thumbnail_path, parse_transcript_path, parse_vtt_file_path, AudioMapping, AuthAction,
+    BlobAccess, BlobDescriptor, BlobMetadata, BlobStatus, ResumableUploadCompleteResponse,
+    ResumableUploadInitRequest, ResumableUploadInitResponse, SubtitleJob, SubtitleJobCreateRequest,
+    SubtitleJobStatus, TranscodeStatus, TranscriptStatus, UploadRequirements, QUALITY_VARIANTS,
 };
 use crate::delete_policy::{
     apply_vanish_shared_updates_with_ops, build_creator_delete_response,
@@ -174,6 +174,7 @@ fn quarantine_source_hash(path: &str) -> Option<String> {
     parse_audio_path(path)
         .or_else(|| parse_transcript_path(path))
         .or_else(|| parse_vtt_file_path(path))
+        .or_else(|| parse_sound_analysis_path(path))
         .or_else(|| parse_quality_variant_path(path).map(|(hash, _, _)| hash))
         .or_else(|| {
             path.strip_prefix('/')
@@ -250,6 +251,10 @@ fn route_request(req: Request) -> Result<Response> {
         // Transcript: /{sha256}/VTT or /{sha256}/vtt
         (Method::GET, p) if is_transcript_path(p) => handle_get_transcript(req, p),
         (Method::HEAD, p) if is_transcript_path(p) => handle_head_transcript(p),
+
+        // Sound classification (music / sfx tags): /{sha256}/sound
+        (Method::GET, p) if is_sound_analysis_path(p) => handle_get_sound_analysis(req, p),
+        (Method::HEAD, p) if is_sound_analysis_path(p) => handle_head_sound_analysis(p),
 
         // Subtitle jobs API
         (Method::POST, "/v1/subtitles/jobs") => handle_create_subtitle_job(req),
@@ -2004,6 +2009,70 @@ fn handle_head_transcript(path: &str) -> Result<Response> {
     let hash = parse_transcript_path(path)
         .ok_or_else(|| BlossomError::BadRequest("Invalid transcript path".into()))?;
     handle_head_transcript_by_hash(&hash)
+}
+
+/// GET /<sha256>/sound - The stored sound classification for an audio blob:
+/// music / sfx / neither, genre and instrument tags and their scores. The
+/// transcoder writes it after the upload; until then this is a 404.
+fn handle_get_sound_analysis(req: Request, path: &str) -> Result<Response> {
+    let hash = parse_sound_analysis_path(path)
+        .ok_or_else(|| BlossomError::BadRequest("Invalid sound path".into()))?;
+    serve_sound_analysis(Some(&req), &hash)
+}
+
+/// HEAD /<sha256>/sound - Check whether a sound classification exists
+fn handle_head_sound_analysis(path: &str) -> Result<Response> {
+    let hash = parse_sound_analysis_path(path)
+        .ok_or_else(|| BlossomError::BadRequest("Invalid sound path".into()))?;
+    let mut resp = serve_sound_analysis(None, &hash)?;
+    resp.set_body(Vec::<u8>::new());
+    Ok(resp)
+}
+
+fn serve_sound_analysis(req: Option<&Request>, hash: &str) -> Result<Response> {
+    use crate::storage::download_sound_analysis_from_gcs;
+
+    let metadata = get_blob_metadata(hash)?
+        .ok_or_else(|| BlossomError::NotFound("Content not found".into()))?;
+
+    // Same moderation gate as transcripts: admin Bearer bypasses it, and a
+    // banned or restricted blob's classification is as hidden as the blob.
+    let is_admin = req
+        .map(|r| admin::validate_bearer_token(r).is_ok())
+        .unwrap_or(false);
+    let requester_pk = match req {
+        Some(request) => media_viewer_context(request, "sound")?.0,
+        None => None,
+    };
+    match metadata.access_for(requester_pk.as_deref(), is_admin) {
+        BlobAccess::Allowed => {}
+        BlobAccess::NotFound => return Err(BlossomError::NotFound("Content not found".into())),
+        BlobAccess::AgeGated => return Err(BlossomError::AuthRequired("age_restricted".into())),
+    }
+
+    if !metadata
+        .mime_type
+        .to_ascii_lowercase()
+        .starts_with("audio/")
+    {
+        return Err(BlossomError::NotFound(
+            "Sound analysis is only available for audio".into(),
+        ));
+    }
+
+    let mut stored = download_sound_analysis_from_gcs(&format!("{hash}/audio/analysis.json"))?;
+    let mut resp = Response::from_status(StatusCode::OK);
+    resp.set_header("Content-Type", "application/json");
+    resp.set_body(stored.take_body());
+    // An owner or admin may read a restricted blob's verdict; never let a
+    // shared cache keep that copy, as for transcripts.
+    if is_admin || status_requires_private_response(metadata.status) {
+        add_private_cache_headers(&mut resp, hash);
+    } else {
+        add_derivative_cache_headers(&mut resp, hash);
+    }
+    add_cors_headers(&mut resp);
+    Ok(resp)
 }
 
 /// GET /<sha256>.vtt - Stable transcript file URL

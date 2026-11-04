@@ -1,6 +1,7 @@
 use crate::error::BlossomError;
 use crate::types::{
-    is_audio_path, is_hash_path, is_quality_variant_path, is_transcript_path, is_vtt_file_path,
+    is_audio_path, is_hash_path, is_quality_variant_path, is_sound_analysis_path,
+    is_transcript_path, is_vtt_file_path,
 };
 
 /// Cap keeps the ID short enough for both the Compute sanitizer and the outer
@@ -99,6 +100,8 @@ pub fn route_category(path: &str) -> &'static str {
         "hls_content"
     } else if is_vtt_file_path(path) || is_transcript_path(path) {
         "transcript"
+    } else if is_sound_analysis_path(path) {
+        "sound"
     } else if path.starts_with("/v1/subtitles/") {
         "subtitle_api"
     } else if path.ends_with("/provenance") {
@@ -322,6 +325,8 @@ mod tests {
         assert_eq!(route_category(&format!("/{hash}.vtt")), "transcript");
         // Invalid transcript-shaped paths route to 404, not "transcript".
         assert_eq!(route_category("/not-a-hash.vtt"), "other");
+        assert_eq!(route_category(&format!("/{hash}/sound")), "sound");
+        assert_eq!(route_category("/not-a-hash/sound"), "other");
         // Router arm order: /hls/ wins over a /provenance suffix.
         assert_eq!(
             route_category(&format!("/{hash}/hls/provenance")),

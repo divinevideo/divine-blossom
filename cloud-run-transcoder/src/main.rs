@@ -44,6 +44,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
 mod mp4;
+mod sound_classification;
 mod transcription_google_stt_v2;
 mod translation_google_v3;
 mod translation_jobs;
@@ -113,6 +114,10 @@ struct Config {
     /// `transcription_provider == "parakeet"`. Audience for the
     /// Cloud Run identity token is the same URL.
     parakeet_asr_url: Option<String>,
+    /// Base URL of the audio analyzer sidecar (Cloud Run, CPU). When set,
+    /// audio-only uploads are classified as music / sfx alongside
+    /// transcription. Also the audience of the Cloud Run identity token.
+    audio_analyzer_url: Option<String>,
     /// Shared secret authorizing `POST /transcribe/audio`. The upload-service
     /// proxy injects it; the service is `--allow-unauthenticated`, so when this
     /// is unset the route fails closed (503).
@@ -267,6 +272,9 @@ impl Config {
                 true,
             ),
             parakeet_asr_url: lookup("PARAKEET_ASR_URL")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
+            audio_analyzer_url: lookup("AUDIO_ANALYZER_URL")
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty()),
             transcribe_shared_secret: lookup("TRANSCRIBE_SHARED_SECRET")
@@ -765,6 +773,12 @@ async fn main() -> Result<()> {
         .route("/transcribe", post(handle_transcribe))
         .route("/transcribe", options(handle_cors_preflight))
         .route(
+            "/analyze-sound",
+            post(sound_classification::handle_analyze_sound).route_layer(
+                middleware::from_fn_with_state(state.clone(), require_transcribe_secret),
+            ),
+        )
+        .route(
             "/translate",
             post(handle_translate).route_layer(middleware::from_fn_with_state(
                 state.clone(),
@@ -917,6 +931,9 @@ async fn handle_transcribe(
     State(state): State<Arc<AppState>>,
     Json(request): Json<TranscodeRequest>,
 ) -> Response {
+    // Every audio upload reaches /transcribe, so sound classification starts
+    // here; it checks the content type itself and skips videos.
+    sound_classification::spawn_classification(state.clone(), request.hash.to_lowercase());
     match process_transcribe(state, request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => {
@@ -6418,6 +6435,18 @@ mod tests {
         assert_eq!(
             config.parakeet_asr_url.as_deref(),
             Some("https://asr.example.com")
+        );
+    }
+
+    #[test]
+    fn audio_analyzer_config_reads_url_when_set() {
+        assert!(Config::from_lookup(|_| None).audio_analyzer_url.is_none());
+        let config = Config::from_lookup(|k| {
+            (k == "AUDIO_ANALYZER_URL").then(|| " https://analyzer.example.com ".to_string())
+        });
+        assert_eq!(
+            config.audio_analyzer_url.as_deref(),
+            Some("https://analyzer.example.com")
         );
     }
 

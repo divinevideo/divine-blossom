@@ -8,6 +8,7 @@ Content-addressed media storage for the [Divine](https://divine.video) platform,
 - **Nostr auth** — Blossom auth events (kind 24242, Schnorr signatures) for uploads and deletes; NIP-98 HTTP auth (kind 27235) for viewer/list requests
 - **HLS transcoding** — multi-quality adaptive streaming (1080p, 720p, 480p, 360p) generated on GPU-backed Cloud Run
 - **WebVTT transcripts** — automatic speech-to-text with a stable transcript URL at `/<sha256>.vtt` and an on-demand subtitle jobs API
+- **Sound classification** — audio uploads are tagged as music or sound effects, with genre and instrument tags for music, and flagged when they are silent, at `/<sha256>/sound`
 - **Range requests** — native video seeking with `206 Partial Content` on blobs, quality variants, and audio
 - **Provenance & audit** — uploads and object deletes retain signed-event provenance; account vanish uses minimal retry-safe authorization and completion records in Cloud Logging
 - **Moderation** — SafeSearch (Vision API) screening plus shadow restriction, so restricted content is visible only to its owner or an admin
@@ -185,6 +186,7 @@ In `enforce` mode, unsigned or untrusted content is rejected (status set to `res
 | `GET` / `HEAD` | `/<sha256>/<quality>` | Quality variant (e.g. `720p`, `480p`) |
 | `GET` / `HEAD` | `/<sha256>.vtt`, `/<sha256>/VTT` | WebVTT transcript (on-demand generation) |
 | `GET` | `/<sha256>/provenance` | Provenance info (owner, uploaders, auth events) |
+| `GET` / `HEAD` | `/<sha256>/sound` | Sound classification for an audio blob (`music` / `sfx` / none, genre and instrument tags, scores, `silent` and loudness); `404` until it has been analyzed |
 
 ### Management (BUD-02)
 
