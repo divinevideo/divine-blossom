@@ -50,6 +50,8 @@ class TestAnalyzeEndpoint(unittest.TestCase):
         self.assertEqual(body["pipeline_version"], main.PIPELINE_VERSION)
         self.assertAlmostEqual(body["analyzed_seconds"], 6.0, places=1)
         self.assertFalse(body["silent"])
+        self.assertAlmostEqual(body["loudness"]["peak_dbfs"], -6.0, delta=0.5)
+        self.assertAlmostEqual(body["loudness"]["audible_seconds"], 6.0, delta=0.05)
 
     def test_silent_audio_is_not_classified(self):
         r = self.client.post("/v1/analyze", content=_wav(np.zeros(48000 * 3)))
@@ -58,6 +60,17 @@ class TestAnalyzeEndpoint(unittest.TestCase):
         self.assertTrue(body["silent"])
         self.assertIsNone(body["kind"])
         self.assertEqual(body["tags"], [])
+        self.assertEqual(self.tagger.calls, 0)
+        # Digital silence has no dBFS level; JSON carries it as null, not -Infinity.
+        self.assertEqual(body["loudness"]["peak_dbfs"], None)
+        self.assertEqual(body["loudness"]["audible_seconds"], 0.0)
+
+    def test_a_click_in_silence_is_silent(self):
+        samples = np.zeros(48000 * 6)
+        samples[48000:48000 + 960] = _tone(0.02)
+        body = self.client.post("/v1/analyze", content=_wav(samples)).json()
+        self.assertTrue(body["silent"])
+        self.assertGreater(body["loudness"]["peak_dbfs"], -10.0)
         self.assertEqual(self.tagger.calls, 0)
 
     def test_empty_body_is_rejected(self):

@@ -61,19 +61,22 @@ def _analyze(body: bytes) -> dict:
     except audio.DecodeError as exc:
         raise HTTPException(status_code=422, detail=f"could not decode audio: {exc}") from exc
     seconds = round(len(samples) / audio.SAMPLE_RATE, 3)
+    loudness = audio.measure_loudness(samples)
     result: dict = {
         "model": _tagger.model_name,
         "pipeline_version": PIPELINE_VERSION,
         "analyzed_seconds": seconds,
-        "silent": audio.is_silent(samples),
+        "silent": loudness.silent,
+        "loudness": loudness.to_dict(),
     }
     if result["silent"]:
         result.update(kind=None, detected=None, scores=None, tags=[], audioset=[])
     else:
         result.update(analyze_scores(_tagger.scores(samples), seconds).to_dict())
     logger.info(
-        "analyzed %.1fs kind=%s tags=%s in %.0f ms",
-        seconds, result["kind"], result["tags"], (time.perf_counter() - started) * 1000,
+        "analyzed %.1fs silent=%s audible=%.2fs kind=%s tags=%s in %.0f ms",
+        seconds, loudness.silent, loudness.audible_seconds, result["kind"], result["tags"],
+        (time.perf_counter() - started) * 1000,
     )
     return result
 

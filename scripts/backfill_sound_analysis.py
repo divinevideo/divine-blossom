@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 # ABOUTME: Classify existing published sounds by asking the transcoder to analyze each one.
 # ABOUTME: Pages Funnelcake's /api/sounds for Blossom-hosted sounds; safe to re-run.
-"""Backfill sound classifications (music / sfx tags) for existing sounds.
+"""Backfill sound classifications (music / sfx tags, silence) for existing sounds.
 
 New audio uploads are classified when they reach the transcoder's
 /transcribe route. Sounds published before that need one call each to
 `POST /analyze-sound` on the transcoder, which skips any sound that already
 has a stored verdict, so the script can be stopped and re-run.
+
+`--force` replaces stored verdicts instead, after the analyzer's rules or
+thresholds changed. The edge caches `/<sha256>/sound` under the hash's
+surrogate key, so purge those keys afterwards or Funnelcake keeps reading the
+old verdict. `--hashes-file` limits a run to the listed hashes, for example
+sounds Funnelcake already hides and so no longer lists.
 
 `/analyze-sound` takes the transcoder's `X-Divine-Transcribe-Secret`; pass it
 in TRANSCRIBE_SHARED_SECRET (Secret Manager: transcribe_shared_secret).
@@ -14,7 +20,7 @@ in TRANSCRIBE_SHARED_SECRET (Secret Manager: transcribe_shared_secret).
 Examples:
   python3 scripts/backfill_sound_analysis.py --transcoder-url https://<transcoder> --dry-run
   TRANSCRIBE_SHARED_SECRET=... python3 scripts/backfill_sound_analysis.py \
-      --transcoder-url https://<transcoder> --concurrency 2
+      --transcoder-url https://<transcoder> --concurrency 2 --silent-out silent.txt
 """
 
 import argparse
@@ -25,7 +31,7 @@ import urllib.parse
 import urllib.request
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from typing import Iterable, Iterator, List, Optional
+from typing import Iterable, Iterator, List, Optional, Tuple
 
 DEFAULT_API_BASE = "https://api.divine.video"
 BLOSSOM_HOSTS = {"media.divine.video"}
@@ -78,20 +84,43 @@ def iter_sound_hashes(api_base: str, max_sounds: Optional[int]) -> Iterator[str]
                 return
 
 
-def analyze(transcoder_url: str, secret: str, sha: str) -> str:
+def read_hashes(path: str) -> List[str]:
+    """Unique sha256 hashes from a file, one per line; blank lines and `#` comments skipped.
+
+    Raises:
+        ValueError: if a line is not a sha256 hash.
+    """
+    hashes: List[str] = []
+    seen = set()
+    with open(path, encoding="utf-8") as f:
+        for number, line in enumerate(f, 1):
+            sha = line.split("#", 1)[0].strip().lower()
+            if not sha:
+                continue
+            if not is_sha256(sha):
+                raise ValueError(f"{path}:{number}: not a sha256 hash: {sha!r}")
+            if sha not in seen:
+                seen.add(sha)
+                hashes.append(sha)
+    return hashes
+
+
+def analyze(transcoder_url: str, secret: str, sha: str, force: bool = False) -> Tuple[str, Optional[bool]]:
+    """The transcoder's status for `sha`, and whether a verdict it just wrote is silent."""
     request = urllib.request.Request(
         f"{transcoder_url.rstrip('/')}/analyze-sound",
-        data=json.dumps({"hash": sha}).encode(),
+        data=json.dumps({"hash": sha, "force": force}).encode(),
         headers={"Content-Type": "application/json", SECRET_HEADER: secret},
         method="POST",
     )
     try:
         with urllib.request.urlopen(request, timeout=180) as resp:
-            return json.load(resp).get("status", "unknown")
+            body = json.load(resp)
+            return body.get("status", "unknown"), body.get("silent")
     except urllib.error.HTTPError as exc:
-        return f"http_{exc.code}"
+        return f"http_{exc.code}", None
     except (urllib.error.URLError, TimeoutError) as exc:
-        return f"error:{type(exc).__name__}"
+        return f"error:{type(exc).__name__}", None
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -106,10 +135,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="parallel requests; keep at or below the analyzer's max-instances (default 2)",
     )
     parser.add_argument("--dry-run", action="store_true", help="list hashes without analyzing")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="replace stored verdicts; purge the hashes' surrogate keys on the edge afterwards",
+    )
+    parser.add_argument(
+        "--hashes-file", help="analyze only the sha256 hashes in this file instead of listing sounds"
+    )
+    parser.add_argument("--silent-out", help="append the hash of every sound found silent to this file")
     args = parser.parse_args(argv)
 
-    hashes = list(iter_sound_hashes(args.api_base, args.max_sounds))
-    print(f"{len(hashes)} Blossom-hosted sounds found", file=sys.stderr)
+    if args.hashes_file:
+        hashes = read_hashes(args.hashes_file)[: args.max_sounds]
+        print(f"{len(hashes)} hashes read from {args.hashes_file}", file=sys.stderr)
+    else:
+        hashes = list(iter_sound_hashes(args.api_base, args.max_sounds))
+        print(f"{len(hashes)} Blossom-hosted sounds found", file=sys.stderr)
     if args.dry_run:
         for sha in hashes:
             print(sha)
@@ -121,16 +163,24 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     outcomes: Counter = Counter()
     failed: List[str] = []
+    silent: List[str] = []
     with ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as pool:
-        results = pool.map(lambda sha: (sha, analyze(args.transcoder_url, secret, sha)), hashes)
-        for i, (sha, status) in enumerate(results, 1):
+        results = pool.map(
+            lambda sha: (sha, *analyze(args.transcoder_url, secret, sha, args.force)), hashes
+        )
+        for i, (sha, status, is_silent) in enumerate(results, 1):
             outcomes[status] += 1
             if status not in SETTLED:
                 failed.append(sha)
                 print(f"failed {sha}: {status}", file=sys.stderr)
+            if is_silent:
+                silent.append(sha)
             if i % 100 == 0:
-                print(f"{i}/{len(hashes)} {dict(outcomes)}", file=sys.stderr)
-    print(json.dumps(dict(outcomes), sort_keys=True))
+                print(f"{i}/{len(hashes)} {dict(outcomes)} silent={len(silent)}", file=sys.stderr)
+    if args.silent_out and silent:
+        with open(args.silent_out, "a", encoding="utf-8") as f:
+            f.writelines(f"{sha}\n" for sha in silent)
+    print(json.dumps({**outcomes, "silent": len(silent)}, sort_keys=True))
     return 1 if failed else 0
 
 

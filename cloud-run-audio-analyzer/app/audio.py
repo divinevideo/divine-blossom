@@ -1,19 +1,27 @@
-# ABOUTME: Decodes uploaded audio with ffmpeg into mono float32 PCM for the tagger.
-# ABOUTME: Only the first MAX_SECONDS are analyzed; sounds are usually ~6 s long.
+# ABOUTME: Decodes uploaded audio with ffmpeg into mono float32 PCM for the tagger,
+# ABOUTME: and measures its loudness to decide whether the sound plays anything.
 
 from __future__ import annotations
 
+import math
 import subprocess
 import tempfile
+from dataclasses import dataclass
 
 import numpy as np
 
 SAMPLE_RATE = 32000  # PANNs CNN14 is trained on 32 kHz audio.
 MAX_SECONDS = 30.0
-# Below this RMS level a clip is treated as silent and is not classified. Real
-# quiet field recordings (crickets at night) measured -60 dBFS; silent uploads
-# are digital zero.
-SILENCE_DBFS = -70.0
+
+# A sound is silent when almost none of it is audible. Audible means a 10 ms
+# window whose sample peak reaches AUDIBLE_FLOOR_DBFS. Silent means less audible
+# time than MIN_AUDIBLE_SECONDS, or than MIN_AUDIBLE_SHARE of the clip if that is
+# shorter, so a deliberately short effect stays audible. Measured on 3,064
+# production sounds; see "Silence" in the README for why these values.
+AUDIBLE_FLOOR_DBFS = -50.0
+AUDIBLE_WINDOW_SECONDS = 0.01
+MIN_AUDIBLE_SECONDS = 0.25
+MIN_AUDIBLE_SHARE = 0.10
 
 
 def analysis_windows(samples: np.ndarray, window_seconds: int = 10) -> list:
@@ -63,10 +71,47 @@ def decode(audio: bytes, timeout_s: float = 60.0) -> np.ndarray:
     return samples
 
 
-def rms_dbfs(samples: np.ndarray) -> float:
-    rms = float(np.sqrt(np.mean(np.square(samples, dtype=np.float64))))
-    return 20.0 * float(np.log10(rms)) if rms > 0 else float("-inf")
+def _dbfs(level: float) -> float | None:
+    """Level in dBFS rounded to 0.1 dB; None for digital silence, which JSON cannot hold as -inf."""
+    return round(20.0 * math.log10(level), 1) if level > 0 else None
 
 
-def is_silent(samples: np.ndarray) -> bool:
-    return bool(rms_dbfs(samples) < SILENCE_DBFS)
+@dataclass(frozen=True)
+class Loudness:
+    peak_dbfs: float | None
+    rms_dbfs: float | None
+    audible_seconds: float
+    silent: bool
+
+    def to_dict(self) -> dict:
+        return {
+            "peak_dbfs": self.peak_dbfs,
+            "rms_dbfs": self.rms_dbfs,
+            "audible_seconds": self.audible_seconds,
+            "audible_floor_dbfs": AUDIBLE_FLOOR_DBFS,
+        }
+
+
+def measure_loudness(samples: np.ndarray) -> Loudness:
+    """Peak, RMS and audible time of decoded samples, and whether they count as silent.
+
+    A clip that fills MAX_SECONDS was cut by `decode`, so the rest of it was never
+    heard. It is never called silent: a long track may start with a silent intro.
+    """
+    x = samples.astype(np.float64)
+    window = int(AUDIBLE_WINDOW_SECONDS * SAMPLE_RATE)
+    # The trailing partial window counts as a whole one; at 10 ms that is noise.
+    padded = np.pad(np.abs(x), (0, -len(x) % window))
+    window_peaks = padded.reshape(-1, window).max(axis=1)
+    audible = int(np.count_nonzero(window_peaks >= 10 ** (AUDIBLE_FLOOR_DBFS / 20)))
+    audible_seconds = round(audible * AUDIBLE_WINDOW_SECONDS, 2)
+
+    seconds = len(x) / SAMPLE_RATE
+    truncated = len(x) >= int(MAX_SECONDS * SAMPLE_RATE)
+    needed = min(MIN_AUDIBLE_SECONDS, MIN_AUDIBLE_SHARE * seconds)
+    return Loudness(
+        peak_dbfs=_dbfs(float(np.max(np.abs(x)))),
+        rms_dbfs=_dbfs(float(np.sqrt(np.mean(x * x)))),
+        audible_seconds=audible_seconds,
+        silent=not truncated and audible_seconds < needed,
+    )

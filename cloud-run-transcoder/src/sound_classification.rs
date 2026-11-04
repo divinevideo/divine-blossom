@@ -6,8 +6,9 @@
 //! instrument tags, scores) beside the transcript as
 //! `{hash}/audio/analysis.json`. The edge serves it at `/<hash>/sound`.
 //! `POST /analyze-sound` runs the same step for one hash, which is how
-//! existing sounds are backfilled. The service is public, so that route takes
-//! the same `X-Divine-Transcribe-Secret` header as `/transcribe/audio`.
+//! existing sounds are backfilled, and with `force` re-runs it over a stored
+//! verdict. The service is public, so that route takes the same
+//! `X-Divine-Transcribe-Secret` header as `/transcribe/audio`.
 
 use std::{
     collections::HashSet,
@@ -110,22 +111,49 @@ fn is_valid_hash(hash: &str) -> bool {
     hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Accept the analyzer's body only if it is the JSON object the edge will serve.
-pub(crate) fn validate_verdict(body: &[u8]) -> Result<()> {
+/// Accept the analyzer's body only if it is the JSON object the edge will
+/// serve, and return its `silent` flag. Funnelcake hides silent sounds, so a
+/// verdict without the flag must not be stored.
+pub(crate) fn validate_verdict(body: &[u8]) -> Result<bool> {
     let value: serde_json::Value = serde_json::from_slice(body)
         .map_err(|e| anyhow!("analyzer returned invalid JSON: {}", e))?;
-    match value.get("tags") {
-        Some(serde_json::Value::Array(_)) => Ok(()),
-        _ => Err(anyhow!("analyzer response has no tags array")),
+    if !matches!(value.get("tags"), Some(serde_json::Value::Array(_))) {
+        return Err(anyhow!("analyzer response has no tags array"));
+    }
+    value
+        .get("silent")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| anyhow!("analyzer response has no silent flag"))
+}
+
+/// What one classification did, and for a fresh verdict whether it is silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Classification {
+    pub(crate) status: ClassifyOutcome,
+    pub(crate) silent: Option<bool>,
+}
+
+impl From<ClassifyOutcome> for Classification {
+    fn from(status: ClassifyOutcome) -> Self {
+        Classification {
+            status,
+            silent: None,
+        }
     }
 }
 
-pub(crate) async fn classify_sound(state: &AppState, hash: &str) -> Result<ClassifyOutcome> {
+/// Classify the stored blob `hash`. A stored verdict is kept unless `force`
+/// is set; then it is replaced.
+pub(crate) async fn classify_sound(
+    state: &AppState,
+    hash: &str,
+    force: bool,
+) -> Result<Classification> {
     let Some(base_url) = state.config.audio_analyzer_url.as_deref() else {
-        return Ok(ClassifyOutcome::NotConfigured);
+        return Ok(ClassifyOutcome::NotConfigured.into());
     };
     let Some(_claim) = InFlightClaim::try_claim(hash) else {
-        return Ok(ClassifyOutcome::InProgress);
+        return Ok(ClassifyOutcome::InProgress.into());
     };
     let bucket = &state.config.gcs_bucket;
     let source = GetObjectRequest {
@@ -136,18 +164,18 @@ pub(crate) async fn classify_sound(state: &AppState, hash: &str) -> Result<Class
     let object = match state.gcs_client.get_object(&source).await {
         Ok(object) => object,
         Err(google_cloud_storage::http::Error::Response(e)) if e.code == 404 => {
-            return Ok(ClassifyOutcome::Missing);
+            return Ok(ClassifyOutcome::Missing.into());
         }
         Err(e) => return Err(anyhow!("Failed to read source object metadata: {}", e)),
     };
     let content_type = object.content_type.unwrap_or_default();
     if let Some(skip) = skip_reason(&content_type, object.size) {
-        return Ok(skip);
+        return Ok(skip.into());
     }
 
     let path = analysis_object_path(hash);
-    if check_gcs_exists(&state.gcs_client, bucket, &path).await? {
-        return Ok(ClassifyOutcome::AlreadyExists);
+    if !force && check_gcs_exists(&state.gcs_client, bucket, &path).await? {
+        return Ok(ClassifyOutcome::AlreadyExists.into());
     }
 
     let audio = state
@@ -155,7 +183,7 @@ pub(crate) async fn classify_sound(state: &AppState, hash: &str) -> Result<Class
         .download_object(&source, &DownloadRange::default())
         .await
         .map_err(|e| anyhow!("Failed to download from GCS: {}", e))?;
-    let verdict = call_analyzer(base_url, &content_type, audio).await?;
+    let (verdict, silent) = call_analyzer(base_url, &content_type, audio).await?;
 
     let mut media = Media::new(path.clone());
     media.content_type = "application/json".into();
@@ -171,10 +199,18 @@ pub(crate) async fn classify_sound(state: &AppState, hash: &str) -> Result<Class
         )
         .await
         .map_err(|e| anyhow!("Failed to upload {}: {}", path, e))?;
-    Ok(ClassifyOutcome::Classified)
+    Ok(Classification {
+        status: ClassifyOutcome::Classified,
+        silent: Some(silent),
+    })
 }
 
-async fn call_analyzer(base_url: &str, content_type: &str, audio: Vec<u8>) -> Result<Bytes> {
+/// The analyzer's verdict body and its `silent` flag.
+async fn call_analyzer(
+    base_url: &str,
+    content_type: &str,
+    audio: Vec<u8>,
+) -> Result<(Bytes, bool)> {
     // Audience for the OIDC token is the sidecar's base URL (no path).
     let audience = base_url.trim().trim_end_matches('/').to_string();
     let token = fetch_gcp_identity_token(&audience)
@@ -198,8 +234,8 @@ async fn call_analyzer(base_url: &str, content_type: &str, audio: Vec<u8>) -> Re
         let detail: String = String::from_utf8_lossy(&body).chars().take(300).collect();
         return Err(anyhow!("audio analyzer returned {}: {}", status, detail));
     }
-    validate_verdict(&body)?;
-    Ok(body)
+    let silent = validate_verdict(&body)?;
+    Ok((body, silent))
 }
 
 /// Classifies `hash` in the background while `/transcribe` does its own work.
@@ -210,8 +246,11 @@ pub(crate) fn spawn_classification(state: Arc<AppState>, hash: String) {
         return;
     }
     tokio::spawn(async move {
-        match classify_sound(&state, &hash).await {
-            Ok(ClassifyOutcome::Classified) => info!("Classified sound {}", hash),
+        match classify_sound(&state, &hash, false).await {
+            Ok(Classification {
+                status: ClassifyOutcome::Classified,
+                silent,
+            }) => info!("Classified sound {} (silent: {:?})", hash, silent),
             Ok(_) => {}
             Err(e) => warn!("Sound classification failed for {}: {:#}", hash, e),
         }
@@ -221,6 +260,9 @@ pub(crate) fn spawn_classification(state: Arc<AppState>, hash: String) {
 #[derive(Debug, Deserialize)]
 pub(crate) struct AnalyzeSoundRequest {
     hash: String,
+    /// Replace a stored verdict, after the analyzer's rules changed.
+    #[serde(default)]
+    force: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -228,10 +270,14 @@ struct AnalyzeSoundResponse {
     hash: String,
     status: ClassifyOutcome,
     path: String,
+    /// Whether a verdict written by this request is silent; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    silent: Option<bool>,
 }
 
-/// `POST /analyze-sound {"hash": "<sha256>"}`: classify one stored sound now.
-/// Idempotent: a stored verdict is kept and reported as `already_exists`.
+/// `POST /analyze-sound {"hash": "<sha256>", "force": false}`: classify one
+/// stored sound now. Idempotent: a stored verdict is kept and reported as
+/// `already_exists`, unless `force` asks to replace it.
 /// Guarded by `require_transcribe_secret` in the router.
 pub(crate) async fn handle_analyze_sound(
     State(state): State<Arc<AppState>>,
@@ -245,13 +291,14 @@ pub(crate) async fn handle_analyze_sound(
         )
             .into_response();
     }
-    match classify_sound(&state, &hash).await {
-        Ok(status) => (
+    match classify_sound(&state, &hash, request.force).await {
+        Ok(Classification { status, silent }) => (
             StatusCode::OK,
             Json(AnalyzeSoundResponse {
                 path: analysis_object_path(&hash),
                 hash,
                 status,
+                silent,
             }),
         )
             .into_response(),
@@ -305,11 +352,40 @@ mod tests {
     }
 
     #[test]
-    fn verdict_must_be_an_object_with_tags() {
-        assert!(validate_verdict(br#"{"kind":"music","tags":["music","piano"]}"#).is_ok());
-        assert!(validate_verdict(br#"{"kind":null,"tags":[]}"#).is_ok());
-        assert!(validate_verdict(br#"{"kind":"music"}"#).is_err());
+    fn verdict_must_be_an_object_with_tags_and_a_silent_flag() {
+        assert!(!validate_verdict(br#"{"silent":false,"kind":"music","tags":["music"]}"#).unwrap());
+        assert!(validate_verdict(br#"{"silent":true,"kind":null,"tags":[]}"#).unwrap());
+        assert!(validate_verdict(br#"{"silent":false,"kind":"music"}"#).is_err());
+        assert!(validate_verdict(br#"{"kind":null,"tags":[]}"#).is_err());
+        assert!(validate_verdict(br#"{"silent":"no","tags":[]}"#).is_err());
         assert!(validate_verdict(b"<html>502</html>").is_err());
+    }
+
+    #[test]
+    fn force_defaults_to_off() {
+        let request: AnalyzeSoundRequest =
+            serde_json::from_str(&format!(r#"{{"hash":"{}"}}"#, "a".repeat(64))).unwrap();
+        assert!(!request.force);
+        let request: AnalyzeSoundRequest =
+            serde_json::from_str(&format!(r#"{{"hash":"{}","force":true}}"#, "a".repeat(64)))
+                .unwrap();
+        assert!(request.force);
+    }
+
+    #[test]
+    fn silent_is_reported_only_for_a_fresh_verdict() {
+        let fresh = AnalyzeSoundResponse {
+            hash: "a".repeat(64),
+            status: ClassifyOutcome::Classified,
+            path: analysis_object_path(&"a".repeat(64)),
+            silent: Some(true),
+        };
+        assert_eq!(serde_json::to_value(&fresh).unwrap()["silent"], true);
+        let kept = AnalyzeSoundResponse {
+            silent: Classification::from(ClassifyOutcome::AlreadyExists).silent,
+            ..fresh
+        };
+        assert!(serde_json::to_value(&kept).unwrap().get("silent").is_none());
     }
 
     #[test]

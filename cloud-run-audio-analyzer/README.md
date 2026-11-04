@@ -6,7 +6,8 @@ returns:
 - whether it belongs under **music**, **sfx** or only **All**;
 - for music, a genre and the instruments it hears;
 - the scores behind those decisions;
-- the top AudioSet labels as searchable words.
+- the top AudioSet labels as searchable words;
+- whether it is silent (nothing, or only a click), so sound lists can leave it out.
 
 It runs the PANNs CNN14 AudioSet tagger on CPU and is private (no public
 ingress), like the Parakeet ASR sidecar.
@@ -52,9 +53,40 @@ Only the first 30 s are analyzed. Clips shorter than a second are padded with si
 }
 ```
 
-`audioset` is shortened here; it lists up to ten classes scoring at least 0.1.
+`audioset` is shortened here; it lists up to ten classes scoring at least 0.1. Every response also carries `loudness`, described under [Silence](#silence).
 
-A silent upload (digital silence or below −70 dBFS) returns `"silent": true`, no kind, no tags and no scores.
+A silent sound returns `"silent": true`, no kind, no tags and no scores.
+
+## Silence
+
+A sound is `silent` when it would play nothing: less than 0.25 s of it is audible, or less than a tenth of the clip if that is shorter. Audible means a 10 ms window whose sample peak reaches −50 dBFS. Funnelcake leaves silent sounds out of its sound lists.
+
+`loudness` holds the numbers behind the verdict. This is a real "Original sound" from the trending list, one click in six seconds of silence:
+
+```json
+"loudness": {"peak_dbfs": -13.2, "rms_dbfs": -52.0, "audible_seconds": 0.11, "audible_floor_dbfs": -50.0}
+```
+
+`peak_dbfs` and `rms_dbfs` are `null` for digital silence. All values are measured on the mono 32 kHz signal the tagger gets, over the same first 30 s. A sound longer than that is never silent, because the rest of it was not heard.
+
+| Constant in `app/audio.py` | Value | Why |
+|---|---:|---|
+| `AUDIBLE_FLOOR_DBFS` | −50 dBFS | 47 dB under the median peak of the random sounds measured below (−3 dBFS). Content below it is at whisper level or under at a normal listening volume. The app's own upload guard (divine-mobile `SoundSilenceTrimmer`) stops at −60 dBFS, which only catches sounds with no signal at all. |
+| `AUDIBLE_WINDOW_SECONDS` | 0.01 s | Short enough that a click counts as a few windows, not as a second. |
+| `MIN_AUDIBLE_SECONDS` | 0.25 s | No click in the sample stayed above the floor for longer than 0.2 s. A short spoken word lasts longer. |
+| `MIN_AUDIBLE_SHARE` | 10% | Keeps a deliberately short effect: 0.15 s of sound in a 0.2 s clip is not silence. |
+
+The values come from production sounds measured on 2026-11-04. ffmpeg `volumedetect` ran on all 1,064 trending sounds and on 2,000 random ones of the other 14,094. Every quiet sound among them (peak under −30 dBFS or mean under −45 dBFS, 223 sounds) and 200 random others were then measured again with this module:
+
+| | Trending (1,064) | Random others (2,000) |
+|---|---:|---:|
+| Silent | 29 (2.7%) | 34 (1.7%, about 240 of 14,094) |
+| …of those digital silence | 14 | 16 |
+| …peak below −50 dBFS | 6 | 6 |
+| …a click, under 0.25 s above −50 dBFS | 9 | 12 |
+| Random louder sounds called silent | – | 0 of 200 |
+
+Almost all silent sounds are ~6 s "Original sound" extractions of videos without sound. There is no clean gap at 0.25 s: the quietest sounds kept had 0.25 to 0.3 s of audible content. Have a person listen to the sounds between 0.1 and 0.5 s before moving the threshold. To re-run every sound after a change, see [How it is wired](#how-it-is-wired).
 
 ## Rules
 
@@ -140,10 +172,13 @@ The script prints the two commands that wire it up. The first grants the transco
 2. The classification skips blobs that are not `audio/*` or exceed 50 MB. It also skips sounds that already have a verdict.
 3. Otherwise it sends the original blob to this service and stores the JSON beside the transcript as `{sha256}/audio/analysis.json`.
 4. The edge serves that file at `GET /<sha256>/sound`, with the same moderation gate as transcripts. Until the verdict exists the route returns `404`. Funnelcake reads it from there for its sound index (divinevideo/divine-funnelcake#1422).
-5. `POST /analyze-sound {"hash": "<sha256>"}` on the transcoder runs the same step for one stored sound. It needs the `X-Divine-Transcribe-Secret` header, like `/transcribe/audio`. It is idempotent, and an instance never analyzes the same hash twice at once. It answers with a `status`: `classified`, `already_exists`, `not_audio`, `too_large`, `missing` (no such blob), `in_progress` or `not_configured`.
-6. `scripts/backfill_sound_analysis.py` calls it for every Blossom-hosted sound that Funnelcake's `/api/sounds` lists, to classify sounds published before this shipped. It reads the secret from `TRANSCRIBE_SHARED_SECRET` and prints every hash that failed.
+5. `POST /analyze-sound {"hash": "<sha256>"}` on the transcoder runs the same step for one stored sound. It needs the `X-Divine-Transcribe-Secret` header, like `/transcribe/audio`. It is idempotent, and an instance never analyzes the same hash twice at once. It answers with a `status`: `classified`, `already_exists`, `not_audio`, `too_large`, `missing` (no such blob), `in_progress` or `not_configured`. When it wrote a verdict, the answer also carries `silent`. With `"force": true` it replaces a stored verdict instead of keeping it.
+6. `scripts/backfill_sound_analysis.py` calls it for every Blossom-hosted sound that Funnelcake's `/api/sounds` lists, to classify sounds published before this shipped. It reads the secret from `TRANSCRIBE_SHARED_SECRET`, prints every hash that failed and counts the silent ones; `--silent-out <file>` also lists their hashes.
+7. Funnelcake's `sound-analysis-sync` janitor job reads `/<sha256>/sound` for every sound and stops listing silent ones in `GET /api/sounds`.
 
 A failed classification is only logged; re-running the backfill script retries it.
+
+To apply changed rules or thresholds to sounds that already have a verdict, run the backfill script with `--force`. Funnelcake no longer lists sounds it hides, so add `--hashes-file` with their hashes to reach those too. The edge keeps serving the old `/<sha256>/sound` until each hash's surrogate key is purged (`fastly purge --key <sha256> --service-id pOvEEWykEbpnylqst1KTrR`), and Funnelcake picks the new verdict up on its next re-check.
 
 ## Licence
 

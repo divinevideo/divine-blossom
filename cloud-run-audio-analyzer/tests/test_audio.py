@@ -1,4 +1,4 @@
-# ABOUTME: Tests ffmpeg decoding and the silence check on generated audio.
+# ABOUTME: Tests ffmpeg decoding and the loudness and silence check on generated audio.
 # ABOUTME: Needs ffmpeg and numpy, no model.
 
 import io
@@ -79,16 +79,69 @@ class TestWindows(unittest.TestCase):
         self.assertEqual(len(ws), 1)
 
 
+def _silence(seconds: float) -> np.ndarray:
+    return np.zeros(int(seconds * audio.SAMPLE_RATE), dtype=np.float32)
+
+
+def _at(samples: np.ndarray, start_s: float, burst: np.ndarray) -> np.ndarray:
+    out = samples.copy()
+    i = int(start_s * audio.SAMPLE_RATE)
+    out[i:i + len(burst)] = burst
+    return out
+
+
+def _burst(seconds: float, amplitude: float = 0.5) -> np.ndarray:
+    return _tone(seconds, rate=audio.SAMPLE_RATE, amplitude=amplitude).astype(np.float32)
+
+
 class TestSilence(unittest.TestCase):
-    def test_digital_silence_is_silent(self):
-        self.assertTrue(audio.is_silent(np.zeros(32000, dtype=np.float32)))
+    def test_digital_silence_is_silent_and_has_no_level(self):
+        loudness = audio.measure_loudness(_silence(6.0))
+        self.assertTrue(loudness.silent)
+        self.assertIsNone(loudness.peak_dbfs)
+        self.assertIsNone(loudness.rms_dbfs)
+        self.assertEqual(loudness.audible_seconds, 0.0)
 
-    def test_quiet_hiss_below_the_floor_is_silent(self):
-        noise = np.random.default_rng(1).normal(0, 1e-4, 32000).astype(np.float32)
-        self.assertTrue(audio.is_silent(noise))
+    def test_hiss_below_the_audible_floor_is_silent(self):
+        # Peaks around -60 dBFS: the level of the inaudible "Original sound" uploads.
+        noise = np.random.default_rng(1).normal(0, 2.5e-4, 6 * audio.SAMPLE_RATE)
+        loudness = audio.measure_loudness(noise.astype(np.float32))
+        self.assertLess(loudness.peak_dbfs, audio.AUDIBLE_FLOOR_DBFS)
+        self.assertTrue(loudness.silent)
 
-    def test_a_tone_is_not_silent(self):
-        self.assertFalse(audio.is_silent(_tone(1.0).astype(np.float32)))
+    def test_a_single_click_in_silence_is_silent(self):
+        click = _at(_silence(6.0), 1.0, _burst(0.02, amplitude=0.9))
+        loudness = audio.measure_loudness(click)
+        self.assertGreater(loudness.peak_dbfs, -3.0)
+        self.assertLess(loudness.audible_seconds, audio.MIN_AUDIBLE_SECONDS)
+        self.assertTrue(loudness.silent)
+
+    def test_a_short_word_in_silence_is_audible(self):
+        word = _at(_silence(6.0), 2.0, _burst(0.4))
+        self.assertFalse(audio.measure_loudness(word).silent)
+
+    def test_quiet_audio_above_the_floor_is_audible(self):
+        # About -40 dBFS peak: quiet, but it plays.
+        quiet = _burst(6.0, amplitude=0.01)
+        self.assertFalse(audio.measure_loudness(quiet).silent)
+
+    def test_a_short_effect_that_is_mostly_sound_is_audible(self):
+        # 0.15 s of a 0.2 s clip is audible: under MIN_AUDIBLE_SECONDS, but most of the clip.
+        effect = _at(_silence(0.2), 0.0, _burst(0.15))
+        loudness = audio.measure_loudness(effect)
+        self.assertLess(loudness.audible_seconds, audio.MIN_AUDIBLE_SECONDS)
+        self.assertFalse(loudness.silent)
+
+    def test_a_clip_cut_at_the_analysis_limit_is_never_silent(self):
+        # Only the first MAX_SECONDS are decoded; a long track may start quietly.
+        self.assertFalse(audio.measure_loudness(_silence(audio.MAX_SECONDS)).silent)
+
+    def test_levels_are_reported_in_dbfs(self):
+        loudness = audio.measure_loudness(_burst(1.0, amplitude=0.5))
+        self.assertAlmostEqual(loudness.peak_dbfs, -6.0, delta=0.1)
+        self.assertAlmostEqual(loudness.rms_dbfs, -9.0, delta=0.1)
+        self.assertAlmostEqual(loudness.audible_seconds, 1.0, delta=0.01)
+        self.assertEqual(loudness.to_dict()["audible_floor_dbfs"], audio.AUDIBLE_FLOOR_DBFS)
 
 
 if __name__ == "__main__":
