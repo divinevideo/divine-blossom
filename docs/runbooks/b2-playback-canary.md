@@ -165,7 +165,11 @@ playback successful. The hint grants no copying permission. See
 [b2-original-sync.md](b2-original-sync.md) for durable intake and repair.
 
 Demand requests admit at most 16 uploader references plus the owner to bound
-policy fanout. B2 authorization headers/body and each media response-header attempt have a
+policy fanout. Originals above that reference limit receive a terminal 404 on
+this test host, with no origin request or client fallback: the remaining
+references have not passed the required policy checks. This does not change
+canonical playback; turn off the device flag to leave the bounded test cohort.
+B2 authorization headers/body and each media response-header attempt have a
 three-second wait bound within a twelve-second origin/hint budget; the enqueue
 wait is at most 50 milliseconds. Synchronous policy KV reads and the full client
 download are outside that I/O budget. Response bodies stream after the final policy check: a later
