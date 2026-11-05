@@ -159,6 +159,7 @@ class State:
         self.db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
         self.db.execute("CREATE TABLE IF NOT EXISTS demand_queue (hash TEXT PRIMARY KEY, hint TEXT NOT NULL, available_at INTEGER NOT NULL, created_at INTEGER NOT NULL)")
         self.db.execute("CREATE INDEX IF NOT EXISTS demand_due ON demand_queue(available_at,hash)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS gate_backoff (hash TEXT PRIMARY KEY, available_at INTEGER NOT NULL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS object_age (hash TEXT PRIMARY KEY, first_seen INTEGER NOT NULL, checked_at INTEGER NOT NULL)")
         if not self.db.execute("SELECT 1 FROM settings WHERE key='object_age_migrated'").fetchone():
             self.db.execute("INSERT OR IGNORE INTO object_age SELECT hash,?,? FROM objects", (int(time.time()), int(time.time())))
@@ -236,6 +237,18 @@ class State:
         with self.db:
             self.db.execute("DELETE FROM demand_queue WHERE hash=?", (key,))
 
+    def defer_gate(self, key):
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO gate_backoff VALUES (?,?)", (key, int(time.time()) + 300))
+
+    def gate_deferred(self, key):
+        return self.db.execute("SELECT 1 FROM gate_backoff WHERE hash=? AND available_at>?",
+                               (key, int(time.time()))).fetchone() is not None
+
+    def clear_gate_backoff(self, key):
+        with self.db:
+            self.db.execute("DELETE FROM gate_backoff WHERE hash=?", (key,))
+
     def defer_upload(self, key, generation, now=None):
         with self.db:
             self.db.execute("UPDATE upload_queue SET available_at=? WHERE hash=? AND generation=?",
@@ -281,6 +294,7 @@ class Worker:
         owned = attempt is not None
         attempt = attempt or str(uuid.uuid4())
         if not owned and not self.kv.claim_copy(key, attempt):
+            self.state.defer_gate(key)
             return False
         try:
             if (self.kv.get("b2-sync:v1:" + key) != {"state": "copying", "attempt_id": attempt}
@@ -303,9 +317,11 @@ class Worker:
         observed = self.kv.snapshot("b2-ready:" + key)
         existing_gate = self.kv.get("b2-sync:v1:" + key)
         if existing_gate is not None:
+            self.state.defer_gate(key)
             if existing_gate == {"state": "erasing"}:
                 self.state.reset(key)
             return "terminal" if reconcile and existing_gate == {"state": "erasing"} else "locked"
+        self.state.clear_gate_backoff(key)
         meta = approved_metadata(self.kv, key)
         if meta is None:
             invalidated = self.invalidate(key, observed=observed,
@@ -368,6 +384,8 @@ class Worker:
                 row = self.state.db.execute("SELECT size FROM objects WHERE hash=?", (part.stem,)).fetchone()
                 if row is not None and row[0] is not None and part.stat().st_size >= row[0]:
                     continue  # Complete staged files reserve only their actual bytes.
+                if self.state.gate_deferred(part.stem):
+                    continue
                 # A gated hash cannot resume this partial until operator recovery
                 # or erasure completes. Do not turn its per-hash exclusion into
                 # a global migration halt; still account for its occupied bytes.
@@ -376,6 +394,7 @@ class Worker:
                 self.metrics["spool_gate_probes"] += 1
                 if self.kv.get("b2-sync:v1:" + part.stem) is None:
                     return "pending"
+                self.state.defer_gate(part.stem)
         if offset > 0 and size - offset > self.max_spool_bytes - spool_bytes:
             # Recover an older overcommitted spool by dropping ONLY this local
             # partial download, before any PUT/gate. Durable work remains queued.
@@ -517,12 +536,12 @@ class Worker:
                    if not self.state.db.execute("SELECT 1 FROM demand_queue WHERE hash=? AND available_at>?", (key, now)).fetchone()]
         upload_generations = dict(uploads)
         partials = {p.stem for p in self.state.directory.glob("*.part") if HEX.fullmatch(p.stem)}
-        history_partials = [key for key in sorted(partials) if self.state.db.execute(
+        history_partials = [key for key in sorted(partials) if not self.state.gate_deferred(key) and self.state.db.execute(
             "SELECT 1 FROM objects WHERE hash=? AND NOT EXISTS (SELECT 1 FROM upload_queue WHERE hash=?) AND NOT EXISTS (SELECT 1 FROM demand_queue WHERE hash=?)",
             (key, key, key)).fetchone()]
         historical = [row[0] for row in self.state.db.execute(
-            "SELECT hash FROM objects WHERE NOT EXISTS (SELECT 1 FROM upload_queue WHERE upload_queue.hash=objects.hash) AND NOT EXISTS (SELECT 1 FROM demand_queue WHERE demand_queue.hash=objects.hash) ORDER BY checked,hash LIMIT ?",
-            (max_objects,))]
+            "SELECT hash FROM objects WHERE NOT EXISTS (SELECT 1 FROM upload_queue WHERE upload_queue.hash=objects.hash) AND NOT EXISTS (SELECT 1 FROM demand_queue WHERE demand_queue.hash=objects.hash) AND NOT EXISTS (SELECT 1 FROM gate_backoff WHERE gate_backoff.hash=objects.hash AND available_at>?) ORDER BY checked,hash LIMIT ?",
+            (now, max_objects))]
         groups = {"demand": demands, "uploads": [key for key, _ in uploads],
                   "history": list(dict.fromkeys(history_partials + historical))[:max_objects]}
         for group in groups.values():
@@ -560,6 +579,8 @@ class Worker:
                 # SDK exceptions may contain signed URLs or identifiers.
                 report["errors"] += 1
             finally:
+                if result == "locked":
+                    self.state.defer_gate(key)
                 if generation is not None:
                     if result in ("ready", "missing", "oversized", "ignored", "terminal"):
                         self.state.finish_upload(key, generation)

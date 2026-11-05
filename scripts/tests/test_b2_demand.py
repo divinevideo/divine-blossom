@@ -286,6 +286,22 @@ class IntakeTests(unittest.TestCase):
 
 
 class SchedulerTests(WorkerFixture):
+    def test_many_gated_partials_do_not_starve_history_or_repeat_probe_prefix_forever(self):
+        self.state.remember(HASH)
+        self.source.page = lambda *args: ([], None)
+        for number in range(17):
+            closed = f"{number:064x}"
+            self.state.remember(closed)
+            self.state.db.execute("UPDATE objects SET size=24 WHERE hash=?", (closed,))
+            self.state.spool(closed).write_bytes(b"x")
+            self.kv.values["b2-sync:v1:" + closed] = {"state": "copying", "attempt_id": "synthetic-uncertain"}
+        self.state.db.commit()
+        self.worker.max_spool_bytes = 1000
+        for _ in range(4):
+            self.worker.cycle(max_objects=3, max_bytes=200)
+        self.assertIsNotNone(self.kv.get("b2-ready:" + HASH))
+        self.assertEqual(len([k for k in self.kv.values if k.startswith("b2-sync:v1:")]), 17)
+
     def test_erasing_partial_does_not_block_unrelated_copy_or_clear_erasing_gate(self):
         closed = "b" * 64
         self.state.spool(closed).write_bytes(b"old partial")
