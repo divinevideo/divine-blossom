@@ -286,7 +286,7 @@ class IntakeTests(unittest.TestCase):
 
 
 class SchedulerTests(WorkerFixture):
-    def test_many_gated_partials_do_not_starve_history_or_repeat_probe_prefix_forever(self):
+    def test_many_gated_partials_eventually_give_healthy_history_an_object_slot(self):
         self.state.remember(HASH)
         self.source.page = lambda *args: ([], None)
         for number in range(17):
@@ -297,10 +297,45 @@ class SchedulerTests(WorkerFixture):
             self.kv.values["b2-sync:v1:" + closed] = {"state": "copying", "attempt_id": "synthetic-uncertain"}
         self.state.db.commit()
         self.worker.max_spool_bytes = 1000
-        for _ in range(4):
+        # Seventeen initial lock observations can occupy six three-object passes.
+        # They must then defer, leaving the seventh pass for the healthy object.
+        for _ in range(7):
             self.worker.cycle(max_objects=3, max_bytes=200)
         self.assertIsNotNone(self.kv.get("b2-ready:" + HASH))
         self.assertEqual(len([k for k in self.kv.values if k.startswith("b2-sync:v1:")]), 17)
+
+    def test_spool_probe_cap_retains_progress_across_restart(self):
+        for number in range(17):
+            closed = f"{number:064x}"
+            self.state.remember(closed)
+            self.state.db.execute("UPDATE objects SET size=24 WHERE hash=?", (closed,))
+            self.state.spool(closed).write_bytes(b"x")
+            self.kv.values["b2-sync:v1:" + closed] = {"state": "copying", "attempt_id": "synthetic-uncertain"}
+        self.state.db.commit()
+        self.worker.max_spool_bytes = 1000
+        self.assertEqual(self.process(), "pending")
+        self.assertEqual(self.worker.metrics["spool_gate_probes"], 16)
+        self.state.close()
+        self.state = mirror.State(Path(self.temp.name))
+        self.worker.state = self.state
+        self.worker.metrics.clear()
+        self.assertEqual(self.process(), "ready")
+        self.assertEqual(self.worker.metrics["spool_gate_probes"], 1)
+
+    def test_complete_locked_history_does_not_monopolize_every_pass(self):
+        for number in range(3):
+            closed = f"{number:064x}"
+            self.state.remember(closed)
+            self.state.db.execute("UPDATE objects SET size=24 WHERE hash=?", (closed,))
+            self.state.spool(closed).write_bytes(b"x" * 24)
+            self.kv.values["b2-sync:v1:" + closed] = {"state": "copying", "attempt_id": "synthetic-uncertain"}
+        self.state.db.commit()
+        self.state.remember(HASH)
+        self.source.page = lambda *args: ([], None)
+        self.worker.max_spool_bytes = 1000
+        self.worker.cycle(max_objects=3, max_bytes=200)
+        self.worker.cycle(max_objects=3, max_bytes=200)
+        self.assertIsNotNone(self.kv.get("b2-ready:" + HASH))
 
     def test_erasing_partial_does_not_block_unrelated_copy_or_clear_erasing_gate(self):
         closed = "b" * 64
