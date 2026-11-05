@@ -302,10 +302,12 @@ budgets across passes, reclaim unused slots and attempt each hash once. Existing
 partial files get priority; a new download waits for unfinished ungated
 downloads. Completed staged files and gated hashes reserve their actual occupied
 bytes without blocking unrelated work when space permits. Additional spool-gate
-probes are capped at 16 per pass. Observed gated hashes retain a local
-five-minute retry deadline, so later passes progress beyond the same probe
-prefix. Deferred gated partials do not monopolize historical candidate slots.
-This local scheduling deadline never expires or removes a remote gate. An older overcommitted spool recovers by discarding only the current
+probes are capped at 16 per pass. Positive gate observations persist for spool
+admission until a fresh per-hash check clears them; the separate five-minute
+retry deadline does not erase probe progress. History alternates resumable and
+checked-order candidates independently of wall-clock cadence, preserving ordinary
+work opportunities even on an hourly timer. This scheduling cache never grants
+copy permission or expires/removes a remote gate. An older overcommitted spool recovers by discarding only the current
 worker's incomplete local download before PUT, freeing space for another partial
 to finish. Durable jobs, remote objects and gates remain intact.
 Intake/listing failures are reported without abandoning

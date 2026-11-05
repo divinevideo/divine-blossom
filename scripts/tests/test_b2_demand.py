@@ -305,6 +305,7 @@ class SchedulerTests(WorkerFixture):
         self.assertEqual(len([k for k in self.kv.values if k.startswith("b2-sync:v1:")]), 17)
 
     def test_spool_probe_cap_retains_progress_across_restart(self):
+        from unittest.mock import patch
         for number in range(17):
             closed = f"{number:064x}"
             self.state.remember(closed)
@@ -313,16 +314,19 @@ class SchedulerTests(WorkerFixture):
             self.kv.values["b2-sync:v1:" + closed] = {"state": "copying", "attempt_id": "synthetic-uncertain"}
         self.state.db.commit()
         self.worker.max_spool_bytes = 1000
-        self.assertEqual(self.process(), "pending")
+        with patch.object(mirror.time, "time", return_value=100):
+            self.assertEqual(self.process(), "pending")
         self.assertEqual(self.worker.metrics["spool_gate_probes"], 16)
         self.state.close()
         self.state = mirror.State(Path(self.temp.name))
         self.worker.state = self.state
         self.worker.metrics.clear()
-        self.assertEqual(self.process(), "ready")
+        with patch.object(mirror.time, "time", return_value=400):
+            self.assertEqual(self.process(), "ready")
         self.assertEqual(self.worker.metrics["spool_gate_probes"], 1)
 
     def test_complete_locked_history_does_not_monopolize_every_pass(self):
+        from unittest.mock import patch
         for number in range(3):
             closed = f"{number:064x}"
             self.state.remember(closed)
@@ -333,8 +337,10 @@ class SchedulerTests(WorkerFixture):
         self.state.remember(HASH)
         self.source.page = lambda *args: ([], None)
         self.worker.max_spool_bytes = 1000
-        self.worker.cycle(max_objects=3, max_bytes=200)
-        self.worker.cycle(max_objects=3, max_bytes=200)
+        with patch.object(mirror.time, "time", return_value=100):
+            self.worker.cycle(max_objects=3, max_bytes=200)
+        with patch.object(mirror.time, "time", return_value=400):
+            self.worker.cycle(max_objects=3, max_bytes=200)
         self.assertIsNotNone(self.kv.get("b2-ready:" + HASH))
 
     def test_erasing_partial_does_not_block_unrelated_copy_or_clear_erasing_gate(self):

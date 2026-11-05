@@ -245,6 +245,12 @@ class State:
         return self.db.execute("SELECT 1 FROM gate_backoff WHERE hash=? AND available_at>?",
                                (key, int(time.time()))).fetchone() is not None
 
+    def gate_observed(self, key):
+        # Positive observations bound spool admission probes across timer passes.
+        # Only a fresh per-hash gate read can clear this scheduling cache; it is
+        # never permission to mutate/read an object without its own policy gate.
+        return self.db.execute("SELECT 1 FROM gate_backoff WHERE hash=?", (key,)).fetchone() is not None
+
     def clear_gate_backoff(self, key):
         with self.db:
             self.db.execute("DELETE FROM gate_backoff WHERE hash=?", (key,))
@@ -384,7 +390,7 @@ class Worker:
                 row = self.state.db.execute("SELECT size FROM objects WHERE hash=?", (part.stem,)).fetchone()
                 if row is not None and row[0] is not None and part.stat().st_size >= row[0]:
                     continue  # Complete staged files reserve only their actual bytes.
-                if self.state.gate_deferred(part.stem):
+                if self.state.gate_observed(part.stem):
                     continue
                 # A gated hash cannot resume this partial until operator recovery
                 # or erasure completes. Do not turn its per-hash exclusion into
@@ -542,10 +548,23 @@ class Worker:
         historical = [row[0] for row in self.state.db.execute(
             "SELECT hash FROM objects WHERE NOT EXISTS (SELECT 1 FROM upload_queue WHERE upload_queue.hash=objects.hash) AND NOT EXISTS (SELECT 1 FROM demand_queue WHERE demand_queue.hash=objects.hash) AND NOT EXISTS (SELECT 1 FROM gate_backoff WHERE gate_backoff.hash=objects.hash AND available_at>?) ORDER BY checked,hash LIMIT ?",
             (now, max_objects))]
+        # Alternate history's resumable and checked-order lanes independently
+        # of wall-clock retry expiry. An hourly timer must not repeatedly pick
+        # the same locked partial prefix ahead of every healthy original.
+        history_groups = [history_partials, historical]
+        history_turn = int(self.state.setting("history_turn") or 0) % 2
+        self.state.set_setting("history_turn", str(1 - history_turn))
+        if history_turn:
+            history_groups.reverse()
+        history_order = []
+        for index in range(max_objects):
+            for group in history_groups:
+                if index < len(group) and group[index] not in history_order:
+                    history_order.append(group[index])
         groups = {"demand": demands, "uploads": [key for key, _ in uploads],
-                  "history": list(dict.fromkeys(history_partials + historical))[:max_objects]}
-        for group in groups.values():
-            group.sort(key=lambda key: key not in partials)
+                  "history": history_order[:max_objects]}
+        for lane in ("demand", "uploads"):
+            groups[lane].sort(key=lambda key: key not in partials)
         turn = int(self.state.setting("lane_turn") or 0) % len(lanes)
         self.state.set_setting("lane_turn", str((turn + 1) % len(lanes)))
         lanes = lanes[turn:] + lanes[:turn]
@@ -554,9 +573,8 @@ class Worker:
             for lane in lanes:
                 if index < len(groups[lane]) and groups[lane][index] not in candidates:
                     candidates.append(groups[lane][index])
-        # Existing partials get first use of spool/bytes; lane rotation determines
-        # fair admission whenever no resumable copy holds the spool.
-        candidates.sort(key=lambda key: key not in partials)
+        # Keep the lane shares: global partial sorting could take every slot
+        # away from demand/uploads. Spool admission protects unfinished work.
         budget = Budget(max_bytes)
         for key in candidates[:max_objects]:
             generation = upload_generations.get(key)
