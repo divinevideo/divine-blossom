@@ -234,24 +234,46 @@ class UploadQueueTests(unittest.TestCase):
         self.assertEqual(report['notification_errors'],1)
         self.assertEqual(report['errors'],1)
 
-    def test_pending_approval_is_deferred_and_retried(self):
+    def test_restricted_upload_is_deferred_until_public_access_restored(self):
         self.state.queue_upload(HASH,'7')
         source=Source()
         source.page=lambda cursor,limit:([],None)
         kv=KV()
-        kv.values['blob:'+HASH]['status']='pending'
+        kv.values['blob:'+HASH]['status']='restricted'
         worker=mirror.Worker(source,Destination(),kv,self.state,max_object_bytes=100,chunk_bytes=5,max_spool_bytes=100)
         worker.cycle(max_objects=2,max_bytes=200)
         self.assertEqual(self.state.queued_uploads(10,now=0),[])
         self.assertEqual(self.state.db.execute('SELECT COUNT(*) FROM upload_queue').fetchone()[0],1)
         self.state.db.execute('UPDATE upload_queue SET available_at=0')
         self.state.db.commit()
-        kv.values['blob:'+HASH]['status']='active'
+        kv.values['blob:'+HASH]['status']='pending'
         worker.cycle(max_objects=2,max_bytes=200)
         self.assertEqual(self.state.db.execute('SELECT COUNT(*) FROM upload_queue').fetchone()[0],0)
         self.assertIsNotNone(kv.get('b2-ready:'+HASH))
 
 class WorkerTests(unittest.TestCase):
+    def test_public_pending_original_is_mirrored_without_changing_status(self):
+        self.kv.values['blob:' + HASH]['status'] = 'pending'
+        self.assertEqual(self.copy(), 'ready')
+        self.assertEqual(self.ready()['verified_sha256'], HASH)
+        self.assertEqual(self.kv.get('blob:' + HASH)['status'], 'pending')
+        self.assertIsNone(self.kv.get('b2-sync:v1:' + HASH))
+
+    def test_pending_original_cannot_override_quarantine(self):
+        self.kv.values['blob:' + HASH]['status'] = 'pending'
+        self.kv.values['quarantine:v1:' + HASH] = {
+            'version': 1, 'holds': {'review:synthetic': {'version': 1, 'active': True}}}
+        self.assertEqual(self.copy(), 'blocked')
+        self.assertFalse(self.dest.versions)
+        self.assertIsNone(self.ready())
+
+    def test_pending_original_revoked_during_copy_is_not_ready(self):
+        self.kv.values['blob:' + HASH]['status'] = 'pending'
+        self.dest.after_upload = lambda: self.kv.values['blob:' + HASH].update(status='restricted')
+        self.assertEqual(self.copy(), 'blocked')
+        self.assertIsNone(self.ready())
+        self.assertIsNone(self.kv.get('b2-sync:v1:' + HASH))
+
     def test_quarantine_hold_blocks_copy_and_revokes_existing_readiness(self):
         self.assertEqual(self.copy(), "ready")
         versions = dict(self.dest.versions)
@@ -408,7 +430,7 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(self.copy(2 * len(DATA)), "ready")
 
     def test_policy_is_deny_by_default_for_status_owner_refs_and_vanish(self):
-        for status in ("pending", "banned", "deleted", "restricted", "age_restricted", None):
+        for status in ("unknown", "banned", "deleted", "restricted", "age_restricted", None):
             self.kv.values["blob:" + HASH]["status"] = status
             self.assertIsNone(mirror.approved_metadata(self.kv, HASH))
         self.kv.values["blob:" + HASH]["status"] = "active"

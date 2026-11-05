@@ -62,7 +62,7 @@ def approved_metadata(kv, key):
     meta = kv.get("blob:" + key)
     if not isinstance(meta, dict) or meta.get("sha256") != key:
         return None
-    if meta.get("status") != "active" or not str(meta.get("type", "")).startswith("video/"):
+    if meta.get("status") not in ("active", "pending") or not str(meta.get("type", "")).startswith("video/"):
         return None
     if not quarantine_allows_copy(kv.get("quarantine:v1:" + key)):
         return None
