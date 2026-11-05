@@ -79,9 +79,7 @@ pub fn demand_origin_matches(
     range: Option<&str>,
 ) -> bool {
     if status == 416 {
-        return range
-            .is_some_and(|r| single_range(Some(r)).is_some() && requested_span(r, size).is_none())
-            && content_range == Some(format!("bytes */{size}").as_str());
+        return unsatisfied_range_matches(content_range, size, range);
     }
     if !origin_size_matches(status, length, content_range, size) {
         return false;
@@ -94,6 +92,18 @@ pub fn demand_origin_matches(
         .is_some_and(|(start, end)| {
             content_range == Some(format!("bytes {start}-{end}/{size}").as_str())
         })
+}
+
+/// A provider may omit Content-Range on 416. Only normalize that omission
+/// when a valid single requested range proves absence against the known size.
+/// An explicitly conflicting provider total remains an integrity failure.
+pub fn unsatisfied_range_matches(
+    content_range: Option<&str>,
+    size: u64,
+    range: Option<&str>,
+) -> bool {
+    range.is_some_and(|r| single_range(Some(r)).is_some() && requested_span(r, size).is_none())
+        && (content_range.is_none() || content_range == Some(format!("bytes */{size}").as_str()))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -210,7 +220,13 @@ mod tests {
             (Some("bytes=4-"), 206, "5", Some("bytes 4-8/9"), true),
             (Some("bytes=-3"), 206, "3", Some("bytes 6-8/9"), true),
             (Some("bytes=99-"), 416, "10", Some("bytes */9"), true),
+            (Some("bytes=99-"), 416, "10", None, true),
+            (Some("bytes=99-"), 416, "10", Some("bytes */10"), false),
             (Some("bytes=1-3"), 416, "0", Some("bytes */9"), false),
+            (Some("bytes=1-3"), 416, "0", None, false),
+            (Some("bytes=-0"), 416, "0", None, true),
+            (Some("bytes=4-3"), 416, "0", None, false),
+            (Some("bytes=99-,1-2"), 416, "0", None, false),
             (Some("bytes=0-1,3-4"), 206, "2", Some("bytes 0-1/9"), false),
             (None, 206, "3", Some("bytes 1-3/9"), false),
         ] {

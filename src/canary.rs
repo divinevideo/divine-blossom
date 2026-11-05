@@ -1,5 +1,5 @@
 //! Default-off private B2 playback. No upload or admin routes.
-use crate::blossom::{BlobMetadata, BlobStatus};
+use crate::blossom::{BlobAccess, BlobMetadata};
 use crate::error::{BlossomError, Result};
 use crate::metadata::{get_blob_metadata_uncached, get_blob_refs, get_tombstone, open_store};
 use blossom_core::canary::{self, CanaryRoute, Readiness};
@@ -41,8 +41,7 @@ fn approved_metadata_with_limit(hash: &str, bounded: bool) -> Result<BlobMetadat
     let denied = || BlossomError::NotFound("Blob not found".into());
     let metadata = get_blob_metadata_uncached(hash)?.ok_or_else(denied)?;
     if metadata.sha256 != hash
-        || metadata.status != BlobStatus::Active
-        || !metadata.quarantine_hold_ids.is_empty()
+        || metadata.access_for(None, false) != BlobAccess::Allowed
         || !metadata.mime_type.starts_with("video/")
         || metadata.owner.len() != 64
         || !metadata.owner.bytes().all(|b| b.is_ascii_hexdigit())
@@ -556,6 +555,7 @@ mod tests {
         let hash = "a".repeat(64);
         let store = crate::metadata::open_store().unwrap();
         let mut meta = crate::metadata::get_blob_metadata(&hash).unwrap().unwrap();
+        let initial_status = meta.status;
         let request = || Request::get(format!("https://media-b2.divine.video/{hash}"));
         assert_eq!(handle_main(request()).unwrap().get_status(), StatusCode::OK);
         let mut ready = store.lookup(&format!("b2-ready:{hash}")).unwrap();
@@ -582,9 +582,9 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .status,
-            crate::blossom::BlobStatus::Active
+            initial_status
         );
-        meta.status = crate::blossom::BlobStatus::Active;
+        meta.status = initial_status;
         store
             .insert(
                 &format!("blob:{hash}"),

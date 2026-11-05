@@ -42,7 +42,7 @@ class DemandTests(WorkerFixture):
         def read(key):
             if key == "blob:" + HASH and armed[0]:
                 armed[0] = False
-                stale = dict(lookup(key), status="pending")
+                stale = dict(lookup(key), status="restricted")
                 self.kv.values["b2-ready:" + HASH] = replacement
                 return stale
             return lookup(key)
@@ -139,15 +139,22 @@ class DemandTests(WorkerFixture):
             self.process()
         self.assertEqual(self.kv.get("b2-ready:" + HASH), {"version": 1})
 
-    def test_pending_hold_and_malformed_policy_defer_but_revocation_is_terminal(self):
-        for status, expected in [("pending", "deferred"), ("restricted", "terminal"),
+    def test_public_pending_is_eligible_but_holds_and_malformed_policy_defer(self):
+        self.kv.values["blob:" + HASH]["status"] = "pending"
+        self.assertEqual(self.process(), "ready")
+        self.assertEqual(self.kv.get("blob:" + HASH)["status"], "pending")
+        versions = dict(self.dest.versions)
+        for status, expected in [("restricted", "terminal"),
                                  ("banned", "terminal"), ("deleted", "terminal")]:
             self.kv.values["blob:" + HASH]["status"] = status
             self.assertEqual(self.process(), expected)
         self.kv.values["blob:" + HASH]["status"] = "active"
         self.kv.values["quarantine:v1:" + HASH] = {"version": 1, "holds": {"review": {"version": 1, "active": True}}}
         self.assertEqual(self.process(), "deferred")
-        self.assertFalse(self.dest.versions)
+        self.kv.values.pop("quarantine:v1:" + HASH)
+        self.kv.values["blob:" + HASH]["owner"] = None
+        self.assertEqual(self.process(), "deferred")
+        self.assertEqual(self.dest.versions, versions)
 
     def test_revocation_during_probe_does_not_adopt_or_copy(self):
         self.process()

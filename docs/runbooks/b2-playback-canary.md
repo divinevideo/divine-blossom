@@ -38,8 +38,10 @@ Only GET and HEAD of /{lowercase-sha256} or /{lowercase-sha256}.mp4 are accepted
 Thumbnail, HLS, transcript, quality, upload, admin, and all other routes/methods
 are denied. Authentication grants no bypass.
 
-Each request reads uncached authoritative Fastly KV metadata. The blob must be
-active, have a video MIME type and valid owner, have no tombstone, and have no
+Each request reads uncached authoritative Fastly KV metadata and applies the
+canonical anonymous access policy. Active and pending blobs are public; pending
+does not require upload pre-screening under reactive moderation. The blob must
+have a video MIME type and valid owner, have no tombstone, and have no
 account vanish in progress for its owner or any uploader reference. Missing or
 malformed metadata, failed lookups, and any copy/erase mutex prevent delivery.
 Policy is checked again after origin I/O. The canonical metadata cache is never
@@ -149,8 +151,11 @@ GCS success reports `X-Divine-Source: gcs` and
 `X-Divine-Storage-Cache: BYPASS`. Every response is private/no-store. HEAD uses
 an actual HEAD and ignores Range. GET supports one closed, open-ended or suffix
 range; malformed or multiple ranges are ignored and request the full object.
-206 must match the requested span and metadata size. 416 preserves validated
-`Content-Range: bytes */<size>` and an empty body, and emits no hint.
+206 must match the requested span and metadata size. For a mathematically unsatisfiable valid single range, 416 returns
+`Content-Range: bytes */<size>` and an empty body, and emits no hint. Some
+B2 responses omit this header; the edge reconstructs it only from the known
+authoritative size after validating unsatisfiability. An explicit mismatched
+header or unexpected 416 for a satisfiable/malformed request remains an error.
 
 A successful GCS 200/206/HEAD for an eligible missing copy attempts at most one
 add-only `b2-demand:v1:{hash}` insertion. Version-1 values carry `version: 1`,

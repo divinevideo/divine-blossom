@@ -403,6 +403,17 @@ pub(crate) fn download_canary_original(
             "B2 canary origin rejected read".into(),
         ));
     }
+    if status == StatusCode::RANGE_NOT_SATISFIABLE
+        && !blossom_core::canary::unsatisfied_range_matches(
+            response.get_header_str("Content-Range"),
+            ready.size,
+            range,
+        )
+    {
+        return Err(BlossomError::StorageError(
+            "B2 canary unsatisfied range verification failed".into(),
+        ));
+    }
     if status != StatusCode::RANGE_NOT_SATISFIABLE {
         if response.get_header_str("x-amz-version-id")
             != Some(ready.destination_version_id.as_str())
@@ -431,6 +442,7 @@ pub(crate) fn download_canary_original(
     }
     if status == StatusCode::RANGE_NOT_SATISFIABLE {
         delivery.set_header("Content-Length", "0");
+        delivery.set_header("Content-Range", format!("bytes */{}", ready.size));
     } else if *method != Method::HEAD {
         delivery.set_body(response.take_body());
     }
@@ -644,6 +656,7 @@ fn demand_delivery(
     }
     if status == StatusCode::RANGE_NOT_SATISFIABLE {
         delivery.set_header("Content-Length", "0");
+        delivery.set_header("Content-Range", format!("bytes */{size}"));
     } else if *method != Method::HEAD {
         delivery.set_body(response.take_body());
     }

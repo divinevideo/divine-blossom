@@ -12,6 +12,7 @@
 
 ## Global constraints
 
+- Canonical anonymous access policy remains authoritative, including public pending originals as merged in PR #322; status is never overridden.
 - Only exact configured direct host; `b2_demand_mirror_enabled` is absent/off by default. No canonical traffic activation.
 - Copy ceiling 67,108,864 bytes; no copying in a playback request; all responses private/no-store.
 - Actual HEAD and validated single ranges; policy and gate rechecked after each attempt. Denial is terminal.

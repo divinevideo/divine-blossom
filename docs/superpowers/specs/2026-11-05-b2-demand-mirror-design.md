@@ -2,7 +2,7 @@
 
 ## Intent and selected approach
 
-Serve media seamlessly while moving approved original videos from GCS to private B2. Keep published event URLs and GCS upload authority. The existing design records the maintainer's selection: immediate GCS playback with deduplicated background copying, while retaining upload synchronization, historical backfill and rollback.
+Serve media seamlessly while moving public original videos from GCS to private B2. Keep published event URLs and GCS upload authority. The existing design records the maintainer's selection: immediate GCS playback with deduplicated background copying, while retaining upload synchronization, historical backfill and rollback.
 
 Inline copying delays playback and repeats work for popular clips. Scheduled backfill alone does not prioritize requested videos. Retain the selected background approach; this revision clarifies its delivery, durable handoff and repair contracts. It is a design update, not authorization to deploy, copy production media or switch global traffic.
 
@@ -28,7 +28,7 @@ The existing per-device app flag selects the direct host. Verify the client stil
 
 ### Policy comes first
 
-Use the canary's uncached authoritative policy path for both origins, including the independent quarantine record, active blob metadata, valid owner/references, tombstone and owner/reference vanish checks. Missing or malformed policy and failed policy lookups cannot authorize delivery or enqueue. Authenticated callers get no bypass.
+Use the canary's uncached authoritative policy path for both origins, including the independent quarantine record, blob metadata allowing canonical anonymous access (active or public pending under reactive moderation), valid owner/references, tombstone and owner/reference vanish checks. Missing or malformed policy and failed policy lookups cannot authorize delivery or enqueue. Authenticated callers get no bypass.
 
 Read `b2-sync:v1:{hash}` separately from approval. A valid `copying` marker permits GCS fallback only in demand mode, with no additional hint. `erasing`, malformed markers and failed gate lookups remain terminal: no origin request, fallback or hint. Never expire or steal a gate.
 
@@ -61,7 +61,7 @@ Bound an execution to one B2 media attempt and at most one GCS media attempt, pl
 
 ### HTTP and cache behavior
 
-Both origins use actual HEAD for HEAD, without downloading a full body. Forward the requested Range for GET, preserve 206, validate its total and span against metadata and the requested range, and retain 416 with an empty body. Cover open-ended and suffix ranges; document and test one consistent policy for unsupported multiple/malformed ranges. Preserve the strict host's conditional-header behavior; do not introduce provider-specific 304 handling during this change.
+Both origins use actual HEAD for HEAD, without downloading a full body. Forward the requested Range for GET, preserve 206, validate its total and span against metadata and the requested range, and retain 416 with an empty body. If B2 omits Content-Range on 416, reconstruct bytes */<size> only when the requested valid single range is mathematically unsatisfiable against authoritative size; reject mismatched origin totals and unexpected 416 for satisfiable or malformed requests. Cover open-ended and suffix ranges; document and test one consistent policy for unsupported multiple/malformed ranges. Preserve the strict host's conditional-header behavior; do not introduce provider-specific 304 handling during this change.
 
 Every response on this host, including errors, has `Cache-Control: private, no-store` and `Surrogate-Control: no-store`. Both origin requests bypass backend storage caches. Successful responses set the actual `X-Divine-Source` (`b2` or `gcs`), `X-Divine-Storage-Cache: BYPASS`, current content type, hash/size headers and existing CORS headers. Never label fallback bytes as B2.
 
@@ -88,7 +88,7 @@ Deduplication covers outstanding work, not a hash's lifetime. After handoff, ano
 
 Never invalidate readiness or create a new B2 version solely because playback reported a miss. For a due demand item:
 
-1. Read current authoritative approval, source identity/size, gate and readiness. Honor current rejection or erasure even if the queued hint predates it. Missing source, unsupported size/type and permanent denial finish the demand item without copying; pending approval or transient lookup failure defer it. Keep the historical reconciliation record. Introduce an explicit eligible/deferred/terminal worker result instead of treating every `approved_metadata(...) is None` identically: pending moderation or an active quarantine hold defers; banned/deleted/restricted/age-restricted state, tombstone, vanish or erasing ends this demand item; missing/malformed policy and lookup errors defer without authorizing work. Historical reconciliation can reconsider later approval.
+1. Read current authoritative approval, source identity/size, gate and readiness. Honor current rejection or erasure even if the queued hint predates it. Missing source, unsupported size/type and permanent denial finish the demand item without copying; an active review hold or transient lookup failure defers it. Keep the historical reconciliation record. Introduce an explicit eligible/deferred/terminal worker result instead of treating every `approved_metadata(...) is None` identically: public pending status is eligible, while an active quarantine hold defers; banned/deleted/restricted/age-restricted state, tombstone, vanish or erasing ends this demand item; missing/malformed policy and lookup errors defer without authorizing work. Historical reconciliation can reconsider later approval.
 2. If readiness is valid, independently probe that exact immutable B2 version with bounded I/O and verify version/size on success. An old observed version must never invalidate a different current record. A generic hint still probes the current record, closing the coalesced-repair gap.
 3. Verified existence completes demand without another PUT. Availability, authentication, malformed-response and integrity failures are not evidence of absence: preserve readiness, defer and alert as appropriate. Only an authoritative not-found result for the exact version permits repair.
 4. Before clearing stale readiness/local completion, acquire the existing shared copy gate and reread policy, source and readiness. Compare the observed readiness generation/version; if it changed, stop this repair and reconcile the new state. Conditional deletion must prevent a stale observer from deleting newer readiness. Apply generation-aware invalidation to interacting worker paths as well; locking just the new repair helper while existing paths delete unconditionally is insufficient.

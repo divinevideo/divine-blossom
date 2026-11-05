@@ -64,7 +64,7 @@ class Origin(BaseHTTPRequestHandler):
                 time.sleep(3.5)
                 status = 200
             content_range = "bytes 1-3/9"
-            if self.headers.get("Range") == "bytes=99-":
+            if self.headers.get("Range") == "bytes=99-" or self.server.range_mode == "force":
                 status, body = 416, b"range error"
             elif self.headers.get("Range") == "bytes=4-":
                 status, body, content_range = 206, body[4:], "bytes 4-8/9"
@@ -76,8 +76,8 @@ class Origin(BaseHTTPRequestHandler):
             self.send_header("x-amz-version-id", self.server.version)
             if status == 206:
                 self.send_header("Content-Range", content_range)
-            elif status == 416:
-                self.send_header("Content-Range", "bytes */9")
+            elif status == 416 and self.server.range_mode != "missing":
+                self.send_header("Content-Range", "bytes */10" if self.server.range_mode == "wrong" else "bytes */9")
         self.send_header("Content-Length", str(self.server.gcs_size if self.path.startswith("/gcs-test/") and self.command == "HEAD" else len(body)))
         self.end_headers()
         if self.command != "HEAD":
@@ -136,7 +136,13 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                 ready = {"version": 1, "sha256": HASH, "verified_sha256": HASH,
                          "bucket": "private-test", "key": HASH, "size": 9,
                          "verified_at": 1, "destination_version_id": VERSION}
-                cases = [("flag_off", 503), ("flag_malformed", 503), ("auth429", 502), ("auth_disconnect", 502), ("valid", 200), ("disabled", 404), ("pending", 404), ("restricted", 404),
+                cases = [("flag_off", 503), ("flag_malformed", 503), ("auth429", 502), ("auth_disconnect", 502),
+                         ("range_missing", 416), ("range_wrong", 502), ("range_satisfiable", 502),
+                         ("range_malformed", 502), ("range_multiple", 502),
+                         ("valid", 200), ("disabled", 404), ("pending", 200),
+                         ("pending_missing_ready", 503), ("pending_quarantine", 404),
+                         ("pending_tombstone", 404), ("pending_vanish_ref", 404),
+                         ("pending_erasing", 404), ("restricted", 404),
                          ("banned", 404), ("deleted", 404), ("age_restricted", 404),
                          ("missing_metadata", 404), ("tombstone", 404), ("vanish_owner", 404),
                          ("vanish_ref", 404), ("copying", 503), ("copying_restricted", 404), ("malformed_gate", 404), ("erasing", 404),
@@ -146,7 +152,15 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                          ("missing_region", 502), ("missing_read_bucket", 502), ("missing_backend", 502), ("erasure_auth_failed", 502),
                          ("wrong_origin_version", 502), ("origin_missing", 503),
                          ("origin_forbidden", 502), ("origin_unauthorized", 502), ("origin_failed", 503), ("origin_disconnect", 503)]
-                demand_cases = [("demand_auth503", 200), ("demand_auth429", 200),
+                demand_cases = [("demand_b2_416_missing", 416), ("demand_gcs_416_missing", 416),
+                                ("demand_b2_416_wrong", 502), ("demand_gcs_416_wrong", 502),
+                                ("demand_b2_416_satisfiable", 502), ("demand_gcs_416_satisfiable", 502),
+                                ("demand_b2_416_malformed", 502), ("demand_gcs_416_malformed", 502),
+                                ("demand_b2_416_multiple", 502), ("demand_gcs_416_multiple", 502),
+                                ("demand_pending", 200), ("demand_pending_missing_ready", 200),
+                                ("demand_pending_quarantine", 404), ("demand_pending_tombstone", 404),
+                                ("demand_pending_vanish_ref", 404), ("demand_pending_erasing", 404),
+                                ("demand_auth503", 200), ("demand_auth429", 200),
                                 ("demand_auth_disconnect", 200), ("demand_auth_slow", 200),
                                 ("demand_auth_slow_body", 200), ("demand_auth401", 502),
                                 ("demand_auth403", 502), ("demand_auth_malformed", 502),
@@ -170,7 +184,7 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                                 ("demand_quarantine", 404)]
                 server.bucket_name, server.bucket_id = "private-test", "synthetic-bucket-id"
                 server.status, server.version, server.auth_status = 200, VERSION, 200
-                server.gcs_status, server.gcs_size = 200, 9
+                server.gcs_status, server.gcs_size, server.range_mode = 200, 9, "normal"
                 selected = os.environ.get("B2_CANARY_CASE")
                 for original_case, expected in cases + demand_cases:
                     if selected and selected != original_case:
@@ -179,12 +193,13 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                     case = original_case.removeprefix("demand_")
                     case = "missing_ready" if case in ("flag_off", "flag_malformed") else case
                     case = "origin_missing" if original_case == "demand_max_fanout_fallback" else case
+                    case = "missing_ready" if case.startswith("gcs_416_") else case
                     case = "valid" if case.startswith("b2_") or case in ("multiple", "malformed") else case
                     case = "missing_ready" if case in ("max_fanout","missing_ready_head", "missing_ready_range", "missing_ready_416", "gcs_missing", "gcs_failed", "gcs_forbidden", "dedup") else case
                     server.requests = []
                     server.bucket_name, server.bucket_id = "private-test", "synthetic-bucket-id"
                     server.status, server.version, server.auth_status = 200, VERSION, 200
-                    server.gcs_status, server.gcs_size = 200, 9
+                    server.gcs_status, server.gcs_size, server.range_mode = 200, 9, "normal"
                     values, meta, readiness = copy.deepcopy(base), copy.deepcopy(metadata), copy.deepcopy(ready)
                     data = {f"blob:{HASH}": meta, f"b2-ready:{HASH}": readiness}
                     if original_case in ("flag_off", "flag_malformed"):
@@ -193,8 +208,8 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                         values["b2_demand_mirror_enabled"] = "true"
                         values["media_read_primary"] = "b2"
                         values["fos_read_enabled"] = "true"
-                        values["test_source"] = "b2" if case == "valid" else "gcs"
-                        values["test_body"] = "b2 bytes!" if case == "valid" else "gcsbytes!"
+                        values["test_source"] = "b2" if case in ("valid", "pending") else "gcs"
+                        values["test_body"] = "b2 bytes!" if case in ("valid", "pending") else "gcsbytes!"
                         if original_case == "demand_max_fanout_fallback":
                             data[f"refs:{HASH}"] = [f"{i:064x}" for i in range(16)]
                         if original_case == "demand_max_fanout":
@@ -228,30 +243,42 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                         if original_case == "demand_dedup":
                             data[f"b2-demand:v1:{HASH}"] = {"version": 1, "sha256": HASH, "reason": "missing_version", "observed_destination_version_id": VERSION}
                             values["test_hint"] = "missing_version"
-                        if original_case.startswith("demand_gcs_"):
+                        if original_case in ("demand_gcs_missing", "demand_gcs_failed", "demand_gcs_forbidden"):
                             server.gcs_status = {"demand_gcs_missing": 404, "demand_gcs_failed": 503, "demand_gcs_forbidden": 403}[original_case]
+                    range_case = original_case if original_case.startswith("range_") else original_case.split("_416_", 1)[1] if "_416_" in original_case else None
+                    if range_case is not None:
+                        variant = range_case.removeprefix("range_")
+                        values["test_range"] = {"missing": "bytes=99-", "wrong": "bytes=99-", "satisfiable": "bytes=1-3", "malformed": "invalid", "multiple": "bytes=99-,1-2"}[variant]
+                        server.range_mode = variant if variant in ("missing", "wrong") else "force"
+                    if original_case == "demand_pending_missing_ready":
+                        values["test_hint"] = "missing_readiness"
                     if case == "disabled":
                         del values["b2_canary_host"]
                     if case in ("pending", "restricted", "banned", "deleted", "age_restricted"):
                         meta["status"] = case
+                    if case.startswith("pending_"):
+                        meta["status"] = "pending"
+                    if case == "pending_quarantine":
+                        data[f"quarantine:v1:{HASH}"] = {
+                            "version": 1, "holds": {"review:synthetic": {"version": 1, "active": True}}}
                     if case == "missing_metadata":
                         del data[f"blob:{HASH}"]
-                    if case == "tombstone":
+                    if case in ("tombstone", "pending_tombstone"):
                         data[f"tombstone:{HASH}"] = {}
                     if case == "vanish_owner":
                         data[f"vanish_in_progress:v1:{OWNER}"] = {}
-                    if case == "vanish_ref":
+                    if case in ("vanish_ref", "pending_vanish_ref"):
                         data[f"refs:{HASH}"] = ["c" * 64]
                         data[f"vanish_in_progress:v1:{'c' * 64}"] = {}
                     if case in ("copying", "copying_restricted"):
                         data[f"b2-sync:v1:{HASH}"] = {"state": "copying", "attempt_id": "synthetic"}
                     if case == "copying_restricted":
                         meta["status"] = "restricted"
-                    if case == "erasing":
+                    if case in ("erasing", "pending_erasing"):
                         data[f"b2-sync:v1:{HASH}"] = {"state": "erasing"}
                     if case == "malformed_gate":
                         data[f"b2-sync:v1:{HASH}"] = {"state": "copying"}
-                    if case == "missing_ready":
+                    if case in ("missing_ready", "pending_missing_ready"):
                         del data[f"b2-ready:{HASH}"]
                     if case == "invalid_ready":
                         data[f"b2-ready:{HASH}"] = "malformed"
@@ -286,14 +313,14 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                     settings.write_text(json.dumps(values))
                     kv.write_text(json.dumps({k: json.dumps(v) for k, v in data.items()}))
                     started = time.monotonic()
-                    run(repo, env, "demand_endpoint_contract" if demand else "canary_endpoint_integration_contract")
+                    run(repo, env, "demand_endpoint_contract" if demand or original_case.startswith("range_") else "canary_endpoint_integration_contract")
                     if original_case == "demand_origin_slow":
                         assert time.monotonic() - started < 8, "origin timeout exceeded request budget"
                     storage = [r for r in server.requests if r[1].startswith("/private-test/")]
                     if demand:
                         gcs = [r for r in server.requests if r[1].startswith("/gcs-test/")]
                         assert len(storage) <= 1 and len(gcs) <= 1, server.requests
-                        if case == "valid":
+                        if case in ("valid", "pending"):
                             assert not gcs and len(storage) == 1, server.requests
                         elif expected in (200, 206, 416, 503) or original_case.startswith("demand_gcs_"):
                             assert len(gcs) == 1, server.requests
@@ -303,10 +330,12 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                             assert (storage if case == "valid" else gcs)[0][0] == "HEAD", server.requests
                         print(f"PASS {original_case}")
                         continue
-                    if case == "valid":
+                    if case in ("valid", "pending"):
                         assert [r[0] for r in storage] == ["GET", "GET", "GET", "HEAD"], storage
                         assert storage[1][2] == "bytes=1-3"
                         assert len(server.requests) == 8, server.requests
+                    elif original_case.startswith("range_"):
+                        assert len(storage) == 1, server.requests
                     elif case in ("wrong_origin_version", "origin_missing", "origin_forbidden", "origin_unauthorized", "origin_failed", "origin_disconnect"):
                         assert len(storage) == 1, server.requests
                     else:
@@ -317,12 +346,12 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                         run(repo, env, "canary_origin_outage_during_revocation_is_terminal")
                         assert len(server.requests) == 2, server.requests
                         print(f"PASS {case} with policy revoked during origin I/O remains terminal")
-                    if case == "valid":
+                    if case in ("valid", "pending"):
                         server.requests = []
                         run(repo, env, "canary_revocation_bypasses_warm_metadata_and_readiness")
                         assert len(server.requests) == 2, server.requests
                         print("PASS live policy/readiness revocation bypass warm canonical metadata")
-                for phase in (("b2", "gcs") if selected in (None, "races") else ()):
+                for phase, initial_policy in ([(phase, policy) for phase in ("b2", "gcs") for policy in ("active", "pending")] if selected in (None, "races") else []):
                     race_cases = [(change, 200) for change in ("restricted", "size", "type", "quarantine", "vanish", "erasing", "malformed_gate", "copying")]
                     race_cases += [("restricted", 503), ("restricted", 403)]
                     for change, origin_status in race_cases:
@@ -330,7 +359,7 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                         server.status = origin_status if phase == "b2" else 200
                         server.gcs_status = origin_status if phase == "gcs" else 200
                         values = dict(base, b2_demand_mirror_enabled="true", test_revoke_phase=phase, test_revoke_change=change)
-                        data = {f"blob:{HASH}": metadata}
+                        data = {f"blob:{HASH}": dict(metadata, status=initial_policy)}
                         if phase == "b2":
                             data[f"b2-ready:{HASH}"] = ready
                         settings.write_text(json.dumps(values))
@@ -340,7 +369,7 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                         gcs_reads = [r for r in server.requests if r[1].startswith("/gcs-test/")]
                         assert len(b2_reads) == (1 if phase == "b2" else 0), server.requests
                         assert len(gcs_reads) == (1 if phase == "gcs" or change == "copying" else 0), server.requests
-                        print(f"PASS demand {phase} {origin_status} then {change}")
+                        print(f"PASS demand {initial_policy} {phase} {origin_status} then {change}")
                 if selected in (None, "auth_races"):
                     for auth_status in (503, 429, "disconnect", "slow_body"):
                         server.requests = []
