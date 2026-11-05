@@ -299,8 +299,10 @@ copying gate indefinitely; repair never removes an erasing gate or B2 versions.
 
 Demand, upload and history lanes rotate first access to the shared object/byte
 budgets across passes, reclaim unused slots and attempt each hash once. Existing
-partial files get priority; no second partial is admitted while a prior one is
-unfinished. An older overcommitted spool recovers by discarding only the current
+partial files get priority; a new download waits for unfinished ungated
+downloads. Completed staged files and gated hashes reserve their actual occupied
+bytes without blocking unrelated work when space permits. Additional spool-gate
+probes are capped at 16 per pass. An older overcommitted spool recovers by discarding only the current
 worker's incomplete local download before PUT, freeing space for another partial
 to finish. Durable jobs, remote objects and gates remain intact.
 Intake/listing failures are reported without abandoning

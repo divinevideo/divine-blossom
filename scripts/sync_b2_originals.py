@@ -303,6 +303,8 @@ class Worker:
         observed = self.kv.snapshot("b2-ready:" + key)
         existing_gate = self.kv.get("b2-sync:v1:" + key)
         if existing_gate is not None:
+            if existing_gate == {"state": "erasing"}:
+                self.state.reset(key)
             return "terminal" if reconcile and existing_gate == {"state": "erasing"} else "locked"
         meta = approved_metadata(self.kv, key)
         if meta is None:
@@ -359,9 +361,21 @@ class Worker:
         parts = list(self.state.directory.glob("*.part"))
         spool_bytes = sum(part.stat().st_size for part in parts)
         others = [part for part in parts if part != path]
-        # Never admit another partial while an earlier one is unfinished.
-        if offset == 0 and (others or self.max_spool_bytes - spool_bytes < size):
-            return "pending"
+        if offset == 0:
+            if self.max_spool_bytes - spool_bytes < size:
+                return "pending"
+            for part in others:
+                row = self.state.db.execute("SELECT size FROM objects WHERE hash=?", (part.stem,)).fetchone()
+                if row is not None and row[0] is not None and part.stat().st_size >= row[0]:
+                    continue  # Complete staged files reserve only their actual bytes.
+                # A gated hash cannot resume this partial until operator recovery
+                # or erasure completes. Do not turn its per-hash exclusion into
+                # a global migration halt; still account for its occupied bytes.
+                if self.metrics["spool_gate_probes"] >= 16:
+                    return "pending"
+                self.metrics["spool_gate_probes"] += 1
+                if self.kv.get("b2-sync:v1:" + part.stem) is None:
+                    return "pending"
         if offset > 0 and size - offset > self.max_spool_bytes - spool_bytes:
             # Recover an older overcommitted spool by dropping ONLY this local
             # partial download, before any PUT/gate. Durable work remains queued.

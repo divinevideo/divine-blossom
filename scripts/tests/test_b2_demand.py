@@ -286,6 +286,39 @@ class IntakeTests(unittest.TestCase):
 
 
 class SchedulerTests(WorkerFixture):
+    def test_erasing_partial_does_not_block_unrelated_copy_or_clear_erasing_gate(self):
+        closed = "b" * 64
+        self.state.spool(closed).write_bytes(b"old partial")
+        self.kv.values["b2-sync:v1:" + closed] = {"state": "erasing"}
+        self.assertEqual(self.process(), "ready")
+        self.assertEqual(self.kv.get("b2-sync:v1:" + closed), {"state": "erasing"})
+        self.assertEqual(self.worker.process(closed, mirror.Budget(200)), "locked")
+        self.assertFalse(self.state.spool(closed).exists())
+
+    def test_uncertain_put_retains_its_gate_without_stopping_unrelated_copies(self):
+        import hashlib
+        bodies = [b"a" * 24, b"b" * 22]
+        keys = [hashlib.sha256(body).hexdigest() for body in bodies]
+        content = dict(zip(keys, bodies))
+        self.source.head = lambda key: {"generation": "7", "size": len(content[key])}
+        self.source.read = lambda key, generation, start, length: content[key][start:start + length]
+        self.source.page = lambda *args: ([], None)
+        for key, body in zip(keys, bodies):
+            self.kv.values["blob:" + key] = dict(self.kv.values["blob:" + HASH], sha256=key, size=len(body))
+            self.state.remember(key)
+        upload = self.dest.upload
+        def uncertain(key, *args):
+            if key == keys[0]:
+                raise OSError("synthetic uncertain PUT")
+            return upload(key, *args)
+        self.dest.upload = uncertain
+        with self.assertRaises(OSError):
+            self.worker.process(keys[0], mirror.Budget(200))
+        self.worker.cycle(max_objects=2, max_bytes=200)
+        self.assertIsNotNone(self.kv.get("b2-ready:" + keys[1]))
+        self.assertEqual(self.kv.get("b2-sync:v1:" + keys[0])["state"], "copying")
+        self.assertEqual(self.state.spool(keys[0]).stat().st_size, 24)
+
     def test_upload_retry_age_tracks_enqueue_time_instead_of_retry_deadline(self):
         from unittest.mock import patch
         self.state.queue_upload(HASH, "7", now=100)
