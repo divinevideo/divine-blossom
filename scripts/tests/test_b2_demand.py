@@ -34,6 +34,31 @@ class WorkerFixture(unittest.TestCase):
 
 class DemandTests(WorkerFixture):
 
+    def test_absent_readiness_invalidation_never_claims_a_copy_gate(self):
+        self.state.remember(HASH)
+        self.state.spool(HASH).write_bytes(b"unfinished")
+        self.kv.values["blob:" + HASH]["status"] = "restricted"
+        self.kv.claim_copy = lambda *args: self.fail("local cleanup must not block erasure")
+        self.assertEqual(self.process(), "terminal")
+        self.assertFalse(self.state.spool(HASH).exists())
+        self.assertIsNone(self.kv.get("b2-sync:v1:" + HASH))
+
+    def test_local_only_invalidation_preserves_concurrently_published_readiness(self):
+        self.state.remember(HASH)
+        replacement = {"destination_version_id": "new-version"}
+        def changed_remote_state():
+            self.kv.values["b2-ready:" + HASH] = replacement
+            return True
+        self.kv.claim_copy = lambda *args: self.fail("local cleanup must not claim a gate")
+        self.assertTrue(self.worker.invalidate(HASH, observed=None, allowed=changed_remote_state))
+        self.assertEqual(self.kv.get("b2-ready:" + HASH), replacement)
+
+    def test_local_only_invalidation_rechecks_its_decision(self):
+        self.state.remember(HASH)
+        self.state.spool(HASH).write_bytes(b"unfinished")
+        self.assertFalse(self.worker.invalidate(HASH, observed=None, allowed=lambda: False))
+        self.assertEqual(self.state.spool(HASH).read_bytes(), b"unfinished")
+
     def test_stale_policy_observer_cannot_delete_newer_readiness_before_snapshot(self):
         self.process()
         replacement = dict(self.kv.get("b2-ready:" + HASH), destination_version_id="new-version")

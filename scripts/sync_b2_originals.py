@@ -297,6 +297,12 @@ class Worker:
 
     def invalidate(self, key, info=None, *, observed, allowed=lambda: True, attempt=None):
         """Invalidate the observed record under the shared gate, never 'delete latest'."""
+        if observed is None and attempt is None:
+            # Local cleanup cannot invalidate a concurrent remote publication.
+            if not allowed():
+                return False
+            self.state.reset(key, info)
+            return True
         owned = attempt is not None
         attempt = attempt or str(uuid.uuid4())
         if not owned and not self.kv.claim_copy(key, attempt):
