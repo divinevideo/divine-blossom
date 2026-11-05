@@ -32,7 +32,7 @@ authenticated bucket name matches b2_media_bucket. A configured assertion alone
 cannot enable delivery outside the actual erasure mapping. This adds a native
 authorization request per origin read, intentionally uncached for this canary.
 
-## Request and readiness contract
+## Strict request and readiness contract (default)
 
 Only GET and HEAD of /{lowercase-sha256} or /{lowercase-sha256}.mp4 are accepted.
 Thumbnail, HLS, transcript, quality, upload, admin, and all other routes/methods
@@ -125,3 +125,61 @@ headers and no-store policy, and prove revoked or missing readiness cannot
 return cached canonical bytes. Validate real private-bucket all-version erasure
 with synthetic content through the owning operator workflow before production
 content. No visual change.
+
+## Demand mode (separately enabled)
+
+After deploying and proving the bounded worker and erasure path with an owned
+approved fixture, exact `b2_demand_mirror_enabled=true` adds server-side GCS
+fallback on the already configured direct host. This flag does not enable the
+host, affect canonical reads, or start a runner. Devices must keep the B2 flag
+off until the actual endpoint acceptance passes. A disabled host returns 404;
+clients deliberately do not fall back from that terminal response.
+
+Approved supported originals use a verified B2 version when ready. Missing
+readiness or an independently observed B2 404/410 tries GCS once, bypassing FOS,
+legacy origins, storage caches and the global read-primary flag. A B2 transport
+outage, 429 or 5xx (including native authorization availability failures) also
+tries GCS once, preserving readiness and emitting no copy hint. Invalid native
+credentials, malformed responses and incorrect scope/mapping remain terminal. Copying intent permits GCS without a hint; erasing or malformed intent
+remains terminal. Approved originals above 64 MiB use GCS without B2 or hints.
+Malformed/mismatched readiness and auth/configuration/integrity failures return
+502 without fallback; unavailable readiness returns 503. Failed policy/gate
+lookups cannot authorize an origin request. Both origins recheck uncached policy
+and the gate after I/O, including failed attempts. A newly observed denial wins.
+
+GCS success reports `X-Divine-Source: gcs` and
+`X-Divine-Storage-Cache: BYPASS`. Every response is private/no-store. HEAD uses
+an actual HEAD and ignores Range. GET supports one closed, open-ended or suffix
+range; malformed or multiple ranges are ignored and request the full object.
+206 must match the requested span and metadata size. For a mathematically unsatisfiable valid single range, 416 returns
+`Content-Range: bytes */<size>` and an empty body, and emits no hint. Some
+B2 responses omit this header; the edge reconstructs it only from the known
+authoritative size after validating unsatisfiability. An explicit mismatched
+header or unexpected 416 for a satisfiable/malformed request remains an error.
+
+A successful GCS 200/206/HEAD for an eligible missing copy attempts at most one
+add-only `b2-demand:v1:{hash}` insertion. Version-1 values carry `version: 1`,
+`sha256`, and `reason: missing_readiness` or `reason: missing_version` with
+`observed_destination_version_id`. Existing hints coalesce; hint failure leaves
+playback successful. The hint grants no copying permission. See
+[b2-original-sync.md](b2-original-sync.md) for durable intake and repair.
+
+Demand requests admit at most 16 uploader references plus the owner to bound
+policy fanout. Originals above that reference limit receive a terminal 404 on
+this test host, with no origin request or client fallback: the remaining
+references have not passed the required policy checks. This does not change
+canonical playback; turn off the device flag to leave the bounded test cohort.
+B2 authorization headers/body and each media response-header attempt have a
+three-second wait bound within a twelve-second origin/hint budget; the enqueue
+wait is at most 50 milliseconds. Synchronous policy KV reads and the full client
+download are outside that I/O budget. Response bodies stream after the final policy check: a later
+stream failure terminates that response rather than switching origins. These
+are execution bounds, not a measured latency or global revocation guarantee.
+Cross-POP propagation and inflight-body limits remain production acceptance
+work.
+
+Turning this flag off restores strict B2-only mode, including its 503 behavior.
+For ordinary GCS playback, turn off the device flag. Pause worker intake or the
+runner separately; preserve committed queues, state backups, copy gates and
+permanent erasing markers. Keep B2 erasure enabled while any replica bytes remain.
+No canonical/global traffic switch is included.
