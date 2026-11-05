@@ -73,6 +73,13 @@ class Destination:
     def read(self, key, version, start, length, total_size):
         return self.versions[version][start:start + length]
 
+    def exists(self, key, version, size):
+        if version not in self.versions:
+            return False
+        if len(self.versions[version]) != size:
+            raise ValueError("synthetic version size mismatch")
+        return True
+
 
 class KV:
     def __init__(self):
@@ -89,6 +96,23 @@ class KV:
 
     def delete(self, key):
         self.values.pop(key, None)
+
+    def snapshot(self, key):
+        value = self.get(key)
+        if value is None:
+            return None
+        encoded = json.dumps(value, sort_keys=True)
+        generation = str(int(hashlib.sha256(encoded.encode()).hexdigest()[:15], 16) + 1)
+        return json.loads(encoded), generation
+
+    def delete_if_generation(self, key, generation):
+        current = self.snapshot(key)
+        if current is None:
+            return True
+        if current[1] != generation:
+            return False
+        self.delete(key)
+        return True
 
     def claim_copy(self, key, attempt):
         gate = "b2-sync:v1:" + key
@@ -476,7 +500,8 @@ class WorkerTests(unittest.TestCase):
     def test_spool_limit_never_exceeded(self):
         self.worker.max_spool_bytes = 8
         self.assertEqual(self.copy(), "pending")
-        self.assertEqual(self.state.spool(HASH).stat().st_size, 8)
+        self.assertFalse(self.state.spool(HASH).exists())
+        self.assertEqual(self.source.reads, [])
         self.assertIsNone(self.ready())
 
     def test_state_cannot_be_reused_for_another_bucket(self):

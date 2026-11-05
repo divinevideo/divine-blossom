@@ -116,6 +116,8 @@ Configuration is split across the Fastly config store (non-secret) and secret st
 | `gcs_bucket` | GCS bucket name (`divine-blossom-media`) |
 | `gcs_project_id` | GCP project ID |
 | `media_read_primary` | `gcs` (default) or `b2`. Controls immutable original reads only; does not move writes, derivatives, or coordination. |
+| `b2_canary_host` | Exact direct-Compute host `media-b2.divine.video`; absent disables it. Requires separate playback/erasure acceptance before enabling devices. |
+| `b2_demand_mirror_enabled` | Exact `true` enables uncached GCS fallback and demand hints on the already-enabled canary host only. Absent/off preserves strict B2-only canary behavior. See the B2 playback runbook. |
 | `gcs_fallback_enabled` | `true` (default) or `false`. With B2 reads, permit GCS fallback on 404, 5xx, or transport failure. Authentication failures do not fall back. |
 | `b2_media_bucket` | Private authoritative B2 bucket for migrated Blossom media; separate from the approved-only delivery replica. |
 | `b2_media_region` | Verified account region used for B2 S3 signing and its endpoint. The `b2_storage` backend must target that endpoint with matching TLS/SNI. |

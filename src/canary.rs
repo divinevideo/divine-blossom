@@ -35,6 +35,9 @@ fn exists(key: &str) -> Result<bool> {
     }
 }
 fn approved_metadata(hash: &str) -> Result<BlobMetadata> {
+    approved_metadata_with_limit(hash, false)
+}
+fn approved_metadata_with_limit(hash: &str, bounded: bool) -> Result<BlobMetadata> {
     let denied = || BlossomError::NotFound("Blob not found".into());
     let metadata = get_blob_metadata_uncached(hash)?.ok_or_else(denied)?;
     if metadata.sha256 != hash
@@ -48,7 +51,12 @@ fn approved_metadata(hash: &str) -> Result<BlobMetadata> {
         return Err(denied());
     }
     let mut uploaders = get_blob_refs(hash)?;
+    if bounded && (metadata.size == 0 || uploaders.len() > canary::MAX_DEMAND_REFERENCES) {
+        return Err(denied());
+    }
     uploaders.push(metadata.owner.clone());
+    uploaders.sort_unstable();
+    uploaders.dedup();
     for uploader in uploaders {
         if uploader.len() != 64
             || !uploader.bytes().all(|b| b.is_ascii_hexdigit())
@@ -97,7 +105,178 @@ pub(crate) fn unavailable() -> Response {
     response
 }
 pub(crate) fn handle(req: Request) -> Result<Response> {
+    if crate::storage::get_config("b2_demand_mirror_enabled").is_ok_and(|v| v == "true") {
+        return handle_demand(
+            req,
+            crate::storage::download_demand_b2,
+            crate::storage::download_demand_gcs,
+        );
+    }
     handle_with_origin(req, crate::storage::download_canary_original)
+}
+
+fn recheck_demand(hash: &str, metadata: &BlobMetadata) -> Result<bool> {
+    let current = approved_metadata_with_limit(hash, true)?;
+    let copying = copy_in_progress(hash)?;
+    if current.size != metadata.size || current.mime_type != metadata.mime_type {
+        return Err(BlossomError::NotFound("Blob not found".into()));
+    }
+    Ok(copying)
+}
+
+fn demand_headers(
+    mut response: Response,
+    hash: &str,
+    metadata: &BlobMetadata,
+    source: &str,
+) -> Response {
+    eprintln!("b2-demand source={source}");
+    response.set_header("Content-Type", &metadata.mime_type);
+    response.set_header("X-Sha256", hash);
+    response.set_header("X-Content-Length", metadata.size.to_string());
+    response.set_header("X-Divine-Source", source);
+    response.set_header("X-Divine-Storage-Cache", "BYPASS");
+    response.set_header("Accept-Ranges", "bytes");
+    crate::add_cors_headers(&mut response);
+    no_store(&mut response);
+    response
+}
+
+/// Add-only coalescing is best effort, but waits are finite and never detached.
+#[allow(deprecated)]
+fn insert_demand_hint(hash: &str, observed: Option<&str>, deadline: std::time::Instant) {
+    use fastly::kv_store::InsertMode;
+    let insert = || -> std::result::Result<(), &'static str> {
+        let hint = canary::DemandHint::new(hash, observed).ok_or("invalid")?;
+        let payload = serde_json::to_string(&hint).map_err(|_| "invalid")?;
+        if payload.len() > 2048 || std::time::Instant::now() >= deadline {
+            return Err("budget");
+        }
+        let store = open_store().map_err(|_| "unavailable")?;
+        let pending = store
+            .build_insert()
+            .mode(InsertMode::Add)
+            .execute_async(&format!("b2-demand:v1:{hash}"), payload)
+            .map_err(|_| "unavailable")?;
+        crate::storage::wait_for_demand_io(pending.as_u32(), deadline).map_err(|_| "budget")?;
+        match store.pending_insert_wait(pending) {
+            Ok(()) => {
+                eprintln!("b2-demand hint=inserted");
+                Ok(())
+            }
+            Err(KVStoreError::ItemPreconditionFailed) => {
+                eprintln!("b2-demand hint=coalesced");
+                Ok(())
+            }
+            Err(_) => Err("unavailable"),
+        }
+    };
+    if let Err(reason) = insert() {
+        eprintln!("b2-demand hint=failed reason={reason}");
+    }
+}
+
+fn handle_demand(
+    req: Request,
+    fetch_b2: impl FnOnce(
+        &Readiness,
+        &fastly::http::Method,
+        Option<&str>,
+        std::time::Instant,
+    ) -> Result<crate::storage::CanaryOrigin>,
+    fetch_gcs: impl FnOnce(
+        &str,
+        u64,
+        &fastly::http::Method,
+        Option<&str>,
+        std::time::Instant,
+    ) -> Result<crate::storage::CanaryOrigin>,
+) -> Result<Response> {
+    use crate::storage::CanaryOrigin;
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + crate::storage::DEMAND_IO_BUDGET;
+    let hash = canary::original_hash(req.get_method_str(), req.get_path())
+        .ok_or_else(|| BlossomError::NotFound("Not found".into()))?;
+    let metadata = approved_metadata_with_limit(&hash, true)?;
+    let copying = copy_in_progress(&hash)?;
+    let eligible = metadata.size <= canary::MAX_DEMAND_BYTES;
+    let range = if *req.get_method() == fastly::http::Method::HEAD {
+        None
+    } else {
+        canary::single_range(req.get_header_str("Range"))
+    };
+    let mut hint: Option<Option<String>> = None;
+    let mut copying_seen = copying;
+    if copying {
+        eprintln!("b2-demand fallback=copying");
+    } else if !eligible {
+        eprintln!("b2-demand fallback=oversized");
+    }
+    if !copying && eligible {
+        let store = open_store()?;
+        let ready = match store.lookup(&format!("b2-ready:{hash}")) {
+            Ok(mut lookup) => {
+                let body = lookup.take_body().into_string();
+                if body.len() > 8192 {
+                    return Err(BlossomError::StorageError(
+                        "Demand readiness invalid".into(),
+                    ));
+                }
+                let ready: Readiness = serde_json::from_str(&body)
+                    .map_err(|_| BlossomError::StorageError("Demand readiness invalid".into()))?;
+                let bucket = crate::storage::get_config("b2_media_bucket").map_err(|_| {
+                    BlossomError::StorageError("B2 demand configuration unavailable".into())
+                })?;
+                if !ready.matches(&hash, &bucket, metadata.size) {
+                    eprintln!("b2-demand readiness=invalid");
+                    return Err(BlossomError::StorageError(
+                        "Demand readiness invalid".into(),
+                    ));
+                }
+                Some(ready)
+            }
+            Err(KVStoreError::ItemNotFound) => {
+                eprintln!("b2-demand fallback=missing_readiness");
+                hint = Some(None);
+                None
+            }
+            Err(_) => return Ok(unavailable()),
+        };
+        if let Some(ready) = ready {
+            let outcome = fetch_b2(&ready, req.get_method(), range, deadline);
+            // Recheck even on errors: denial always beats availability/config.
+            copying_seen |= recheck_demand(&hash, &metadata)?;
+            match outcome? {
+                CanaryOrigin::Delivered(response) if !copying_seen => {
+                    return Ok(demand_headers(response, &hash, &metadata, "b2"))
+                }
+                CanaryOrigin::Missing => {
+                    hint = Some(Some(ready.destination_version_id));
+                    eprintln!("b2-demand fallback=missing_version");
+                }
+                CanaryOrigin::Unavailable => eprintln!("b2-demand fallback=unavailable"),
+                CanaryOrigin::Delivered(_) => {}
+            }
+        }
+    }
+    let outcome = fetch_gcs(&hash, metadata.size, req.get_method(), range, deadline);
+    copying_seen |= recheck_demand(&hash, &metadata)?;
+    match outcome? {
+        CanaryOrigin::Delivered(response) => {
+            if response.get_status().is_success() && eligible && !copying_seen {
+                if let Some(observed) = hint {
+                    insert_demand_hint(
+                        &hash,
+                        observed.as_deref(),
+                        (Instant::now() + Duration::from_millis(50)).min(deadline),
+                    );
+                }
+            }
+            Ok(demand_headers(response, &hash, &metadata, "gcs"))
+        }
+        CanaryOrigin::Missing => Err(BlossomError::NotFound("Blob not found".into())),
+        CanaryOrigin::Unavailable => Ok(unavailable()),
+    }
 }
 
 fn handle_with_origin(
@@ -156,6 +335,168 @@ fn handle_with_origin(
 mod tests {
     use crate::handle_main;
     use fastly::{http::StatusCode, Request};
+    #[test]
+    #[ignore = "requires demand fixtures; scripts/run-b2-canary-tests.py"]
+    fn demand_exhausted_deadline_starts_no_origin_request() {
+        let result = crate::storage::download_demand_gcs(
+            &"a".repeat(64),
+            9,
+            &fastly::http::Method::GET,
+            None,
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert!(matches!(result, crate::storage::CanaryOrigin::Unavailable));
+    }
+    #[test]
+    #[ignore = "requires demand fixtures; scripts/run-b2-canary-tests.py"]
+    fn demand_revocation_after_each_origin_is_terminal() {
+        let hash = "a".repeat(64);
+        let config = fastly::config_store::ConfigStore::open("blossom_config");
+        let phase = config.get("test_revoke_phase").unwrap();
+        let change = config.get("test_revoke_change").unwrap();
+        let revoke = || {
+            let store = crate::metadata::open_store().unwrap();
+            let mut metadata = crate::metadata::get_blob_metadata_uncached(&hash)
+                .unwrap()
+                .unwrap();
+            match change.as_str() {
+                "restricted" => metadata.status = crate::blossom::BlobStatus::Restricted,
+                "size" => metadata.size += 1,
+                "type" => metadata.mime_type = "video/webm".into(),
+                "quarantine" => {
+                    store
+                        .insert(
+                            &format!("quarantine:v1:{hash}"),
+                            r#"{"version":1,"holds":{"race":{"version":1,"active":true}}}"#,
+                        )
+                        .unwrap();
+                }
+                "vanish" => {
+                    store
+                        .insert(&format!("vanish_in_progress:v1:{}", metadata.owner), "{}")
+                        .unwrap();
+                }
+                "erasing" | "malformed_gate" | "copying" => {
+                    let gate = match change.as_str() {
+                        "copying" => r#"{"state":"copying","attempt_id":"race"}"#,
+                        "erasing" => r#"{"state":"erasing"}"#,
+                        _ => r#"{"state":"copying"}"#,
+                    };
+                    store.insert(&format!("b2-sync:v1:{hash}"), gate).unwrap();
+                }
+                _ => panic!("unknown revocation fixture"),
+            }
+            store
+                .insert(
+                    &format!("blob:{hash}"),
+                    serde_json::to_string(&metadata).unwrap(),
+                )
+                .unwrap();
+        };
+        let result = super::handle_demand(
+            Request::get(format!("https://media-b2.divine.video/{hash}")),
+            |ready, method, range, deadline| {
+                let outcome = crate::storage::download_demand_b2(ready, method, range, deadline);
+                if phase == "b2" {
+                    revoke();
+                }
+                outcome
+            },
+            |hash, size, method, range, deadline| {
+                let outcome =
+                    crate::storage::download_demand_gcs(hash, size, method, range, deadline);
+                if phase == "gcs" {
+                    revoke();
+                }
+                outcome
+            },
+        );
+        if change == "copying" {
+            assert_eq!(
+                result.unwrap().get_header_str("X-Divine-Source"),
+                Some("gcs")
+            );
+        } else {
+            assert_eq!(
+                result
+                    .expect_err("revocation must discard origin bytes")
+                    .status_code()
+                    .as_u16(),
+                404
+            );
+        }
+        assert!(crate::metadata::open_store()
+            .unwrap()
+            .lookup(&format!("b2-demand:v1:{hash}"))
+            .is_err());
+    }
+    #[test]
+    #[ignore = "requires demand fixtures; scripts/run-b2-canary-tests.py"]
+    fn demand_endpoint_contract() {
+        use fastly::config_store::ConfigStore;
+        let config = ConfigStore::open("blossom_config");
+        let expected = config
+            .get("test_expected_status")
+            .unwrap()
+            .parse::<u16>()
+            .unwrap();
+        let method = config.get("test_method").unwrap_or_else(|| "GET".into());
+        let mut request = Request::new(
+            method,
+            format!("https://media-b2.divine.video/{}", "a".repeat(64)),
+        );
+        if let Some(range) = config.get("test_range") {
+            request.set_header("Range", range);
+        }
+        let mut response = handle_main(request).unwrap();
+        assert_eq!(response.get_status().as_u16(), expected);
+        assert_eq!(
+            response.get_header_str("Cache-Control"),
+            Some("private, no-store")
+        );
+        assert_eq!(
+            response.get_header_str("Surrogate-Control"),
+            Some("no-store")
+        );
+        if expected == 200 || expected == 206 {
+            assert_eq!(
+                response.get_header_str("X-Divine-Source"),
+                config.get("test_source").as_deref()
+            );
+            assert_eq!(
+                response.get_header_str("X-Divine-Storage-Cache"),
+                Some("BYPASS")
+            );
+            assert_eq!(
+                response.take_body().into_string(),
+                config.get("test_body").unwrap()
+            );
+        } else if expected == 416 {
+            assert_eq!(response.get_header_str("Content-Range"), Some("bytes */9"));
+            assert_eq!(response.get_header_str("Content-Length"), Some("0"));
+            assert_eq!(response.take_body().into_string(), "");
+        }
+        let hint = crate::metadata::open_store()
+            .unwrap()
+            .lookup(&format!("b2-demand:v1:{}", "a".repeat(64)));
+        if let Some(reason) = config.get("test_hint") {
+            let mut hint = hint.expect("successful GCS delivery must queue demand");
+            let value: serde_json::Value =
+                serde_json::from_str(&hint.take_body().into_string()).unwrap();
+            assert_eq!(value["version"], 1);
+            assert_eq!(value["sha256"], "a".repeat(64));
+            assert_eq!(value["reason"], reason);
+            if reason == "missing_version" {
+                assert_eq!(
+                    value["observed_destination_version_id"],
+                    "4_zSynthetic+version"
+                );
+            }
+        } else {
+            assert!(hint.is_err(), "must not queue hint");
+        }
+    }
     #[test]
     fn disabled_canary_denies_reads_writes_and_admin_without_storage_access() {
         for (method, path) in [

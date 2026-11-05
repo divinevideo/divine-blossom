@@ -247,3 +247,65 @@ References: [GCS generation-pinned downloads](https://docs.cloud.google.com/pyth
 and [Fastly atomic add-only operations](https://www.fastly.com/blog/beyond-crud-advanced-features-of-fastlys-kv-store).
 Fastly's [official client implementation](https://github.com/fastly/go-fastly/blob/main/fastly/kv_store.go)
 documents the `generation` response header and `if-generation-match` delete header.
+
+## Demand intake and missing-version repair
+
+`--demand-intake` separately enables one bounded KV demand page per invocation.
+It defaults off. The edge flag does not start this worker; the worker flag does
+not enable a hostname. Committed demand is processed even when new intake is off.
+Use `--max-pending-demand` (default 10,000; maximum 100,000) to bound local pending
+requests. With demand, notifications and history configured, use at least three
+object slots; demand and history require at least two. Object slots are capped
+at 1,000; demand intake reads at most 100 keys, each value at most 4 KiB.
+
+Fastly's list API rejects colons in prefixes. The adapter lists the supported
+`b2-demand` prefix, then validates exact `b2-demand:v1:{lowercase-sha256}` keys
+and version-1 payloads. Other names/future versions are counted and retained;
+scanning continues. Its opaque cursor is persisted; an invalid cursor resets
+for the next pass. Invalid known-version payloads may be conditionally removed.
+Saturation leaves new work in KV for a later scan.
+
+Every accepted request commits to SQLite before generation-conditional hint
+removal. Missing generation, conflict and uncertain acknowledgement never fall
+back to unconditional deletion. Duplicates coalesce without resetting a retry
+deadline. Schema updates are additive and restart-safe. SQLite owns retry
+responsibility after acknowledgement: retain and back up the state directory.
+For a live backup, use Python's SQLite `Connection.backup()` to another private
+filesystem, then verify `PRAGMA integrity_check` on the backup. Restore that
+backup with the single writer stopped, preserve the mapping and copy/erase
+namespace, and revalidate it before resuming. A fresh source listing cannot
+replace lost acknowledged demand or historical readiness state.
+
+Every due demand request reconciles current policy/source and the current pinned
+B2 version, even when the first hint only reported missing readiness. A valid
+version-pinned HEAD with matching size completes demand without another upload;
+matching source generation and destination readiness can be adopted into a new
+local database. Authentication, outage or integrity failures preserve readiness
+and defer. Only a confirmed missing exact version permits repair. The worker
+stages checksum-verified source bytes, claims the existing copy gate, rereads
+policy/source/readiness, records retry responsibility and clears local completion,
+then conditionally removes only the observed readiness generation and uses the
+existing verified PUT path under that same gate. Changed readiness stops repair.
+All readiness invalidation paths now use generation preconditions.
+
+Pending approval, active quarantine and unavailable/malformed policy defer;
+permanent policy denial, vanish/tombstone, erasing, missing source and unsupported
+media finish that demand request without copying. Historical reconciliation
+remains able to reconsider later approval. Retries wait at least 300 seconds;
+new hints cannot bypass an upload's backoff. Uncertain PUT still retains its
+copying gate indefinitely; repair never removes an erasing gate or B2 versions.
+
+Demand, upload and history lanes rotate first access to the shared object/byte
+budgets across passes, reclaim unused slots and attempt each hash once. Existing
+partial files get priority; a new spool file is admitted only when enough space
+remains to finish it. Intake/listing failures are reported without abandoning
+already committed work. Aggregate output includes demand intake/errors/saturation,
+pending queues and oldest ages, reconciliation age, copy results, spool bytes
+and reserved transfer bytes. Migration of an old database starts age tracking at
+the migration time; it cannot reconstruct historical queue age.
+
+The existing suspended production runner remains operator-owned. Set its cadence
+and budgets from measured pass duration, queue ages, spool use and fallback
+latency; require monitored error/saturation/stuck-gate alerts and an off-volume
+restore drill before activation. Merging this CLI adds no schedule or alert
+routing. Never enable automatic copies solely because local tests passed.

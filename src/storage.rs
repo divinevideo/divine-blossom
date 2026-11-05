@@ -437,6 +437,208 @@ pub(crate) fn download_canary_original(
     Ok(delivery)
 }
 
+/// Demand mode keeps absence separate from availability and terminal errors.
+pub(crate) enum CanaryOrigin {
+    Delivered(Response),
+    Missing,
+    Unavailable,
+}
+
+/// The entire demand execution leaves room for final policy reads and enqueue.
+pub(crate) const DEMAND_IO_BUDGET: Duration = Duration::from_secs(12);
+const DEMAND_ATTEMPT_BUDGET: Duration = Duration::from_secs(3);
+
+#[allow(deprecated)]
+fn send_demand(request: Request, backend: &str, deadline: Instant) -> Result<Option<Response>> {
+    if Instant::now() >= deadline {
+        return Ok(None);
+    }
+    let (request, body) = request.into_handles();
+    let pending = match request.send_async(
+        body.unwrap_or_else(fastly::handle::BodyHandle::new),
+        backend,
+    ) {
+        Ok(pending) => pending,
+        Err(cause) if transient_canary_origin_error(&cause) => return Ok(None),
+        Err(_) => {
+            return Err(BlossomError::StorageError(
+                "Demand origin setup failed".into(),
+            ))
+        }
+    };
+    if wait_for_probe_io(pending.as_u32(), deadline).is_err() {
+        return Ok(None);
+    }
+    match pending.wait() {
+        Ok((response, body)) => Ok(Some(Response::from_handles(response, body))),
+        Err(cause) if transient_canary_origin_error(&cause) => Ok(None),
+        Err(_) => Err(BlossomError::StorageError(
+            "Demand origin protocol failed".into(),
+        )),
+    }
+}
+
+#[allow(deprecated)]
+fn bounded_demand_body(response: Response, deadline: Instant) -> Result<String> {
+    let (_, mut body) = response.into_handles();
+    let mut bytes = Vec::new();
+    let mut chunk = [0; 4096];
+    loop {
+        wait_for_probe_io(unsafe { body.as_u32() }, deadline)
+            .map_err(|_| BlossomError::StorageError("Demand authorization timed out".into()))?;
+        let read = body
+            .read(&mut chunk)
+            .map_err(|_| BlossomError::StorageError("Demand authorization unavailable".into()))?;
+        if read == 0 {
+            break;
+        }
+        if bytes.len() + read > 16384 {
+            return Err(BlossomError::StorageError(
+                "Demand authorization too large".into(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| BlossomError::StorageError("Demand authorization invalid".into()))
+}
+
+pub(crate) fn download_demand_b2(
+    ready: &blossom_core::canary::Readiness,
+    method: &Method,
+    range: Option<&str>,
+    deadline: Instant,
+) -> Result<CanaryOrigin> {
+    if !b2_replica_enabled() {
+        return Err(BlossomError::StorageError("B2 erasure is disabled".into()));
+    }
+    let config = S3Config::load_b2_media()
+        .map_err(|_| BlossomError::StorageError("B2 demand configuration unavailable".into()))?;
+    let authorization = authorize_b2_vanish_with_deadline(Some(
+        (Instant::now() + DEMAND_ATTEMPT_BUDGET).min(deadline),
+    ))
+    .map_err(|_| {
+        BlossomError::StorageError("B2 demand erasure authorization unavailable".into())
+    })?;
+    if authorization.bucket_name.as_deref() != Some(config.bucket.as_str()) {
+        return Err(BlossomError::StorageError(
+            "B2 read and erasure buckets do not match".into(),
+        ));
+    }
+    let version = ready
+        .destination_version_id
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect::<String>();
+    let mut request = Request::new(
+        method.clone(),
+        format!(
+            "{}{}?versionId={version}",
+            config.endpoint(),
+            config.object_path(&ready.key)
+        ),
+    );
+    request.set_header("Host", config.host());
+    if let Some(range) = range {
+        request.set_header("Range", range);
+    }
+    request.set_pass(true);
+    sign_request(&mut request, &config, Some("UNSIGNED-PAYLOAD".into()))?;
+    let Some(response) = send_demand(
+        request,
+        B2_MEDIA_BACKEND,
+        (Instant::now() + DEMAND_ATTEMPT_BUDGET).min(deadline),
+    )?
+    else {
+        return Ok(CanaryOrigin::Unavailable);
+    };
+    demand_delivery(
+        response,
+        ready.size,
+        method,
+        range,
+        Some(&ready.destination_version_id),
+    )
+}
+
+/// Direct authoritative GCS only: no provider selection, FOS or storage cache.
+pub(crate) fn download_demand_gcs(
+    hash: &str,
+    size: u64,
+    method: &Method,
+    range: Option<&str>,
+    deadline: Instant,
+) -> Result<CanaryOrigin> {
+    let config = S3Config::load_gcs()
+        .map_err(|_| BlossomError::StorageError("GCS demand configuration unavailable".into()))?;
+    let mut request = Request::new(
+        method.clone(),
+        format!("{}{}", config.endpoint(), config.object_path(hash)),
+    );
+    request.set_header("Host", config.host());
+    if let Some(range) = range {
+        request.set_header("Range", range);
+    }
+    request.set_pass(true);
+    sign_request(&mut request, &config, Some("UNSIGNED-PAYLOAD".into()))?;
+    let Some(response) = send_demand(
+        request,
+        GCS_BACKEND,
+        (Instant::now() + DEMAND_ATTEMPT_BUDGET).min(deadline),
+    )?
+    else {
+        return Ok(CanaryOrigin::Unavailable);
+    };
+    demand_delivery(response, size, method, range, None)
+}
+
+fn demand_delivery(
+    mut response: Response,
+    size: u64,
+    method: &Method,
+    range: Option<&str>,
+    version: Option<&str>,
+) -> Result<CanaryOrigin> {
+    let status = response.get_status();
+    if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
+        return Ok(CanaryOrigin::Missing);
+    }
+    if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        return Ok(CanaryOrigin::Unavailable);
+    }
+    if !blossom_core::canary::demand_origin_matches(
+        status.as_u16(),
+        response.get_header_str("Content-Length"),
+        response.get_header_str("Content-Range"),
+        size,
+        range,
+    ) || (status != StatusCode::RANGE_NOT_SATISFIABLE
+        && version.is_some_and(|v| response.get_header_str("x-amz-version-id") != Some(v)))
+    {
+        return Err(BlossomError::StorageError(
+            "Demand origin verification failed".into(),
+        ));
+    }
+    let mut delivery = Response::from_status(status);
+    for name in ["Content-Length", "Content-Range", "ETag", "Last-Modified"] {
+        if let Some(value) = response.get_header(name) {
+            delivery.set_header(name, value);
+        }
+    }
+    if status == StatusCode::RANGE_NOT_SATISFIABLE {
+        delivery.set_header("Content-Length", "0");
+    } else if *method != Method::HEAD {
+        delivery.set_body(response.take_body());
+    }
+    Ok(CanaryOrigin::Delivered(delivery))
+}
+
 /// Upload a blob to GCS (simple PUT for small files)
 /// owner: pubkey of the blob owner (stored in x-amz-meta-owner for durability)
 pub fn upload_blob(
@@ -1416,6 +1618,10 @@ fn validate_b2_authorization(
 }
 
 fn authorize_b2_vanish() -> Result<B2Authorization> {
+    authorize_b2_vanish_with_deadline(None)
+}
+
+fn authorize_b2_vanish_with_deadline(deadline: Option<Instant>) -> Result<B2Authorization> {
     let key_id = get_secret("b2_vanish_application_key_id")?;
     let application_key = get_secret("b2_vanish_application_key")?;
     let bucket_id = get_config("b2_bucket_id")?;
@@ -1426,19 +1632,28 @@ fn authorize_b2_vanish() -> Result<B2Authorization> {
     request.set_header("Host", "api.backblazeb2.com");
     request.set_header("Authorization", format!("Basic {}", basic));
     request.set_pass(true);
-    let mut response = request
-        .send(B2_API_BACKEND)
-        .map_err(|error| BlossomError::StorageError(format!("B2 authorization failed: {error}")))?;
+    let mut response = if let Some(deadline) = deadline {
+        send_demand(request, B2_API_BACKEND, deadline)?
+            .ok_or_else(|| BlossomError::StorageError("B2 authorization unavailable".into()))?
+    } else {
+        request.send(B2_API_BACKEND).map_err(|error| {
+            BlossomError::StorageError(format!("B2 authorization failed: {error}"))
+        })?
+    };
     if !response.get_status().is_success() {
         return Err(BlossomError::StorageError(format!(
             "B2 authorization failed with status: {}",
             response.get_status()
         )));
     }
-    let authorization =
-        serde_json::from_str(&response.take_body().into_string()).map_err(|error| {
-            BlossomError::StorageError(format!("Invalid B2 authorization response: {error}"))
-        })?;
+    let body = if let Some(deadline) = deadline {
+        bounded_demand_body(response, deadline)?
+    } else {
+        response.take_body().into_string()
+    };
+    let authorization = serde_json::from_str(&body).map_err(|error| {
+        BlossomError::StorageError(format!("Invalid B2 authorization response: {error}"))
+    })?;
     validate_b2_authorization(authorization, &bucket_id)
 }
 
@@ -3457,6 +3672,10 @@ fn delivery_probe_report_from_body(body: &str) -> Option<DeliveryProbeReport> {
 
 /// Wait on a borrowed pending-request or body handle without extending the
 /// caller's absolute deadline. The host API treats a zero timeout as infinite.
+pub(crate) fn wait_for_demand_io(handle: u32, deadline: Instant) -> io::Result<()> {
+    wait_for_probe_io(handle, deadline)
+}
+
 fn wait_for_probe_io(handle: u32, deadline: Instant) -> io::Result<()> {
     let timeout_ms = deadline
         .saturating_duration_since(Instant::now())

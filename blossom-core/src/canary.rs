@@ -2,6 +2,99 @@
 use serde::{Deserialize, Serialize};
 
 pub const RESERVED_HOST: &str = "media-b2.divine.video";
+pub const MAX_DEMAND_BYTES: u64 = 67_108_864;
+// Each policy pass performs one vanish lookup per distinct reference. Bound
+// three policy passes so adversarial references cannot exhaust execution work.
+pub const MAX_DEMAND_REFERENCES: usize = 16;
+
+#[derive(Debug, Serialize)]
+pub struct DemandHint<'a> {
+    version: u32,
+    sha256: &'a str,
+    reason: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_destination_version_id: Option<&'a str>,
+}
+impl<'a> DemandHint<'a> {
+    pub fn new(hash: &'a str, observed: Option<&'a str>) -> Option<Self> {
+        if hash.len() != 64
+            || original_hash("GET", &format!("/{hash}")).is_none()
+            || observed.is_some_and(|v| v.is_empty() || v.len() > 1024)
+        {
+            return None;
+        }
+        Some(Self {
+            version: 1,
+            sha256: hash,
+            reason: if observed.is_some() {
+                "missing_version"
+            } else {
+                "missing_readiness"
+            },
+            observed_destination_version_id: observed,
+        })
+    }
+}
+
+/// One supported byte range. Multiple or malformed ranges are ignored before
+/// origin I/O, consistently producing a full response rather than multipart.
+pub fn single_range(value: Option<&str>) -> Option<&str> {
+    let value = value?;
+    let (start, end) = value.strip_prefix("bytes=")?.split_once('-')?;
+    let number = |v: &str| {
+        !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) && v.parse::<u64>().is_ok()
+    };
+    if number(start) && number(end) && start.parse::<u64>().ok()? > end.parse::<u64>().ok()? {
+        return None;
+    }
+    ((number(start) && (end.is_empty() || number(end))) || (start.is_empty() && number(end)))
+        .then_some(value)
+}
+
+fn requested_span(range: &str, size: u64) -> Option<(u64, u64)> {
+    let (start, end) = single_range(Some(range))?
+        .strip_prefix("bytes=")?
+        .split_once('-')?;
+    if size == 0 {
+        return None;
+    }
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().ok()?;
+        return (suffix > 0).then(|| (size.saturating_sub(suffix), size - 1));
+    }
+    let start = start.parse::<u64>().ok()?;
+    let end = if end.is_empty() {
+        size - 1
+    } else {
+        end.parse::<u64>().ok()?.min(size - 1)
+    };
+    (start <= end && start < size).then_some((start, end))
+}
+
+pub fn demand_origin_matches(
+    status: u16,
+    length: Option<&str>,
+    content_range: Option<&str>,
+    size: u64,
+    range: Option<&str>,
+) -> bool {
+    if status == 416 {
+        return range
+            .is_some_and(|r| single_range(Some(r)).is_some() && requested_span(r, size).is_none())
+            && content_range == Some(format!("bytes */{size}").as_str());
+    }
+    if !origin_size_matches(status, length, content_range, size) {
+        return false;
+    }
+    if status == 200 {
+        return true;
+    } // Origins may ignore Range.
+    range
+        .and_then(|r| requested_span(r, size))
+        .is_some_and(|(start, end)| {
+            content_range == Some(format!("bytes {start}-{end}/{size}").as_str())
+        })
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CanaryRoute {
@@ -109,6 +202,56 @@ pub fn origin_size_matches(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn demand_ranges_validate_requested_span_and_unsatisfied_range() {
+        for (range, status, length, content_range, expected) in [
+            (Some("bytes=1-3"), 206, "3", Some("bytes 1-3/9"), true),
+            (Some("bytes=1-3"), 206, "3", Some("bytes 2-4/9"), false),
+            (Some("bytes=4-"), 206, "5", Some("bytes 4-8/9"), true),
+            (Some("bytes=-3"), 206, "3", Some("bytes 6-8/9"), true),
+            (Some("bytes=99-"), 416, "10", Some("bytes */9"), true),
+            (Some("bytes=1-3"), 416, "0", Some("bytes */9"), false),
+            (Some("bytes=0-1,3-4"), 206, "2", Some("bytes 0-1/9"), false),
+            (None, 206, "3", Some("bytes 1-3/9"), false),
+        ] {
+            assert_eq!(
+                demand_origin_matches(status, Some(length), content_range, 9, range),
+                expected,
+                "{range:?} {status}"
+            );
+        }
+        assert!(demand_origin_matches(
+            200,
+            Some("9"),
+            None,
+            9,
+            Some("bytes=1-3")
+        ));
+    }
+    #[test]
+    fn demand_hint_bounds_version_and_keeps_full_hash() {
+        let hash = "a".repeat(64);
+        let hint = DemandHint::new(&hash, Some("4_zSynthetic+version")).unwrap();
+        let value = serde_json::to_value(hint).unwrap();
+        assert_eq!(value["sha256"], hash);
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["reason"], "missing_version");
+        assert_eq!(
+            value["observed_destination_version_id"],
+            "4_zSynthetic+version"
+        );
+        assert!(DemandHint::new("a", None).is_none());
+        assert!(DemandHint::new(&format!("{hash}.mp4"), None).is_none());
+        assert!(DemandHint::new(&hash, Some(&"x".repeat(1025))).is_none());
+        assert_eq!(
+            serde_json::to_value(DemandHint::new(&hash, None).unwrap()).unwrap()["reason"],
+            "missing_readiness"
+        );
+    }
+    #[test]
+    fn invalid_reversed_range_is_ignored_like_other_malformed_ranges() {
+        assert_eq!(single_range(Some("bytes=4-3")), None);
+    }
     #[test]
     fn canary_is_disabled_without_exact_host_and_rejects_forwarded_host_conflicts() {
         assert_eq!(
