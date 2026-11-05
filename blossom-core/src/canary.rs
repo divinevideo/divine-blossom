@@ -71,6 +71,19 @@ fn requested_span(range: &str, size: u64) -> Option<(u64, u64)> {
     (start <= end && start < size).then_some((start, end))
 }
 
+/// Send an equivalent range bounded by the verified object size. B2 returns
+/// 500 for components above signed i64, even though they are valid HTTP ranges.
+/// Preserve malformed/multiple inputs so the caller retains its existing policy.
+pub fn normalize_origin_range(range: &str, size: u64) -> String {
+    if single_range(Some(range)).is_none() {
+        return range.to_owned();
+    }
+    match requested_span(range, size) {
+        Some((start, end)) => format!("bytes={start}-{end}"),
+        None => format!("bytes={size}-"),
+    }
+}
+
 pub fn demand_origin_matches(
     status: u16,
     length: Option<&str>,
@@ -212,6 +225,28 @@ pub fn origin_size_matches(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn origin_ranges_preserve_spans_without_provider_integer_overflow() {
+        for (range, size, expected) in [
+            ("bytes=9223372036854775808-", 9, "bytes=9-"),
+            ("bytes=18446744073709551615-", 9, "bytes=9-"),
+            ("bytes=0-18446744073709551615", 9, "bytes=0-8"),
+            ("bytes=-18446744073709551615", 9, "bytes=0-8"),
+            ("bytes=4-", 9, "bytes=4-8"),
+            ("bytes=-3", 9, "bytes=6-8"),
+            ("bytes=-0", 9, "bytes=9-"),
+            ("bytes=0-0", 0, "bytes=0-"),
+            ("bytes=0-1,3-4", 9, "bytes=0-1,3-4"),
+            ("bytes=4-3", 9, "bytes=4-3"),
+            ("invalid", 9, "invalid"),
+        ] {
+            assert_eq!(normalize_origin_range(range, size), expected, "{range}");
+            if single_range(Some(range)).is_some() {
+                assert_eq!(requested_span(range, size), requested_span(expected, size));
+            }
+        }
+    }
+
     #[test]
     fn demand_ranges_validate_requested_span_and_unsatisfied_range() {
         for (range, status, length, content_range, expected) in [
