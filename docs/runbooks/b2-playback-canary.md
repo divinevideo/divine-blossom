@@ -38,8 +38,10 @@ Only GET and HEAD of /{lowercase-sha256} or /{lowercase-sha256}.mp4 are accepted
 Thumbnail, HLS, transcript, quality, upload, admin, and all other routes/methods
 are denied. Authentication grants no bypass.
 
-Each request reads uncached authoritative Fastly KV metadata. The blob must be
-active, have a video MIME type and valid owner, have no tombstone, and have no
+Each request reads uncached authoritative Fastly KV metadata and applies the
+canonical anonymous access policy. Active and pending blobs are public; pending
+does not require upload pre-screening under reactive moderation. The blob must
+have a video MIME type and valid owner, have no tombstone, and have no
 account vanish in progress for its owner or any uploader reference. Missing or
 malformed metadata, failed lookups, and any copy/erase mutex prevent delivery.
 Policy is checked again after origin I/O. The canonical metadata cache is never

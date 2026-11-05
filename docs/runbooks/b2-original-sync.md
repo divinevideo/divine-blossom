@@ -163,10 +163,12 @@ The independent `quarantine:v1:{hash}` record is checked on every policy read.
 An active review hold, malformed hold state, or failed lookup cannot authorize
 copying or readiness. Released holds permit only what the current base policy
 allows; they never override a ban or deletion.
-An original needs `blob:{hash}` with matching hash/size, `status: active`, a video
-MIME type, a valid owner, no `tombstone:{hash}`, and no
+An original needs `blob:{hash}` with matching hash/size, `status: active` or
+`status: pending`, a video MIME type, a valid owner, no `tombstone:{hash}`, and no
 `vanish_in_progress:v1:{uploader}` for the owner or any known uploader in
 `refs:{hash}`. Missing/malformed policy or a lookup failure cannot grant access.
+Pending uploads are public under canonical reactive moderation. Mirroring does
+not change their status or override any hold, restriction or deletion.
 
 The worker checks policy before download, after obtaining the copy gate,
 immediately before readiness, and after publication. It verifies the complete

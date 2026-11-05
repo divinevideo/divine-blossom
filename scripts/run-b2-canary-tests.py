@@ -111,7 +111,10 @@ blossom_secrets = [{{key="b2_media_access_key",data="synthetic"}},{{key="b2_medi
                 ready = {"version": 1, "sha256": HASH, "verified_sha256": HASH,
                          "bucket": "private-test", "key": HASH, "size": 9,
                          "verified_at": 1, "destination_version_id": VERSION}
-                cases = [("valid", 200), ("disabled", 404), ("pending", 404), ("restricted", 404),
+                cases = [("valid", 200), ("disabled", 404), ("pending", 200),
+                         ("pending_missing_ready", 503), ("pending_quarantine", 404),
+                         ("pending_tombstone", 404), ("pending_vanish_ref", 404),
+                         ("pending_erasing", 404), ("restricted", 404),
                          ("banned", 404), ("deleted", 404), ("age_restricted", 404),
                          ("missing_metadata", 404), ("tombstone", 404), ("vanish_owner", 404),
                          ("vanish_ref", 404), ("copying", 503), ("copying_restricted", 404), ("malformed_gate", 404), ("erasing", 404),
@@ -131,24 +134,29 @@ blossom_secrets = [{{key="b2_media_access_key",data="synthetic"}},{{key="b2_medi
                         del values["b2_canary_host"]
                     if case in ("pending", "restricted", "banned", "deleted", "age_restricted"):
                         meta["status"] = case
+                    if case.startswith("pending_"):
+                        meta["status"] = "pending"
+                    if case == "pending_quarantine":
+                        data[f"quarantine:v1:{HASH}"] = {
+                            "version": 1, "holds": {"review:synthetic": {"version": 1, "active": True}}}
                     if case == "missing_metadata":
                         del data[f"blob:{HASH}"]
-                    if case == "tombstone":
+                    if case in ("tombstone", "pending_tombstone"):
                         data[f"tombstone:{HASH}"] = {}
                     if case == "vanish_owner":
                         data[f"vanish_in_progress:v1:{OWNER}"] = {}
-                    if case == "vanish_ref":
+                    if case in ("vanish_ref", "pending_vanish_ref"):
                         data[f"refs:{HASH}"] = ["c" * 64]
                         data[f"vanish_in_progress:v1:{'c' * 64}"] = {}
                     if case in ("copying", "copying_restricted"):
                         data[f"b2-sync:v1:{HASH}"] = {"state": "copying", "attempt_id": "synthetic"}
                     if case == "copying_restricted":
                         meta["status"] = "restricted"
-                    if case == "erasing":
+                    if case in ("erasing", "pending_erasing"):
                         data[f"b2-sync:v1:{HASH}"] = {"state": "erasing"}
                     if case == "malformed_gate":
                         data[f"b2-sync:v1:{HASH}"] = {"state": "copying"}
-                    if case == "missing_ready":
+                    if case in ("missing_ready", "pending_missing_ready"):
                         del data[f"b2-ready:{HASH}"]
                     if case == "invalid_ready":
                         data[f"b2-ready:{HASH}"] = "malformed"
@@ -182,7 +190,7 @@ blossom_secrets = [{{key="b2_media_access_key",data="synthetic"}},{{key="b2_medi
                     kv.write_text(json.dumps({k: json.dumps(v) for k, v in data.items()}))
                     run(repo, env, "canary_endpoint_integration_contract")
                     storage = [r for r in server.requests if r[1].startswith("/private-test/")]
-                    if case == "valid":
+                    if case in ("valid", "pending"):
                         assert [r[0] for r in storage] == ["GET", "GET", "GET", "HEAD"], storage
                         assert storage[1][2] == "bytes=1-3"
                         assert len(server.requests) == 8, server.requests
@@ -196,7 +204,7 @@ blossom_secrets = [{{key="b2_media_access_key",data="synthetic"}},{{key="b2_medi
                         run(repo, env, "canary_origin_outage_during_revocation_is_terminal")
                         assert len(server.requests) == 2, server.requests
                         print(f"PASS {case} with policy revoked during origin I/O remains terminal")
-                    if case == "valid":
+                    if case in ("valid", "pending"):
                         server.requests = []
                         run(repo, env, "canary_revocation_bypasses_warm_metadata_and_readiness")
                         assert len(server.requests) == 2, server.requests
