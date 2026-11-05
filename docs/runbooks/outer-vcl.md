@@ -10,6 +10,18 @@ Fastly snippet name, type, and priority. `vcl/log_cdn_views.vcl` is not a live
 snippet; production uses a dashboard logging endpoint. See
 [CDN view counting](cdn-view-counting.md).
 
+The managed `pass.vcl` snippet allows 60 seconds for the first response byte on
+`DELETE /vanish` and `POST /admin/api/vanish`, including query strings. Erasure
+finishes its current storage batch and completion audit before returning; its
+loop admission budget is not a hard deadline for that work. The outer backend's
+15-second delivery timeout can therefore expire after successful deletion.
+Upload routes keep their existing 120-second allowance, and media delivery
+keeps the backend's 15-second timeout. This change needs the separate outer VCL
+draft, validation, and activation procedure below; a Compute publish does not
+deploy it. After activation, verify a signed erasure of an owned fixture returns
+its completion response and independently confirm that all fixture versions are
+absent. A 503 alone does not establish whether deletion happened.
+
 ## Diff git against the active version
 
 Read-only. Uses the read-only Fastly credential namespace and exits `1` when
@@ -37,6 +49,14 @@ reviews and activates that complete version.
 Apply updates every snippet in the manifest, not one selected snippet. Review
 the complete Fastly version diff before activation and do not activate a draft
 that contains an unrelated change.
+
+For a scoped repair when other snippets have known drift, prepare an operator
+root containing the complete active snippet set and its manifest, preserving
+each active snippet's content and metadata. Replace only the reviewed repair
+in that root. Use `--root <operator-root>` before `diff` or `apply`, and require
+the diff to show only that repair before cloning. Pin the active version used
+for the snapshot and rebuild the operator root if it changes. Review the full
+draft and validate it as usual; this does not authorize activation.
 
 A push to `main` runs `diff` only. The same apply is available as a manual
 `Outer VCL` workflow with `apply_draft`, which does not run `diff` as a
