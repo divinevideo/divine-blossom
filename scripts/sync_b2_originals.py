@@ -46,11 +46,12 @@ def valid_hint(key, value):
     return set(value) == fields and value.get("sha256") == key and HEX.fullmatch(key) is not None
 
 
-def readiness_matches(record, key, info, source, destination):
+def readiness_identity_matches(record, key, info, source, destination):
     return (isinstance(record, dict) and type(record.get("version")) is int and record["version"] == 1
             and record.get("sha256") == record.get("verified_sha256") == record.get("key") == key
             and record.get("bucket") == destination and record.get("source_bucket") == source
-            and record.get("source_generation") == info["generation"]
+            and isinstance(record.get("source_generation"), str)
+            and re.fullmatch(r"[1-9][0-9]{0,29}", record["source_generation"]) is not None
             and type(record.get("size")) is int and record["size"] == info["size"]
             and type(record.get("verified_at")) is int and record["verified_at"] > 0
             and isinstance(record.get("destination_version_id"), str)
@@ -149,13 +150,19 @@ class State:
         self.db.execute("CREATE TABLE IF NOT EXISTS objects (hash TEXT PRIMARY KEY, generation TEXT, size INTEGER, checked INTEGER DEFAULT 0, ready TEXT)")
         self.db.execute("CREATE INDEX IF NOT EXISTS objects_checked ON objects(checked,hash)")
         self.db.execute("CREATE TABLE IF NOT EXISTS upload_queue (hash TEXT PRIMARY KEY, generation TEXT NOT NULL, available_at INTEGER NOT NULL DEFAULT 0)")
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(upload_queue)")}
+        if "created_at" not in columns:
+            self.db.execute("ALTER TABLE upload_queue ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0")
+        self.db.execute("UPDATE upload_queue SET created_at=? WHERE created_at=0", (int(time.time()),))
         self.db.execute("UPDATE upload_queue SET available_at=? WHERE available_at=0",(int(time.time()),))
         self.db.execute("CREATE INDEX IF NOT EXISTS uploads_due ON upload_queue(available_at,hash)")
         self.db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
         self.db.execute("CREATE TABLE IF NOT EXISTS demand_queue (hash TEXT PRIMARY KEY, hint TEXT NOT NULL, available_at INTEGER NOT NULL, created_at INTEGER NOT NULL)")
         self.db.execute("CREATE INDEX IF NOT EXISTS demand_due ON demand_queue(available_at,hash)")
         self.db.execute("CREATE TABLE IF NOT EXISTS object_age (hash TEXT PRIMARY KEY, first_seen INTEGER NOT NULL, checked_at INTEGER NOT NULL)")
-        self.db.execute("INSERT OR IGNORE INTO object_age SELECT hash,?,? FROM objects", (int(time.time()), int(time.time())))
+        if not self.db.execute("SELECT 1 FROM settings WHERE key='object_age_migrated'").fetchone():
+            self.db.execute("INSERT OR IGNORE INTO object_age SELECT hash,?,? FROM objects", (int(time.time()), int(time.time())))
+            self.db.execute("INSERT INTO settings VALUES ('object_age_migrated','true')")
         self.db.commit()
 
     def close(self):
@@ -194,9 +201,9 @@ class State:
             self.db.execute("INSERT OR IGNORE INTO objects(hash) VALUES (?)", (key,))
             old = self.db.execute("SELECT generation FROM upload_queue WHERE hash=?", (key,)).fetchone()
             if old is None:
-                self.db.execute("INSERT INTO upload_queue(hash,generation,available_at) VALUES (?,?,?)", (key,generation,due))
+                self.db.execute("INSERT INTO upload_queue(hash,generation,available_at,created_at) VALUES (?,?,?,?)", (key,generation,due,due))
             elif int(generation) > int(old[0]):
-                self.db.execute("UPDATE upload_queue SET generation=?,available_at=? WHERE hash=?", (generation,due,key))
+                self.db.execute("UPDATE upload_queue SET generation=?,available_at=?,created_at=? WHERE hash=?", (generation,due,due,key))
 
     def queued_uploads(self, limit, now=None):
         return self.db.execute("SELECT hash,generation FROM upload_queue WHERE available_at<=? ORDER BY available_at,hash LIMIT ?",
@@ -269,70 +276,97 @@ class Worker:
         self.chunk_bytes, self.max_spool_bytes = chunk_bytes, max_spool_bytes
         self.metrics = Counter()
 
-    def invalidate(self, key, info=None):
-        snapshot = self.kv.snapshot("b2-ready:" + key)
-        if snapshot is not None and not self.kv.delete_if_generation("b2-ready:" + key, snapshot[1]):
-            raise RuntimeError("readiness changed during invalidation")
-        self.state.reset(key, info)
+    def invalidate(self, key, info=None, *, observed, allowed=lambda: True, attempt=None):
+        """Invalidate the observed record under the shared gate, never 'delete latest'."""
+        owned = attempt is not None
+        attempt = attempt or str(uuid.uuid4())
+        if not owned and not self.kv.claim_copy(key, attempt):
+            return False
+        try:
+            if (self.kv.get("b2-sync:v1:" + key) != {"state": "copying", "attempt_id": attempt}
+                    or self.kv.snapshot("b2-ready:" + key) != observed or not allowed()):
+                return False
+            if observed is not None and not self.kv.delete_if_generation("b2-ready:" + key, observed[1]):
+                return False
+            self.state.reset(key, info)
+            return True
+        finally:
+            if not owned:
+                self.kv.release_copy(key, attempt)
 
     def process(self, key, budget, reconcile=False):
         if not HEX.fullmatch(key):
             return "ignored"
         generation, size, ready = self.state.row(key)
+        # Observe readiness BEFORE policy/source. A later publication can never
+        # become the deletion target of this observer's stale denial/miss.
+        observed = self.kv.snapshot("b2-ready:" + key)
+        existing_gate = self.kv.get("b2-sync:v1:" + key)
+        if existing_gate is not None:
+            return "terminal" if reconcile and existing_gate == {"state": "erasing"} else "locked"
         meta = approved_metadata(self.kv, key)
         if meta is None:
-            self.invalidate(key)
+            invalidated = self.invalidate(key, observed=observed,
+                allowed=lambda: approved_metadata(self.kv, key) is None)
+            if not invalidated:
+                return "changed"
             return demand_policy(self.kv, key) if reconcile else "blocked"
         info = self.source.head(key)
+        same_inputs = lambda: approved_metadata(self.kv, key) == meta and self.source.head(key) == info
         if info is None:
-            self.invalidate(key)
-            return "missing"
+            return "missing" if self.invalidate(key, observed=observed, allowed=same_inputs) else "changed"
         if info["size"] <= 0 or info["size"] > self.max_object_bytes:
-            self.invalidate(key)
-            return "oversized"
+            return "oversized" if self.invalidate(key, observed=observed, allowed=same_inputs) else "changed"
         if type(meta.get("size")) is not int or meta["size"] != info["size"]:
-            self.invalidate(key)
+            self.invalidate(key, observed=observed, allowed=same_inputs)
             return "changed"
         gate = self.kv.get("b2-sync:v1:" + key)
         if gate is not None:
             return "terminal" if reconcile and gate == {"state": "erasing"} else "locked"
-        observed = self.kv.snapshot("b2-ready:" + key) if reconcile else None
-        if observed is not None:
+        missing_version = False
+        if reconcile and observed is not None:
             record = observed[0]
-            if not readiness_matches(record, key, info, self.source.bucket, self.destination.bucket):
+            if not readiness_identity_matches(record, key, info, self.source.bucket, self.destination.bucket):
                 raise ValueError("remote readiness cannot be adopted or repaired")
             present = self.destination.exists(key, record["destination_version_id"], info["size"])
+            missing_version = not present
             if approved_metadata(self.kv, key) != meta:
-                self.invalidate(key)
+                self.invalidate(key, observed=observed,
+                    allowed=lambda: approved_metadata(self.kv, key) is None)
                 return demand_policy(self.kv, key)
             if self.source.head(key) != info or self.kv.snapshot("b2-ready:" + key) != observed:
                 return "changed"
             if self.kv.get("b2-sync:v1:" + key) is not None:
                 return "locked"
-            if present:
+            if present and record["source_generation"] == info["generation"]:
                 self.state.reset(key, info)
                 self.state.ready(key, record)
                 self.metrics["readiness_adopted"] += 1
                 return "ready"
         if (generation, size) != (info["generation"], info["size"]):
-            if reconcile:
-                self.state.reset(key, info)
-            else:
-                self.invalidate(key, info)
+            # Stage locally first. Readiness removal waits for the owned gate
+            # immediately before PUT, for history/upload paths as well as demand.
+            self.state.reset(key, info)
             ready = None
-        elif not reconcile and ready is not None and self.kv.get("b2-ready:" + key) == json.loads(ready):
+        elif not reconcile and ready is not None and observed is not None and observed[0] == json.loads(ready):
             return "ready"
         generation, size = info["generation"], info["size"]
         path = self.state.spool(key)
         offset = path.stat().st_size if path.exists() else 0
         if offset > size:
-            self.invalidate(key, info)
+            path.unlink()
             offset = 0
-        spool_bytes = sum(p.stat().st_size for p in self.state.directory.glob("*.part"))
-        # Leave space to finish this original before starting another partial file.
-        # The scheduler prioritizes existing partials; without this admission check
-        # several partials could consume all spool capacity while none can finish.
-        if offset == 0 and self.max_spool_bytes - spool_bytes < size:
+        parts = list(self.state.directory.glob("*.part"))
+        spool_bytes = sum(part.stat().st_size for part in parts)
+        others = [part for part in parts if part != path]
+        # Never admit another partial while an earlier one is unfinished.
+        if offset == 0 and (others or self.max_spool_bytes - spool_bytes < size):
+            return "pending"
+        if offset > 0 and size - offset > self.max_spool_bytes - spool_bytes:
+            # Recover an older overcommitted spool by dropping ONLY this local
+            # partial download, before any PUT/gate. Durable work remains queued.
+            # This releases space for another partial to finish on this pass.
+            path.unlink()
             return "pending"
         while offset < size:
             count = min(self.chunk_bytes, size - offset, budget.remaining,
@@ -352,49 +386,50 @@ class Worker:
         with path.open("rb") as handle:
             digest = hashlib.file_digest(handle, "sha256").hexdigest()
         if digest != key:
-            self.invalidate(key, info)
+            self.invalidate(key, info, observed=observed, allowed=same_inputs)
             raise ValueError("source checksum mismatch")
-        # Reserve both upload and independent full download before starting either.
         if budget.remaining < 2 * size:
             return "pending"
         if self.source.head(key) != info:
-            self.invalidate(key)
+            self.state.reset(key)
             return "changed"
         if approved_metadata(self.kv, key) != meta:
-            self.invalidate(key)
-            return "blocked"
+            self.invalidate(key, observed=observed,
+                allowed=lambda: approved_metadata(self.kv, key) is None)
+            return demand_policy(self.kv, key) if reconcile else "blocked"
         attempt = str(uuid.uuid4())
         if not self.kv.claim_copy(key, attempt):
             return "locked"
         upload_state = {"uncertain": False}
         try:
-            if approved_metadata(self.kv, key) != meta or self.source.head(key) != info:
-                self.invalidate(key)
+            if not same_inputs():
+                self.invalidate(key, observed=observed, attempt=attempt,
+                    allowed=lambda: approved_metadata(self.kv, key) is None)
                 return demand_policy(self.kv, key) if reconcile else "blocked"
-            if reconcile:
-                if self.kv.snapshot("b2-ready:" + key) != observed:
-                    return "changed"
-                if observed is not None:
-                    # Keep durable retry responsibility before touching remote state.
-                    if not self.state.queue_demand(key, {"version": 1, "sha256": key,
-                            "reason": "missing_version", "observed_destination_version_id": observed[0]["destination_version_id"]}):
+            if self.kv.snapshot("b2-ready:" + key) != observed:
+                return "changed"
+            if observed is not None:
+                if reconcile:
+                    retry_hint = {"version": 1, "sha256": key, "reason": "missing_readiness"}
+                    if missing_version:
+                        retry_hint.update(reason="missing_version",
+                            observed_destination_version_id=observed[0]["destination_version_id"])
+                    if not self.state.queue_demand(key, retry_hint):
                         return "pending"
-                    with self.state.db:
-                        self.state.db.execute("UPDATE objects SET generation=?,size=?,ready=NULL WHERE hash=?",
-                                              (info["generation"], info["size"], key))
-                    if not self.kv.delete_if_generation("b2-ready:" + key, observed[1]):
-                        return "changed"
-            result = self.transfer(key, budget, path, size, generation, info, meta, upload_state)
-            if reconcile and observed is not None and result == "ready":
+                with self.state.db:
+                    self.state.db.execute("UPDATE objects SET generation=?,size=?,ready=NULL WHERE hash=?",
+                                          (info["generation"], info["size"], key))
+                if not self.kv.delete_if_generation("b2-ready:" + key, observed[1]):
+                    return "changed"
+            result = self.transfer(key, budget, path, size, generation, info, meta, upload_state, attempt)
+            if reconcile and missing_version and result == "ready":
                 self.metrics["repairs_completed"] += 1
             return demand_policy(self.kv, key) if reconcile and result == "blocked" else result
         finally:
-            # No TTL: an interrupted/uncertain PUT must block erasure completion
-            # until an operator has drained that writer and reconciled versions.
             if not upload_state["uncertain"]:
                 self.kv.release_copy(key, attempt)
 
-    def transfer(self, key, budget, path, size, generation, info, meta, upload_state):
+    def transfer(self, key, budget, path, size, generation, info, meta, upload_state, attempt):
         budget.spend(size)
         upload_state["uncertain"] = True
         version = self.destination.upload(key, path, size)
@@ -410,25 +445,27 @@ class Worker:
                 raise ValueError("destination range length mismatch")
             digest.update(data)
         if digest.hexdigest() != key:
-            self.invalidate(key, info)
+            self.invalidate(key, info, observed=None, attempt=attempt)
             raise ValueError("destination checksum mismatch")
         if self.source.head(key) != info:
-            self.invalidate(key)
+            self.invalidate(key, observed=None, attempt=attempt)
             return "changed"
         if approved_metadata(self.kv, key) != meta:
-            self.invalidate(key)
+            self.invalidate(key, observed=None, attempt=attempt)
             return "blocked"
         record = {"version": 1, "sha256": key, "verified_sha256": key,
                   "source_bucket": self.source.bucket, "source_generation": generation,
                   "bucket": self.destination.bucket, "key": key, "size": size,
                   "destination_version_id": version, "verified_at": int(time.time())}
         self.kv.put("b2-ready:" + key, record)
-        if self.kv.get("b2-ready:" + key) != record:
+        published = self.kv.snapshot("b2-ready:" + key)
+        if published is None or published[0] != record:
             raise ValueError("readiness publication not confirmed")
         # No cross-service transaction exists. Endpoint independently gates policy on
         # every request, including a vanish between this last check and publication.
         if approved_metadata(self.kv, key) != meta:
-            self.invalidate(key)
+            self.invalidate(key, observed=published, attempt=attempt,
+                allowed=lambda: approved_metadata(self.kv, key) is None)
             return "blocked"
         self.state.ready(key, record)
         self.metrics["copies_completed"] += 1
@@ -493,11 +530,13 @@ class Worker:
             reconciles = key in demands
             result = "errors"
             try:
+                image_observed = self.kv.snapshot("b2-ready:" + key) if generation is not None and self.kv is not None else None
                 metadata = self.kv.get("blob:" + key) if generation is not None and self.kv is not None else None
                 mime = metadata.get("type") if isinstance(metadata, dict) else None
                 if isinstance(mime, str) and "/" in mime and not mime.startswith("video/"):
-                    self.invalidate(key)
-                    result = "ignored"
+                    removed = self.invalidate(key, observed=image_observed,
+                        allowed=lambda: self.kv.get("blob:" + key) == metadata)
+                    result = "ignored" if removed else "changed"
                 elif reconciles:
                     result = self.process(key, budget, reconcile=True)
                 else:
@@ -519,7 +558,7 @@ class Worker:
                         self.state.defer_demand(key)
                 self.state.checked(key)
         for lane, table, age_column in [("demand", "demand_queue", "created_at"),
-                                         ("notification", "upload_queue", "available_at")]:
+                                         ("notification", "upload_queue", "created_at")]:
             count, oldest = self.state.db.execute(f"SELECT COUNT(*),MIN({age_column}) FROM {table}").fetchone()
             report[lane + "_pending"] = count
             report[lane + "_oldest_seconds"] = max(0, now - oldest) if oldest is not None else 0

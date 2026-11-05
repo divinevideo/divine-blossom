@@ -479,16 +479,23 @@ fn send_demand(request: Request, backend: &str, deadline: Instant) -> Result<Opt
 }
 
 #[allow(deprecated)]
-fn bounded_demand_body(response: Response, deadline: Instant) -> Result<String> {
+fn bounded_demand_body(response: Response, deadline: Instant) -> Result<Option<String>> {
     let (_, mut body) = response.into_handles();
     let mut bytes = Vec::new();
     let mut chunk = [0; 4096];
     loop {
-        wait_for_probe_io(unsafe { body.as_u32() }, deadline)
-            .map_err(|_| BlossomError::StorageError("Demand authorization timed out".into()))?;
-        let read = body
-            .read(&mut chunk)
-            .map_err(|_| BlossomError::StorageError("Demand authorization unavailable".into()))?;
+        if let Err(error) = wait_for_probe_io(unsafe { body.as_u32() }, deadline) {
+            if error.kind() == io::ErrorKind::TimedOut {
+                return Ok(None);
+            }
+            return Err(BlossomError::StorageError(
+                "Demand authorization protocol failed".into(),
+            ));
+        }
+        let read = match body.read(&mut chunk) {
+            Ok(read) => read,
+            Err(_) => return Ok(None),
+        };
         if read == 0 {
             break;
         }
@@ -500,6 +507,7 @@ fn bounded_demand_body(response: Response, deadline: Instant) -> Result<String> 
         bytes.extend_from_slice(&chunk[..read]);
     }
     String::from_utf8(bytes)
+        .map(Some)
         .map_err(|_| BlossomError::StorageError("Demand authorization invalid".into()))
 }
 
@@ -514,12 +522,15 @@ pub(crate) fn download_demand_b2(
     }
     let config = S3Config::load_b2_media()
         .map_err(|_| BlossomError::StorageError("B2 demand configuration unavailable".into()))?;
-    let authorization = authorize_b2_vanish_with_deadline(Some(
+    let Some(authorization) = authorize_b2_vanish_with_deadline(Some(
         (Instant::now() + DEMAND_ATTEMPT_BUDGET).min(deadline),
     ))
     .map_err(|_| {
         BlossomError::StorageError("B2 demand erasure authorization unavailable".into())
-    })?;
+    })?
+    else {
+        return Ok(CanaryOrigin::Unavailable);
+    };
     if authorization.bucket_name.as_deref() != Some(config.bucket.as_str()) {
         return Err(BlossomError::StorageError(
             "B2 read and erasure buckets do not match".into(),
@@ -1618,10 +1629,13 @@ fn validate_b2_authorization(
 }
 
 fn authorize_b2_vanish() -> Result<B2Authorization> {
-    authorize_b2_vanish_with_deadline(None)
+    authorize_b2_vanish_with_deadline(None)?
+        .ok_or_else(|| BlossomError::StorageError("B2 authorization unavailable".into()))
 }
 
-fn authorize_b2_vanish_with_deadline(deadline: Option<Instant>) -> Result<B2Authorization> {
+/// Only demand mode treats authorization transport/429/5xx as availability.
+/// Strict reads and erasure retain their existing fail-closed error contract.
+fn authorize_b2_vanish_with_deadline(deadline: Option<Instant>) -> Result<Option<B2Authorization>> {
     let key_id = get_secret("b2_vanish_application_key_id")?;
     let application_key = get_secret("b2_vanish_application_key")?;
     let bucket_id = get_config("b2_bucket_id")?;
@@ -1633,13 +1647,21 @@ fn authorize_b2_vanish_with_deadline(deadline: Option<Instant>) -> Result<B2Auth
     request.set_header("Authorization", format!("Basic {}", basic));
     request.set_pass(true);
     let mut response = if let Some(deadline) = deadline {
-        send_demand(request, B2_API_BACKEND, deadline)?
-            .ok_or_else(|| BlossomError::StorageError("B2 authorization unavailable".into()))?
+        let Some(response) = send_demand(request, B2_API_BACKEND, deadline)? else {
+            return Ok(None);
+        };
+        response
     } else {
         request.send(B2_API_BACKEND).map_err(|error| {
             BlossomError::StorageError(format!("B2 authorization failed: {error}"))
         })?
     };
+    if deadline.is_some()
+        && (response.get_status() == StatusCode::TOO_MANY_REQUESTS
+            || response.get_status().is_server_error())
+    {
+        return Ok(None);
+    }
     if !response.get_status().is_success() {
         return Err(BlossomError::StorageError(format!(
             "B2 authorization failed with status: {}",
@@ -1647,14 +1669,17 @@ fn authorize_b2_vanish_with_deadline(deadline: Option<Instant>) -> Result<B2Auth
         )));
     }
     let body = if let Some(deadline) = deadline {
-        bounded_demand_body(response, deadline)?
+        let Some(body) = bounded_demand_body(response, deadline)? else {
+            return Ok(None);
+        };
+        body
     } else {
         response.take_body().into_string()
     };
     let authorization = serde_json::from_str(&body).map_err(|error| {
         BlossomError::StorageError(format!("Invalid B2 authorization response: {error}"))
     })?;
-    validate_b2_authorization(authorization, &bucket_id)
+    validate_b2_authorization(authorization, &bucket_id).map(Some)
 }
 
 fn build_b2_list_versions_request(

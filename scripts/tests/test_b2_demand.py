@@ -34,6 +34,52 @@ class WorkerFixture(unittest.TestCase):
 
 class DemandTests(WorkerFixture):
 
+    def test_stale_policy_observer_cannot_delete_newer_readiness_before_snapshot(self):
+        self.process()
+        replacement = dict(self.kv.get("b2-ready:" + HASH), destination_version_id="new-version")
+        lookup = self.kv.get
+        armed = [True]
+        def read(key):
+            if key == "blob:" + HASH and armed[0]:
+                armed[0] = False
+                stale = dict(lookup(key), status="pending")
+                self.kv.values["b2-ready:" + HASH] = replacement
+                return stale
+            return lookup(key)
+        self.kv.get = read
+        self.process()
+        self.assertEqual(self.kv.get("b2-ready:" + HASH), replacement)
+
+    def test_spool_never_opens_second_partial_and_recovers_older_overcommit(self):
+        other = "b" * 64
+        self.worker.max_spool_bytes = 40
+        self.state.spool(other).write_bytes(b"x" * 30)
+        self.worker.max_object_bytes = 40
+        self.source.data = b"x" * 40
+        self.kv.values["blob:" + HASH]["size"] = 40
+        self.assertEqual(self.process(), "pending")
+        self.assertFalse(self.state.spool(HASH).exists())
+        self.state.spool(HASH).write_bytes(b"x" * 5)
+        self.assertEqual(self.process(), "pending")
+        self.assertFalse(self.state.spool(HASH).exists())
+        self.assertEqual(self.state.spool(other).stat().st_size, 30)
+
+    def test_source_generation_refresh_survives_overlapping_demand_and_upload(self):
+        for version_present in (False, True):
+            with self.subTest(version_present=version_present):
+                self.source.generation = "7"
+                self.assertEqual(self.process(), "ready")
+                self.source.generation = "8"
+                if not version_present:
+                    self.dest.versions.clear()
+                self.state.queue_demand(HASH, hint())
+                self.state.queue_upload(HASH, "8")
+                report = self.worker.cycle(max_objects=3, max_bytes=200)
+                self.assertEqual(report.get("errors", 0), 0)
+                self.assertEqual(self.kv.get("b2-ready:" + HASH)["source_generation"], "8")
+                self.assertEqual(self.state.queued_demands(10), [])
+                self.assertEqual(self.state.queued_uploads(10), [])
+
     def test_duplicate_and_restart_preserve_retry_deadline_and_pending_cap(self):
         self.assertTrue(self.state.queue_demand(HASH, hint(), cap=1, now=100))
         self.state.defer_demand(HASH, now=100)
@@ -117,8 +163,7 @@ class DemandTests(WorkerFixture):
         self.process()
         ready = self.state.row(HASH)[2]
         self.kv.delete_if_generation = lambda *args: False
-        with self.assertRaises(RuntimeError):
-            self.worker.invalidate(HASH)
+        self.assertFalse(self.worker.invalidate(HASH, observed=self.kv.snapshot("b2-ready:" + HASH)))
         self.assertEqual(self.state.row(HASH)[2], ready)
 
 
@@ -241,6 +286,34 @@ class IntakeTests(unittest.TestCase):
 
 
 class SchedulerTests(WorkerFixture):
+    def test_upload_retry_age_tracks_enqueue_time_instead_of_retry_deadline(self):
+        from unittest.mock import patch
+        self.state.queue_upload(HASH, "7", now=100)
+        self.state.defer_upload(HASH, "7", now=400)
+        self.source.page = lambda *args: ([], None)
+        with patch.object(mirror.time, "time", return_value=401):
+            report = self.worker.cycle(max_objects=2, max_bytes=200)
+        self.assertEqual(report["notification_oldest_seconds"], 301)
+
+    def test_legacy_overcommitted_partials_recover_and_both_copies_finish(self):
+        import hashlib
+        bodies = [b"a" * 40, b"b" * 35]
+        keys = [hashlib.sha256(body).hexdigest() for body in bodies]
+        content = dict(zip(keys, bodies))
+        self.source.head = lambda key: {"generation": "7", "size": len(content[key])}
+        self.source.read = lambda key, generation, start, length: content[key][start:start + length]
+        for key, body, offset in zip(keys, bodies, [5, 30]):
+            self.kv.values["blob:" + key] = dict(self.kv.values["blob:" + HASH], sha256=key, size=len(body))
+            self.state.remember(key)
+            self.state.db.execute("UPDATE objects SET generation='7',size=? WHERE hash=?", (len(body), key))
+            self.state.spool(key).write_bytes(body[:offset])
+        self.state.db.commit()
+        self.worker.max_spool_bytes = 40
+        self.assertEqual(self.worker.process(keys[0], mirror.Budget(200)), "pending")
+        self.assertEqual(self.worker.process(keys[1], mirror.Budget(200)), "ready")
+        self.assertEqual(self.worker.process(keys[0], mirror.Budget(200)), "ready")
+        self.assertFalse(list(self.state.directory.glob("*.part")))
+
     def test_all_three_lanes_progress_rotate_and_do_not_double_attempt_a_hash(self):
         self.state.queue_demand(HASH, hint())
         upload, history = "e" * 64, "f" * 64

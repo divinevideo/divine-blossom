@@ -35,11 +35,19 @@ class Origin(BaseHTTPRequestHandler):
         self.server.requests.append((self.command, self.path, self.headers.get("Range")))
         if self.path == "/b2api/v4/b2_authorize_account":
             assert self.headers.get("Authorization", "").startswith("Basic ")
+            if self.server.auth_status == "disconnect":
+                self.connection.shutdown(socket.SHUT_RDWR)
+                self.connection.close()
+                return
+            if self.server.auth_status == "slow":
+                time.sleep(3.5)
             allowed = {"buckets": [{"id": self.server.bucket_id, "name": self.server.bucket_name}],
                        "capabilities": ["listFiles", "deleteFiles"], "namePrefix": None}
             body = json.dumps({"authorizationToken": "synthetic-token", "apiInfo": {"storageApi": {
                 "apiUrl": "https://api.backblazeb2.com", "allowed": allowed}}}).encode()
-            self.send_response(self.server.auth_status)
+            if self.server.auth_status == "malformed":
+                body = b"invalid authorization JSON"
+            self.send_response(self.server.auth_status if isinstance(self.server.auth_status, int) else 200)
         else:
             parsed = urlparse(self.path)
             is_gcs = parsed.path == f"/gcs-test/{HASH}"
@@ -73,6 +81,8 @@ class Origin(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(self.server.gcs_size if self.path.startswith("/gcs-test/") and self.command == "HEAD" else len(body)))
         self.end_headers()
         if self.command != "HEAD":
+            if self.path == "/b2api/v4/b2_authorize_account" and self.server.auth_status == "slow_body":
+                time.sleep(3.5)
             try:
                 self.wfile.write(body)
             except (BrokenPipeError, ConnectionResetError):
@@ -126,7 +136,7 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                 ready = {"version": 1, "sha256": HASH, "verified_sha256": HASH,
                          "bucket": "private-test", "key": HASH, "size": 9,
                          "verified_at": 1, "destination_version_id": VERSION}
-                cases = [("flag_off", 503), ("flag_malformed", 503), ("valid", 200), ("disabled", 404), ("pending", 404), ("restricted", 404),
+                cases = [("flag_off", 503), ("flag_malformed", 503), ("auth429", 502), ("auth_disconnect", 502), ("valid", 200), ("disabled", 404), ("pending", 404), ("restricted", 404),
                          ("banned", 404), ("deleted", 404), ("age_restricted", 404),
                          ("missing_metadata", 404), ("tombstone", 404), ("vanish_owner", 404),
                          ("vanish_ref", 404), ("copying", 503), ("copying_restricted", 404), ("malformed_gate", 404), ("erasing", 404),
@@ -136,7 +146,11 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                          ("missing_region", 502), ("missing_read_bucket", 502), ("missing_backend", 502), ("erasure_auth_failed", 502),
                          ("wrong_origin_version", 502), ("origin_missing", 503),
                          ("origin_forbidden", 502), ("origin_unauthorized", 502), ("origin_failed", 503), ("origin_disconnect", 503)]
-                demand_cases = [("demand_missing_ready", 200), ("demand_origin_missing", 200),
+                demand_cases = [("demand_auth503", 200), ("demand_auth429", 200),
+                                ("demand_auth_disconnect", 200), ("demand_auth_slow", 200),
+                                ("demand_auth_slow_body", 200), ("demand_auth401", 502),
+                                ("demand_auth403", 502), ("demand_auth_malformed", 502),
+                                ("demand_missing_ready", 200), ("demand_origin_missing", 200),
                                 ("demand_origin_gone", 200), ("demand_origin_failed", 200),
                                 ("demand_origin_disconnect", 200), ("demand_origin_rate", 200), ("demand_origin_slow", 200),
                                 ("demand_invalid_ready", 502), ("demand_wrong_ready_bucket", 502),
@@ -257,6 +271,8 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                         del values["b2_media_region"]
                     if case == "missing_read_bucket":
                         del values["b2_media_bucket"]
+                    if case.startswith("auth"):
+                        server.auth_status = {"auth503": 503, "auth429": 429, "auth401": 401, "auth403": 403, "auth_disconnect": "disconnect", "auth_slow": "slow", "auth_slow_body": "slow_body", "auth_malformed": "malformed"}[case]
                     if case == "erasure_auth_failed":
                         server.auth_status = 503
                     if case == "wrong_origin_version":
@@ -325,6 +341,17 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                         assert len(b2_reads) == (1 if phase == "b2" else 0), server.requests
                         assert len(gcs_reads) == (1 if phase == "gcs" or change == "copying" else 0), server.requests
                         print(f"PASS demand {phase} {origin_status} then {change}")
+                if selected in (None, "auth_races"):
+                    for auth_status in (503, 429, "disconnect", "slow_body"):
+                        server.requests = []
+                        server.status, server.auth_status, server.gcs_status = 200, auth_status, 200
+                        values = dict(base, b2_demand_mirror_enabled="true", test_revoke_phase="b2", test_revoke_change="restricted")
+                        settings.write_text(json.dumps(values))
+                        kv.write_text(json.dumps({f"blob:{HASH}": json.dumps(metadata), f"b2-ready:{HASH}": json.dumps(ready)}))
+                        run(repo, env, "demand_revocation_after_each_origin_is_terminal")
+                        assert server.requests == [("GET", "/b2api/v4/b2_authorize_account", None)], server.requests
+                        print(f"PASS demand native auth {auth_status} then revocation denies fallback")
+                    server.auth_status = 200
                 if selected in (None, "deadline"):
                     settings.write_text(json.dumps(base))
                     kv.write_text(json.dumps({f"blob:{HASH}": json.dumps(metadata)}))
@@ -333,6 +360,7 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                     assert not server.requests, server.requests
                     print("PASS demand exhausted deadline starts no origin")
                 kv.write_text("{}")
+                server.auth_status = 200
                 server.requests = []
                 run(repo, env, "canary_sync_erasure_mutex")
                 assert server.requests == [("GET", "/b2api/v4/b2_authorize_account", None)], server.requests

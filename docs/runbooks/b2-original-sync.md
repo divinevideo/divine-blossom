@@ -130,10 +130,9 @@ because SQLite now owns the durable retry. Preserve/back up this database.
 Changing subscription identity on existing state is rejected. Disabling event
 intake does not discard previously queued work.
 
-At most half of the copy-object slots are used for queued uploads. Historical
-candidates exclude the priority queue, and the first group to use the shared byte
-budget alternates across persisted passes, so large new uploads cannot always
-consume transfer capacity first. Unused slots do not increase the byte ceiling.
+Upload, optional demand, and historical lanes rotate first access to the shared
+object/byte budgets across persisted passes. Historical candidates exclude both
+queues; unused slots are reclaimed without increasing the byte ceiling.
 Notification mode requires at least two object slots. Discovery may list up to
 1000 names per pass independently of the copy-object bound; no listing argument
 increases media transfer limits. The old discovery default remains unchanged.
@@ -286,7 +285,10 @@ stages checksum-verified source bytes, claims the existing copy gate, rereads
 policy/source/readiness, records retry responsibility and clears local completion,
 then conditionally removes only the observed readiness generation and uses the
 existing verified PUT path under that same gate. Changed readiness stops repair.
-All readiness invalidation paths now use generation preconditions.
+All readiness invalidation paths now carry the pre-policy/source observed
+generation, claim the shared gate, and recheck the relevant policy/source decision
+before conditional removal. A new source generation uses the normal verified
+refresh path; it cannot be indefinitely blocked by older remote readiness.
 
 Pending approval, active quarantine and unavailable/malformed policy defer;
 permanent policy denial, vanish/tombstone, erasing, missing source and unsupported
@@ -297,8 +299,11 @@ copying gate indefinitely; repair never removes an erasing gate or B2 versions.
 
 Demand, upload and history lanes rotate first access to the shared object/byte
 budgets across passes, reclaim unused slots and attempt each hash once. Existing
-partial files get priority; a new spool file is admitted only when enough space
-remains to finish it. Intake/listing failures are reported without abandoning
+partial files get priority; no second partial is admitted while a prior one is
+unfinished. An older overcommitted spool recovers by discarding only the current
+worker's incomplete local download before PUT, freeing space for another partial
+to finish. Durable jobs, remote objects and gates remain intact.
+Intake/listing failures are reported without abandoning
 already committed work. Aggregate output includes demand intake/errors/saturation,
 pending queues and oldest ages, reconciliation age, copy results, spool bytes
 and reserved transfer bytes. Migration of an old database starts age tracking at

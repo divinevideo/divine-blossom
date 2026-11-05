@@ -136,8 +136,9 @@ clients deliberately do not fall back from that terminal response.
 Approved supported originals use a verified B2 version when ready. Missing
 readiness or an independently observed B2 404/410 tries GCS once, bypassing FOS,
 legacy origins, storage caches and the global read-primary flag. A B2 transport
-outage, 429 or 5xx also tries GCS once, preserving readiness and emitting no copy
-hint. Copying intent permits GCS without a hint; erasing or malformed intent
+outage, 429 or 5xx (including native authorization availability failures) also
+tries GCS once, preserving readiness and emitting no copy hint. Invalid native
+credentials, malformed responses and incorrect scope/mapping remain terminal. Copying intent permits GCS without a hint; erasing or malformed intent
 remains terminal. Approved originals above 64 MiB use GCS without B2 or hints.
 Malformed/mismatched readiness and auth/configuration/integrity failures return
 502 without fallback; unavailable readiness returns 503. Failed policy/gate
