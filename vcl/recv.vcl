@@ -4,6 +4,14 @@
 # Pass original host to Compute so it can generate correct URLs
 set req.http.X-Original-Host = req.http.Host;
 
+# B2 outer request correlation is generated at the client-facing boundary.
+# Caller IDs never identify an outer request; a shield continuation preserves
+# the trusted edge ID rather than creating another one for the same request.
+if (fastly.ff.visits_this_service == 0 &&
+    req.http.Host ~ "(?i)^media-b2(-cdn)?[.]divine[.]video(:[0-9]+)?$") {
+  set req.http.X-Request-Id = uuid.version4();
+}
+
 # Keep one correlation ID across the outer VCL and chained Compute services.
 if (std.strlen(req.http.X-Request-Id) == 0) {
   set req.http.X-Request-Id = uuid.version4();
@@ -28,6 +36,19 @@ if (req.method != "GET" && req.method != "HEAD") {
 # Don't cache requests with Authorization header (restricted content needs auth check)
 if (req.http.Authorization) {
   return(pass);
+}
+
+# B2 original delivery has one key per declared host and lowercase hash.
+# Only the original parser's bare/.mp4 paths are aliases; arbitrary queries
+# do not affect original bytes. Unknown paths and host aliases cannot lookup.
+if (req.http.Host ~ "(?i)^media-b2(-cdn)?[.]divine[.]video(:[0-9]+)?$") {
+  if (req.http.Host !~ "^media-b2(-cdn)?[.]divine[.]video$" || req.http.Cookie) {
+    return(pass);
+  }
+  if (req.url !~ "^/[0-9a-f]{64}([.]mp4)?([?].*)?$") {
+    return(pass);
+  }
+  set req.url = regsub(req.url, "^/([0-9a-f]{64})([.]mp4)?([?].*)?$", "/\1");
 }
 
 # Cache hash-based content paths: /{64-char-hex}[.ext], /{hash}.hls,

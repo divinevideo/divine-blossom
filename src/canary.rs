@@ -118,6 +118,18 @@ pub(crate) fn handle(req: Request) -> Result<Response> {
     handle_with_origin(req, crate::storage::download_canary_original)
 }
 
+/// Production CDN misses always use the verified demand path. This does not
+/// change the independently configured direct canary's fresh-read behavior.
+pub(crate) fn handle_cdn(req: Request) -> Result<Response> {
+    crate::delivery_telemetry::observe(Provider::None, Cache::Unknown);
+    crate::delivery_telemetry::fallback(Fallback::None);
+    handle_demand(
+        req,
+        crate::storage::download_demand_b2,
+        crate::storage::download_demand_gcs,
+    )
+}
+
 fn recheck_demand(hash: &str, metadata: &BlobMetadata) -> Result<bool> {
     let current = approved_metadata_with_limit(hash, true)?;
     let copying = copy_in_progress(hash)?;

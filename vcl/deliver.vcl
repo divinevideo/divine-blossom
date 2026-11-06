@@ -74,6 +74,31 @@ unset resp.http.x-amz-meta-owner;
 unset resp.http.x-amz-checksum-crc32c;
 unset resp.http.expires;
 
+# B2 client delivery must not reuse the cache-fill Compute request ID or
+# imply a fresh provider read on a warm outer hit. Keep the admission marker
+# on the shield hop, then strip it only on client-facing delivery.
+if (fastly.ff.visits_this_service == 0 &&
+    req.http.Host ~ "(?i)^media-b2(-cdn)?[.]divine[.]video(:[0-9]+)?$") {
+  unset resp.http.X-Divine-B2-CDN-Admission;
+  unset resp.http.X-Playback-Request-Id;
+  unset resp.http.X-Playback-Load-Id;
+  unset resp.http.X-Divine-Source;
+  unset resp.http.X-Divine-Storage-Cache;
+  unset resp.http.X-Divine-Storage-Cache-Reason;
+  unset resp.http.X-Divine-Storage-Cache-Reads;
+  unset resp.http.X-Divine-Storage-Cache-Bytes;
+  unset resp.http.X-Divine-Storage-Cache-Enabled;
+  unset resp.http.X-Divine-Storage-Cache-Compute;
+  unset resp.http.X-Divine-Storage-Cache-Linear-Memory-Bytes;
+  unset resp.http.X-Divine-Storage-Cache-Fill-Mode;
+  unset resp.http.X-Divine-Storage-Cache-Expected-Bytes;
+  unset resp.http.X-Divine-Storage-Cache-Buffer-Reads;
+  unset resp.http.X-Divine-Storage-Cache-Buffered-Bytes;
+  unset resp.http.X-Divine-Storage-Cache-CPU-Ms;
+  set resp.http.X-Request-Id = req.http.X-Divine-Edge-Request-Id;
+  set resp.http.Cache-Control = "private, no-store";
+}
+
 # Add cache debug header
 if (obj.hits > 0) {
   set resp.http.X-Cache = "HIT";

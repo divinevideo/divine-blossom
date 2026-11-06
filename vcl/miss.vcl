@@ -23,3 +23,9 @@
 
 unset bereq.http.Range;
 
+
+# A B2 HEAD miss fills the same complete object as GET, never a headers-only
+# entry. Fastly suppresses the client body for HEAD after cache delivery.
+if (req.http.Host ~ "^media-b2(-cdn)?[.]divine[.]video$") {
+  set bereq.method = "GET";
+}
