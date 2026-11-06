@@ -83,8 +83,10 @@ memory; use the dashboard for non-secret inspection and draft validation:
    non-secret metadata in the change record; never dump the API response or
    request. Preserve compute-diagnostics, edge_upload_logs and all other
    existing service configuration.
-4. Preserve raw guest-written JSON. Compute writes one complete
-   divine.media.delivery.v1 object followed by a newline. Its logging endpoint
+4. Preserve raw guest-written JSON. Compute sends one complete
+   divine.media.delivery.v1 object in exactly one endpoint write, without a
+   newline. Fastly defines a log record at each write call; a separate newline
+   write would create an additional non-JSON record. Its logging endpoint
    template is inert on Compute; leave the default/empty template and validate
    actual message bytes during readback. Apply no VCL view-count template,
    response condition, success-only filter, wrapper, or field transformation.

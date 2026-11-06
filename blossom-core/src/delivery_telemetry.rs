@@ -171,7 +171,9 @@ impl DeliveryLogOutcome {
     }
 }
 
-/// Preserve the raw JSON line, reporting only finite host-level outcomes.
+/// Emit one raw JSON record in exactly one host write, without a newline.
+/// Fastly treats each Write call as a separate record; retrying a short-write
+/// suffix would create another malformed record. Report it as failure instead.
 /// The platform may accept writes without publishing them; no durable ack exists.
 pub fn write_delivery_log<W: std::io::Write>(
     endpoint: Option<W>,
@@ -180,9 +182,8 @@ pub fn write_delivery_log<W: std::io::Write>(
     let Some(mut endpoint) = endpoint else {
         return DeliveryLogOutcome::EndpointUnavailable;
     };
-    if writeln!(endpoint, "{line}").is_err() {
-        DeliveryLogOutcome::WriteFailed
-    } else {
-        DeliveryLogOutcome::HostAccepted
+    match endpoint.write(line.as_bytes()) {
+        Ok(written) if written == line.len() => DeliveryLogOutcome::HostAccepted,
+        _ => DeliveryLogOutcome::WriteFailed,
     }
 }

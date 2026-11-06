@@ -35,7 +35,7 @@ caller retry ID used by existing request logs remains unchanged and is not reuse
 for telemetry. `X-Playback-Request-Id` is attached to the final response only after
 all routing, storage and cache work. IDs and observations are held in request
 memory, never in URLs, cache keys, media objects, or cached responses. Randomness
-or logging failures fail open. Each emitted line fixes its event ID, so Pub/Sub
+or logging failures fail open. Each emitted record fixes its event ID, so Pub/Sub
 redelivery keeps the original ID and payload. Do not regenerate records during
 transport retry.
 

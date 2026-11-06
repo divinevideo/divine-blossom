@@ -160,18 +160,35 @@ fn missing_endpoint_reports_a_safe_counter_without_failing_delivery() {
     );
 }
 
-#[test]
-fn rejected_log_write_reports_no_raw_error_or_event_payload() {
-    struct Rejected;
-    impl std::io::Write for Rejected {
-        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+/// Models the pinned Fastly endpoint boundary: each Write call is one record.
+#[derive(Default)]
+struct RecordingLog {
+    writes: Vec<Vec<u8>>,
+    short_count: Option<usize>,
+    reject: bool,
+}
+impl std::io::Write for RecordingLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.writes.push(bytes.to_vec());
+        if self.reject {
             Err(std::io::Error::other("private auth and request details"))
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
+        } else {
+            Ok(self.short_count.unwrap_or(bytes.len()).min(bytes.len()))
         }
     }
-    let outcome = write_delivery_log(Some(Rejected), "private-request-payload");
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn rejected_log_write_reports_no_raw_error_or_event_payload() {
+    let mut log = RecordingLog {
+        reject: true,
+        ..RecordingLog::default()
+    };
+    let outcome = write_delivery_log(Some(&mut log), "private-request-payload");
+    assert_eq!(log.writes, vec![b"private-request-payload".to_vec()]);
     assert_eq!(outcome, DeliveryLogOutcome::WriteFailed);
     assert_eq!(
         outcome.diagnostic(),
@@ -180,13 +197,34 @@ fn rejected_log_write_reports_no_raw_error_or_event_payload() {
 }
 
 #[test]
-fn accepted_log_write_preserves_raw_json_and_does_not_claim_sink_delivery() {
-    let mut bytes = Vec::new();
-    let outcome = write_delivery_log(Some(&mut bytes), r#"{"schema":"divine.media.delivery.v1"}"#);
-    assert_eq!(bytes, b"{\"schema\":\"divine.media.delivery.v1\"}\n");
+fn accepted_log_write_is_exactly_one_raw_json_record_without_delimiter_record() {
+    let mut log = RecordingLog::default();
+    let outcome = write_delivery_log(Some(&mut log), r#"{"schema":"divine.media.delivery.v1"}"#);
+    assert_eq!(
+        log.writes,
+        vec![b"{\"schema\":\"divine.media.delivery.v1\"}".to_vec()]
+    );
     assert_eq!(outcome, DeliveryLogOutcome::HostAccepted);
     assert_eq!(
         outcome.diagnostic(),
         "playback_delivery_log outcome=host_accepted count=1"
+    );
+}
+
+#[test]
+fn short_log_write_reports_failure_without_retrying_a_fragment_as_another_record() {
+    let mut log = RecordingLog {
+        short_count: Some(3),
+        ..RecordingLog::default()
+    };
+    let outcome = write_delivery_log(Some(&mut log), r#"{"schema":"divine.media.delivery.v1"}"#);
+    assert_eq!(outcome, DeliveryLogOutcome::WriteFailed);
+    assert_eq!(
+        log.writes,
+        vec![b"{\"schema\":\"divine.media.delivery.v1\"}".to_vec()]
+    );
+    assert_eq!(
+        outcome.diagnostic(),
+        "playback_delivery_log outcome=write_failed count=1"
     );
 }
