@@ -2459,10 +2459,42 @@ fn vanish_physical_outcome(
     if failed.contains(hash) || !replica_enabled {
         Physical::Failed
     } else if remaining.contains(hash) {
-        Physical::Unknown
+        // A version set larger than one bounded page is known, safe progress:
+        // the next wave continues it. It is not an uncertain outcome, so it
+        // stays Pending and may run again.
+        Physical::Pending
     } else {
         Physical::Absent
     }
+}
+
+/// Split candidate hashes into those allowed to run the bounded physical wave
+/// and those that must be held this pass.
+///
+/// A hash runs only when it has a durable attempt epoch and its phase record is
+/// readable and says the wave may run. Anything else — a missing epoch from a
+/// failed `begin_vanish_phase`, or an unreadable phase record — is held rather
+/// than erased without durable progress, so a partial failure can never cause a
+/// destructive wave with no record of it.
+pub(crate) fn plan_vanish_physical_with(
+    hashes: &[String],
+    epochs: &std::collections::HashMap<String, String>,
+    mut may_run: impl FnMut(&str) -> Result<bool>,
+) -> (Vec<String>, Vec<String>) {
+    let mut run = Vec::new();
+    let mut held = Vec::new();
+    for hash in hashes {
+        if !epochs.contains_key(&hash.to_ascii_lowercase()) {
+            held.push(hash.clone());
+            continue;
+        }
+        match may_run(hash) {
+            Ok(true) => run.push(hash.clone()),
+            // Unreadable state fails closed: hold, never erase.
+            Ok(false) | Err(_) => held.push(hash.clone()),
+        }
+    }
+    (run, held)
 }
 
 /// Persist the deny/erasing gate and open a phased physical attempt for a hash
@@ -2479,10 +2511,13 @@ pub(crate) fn begin_vanish_phase(hash: &str) -> Result<Option<String>> {
     Ok(Some(crate::b2_cdn_phase::begin_erase(hash)?))
 }
 
-/// Whether the bounded wave must run for this hash. A completed hash and an
-/// already-absent hash never replay their physical erase.
-pub(crate) fn vanish_needs_physical(hash: &str) -> bool {
-    crate::b2_cdn_phase::needs_physical(hash).unwrap_or(true)
+/// Whether the bounded wave must run for this hash.
+///
+/// An unreadable phase record returns `Err`, and the caller holds the hash.
+/// Defaulting to "run" here would turn a KV read failure into a destructive
+/// erase with no durable progress.
+pub(crate) fn vanish_needs_physical(hash: &str) -> Result<bool> {
+    crate::b2_cdn_phase::needs_physical(hash)
 }
 
 /// Record the wave's outcome for the exact attempt and queue the blocking final
@@ -2530,7 +2565,7 @@ pub(crate) fn vanish_attempt_for_test(
     let Some(epoch) = begin_vanish_phase(hash).ok().flatten() else {
         return (false, true);
     };
-    let ran = if vanish_needs_physical(hash) {
+    let ran = if vanish_needs_physical(hash).unwrap_or(false) {
         let failed = wave(&[hash.to_string()]);
         if let Err(error) = finish_vanish_phase(hash, &epoch, &failed, &HashSet::new()) {
             eprintln!("[test] finish_vanish_phase failed: {error}");
@@ -2544,9 +2579,46 @@ pub(crate) fn vanish_attempt_for_test(
 
 #[cfg(test)]
 mod vanish_phase_tests {
-    use super::vanish_physical_outcome;
+    use super::{plan_vanish_physical_with, vanish_physical_outcome};
     use crate::b2_cdn_phase::Physical;
     use std::collections::HashSet;
+
+    #[test]
+    fn known_remaining_progress_is_not_an_uncertain_outcome() {
+        let hash = "b".repeat(64);
+        let failed: HashSet<String> = HashSet::new();
+        let remaining: HashSet<String> = [hash.clone()].into_iter().collect();
+        // B2 versions beyond one bounded page is known safe progress: it must
+        // retry the wave next time, not become an unreconcilable Unknown.
+        assert_eq!(
+            vanish_physical_outcome(&hash, &failed, &remaining, true),
+            Physical::Pending
+        );
+    }
+
+    #[test]
+    fn the_physical_wave_excludes_hashes_without_a_durable_epoch() {
+        let with_epoch = "c".repeat(64);
+        let no_epoch = "d".repeat(64);
+        let unsafe_state = "e".repeat(64);
+        let hashes = vec![with_epoch.clone(), no_epoch.clone(), unsafe_state.clone()];
+        let mut epochs = std::collections::HashMap::new();
+        epochs.insert(with_epoch.clone(), "0".repeat(32));
+        epochs.insert(unsafe_state.clone(), "1".repeat(32));
+        let (run, held) = plan_vanish_physical_with(&hashes, &epochs, |hash| {
+            if hash == unsafe_state {
+                Err(crate::error::BlossomError::MetadataError("unreadable".into()))
+            } else {
+                Ok(true)
+            }
+        });
+        assert_eq!(run, vec![with_epoch], "only a durable, readable hash may run");
+        assert_eq!(
+            held,
+            vec![no_epoch, unsafe_state],
+            "missing epoch and unreadable state are held, never erased"
+        );
+    }
 
     #[test]
     fn a_skipped_replica_erase_is_never_reported_absent() {

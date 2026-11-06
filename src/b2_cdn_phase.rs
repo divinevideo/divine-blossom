@@ -70,6 +70,11 @@ impl Physical {
 struct Record {
     epoch: String,
     physical: Physical,
+    /// A final purge intent was durably queued for this epoch. Recorded
+    /// separately from the physical outcome so a crash between "physical is
+    /// absent" and "intent queued" is repaired on the next request instead of
+    /// leaving the hash pending forever.
+    final_queued: bool,
     /// The final purge for this epoch was purged and acknowledged.
     final_acked: bool,
     /// Reported complete. Implies `Absent` and `final_acked`.
@@ -118,6 +123,7 @@ fn encode(record: &Record) -> String {
         "version": RECORD_VERSION,
         "epoch": record.epoch,
         "physical": record.physical.as_str(),
+        "final_queued": record.final_queued,
         "final_acked": record.final_acked,
         "complete": record.complete,
         "updated_at": record.updated_at,
@@ -130,7 +136,7 @@ fn parse(value: &str) -> Option<Record> {
     let object = object.as_object()?;
     // A record with any key we do not own may be a newer schema with different
     // meaning. Unreadable, never reinterpreted.
-    if object.len() != 6 {
+    if object.len() != 7 {
         return None;
     }
     if object.get("version")?.as_u64()? != RECORD_VERSION {
@@ -141,6 +147,7 @@ fn parse(value: &str) -> Option<Record> {
         return None;
     }
     let physical = Physical::parse(object.get("physical")?.as_str()?)?;
+    let final_queued = object.get("final_queued")?.as_bool()?;
     let final_acked = object.get("final_acked")?.as_bool()?;
     let complete = object.get("complete")?.as_bool()?;
     // Completion is only coherent when the bytes are absent and the final purge
@@ -148,9 +155,14 @@ fn parse(value: &str) -> Option<Record> {
     if complete && (!final_acked || physical != Physical::Absent) {
         return None;
     }
+    // An acknowledgement implies its intent was queued.
+    if final_acked && !final_queued {
+        return None;
+    }
     Some(Record {
         epoch: epoch.to_string(),
         physical,
+        final_queued,
         final_acked,
         complete,
         updated_at: object.get("updated_at")?.as_u64()?,
@@ -191,6 +203,108 @@ fn lookup(store: &KVStore, key: &str) -> Result<Option<Observed>> {
     }))
 }
 
+/// Strict read: a present but unreadable record is an error.
+///
+/// Destructive decisions must not treat a malformed record as "no record", or a
+/// corrupt phase would look like a fresh hash and re-run the wave.
+fn observed_strict(hash: &str) -> Result<Option<Observed>> {
+    let Some(key) = phase_key(&hash.to_ascii_lowercase()) else {
+        return Err(BlossomError::BadRequest("Invalid hash for B2 CDN phase".into()));
+    };
+    let store = open_store()?;
+    let mut response = match store.build_lookup().execute(&key) {
+        Ok(response) => response,
+        Err(KVStoreError::ItemNotFound) => return Ok(None),
+        Err(_) => {
+            return Err(BlossomError::MetadataError(
+                "B2 CDN phase unavailable".into(),
+            ))
+        }
+    };
+    let generation = response.current_generation();
+    let body = response.take_body_bytes();
+    if body.len() > MAX_RECORD_BYTES {
+        return Err(BlossomError::MetadataError(
+            "B2 CDN phase record invalid".into(),
+        ));
+    }
+    let value = std::str::from_utf8(&body)
+        .map_err(|_| BlossomError::MetadataError("B2 CDN phase record invalid".into()))?;
+    let record = parse(value)
+        .ok_or_else(|| BlossomError::MetadataError("B2 CDN phase record invalid".into()))?;
+    Ok(Some(Observed {
+        record,
+        generation,
+    }))
+}
+
+/// A checked purge target captured *before* the purge callback runs.
+///
+/// The drain must not re-read the phase after the purge: the physical outcome
+/// may have changed mid-flight, and a stale callback must not acknowledge the
+/// new state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PurgeToken {
+    hash: String,
+    epoch: String,
+    generation: u64,
+}
+
+/// Capture the purge target for a hash, or `None` when it is not purgeable now.
+///
+/// Returns `Err` for an unreadable record so a corrupt phase is not treated as
+/// "nothing to purge".
+pub(crate) fn purge_token(hash: &str) -> Result<Option<PurgeToken>> {
+    let hash = hash.to_ascii_lowercase();
+    let Some(observed) = observed_strict(&hash)? else {
+        return Ok(None);
+    };
+    if observed.record.final_acked || observed.record.physical == Physical::Pending {
+        return Ok(None);
+    }
+    Ok(Some(PurgeToken {
+        hash,
+        epoch: observed.record.epoch,
+        generation: observed.generation,
+    }))
+}
+
+/// Acknowledge a purge only if the phase is still the exact state the token
+/// captured. A physical change during the purge bumps the generation, so the
+/// stale callback cannot advance the new outcome.
+pub(crate) fn mark_final_purged_observed(store: &KVStore, token: &PurgeToken) -> Result<bool> {
+    let Some(key) = phase_key(&token.hash) else {
+        return Ok(false);
+    };
+    let Some(observed) = lookup(store, &key)? else {
+        return Ok(false);
+    };
+    if observed.generation != token.generation
+        || observed.record.epoch != token.epoch
+        || observed.record.final_acked
+        || !observed.record.final_queued
+    {
+        return Ok(false);
+    }
+    let updated = Record {
+        final_acked: true,
+        updated_at: now(),
+        ..observed.record
+    };
+    match store
+        .build_insert()
+        .mode(InsertMode::Overwrite)
+        .if_generation_match(observed.generation)
+        .execute(&key, encode(&updated))
+    {
+        Ok(()) => Ok(true),
+        Err(KVStoreError::ItemPreconditionFailed) => Ok(false),
+        Err(_) => Err(BlossomError::MetadataError(
+            "B2 CDN phase unavailable".into(),
+        )),
+    }
+}
+
 fn observed(hash: &str) -> Result<Option<Observed>> {
     let Some(key) = phase_key(&hash.to_ascii_lowercase()) else {
         return Err(BlossomError::BadRequest("Invalid hash for B2 CDN phase".into()));
@@ -200,12 +314,17 @@ fn observed(hash: &str) -> Result<Option<Observed>> {
 
 /// Whether the hash should run the bounded physical wave.
 ///
-/// A completed hash never replays its erase; an absent hash has nothing left to
-/// delete. Everything else — including a failed or unknown wave — may run again.
+/// Only a hash that has never run (`Pending`) or whose wave definitely failed
+/// may run again. `Absent` has nothing left to delete, `Complete` must never
+/// replay, and `Unknown` must be reconciled read-only rather than re-issued as
+/// a second destructive wave.
 pub(crate) fn needs_physical(hash: &str) -> Result<bool> {
-    Ok(match observed(hash)? {
+    Ok(match observed_strict(hash)? {
         None => true,
-        Some(observed) => !observed.record.complete && observed.record.physical != Physical::Absent,
+        Some(observed) => {
+            !observed.record.complete
+                && matches!(observed.record.physical, Physical::Pending | Physical::Failed)
+        }
     })
 }
 
@@ -230,6 +349,7 @@ pub(crate) fn begin_erase(hash: &str) -> Result<String> {
     let record = Record {
         epoch: epoch_nonce()?,
         physical: Physical::Pending,
+        final_queued: false,
         final_acked: false,
         complete: false,
         updated_at: now(),
@@ -270,8 +390,17 @@ pub(crate) fn record_physical(hash: &str, epoch: &str, outcome: Physical) -> Res
         // Never downgrade proven absence to an unknown observation.
         return Ok(false);
     }
+    if observed.record.physical == outcome {
+        // Nothing changed, so a valid acknowledgement still describes this
+        // exact physical state. Keep it.
+        return Ok(false);
+    }
     let updated = Record {
         physical: outcome,
+        // A purge or intent that happened before this new observation does not
+        // cover the new physical state. Require a fresh intent and purge.
+        final_queued: false,
+        final_acked: false,
         updated_at: now(),
         ..observed.record
     };
@@ -298,10 +427,80 @@ pub(crate) fn final_purge_pending(hash: &str) -> Result<bool> {
     Ok(match observed(hash)? {
         None => false,
         Some(observed) => {
-            !observed.record.final_acked
-                && matches!(observed.record.physical, Physical::Absent | Physical::Failed)
+            // Every definite outcome purges cached bytes. `Unknown` purges too,
+            // because a warm outer entry may still serve whatever the wave did;
+            // it simply can never complete. `Pending` has not run yet.
+            !observed.record.final_acked && observed.record.physical != Physical::Pending
         }
     })
+}
+
+/// Whether a final intent has been durably queued for this hash's epoch.
+pub(crate) fn final_queued(hash: &str) -> Result<bool> {
+    Ok(observed(hash)?.is_some_and(|observed| observed.record.final_queued))
+}
+
+/// Record that a final intent was queued for the exact epoch.
+///
+/// A stale epoch is refused rather than reported as success.
+pub(crate) fn mark_final_queued(hash: &str, epoch: &str) -> Result<bool> {
+    let hash = hash.to_ascii_lowercase();
+    let Some(key) = phase_key(&hash) else {
+        return Ok(false);
+    };
+    let store = open_store()?;
+    let Some(observed) = lookup(&store, &key)? else {
+        return Ok(false);
+    };
+    if observed.record.epoch != epoch || observed.record.final_queued {
+        return Ok(false);
+    }
+    let updated = Record {
+        final_queued: true,
+        updated_at: now(),
+        ..observed.record
+    };
+    match store
+        .build_insert()
+        .mode(InsertMode::Overwrite)
+        .if_generation_match(observed.generation)
+        .execute(&key, encode(&updated))
+    {
+        Ok(()) => Ok(true),
+        Err(KVStoreError::ItemPreconditionFailed) => Ok(false),
+        Err(_) => Err(BlossomError::MetadataError(
+            "B2 CDN phase unavailable".into(),
+        )),
+    }
+}
+
+/// Ensure a durable final purge intent exists for this hash, independent of
+/// whether the physical wave runs on this request.
+///
+/// This repairs the crash gap where the physical outcome was recorded but the
+/// intent was never queued: the next request must still enqueue, even though
+/// `needs_physical` is now false. Idempotent through the durable `final_queued`
+/// flag. Returns `true` when an intent is durably queued.
+pub(crate) fn ensure_final_intent(hash: &str) -> Result<bool> {
+    let hash = hash.to_ascii_lowercase();
+    let Some(key) = phase_key(&hash) else {
+        return Ok(false);
+    };
+    let store = open_store()?;
+    let Some(observed) = lookup(&store, &key)? else {
+        return Ok(false);
+    };
+    if observed.record.final_queued {
+        return Ok(true);
+    }
+    if observed.record.physical == Physical::Pending {
+        // Nothing physical has happened yet; this request's wave will decide.
+        return Ok(false);
+    }
+    let epoch = observed.record.epoch.clone();
+    crate::b2_cdn_purge::enqueue(&hash, crate::b2_cdn_purge::Phase::Final)?;
+    mark_final_queued(&hash, &epoch)?;
+    Ok(true)
 }
 
 /// Whether the final purge for this hash is acknowledged. Used by the drain to
@@ -329,6 +528,7 @@ pub(crate) fn mark_final_purged(store: &KVStore, hash: &str, epoch: &str) -> Res
     };
     if observed.record.epoch != epoch
         || observed.record.final_acked
+        || !observed.record.final_queued
         || !matches!(observed.record.physical, Physical::Absent | Physical::Failed)
     {
         return Ok(false);
@@ -358,7 +558,7 @@ pub(crate) fn mark_final_purged(store: &KVStore, hash: &str, epoch: &str) -> Res
 /// acknowledged. A completed record stays true; a failed physical wave can never
 /// become true.
 pub(crate) fn complete_ready(hash: &str) -> Result<bool> {
-    Ok(observed(hash)?.is_some_and(|observed| {
+    Ok(observed_strict(hash)?.is_some_and(|observed| {
         observed.record.complete
             || (observed.record.physical == Physical::Absent && observed.record.final_acked)
     }))
@@ -420,6 +620,7 @@ mod tests {
         Record {
             epoch: EPOCH.into(),
             physical: Physical::Pending,
+            final_queued: false,
             final_acked: false,
             complete: false,
             updated_at: 7,
@@ -446,12 +647,14 @@ mod tests {
             Record { complete: true, ..record() },
             Record {
                 complete: true,
+                final_queued: true,
                 final_acked: true,
                 physical: Physical::Failed,
                 ..record()
             },
             Record {
                 complete: true,
+                final_queued: true,
                 final_acked: true,
                 physical: Physical::Pending,
                 ..record()
@@ -539,7 +742,9 @@ mod tests {
             // Bytes gone is not completion: the final purge has not acked.
             assert!(!complete_ready(&hash).unwrap());
 
-            // Drain purges and acknowledges the exact epoch.
+            // The drain queues the intent after the definite outcome, then
+            // purges and acknowledges the exact epoch.
+            assert!(ensure_final_intent(&hash).unwrap());
             assert!(mark_final_purged(&store(), &hash, &attempt).unwrap());
             assert!(complete_ready(&hash).unwrap());
             assert!(mark_complete(&hash).unwrap());
@@ -558,6 +763,7 @@ mod tests {
             assert!(record_physical(&hash, &epoch, Physical::Failed).unwrap());
             // Failed still needs a purge so cached bytes leave the CDN.
             assert!(final_purge_pending(&hash).unwrap());
+            assert!(ensure_final_intent(&hash).unwrap());
             assert!(mark_final_purged(&store(), &hash, &epoch).unwrap());
             // But a failed wave can never be complete.
             assert!(!complete_ready(&hash).unwrap());
@@ -575,10 +781,11 @@ mod tests {
             let epoch = begin_erase(&hash).unwrap();
             assert!(record_physical(&hash, &epoch, Physical::Unknown).unwrap());
             assert_eq!(physical_state(&hash).unwrap(), Some(Physical::Unknown));
-            // Unknown must not purge yet: it needs a read-only reconcile.
-            assert!(!final_purge_pending(&hash).unwrap());
+            // Unknown must not replay the destructive wave, but its cached bytes
+            // must still be purged; it simply can never complete.
+            assert!(!needs_physical(&hash).unwrap());
+            assert!(final_purge_pending(&hash).unwrap());
             assert!(!complete_ready(&hash).unwrap());
-            assert!(needs_physical(&hash).unwrap());
             // A later definite observation resolves it.
             assert!(record_physical(&hash, &epoch, Physical::Absent).unwrap());
             assert!(final_purge_pending(&hash).unwrap());
@@ -597,6 +804,7 @@ mod tests {
             // bogus one; it must be refused.
             assert!(!mark_final_purged(&store(), &hash, &"f".repeat(32)).unwrap());
             assert!(!complete_ready(&hash).unwrap());
+            assert!(ensure_final_intent(&hash).unwrap());
             assert!(mark_final_purged(&store(), &hash, &old_epoch).unwrap());
             assert!(complete_ready(&hash).unwrap());
             reset_all();
@@ -621,6 +829,7 @@ mod tests {
             let hash = "d6".repeat(32);
             let epoch = begin_erase(&hash).unwrap();
             record_physical(&hash, &epoch, Physical::Absent).unwrap();
+            ensure_final_intent(&hash).unwrap();
             mark_final_purged(&store(), &hash, &epoch).unwrap();
             mark_complete(&hash).unwrap();
             // A third request must not reopen the attempt or replay physical.
@@ -639,6 +848,7 @@ mod tests {
             let epoch = begin_erase(&hash).unwrap();
             record_physical(&hash, &epoch, Physical::Absent).unwrap();
             // Purge callback failed, so the drain never acked.
+            assert!(ensure_final_intent(&hash).unwrap());
             assert!(final_purge_pending(&hash).unwrap());
             assert!(!final_acked(&hash).unwrap());
             assert!(!complete_ready(&hash).unwrap());
@@ -679,7 +889,8 @@ mod tests {
             assert_eq!(waves.get(), 1, "the wave ran exactly once");
             assert!(!complete);
 
-            // The drain purges and acknowledges the final phase.
+            // The drain queues the intent, purges, and acknowledges.
+            assert!(ensure_final_intent(&hash).unwrap());
             let epoch = epoch(&hash).unwrap().expect("attempt epoch");
             assert!(mark_final_purged(&store(), &hash, &epoch).unwrap());
 
@@ -719,6 +930,112 @@ mod tests {
             assert_eq!(waves.get(), 1, "the failing wave ran once; retry is separate");
             assert_eq!(physical_state(&hash).unwrap(), Some(Physical::Absent));
             assert!(!complete);
+            reset_all();
+        }
+
+        #[test]
+        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-phase-tests.py"]
+        fn unknown_never_replays_physical_but_still_purges() {
+            reset_all();
+            let hash = "f1".repeat(32);
+            let epoch = begin_erase(&hash).unwrap();
+            record_physical(&hash, &epoch, Physical::Unknown).unwrap();
+            // An uncertain outcome must not blindly replay the destructive wave.
+            assert!(!needs_physical(&hash).unwrap(), "Unknown must not re-run the wave");
+            // But cached bytes must still leave the CDN.
+            assert!(final_purge_pending(&hash).unwrap());
+            assert!(!complete_ready(&hash).unwrap());
+            reset_all();
+        }
+
+        #[test]
+        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-phase-tests.py"]
+        fn a_changed_physical_outcome_invalidates_the_previous_ack() {
+            reset_all();
+            let hash = "f2".repeat(32);
+            let epoch = begin_erase(&hash).unwrap();
+            // Failed, intent queued, purged, acked.
+            record_physical(&hash, &epoch, Physical::Failed).unwrap();
+            assert!(ensure_final_intent(&hash).unwrap());
+            assert!(mark_final_purged(&store(), &hash, &epoch).unwrap());
+            assert!(final_acked(&hash).unwrap());
+            assert!(!complete_ready(&hash).unwrap(), "failed can never complete");
+            // Retry observes absence. The old ack predates this physical state,
+            // so it must not satisfy completion; a fresh purge is required.
+            record_physical(&hash, &epoch, Physical::Absent).unwrap();
+            assert!(
+                !final_acked(&hash).unwrap(),
+                "ack from before the new outcome must be cleared"
+            );
+            assert!(final_purge_pending(&hash).unwrap());
+            assert!(!complete_ready(&hash).unwrap());
+            assert!(ensure_final_intent(&hash).unwrap());
+            assert!(mark_final_purged(&store(), &hash, &epoch).unwrap());
+            assert!(complete_ready(&hash).unwrap());
+            reset_all();
+        }
+
+        #[test]
+        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-phase-tests.py"]
+        fn a_same_outcome_report_keeps_a_valid_ack() {
+            reset_all();
+            let hash = "f3".repeat(32);
+            let epoch = begin_erase(&hash).unwrap();
+            record_physical(&hash, &epoch, Physical::Absent).unwrap();
+            assert!(ensure_final_intent(&hash).unwrap());
+            assert!(mark_final_purged(&store(), &hash, &epoch).unwrap());
+            // A repeated identical observation must not force a second purge.
+            assert!(!record_physical(&hash, &epoch, Physical::Absent).unwrap());
+            assert!(final_acked(&hash).unwrap());
+            assert!(complete_ready(&hash).unwrap());
+            reset_all();
+        }
+
+        #[test]
+        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-phase-tests.py"]
+        fn a_crash_between_absent_and_enqueue_is_repaired_on_retry() {
+            reset_all();
+            let hash = "f4".repeat(32);
+            let epoch = begin_erase(&hash).unwrap();
+            // Physical recorded Absent, then the process died before enqueue.
+            record_physical(&hash, &epoch, Physical::Absent).unwrap();
+            assert!(!final_queued(&hash).unwrap());
+            // The next request sees needs_physical == false, so the wave will not
+            // run; ensure_final_intent must still queue the intent.
+            assert!(!needs_physical(&hash).unwrap());
+            assert!(ensure_final_intent(&hash).unwrap());
+            assert!(final_queued(&hash).unwrap());
+            assert!(final_purge_pending(&hash).unwrap());
+            // Idempotent on a further request.
+            assert!(ensure_final_intent(&hash).unwrap());
+            assert!(mark_final_purged(&store(), &hash, &epoch).unwrap());
+            assert!(complete_ready(&hash).unwrap());
+            reset_all();
+        }
+
+        #[test]
+        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-phase-tests.py"]
+        fn a_queued_intent_is_required_before_an_ack_counts() {
+            reset_all();
+            let hash = "f5".repeat(32);
+            let epoch = begin_erase(&hash).unwrap();
+            record_physical(&hash, &epoch, Physical::Absent).unwrap();
+            // No intent queued yet: an ack must not advance the record.
+            assert!(!mark_final_purged(&store(), &hash, &epoch).unwrap());
+            assert!(ensure_final_intent(&hash).unwrap());
+            assert!(mark_final_purged(&store(), &hash, &epoch).unwrap());
+            assert!(complete_ready(&hash).unwrap());
+            reset_all();
+        }
+
+        #[test]
+        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-phase-tests.py"]
+        fn ensure_final_intent_does_nothing_before_the_wave() {
+            reset_all();
+            let hash = "f6".repeat(32);
+            begin_erase(&hash).unwrap();
+            assert!(!ensure_final_intent(&hash).unwrap());
+            assert!(!final_queued(&hash).unwrap());
             reset_all();
         }
 

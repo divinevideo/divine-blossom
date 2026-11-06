@@ -63,7 +63,8 @@ use crate::storage::{
     b2_replica_enabled, blob_exists, check_funnelcake_audio_reuse, current_timestamp,
     delete_blob as storage_delete, delivery_probe_sample, dispatch_vanish_timing_log,
     download_blob_read_through, download_blob_with_fallback, download_thumbnail,
-    begin_vanish_phase, erase_vanish_batch, finish_vanish_phase, probe_erased_delivery,
+    begin_vanish_phase, erase_vanish_batch, finish_vanish_phase, plan_vanish_physical_with,
+    probe_erased_delivery,
     trigger_audio_extraction, vanish_complete, vanish_needs_physical,
     trigger_cloud_run_delete_blob, upload_blob, write_audit_log, write_vanish_audit_log,
     DeliveryProbeCounts, VanishAuditInitiator, VanishAuditPhase, VanishStorageTimings,
@@ -5270,14 +5271,25 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
                 }
             }
         }
-        // Only run the bounded physical wave for hashes that still need it. A
-        // completed hash must never replay its erase, and one already proven
-        // absent has nothing to delete.
-        let physical_hashes: Vec<String> = erase_hashes
-            .iter()
-            .filter(|hash| vanish_needs_physical(hash))
-            .cloned()
-            .collect();
+        // Only run the bounded physical wave for hashes that still need it and
+        // have durable phase progress. A completed hash must never replay its
+        // erase, one already proven absent has nothing to delete, and a hash
+        // whose phase could not be opened or read must be held rather than
+        // erased without a record.
+        let (physical_hashes, held_hashes) = plan_vanish_physical_with(
+            &erase_hashes,
+            &wave_epochs,
+            |hash| vanish_needs_physical(hash),
+        );
+        for hash in &held_hashes {
+            eprintln!(
+                "[VANISH] pubkey={} hash={} held: no durable purge phase",
+                pubkey, hash
+            );
+            retry_hashes.push(hash.clone());
+            deferred_pending = deferred_pending.saturating_add(1);
+            phase_blocked.insert(hash.to_lowercase());
+        }
         let storage_result = if physical_hashes.is_empty() {
             crate::storage::VanishStorageResult::default()
         } else {
@@ -5314,6 +5326,20 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
                 execution.errors += 1;
             }
         }
+        // Repair a crash between recording the outcome and queueing the intent,
+        // and cover hashes whose wave already finished on an earlier request so
+        // they never stay pending with no final intent. Idempotent.
+        for hash in &erase_hashes {
+            if wave_epochs.contains_key(&hash.to_lowercase()) || phase_blocked.contains(&hash.to_lowercase()) {
+                if let Err(error) = crate::b2_cdn_phase::ensure_final_intent(hash) {
+                    eprintln!(
+                        "[VANISH] pubkey={} hash={} failed to ensure final purge intent: {}",
+                        pubkey, hash, error
+                    );
+                    execution.errors += 1;
+                }
+            }
+        }
 
         let finalize_started = Instant::now();
         let mut failed_derived_sources = HashSet::new();
@@ -5327,12 +5353,26 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
                 deferred_derived_sources.insert(plan.source_hash.clone());
                 continue;
             }
+            // The audio object has its own warm CDN entry. Removing the mapping
+            // before its final purge is acknowledged would lose discovery while
+            // the cached audio still serves. Keep the source pending until the
+            // audio phase completes.
+            if crate::storage::cdn_invalidation_configured()
+                && !crate::storage::vanish_complete(&plan.audio_hash)
+            {
+                deferred_derived_sources.insert(plan.source_hash.clone());
+                continue;
+            }
             if let Err(error) = finalize_derived_audio_cleanup(plan) {
                 eprintln!(
                     "[VANISH] pubkey={} hash={} failed to finalize derived audio: {}",
                     pubkey, plan.source_hash, error
                 );
                 failed_derived_sources.insert(plan.source_hash.clone());
+                continue;
+            }
+            if crate::storage::cdn_invalidation_configured() {
+                let _ = crate::b2_cdn_phase::mark_complete(&plan.audio_hash);
             }
         }
         let mut finalize_blobs = Vec::new();

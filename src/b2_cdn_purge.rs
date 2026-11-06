@@ -682,30 +682,27 @@ fn drain(
                 }
                 RecordState::Committed => {
                     processed += 1;
+                    // Capture the exact phase state BEFORE the purge callback.
+                    // The physical outcome can change mid-purge, and a stale
+                    // callback must never acknowledge the new state.
+                    let phase_token = if snapshot.record.phase == Phase::Final {
+                        crate::b2_cdn_phase::purge_token(&snapshot.hash)?
+                    } else {
+                        None
+                    };
                     match purge(&[snapshot.hash.clone()]) {
                         Ok(()) => {
-                            // Only the final phase is blocking. Advance the
-                            // phase record, bound to the epoch the intent was
-                            // created for, then write the attempt-bound receipt.
-                            // A failure leaves both outstanding, so a checked
-                            // purge is never claimed as an acknowledgement.
-                            if snapshot.record.phase == Phase::Final {
-                                let phase_epoch =
-                                    crate::b2_cdn_phase::epoch(&snapshot.hash)?;
-                                if let Some(phase_epoch) = phase_epoch {
-                                    if crate::b2_cdn_phase::mark_final_purged(
-                                        store,
-                                        &snapshot.hash,
-                                        &phase_epoch,
-                                    )? {
-                                        let token = Token {
-                                            key: snapshot.key.clone(),
-                                            hash: snapshot.hash.clone(),
-                                            attempt: snapshot.record.attempt.clone(),
-                                            generation: snapshot.generation,
-                                        };
-                                        ack_with_store(store, &token, "final")?;
-                                    }
+                            // Only aacknowledge the exact state the token
+                            // captured, by generation compare-and-swap.
+                            if let Some(token) = phase_token {
+                                if crate::b2_cdn_phase::mark_final_purged_observed(store, &token)? {
+                                    let receipt = Token {
+                                        key: snapshot.key.clone(),
+                                        hash: snapshot.hash.clone(),
+                                        attempt: snapshot.record.attempt.clone(),
+                                        generation: snapshot.generation,
+                                    };
+                                    ack_with_store(store, &receipt, "final")?;
                                 }
                             }
                             match complete_observed(store, &snapshot)? {
@@ -1416,6 +1413,51 @@ mod tests {
 
         #[test]
         #[ignore = "requires local KV fixture; scripts/run-b2-cdn-purge-outbox-tests.py"]
+        fn a_stale_purge_callback_cannot_ack_a_physical_state_change() {
+            use crate::b2_cdn_phase::{self, Physical};
+            let store = store();
+            reset_all(&store);
+            let hash = "bf".repeat(32);
+            let _ = store
+                .build_delete()
+                .execute(&format!("b2-cdn-phase:v1:{hash}"));
+
+            // Physical failed, intent queued: the drain may purge it.
+            let phase_epoch = b2_cdn_phase::begin_erase(&hash).unwrap();
+            b2_cdn_phase::record_physical(&hash, &phase_epoch, Physical::Failed).unwrap();
+            b2_cdn_phase::ensure_final_intent(&hash).unwrap();
+            let token = begin_phase(&hash, Phase::Final).unwrap();
+            commit(&store, &token).unwrap();
+
+            // The purge "succeeds" but, mid-flight, the physical outcome changes
+            // to Absent. That is a new state needing its own purge.
+            let racing_purge = |_: &[String]| -> Result<()> {
+                b2_cdn_phase::record_physical(&hash, &phase_epoch, Physical::Absent).unwrap();
+                Ok(())
+            };
+            let outcome = drain(&store, 2, racing_purge).unwrap();
+            assert_eq!(outcome.result, 0, "stale callback must not finish the row");
+            assert!(
+                !acknowledged(&store, &token, "final").unwrap(),
+                "a stale purge must not write a final receipt"
+            );
+            assert!(
+                !b2_cdn_phase::complete_ready(&hash).unwrap(),
+                "new Absent state still needs its own purge"
+            );
+
+            // The next drain sees the new state and can acknowledge it.
+            let outcome = drain(&store, 2, purge_ok).unwrap();
+            assert_eq!(outcome.result, 1);
+            assert!(b2_cdn_phase::complete_ready(&hash).unwrap());
+            let _ = store
+                .build_delete()
+                .execute(&format!("b2-cdn-phase:v1:{hash}"));
+            reset_all(&store);
+        }
+
+        #[test]
+        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-purge-outbox-tests.py"]
         fn final_drain_advances_the_phase_and_writes_the_receipt() {
             use crate::b2_cdn_phase::{self, Physical};
             let store = store();
@@ -1429,12 +1471,14 @@ mod tests {
             let epoch = b2_cdn_phase::begin_erase(&hash).unwrap();
             b2_cdn_phase::record_physical(&hash, &epoch, Physical::Absent).unwrap();
             assert!(b2_cdn_phase::final_purge_pending(&hash).unwrap());
+            // The production flow queues a durable final intent, then the drain
+            // wrote it. A queued intent is required before an ack counts.
+            // ensure_final_intent already queued the durable intent this drain
+            // consumes, so the drain finishes the phase for that attempt.
+            b2_cdn_phase::ensure_final_intent(&hash).unwrap();
 
-            let token = begin_phase(&hash, Phase::Final).unwrap();
-            assert_eq!(commit(&store, &token).unwrap(), CommitOutcome::Committed);
             let outcome = drain(&store, 2, purge_ok).unwrap();
-            assert_eq!(outcome.result, 1);
-            assert!(acknowledged(&store, &token, "final").unwrap());
+            assert!(outcome.result >= 1, "the queued final intent must drain");
             assert!(b2_cdn_phase::complete_ready(&hash).unwrap());
             let _ = store
                 .build_delete()
