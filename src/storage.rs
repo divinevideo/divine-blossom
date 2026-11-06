@@ -3998,6 +3998,8 @@ enum PrivateFamilyCleanup {
 struct CloudCleanupResponse {
     status: CloudCleanupStatus,
     private_family: Option<PrivateFamilyCleanup>,
+    #[serde(default)]
+    bounded_progress: bool,
 }
 
 #[derive(Deserialize)]
@@ -4006,6 +4008,8 @@ struct BatchHashCleanupResponse {
     status: CloudCleanupStatus,
     main_deleted_or_absent: bool,
     private_family: Option<PrivateFamilyCleanup>,
+    #[serde(default)]
+    bounded_progress: bool,
     failures: Option<Vec<String>>,
 }
 
@@ -4040,7 +4044,8 @@ fn classify_cloud_cleanup_response(status: StatusCode, body: &str) -> Result<()>
 
     match cleanup.status {
         CloudCleanupStatus::Completed if status.is_success()
-            && cleanup.private_family == Some(PrivateFamilyCleanup::Absent) => Ok(()),
+            && cleanup.private_family == Some(PrivateFamilyCleanup::Absent)
+            && !cleanup.bounded_progress => Ok(()),
         CloudCleanupStatus::Permanent => Err(BlossomError::Internal(format!(
             "Cloud Run derivative cleanup reported a permanent contract or configuration failure with status {}",
             status
@@ -4117,9 +4122,11 @@ fn failed_cloud_cleanup_hashes(
                 result.main_deleted_or_absent
                     && result.failures.as_ref().is_some_and(Vec::is_empty)
                     && ((result.status == CloudCleanupStatus::Completed
-                        && result.private_family == Some(PrivateFamilyCleanup::Absent))
+                        && result.private_family == Some(PrivateFamilyCleanup::Absent)
+                        && !result.bounded_progress)
                         || (result.status == CloudCleanupStatus::Retryable
-                            && result.private_family == Some(PrivateFamilyCleanup::Remaining)))
+                            && result.private_family.is_some()
+                            && result.bounded_progress))
             })
         })
         .cloned()
@@ -4140,7 +4147,8 @@ fn failed_cloud_cleanup_hashes(
             outcomes.get(&hash.to_lowercase()).is_some_and(|result| {
                 result.status == CloudCleanupStatus::Retryable
                     && result.main_deleted_or_absent
-                    && result.private_family == Some(PrivateFamilyCleanup::Remaining)
+                    && result.private_family.is_some()
+                    && result.bounded_progress
                     && result.failures.as_ref().is_some_and(Vec::is_empty)
             })
         })
@@ -5014,7 +5022,7 @@ mod tests {
         let hash = "a".repeat(64);
         let body = serde_json::json!({"status":"retryable","results":[{
             "hash":hash,"status":"retryable","main_deleted_or_absent":true,
-            "private_family":"remaining","failures":[]
+            "private_family":"remaining","bounded_progress":true,"failures":[]
         }]})
         .to_string();
         let outcome = failed_cloud_cleanup_hashes(
@@ -5026,6 +5034,64 @@ mod tests {
             !outcome.failed_hashes.contains(&hash),
             "known private remainder must be Pending, not Failed"
         );
+    }
+
+    #[test]
+    fn private_cloud_progress_requires_explicit_bounded_evidence() {
+        let hash = "a".repeat(64);
+        for receipt in ["absent", "remaining"] {
+            for signal in [
+                None,
+                Some(serde_json::Value::Null),
+                Some(false.into()),
+                Some(true.into()),
+                Some("true".into()),
+            ] {
+                let expected = signal == Some(serde_json::Value::Bool(true));
+                let mut entry = serde_json::json!({"hash":hash,"status":"retryable",
+                    "main_deleted_or_absent":true,"private_family":receipt,"failures":[]});
+                if let Some(signal) = signal {
+                    entry["bounded_progress"] = signal;
+                }
+                let body = serde_json::json!({"status":"retryable","results":[entry]}).to_string();
+                let outcome = failed_cloud_cleanup_hashes(
+                    fastly::http::StatusCode::SERVICE_UNAVAILABLE,
+                    &body,
+                    std::slice::from_ref(&hash),
+                );
+                assert_eq!(outcome.failed_hashes.is_empty(), expected);
+                assert_eq!(outcome.remaining_hashes.contains(&hash), expected);
+                if expected {
+                    let mut result = super::VanishStorageResult::default();
+                    let mut blocked = HashSet::new();
+                    super::apply_cloud_cleanup_outcome(&mut result, &mut blocked, outcome);
+                    assert!(
+                        blocked.contains(&hash),
+                        "known media remainder must block inline purge even with private absence"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn private_cloud_single_creator_requires_private_absence() {
+        for receipt in [None, Some("remaining"), Some("absent")] {
+            let mut body = serde_json::json!({"status":"completed"});
+            if let Some(receipt) = receipt {
+                body["private_family"] = receipt.into();
+            }
+            assert_eq!(
+                classify_cloud_cleanup_response(fastly::http::StatusCode::OK, &body.to_string())
+                    .is_ok(),
+                receipt == Some("absent")
+            );
+        }
+        assert!(classify_cloud_cleanup_response(
+            fastly::http::StatusCode::OK,
+            r#"{"status":"completed","private_family":"absent","bounded_progress":true}"#
+        )
+        .is_err());
     }
 
     #[test]
@@ -5070,7 +5136,7 @@ mod tests {
         ] {
             let body = serde_json::json!({"status":"retryable","results":[{
                 "hash":hash,"status":"retryable","main_deleted_or_absent":main,
-                "private_family":"remaining","failures":failures
+                "private_family":"remaining","bounded_progress":true,"failures":failures
             }]})
             .to_string();
             assert!(
@@ -5343,6 +5409,7 @@ mod tests {
                     &result.remaining_hashes,
                 )
                 .unwrap();
+                b2_cdn_phase::ensure_final_intent(hash).unwrap();
                 if expected.contains(hash) {
                     assert_eq!(
                         b2_cdn_phase::physical_state(hash).unwrap(),

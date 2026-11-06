@@ -38,6 +38,7 @@ pub struct HashCleanupResult {
     pub main_deleted_or_absent: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub private_family: Option<PrivateFamilyCleanup>,
+    pub bounded_progress: bool,
     pub deleted: usize,
     pub absent: usize,
     pub failures: Vec<String>,
@@ -214,6 +215,7 @@ async fn cleanup_hash_with_backend<B: CleanupBackend + Sync>(
             status: CleanupStatus::Retryable,
             main_deleted_or_absent: false,
             private_family: None,
+            bounded_progress: false,
             deleted,
             absent,
             failures: vec!["deadline exceeded while listing private family versions".to_string()],
@@ -232,6 +234,7 @@ async fn cleanup_hash_with_backend<B: CleanupBackend + Sync>(
                 status: CleanupStatus::Retryable,
                 main_deleted_or_absent: false,
                 private_family: None,
+                bounded_progress: false,
                 deleted,
                 absent,
                 failures: vec![match result {
@@ -248,6 +251,7 @@ async fn cleanup_hash_with_backend<B: CleanupBackend + Sync>(
                 status: CleanupStatus::Retryable,
                 main_deleted_or_absent: false,
                 private_family: None,
+                bounded_progress: false,
                 deleted,
                 absent,
                 failures: vec![
@@ -265,6 +269,7 @@ async fn cleanup_hash_with_backend<B: CleanupBackend + Sync>(
                     status: CleanupStatus::Retryable,
                     main_deleted_or_absent: false,
                     private_family: None,
+                    bounded_progress: false,
                     deleted,
                     absent,
                     failures: vec![match result {
@@ -321,11 +326,18 @@ async fn cleanup_hash_with_backend<B: CleanupBackend + Sync>(
         }
     }
 
+    let mut bounded_media_remaining = false;
     if Instant::now() >= deadline {
         failures.push("cleanup deadline exceeded during verification".to_string());
     } else {
         match timeout_at(deadline, backend.list_prefix(&prefix, 1)).await {
             Err(_) => failures.push("cleanup deadline exceeded during verification".to_string()),
+            Ok(Ok(remaining)) if !private_page.objects.is_empty() && !remaining.is_empty() => {
+                // The shared slice may deliberately defer public media after
+                // private versions consume its budget. Positive observations
+                // remain pending; operation errors still populate failures.
+                bounded_media_remaining = true;
+            }
             Ok(Ok(remaining)) => failures.extend(
                 remaining
                     .into_iter()
@@ -351,15 +363,22 @@ async fn cleanup_hash_with_backend<B: CleanupBackend + Sync>(
             }
         };
 
+    let bounded_progress = failures.is_empty()
+        && main_deleted_or_absent
+        && (bounded_media_remaining || private_family == Some(PrivateFamilyCleanup::Remaining));
     HashCleanupResult {
         hash: hash.to_string(),
-        status: if failures.is_empty() && private_family == Some(PrivateFamilyCleanup::Absent) {
+        status: if failures.is_empty()
+            && private_family == Some(PrivateFamilyCleanup::Absent)
+            && !bounded_media_remaining
+        {
             CleanupStatus::Completed
         } else {
             CleanupStatus::Retryable
         },
         main_deleted_or_absent,
         private_family,
+        bounded_progress,
         deleted,
         absent,
         failures,
@@ -550,6 +569,7 @@ mod tests {
     #[derive(Clone)]
     struct VersionedGcsFixture {
         mode: &'static str,
+        public_remaining: std::sync::Arc<Mutex<bool>>,
         generations: std::sync::Arc<Mutex<BTreeSet<i64>>>,
         requests: std::sync::Arc<Mutex<Vec<wiremock::Request>>>,
     }
@@ -564,6 +584,10 @@ mod tests {
                 }));
             }
             if request.method == wiremock::http::Method::Delete {
+                if request.url.path().ends_with("master.m3u8") {
+                    *self.public_remaining.lock().unwrap() = false;
+                    return wiremock::ResponseTemplate::new(204);
+                }
                 if self.mode == "retention" {
                     return wiremock::ResponseTemplate::new(403).set_body_json(serde_json::json!({
                         "error":{"code":403,"message":"retention constraint","errors":[]}
@@ -588,7 +612,7 @@ mod tests {
                 let generations = self.generations.lock().unwrap();
                 // Deliberately short nonterminal pages: maxResults is not a promise.
                 let limit = query["maxResults"].parse::<usize>().unwrap().min(
-                    if self.mode == "full_page" {
+                    if self.mode == "full_page" || self.mode == "mixed" {
                         MAX_PREFIX_OBJECTS_PER_ATTEMPT
                     } else {
                         3
@@ -607,6 +631,14 @@ mod tests {
                         "bucket":"synthetic"}));
                 }
             }
+            if prefix == &format!("{HASH_A}/") && *self.public_remaining.lock().unwrap() {
+                items.push(
+                    serde_json::json!({"name":format!("{HASH_A}/hls/master.m3u8"),
+                    "generation":"1","metageneration":"1","size":"1",
+                    "id":"synthetic","etag":"synthetic","selfLink":"","mediaLink":"",
+                    "bucket":"synthetic"}),
+                );
+            }
             wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "items":items,"nextPageToken":if more {Some("next")} else {None}
             }))
@@ -618,6 +650,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         let fixture = VersionedGcsFixture {
             mode: "normal",
+            public_remaining: Default::default(),
             generations: std::sync::Arc::new(Mutex::new((1..=7).collect())),
             requests: Default::default(),
         };
@@ -673,6 +706,7 @@ mod tests {
             let server = wiremock::MockServer::start().await;
             let fixture = VersionedGcsFixture {
                 mode,
+                public_remaining: Default::default(),
                 generations: std::sync::Arc::new(Mutex::new([1, 2].into_iter().collect())),
                 requests: Default::default(),
             };
@@ -700,6 +734,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         let fixture = VersionedGcsFixture {
             mode: "full_page",
+            public_remaining: Default::default(),
             generations: std::sync::Arc::new(Mutex::new((1..=26).collect())),
             requests: Default::default(),
         };
@@ -733,6 +768,51 @@ mod tests {
             CleanupStatus::Completed
         );
         assert!(fixture.generations.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn shared_private_budget_defers_existing_media_as_known_progress() {
+        for count in [25, 26] {
+            let server = wiremock::MockServer::start().await;
+            let fixture = VersionedGcsFixture {
+                mode: "mixed",
+                public_remaining: std::sync::Arc::new(Mutex::new(true)),
+                generations: std::sync::Arc::new(Mutex::new((1..=count).collect())),
+                requests: Default::default(),
+            };
+            wiremock::Mock::given(wiremock::matchers::any())
+                .respond_with(fixture.clone())
+                .mount(&server)
+                .await;
+            let mut config = google_cloud_storage::client::ClientConfig::default().anonymous();
+            config.storage_endpoint = server.uri();
+            let client = GcsClient::new(config);
+            let backend = GcsCleanupBackend::new(&client, "synthetic");
+            let first = cleanup_hash(&backend, HASH_A).await;
+            assert_eq!(first.status, CleanupStatus::Retryable);
+            assert!(
+                first.failures.is_empty(),
+                "deliberately deferred media is known remaining, not an operation error"
+            );
+            assert_eq!(
+                serde_json::to_value(&first).unwrap()["bounded_progress"],
+                true
+            );
+            assert_eq!(first.deleted, MAX_PREFIX_OBJECTS_PER_ATTEMPT);
+            assert_eq!(
+                first.private_family,
+                Some(if count == 25 {
+                    PrivateFamilyCleanup::Absent
+                } else {
+                    PrivateFamilyCleanup::Remaining
+                })
+            );
+            assert!(*fixture.public_remaining.lock().unwrap());
+            let second = cleanup_hash(&backend, HASH_A).await;
+            assert_eq!(second.status, CleanupStatus::Completed);
+            assert!(!*fixture.public_remaining.lock().unwrap());
+            assert!(fixture.generations.lock().unwrap().is_empty());
+        }
     }
 
     #[tokio::test]

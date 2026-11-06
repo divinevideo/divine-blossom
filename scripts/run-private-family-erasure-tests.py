@@ -50,7 +50,8 @@ class Provider(BaseHTTPRequestHandler):
                     pending = attempt == 0 or (attempt == 1 and index == 1)
                     results.append({'hash': hash_value, 'status': 'retryable' if pending else 'completed',
                                     'main_deleted_or_absent': True, 'failures': [],
-                                    'private_family': 'remaining' if pending else 'absent'})
+                                    'private_family': 'remaining' if pending and index == 1 else 'absent',
+                                    'bounded_progress': pending})
                 pending = any(result['status'] == 'retryable' for result in results)
                 return self.reply(503 if pending else 200,
                                   {'status': 'retryable' if pending else 'completed', 'results': results})
