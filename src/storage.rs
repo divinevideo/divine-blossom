@@ -2526,25 +2526,59 @@ fn vanish_physical_outcome(
 /// failed `begin_vanish_phase`, or an unreadable phase record — is held rather
 /// than erased without durable progress, so a partial failure can never cause a
 /// destructive wave with no record of it.
-pub(crate) fn plan_vanish_physical_with(
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct VanishPhysicalPlan {
+    /// Hashes that may run the bounded physical wave this request.
+    pub run: Vec<String>,
+    /// Hashes with no durable epoch or unreadable phase: hold, never erase.
+    pub held: Vec<String>,
+    /// Hashes the phase says need no wave (Absent/Complete). Normal completion,
+    /// never pending work.
+    pub skipped: Vec<String>,
+}
+
+/// Plan the bounded physical wave.
+///
+/// With phase not configured this is byte-for-byte the legacy behavior: every
+/// hash runs and nothing is held, so enabling the feature cannot change what an
+/// ordinary vanish deletes.
+pub(crate) fn plan_vanish_physical(
     hashes: &[String],
     epochs: &std::collections::HashMap<String, String>,
+    configured: bool,
     mut may_run: impl FnMut(&str) -> Result<bool>,
-) -> (Vec<String>, Vec<String>) {
-    let mut run = Vec::new();
-    let mut held = Vec::new();
+) -> VanishPhysicalPlan {
+    let mut plan = VanishPhysicalPlan::default();
+    if !configured {
+        plan.run.extend(hashes.iter().cloned());
+        return plan;
+    }
     for hash in hashes {
         if !epochs.contains_key(&hash.to_ascii_lowercase()) {
-            held.push(hash.clone());
+            plan.held.push(hash.clone());
             continue;
         }
         match may_run(hash) {
-            Ok(true) => run.push(hash.clone()),
+            Ok(true) => plan.run.push(hash.clone()),
+            // The phase says the wave already finished; skip quietly.
+            Ok(false) => plan.skipped.push(hash.clone()),
             // Unreadable state fails closed: hold, never erase.
-            Ok(false) | Err(_) => held.push(hash.clone()),
+            Err(_) => plan.held.push(hash.clone()),
         }
     }
-    (run, held)
+    plan
+}
+
+/// Backwards-compatible two-list view for callers that already distinguish run
+/// from held. Skips are returned as run=false but not held only through the
+/// full [`plan_vanish_physical`] API.
+pub(crate) fn plan_vanish_physical_with(
+    hashes: &[String],
+    epochs: &std::collections::HashMap<String, String>,
+    may_run: impl FnMut(&str) -> Result<bool>,
+) -> (Vec<String>, Vec<String>) {
+    let plan = plan_vanish_physical(hashes, epochs, true, may_run);
+    (plan.run, plan.held)
 }
 
 /// Persist the deny/erasing gate and open a phased physical attempt for a hash
@@ -2629,7 +2663,7 @@ pub(crate) fn vanish_attempt_for_test(
 
 #[cfg(test)]
 mod vanish_phase_tests {
-    use super::{plan_vanish_physical_with, vanish_physical_outcome};
+    use super::{plan_vanish_physical, plan_vanish_physical_with, vanish_physical_outcome};
     use crate::b2_cdn_phase::Physical;
     use std::collections::HashSet;
 
@@ -2644,6 +2678,37 @@ mod vanish_phase_tests {
             vanish_physical_outcome(&hash, &failed, &remaining, true),
             Physical::Pending
         );
+    }
+
+    #[test]
+    fn planning_is_default_parity_when_phase_is_not_configured() {
+        // With CDN invalidation off every hash must run the ordinary wave,
+        // exactly as before this feature. No epoch is required and nothing is
+        // held, or existing vanish would stop deleting anything.
+        let hashes: Vec<String> = ["10", "11", "12"]
+            .iter()
+            .map(|h| h.repeat(32))
+            .collect();
+        let empty = std::collections::HashMap::new();
+        let plan = plan_vanish_physical(&hashes, &empty, false, |_| Ok(true));
+        assert_eq!(plan.run, hashes, "default-off must run every hash");
+        assert!(plan.held.is_empty(), "default-off must hold nothing");
+        assert!(plan.skipped.is_empty());
+    }
+
+    #[test]
+    fn an_already_finished_hash_is_skipped_not_held() {
+        // Configured, but the phase says the wave must not run (Absent or
+        // Complete). That is normal completion, not an error: skip it without
+        // holding or counting it pending forever.
+        let hash = "13".repeat(32);
+        let hashes = vec![hash.clone()];
+        let mut epochs = std::collections::HashMap::new();
+        epochs.insert(hash.clone(), "0".repeat(32));
+        let plan = plan_vanish_physical(&hashes, &epochs, true, |_| Ok(false));
+        assert!(plan.run.is_empty(), "a finished hash must not re-run");
+        assert!(plan.held.is_empty(), "a finished hash must not be held");
+        assert_eq!(plan.skipped, hashes, "it is skipped, not pending work");
     }
 
     #[test]
@@ -2692,12 +2757,13 @@ mod vanish_phase_tests {
             vanish_physical_outcome(&hash, &failed, &remaining, true),
             Physical::Failed
         );
-        // Still-progressing versions are Unknown, not failure.
+        // Still-progressing versions are known safe progress: Pending, so the
+        // next wave continues them. Not an uncertain Unknown.
         let failed: HashSet<String> = HashSet::new();
         let remaining: HashSet<String> = [hash.clone()].into_iter().collect();
         assert_eq!(
             vanish_physical_outcome(&hash, &failed, &remaining, true),
-            Physical::Unknown
+            Physical::Pending
         );
     }
 }

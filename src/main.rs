@@ -63,7 +63,7 @@ use crate::storage::{
     b2_replica_enabled, blob_exists, check_funnelcake_audio_reuse, current_timestamp,
     delete_blob as storage_delete, delivery_probe_sample, dispatch_vanish_timing_log,
     download_blob_read_through, download_blob_with_fallback, download_thumbnail,
-    begin_vanish_phase, erase_vanish_batch, finish_vanish_phase, plan_vanish_physical_with,
+    begin_vanish_phase, erase_vanish_batch, finish_vanish_phase, plan_vanish_physical,
     probe_erased_delivery,
     trigger_audio_extraction, vanish_complete, vanish_needs_physical,
     trigger_cloud_run_delete_blob, upload_blob, write_audit_log, write_vanish_audit_log,
@@ -5284,12 +5284,15 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         // erase, one already proven absent has nothing to delete, and a hash
         // whose phase could not be opened or read must be held rather than
         // erased without a record.
-        let (physical_hashes, held_hashes) = plan_vanish_physical_with(
+        let physical_plan = plan_vanish_physical(
             &erase_hashes,
             &wave_epochs,
+            crate::storage::cdn_invalidation_configured(),
             |hash| vanish_needs_physical(hash),
         );
-        for hash in &held_hashes {
+        // Held: no durable epoch or unreadable phase. Never erase without a
+        // record, so this stays pending.
+        for hash in &physical_plan.held {
             eprintln!(
                 "[VANISH] pubkey={} hash={} held: no durable purge phase",
                 pubkey, hash
@@ -5298,6 +5301,13 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
             deferred_pending = deferred_pending.saturating_add(1);
             phase_blocked.insert(hash.to_lowercase());
         }
+        // Skipped: the phase says the wave already finished (Absent/Complete).
+        // Normal completion, never pending work; the final ack gate below still
+        // decides whether erasure may be reported complete.
+        for hash in &physical_plan.skipped {
+            phase_blocked.insert(hash.to_lowercase());
+        }
+        let physical_hashes = physical_plan.run;
         let storage_result = if physical_hashes.is_empty() {
             crate::storage::VanishStorageResult::default()
         } else {

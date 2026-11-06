@@ -59,7 +59,9 @@ const MAX_LIST_LIMIT: u32 = 100;
 /// exact attempt. A receipt is evidence that a specific attempt's double purge
 /// completed. It is never inferred from a missing queue record, and it is bound
 /// to the attempt so an old completion cannot answer for a new operation.
-const RECEIPT_PREFIX: &str = "b2-cdn-purge-ack";
+/// Deliberately outside `PREFIX`: receipts are retained forever, and sharing
+/// the queue prefix would make the drain spend its scan budget on them.
+const RECEIPT_PREFIX: &str = "b2-cdn-ack";
 const RECEIPT_BODY_MAX: usize = 2048;
 /// Phases a caller may name. Anything else is refused rather than stored, so a
 /// typo cannot silently create an unrecognised receipt namespace.
@@ -596,11 +598,76 @@ pub(crate) fn execute<T>(hash: &str, mutation: impl FnOnce() -> Result<T>) -> Re
     }
 }
 
-fn cursor(store: &KVStore) -> Option<String> {
-    let mut response = store.build_lookup().execute(CURSOR_KEY).ok()?;
+/// Durable drain progress: a provider page token plus the last queue key
+/// handled inside that page.
+///
+/// Persisting the page token is what lets a drain skip retained cleared history
+/// without rescanning it from the start. The within-page key makes a pass that
+/// stops mid-page resume exactly.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Progress {
+    /// Provider page token to resume listing at, or `None` to start over.
+    page: Option<String>,
+    /// Last queue key handled in the current pass, used to skip within a page
+    /// after a mid-page stop.
+    after: Option<String>,
+}
+
+impl Progress {
+    fn encode(&self) -> String {
+        serde_json::json!({
+            "version": 1,
+            "page": self.page,
+            "after": self.after,
+        })
+        .to_string()
+    }
+
+    /// Parse persisted progress. A malformed cursor is an error, never a silent
+    /// reset: a blind restart would rescan retained history forever.
+    fn parse(value: &str) -> Result<Self> {
+        let object: serde_json::Value = serde_json::from_str(value)
+            .map_err(|_| BlossomError::MetadataError("B2 CDN outbox cursor invalid".into()))?;
+        let object = object
+            .as_object()
+            .ok_or_else(|| BlossomError::MetadataError("B2 CDN outbox cursor invalid".into()))?;
+        if object.len() != 3 || object.get("version").and_then(|v| v.as_u64()) != Some(1) {
+            return Err(BlossomError::MetadataError(
+                "B2 CDN outbox cursor invalid".into(),
+            ));
+        }
+        let field = |name: &str| -> Result<Option<String>> {
+            match object.get(name) {
+                Some(serde_json::Value::Null) => Ok(None),
+                Some(serde_json::Value::String(value)) if value.len() <= 4096 => {
+                    Ok(Some(value.clone()))
+                }
+                _ => Err(BlossomError::MetadataError(
+                    "B2 CDN outbox cursor invalid".into(),
+                )),
+            }
+        };
+        Ok(Progress {
+            page: field("page")?,
+            after: field("after")?,
+        })
+    }
+}
+
+fn cursor(store: &KVStore) -> Result<Progress> {
+    let mut response = match store.build_lookup().execute(CURSOR_KEY) {
+        Ok(response) => response,
+        Err(KVStoreError::ItemNotFound) => return Ok(Progress::default()),
+        Err(_) => {
+            return Err(BlossomError::MetadataError(
+                "B2 CDN outbox cursor unavailable".into(),
+            ))
+        }
+    };
     let body = response.take_body_bytes();
-    let value = String::from_utf8(body).ok()?;
-    (!value.is_empty() && value.len() <= 4096).then_some(value)
+    let value = std::str::from_utf8(&body)
+        .map_err(|_| BlossomError::MetadataError("B2 CDN outbox cursor invalid".into()))?;
+    Progress::parse(value)
 }
 
 fn save_cursor(store: &KVStore, value: Option<&str>) -> Result<()> {
@@ -637,18 +704,20 @@ fn drain(
     purge: impl Fn(&[String]) -> Result<()>,
 ) -> Result<DrainOutcome> {
     let mut outcome = DrainOutcome::default();
-    // The persisted cursor is the last queue key this drain finished, not a
-    // list page token. A page token only advances between pages, so a pass that
-    // stops two rows into a page would either re-read those rows forever or
-    // skip the rest of the page. Keys sort lexicographically, so "resume after
-    // this key" is exact for both a partial page and a partial scan.
-    let after = cursor(store);
+    // Resume at the persisted provider page and within-page key. This is what
+    // lets a drain skip retained cleared history without rescanning it from the
+    // start on every pass. A missing or malformed cursor fails closed rather
+    // than silently restarting.
+    let start = cursor(store)?;
+    let mut page_token = start.page.clone();
+    let after = start.after.clone();
     let mut processed = 0usize;
     let mut scanned = 0usize;
-    let mut page_token: Option<String> = None;
-    let mut last_processed: Option<String> = None;
+    let mut last_key: Option<String> = None;
+    // Bounded so one call cannot walk unbounded retained history.
+    const MAX_SCAN: usize = MAX_LIST_LIMIT as usize * 16;
 
-    'pages: loop {
+    loop {
         let mut builder = store.build_list().limit(MAX_LIST_LIMIT).prefix(PREFIX);
         if let Some(token) = page_token.as_deref() {
             builder = builder.cursor(token);
@@ -656,23 +725,39 @@ fn drain(
         let page = builder
             .execute()
             .map_err(|_| BlossomError::MetadataError("B2 CDN outbox listing unavailable".into()))?;
+        let next_page = page.next_cursor();
 
         for key in page.keys() {
             scanned += 1;
+            // Skip rows already handled in an earlier pass of this same page.
             if after.as_deref().is_some_and(|after| key.as_str() <= after) {
                 continue;
             }
             if key == CURSOR_KEY || queue_parts(key).is_none() {
+                // Not our row, but it is safely passed: advance past it.
+                last_key = Some(key.clone());
                 continue;
             }
             if processed >= limit {
-                break 'pages;
+                // Stop before handling this key, and resume AFTER the last key
+                // actually handled. Recording this unprocessed key as done
+                // would silently skip it.
+                save_cursor(
+                    store,
+                    Some(
+                        &Progress {
+                            page: page_token.clone(),
+                            after: last_key.clone(),
+                        }
+                        .encode(),
+                    ),
+                )?;
+                return Ok(outcome);
             }
-            last_processed = Some(key.clone());
+            last_key = Some(key.clone());
             let Some(snapshot) = lookup(store, key)? else {
                 // Missing, oversized, malformed or foreign: retained and
-                // skipped, but the cursor still advances past it so it cannot
-                // starve the healthy suffix.
+                // skipped, but progress still advances past it.
                 continue;
             };
             match snapshot.record.state {
@@ -701,18 +786,22 @@ fn drain(
                     };
                     match purge(&[snapshot.hash.clone()]) {
                         Ok(()) => {
-                            // Only aacknowledge the exact state the token
-                            // captured, by generation compare-and-swap.
                             if let Some(token) = phase_token {
-                                if crate::b2_cdn_phase::mark_final_purged_observed(store, &token)? {
-                                    let receipt = Token {
-                                        key: snapshot.key.clone(),
-                                        hash: snapshot.hash.clone(),
-                                        attempt: snapshot.record.attempt.clone(),
-                                        generation: snapshot.generation,
-                                    };
-                                    ack_with_store(store, &receipt, "final")?;
+                                if !crate::b2_cdn_phase::mark_final_purged_observed(store, &token)? {
+                                    // The physical state changed while this purge
+                                    // was in flight. The new state needs its own
+                                    // purge, so leave the intent outstanding
+                                    // instead of clearing it.
+                                    outcome.pending += 1;
+                                    continue;
                                 }
+                                let receipt = Token {
+                                    key: snapshot.key.clone(),
+                                    hash: snapshot.hash.clone(),
+                                    attempt: snapshot.record.attempt.clone(),
+                                    generation: snapshot.generation,
+                                };
+                                ack_with_store(store, &receipt, "final")?;
                             }
                             match complete_observed(store, &snapshot)? {
                                 true => outcome.result += 1,
@@ -730,23 +819,29 @@ fn drain(
             }
         }
 
-        if processed >= limit || scanned >= MAX_LIST_LIMIT as usize * 16 {
-            break;
+        if scanned >= MAX_SCAN {
+            // Scan budget spent: resume at the same page after the last key we
+            // actually looked at, so no page is silently skipped.
+            save_cursor(
+                store,
+                Some(
+                    &Progress {
+                        page: page_token.clone(),
+                        after: last_key.clone(),
+                    }
+                    .encode(),
+                ),
+            )?;
+            return Ok(outcome);
         }
-        match page.next_cursor() {
-            Some(next) => page_token = Some(next),
+        match next_page.as_deref() {
+            Some(next) => page_token = Some(next.to_string()),
             None => break,
         }
     }
 
-    // A pass that hit its limit resumes after the exact last key it processed;
-    // a pass that reached the end clears the cursor so blocked rows are retried
-    // from the start. The cursor is never a stale page token.
-    if processed >= limit {
-        save_cursor(store, last_processed.as_deref())?;
-    } else {
-        save_cursor(store, None)?;
-    }
+    // Reached the end: the next pass starts over so blocked rows retry.
+    save_cursor(store, None)?;
     Ok(outcome)
 }
 
@@ -1357,6 +1452,70 @@ mod tests {
 
         #[test]
         #[ignore = "requires local KV fixture; scripts/run-b2-cdn-purge-outbox-tests.py"]
+        fn long_cleared_history_does_not_starve_a_healthy_suffix() {
+            let store = store();
+            reset_all(&store);
+            // 1,650 cleared records sort before one healthy committed record.
+            // A drain that only scans the first 1,600 keys from the start would
+            // never reach the healthy row.
+            for i in 0..1650u32 {
+                let attempt = format!("{i:032x}");
+                let key = format!("{RECORD_PREFIX}{}:{attempt}", "a".repeat(64));
+                store
+                    .build_insert()
+                    .mode(InsertMode::Overwrite)
+                    .execute(&key, {
+                        let now = requested_at();
+                        let record = Record {
+                            attempt,
+                            phase: Phase::Single,
+                            requested_at: now,
+                            committed_at: Some(now),
+                            cleared_at: Some(now),
+                            attempts: 0,
+                            state: RecordState::Cleared,
+                        };
+                        encode(&record)
+                    })
+                    .unwrap();
+            }
+            let healthy = "f".repeat(64);
+            let token = begin(&healthy).unwrap();
+            commit(&store, &token).unwrap();
+
+            // Repeated bounded passes must eventually reach and clear the
+            // healthy record, not scan the same 1,600-key prefix forever.
+            let mut drained = 0;
+            for _ in 0..40 {
+                let outcome = drain(&store, 2, purge_ok).unwrap();
+                drained += outcome.result;
+                if drained > 0 {
+                    break;
+                }
+            }
+            assert_eq!(
+                drained, 1,
+                "a healthy record after long cleared history must drain"
+            );
+            reset_all(&store);
+        }
+
+        #[test]
+        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-purge-outbox-tests.py"]
+        fn receipts_do_not_share_the_queue_list_prefix() {
+            // Receipts are retained forever; if they shared the queue prefix the
+            // drain would burn its scan budget on them. They must sort outside.
+            let hash = "aa".repeat(32);
+            let attempt = "0".repeat(32);
+            let receipt = receipt_key("final", &hash, &attempt).unwrap();
+            assert!(
+                !receipt.starts_with(PREFIX),
+                "receipt {receipt} must not match queue prefix {PREFIX}"
+            );
+        }
+
+        #[test]
+        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-purge-outbox-tests.py"]
         fn a_partial_pass_does_not_starve_healthy_rows_behind_blocked_ones() {
             let store = store();
             reset_all(&store);
@@ -1386,9 +1545,14 @@ mod tests {
             assert_eq!(first.result, 0);
             assert_eq!(first.errors, 2);
             let mut drained = 0;
-            for _ in 0..6 {
+            // With exact mid-page resume a blocked row is not retried until the
+            // cursor wraps, so allow several passes.
+            for _ in 0..20 {
                 let outcome = drain(&store, 2, purge).unwrap();
                 drained += outcome.result;
+                if drained == 3 {
+                    break;
+                }
             }
             assert_eq!(
                 drained, 3,
@@ -1455,8 +1619,22 @@ mod tests {
                 "new Absent state still needs its own purge"
             );
 
-            // The next drain sees the new state and can acknowledge it.
-            let outcome = drain(&store, 2, purge_ok).unwrap();
+            // The new Absent state cleared its queued flag, so a fresh durable
+            // intent is required before it can be acknowledged.
+            b2_cdn_phase::ensure_final_intent(&hash).unwrap();
+            assert!(crate::b2_cdn_phase::final_queued(&hash).unwrap());
+
+            // The next pass continues after the row it already attempted. A
+            // subsequent full pass (cursor wrapped) sees the new state and can
+            // acknowledge it.
+            let _ = drain(&store, 2, purge_ok).unwrap();
+            let mut outcome = drain(&store, 2, purge_ok).unwrap();
+            for _ in 0..4 {
+                if outcome.result == 1 {
+                    break;
+                }
+                outcome = drain(&store, 2, purge_ok).unwrap();
+            }
             assert_eq!(outcome.result, 1);
             assert!(b2_cdn_phase::complete_ready(&hash).unwrap());
             let _ = store
