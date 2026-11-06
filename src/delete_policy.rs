@@ -18,6 +18,18 @@ pub fn soft_delete_blob(
     reason: &str,
     legal_hold: bool,
 ) -> Result<()> {
+    soft_delete_blob_metadata(hash, metadata, reason, legal_hold)?;
+    crate::storage::purge_policy_cache(hash)
+}
+
+// Physical CDN erasure uses a separate bounded purge drain. Persist denial and
+// indexes here without spending purge subrequests before its physical wave.
+fn soft_delete_blob_metadata(
+    hash: &str,
+    metadata: &BlobMetadata,
+    reason: &str,
+    legal_hold: bool,
+) -> Result<()> {
     if metadata.status != BlobStatus::Deleted {
         update_blob_status(hash, BlobStatus::Deleted)?;
         let _ = update_stats_on_status_change(metadata.status, BlobStatus::Deleted);
@@ -35,7 +47,7 @@ pub fn soft_delete_blob(
         let _ = put_tombstone(hash, reason);
     }
 
-    crate::storage::purge_policy_cache(hash)
+    Ok(())
 }
 
 pub(crate) struct DefaultCreatorDeleteOps;
@@ -243,6 +255,9 @@ pub fn handle_creator_delete(
     physical_delete_enabled: bool,
     req_id: &str,
 ) -> Result<CreatorDeleteOutcome> {
+    if physical_delete_enabled && crate::storage::cdn_invalidation_configured() {
+        return handle_phased_creator_delete(hash, metadata, reason);
+    }
     handle_creator_delete_with_ops(
         hash,
         metadata,
@@ -251,6 +266,72 @@ pub fn handle_creator_delete(
         req_id,
         &DefaultCreatorDeleteOps,
     )
+}
+
+fn handle_phased_creator_delete(
+    hash: &str,
+    metadata: &BlobMetadata,
+    reason: &str,
+) -> Result<CreatorDeleteOutcome> {
+    use crate::error::BlossomError;
+    use std::collections::HashMap;
+
+    // Retain the source->audio mapping until BOTH hashes have proven physical
+    // absence and a final eviction receipt. Otherwise retries lose discovery.
+    let audio = crate::prepare_derived_audio_cleanup(hash)?;
+    let mut hashes = vec![hash.to_ascii_lowercase()];
+    if let Some(plan) = &audio {
+        if !hashes.contains(&plan.audio_hash) {
+            hashes.push(plan.audio_hash.clone());
+        }
+    }
+    // A creator source and its one derived audio fit the same two-hash physical
+    // request budget as vanish. Purging runs in a SEPARATE drain, never inline.
+    if hashes.len() > crate::storage::B2_VANISH_MAX_HASHES_PER_WAVE {
+        return Err(BlossomError::StorageError("Creator erasure exceeds bounded wave".into()));
+    }
+    let mut epochs = HashMap::new();
+    for candidate in &hashes {
+        let epoch = crate::storage::begin_vanish_phase(candidate)?
+            .ok_or_else(|| BlossomError::MetadataError("Creator erasure phase unavailable".into()))?;
+        epochs.insert(candidate.clone(), epoch);
+    }
+    soft_delete_blob_metadata(hash, metadata, reason, false)?;
+    let physical: Vec<String> = hashes.iter()
+        .filter(|candidate| crate::storage::vanish_needs_physical(candidate))
+        .cloned().collect();
+    if !physical.is_empty() {
+        let result = crate::storage::erase_vanish_batch(&physical);
+        for candidate in &physical {
+            crate::storage::finish_vanish_phase(
+                candidate, &epochs[candidate], &result.failed_hashes, &result.remaining_hashes,
+            )?;
+        }
+    }
+    // A crash after recording absence but before enqueue must remain retryable.
+    for candidate in &hashes {
+        if crate::b2_cdn_phase::final_purge_pending(candidate)? {
+            crate::b2_cdn_purge::enqueue(candidate, crate::b2_cdn_purge::Phase::Final)?;
+        }
+    }
+    if hashes.iter().any(|candidate| !crate::storage::vanish_complete(candidate)) {
+        return Err(BlossomError::Conflict(
+            "Creator erasure pending physical confirmation and final CDN purge; retry required".into(),
+        ));
+    }
+    if let Some(plan) = &audio {
+        crate::finalize_derived_audio_cleanup(plan)?;
+    }
+    for candidate in &hashes {
+        if !crate::b2_cdn_phase::mark_complete(candidate)? {
+            return Err(BlossomError::Conflict("Creator erasure completion changed; retry required".into()));
+        }
+    }
+    Ok(CreatorDeleteOutcome {
+        old_status: metadata.status,
+        physical_delete_enabled: true,
+        physical_deleted: true,
+    })
 }
 
 pub fn restore_soft_deleted_blob(

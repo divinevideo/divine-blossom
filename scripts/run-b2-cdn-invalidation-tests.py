@@ -74,6 +74,9 @@ blossom_secrets = [{{key="admin_token",data="synthetic-admin-token"}},{{key="fas
                 ]
                 if os.environ.get("TEST_CDN_CONTRACT") in (
                     "cdn_purge_drain_requires_admin_and_rejects_oversized_batches",
+                    "creator_physical_delete_waits_for_final_purge_without_replaying_absent_bytes",
+                    "creator_physical_delete_retains_audio_discovery_until_both_final_receipts",
+                    "creator_physical_delete_unreadable_phase_fails_before_policy_mutation",
                     "bulk_approve_skip_purge_reports_durable_pending_hashes",
                     "restore_without_cdn_keeps_existing_non_deleted_rejection",
                     "pending_cdn_intent_cannot_clear_when_purge_configuration_disappears",

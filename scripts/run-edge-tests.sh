@@ -76,6 +76,28 @@ VICEROY="$VICEROY" python3 scripts/run-b2-canary-tests.py
 # Default-off production CDN routing admits only final verified B2 originals.
 VICEROY="$VICEROY" python3 scripts/run-b2-cdn-tests.py
 
+# Durable eviction retries and physical erasure completion use real loopback KV.
+VICEROY="$VICEROY" python3 scripts/run-b2-cdn-purge-outbox-tests.py
+VICEROY="$VICEROY" python3 scripts/run-b2-cdn-phase-tests.py
+for contract in \
+  quarantine_cdn_purge_failure_remains_denied_and_idempotently_retries \
+  moderation_cdn_purge_failure_is_durable_and_same_status_retry_purges \
+  soft_delete_cdn_failure_cannot_be_acknowledged_before_eviction \
+  restore_cdn_failure_keeps_durable_retry_after_status_commits \
+  bulk_approve_skip_purge_reports_durable_pending_hashes \
+  cdn_purge_drain_requires_admin_and_rejects_oversized_batches \
+  creator_physical_delete_waits_for_final_purge_without_replaying_absent_bytes \
+  creator_physical_delete_retains_audio_discovery_until_both_final_receipts \
+  creator_physical_delete_unreadable_phase_fails_before_policy_mutation; do
+  TEST_CDN_CONTRACT="$contract" VICEROY="$VICEROY" python3 scripts/run-b2-cdn-invalidation-tests.py
+done
+TEST_CDN_ADMISSION=false VICEROY="$VICEROY" python3 scripts/run-b2-cdn-invalidation-tests.py
+for contract in \
+  restore_without_cdn_keeps_existing_non_deleted_rejection \
+  pending_cdn_intent_cannot_clear_when_purge_configuration_disappears; do
+  TEST_CDN_ABSENT=1 TEST_CDN_CONTRACT="$contract" VICEROY="$VICEROY" python3 scripts/run-b2-cdn-invalidation-tests.py
+done
+
 # Streaming fills must outlive guest exit and remain safe under 1KiB fragmentation.
 VICEROY="$VICEROY" python3 scripts/run-b2-native-stream-tests.py
 

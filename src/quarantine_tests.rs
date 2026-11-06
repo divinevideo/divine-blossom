@@ -556,3 +556,66 @@ fn quarantine_hold_http_contract() {
         StatusCode::INTERNAL_SERVER_ERROR
     );
 }
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn creator_physical_delete_waits_for_final_purge_without_replaying_absent_bytes() {
+    let metadata: BlobMetadata = serde_json::from_value(serde_json::json!({
+        "sha256": hash(), "size": 9, "type": "video/mp4", "uploaded": "2026-01-01T00:00:00Z",
+        "owner": "b".repeat(64), "status": "active"
+    })).unwrap();
+    put_blob_metadata(&metadata).unwrap();
+    let epoch = storage::begin_vanish_phase(&hash()).unwrap().unwrap();
+    b2_cdn_phase::record_physical(&hash(), &epoch, b2_cdn_phase::Physical::Absent).unwrap();
+    let result = delete_policy::handle_creator_delete(&hash(), &metadata, "synthetic", true, "synthetic");
+    assert!(matches!(result, Err(BlossomError::Conflict(_))), "must report pending final purge, never replay physical or purge inline: {result:?}");
+    assert_eq!(get_blob_metadata_uncached(&hash()).unwrap().unwrap().status, BlobStatus::Deleted);
+    let store = open_store().unwrap();
+    assert!(b2_cdn_phase::mark_final_purged(&store, &hash(), &epoch).unwrap());
+    let deleted = get_blob_metadata_uncached(&hash()).unwrap().unwrap();
+    let result = delete_policy::handle_creator_delete(&hash(), &deleted, "synthetic", true, "synthetic").unwrap();
+    assert!(result.physical_deleted);
+}
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn creator_physical_delete_retains_audio_discovery_until_both_final_receipts() {
+    let metadata: BlobMetadata = serde_json::from_value(serde_json::json!({
+        "sha256": hash(), "size": 9, "type": "video/mp4", "uploaded": "2026-01-01T00:00:00Z",
+        "owner": "b".repeat(64), "status": "active"
+    })).unwrap();
+    put_blob_metadata(&metadata).unwrap();
+    let audio = "c".repeat(64);
+    metadata::put_audio_mapping(&blossom::AudioMapping {
+        source_sha256: hash(), audio_sha256: audio.clone(), duration_seconds: 6.0,
+        size_bytes: 3, mime_type: "audio/aac".into(),
+    }).unwrap();
+    let store = open_store().unwrap();
+    for candidate in [&hash(), &audio] {
+        let epoch = storage::begin_vanish_phase(candidate).unwrap().unwrap();
+        b2_cdn_phase::record_physical(candidate, &epoch, b2_cdn_phase::Physical::Absent).unwrap();
+        if candidate != &audio {
+            assert!(b2_cdn_phase::mark_final_purged(&store, candidate, &epoch).unwrap());
+        }
+    }
+    assert!(matches!(delete_policy::handle_creator_delete(&hash(), &metadata, "synthetic", true, "synthetic"), Err(BlossomError::Conflict(_))));
+    assert!(metadata::get_audio_mapping(&hash()).unwrap().is_some(), "retry must still discover audio awaiting final purge");
+    let epoch = b2_cdn_phase::epoch(&audio).unwrap().unwrap();
+    assert!(b2_cdn_phase::mark_final_purged(&store, &audio, &epoch).unwrap());
+    let deleted = get_blob_metadata_uncached(&hash()).unwrap().unwrap();
+    assert!(delete_policy::handle_creator_delete(&hash(), &deleted, "synthetic", true, "synthetic").unwrap().physical_deleted);
+    assert!(metadata::get_audio_mapping(&hash()).unwrap().is_none());
+}
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn creator_physical_delete_unreadable_phase_fails_before_policy_mutation() {
+    let metadata: BlobMetadata = serde_json::from_value(serde_json::json!({
+        "sha256": hash(), "size": 9, "type": "video/mp4", "uploaded": "2026-01-01T00:00:00Z",
+        "owner": "b".repeat(64), "status": "active"
+    })).unwrap();
+    put_blob_metadata(&metadata).unwrap();
+    open_store().unwrap().insert(&format!("b2-cdn-phase:v1:{}", hash()), "{foreign}").unwrap();
+    assert!(delete_policy::handle_creator_delete(&hash(), &metadata, "synthetic", true, "synthetic").is_err());
+    assert_eq!(get_blob_metadata_uncached(&hash()).unwrap().unwrap().status, BlobStatus::Active);
+}
