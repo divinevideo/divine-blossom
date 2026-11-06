@@ -233,7 +233,11 @@ impl MediaStorage {
                 if response.status() == StatusCode::NOT_FOUND {
                     return Ok(None);
                 }
-                successful(response.status())?;
+                if response.status() != StatusCode::OK
+                    || response.headers().contains_key("content-range")
+                {
+                    bail!("B2 full media metadata response required");
+                }
                 from_b2(bucket, key, response.headers())?
             }
         };
@@ -246,12 +250,25 @@ impl MediaStorage {
         self.validate_reference(&object.reference)?;
         match &self.backend {
             Backend::Gcs { client, bucket } => {
-                let request = GetObjectRequest {
+                let mut request = GetObjectRequest {
                     bucket: bucket.clone(),
                     object: object.reference.key.clone(),
                     generation: gcs_generation(object.reference.version.as_deref())?,
                     ..Default::default()
                 };
+                // GCS metadata can change without a new byte generation. Bind
+                // the byte GET to the metadata values actually checked here.
+                let metadata = tokio::time::timeout(CONTROL_TIMEOUT, client.get_object(&request))
+                    .await
+                    .context("GCS pinned metadata deadline exceeded")?
+                    .map_err(|_| anyhow!("GCS pinned media metadata unavailable"))?;
+                if metadata.metageneration <= 0 {
+                    bail!("GCS metadata generation invalid");
+                }
+                request.if_metageneration_match = Some(metadata.metageneration);
+                if from_gcs(bucket, &object.reference.key, metadata)? != *object {
+                    bail!("GCS pinned media metadata mismatch");
+                }
                 let stream = tokio::time::timeout(
                     CONTROL_TIMEOUT,
                     client.download_streamed_object(&request, &Range::default()),
@@ -646,6 +663,7 @@ fn successful(status: StatusCode) -> Result<()> {
 }
 fn valid_version(version: &str) -> bool {
     !version.is_empty()
+        && version != "null"
         && version.len() <= 1024
         && version.bytes().all(|byte| (b' '..=b'~').contains(&byte))
 }

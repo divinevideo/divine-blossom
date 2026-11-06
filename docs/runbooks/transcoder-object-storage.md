@@ -24,8 +24,10 @@ remaining coordination and compatibility operations.
   carrying an event's object identity must use this method rather than resolve
   its key again. Wrong provider/bucket and missing versions fail before I/O.
 - `download_original(metadata, expected_sha256, path)` reads the selected version,
-  checks its length and SHA-256, and replaces the destination only after
-  verification. The original key must equal the full lowercase SHA-256.
+  checks its metadata, length and SHA-256, and replaces the destination only
+  after verification. GCS reads refetch the selected generation's metadata and
+  condition the byte GET on the observed metageneration to reject in-place
+  metadata changes. The original key must equal the full lowercase SHA-256.
 - `verify_sha256(metadata, expected_sha256)` verifies pinned bytes without saving
   a file.
 - `put_verified(key, bytes, mime, custom_metadata, cache_control)` writes metadata
@@ -39,7 +41,8 @@ computed lowercase `sha256`. `ObjectRef.version` is a GCS generation or B2
 version ID; it is never an ETag. Version IDs must be nonempty, at most
 1024 bytes, and printable ASCII so the returned version header can be
 verified exactly. Spaces and punctuation are preserved and query encoded;
-non-ASCII and control bytes fail closed. Keys can contain Unicode. A write may have reached the provider when a
+non-ASCII and control bytes fail closed. The unversioned `null` sentinel is
+rejected. Keys can contain Unicode. A write may have reached the provider when a
 later verification fails; no receipt is issued for an unconfirmed outcome.
 
 The production HLS helper preserves `source_sha256`, `derivative=hls`,

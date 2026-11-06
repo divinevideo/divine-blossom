@@ -28,6 +28,7 @@ struct Objects {
     missing_version: bool,
     corrupt: bool,
     get_status: Option<StatusCode>,
+    head_status: Option<StatusCode>,
     content_range: bool,
     wrong_get_metadata: bool,
     next_version: Option<String>,
@@ -194,7 +195,7 @@ async fn request(State(state): State<Arc<Mutex<Objects>>>, req: Request) -> Resp
         .status(if method == "GET" {
             state.get_status.unwrap_or(StatusCode::OK)
         } else {
-            StatusCode::OK
+            state.head_status.unwrap_or(StatusCode::OK)
         })
         .header("x-amz-version-id", version)
         .header("content-type", &object.mime)
@@ -538,6 +539,7 @@ async fn default_gcs_uses_atomic_metadata_and_pinned_verified_reads() {
     struct GcsObjects {
         object: Option<serde_json::Value>,
         bytes: String,
+        patch_after_metadata: bool,
         requests: Vec<(String, String)>,
     }
     async fn gcs_request(
@@ -586,12 +588,38 @@ async fn default_gcs_uses_atomic_metadata_and_pinned_verified_reads() {
             assert!(uri.starts_with("/storage/v1/b/synthetic-gcs/o/"));
             assert!(uri.contains("generation=123456789"));
             if uri.contains("alt=media") {
+                let url = reqwest::Url::parse(&format!("http://synthetic{uri}")).unwrap();
+                let supplied = url
+                    .query_pairs()
+                    .find(|(name, _)| name == "ifMetagenerationMatch")
+                    .map(|(_, value)| value.into_owned());
+                if supplied.is_some_and(|value| {
+                    value
+                        != state.object.as_ref().unwrap()["metageneration"]
+                            .as_str()
+                            .unwrap()
+                }) {
+                    return Response::builder()
+                        .status(412)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"error":{"code":412,"message":"synthetic precondition mismatch"}}"#,
+                        ))
+                        .unwrap();
+                }
                 return Response::new(Body::from(state.bytes.clone()));
             }
         }
+        let body = state.object.as_ref().unwrap().to_string();
+        if state.patch_after_metadata {
+            state.patch_after_metadata = false;
+            let object = state.object.as_mut().unwrap();
+            object["metadata"]["owner"] = "d".repeat(64).into();
+            object["metageneration"] = "3".into();
+        }
         Response::builder()
             .header("content-type", "application/json")
-            .body(Body::from(state.object.as_ref().unwrap().to_string()))
+            .body(Body::from(body))
             .unwrap()
     }
     let state = Arc::new(Mutex::new(GcsObjects::default()));
@@ -640,7 +668,31 @@ async fn default_gcs_uses_atomic_metadata_and_pinned_verified_reads() {
         .await
         .unwrap();
     assert_eq!(tokio::fs::read(path).await.unwrap(), bytes);
-    assert_eq!(state.lock().await.requests.len(), 4);
+    {
+        let state = state.lock().await;
+        assert_eq!(state.requests.len(), 6);
+        assert!(state
+            .requests
+            .iter()
+            .filter(|(_, uri)| uri.contains("alt=media"))
+            .all(|(_, uri)| uri.contains("ifMetagenerationMatch=1")));
+    }
+    let mut wrong_metadata = receipt.object.clone();
+    wrong_metadata.content_type = "audio/mp4".into();
+    assert!(store.verify_sha256(&wrong_metadata, &hash).await.is_err());
+    {
+        let mut state = state.lock().await;
+        let object = state.object.as_mut().unwrap();
+        object["metadata"]["owner"] = "d".repeat(64).into();
+        object["metageneration"] = "2".into();
+    }
+    assert!(store.verify_sha256(&receipt.object, &hash).await.is_err());
+    {
+        let mut state = state.lock().await;
+        state.object.as_mut().unwrap()["metadata"]["owner"] = "c".repeat(64).into();
+        state.patch_after_metadata = true;
+    }
+    assert!(store.verify_sha256(&receipt.object, &hash).await.is_err());
     task.abort();
 }
 
@@ -741,4 +793,39 @@ async fn version_header_constraints_are_fail_closed() {
         reqwest::header::HeaderValue::from_bytes(b"non-ascii-\xc3\xa9").unwrap(),
     );
     assert!(from_b2("synthetic-bucket", "artifact", &headers).is_err());
+}
+
+#[tokio::test]
+async fn current_selection_requires_full_metadata_and_real_version() {
+    let origin = Origin::start().await;
+    let store = origin.store();
+    store
+        .put_verified(
+            "artifact",
+            Bytes::from_static(b"bytes"),
+            "video/mp4",
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+    origin.objects.lock().await.head_status = Some(StatusCode::PARTIAL_CONTENT);
+    assert!(store.stat("artifact").await.is_err());
+}
+
+#[tokio::test]
+async fn unversioned_sentinel_never_returns_a_verification_receipt() {
+    let origin = Origin::start().await;
+    let store = origin.store();
+    origin.objects.lock().await.next_version = Some("null".into());
+    assert!(store
+        .put_verified(
+            "artifact",
+            Bytes::from_static(b"bytes"),
+            "video/mp4",
+            HashMap::new(),
+            None
+        )
+        .await
+        .is_err());
 }
