@@ -54,6 +54,19 @@ pub fn validate_admin_auth(req: &Request) -> Result<()> {
     ))
 }
 
+/// The recurring eviction worker has authority only on the bounded drain route.
+/// Never add this secret to the general admin/webhook credential list.
+pub(crate) fn validate_b2_cdn_purge_drain_auth(req: &Request) -> Result<()> {
+    if let Some(provided) = extract_bearer_token(req) {
+        if validate_bearer_token_against_secret_keys(
+            &provided, &["b2_cdn_purge_drain_token"],
+        ).is_ok() {
+            return Ok(());
+        }
+    }
+    validate_admin_auth(req)
+}
+
 /// Validate Bearer token from Authorization header.
 /// Accepts either admin_token or webhook_secret from the Fastly Secret Store.
 /// Both are checked independently — webhook_secret is used by divine-moderation-service.

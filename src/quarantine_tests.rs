@@ -619,3 +619,18 @@ fn creator_physical_delete_unreadable_phase_fails_before_policy_mutation() {
     assert!(delete_policy::handle_creator_delete(&hash(), &metadata, "synthetic", true, "synthetic").is_err());
     assert_eq!(get_blob_metadata_uncached(&hash()).unwrap().unwrap().status, BlobStatus::Active);
 }
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn cdn_drain_service_token_is_not_an_admin_credential() {
+    let mut drain = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false);
+    drain.set_header("Authorization", "Bearer synthetic-drain-token");
+    assert_eq!(call(drain).get_status(), StatusCode::OK);
+    let mut moderation = request(Method::POST, "/admin/api/moderate", false);
+    moderation.set_header("Authorization", "Bearer synthetic-drain-token");
+    moderation.set_body(serde_json::json!({"sha256": hash(), "action": "BAN"}).to_string());
+    assert_eq!(call(moderation).get_status(), StatusCode::UNAUTHORIZED);
+    let mut wrong = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false);
+    wrong.set_header("Authorization", "Bearer invalid-drain-token");
+    assert_eq!(call(wrong).get_status(), StatusCode::UNAUTHORIZED);
+}

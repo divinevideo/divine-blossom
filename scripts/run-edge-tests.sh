@@ -86,6 +86,7 @@ for contract in \
   restore_cdn_failure_keeps_durable_retry_after_status_commits \
   bulk_approve_skip_purge_reports_durable_pending_hashes \
   cdn_purge_drain_requires_admin_and_rejects_oversized_batches \
+  cdn_drain_service_token_is_not_an_admin_credential \
   creator_physical_delete_waits_for_final_purge_without_replaying_absent_bytes \
   creator_physical_delete_retains_audio_discovery_until_both_final_receipts \
   creator_physical_delete_unreadable_phase_fails_before_policy_mutation; do

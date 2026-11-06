@@ -752,7 +752,7 @@ pub(crate) fn handle_drain(
     req: Request,
     purge: impl Fn(&[String]) -> Result<()>,
 ) -> Result<Response> {
-    crate::admin::validate_admin_auth(&req)?;
+    crate::admin::validate_b2_cdn_purge_drain_auth(&req)?;
     if req.get_method() != Method::POST {
         return Err(BlossomError::BadRequest("POST required".into()));
     }

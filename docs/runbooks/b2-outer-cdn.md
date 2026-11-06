@@ -147,7 +147,12 @@ intent can be marked cleared, and a receipt is bound to its exact attempt.
 Missing records do not imply acknowledgement.
 
 The authenticated POST `/admin/api/b2-cdn-purge/drain?max=2` drains at most two
-hashes per execution. The request budget includes both URL/key rounds and
+hashes per execution. A recurring worker may use the dedicated Secret Store key
+`b2_cdn_purge_drain_token`; it is accepted only on this endpoint and grants no
+moderation or general admin authority. Existing operator admin authentication
+remains supported. The response's `result`, `pending`, `errors` and `unknown`
+are nonnegative counts for this bounded pass, not proof of a globally empty
+queue. The request budget includes both URL/key rounds and
 metadata operations. Do not combine that drain with a physical erasure wave or
 raise its limit to accelerate a backlog. Cursor progress must pass blocked rows
 without discarding them. A functioning unattended drain and alert/recovery path
