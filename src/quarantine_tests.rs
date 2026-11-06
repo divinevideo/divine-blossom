@@ -49,6 +49,39 @@ fn status() -> serde_json::Value {
 
 #[test]
 #[ignore = "requires failing then recovering local purge backend"]
+fn pending_cdn_intent_cannot_clear_when_purge_configuration_disappears() {
+    let store = open_store().unwrap();
+    let token = b2_cdn_purge::begin(&hash()).unwrap();
+    assert_eq!(b2_cdn_purge::commit(&store, &token).unwrap(), b2_cdn_purge::CommitOutcome::Committed);
+    let mut response = call(request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=1", true));
+    assert_eq!(response.get_status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&response.take_body_str()).unwrap();
+    assert_eq!(body["result"], 0);
+    assert_eq!(body["errors"], 1);
+    assert_eq!(body["pending"], 1);
+    let entries = store.build_list().prefix("b2-cdn-purge").execute().unwrap();
+    for key in entries.keys() {
+        let mut entry = store.lookup(key).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&entry.take_body().into_string()).unwrap();
+        assert_eq!(value["state"], "committed");
+    }
+}
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn restore_without_cdn_keeps_existing_non_deleted_rejection() {
+    let metadata: BlobMetadata = serde_json::from_value(serde_json::json!({
+        "sha256": hash(), "size": 9, "type": "video/mp4", "uploaded": "2026-01-01T00:00:00Z",
+        "owner": "b".repeat(64), "status": "active"
+    })).unwrap();
+    put_blob_metadata(&metadata).unwrap();
+    let mut req = request(Method::POST, "/admin/api/restore", true);
+    req.set_body(serde_json::json!({"sha256": hash()}).to_string());
+    assert_eq!(call(req).get_status(), StatusCode::BAD_REQUEST);
+}
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
 fn bulk_approve_skip_purge_reports_durable_pending_hashes() {
     let metadata: BlobMetadata = serde_json::from_value(serde_json::json!({
         "sha256": hash(), "size": 9, "type": "video/mp4", "uploaded": "2026-01-01T00:00:00Z",

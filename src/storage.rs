@@ -2247,7 +2247,10 @@ fn b2_cdn_purge_urls(hash: &str, hosts: &str, current_host: &str) -> Result<Vec<
 /// In-flight cache behavior still requires live provider acceptance tests.
 /// All requests are drained; no acknowledgement is returned on partial failure.
 pub(crate) fn invalidate_b2_cdn(hashes: &[String]) -> Result<()> {
-    if !b2_cdn_invalidation_enabled() || hashes.is_empty() { return Ok(()); }
+    // A discovered durable intent is still owed an eviction even if an operator
+    // removed admission/purge configuration. Missing configuration must fail
+    // this checked operation, never masquerade as a successful empty purge.
+    if hashes.is_empty() { return Ok(()); }
     validate_b2_cdn_purge_batch(hashes)?;
     let hosts = get_config("b2_cdn_purge_hosts")?;
     let current_host = get_config("b2_cdn_host")?;

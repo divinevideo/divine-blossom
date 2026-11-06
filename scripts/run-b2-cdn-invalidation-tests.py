@@ -35,11 +35,14 @@ def main():
             with tempfile.TemporaryDirectory(prefix="cdn-purge-contract-") as directory:
                 root = Path(directory)
                 config, settings, kv = (root / name for name in ("fastly.toml", "settings.json", "kv.json"))
-                settings.write_text(json.dumps({
+                values = {
                     "b2_cdn_enabled": os.environ.get("TEST_CDN_ADMISSION", "true"),
                     "b2_cdn_host": "media-b2-cdn.divine.video",
                     "b2_cdn_purge_hosts": "media-b2-cdn.divine.video",
-                }))
+                }
+                if os.environ.get("TEST_CDN_ABSENT") == "1":
+                    values = {}
+                settings.write_text(json.dumps(values))
                 kv.write_text("{}")
                 config.write_text(f'''manifest_version = 3
 name = "synthetic-cdn-purge"
@@ -72,6 +75,8 @@ blossom_secrets = [{{key="admin_token",data="synthetic-admin-token"}},{{key="fas
                 if os.environ.get("TEST_CDN_CONTRACT") in (
                     "cdn_purge_drain_requires_admin_and_rejects_oversized_batches",
                     "bulk_approve_skip_purge_reports_durable_pending_hashes",
+                    "restore_without_cdn_keeps_existing_non_deleted_rejection",
+                    "pending_cdn_intent_cannot_clear_when_purge_configuration_disappears",
                 ):
                     assert not server.calls
                     print(f"PASS {os.environ['TEST_CDN_CONTRACT']}: no inline purge requests")

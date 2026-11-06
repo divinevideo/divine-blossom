@@ -1043,7 +1043,8 @@ pub fn handle_admin_restore_action(mut req: Request) -> Result<Response> {
     let old_status = metadata.status;
 
     let new_status = parse_restore_status(restore_req.status.as_deref())?;
-    if old_status != BlobStatus::Deleted && old_status != new_status {
+    let cdn_retry = crate::b2_cdn_purge::configured() && old_status == new_status;
+    if old_status != BlobStatus::Deleted && !cdn_retry {
         return Err(BlossomError::BadRequest("Blob is not soft-deleted".into()));
     }
     if old_status == BlobStatus::Deleted {
