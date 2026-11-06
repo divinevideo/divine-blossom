@@ -106,7 +106,15 @@ class Origin(BaseHTTPRequestHandler):
                     time.sleep(3.5)
                     self.wfile.write(body[3:])
                 else:
-                    self.wfile.write(body)
+                    fragment=getattr(self.server,"fragment_bytes",0)
+                    if fragment and self.path!="/b2api/v4/b2_authorize_account":
+                        self.connection.setsockopt(socket.IPPROTO_TCP,socket.TCP_NODELAY,1)
+                        for offset in range(0,len(body),fragment):
+                            self.wfile.write(body[offset:offset+fragment])
+                            self.wfile.flush()
+                            time.sleep(0.0005)
+                    else:
+                        self.wfile.write(body)
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
@@ -183,6 +191,9 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                                 ("demand_cached_large_b2", 200),
                                 ("demand_cached_large_16_b2", 200), ("demand_cached_large_32_b2", 200),
                                 ("demand_cached_large_oversize_b2", 200),
+                                ("demand_cached_large_8_fragmented_b2",200),
+                                ("demand_cached_large_16_fragmented_b2",200),
+                                ("demand_cached_large_32_fragmented_b2",200),
                                 ("demand_b2_overflow_open", 416), ("demand_b2_overflow_end", 206), ("demand_b2_overflow_suffix", 206),
                                 ("demand_b2_416_wrong", 502), ("demand_gcs_416_wrong", 502),
                                 ("demand_b2_416_satisfiable", 502), ("demand_gcs_416_satisfiable", 502),
@@ -238,7 +249,9 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                     server.wrong_version_once = original_case == "demand_cached_wrong_version_b2"
                     server.slow_body_once = original_case == "demand_cached_timeout_b2"
                     server.body_override = None
+                    server.fragment_bytes=1024 if "_fragmented_" in original_case else 0
                     values, meta, readiness = copy.deepcopy(base), copy.deepcopy(metadata), copy.deepcopy(ready)
+                    values['test_fragmented']='true' if server.fragment_bytes else 'false'
                     data = {f"blob:{HASH}": meta, f"b2-ready:{HASH}": readiness}
                     if original_case == "cache_flag_strict":
                         values["b2_canary_cache_enabled"] = "true"
@@ -382,11 +395,11 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                     if original_case.startswith("demand_cached_"):
                         origin = "/private-test/" if original_case.endswith("_b2") else "/gcs-test/"
                         reads = [r for r in server.requests if r[1].startswith(origin)]
-                        assert [r[0] for r in reads] == (["GET", "HEAD"] if "_oversize_" in original_case else ["GET"] if "_large_" in original_case else ["GET", "GET"]), server.requests
+                        assert [r[0] for r in reads] == (["GET", "HEAD"] if "_oversize_" in original_case else ["GET"] if "_large_" in original_case or "_timeout_" in original_case else ["GET", "GET"]), server.requests
                         for line in test_output.splitlines():
                             if line.startswith("CACHE_FILL "):
                                 print(line)
-                        detail = "32MiB+1 streams full/checksum and genuine HEAD without fill" if "_oversize_" in original_case else f"{large_mib}MiB MISS/checksum then warm HEAD/range with one origin GET" if "_large_" in original_case else "buffer timeout preserves streaming and later fill" if "_timeout_" in original_case else "wrong version rejected, recovery MISS then HIT" if "_wrong_version_" in original_case else "warm GET/HEAD/range/416, purge and policy/erasure denial"
+                        detail = "32MiB+1 streams full/checksum and genuine HEAD without fill" if "_oversize_" in original_case else f"{large_mib}MiB MISS/checksum then warm HEAD/range with one origin GET" if "_large_" in original_case else "slow body streams then becomes completed HIT" if "_timeout_" in original_case else "wrong version rejected, recovery MISS then HIT" if "_wrong_version_" in original_case else "warm GET/HEAD/range/416, purge and policy/erasure denial"
                         print(f"PASS {original_case} {detail}")
                         continue
                     if "_overflow_" in original_case:

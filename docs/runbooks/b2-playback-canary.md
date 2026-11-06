@@ -193,34 +193,52 @@ tests cached video bytes, not an outer cache that could skip Compute policy.
 
 Entries are isolated by provider, host, bucket, key, hash, verified size and
 exact B2 version. GCS fallback entries are distinct. The
-`divine-demand-playback-v2` namespace excludes older in-flight insertion semantics.
-Only complete GETs up to 32 MiB (33,554,432 bytes) populate the cache, after
-existing origin version/size and full-length verification. They
+`divine-demand-playback-v3` namespace excludes earlier buffered fill semantics.
+Full GETs up to 32 MiB (33,554,432 bytes) may populate the cache after
+existing origin version and advertised-size validation. Entries become usable
+only after host collection completes with the expected length. They
 expire after one hour, without stale serving, and use the normal bare-hash
 surrogate key so existing erasure purges cover every version. Larger originals
 stay available through the uncached path.
 
 A full warm GET supplies later GET/HEAD/range responses. A cold HEAD or range
-request goes to the real origin and does not fill the cache. Cache coordination
-waits at most 50 ms; body verification buffers at most 32 MiB plus one byte for
-up to three seconds within the remaining I/O budget. A 25 ms per-request CPU
-guard reserves capacity for insertion and final policy checks. If either budget expires,
-the consumed prefix and remaining body resume as uncached streaming. Cache
-errors do not grant access or convert an available origin into a cache-only
-failure. Wrong version/size and complete-body length mismatches remain integrity
-failures. Reads use one initialized buffer with windows up to 256 KiB; short
-reads continue with fresh deadline checks. Successful fills stream back from
-the finished cache write instead of copying the whole buffer again for delivery.
-Insertion does not advertise a length until completion; HIT admission requires
-the inferred exact completed length, excluding partial writes. These guards
-also apply when a cache writer fails. Video bodies are not rehashed at the edge: admission trusts the
-worker-verified immutable B2 version or authoritative GCS content-addressed
+request goes to the real origin and does not fill the cache. Each cache lookup
+or failure-probe readiness wait is capped at 50 ms within the remaining request
+deadline; a repair may perform more than one such wait. A 25 ms per-request CPU guard reserves capacity for
+insertion and final policy checks; existing policy/header I/O deadlines remain.
+Cache setup prepares an insertion-owned readback stream before moving the
+origin body. The host then splices that body into the cache and streams it to
+the client, including after guest exit. Video fragments do not cross guest
+memory, and headers do not wait for the complete download. The former
+three-second guest-buffer deadline no longer applies; ordinary backend streaming
+timeouts still apply after headers, as on uncached delivery.
+
+Early lookup/setup/readback failures leave the source untouched and bypass
+cache. After ownership moves, the SDK has no independent source tee: a finish
+failure is transient unavailability before delivery, and a later origin/cache
+I/O failure terminates that response. Do not assume uncached replay after a
+streaming failure. Insertion does not advertise a length until completion;
+HIT admission requires the inferred exact completed length, excluding partial
+or truncated writes. The host may retain an unusable entry after a failed fill.
+A later full GET can replace a positively failed stream or completed invalid
+entry while fetching the origin it already needs; HEAD/range requests still do
+not fill. Unknown length alone never triggers replacement. One readiness-bounded
+byte read checks for an error or terminal empty stream; a byte or timeout leaves
+an in-flight producer intact. A host that replays a prefix before reporting a
+failure may remain bypassed until expiry or invalidation. A bounded readback lookup must match the
+new internal insertion nonce before source ownership moves. On a concurrent
+replacement or setup failure, the untouched source bypasses cache. Healthy
+existing streams retain their own handles; no purge is used for repair.
+Wrong origin version or advertised size still fails
+integrity checks before insertion. Video bodies are not rehashed at the edge:
+admission trusts the worker-verified immutable B2 version or authoritative GCS content-addressed
 object, matching existing origin delivery. Same-length bad content with valid
 headers can remain cached for one hour. The operator's checksum verification
 detects such a fill after insertion; it does not prevent that initial insertion.
 
-Inspect `X-Divine-Storage-Cache`: HIT means cached bytes, MISS means a newly
-verified full fill, BYPASS means this response was not filled/hit. The normal
+Inspect `X-Divine-Storage-Cache`: HIT means completed cached bytes, MISS means
+an origin stream selected for insertion, and BYPASS means this response was not filled/hit. A MISS alone does
+not establish completed storage: verify a full checksum and a later HIT. The normal
 `X-Divine-Source` describes the bytes' provider; on HIT it is fill provenance,
 not proof of a media-origin request during this attempt. B2 authorization is
 still a fresh network request, so a cache hit does not remove all overhead.
@@ -228,7 +246,7 @@ still a fresh network request, so a cache hit does not remove all overhead.
 Before warming a cohort, prove a real MISS→HIT with matching checksum, warm
 HEAD/ranges/416, surrogate invalidation, representative 8/16/32 MiB cold fills, and
 denial after moderation or erasure.
-Record request CPU, actual buffer reads, memory and header/full-download times
+Record request CPU, host-stream mode, memory and header/full-download times
 at each size. A normal-size CPU bypass is failed caching acceptance. Local
 Viceroy CPU counters do not establish production resource viability.
 Then refresh the private cohort manifest's policy, size, source generation,
@@ -242,22 +260,27 @@ ordinary demand fallback and durable queue.
 Demand responses also report request-local cache diagnostics:
 `X-Divine-Storage-Cache-Reason` distinguishes a disabled flag, ineligible request,
 CPU rejection stage, lookup start/select/wait failure or timeout, origin header
-or metadata rejection, buffering timeout, and insert/write/finish failure.
-`inserted` and `hit` identify successful fills and reads. These fixed codes contain
-no object or provider identifiers. `X-Divine-Storage-Cache-Compute` reports the
+or metadata rejection, handoff budget expiry, and insertion/repair setup or
+readback failure.
+`streaming_insert` identifies a selected fill; `hit` identifies a completed read.
+These fixed codes contain no object or provider identifiers. `X-Divine-Storage-Cache-Compute` reports the
 serving Compute version, `X-Divine-Storage-Cache-Enabled` reports the final flag
 read, and `X-Divine-Storage-Cache-Cpu-Ms` reports request CPU consumed when
 available. A false flag includes unavailable configuration reads. None of these
 observations is stored in cache metadata. Record them on the actual probe:
 control-plane activation alone does not establish POP propagation or admission.
 `X-Divine-Storage-Cache-Buffer-Reads` and
-`X-Divine-Storage-Cache-Buffered-Bytes` describe this attempt's buffering only;
+`X-Divine-Storage-Cache-Buffered-Bytes` are zero for host-stream fills.
+`X-Divine-Storage-Cache-Fill-Mode: host-stream` and
+`X-Divine-Storage-Cache-Expected-Bytes` describe the selected transfer, not proof
+that it completed;
 `X-Divine-Storage-Cache-Linear-Memory-Bytes` is committed WASM linear memory,
 including allocator free space, rather than live heap or host cache/delivery
-memory. A larger read window does not guarantee a larger actual read.
+memory; these counters do not measure host buffering.
 
-Turning this flag off restores strict B2-only mode, including its 503 behavior.
-For ordinary GCS playback, turn off the device flag. Pause worker intake or the
-runner separately; preserve committed queues, state backups, copy gates and
+Turning only the cache flag off restores uncached demand playback with GCS
+fallback. Turning the demand-mode flag off restores strict B2-only mode,
+including its 503 behavior. Keep the device flag on for B2 playback testing.
+Pause worker intake or the runner separately; preserve committed queues, state backups, copy gates and
 permanent erasing markers. Keep B2 erasure enabled while any replica bytes remain.
 No canonical/global traffic switch is included.

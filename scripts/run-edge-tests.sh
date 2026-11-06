@@ -73,6 +73,9 @@ VICEROY="$VICEROY" python3 scripts/run-media-origin-tests.py
 # Canary policy/readiness runs before every uncached pinned-version read.
 VICEROY="$VICEROY" python3 scripts/run-b2-canary-tests.py
 
+# Streaming fills must outlive guest exit and remain safe under 1KiB fragmentation.
+VICEROY="$VICEROY" python3 scripts/run-b2-native-stream-tests.py
+
 # Named media holds preserve base policy and enforce every derived route.
 VICEROY="$VICEROY" python3 scripts/run-quarantine-tests.py
 
