@@ -526,6 +526,11 @@ fn bounded_demand_body(response: Response, deadline: Instant) -> Result<Option<S
         .map_err(|_| BlossomError::StorageError("Demand authorization invalid".into()))
 }
 
+/// Internal caching remains opt-in and is called only by the demand test host.
+pub(crate) fn b2_canary_cache_enabled() -> bool {
+    config_flag("b2_canary_cache_enabled")
+}
+
 pub(crate) fn download_demand_b2(
     ready: &blossom_core::canary::Readiness,
     method: &Method,
@@ -579,24 +584,46 @@ pub(crate) fn download_demand_b2(
     }
     request.set_pass(true);
     sign_request(&mut request, &config, Some("UNSIGNED-PAYLOAD".into()))?;
-    let Some(response) = send_demand(
-        request,
-        B2_MEDIA_BACKEND,
-        (Instant::now() + DEMAND_ATTEMPT_BUDGET).min(deadline),
-    )?
-    else {
-        return Ok(CanaryOrigin::Unavailable);
+    let fetch = || {
+        let Some(response) = send_demand(
+            request,
+            B2_MEDIA_BACKEND,
+            (Instant::now() + DEMAND_ATTEMPT_BUDGET).min(deadline),
+        )?
+        else {
+            return Ok(CanaryOrigin::Unavailable);
+        };
+        demand_delivery(
+            response,
+            ready.size,
+            method,
+            range,
+            Some(&ready.destination_version_id),
+        )
     };
-    demand_delivery(
-        response,
-        ready.size,
-        method,
-        range,
-        Some(&ready.destination_version_id),
-    )
+    if b2_canary_cache_enabled() {
+        crate::playback_cache::read(
+            crate::playback_cache::Identity {
+                source: "b2",
+                host: &config.host,
+                bucket: &config.bucket,
+                key: &ready.key,
+                hash: &ready.sha256,
+                size: ready.size,
+                version: Some(&ready.destination_version_id),
+            },
+            method,
+            range,
+            deadline,
+            fetch,
+        )
+    } else {
+        fetch()
+    }
 }
 
-/// Direct authoritative GCS only: no provider selection, FOS or storage cache.
+/// Direct authoritative GCS only: no provider selection or FOS. A separate
+/// opt-in may cache verified bytes behind the demand host's policy checks.
 pub(crate) fn download_demand_gcs(
     hash: &str,
     size: u64,
@@ -616,15 +643,36 @@ pub(crate) fn download_demand_gcs(
     }
     request.set_pass(true);
     sign_request(&mut request, &config, Some("UNSIGNED-PAYLOAD".into()))?;
-    let Some(response) = send_demand(
-        request,
-        GCS_BACKEND,
-        (Instant::now() + DEMAND_ATTEMPT_BUDGET).min(deadline),
-    )?
-    else {
-        return Ok(CanaryOrigin::Unavailable);
+    let fetch = || {
+        let Some(response) = send_demand(
+            request,
+            GCS_BACKEND,
+            (Instant::now() + DEMAND_ATTEMPT_BUDGET).min(deadline),
+        )?
+        else {
+            return Ok(CanaryOrigin::Unavailable);
+        };
+        demand_delivery(response, size, method, range, None)
     };
-    demand_delivery(response, size, method, range, None)
+    if b2_canary_cache_enabled() {
+        crate::playback_cache::read(
+            crate::playback_cache::Identity {
+                source: "gcs",
+                host: &config.host,
+                bucket: &config.bucket,
+                key: hash,
+                hash,
+                size,
+                version: None,
+            },
+            method,
+            range,
+            deadline,
+            fetch,
+        )
+    } else {
+        fetch()
+    }
 }
 
 fn demand_delivery(

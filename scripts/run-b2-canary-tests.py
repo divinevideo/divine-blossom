@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise actual Compute policy, private-origin reads and erasure mutex."""
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -50,8 +51,9 @@ class Origin(BaseHTTPRequestHandler):
             self.send_response(self.server.auth_status if isinstance(self.server.auth_status, int) else 200)
         else:
             parsed = urlparse(self.path)
-            is_gcs = parsed.path == f"/gcs-test/{HASH}"
-            assert is_gcs or parsed.path == f"/private-test/{HASH}", self.path
+            current_hash = getattr(self.server, "hash", HASH)
+            is_gcs = parsed.path == f"/gcs-test/{current_hash}"
+            assert is_gcs or parsed.path == f"/private-test/{current_hash}", self.path
             assert parse_qs(parsed.query) == ({} if is_gcs else {"versionId": [VERSION]}), self.path
             assert ("/auto/s3/aws4_request" if is_gcs else "/us-west-004/s3/aws4_request") in self.headers.get("Authorization", "")
             assert self.headers.get("Host") == ("storage.googleapis.com" if is_gcs else "s3.us-west-004.backblazeb2.com")
@@ -60,6 +62,8 @@ class Origin(BaseHTTPRequestHandler):
                 self.connection.close()
                 return
             status, body = (self.server.gcs_status, b"gcsbytes!") if is_gcs else (self.server.status, BODY)
+            if getattr(self.server, "body_override", None) is not None:
+                body = self.server.body_override
             if status == "slow":
                 time.sleep(3.5)
                 status = 200
@@ -79,8 +83,12 @@ class Origin(BaseHTTPRequestHandler):
                 status, body, content_range = 206, body[-3:], "bytes 6-8/9"
             elif self.headers.get("Range"):
                 status, body = 206, body[1:4]
+            version = self.server.version
+            if getattr(self.server, "wrong_version_once", False):
+                self.server.wrong_version_once = False
+                version = "unverified-version"
             self.send_response(status)
-            self.send_header("x-amz-version-id", self.server.version)
+            self.send_header("x-amz-version-id", version)
             if status == 206:
                 self.send_header("Content-Range", content_range)
             elif status == 416 and self.server.range_mode != "missing":
@@ -91,7 +99,14 @@ class Origin(BaseHTTPRequestHandler):
             if self.path == "/b2api/v4/b2_authorize_account" and self.server.auth_status == "slow_body":
                 time.sleep(3.5)
             try:
-                self.wfile.write(body)
+                if self.path != "/b2api/v4/b2_authorize_account" and getattr(self.server, "slow_body_once", False):
+                    self.server.slow_body_once = False
+                    self.wfile.write(body[:3])
+                    self.wfile.flush()
+                    time.sleep(3.5)
+                    self.wfile.write(body[3:])
+                else:
+                    self.wfile.write(body)
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
@@ -144,6 +159,7 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                          "bucket": "private-test", "key": HASH, "size": 9,
                          "verified_at": 1, "destination_version_id": VERSION}
                 cases = [("flag_off", 503), ("flag_malformed", 503), ("auth429", 502), ("auth_disconnect", 502),
+                         ("cache_flag_strict", 200),
                          ("range_overflow_open", 416), ("range_overflow_end", 206), ("range_overflow_suffix", 206),
                          ("range_missing", 416), ("range_wrong", 502), ("range_satisfiable", 502),
                          ("range_malformed", 502), ("range_multiple", 502),
@@ -161,6 +177,9 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                          ("wrong_origin_version", 502), ("origin_missing", 503),
                          ("origin_forbidden", 502), ("origin_unauthorized", 502), ("origin_failed", 503), ("origin_disconnect", 503)]
                 demand_cases = [("demand_b2_416_missing", 416), ("demand_gcs_416_missing", 416),
+                                ("demand_cached_b2", 200), ("demand_cached_gcs", 200),
+                                ("demand_cached_wrong_version_b2", 200), ("demand_cached_timeout_b2", 200),
+                                ("demand_cached_large_b2", 200),
                                 ("demand_b2_overflow_open", 416), ("demand_b2_overflow_end", 206), ("demand_b2_overflow_suffix", 206),
                                 ("demand_b2_416_wrong", 502), ("demand_gcs_416_wrong", 502),
                                 ("demand_b2_416_satisfiable", 502), ("demand_gcs_416_satisfiable", 502),
@@ -200,6 +219,10 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                         continue
                     demand = original_case.startswith("demand_")
                     case = original_case.removeprefix("demand_")
+                    if case == "cache_flag_strict":
+                        case = "valid"
+                    if original_case.startswith("demand_cached_"):
+                        case = "valid" if original_case.endswith("_b2") else "missing_ready"
                     case = "missing_ready" if case in ("flag_off", "flag_malformed") else case
                     case = "origin_missing" if original_case == "demand_max_fanout_fallback" else case
                     case = "missing_ready" if case.startswith("gcs_416_") else case
@@ -209,12 +232,19 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                     server.bucket_name, server.bucket_id = "private-test", "synthetic-bucket-id"
                     server.status, server.version, server.auth_status = 200, VERSION, 200
                     server.gcs_status, server.gcs_size, server.range_mode = 200, 9, "normal"
+                    server.wrong_version_once = original_case == "demand_cached_wrong_version_b2"
+                    server.slow_body_once = original_case == "demand_cached_timeout_b2"
+                    server.body_override = None
                     values, meta, readiness = copy.deepcopy(base), copy.deepcopy(metadata), copy.deepcopy(ready)
                     data = {f"blob:{HASH}": meta, f"b2-ready:{HASH}": readiness}
+                    if original_case == "cache_flag_strict":
+                        values["b2_canary_cache_enabled"] = "true"
                     if original_case in ("flag_off", "flag_malformed"):
                         values["b2_demand_mirror_enabled"] = "false" if original_case == "flag_off" else "TRUE"
                     if demand:
                         values["b2_demand_mirror_enabled"] = "true"
+                        if original_case.startswith("demand_cached_"):
+                            values["b2_canary_cache_enabled"] = "true"
                         values["media_read_primary"] = "b2"
                         values["fos_read_enabled"] = "true"
                         values["test_source"] = "b2" if case in ("valid", "pending") else "gcs"
@@ -324,13 +354,34 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                         f'[local_server.backends.b2_storage]\nurl = "http://127.0.0.1:{server.server_port}"\n', ""
                     ) if case == "missing_backend" else manifest)
                     values["test_expected_status"] = str(expected)
+                    server.hash = HASH
+                    if original_case.startswith("demand_cached_"):
+                        payload = b'A' * (8 * 1024 * 1024) if "_large_" in original_case else values["test_body"].encode()
+                        current_hash = hashlib.sha256(payload).hexdigest()
+                        values["test_hash"] = current_hash
+                        values["test_size"] = str(len(payload))
+                        meta["size"] = len(payload)
+                        values["test_cache_failure"] = "timeout" if "_timeout_" in original_case else "integrity"
+                        meta["sha256"] = current_hash
+                        readiness.update(sha256=current_hash, verified_sha256=current_hash, key=current_hash, size=len(payload))
+                        data = {k.replace(HASH, current_hash): v for k, v in data.items()}
+                        server.hash = current_hash
+                        if "_large_" in original_case:
+                            server.body_override = payload
                     settings.write_text(json.dumps(values))
                     kv.write_text(json.dumps({k: json.dumps(v) for k, v in data.items()}))
                     started = time.monotonic()
-                    run(repo, env, "demand_endpoint_contract" if demand or original_case.startswith("range_") else "canary_endpoint_integration_contract")
+                    run(repo, env, "demand_cached_large_contract" if original_case == "demand_cached_large_b2" else "demand_cached_fill_failure_contract" if original_case in ("demand_cached_wrong_version_b2", "demand_cached_timeout_b2") else "demand_cached_playback_contract" if original_case.startswith("demand_cached_") else "demand_endpoint_contract" if demand or original_case.startswith("range_") else "canary_endpoint_integration_contract")
                     if original_case == "demand_origin_slow":
                         assert time.monotonic() - started < 8, "origin timeout exceeded request budget"
                     storage = [r for r in server.requests if r[1].startswith("/private-test/")]
+                    if original_case.startswith("demand_cached_"):
+                        origin = "/private-test/" if original_case.endswith("_b2") else "/gcs-test/"
+                        reads = [r for r in server.requests if r[1].startswith(origin)]
+                        assert [r[0] for r in reads] == (["GET"] if "_large_" in original_case else ["GET", "GET"]), server.requests
+                        detail = "8MiB MISS/checksum then warm HEAD/range with one origin GET" if "_large_" in original_case else "buffer timeout preserves streaming and later fill" if "_timeout_" in original_case else "wrong version rejected, recovery MISS then HIT" if "_wrong_version_" in original_case else "warm GET/HEAD/range/416, purge and policy/erasure denial"
+                        print(f"PASS {original_case} {detail}")
+                        continue
                     if "_overflow_" in original_case:
                         expected_range = "bytes=9-" if original_case.endswith("_open") else "bytes=0-8"
                         assert len(storage) == 1 and storage[0][2] == expected_range, server.requests
@@ -405,7 +456,16 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                     run(repo, env, "demand_exhausted_deadline_starts_no_origin_request")
                     assert not server.requests, server.requests
                     print("PASS demand exhausted deadline starts no origin")
+                if selected in (None, "cache_lookup"):
+                    server.requests = []
+                    config.write_text(manifest)
+                    settings.write_text(json.dumps(base))
+                    kv.write_text("{}")
+                    run(repo, env, "cache_lookup_wait_is_bounded")
+                    assert not server.requests, server.requests
+                    print("PASS busy cache lookup times out to uncached origin without waiting for leader")
                 kv.write_text("{}")
+                server.hash = HASH
                 server.auth_status = 200
                 server.requests = []
                 run(repo, env, "canary_sync_erasure_mutex")

@@ -134,7 +134,16 @@ fn demand_headers(
     response.set_header("X-Sha256", hash);
     response.set_header("X-Content-Length", metadata.size.to_string());
     response.set_header("X-Divine-Source", source);
-    response.set_header("X-Divine-Storage-Cache", "BYPASS");
+    let cache_status = if crate::storage::b2_canary_cache_enabled() {
+        match response.get_header_str("X-Divine-Storage-Cache") {
+            Some("HIT") => "HIT",
+            Some("MISS") => "MISS",
+            _ => "BYPASS",
+        }
+    } else {
+        "BYPASS"
+    };
+    response.set_header("X-Divine-Storage-Cache", cache_status);
     response.set_header("Accept-Ranges", "bytes");
     crate::add_cors_headers(&mut response);
     no_store(&mut response);
@@ -334,6 +343,142 @@ fn handle_with_origin(
 mod tests {
     use crate::handle_main;
     use fastly::{http::StatusCode, Request};
+    #[test]
+    #[ignore = "requires demand fixtures; scripts/run-b2-canary-tests.py"]
+    fn demand_cached_large_contract() {
+        use sha2::{Digest, Sha256};
+        let config = fastly::config_store::ConfigStore::open("blossom_config");
+        let hash = config.get("test_hash").unwrap();
+        let size = config.get("test_size").unwrap().parse::<usize>().unwrap();
+        let url = format!("https://media-b2.divine.video/{hash}");
+        let mut first = handle_main(Request::get(&url)).unwrap();
+        assert_eq!(first.get_status(), StatusCode::OK);
+        assert_eq!(first.get_header_str("X-Divine-Storage-Cache"), Some("MISS"));
+        let bytes = first.take_body().into_bytes();
+        assert_eq!(bytes.len(), size);
+        assert_eq!(hex::encode(Sha256::digest(bytes)), hash);
+        let mut head = handle_main(Request::new("HEAD", &url)).unwrap();
+        assert_eq!(head.get_header_str("X-Divine-Storage-Cache"), Some("HIT"));
+        assert_eq!(head.take_body().into_string(), "");
+        let mut request = Request::get(&url);
+        request.set_header("Range", "bytes=0-31");
+        let mut part = handle_main(request).unwrap();
+        assert_eq!(part.get_status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(part.get_header_str("X-Divine-Storage-Cache"), Some("HIT"));
+        assert_eq!(
+            part.get_header_str("Content-Range"),
+            Some(format!("bytes 0-31/{size}").as_str())
+        );
+        assert_eq!(part.take_body().into_bytes(), vec![b'A'; 32]);
+    }
+
+    #[test]
+    #[ignore = "requires demand fixtures; scripts/run-b2-canary-tests.py"]
+    fn demand_cached_fill_failure_contract() {
+        let config = fastly::config_store::ConfigStore::open("blossom_config");
+        let hash = config.get("test_hash").unwrap();
+        let body = config.get("test_body").unwrap();
+        let timeout = config.get("test_cache_failure").as_deref() == Some("timeout");
+        let url = format!("https://media-b2.divine.video/{hash}");
+        let mut first = handle_main(Request::get(&url)).unwrap();
+        if timeout {
+            assert_eq!(first.get_status(), StatusCode::OK);
+            assert_eq!(
+                first.get_header_str("X-Divine-Storage-Cache"),
+                Some("BYPASS")
+            );
+            assert_eq!(first.take_body().into_string(), body);
+        } else {
+            assert_eq!(first.get_status(), StatusCode::BAD_GATEWAY);
+        }
+        let mut retry = handle_main(Request::get(&url)).unwrap();
+        assert_eq!(retry.get_status(), StatusCode::OK);
+        assert_eq!(retry.get_header_str("X-Divine-Storage-Cache"), Some("MISS"));
+        assert_eq!(retry.take_body().into_string(), body);
+        let mut warm = handle_main(Request::get(&url)).unwrap();
+        assert_eq!(warm.get_header_str("X-Divine-Storage-Cache"), Some("HIT"));
+        assert_eq!(warm.take_body().into_string(), body);
+    }
+
+    #[test]
+    #[ignore = "requires demand fixtures; scripts/run-b2-canary-tests.py"]
+    fn demand_cached_playback_contract() {
+        use fastly::config_store::ConfigStore;
+        let config = ConfigStore::open("blossom_config");
+        let source = config.get("test_source").unwrap();
+        let expected = config.get("test_body").unwrap();
+        let hash = config.get("test_hash").unwrap();
+        let url = format!("https://media-b2.divine.video/{hash}");
+        let read = |method: &str, range: Option<&str>| {
+            let mut req = Request::new(method, &url);
+            if let Some(range) = range {
+                req.set_header("Range", range);
+            }
+            handle_main(req).unwrap()
+        };
+        let mut first = read("GET", None);
+        assert_eq!(first.get_status(), StatusCode::OK);
+        assert_eq!(first.get_header_str("X-Divine-Storage-Cache"), Some("MISS"));
+        assert_eq!(first.take_body().into_string(), expected);
+        let mut second = read("GET", None);
+        assert_eq!(second.get_header_str("X-Divine-Storage-Cache"), Some("HIT"));
+        assert_eq!(
+            second.get_header_str("X-Divine-Source"),
+            Some(source.as_str())
+        );
+        assert_eq!(
+            second.get_header_str("Cache-Control"),
+            Some("private, no-store")
+        );
+        assert_eq!(second.take_body().into_string(), expected);
+        let mut head = read("HEAD", None);
+        assert_eq!(head.get_status(), StatusCode::OK);
+        assert_eq!(head.get_header_str("X-Divine-Storage-Cache"), Some("HIT"));
+        assert_eq!(head.take_body().into_string(), "");
+        let mut part = read("GET", Some("bytes=1-3"));
+        assert_eq!(part.get_status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(part.get_header_str("X-Divine-Storage-Cache"), Some("HIT"));
+        assert_eq!(part.get_header_str("Content-Range"), Some("bytes 1-3/9"));
+        assert_eq!(part.take_body().into_string(), &expected[1..4]);
+        let mut unsat = read("GET", Some("bytes=9223372036854775808-"));
+        assert_eq!(unsat.get_status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(unsat.get_header_str("X-Divine-Storage-Cache"), Some("HIT"));
+        assert_eq!(unsat.get_header_str("Content-Range"), Some("bytes */9"));
+        assert_eq!(unsat.take_body().into_string(), "");
+        fastly::http::purge::purge_surrogate_key(&hash).unwrap();
+        let mut after_purge = read("GET", None);
+        assert_eq!(
+            after_purge.get_header_str("X-Divine-Storage-Cache"),
+            Some("MISS")
+        );
+        assert_eq!(after_purge.take_body().into_string(), expected);
+        let store = crate::metadata::open_store().unwrap();
+        let mut metadata = crate::metadata::get_blob_metadata_uncached(&hash)
+            .unwrap()
+            .unwrap();
+        metadata.status = crate::blossom::BlobStatus::Restricted;
+        store
+            .insert(
+                &format!("blob:{hash}"),
+                serde_json::to_string(&metadata).unwrap(),
+            )
+            .unwrap();
+        let denied = handle_main(Request::get(&url)).unwrap();
+        assert_eq!(denied.get_status(), StatusCode::NOT_FOUND);
+        metadata.status = crate::blossom::BlobStatus::Active;
+        store
+            .insert(
+                &format!("blob:{hash}"),
+                serde_json::to_string(&metadata).unwrap(),
+            )
+            .unwrap();
+        store
+            .insert(&format!("b2-sync:v1:{hash}"), r#"{"state":"erasing"}"#)
+            .unwrap();
+        let denied = handle_main(Request::get(&url)).unwrap();
+        assert_eq!(denied.get_status(), StatusCode::NOT_FOUND);
+    }
+
     #[test]
     #[ignore = "requires demand fixtures; scripts/run-b2-canary-tests.py"]
     fn demand_exhausted_deadline_starts_no_origin_request() {

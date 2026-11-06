@@ -6,6 +6,7 @@ mod admin_sweep;
 mod auth;
 mod blossom;
 mod canary;
+mod playback_cache;
 mod delete_policy;
 mod error;
 mod media_auth_log;
@@ -113,6 +114,7 @@ fn main() -> std::result::Result<(), Error> {
 }
 
 fn handle_main(mut req: Request) -> std::result::Result<Response, Error> {
+    playback_cache::begin_request();
     // Route Rust panics to the persistent diagnostics endpoint so a
     // non-returning guest failure still leaves a record. The message is the
     // panic text, not the compute_request JSON schema. Fails open when the
