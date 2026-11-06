@@ -35,8 +35,7 @@ pub fn soft_delete_blob(
         let _ = put_tombstone(hash, reason);
     }
 
-    crate::purge_edge_cache(hash);
-    Ok(())
+    crate::storage::purge_policy_cache(hash)
 }
 
 pub(crate) struct DefaultCreatorDeleteOps;
@@ -275,7 +274,7 @@ pub fn restore_soft_deleted_blob(
         }
     }
     let _ = add_to_recent_index(hash);
-    crate::purge_edge_cache(hash);
+    crate::storage::purge_policy_cache(hash)?;
 
     Ok(())
 }

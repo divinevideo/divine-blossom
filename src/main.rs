@@ -375,6 +375,9 @@ fn route_request(req: Request) -> Result<Response> {
             admin::handle_admin_blob_detail(req, hash)
         }
         (Method::POST, "/admin/api/moderate") => admin::handle_admin_moderate_action(req),
+        (_, "/admin/api/b2-cdn-purge/drain") => {
+            b2_cdn_purge::handle_drain(req, storage::invalidate_b2_cdn)
+        }
         (Method::POST, "/admin/api/quarantine") => admin::handle_admin_quarantine_action(req),
         (Method::GET, p) if p.starts_with("/admin/api/quarantine/") => {
             admin::handle_admin_quarantine_status(
@@ -6382,7 +6385,7 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
 
             // Purge VCL cache so the new status takes effect immediately.
             // Banned/restricted content will 404 on next request; approved content will 200.
-            purge_edge_cache(sha256);
+            storage::purge_policy_cache(sha256)?;
 
             let response = serde_json::json!({
                 "success": true,

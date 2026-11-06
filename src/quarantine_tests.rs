@@ -49,6 +49,72 @@ fn status() -> serde_json::Value {
 
 #[test]
 #[ignore = "requires failing then recovering local purge backend"]
+fn bulk_approve_skip_purge_reports_durable_pending_hashes() {
+    let metadata: BlobMetadata = serde_json::from_value(serde_json::json!({
+        "sha256": hash(), "size": 9, "type": "video/mp4", "uploaded": "2026-01-01T00:00:00Z",
+        "owner": "b".repeat(64), "status": "banned"
+    })).unwrap();
+    put_blob_metadata(&metadata).unwrap();
+    let mut req = request(Method::POST, "/admin/api/bulk-approve", true);
+    req.set_body(serde_json::json!({"hashes": [hash()], "skip_purge": true}).to_string());
+    let mut response = call(req);
+    assert_eq!(response.get_status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&response.take_body_str()).unwrap();
+    assert_eq!(body["cdn_purge_pending_hashes"], serde_json::json!([hash()]));
+    let store = open_store().unwrap();
+    assert!(!store.build_list().prefix("b2-cdn-purge").execute().unwrap().keys().is_empty());
+}
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn soft_delete_cdn_failure_cannot_be_acknowledged_before_eviction() {
+    let metadata: BlobMetadata = serde_json::from_value(serde_json::json!({
+        "sha256": hash(), "size": 9, "type": "video/mp4", "uploaded": "2026-01-01T00:00:00Z",
+        "owner": "b".repeat(64), "status": "active"
+    })).unwrap();
+    put_blob_metadata(&metadata).unwrap();
+    let mutate = || {
+        let mut req = request(Method::POST, "/admin/api/moderate", true);
+        req.set_body(serde_json::json!({"sha256": hash(), "action": "DELETE"}).to_string());
+        call(req)
+    };
+    assert_eq!(mutate().get_status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(get_blob_metadata_uncached(&hash()).unwrap().unwrap().status, BlobStatus::Deleted);
+    assert_eq!(mutate().get_status(), StatusCode::OK);
+    assert_eq!(mutate().get_status(), StatusCode::OK);
+}
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn restore_cdn_failure_keeps_durable_retry_after_status_commits() {
+    let metadata: BlobMetadata = serde_json::from_value(serde_json::json!({
+        "sha256": hash(), "size": 9, "type": "video/mp4", "uploaded": "2026-01-01T00:00:00Z",
+        "owner": "b".repeat(64), "status": "deleted"
+    })).unwrap();
+    put_blob_metadata(&metadata).unwrap();
+    let mutate = || {
+        let mut req = request(Method::POST, "/admin/api/restore", true);
+        req.set_body(serde_json::json!({"sha256": hash()}).to_string());
+        call(req)
+    };
+    assert_eq!(mutate().get_status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(get_blob_metadata_uncached(&hash()).unwrap().unwrap().status, BlobStatus::Active);
+    assert_eq!(mutate().get_status(), StatusCode::OK);
+    assert_eq!(mutate().get_status(), StatusCode::OK);
+}
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn cdn_purge_drain_requires_admin_and_rejects_oversized_batches() {
+    for method in [Method::GET, Method::POST] {
+        assert_eq!(call(request(method, "/admin/api/b2-cdn-purge/drain", false)).get_status(), StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(call(request(Method::GET, "/admin/api/b2-cdn-purge/drain", true)).get_status(), StatusCode::BAD_REQUEST);
+    assert_eq!(call(request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=3", true)).get_status(), StatusCode::BAD_REQUEST);
+}
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
 fn moderation_cdn_purge_failure_is_durable_and_same_status_retry_purges() {
     let metadata: BlobMetadata = serde_json::from_value(serde_json::json!({
         "sha256": hash(), "size": 9, "type": "video/mp4", "uploaded": "2026-01-01T00:00:00Z",

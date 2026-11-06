@@ -1014,7 +1014,9 @@ pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
     }
     // Repeat eviction even when a prior attempt already committed the status
     // but failed to receive both CDN purge acknowledgements.
-    crate::storage::purge_policy_cache(&moderate_req.sha256)?;
+    if !(old_status == BlobStatus::Deleted && old_status != new_status) {
+        crate::storage::purge_policy_cache(&moderate_req.sha256)?;
+    }
 
     let response = serde_json::json!({
         "success": true,
@@ -1040,12 +1042,16 @@ pub fn handle_admin_restore_action(mut req: Request) -> Result<Response> {
         .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
     let old_status = metadata.status;
 
-    if old_status != BlobStatus::Deleted {
+    let new_status = parse_restore_status(restore_req.status.as_deref())?;
+    if old_status != BlobStatus::Deleted && old_status != new_status {
         return Err(BlossomError::BadRequest("Blob is not soft-deleted".into()));
     }
-
-    let new_status = parse_restore_status(restore_req.status.as_deref())?;
-    restore_soft_deleted_blob(&restore_req.sha256, &metadata, new_status)?;
+    if old_status == BlobStatus::Deleted {
+        restore_soft_deleted_blob(&restore_req.sha256, &metadata, new_status)?;
+    } else {
+        // A prior restore may have committed metadata before purge failed.
+        crate::storage::purge_policy_cache(&restore_req.sha256)?;
+    }
 
     let response = serde_json::json!({
         "success": true,
@@ -1080,6 +1086,7 @@ pub fn handle_admin_bulk_approve(mut req: Request) -> Result<Response> {
     // skip_purge=true skips per-blob VCL purge (caller then purges each hash
     // by Surrogate-Key; never `purge --all` for routine moderation)
     let skip_purge = payload["skip_purge"].as_bool().unwrap_or(false);
+    let queued_cdn_invalidation = crate::b2_cdn_purge::configured();
 
     if hashes.is_empty() {
         return Err(BlossomError::BadRequest("No hashes provided".into()));
@@ -1108,7 +1115,9 @@ pub fn handle_admin_bulk_approve(mut req: Request) -> Result<Response> {
                             if !skip_purge {
                                 let _ =
                                     update_stats_on_status_change(meta.status, BlobStatus::Active);
-                                crate::purge_edge_cache(hash);
+                                if !queued_cdn_invalidation {
+                                    crate::purge_edge_cache(hash);
+                                }
                             }
                             approved += 1;
                             approved_hashes.push(hash.clone());
@@ -1141,6 +1150,7 @@ pub fn handle_admin_bulk_approve(mut req: Request) -> Result<Response> {
         "not_found": not_found,
         "errors": errors,
         "approved_hashes": approved_hashes,
+        "cdn_purge_pending_hashes": if queued_cdn_invalidation { approved_hashes.clone() } else { Vec::<String>::new() },
     });
 
     json_response(StatusCode::OK, &response)
