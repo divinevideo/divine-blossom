@@ -792,9 +792,10 @@ fn drain(
                                 // state cannot be acknowledged. Purge as a
                                 // precaution, then retain the intent and report
                                 // the phase error. Never ack or clear.
-                                if purge(&[snapshot.hash.clone()]).is_err() {
-                                    outcome.errors += 1;
-                                }
+                                let _ = purge(&[snapshot.hash.clone()]);
+                                // Count this failed intent even when eviction
+                                // succeeds: its phase is still unreadable.
+                                outcome.errors += 1;
                                 outcome.pending += 1;
                                 continue;
                             }
@@ -1490,9 +1491,19 @@ mod tests {
                 )
                 .unwrap();
             let poison_token = begin_phase(&poison, Phase::Final).unwrap();
-            commit(&store, &poison_token).unwrap();
+            assert_eq!(
+                commit(&store, &poison_token).unwrap(),
+                CommitOutcome::Committed
+            );
+            let poison_snapshot = snapshot_for(&store, &poison_token);
+            assert_eq!(poison_snapshot.record.phase, Phase::Final);
+            assert_eq!(poison_snapshot.record.state, RecordState::Committed);
+            assert!(crate::b2_cdn_phase::purge_token(&poison).is_err());
             let healthy_token = begin(&healthy).unwrap();
-            commit(&store, &healthy_token).unwrap();
+            assert_eq!(
+                commit(&store, &healthy_token).unwrap(),
+                CommitOutcome::Committed
+            );
 
             // Track which hashes the checked purge actually attempted.
             let attempted = std::cell::RefCell::new(Vec::<String>::new());

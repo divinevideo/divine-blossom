@@ -312,9 +312,11 @@ blossom_secrets = [{{key="admin_token",data="synthetic-admin"}},{{key="gcs_acces
                     started = time.monotonic()
                     response = open_response(base, "/" + concurrent)
                     marker = response.headers.get("X-Divine-Storage-Cache")
+                    reason = response.headers.get("X-Divine-Storage-Cache-Reason")
+                    cpu = response.headers.get("X-Divine-Storage-Cache-Cpu-Ms")
                     assert response.status == 200
                     assert consume(response) == (8 * 1024 * 1024, concurrent)
-                    return marker, started, time.monotonic()
+                    return marker, started, time.monotonic(), reason, cpu
 
                 with ThreadPoolExecutor(max_workers=16) as readers:
                     pending = []
@@ -322,6 +324,7 @@ blossom_secrets = [{{key="admin_token",data="synthetic-admin"}},{{key="gcs_acces
                         pending.append(readers.submit(concurrent_read))
                         time.sleep(0.25)
                     results = [future.result() for future in pending]
+                print("native staggered cache diagnostics: " + json.dumps(results), flush=True)
                 misses = [row for row in results if row[0] == "MISS"]
                 assert len(misses) == 1, "followers replaced a healthy cache fill"
                 later = [row for row in results if row[1] > misses[0][2]]
