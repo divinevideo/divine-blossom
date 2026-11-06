@@ -381,7 +381,7 @@ class SchedulerTests(WorkerFixture):
         self.kv.values["b2-sync:v1:" + closed] = {"state": "erasing"}
         self.assertEqual(self.process(), "ready")
         self.assertEqual(self.kv.get("b2-sync:v1:" + closed), {"state": "erasing"})
-        self.assertEqual(self.worker.process(closed, mirror.Budget(200)), "locked")
+        self.assertEqual(self.worker.process(closed, mirror.Budget(200)), "terminal")
         self.assertFalse(self.state.spool(closed).exists())
 
     def test_uncertain_put_retains_its_gate_without_stopping_unrelated_copies(self):

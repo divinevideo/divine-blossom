@@ -508,7 +508,7 @@ class WorkerTests(unittest.TestCase):
     def test_erasure_gate_prevents_late_copy_after_all_version_delete(self):
         # Erasure acquired its durable gate, deleted all versions and completed.
         self.kv.values["b2-sync:v1:" + HASH] = {"state": "erasing"}
-        self.assertEqual(self.copy(), "locked")
+        self.assertEqual(self.copy(), "terminal")
         self.assertFalse(self.dest.versions)
         self.assertIsNone(self.ready())
 

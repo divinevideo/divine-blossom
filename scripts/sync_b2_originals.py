@@ -353,7 +353,7 @@ class Worker:
             self.state.defer_gate(key)
             if existing_gate == {"state": "erasing"}:
                 self.state.reset(key)
-            return "terminal" if reconcile and existing_gate == {"state": "erasing"} else "locked"
+            return "terminal" if existing_gate == {"state": "erasing"} else "locked"
         self.state.clear_gate_backoff(key)
         meta = self.observe("policy_read", approved_metadata, self.kv, key)
         if meta is None:
@@ -373,7 +373,7 @@ class Worker:
             return "changed"
         gate = self.observe("policy_or_gate_read", self.kv.get, "b2-sync:v1:" + key)
         if gate is not None:
-            return "terminal" if reconcile and gate == {"state": "erasing"} else "locked"
+            return "terminal" if gate == {"state": "erasing"} else "locked"
         missing_version = False
         if reconcile and observed is not None:
             record = observed[0]
@@ -387,8 +387,9 @@ class Worker:
                 return self.observe("policy_read", demand_policy, self.kv, key)
             if self.observe("source_head", self.source.head, key) != info or self.observe("readiness_read", self.kv.snapshot, "b2-ready:" + key) != observed:
                 return "changed"
-            if self.observe("policy_or_gate_read", self.kv.get, "b2-sync:v1:" + key) is not None:
-                return "locked"
+            gate = self.observe("policy_or_gate_read", self.kv.get, "b2-sync:v1:" + key)
+            if gate is not None:
+                return "terminal" if gate == {"state": "erasing"} else "locked"
             if present and record["source_generation"] == info["generation"]:
                 self.state.reset(key, info)
                 self.state.ready(key, record)
