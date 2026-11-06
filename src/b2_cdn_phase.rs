@@ -443,16 +443,25 @@ pub(crate) fn final_queued(hash: &str) -> Result<bool> {
 /// Record that a final intent was queued for the exact epoch.
 ///
 /// A stale epoch is refused rather than reported as success.
-pub(crate) fn mark_final_queued(hash: &str, epoch: &str) -> Result<bool> {
-    let hash = hash.to_ascii_lowercase();
-    let Some(key) = phase_key(&hash) else {
+fn mark_final_queued_observed(
+    store: &KVStore,
+    hash: &str,
+    epoch: &str,
+    generation: u64,
+) -> Result<bool> {
+    let Some(key) = phase_key(&hash.to_ascii_lowercase()) else {
         return Ok(false);
     };
-    let store = open_store()?;
-    let Some(observed) = lookup(&store, &key)? else {
+    let Some(observed) = lookup(store, &key)? else {
         return Ok(false);
     };
-    if observed.record.epoch != epoch || observed.record.final_queued {
+    // Bind to the generation captured BEFORE the enqueue. A physical change or
+    // a newer attempt during the enqueue makes this false, so a newer state is
+    // never marked queued by an older intent.
+    if observed.generation != generation
+        || observed.record.epoch != epoch
+        || observed.record.final_queued
+    {
         return Ok(false);
     }
     let updated = Record {
@@ -497,10 +506,13 @@ pub(crate) fn ensure_final_intent(hash: &str) -> Result<bool> {
         // Nothing physical has happened yet; this request's wave will decide.
         return Ok(false);
     }
+    // Capture the exact state the intent is for, then bind the queued CAS to
+    // that generation. A physical change during the enqueue makes the CAS fail
+    // rather than marking the new state covered by an older intent.
     let epoch = observed.record.epoch.clone();
+    let generation = observed.generation;
     crate::b2_cdn_purge::enqueue(&hash, crate::b2_cdn_purge::Phase::Final)?;
-    mark_final_queued(&hash, &epoch)?;
-    Ok(true)
+    mark_final_queued_observed(&store, &hash, &epoch, generation)
 }
 
 /// Whether the final purge for this hash is acknowledged. Used by the drain to
@@ -1025,6 +1037,58 @@ mod tests {
             assert!(ensure_final_intent(&hash).unwrap());
             assert!(mark_final_purged(&store(), &hash, &epoch).unwrap());
             assert!(complete_ready(&hash).unwrap());
+            reset_all();
+        }
+
+        #[test]
+        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-phase-tests.py"]
+        fn ensure_final_intent_never_marks_a_newer_physical_state_queued() {
+            reset_all();
+            let hash = "f7".repeat(32);
+            let epoch = begin_erase(&hash).unwrap();
+            // Old state: Absent. The request captures it, then enqueues.
+            record_physical(&hash, &epoch, Physical::Absent).unwrap();
+            let captured = observed(&hash).unwrap().unwrap();
+
+            // Between the capture and the queued CAS, a retry reports a NEW
+            // physical state with the same epoch. The old intent does not cover
+            // it, so the queued CAS must not set the new state as queued.
+            record_physical(&hash, &epoch, Physical::Failed).unwrap();
+            let marked = mark_final_queued_observed(
+                &store(),
+                &hash,
+                &captured.record.epoch,
+                captured.generation,
+            )
+            .unwrap();
+            assert!(
+                !marked,
+                "a stale generation must not mark a newer physical state queued"
+            );
+            assert!(!final_queued(&hash).unwrap());
+            // And the new state remains purgeable once its own intent lands.
+            assert!(final_purge_pending(&hash).unwrap());
+            reset_all();
+        }
+
+        #[test]
+        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-phase-tests.py"]
+        fn a_captured_generation_still_marks_the_same_state_queued() {
+            reset_all();
+            let hash = "f8".repeat(32);
+            let epoch = begin_erase(&hash).unwrap();
+            record_physical(&hash, &epoch, Physical::Absent).unwrap();
+            let captured = observed(&hash).unwrap().unwrap();
+            assert!(
+                mark_final_queued_observed(
+                    &store(),
+                    &hash,
+                    &captured.record.epoch,
+                    captured.generation
+                )
+                .unwrap()
+            );
+            assert!(final_queued(&hash).unwrap());
             reset_all();
         }
 

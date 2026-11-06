@@ -779,8 +779,26 @@ fn drain(
                     // Capture the exact phase state BEFORE the purge callback.
                     // The physical outcome can change mid-purge, and a stale
                     // callback must never acknowledge the new state.
+                    //
+                    // A malformed or unreadable phase must not abort the whole
+                    // pass: that would clear no cursor and starve every healthy
+                    // row after it. Contain it to this row.
                     let phase_token = if snapshot.record.phase == Phase::Final {
-                        crate::b2_cdn_phase::purge_token(&snapshot.hash)?
+                        match crate::b2_cdn_phase::purge_token(&snapshot.hash) {
+                            Ok(token) => token,
+                            Err(_) => {
+                                // A malformed phase still owes a cache eviction:
+                                // cached bytes must leave even when the physical
+                                // state cannot be acknowledged. Purge as a
+                                // precaution, then retain the intent and report
+                                // the phase error. Never ack or clear.
+                                if purge(&[snapshot.hash.clone()]).is_err() {
+                                    outcome.errors += 1;
+                                }
+                                outcome.pending += 1;
+                                continue;
+                            }
+                        }
                     } else {
                         None
                     };
@@ -1447,6 +1465,69 @@ mod tests {
                 snapshot_for(&store, &token).record.state,
                 RecordState::Committed
             );
+            reset_all(&store);
+        }
+
+        #[test]
+        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-purge-outbox-tests.py"]
+        fn one_poison_phase_does_not_stall_the_whole_drain() {
+            let store = store();
+            reset_all(&store);
+            // A valid Final intent whose phase record is malformed sorts before
+            // a healthy Single intent. The malformed phase must not abort the
+            // pass before the cursor is persisted or starve the healthy suffix.
+            let poison = "e8".repeat(32);
+            let healthy = "e9".repeat(32);
+            let _ = store
+                .build_delete()
+                .execute(&format!("b2-cdn-phase:v1:{poison}"));
+            store
+                .build_insert()
+                .mode(InsertMode::Overwrite)
+                .execute(
+                    &format!("b2-cdn-phase:v1:{poison}"),
+                    r#"{"version":99,"physical":"future"}"#,
+                )
+                .unwrap();
+            let poison_token = begin_phase(&poison, Phase::Final).unwrap();
+            commit(&store, &poison_token).unwrap();
+            let healthy_token = begin(&healthy).unwrap();
+            commit(&store, &healthy_token).unwrap();
+
+            // Track which hashes the checked purge actually attempted.
+            let attempted = std::cell::RefCell::new(Vec::<String>::new());
+            let recording_purge = |batch: &[String]| -> Result<()> {
+                attempted.borrow_mut().extend(batch.iter().cloned());
+                Ok(())
+            };
+            let first = drain(&store, 2, recording_purge).unwrap();
+            // The poison row still owes a cache eviction, so purge was attempted
+            // even though the phase cannot be acknowledged.
+            assert!(
+                attempted.borrow().iter().any(|h| h == &poison),
+                "poison phase must still be purged for cache eviction"
+            );
+            // It is retained and reported, never acked or cleared.
+            assert_eq!(first.errors, 1, "poison phase is an error");
+            assert_eq!(first.pending, 1);
+            assert!(!acknowledged(&store, &poison_token, "final").unwrap());
+            assert_eq!(
+                snapshot_for(&store, &poison_token).record.state,
+                RecordState::Committed,
+                "a poison phase intent must stay outstanding"
+            );
+            // The healthy row must still drain in this or a following pass.
+            let mut drained = first.result;
+            for _ in 0..4 {
+                if drained >= 1 {
+                    break;
+                }
+                drained += drain(&store, 2, recording_purge).unwrap().result;
+            }
+            assert_eq!(drained, 1, "healthy suffix must not be starved");
+            let _ = store
+                .build_delete()
+                .execute(&format!("b2-cdn-phase:v1:{poison}"));
             reset_all(&store);
         }
 
