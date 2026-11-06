@@ -64,11 +64,18 @@ class Origin(BaseHTTPRequestHandler):
                 time.sleep(3.5)
                 status = 200
             content_range = "bytes 1-3/9"
-            if self.headers.get("Range") == "bytes=99-" or self.server.range_mode == "force":
+            requested = self.headers.get("Range", "")
+            # Real B2 returns 500 when a range component exceeds signed i64.
+            overflow = any(int(part) > 2**63 - 1 for part in requested.removeprefix("bytes=").split("-") if part.isdigit())
+            if overflow and not is_gcs:
+                status, body = 500, b"provider range overflow"
+            elif requested in ("bytes=99-", "bytes=9-") or self.server.range_mode == "force":
                 status, body = 416, b"range error"
-            elif self.headers.get("Range") == "bytes=4-":
+            elif requested == "bytes=0-8":
+                status, content_range = 206, "bytes 0-8/9"
+            elif requested in ("bytes=4-", "bytes=4-8"):
                 status, body, content_range = 206, body[4:], "bytes 4-8/9"
-            elif self.headers.get("Range") == "bytes=-3":
+            elif requested in ("bytes=-3", "bytes=6-8"):
                 status, body, content_range = 206, body[-3:], "bytes 6-8/9"
             elif self.headers.get("Range"):
                 status, body = 206, body[1:4]
@@ -137,6 +144,7 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                          "bucket": "private-test", "key": HASH, "size": 9,
                          "verified_at": 1, "destination_version_id": VERSION}
                 cases = [("flag_off", 503), ("flag_malformed", 503), ("auth429", 502), ("auth_disconnect", 502),
+                         ("range_overflow_open", 416), ("range_overflow_end", 206), ("range_overflow_suffix", 206),
                          ("range_missing", 416), ("range_wrong", 502), ("range_satisfiable", 502),
                          ("range_malformed", 502), ("range_multiple", 502),
                          ("valid", 200), ("disabled", 404), ("pending", 200),
@@ -153,6 +161,7 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                          ("wrong_origin_version", 502), ("origin_missing", 503),
                          ("origin_forbidden", 502), ("origin_unauthorized", 502), ("origin_failed", 503), ("origin_disconnect", 503)]
                 demand_cases = [("demand_b2_416_missing", 416), ("demand_gcs_416_missing", 416),
+                                ("demand_b2_overflow_open", 416), ("demand_b2_overflow_end", 206), ("demand_b2_overflow_suffix", 206),
                                 ("demand_b2_416_wrong", 502), ("demand_gcs_416_wrong", 502),
                                 ("demand_b2_416_satisfiable", 502), ("demand_gcs_416_satisfiable", 502),
                                 ("demand_b2_416_malformed", 502), ("demand_gcs_416_malformed", 502),
@@ -246,10 +255,15 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                         if original_case in ("demand_gcs_missing", "demand_gcs_failed", "demand_gcs_forbidden"):
                             server.gcs_status = {"demand_gcs_missing": 404, "demand_gcs_failed": 503, "demand_gcs_forbidden": 403}[original_case]
                     range_case = original_case if original_case.startswith("range_") else original_case.split("_416_", 1)[1] if "_416_" in original_case else None
-                    if range_case is not None:
+                    if range_case is not None and "overflow" not in range_case:
                         variant = range_case.removeprefix("range_")
                         values["test_range"] = {"missing": "bytes=99-", "wrong": "bytes=99-", "satisfiable": "bytes=1-3", "malformed": "invalid", "multiple": "bytes=99-,1-2"}[variant]
                         server.range_mode = variant if variant in ("missing", "wrong") else "force"
+                    if "_overflow_" in original_case:
+                        variant = original_case.rsplit("_", 1)[1]
+                        values["test_range"] = {"open": "bytes=9223372036854775808-", "end": "bytes=0-18446744073709551615", "suffix": "bytes=-18446744073709551615"}[variant]
+                        values["test_body"] = BODY.decode()
+                        values["test_source"] = "b2"
                     if original_case == "demand_pending_missing_ready":
                         values["test_hint"] = "missing_readiness"
                     if case == "disabled":
@@ -317,6 +331,9 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                     if original_case == "demand_origin_slow":
                         assert time.monotonic() - started < 8, "origin timeout exceeded request budget"
                     storage = [r for r in server.requests if r[1].startswith("/private-test/")]
+                    if "_overflow_" in original_case:
+                        expected_range = "bytes=9-" if original_case.endswith("_open") else "bytes=0-8"
+                        assert len(storage) == 1 and storage[0][2] == expected_range, server.requests
                     if demand:
                         gcs = [r for r in server.requests if r[1].startswith("/gcs-test/")]
                         assert len(storage) <= 1 and len(gcs) <= 1, server.requests

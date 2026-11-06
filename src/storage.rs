@@ -376,7 +376,10 @@ pub(crate) fn download_canary_original(
     );
     request.set_header("Host", config.host());
     if let Some(range) = range {
-        request.set_header("Range", range);
+        request.set_header(
+            "Range",
+            blossom_core::canary::normalize_origin_range(range, ready.size),
+        );
     }
     request.set_pass(true);
     sign_request(&mut request, &config, Some("UNSIGNED-PAYLOAD".into()))?;
@@ -569,7 +572,10 @@ pub(crate) fn download_demand_b2(
     );
     request.set_header("Host", config.host());
     if let Some(range) = range {
-        request.set_header("Range", range);
+        request.set_header(
+            "Range",
+            blossom_core::canary::normalize_origin_range(range, ready.size),
+        );
     }
     request.set_pass(true);
     sign_request(&mut request, &config, Some("UNSIGNED-PAYLOAD".into()))?;
