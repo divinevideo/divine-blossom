@@ -1381,11 +1381,11 @@ async fn process_transcode(
     }
     // Repairs operate only on existing HLS, never race initial generation.
     // Operators must verify the original job completed before submitting a repair.
-    if !state
+    if state
         .media_storage
         .stat(&format!("{}/hls/master.m3u8", hash))
         .await?
-        .is_some()
+        .is_none()
     {
         return Err(anyhow!("Repair requires an existing HLS master"));
     }
@@ -1515,7 +1515,10 @@ async fn process_transcode_inner(
         }
     };
 
-    info!("Downloaded video to {:?}", input_path);
+    info!(
+        "Downloaded verified video {} to {:?}",
+        verified_source.sha256, input_path
+    );
     // Metadata belongs to the exact version whose bytes were verified.
     let mut source_metadata = SourceObjectMetadata {
         content_type: Some(verified_source.object.content_type),

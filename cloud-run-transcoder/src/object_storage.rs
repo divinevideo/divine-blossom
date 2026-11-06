@@ -536,15 +536,14 @@ impl MediaStorage {
         // Reuse the verified upload-server B2 adapter's canonical wire layout;
         // the signing core is shared with the existing edge wrappers.
         let signed = headers.keys().cloned().collect::<Vec<_>>().join(";");
-        let canonical_headers = headers
-            .iter()
-            .map(|(name, value)| {
-                format!(
-                    "{name}:{}\n",
-                    value.split_ascii_whitespace().collect::<Vec<_>>().join(" ")
-                )
-            })
-            .collect::<String>();
+        let mut canonical_headers = String::new();
+        for (name, value) in &headers {
+            canonical_headers.push_str(name);
+            canonical_headers.push(':');
+            canonical_headers
+                .push_str(&value.split_ascii_whitespace().collect::<Vec<_>>().join(" "));
+            canonical_headers.push('\n');
+        }
         let canonical = format!(
             "{}\n{path}\n{query}\n{canonical_headers}\n{signed}\n{hash}",
             method.as_str()

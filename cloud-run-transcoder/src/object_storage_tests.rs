@@ -111,18 +111,19 @@ async fn request(State(state): State<Arc<Mutex<Objects>>>, req: Request) -> Resp
         .split(',')
         .next()
         .unwrap();
-    let canonical_headers = signed
-        .split(';')
-        .map(|name| {
-            let value = req.headers()[name]
-                .to_str()
-                .unwrap()
-                .split_ascii_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ");
-            format!("{name}:{value}\n")
-        })
-        .collect::<String>();
+    let mut canonical_headers = String::new();
+    for name in signed.split(';') {
+        let value = req.headers()[name]
+            .to_str()
+            .unwrap()
+            .split_ascii_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        canonical_headers.push_str(name);
+        canonical_headers.push(':');
+        canonical_headers.push_str(&value);
+        canonical_headers.push('\n');
+    }
     let timestamp = req.headers()["x-amz-date"].to_str().unwrap();
     let payload_hash = req.headers()["x-amz-content-sha256"].to_str().unwrap();
     let canonical = format!(
