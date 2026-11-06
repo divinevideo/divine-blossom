@@ -1623,7 +1623,7 @@ pub(crate) struct VanishStorageResult {
     /// this batch. The post-purge delivery probe samples only these, because a
     /// hash the purge could not reach is not expected to be absent yet.
     pub purged_hashes: HashSet<String>,
-    /// Hashes whose B2 version set exceeded one bounded page. Their deletion is
+    /// Hashes whose provider version set exceeded one bounded slice. Their deletion is
     /// progressing, so they are pending work rather than failures.
     pub remaining_hashes: HashSet<String>,
     pub timings: VanishStorageTimings,
@@ -2937,8 +2937,7 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
     } else {
         match trigger_cloud_run_delete_blobs(hashes) {
             Ok(outcome) => {
-                result.failed_hashes.extend(outcome.failed_hashes);
-                main_origin_failures.extend(outcome.main_failures);
+                apply_cloud_cleanup_outcome(&mut result, &mut main_origin_failures, outcome);
             }
             Err(_) => {
                 result.failed_hashes.extend(hashes.iter().cloned());
@@ -3988,9 +3987,17 @@ enum CloudCleanupStatus {
     Permanent,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PrivateFamilyCleanup {
+    Absent,
+    Remaining,
+}
+
 #[derive(Deserialize)]
 struct CloudCleanupResponse {
     status: CloudCleanupStatus,
+    private_family: Option<PrivateFamilyCleanup>,
 }
 
 #[derive(Deserialize)]
@@ -3998,6 +4005,8 @@ struct BatchHashCleanupResponse {
     hash: String,
     status: CloudCleanupStatus,
     main_deleted_or_absent: bool,
+    private_family: Option<PrivateFamilyCleanup>,
+    failures: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -4009,12 +4018,14 @@ struct BatchCleanupResponse {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct CloudBatchCleanupOutcome {
     failed_hashes: HashSet<String>,
+    remaining_hashes: HashSet<String>,
     main_failures: HashSet<String>,
 }
 
 fn fail_all_cloud_cleanup(hashes: &[String]) -> CloudBatchCleanupOutcome {
     CloudBatchCleanupOutcome {
         failed_hashes: hashes.iter().cloned().collect(),
+        remaining_hashes: HashSet::new(),
         main_failures: hashes.iter().cloned().collect(),
     }
 }
@@ -4028,7 +4039,8 @@ fn classify_cloud_cleanup_response(status: StatusCode, body: &str) -> Result<()>
     })?;
 
     match cleanup.status {
-        CloudCleanupStatus::Completed if status.is_success() => Ok(()),
+        CloudCleanupStatus::Completed if status.is_success()
+            && cleanup.private_family == Some(PrivateFamilyCleanup::Absent) => Ok(()),
         CloudCleanupStatus::Permanent => Err(BlossomError::Internal(format!(
             "Cloud Run derivative cleanup reported a permanent contract or configuration failure with status {}",
             status
@@ -4098,11 +4110,16 @@ fn failed_cloud_cleanup_hashes(
     if (response.status == CloudCleanupStatus::Completed) != all_completed {
         return fail_all_cloud_cleanup(requested);
     }
-    let failed_hashes = requested
+    let failed_hashes: HashSet<String> = requested
         .iter()
         .filter(|hash| {
             !outcomes.get(&hash.to_lowercase()).is_some_and(|result| {
-                result.status == CloudCleanupStatus::Completed && result.main_deleted_or_absent
+                result.main_deleted_or_absent
+                    && result.failures.as_ref().is_some_and(Vec::is_empty)
+                    && ((result.status == CloudCleanupStatus::Completed
+                        && result.private_family == Some(PrivateFamilyCleanup::Absent))
+                        || (result.status == CloudCleanupStatus::Retryable
+                            && result.private_family == Some(PrivateFamilyCleanup::Remaining)))
             })
         })
         .cloned()
@@ -4110,16 +4127,41 @@ fn failed_cloud_cleanup_hashes(
     let main_failures = requested
         .iter()
         .filter(|hash| {
-            !outcomes
-                .get(&hash.to_lowercase())
-                .is_some_and(|result| result.main_deleted_or_absent)
+            !outcomes.get(&hash.to_lowercase()).is_some_and(|result| {
+                result.main_deleted_or_absent && result.private_family.is_some()
+            })
         })
+        .cloned()
+        .collect();
+    let remaining_hashes = requested
+        .iter()
+        .filter(|hash| {
+            outcomes.get(&hash.to_lowercase()).is_some_and(|result| {
+                result.status == CloudCleanupStatus::Retryable
+                    && result.main_deleted_or_absent
+                    && result.private_family == Some(PrivateFamilyCleanup::Remaining)
+                    && result.failures.as_ref().is_some_and(Vec::is_empty)
+            })
+        })
+        .filter(|hash| !failed_hashes.contains(*hash))
         .cloned()
         .collect();
     CloudBatchCleanupOutcome {
         failed_hashes,
+        remaining_hashes,
         main_failures,
     }
+}
+
+fn apply_cloud_cleanup_outcome(
+    result: &mut VanishStorageResult,
+    main_origin_failures: &mut HashSet<String>,
+    outcome: CloudBatchCleanupOutcome,
+) {
+    result.failed_hashes.extend(outcome.failed_hashes);
+    main_origin_failures.extend(outcome.main_failures);
+    main_origin_failures.extend(outcome.remaining_hashes.iter().cloned());
+    result.remaining_hashes.extend(outcome.remaining_hashes);
 }
 
 fn plan_cloud_run_delete_chunks(hashes: &[String]) -> Vec<&[String]> {
@@ -4140,6 +4182,7 @@ fn trigger_cloud_run_delete_blobs(hashes: &[String]) -> Result<CloudBatchCleanup
             &expected_bucket,
         )?;
         outcome.failed_hashes.extend(chunk_outcome.failed_hashes);
+        outcome.remaining_hashes.extend(chunk_outcome.remaining_hashes);
         outcome.main_failures.extend(chunk_outcome.main_failures);
     }
     Ok(outcome)
@@ -4914,7 +4957,7 @@ mod tests {
     fn cloud_cleanup_response_distinguishes_retryable_and_permanent_failures() {
         let completed = classify_cloud_cleanup_response(
             fastly::http::StatusCode::OK,
-            r#"{"status":"completed","deleted":1}"#,
+            r#"{"status":"completed","private_family":"absent","deleted":1}"#,
         );
         let retryable = classify_cloud_cleanup_response(
             fastly::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -4948,7 +4991,7 @@ mod tests {
         let retryable = "b".repeat(64);
         let missing = "c".repeat(64);
         let body = format!(
-            r#"{{"status":"retryable","results":[{{"hash":"{completed_result}","status":"completed","main_deleted_or_absent":true}},{{"hash":"{retryable}","status":"retryable","main_deleted_or_absent":true}}]}}"#
+            r#"{{"status":"retryable","results":[{{"hash":"{completed_result}","status":"completed","main_deleted_or_absent":true,"private_family":"absent","failures":[]}},{{"hash":"{retryable}","status":"retryable","main_deleted_or_absent":true,"private_family":"absent","failures":["derivative failure"]}}]}}"#
         );
 
         let outcome = failed_cloud_cleanup_hashes(
@@ -4966,10 +5009,82 @@ mod tests {
     }
 
     #[test]
+    fn private_cloud_progress_is_pending_not_failed() {
+        let hash = "a".repeat(64);
+        let body = serde_json::json!({"status":"retryable","results":[{
+            "hash":hash,"status":"retryable","main_deleted_or_absent":true,
+            "private_family":"remaining","failures":[]
+        }]})
+        .to_string();
+        let outcome = failed_cloud_cleanup_hashes(
+            fastly::http::StatusCode::SERVICE_UNAVAILABLE,
+            &body,
+            std::slice::from_ref(&hash),
+        );
+        assert!(
+            !outcome.failed_hashes.contains(&hash),
+            "known private remainder must be Pending, not Failed"
+        );
+    }
+
+    #[test]
+    fn private_cloud_completion_requires_private_absence_receipt() {
+        let hash = "a".repeat(64);
+        for receipt in [None, Some("remaining"), Some("unknown"), Some("absent")] {
+            let mut result = serde_json::json!({"hash":hash,"status":"completed",
+                "main_deleted_or_absent":true,"failures":[]});
+            if let Some(receipt) = receipt {
+                result["private_family"] = receipt.into();
+            }
+            let body = serde_json::json!({"status":"completed","results":[result]}).to_string();
+            let outcome = failed_cloud_cleanup_hashes(
+                fastly::http::StatusCode::OK,
+                &body,
+                std::slice::from_ref(&hash),
+            );
+            assert_eq!(outcome.failed_hashes.is_empty(), receipt == Some("absent"));
+        }
+    }
+
+    #[test]
+    fn private_cloud_progress_cannot_hide_uncertainty() {
+        let hash = "a".repeat(64);
+        for (main, failures, status) in [
+            (
+                false,
+                serde_json::json!([]),
+                fastly::http::StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                true,
+                serde_json::json!(["listing failed"]),
+                fastly::http::StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                true,
+                serde_json::Value::Null,
+                fastly::http::StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (true, serde_json::json!([]), fastly::http::StatusCode::OK),
+        ] {
+            let body = serde_json::json!({"status":"retryable","results":[{
+                "hash":hash,"status":"retryable","main_deleted_or_absent":main,
+                "private_family":"remaining","failures":failures
+            }]})
+            .to_string();
+            assert!(
+                failed_cloud_cleanup_hashes(status, &body, std::slice::from_ref(&hash))
+                    .failed_hashes
+                    .contains(&hash)
+            );
+        }
+    }
+
+    #[test]
     fn batch_cloud_cleanup_keeps_main_success_separate_from_derivative_failure() {
         let hash = "a".repeat(64);
         let body = format!(
-            r#"{{"status":"retryable","results":[{{"hash":"{hash}","status":"retryable","main_deleted_or_absent":true}}]}}"#
+            r#"{{"status":"retryable","results":[{{"hash":"{hash}","status":"retryable","main_deleted_or_absent":true,"private_family":"absent","failures":["derivative failure"]}}]}}"#
         );
 
         let outcome = failed_cloud_cleanup_hashes(
@@ -5003,7 +5118,7 @@ mod tests {
     fn batch_cloud_cleanup_rejects_completed_body_with_error_status() {
         let hash = "a".repeat(64);
         let body = format!(
-            r#"{{"status":"completed","results":[{{"hash":"{hash}","status":"completed","main_deleted_or_absent":true}}]}}"#
+            r#"{{"status":"completed","results":[{{"hash":"{hash}","status":"completed","main_deleted_or_absent":true,"private_family":"absent","failures":[]}}]}}"#
         );
 
         let outcome = failed_cloud_cleanup_hashes(
@@ -5177,6 +5292,106 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "loopback Cloud Run fixture and persistent local KV required"]
+    fn private_cloud_progress_reaches_physical_pending_and_retains_audio_discovery() {
+        use crate::b2_cdn_phase::{self, Physical};
+        let source = "4".repeat(64);
+        let audio = "5".repeat(64);
+        let hashes = vec![source.clone(), audio.clone()];
+        crate::metadata::put_audio_mapping(&crate::blossom::AudioMapping {
+            source_sha256: source.clone(),
+            audio_sha256: audio.clone(),
+            duration_seconds: 6.0,
+            size_bytes: 1,
+            mime_type: "audio/aac".into(),
+        })
+        .unwrap();
+        let plan = crate::prepare_derived_audio_cleanup(&source)
+            .unwrap()
+            .unwrap();
+        let store = crate::metadata::open_store().unwrap();
+        for attempt in 0..3 {
+            let outcome =
+                super::trigger_cloud_run_delete_blobs_chunk(&hashes, "synthetic", "synthetic")
+                    .unwrap();
+            let mut result = super::VanishStorageResult::default();
+            let mut blocked = HashSet::new();
+            super::apply_cloud_cleanup_outcome(&mut result, &mut blocked, outcome);
+            let expected = if attempt == 0 {
+                hashes.iter().cloned().collect()
+            } else if attempt == 1 {
+                HashSet::from([audio.clone()])
+            } else {
+                HashSet::new()
+            };
+            assert!(
+                result.failed_hashes.is_empty(),
+                "bounded GCS progress must not count as error"
+            );
+            assert_eq!(result.remaining_hashes, expected);
+            assert_eq!(
+                blocked, expected,
+                "pending private versions cannot reach inline purge"
+            );
+            for hash in &hashes {
+                let epoch = super::begin_vanish_phase(hash).unwrap().unwrap();
+                super::finish_vanish_phase(
+                    hash,
+                    &epoch,
+                    &result.failed_hashes,
+                    &result.remaining_hashes,
+                )
+                .unwrap();
+                if expected.contains(hash) {
+                    assert_eq!(
+                        b2_cdn_phase::physical_state(hash).unwrap(),
+                        Some(Physical::Pending)
+                    );
+                    assert!(!b2_cdn_phase::final_queued(hash).unwrap());
+                    assert!(!super::vanish_complete(hash));
+                } else {
+                    assert_eq!(
+                        b2_cdn_phase::physical_state(hash).unwrap(),
+                        Some(Physical::Absent)
+                    );
+                    // Synthetic acknowledgement after the final intent, matching
+                    // the existing separately executed purge receipt contract.
+                    let _ = b2_cdn_phase::mark_final_purged(&store, hash, &epoch).unwrap();
+                    assert!(super::vanish_complete(hash));
+                }
+            }
+            let deferred = if expected.contains(&audio) {
+                HashSet::from([source.clone()])
+            } else {
+                HashSet::new()
+            };
+            assert_eq!(
+                crate::vanish_blob_disposition(
+                    &source,
+                    &result.failed_hashes,
+                    &result.remaining_hashes,
+                    &HashSet::new(),
+                    &deferred
+                ),
+                if attempt < 2 {
+                    crate::VanishBlobDisposition::Deferred
+                } else {
+                    crate::VanishBlobDisposition::Finalize
+                }
+            );
+            assert!(crate::metadata::get_audio_mapping(&source)
+                .unwrap()
+                .is_some());
+            if attempt == 2 {
+                crate::finalize_derived_audio_cleanup(&plan).unwrap();
+            }
+        }
+        assert!(crate::metadata::get_audio_mapping(&source)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     #[ignore = "loopback provider fixture and persistent local KV required"]
     fn private_family_erasure_contract() {
         let authorization = B2Authorization {
@@ -5239,8 +5454,11 @@ mod tests {
                     .unwrap()
                     .lookup(&format!("b2-sync:v1:{hash}"))
                     .unwrap();
-                assert!(entry.take_body().into_string().contains(
-                    if letter == '3' { "copying" } else { "erasing" }));
+                assert!(entry.take_body().into_string().contains(if letter == '3' {
+                    "copying"
+                } else {
+                    "erasing"
+                }));
             }
             assert_eq!(super::B2_VANISH_MAX_STORAGE_BACKEND_REQUESTS, 26);
         }

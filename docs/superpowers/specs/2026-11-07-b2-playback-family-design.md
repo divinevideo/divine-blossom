@@ -40,9 +40,13 @@ receipts must wait for both namespace confirmations.
 
 Cloud Run cleanup lists all private control generations and deletes by exact
 GCS generation, sharing its existing 25-object slice and 30-second deadline with
-parent cleanup. The HTTP request and response contract is unchanged. The service
-cleanup change must be deployed before relying on this private-generation cleanup
-in edge completion. Existing GCS parent-media generation and retention semantics
+parent cleanup. The HTTP request is unchanged. Each result adds a typed
+`private_family` receipt: `absent` permits completion, `remaining` with a clean
+retryable result permits bounded Pending, and missing evidence fails closed.
+Older edges ignore the additive receipt and retain their retry behavior; newer
+edges cannot accept completion from an older backend that never inspected this
+namespace. Deploy the service cleanup before Compute to preserve availability.
+Creator deletion continues to retry until an absent receipt is returned. Existing GCS parent-media generation and retention semantics
 are unchanged; this does not establish historical GCS retirement or remove
 provider retention and legal holds. Listing, deletion, or verification uncertainty
 keeps cleanup retryable.

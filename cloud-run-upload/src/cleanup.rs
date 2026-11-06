@@ -23,11 +23,21 @@ pub enum CleanupStatus {
     Permanent,
 }
 
+/// Typed evidence for the private generation inventory. Omitted on uncertainty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivateFamilyCleanup {
+    Absent,
+    Remaining,
+}
+
 #[derive(Debug, Serialize)]
 pub struct HashCleanupResult {
     pub hash: String,
     pub status: CleanupStatus,
     pub main_deleted_or_absent: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub private_family: Option<PrivateFamilyCleanup>,
     pub deleted: usize,
     pub absent: usize,
     pub failures: Vec<String>,
@@ -203,6 +213,7 @@ async fn cleanup_hash_with_backend<B: CleanupBackend + Sync>(
             hash: hash.to_string(),
             status: CleanupStatus::Retryable,
             main_deleted_or_absent: false,
+            private_family: None,
             deleted,
             absent,
             failures: vec!["deadline exceeded while listing private family versions".to_string()],
@@ -220,6 +231,7 @@ async fn cleanup_hash_with_backend<B: CleanupBackend + Sync>(
                 hash: hash.to_string(),
                 status: CleanupStatus::Retryable,
                 main_deleted_or_absent: false,
+                private_family: None,
                 deleted,
                 absent,
                 failures: vec![match result {
@@ -235,6 +247,7 @@ async fn cleanup_hash_with_backend<B: CleanupBackend + Sync>(
                 hash: hash.to_string(),
                 status: CleanupStatus::Retryable,
                 main_deleted_or_absent: false,
+                private_family: None,
                 deleted,
                 absent,
                 failures: vec![
@@ -251,6 +264,7 @@ async fn cleanup_hash_with_backend<B: CleanupBackend + Sync>(
                     hash: hash.to_string(),
                     status: CleanupStatus::Retryable,
                     main_deleted_or_absent: false,
+                    private_family: None,
                     deleted,
                     absent,
                     failures: vec![match result {
@@ -321,21 +335,31 @@ async fn cleanup_hash_with_backend<B: CleanupBackend + Sync>(
         }
     }
 
-    match timeout_at(deadline, backend.list_private_versions(&private_prefix, 1)).await {
-        Ok(Ok(page)) if page.objects.is_empty() && !page.more && !private_page.more => {}
-        Ok(Ok(_)) => failures.push("private family versions remain; retry cleanup".to_string()),
-        Ok(Err(error)) => failures.push(format!("private family verification: {error}")),
-        Err(_) => failures.push("deadline exceeded during private family verification".to_string()),
-    }
+    let private_family =
+        match timeout_at(deadline, backend.list_private_versions(&private_prefix, 1)).await {
+            Ok(Ok(page)) if page.objects.is_empty() && !page.more && !private_page.more => {
+                Some(PrivateFamilyCleanup::Absent)
+            }
+            Ok(Ok(_)) => Some(PrivateFamilyCleanup::Remaining),
+            Ok(Err(error)) => {
+                failures.push(format!("private family verification: {error}"));
+                None
+            }
+            Err(_) => {
+                failures.push("deadline exceeded during private family verification".to_string());
+                None
+            }
+        };
 
     HashCleanupResult {
         hash: hash.to_string(),
-        status: if failures.is_empty() {
+        status: if failures.is_empty() && private_family == Some(PrivateFamilyCleanup::Absent) {
             CleanupStatus::Completed
         } else {
             CleanupStatus::Retryable
         },
         main_deleted_or_absent,
+        private_family,
         deleted,
         absent,
         failures,
@@ -690,6 +714,11 @@ mod tests {
         let first = cleanup_hash(&backend, HASH_A).await;
         assert_eq!(first.status, CleanupStatus::Retryable);
         assert_eq!(first.deleted, MAX_PREFIX_OBJECTS_PER_ATTEMPT);
+        assert_eq!(
+            serde_json::to_value(&first).unwrap()["private_family"],
+            "remaining",
+            "known private remainder needs a typed progress signal"
+        );
         assert_eq!(fixture.generations.lock().unwrap().len(), 1);
         let deletes = fixture
             .requests

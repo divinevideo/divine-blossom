@@ -42,6 +42,18 @@ class Provider(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         with self.server.lock:
+            if self.path == '/delete-blobs':
+                attempt = self.server.cloud_attempts
+                self.server.cloud_attempts += 1
+                results = []
+                for index, hash_value in enumerate(body['hashes']):
+                    pending = attempt == 0 or (attempt == 1 and index == 1)
+                    results.append({'hash': hash_value, 'status': 'retryable' if pending else 'completed',
+                                    'main_deleted_or_absent': True, 'failures': [],
+                                    'private_family': 'remaining' if pending else 'absent'})
+                pending = any(result['status'] == 'retryable' for result in results)
+                return self.reply(503 if pending else 200,
+                                  {'status': 'retryable' if pending else 'completed', 'results': results})
             self.server.calls.append((self.path, body))
             case, attempt = self.server.case, self.server.attempt
             if self.path.endswith('b2_list_file_versions'):
@@ -77,7 +89,7 @@ class Provider(BaseHTTPRequestHandler):
 
 
 def main():
-    for case, attempts in [('a', 1), ('b', 4), ('c', 2), ('d', 2), ('e', 2), ('f', 2), ('0', 1), ('2', 2), ('3', 1)]:
+    for case, attempts in [('a', 1), ('b', 4), ('c', 2), ('d', 2), ('e', 2), ('f', 2), ('0', 1), ('2', 2), ('3', 1), ('4', 3)]:
         hash_value = case * 64
         marker = f'{PRIVATE}{hash_value}/complete.json'
         sibling = (f'{PRIVATE}{hash_value}0/complete.json', 'sibling')
@@ -92,17 +104,22 @@ def main():
             server.case, server.attempt = case, 0
             server.versions, server.calls, server.counts = versions, [], []
             server.private_lists, server.lock = 0, threading.Lock()
+            server.cloud_attempts = 0
             threading.Thread(target=server.serve_forever, daemon=True).start()
             with tempfile.TemporaryDirectory(prefix='family-erasure-') as directory:
                 root = Path(directory)
                 config, kv, settings = [root / name for name in ('fastly.toml', 'kv.json', 'settings.json')]
-                kv.write_text(json.dumps({f'b2-sync:v1:{hash_value}': {'state': 'copying'}}
+                kv.write_text(json.dumps({f'b2-sync:v1:{hash_value}': {'data': json.dumps({'state': 'copying'})}}
                                          if case == '3' else {}))
-                settings.write_text(json.dumps({'fixture_case': case, 'fixture_attempts': str(attempts)}))
+                settings.write_text(json.dumps({'fixture_case': case, 'fixture_attempts': str(attempts),
+                                               'b2_replica_enabled': 'true',
+                                               'b2_cdn_purge_hosts': 'media-b2-cdn.divine.video'}))
                 config.write_text(f'''manifest_version = 3
 name = "synthetic-family-erasure"
 language = "rust"
 [local_server.backends.b2_api]
+url = "http://127.0.0.1:{server.server_port}"
+[local_server.backends.cloud_run_upload]
 url = "http://127.0.0.1:{server.server_port}"
 [local_server.kv_stores.blossom_metadata]
 file = "{kv}"
@@ -115,11 +132,18 @@ format = "json"
                 env['CARGO_TARGET_WASM32_WASIP1_RUNNER'] = shlex.join([
                     env.get('VICEROY', 'viceroy'), 'run', '-C', str(config), '--'])
                 result = subprocess.run(['cargo', 'test', '--locked', '--target', 'wasm32-wasip1',
-                                         '--bin', 'fastly-blossom', 'storage::tests::private_family_erasure_contract',
+                                         '--bin', 'fastly-blossom',
+                                         'storage::tests::private_cloud_progress_reaches_physical_pending_and_retains_audio_discovery'
+                                         if case == '4' else 'storage::tests::private_family_erasure_contract',
                                          '--', '--ignored', '--exact', '--nocapture'],
                                         cwd=ROOT, env=env, text=True, capture_output=True, timeout=900)
                 if result.returncode or '1 passed; 0 failed' not in result.stdout:
                     raise RuntimeError(result.stdout + result.stderr)
+                if case == '4':
+                    assert server.cloud_attempts == 3 and not server.calls
+                    print('PASS private Cloud Run receipts: Pending convergence, final receipts, and audio discovery retention')
+                    server.shutdown()
+                    continue
                 if case == '3':
                     assert server.versions == original_versions and server.counts == [(0, 0)]
                 else:
@@ -128,7 +152,8 @@ format = "json"
                 if case == '0':
                     assert server.counts == [(8, 4), (8, 4)], server.counts
                     assert sum(count for count, _ in server.counts) + 10 == 26
-                print(f'PASS private family {case}: retained generations drained; attempt (requests,deletes)={server.counts}')
+                detail = 'copy gate held without provider requests' if case == '3' else 'retained generations drained'
+                print(f'PASS private family {case}: {detail}; attempt (requests,deletes)={server.counts}')
             server.shutdown()
 
 
