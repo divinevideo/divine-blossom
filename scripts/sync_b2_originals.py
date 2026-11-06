@@ -677,12 +677,12 @@ class JsonHTTP:
         self.headers = headers or {}
         self.opener = urllib.request.build_opener(NoRedirect)
 
-    def request(self, url, method="GET", value=None, missing=False, conflict=False, headers=None, include_headers=False, max_response_bytes=MIB):
+    def request(self, url, method="GET", value=None, missing=False, conflict=False, headers=None, include_headers=False, max_response_bytes=MIB, timeout=30):
         body = json.dumps(value).encode() if value is not None else None
         request = urllib.request.Request(url, data=body, method=method,
                                          headers={**self.headers, "Content-Type": "application/json", **(headers or {})})
         try:
-            with self.opener.open(request, timeout=30) as response:
+            with self.opener.open(request, timeout=timeout) as response:
                 data = response.read(max_response_bytes + 1)
                 if len(data) > max_response_bytes:
                     raise ValueError("control response too large")
@@ -898,6 +898,31 @@ class FastlyKV:
             self.claim_failure = phase + "_response_invalid"
             raise
 
+    def confirm_claim(self, key, expected):
+        """Retry only absent readback; never repeat the add or accept a late match."""
+        observed = self.get(key)  # Preserve the first GET's existing timeout.
+        if observed is not None:
+            return observed
+        # This bounds scheduling and acceptance after absence, not transport wall
+        # time: urllib's socket timeout cannot interrupt every blocking operation.
+        deadline = time.monotonic() + 3.0
+        for _ in range(2):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("copy gate confirmation deadline expired")
+            time.sleep(min(0.25, remaining))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("copy gate confirmation deadline expired")
+            observed = self.http.request(self.url(key), missing=True, timeout=min(1.0, remaining))
+            if observed is not None and observed != expected:
+                return observed  # Preserve the terminal ownership diagnosis, even if late.
+            if time.monotonic() >= deadline:
+                raise TimeoutError("copy gate confirmation deadline expired")
+            if observed is not None:
+                return observed
+        return None
+
     def claim_copy(self, key, attempt):
         self.claim_failure = None
         if not HEX.fullmatch(key):
@@ -907,7 +932,7 @@ class FastlyKV:
                                     self.url("b2-sync:v1:" + key) + "?add=true", "PUT", value, conflict=True)
         if result is False:
             return False
-        observed = self.claim_request("confirm", self.get, "b2-sync:v1:" + key)
+        observed = self.claim_request("confirm", self.confirm_claim, "b2-sync:v1:" + key, value)
         if observed != value:
             # get() maps both HTTP 404 and a JSON null/empty response to None.
             if observed is None:
