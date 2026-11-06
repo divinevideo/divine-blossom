@@ -96,17 +96,21 @@ const FOS_READ_FLAG: &str = "fos_read_enabled";
 const FOS_WRITE_BACK_FLAG: &str = "fos_write_back_enabled";
 const B2_REPLICA_FLAG: &str = "b2_replica_enabled";
 // One B2-enabled vanish wave covers at most a source blob and its derived
-// audio, each listing one bounded page of versions, deleting them, and
-// confirming absence. The vanish wave loop in main.rs asserts that this whole
+// audio, each listing bounded pages in media and private-control namespaces,
+// deleting a shared bounded version set, and confirming both absent. The vanish wave loop in main.rs asserts that this whole
 // wave plus the execution's audit and timing requests fits Fastly Compute's
 // 32-backend-request per-execution limit. A larger version set is drained
 // across caller retries as pending work instead of exhausting the execution.
 const B2_LIST_PAGE_SIZE: usize = 6;
+// Two namespace lists and confirmations share the original eight-request
+// per-hash ceiling. Retained history drains through caller retries.
+const B2_ERASE_DELETES_PER_HASH: usize = 4;
+const B2_ERASE_LISTS_PER_HASH: usize = 4;
 const MAX_BUNNY_DELIVERY_ZONES: usize = 2;
 pub(crate) const B2_VANISH_MAX_HASHES_PER_WAVE: usize = 2;
 pub(crate) const B2_VANISH_MAX_STORAGE_BACKEND_REQUESTS: usize = 2 // GCS and FOS multi-delete
     + 1 // B2 authorization
-    + B2_VANISH_MAX_HASHES_PER_WAVE * (2 + B2_LIST_PAGE_SIZE) // list, deletes, confirm
+    + B2_VANISH_MAX_HASHES_PER_WAVE * (B2_ERASE_LISTS_PER_HASH + B2_ERASE_DELETES_PER_HASH)
     + 1 // Cloud Run derivative cleanup
     + 2 // Fastly VCL and Compute purges
     + B2_VANISH_MAX_HASHES_PER_WAVE * MAX_BUNNY_DELIVERY_ZONES;
@@ -1517,7 +1521,6 @@ struct B2Authorization {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct B2ListFileVersionsResponse {
-    #[serde(default)]
     files: Vec<B2FileVersion>,
     next_file_name: Option<String>,
     next_file_id: Option<String>,
@@ -1928,26 +1931,51 @@ fn delete_b2_version_page(
 enum B2HashErasure {
     /// Every listed version was deleted and absence was confirmed.
     Erased,
-    /// The prefix holds more versions than one bounded page. The page was
-    /// deleted, and the next attempt continues the drain as pending work.
+    /// At least one namespace holds more versions than this attempt can
+    /// delete or observes late versions. Caller retries continue the drain.
     MoreRemaining,
 }
 
 fn erase_b2_hash_versions(authorization: &B2Authorization, hash: &str) -> Result<B2HashErasure> {
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(BlossomError::StorageError("Invalid B2 erasure hash".into()));
+    }
     crate::metadata::claim_b2_erasure(hash)?;
-    let page = list_b2_file_versions(authorization, hash, Some((hash, None)))?;
-    let (versions, next) = b2_prefix_page(hash, &page)?;
-    delete_b2_version_page(authorization, versions)?;
-    if next.is_some() {
+    // The private parent namespace is deliberately outside the media prefix.
+    // The trailing slash isolates adjacent parent names and includes every
+    // control object, including retained completion-marker versions.
+    let private_prefix = format!("_private/artifact-families/v1/{hash}/");
+    let prefixes = [hash, private_prefix.as_str()];
+    // Resolve both inventories before any delete: an unreadable private
+    // namespace cannot silently become evidence of complete erasure.
+    let pages = prefixes
+        .iter()
+        .map(|prefix| list_b2_file_versions(authorization, prefix, Some((prefix, None))))
+        .collect::<Result<Vec<_>>>()?;
+    let inventories = prefixes
+        .iter()
+        .zip(&pages)
+        .map(|(prefix, page)| b2_prefix_page(prefix, page))
+        .collect::<Result<Vec<_>>>()?;
+    let mut delete_budget = B2_ERASE_DELETES_PER_HASH;
+    let mut remaining = false;
+    for (versions, next) in inventories {
+        let count = versions.len().min(delete_budget);
+        delete_b2_version_page(authorization, &versions[..count])?;
+        delete_budget -= count;
+        remaining |= count < versions.len() || next.is_some();
+    }
+    if remaining {
         return Ok(B2HashErasure::MoreRemaining);
     }
-
-    let confirmation = list_b2_file_versions(authorization, hash, Some((hash, None)))?;
-    let (versions, next) = b2_prefix_page(hash, &confirmation)?;
-    if !versions.is_empty() || next.is_some() {
-        return Err(BlossomError::StorageError(
-            "B2 replica still contains versions after deletion".into(),
-        ));
+    // Completion requires confirmed absence in both namespaces. Observed
+    // late versions are pending; uncertain listing/deletion stays an error.
+    for prefix in prefixes {
+        let confirmation = list_b2_file_versions(authorization, prefix, Some((prefix, None)))?;
+        let (versions, next) = b2_prefix_page(prefix, &confirmation)?;
+        if !versions.is_empty() || next.is_some() {
+            return Ok(B2HashErasure::MoreRemaining);
+        }
     }
     Ok(B2HashErasure::Erased)
 }
@@ -5146,6 +5174,76 @@ mod tests {
         let (versions, next) = b2_prefix_page(&hash, &absent).expect("terminal page");
         assert!(versions.is_empty());
         assert!(next.is_none());
+    }
+
+    #[test]
+    #[ignore = "loopback provider fixture and persistent local KV required"]
+    fn private_family_erasure_contract() {
+        let authorization = B2Authorization {
+            api_url: "https://api001.backblazeb2.com".into(),
+            authorization_token: "synthetic".into(),
+            bucket_id: "synthetic".into(),
+            bucket_name: None,
+            backend: fastly::Backend::from_name("b2_api").unwrap(),
+        };
+        {
+            let letter = super::get_config("fixture_case").unwrap();
+            let letter = letter.chars().next().unwrap();
+            let attempts: usize = super::get_config("fixture_attempts")
+                .unwrap()
+                .parse()
+                .unwrap();
+            let letters = if letter == '0' {
+                vec!['0', '1']
+            } else {
+                vec![letter]
+            };
+            for hash_letter in letters {
+                let hash = hash_letter.to_string().repeat(64);
+                for attempt in 0..attempts {
+                    assert_eq!(
+                        Request::get(format!(
+                            "https://api001.backblazeb2.com/fixture/begin/{hash}/{attempt}"
+                        ))
+                        .send("b2_api")
+                        .unwrap()
+                        .get_status(),
+                        200
+                    );
+                    let result = super::erase_b2_hash_versions(&authorization, &hash);
+                    assert_eq!(
+                        Request::get("https://api001.backblazeb2.com/fixture/end")
+                            .send("b2_api")
+                            .unwrap()
+                            .get_status(),
+                        200
+                    );
+                    if letter == '3' {
+                        assert!(result.is_err(), "uncertain copy gate must retain erasure");
+                    } else if attempt + 1 == attempts {
+                        assert!(
+                            matches!(result, Ok(super::B2HashErasure::Erased)),
+                            "{letter}: final attempt did not prove both namespaces absent"
+                        );
+                    } else if letter == 'b' || letter == 'f' {
+                        assert!(
+                            matches!(result, Ok(super::B2HashErasure::MoreRemaining)),
+                            "large retained marker history must remain pending"
+                        );
+                    } else {
+                        assert!(result.is_err(), "{letter}: uncertainty must fail closed");
+                    }
+                }
+                let mut entry = fastly::kv_store::KVStore::open("blossom_metadata")
+                    .unwrap()
+                    .unwrap()
+                    .lookup(&format!("b2-sync:v1:{hash}"))
+                    .unwrap();
+                assert!(entry.take_body().into_string().contains(
+                    if letter == '3' { "copying" } else { "erasing" }));
+            }
+            assert_eq!(super::B2_VANISH_MAX_STORAGE_BACKEND_REQUESTS, 26);
+        }
     }
 
     #[test]
