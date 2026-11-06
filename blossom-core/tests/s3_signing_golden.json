@@ -1,0 +1,44 @@
+[
+  {
+    "name": "encoded_path",
+    "canonical_request": "GET\n/private-test/a%2Fb%20c%25%2B\n\nhost:s3.us-west-004.backblazeb2.com\nx-amz-content-sha256:UNSIGNED-PAYLOAD\nx-amz-date:20261107T010203Z\n\nhost;x-amz-content-sha256;x-amz-date\nUNSIGNED-PAYLOAD",
+    "signed_headers": "host;x-amz-content-sha256;x-amz-date",
+    "authorization": "AWS4-HMAC-SHA256 Credential=synthetic-access/20261107/us-west-004/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=b24e577e52a367c03493441944d8defe446649b2e3dd0eff082ea3e6b05abed5"
+  },
+  {
+    "name": "encoded_query",
+    "canonical_request": "GET\n/private-test/object\nversionId=opaque%2B%2F%3D&download=1\nhost:s3.us-west-004.backblazeb2.com\nx-amz-content-sha256:UNSIGNED-PAYLOAD\nx-amz-date:20261107T010203Z\n\nhost;x-amz-content-sha256;x-amz-date\nUNSIGNED-PAYLOAD",
+    "signed_headers": "host;x-amz-content-sha256;x-amz-date",
+    "authorization": "AWS4-HMAC-SHA256 Credential=synthetic-access/20261107/us-west-004/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=042ab5d7847df7cb164991070e4a92b8745b43cac4459aee1da5d222b9c85f2a"
+  },
+  {
+    "name": "host_bytes",
+    "canonical_request": "HEAD\n/private-test/object\n\nhost:Synthetic.EXAMPLE:443\nx-amz-content-sha256:UNSIGNED-PAYLOAD\nx-amz-date:20261107T010203Z\n\nhost;x-amz-content-sha256;x-amz-date\nUNSIGNED-PAYLOAD",
+    "signed_headers": "host;x-amz-content-sha256;x-amz-date",
+    "authorization": "AWS4-HMAC-SHA256 Credential=synthetic-access/20261107/us-west-004/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=e519f9c8c98ef13f9db7873c26fe747dfd545e9bb56c2935d3e4adec2bfe93c4"
+  },
+  {
+    "name": "owner_metadata",
+    "canonical_request": "PUT\n/private-test/object\n\nhost:s3.us-west-004.backblazeb2.com\nx-amz-content-sha256:UNSIGNED-PAYLOAD\nx-amz-date:20261107T010203Z\nx-amz-meta-owner:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\n\nhost;x-amz-content-sha256;x-amz-date;x-amz-meta-owner\nUNSIGNED-PAYLOAD",
+    "signed_headers": "host;x-amz-content-sha256;x-amz-date;x-amz-meta-owner",
+    "authorization": "AWS4-HMAC-SHA256 Credential=synthetic-access/20261107/us-west-004/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-meta-owner, Signature=9d16fd830962ef65464ddb017ef9ee728ff064ee30e49563188a6f720eecdba3"
+  },
+  {
+    "name": "empty_payload",
+    "canonical_request": "PUT\n/private-test/object\n\nhost:s3.us-west-004.backblazeb2.com\nx-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nx-amz-date:20261107T010203Z\n\nhost;x-amz-content-sha256;x-amz-date\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "signed_headers": "host;x-amz-content-sha256;x-amz-date",
+    "authorization": "AWS4-HMAC-SHA256 Credential=synthetic-access/20261107/us-west-004/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=26a4863fbd2a98306bcf72d6d12f4cfc4755271400ea28ad21de0808365ad217"
+  },
+  {
+    "name": "payload_sha",
+    "canonical_request": "PUT\n/private-test/object\n\nhost:s3.us-west-004.backblazeb2.com\nx-amz-content-sha256:a3b16b6e44c6ea47c8f2531f402530e414091de3769594c3db04ddedd3165bc5\nx-amz-date:20261107T010203Z\n\nhost;x-amz-content-sha256;x-amz-date\na3b16b6e44c6ea47c8f2531f402530e414091de3769594c3db04ddedd3165bc5",
+    "signed_headers": "host;x-amz-content-sha256;x-amz-date",
+    "authorization": "AWS4-HMAC-SHA256 Credential=synthetic-access/20261107/us-west-004/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=e1984e63276f511c18a58ea29b8efb9f60807813b496a987b9be4805f39e31a6"
+  },
+  {
+    "name": "copy_metadata",
+    "canonical_request": "PUT\n/private-test/object\ncopy=1\nhost:s3.us-west-004.backblazeb2.com\nx-amz-content-sha256:UNSIGNED-PAYLOAD\nx-amz-copy-source:/source/key%2Bvalue\nx-amz-date:20261107T010203Z\n\nhost;x-amz-content-sha256;x-amz-copy-source;x-amz-date\nUNSIGNED-PAYLOAD",
+    "signed_headers": "host;x-amz-content-sha256;x-amz-copy-source;x-amz-date",
+    "authorization": "AWS4-HMAC-SHA256 Credential=synthetic-access/20261107/us-west-004/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-copy-source;x-amz-date, Signature=c608602aca97efcf6ff9196b610ad7f92b370d9cf1c7d727cf126c92159cb851"
+  }
+]
