@@ -2266,6 +2266,118 @@ fn mark_failed_stage(
     }
 }
 
+/// Production CDN invalidation is opt-in with the production delivery path.
+pub(crate) fn b2_cdn_invalidation_enabled() -> bool {
+    // Disabling admission does not revoke a stored outer response. Retained
+    // purge hosts keep invalidation active throughout rollback and draining.
+    crate::b2_cdn_purge::configured()
+}
+
+fn b2_cdn_purge_urls(hash: &str, hosts: &str, current_host: &str) -> Result<Vec<String>> {
+    let invalid = || BlossomError::StorageError("B2 CDN purge configuration invalid".into());
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid());
+    }
+    let names = blossom_core::b2_cdn::purge_hosts(Some(hosts), Some(current_host))
+        .ok_or_else(invalid)?;
+    Ok(names.into_iter().map(|host| format!("https://{host}/{}", hash.to_ascii_lowercase())).collect())
+}
+
+/// Send targeted URL purges as well as committed hash-variant purges.
+/// In-flight cache behavior still requires live provider acceptance tests.
+/// All requests are drained; no acknowledgement is returned on partial failure.
+pub(crate) fn invalidate_b2_cdn(hashes: &[String]) -> Result<()> {
+    // A discovered durable intent is still owed an eviction even if an operator
+    // removed admission/purge configuration. Missing configuration must fail
+    // this checked operation, never masquerade as a successful empty purge.
+    if hashes.is_empty() { return Ok(()); }
+    validate_b2_cdn_purge_batch(hashes)?;
+    let hosts = get_config("b2_cdn_purge_hosts")?;
+    let current_host = get_config("b2_cdn_host")?;
+    let mut requests = Vec::new();
+    for hash in hashes {
+        for url in b2_cdn_purge_urls(hash, &hosts, &current_host)? {
+            let encoded: String = url.bytes().map(|byte| {
+                if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                    (byte as char).to_string()
+                } else { format!("%{byte:02X}") }
+            }).collect();
+            requests.push(Request::post(format!("https://api.fastly.com/purge/{encoded}")));
+        }
+    }
+    let token = get_secret("fastly_api_token")?;
+    if token.is_empty() { return Err(BlossomError::StorageError("B2 CDN purge credential unavailable".into())); }
+    for chunk in hashes.chunks(256) {
+        for service in ["ML7R82HKfmTaqTpHExIDVN", "pOvEEWykEbpnylqst1KTrR"] {
+            let mut request = Request::post(format!("https://api.fastly.com/service/{service}/purge"));
+            request.set_header("Surrogate-Key", chunk.iter().map(|hash| hash.to_ascii_lowercase()).collect::<Vec<_>>().join(" "));
+            requests.push(request);
+        }
+    }
+    let mut failed = false;
+    for round in 0..2 {
+        let mut pending = Vec::new();
+        for template in &requests {
+            let mut request = template.clone_without_body();
+            request.set_header("Host", "api.fastly.com");
+            request.set_header("Fastly-Key", &token);
+            request.set_header("Accept", "application/json");
+            match request.send_async("fastly_api") {
+                Ok(handle) => pending.push(handle),
+                Err(_) => failed = true,
+            }
+        }
+        while !pending.is_empty() {
+            let (response, remaining) = fastly::http::request::select(pending);
+            pending = remaining;
+            let acknowledged = match response {
+                Ok(response) if response.get_status().is_success() => true,
+                // A retained host may already be unbound during rollback. The
+                // URL has no current route to evict; both service-targeted hash
+                // key purges must still acknowledge in this same round.
+                Ok(response) if response.get_status() == StatusCode::NOT_FOUND => response
+                    .get_backend_request()
+                    .is_some_and(|request| request.get_path().starts_with("/purge/https%3A%2F%2F")),
+                _ => false,
+            };
+            if !acknowledged { failed = true; }
+        }
+        if round == 0 { wait_b2_cdn_purge_interval()?; }
+    }
+    if failed { Err(BlossomError::StorageError("B2 CDN invalidation incomplete; retry required".into())) } else { Ok(()) }
+}
+
+fn validate_b2_cdn_purge_batch(hashes: &[String]) -> Result<()> {
+    let mut seen = HashSet::new();
+    if hashes.len() > 4 || hashes.iter().any(|hash| {
+        hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !seen.insert(hash.to_ascii_lowercase())
+    }) {
+        return Err(BlossomError::StorageError("B2 CDN purge batch invalid or over budget".into()));
+    }
+    Ok(())
+}
+
+/// Fastly documents a second URL/key purge after about two seconds for
+/// shield ordering races. Yield to the host timer instead of consuming CPU.
+fn wait_b2_cdn_purge_interval() -> Result<()> {
+    let handles: [fastly_sys::AsyncItemHandle; 0] = [];
+    let mut index = u32::MAX;
+    // SAFETY: the empty slice pointer and output pointer remain valid for this
+    // hostcall. The timeout is strictly positive (zero would wait indefinitely).
+    let status = unsafe { fastly_sys::fastly_async_io::select(handles.as_ptr(), 0, 2000, &mut index) };
+    if status.is_err() || index != u32::MAX {
+        return Err(BlossomError::StorageError("B2 CDN purge interval unavailable; retry required".into()));
+    }
+    Ok(())
+}
+
+/// Retain legacy best-effort behavior until production CDN mode is enabled.
+pub(crate) fn purge_policy_cache(hash: &str) -> Result<()> {
+    if b2_cdn_invalidation_enabled() { invalidate_b2_cdn(&[hash.to_string()]) }
+    else { crate::purge_edge_cache(hash); Ok(()) }
+}
+
 /// Purge the given hashes by surrogate key from both CDN services and return
 /// the hashes whose purge request both services accepted.
 fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) -> HashSet<String> {
@@ -2371,6 +2483,289 @@ fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) -> H
         }
     }
     purged
+}
+
+/// Whether a warm outer CDN copy could exist for this object. Invalidation
+/// depends only on retained CDN configuration, never on the admission or
+/// replica flags: turning either off does not revoke an already-stored outer
+/// response.
+pub(crate) fn cdn_invalidation_configured() -> bool {
+    crate::b2_cdn_purge::configured()
+}
+
+/// Decide the physical outcome for one hash. Pure so the rollback trap is
+/// covered without a provider.
+///
+/// A skipped B2 erase is never `Absent`: with the replica flag off the versions
+/// were not deleted, so claiming absence would mark warm content safe while it
+/// still exists. It is a failure that keeps the hash pending.
+fn vanish_physical_outcome(
+    hash: &str,
+    failed: &HashSet<String>,
+    remaining: &HashSet<String>,
+    replica_enabled: bool,
+) -> crate::b2_cdn_phase::Physical {
+    use crate::b2_cdn_phase::Physical;
+    if failed.contains(hash) || !replica_enabled {
+        Physical::Failed
+    } else if remaining.contains(hash) {
+        // A version set larger than one bounded page is known, safe progress:
+        // the next wave continues it. It is not an uncertain outcome, so it
+        // stays Pending and may run again.
+        Physical::Pending
+    } else {
+        Physical::Absent
+    }
+}
+
+/// Split candidate hashes into those allowed to run the bounded physical wave
+/// and those that must be held this pass.
+///
+/// A hash runs only when it has a durable attempt epoch and its phase record is
+/// readable and says the wave may run. Anything else — a missing epoch from a
+/// failed `begin_vanish_phase`, or an unreadable phase record — is held rather
+/// than erased without durable progress, so a partial failure can never cause a
+/// destructive wave with no record of it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct VanishPhysicalPlan {
+    /// Hashes that may run the bounded physical wave this request.
+    pub run: Vec<String>,
+    /// Hashes with no durable epoch or unreadable phase: hold, never erase.
+    pub held: Vec<String>,
+    /// Hashes the phase says need no wave (Absent/Complete). Normal completion,
+    /// never pending work.
+    pub skipped: Vec<String>,
+}
+
+/// Plan the bounded physical wave.
+///
+/// With phase not configured this is byte-for-byte the legacy behavior: every
+/// hash runs and nothing is held, so enabling the feature cannot change what an
+/// ordinary vanish deletes.
+pub(crate) fn plan_vanish_physical(
+    hashes: &[String],
+    epochs: &std::collections::HashMap<String, String>,
+    configured: bool,
+    mut may_run: impl FnMut(&str) -> Result<bool>,
+) -> VanishPhysicalPlan {
+    let mut plan = VanishPhysicalPlan::default();
+    if !configured {
+        plan.run.extend(hashes.iter().cloned());
+        return plan;
+    }
+    for hash in hashes {
+        if !epochs.contains_key(&hash.to_ascii_lowercase()) {
+            plan.held.push(hash.clone());
+            continue;
+        }
+        match may_run(hash) {
+            Ok(true) => plan.run.push(hash.clone()),
+            // The phase says the wave already finished; skip quietly.
+            Ok(false) => plan.skipped.push(hash.clone()),
+            // Unreadable state fails closed: hold, never erase.
+            Err(_) => plan.held.push(hash.clone()),
+        }
+    }
+    plan
+}
+
+/// Backwards-compatible two-list view for callers that already distinguish run
+/// from held. Skips are returned as run=false but not held only through the
+/// full [`plan_vanish_physical`] API.
+pub(crate) fn plan_vanish_physical_with(
+    hashes: &[String],
+    epochs: &std::collections::HashMap<String, String>,
+    may_run: impl FnMut(&str) -> Result<bool>,
+) -> (Vec<String>, Vec<String>) {
+    let plan = plan_vanish_physical(hashes, epochs, true, may_run);
+    (plan.run, plan.held)
+}
+
+/// Persist the deny/erasing gate and open a phased physical attempt for a hash
+/// the caller is about to erase. Must run before the physical wave so a warm
+/// outer entry is invalidated even if the wave is interrupted.
+///
+/// Gated only on CDN invalidation configuration. Returns the attempt's epoch,
+/// or `None` when CDN invalidation is not configured.
+pub(crate) fn begin_vanish_phase(hash: &str) -> Result<Option<String>> {
+    if !cdn_invalidation_configured() {
+        return Ok(None);
+    }
+    crate::metadata::claim_b2_erasure(hash)?;
+    Ok(Some(crate::b2_cdn_phase::begin_erase(hash)?))
+}
+
+/// Whether the bounded wave must run for this hash.
+///
+/// An unreadable phase record returns `Err`, and the caller holds the hash.
+/// Defaulting to "run" here would turn a KV read failure into a destructive
+/// erase with no durable progress.
+pub(crate) fn vanish_needs_physical(hash: &str) -> Result<bool> {
+    crate::b2_cdn_phase::needs_physical(hash)
+}
+
+/// Record the wave's outcome for the exact attempt and queue the blocking final
+/// purge when the outcome is definite. A failed or replica-skipped wave is
+/// purged too, so cached bytes leave the CDN; it simply can never complete. An
+/// unknown outcome stays pending for a read-only reconcile and is not purged.
+///
+/// Returns `true` when a final intent was queued.
+pub(crate) fn finish_vanish_phase(
+    hash: &str,
+    epoch: &str,
+    failed: &HashSet<String>,
+    remaining: &HashSet<String>,
+) -> Result<bool> {
+    if !cdn_invalidation_configured() {
+        return Ok(false);
+    }
+    let outcome = vanish_physical_outcome(hash, failed, remaining, b2_replica_enabled());
+    crate::b2_cdn_phase::record_physical(hash, epoch, outcome)?;
+    if !crate::b2_cdn_phase::final_purge_pending(hash)? {
+        return Ok(false);
+    }
+    crate::b2_cdn_purge::enqueue(hash, crate::b2_cdn_purge::Phase::Final)?;
+    Ok(true)
+}
+
+/// Whether erasure for this hash may be reported complete: bytes proven absent
+/// and the final purge acknowledged. A failed or replica-skipped wave can never
+/// be complete.
+pub(crate) fn vanish_complete(hash: &str) -> bool {
+    crate::b2_cdn_phase::complete_ready(hash).unwrap_or(false)
+}
+
+/// One full vanish attempt for one hash, in the same order `execute_vanish`
+/// uses: open the attempt, run the bounded wave only if still needed, record
+/// the outcome, and report whether the hash may be finalized.
+///
+/// `wave` is the caller's bounded physical erase so the test can count how many
+/// times it actually runs. Returns `(physical_ran, may_finalize)`.
+#[cfg(test)]
+pub(crate) fn vanish_attempt_for_test(
+    hash: &str,
+    wave: impl FnOnce(&[String]) -> HashSet<String>,
+) -> (bool, bool) {
+    let Some(epoch) = begin_vanish_phase(hash).ok().flatten() else {
+        return (false, true);
+    };
+    let ran = if vanish_needs_physical(hash).unwrap_or(false) {
+        let failed = wave(&[hash.to_string()]);
+        if let Err(error) = finish_vanish_phase(hash, &epoch, &failed, &HashSet::new()) {
+            eprintln!("[test] finish_vanish_phase failed: {error}");
+        }
+        true
+    } else {
+        false
+    };
+    (ran, vanish_complete(hash))
+}
+
+#[cfg(test)]
+mod vanish_phase_tests {
+    use super::{plan_vanish_physical, plan_vanish_physical_with, vanish_physical_outcome};
+    use crate::b2_cdn_phase::Physical;
+    use std::collections::HashSet;
+
+    #[test]
+    fn known_remaining_progress_is_not_an_uncertain_outcome() {
+        let hash = "b".repeat(64);
+        let failed: HashSet<String> = HashSet::new();
+        let remaining: HashSet<String> = [hash.clone()].into_iter().collect();
+        // B2 versions beyond one bounded page is known safe progress: it must
+        // retry the wave next time, not become an unreconcilable Unknown.
+        assert_eq!(
+            vanish_physical_outcome(&hash, &failed, &remaining, true),
+            Physical::Pending
+        );
+    }
+
+    #[test]
+    fn planning_is_default_parity_when_phase_is_not_configured() {
+        // With CDN invalidation off every hash must run the ordinary wave,
+        // exactly as before this feature. No epoch is required and nothing is
+        // held, or existing vanish would stop deleting anything.
+        let hashes: Vec<String> = ["10", "11", "12"]
+            .iter()
+            .map(|h| h.repeat(32))
+            .collect();
+        let empty = std::collections::HashMap::new();
+        let plan = plan_vanish_physical(&hashes, &empty, false, |_| Ok(true));
+        assert_eq!(plan.run, hashes, "default-off must run every hash");
+        assert!(plan.held.is_empty(), "default-off must hold nothing");
+        assert!(plan.skipped.is_empty());
+    }
+
+    #[test]
+    fn an_already_finished_hash_is_skipped_not_held() {
+        // Configured, but the phase says the wave must not run (Absent or
+        // Complete). That is normal completion, not an error: skip it without
+        // holding or counting it pending forever.
+        let hash = "13".repeat(32);
+        let hashes = vec![hash.clone()];
+        let mut epochs = std::collections::HashMap::new();
+        epochs.insert(hash.clone(), "0".repeat(32));
+        let plan = plan_vanish_physical(&hashes, &epochs, true, |_| Ok(false));
+        assert!(plan.run.is_empty(), "a finished hash must not re-run");
+        assert!(plan.held.is_empty(), "a finished hash must not be held");
+        assert_eq!(plan.skipped, hashes, "it is skipped, not pending work");
+    }
+
+    #[test]
+    fn the_physical_wave_excludes_hashes_without_a_durable_epoch() {
+        let with_epoch = "c".repeat(64);
+        let no_epoch = "d".repeat(64);
+        let unsafe_state = "e".repeat(64);
+        let hashes = vec![with_epoch.clone(), no_epoch.clone(), unsafe_state.clone()];
+        let mut epochs = std::collections::HashMap::new();
+        epochs.insert(with_epoch.clone(), "0".repeat(32));
+        epochs.insert(unsafe_state.clone(), "1".repeat(32));
+        let (run, held) = plan_vanish_physical_with(&hashes, &epochs, |hash| {
+            if hash == unsafe_state {
+                Err(crate::error::BlossomError::MetadataError("unreadable".into()))
+            } else {
+                Ok(true)
+            }
+        });
+        assert_eq!(run, vec![with_epoch], "only a durable, readable hash may run");
+        assert_eq!(
+            held,
+            vec![no_epoch, unsafe_state],
+            "missing epoch and unreadable state are held, never erased"
+        );
+    }
+
+    #[test]
+    fn a_skipped_replica_erase_is_never_reported_absent() {
+        let hash = "a".repeat(64);
+        let failed: HashSet<String> = HashSet::new();
+        let remaining: HashSet<String> = HashSet::new();
+        // Normal success.
+        assert_eq!(
+            vanish_physical_outcome(&hash, &failed, &remaining, true),
+            Physical::Absent
+        );
+        // Replica flag off means versions were not deleted: never Absent, so the
+        // hash can never be marked complete while outer bytes may survive.
+        assert_eq!(
+            vanish_physical_outcome(&hash, &failed, &remaining, false),
+            Physical::Failed
+        );
+        // A provider failure dominates a clean remainder.
+        let failed: HashSet<String> = [hash.clone()].into_iter().collect();
+        assert_eq!(
+            vanish_physical_outcome(&hash, &failed, &remaining, true),
+            Physical::Failed
+        );
+        // Still-progressing versions are known safe progress: Pending, so the
+        // next wave continues them. Not an uncertain Unknown.
+        let failed: HashSet<String> = HashSet::new();
+        let remaining: HashSet<String> = [hash.clone()].into_iter().collect();
+        assert_eq!(
+            vanish_physical_outcome(&hash, &failed, &remaining, true),
+            Physical::Pending
+        );
+    }
 }
 
 /// Erase one bounded vanish batch from every enabled origin and CDN service.
@@ -4169,6 +4564,25 @@ pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtracti
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cdn_invalidation_rejects_unbounded_or_ambiguous_batches_before_dispatch() {
+        let hashes: Vec<String> = (0..5).map(|n| format!("{n:064x}")).collect();
+        assert!(super::validate_b2_cdn_purge_batch(&hashes[..4]).is_ok());
+        assert!(super::validate_b2_cdn_purge_batch(&hashes).is_err());
+        assert!(super::validate_b2_cdn_purge_batch(&[hashes[0].clone(), hashes[0].clone()]).is_err());
+        assert!(super::validate_b2_cdn_purge_batch(&["not-a-hash".into()]).is_err());
+    }
+    #[test]
+    fn b2_cdn_purge_urls_cover_only_configured_normalized_keys() {
+        let hash = "A".repeat(64);
+        let urls = super::b2_cdn_purge_urls(&hash, "media-b2-cdn.divine.video,media-b2.divine.video", "media-b2-cdn.divine.video").unwrap();
+        assert_eq!(urls, vec![format!("https://media-b2-cdn.divine.video/{}", "a".repeat(64)), format!("https://media-b2.divine.video/{}", "a".repeat(64))]);
+        for hosts in ["", "https://media-b2-cdn.divine.video", "media-b2-cdn.divine.video:443", "media-b2-cdn.divine.video/path", "media-b2-cdn.divine.video\r\nX:bad", "other.divine.video", "media-b2-cdn.divine.video, media-b2.divine.video"] {
+            assert!(super::b2_cdn_purge_urls(&hash, hosts, "media-b2-cdn.divine.video").is_err(), "invalid purge host set accepted");
+        }
+        assert!(super::b2_cdn_purge_urls("bad", "media-b2-cdn.divine.video", "media-b2-cdn.divine.video").is_err());
+        assert!(super::b2_cdn_purge_urls(&hash, "media-b2-cdn.divine.video,media-b2-cdn.divine.video", "media-b2-cdn.divine.video").is_err());
+    }
     #[test]
     fn canary_transient_transport_classification_preserves_setup_failures() {
         use fastly::http::request::SendErrorCause;

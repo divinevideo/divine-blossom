@@ -48,6 +48,155 @@ fn status() -> serde_json::Value {
 }
 
 #[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn pending_cdn_intent_cannot_clear_when_purge_configuration_disappears() {
+    let store = open_store().unwrap();
+    let token = b2_cdn_purge::begin(&hash()).unwrap();
+    assert_eq!(b2_cdn_purge::commit(&store, &token).unwrap(), b2_cdn_purge::CommitOutcome::Committed);
+    let mut response = call(request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=1", true));
+    assert_eq!(response.get_status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&response.take_body_str()).unwrap();
+    assert_eq!(body["result"], 0);
+    assert_eq!(body["errors"], 1);
+    assert_eq!(body["pending"], 1);
+    let entries = store.build_list().prefix("b2-cdn-purge").execute().unwrap();
+    for key in entries.keys() {
+        let mut entry = store.lookup(key).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&entry.take_body().into_string()).unwrap();
+        assert_eq!(value["state"], "committed");
+    }
+}
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn restore_without_cdn_keeps_existing_non_deleted_rejection() {
+    let metadata: BlobMetadata = serde_json::from_value(serde_json::json!({
+        "sha256": hash(), "size": 9, "type": "video/mp4", "uploaded": "2026-01-01T00:00:00Z",
+        "owner": "b".repeat(64), "status": "active"
+    })).unwrap();
+    put_blob_metadata(&metadata).unwrap();
+    let mut req = request(Method::POST, "/admin/api/restore", true);
+    req.set_body(serde_json::json!({"sha256": hash()}).to_string());
+    assert_eq!(call(req).get_status(), StatusCode::BAD_REQUEST);
+}
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn bulk_approve_skip_purge_reports_durable_pending_hashes() {
+    let metadata: BlobMetadata = serde_json::from_value(serde_json::json!({
+        "sha256": hash(), "size": 9, "type": "video/mp4", "uploaded": "2026-01-01T00:00:00Z",
+        "owner": "b".repeat(64), "status": "banned"
+    })).unwrap();
+    put_blob_metadata(&metadata).unwrap();
+    let mut req = request(Method::POST, "/admin/api/bulk-approve", true);
+    req.set_body(serde_json::json!({"hashes": [hash()], "skip_purge": true}).to_string());
+    let mut response = call(req);
+    assert_eq!(response.get_status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&response.take_body_str()).unwrap();
+    assert_eq!(body["cdn_purge_pending_hashes"], serde_json::json!([hash()]));
+    let store = open_store().unwrap();
+    assert!(!store.build_list().prefix("b2-cdn-purge").execute().unwrap().keys().is_empty());
+}
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn soft_delete_cdn_failure_cannot_be_acknowledged_before_eviction() {
+    let metadata: BlobMetadata = serde_json::from_value(serde_json::json!({
+        "sha256": hash(), "size": 9, "type": "video/mp4", "uploaded": "2026-01-01T00:00:00Z",
+        "owner": "b".repeat(64), "status": "active"
+    })).unwrap();
+    put_blob_metadata(&metadata).unwrap();
+    let mutate = || {
+        let mut req = request(Method::POST, "/admin/api/moderate", true);
+        req.set_body(serde_json::json!({"sha256": hash(), "action": "DELETE"}).to_string());
+        call(req)
+    };
+    assert_eq!(mutate().get_status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(get_blob_metadata_uncached(&hash()).unwrap().unwrap().status, BlobStatus::Deleted);
+    assert_eq!(mutate().get_status(), StatusCode::OK);
+    assert_eq!(mutate().get_status(), StatusCode::OK);
+}
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn restore_cdn_failure_keeps_durable_retry_after_status_commits() {
+    let metadata: BlobMetadata = serde_json::from_value(serde_json::json!({
+        "sha256": hash(), "size": 9, "type": "video/mp4", "uploaded": "2026-01-01T00:00:00Z",
+        "owner": "b".repeat(64), "status": "deleted"
+    })).unwrap();
+    put_blob_metadata(&metadata).unwrap();
+    let mutate = || {
+        let mut req = request(Method::POST, "/admin/api/restore", true);
+        req.set_body(serde_json::json!({"sha256": hash()}).to_string());
+        call(req)
+    };
+    assert_eq!(mutate().get_status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(get_blob_metadata_uncached(&hash()).unwrap().unwrap().status, BlobStatus::Active);
+    assert_eq!(mutate().get_status(), StatusCode::OK);
+    assert_eq!(mutate().get_status(), StatusCode::OK);
+}
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn cdn_purge_drain_requires_admin_and_rejects_oversized_batches() {
+    for method in [Method::GET, Method::POST] {
+        assert_eq!(call(request(method, "/admin/api/b2-cdn-purge/drain", false)).get_status(), StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(call(request(Method::GET, "/admin/api/b2-cdn-purge/drain", true)).get_status(), StatusCode::BAD_REQUEST);
+    assert_eq!(call(request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=3", true)).get_status(), StatusCode::BAD_REQUEST);
+}
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn moderation_cdn_purge_failure_is_durable_and_same_status_retry_purges() {
+    let metadata: BlobMetadata = serde_json::from_value(serde_json::json!({
+        "sha256": hash(), "size": 9, "type": "video/mp4", "uploaded": "2026-01-01T00:00:00Z",
+        "owner": "b".repeat(64), "status": "active"
+    })).unwrap();
+    put_blob_metadata(&metadata).unwrap();
+    let mutate = |action: &str| {
+        let mut req = request(Method::POST, "/admin/api/moderate", true);
+        req.set_body(serde_json::json!({"sha256": hash(), "action": action}).to_string());
+        call(req)
+    };
+    assert_eq!(mutate("BAN").get_status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(get_blob_metadata_uncached(&hash()).unwrap().unwrap().status, BlobStatus::Banned);
+    let store = open_store().unwrap();
+    assert!(!store.build_list().prefix("b2-cdn-purge").execute().unwrap().keys().is_empty());
+    // The already-banned status must not skip a previously failed purge.
+    assert_eq!(mutate("BAN").get_status(), StatusCode::OK);
+    assert_eq!(mutate("APPROVE").get_status(), StatusCode::OK);
+    assert_eq!(get_blob_metadata_uncached(&hash()).unwrap().unwrap().status, BlobStatus::Active);
+}
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn quarantine_cdn_purge_failure_remains_denied_and_idempotently_retries() {
+    let mutate = |action: &str, version: u64| {
+        let mut req = request(Method::POST, "/admin/api/quarantine", true);
+        req.set_body(serde_json::json!({
+            "sha256": hash(), "hold_id": "synthetic", "version": version, "action": action
+        }).to_string());
+        call(req)
+    };
+    assert_eq!(mutate("hold", 1).get_status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(status()["quarantined"], true);
+    let store = open_store().unwrap();
+    let pending = store.build_list().prefix("b2-cdn-purge").execute().unwrap();
+    assert!(!pending.keys().is_empty(), "failed purge lost durable retry discovery");
+    for key in pending.keys() {
+        let mut entry = store.lookup(key).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&entry.take_body().into_string()).unwrap();
+        assert_eq!(value["state"], "committed");
+    }
+    // The state mutation is idempotent, but a failed invalidation is not an ack.
+    assert_eq!(mutate("hold", 1).get_status(), StatusCode::OK);
+    assert_eq!(status()["quarantined"], true);
+    assert_eq!(mutate("release", 2).get_status(), StatusCode::OK);
+    assert_eq!(status()["quarantined"], false);
+}
+
+#[test]
 fn quarantine_response_source_hashes_cover_public_media_only() {
     let sha = "c".repeat(64);
     for path in [
@@ -406,4 +555,101 @@ fn quarantine_hold_http_contract() {
         call(request(Method::GET, &format!("/{}.mp4", hash()), false)).get_status(),
         StatusCode::INTERNAL_SERVER_ERROR
     );
+}
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn creator_physical_delete_waits_for_final_purge_without_replaying_absent_bytes() {
+    let metadata: BlobMetadata = serde_json::from_value(serde_json::json!({
+        "sha256": hash(), "size": 9, "type": "video/mp4", "uploaded": "2026-01-01T00:00:00Z",
+        "owner": "b".repeat(64), "status": "active"
+    })).unwrap();
+    put_blob_metadata(&metadata).unwrap();
+    let epoch = storage::begin_vanish_phase(&hash()).unwrap().unwrap();
+    b2_cdn_phase::record_physical(&hash(), &epoch, b2_cdn_phase::Physical::Absent).unwrap();
+    let result = delete_policy::handle_creator_delete(&hash(), &metadata, "synthetic", true, "synthetic");
+    assert!(matches!(result, Err(BlossomError::Conflict(_))), "must report pending final purge, never replay physical or purge inline: {result:?}");
+    assert_eq!(get_blob_metadata_uncached(&hash()).unwrap().unwrap().status, BlobStatus::Deleted);
+    let store = open_store().unwrap();
+    assert!(b2_cdn_phase::mark_final_purged(&store, &hash(), &epoch).unwrap());
+    let deleted = get_blob_metadata_uncached(&hash()).unwrap().unwrap();
+    let result = delete_policy::handle_creator_delete(&hash(), &deleted, "synthetic", true, "synthetic").unwrap();
+    assert!(result.physical_deleted);
+}
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn creator_physical_delete_retains_audio_discovery_until_both_final_receipts() {
+    let metadata: BlobMetadata = serde_json::from_value(serde_json::json!({
+        "sha256": hash(), "size": 9, "type": "video/mp4", "uploaded": "2026-01-01T00:00:00Z",
+        "owner": "b".repeat(64), "status": "active"
+    })).unwrap();
+    put_blob_metadata(&metadata).unwrap();
+    let audio = "c".repeat(64);
+    metadata::put_audio_mapping(&blossom::AudioMapping {
+        source_sha256: hash(), audio_sha256: audio.clone(), duration_seconds: 6.0,
+        size_bytes: 3, mime_type: "audio/aac".into(),
+    }).unwrap();
+    let store = open_store().unwrap();
+    for candidate in [&hash(), &audio] {
+        let epoch = storage::begin_vanish_phase(candidate).unwrap().unwrap();
+        b2_cdn_phase::record_physical(candidate, &epoch, b2_cdn_phase::Physical::Absent).unwrap();
+        if candidate != &audio {
+            b2_cdn_phase::ensure_final_intent(candidate).unwrap();
+            assert!(b2_cdn_phase::mark_final_purged(&store, candidate, &epoch).unwrap());
+        }
+    }
+    assert!(matches!(delete_policy::handle_creator_delete(&hash(), &metadata, "synthetic", true, "synthetic"), Err(BlossomError::Conflict(_))));
+    assert!(metadata::get_audio_mapping(&hash()).unwrap().is_some(), "retry must still discover audio awaiting final purge");
+    let epoch = b2_cdn_phase::epoch(&audio).unwrap().unwrap();
+    assert!(b2_cdn_phase::mark_final_purged(&store, &audio, &epoch).unwrap());
+    let deleted = get_blob_metadata_uncached(&hash()).unwrap().unwrap();
+    assert!(delete_policy::handle_creator_delete(&hash(), &deleted, "synthetic", true, "synthetic").unwrap().physical_deleted);
+    assert!(metadata::get_audio_mapping(&hash()).unwrap().is_none());
+}
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn creator_physical_delete_unreadable_phase_fails_before_policy_mutation() {
+    let metadata: BlobMetadata = serde_json::from_value(serde_json::json!({
+        "sha256": hash(), "size": 9, "type": "video/mp4", "uploaded": "2026-01-01T00:00:00Z",
+        "owner": "b".repeat(64), "status": "active"
+    })).unwrap();
+    put_blob_metadata(&metadata).unwrap();
+    open_store().unwrap().insert(&format!("b2-cdn-phase:v1:{}", hash()), "{foreign}").unwrap();
+    assert!(delete_policy::handle_creator_delete(&hash(), &metadata, "synthetic", true, "synthetic").is_err());
+    assert_eq!(get_blob_metadata_uncached(&hash()).unwrap().unwrap().status, BlobStatus::Active);
+}
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn cdn_drain_service_token_is_not_an_admin_credential() {
+    let mut drain = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false);
+    drain.set_header("Authorization", "Bearer synthetic-drain-token");
+    assert_eq!(call(drain).get_status(), StatusCode::OK);
+    let mut moderation = request(Method::POST, "/admin/api/moderate", false);
+    moderation.set_header("Authorization", "Bearer synthetic-drain-token");
+    moderation.set_body(serde_json::json!({"sha256": hash(), "action": "BAN"}).to_string());
+    assert_eq!(call(moderation).get_status(), StatusCode::UNAUTHORIZED);
+    let mut wrong = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false);
+    wrong.set_header("Authorization", "Bearer invalid-drain-token");
+    assert_eq!(call(wrong).get_status(), StatusCode::UNAUTHORIZED);
+}
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn retained_unbound_host_does_not_cancel_successful_key_eviction() {
+    storage::invalidate_b2_cdn(&[hash()]).unwrap();
+}
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn missing_hash_key_purge_acknowledgement_is_not_success() {
+    assert!(storage::invalidate_b2_cdn(&[hash()]).is_err());
+}
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn unavailable_config_store_cannot_disable_durable_eviction() {
+    assert!(b2_cdn_purge::configured(), "configuration read failure must not impersonate explicitly absent CDN keys");
 }

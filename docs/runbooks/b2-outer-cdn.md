@@ -129,3 +129,49 @@ existing canary and quarantine-race suites. Pure policy tests run with
 `cargo test -p blossom-core --locked`; VCL source contracts run with
 `python3 -m unittest scripts.tests.test_b2_cdn_vcl`. No provider writes or
 credentialed media probes are part of local validation.
+
+
+## Durable invalidation and physical completion
+
+CDN admission and invalidation have different lifetimes. Retaining the
+`b2_cdn_purge_hosts` key keeps invalidation active even when admission or replica
+reads are disabled. An empty or invalid retained host value is an error, never
+permission to silently discard a queued eviction. Keep purge credentials and
+host bindings until all retained entries and pending fills are reconciled.
+
+Policy writes first persist a distinct per-attempt intent in
+`b2-cdn-purge:v1:{hash}:{attempt}`. Prepared intents survive an interrupted
+mutation; committed intents survive failed eviction. Prepared or foreign records
+are not automatically cleared. A checked purge must succeed before a committed
+intent can be marked cleared, and a receipt is bound to its exact attempt.
+Missing records do not imply acknowledgement. A URL purge404 for a retained,
+already-unbound hostname is a no-op only while both hash-key service purges
+acknowledge; a key-purge404, authentication failure or provider error still
+fails the checked eviction and retains the intent.
+
+The authenticated POST `/admin/api/b2-cdn-purge/drain?max=2` drains at most two
+hashes per execution. A recurring worker may use the dedicated Secret Store key
+`b2_cdn_purge_drain_token`; it is accepted only on this endpoint and grants no
+moderation or general admin authority. Existing operator admin authentication
+remains supported. The response's `result`, `pending`, `errors` and `unknown`
+are nonnegative counts for this bounded pass, not proof of a globally empty
+queue. The request budget includes both URL/key rounds and
+metadata operations. Do not combine that drain with a physical erasure wave or
+raise its limit to accelerate a backlog. Cursor progress must pass blocked rows
+without discarding them. A functioning unattended drain and alert/recovery path
+must be deployed and demonstrated before broad CDN admission; a source endpoint
+and manual successful call alone do not establish that operational readiness.
+
+Physical creator deletion uses a separate bounded wave for the source and, if
+unshared, its derived audio. Metadata denies delivery while the operation is
+pending. Physical absence and the final checked eviction receipt are both needed
+before reporting success. A request awaiting eviction returns conflict/retry;
+it must not repeat an already-absent physical deletion. Audio mappings remain
+until the audio has its own final receipt so a retry can still discover it.
+Replica/provider failure never permits completion, and never cancels the need
+to evict cached bytes. Permanent erasing gates remain in place.
+
+These source transitions do not prove that a purge cancels an already-admitted
+shield fill. Real pre-header and mid-body held-origin experiments and real
+moderation/erasure tests remain required. A two-second second purge is a shield
+ordering mitigation, not an unconditional late-fill cancellation guarantee.
