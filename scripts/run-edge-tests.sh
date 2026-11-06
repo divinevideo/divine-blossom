@@ -99,6 +99,7 @@ for contract in \
   TEST_CDN_ABSENT=1 TEST_CDN_CONTRACT="$contract" VICEROY="$VICEROY" python3 scripts/run-b2-cdn-invalidation-tests.py
 done
 
+TEST_CDN_MISSING_STORE=1 TEST_CDN_CONTRACT=unavailable_config_store_cannot_disable_durable_eviction VICEROY="$VICEROY" python3 scripts/run-b2-cdn-invalidation-tests.py
 TEST_CDN_URL404=1 TEST_CDN_CONTRACT=retained_unbound_host_does_not_cancel_successful_key_eviction VICEROY="$VICEROY" python3 scripts/run-b2-cdn-invalidation-tests.py
 TEST_CDN_KEY404=1 TEST_CDN_CONTRACT=missing_hash_key_purge_acknowledgement_is_not_success VICEROY="$VICEROY" python3 scripts/run-b2-cdn-invalidation-tests.py
 

@@ -170,10 +170,19 @@ pub(crate) struct DrainOutcome {
 /// lose their only eviction path. A missing credential is a drain-time failure,
 /// never a reason to pretend the queue is disabled.
 pub(crate) fn configured() -> bool {
-    let flag = crate::storage::get_config("b2_cdn_enabled").ok();
-    let hosts = fastly::config_store::ConfigStore::try_open("blossom_config")
-        .ok()
-        .and_then(|store| store.get("b2_cdn_purge_hosts"));
+    // Only successful reads proving BOTH keys absent can select the legacy
+    // default. A store outage must not disable durable revocation while old
+    // outer objects may still be serving. Checked purging then reports the
+    // unavailable configuration and retains the intent instead of acknowledging.
+    let Ok(store) = fastly::config_store::ConfigStore::try_open("blossom_config") else {
+        return true;
+    };
+    let (Ok(flag), Ok(hosts)) = (
+        store.try_get("b2_cdn_enabled"),
+        store.try_get("b2_cdn_purge_hosts"),
+    ) else {
+        return true;
+    };
     configured_from(flag.as_deref(), hosts.as_deref())
 }
 

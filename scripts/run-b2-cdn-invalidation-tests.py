@@ -63,6 +63,11 @@ format = "json"
 [local_server.secret_stores]
 blossom_secrets = [{{key="b2_cdn_purge_drain_token",data="synthetic-drain-token"}},{{key="admin_token",data="synthetic-admin-token"}},{{key="fastly_api_token",data="synthetic-purge"}}]
 ''')
+                if os.environ.get("TEST_CDN_MISSING_STORE") == "1":
+                    section = f'[local_server.config_stores.blossom_config]\nfile = "{settings}"\nformat = "json"\n'
+                    contents = config.read_text()
+                    assert section in contents
+                    config.write_text(contents.replace(section, "", 1))
                 env = os.environ.copy()
                 env["CARGO_TARGET_WASM32_WASIP1_RUNNER"] = shlex.join([
                     env.get("VICEROY", "viceroy"), "run", "-C", str(config), "--"])
@@ -80,6 +85,7 @@ blossom_secrets = [{{key="b2_cdn_purge_drain_token",data="synthetic-drain-token"
                 if os.environ.get("TEST_CDN_CONTRACT") in (
                     "cdn_purge_drain_requires_admin_and_rejects_oversized_batches",
                     "cdn_drain_service_token_is_not_an_admin_credential",
+                    "unavailable_config_store_cannot_disable_durable_eviction",
                     "creator_physical_delete_waits_for_final_purge_without_replaying_absent_bytes",
                     "creator_physical_delete_retains_audio_discovery_until_both_final_receipts",
                     "creator_physical_delete_unreadable_phase_fails_before_policy_mutation",

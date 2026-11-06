@@ -647,3 +647,9 @@ fn retained_unbound_host_does_not_cancel_successful_key_eviction() {
 fn missing_hash_key_purge_acknowledgement_is_not_success() {
     assert!(storage::invalidate_b2_cdn(&[hash()]).is_err());
 }
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn unavailable_config_store_cannot_disable_durable_eviction() {
+    assert!(b2_cdn_purge::configured(), "configuration read failure must not impersonate explicitly absent CDN keys");
+}
