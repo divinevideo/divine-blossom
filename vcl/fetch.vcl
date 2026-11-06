@@ -36,6 +36,32 @@ if (beresp.status >= 500 && beresp.status < 600) {
     {"}"};
 }
 
+# B2 original admission is default-deny on both declared delivery names.
+# The marker is issued by Compute only at its final guarded response boundary.
+# Preserve it and the bare-hash key through shield delivery for edge admission.
+if (req.http.Host ~ "(?i)^media-b2(-cdn)?[.]divine[.]video(:[0-9]+)?$") {
+  set beresp.grace = 0s;
+  set beresp.stale_while_revalidate = 0s;
+  set beresp.stale_if_error = 0s;
+  if (req.http.Host !~ "^media-b2(-cdn)?[.]divine[.]video$" ||
+      req.url !~ "^/[0-9a-f]{64}$" ||
+      (req.method != "GET" && req.method != "HEAD") ||
+      req.http.Authorization || req.http.Cookie ||
+      beresp.status != 200 ||
+      beresp.http.X-Divine-B2-CDN-Admission != "original-v1" ||
+      beresp.http.Surrogate-Control != "max-age=31536000, stale-while-revalidate=0, stale-if-error=0" ||
+      beresp.http.Surrogate-Key != regsub(req.url, "^/", "") ||
+      beresp.http.X-Sha256 != regsub(req.url, "^/", "") ||
+      beresp.http.Content-Range || beresp.http.Set-Cookie) {
+    set beresp.ttl = 0s;
+    return(pass);
+  }
+  set beresp.ttl = 365d;
+  set beresp.do_stream = true;
+  set beresp.http.Cache-Control = "private, no-store";
+  return(deliver);
+}
+
 # Origin owns the edge-cache decision through Surrogate-Control. Compute marks
 # restricted and admin content `no-store` there, and that must win over the long
 # TTL set below -- otherwise a credentialed fetch of restricted content would be

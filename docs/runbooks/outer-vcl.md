@@ -90,3 +90,11 @@ approval, activation, and verification procedure in
 If apply fails after printing `cloned A -> B`, treat version `B` as an abandoned
 partial draft. Do not activate it; investigate the read-back failure and start
 again from the then-active version.
+
+## Default-off B2 original delivery
+
+The B2-specific admission source is documented in [B2 outer CDN](b2-outer-cdn.md).
+It requires explicit Compute configuration, exact declared host routing and a
+final verified-original admission marker. It preserves the canonical GCS cache
+policy. Keep activation gated on the separate purge/in-flight/shield proof;
+merging this source neither deploys it nor establishes safe invalidation.

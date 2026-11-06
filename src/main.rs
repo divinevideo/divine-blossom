@@ -4,6 +4,7 @@
 mod admin;
 mod admin_sweep;
 mod auth;
+mod b2_cdn;
 mod blossom;
 mod canary;
 mod playback_cache;
@@ -128,6 +129,7 @@ fn handle_main(mut req: Request) -> std::result::Result<Response, Error> {
     let method = req.get_method().as_str().to_string();
     let route = route_category(req.get_path());
     let path = req.get_path().to_string();
+    let b2_cdn_policy = b2_cdn::FinalPolicy::for_request(&req);
     let is_canary = canary::route(&req) != blossom_core::canary::CanaryRoute::Canonical;
     let result = handle_request(req);
     let (mut response, error) = match result {
@@ -151,6 +153,7 @@ fn handle_main(mut req: Request) -> std::result::Result<Response, Error> {
             response.take_body();
         }
     }
+    b2_cdn_policy.apply(&mut response);
     let status = response.get_status().as_u16();
     request_log::emit(
         &mut response,
@@ -225,6 +228,13 @@ where
 }
 
 fn route_request(req: Request) -> Result<Response> {
+    match b2_cdn::route(&req) {
+        blossom_core::b2_cdn::Route::Delivery => return b2_cdn::handle(req),
+        blossom_core::b2_cdn::Route::Denied => {
+            return Err(BlossomError::NotFound("Not found".into()))
+        }
+        blossom_core::b2_cdn::Route::Unrelated => {}
+    }
     match canary::route(&req) {
         blossom_core::canary::CanaryRoute::Canary => return canary::handle(req),
         blossom_core::canary::CanaryRoute::Denied => {
