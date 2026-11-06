@@ -88,7 +88,8 @@ must show distinct outer request IDs.
 
 The currently inspected outer service has a 20 MiB ordinary/streaming-miss
 object limit. This route does not raise that limit. Initial acceptance must
-stay below it; 32 MiB outer caching is not supported by this change. Fastly's
+stay below it; larger originals remain uncached and 32 MiB outer caching is
+not supported by this change. Fastly's
 documented segmented-caching option changes origin range requests and cache
 identity, so it needs separate admission and invalidation tests before use.
 Do not invent a settings API field or override generated VCL pragmas. An
