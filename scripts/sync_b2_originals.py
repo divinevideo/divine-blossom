@@ -11,6 +11,7 @@ import base64
 from collections import Counter
 import fcntl
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
@@ -26,6 +27,11 @@ import uuid
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 MIB = 1024 * 1024
 DEMAND_PREFIX = "b2-demand:v1:"
+CLAIM_FAILURES = frozenset({
+    "add_http", "add_transport", "add_response_invalid",
+    "confirm_http", "confirm_transport", "confirm_response_invalid",
+    "confirm_absent", "confirm_wrong_owner", "confirm_erasing", "confirm_other",
+})
 
 
 def valid_generation(value):
@@ -295,6 +301,7 @@ class Worker:
         self.chunk_bytes, self.max_spool_bytes = chunk_bytes, max_spool_bytes
         self.metrics = Counter()
         self.failure_stage = None
+        self.failure_detail = None
 
     def observe(self, stage, operation, *args, **kwargs):
         """Remember only a fixed call-site label, never SDK diagnostics or keys."""
@@ -304,6 +311,9 @@ class Worker:
             # A gate-release failure must not hide the earlier transfer failure.
             if self.failure_stage is None:
                 self.failure_stage = stage
+                detail = getattr(self.kv, "claim_failure", None)
+                if stage == "gate_claim" and isinstance(detail, str) and detail in CLAIM_FAILURES:
+                    self.failure_detail = detail
             raise
 
     def invalidate(self, key, info=None, *, observed, allowed=lambda: True, attempt=None):
@@ -598,6 +608,7 @@ class Worker:
             reconciles = key in demands
             result = "errors"
             self.failure_stage = None
+            self.failure_detail = None
             try:
                 image_observed = self.observe("readiness_read", self.kv.snapshot, "b2-ready:" + key) if generation is not None and self.kv is not None else None
                 metadata = self.observe("policy_or_gate_read", self.kv.get, "blob:" + key) if generation is not None and self.kv is not None else None
@@ -616,6 +627,8 @@ class Worker:
                 # fixed operation names cross the aggregate report boundary.
                 report["errors"] += 1
                 report["failure_" + (self.failure_stage or "validation_or_state")] += 1
+                if self.failure_detail is not None:
+                    report["failure_gate_claim_" + self.failure_detail] += 1
             finally:
                 if result == "locked":
                     self.state.defer_gate(key)
@@ -799,6 +812,7 @@ class FastlyKV:
             raise ValueError("invalid KV store id")
         self.base = "https://api.fastly.com/resources/stores/kv/" + store_id + "/keys/"
         self.http = http or JsonHTTP({"Fastly-Key": token})
+        self.claim_failure = None
 
     def url(self, key):
         return self.base + urllib.parse.quote(key, safe="")
@@ -870,14 +884,42 @@ class FastlyKV:
             raise ValueError("out-of-prefix demand listing")
         return keys, next_cursor or None
 
+    def claim_request(self, phase, operation, *args, **kwargs):
+        """Classify the existing request without retrying or exposing its error."""
+        try:
+            return operation(*args, **kwargs)
+        except ControlAPIError:
+            self.claim_failure = phase + "_http"
+            raise
+        except (OSError, http.client.HTTPException):
+            self.claim_failure = phase + "_transport"
+            raise
+        except ValueError:
+            self.claim_failure = phase + "_response_invalid"
+            raise
+
     def claim_copy(self, key, attempt):
+        self.claim_failure = None
         if not HEX.fullmatch(key):
             raise ValueError("invalid copy gate hash")
         value = {"state": "copying", "attempt_id": attempt}
-        result = self.http.request(self.url("b2-sync:v1:" + key) + "?add=true", "PUT", value, conflict=True)
+        result = self.claim_request("add", self.http.request,
+                                    self.url("b2-sync:v1:" + key) + "?add=true", "PUT", value, conflict=True)
         if result is False:
             return False
-        if self.get("b2-sync:v1:" + key) != value:
+        observed = self.claim_request("confirm", self.get, "b2-sync:v1:" + key)
+        if observed != value:
+            # get() maps both HTTP 404 and a JSON null/empty response to None.
+            if observed is None:
+                self.claim_failure = "confirm_absent"
+            elif isinstance(observed, dict) and observed.get("state") == "erasing":
+                self.claim_failure = "confirm_erasing"
+            elif (isinstance(observed, dict) and observed.get("state") == "copying"
+                  and isinstance(observed.get("attempt_id"), str)
+                  and observed["attempt_id"] != attempt):
+                self.claim_failure = "confirm_wrong_owner"
+            else:
+                self.claim_failure = "confirm_other"
             raise ValueError("copy gate acquisition not confirmed")
         return True
 
