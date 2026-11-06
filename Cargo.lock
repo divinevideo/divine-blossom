@@ -265,6 +265,7 @@ dependencies = [
  "blossom-core",
  "fastly",
  "fastly-sys",
+ "getrandom",
  "hex",
  "hmac",
  "k256",

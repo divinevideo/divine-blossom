@@ -3,6 +3,7 @@ use crate::blossom::{BlobAccess, BlobMetadata};
 use crate::error::{BlossomError, Result};
 use crate::metadata::{get_blob_metadata_uncached, get_blob_refs, get_tombstone, open_store};
 use blossom_core::canary::{self, CanaryRoute, Readiness};
+use blossom_core::delivery_telemetry::{Cache, Fallback, Provider};
 use fastly::kv_store::KVStoreError;
 use fastly::{Request, Response};
 
@@ -104,6 +105,9 @@ pub(crate) fn unavailable() -> Response {
     response
 }
 pub(crate) fn handle(req: Request) -> Result<Response> {
+    // No media fetch has occurred. Native authorization is not a media origin.
+    crate::delivery_telemetry::observe(Provider::None, Cache::Unknown);
+    crate::delivery_telemetry::fallback(Fallback::None);
     if crate::storage::get_config("b2_demand_mirror_enabled").is_ok_and(|v| v == "true") {
         return handle_demand(
             req,
@@ -218,8 +222,10 @@ fn handle_demand(
     let mut hint: Option<Option<String>> = None;
     let mut copying_seen = copying;
     if copying {
+        crate::delivery_telemetry::fallback(Fallback::Copying);
         eprintln!("b2-demand fallback=copying");
     } else if !eligible {
+        crate::delivery_telemetry::fallback(Fallback::Oversized);
         eprintln!("b2-demand fallback=oversized");
     }
     if !copying && eligible {
@@ -246,6 +252,7 @@ fn handle_demand(
                 Some(ready)
             }
             Err(KVStoreError::ItemNotFound) => {
+                crate::delivery_telemetry::fallback(Fallback::MissingReadiness);
                 eprintln!("b2-demand fallback=missing_readiness");
                 hint = Some(None);
                 None
@@ -262,12 +269,19 @@ fn handle_demand(
                 }
                 CanaryOrigin::Missing => {
                     hint = Some(Some(ready.destination_version_id));
+                    crate::delivery_telemetry::fallback(Fallback::MissingVersion);
                     eprintln!("b2-demand fallback=missing_version");
                 }
-                CanaryOrigin::Unavailable => eprintln!("b2-demand fallback=unavailable"),
+                CanaryOrigin::Unavailable => {
+                    crate::delivery_telemetry::fallback(Fallback::Unavailable);
+                    eprintln!("b2-demand fallback=unavailable");
+                }
                 CanaryOrigin::Delivered(_) => {}
             }
         }
+    }
+    if copying_seen {
+        crate::delivery_telemetry::fallback(Fallback::Copying);
     }
     let outcome = fetch_gcs(&hash, metadata.size, req.get_method(), range, deadline);
     copying_seen |= recheck_demand(&hash, &metadata)?;

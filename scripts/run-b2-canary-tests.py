@@ -99,7 +99,15 @@ class Origin(BaseHTTPRequestHandler):
             if self.path == "/b2api/v4/b2_authorize_account" and self.server.auth_status == "slow_body":
                 time.sleep(3.5)
             try:
-                if self.path != "/b2api/v4/b2_authorize_account" and getattr(self.server, "slow_body_once", False):
+                body_gate = getattr(self.server, "media_body_gate", None)
+                if self.path != "/b2api/v4/b2_authorize_account" and body_gate is not None:
+                    self.wfile.write(body[:3])
+                    self.wfile.flush()
+                    self.server.gate_started.set()
+                    if not body_gate.wait(timeout=10):
+                        self.server.gate_timed_out = True
+                    self.wfile.write(body[3:])
+                elif self.path != "/b2api/v4/b2_authorize_account" and getattr(self.server, "slow_body_once", False):
                     self.server.slow_body_once = False
                     self.wfile.write(body[:3])
                     self.wfile.flush()

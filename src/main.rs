@@ -8,6 +8,7 @@ mod blossom;
 mod canary;
 mod playback_cache;
 mod delete_policy;
+mod delivery_telemetry;
 mod error;
 mod media_auth_log;
 mod metadata;
@@ -121,6 +122,7 @@ fn handle_main(mut req: Request) -> std::result::Result<Response, Error> {
     // endpoint is not configured, matching request_log::emit.
     let _ = fastly::log::set_panic_endpoint(request_log::ENDPOINT_NAME);
     let started = Instant::now();
+    let delivery = delivery_telemetry::RequestContext::start(&req);
     let request_id = req_id::for_request(&req);
     req.set_header(req_id::REQUEST_ID_HEADER, &request_id);
     let method = req.get_method().as_str().to_string();
@@ -159,6 +161,9 @@ fn handle_main(mut req: Request) -> std::result::Result<Response, Error> {
         error.as_ref(),
         started.elapsed(),
     );
+    if let Some(delivery) = delivery {
+        delivery.finish(&mut response, started.elapsed());
+    }
     Ok(response)
 }
 
