@@ -83,7 +83,7 @@ impl FinalPolicy {
                     response.get_header_str("X-Divine-Source"),
                     response.contains_header("Content-Range"),
                 ) && response.get_header_str("X-Sha256") == Some(hash.as_str())
-                    && response.get_header_str("Content-Length").is_some()
+                    && b2_cdn::outer_cacheable_length(response.get_header_str("Content-Length"))
                     && response.get_header_str("Content-Length")
                         == response.get_header_str("X-Content-Length")
                     && !response.contains_header("Set-Cookie")
@@ -106,6 +106,30 @@ impl FinalPolicy {
 #[cfg(test)]
 mod tests {
     use fastly::{http::StatusCode, Request};
+    #[test]
+    fn oversize_original_remains_successful_but_is_not_outer_cacheable() {
+        let hash = "a".repeat(64);
+        let policy = super::FinalPolicy {
+            route: blossom_core::b2_cdn::Route::Delivery,
+            hash: Some(hash.clone()),
+            head: false,
+        };
+        // The boundary trusts the upstream verified origin contract. This test
+        // exercises header admission only, not a synthetic large-body transfer.
+        let mut response = fastly::Response::from_status(StatusCode::OK).with_body("stream");
+        response.set_header("X-Divine-Source", "b2");
+        response.set_header("X-Sha256", hash);
+        response.set_header("Content-Length", "33554432");
+        response.set_header("X-Content-Length", "33554432");
+        policy.apply(&mut response);
+        assert_eq!(response.get_status(), StatusCode::OK);
+        assert_eq!(
+            response.get_header_str("Surrogate-Control"),
+            Some("no-store")
+        );
+        assert!(!response.contains_header("X-Divine-B2-CDN-Admission"));
+        assert_eq!(response.take_body_str(), "stream");
+    }
     #[test]
     fn disabled_production_host_never_falls_through_to_canonical_routes() {
         for (method, path) in [

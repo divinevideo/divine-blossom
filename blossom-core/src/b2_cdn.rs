@@ -89,6 +89,18 @@ pub fn admit(status: u16, source: Option<&str>, content_range: bool) -> bool {
     status == 200 && source == Some("b2") && !content_range
 }
 
+/// The currently verified ordinary outer cache limit. Larger originals must
+/// stream uncached until a separately tested segmented-cache path is enabled.
+pub fn outer_cacheable_length(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        !value.is_empty()
+            && value.bytes().all(|byte| byte.is_ascii_digit())
+            && value
+                .parse::<u64>()
+                .is_ok_and(|size| size <= 20 * 1024 * 1024)
+    })
+}
+
 /// Hosts bound to the outer service and retained for targeted URL purges.
 /// Only the delivery names managed by this VCL source are eligible.
 pub fn purge_hosts<'a>(
@@ -116,6 +128,28 @@ pub fn purge_hosts<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ordinary_cache_admission_stays_within_verified_outer_size_limit() {
+        for value in [
+            Some("0"),
+            Some("8388608"),
+            Some("16777216"),
+            Some("20971520"),
+        ] {
+            assert!(outer_cacheable_length(value));
+        }
+        for value in [
+            None,
+            Some(""),
+            Some("-1"),
+            Some("20971521"),
+            Some("33554432"),
+            Some("bytes"),
+            Some("18446744073709551616"),
+        ] {
+            assert!(!outer_cacheable_length(value));
+        }
+    }
     const HOST: &str = "media-b2-cdn.divine.video";
     const ORIGIN: &str = "synthetic.edgecompute.app";
     fn configured() -> Config<'static> {
