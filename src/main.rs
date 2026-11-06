@@ -1978,7 +1978,7 @@ fn serve_transcript_by_hash(
     // A translated request must first establish the current source. Bypass the
     // source content cache here so even an out-of-band repair changes the key.
     let source = if lang.is_some() {
-        crate::storage::download_transcript_uncached_from_gcs(&gcs_path)
+        crate::storage::download_transcript_uncached(&gcs_path)
     } else {
         download_transcript_content(&gcs_path)
     };
