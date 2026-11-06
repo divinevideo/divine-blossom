@@ -48,10 +48,11 @@ const RECORD_PREFIX: &str = "b2-cdn-purge:v1:";
 const CURSOR_KEY: &str = "b2-cdn-drain-cursor";
 const RECORD_VERSION: u64 = 1;
 /// Bounded so one drain call cannot spend the whole subrequest budget.
-/// The checked double purge costs URLs plus keys per hash, so four is the
-/// ceiling the purge owner tests against; the default leaves headroom.
+/// Each hash costs up to two URL purges and two key purges per round, twice,
+/// so two hashes is 16 purge subrequests before KV listing, cursor and
+/// conditional metadata calls. The independent budget audit set this ceiling.
 const DEFAULT_DRAIN_LIMIT: usize = 2;
-const MAX_DRAIN_LIMIT: usize = 4;
+const MAX_DRAIN_LIMIT: usize = 2;
 const MAX_RECORD_BYTES: usize = 4096;
 const MAX_LIST_LIMIT: u32 = 100;
 /// Durable purge acknowledgement receipts, keyed by operation phase and the
@@ -138,13 +139,21 @@ pub(crate) struct DrainOutcome {
 /// lose their only eviction path. A missing credential is a drain-time failure,
 /// never a reason to pretend the queue is disabled.
 pub(crate) fn configured() -> bool {
-    if crate::storage::get_config("b2_cdn_enabled").is_ok_and(|value| value == "true") {
-        return true;
-    }
-    fastly::config_store::ConfigStore::try_open("blossom_config")
+    let flag = crate::storage::get_config("b2_cdn_enabled").ok();
+    let hosts = fastly::config_store::ConfigStore::try_open("blossom_config")
         .ok()
-        .and_then(|store| store.get("b2_cdn_purge_hosts"))
-        .is_some_and(|value| !value.trim().is_empty())
+        .and_then(|store| store.get("b2_cdn_purge_hosts"));
+    configured_from(flag.as_deref(), hosts.as_deref())
+}
+
+/// Pure core of [`configured`].
+///
+/// A *present* purge host set enables the outbox even when the value is empty:
+/// an empty retained configuration is an error the drain must surface, never a
+/// silent disable. Only an absent flag and absent host key mean "not in
+/// service". A missing credential is likewise a drain-time failure.
+fn configured_from(flag: Option<&str>, hosts: Option<&str>) -> bool {
+    flag == Some("true") || hosts.is_some()
 }
 
 fn open_store() -> Result<KVStore> {
@@ -514,8 +523,16 @@ pub(crate) fn execute<T>(hash: &str, mutation: impl FnOnce() -> Result<T>) -> Re
     let token = begin(hash)?;
     let value = mutation()?;
     let store = open_store()?;
-    commit(&store, &token)?;
-    Ok(value)
+    match commit(&store, &token)? {
+        CommitOutcome::Committed => Ok(value),
+        // Attempts have unique keys and a prepared record is never drained, so
+        // a missing or mismatched record means the durable intent was lost.
+        // The mutation already landed; returning Ok would hide that there is no
+        // retry record, so fail closed and let the caller retry or reconcile.
+        CommitOutcome::Superseded => Err(BlossomError::MetadataError(
+            "B2 CDN purge intent lost before commit; retry required".into(),
+        )),
+    }
 }
 
 fn cursor(store: &KVStore) -> Option<String> {
@@ -724,10 +741,28 @@ mod tests {
     fn drain_limit_defaults_to_two_and_refuses_out_of_range() {
         assert_eq!(parse_drain_limit(None).unwrap(), 2);
         assert_eq!(parse_drain_limit(Some("1")).unwrap(), 1);
-        assert_eq!(parse_drain_limit(Some("4")).unwrap(), 4);
-        for bad in ["", "0", "5", "17", "1000", "-1", "1.5", "abc", " 1 1"] {
+        assert_eq!(parse_drain_limit(Some("2")).unwrap(), 2);
+        // Two is the hard ceiling: four hashes cost 32 purge subrequests
+        // (4 * (2 URL + 2 key) * 2 rounds) before KV and metadata calls.
+        for bad in ["", "0", "3", "4", "5", "17", "1000", "-1", "1.5", "abc", " 1 1"] {
             assert!(parse_drain_limit(Some(bad)).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_present_but_empty_purge_host_set_enables_invalidation_not_disable() {
+        // A retained empty purge host set is a configuration error the drain
+        // must surface. It must not look like "feature off" and silently skip
+        // eviction while warm entries keep serving.
+        assert!(configured_from(Some("true"), None));
+        assert!(configured_from(Some("true"), Some("")));
+        assert!(configured_from(None, Some("")));
+        assert!(configured_from(Some("false"), Some("")));
+        assert!(configured_from(None, Some("media-b2-cdn.divine.video")));
+        assert!(!configured_from(None, None));
+        assert!(!configured_from(Some("false"), None));
+        assert!(!configured_from(Some("TRUE"), None));
+        assert!(!configured_from(Some(""), None));
     }
 
     #[test]
@@ -1154,6 +1189,81 @@ mod tests {
             assert_eq!(
                 String::from_utf8(response.take_body_bytes()).unwrap(),
                 r#"{"version":9,"state":"future"}"#
+            );
+            reset_all(&store);
+        }
+
+        #[test]
+        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-purge-outbox-tests.py"]
+        fn execute_fails_closed_when_the_prepared_record_disappears_before_commit() {
+            let store = store();
+            reset_all(&store);
+            let hash = "bb".repeat(32);
+            let mut mutation_applied = false;
+            let result = execute(&hash, || -> Result<()> {
+                // The mutation lands, then the durable intent vanishes before
+                // commit. Per-attempt keys make this lost durability, not a
+                // benign supersede by another writer.
+                for key in plan_keys(&store) {
+                    let _ = store.build_delete().execute(&key);
+                }
+                mutation_applied = true;
+                Ok(())
+            });
+            assert!(mutation_applied, "mutation must have run");
+            let error = result.expect_err("lost intent must fail closed");
+            assert_eq!(error.kind(), "metadata_error");
+            reset_all(&store);
+        }
+
+        #[test]
+        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-purge-outbox-tests.py"]
+        fn execute_fails_closed_when_the_record_no_longer_describes_the_attempt() {
+            let store = store();
+            reset_all(&store);
+            let hash = "bc".repeat(32);
+            let result = execute(&hash, || -> Result<()> {
+                let keys = plan_keys(&store);
+                assert_eq!(keys.len(), 1);
+                // Another attempt's body under this key is not this intent.
+                store
+                    .build_insert()
+                    .mode(InsertMode::Overwrite)
+                    .execute(
+                        &keys[0],
+                        r#"{"version":1,"state":"prepared","attempt":"00000000000000000000000000000000","requested_at":1,"committed_at":null,"cleared_at":null,"attempts":0}"#,
+                    )
+                    .unwrap();
+                Ok(())
+            });
+            let error = result.expect_err("mismatched record must fail closed");
+            assert_eq!(error.kind(), "metadata_error");
+            reset_all(&store);
+        }
+
+        #[test]
+        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-purge-outbox-tests.py"]
+        fn invalid_purge_configuration_is_an_error_and_retains_the_record() {
+            let store = store();
+            reset_all(&store);
+            let hash = "ba".repeat(32);
+            let token = begin(&hash).unwrap();
+            commit(&store, &token).unwrap();
+
+            // A present-but-empty host set must fail the purge callback, not
+            // pretend the queue is disabled. The committed record is retained.
+            let invalid_config = |_: &[String]| -> Result<()> {
+                Err(BlossomError::StorageError(
+                    "B2 CDN purge configuration invalid".into(),
+                ))
+            };
+            let outcome = drain(&store, 2, invalid_config).unwrap();
+            assert_eq!(outcome.result, 0, "invalid config must not report success");
+            assert_eq!(outcome.errors, 1);
+            assert_eq!(outcome.pending, 1);
+            assert_eq!(
+                snapshot_for(&store, &token).record.state,
+                RecordState::Committed
             );
             reset_all(&store);
         }

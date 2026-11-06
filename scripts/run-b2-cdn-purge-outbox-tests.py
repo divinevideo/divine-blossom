@@ -24,6 +24,9 @@ TESTS = [
     "b2_cdn_purge::tests::storage::execute_commits_after_successful_mutation_and_drains",
     "b2_cdn_purge::tests::storage::drain_limit_bounds_one_pass_and_cursor_advances",
     "b2_cdn_purge::tests::storage::foreign_records_are_retained_and_do_not_starve_healthy_suffix",
+    "b2_cdn_purge::tests::storage::execute_fails_closed_when_the_prepared_record_disappears_before_commit",
+    "b2_cdn_purge::tests::storage::execute_fails_closed_when_the_record_no_longer_describes_the_attempt",
+    "b2_cdn_purge::tests::storage::invalid_purge_configuration_is_an_error_and_retains_the_record",
     "b2_cdn_purge::tests::storage::receipts_bind_to_one_attempt_and_never_imply_from_absence",
 ]
 
