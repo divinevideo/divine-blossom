@@ -3,6 +3,16 @@ use blossom_core::b2_cdn::{self, Config, Route};
 use fastly::{Request, Response};
 
 pub(crate) fn route(req: &Request) -> Route {
+    let authority = req.get_url().host_str().unwrap_or("");
+    b2_cdn::route_with_configuration(
+        authority,
+        req.get_header_str("Host").unwrap_or(authority),
+        req.get_header_str("X-Original-Host"),
+        || configured_route(req),
+    )
+}
+
+fn configured_route(req: &Request) -> Route {
     let enabled = crate::storage::get_config("b2_cdn_enabled").ok();
     let host = crate::storage::get_config("b2_cdn_host").ok();
     let origin_host = crate::storage::get_config("b2_cdn_origin_host").ok();

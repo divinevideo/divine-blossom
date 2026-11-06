@@ -7,6 +7,25 @@ pub enum Route {
     Delivery,
     Denied,
 }
+/// Keep unrelated traffic out of the CDN configuration/secret-store path.
+/// Include aliases and forwarded names so malformed B2 requests still reach
+/// the exact configured validation and cannot fall through to canonical routes.
+pub fn route_with_configuration(
+    authority: &str,
+    host: &str,
+    original_host: Option<&str>,
+    resolve: impl FnOnce() -> Route,
+) -> Route {
+    let concerned = |value: &str| {
+        let name = value.split(':').next().unwrap_or(value);
+        name.eq_ignore_ascii_case(HOST) || name.eq_ignore_ascii_case(crate::canary::RESERVED_HOST)
+    };
+    if concerned(authority) || concerned(host) || original_host.is_some_and(concerned) {
+        resolve()
+    } else {
+        Route::Unrelated
+    }
+}
 pub struct Config<'a> {
     pub enabled: Option<&'a str>,
     pub host: Option<&'a str>,
@@ -104,6 +123,46 @@ mod tests {
             enabled: Some("true"),
             host: Some(HOST),
             origin_host: Some(ORIGIN),
+        }
+    }
+    #[test]
+    fn unrelated_requests_do_not_load_cdn_configuration() {
+        for (authority, host, forwarded) in [
+            ("media.divine.video", "media.divine.video", None),
+            (ORIGIN, ORIGIN, Some("media.divine.video")),
+            ("upload.example", "upload.example", None),
+        ] {
+            assert_eq!(
+                route_with_configuration(authority, host, forwarded, || {
+                    panic!("unrelated request loaded CDN configuration")
+                }),
+                Route::Unrelated
+            );
+        }
+    }
+    #[test]
+    fn delivery_names_and_aliases_still_load_configuration_and_fail_closed() {
+        for (authority, host, forwarded) in [
+            (HOST, HOST, None),
+            (ORIGIN, ORIGIN, Some(HOST)),
+            (
+                "MEDIA-B2-CDN.divine.video",
+                "MEDIA-B2-CDN.divine.video",
+                None,
+            ),
+            ("media-b2-cdn.divine.video:443", HOST, None),
+            ("media-b2.divine.video", "media-b2.divine.video", None),
+            (ORIGIN, ORIGIN, Some("media-b2.divine.video")),
+        ] {
+            let mut loaded = false;
+            assert_eq!(
+                route_with_configuration(authority, host, forwarded, || {
+                    loaded = true;
+                    Route::Denied
+                }),
+                Route::Denied
+            );
+            assert!(loaded);
         }
     }
     #[test]
