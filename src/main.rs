@@ -15,6 +15,7 @@ mod delivery_telemetry;
 mod error;
 mod media_auth_log;
 mod metadata;
+mod parent_gate;
 mod rate_limit;
 mod req_id;
 mod request_log;
@@ -348,6 +349,13 @@ fn route_request(req: Request) -> Result<Response> {
 
         // Admin Dashboard
         (Method::GET, "/admin") => admin::handle_admin_dashboard(req),
+        (_, p) if p.starts_with("/admin/api/b2-parent-gate/") => {
+            let operation = p
+                .strip_prefix("/admin/api/b2-parent-gate/")
+                .unwrap_or("")
+                .to_owned();
+            Ok(parent_gate::handle(req, &operation))
+        }
         (Method::GET, "/admin/api/stats") => admin::handle_admin_stats(req),
         (Method::GET, "/admin/api/recent") => admin::handle_admin_recent(req),
         (Method::GET, "/admin/api/users") => admin::handle_admin_users(req),

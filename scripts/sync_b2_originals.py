@@ -133,6 +133,22 @@ def quarantine_allows_copy(record):
     return True
 
 
+def released_parent_gate(record):
+    if (not isinstance(record, dict) or set(record) != {"state", "version", "settled_attempt_id", "released_from_generation"}
+            or record["state"] != "released" or type(record["version"]) is not int or record["version"] != 1):
+        return False
+    attempt, generation = record["settled_attempt_id"], record["released_from_generation"]
+    return (isinstance(attempt, str) and 1 <= len(attempt) <= 128
+            and all(33 <= ord(c) <= 126 for c in attempt)
+            and valid_generation(generation) and str(int(generation)) == generation)
+
+
+def parent_gate_available(kv, record):
+    # Old runner mode deliberately stays pending on sentinels. Root must drain
+    # legacy delete writers and verify compatible consumers before opting in.
+    return record is None or (getattr(kv, "released_parent_gates", False) and released_parent_gate(record))
+
+
 def approved_metadata(kv, key):
     """Uncached authoritative policy; errors propagate and cannot grant readiness."""
     meta = kv.get("blob:" + key)
@@ -387,7 +403,7 @@ class Worker:
         # become the deletion target of this observer's stale denial/miss.
         observed = self.observe("readiness_read", self.kv.snapshot, "b2-ready:" + key)
         existing_gate = self.observe("policy_or_gate_read", self.kv.get, "b2-sync:v1:" + key)
-        if existing_gate is not None:
+        if not parent_gate_available(self.kv, existing_gate):
             self.state.defer_gate(key)
             if existing_gate == {"state": "erasing"}:
                 self.state.reset(key)
@@ -410,7 +426,7 @@ class Worker:
             self.invalidate(key, observed=observed, allowed=same_inputs)
             return "changed"
         gate = self.observe("policy_or_gate_read", self.kv.get, "b2-sync:v1:" + key)
-        if gate is not None:
+        if not parent_gate_available(self.kv, gate):
             return "terminal" if gate == {"state": "erasing"} else "locked"
         missing_version = False
         if reconcile and observed is not None:
@@ -426,7 +442,7 @@ class Worker:
             if self.observe("source_head", self.source.head, key) != info or self.observe("readiness_read", self.kv.snapshot, "b2-ready:" + key) != observed:
                 return "changed"
             gate = self.observe("policy_or_gate_read", self.kv.get, "b2-sync:v1:" + key)
-            if gate is not None:
+            if not parent_gate_available(self.kv, gate):
                 return "terminal" if gate == {"state": "erasing"} else "locked"
             if present and record["source_generation"] == info["generation"]:
                 self.state.reset(key, info)
@@ -464,7 +480,7 @@ class Worker:
                 if self.metrics["spool_gate_probes"] >= 16:
                     return "pending"
                 self.metrics["spool_gate_probes"] += 1
-                if self.observe("policy_or_gate_read", self.kv.get, "b2-sync:v1:" + part.stem) is None:
+                if parent_gate_available(self.kv, self.observe("policy_or_gate_read", self.kv.get, "b2-sync:v1:" + part.stem)):
                     return "pending"
                 self.state.defer_gate(part.stem)
         if offset > 0 and size - offset > self.max_spool_bytes - spool_bytes:
@@ -538,9 +554,9 @@ class Worker:
         budget.spend(size)
         upload_state["uncertain"] = True
         version = self.observe("destination_upload", self.destination.upload, key, path, size)
-        upload_state["uncertain"] = False
         if not isinstance(version, str) or not version or version == "null":
             raise validation_error("destination_version", "destination did not return immutable version")
+        upload_state["uncertain"] = False
         digest = hashlib.sha256()
         for start in range(0, size, self.chunk_bytes):
             count = min(self.chunk_bytes, size - start)
@@ -562,11 +578,15 @@ class Worker:
                   "source_bucket": self.source.bucket, "source_generation": generation,
                   "bucket": self.destination.bucket, "key": key, "size": size,
                   "destination_version_id": version, "verified_at": int(time.time())}
+        # Readiness PUT is another effect: a lost response can leave it in flight.
+        # Retain exclusion until this exact publication is positively observed.
+        upload_state["uncertain"] = True
         self.observe("readiness_write", self.kv.put, "b2-ready:" + key, record)
         published = self.observe("readiness_read", confirm_readback,
             lambda timeout: self.kv.snapshot("b2-ready:" + key, timeout=timeout))
         if published is None or published[0] != record:
             raise validation_error("readiness_publication", "readiness publication not confirmed")
+        upload_state["uncertain"] = False
         # No cross-service transaction exists. Endpoint independently gates policy on
         # every request, including a vanish between this last check and publication.
         if self.observe("policy_read", approved_metadata, self.kv, key) != meta:
@@ -851,18 +871,19 @@ class PubSubNotifications:
 
 
 class FastlyKV:
-    def __init__(self, store_id, token, http=None):
+    def __init__(self, store_id, token, http=None, released_parent_gates=False):
         if not re.fullmatch(r"[A-Za-z0-9_-]+", store_id):
             raise ValueError("invalid KV store id")
         self.base = "https://api.fastly.com/resources/stores/kv/" + store_id + "/keys/"
         self.http = http or JsonHTTP({"Fastly-Key": token})
         self.claim_failure = None
+        self.released_parent_gates = released_parent_gates
 
     def url(self, key):
         return self.base + urllib.parse.quote(key, safe="")
 
     def get(self, key):
-        if key.startswith("quarantine:v1:"):
+        if key.startswith(("quarantine:v1:", "b2-sync:v1:")):
             # HTTP 404 means no holds; a present JSON null is malformed, not absent.
             result = self.http.request(self.url(key), missing=True, include_headers=True)
             if result is None:
@@ -961,8 +982,18 @@ class FastlyKV:
         if not HEX.fullmatch(key):
             raise ValueError("invalid copy gate hash")
         value = {"state": "copying", "attempt_id": attempt}
-        result = self.claim_request("add", self.http.request,
-                                    self.url("b2-sync:v1:" + key) + "?add=true", "PUT", value, conflict=True)
+        url, headers = self.url("b2-sync:v1:" + key) + "?add=true", {}
+        if self.released_parent_gates:
+            snapshot = self.http.request(self.url("b2-sync:v1:" + key), missing=True, include_headers=True, max_response_bytes=4096)
+            if snapshot is not None:
+                record, observed_headers = snapshot
+                if not released_parent_gate(record) or record["settled_attempt_id"] == attempt:
+                    return False
+                generation = observed_headers.get("generation")
+                if not valid_generation(generation) or str(int(generation)) != generation:
+                    raise ValueError("copy gate generation unavailable")
+                url, headers = self.url("b2-sync:v1:" + key), {"if-generation-match": generation}
+        result = self.claim_request("add", self.http.request, url, "PUT", value, conflict=True, headers=headers)
         if result is False:
             return False
         observed = self.claim_request("confirm", self.confirm_claim, "b2-sync:v1:" + key, value)
@@ -991,7 +1022,15 @@ class FastlyKV:
         generation = headers.get("generation")
         if not isinstance(generation, str) or not re.fullmatch(r"[0-9]+", generation) or not 0 < int(generation) < 2 ** 64:
             raise ValueError("copy gate generation unavailable")
-        self.http.request(self.url(gate), "DELETE", headers={"if-generation-match": generation})
+        if self.released_parent_gates:
+            if str(int(generation)) != generation:
+                raise ValueError("copy gate generation unavailable")
+            self.http.request(self.url(gate), "PUT", {
+                "state": "released", "version": 1, "settled_attempt_id": attempt,
+                "released_from_generation": generation,
+            }, headers={"if-generation-match": generation})
+        else:
+            self.http.request(self.url(gate), "DELETE", headers={"if-generation-match": generation})
 
 
 class GCSSource:
@@ -1098,6 +1137,7 @@ def main(argv=None):
     parser.add_argument("--state-dir", required=True, type=Path)
     parser.add_argument("--notification-subscription", help="Dedicated GCS OBJECT_FINALIZE subscription; disabled by default")
     parser.add_argument("--demand-intake", action="store_true", help="Intake bounded demand hints; disabled by default. Committed demand is processed even when intake is off.")
+    parser.add_argument("--released-parent-gates", action="store_true", help="Use reviewed shared-gate CAS protocol; disabled until all consumers/writers are compatible and legacy releases drained")
     parser.add_argument("--max-pending-demand", type=int, default=10000)
     parser.add_argument("--discovery-limit", type=int, help="Source names discovered per pass (1..1000); defaults to max-objects")
     parser.add_argument("--max-objects", type=int, default=10)
@@ -1143,7 +1183,7 @@ def main(argv=None):
                         "bucket_id": args.destination_bucket_id, "kv_store": args.kv_store_id})
             worker = Worker(GCSSource(args.source_bucket, storage.Client()),
                         B2Destination(args.destination_bucket, client),
-                        FastlyKV(args.kv_store_id, os.environ["FASTLY_API_TOKEN"]), state,
+                        FastlyKV(args.kv_store_id, os.environ["FASTLY_API_TOKEN"], released_parent_gates=args.released_parent_gates), state,
                         max_object_bytes=args.max_object_bytes, chunk_bytes=args.chunk_bytes,
                         max_spool_bytes=args.max_spool_bytes)
             notifications = None

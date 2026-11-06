@@ -81,6 +81,7 @@ VICEROY="$VICEROY" python3 scripts/run-private-family-erasure-tests.py
 
 # Durable eviction retries and physical erasure completion use real loopback KV.
 VICEROY="$VICEROY" python3 scripts/run-b2-cdn-purge-outbox-tests.py
+VICEROY="$VICEROY" python3 scripts/run-parent-gate-tests.py
 VICEROY="$VICEROY" python3 scripts/run-b2-cdn-phase-tests.py
 for contract in \
   quarantine_cdn_purge_failure_remains_denied_and_idempotently_retries \

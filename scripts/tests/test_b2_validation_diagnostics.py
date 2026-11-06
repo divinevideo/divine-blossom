@@ -65,7 +65,10 @@ class ValidationDiagnosticsTests(unittest.TestCase):
                 self.assertEqual(report.get('failure_validation_or_state'), 1)
                 self.assertEqual({k: v for k, v in report.items() if k.startswith('failure_')},
                                  {'failure_validation_or_state': 1, 'failure_validation_' + category: 1})
-                self.assertIsNone(kv.get('b2-sync:v1:' + HASH))
+                if category in ('destination_version', 'readiness_publication'):
+                    self.assertEqual(kv.get('b2-sync:v1:' + HASH)['state'], 'copying')
+                else:
+                    self.assertIsNone(kv.get('b2-sync:v1:' + HASH))
                 self.assertEqual(kv.values['blob:' + HASH], policy)
                 uploaded = category.startswith('destination_') or category == 'readiness_publication'
                 self.assertEqual(bool(destination.versions), uploaded)
@@ -92,7 +95,7 @@ class ValidationDiagnosticsTests(unittest.TestCase):
         self.assertEqual(report.get('failure_validation_readiness_publication'), 1)
         self.assertEqual(report.get('failure_validation_or_state'), 1)
         self.assertIs(kv.values['b2-ready:' + HASH], replacement)
-        self.assertIsNone(kv.get('b2-sync:v1:' + HASH))
+        self.assertEqual(kv.get('b2-sync:v1:' + HASH)['state'], 'copying')
         self.assert_private(report)
 
     def test_local_state_and_unrecognized_tags_stay_generic(self):
