@@ -157,31 +157,72 @@ impl Drop for CacheTransaction {
     }
 }
 
-fn lookup(key: String, deadline: Instant) -> Option<Transaction> {
+fn lookup(key: String, deadline: Instant) -> std::result::Result<Transaction, &'static str> {
     if Instant::now() >= deadline {
-        return None;
+        return Err("lookup_timeout");
     }
     let pending = Transaction::lookup(key.into_bytes().into())
         .execute_async()
-        .ok()?;
+        .map_err(|_| "lookup_start")?;
     // SAFETY: transfer ownership out solely to borrow the ABI handle for the
     // readiness wait. Reconstruct exactly once even when readiness fails; drop
     // then cancels the outstanding busy lookup without blocking on .wait().
     let raw = unsafe { pending.into_handle() }.into_abi();
     let ready = wait_for_demand_io(raw, deadline.min(Instant::now() + LOOKUP_BUDGET));
     let pending = unsafe { PendingTransaction::from_handle(CacheBusyHandle::from_abi(raw)) };
-    ready.ok()?;
-    pending.wait().ok()
+    ready.map_err(|error| {
+        if error.kind() == io::ErrorKind::TimedOut {
+            "lookup_timeout"
+        } else {
+            "lookup_select"
+        }
+    })?;
+    pending.wait().map_err(|_| "lookup_wait")
 }
 
-fn marked(origin: CanaryOrigin, marker: &str) -> CanaryOrigin {
+fn marked(origin: CanaryOrigin, marker: &str, reason: &'static str) -> CanaryOrigin {
     match origin {
         CanaryOrigin::Delivered(mut response) => {
             response.set_header("X-Divine-Storage-Cache", marker);
+            response.set_header("X-Divine-Storage-Cache-Reason", reason);
             CanaryOrigin::Delivered(response)
         }
         other => other,
     }
+}
+
+pub(crate) fn disabled(origin: CanaryOrigin) -> CanaryOrigin {
+    marked(origin, "BYPASS", "disabled")
+}
+
+/// These observations belong to this request, never the cached object metadata.
+/// Fixed reason codes distinguish a disabled POP from an admission bypass.
+pub(crate) fn attach_diagnostics(response: &mut Response, enabled: bool) {
+    response.set_header(
+        "X-Divine-Storage-Cache-Enabled",
+        if enabled { "true" } else { "false" },
+    );
+    if response
+        .get_header("X-Divine-Storage-Cache-Reason")
+        .is_none()
+    {
+        response.set_header(
+            "X-Divine-Storage-Cache-Reason",
+            if enabled { "unobserved" } else { "disabled" },
+        );
+    }
+    let version = fastly::compute_runtime::service_version().to_string();
+    response.set_header("X-Divine-Storage-Cache-Compute", version);
+    let consumed = REQUEST_CPU_BASELINE
+        .get()
+        .zip(fastly::compute_runtime::elapsed_vcpu_ms().ok())
+        .and_then(|(baseline, current)| current.checked_sub(baseline));
+    response.set_header(
+        "X-Divine-Storage-Cache-Cpu-Ms",
+        consumed
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".into()),
+    );
 }
 
 fn cached_response(
@@ -225,7 +266,7 @@ fn cached_response(
 
 enum Buffered {
     Complete(Vec<u8>),
-    Streaming(Body),
+    Streaming(Body, &'static str),
     Unavailable,
 }
 
@@ -241,7 +282,7 @@ fn buffer(body: Body, size: u64, deadline: Instant) -> Buffered {
         if !cpu_budget_available() {
             let mut prefix = Body::from(bytes);
             prefix.append(body.into());
-            return Buffered::Streaming(prefix);
+            return Buffered::Streaming(prefix, "cpu_buffer");
         }
         // SAFETY: this is a borrowed live body handle retained until after wait.
         if let Err(error) = wait_for_demand_io(unsafe { body.as_u32() }, deadline) {
@@ -250,7 +291,7 @@ fn buffer(body: Body, size: u64, deadline: Instant) -> Buffered {
             }
             let mut prefix = Body::from(bytes);
             prefix.append(body.into());
-            return Buffered::Streaming(prefix);
+            return Buffered::Streaming(prefix, "buffer_timeout");
         }
         let capacity = (limit - bytes.len()).min(chunk.len());
         match body.read(&mut chunk[..capacity]) {
@@ -273,15 +314,16 @@ pub(crate) fn read(
     deadline: Instant,
     fetch: impl FnOnce() -> Result<CanaryOrigin>,
 ) -> Result<CanaryOrigin> {
-    if !identity.eligible()
-        || (*method != Method::GET && *method != Method::HEAD)
-        || !cpu_budget_available()
-    {
-        return fetch().map(|origin| marked(origin, "BYPASS"));
+    if !identity.eligible() || (*method != Method::GET && *method != Method::HEAD) {
+        return fetch().map(|origin| marked(origin, "BYPASS", "ineligible"));
+    }
+    if !cpu_budget_available() {
+        return fetch().map(|origin| marked(origin, "BYPASS", "cpu_before_lookup"));
     }
     let digest = identity.digest();
-    let Some(transaction) = lookup(format!("divine-demand-playback-v1:{digest}"), deadline) else {
-        return fetch().map(|origin| marked(origin, "BYPASS"));
+    let transaction = match lookup(format!("divine-demand-playback-v1:{digest}"), deadline) {
+        Ok(transaction) => transaction,
+        Err(reason) => return fetch().map(|origin| marked(origin, "BYPASS", reason)),
     };
     let mut transaction = CacheTransaction(Some(transaction));
     let current = transaction.0.as_ref().expect("owned transaction");
@@ -290,7 +332,7 @@ pub(crate) fn read(
             if let Some(metadata) = Metadata::decode(&found.user_metadata(), &digest, identity.size)
             {
                 if let Some(response) = cached_response(&found, &metadata, method, range) {
-                    return Ok(marked(CanaryOrigin::Delivered(response), "HIT"));
+                    return Ok(marked(CanaryOrigin::Delivered(response), "HIT", "hit"));
                 }
             }
         }
@@ -298,7 +340,7 @@ pub(crate) fn read(
     // HEAD and range misses retain their genuine origin semantics and never fill.
     if *method != Method::GET || range.is_some() || !current.must_insert_or_update() {
         drop(transaction);
-        return fetch().map(|origin| marked(origin, "BYPASS"));
+        return fetch().map(|origin| marked(origin, "BYPASS", "not_fill_leader"));
     }
     let origin = fetch()?;
     let CanaryOrigin::Delivered(mut response) = origin else {
@@ -311,17 +353,35 @@ pub(crate) fn read(
             .and_then(|v| v.parse::<u64>().ok())
             != Some(identity.size)
     {
-        return Ok(marked(CanaryOrigin::Delivered(response), "BYPASS"));
+        return Ok(marked(
+            CanaryOrigin::Delivered(response),
+            "BYPASS",
+            "origin_headers",
+        ));
     }
     let Some(metadata) = Metadata::from_response(&response, &digest, identity.size) else {
-        return Ok(marked(CanaryOrigin::Delivered(response), "BYPASS"));
+        return Ok(marked(
+            CanaryOrigin::Delivered(response),
+            "BYPASS",
+            "origin_metadata",
+        ));
     };
     let encoded = match serde_json::to_vec(&metadata) {
         Ok(encoded) if encoded.len() <= MAX_METADATA_BYTES => encoded,
-        _ => return Ok(marked(CanaryOrigin::Delivered(response), "BYPASS")),
+        _ => {
+            return Ok(marked(
+                CanaryOrigin::Delivered(response),
+                "BYPASS",
+                "metadata_encoding",
+            ))
+        }
     };
     if !cpu_budget_available() {
-        return Ok(marked(CanaryOrigin::Delivered(response), "BYPASS"));
+        return Ok(marked(
+            CanaryOrigin::Delivered(response),
+            "BYPASS",
+            "cpu_before_buffer",
+        ));
     }
     let bytes = match buffer(
         response.take_body(),
@@ -329,9 +389,9 @@ pub(crate) fn read(
         deadline.min(Instant::now() + BUFFER_BUDGET),
     ) {
         Buffered::Complete(bytes) => bytes,
-        Buffered::Streaming(body) => {
+        Buffered::Streaming(body, reason) => {
             response.set_body(body);
-            return Ok(marked(CanaryOrigin::Delivered(response), "BYPASS"));
+            return Ok(marked(CanaryOrigin::Delivered(response), "BYPASS", reason));
         }
         Buffered::Unavailable => return Ok(CanaryOrigin::Unavailable),
     };
@@ -342,7 +402,11 @@ pub(crate) fn read(
     }
     if !cpu_budget_available() {
         response.set_body(bytes);
-        return Ok(marked(CanaryOrigin::Delivered(response), "BYPASS"));
+        return Ok(marked(
+            CanaryOrigin::Delivered(response),
+            "BYPASS",
+            "cpu_before_insert",
+        ));
     }
     // No cache reader sees a body until the complete expected size has arrived.
     // Keep the Vec for delivery so cache-write failures are harmless.
@@ -356,16 +420,16 @@ pub(crate) fn read(
         .surrogate_keys([identity.hash])
         .user_metadata(encoded.into())
         .execute()
-        .ok()
+        .map_err(|_| "insert_unavailable")
         .and_then(|mut writer| {
-            writer.write_all(&bytes).ok()?;
-            writer.finish().ok()
-        })
-        .is_some();
+            writer.write_all(&bytes).map_err(|_| "insert_write")?;
+            writer.finish().map_err(|_| "insert_finish")
+        });
     response.set_body(bytes);
     Ok(marked(
         CanaryOrigin::Delivered(response),
-        if inserted { "MISS" } else { "BYPASS" },
+        if inserted.is_ok() { "MISS" } else { "BYPASS" },
+        inserted.err().unwrap_or("inserted"),
     ))
 }
 
@@ -412,6 +476,10 @@ mod tests {
             response.get_header_str("X-Divine-Storage-Cache"),
             Some("BYPASS")
         );
+        assert_eq!(
+            response.get_header_str("X-Divine-Storage-Cache-Reason"),
+            Some("lookup_timeout")
+        );
         assert_eq!(response.take_body().into_string(), "uncached");
         leader.cancel_insert_or_update().unwrap();
     }
@@ -429,6 +497,33 @@ mod tests {
         // A fresh request's baseline measures its own consumption rather than
         // rejecting a reused VM's cumulative vCPU counter.
         assert!(within_cpu_budget(Some(10_000), Some(10_024)));
+    }
+
+    #[test]
+    fn ineligible_cache_diagnostic_preserves_origin_and_contains_no_identity() {
+        begin_request();
+        let mut identity = identity();
+        identity.size = MAX_CACHE_BYTES + 1;
+        let origin = read(
+            identity,
+            &Method::GET,
+            None,
+            Instant::now() + Duration::from_secs(1),
+            || Ok(CanaryOrigin::Delivered(Response::from_body("origin bytes"))),
+        )
+        .unwrap();
+        let CanaryOrigin::Delivered(mut response) = origin else {
+            panic!("expected origin response")
+        };
+        assert_eq!(
+            response.get_header_str("X-Divine-Storage-Cache"),
+            Some("BYPASS")
+        );
+        assert_eq!(
+            response.get_header_str("X-Divine-Storage-Cache-Reason"),
+            Some("ineligible")
+        );
+        assert_eq!(response.take_body().into_string(), "origin bytes");
     }
 
     #[test]

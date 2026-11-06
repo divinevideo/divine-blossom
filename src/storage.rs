@@ -618,7 +618,7 @@ pub(crate) fn download_demand_b2(
             fetch,
         )
     } else {
-        fetch()
+        fetch().map(crate::playback_cache::disabled)
     }
 }
 
@@ -671,7 +671,7 @@ pub(crate) fn download_demand_gcs(
             fetch,
         )
     } else {
-        fetch()
+        fetch().map(crate::playback_cache::disabled)
     }
 }
 
