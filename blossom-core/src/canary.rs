@@ -51,7 +51,9 @@ pub fn single_range(value: Option<&str>) -> Option<&str> {
         .then_some(value)
 }
 
-fn requested_span(range: &str, size: u64) -> Option<(u64, u64)> {
+/// Resolve a valid single byte range to its inclusive span, or no span when
+/// malformed or unsatisfiable. Callers distinguish those cases with single_range.
+pub fn requested_span(range: &str, size: u64) -> Option<(u64, u64)> {
     let (start, end) = single_range(Some(range))?
         .strip_prefix("bytes=")?
         .split_once('-')?;

@@ -178,6 +178,57 @@ are execution bounds, not a measured latency or global revocation guarantee.
 Cross-POP propagation and inflight-body limits remain production acceptance
 work.
 
+## Opt-in cached playback test
+
+With demand mode already enabled, exact `b2_canary_cache_enabled=true` permits
+an internal Fastly byte cache on this test host. Absent, malformed or false
+preserves the uncached baseline above. Strict mode and canonical routing do not
+use this option. Keep the device B2 playback setting enabled when testing it.
+
+Every cache lookup still follows authoritative policy, readiness and copy/erase
+checks. B2 also authenticates the live erasure credential before lookup; the
+handler repeats its policy/gate checks after a hit. Outward responses remain
+private/no-store, and the direct hostname continues bypassing outer VCL. This
+tests cached video bytes, not an outer cache that could skip Compute policy.
+
+Entries are isolated by provider, host, bucket, key, hash, verified size and
+exact B2 version. GCS fallback entries are distinct. Only complete GETs up to
+16 MiB populate the cache, after existing origin version/size and full-length verification. They
+expire after one hour, without stale serving, and use the normal bare-hash
+surrogate key so existing erasure purges cover every version. Larger originals
+stay available through the uncached path.
+
+A full warm GET supplies later GET/HEAD/range responses. A cold HEAD or range
+request goes to the real origin and does not fill the cache. Cache coordination
+waits at most 50 ms; body verification buffers at most 16 MiB plus one byte for
+up to three seconds within the remaining I/O budget. A 25 ms per-request CPU
+guard reserves capacity for insertion and final policy checks. If either budget expires,
+the consumed prefix and remaining body resume as uncached streaming. Cache
+errors do not grant access or convert an available origin into a cache-only
+failure. Wrong version/size and complete-body length mismatches remain integrity
+failures. Video bodies are not rehashed at the edge: admission trusts the
+worker-verified immutable B2 version or authoritative GCS content-addressed
+object, matching existing origin delivery. Same-length bad content with valid
+headers can remain cached for one hour. The operator's checksum verification
+detects such a fill after insertion; it does not prevent that initial insertion.
+
+Inspect `X-Divine-Storage-Cache`: HIT means cached bytes, MISS means a newly
+verified full fill, BYPASS means this response was not filled/hit. The normal
+`X-Divine-Source` describes the bytes' provider; on HIT it is fill provenance,
+not proof of a media-origin request during this attempt. B2 authorization is
+still a fresh network request, so a cache hit does not remove all overhead.
+
+Before warming a cohort, prove a real MISS→HIT with matching checksum, warm
+HEAD/ranges/416, surrogate invalidation, a representative 8 MiB cold fill, and
+denial after moderation or erasure.
+Then refresh the private cohort manifest's policy, size, source generation,
+readiness and gate state; mirror only missing eligible originals with a bounded
+worker; perform one full checksum-verified warm GET followed by one small hit
+check per object. Retain request-count/byte/time bounds and failures rather
+than retrying until green. The cache is regional: one operator's warm pass is
+not proof that every POP is warm. Disabling this cache flag preserves the
+ordinary demand fallback and durable queue.
+
 Turning this flag off restores strict B2-only mode, including its 503 behavior.
 For ordinary GCS playback, turn off the device flag. Pause worker intake or the
 runner separately; preserve committed queues, state backups, copy gates and
