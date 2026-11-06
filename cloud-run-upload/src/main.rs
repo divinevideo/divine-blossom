@@ -824,6 +824,7 @@ async fn handle_delete_blobs_ready() -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "ready",
         "contract": "vanish-batch-v2",
+        "private_family_cleanup": "all-versions-v1",
         "max_hashes": MAX_BATCH_CLEANUP_HASHES,
         "deadline_seconds": cleanup::CLEANUP_REQUEST_DEADLINE.as_secs(),
         "vanish_audit": "authenticated-v1",
@@ -2096,12 +2097,22 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cleanup_readiness_advertises_private_generation_contract() {
+        let response = axum::response::IntoResponse::into_response(super::handle_delete_blobs_ready().await);
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["private_family_cleanup"], "all-versions-v1");
+    }
+
     #[test]
     fn batch_cleanup_rollup_is_retryable_if_any_hash_fails() {
         let completed = crate::cleanup::HashCleanupResult {
             hash: "a".repeat(64),
             status: crate::cleanup::CleanupStatus::Completed,
             main_deleted_or_absent: true,
+            private_family: Some(crate::cleanup::PrivateFamilyCleanup::Absent),
+            bounded_progress: false,
             deleted: 1,
             absent: 0,
             failures: Vec::new(),
@@ -2110,6 +2121,8 @@ mod tests {
             hash: "b".repeat(64),
             status: crate::cleanup::CleanupStatus::Retryable,
             main_deleted_or_absent: true,
+            private_family: None,
+            bounded_progress: false,
             deleted: 0,
             absent: 1,
             failures: vec!["verification failed".to_string()],

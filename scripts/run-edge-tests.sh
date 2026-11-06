@@ -76,6 +76,9 @@ VICEROY="$VICEROY" python3 scripts/run-b2-canary-tests.py
 # Default-off production CDN routing admits only final verified B2 originals.
 VICEROY="$VICEROY" python3 scripts/run-b2-cdn-tests.py
 
+# Private control objects participate in the same bounded all-version erasure.
+VICEROY="$VICEROY" python3 scripts/run-private-family-erasure-tests.py
+
 # Durable eviction retries and physical erasure completion use real loopback KV.
 VICEROY="$VICEROY" python3 scripts/run-b2-cdn-purge-outbox-tests.py
 VICEROY="$VICEROY" python3 scripts/run-b2-cdn-phase-tests.py

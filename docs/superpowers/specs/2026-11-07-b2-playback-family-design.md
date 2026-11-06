@@ -27,3 +27,31 @@ The producer marker must carry producer_job_id, pipeline_version, parent identit
 Line syntax and byte-range inheritance follow [RFC 8216 section 4.1](https://www.rfc-editor.org/rfc/rfc8216#section-4.1) and [section 4.3.2.2](https://www.rfc-editor.org/rfc/rfc8216#section-4.3.2.2). This is a deliberately narrow validator for the existing producer shape, not a general HLS implementation. It preserves actual URI line bytes, accepts LF/CRLF and blank lines, rejects other line-ending interpretations, and requires version 4 or newer for byte ranges.
 
 Fourteen focused tests pass after observed RED failures. An independent review found whitespace/Unicode-line normalization could validate different references from copied bytes; the regression was reproduced, fixed, and re-reviewed clear. A locally generated FFmpeg 8.1.2 single_file VOD family plus remuxed MP4s passed. This does not establish deployed FFmpeg 4.4 compatibility or live provider behavior.
+
+## Private control erasure
+
+The reserved parent control namespace is `_private/artifact-families/v1/{parent}/`,
+including `complete.json`. Physical erasure must confirm this namespace absent
+alongside the parent media prefix. B2 deletes retained uploads and hide markers by
+file ID under the permanent parent erasing gate. A shared four-version delete cap
+and at most four listings retain the existing eight-request per-hash ceiling;
+remaining history stays pending across caller retries. Completion and purge
+receipts must wait for both namespace confirmations.
+
+Cloud Run cleanup lists all private control generations and deletes by exact
+GCS generation, sharing its existing 25-object slice and 30-second deadline with
+parent cleanup. The HTTP request is unchanged. Each result adds a typed
+`private_family` receipt: `absent` permits completion, while `remaining` records
+retained private versions. Explicit `bounded_progress: true` permits Pending only
+for a clean retryable result with main absence and a known private receipt; it
+also covers public media deliberately deferred by the shared slice after private
+versions consume its budget. Missing or malformed evidence fails closed.
+Older edges ignore the additive receipt and retain their retry behavior; newer
+edges cannot accept completion from an older backend that never inspected this
+namespace. The existing backend-before-Compute CI sequence requires the readiness
+capability `private_family_cleanup: all-versions-v1` at both deployment checks.
+Deploy the service cleanup before Compute to preserve availability.
+Creator deletion continues to retry until an absent receipt is returned. Existing GCS parent-media generation and retention semantics
+are unchanged; this does not establish historical GCS retirement or remove
+provider retention and legal holds. Listing, deletion, or verification uncertainty
+keeps cleanup retryable.
