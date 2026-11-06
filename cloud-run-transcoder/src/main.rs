@@ -43,6 +43,7 @@ use tower::Service;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
+mod media_command;
 mod mp4;
 mod sound_classification;
 mod transcription_google_stt_v2;
@@ -2486,8 +2487,8 @@ async fn extract_audio_for_transcription(input_path: &Path, audio_path: &Path) -
     let input_str = input_path.to_string_lossy();
     let audio_str = audio_path.to_string_lossy();
 
-    let output = Command::new("ffmpeg")
-        .args([
+    let output = media_command::output(
+        Command::new("ffmpeg").args([
             "-y",
             "-i",
             &input_str,
@@ -2499,10 +2500,11 @@ async fn extract_audio_for_transcription(input_path: &Path, audio_path: &Path) -
             "-c:a",
             "pcm_s16le",
             &audio_str,
-        ])
-        .output()
-        .await
-        .map_err(|e| anyhow!("Failed to run ffmpeg audio extraction: {}", e))?;
+        ]),
+        media_command::AUDIO_TIMEOUT,
+    )
+    .await
+    .map_err(|e| anyhow!("Failed to run ffmpeg audio extraction: {}", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2533,8 +2535,8 @@ async fn extract_bounded_audio_for_transcription(
     let audio_str = audio_path.to_string_lossy();
     let duration = max_seconds.to_string();
 
-    let output = Command::new("ffmpeg")
-        .args([
+    let output = media_command::output(
+        Command::new("ffmpeg").args([
             "-y",
             "-i",
             &input_str,
@@ -2548,10 +2550,11 @@ async fn extract_bounded_audio_for_transcription(
             "-t",
             &duration,
             &audio_str,
-        ])
-        .output()
-        .await
-        .map_err(|e| anyhow!("Failed to run ffmpeg audio extraction: {}", e))?;
+        ]),
+        media_command::AUDIO_TIMEOUT,
+    )
+    .await
+    .map_err(|e| anyhow!("Failed to run ffmpeg audio extraction: {}", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2572,8 +2575,8 @@ async fn analyze_audio_signal(audio_path: &Path) -> Result<AudioAnalysis> {
     let duration_ms = audio_duration_ms(audio_path).await?;
     let audio_str = audio_path.to_string_lossy().to_string();
 
-    let output = Command::new("ffmpeg")
-        .args([
+    let output = media_command::output(
+        Command::new("ffmpeg").args([
             "-hide_banner",
             "-nostats",
             "-i",
@@ -2583,10 +2586,11 @@ async fn analyze_audio_signal(audio_path: &Path) -> Result<AudioAnalysis> {
             "-f",
             "null",
             "-",
-        ])
-        .output()
-        .await
-        .map_err(|e| anyhow!("Failed to analyze extracted audio: {}", e))?;
+        ]),
+        media_command::AUDIO_TIMEOUT,
+    )
+    .await
+    .map_err(|e| anyhow!("Failed to analyze extracted audio: {}", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -6785,8 +6789,8 @@ async fn probe_video(input_path: &Path) -> Result<VideoInfo> {
 /// Check if the video file has an audio stream
 async fn check_has_audio(input_path: &Path) -> bool {
     let input_str = input_path.to_string_lossy();
-    let output = Command::new("ffprobe")
-        .args([
+    let output = media_command::output(
+        Command::new("ffprobe").args([
             "-v",
             "quiet",
             "-print_format",
@@ -6795,9 +6799,10 @@ async fn check_has_audio(input_path: &Path) -> bool {
             "-select_streams",
             "a:0",
             &input_str,
-        ])
-        .output()
-        .await;
+        ]),
+        media_command::PROBE_TIMEOUT,
+    )
+    .await;
 
     match output {
         Ok(out) if out.status.success() => {
@@ -6809,6 +6814,10 @@ async fn check_has_audio(input_path: &Path) -> bool {
             } else {
                 true // assume audio exists if parse fails (safe default)
             }
+        }
+        Err(error) => {
+            warn!(%error, "Audio probe failed; attempting audio extraction");
+            true
         }
         _ => true, // assume audio exists if probe fails (safe default)
     }
