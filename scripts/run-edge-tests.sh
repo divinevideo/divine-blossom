@@ -73,6 +73,9 @@ VICEROY="$VICEROY" python3 scripts/run-media-origin-tests.py
 # Canary policy/readiness runs before every uncached pinned-version read.
 VICEROY="$VICEROY" python3 scripts/run-b2-canary-tests.py
 
+# Default-off production CDN routing admits only final verified B2 originals.
+VICEROY="$VICEROY" python3 scripts/run-b2-cdn-tests.py
+
 # Streaming fills must outlive guest exit and remain safe under 1KiB fragmentation.
 VICEROY="$VICEROY" python3 scripts/run-b2-native-stream-tests.py
 

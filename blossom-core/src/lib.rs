@@ -1,3 +1,4 @@
+pub mod b2_cdn;
 pub mod cache_policy;
 pub mod canary;
 pub mod conditional_update;
