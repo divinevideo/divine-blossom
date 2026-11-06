@@ -276,6 +276,40 @@ class UploadQueueTests(unittest.TestCase):
         self.assertIsNotNone(kv.get('b2-ready:'+HASH))
 
 class WorkerTests(unittest.TestCase):
+    def test_cycle_reports_safe_source_failure_stage_and_resets_after_success(self):
+        self.source.interrupt = True
+        report = self.worker.cycle(max_objects=1, max_bytes=1000)
+        self.assertEqual(report['errors'], 1)
+        self.assertEqual(report.get('failure_source_read'), 1)
+        self.assertNotIn(HASH, json.dumps(report))
+        self.assertNotIn('synthetic interruption', json.dumps(report))
+        report = self.worker.cycle(max_objects=1, max_bytes=1000)
+        self.assertEqual(report['ready'], 1)
+        self.assertFalse(any(k.startswith('failure_') for k in report))
+
+    def test_cycle_reports_uncertain_upload_without_releasing_gate_or_leaking_error(self):
+        def unavailable(*args):
+            raise OSError('SYNTHETIC_SECRET https://synthetic.invalid/signed?token=secret')
+        self.dest.upload = unavailable
+        report = self.worker.cycle(max_objects=1, max_bytes=1000)
+        self.assertEqual(report['errors'], 1)
+        self.assertEqual(report.get('failure_destination_upload'), 1)
+        self.assertEqual(self.kv.get('b2-sync:v1:' + HASH)['state'], 'copying')
+        self.assertIsNone(self.ready())
+        self.assertNotIn('SYNTHETIC_SECRET', json.dumps(report))
+        self.assertNotIn(HASH, json.dumps(report))
+
+    def test_cycle_keeps_first_failure_stage_when_release_also_fails(self):
+        def unavailable(*args):
+            raise OSError('SYNTHETIC_SECRET')
+        self.dest.read = unavailable
+        self.kv.release_copy = unavailable
+        report = self.worker.cycle(max_objects=1, max_bytes=1000)
+        self.assertEqual(report['errors'], 1)
+        self.assertEqual(report.get('failure_destination_read'), 1)
+        self.assertNotIn('failure_gate_release', report)
+        self.assertIsNone(self.ready())
+
     def test_public_pending_original_is_mirrored_without_changing_status(self):
         self.kv.values['blob:' + HASH]['status'] = 'pending'
         self.assertEqual(self.copy(), 'ready')
