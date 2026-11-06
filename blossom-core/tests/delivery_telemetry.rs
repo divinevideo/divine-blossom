@@ -67,7 +67,7 @@ fn all_terminal_statuses_emit_only_headers_and_exact_private_wire_fields() {
                 "cohort":"b2_canary", "stage":"compute_headers", "method":method,
                 "status":status, "range_request":true, "provider":"unknown",
                 "storage_cache":"unknown", "outer_cache":"bypass", "fallback":"unknown",
-                "header_ready_ms":7, "transfer_ms":null, "bytes_sent":null
+                "origin_attempted":null, "header_ready_ms":7, "transfer_ms":null, "bytes_sent":null
             });
             assert_eq!(value, expected);
         }
@@ -148,4 +148,45 @@ fn invalid_output_and_unrepresentable_duration_are_not_fabricated() {
 fn random_bytes_become_canonical_v4_without_clock_or_caller_identity() {
     assert_eq!(uuid_v4([0; 16]), "00000000-0000-4000-8000-000000000000");
     assert_eq!(uuid_v4([255; 16]), "ffffffff-ffff-4fff-bfff-ffffffffffff");
+}
+
+#[test]
+fn missing_endpoint_reports_a_safe_counter_without_failing_delivery() {
+    let outcome = write_delivery_log(None::<Vec<u8>>, "private-request-payload");
+    assert_eq!(outcome, DeliveryLogOutcome::EndpointUnavailable);
+    assert_eq!(
+        outcome.diagnostic(),
+        "playback_delivery_log outcome=endpoint_unavailable count=1"
+    );
+}
+
+#[test]
+fn rejected_log_write_reports_no_raw_error_or_event_payload() {
+    struct Rejected;
+    impl std::io::Write for Rejected {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("private auth and request details"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let outcome = write_delivery_log(Some(Rejected), "private-request-payload");
+    assert_eq!(outcome, DeliveryLogOutcome::WriteFailed);
+    assert_eq!(
+        outcome.diagnostic(),
+        "playback_delivery_log outcome=write_failed count=1"
+    );
+}
+
+#[test]
+fn accepted_log_write_preserves_raw_json_and_does_not_claim_sink_delivery() {
+    let mut bytes = Vec::new();
+    let outcome = write_delivery_log(Some(&mut bytes), r#"{"schema":"divine.media.delivery.v1"}"#);
+    assert_eq!(bytes, b"{\"schema\":\"divine.media.delivery.v1\"}\n");
+    assert_eq!(outcome, DeliveryLogOutcome::HostAccepted);
+    assert_eq!(
+        outcome.diagnostic(),
+        "playback_delivery_log outcome=host_accepted count=1"
+    );
 }

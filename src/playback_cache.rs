@@ -7,6 +7,7 @@
 
 use crate::error::Result;
 use crate::storage::{wait_for_demand_io, CanaryOrigin};
+use blossom_core::delivery_telemetry::Cache;
 use fastly::cache::core::{CacheBusyHandle, CacheError, Found, PendingTransaction, Transaction};
 use fastly::http::body::StreamingBody;
 use fastly::http::{Method, StatusCode};
@@ -216,7 +217,14 @@ fn lookup(key: String, deadline: Instant) -> std::result::Result<Transaction, &'
     pending.wait().map_err(|_| "lookup_wait")
 }
 
-fn marked(origin: CanaryOrigin, marker: &str, reason: &'static str) -> CanaryOrigin {
+fn marked(origin: CanaryOrigin, cache: Cache, reason: &'static str) -> CanaryOrigin {
+    crate::delivery_telemetry::storage_cache(cache);
+    let marker = match cache {
+        Cache::Hit => "HIT",
+        Cache::Miss => "MISS",
+        Cache::Bypass => "BYPASS",
+        Cache::Unknown => return origin,
+    };
     match origin {
         CanaryOrigin::Delivered(mut response) => {
             response.set_header("X-Divine-Storage-Cache", marker);
@@ -228,7 +236,7 @@ fn marked(origin: CanaryOrigin, marker: &str, reason: &'static str) -> CanaryOri
 }
 
 pub(crate) fn disabled(origin: CanaryOrigin) -> CanaryOrigin {
-    marked(origin, "BYPASS", "disabled")
+    marked(origin, Cache::Bypass, "disabled")
 }
 
 /// These observations belong to this request, never the cached object metadata.
@@ -385,16 +393,16 @@ pub(crate) fn read(
     fetch: impl FnOnce() -> Result<CanaryOrigin>,
 ) -> Result<CanaryOrigin> {
     if !identity.eligible() || (*method != Method::GET && *method != Method::HEAD) {
-        return fetch().map(|origin| marked(origin, "BYPASS", "ineligible"));
+        return fetch().map(|origin| marked(origin, Cache::Bypass, "ineligible"));
     }
     if !cpu_budget_available() {
-        return fetch().map(|origin| marked(origin, "BYPASS", "cpu_before_lookup"));
+        return fetch().map(|origin| marked(origin, Cache::Bypass, "cpu_before_lookup"));
     }
     let digest = identity.digest();
     let key = format!("{CACHE_NAMESPACE}:{digest}");
     let transaction = match lookup(key.clone(), deadline) {
         Ok(transaction) => transaction,
-        Err(reason) => return fetch().map(|origin| marked(origin, "BYPASS", reason)),
+        Err(reason) => return fetch().map(|origin| marked(origin, Cache::Bypass, reason)),
     };
     let mut transaction = CacheTransaction(Some(transaction));
     let current = transaction.0.as_ref().expect("owned transaction");
@@ -404,7 +412,7 @@ pub(crate) fn read(
             if let Some(metadata) = Metadata::decode(&found.user_metadata(), &digest, identity.size)
             {
                 if let Some(response) = cached_response(&found, &metadata, method, range) {
-                    return Ok(marked(CanaryOrigin::Delivered(response), "HIT", "hit"));
+                    return Ok(marked(CanaryOrigin::Delivered(response), Cache::Hit, "hit"));
                 }
             }
         }
@@ -419,7 +427,7 @@ pub(crate) fn read(
         || (!current.must_insert_or_update() && !repairable)
     {
         drop(transaction);
-        return fetch().map(|origin| marked(origin, "BYPASS", "not_fill_leader"));
+        return fetch().map(|origin| marked(origin, Cache::Bypass, "not_fill_leader"));
     }
     let origin = fetch()?;
     let CanaryOrigin::Delivered(mut response) = origin else {
@@ -434,14 +442,14 @@ pub(crate) fn read(
     {
         return Ok(marked(
             CanaryOrigin::Delivered(response),
-            "BYPASS",
+            Cache::Bypass,
             "origin_headers",
         ));
     }
     let Some(metadata) = Metadata::from_response(&response, &digest, identity.size) else {
         return Ok(marked(
             CanaryOrigin::Delivered(response),
-            "BYPASS",
+            Cache::Bypass,
             "origin_metadata",
         ));
     };
@@ -450,7 +458,7 @@ pub(crate) fn read(
         _ => {
             return Ok(marked(
                 CanaryOrigin::Delivered(response),
-                "BYPASS",
+                Cache::Bypass,
                 "metadata_encoding",
             ))
         }
@@ -458,7 +466,7 @@ pub(crate) fn read(
     if !cpu_budget_available() || Instant::now() >= deadline {
         return Ok(marked(
             CanaryOrigin::Delivered(response),
-            "BYPASS",
+            Cache::Bypass,
             "handoff_budget",
         ));
     }
@@ -477,7 +485,7 @@ pub(crate) fn read(
     };
     let (mut writer, found) = match insertion {
         Ok(insertion) => insertion,
-        Err(reason) => return Ok(marked(CanaryOrigin::Delivered(response), "BYPASS", reason)),
+        Err(reason) => return Ok(marked(CanaryOrigin::Delivered(response), Cache::Bypass, reason)),
     };
     // Prepare readback before transferring origin ownership. Setup/readback
     // failures still return the untouched source response.
@@ -486,7 +494,7 @@ pub(crate) fn read(
         Err(_) => {
             return Ok(marked(
                 CanaryOrigin::Delivered(response),
-                "BYPASS",
+                Cache::Bypass,
                 "insert_stream",
             ))
         }
@@ -494,7 +502,7 @@ pub(crate) fn read(
     if !cpu_budget_available() || Instant::now() >= deadline {
         return Ok(marked(
             CanaryOrigin::Delivered(response),
-            "BYPASS",
+            Cache::Bypass,
             "handoff_budget",
         ));
     }
@@ -521,7 +529,7 @@ pub(crate) fn read(
     LAST_INSERTED_KEY.set(Some(insertion_key));
     Ok(marked(
         CanaryOrigin::Delivered(response),
-        "MISS",
+        Cache::Miss,
         "streaming_insert",
     ))
 }

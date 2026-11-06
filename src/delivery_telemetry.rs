@@ -2,11 +2,11 @@
 use blossom_core::delivery_telemetry::{self, Cache, DeliveryObservation, Fallback, Provider};
 use fastly::{Request, Response};
 use std::cell::RefCell;
-use std::io::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub(crate) const REQUEST_HEADER: &str = "X-Playback-Request-Id";
 const LOAD_HEADER: &str = "X-Playback-Load-Id";
+const LOG_ENDPOINT_NAME: &str = "cdn-view-logs";
 thread_local! { static OBSERVATION: RefCell<Option<DeliveryObservation>> = const { RefCell::new(None) }; }
 
 pub(crate) struct RequestContext {
@@ -39,7 +39,12 @@ impl RequestContext {
             method: req.get_method_str().to_owned(),
             range_request: req.contains_header("Range"),
         };
-        OBSERVATION.with(|state| *state.borrow_mut() = Some(DeliveryObservation::default()));
+        OBSERVATION.with(|state| {
+            *state.borrow_mut() = Some(DeliveryObservation {
+                origin_attempted: Some(false),
+                ..DeliveryObservation::default()
+            })
+        });
         Some(context)
     }
     pub(crate) fn finish(self, response: &mut Response, elapsed: Duration) -> Option<String> {
@@ -66,9 +71,12 @@ impl RequestContext {
         let line = serde_json::to_string(&event).ok()?;
         // This runs after every cache/policy handler has returned. Never put this in origin/cache headers.
         response.set_header(REQUEST_HEADER, &self.request_id);
-        if let Ok(mut endpoint) = fastly::log::Endpoint::try_from_name("cdn-view-logs") {
-            let _ = writeln!(endpoint, "{line}");
-        }
+        let outcome = delivery_telemetry::write_delivery_log(
+            fastly::log::Endpoint::try_from_name(LOG_ENDPOINT_NAME).ok(),
+            &line,
+        );
+        // Fixed aggregate labels only. Host acceptance is not Pub/Sub/storage acknowledgement.
+        eprintln!("{}", outcome.diagnostic());
         Some(line)
     }
 }
@@ -80,6 +88,30 @@ pub(crate) fn observe(provider: Provider, storage_cache: Cache) {
         }
     });
 }
+/// Record an actual media-send boundary; auth/policy I/O never calls this.
+pub(crate) fn media_origin_attempt(provider: Provider) {
+    OBSERVATION.with(|state| {
+        if let Some(observation) = state.borrow_mut().as_mut() {
+            observation.provider = provider;
+            observation.storage_cache = Cache::Bypass;
+            observation.origin_attempted = Some(true);
+        }
+    });
+}
+
+/// The final selected cache path may replace provider, but cannot erase an
+/// earlier failed media attempt before fallback reaches a cache hit.
+pub(crate) fn storage_cache(cache: Cache) {
+    OBSERVATION.with(|state| {
+        if let Some(observation) = state.borrow_mut().as_mut() {
+            observation.storage_cache = cache;
+            if cache == Cache::Hit {
+                observation.provider = Provider::None;
+            }
+        }
+    });
+}
+
 pub(crate) fn fallback(fallback: Fallback) {
     OBSERVATION.with(|state| {
         if let Some(observation) = state.borrow_mut().as_mut() {
@@ -105,7 +137,7 @@ mod tests {
                 req.set_header("Range", "bytes=0-0");
                 req.set_header("Authorization", "Bearer private-synthetic");
                 let context = RequestContext::start(&req).expect("eligible");
-                observe(Provider::Gcs, Cache::Bypass);
+                media_origin_attempt(Provider::Gcs);
                 fallback(Fallback::MissingReadiness);
                 let mut response = Response::from_status(status).with_body("body");
                 response.set_header("Cache-Control", "private, no-store");
@@ -118,6 +150,7 @@ mod tests {
                 assert_eq!(value["status"], status);
                 assert_eq!(value["method"], method);
                 assert_eq!(value["provider"], "gcs");
+                assert_eq!(value["origin_attempted"], true);
                 assert_eq!(value["storage_cache"], "bypass");
                 assert_eq!(value["fallback"], "missing_readiness");
                 assert_eq!(value["transfer_ms"], serde_json::Value::Null);
@@ -177,6 +210,98 @@ mod tests {
         );
         assert!(value["transfer_ms"].is_null());
         assert!(value["bytes_sent"].is_null());
+        assert_eq!(
+            value["origin_attempted"].as_bool(),
+            Some(config.get("test_telemetry_provider").as_deref() != Some("none"))
+        );
+    }
+    #[test]
+    #[ignore = "requires synthetic Core Cache/origin fixtures; run-playback-cache-telemetry-tests.py"]
+    fn cache_delivery_observation_contract() {
+        let config = fastly::config_store::ConfigStore::open("blossom_config");
+        let scenario = config.get("test_cache_observation_scenario").unwrap();
+        let hash = config.get("test_hash").unwrap();
+        let body = config.get("test_body").unwrap();
+        let read = |method: &str, load: &str| {
+            crate::playback_cache::begin_request();
+            let mut request = Request::new(method, format!("https://media-b2.divine.video/{hash}"));
+            request.set_header(LOAD_HEADER, load);
+            request.set_header(REQUEST_HEADER, "replayed-caller-id");
+            request.set_header("X-Request-Id", "reused-retry-id");
+            let context = RequestContext::start(&request).unwrap();
+            let mut response = crate::handle_request(request)
+                .unwrap_or_else(|error| crate::error_response(&error));
+            let line = context.finish(&mut response, Duration::ZERO).unwrap();
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(event["load_id"], load);
+            assert_eq!(
+                response.get_header_str(REQUEST_HEADER),
+                event["request_id"].as_str()
+            );
+            assert_eq!(
+                response.get_header_str("Cache-Control"),
+                Some("private, no-store")
+            );
+            assert_eq!(
+                response.get_header_str("Surrogate-Control"),
+                Some("no-store")
+            );
+            assert_eq!(event["transfer_ms"], serde_json::Value::Null);
+            assert_eq!(event["bytes_sent"], serde_json::Value::Null);
+            assert!(delivery_telemetry::is_uuid_v4(
+                event["event_id"].as_str().unwrap()
+            ));
+            assert!(delivery_telemetry::is_uuid_v4(
+                event["request_id"].as_str().unwrap()
+            ));
+            assert_eq!(
+                response.take_body().into_string(),
+                if method == "HEAD" { "" } else { body.as_str() }
+            );
+            event
+        };
+        let seed = if matches!(
+            scenario.as_str(),
+            "warm_hit" | "fallback_hit" | "failed_b2_fallback_hit"
+        ) {
+            let seed = read("GET", LOAD);
+            if scenario == "failed_b2_fallback_hit" {
+                // Warm the GCS path with missing readiness, then make B2 eligible
+                // for the next request. Both KV and origins are local fixtures.
+                crate::metadata::open_store()
+                    .unwrap()
+                    .insert(
+                        &format!("b2-ready:{hash}"),
+                        config.get("test_readiness").unwrap(),
+                    )
+                    .unwrap();
+            }
+            Some(seed)
+        } else {
+            None
+        };
+        let method = if scenario == "bypass" { "HEAD" } else { "GET" };
+        let event = read(method, "44444444-4444-4444-8444-444444444444");
+        for (field, setting) in [
+            ("provider", "test_telemetry_provider"),
+            ("storage_cache", "test_telemetry_storage_cache"),
+            ("fallback", "test_telemetry_fallback"),
+        ] {
+            assert_eq!(
+                event[field].as_str(),
+                config.get(setting).as_deref(),
+                "{scenario} {field}"
+            );
+        }
+        assert_eq!(
+            event["origin_attempted"].as_bool(),
+            Some(config.get("test_origin_attempted").as_deref() == Some("true")),
+            "{scenario} origin_attempted"
+        );
+        if let Some(seed) = seed {
+            assert_ne!(event["event_id"], seed["event_id"]);
+            assert_ne!(event["request_id"], seed["request_id"]);
+        }
     }
     #[test]
     #[ignore = "requires explicit telemetry canary configuration; run-playback-telemetry-tests.py"]
@@ -193,6 +318,7 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(&line).unwrap();
             assert_eq!(value["provider"], "unknown");
             assert_eq!(value["storage_cache"], "unknown");
+            assert_eq!(value["origin_attempted"], false);
         }
         for url in [
             "https://media.divine.video/synthetic",

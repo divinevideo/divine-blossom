@@ -39,6 +39,7 @@ pub struct DeliveryObservation {
     pub provider: Provider,
     pub storage_cache: Cache,
     pub fallback: Fallback,
+    pub origin_attempted: Option<bool>,
 }
 
 pub fn is_uuid_v4(value: &str) -> bool {
@@ -97,6 +98,7 @@ pub struct DeliveryEvent<'a> {
     storage_cache: Cache,
     outer_cache: Cache,
     fallback: Fallback,
+    origin_attempted: Option<bool>,
     header_ready_ms: Option<u32>,
     transfer_ms: Option<u32>,
     bytes_sent: Option<u64>,
@@ -143,8 +145,44 @@ pub fn compute_headers<'a>(
         storage_cache: observation.storage_cache,
         outer_cache: Cache::Bypass,
         fallback: observation.fallback,
+        origin_attempted: observation.origin_attempted,
         header_ready_ms: (elapsed_ms <= 600000).then_some(elapsed_ms as u32),
         transfer_ms: None,
         bytes_sent: None,
     })
+}
+
+/// Guest logging outcomes do not acknowledge topic publication or storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeliveryLogOutcome {
+    HostAccepted,
+    EndpointUnavailable,
+    WriteFailed,
+}
+impl DeliveryLogOutcome {
+    pub fn diagnostic(self) -> &'static str {
+        match self {
+            Self::HostAccepted => "playback_delivery_log outcome=host_accepted count=1",
+            Self::EndpointUnavailable => {
+                "playback_delivery_log outcome=endpoint_unavailable count=1"
+            }
+            Self::WriteFailed => "playback_delivery_log outcome=write_failed count=1",
+        }
+    }
+}
+
+/// Preserve the raw JSON line, reporting only finite host-level outcomes.
+/// The platform may accept writes without publishing them; no durable ack exists.
+pub fn write_delivery_log<W: std::io::Write>(
+    endpoint: Option<W>,
+    line: &str,
+) -> DeliveryLogOutcome {
+    let Some(mut endpoint) = endpoint else {
+        return DeliveryLogOutcome::EndpointUnavailable;
+    };
+    if writeln!(endpoint, "{line}").is_err() {
+        DeliveryLogOutcome::WriteFailed
+    } else {
+        DeliveryLogOutcome::HostAccepted
+    }
 }

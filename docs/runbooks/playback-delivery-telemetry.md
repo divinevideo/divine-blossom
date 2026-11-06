@@ -1,7 +1,11 @@
 # Playback delivery telemetry
 
 This producer is disabled by default. It emits the explicit
-`divine.media.delivery.v1` schema to the existing `cdn-view-logs` logging endpoint.
+`divine.media.delivery.v1` schema to a Compute logging endpoint named
+cdn-view-logs, targeting the existing topic. That endpoint still requires
+operator provisioning: the current read-only preflight found it only on outer
+VCL, not Compute. Follow the [endpoint setup and bounded acceptance
+runbook](playback-delivery-endpoint-setup.md) before enabling the flag.
 The subscriber must dispatch this schema into the operational delivery table;
 these records must never become legacy views or recommendation events.
 
@@ -48,22 +52,35 @@ while a cohort context exists. Uninstrumented paths remain `unknown`.
 
 Canary entry records `provider=none` until a media-origin send is attempted.
 Actual B2/GCS media sends record their provider and `storage_cache=bypass`;
-B2 native erasure authorization is excluded. A source field is an attempted media
-origin, including transport or HTTP failures, rather than proof of bytes received.
-When both origins are attempted, the final attempted media source is reported.
-Demand fallback reasons are recorded at the observed branch: missing readiness,
-missing version, unavailable origin, copying, or oversized. Strict B2 mode never
-falls back and reports `fallback=none` even when it returns unavailable.
+B2 native erasure authorization is excluded. On a final storage-cache hit,
+`provider=none` means the selected delivery was served from cache. Otherwise
+provider identifies the last attempted media source, including transport/HTTP
+failure. It is not proof of bytes received.
+
+`origin_attempted` is an optional boolean: true when ANY media-origin send was
+attempted in this execution, false when the instrumented request scope saw none,
+and null when that scope is not reliably known. Request-local context starts
+false; only an actual media-send site changes it to true. A later cache hit
+cannot reset it. Thus failed B2 followed by a GCS fallback cache hit reports
+`provider=none, storage_cache=hit, fallback=unavailable, origin_attempted=true`.
+Missing readiness followed by a GCS cache hit reports `origin_attempted=false`.
+Native erasure authorization, policy reads, and metadata I/O do not count as
+media-origin attempts. The flat record does not describe each individual attempt.
+
+The cache's actual return branches update typed request-local state directly.
+A usable cache hit reports `storage_cache=hit`; a completed cache fill reports
+`miss`; paths that decline or cannot complete caching report `bypass`, matching
+the existing outward marker semantics. Failed fills are not successful MISS
+fills. Cached X-Divine-Source remains fill provenance and is never read as a
+telemetry provider. Fallback reasons come from the observed demand branch:
+missing readiness/version, unavailable origin, copying, or oversized. Strict B2
+mode never falls back and reports `fallback=none` even if it is unavailable.
 Direct canary requests bypass outer VCL, so `outer_cache=bypass`.
 
-The separate storage-cache work must integrate these typed hooks before its
-telemetry is enabled. On a cache hit, set `provider=none, storage_cache=hit`;
-`X-Divine-Source` on a hit describes fill provenance and must not become the
-provider. On a cache miss, preserve the actual media-send provider and set
-`storage_cache=miss` after the fetch hook. Read fallback from request execution,
-not cached headers. A cache hit does not imply zero network traffic: native
-erasure authorization and policy reads can still run. This producer does not
-change caching, outward no-store headers, policy checks, or erasure.
+These observations do not change cache keys, cached metadata/bytes, outward
+no-store headers, policy checks, or erasure. Cache hits can still perform native
+authorization and policy network calls; neither `provider=none` nor
+`origin_attempted=false` means there was no network traffic at all.
 
 ## Local verification and coverage
 
@@ -76,18 +93,22 @@ cargo clippy --locked --all-targets --all-features
 VICEROY=/path/to/viceroy ./scripts/run-edge-tests.sh
 VICEROY=/path/to/viceroy python3 scripts/run-playback-telemetry-tests.py
 VICEROY=/path/to/viceroy python3 scripts/run-playback-origin-telemetry-tests.py
+VICEROY=/path/to/viceroy python3 scripts/run-playback-cache-telemetry-tests.py
 ```
 
 The first telemetry runner covers opt-in/host/UUID gates, request uniqueness,
 all terminal status classes, privacy, and response cache/body neutrality. The
 second reuses the existing local synthetic canary origin fixtures to verify
 provider/cache/fallback against actual origin execution, including authorization
-failures and fallback failures. No live infrastructure is used.
+failures and fallback failures. The cache runner verifies cold MISS, warm HIT,
+HEAD BYPASS, missing-readiness fallback HIT, failed-B2 fallback HIT, fresh request
+IDs across cached responses, and the distinct media-attempt boolean. No live
+infrastructure is used.
 
 An example headers marker (synthetic IDs and timestamp):
 
 ```json
-{"schema":"divine.media.delivery.v1","event_id":"22222222-2222-4222-a222-222222222222","load_id":"12345678-1234-4234-9234-123456789abc","request_id":"33333333-3333-4333-b333-333333333333","occurred_at_ms":1793900000000,"cohort":"b2_canary","stage":"compute_headers","method":"GET","status":206,"range_request":true,"provider":"b2","storage_cache":"bypass","outer_cache":"bypass","fallback":"none","header_ready_ms":7,"transfer_ms":null,"bytes_sent":null}
+{"schema":"divine.media.delivery.v1","event_id":"22222222-2222-4222-a222-222222222222","load_id":"12345678-1234-4234-9234-123456789abc","request_id":"33333333-3333-4333-b333-333333333333","occurred_at_ms":1793900000000,"cohort":"b2_canary","stage":"compute_headers","method":"GET","status":206,"range_request":true,"provider":"b2","storage_cache":"bypass","outer_cache":"bypass","fallback":"none","origin_attempted":true,"header_ready_ms":7,"transfer_ms":null,"bytes_sent":null}
 ```
 
 This does not establish production acceptance, consent/device correctness, sink

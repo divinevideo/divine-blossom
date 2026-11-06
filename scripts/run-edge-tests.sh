@@ -85,3 +85,4 @@ VICEROY="$VICEROY" python3 scripts/run-quarantine-race-tests.py
 # Opt-in delivery correlation uses request-local observations and never cache metadata.
 VICEROY="$VICEROY" python3 scripts/run-playback-telemetry-tests.py
 VICEROY="$VICEROY" python3 scripts/run-playback-origin-telemetry-tests.py
+VICEROY="$VICEROY" python3 scripts/run-playback-cache-telemetry-tests.py

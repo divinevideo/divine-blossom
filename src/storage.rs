@@ -383,9 +383,8 @@ pub(crate) fn download_canary_original(
     }
     request.set_pass(true);
     sign_request(&mut request, &config, Some("UNSIGNED-PAYLOAD".into()))?;
-    crate::delivery_telemetry::observe(
+    crate::delivery_telemetry::media_origin_attempt(
         blossom_core::delivery_telemetry::Provider::B2,
-        blossom_core::delivery_telemetry::Cache::Bypass,
     );
     let mut response = match request.send(B2_MEDIA_BACKEND) {
         Ok(response) => response,
@@ -480,10 +479,7 @@ fn send_demand(request: Request, backend: &str, deadline: Instant) -> Result<Opt
         _ => None,
     };
     if let Some(provider) = provider {
-        crate::delivery_telemetry::observe(
-            provider,
-            blossom_core::delivery_telemetry::Cache::Bypass,
-        );
+        crate::delivery_telemetry::media_origin_attempt(provider);
     }
     let (request, body) = request.into_handles();
     let pending = match request.send_async(
