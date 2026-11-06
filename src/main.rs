@@ -3150,8 +3150,18 @@ fn handle_admin_hls_content(req: Request, path: &str) -> Result<Response> {
     }
 }
 
-/// Maximum size for in-process upload (500KB) - larger files proxy to the upload service
-const UPLOAD_SERVICE_THRESHOLD: u64 = 500 * 1024;
+/// Route new canonical direct uploads through the existing provider-aware
+/// upload service. Missing configuration retains the original size/MIME policy;
+/// an unavailable store or invalid value never silently selects inline GCS.
+fn should_proxy_direct_upload(size: u64, mime: &str) -> Result<bool> {
+    let store = fastly::config_store::ConfigStore::try_open("blossom_config")
+        .map_err(|_| BlossomError::Internal("Upload routing configuration unavailable".into()))?;
+    let flag = store
+        .try_get("upload_service_all_uploads")
+        .map_err(|_| BlossomError::Internal("Upload routing configuration unavailable".into()))?;
+    blossom_core::upload_routing::should_proxy(flag.as_deref(), size, mime)
+        .map_err(|message| BlossomError::Internal(message.into()))
+}
 
 /// Upload service backend name (must match a backend configured in the
 /// Fastly dashboard whose address is `upload.divine.video`).
@@ -3586,13 +3596,11 @@ fn handle_upload(mut req: Request, record: &mut UploadLogRecord) -> Result<Respo
 
     let base_url = get_base_url(&req);
 
-    // Proxy to Cloud Run for:
-    // 1. Large uploads (> 500KB) to avoid WASM memory limits
-    // 2. Video uploads (any size) for thumbnail generation
-    // In local mode, handle all uploads inline (no Cloud Run available).
-    // Viceroy doesn't have WASM heap limits, but very large files (>50MB) may be slow.
+    // Reuse the provider-aware upload service for large/video uploads and,
+    // when explicitly configured, small images and other canonical uploads.
+    // Explicit synthetic local mode keeps its inline test behavior.
     if !crate::storage::is_local_mode()
-        && (content_length > UPLOAD_SERVICE_THRESHOLD || is_video_mime_type(&content_type))
+        && should_proxy_direct_upload(content_length, &content_type)?
     {
         return handle_upload_service_proxy(
             req,
@@ -8824,3 +8832,6 @@ mod tests {
 
 #[cfg(test)]
 mod subtitle_translation_tests;
+
+#[cfg(test)]
+mod upload_routing_tests;
