@@ -15,6 +15,7 @@ pub enum Provider {
 #[serde(rename_all = "snake_case")]
 pub enum Cache {
     Hit,
+    /// Insertion selected at header-ready; host collection can still fail later.
     Miss,
     Bypass,
     #[default]

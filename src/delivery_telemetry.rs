@@ -254,6 +254,37 @@ mod tests {
             assert!(delivery_telemetry::is_uuid_v4(
                 event["request_id"].as_str().unwrap()
             ));
+            if event["storage_cache"] == "miss" {
+                assert_eq!(
+                    response.get_header_str("X-Divine-Storage-Cache-Reason"),
+                    Some("streaming_insert")
+                );
+                assert_eq!(
+                    response.get_header_str("X-Divine-Storage-Cache-Fill-Mode"),
+                    Some("host-stream")
+                );
+                assert_eq!(
+                    response.get_header_str("X-Divine-Storage-Cache-Expected-Bytes"),
+                    Some(body.len().to_string().as_str())
+                );
+                assert_eq!(
+                    response.get_header_str("X-Divine-Storage-Cache-Buffer-Reads"),
+                    Some("0")
+                );
+                assert_eq!(
+                    response.get_header_str("X-Divine-Storage-Cache-Buffered-Bytes"),
+                    Some("0")
+                );
+            }
+            if scenario == "streaming_miss" {
+                // The fixture cannot complete the body until this event has
+                // been serialized. No wall-clock threshold or fake completion.
+                assert_eq!(event["storage_cache"], "miss");
+                let release = Request::get("http://telemetry-control/telemetry-finished")
+                    .send("telemetry_control")
+                    .unwrap();
+                assert_eq!(release.get_status().as_u16(), 200);
+            }
             assert_eq!(
                 response.take_body().into_string(),
                 if method == "HEAD" { "" } else { body.as_str() }
@@ -265,6 +296,10 @@ mod tests {
             "warm_hit" | "fallback_hit" | "failed_b2_fallback_hit"
         ) {
             let seed = read("GET", LOAD);
+            assert!(crate::playback_cache::wait_for_last_insert_completion(
+                body.len() as u64,
+                std::time::Instant::now() + Duration::from_millis(250),
+            ));
             if scenario == "failed_b2_fallback_hit" {
                 // Warm the GCS path with missing readiness, then make B2 eligible
                 // for the next request. Both KV and origins are local fixtures.

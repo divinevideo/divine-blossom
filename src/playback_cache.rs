@@ -485,7 +485,13 @@ pub(crate) fn read(
     };
     let (mut writer, found) = match insertion {
         Ok(insertion) => insertion,
-        Err(reason) => return Ok(marked(CanaryOrigin::Delivered(response), Cache::Bypass, reason)),
+        Err(reason) => {
+            return Ok(marked(
+                CanaryOrigin::Delivered(response),
+                Cache::Bypass,
+                reason,
+            ))
+        }
     };
     // Prepare readback before transferring origin ownership. Setup/readback
     // failures still return the untouched source response.

@@ -18,13 +18,28 @@ spec.loader.exec_module(fixtures)
 repo = path.parent.parent
 cases = {
     "cold_miss": ("b2", "miss", "none", True, True),
+    "streaming_miss": ("b2", "miss", "none", True, True),
     "warm_hit": ("none", "hit", "none", False, True),
     "bypass": ("b2", "bypass", "none", True, True),
     "fallback_hit": ("none", "hit", "missing_readiness", False, False),
     "failed_b2_fallback_hit": ("none", "hit", "unavailable", True, False),
 }
+
+
+class TelemetryOrigin(fixtures.Origin):
+    def do_GET(self):
+        if self.path == "/telemetry-finished":
+            self.server.control_calls += 1
+            self.server.media_body_gate.set()
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        else:
+            super().do_GET()
+
+
 failures = []
-with ThreadingHTTPServer(("127.0.0.1", 0), fixtures.Origin) as server:
+with ThreadingHTTPServer(("127.0.0.1", 0), TelemetryOrigin) as server:
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -39,6 +54,8 @@ url = "http://127.0.0.1:{server.server_port}"
 [local_server.backends.gcs_storage]
 url = "http://127.0.0.1:{server.server_port}"
 [local_server.backends.b2_api]
+url = "http://127.0.0.1:{server.server_port}"
+[local_server.backends.telemetry_control]
 url = "http://127.0.0.1:{server.server_port}"
 [local_server.kv_stores.blossom_metadata]
 file = "{kv}"
@@ -59,6 +76,9 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                 server.status = 503 if scenario == "failed_b2_fallback_hit" else 200
                 server.version, server.auth_status = fixtures.VERSION, 200
                 server.gcs_status, server.gcs_size, server.range_mode = 200, 9, "normal"
+                server.media_body_gate = threading.Event() if scenario == "streaming_miss" else None
+                server.gate_started = threading.Event()
+                server.gate_timed_out, server.control_calls = False, 0
                 body = "b2 bytes!" if ready_at_start else "gcsbytes!"
                 server.hash = hashlib.sha256(body.encode()).hexdigest()
                 values = {
@@ -96,6 +116,9 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                 assert [(method, url.split("?", 1)[0]) for method, url, _ in media] == [(method, url.split("?", 1)[0]) for method, url in expected_media], media
                 auth = [request for request in server.requests if request[1] == "/b2api/v4/b2_authorize_account"]
                 assert len(auth) == (2 if scenario == "warm_hit" else 1 if ready_at_start or scenario == "failed_b2_fallback_hit" else 0), server.requests
+                if scenario == "streaming_miss":
+                    assert server.gate_started.is_set() and not server.gate_timed_out
+                    assert server.control_calls == 1
                 print(f"PASS cache telemetry {scenario}", flush=True)
     finally:
         server.shutdown()

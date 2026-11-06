@@ -68,11 +68,16 @@ Native erasure authorization, policy reads, and metadata I/O do not count as
 media-origin attempts. The flat record does not describe each individual attempt.
 
 The cache's actual return branches update typed request-local state directly.
-A usable cache hit reports `storage_cache=hit`; a completed cache fill reports
-`miss`; paths that decline or cannot complete caching report `bypass`, matching
-the existing outward marker semantics. Failed fills are not successful MISS
-fills. Cached X-Divine-Source remains fill provenance and is never read as a
-telemetry provider. Fallback reasons come from the observed demand branch:
+A usable completed cache entry reports `storage_cache=hit`. Native host streaming
+reports `miss` when insertion is selected (`streaming_insert`), before the host
+has completed collecting the body. It is not successful-fill or delivery proof:
+the body may subsequently fail. Setup paths that decline caching report `bypass`.
+`transfer_ms` and `bytes_sent` remain null for every outcome. Future HITs require
+completed host-inferred length equal to expected size; no telemetry timing infers
+host completion. The cache's
+internal random insertion nonce is coordination metadata, separate from playback
+IDs and absent from these records. Cached X-Divine-Source remains fill provenance
+and is never read as a telemetry provider. Fallback reasons come from the observed demand branch:
 missing readiness/version, unavailable origin, copying, or oversized. Strict B2
 mode never falls back and reports `fallback=none` even if it is unavailable.
 Direct canary requests bypass outer VCL, so `outer_cache=bypass`.
