@@ -134,7 +134,8 @@ fn demand_headers(
     response.set_header("X-Sha256", hash);
     response.set_header("X-Content-Length", metadata.size.to_string());
     response.set_header("X-Divine-Source", source);
-    let cache_status = if crate::storage::b2_canary_cache_enabled() {
+    let cache_enabled = crate::storage::b2_canary_cache_enabled();
+    let cache_status = if cache_enabled {
         match response.get_header_str("X-Divine-Storage-Cache") {
             Some("HIT") => "HIT",
             Some("MISS") => "MISS",
@@ -144,6 +145,7 @@ fn demand_headers(
         "BYPASS"
     };
     response.set_header("X-Divine-Storage-Cache", cache_status);
+    crate::playback_cache::attach_diagnostics(&mut response, cache_enabled);
     response.set_header("Accept-Ranges", "bytes");
     crate::add_cors_headers(&mut response);
     no_store(&mut response);
@@ -354,6 +356,17 @@ mod tests {
         let mut first = handle_main(Request::get(&url)).unwrap();
         assert_eq!(first.get_status(), StatusCode::OK);
         assert_eq!(first.get_header_str("X-Divine-Storage-Cache"), Some("MISS"));
+        assert_eq!(
+            first.get_header_str("X-Divine-Storage-Cache-Reason"),
+            Some("inserted")
+        );
+        assert_eq!(
+            first.get_header_str("X-Divine-Storage-Cache-Enabled"),
+            Some("true")
+        );
+        assert!(first
+            .get_header_str("X-Divine-Storage-Cache-Compute")
+            .is_some());
         let bytes = first.take_body().into_bytes();
         assert_eq!(bytes.len(), size);
         assert_eq!(hex::encode(Sha256::digest(bytes)), hash);
@@ -386,6 +399,10 @@ mod tests {
             assert_eq!(
                 first.get_header_str("X-Divine-Storage-Cache"),
                 Some("BYPASS")
+            );
+            assert_eq!(
+                first.get_header_str("X-Divine-Storage-Cache-Reason"),
+                Some("buffer_timeout")
             );
             assert_eq!(first.take_body().into_string(), body);
         } else {
@@ -422,6 +439,10 @@ mod tests {
         assert_eq!(first.take_body().into_string(), expected);
         let mut second = read("GET", None);
         assert_eq!(second.get_header_str("X-Divine-Storage-Cache"), Some("HIT"));
+        assert_eq!(
+            second.get_header_str("X-Divine-Storage-Cache-Reason"),
+            Some("hit")
+        );
         assert_eq!(
             second.get_header_str("X-Divine-Source"),
             Some(source.as_str())

@@ -229,6 +229,18 @@ than retrying until green. The cache is regional: one operator's warm pass is
 not proof that every POP is warm. Disabling this cache flag preserves the
 ordinary demand fallback and durable queue.
 
+Demand responses also report request-local cache diagnostics:
+`X-Divine-Storage-Cache-Reason` distinguishes a disabled flag, ineligible request,
+CPU rejection stage, lookup start/select/wait failure or timeout, origin header
+or metadata rejection, buffering timeout, and insert/write/finish failure.
+`inserted` and `hit` identify successful fills and reads. These fixed codes contain
+no object or provider identifiers. `X-Divine-Storage-Cache-Compute` reports the
+serving Compute version, `X-Divine-Storage-Cache-Enabled` reports the final flag
+read, and `X-Divine-Storage-Cache-Cpu-Ms` reports request CPU consumed when
+available. A false flag includes unavailable configuration reads. None of these
+observations is stored in cache metadata. Record them on the actual probe:
+control-plane activation alone does not establish POP propagation or admission.
+
 Turning this flag off restores strict B2-only mode, including its 503 behavior.
 For ordinary GCS playback, turn off the device flag. Pause worker intake or the
 runner separately; preserve committed queues, state backups, copy gates and
