@@ -33,6 +33,19 @@ CLAIM_FAILURES = frozenset({
     "confirm_absent", "confirm_wrong_owner", "confirm_erasing", "confirm_other",
 })
 
+VALIDATION_FAILURES = frozenset({
+    "source_length", "source_checksum", "destination_version",
+    "destination_length", "destination_checksum",
+    "readiness_identity", "readiness_publication",
+})
+
+
+def validation_error(kind, message):
+    """Keep the existing ValueError while attaching a fixed diagnostic label."""
+    error = ValueError(message)
+    error._b2_validation_kind = kind
+    return error
+
 
 def valid_generation(value):
     return isinstance(value, str) and re.fullmatch(r"[0-9]+", value) and 0 < int(value) < 2 ** 64
@@ -378,7 +391,7 @@ class Worker:
         if reconcile and observed is not None:
             record = observed[0]
             if not readiness_identity_matches(record, key, info, self.source.bucket, self.destination.bucket):
-                raise ValueError("remote readiness cannot be adopted or repaired")
+                raise validation_error("readiness_identity", "remote readiness cannot be adopted or repaired")
             present = self.observe("destination_head", self.destination.exists, key, record["destination_version_id"], info["size"])
             missing_version = not present
             if self.observe("policy_read", approved_metadata, self.kv, key) != meta:
@@ -443,7 +456,7 @@ class Worker:
             budget.spend(count)
             data = self.observe("source_read", self.source.read, key, generation, offset, count)
             if len(data) != count:
-                raise ValueError("source range length mismatch")
+                raise validation_error("source_length", "source range length mismatch")
             with path.open("ab") as handle:
                 handle.write(data)
                 handle.flush()
@@ -454,7 +467,7 @@ class Worker:
             digest = hashlib.file_digest(handle, "sha256").hexdigest()
         if digest != key:
             self.invalidate(key, info, observed=observed, allowed=same_inputs)
-            raise ValueError("source checksum mismatch")
+            raise validation_error("source_checksum", "source checksum mismatch")
         if budget.remaining < 2 * size:
             return "pending"
         if self.observe("source_head", self.source.head, key) != info:
@@ -502,18 +515,18 @@ class Worker:
         version = self.observe("destination_upload", self.destination.upload, key, path, size)
         upload_state["uncertain"] = False
         if not isinstance(version, str) or not version or version == "null":
-            raise ValueError("destination did not return immutable version")
+            raise validation_error("destination_version", "destination did not return immutable version")
         digest = hashlib.sha256()
         for start in range(0, size, self.chunk_bytes):
             count = min(self.chunk_bytes, size - start)
             budget.spend(count)
             data = self.observe("destination_read", self.destination.read, key, version, start, count, size)
             if len(data) != count:
-                raise ValueError("destination range length mismatch")
+                raise validation_error("destination_length", "destination range length mismatch")
             digest.update(data)
         if digest.hexdigest() != key:
             self.invalidate(key, info, observed=None, attempt=attempt)
-            raise ValueError("destination checksum mismatch")
+            raise validation_error("destination_checksum", "destination checksum mismatch")
         if self.observe("source_head", self.source.head, key) != info:
             self.invalidate(key, observed=None, attempt=attempt)
             return "changed"
@@ -527,7 +540,7 @@ class Worker:
         self.observe("readiness_write", self.kv.put, "b2-ready:" + key, record)
         published = self.observe("readiness_read", self.kv.snapshot, "b2-ready:" + key)
         if published is None or published[0] != record:
-            raise ValueError("readiness publication not confirmed")
+            raise validation_error("readiness_publication", "readiness publication not confirmed")
         # No cross-service transaction exists. Endpoint independently gates policy on
         # every request, including a vanish between this last check and publication.
         if self.observe("policy_read", approved_metadata, self.kv, key) != meta:
@@ -623,11 +636,15 @@ class Worker:
                 else:
                     result = self.process(key, budget)
                 report[result] += 1
-            except Exception:
+            except Exception as error:
                 # SDK exceptions may contain signed URLs or identifiers. Only
                 # fixed operation names cross the aggregate report boundary.
                 report["errors"] += 1
                 report["failure_" + (self.failure_stage or "validation_or_state")] += 1
+                if self.failure_stage is None and type(error) is ValueError:
+                    kind = getattr(error, "_b2_validation_kind", None)
+                    if isinstance(kind, str) and kind in VALIDATION_FAILURES:
+                        report["failure_validation_" + kind] += 1
                 if self.failure_detail is not None:
                     report["failure_gate_claim_" + self.failure_detail] += 1
             finally:
