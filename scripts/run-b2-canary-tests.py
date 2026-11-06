@@ -117,6 +117,7 @@ def run(repo, env, test):
                             cwd=repo, env=env, text=True, capture_output=True, timeout=180)
     if result.returncode or "test result: ok. 1 passed; 0 failed; 0 ignored;" not in result.stdout:
         raise RuntimeError(result.stdout + result.stderr)
+    return result.stdout + result.stderr
 
 
 def main():
@@ -180,6 +181,8 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                                 ("demand_cached_b2", 200), ("demand_cached_gcs", 200),
                                 ("demand_cached_wrong_version_b2", 200), ("demand_cached_timeout_b2", 200),
                                 ("demand_cached_large_b2", 200),
+                                ("demand_cached_large_16_b2", 200), ("demand_cached_large_32_b2", 200),
+                                ("demand_cached_large_oversize_b2", 200),
                                 ("demand_b2_overflow_open", 416), ("demand_b2_overflow_end", 206), ("demand_b2_overflow_suffix", 206),
                                 ("demand_b2_416_wrong", 502), ("demand_gcs_416_wrong", 502),
                                 ("demand_b2_416_satisfiable", 502), ("demand_gcs_416_satisfiable", 502),
@@ -356,7 +359,8 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                     values["test_expected_status"] = str(expected)
                     server.hash = HASH
                     if original_case.startswith("demand_cached_"):
-                        payload = b'A' * (8 * 1024 * 1024) if "_large_" in original_case else values["test_body"].encode()
+                        large_mib = 32 if "_large_32_" in original_case or "_oversize_" in original_case else 16 if "_large_16_" in original_case else 8
+                        payload = b'A' * (large_mib * 1024 * 1024 + (1 if "_oversize_" in original_case else 0)) if "_large_" in original_case else values["test_body"].encode()
                         current_hash = hashlib.sha256(payload).hexdigest()
                         values["test_hash"] = current_hash
                         values["test_size"] = str(len(payload))
@@ -371,15 +375,18 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                     settings.write_text(json.dumps(values))
                     kv.write_text(json.dumps({k: json.dumps(v) for k, v in data.items()}))
                     started = time.monotonic()
-                    run(repo, env, "demand_cached_large_contract" if original_case == "demand_cached_large_b2" else "demand_cached_fill_failure_contract" if original_case in ("demand_cached_wrong_version_b2", "demand_cached_timeout_b2") else "demand_cached_playback_contract" if original_case.startswith("demand_cached_") else "demand_endpoint_contract" if demand or original_case.startswith("range_") else "canary_endpoint_integration_contract")
+                    test_output = run(repo, env, "demand_cached_oversize_streams_without_fill" if "_oversize_" in original_case and "_cached_" in original_case else "demand_cached_large_contract" if "_large_" in original_case else "demand_cached_fill_failure_contract" if original_case in ("demand_cached_wrong_version_b2", "demand_cached_timeout_b2") else "demand_cached_playback_contract" if original_case.startswith("demand_cached_") else "demand_endpoint_contract" if demand or original_case.startswith("range_") else "canary_endpoint_integration_contract")
                     if original_case == "demand_origin_slow":
                         assert time.monotonic() - started < 8, "origin timeout exceeded request budget"
                     storage = [r for r in server.requests if r[1].startswith("/private-test/")]
                     if original_case.startswith("demand_cached_"):
                         origin = "/private-test/" if original_case.endswith("_b2") else "/gcs-test/"
                         reads = [r for r in server.requests if r[1].startswith(origin)]
-                        assert [r[0] for r in reads] == (["GET"] if "_large_" in original_case else ["GET", "GET"]), server.requests
-                        detail = "8MiB MISS/checksum then warm HEAD/range with one origin GET" if "_large_" in original_case else "buffer timeout preserves streaming and later fill" if "_timeout_" in original_case else "wrong version rejected, recovery MISS then HIT" if "_wrong_version_" in original_case else "warm GET/HEAD/range/416, purge and policy/erasure denial"
+                        assert [r[0] for r in reads] == (["GET", "HEAD"] if "_oversize_" in original_case else ["GET"] if "_large_" in original_case else ["GET", "GET"]), server.requests
+                        for line in test_output.splitlines():
+                            if line.startswith("CACHE_FILL "):
+                                print(line)
+                        detail = "32MiB+1 streams full/checksum and genuine HEAD without fill" if "_oversize_" in original_case else f"{large_mib}MiB MISS/checksum then warm HEAD/range with one origin GET" if "_large_" in original_case else "buffer timeout preserves streaming and later fill" if "_timeout_" in original_case else "wrong version rejected, recovery MISS then HIT" if "_wrong_version_" in original_case else "warm GET/HEAD/range/416, purge and policy/erasure denial"
                         print(f"PASS {original_case} {detail}")
                         continue
                     if "_overflow_" in original_case:
@@ -464,6 +471,15 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                     run(repo, env, "cache_lookup_wait_is_bounded")
                     assert not server.requests, server.requests
                     print("PASS busy cache lookup times out to uncached origin without waiting for leader")
+                if selected in (None, "cache_visibility"):
+                    server.requests = []
+                    config.write_text(manifest)
+                    settings.write_text(json.dumps(base))
+                    kv.write_text("{}")
+                    run(repo, env, "incomplete_cache_insertion_is_not_a_hit")
+                    run(repo, env, "aborted_cache_insert_never_serves_a_partial_hit")
+                    assert not server.requests, server.requests
+                    print("PASS incomplete cache insertion bypasses until complete length is known")
                 kv.write_text("{}")
                 server.hash = HASH
                 server.auth_status = 200
