@@ -27,6 +27,32 @@ const REQUEST_CPU_BUDGET_MS: u64 = 25;
 
 thread_local! {
     static REQUEST_CPU_BASELINE: Cell<Option<u64>> = const { Cell::new(None) };
+    #[cfg(test)]
+    static LAST_INSERTED_KEY: Cell<Option<String>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn wait_for_last_insert_completion(expected_size: u64, deadline: Instant) -> bool {
+    let Some(key) = LAST_INSERTED_KEY.take() else {
+        return false;
+    };
+    while Instant::now() < deadline {
+        let Ok(transaction) = lookup(key.clone(), deadline) else {
+            return false;
+        };
+        let transaction = CacheTransaction(Some(transaction));
+        if transaction
+            .0
+            .as_ref()
+            .and_then(Transaction::found)
+            .is_some_and(|found| found.known_length() == Some(expected_size))
+        {
+            return true;
+        }
+        drop(transaction);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    false
 }
 
 /// Reset at the start of each request, including requests in a reused test VM.
@@ -436,6 +462,8 @@ pub(crate) fn read(
             "handoff_budget",
         ));
     }
+    #[cfg(test)]
+    let insertion_key = key.clone();
     let insertion = if transaction.0.as_ref().unwrap().must_insert_or_update() {
         begin_insert(
             transaction.0.take().expect("owned transaction"),
@@ -489,6 +517,8 @@ pub(crate) fn read(
     );
     response.set_header("X-Divine-Storage-Cache-Buffer-Reads", "0");
     response.set_header("X-Divine-Storage-Cache-Buffered-Bytes", "0");
+    #[cfg(test)]
+    LAST_INSERTED_KEY.set(Some(insertion_key));
     Ok(marked(
         CanaryOrigin::Delivered(response),
         "MISS",

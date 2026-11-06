@@ -345,6 +345,15 @@ fn handle_with_origin(
 mod tests {
     use crate::handle_main;
     use fastly::{http::StatusCode, Request};
+
+    fn await_cache_collection(size: u64) {
+        // EOF can precede the host collector publishing inferred length. Wait
+        // for that storage event without retrying any playback/origin request.
+        assert!(crate::playback_cache::wait_for_last_insert_completion(
+            size,
+            std::time::Instant::now() + std::time::Duration::from_millis(250),
+        ));
+    }
     #[test]
     #[ignore = "requires demand fixtures; scripts/run-b2-canary-tests.py"]
     fn demand_cached_large_contract() {
@@ -436,6 +445,7 @@ mod tests {
         }
         assert_eq!(received, size);
         assert_eq!(hex::encode(digest.finalize()), hash);
+        await_cache_collection(size as u64);
         let mut head = handle_main(Request::new("HEAD", &url)).unwrap();
         assert_eq!(head.get_header_str("X-Divine-Storage-Cache"), Some("HIT"));
         assert_eq!(head.take_body().into_string(), "");
@@ -515,6 +525,7 @@ mod tests {
                 Some("streaming_insert")
             );
             assert_eq!(first.take_body().into_string(), body);
+            await_cache_collection(body.len() as u64);
         } else {
             assert_eq!(first.get_status(), StatusCode::BAD_GATEWAY);
         }
@@ -525,6 +536,9 @@ mod tests {
             Some(if timeout { "HIT" } else { "MISS" })
         );
         assert_eq!(retry.take_body().into_string(), body);
+        if !timeout {
+            await_cache_collection(body.len() as u64);
+        }
         let mut warm = handle_main(Request::get(&url)).unwrap();
         assert_eq!(warm.get_header_str("X-Divine-Storage-Cache"), Some("HIT"));
         assert_eq!(warm.take_body().into_string(), body);
@@ -550,6 +564,7 @@ mod tests {
         assert_eq!(first.get_status(), StatusCode::OK);
         assert_eq!(first.get_header_str("X-Divine-Storage-Cache"), Some("MISS"));
         assert_eq!(first.take_body().into_string(), expected);
+        await_cache_collection(expected.len() as u64);
         let mut second = read("GET", None);
         assert_eq!(second.get_header_str("X-Divine-Storage-Cache"), Some("HIT"));
         assert_eq!(
@@ -586,6 +601,7 @@ mod tests {
             Some("MISS")
         );
         assert_eq!(after_purge.take_body().into_string(), expected);
+        await_cache_collection(expected.len() as u64);
         let store = crate::metadata::open_store().unwrap();
         let mut metadata = crate::metadata::get_blob_metadata_uncached(&hash)
             .unwrap()
