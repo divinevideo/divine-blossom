@@ -295,7 +295,41 @@ fn download_media_object(
     immutable: bool,
     uncached: bool,
 ) -> Result<(Response, &'static str)> {
-    let policy = media_read_policy()?;
+    download_object_with_policy(media_read_policy()?, key, range, immutable, uncached)
+}
+
+fn download_derived_media_object(
+    key: &str,
+    range: Option<&str>,
+    uncached: bool,
+) -> Result<Response> {
+    // Originals and derived artifacts are migrated independently. Never inherit
+    // an original-only rollout flag before the artifact family is available.
+    let policy = MediaReadPolicy::parse(
+        get_config("derived_media_read_primary").ok().as_deref(),
+        get_config("derived_media_gcs_fallback_enabled").ok().as_deref(),
+    )
+    .map_err(|_| BlossomError::StorageError("Invalid derived media origin policy".into()))?;
+    let (mut response, source) = download_object_with_policy(policy, key, range, false, uncached)?;
+    if source == "b2" {
+        // Existing derivative handlers consume the GCS spellings. Preserve the
+        // public provenance contract when the private storage provider changes.
+        for name in ["c2pa-manifest-id", "source-sha256"] {
+            if let Some(value) = response.get_header(format!("x-amz-meta-{name}")).cloned() {
+                response.set_header(format!("x-goog-meta-{name}"), value);
+            }
+        }
+    }
+    Ok(response)
+}
+
+fn download_object_with_policy(
+    policy: MediaReadPolicy,
+    key: &str,
+    range: Option<&str>,
+    immutable: bool,
+    uncached: bool,
+) -> Result<(Response, &'static str)> {
     let response = fetch_media_origin(policy.primary, key, range, immutable, uncached);
     let should_fallback = match &response {
         Ok(resp) => policy.should_fallback(resp.get_status().as_u16()),
@@ -774,11 +808,9 @@ pub fn upload_blob(
     Ok(())
 }
 
-/// Derivatives stay on the writer's origin until derivative replication ships.
-/// Download a thumbnail from GCS (stored as {hash}.jpg).
+/// Download a thumbnail from the independently selected derived-media origin.
 pub fn download_thumbnail(gcs_key: &str) -> Result<Response> {
-    let resp = fetch_media_origin(StorageProvider::Gcs, gcs_key, None, false, false)
-        .map_err(MediaFetchError::into_storage_error)?;
+    let resp = download_derived_media_object(gcs_key, None, false)?;
 
     match resp.get_status() {
         StatusCode::OK => Ok(resp),
@@ -790,11 +822,11 @@ pub fn download_thumbnail(gcs_key: &str) -> Result<Response> {
     }
 }
 
-/// Download HLS content from GCS (manifests and segments)
+/// Download HLS and optimized MP4 from the selected derived-media origin.
+/// The historical function name is retained for existing callers.
 /// gcs_key format: {hash}/hls/{filename}
 pub fn download_hls_from_gcs(gcs_key: &str, range: Option<&str>) -> Result<Response> {
-    let resp = fetch_media_origin(StorageProvider::Gcs, gcs_key, range, false, false)
-        .map_err(MediaFetchError::into_storage_error)?;
+    let resp = download_derived_media_object(gcs_key, range, false)?;
 
     match resp.get_status() {
         StatusCode::OK | StatusCode::PARTIAL_CONTENT => Ok(resp),
@@ -806,13 +838,19 @@ pub fn download_hls_from_gcs(gcs_key: &str, range: Option<&str>) -> Result<Respo
     }
 }
 
-/// Download transcript content from GCS (WebVTT files)
+/// Download public WebVTT from the selected derived-media origin.
 /// gcs_key format: {hash}/vtt/{filename}
 pub fn download_transcript_from_gcs(gcs_key: &str) -> Result<Response> {
-    download_transcript_object_from_gcs(gcs_key, false)
+    transcript_download_response(download_derived_media_object(gcs_key, None, false)?)
 }
 
-/// Mutable sources and job states must bypass the backend cache as well as Simple Cache.
+/// Fetch current public subtitle bytes without caching (translation source).
+pub fn download_transcript_uncached(gcs_key: &str) -> Result<Response> {
+    transcript_download_response(download_derived_media_object(gcs_key, None, true)?)
+}
+
+/// Internal job state stays on its writer origin until coordination migrates.
+/// Bypass the backend cache as well as Simple Cache.
 pub fn download_transcript_uncached_from_gcs(gcs_key: &str) -> Result<Response> {
     download_transcript_object_from_gcs(gcs_key, true)
 }
@@ -820,7 +858,10 @@ pub fn download_transcript_uncached_from_gcs(gcs_key: &str) -> Result<Response> 
 fn download_transcript_object_from_gcs(gcs_key: &str, uncached: bool) -> Result<Response> {
     let resp = fetch_media_origin(StorageProvider::Gcs, gcs_key, None, false, uncached)
         .map_err(MediaFetchError::into_storage_error)?;
+    transcript_download_response(resp)
+}
 
+fn transcript_download_response(resp: Response) -> Result<Response> {
     match resp.get_status() {
         StatusCode::OK => Ok(resp),
         StatusCode::NOT_FOUND => Err(BlossomError::NotFound(
@@ -835,8 +876,7 @@ fn download_transcript_object_from_gcs(gcs_key: &str, uncached: bool) -> Result<
 
 /// Download a stored sound classification (`{hash}/audio/analysis.json`).
 pub fn download_sound_analysis_from_gcs(gcs_key: &str) -> Result<Response> {
-    let resp = fetch_media_origin(StorageProvider::Gcs, gcs_key, None, false, false)
-        .map_err(MediaFetchError::into_storage_error)?;
+    let resp = download_derived_media_object(gcs_key, None, false)?;
 
     match resp.get_status() {
         StatusCode::OK => Ok(resp),
@@ -4150,6 +4190,52 @@ mod tests {
         ] {
             assert!(!super::transient_canary_origin_error(&cause));
         }
+    }
+
+    #[test]
+    #[ignore = "requires synthetic storage backends; run-media-origin-tests.py"]
+    fn derived_origin_b2_without_gcs_contract() {
+        for mut response in [
+            super::download_thumbnail("fixture.jpg").unwrap(),
+            super::download_hls_from_gcs("fixture/hls/720p.mp4", Some("bytes=1-3")).unwrap(),
+            super::download_transcript_from_gcs("fixture/vtt/main.vtt").unwrap(),
+            super::download_transcript_uncached("fixture/vtt/main.vtt").unwrap(),
+            super::download_sound_analysis_from_gcs("fixture/audio/analysis.json").unwrap(),
+        ] {
+            assert_eq!(response.get_header_str("x-goog-meta-c2pa-manifest-id"), Some("synthetic-manifest"));
+            assert_eq!(response.get_header_str("x-goog-meta-source-sha256"), Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+            if response.get_status() == fastly::http::StatusCode::PARTIAL_CONTENT {
+                assert_eq!(response.get_header_str("Content-Range"), Some("bytes 1-3/8"));
+                assert_eq!(response.take_body().into_string(), "2 b");
+            } else {
+                assert_eq!(response.take_body().into_string(), "b2 bytes");
+            }
+        }
+        assert!(super::download_thumbnail("missing").is_err());
+        assert!(super::download_thumbnail("forbidden").is_err());
+    }
+
+    #[test]
+    #[ignore = "requires synthetic storage backends; run-media-origin-tests.py"]
+    fn derived_origin_default_independent_contract() {
+        let mut response = super::download_hls_from_gcs("fixture/hls/720p.mp4", None).unwrap();
+        assert_eq!(response.take_body().into_string(), "gcs bytes");
+    }
+
+    #[test]
+    #[ignore = "requires synthetic storage backends; run-media-origin-tests.py"]
+    fn derived_origin_fallback_contract() {
+        let mut response = super::download_thumbnail("missing").unwrap();
+        assert_eq!(response.take_body().into_string(), "gcs bytes");
+        assert!(super::download_thumbnail("forbidden").is_err());
+        let mut job = super::download_transcript_uncached_from_gcs("fixture/vtt/job.json").unwrap();
+        assert_eq!(job.take_body().into_string(), "gcs bytes");
+    }
+
+    #[test]
+    #[ignore = "requires synthetic storage backends; run-media-origin-tests.py"]
+    fn derived_origin_invalid_config_contract() {
+        assert!(super::download_thumbnail("fixture.jpg").is_err());
     }
 
     #[test]
