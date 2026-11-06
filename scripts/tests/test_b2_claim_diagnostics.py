@@ -35,7 +35,7 @@ class ClaimHTTP:
         if self.claimed and key.startswith('b2-sync:'):
             if isinstance(self.reply, Exception):
                 raise self.reply
-            return self.reply
+            return (self.reply, {'generation': '7'}) if options.get('include_headers') and self.reply is not None else self.reply
         result = self.values.get(key)
         return (result, {'generation': '7'}) if options.get('include_headers') and result is not None else result
 
@@ -167,7 +167,7 @@ class ClaimDiagnosticsTests(unittest.TestCase):
                 if method == 'PUT':
                     self.value = value
                     return False if self.conflict else None
-                return self.value
+                return (self.value, {'generation': '7'}) if options.get('include_headers') else self.value
         for conflict in (True, False):
             http = HTTP(conflict)
             kv = mirror.FastlyKV('synthetic', SECRET, http=http)
