@@ -1723,8 +1723,66 @@ fn parse_transcript_status_webhook_payload(
     })
 }
 
+// Metadata writers emit UTC whole-second timestamps. Unknown legacy formats
+// are recoverable: the worker's generation-checked GCS lock remains authoritative.
+fn transcript_attempt_epoch_secs(value: &str) -> Option<u64> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 20
+        || !value.is_ascii()
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+    {
+        return None;
+    }
+    let number = |start: usize, end: usize| -> Option<u64> {
+        let part = &value[start..end];
+        part.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| part.parse().ok())
+            .flatten()
+    };
+    let year = number(0, 4)?;
+    let month = number(5, 7)?;
+    let day = number(8, 10)?;
+    let hour = number(11, 13)?;
+    let minute = number(14, 16)?;
+    let second = number(17, 19)?;
+    if year < 1970 || !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let months = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if day == 0 || day > months[month as usize - 1] {
+        return None;
+    }
+    let leaps_before = |y: u64| y / 4 - y / 100 + y / 400;
+    let days = (year - 1970) * 365 + leaps_before(year - 1) - leaps_before(1969)
+        + months[..month as usize - 1].iter().sum::<u64>()
+        + day
+        - 1;
+    Some(days * 86400 + hour * 3600 + minute * 60 + second)
+}
+
 fn decide_transcript_fetch_action(
     status: Option<TranscriptStatus>,
+    last_attempt_at: Option<&str>,
     retry_after_epoch_secs: Option<u64>,
     attempt_count: u32,
     terminal: bool,
@@ -1737,11 +1795,22 @@ fn decide_transcript_fetch_action(
         return TranscriptFetchAction::Terminal;
     }
 
-    if matches!(status, Some(TranscriptStatus::Processing)) {
+    // Match the worker's 900-second lock lease. An expired/missing timestamp
+    // allows another dispatch, never a lock deletion or policy override here.
+    let processing_fresh = last_attempt_at
+        .and_then(transcript_attempt_epoch_secs)
+        .is_some_and(|started| now_epoch_secs.saturating_sub(started) < 900);
+    if matches!(status, Some(TranscriptStatus::Processing)) && processing_fresh {
         return TranscriptFetchAction::Accepted {
             state: TranscriptPendingState::InProgress,
             retry_after_secs: 5,
         };
+    }
+
+    if matches!(status, Some(TranscriptStatus::Processing))
+        && attempt_count >= DERIVATIVE_MAX_ATTEMPTS
+    {
+        return TranscriptFetchAction::Terminal;
     }
 
     if let Some(retry_after_epoch_secs) = retry_after_epoch_secs {
@@ -1934,6 +2003,7 @@ fn serve_transcript_by_hash(
             // Transcript does not exist yet. Trigger transcription if needed.
             match decide_transcript_fetch_action(
                 metadata.transcript_status,
+                metadata.transcript_last_attempt_at.as_deref(),
                 metadata.transcript_retry_after,
                 metadata.transcript_attempt_count,
                 metadata.transcript_terminal,
@@ -2129,6 +2199,7 @@ fn handle_head_transcript_by_hash(hash: &str) -> Result<Response> {
         }
         Err(BlossomError::NotFound(_)) => match decide_transcript_fetch_action(
             metadata.transcript_status,
+            metadata.transcript_last_attempt_at.as_deref(),
             metadata.transcript_retry_after,
             metadata.transcript_attempt_count,
             metadata.transcript_terminal,
@@ -8098,10 +8169,154 @@ mod tests {
     }
 
     #[test]
+    fn transcript_fetch_action_recovers_abandoned_processing() {
+        for last_attempt in [Some("1970-01-01T00:00:00Z"), None, Some("malformed")] {
+            assert_eq!(
+                decide_transcript_fetch_action(
+                    Some(TranscriptStatus::Processing),
+                    last_attempt,
+                    None,
+                    0,
+                    false,
+                    901
+                ),
+                TranscriptFetchAction::Trigger {
+                    retry_after_secs: 10,
+                    should_repair: false
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_processing_lease_boundary_and_clock_skew() {
+        for now in [0, 899] {
+            assert_eq!(
+                decide_transcript_fetch_action(
+                    Some(TranscriptStatus::Processing),
+                    Some("1970-01-01T00:00:00Z"),
+                    None,
+                    0,
+                    false,
+                    now
+                ),
+                TranscriptFetchAction::Accepted {
+                    state: TranscriptPendingState::InProgress,
+                    retry_after_secs: 5
+                }
+            );
+        }
+        assert_eq!(
+            decide_transcript_fetch_action(
+                Some(TranscriptStatus::Processing),
+                Some("1970-01-01T00:00:00Z"),
+                None,
+                0,
+                false,
+                900
+            ),
+            TranscriptFetchAction::Trigger {
+                retry_after_secs: 10,
+                should_repair: false
+            }
+        );
+        assert_eq!(
+            decide_transcript_fetch_action(
+                Some(TranscriptStatus::Processing),
+                Some("1970-01-01T00:16:40Z"),
+                None,
+                0,
+                false,
+                900
+            ),
+            TranscriptFetchAction::Accepted {
+                state: TranscriptPendingState::InProgress,
+                retry_after_secs: 5
+            }
+        );
+    }
+
+    #[test]
+    fn stale_transcript_processing_preserves_retry_limits() {
+        assert_eq!(
+            decide_transcript_fetch_action(
+                Some(TranscriptStatus::Processing),
+                None,
+                Some(1030),
+                1,
+                false,
+                1000
+            ),
+            TranscriptFetchAction::Accepted {
+                state: TranscriptPendingState::CoolingDown,
+                retry_after_secs: 30
+            }
+        );
+        assert_eq!(
+            decide_transcript_fetch_action(
+                Some(TranscriptStatus::Processing),
+                None,
+                None,
+                3,
+                false,
+                1000
+            ),
+            TranscriptFetchAction::Terminal
+        );
+        assert_eq!(
+            decide_transcript_fetch_action(
+                Some(TranscriptStatus::Processing),
+                None,
+                None,
+                0,
+                true,
+                1000
+            ),
+            TranscriptFetchAction::Terminal
+        );
+    }
+
+    #[test]
+    fn transcript_attempt_timestamp_validates_calendar_and_format() {
+        use super::transcript_attempt_epoch_secs;
+        assert_eq!(
+            transcript_attempt_epoch_secs("1970-01-01T00:00:00Z"),
+            Some(0)
+        );
+        assert_eq!(
+            transcript_attempt_epoch_secs("2000-02-29T12:34:56Z"),
+            Some(951827696)
+        );
+        assert_eq!(
+            transcript_attempt_epoch_secs("2026-11-06T00:00:00Z"),
+            Some(1793923200)
+        );
+        for value in [
+            "",
+            "malformed",
+            "1970-00-01T00:00:00Z",
+            "1970-01-00T00:00:00Z",
+            "1970-02-29T00:00:00Z",
+            "2100-02-29T00:00:00Z",
+            "1970-04-31T00:00:00Z",
+            "1970-01-01T24:00:00Z",
+            "1970-01-01T00:60:00Z",
+            "1970-01-01T00:00:60Z",
+            "1970-01-01T00:00:00+00:00",
+            "1970-01-01T00:00:00.1Z",
+            "é970-01-01T00:00:00Z",
+            "1969-01-01T00:00:00Z",
+        ] {
+            assert_eq!(transcript_attempt_epoch_secs(value), None, "{value}");
+        }
+    }
+
+    #[test]
     fn transcript_fetch_action_cools_down_when_retry_after_is_in_future() {
         assert_eq!(
             decide_transcript_fetch_action(
                 Some(TranscriptStatus::Failed),
+                Some("1970-01-01T00:16:40Z"),
                 Some(1_030),
                 1,
                 false,
@@ -8119,6 +8334,7 @@ mod tests {
         assert_eq!(
             decide_transcript_fetch_action(
                 Some(TranscriptStatus::Processing),
+                Some("1970-01-01T00:16:40Z"),
                 None,
                 0,
                 false,
@@ -8134,7 +8350,14 @@ mod tests {
     #[test]
     fn transcript_fetch_action_triggers_pending_items_without_cooldown() {
         assert_eq!(
-            decide_transcript_fetch_action(Some(TranscriptStatus::Pending), None, 0, false, 1_000,),
+            decide_transcript_fetch_action(
+                Some(TranscriptStatus::Pending),
+                Some("1970-01-01T00:16:40Z"),
+                None,
+                0,
+                false,
+                1_000,
+            ),
             TranscriptFetchAction::Trigger {
                 retry_after_secs: 10,
                 should_repair: false,
@@ -8145,7 +8368,14 @@ mod tests {
     #[test]
     fn transcript_fetch_action_repairs_missing_vtt_for_complete_status() {
         assert_eq!(
-            decide_transcript_fetch_action(Some(TranscriptStatus::Complete), None, 0, false, 1_000,),
+            decide_transcript_fetch_action(
+                Some(TranscriptStatus::Complete),
+                Some("1970-01-01T00:16:40Z"),
+                None,
+                0,
+                false,
+                1_000,
+            ),
             TranscriptFetchAction::Trigger {
                 retry_after_secs: 10,
                 should_repair: true,
@@ -8156,7 +8386,14 @@ mod tests {
     #[test]
     fn transcript_fetch_action_retries_failed_items_under_cap() {
         assert_eq!(
-            decide_transcript_fetch_action(Some(TranscriptStatus::Failed), None, 2, false, 1_000,),
+            decide_transcript_fetch_action(
+                Some(TranscriptStatus::Failed),
+                Some("1970-01-01T00:16:40Z"),
+                None,
+                2,
+                false,
+                1_000,
+            ),
             TranscriptFetchAction::Trigger {
                 retry_after_secs: 10,
                 should_repair: false,
@@ -8167,7 +8404,14 @@ mod tests {
     #[test]
     fn transcript_fetch_action_stops_retrying_at_cap() {
         assert_eq!(
-            decide_transcript_fetch_action(Some(TranscriptStatus::Failed), None, 3, false, 1_000,),
+            decide_transcript_fetch_action(
+                Some(TranscriptStatus::Failed),
+                Some("1970-01-01T00:16:40Z"),
+                None,
+                3,
+                false,
+                1_000,
+            ),
             TranscriptFetchAction::Terminal
         );
     }
@@ -8175,7 +8419,14 @@ mod tests {
     #[test]
     fn transcript_fetch_action_honors_terminal_failure() {
         assert_eq!(
-            decide_transcript_fetch_action(Some(TranscriptStatus::Failed), None, 1, true, 1_000,),
+            decide_transcript_fetch_action(
+                Some(TranscriptStatus::Failed),
+                Some("1970-01-01T00:16:40Z"),
+                None,
+                1,
+                true,
+                1_000,
+            ),
             TranscriptFetchAction::Terminal
         );
     }
