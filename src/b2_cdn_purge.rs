@@ -75,14 +75,16 @@ enum RecordState {
     Cleared,
 }
 
-/// Which revocation phase an intent belongs to. A single-hash policy change
-/// uses `Single`; account vanish and creator deletion use `Early` then `Final`.
-/// The phase is stored with the intent so the drain purges the right phase and
-/// the phase state machine advances only for the matching attempt.
+/// Which revocation an intent belongs to.
+///
+/// `Single` is a policy or gate change with no physical wave. `Final` is the
+/// blocking purge after a bounded physical erase: when its checked purge
+/// succeeds the drain advances the hash's phase record and writes the receipt.
+/// An early eviction is opportunistic and deliberately not a phase, so it can
+/// never gate progress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
     Single,
-    Early,
     Final,
 }
 
@@ -90,7 +92,6 @@ impl Phase {
     fn as_str(self) -> &'static str {
         match self {
             Phase::Single => "single",
-            Phase::Early => "early",
             Phase::Final => "final",
         }
     }
@@ -98,7 +99,6 @@ impl Phase {
     fn parse(value: &str) -> Option<Self> {
         Some(match value {
             "single" => Phase::Single,
-            "early" => Phase::Early,
             "final" => Phase::Final,
             _ => return None,
         })
@@ -684,25 +684,29 @@ fn drain(
                     processed += 1;
                     match purge(&[snapshot.hash.clone()]) {
                         Ok(()) => {
-                            // Phase intents advance the phase state machine
-                            // before the intent is cleared. A failure leaves
-                            // both records outstanding, so a checked purge is
-                            // never claimed as an acknowledgement.
-                            let phased = snapshot.record.phase != Phase::Single;
-                            if phased
-                                && crate::b2_cdn_phase::mark_purged(
-                                    store,
-                                    snapshot.record.phase.as_str(),
-                                    &snapshot.hash,
-                                )?
-                            {
-                                let token = Token {
-                                    key: snapshot.key.clone(),
-                                    hash: snapshot.hash.clone(),
-                                    attempt: snapshot.record.attempt.clone(),
-                                    generation: snapshot.generation,
-                                };
-                                ack_with_store(store, &token, snapshot.record.phase.as_str())?;
+                            // Only the final phase is blocking. Advance the
+                            // phase record, bound to the epoch the intent was
+                            // created for, then write the attempt-bound receipt.
+                            // A failure leaves both outstanding, so a checked
+                            // purge is never claimed as an acknowledgement.
+                            if snapshot.record.phase == Phase::Final {
+                                let phase_epoch =
+                                    crate::b2_cdn_phase::epoch(&snapshot.hash)?;
+                                if let Some(phase_epoch) = phase_epoch {
+                                    if crate::b2_cdn_phase::mark_final_purged(
+                                        store,
+                                        &snapshot.hash,
+                                        &phase_epoch,
+                                    )? {
+                                        let token = Token {
+                                            key: snapshot.key.clone(),
+                                            hash: snapshot.hash.clone(),
+                                            attempt: snapshot.record.attempt.clone(),
+                                            generation: snapshot.generation,
+                                        };
+                                        ack_with_store(store, &token, "final")?;
+                                    }
+                                }
                             }
                             match complete_observed(store, &snapshot)? {
                                 true => outcome.result += 1,
@@ -1412,8 +1416,8 @@ mod tests {
 
         #[test]
         #[ignore = "requires local KV fixture; scripts/run-b2-cdn-purge-outbox-tests.py"]
-        fn phased_drain_acks_early_and_final_and_advances_the_state_machine() {
-            use crate::b2_cdn_phase::{self, PhysicalOutcome, State};
+        fn final_drain_advances_the_phase_and_writes_the_receipt() {
+            use crate::b2_cdn_phase::{self, Physical};
             let store = store();
             reset_all(&store);
             let hash = "bd".repeat(32);
@@ -1421,33 +1425,16 @@ mod tests {
                 .build_delete()
                 .execute(&format!("b2-cdn-phase:v1:{hash}"));
 
-            // Early phase: deny/erasing gate persisted, early purge outstanding.
-            b2_cdn_phase::begin_early(&hash).unwrap();
-            let early = begin_phase(&hash, Phase::Early).unwrap();
-            assert_eq!(commit(&store, &early).unwrap(), CommitOutcome::Committed);
-            let outcome = drain(&store, 2, purge_ok).unwrap();
-            assert_eq!(outcome.result, 1);
-            assert_eq!(
-                b2_cdn_phase::state(&hash).unwrap(),
-                Some(State::EarlyAcked),
-                "drain must advance the early phase"
-            );
-            assert!(acknowledged(&store, &early, "early").unwrap());
+            // Physical wave confirms absence, then the final intent is queued.
+            let epoch = b2_cdn_phase::begin_erase(&hash).unwrap();
+            b2_cdn_phase::record_physical(&hash, &epoch, Physical::Absent).unwrap();
+            assert!(b2_cdn_phase::final_purge_pending(&hash).unwrap());
 
-            // Physical wave, then the final phase.
-            b2_cdn_phase::record_physical(&hash, PhysicalOutcome::Absent).unwrap();
-            let final_token = begin_phase(&hash, Phase::Final).unwrap();
-            assert_eq!(
-                commit(&store, &final_token).unwrap(),
-                CommitOutcome::Committed
-            );
+            let token = begin_phase(&hash, Phase::Final).unwrap();
+            assert_eq!(commit(&store, &token).unwrap(), CommitOutcome::Committed);
             let outcome = drain(&store, 2, purge_ok).unwrap();
             assert_eq!(outcome.result, 1);
-            assert_eq!(
-                b2_cdn_phase::state(&hash).unwrap(),
-                Some(State::FinalAcked)
-            );
-            assert!(acknowledged(&store, &final_token, "final").unwrap());
+            assert!(acknowledged(&store, &token, "final").unwrap());
             assert!(b2_cdn_phase::complete_ready(&hash).unwrap());
             let _ = store
                 .build_delete()
@@ -1457,27 +1444,24 @@ mod tests {
 
         #[test]
         #[ignore = "requires local KV fixture; scripts/run-b2-cdn-purge-outbox-tests.py"]
-        fn phased_purge_failure_never_advances_or_acks_the_phase() {
-            use crate::b2_cdn_phase::{self, State};
+        fn a_failed_final_purge_never_acks_or_completes() {
+            use crate::b2_cdn_phase::{self, Physical};
             let store = store();
             reset_all(&store);
             let hash = "be".repeat(32);
             let _ = store
                 .build_delete()
                 .execute(&format!("b2-cdn-phase:v1:{hash}"));
-            b2_cdn_phase::begin_early(&hash).unwrap();
-            let token = begin_phase(&hash, Phase::Early).unwrap();
+            let epoch = b2_cdn_phase::begin_erase(&hash).unwrap();
+            b2_cdn_phase::record_physical(&hash, &epoch, Physical::Absent).unwrap();
+            let token = begin_phase(&hash, Phase::Final).unwrap();
             commit(&store, &token).unwrap();
 
             let outcome = drain(&store, 2, purge_fail).unwrap();
             assert_eq!(outcome.result, 0);
             assert_eq!(outcome.errors, 1);
-            assert_eq!(
-                b2_cdn_phase::state(&hash).unwrap(),
-                Some(State::EarlyPending),
-                "a failed purge must not acknowledge the phase"
-            );
-            assert!(!acknowledged(&store, &token, "early").unwrap());
+            assert!(!acknowledged(&store, &token, "final").unwrap());
+            assert!(!b2_cdn_phase::complete_ready(&hash).unwrap());
             let _ = store
                 .build_delete()
                 .execute(&format!("b2-cdn-phase:v1:{hash}"));

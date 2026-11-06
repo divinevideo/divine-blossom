@@ -2435,71 +2435,149 @@ fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) -> H
     purged
 }
 
-/// Persist the deny/erasing gate and an early-phase purge intent for a hash the
-/// caller is about to erase. Must run before the physical wave so a warm outer
-/// entry is invalidated even if the wave is interrupted.
+/// Whether a warm outer CDN copy could exist for this object. Invalidation
+/// depends only on retained CDN configuration, never on the admission or
+/// replica flags: turning either off does not revoke an already-stored outer
+/// response.
+pub(crate) fn cdn_invalidation_configured() -> bool {
+    crate::b2_cdn_purge::configured()
+}
+
+/// Decide the physical outcome for one hash. Pure so the rollback trap is
+/// covered without a provider.
 ///
-/// Returns `true` when the early phase is outstanding and the caller must wait
-/// for the bounded drain to acknowledge it before treating the hash as done.
-/// A missing B2 replica or disabled outbox returns `false` without side effects.
-pub(crate) fn begin_vanish_early_phase(hash: &str) -> Result<bool> {
-    if !b2_replica_enabled() || !crate::b2_cdn_purge::configured() {
-        return Ok(false);
+/// A skipped B2 erase is never `Absent`: with the replica flag off the versions
+/// were not deleted, so claiming absence would mark warm content safe while it
+/// still exists. It is a failure that keeps the hash pending.
+fn vanish_physical_outcome(
+    hash: &str,
+    failed: &HashSet<String>,
+    remaining: &HashSet<String>,
+    replica_enabled: bool,
+) -> crate::b2_cdn_phase::Physical {
+    use crate::b2_cdn_phase::Physical;
+    if failed.contains(hash) || !replica_enabled {
+        Physical::Failed
+    } else if remaining.contains(hash) {
+        Physical::Unknown
+    } else {
+        Physical::Absent
+    }
+}
+
+/// Persist the deny/erasing gate and open a phased physical attempt for a hash
+/// the caller is about to erase. Must run before the physical wave so a warm
+/// outer entry is invalidated even if the wave is interrupted.
+///
+/// Gated only on CDN invalidation configuration. Returns the attempt's epoch,
+/// or `None` when CDN invalidation is not configured.
+pub(crate) fn begin_vanish_phase(hash: &str) -> Result<Option<String>> {
+    if !cdn_invalidation_configured() {
+        return Ok(None);
     }
     crate::metadata::claim_b2_erasure(hash)?;
-    crate::b2_cdn_phase::begin_early(hash)?;
-    crate::b2_cdn_purge::enqueue(hash, crate::b2_cdn_purge::Phase::Early)?;
+    Ok(Some(crate::b2_cdn_phase::begin_erase(hash)?))
+}
+
+/// Whether the bounded wave must run for this hash. A completed hash and an
+/// already-absent hash never replay their physical erase.
+pub(crate) fn vanish_needs_physical(hash: &str) -> bool {
+    crate::b2_cdn_phase::needs_physical(hash).unwrap_or(true)
+}
+
+/// Record the wave's outcome for the exact attempt and queue the blocking final
+/// purge when the outcome is definite. A failed or replica-skipped wave is
+/// purged too, so cached bytes leave the CDN; it simply can never complete. An
+/// unknown outcome stays pending for a read-only reconcile and is not purged.
+///
+/// Returns `true` when a final intent was queued.
+pub(crate) fn finish_vanish_phase(
+    hash: &str,
+    epoch: &str,
+    failed: &HashSet<String>,
+    remaining: &HashSet<String>,
+) -> Result<bool> {
+    if !cdn_invalidation_configured() {
+        return Ok(false);
+    }
+    let outcome = vanish_physical_outcome(hash, failed, remaining, b2_replica_enabled());
+    crate::b2_cdn_phase::record_physical(hash, epoch, outcome)?;
+    if !crate::b2_cdn_phase::final_purge_pending(hash)? {
+        return Ok(false);
+    }
+    crate::b2_cdn_purge::enqueue(hash, crate::b2_cdn_purge::Phase::Final)?;
     Ok(true)
 }
 
-/// Record the physical-wave outcome for every hash in the wave, including one
-/// that failed, and enqueue the final purge. Called after the wave so the final
-/// phase exists even when provider deletion failed.
-///
-/// Returns the hashes whose final phase is outstanding. A hash whose earlier
-/// phase is not acknowledged yet keeps its early intent; the final intent is
-/// still recorded so no hash is silently dropped.
-pub(crate) fn finish_vanish_final_phase(
-    hashes: &[String],
-    failed: &HashSet<String>,
-    remaining: &HashSet<String>,
-) -> Result<HashSet<String>> {
-    let mut outstanding = HashSet::new();
-    if !b2_replica_enabled() || !crate::b2_cdn_purge::configured() {
-        return Ok(outstanding);
-    }
-    for hash in hashes {
-        // Any hash whose bytes are proven absent is `Absent`; one that failed or
-        // still has versions is `Failed`/`Unknown` and must be reconciled, never
-        // blindly deleted again.
-        let outcome = if failed.contains(hash) {
-            crate::b2_cdn_phase::PhysicalOutcome::Failed
-        } else if remaining.contains(hash) {
-            crate::b2_cdn_phase::PhysicalOutcome::Unknown
-        } else {
-            crate::b2_cdn_phase::PhysicalOutcome::Absent
-        };
-        match crate::b2_cdn_phase::record_physical(hash, outcome) {
-            Ok(true) => {}
-            // The hash never entered the phased flow (outbox disabled when its
-            // early phase was attempted). Leave it alone.
-            Ok(false) => continue,
-            Err(_) => {
-                outstanding.insert(hash.clone());
-                continue;
-            }
-        }
-        if crate::b2_cdn_purge::enqueue(hash, crate::b2_cdn_purge::Phase::Final).is_err() {
-            outstanding.insert(hash.clone());
-        }
-    }
-    Ok(outstanding)
+/// Whether erasure for this hash may be reported complete: bytes proven absent
+/// and the final purge acknowledged. A failed or replica-skipped wave can never
+/// be complete.
+pub(crate) fn vanish_complete(hash: &str) -> bool {
+    crate::b2_cdn_phase::complete_ready(hash).unwrap_or(false)
 }
 
-/// Whether the final phase for a hash is purged and acknowledged, so erasure
-/// may be reported complete.
-pub(crate) fn vanish_final_phase_complete(hash: &str) -> bool {
-    crate::b2_cdn_phase::complete_ready(hash).unwrap_or(false)
+/// One full vanish attempt for one hash, in the same order `execute_vanish`
+/// uses: open the attempt, run the bounded wave only if still needed, record
+/// the outcome, and report whether the hash may be finalized.
+///
+/// `wave` is the caller's bounded physical erase so the test can count how many
+/// times it actually runs. Returns `(physical_ran, may_finalize)`.
+#[cfg(test)]
+pub(crate) fn vanish_attempt_for_test(
+    hash: &str,
+    wave: impl FnOnce(&[String]) -> HashSet<String>,
+) -> (bool, bool) {
+    let Some(epoch) = begin_vanish_phase(hash).ok().flatten() else {
+        return (false, true);
+    };
+    let ran = if vanish_needs_physical(hash) {
+        let failed = wave(&[hash.to_string()]);
+        if let Err(error) = finish_vanish_phase(hash, &epoch, &failed, &HashSet::new()) {
+            eprintln!("[test] finish_vanish_phase failed: {error}");
+        }
+        true
+    } else {
+        false
+    };
+    (ran, vanish_complete(hash))
+}
+
+#[cfg(test)]
+mod vanish_phase_tests {
+    use super::vanish_physical_outcome;
+    use crate::b2_cdn_phase::Physical;
+    use std::collections::HashSet;
+
+    #[test]
+    fn a_skipped_replica_erase_is_never_reported_absent() {
+        let hash = "a".repeat(64);
+        let failed: HashSet<String> = HashSet::new();
+        let remaining: HashSet<String> = HashSet::new();
+        // Normal success.
+        assert_eq!(
+            vanish_physical_outcome(&hash, &failed, &remaining, true),
+            Physical::Absent
+        );
+        // Replica flag off means versions were not deleted: never Absent, so the
+        // hash can never be marked complete while outer bytes may survive.
+        assert_eq!(
+            vanish_physical_outcome(&hash, &failed, &remaining, false),
+            Physical::Failed
+        );
+        // A provider failure dominates a clean remainder.
+        let failed: HashSet<String> = [hash.clone()].into_iter().collect();
+        assert_eq!(
+            vanish_physical_outcome(&hash, &failed, &remaining, true),
+            Physical::Failed
+        );
+        // Still-progressing versions are Unknown, not failure.
+        let failed: HashSet<String> = HashSet::new();
+        let remaining: HashSet<String> = [hash.clone()].into_iter().collect();
+        assert_eq!(
+            vanish_physical_outcome(&hash, &failed, &remaining, true),
+            Physical::Unknown
+        );
+    }
 }
 
 /// Erase one bounded vanish batch from every enabled origin and CDN service.

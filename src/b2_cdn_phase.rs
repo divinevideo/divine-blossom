@@ -1,87 +1,79 @@
 //! Durable phase progress for purge-based B2 outer-CDN invalidation.
 //!
-//! A B2 original leaves the shared CDN in two phases: an early purge when the
-//! deny/erasing gate is first persisted, and a final purge after the physical
-//! wave has drained the object's versions. A warm outer entry lives for a year,
-//! so neither purge may be assumed: each phase must be recorded, purged by the
-//! bounded drain, and acknowledged before the next step runs or completion is
-//! claimed.
+//! A B2 original leaves the shared CDN only after its bytes are physically gone
+//! from the pinned provider versions *and* the final purge has been
+//! acknowledged. A warm outer entry lives for a year, so that final purge may
+//! not be assumed.
 //!
-//! This module holds the per-hash state machine. It never purges and never
-//! calls a provider; the drain calls [`mark_purged`] only after a checked purge
-//! callback succeeded, and that writes the phase transition. It is shared by
-//! account vanish and creator deletion so both use one contract.
+//! Contract, kept deliberately small:
 //!
-//! States, in order:
+//! - One record per hash holds an **epoch** (a nonce for one physical attempt),
+//!   the physical outcome, and whether the final purge has been acknowledged.
+//! - Physical erasure is bounded by the existing wave. It records its outcome
+//!   for every hash, including a provider failure.
+//! - Only the **final** purge is blocking. An early purge is opportunistic and
+//!   never gates anything.
+//! - Completion requires `physical == Absent && final acknowledged`. A failed
+//!   wave is still purged so cached bytes go, but it can never complete.
+//! - An unknown physical outcome stays pending for a read-only reconcile.
+//! - A completed hash never replays its physical erase.
+//! - Every transition is bound to the record's epoch, compared with a
+//!   generation compare-and-swap, so a stale acknowledgement for an old attempt
+//!   can never advance a newer one.
 //!
-//! `EarlyPending`  -> deny/erasing gate persisted, early purge outstanding.
-//! `EarlyAcked`    -> the bounded drain purged and acknowledged the early phase.
-//! `PhysicalUnknown` -> a physical wave was attempted and its outcome is not
-//!                    proven; reconcile, never blind-delete again.
-//! `FinalPending`  -> physical wave finished (or failed); final purge outstanding.
-//! `FinalAcked`    -> the drain purged and acknowledged the final phase.
-//! `Complete`      -> final acknowledged and physical absence confirmed.
-//!
-//! No state expires. A stuck phase is an operator-visible anomaly, not a TTL.
+//! No state expires. A stuck phase is operator-visible, not a TTL.
 #![allow(dead_code)] // Call sites are wired by the owning change after review.
 
 use crate::error::{BlossomError, Result};
 use fastly::kv_store::{InsertMode, KVStore, KVStoreError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const PREFIX: &str = "b2-cdn-phase";
 const RECORD_PREFIX: &str = "b2-cdn-phase:v1:";
 const RECORD_VERSION: u64 = 1;
 const MAX_RECORD_BYTES: usize = 1024;
 
+/// What the bounded physical wave observed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum State {
-    EarlyPending,
-    EarlyAcked,
-    PhysicalUnknown,
-    FinalPending,
-    FinalAcked,
-    Complete,
+pub(crate) enum Physical {
+    /// The wave has not finished, or has never run.
+    Pending,
+    /// Every required version was confirmed absent.
+    Absent,
+    /// A provider delete failed. Versions may still exist.
+    Failed,
+    /// The wave ran but its outcome is unproven. Reconcile read-only.
+    Unknown,
 }
 
-impl State {
+impl Physical {
     fn as_str(self) -> &'static str {
         match self {
-            State::EarlyPending => "early_pending",
-            State::EarlyAcked => "early_acked",
-            State::PhysicalUnknown => "physical_unknown",
-            State::FinalPending => "final_pending",
-            State::FinalAcked => "final_acked",
-            State::Complete => "complete",
+            Physical::Pending => "pending",
+            Physical::Absent => "absent",
+            Physical::Failed => "failed",
+            Physical::Unknown => "unknown",
         }
     }
 
     fn parse(value: &str) -> Option<Self> {
         Some(match value {
-            "early_pending" => State::EarlyPending,
-            "early_acked" => State::EarlyAcked,
-            "physical_unknown" => State::PhysicalUnknown,
-            "final_pending" => State::FinalPending,
-            "final_acked" => State::FinalAcked,
-            "complete" => State::Complete,
+            "pending" => Physical::Pending,
+            "absent" => Physical::Absent,
+            "failed" => Physical::Failed,
+            "unknown" => Physical::Unknown,
             _ => return None,
         })
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PhysicalOutcome {
-    /// Every required version was confirmed absent.
-    Absent,
-    /// The wave ran but its outcome is unproven. Reconcile; do not blind-delete.
-    Unknown,
-    /// A provider delete failed. The versions may still exist.
-    Failed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Record {
-    state: State,
+    epoch: String,
+    physical: Physical,
+    /// The final purge for this epoch was purged and acknowledged.
+    final_acked: bool,
+    /// Reported complete. Implies `Absent` and `final_acked`.
+    complete: bool,
     updated_at: u64,
 }
 
@@ -91,20 +83,20 @@ fn open_store() -> Result<KVStore> {
         .ok_or_else(|| BlossomError::MetadataError("B2 CDN phase store missing".into()))
 }
 
-fn is_lower_hex_64(value: &str) -> bool {
-    value.len() == 64
+fn is_lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn phase_key(hash: &str) -> Option<String> {
-    is_lower_hex_64(hash).then(|| format!("{RECORD_PREFIX}{hash}"))
+    is_lower_hex(hash, 64).then(|| format!("{RECORD_PREFIX}{hash}"))
 }
 
 fn hash_from_key(key: &str) -> Option<&str> {
     key.strip_prefix(RECORD_PREFIX)
-        .filter(|hash| is_lower_hex_64(hash))
+        .filter(|hash| is_lower_hex(hash, 64))
 }
 
 fn now() -> u64 {
@@ -114,10 +106,20 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
+fn epoch_nonce() -> Result<String> {
+    let mut random = [0u8; 16];
+    getrandom::getrandom(&mut random)
+        .map_err(|_| BlossomError::Internal("B2 CDN phase entropy unavailable".into()))?;
+    Ok(hex::encode(random))
+}
+
 fn encode(record: &Record) -> String {
     serde_json::json!({
         "version": RECORD_VERSION,
-        "state": record.state.as_str(),
+        "epoch": record.epoch,
+        "physical": record.physical.as_str(),
+        "final_acked": record.final_acked,
+        "complete": record.complete,
         "updated_at": record.updated_at,
     })
     .to_string()
@@ -126,24 +128,40 @@ fn encode(record: &Record) -> String {
 fn parse(value: &str) -> Option<Record> {
     let object: serde_json::Value = serde_json::from_str(value).ok()?;
     let object = object.as_object()?;
-    // Unknown fields may carry future meaning. Treat the record as unreadable
-    // rather than guessing, so a future schema is never reinterpreted.
-    if object.len() != 3 {
+    // A record with any key we do not own may be a newer schema with different
+    // meaning. Unreadable, never reinterpreted.
+    if object.len() != 6 {
         return None;
     }
     if object.get("version")?.as_u64()? != RECORD_VERSION {
         return None;
     }
-    let state = State::parse(object.get("state")?.as_str()?)?;
-    let updated_at = object.get("updated_at")?.as_u64()?;
-    Some(Record { state, updated_at })
+    let epoch = object.get("epoch")?.as_str()?;
+    if !is_lower_hex(epoch, 32) {
+        return None;
+    }
+    let physical = Physical::parse(object.get("physical")?.as_str()?)?;
+    let final_acked = object.get("final_acked")?.as_bool()?;
+    let complete = object.get("complete")?.as_bool()?;
+    // Completion is only coherent when the bytes are absent and the final purge
+    // was acknowledged.
+    if complete && (!final_acked || physical != Physical::Absent) {
+        return None;
+    }
+    Some(Record {
+        epoch: epoch.to_string(),
+        physical,
+        final_acked,
+        complete,
+        updated_at: object.get("updated_at")?.as_u64()?,
+    })
 }
 
-/// The observed state plus the generation used as a compare-and-swap token.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Observed {
-    pub state: State,
-    pub generation: u64,
+/// Observed record plus the generation used as a compare-and-swap token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Observed {
+    record: Record,
+    generation: u64,
 }
 
 fn lookup(store: &KVStore, key: &str) -> Result<Option<Observed>> {
@@ -168,39 +186,52 @@ fn lookup(store: &KVStore, key: &str) -> Result<Option<Observed>> {
         return Ok(None);
     };
     Ok(Some(Observed {
-        state: record.state,
+        record,
         generation,
     }))
 }
 
-/// Read the current phase state. `None` means no phase was ever recorded.
-pub(crate) fn state(hash: &str) -> Result<Option<State>> {
+fn observed(hash: &str) -> Result<Option<Observed>> {
     let Some(key) = phase_key(&hash.to_ascii_lowercase()) else {
         return Err(BlossomError::BadRequest("Invalid hash for B2 CDN phase".into()));
     };
-    Ok(lookup(&open_store()?, &key)?.map(|observed| observed.state))
+    lookup(&open_store()?, &key)
 }
 
-/// Insert `EarlyPending` for a hash that is about to be denied or erased.
+/// Whether the hash should run the bounded physical wave.
 ///
-/// Idempotent and never regresses an existing record: a later phase must not be
-/// reset by a repeated early call.
-pub(crate) fn begin_early(hash: &str) -> Result<()> {
-    begin_if_absent(hash, State::EarlyPending)
+/// A completed hash never replays its erase; an absent hash has nothing left to
+/// delete. Everything else — including a failed or unknown wave — may run again.
+pub(crate) fn needs_physical(hash: &str) -> Result<bool> {
+    Ok(match observed(hash)? {
+        None => true,
+        Some(observed) => !observed.record.complete && observed.record.physical != Physical::Absent,
+    })
 }
 
-/// Insert `FinalPending` after a physical wave, including one that failed.
-pub(crate) fn begin_final(hash: &str) -> Result<()> {
-    begin_if_absent(hash, State::FinalPending)
+/// The epoch this hash's current attempt is bound to, if a record exists.
+pub(crate) fn epoch(hash: &str) -> Result<Option<String>> {
+    Ok(observed(hash)?.map(|observed| observed.record.epoch))
 }
 
-fn begin_if_absent(hash: &str, state: State) -> Result<()> {
+/// Open one physical attempt and return its epoch.
+///
+/// Idempotent for a hash that is already mid-attempt: the existing epoch is
+/// returned so a retry continues the same attempt instead of orphaning a pending
+/// final acknowledgement. A completed hash keeps its epoch and is never reopened.
+pub(crate) fn begin_erase(hash: &str) -> Result<String> {
     let hash = hash.to_ascii_lowercase();
     let key =
         phase_key(&hash).ok_or_else(|| BlossomError::BadRequest("Invalid hash for B2 CDN phase".into()))?;
     let store = open_store()?;
+    if let Some(existing) = lookup(&store, &key)? {
+        return Ok(existing.record.epoch);
+    }
     let record = Record {
-        state,
+        epoch: epoch_nonce()?,
+        physical: Physical::Pending,
+        final_acked: false,
+        complete: false,
         updated_at: now(),
     };
     match store
@@ -208,40 +239,47 @@ fn begin_if_absent(hash: &str, state: State) -> Result<()> {
         .mode(InsertMode::Add)
         .execute(&key, encode(&record))
     {
-        Ok(()) => Ok(()),
-        // A concurrent writer already began this phase (or a later one). The
-        // existing record is authoritative.
-        Err(KVStoreError::ItemPreconditionFailed) => Ok(()),
+        Ok(()) => Ok(record.epoch),
+        // A concurrent writer opened the attempt first. Use theirs.
+        Err(KVStoreError::ItemPreconditionFailed) => lookup(&store, &key)?
+            .map(|observed| observed.record.epoch)
+            .ok_or_else(|| BlossomError::MetadataError("B2 CDN phase unavailable".into())),
         Err(_) => Err(BlossomError::MetadataError(
             "B2 CDN phase unavailable".into(),
         )),
     }
 }
 
-/// Transition `expected` -> `next` by generation compare-and-swap.
+/// Record the bounded wave's outcome for the epoch that produced it.
 ///
-/// Returns `false` when the record is not (or is no longer) in `expected`, so a
-/// concurrent actor's newer state is never overwritten.
-pub(crate) fn transition(hash: &str, expected: State, next: State) -> Result<bool> {
+/// Bound to `epoch`, so a late report from an older attempt cannot overwrite a
+/// newer one. `Unknown` never overwrites a definite `Absent`.
+pub(crate) fn record_physical(hash: &str, epoch: &str, outcome: Physical) -> Result<bool> {
     let hash = hash.to_ascii_lowercase();
-    let key =
-        phase_key(&hash).ok_or_else(|| BlossomError::BadRequest("Invalid hash for B2 CDN phase".into()))?;
+    let Some(key) = phase_key(&hash) else {
+        return Ok(false);
+    };
     let store = open_store()?;
     let Some(observed) = lookup(&store, &key)? else {
         return Ok(false);
     };
-    if observed.state != expected {
+    if observed.record.epoch != epoch || observed.record.complete {
         return Ok(false);
     }
-    let record = Record {
-        state: next,
+    if observed.record.physical == Physical::Absent && outcome == Physical::Unknown {
+        // Never downgrade proven absence to an unknown observation.
+        return Ok(false);
+    }
+    let updated = Record {
+        physical: outcome,
         updated_at: now(),
+        ..observed.record
     };
     match store
         .build_insert()
         .mode(InsertMode::Overwrite)
         .if_generation_match(observed.generation)
-        .execute(&key, encode(&record))
+        .execute(&key, encode(&updated))
     {
         Ok(()) => Ok(true),
         Err(KVStoreError::ItemPreconditionFailed) => Ok(false),
@@ -251,26 +289,37 @@ pub(crate) fn transition(hash: &str, expected: State, next: State) -> Result<boo
     }
 }
 
-/// Record the result of a physical wave. Called with every hash in the wave,
-/// whether the provider failed or not, so no hash is left without a next step.
-pub(crate) fn record_physical(hash: &str, outcome: PhysicalOutcome) -> Result<bool> {
-    let next = match outcome {
-        PhysicalOutcome::Unknown => State::PhysicalUnknown,
-        PhysicalOutcome::Absent | PhysicalOutcome::Failed => State::FinalPending,
-    };
-    // From EarlyAcked (normal), or from PhysicalUnknown/FinalPending on a
-    // retry that produced a definite answer.
-    for expected in [State::EarlyAcked, State::PhysicalUnknown, State::FinalPending] {
-        if transition(hash, expected, next)? {
-            return Ok(true);
+/// Whether the drain should purge this hash's final phase.
+///
+/// The final purge runs when the physical outcome is definite — absent or
+/// failed — because cached bytes must leave the CDN either way. An unknown
+/// outcome stays pending for reconcile and does not purge.
+pub(crate) fn final_purge_pending(hash: &str) -> Result<bool> {
+    Ok(match observed(hash)? {
+        None => false,
+        Some(observed) => {
+            !observed.record.final_acked
+                && matches!(observed.record.physical, Physical::Absent | Physical::Failed)
         }
-    }
-    Ok(false)
+    })
 }
 
-/// Called by the drain after a checked purge succeeded and the committed intent
-/// was cleared. Advances only the matching pending phase.
-pub(crate) fn mark_purged(store: &KVStore, phase: &str, hash: &str) -> Result<bool> {
+/// Whether the final purge for this hash is acknowledged. Used by the drain to
+/// decide whether it already handled this epoch.
+pub(crate) fn final_acked(hash: &str) -> Result<bool> {
+    Ok(observed(hash)?.is_some_and(|observed| observed.record.final_acked))
+}
+
+/// Whether this hash's bytes are proven absent, regardless of purge state.
+pub(crate) fn physical_absent(hash: &str) -> Result<bool> {
+    Ok(observed(hash)?.is_some_and(|observed| observed.record.physical == Physical::Absent))
+}
+
+/// Mark the final phase purged and acknowledged for the exact epoch.
+///
+/// Called only after a checked purge succeeded. Bound to the epoch so a stale
+/// acknowledgement cannot advance a newer attempt.
+pub(crate) fn mark_final_purged(store: &KVStore, hash: &str, epoch: &str) -> Result<bool> {
     let hash = hash.to_ascii_lowercase();
     let Some(key) = phase_key(&hash) else {
         return Ok(false);
@@ -278,20 +327,22 @@ pub(crate) fn mark_purged(store: &KVStore, phase: &str, hash: &str) -> Result<bo
     let Some(observed) = lookup(store, &key)? else {
         return Ok(false);
     };
-    let next = match (phase, observed.state) {
-        ("early", State::EarlyPending) => State::EarlyAcked,
-        ("final", State::FinalPending) => State::FinalAcked,
-        _ => return Ok(false),
-    };
-    let record = Record {
-        state: next,
+    if observed.record.epoch != epoch
+        || observed.record.final_acked
+        || !matches!(observed.record.physical, Physical::Absent | Physical::Failed)
+    {
+        return Ok(false);
+    }
+    let updated = Record {
+        final_acked: true,
         updated_at: now(),
+        ..observed.record
     };
     match store
         .build_insert()
         .mode(InsertMode::Overwrite)
         .if_generation_match(observed.generation)
-        .execute(&key, encode(&record))
+        .execute(&key, encode(&updated))
     {
         Ok(()) => Ok(true),
         Err(KVStoreError::ItemPreconditionFailed) => Ok(false),
@@ -301,26 +352,58 @@ pub(crate) fn mark_purged(store: &KVStore, phase: &str, hash: &str) -> Result<bo
     }
 }
 
-/// Whether the early phase has been purged, so the physical wave may start.
-pub(crate) fn early_ready(hash: &str) -> Result<bool> {
-    Ok(matches!(
-        state(hash)?,
-        Some(State::EarlyAcked | State::PhysicalUnknown | State::FinalPending | State::FinalAcked | State::Complete)
-    ))
-}
-
-/// Whether the final phase has been purged and physical absence confirmed, so
-/// erasure may be reported complete. A physical failure leaves this false.
+/// Whether erasure for this hash may be reported complete.
+///
+/// True only when the bytes are proven absent and the final purge is
+/// acknowledged. A completed record stays true; a failed physical wave can never
+/// become true.
 pub(crate) fn complete_ready(hash: &str) -> Result<bool> {
-    Ok(state(hash)? == Some(State::FinalAcked))
+    Ok(observed(hash)?.is_some_and(|observed| {
+        observed.record.complete
+            || (observed.record.physical == Physical::Absent && observed.record.final_acked)
+    }))
 }
 
-/// Mark a fully purged and physically absent hash complete.
+/// Mark a fully purged, physically absent hash complete. Idempotent.
 pub(crate) fn mark_complete(hash: &str) -> Result<bool> {
-    transition(hash, State::FinalAcked, State::Complete)
+    let hash = hash.to_ascii_lowercase();
+    let Some(key) = phase_key(&hash) else {
+        return Ok(false);
+    };
+    let store = open_store()?;
+    let Some(observed) = lookup(&store, &key)? else {
+        return Ok(false);
+    };
+    if observed.record.complete {
+        return Ok(true);
+    }
+    if observed.record.physical != Physical::Absent || !observed.record.final_acked {
+        return Ok(false);
+    }
+    let updated = Record {
+        complete: true,
+        updated_at: now(),
+        ..observed.record
+    };
+    match store
+        .build_insert()
+        .mode(InsertMode::Overwrite)
+        .if_generation_match(observed.generation)
+        .execute(&key, encode(&updated))
+    {
+        Ok(()) => Ok(true),
+        Err(KVStoreError::ItemPreconditionFailed) => Ok(false),
+        Err(_) => Err(BlossomError::MetadataError(
+            "B2 CDN phase unavailable".into(),
+        )),
+    }
 }
 
-/// Test and operator helper: the exact key a phase record lives under.
+/// Read the record's physical outcome for operator reporting.
+pub(crate) fn physical_state(hash: &str) -> Result<Option<Physical>> {
+    Ok(observed(hash)?.map(|observed| observed.record.physical))
+}
+
 #[cfg(test)]
 fn key_for(hash: &str) -> Option<String> {
     phase_key(hash)
@@ -331,43 +414,69 @@ mod tests {
     use super::*;
 
     const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const EPOCH: &str = "0123456789abcdef0123456789abcdef";
+
+    fn record() -> Record {
+        Record {
+            epoch: EPOCH.into(),
+            physical: Physical::Pending,
+            final_acked: false,
+            complete: false,
+            updated_at: 7,
+        }
+    }
 
     #[test]
-    fn every_state_round_trips_and_unknown_is_rejected() {
-        for state in [
-            State::EarlyPending,
-            State::EarlyAcked,
-            State::PhysicalUnknown,
-            State::FinalPending,
-            State::FinalAcked,
-            State::Complete,
+    fn record_round_trips_and_rejects_incoherent_completion() {
+        assert_eq!(parse(&encode(&record())), Some(record()));
+        for physical in [
+            Physical::Pending,
+            Physical::Absent,
+            Physical::Failed,
+            Physical::Unknown,
         ] {
-            assert_eq!(State::parse(state.as_str()), Some(state));
-            let record = Record {
-                state,
-                updated_at: 5,
+            let value = Record {
+                physical,
+                ..record()
             };
-            assert_eq!(parse(&encode(&record)), Some(record));
+            assert_eq!(parse(&encode(&value)), Some(value));
         }
-        assert_eq!(State::parse("invented"), None);
-        assert_eq!(State::parse(""), None);
+        // complete without ack, or without absence, is incoherent.
+        for bad in [
+            Record { complete: true, ..record() },
+            Record {
+                complete: true,
+                final_acked: true,
+                physical: Physical::Failed,
+                ..record()
+            },
+            Record {
+                complete: true,
+                final_acked: true,
+                physical: Physical::Pending,
+                ..record()
+            },
+        ] {
+            assert_eq!(parse(&encode(&bad)), None, "{bad:?}");
+        }
     }
 
     #[test]
     fn foreign_or_future_records_are_unreadable_not_reinterpreted() {
-        let value: serde_json::Value =
-            serde_json::from_str(&encode(&Record { state: State::EarlyPending, updated_at: 1 }))
-                .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encode(&record())).unwrap();
         let mut future = value.clone();
         future["version"] = serde_json::json!(2);
         let mut extra = value.clone();
         extra["owner"] = serde_json::json!("someone");
-        let mut missing = value.clone();
-        missing.as_object_mut().unwrap().remove("updated_at");
+        let mut bad_epoch = value.clone();
+        bad_epoch["epoch"] = serde_json::json!("abcd");
+        let mut bad_physical = value.clone();
+        bad_physical["physical"] = serde_json::json!("invented");
         for candidate in [
             future.to_string(),
             extra.to_string(),
-            missing.to_string(),
+            bad_epoch.to_string(),
+            bad_physical.to_string(),
             "null".into(),
             "[]".into(),
             "{".into(),
@@ -386,32 +495,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn physical_outcomes_map_to_the_right_next_state() {
-        assert_eq!(
-            match PhysicalOutcome::Absent {
-                PhysicalOutcome::Unknown => State::PhysicalUnknown,
-                PhysicalOutcome::Absent | PhysicalOutcome::Failed => State::FinalPending,
-            },
-            State::FinalPending
-        );
-        assert_eq!(
-            match PhysicalOutcome::Failed {
-                PhysicalOutcome::Unknown => State::PhysicalUnknown,
-                PhysicalOutcome::Absent | PhysicalOutcome::Failed => State::FinalPending,
-            },
-            State::FinalPending
-        );
-        assert_eq!(
-            match PhysicalOutcome::Unknown {
-                PhysicalOutcome::Unknown => State::PhysicalUnknown,
-                PhysicalOutcome::Absent | PhysicalOutcome::Failed => State::FinalPending,
-            },
-            State::PhysicalUnknown
-        );
-    }
-
-    /// Real KV state machine. Runs under scripts/run-b2-cdn-phase-tests.py.
+    /// Real KV state machine, including the exact order the vanish flow uses.
+    /// Runs under scripts/run-b2-cdn-phase-tests.py.
     mod storage {
         use super::*;
 
@@ -419,15 +504,11 @@ mod tests {
             open_store().expect("fixture store")
         }
 
-        fn reset(hash: &str) {
-            let store = store();
-            let _ = store.build_delete().execute(&phase_key(hash).unwrap());
-        }
-
         fn reset_all() {
             let store = store();
             loop {
-                let Ok(page) = store.build_list().limit(100).prefix(PREFIX).execute() else {
+                let Ok(page) = store.build_list().limit(100).prefix("b2-cdn-phase").execute()
+                else {
                     return;
                 };
                 let keys: Vec<String> = page.keys().to_vec();
@@ -440,128 +521,216 @@ mod tests {
             }
         }
 
+        /// Mirrors `execute_vanish`: open the attempt, run the wave, record the
+        /// outcome, then require the final acknowledgement before completion.
         #[test]
         #[ignore = "requires local KV fixture; scripts/run-b2-cdn-phase-tests.py"]
-        fn early_pending_blocks_physical_until_the_drain_acks() {
+        fn main_flow_absent_requires_final_ack_before_completion() {
             reset_all();
-            let hash = "c1".repeat(32);
-            begin_early(&hash).unwrap();
-            assert_eq!(state(&hash).unwrap(), Some(State::EarlyPending));
-            assert!(!early_ready(&hash).unwrap());
+            let hash = "d1".repeat(32);
+            assert!(needs_physical(&hash).unwrap());
+            let attempt = begin_erase(&hash).unwrap();
+            assert_eq!(epoch(&hash).unwrap(), Some(attempt.clone()));
 
-            // The drain clears the committed early intent after a checked purge.
-            assert!(mark_purged(&store(), "early", &hash).unwrap());
-            assert_eq!(state(&hash).unwrap(), Some(State::EarlyAcked));
-            assert!(early_ready(&hash).unwrap());
+            // Physical wave confirms absence.
+            assert!(record_physical(&hash, &attempt, Physical::Absent).unwrap());
+            assert!(physical_absent(&hash).unwrap());
+            assert!(final_purge_pending(&hash).unwrap());
+            // Bytes gone is not completion: the final purge has not acked.
             assert!(!complete_ready(&hash).unwrap());
-            reset(&hash);
-        }
 
-        #[test]
-        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-phase-tests.py"]
-        fn final_pending_then_ack_then_complete() {
-            reset_all();
-            let hash = "c2".repeat(32);
-            begin_early(&hash).unwrap();
-            mark_purged(&store(), "early", &hash).unwrap();
-            assert!(record_physical(&hash, PhysicalOutcome::Absent).unwrap());
-            assert_eq!(state(&hash).unwrap(), Some(State::FinalPending));
-            // Physical absence alone is not completion: the final purge must land.
-            assert!(!complete_ready(&hash).unwrap());
-            assert!(mark_purged(&store(), "final", &hash).unwrap());
-            assert_eq!(state(&hash).unwrap(), Some(State::FinalAcked));
+            // Drain purges and acknowledges the exact epoch.
+            assert!(mark_final_purged(&store(), &hash, &attempt).unwrap());
             assert!(complete_ready(&hash).unwrap());
             assert!(mark_complete(&hash).unwrap());
-            assert_eq!(state(&hash).unwrap(), Some(State::Complete));
-            reset(&hash);
+            // Completed hash never replays its physical erase.
+            assert!(!needs_physical(&hash).unwrap());
+            assert!(complete_ready(&hash).unwrap(), "Complete must read as ready");
+            reset_all();
         }
 
         #[test]
         #[ignore = "requires local KV fixture; scripts/run-b2-cdn-phase-tests.py"]
-        fn physical_failure_still_reaches_final_pending_for_purge() {
+        fn main_flow_failed_physical_purges_but_never_completes() {
             reset_all();
-            let hash = "c3".repeat(32);
-            begin_early(&hash).unwrap();
-            mark_purged(&store(), "early", &hash).unwrap();
-            assert!(record_physical(&hash, PhysicalOutcome::Failed).unwrap());
-            assert_eq!(state(&hash).unwrap(), Some(State::FinalPending));
-            // Final purge is still required even though bytes may remain.
-            assert!(mark_purged(&store(), "final", &hash).unwrap());
-            assert_eq!(state(&hash).unwrap(), Some(State::FinalAcked));
-            // Physical failure means completion is not allowed.
-            assert!(mark_complete(&hash).unwrap());
-            reset(&hash);
-        }
-
-        #[test]
-        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-phase-tests.py"]
-        fn unknown_physical_outcome_is_reconciled_not_blind_deleted() {
-            reset_all();
-            let hash = "c4".repeat(32);
-            begin_early(&hash).unwrap();
-            mark_purged(&store(), "early", &hash).unwrap();
-            assert!(record_physical(&hash, PhysicalOutcome::Unknown).unwrap());
-            assert_eq!(state(&hash).unwrap(), Some(State::PhysicalUnknown));
+            let hash = "d2".repeat(32);
+            let epoch = begin_erase(&hash).unwrap();
+            assert!(record_physical(&hash, &epoch, Physical::Failed).unwrap());
+            // Failed still needs a purge so cached bytes leave the CDN.
+            assert!(final_purge_pending(&hash).unwrap());
+            assert!(mark_final_purged(&store(), &hash, &epoch).unwrap());
+            // But a failed wave can never be complete.
             assert!(!complete_ready(&hash).unwrap());
-            // A fresh definite observation resolves it without a blind delete.
-            assert!(record_physical(&hash, PhysicalOutcome::Absent).unwrap());
-            assert_eq!(state(&hash).unwrap(), Some(State::FinalPending));
-            reset(&hash);
+            assert!(!mark_complete(&hash).unwrap());
+            // A retry may run the physical wave again.
+            assert!(needs_physical(&hash).unwrap());
+            reset_all();
         }
 
         #[test]
         #[ignore = "requires local KV fixture; scripts/run-b2-cdn-phase-tests.py"]
-        fn a_third_request_after_final_ack_does_not_replay_physical() {
+        fn main_flow_unknown_stays_pending_without_purging() {
             reset_all();
-            let hash = "c5".repeat(32);
-            begin_early(&hash).unwrap();
-            mark_purged(&store(), "early", &hash).unwrap();
-            record_physical(&hash, PhysicalOutcome::Absent).unwrap();
-            mark_purged(&store(), "final", &hash).unwrap();
+            let hash = "d3".repeat(32);
+            let epoch = begin_erase(&hash).unwrap();
+            assert!(record_physical(&hash, &epoch, Physical::Unknown).unwrap());
+            assert_eq!(physical_state(&hash).unwrap(), Some(Physical::Unknown));
+            // Unknown must not purge yet: it needs a read-only reconcile.
+            assert!(!final_purge_pending(&hash).unwrap());
+            assert!(!complete_ready(&hash).unwrap());
+            assert!(needs_physical(&hash).unwrap());
+            // A later definite observation resolves it.
+            assert!(record_physical(&hash, &epoch, Physical::Absent).unwrap());
+            assert!(final_purge_pending(&hash).unwrap());
+            reset_all();
+        }
+
+        #[test]
+        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-phase-tests.py"]
+        fn a_stale_epoch_ack_cannot_advance_a_newer_attempt() {
+            reset_all();
+            let hash = "d4".repeat(32);
+            let old_epoch = begin_erase(&hash).unwrap();
+            record_physical(&hash, &old_epoch, Physical::Absent).unwrap();
+            // A fresh attempt for the same hash reuses the epoch while the record
+            // exists, so simulate a *different* epoch arriving late by using a
+            // bogus one; it must be refused.
+            assert!(!mark_final_purged(&store(), &hash, &"f".repeat(32)).unwrap());
+            assert!(!complete_ready(&hash).unwrap());
+            assert!(mark_final_purged(&store(), &hash, &old_epoch).unwrap());
+            assert!(complete_ready(&hash).unwrap());
+            reset_all();
+        }
+
+        #[test]
+        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-phase-tests.py"]
+        fn unknown_never_downgrades_proven_absence() {
+            reset_all();
+            let hash = "d5".repeat(32);
+            let epoch = begin_erase(&hash).unwrap();
+            record_physical(&hash, &epoch, Physical::Absent).unwrap();
+            assert!(!record_physical(&hash, &epoch, Physical::Unknown).unwrap());
+            assert_eq!(physical_state(&hash).unwrap(), Some(Physical::Absent));
+            reset_all();
+        }
+
+        #[test]
+        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-phase-tests.py"]
+        fn a_completed_hash_is_not_reopened_by_begin_erase() {
+            reset_all();
+            let hash = "d6".repeat(32);
+            let epoch = begin_erase(&hash).unwrap();
+            record_physical(&hash, &epoch, Physical::Absent).unwrap();
+            mark_final_purged(&store(), &hash, &epoch).unwrap();
             mark_complete(&hash).unwrap();
-            // A repeated begin_final must not regress the completed record.
-            begin_final(&hash).unwrap();
-            assert_eq!(state(&hash).unwrap(), Some(State::Complete));
-            // And a repeated early begin must not regress it either.
-            begin_early(&hash).unwrap();
-            assert_eq!(state(&hash).unwrap(), Some(State::Complete));
-            // record_physical on a Complete record changes nothing.
-            assert!(!record_physical(&hash, PhysicalOutcome::Absent).unwrap());
-            assert_eq!(state(&hash).unwrap(), Some(State::Complete));
-            reset(&hash);
+            // A third request must not reopen the attempt or replay physical.
+            assert_eq!(begin_erase(&hash).unwrap(), epoch);
+            assert!(!needs_physical(&hash).unwrap());
+            assert!(!record_physical(&hash, &epoch, Physical::Unknown).unwrap());
+            assert!(complete_ready(&hash).unwrap());
+            reset_all();
         }
 
         #[test]
         #[ignore = "requires local KV fixture; scripts/run-b2-cdn-phase-tests.py"]
-        fn a_concurrent_ack_never_clears_a_newer_phase() {
+        fn a_failed_final_purge_leaves_final_pending_retryable() {
             reset_all();
-            let hash = "c6".repeat(32);
-            begin_early(&hash).unwrap();
-            // A newer final phase cannot exist before early is acked; force the
-            // race by acking early, recording physical, then a late early ack.
-            mark_purged(&store(), "early", &hash).unwrap();
-            record_physical(&hash, PhysicalOutcome::Absent).unwrap();
-            // A duplicate early ack must not move FinalPending back.
-            assert!(!mark_purged(&store(), "early", &hash).unwrap());
-            assert_eq!(state(&hash).unwrap(), Some(State::FinalPending));
-            reset(&hash);
-        }
-
-        #[test]
-        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-phase-tests.py"]
-        fn a_failed_final_purge_leaves_the_phase_retryable() {
-            reset_all();
-            let hash = "c7".repeat(32);
-            begin_early(&hash).unwrap();
-            mark_purged(&store(), "early", &hash).unwrap();
-            record_physical(&hash, PhysicalOutcome::Absent).unwrap();
-            // Purge callback fails: the drain never calls mark_purged, so the
-            // state stays FinalPending and the next pass retries it.
-            assert_eq!(state(&hash).unwrap(), Some(State::FinalPending));
+            let hash = "d7".repeat(32);
+            let epoch = begin_erase(&hash).unwrap();
+            record_physical(&hash, &epoch, Physical::Absent).unwrap();
+            // Purge callback failed, so the drain never acked.
+            assert!(final_purge_pending(&hash).unwrap());
+            assert!(!final_acked(&hash).unwrap());
             assert!(!complete_ready(&hash).unwrap());
-            assert!(mark_purged(&store(), "final", &hash).unwrap());
-            assert_eq!(state(&hash).unwrap(), Some(State::FinalAcked));
-            reset(&hash);
+            assert!(mark_final_purged(&store(), &hash, &epoch).unwrap());
+            assert!(complete_ready(&hash).unwrap());
+            reset_all();
+        }
+
+        /// The real vanish sequence through the storage seam, not a state model:
+        /// first request runs the wave, second request must not replay it, and
+        /// completion only appears after the final purge is acknowledged.
+        #[test]
+        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-phase-tests.py"]
+        fn the_real_vanish_sequence_does_not_replay_the_physical_wave() {
+            use std::cell::Cell;
+            use crate::storage::{vanish_attempt_for_test, vanish_complete};
+
+            reset_all();
+            let hash = "e1".repeat(32);
+            let waves = Cell::new(0u32);
+            let wave = |hashes: &[String]| -> std::collections::HashSet<String> {
+                waves.set(waves.get() + 1);
+                assert_eq!(hashes, [hash.clone()]);
+                std::collections::HashSet::new()
+            };
+
+            // Request 1: opens the attempt and runs the wave.
+            let (ran, complete) = vanish_attempt_for_test(&hash, wave);
+            assert!(ran, "first request must run the physical wave");
+            assert_eq!(waves.get(), 1);
+            assert!(!complete, "no final ack yet, so not complete");
+            assert!(final_purge_pending(&hash).unwrap());
+
+            // Request 2 before the drain: absence is recorded, so the wave must
+            // not replay. Still not complete.
+            let (ran, complete) = vanish_attempt_for_test(&hash, wave);
+            assert!(!ran, "a second request must not replay the physical wave");
+            assert_eq!(waves.get(), 1, "the wave ran exactly once");
+            assert!(!complete);
+
+            // The drain purges and acknowledges the final phase.
+            let epoch = epoch(&hash).unwrap().expect("attempt epoch");
+            assert!(mark_final_purged(&store(), &hash, &epoch).unwrap());
+
+            // Request 3: complete, and still no replay.
+            let (ran, complete) = vanish_attempt_for_test(&hash, wave);
+            assert!(!ran, "a completed hash must never replay its erase");
+            assert_eq!(waves.get(), 1);
+            assert!(complete, "final ack plus absence is completion");
+            assert!(vanish_complete(&hash));
+            reset_all();
+        }
+
+        #[test]
+        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-phase-tests.py"]
+        fn a_failed_wave_is_retried_on_the_next_request() {
+            use std::cell::Cell;
+            use crate::storage::vanish_attempt_for_test;
+
+            reset_all();
+            let hash = "e2".repeat(32);
+            let waves = Cell::new(0u32);
+            let failing = |hashes: &[String]| -> std::collections::HashSet<String> {
+                waves.set(waves.get() + 1);
+                hashes.iter().cloned().collect()
+            };
+            let (ran, complete) = vanish_attempt_for_test(&hash, failing);
+            assert!(ran);
+            assert!(!complete, "a provider failure can never complete");
+            assert_eq!(physical_state(&hash).unwrap(), Some(Physical::Failed));
+            // Failure still queues a purge so cached bytes leave the CDN.
+            assert!(final_purge_pending(&hash).unwrap());
+
+            // A later request may run the wave again.
+            let ok = |_: &[String]| std::collections::HashSet::new();
+            let (ran, complete) = vanish_attempt_for_test(&hash, ok);
+            assert!(ran, "a failed wave may be retried");
+            assert_eq!(waves.get(), 1, "the failing wave ran once; retry is separate");
+            assert_eq!(physical_state(&hash).unwrap(), Some(Physical::Absent));
+            assert!(!complete);
+            reset_all();
+        }
+
+        #[test]
+        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-phase-tests.py"]
+        fn two_concurrent_begin_erase_calls_share_one_epoch() {
+            reset_all();
+            let hash = "d8".repeat(32);
+            let first = begin_erase(&hash).unwrap();
+            let second = begin_erase(&hash).unwrap();
+            assert_eq!(first, second, "one attempt per unfinished hash");
+            reset_all();
         }
     }
 }

@@ -63,8 +63,8 @@ use crate::storage::{
     b2_replica_enabled, blob_exists, check_funnelcake_audio_reuse, current_timestamp,
     delete_blob as storage_delete, delivery_probe_sample, dispatch_vanish_timing_log,
     download_blob_read_through, download_blob_with_fallback, download_thumbnail,
-    begin_vanish_early_phase, erase_vanish_batch, finish_vanish_final_phase,
-    probe_erased_delivery, trigger_audio_extraction, vanish_final_phase_complete,
+    begin_vanish_phase, erase_vanish_batch, finish_vanish_phase, probe_erased_delivery,
+    trigger_audio_extraction, vanish_complete, vanish_needs_physical,
     trigger_cloud_run_delete_blob, upload_blob, write_audit_log, write_vanish_audit_log,
     DeliveryProbeCounts, VanishAuditInitiator, VanishAuditPhase, VanishStorageTimings,
     B2_VANISH_MAX_HASHES_PER_WAVE, B2_VANISH_MAX_STORAGE_BACKEND_REQUESTS, DELIVERY_PROBE_LIMIT,
@@ -5186,8 +5186,13 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     // pending even when their bytes are already absent, because a warm outer
     // CDN entry can still serve them until the bounded drain purges.
     let mut phase_blocked: HashSet<String> = HashSet::new();
+    // The bounded wave applies whenever the B2 replica participates OR the
+    // retained CDN invalidation configuration is active. Turning the replica
+    // flag off during rollback must not silently restore the unbounded 10-source
+    // wave while warm outer bytes remain and phases still run.
     let b2_enabled = b2_replica_enabled();
-    let wave_fanout = if b2_enabled {
+    let phased = b2_enabled || crate::storage::cdn_invalidation_configured();
+    let wave_fanout = if phased {
         B2_VANISH_KV_FANOUT
     } else {
         VANISH_KV_FANOUT
@@ -5244,18 +5249,19 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         erase_candidates = erase_candidates.saturating_add(erase.len());
         erase_main_candidates.extend(erase.iter().map(|blob| blob.hash.clone()));
         let erase_hashes = vanish_storage_hashes(&erase, &derived_cleanup);
-        // Persist the deny/erasing gate and early purge intent before any
-        // physical delete so a warm outer entry is invalidated even if this
-        // wave is interrupted.
+        // Open a phased attempt for each hash before the physical wave. The
+        // epoch binds this wave's outcome and its final acknowledgement.
+        let mut wave_epochs: HashMap<String, String> = HashMap::new();
         for hash in &erase_hashes {
-            match begin_vanish_early_phase(hash) {
-                Ok(true) => {
+            match begin_vanish_phase(hash) {
+                Ok(Some(epoch)) => {
+                    wave_epochs.insert(hash.to_lowercase(), epoch);
                     phase_blocked.insert(hash.to_lowercase());
                 }
-                Ok(false) => {}
+                Ok(None) => {}
                 Err(error) => {
                     eprintln!(
-                        "[VANISH] pubkey={} hash={} failed to persist early purge phase: {}",
+                        "[VANISH] pubkey={} hash={} failed to open purge phase: {}",
                         pubkey, hash, error
                     );
                     execution.errors += 1;
@@ -5264,7 +5270,19 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
                 }
             }
         }
-        let storage_result = erase_vanish_batch(&erase_hashes);
+        // Only run the bounded physical wave for hashes that still need it. A
+        // completed hash must never replay its erase, and one already proven
+        // absent has nothing to delete.
+        let physical_hashes: Vec<String> = erase_hashes
+            .iter()
+            .filter(|hash| vanish_needs_physical(hash))
+            .cloned()
+            .collect();
+        let storage_result = if physical_hashes.is_empty() {
+            crate::storage::VanishStorageResult::default()
+        } else {
+            erase_vanish_batch(&physical_hashes)
+        };
         storage_attempts = storage_attempts.saturating_add(u32::from(!erase_hashes.is_empty()));
         add_vanish_storage_timings(&mut storage_timings, &storage_result.timings);
         purged_main_hashes.extend(
@@ -5275,19 +5293,26 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
                 .cloned(),
         );
 
-        // Record the physical outcome for every hash and enqueue the final
-        // purge, including hashes whose provider deletion failed: cached bytes
-        // must still be evicted even when erasure needs a retry.
-        if let Err(error) = finish_vanish_final_phase(
-            &erase_hashes,
-            &storage_result.failed_hashes,
-            &storage_result.remaining_hashes,
-        ) {
-            eprintln!(
-                "[VANISH] pubkey={} failed to persist final purge phase: {}",
-                pubkey, error
-            );
-            execution.errors += 1;
+        // Record the wave's outcome for every hash that ran, bound to its
+        // attempt epoch, and queue the blocking final purge for a definite
+        // outcome. A failed wave is purged too; it just cannot complete. An
+        // unknown outcome stays pending for reconcile.
+        for hash in &physical_hashes {
+            let Some(epoch) = wave_epochs.get(&hash.to_lowercase()) else {
+                continue;
+            };
+            if let Err(error) = finish_vanish_phase(
+                hash,
+                epoch,
+                &storage_result.failed_hashes,
+                &storage_result.remaining_hashes,
+            ) {
+                eprintln!(
+                    "[VANISH] pubkey={} hash={} failed to record purge phase: {}",
+                    pubkey, hash, error
+                );
+                execution.errors += 1;
+            }
         }
 
         let finalize_started = Instant::now();
@@ -5338,14 +5363,17 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
                 VanishBlobDisposition::Finalize => {
                     // Byte absence is not completion while the final purge is
                     // unacknowledged: a warm outer entry can still serve it.
-                    // Leave the hash pending for the next attempt and only
-                    // finalize once the drain has purged the final phase.
+                    // Leave the hash pending and only finalize once the drain
+                    // has purged the final phase and bytes are proven absent.
                     if phase_blocked.contains(&blob.hash.to_lowercase())
-                        && !vanish_final_phase_complete(&blob.hash)
+                        && !vanish_complete(&blob.hash)
                     {
                         retry_hashes.push(blob.hash);
                         deferred_pending = deferred_pending.saturating_add(1);
                     } else {
+                        if phase_blocked.contains(&blob.hash.to_lowercase()) {
+                            let _ = crate::b2_cdn_phase::mark_complete(&blob.hash);
+                        }
                         finalize_blobs.push(blob);
                     }
                 }
@@ -5362,7 +5390,7 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         kv_finalize_ms = kv_finalize_ms.saturating_add(finalize_started.elapsed().as_millis());
         last_wave = wave_started.elapsed();
         offset = wave_end;
-        if b2_enabled {
+        if phased {
             b2_waves_started += 1;
             if b2_waves_started >= VANISH_B2_WAVES_PER_EXECUTION {
                 // The started B2 waves now cover the execution's backend-request

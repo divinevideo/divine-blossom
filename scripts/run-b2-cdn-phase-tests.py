@@ -29,13 +29,19 @@ def storage_tests():
 def main():
     with tempfile.TemporaryDirectory(prefix="b2-cdn-phase-") as directory:
         root = Path(directory)
-        manifest, kv = root / "fastly.toml", root / "kv.json"
+        manifest, kv, cfg = root / "fastly.toml", root / "kv.json", root / "config.json"
         kv.write_text("{}")
+        # The phase flow is gated only on retained CDN invalidation config, so a
+        # purge host set is what makes it active here.
+        cfg.write_text('{"b2_cdn_purge_hosts": "media-b2-cdn.divine.video", "b2_replica_enabled": "true"}')
         manifest.write_text(f'''manifest_version = 3
 name = "b2-cdn-phase-test"
 language = "rust"
 [local_server.kv_stores.blossom_metadata]
 file = "{kv}"
+format = "json"
+[local_server.config_stores.blossom_config]
+file = "{cfg}"
 format = "json"
 ''')
         env = os.environ.copy()
