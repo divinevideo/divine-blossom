@@ -47,6 +47,31 @@ def validation_error(kind, message):
     return error
 
 
+def confirm_readback(read):
+    """Retry only absent reads, at most three, within one acceptance deadline.
+
+    `read(timeout)` must distinguish HTTP 404 (None) from present malformed
+    values. Socket timeouts cannot guarantee total transport wall time; check
+    the monotonic deadline before scheduling and after every returned read.
+    """
+    deadline = time.monotonic() + 3.0
+    for attempt in range(3):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("KV confirmation deadline expired")
+        if attempt:
+            time.sleep(min(0.25, remaining))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("KV confirmation deadline expired")
+        observed = read(min(1.0, remaining))
+        if time.monotonic() >= deadline:
+            raise TimeoutError("KV confirmation deadline expired")
+        if observed is not None:
+            return observed
+    return None
+
+
 def valid_generation(value):
     return isinstance(value, str) and re.fullmatch(r"[0-9]+", value) and 0 < int(value) < 2 ** 64
 
@@ -538,7 +563,8 @@ class Worker:
                   "bucket": self.destination.bucket, "key": key, "size": size,
                   "destination_version_id": version, "verified_at": int(time.time())}
         self.observe("readiness_write", self.kv.put, "b2-ready:" + key, record)
-        published = self.observe("readiness_read", self.kv.snapshot, "b2-ready:" + key)
+        published = self.observe("readiness_read", confirm_readback,
+            lambda timeout: self.kv.snapshot("b2-ready:" + key, timeout=timeout))
         if published is None or published[0] != record:
             raise validation_error("readiness_publication", "readiness publication not confirmed")
         # No cross-service transaction exists. Endpoint independently gates policy on
@@ -857,12 +883,12 @@ class FastlyKV:
         if snapshot is not None and not self.delete_if_generation(key, snapshot[1]):
             raise RuntimeError("readiness changed during deletion")
 
-    def snapshot(self, key):
+    def snapshot(self, key, *, timeout=30):
         if not ((key.startswith("b2-ready:") and HEX.fullmatch(key[9:]))
                 or (key.startswith(DEMAND_PREFIX) and HEX.fullmatch(key[len(DEMAND_PREFIX):]))):
             raise ValueError("only readiness and demand snapshots are supported")
         result = self.http.request(self.url(key), missing=True, include_headers=True,
-                                   max_response_bytes=4096)
+                                   max_response_bytes=4096, timeout=timeout)
         if result is None:
             return None
         value, headers = result
@@ -917,29 +943,18 @@ class FastlyKV:
             raise
 
     def confirm_claim(self, key, expected):
-        """Retry only absent readback; never repeat the add or accept a late match."""
-        observed = self.get(key)  # Preserve the first GET's existing timeout.
-        if observed is not None:
-            return observed
-        # This bounds scheduling and acceptance after absence, not transport wall
-        # time: urllib's socket timeout cannot interrupt every blocking operation.
-        deadline = time.monotonic() + 3.0
-        for _ in range(2):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("copy gate confirmation deadline expired")
-            time.sleep(min(0.25, remaining))
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("copy gate confirmation deadline expired")
-            observed = self.http.request(self.url(key), missing=True, timeout=min(1.0, remaining))
-            if observed is not None and observed != expected:
-                return observed  # Preserve the terminal ownership diagnosis, even if late.
-            if time.monotonic() >= deadline:
-                raise TimeoutError("copy gate confirmation deadline expired")
-            if observed is not None:
-                return observed
-        return None
+        """Confirm only this claim; absent reads never repeat the add."""
+        def read(timeout):
+            result = self.http.request(self.url(key), missing=True, include_headers=True,
+                                       max_response_bytes=4096, timeout=timeout)
+            if result is None:
+                return None
+            value, headers = result
+            if not valid_generation(headers.get("generation")):
+                raise ValueError("copy gate generation unavailable")
+            # A present null/empty body is terminal malformed state, not 404.
+            return {} if value is None else value
+        return confirm_readback(read)
 
     def claim_copy(self, key, attempt):
         self.claim_failure = None
@@ -952,7 +967,7 @@ class FastlyKV:
             return False
         observed = self.claim_request("confirm", self.confirm_claim, "b2-sync:v1:" + key, value)
         if observed != value:
-            # get() maps both HTTP 404 and a JSON null/empty response to None.
+            # Only HTTP 404 may exhaust the absent-read confirmation budget.
             if observed is None:
                 self.claim_failure = "confirm_absent"
             elif isinstance(observed, dict) and observed.get("state") == "erasing":
