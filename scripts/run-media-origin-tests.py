@@ -32,10 +32,16 @@ class Storage(BaseHTTPRequestHandler):
         else:
             status = {"forbidden": 403, "unavailable": 503, "invalid-range": 416}.get(key, 200)
         body = f"{bucket} bytes".encode()
+        derived_range = bucket == "b2" and key == "fixture/hls/720p.mp4" and self.headers.get("Range") == "bytes=1-3"
+        if derived_range:
+            status, body = 206, body[1:4]
         self.send_response(status)
         self.send_header("Content-Length", str(len(body)))
+        if bucket == "b2":
+            self.send_header("x-amz-meta-c2pa-manifest-id", "synthetic-manifest")
+            self.send_header("x-amz-meta-source-sha256", "a" * 64)
         if status == 206:
-            self.send_header("Content-Range", "bytes 1-3/9")
+            self.send_header("Content-Range", "bytes 1-3/8" if derived_range else "bytes 1-3/9")
         self.end_headers()
         self.wfile.write(body)
 
@@ -69,6 +75,10 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                     env.get("VICEROY", "viceroy"), "run", "-C", str(config), "--"
                 ])
                 cases = [
+                    ("derived_origin_b2_without_gcs_contract", "gcs", "true"),
+                    ("derived_origin_default_independent_contract", "b2", "true"),
+                    ("derived_origin_fallback_contract", "gcs", "true"),
+                    ("derived_origin_invalid_config_contract", "gcs", "true"),
                     ("media_origin_routing_contract", "b2", "true"),
                     ("media_origin_disabled_fallback_contract", "b2", "false"),
                     ("media_origin_invalid_config_contract", "invalid", "true"),
@@ -85,6 +95,13 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                         del values["media_read_primary"]
                     if test == "media_origin_gcs_missing_config_contract":
                         del values["gcs_bucket"]
+                    if test == "derived_origin_b2_without_gcs_contract":
+                        values.update(derived_media_read_primary="b2", derived_media_gcs_fallback_enabled="false")
+                        del values["gcs_bucket"]
+                    elif test == "derived_origin_fallback_contract":
+                        values.update(derived_media_read_primary="b2", derived_media_gcs_fallback_enabled="true")
+                    elif test == "derived_origin_invalid_config_contract":
+                        values["derived_media_read_primary"] = "invalid"
                     settings.write_text(json.dumps(values))
                     before = len(server.reads)
                     result = subprocess.run([
@@ -96,7 +113,19 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                     if test == "media_origin_routing_contract":
                         assert "primary=b2 fallback=gcs cause=transport" in result.stdout + result.stderr
                     reads = server.reads[before:]
-                    if test == "media_origin_routing_contract":
+                    if test == "derived_origin_b2_without_gcs_contract":
+                        assert reads == [("b2", "fixture.jpg", None),
+                            ("b2", "fixture/hls/720p.mp4", "bytes=1-3"),
+                            ("b2", "fixture/vtt/main.vtt", None),
+                            ("b2", "fixture/vtt/main.vtt", None),
+                            ("b2", "fixture/audio/analysis.json", None),
+                            ("b2", "missing", None), ("b2", "forbidden", None)], reads
+                    elif test == "derived_origin_default_independent_contract":
+                        assert reads == [("gcs", "fixture/hls/720p.mp4", None)], reads
+                    elif test == "derived_origin_fallback_contract":
+                        assert reads == [("b2", "missing", None), ("gcs", "missing", None),
+                            ("b2", "forbidden", None), ("gcs", "fixture/vtt/job.json", None)], reads
+                    elif test == "media_origin_routing_contract":
                         assert reads == [
                             ("b2", "hit", None), ("b2", "missing", None), ("gcs", "missing", None),
                             ("b2", "transient", "bytes=1-3"), ("gcs", "transient", "bytes=1-3"),

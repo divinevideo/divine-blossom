@@ -97,7 +97,7 @@ class KV:
     def delete(self, key):
         self.values.pop(key, None)
 
-    def snapshot(self, key):
+    def snapshot(self, key, *, timeout=30):
         value = self.get(key)
         if value is None:
             return None
