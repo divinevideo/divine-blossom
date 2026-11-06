@@ -5,6 +5,7 @@ mod admin;
 mod admin_sweep;
 mod auth;
 mod b2_cdn;
+mod b2_cdn_purge;
 mod blossom;
 mod canary;
 mod playback_cache;
