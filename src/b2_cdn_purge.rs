@@ -75,9 +75,40 @@ enum RecordState {
     Cleared,
 }
 
+/// Which revocation phase an intent belongs to. A single-hash policy change
+/// uses `Single`; account vanish and creator deletion use `Early` then `Final`.
+/// The phase is stored with the intent so the drain purges the right phase and
+/// the phase state machine advances only for the matching attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Phase {
+    Single,
+    Early,
+    Final,
+}
+
+impl Phase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Phase::Single => "single",
+            Phase::Early => "early",
+            Phase::Final => "final",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "single" => Phase::Single,
+            "early" => Phase::Early,
+            "final" => Phase::Final,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Record {
     attempt: String,
+    phase: Phase,
     requested_at: u64,
     committed_at: Option<u64>,
     cleared_at: Option<u64>,
@@ -208,6 +239,7 @@ fn encode(record: &Record) -> String {
             RecordState::Cleared => "cleared",
         },
         "attempt": record.attempt,
+        "phase": record.phase.as_str(),
         "requested_at": record.requested_at,
         "committed_at": record.committed_at,
         "cleared_at": record.cleared_at,
@@ -225,12 +257,16 @@ fn parse(value: &str) -> Parsed {
     };
     // A record with any key we do not own may be a newer schema with different
     // meaning. Leave it for a reader that understands it.
-    if object.len() != 7 {
+    if object.len() != 8 {
         return Parsed::Foreign;
     }
     let version = object.get("version").and_then(|value| value.as_u64());
     let state = object.get("state").and_then(|value| value.as_str());
     let attempt = object.get("attempt").and_then(|value| value.as_str());
+    let phase = object
+        .get("phase")
+        .and_then(|value| value.as_str())
+        .and_then(Phase::parse);
     let requested_at = object.get("requested_at").and_then(|value| value.as_u64());
     let attempts = object.get("attempts").and_then(|value| value.as_u64());
     let timestamp = |name: &str| match object.get(name) {
@@ -243,8 +279,8 @@ fn parse(value: &str) -> Parsed {
     else {
         return Parsed::Foreign;
     };
-    let (Some(version), Some(state), Some(attempt), Some(requested_at), Some(attempts)) =
-        (version, state, attempt, requested_at, attempts)
+    let (Some(version), Some(state), Some(attempt), Some(phase), Some(requested_at), Some(attempts)) =
+        (version, state, attempt, phase, requested_at, attempts)
     else {
         return Parsed::Foreign;
     };
@@ -268,6 +304,7 @@ fn parse(value: &str) -> Parsed {
     }
     Parsed::Intent(Record {
         attempt: attempt.to_string(),
+        phase,
         requested_at,
         committed_at,
         cleared_at,
@@ -335,6 +372,12 @@ fn lookup(store: &KVStore, key: &str) -> Result<Option<Snapshot>> {
 /// re-reads the key to bind the token to the attempt actually stored. A token
 /// is therefore only usable by the writer that created it.
 pub(crate) fn begin(hash: &str) -> Result<Token> {
+    begin_phase(hash, Phase::Single)
+}
+
+/// Begin an intent for a specific phase. `Early` and `Final` let the drain
+/// advance the matching phase state machine after a checked purge.
+pub(crate) fn begin_phase(hash: &str, phase: Phase) -> Result<Token> {
     let hash = hash.to_ascii_lowercase();
     if !is_lower_hex_64(&hash) {
         return Err(BlossomError::BadRequest(
@@ -346,6 +389,7 @@ pub(crate) fn begin(hash: &str) -> Result<Token> {
         .ok_or_else(|| BlossomError::BadRequest("Invalid hash for purge outbox".into()))?;
     let record = Record {
         attempt: attempt.clone(),
+        phase,
         requested_at: requested_at(),
         committed_at: None,
         cleared_at: None,
@@ -372,6 +416,23 @@ pub(crate) fn begin(hash: &str) -> Result<Token> {
         attempt,
         generation: snapshot.generation,
     })
+}
+
+/// Begin and commit an intent in one step for a caller that already persisted
+/// its policy or gate mutation. Returns the token so the caller can read the
+/// phase receipt later.
+///
+/// Fails closed when the commit does not land, matching [`execute`]: a lost
+/// intent is missing durability, not a benign supersede.
+pub(crate) fn enqueue(hash: &str, phase: Phase) -> Result<Token> {
+    let token = begin_phase(hash, phase)?;
+    let store = open_store()?;
+    match commit(&store, &token)? {
+        CommitOutcome::Committed => Ok(token),
+        CommitOutcome::Superseded => Err(BlossomError::MetadataError(
+            "B2 CDN purge intent lost before commit; retry required".into(),
+        )),
+    }
 }
 
 /// Mark the exact prepared record committed, by generation compare-and-swap.
@@ -432,19 +493,6 @@ fn complete_observed(store: &KVStore, snapshot: &Snapshot) -> Result<bool> {
     }
 }
 
-/// Record a purge attempt on a retained prepared record without changing its
-/// state or clearing it. Best effort: a failure here must not fail the drain.
-fn note_attempt(store: &KVStore, snapshot: &Snapshot) {
-    let updated = Record {
-        attempts: snapshot.record.attempts.saturating_add(1),
-        ..snapshot.record.clone()
-    };
-    let _ = store
-        .build_insert()
-        .mode(InsertMode::Overwrite)
-        .if_generation_match(snapshot.generation)
-        .execute(&snapshot.key, encode(&updated));
-}
 
 /// One durable receipt: `b2-cdn-purge-ack:v1:{phase}:{hash}:{attempt}`.
 fn receipt_key(phase: &str, hash: &str, attempt: &str) -> Option<String> {
@@ -469,6 +517,10 @@ fn receipt_parts(key: &str) -> Option<(&str, &str, &str)> {
 /// succeeded. Never write a receipt for a purge that did not succeed, and never
 /// infer one from an absent queue record.
 pub(crate) fn ack(token: &Token, phase: &str) -> Result<()> {
+    ack_with_store(&open_store()?, token, phase)
+}
+
+fn ack_with_store(store: &KVStore, token: &Token, phase: &str) -> Result<()> {
     let key = receipt_key(phase, &token.hash, &token.attempt)
         .ok_or_else(|| BlossomError::BadRequest("Invalid purge acknowledgement".into()))?;
     let body = serde_json::json!({
@@ -484,7 +536,7 @@ pub(crate) fn ack(token: &Token, phase: &str) -> Result<()> {
             "Purge acknowledgement too large".into(),
         ));
     }
-    open_store()?
+    store
         .build_insert()
         .mode(InsertMode::Overwrite)
         .execute(&key, body)
@@ -576,41 +628,42 @@ fn drain(
     purge: impl Fn(&[String]) -> Result<()>,
 ) -> Result<DrainOutcome> {
     let mut outcome = DrainOutcome::default();
-    let mut start = cursor(store);
+    // The persisted cursor is the last queue key this drain finished, not a
+    // list page token. A page token only advances between pages, so a pass that
+    // stops two rows into a page would either re-read those rows forever or
+    // skip the rest of the page. Keys sort lexicographically, so "resume after
+    // this key" is exact for both a partial page and a partial scan.
+    let after = cursor(store);
     let mut processed = 0usize;
     let mut scanned = 0usize;
-    let mut wrapped = false;
-    // A wrapped pass re-lists keys this pass already handled. Without this set,
-    // one call could purge and clear the same record twice and inflate result.
-    let mut handled: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // Assigned on the first iteration, before any break, and read after the loop.
-    let mut next_cursor: Option<String>;
+    let mut page_token: Option<String> = None;
+    let mut last_processed: Option<String> = None;
 
-    loop {
+    'pages: loop {
         let mut builder = store.build_list().limit(MAX_LIST_LIMIT).prefix(PREFIX);
-        if let Some(cursor) = start.as_deref() {
-            builder = builder.cursor(cursor);
+        if let Some(token) = page_token.as_deref() {
+            builder = builder.cursor(token);
         }
         let page = builder
             .execute()
             .map_err(|_| BlossomError::MetadataError("B2 CDN outbox listing unavailable".into()))?;
-        next_cursor = page.next_cursor();
 
         for key in page.keys() {
             scanned += 1;
-            // The cursor key never matches PREFIX, but guard anyway so a future
-            // rename cannot turn bookkeeping into an intent.
+            if after.as_deref().is_some_and(|after| key.as_str() <= after) {
+                continue;
+            }
             if key == CURSOR_KEY || queue_parts(key).is_none() {
                 continue;
             }
             if processed >= limit {
-                break;
+                break 'pages;
             }
-            if !handled.insert(key.clone()) {
-                continue;
-            }
+            last_processed = Some(key.clone());
             let Some(snapshot) = lookup(store, key)? else {
-                // Missing, oversized, malformed or foreign: retained, skipped.
+                // Missing, oversized, malformed or foreign: retained and
+                // skipped, but the cursor still advances past it so it cannot
+                // starve the healthy suffix.
                 continue;
             };
             match snapshot.record.state {
@@ -618,10 +671,10 @@ fn drain(
                 RecordState::Prepared => {
                     // Safe to purge, never safe to clear: the mutation may not
                     // have landed. Retain and report for operator attention.
+                    // Never rewrite it: the live writer still holds a token
+                    // bound to this generation and must be able to commit.
                     processed += 1;
-                    if purge(&[snapshot.hash.clone()]).is_ok() {
-                        note_attempt(store, &snapshot);
-                    } else {
+                    if purge(&[snapshot.hash.clone()]).is_err() {
                         outcome.errors += 1;
                     }
                     outcome.unknown += 1;
@@ -630,12 +683,34 @@ fn drain(
                 RecordState::Committed => {
                     processed += 1;
                     match purge(&[snapshot.hash.clone()]) {
-                        Ok(()) => match complete_observed(store, &snapshot)? {
-                            true => outcome.result += 1,
-                            // The record changed while the purge was in flight.
-                            // It needs its own pass.
-                            false => outcome.pending += 1,
-                        },
+                        Ok(()) => {
+                            // Phase intents advance the phase state machine
+                            // before the intent is cleared. A failure leaves
+                            // both records outstanding, so a checked purge is
+                            // never claimed as an acknowledgement.
+                            let phased = snapshot.record.phase != Phase::Single;
+                            if phased
+                                && crate::b2_cdn_phase::mark_purged(
+                                    store,
+                                    snapshot.record.phase.as_str(),
+                                    &snapshot.hash,
+                                )?
+                            {
+                                let token = Token {
+                                    key: snapshot.key.clone(),
+                                    hash: snapshot.hash.clone(),
+                                    attempt: snapshot.record.attempt.clone(),
+                                    generation: snapshot.generation,
+                                };
+                                ack_with_store(store, &token, snapshot.record.phase.as_str())?;
+                            }
+                            match complete_observed(store, &snapshot)? {
+                                true => outcome.result += 1,
+                                // The record changed while the purge was in
+                                // flight. It needs its own pass.
+                                false => outcome.pending += 1,
+                            }
+                        }
                         Err(_) => {
                             outcome.errors += 1;
                             outcome.pending += 1;
@@ -648,19 +723,20 @@ fn drain(
         if processed >= limit || scanned >= MAX_LIST_LIMIT as usize * 16 {
             break;
         }
-        match next_cursor.as_deref() {
-            Some(next) => start = Some(next.to_string()),
-            None if !wrapped => {
-                // One wrap so intents that sort before the saved cursor are not
-                // permanently starved once the tail is drained.
-                wrapped = true;
-                start = None;
-            }
+        match page.next_cursor() {
+            Some(next) => page_token = Some(next),
             None => break,
         }
     }
 
-    save_cursor(store, next_cursor.as_deref())?;
+    // A pass that hit its limit resumes after the exact last key it processed;
+    // a pass that reached the end clears the cursor so blocked rows are retried
+    // from the start. The cursor is never a stale page token.
+    if processed >= limit {
+        save_cursor(store, last_processed.as_deref())?;
+    } else {
+        save_cursor(store, None)?;
+    }
     Ok(outcome)
 }
 
@@ -702,6 +778,7 @@ mod tests {
     fn prepared() -> Record {
         Record {
             attempt: ATTEMPT.into(),
+            phase: Phase::Single,
             requested_at: 7,
             committed_at: None,
             cleared_at: None,
@@ -1265,6 +1342,145 @@ mod tests {
                 snapshot_for(&store, &token).record.state,
                 RecordState::Committed
             );
+            reset_all(&store);
+        }
+
+        #[test]
+        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-purge-outbox-tests.py"]
+        fn a_partial_pass_does_not_starve_healthy_rows_behind_blocked_ones() {
+            let store = store();
+            reset_all(&store);
+            // Five committed rows that share a hash prefix so page order is
+            // stable. The first two have purge failures; the remaining three
+            // must still drain across passes.
+            let hashes: Vec<String> = (0..5)
+                .map(|i| format!("{:02x}", i).repeat(32))
+                .collect();
+            for hash in &hashes {
+                let token = begin(hash).unwrap();
+                commit(&store, &token).unwrap();
+            }
+            let blocked: std::collections::HashSet<String> =
+                hashes.iter().take(2).cloned().collect();
+            let purge = |batch: &[String]| -> Result<()> {
+                if batch.iter().any(|hash| blocked.contains(hash)) {
+                    Err(BlossomError::StorageError("synthetic failure".into()))
+                } else {
+                    Ok(())
+                }
+            };
+            // Limit 2 processes the two blocked rows and stores a within-page
+            // position. The next calls must reach the healthy suffix rather
+            // than resetting to the first page forever.
+            let first = drain(&store, 2, purge).unwrap();
+            assert_eq!(first.result, 0);
+            assert_eq!(first.errors, 2);
+            let mut drained = 0;
+            for _ in 0..6 {
+                let outcome = drain(&store, 2, purge).unwrap();
+                drained += outcome.result;
+            }
+            assert_eq!(
+                drained, 3,
+                "healthy rows after two failing rows must eventually drain"
+            );
+            reset_all(&store);
+        }
+
+        #[test]
+        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-purge-outbox-tests.py"]
+        fn a_precautionary_drain_does_not_break_a_live_writers_commit() {
+            let store = store();
+            reset_all(&store);
+            let hash = "e4".repeat(32);
+            // A writer begins, a drain runs and purges the prepared record as a
+            // precaution, then the writer's mutation finishes and it commits.
+            let token = begin(&hash).unwrap();
+            let outcome = drain(&store, 2, purge_ok).unwrap();
+            assert_eq!(outcome.unknown, 1);
+            assert_eq!(
+                commit(&store, &token).unwrap(),
+                CommitOutcome::Committed,
+                "a precautionary purge must not invalidate the live token"
+            );
+            assert_eq!(
+                snapshot_for(&store, &token).record.state,
+                RecordState::Committed
+            );
+            reset_all(&store);
+        }
+
+        #[test]
+        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-purge-outbox-tests.py"]
+        fn phased_drain_acks_early_and_final_and_advances_the_state_machine() {
+            use crate::b2_cdn_phase::{self, PhysicalOutcome, State};
+            let store = store();
+            reset_all(&store);
+            let hash = "bd".repeat(32);
+            let _ = store
+                .build_delete()
+                .execute(&format!("b2-cdn-phase:v1:{hash}"));
+
+            // Early phase: deny/erasing gate persisted, early purge outstanding.
+            b2_cdn_phase::begin_early(&hash).unwrap();
+            let early = begin_phase(&hash, Phase::Early).unwrap();
+            assert_eq!(commit(&store, &early).unwrap(), CommitOutcome::Committed);
+            let outcome = drain(&store, 2, purge_ok).unwrap();
+            assert_eq!(outcome.result, 1);
+            assert_eq!(
+                b2_cdn_phase::state(&hash).unwrap(),
+                Some(State::EarlyAcked),
+                "drain must advance the early phase"
+            );
+            assert!(acknowledged(&store, &early, "early").unwrap());
+
+            // Physical wave, then the final phase.
+            b2_cdn_phase::record_physical(&hash, PhysicalOutcome::Absent).unwrap();
+            let final_token = begin_phase(&hash, Phase::Final).unwrap();
+            assert_eq!(
+                commit(&store, &final_token).unwrap(),
+                CommitOutcome::Committed
+            );
+            let outcome = drain(&store, 2, purge_ok).unwrap();
+            assert_eq!(outcome.result, 1);
+            assert_eq!(
+                b2_cdn_phase::state(&hash).unwrap(),
+                Some(State::FinalAcked)
+            );
+            assert!(acknowledged(&store, &final_token, "final").unwrap());
+            assert!(b2_cdn_phase::complete_ready(&hash).unwrap());
+            let _ = store
+                .build_delete()
+                .execute(&format!("b2-cdn-phase:v1:{hash}"));
+            reset_all(&store);
+        }
+
+        #[test]
+        #[ignore = "requires local KV fixture; scripts/run-b2-cdn-purge-outbox-tests.py"]
+        fn phased_purge_failure_never_advances_or_acks_the_phase() {
+            use crate::b2_cdn_phase::{self, State};
+            let store = store();
+            reset_all(&store);
+            let hash = "be".repeat(32);
+            let _ = store
+                .build_delete()
+                .execute(&format!("b2-cdn-phase:v1:{hash}"));
+            b2_cdn_phase::begin_early(&hash).unwrap();
+            let token = begin_phase(&hash, Phase::Early).unwrap();
+            commit(&store, &token).unwrap();
+
+            let outcome = drain(&store, 2, purge_fail).unwrap();
+            assert_eq!(outcome.result, 0);
+            assert_eq!(outcome.errors, 1);
+            assert_eq!(
+                b2_cdn_phase::state(&hash).unwrap(),
+                Some(State::EarlyPending),
+                "a failed purge must not acknowledge the phase"
+            );
+            assert!(!acknowledged(&store, &token, "early").unwrap());
+            let _ = store
+                .build_delete()
+                .execute(&format!("b2-cdn-phase:v1:{hash}"));
             reset_all(&store);
         }
 

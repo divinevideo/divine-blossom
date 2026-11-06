@@ -27,6 +27,10 @@ TESTS = [
     "b2_cdn_purge::tests::storage::execute_fails_closed_when_the_prepared_record_disappears_before_commit",
     "b2_cdn_purge::tests::storage::execute_fails_closed_when_the_record_no_longer_describes_the_attempt",
     "b2_cdn_purge::tests::storage::invalid_purge_configuration_is_an_error_and_retains_the_record",
+    "b2_cdn_purge::tests::storage::a_partial_pass_does_not_starve_healthy_rows_behind_blocked_ones",
+    "b2_cdn_purge::tests::storage::a_precautionary_drain_does_not_break_a_live_writers_commit",
+    "b2_cdn_purge::tests::storage::phased_drain_acks_early_and_final_and_advances_the_state_machine",
+    "b2_cdn_purge::tests::storage::phased_purge_failure_never_advances_or_acks_the_phase",
     "b2_cdn_purge::tests::storage::receipts_bind_to_one_attempt_and_never_imply_from_absence",
 ]
 

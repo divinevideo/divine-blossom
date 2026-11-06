@@ -2435,6 +2435,73 @@ fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) -> H
     purged
 }
 
+/// Persist the deny/erasing gate and an early-phase purge intent for a hash the
+/// caller is about to erase. Must run before the physical wave so a warm outer
+/// entry is invalidated even if the wave is interrupted.
+///
+/// Returns `true` when the early phase is outstanding and the caller must wait
+/// for the bounded drain to acknowledge it before treating the hash as done.
+/// A missing B2 replica or disabled outbox returns `false` without side effects.
+pub(crate) fn begin_vanish_early_phase(hash: &str) -> Result<bool> {
+    if !b2_replica_enabled() || !crate::b2_cdn_purge::configured() {
+        return Ok(false);
+    }
+    crate::metadata::claim_b2_erasure(hash)?;
+    crate::b2_cdn_phase::begin_early(hash)?;
+    crate::b2_cdn_purge::enqueue(hash, crate::b2_cdn_purge::Phase::Early)?;
+    Ok(true)
+}
+
+/// Record the physical-wave outcome for every hash in the wave, including one
+/// that failed, and enqueue the final purge. Called after the wave so the final
+/// phase exists even when provider deletion failed.
+///
+/// Returns the hashes whose final phase is outstanding. A hash whose earlier
+/// phase is not acknowledged yet keeps its early intent; the final intent is
+/// still recorded so no hash is silently dropped.
+pub(crate) fn finish_vanish_final_phase(
+    hashes: &[String],
+    failed: &HashSet<String>,
+    remaining: &HashSet<String>,
+) -> Result<HashSet<String>> {
+    let mut outstanding = HashSet::new();
+    if !b2_replica_enabled() || !crate::b2_cdn_purge::configured() {
+        return Ok(outstanding);
+    }
+    for hash in hashes {
+        // Any hash whose bytes are proven absent is `Absent`; one that failed or
+        // still has versions is `Failed`/`Unknown` and must be reconciled, never
+        // blindly deleted again.
+        let outcome = if failed.contains(hash) {
+            crate::b2_cdn_phase::PhysicalOutcome::Failed
+        } else if remaining.contains(hash) {
+            crate::b2_cdn_phase::PhysicalOutcome::Unknown
+        } else {
+            crate::b2_cdn_phase::PhysicalOutcome::Absent
+        };
+        match crate::b2_cdn_phase::record_physical(hash, outcome) {
+            Ok(true) => {}
+            // The hash never entered the phased flow (outbox disabled when its
+            // early phase was attempted). Leave it alone.
+            Ok(false) => continue,
+            Err(_) => {
+                outstanding.insert(hash.clone());
+                continue;
+            }
+        }
+        if crate::b2_cdn_purge::enqueue(hash, crate::b2_cdn_purge::Phase::Final).is_err() {
+            outstanding.insert(hash.clone());
+        }
+    }
+    Ok(outstanding)
+}
+
+/// Whether the final phase for a hash is purged and acknowledged, so erasure
+/// may be reported complete.
+pub(crate) fn vanish_final_phase_complete(hash: &str) -> bool {
+    crate::b2_cdn_phase::complete_ready(hash).unwrap_or(false)
+}
+
 /// Erase one bounded vanish batch from every enabled origin and CDN service.
 pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
     let mut result = VanishStorageResult::default();
