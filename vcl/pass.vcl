@@ -1,5 +1,5 @@
 # ABOUTME: VCL pass snippet for Divine Blossom VCL caching layer
-# ABOUTME: Gives upload requests the origin's real time budget instead of the delivery timeout
+# ABOUTME: Gives uploads and account erasure time to complete without extending media delivery waits
 #
 # Applied via the Fastly API/CLI as a VCL snippet in the vcl_pass subroutine.
 #
@@ -30,4 +30,12 @@
 
 if (req.url ~ "^/(upload|mirror)(/|$)") {
   set bereq.first_byte_timeout = 120s;
+}
+
+# Erasure finishes its current storage batch and completion audit before replying.
+# A batch can exceed the loop's admission budget, so the 15s delivery timeout can
+# expire even after every stored version has been deleted successfully.
+if ((req.method == "DELETE" && req.url ~ "^/vanish([?]|$)") ||
+    (req.method == "POST" && req.url ~ "^/admin/api/vanish([?]|$)")) {
+  set bereq.first_byte_timeout = 60s;
 }
