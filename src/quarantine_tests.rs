@@ -48,6 +48,56 @@ fn status() -> serde_json::Value {
 }
 
 #[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn moderation_cdn_purge_failure_is_durable_and_same_status_retry_purges() {
+    let metadata: BlobMetadata = serde_json::from_value(serde_json::json!({
+        "sha256": hash(), "size": 9, "type": "video/mp4", "uploaded": "2026-01-01T00:00:00Z",
+        "owner": "b".repeat(64), "status": "active"
+    })).unwrap();
+    put_blob_metadata(&metadata).unwrap();
+    let mutate = |action: &str| {
+        let mut req = request(Method::POST, "/admin/api/moderate", true);
+        req.set_body(serde_json::json!({"sha256": hash(), "action": action}).to_string());
+        call(req)
+    };
+    assert_eq!(mutate("BAN").get_status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(get_blob_metadata_uncached(&hash()).unwrap().unwrap().status, BlobStatus::Banned);
+    let store = open_store().unwrap();
+    assert!(!store.build_list().prefix("b2-cdn-purge").execute().unwrap().keys().is_empty());
+    // The already-banned status must not skip a previously failed purge.
+    assert_eq!(mutate("BAN").get_status(), StatusCode::OK);
+    assert_eq!(mutate("APPROVE").get_status(), StatusCode::OK);
+    assert_eq!(get_blob_metadata_uncached(&hash()).unwrap().unwrap().status, BlobStatus::Active);
+}
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn quarantine_cdn_purge_failure_remains_denied_and_idempotently_retries() {
+    let mutate = |action: &str, version: u64| {
+        let mut req = request(Method::POST, "/admin/api/quarantine", true);
+        req.set_body(serde_json::json!({
+            "sha256": hash(), "hold_id": "synthetic", "version": version, "action": action
+        }).to_string());
+        call(req)
+    };
+    assert_eq!(mutate("hold", 1).get_status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(status()["quarantined"], true);
+    let store = open_store().unwrap();
+    let pending = store.build_list().prefix("b2-cdn-purge").execute().unwrap();
+    assert!(!pending.keys().is_empty(), "failed purge lost durable retry discovery");
+    for key in pending.keys() {
+        let mut entry = store.lookup(key).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&entry.take_body().into_string()).unwrap();
+        assert_eq!(value["state"], "committed");
+    }
+    // The state mutation is idempotent, but a failed invalidation is not an ack.
+    assert_eq!(mutate("hold", 1).get_status(), StatusCode::OK);
+    assert_eq!(status()["quarantined"], true);
+    assert_eq!(mutate("release", 2).get_status(), StatusCode::OK);
+    assert_eq!(status()["quarantined"], false);
+}
+
+#[test]
 fn quarantine_response_source_hashes_cover_public_media_only() {
     let sha = "c".repeat(64);
     for path in [

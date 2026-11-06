@@ -251,6 +251,25 @@ pub fn update_quarantine_holds(
     version: u64,
     action: QuarantineAction,
 ) -> Result<()> {
+    with_policy_purge_intent(hash, || {
+        update_quarantine_holds_inner(hash, hold_id, version, action)
+    })
+}
+
+fn with_policy_purge_intent<T>(hash: &str, mutation: impl FnOnce() -> Result<T>) -> Result<T> {
+    if crate::b2_cdn_purge::configured() {
+        crate::b2_cdn_purge::execute(&hash.to_lowercase(), mutation)
+    } else {
+        mutation()
+    }
+}
+
+fn update_quarantine_holds_inner(
+    hash: &str,
+    hold_id: &str,
+    version: u64,
+    action: QuarantineAction,
+) -> Result<()> {
     let key = format!("{}{}", QUARANTINE_PREFIX, hash.to_lowercase());
     update_json_conditionally(&key, 5, "quarantine holds", |current| {
         mutate_holds(current, hold_id, version, action)
@@ -874,7 +893,7 @@ pub fn update_blob_status(hash: &str, status: BlobStatus) -> Result<()> {
         get_blob_metadata(hash)?.ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
 
     metadata.status = status;
-    put_blob_metadata(&metadata)?;
+    with_policy_purge_intent(hash, || put_blob_metadata(&metadata))?;
 
     Ok(())
 }

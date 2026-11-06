@@ -2226,6 +2226,105 @@ fn mark_failed_stage(
     }
 }
 
+/// Production CDN invalidation is opt-in with the production delivery path.
+pub(crate) fn b2_cdn_invalidation_enabled() -> bool {
+    // Disabling admission does not revoke a stored outer response. Retained
+    // purge hosts keep invalidation active throughout rollback and draining.
+    crate::b2_cdn_purge::configured()
+}
+
+fn b2_cdn_purge_urls(hash: &str, hosts: &str, current_host: &str) -> Result<Vec<String>> {
+    let invalid = || BlossomError::StorageError("B2 CDN purge configuration invalid".into());
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid());
+    }
+    let names = blossom_core::b2_cdn::purge_hosts(Some(hosts), Some(current_host))
+        .ok_or_else(invalid)?;
+    Ok(names.into_iter().map(|host| format!("https://{host}/{}", hash.to_ascii_lowercase())).collect())
+}
+
+/// Send targeted URL purges as well as committed hash-variant purges.
+/// In-flight cache behavior still requires live provider acceptance tests.
+/// All requests are drained; no acknowledgement is returned on partial failure.
+pub(crate) fn invalidate_b2_cdn(hashes: &[String]) -> Result<()> {
+    if !b2_cdn_invalidation_enabled() || hashes.is_empty() { return Ok(()); }
+    validate_b2_cdn_purge_batch(hashes)?;
+    let hosts = get_config("b2_cdn_purge_hosts")?;
+    let current_host = get_config("b2_cdn_host")?;
+    let mut requests = Vec::new();
+    for hash in hashes {
+        for url in b2_cdn_purge_urls(hash, &hosts, &current_host)? {
+            let encoded: String = url.bytes().map(|byte| {
+                if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                    (byte as char).to_string()
+                } else { format!("%{byte:02X}") }
+            }).collect();
+            requests.push(Request::post(format!("https://api.fastly.com/purge/{encoded}")));
+        }
+    }
+    let token = get_secret("fastly_api_token")?;
+    if token.is_empty() { return Err(BlossomError::StorageError("B2 CDN purge credential unavailable".into())); }
+    for chunk in hashes.chunks(256) {
+        for service in ["ML7R82HKfmTaqTpHExIDVN", "pOvEEWykEbpnylqst1KTrR"] {
+            let mut request = Request::post(format!("https://api.fastly.com/service/{service}/purge"));
+            request.set_header("Surrogate-Key", chunk.iter().map(|hash| hash.to_ascii_lowercase()).collect::<Vec<_>>().join(" "));
+            requests.push(request);
+        }
+    }
+    let mut failed = false;
+    for round in 0..2 {
+        let mut pending = Vec::new();
+        for template in &requests {
+            let mut request = template.clone_without_body();
+            request.set_header("Host", "api.fastly.com");
+            request.set_header("Fastly-Key", &token);
+            request.set_header("Accept", "application/json");
+            match request.send_async("fastly_api") {
+                Ok(handle) => pending.push(handle),
+                Err(_) => failed = true,
+            }
+        }
+        while !pending.is_empty() {
+            let (response, remaining) = fastly::http::request::select(pending);
+            pending = remaining;
+            if !matches!(response, Ok(response) if response.get_status().is_success()) { failed = true; }
+        }
+        if round == 0 { wait_b2_cdn_purge_interval()?; }
+    }
+    if failed { Err(BlossomError::StorageError("B2 CDN invalidation incomplete; retry required".into())) } else { Ok(()) }
+}
+
+fn validate_b2_cdn_purge_batch(hashes: &[String]) -> Result<()> {
+    let mut seen = HashSet::new();
+    if hashes.len() > 4 || hashes.iter().any(|hash| {
+        hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !seen.insert(hash.to_ascii_lowercase())
+    }) {
+        return Err(BlossomError::StorageError("B2 CDN purge batch invalid or over budget".into()));
+    }
+    Ok(())
+}
+
+/// Fastly documents a second URL/key purge after about two seconds for
+/// shield ordering races. Yield to the host timer instead of consuming CPU.
+fn wait_b2_cdn_purge_interval() -> Result<()> {
+    let handles: [fastly_sys::AsyncItemHandle; 0] = [];
+    let mut index = u32::MAX;
+    // SAFETY: the empty slice pointer and output pointer remain valid for this
+    // hostcall. The timeout is strictly positive (zero would wait indefinitely).
+    let status = unsafe { fastly_sys::fastly_async_io::select(handles.as_ptr(), 0, 2000, &mut index) };
+    if status.is_err() || index != u32::MAX {
+        return Err(BlossomError::StorageError("B2 CDN purge interval unavailable; retry required".into()));
+    }
+    Ok(())
+}
+
+/// Retain legacy best-effort behavior until production CDN mode is enabled.
+pub(crate) fn purge_policy_cache(hash: &str) -> Result<()> {
+    if b2_cdn_invalidation_enabled() { invalidate_b2_cdn(&[hash.to_string()]) }
+    else { crate::purge_edge_cache(hash); Ok(()) }
+}
+
 /// Purge the given hashes by surrogate key from both CDN services and return
 /// the hashes whose purge request both services accepted.
 fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) -> HashSet<String> {
@@ -4129,6 +4228,25 @@ pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtracti
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cdn_invalidation_rejects_unbounded_or_ambiguous_batches_before_dispatch() {
+        let hashes: Vec<String> = (0..5).map(|n| format!("{n:064x}")).collect();
+        assert!(super::validate_b2_cdn_purge_batch(&hashes[..4]).is_ok());
+        assert!(super::validate_b2_cdn_purge_batch(&hashes).is_err());
+        assert!(super::validate_b2_cdn_purge_batch(&[hashes[0].clone(), hashes[0].clone()]).is_err());
+        assert!(super::validate_b2_cdn_purge_batch(&["not-a-hash".into()]).is_err());
+    }
+    #[test]
+    fn b2_cdn_purge_urls_cover_only_configured_normalized_keys() {
+        let hash = "A".repeat(64);
+        let urls = super::b2_cdn_purge_urls(&hash, "media-b2-cdn.divine.video,media-b2.divine.video", "media-b2-cdn.divine.video").unwrap();
+        assert_eq!(urls, vec![format!("https://media-b2-cdn.divine.video/{}", "a".repeat(64)), format!("https://media-b2.divine.video/{}", "a".repeat(64))]);
+        for hosts in ["", "https://media-b2-cdn.divine.video", "media-b2-cdn.divine.video:443", "media-b2-cdn.divine.video/path", "media-b2-cdn.divine.video\r\nX:bad", "other.divine.video", "media-b2-cdn.divine.video, media-b2.divine.video"] {
+            assert!(super::b2_cdn_purge_urls(&hash, hosts, "media-b2-cdn.divine.video").is_err(), "invalid purge host set accepted");
+        }
+        assert!(super::b2_cdn_purge_urls("bad", "media-b2-cdn.divine.video", "media-b2-cdn.divine.video").is_err());
+        assert!(super::b2_cdn_purge_urls(&hash, "media-b2-cdn.divine.video,media-b2-cdn.divine.video", "media-b2-cdn.divine.video").is_err());
+    }
     #[test]
     fn canary_transient_transport_classification_preserves_setup_failures() {
         use fastly::http::request::SendErrorCause;

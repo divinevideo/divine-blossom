@@ -919,7 +919,7 @@ pub fn handle_admin_quarantine_action(mut req: Request) -> Result<Response> {
     let hash = payload.sha256.to_lowercase();
     update_quarantine_holds(&hash, &payload.hold_id, payload.version, payload.action)?;
     // Retry this targeted purge even after idempotent or stale mutations.
-    crate::purge_edge_cache(&hash);
+    crate::storage::purge_policy_cache(&hash)?;
     quarantine_status_response(&hash)
 }
 
@@ -1009,10 +1009,12 @@ pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
             restore_soft_deleted_blob(&moderate_req.sha256, &metadata, new_status)?;
         } else {
             update_blob_status(&moderate_req.sha256, new_status)?;
-            crate::purge_edge_cache(&moderate_req.sha256);
             let _ = update_stats_on_status_change(old_status, new_status);
         }
     }
+    // Repeat eviction even when a prior attempt already committed the status
+    // but failed to receive both CDN purge acknowledgements.
+    crate::storage::purge_policy_cache(&moderate_req.sha256)?;
 
     let response = serde_json::json!({
         "success": true,
