@@ -12,3 +12,5 @@ pub mod subtitle_lang;
 pub mod transcribe;
 pub mod types;
 pub mod upload_log;
+
+pub mod delivery_telemetry;

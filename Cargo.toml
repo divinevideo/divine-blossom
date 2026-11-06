@@ -18,6 +18,9 @@ fastly = "=0.11.12"
 # Timed readiness waits for the optional delivery probe (same SDK host ABI).
 fastly-sys = "=0.11.12"
 
+# Request-boundary telemetry IDs, backed by WASI random_get
+getrandom = "0.2"
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -383,6 +383,10 @@ pub(crate) fn download_canary_original(
     }
     request.set_pass(true);
     sign_request(&mut request, &config, Some("UNSIGNED-PAYLOAD".into()))?;
+    crate::delivery_telemetry::observe(
+        blossom_core::delivery_telemetry::Provider::B2,
+        blossom_core::delivery_telemetry::Cache::Bypass,
+    );
     let mut response = match request.send(B2_MEDIA_BACKEND) {
         Ok(response) => response,
         Err(error) if transient_canary_origin_error(error.root_cause()) => {
@@ -467,6 +471,19 @@ const DEMAND_ATTEMPT_BUDGET: Duration = Duration::from_secs(3);
 fn send_demand(request: Request, backend: &str, deadline: Instant) -> Result<Option<Response>> {
     if Instant::now() >= deadline {
         return Ok(None);
+    }
+    // Only actual media-origin sends update this field. Erasure authorization
+    // shares this bounded send helper but is not a media fetch.
+    let provider = match backend {
+        B2_MEDIA_BACKEND => Some(blossom_core::delivery_telemetry::Provider::B2),
+        GCS_BACKEND => Some(blossom_core::delivery_telemetry::Provider::Gcs),
+        _ => None,
+    };
+    if let Some(provider) = provider {
+        crate::delivery_telemetry::observe(
+            provider,
+            blossom_core::delivery_telemetry::Cache::Bypass,
+        );
     }
     let (request, body) = request.into_handles();
     let pending = match request.send_async(
