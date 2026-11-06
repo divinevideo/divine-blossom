@@ -144,7 +144,10 @@ Policy writes first persist a distinct per-attempt intent in
 mutation; committed intents survive failed eviction. Prepared or foreign records
 are not automatically cleared. A checked purge must succeed before a committed
 intent can be marked cleared, and a receipt is bound to its exact attempt.
-Missing records do not imply acknowledgement.
+Missing records do not imply acknowledgement. A URL purge404 for a retained,
+already-unbound hostname is a no-op only while both hash-key service purges
+acknowledge; a key-purge404, authentication failure or provider error still
+fails the checked eviction and retains the intent.
 
 The authenticated POST `/admin/api/b2-cdn-purge/drain?max=2` drains at most two
 hashes per execution. A recurring worker may use the dedicated Secret Store key

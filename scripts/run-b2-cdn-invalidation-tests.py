@@ -21,7 +21,12 @@ class Purge(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         self.rfile.read(length)
         self.server.calls.append((self.path, self.headers.get("Surrogate-Key")))
-        self.send_response(503 if len(self.server.calls) <= 6 else 200)
+        if os.environ.get("TEST_CDN_URL404") == "1":
+            self.send_response(404 if self.path.startswith("/purge/") else 200)
+        elif os.environ.get("TEST_CDN_KEY404") == "1":
+            self.send_response(404 if self.path.startswith("/service/") else 200)
+        else:
+            self.send_response(503 if len(self.server.calls) <= 6 else 200)
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -84,6 +89,15 @@ blossom_secrets = [{{key="b2_cdn_purge_drain_token",data="synthetic-drain-token"
                 ):
                     assert not server.calls
                     print(f"PASS {os.environ['TEST_CDN_CONTRACT']}: no inline purge requests")
+                    return
+                if os.environ.get("TEST_CDN_URL404") == "1" or os.environ.get("TEST_CDN_KEY404") == "1":
+                    assert len(server.calls) == 6, len(server.calls)
+                    for start in range(0, 6, 3):
+                        assert sorted(server.calls[start:start + 3]) == sorted(expected)
+                    if os.environ.get("TEST_CDN_URL404") == "1":
+                        print("PASS retained unbound host: URL404 plus both service key acknowledgements")
+                    else:
+                        print("PASS missing key acknowledgement: URL success cannot acknowledge eviction")
                     return
                 assert len(server.calls) == 18, len(server.calls)
                 for start in range(0, 18, 3):

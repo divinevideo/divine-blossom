@@ -635,3 +635,15 @@ fn cdn_drain_service_token_is_not_an_admin_credential() {
     wrong.set_header("Authorization", "Bearer invalid-drain-token");
     assert_eq!(call(wrong).get_status(), StatusCode::UNAUTHORIZED);
 }
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn retained_unbound_host_does_not_cancel_successful_key_eviction() {
+    storage::invalidate_b2_cdn(&[hash()]).unwrap();
+}
+
+#[test]
+#[ignore = "requires failing then recovering local purge backend"]
+fn missing_hash_key_purge_acknowledgement_is_not_success() {
+    assert!(storage::invalidate_b2_cdn(&[hash()]).is_err());
+}

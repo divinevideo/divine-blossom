@@ -2290,7 +2290,17 @@ pub(crate) fn invalidate_b2_cdn(hashes: &[String]) -> Result<()> {
         while !pending.is_empty() {
             let (response, remaining) = fastly::http::request::select(pending);
             pending = remaining;
-            if !matches!(response, Ok(response) if response.get_status().is_success()) { failed = true; }
+            let acknowledged = match response {
+                Ok(response) if response.get_status().is_success() => true,
+                // A retained host may already be unbound during rollback. The
+                // URL has no current route to evict; both service-targeted hash
+                // key purges must still acknowledge in this same round.
+                Ok(response) if response.get_status() == StatusCode::NOT_FOUND => response
+                    .get_backend_request()
+                    .is_some_and(|request| request.get_path().starts_with("/purge/https%3A%2F%2F")),
+                _ => false,
+            };
+            if !acknowledged { failed = true; }
         }
         if round == 0 { wait_b2_cdn_purge_interval()?; }
     }
