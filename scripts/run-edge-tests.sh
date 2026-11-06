@@ -89,3 +89,6 @@ VICEROY="$VICEROY" python3 scripts/run-quarantine-race-tests.py
 VICEROY="$VICEROY" python3 scripts/run-playback-telemetry-tests.py
 VICEROY="$VICEROY" python3 scripts/run-playback-origin-telemetry-tests.py
 VICEROY="$VICEROY" python3 scripts/run-playback-cache-telemetry-tests.py
+
+# Canonical direct uploads can reuse the provider-aware service for small images.
+VICEROY="$VICEROY" python3 scripts/run-upload-routing-tests.py

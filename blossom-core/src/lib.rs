@@ -15,3 +15,5 @@ pub mod types;
 pub mod upload_log;
 
 pub mod delivery_telemetry;
+
+pub mod upload_routing;
