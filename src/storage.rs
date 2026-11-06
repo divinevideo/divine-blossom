@@ -4128,7 +4128,8 @@ fn failed_cloud_cleanup_hashes(
         .iter()
         .filter(|hash| {
             !outcomes.get(&hash.to_lowercase()).is_some_and(|result| {
-                result.main_deleted_or_absent && result.private_family.is_some()
+                result.main_deleted_or_absent
+                    && result.private_family == Some(PrivateFamilyCleanup::Absent)
             })
         })
         .cloned()
