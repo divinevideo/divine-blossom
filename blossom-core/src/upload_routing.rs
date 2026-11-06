@@ -1,11 +1,13 @@
 //! Canonical direct-upload routing, independent of downstream storage authority.
+pub const INLINE_UPLOAD_MAX_BYTES: u64 = 500 * 1024;
+
 pub fn should_proxy(flag: Option<&str>, size: u64, mime: &str) -> Result<bool, &'static str> {
     let all = match flag {
         None | Some("false") => false,
         Some("true") => true,
         Some(_) => return Err("Invalid upload_service_all_uploads configuration"),
     };
-    Ok(all || size > 500 * 1024 || crate::types::is_video_mime_type(mime))
+    Ok(all || size > INLINE_UPLOAD_MAX_BYTES || crate::types::is_video_mime_type(mime))
 }
 
 #[cfg(test)]
