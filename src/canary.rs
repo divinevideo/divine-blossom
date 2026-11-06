@@ -349,11 +349,19 @@ mod tests {
     #[ignore = "requires demand fixtures; scripts/run-b2-canary-tests.py"]
     fn demand_cached_large_contract() {
         use sha2::{Digest, Sha256};
+        use std::io::Read;
         let config = fastly::config_store::ConfigStore::open("blossom_config");
         let hash = config.get("test_hash").unwrap();
         let size = config.get("test_size").unwrap().parse::<usize>().unwrap();
         let url = format!("https://media-b2.divine.video/{hash}");
+        let started = std::time::Instant::now();
         let mut first = handle_main(Request::get(&url)).unwrap();
+        if config.get("test_fragmented").as_deref() == Some("true") {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(1),
+                "headers waited for fragmented body"
+            );
+        }
         assert_eq!(first.get_status(), StatusCode::OK);
         assert_eq!(
             first.get_header_str("X-Divine-Storage-Cache"),
@@ -366,7 +374,7 @@ mod tests {
         );
         assert_eq!(
             first.get_header_str("X-Divine-Storage-Cache-Reason"),
-            Some("inserted")
+            Some("streaming_insert")
         );
         assert_eq!(
             first.get_header_str("X-Divine-Storage-Cache-Enabled"),
@@ -377,14 +385,22 @@ mod tests {
             .is_some());
         assert_eq!(
             first.get_header_str("X-Divine-Storage-Cache-Buffered-Bytes"),
-            Some(size.to_string().as_str())
+            Some("0")
         );
         let reads = first
             .get_header_str("X-Divine-Storage-Cache-Buffer-Reads")
             .unwrap()
             .parse::<u64>()
             .unwrap();
-        assert!(reads > 0);
+        assert_eq!(reads, 0);
+        assert_eq!(
+            first.get_header_str("X-Divine-Storage-Cache-Fill-Mode"),
+            Some("host-stream")
+        );
+        assert_eq!(
+            first.get_header_str("X-Divine-Storage-Cache-Expected-Bytes"),
+            Some(size.to_string().as_str())
+        );
         let memory = first
             .get_header_str("X-Divine-Storage-Cache-Linear-Memory-Bytes")
             .unwrap()
@@ -404,9 +420,22 @@ mod tests {
         println!(
             "\nCACHE_FILL size_bytes={size} cpu_ms={cpu} read_calls={reads} linear_bytes={memory}"
         );
-        let bytes = first.take_body().into_bytes();
-        assert_eq!(bytes.len(), size);
-        assert_eq!(hex::encode(Sha256::digest(bytes)), hash);
+        // Model downstream streaming, rather than allocating the complete
+        // video inside the guest test consumer and growing its Vec past 32MiB.
+        let mut body = first.take_body();
+        let mut digest = Sha256::new();
+        let mut received = 0;
+        let mut chunk = vec![0; 64 * 1024];
+        loop {
+            let count = body.read(&mut chunk).unwrap();
+            if count == 0 {
+                break;
+            }
+            digest.update(&chunk[..count]);
+            received += count;
+        }
+        assert_eq!(received, size);
+        assert_eq!(hex::encode(digest.finalize()), hash);
         let mut head = handle_main(Request::new("HEAD", &url)).unwrap();
         assert_eq!(head.get_header_str("X-Divine-Storage-Cache"), Some("HIT"));
         assert_eq!(head.take_body().into_string(), "");
@@ -480,13 +509,10 @@ mod tests {
         let mut first = handle_main(Request::get(&url)).unwrap();
         if timeout {
             assert_eq!(first.get_status(), StatusCode::OK);
-            assert_eq!(
-                first.get_header_str("X-Divine-Storage-Cache"),
-                Some("BYPASS")
-            );
+            assert_eq!(first.get_header_str("X-Divine-Storage-Cache"), Some("MISS"));
             assert_eq!(
                 first.get_header_str("X-Divine-Storage-Cache-Reason"),
-                Some("buffer_timeout")
+                Some("streaming_insert")
             );
             assert_eq!(first.take_body().into_string(), body);
         } else {
@@ -494,7 +520,10 @@ mod tests {
         }
         let mut retry = handle_main(Request::get(&url)).unwrap();
         assert_eq!(retry.get_status(), StatusCode::OK);
-        assert_eq!(retry.get_header_str("X-Divine-Storage-Cache"), Some("MISS"));
+        assert_eq!(
+            retry.get_header_str("X-Divine-Storage-Cache"),
+            Some(if timeout { "HIT" } else { "MISS" })
+        );
         assert_eq!(retry.take_body().into_string(), body);
         let mut warm = handle_main(Request::get(&url)).unwrap();
         assert_eq!(warm.get_header_str("X-Divine-Storage-Cache"), Some("HIT"));

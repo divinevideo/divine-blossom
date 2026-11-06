@@ -5,26 +5,24 @@
 //! Callers also validate the worker-verified pinned B2 version or authoritative
 //! immutable GCS object. This cache checks full size without rehashing the body.
 
-use crate::error::{BlossomError, Result};
+use crate::error::Result;
 use crate::storage::{wait_for_demand_io, CanaryOrigin};
 use fastly::cache::core::{CacheBusyHandle, CacheError, Found, PendingTransaction, Transaction};
 use fastly::http::body::StreamingBody;
 use fastly::http::{Method, StatusCode};
-use fastly::{Body, Response};
+use fastly::Response;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::time::{Duration, Instant};
 
 const MAX_CACHE_BYTES: u64 = 32 * 1024 * 1024;
-const BUFFER_READ_BYTES: usize = 256 * 1024;
-const CACHE_NAMESPACE: &str = "divine-demand-playback-v2";
+const CACHE_NAMESPACE: &str = "divine-demand-playback-v3";
 const MAX_METADATA_BYTES: usize = 4096;
 const MAX_HEADER_BYTES: usize = 1024;
 const CACHE_TTL: Duration = Duration::from_secs(3600);
 const LOOKUP_BUDGET: Duration = Duration::from_millis(50);
-const BUFFER_BUDGET: Duration = Duration::from_secs(3);
 const REQUEST_CPU_BUDGET_MS: u64 = 25;
 
 thread_local! {
@@ -93,6 +91,7 @@ impl Identity<'_> {
 struct Metadata {
     identity: String,
     size: u64,
+    insertion: String,
     etag: Option<String>,
     last_modified: Option<String>,
 }
@@ -107,6 +106,8 @@ impl Metadata {
     fn valid(&self, identity: &str, size: u64) -> bool {
         self.identity == identity
             && self.size == size
+            && self.insertion.len() == 32
+            && self.insertion.bytes().all(|b| b.is_ascii_hexdigit())
             && self.etag.as_deref().is_none_or(safe_header)
             && self.last_modified.as_deref().is_none_or(safe_header)
     }
@@ -129,9 +130,15 @@ impl Metadata {
                 }
             }
         }
+        // Internal cache coordination only: never derived from a caller ID
+        // or returned in response headers. Fail open if entropy is unavailable.
+        use k256::elliptic_curve::rand_core::{OsRng, RngCore};
+        let mut insertion = [0; 16];
+        OsRng.try_fill_bytes(&mut insertion).ok()?;
         Some(Self {
             identity: identity.to_owned(),
             size,
+            insertion: hex::encode(insertion),
             etag: header(response, "ETag")?,
             last_modified: header(response, "Last-Modified")?,
         })
@@ -274,31 +281,6 @@ fn cached_response(
     Some(response)
 }
 
-#[derive(Clone, Copy)]
-struct BufferStats {
-    bytes: usize,
-    reads: u64,
-}
-
-impl BufferStats {
-    fn attach(self, response: &mut Response) {
-        response.set_header(
-            "X-Divine-Storage-Cache-Buffered-Bytes",
-            self.bytes.to_string(),
-        );
-        response.set_header(
-            "X-Divine-Storage-Cache-Buffer-Reads",
-            self.reads.to_string(),
-        );
-    }
-}
-
-enum Buffered {
-    Complete(Vec<u8>, BufferStats),
-    Streaming(Body, &'static str, BufferStats),
-    Unavailable,
-}
-
 fn begin_insert(
     transaction: Transaction,
     metadata: Vec<u8>,
@@ -314,66 +296,58 @@ fn begin_insert(
         .execute_and_stream_back()
 }
 
-fn replay_prefix(
-    mut bytes: Vec<u8>,
-    stats: BufferStats,
-    remainder: Body,
-    reason: &'static str,
-) -> Buffered {
-    bytes.truncate(stats.bytes);
-    let mut prefix = Body::from(bytes);
-    prefix.append(remainder);
-    Buffered::Streaming(prefix, reason, stats)
+fn begin_replacement(
+    key: String,
+    metadata: Vec<u8>,
+    identity: &Identity<'_>,
+    deadline: Instant,
+) -> std::result::Result<(StreamingBody, Found), &'static str> {
+    // Replace only after positive invalid-entry/stream-error evidence, on a full
+    // origin fetch already required for this request. Never purge other fills.
+    let writer = fastly::cache::core::insert(key.clone().into_bytes().into(), CACHE_TTL)
+        .stale_while_revalidate(Duration::ZERO)
+        .surrogate_keys([identity.hash])
+        .user_metadata(metadata.clone().into())
+        .execute()
+        .map_err(|_| "repair_insert")?;
+    // Nontransactional insertion lacks stream-back. Bound its readback lookup
+    // and require this insertion's nonce, so a racing writer or failed prior
+    // entry can never supply the stream for this origin. Until this succeeds,
+    // the source response remains untouched and dropping writer aborts our fill.
+    let replacement = CacheTransaction(Some(lookup(key, deadline)?));
+    let found = replacement
+        .0
+        .as_ref()
+        .and_then(Transaction::found)
+        .filter(|found| found.is_usable() && found.user_metadata().as_ref() == metadata.as_slice())
+        .ok_or("repair_readback")?;
+    Ok((writer, found))
 }
 
-#[allow(deprecated)] // Raw unbuffered body handles keep each read deadline-bounded.
-fn buffer(body: Body, size: u64, deadline: Instant) -> Buffered {
+#[allow(deprecated)] // Raw body handle allows readiness-bounded, one-byte probing.
+fn failed_stream(found: &Found, expected_size: u64, deadline: Instant) -> bool {
+    // No range: requesting an unavailable offset can block inside get_body,
+    // before a selectable handle exists. An unbounded stream is nonblocking.
+    let Ok(body) = found.to_stream() else {
+        return false;
+    };
     let mut body = body.into_handle();
-    // The eligibility check guarantees size <= MAX_CACHE_BYTES. Reserve the
-    // exact bounded space to avoid Vec's doubling on the final excess byte.
-    let limit = size as usize + 1;
-    let mut bytes: Vec<u8> = Vec::new();
-    let mut stats = BufferStats { bytes: 0, reads: 0 };
-    if bytes.try_reserve_exact(limit).is_err() {
-        return Buffered::Streaming(body.into(), "allocation", stats);
+    // SAFETY: borrow the live handle until the readiness wait and read finish.
+    if wait_for_demand_io(
+        unsafe { body.as_u32() },
+        deadline.min(Instant::now() + LOOKUP_BUDGET),
+    )
+    .is_err()
+    {
+        return false;
     }
-    // Read requires initialized memory. Reading directly into this one buffer
-    // removes the staging copy, without unsafe uninitialized slices.
-    // SAFETY: try_reserve_exact established capacity >= limit, the allocation
-    // has no aliases, and every u8 is initialized before increasing length.
-    // Use the bulk-memory intrinsic: an element-by-element debug resize can
-    // itself exhaust the admission budget before the first origin read.
-    unsafe {
-        bytes.as_mut_ptr().write_bytes(0, limit);
-        bytes.set_len(limit);
-    }
-    loop {
-        if !cpu_budget_available() {
-            return replay_prefix(bytes, stats, body.into(), "cpu_buffer");
-        }
-        // SAFETY: this is a borrowed live body handle retained until after wait.
-        if let Err(error) = wait_for_demand_io(unsafe { body.as_u32() }, deadline) {
-            if error.kind() != io::ErrorKind::TimedOut {
-                return Buffered::Unavailable;
-            }
-            return replay_prefix(bytes, stats, body.into(), "buffer_timeout");
-        }
-        let capacity = (limit - stats.bytes).min(BUFFER_READ_BYTES);
-        stats.reads += 1;
-        match body.read(&mut bytes[stats.bytes..stats.bytes + capacity]) {
-            Ok(0) => {
-                bytes.truncate(stats.bytes);
-                return Buffered::Complete(bytes, stats);
-            }
-            Ok(read) => stats.bytes += read,
-            Err(_) => return Buffered::Unavailable,
-        }
-        if stats.bytes as u64 > size {
-            // Reaching this bound contradicts the verified advertised length.
-            // Return the complete prefix for the caller's integrity rejection.
-            bytes.truncate(stats.bytes);
-            return Buffered::Complete(bytes, stats);
-        }
+    match body.read(&mut [0; 1]) {
+        Ok(0) => expected_size != 0,
+        Ok(_) => false,
+        Err(error) => !matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
+        ),
     }
 }
 
@@ -391,12 +365,14 @@ pub(crate) fn read(
         return fetch().map(|origin| marked(origin, "BYPASS", "cpu_before_lookup"));
     }
     let digest = identity.digest();
-    let transaction = match lookup(format!("{CACHE_NAMESPACE}:{digest}"), deadline) {
+    let key = format!("{CACHE_NAMESPACE}:{digest}");
+    let transaction = match lookup(key.clone(), deadline) {
         Ok(transaction) => transaction,
         Err(reason) => return fetch().map(|origin| marked(origin, "BYPASS", reason)),
     };
     let mut transaction = CacheTransaction(Some(transaction));
     let current = transaction.0.as_ref().expect("owned transaction");
+    let mut repairable = false;
     if let Some(found) = current.found() {
         if found.is_usable() && !found.is_stale() && found.known_length() == Some(identity.size) {
             if let Some(metadata) = Metadata::decode(&found.user_metadata(), &digest, identity.size)
@@ -406,9 +382,16 @@ pub(crate) fn read(
                 }
             }
         }
+        if *method == Method::GET && range.is_none() && !current.must_insert_or_update() {
+            repairable =
+                found.known_length().is_some() || failed_stream(&found, identity.size, deadline);
+        }
     }
     // HEAD and range misses retain their genuine origin semantics and never fill.
-    if *method != Method::GET || range.is_some() || !current.must_insert_or_update() {
+    if *method != Method::GET
+        || range.is_some()
+        || (!current.must_insert_or_update() && !repairable)
+    {
         drop(transaction);
         return fetch().map(|origin| marked(origin, "BYPASS", "not_fill_leader"));
     }
@@ -446,76 +429,77 @@ pub(crate) fn read(
             ))
         }
     };
-    if !cpu_budget_available() {
+    if !cpu_budget_available() || Instant::now() >= deadline {
         return Ok(marked(
             CanaryOrigin::Delivered(response),
             "BYPASS",
-            "cpu_before_buffer",
+            "handoff_budget",
         ));
     }
-    let bytes = match buffer(
-        response.take_body(),
-        identity.size,
-        deadline.min(Instant::now() + BUFFER_BUDGET),
-    ) {
-        Buffered::Complete(bytes, stats) => {
-            stats.attach(&mut response);
-            bytes
-        }
-        Buffered::Streaming(body, reason, stats) => {
-            stats.attach(&mut response);
-            response.set_body(body);
-            return Ok(marked(CanaryOrigin::Delivered(response), "BYPASS", reason));
-        }
-        Buffered::Unavailable => return Ok(CanaryOrigin::Unavailable),
+    let insertion = if transaction.0.as_ref().unwrap().must_insert_or_update() {
+        begin_insert(
+            transaction.0.take().expect("owned transaction"),
+            encoded,
+            &identity,
+        )
+        .map_err(|_| "insert_unavailable")
+    } else {
+        drop(transaction);
+        begin_replacement(key, encoded, &identity, deadline)
     };
-    if bytes.len() as u64 != identity.size {
-        return Err(BlossomError::StorageError(
-            "Demand cache content size verification failed".into(),
-        ));
-    }
-    if !cpu_budget_available() {
-        response.set_body(bytes);
+    let (mut writer, found) = match insertion {
+        Ok(insertion) => insertion,
+        Err(reason) => return Ok(marked(CanaryOrigin::Delivered(response), "BYPASS", reason)),
+    };
+    // Prepare readback before transferring origin ownership. Setup/readback
+    // failures still return the untouched source response.
+    let delivery = match found.to_stream() {
+        Ok(body) => body,
+        Err(_) => {
+            return Ok(marked(
+                CanaryOrigin::Delivered(response),
+                "BYPASS",
+                "insert_stream",
+            ))
+        }
+    };
+    if !cpu_budget_available() || Instant::now() >= deadline {
         return Ok(marked(
             CanaryOrigin::Delivered(response),
             "BYPASS",
-            "cpu_before_insert",
+            "handoff_budget",
         ));
     }
-    // No cache reader sees a body until the complete expected size has arrived.
-    // Keep the Vec for delivery so cache-write failures are harmless.
-    let inserted = begin_insert(
-        transaction.0.take().expect("owned transaction"),
-        encoded,
-        &identity,
-    )
-    .map_err(|_| "insert_unavailable")
-    .and_then(|(mut writer, found)| {
-        writer.write_all(&bytes).map_err(|_| "insert_write")?;
-        writer.finish().map_err(|_| "insert_finish")?;
-        // This insertion-owned handle snapshots metadata before finish and can
-        // retain an unknown length. Successful complete write+finish authorizes
-        // this full stream; future lookups still require the inferred length.
-        found.to_stream().map_err(|_| "insert_stream")
-    });
-    let (marker, reason) = match inserted {
-        Ok(body) => {
-            // Cache has the complete body already; returning its host stream
-            // avoids another whole-buffer guest-to-host delivery copy.
-            response.set_body(body);
-            ("MISS", "inserted")
-        }
-        Err(reason) => {
-            response.set_body(bytes);
-            ("BYPASS", reason)
-        }
-    };
-    Ok(marked(CanaryOrigin::Delivered(response), marker, reason))
+    // Host-native splice: source fragments never cross guest memory. Finish
+    // closes this producer, not the appended origin stream; the host collects
+    // it asynchronously, including after guest exit. No explicit known_length
+    // is provided, so future lookups cannot HIT until collection is complete.
+    writer.append(response.take_body());
+    if writer.finish().is_err() {
+        // Ownership has moved. There is no independent source tee to replay.
+        // Before delivery this is transient unavailability; later body errors
+        // propagate as stream errors, like ordinary streamed origin delivery.
+        return Ok(CanaryOrigin::Unavailable);
+    }
+    response.set_body(delivery);
+    response.set_header("X-Divine-Storage-Cache-Fill-Mode", "host-stream");
+    response.set_header(
+        "X-Divine-Storage-Cache-Expected-Bytes",
+        identity.size.to_string(),
+    );
+    response.set_header("X-Divine-Storage-Cache-Buffer-Reads", "0");
+    response.set_header("X-Divine-Storage-Cache-Buffered-Bytes", "0");
+    Ok(marked(
+        CanaryOrigin::Delivered(response),
+        "MISS",
+        "streaming_insert",
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn identity() -> Identity<'static> {
         Identity {
@@ -538,6 +522,7 @@ mod tests {
         let encoded = serde_json::to_vec(&Metadata {
             identity: digest.clone(),
             size: cache_identity.size,
+            insertion: "a".repeat(32),
             etag: None,
             last_modified: None,
         })
@@ -713,47 +698,6 @@ mod tests {
     }
 
     #[test]
-    fn initialized_buffer_truncates_short_reads_and_caps_excess() {
-        begin_request();
-        let Buffered::Complete(bytes, stats) = buffer(
-            Body::from("abc"),
-            12,
-            Instant::now() + Duration::from_secs(1),
-        ) else {
-            panic!("short body must reach complete-length validation")
-        };
-        assert_eq!(bytes, b"abc");
-        assert_eq!(stats.bytes, 3);
-        assert!(stats.reads > 0);
-        let Buffered::Complete(bytes, stats) = buffer(
-            Body::from(vec![7; 64]),
-            12,
-            Instant::now() + Duration::from_secs(1),
-        ) else {
-            panic!("oversized body must reach complete-length validation")
-        };
-        assert_eq!(bytes, vec![7; 13]);
-        assert_eq!(stats.bytes, 13);
-    }
-
-    #[test]
-    fn replay_discards_initialized_unread_capacity() {
-        let mut bytes = vec![0; 33];
-        bytes[..3].copy_from_slice(b"abc");
-        let Buffered::Streaming(body, reason, stats) = replay_prefix(
-            bytes,
-            BufferStats { bytes: 3, reads: 1 },
-            Body::from("def"),
-            "buffer_timeout",
-        ) else {
-            panic!("prefix replay must stream")
-        };
-        assert_eq!(body.into_bytes(), b"abcdef");
-        assert_eq!(reason, "buffer_timeout");
-        assert_eq!(stats.bytes, 3);
-    }
-
-    #[test]
     #[ignore = "requires Viceroy Core Cache; scripts/run-b2-canary-tests.py"]
     fn aborted_cache_insert_never_serves_a_partial_hit() {
         begin_request();
@@ -762,6 +706,7 @@ mod tests {
         let encoded = serde_json::to_vec(&Metadata {
             identity: digest.clone(),
             size: 12,
+            insertion: "a".repeat(32),
             etag: None,
             last_modified: None,
         })
@@ -835,6 +780,7 @@ mod tests {
         let mut metadata = Metadata {
             identity: identity().digest(),
             size: 12,
+            insertion: "a".repeat(32),
             etag: Some("\"fixture\"".into()),
             last_modified: Some("Wed, 01 Jan 2025 00:00:00 GMT".into()),
         };
