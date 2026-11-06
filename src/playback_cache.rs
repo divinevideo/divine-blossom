@@ -7,7 +7,8 @@
 
 use crate::error::{BlossomError, Result};
 use crate::storage::{wait_for_demand_io, CanaryOrigin};
-use fastly::cache::core::{CacheBusyHandle, Found, PendingTransaction, Transaction};
+use fastly::cache::core::{CacheBusyHandle, CacheError, Found, PendingTransaction, Transaction};
+use fastly::http::body::StreamingBody;
 use fastly::http::{Method, StatusCode};
 use fastly::{Body, Response};
 use serde::{Deserialize, Serialize};
@@ -16,7 +17,9 @@ use std::cell::Cell;
 use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};
 
-const MAX_CACHE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_CACHE_BYTES: u64 = 32 * 1024 * 1024;
+const BUFFER_READ_BYTES: usize = 256 * 1024;
+const CACHE_NAMESPACE: &str = "divine-demand-playback-v2";
 const MAX_METADATA_BYTES: usize = 4096;
 const MAX_HEADER_BYTES: usize = 1024;
 const CACHE_TTL: Duration = Duration::from_secs(3600);
@@ -62,7 +65,7 @@ impl Identity<'_> {
         // JSON's tuple encoding preserves boundaries, escaping and None versus
         // Some(""). The namespace also versions both key and metadata contracts.
         let encoded = serde_json::to_vec(&(
-            "divine-demand-playback-v1",
+            CACHE_NAMESPACE,
             self.source,
             self.host,
             self.bucket,
@@ -223,6 +226,13 @@ pub(crate) fn attach_diagnostics(response: &mut Response, enabled: bool) {
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unknown".into()),
     );
+    // Committed linear memory includes allocator free space and does not
+    // measure live guest allocations or host cache/delivery buffers.
+    #[cfg(target_arch = "wasm32")]
+    response.set_header(
+        "X-Divine-Storage-Cache-Linear-Memory-Bytes",
+        (core::arch::wasm32::memory_size::<0>() as u64 * 65_536).to_string(),
+    );
 }
 
 fn cached_response(
@@ -264,10 +274,56 @@ fn cached_response(
     Some(response)
 }
 
+#[derive(Clone, Copy)]
+struct BufferStats {
+    bytes: usize,
+    reads: u64,
+}
+
+impl BufferStats {
+    fn attach(self, response: &mut Response) {
+        response.set_header(
+            "X-Divine-Storage-Cache-Buffered-Bytes",
+            self.bytes.to_string(),
+        );
+        response.set_header(
+            "X-Divine-Storage-Cache-Buffer-Reads",
+            self.reads.to_string(),
+        );
+    }
+}
+
 enum Buffered {
-    Complete(Vec<u8>),
-    Streaming(Body, &'static str),
+    Complete(Vec<u8>, BufferStats),
+    Streaming(Body, &'static str, BufferStats),
     Unavailable,
+}
+
+fn begin_insert(
+    transaction: Transaction,
+    metadata: Vec<u8>,
+    identity: &Identity<'_>,
+) -> std::result::Result<(StreamingBody, Found), CacheError> {
+    transaction
+        .insert(CACHE_TTL)
+        .stale_while_revalidate(Duration::ZERO)
+        // An explicit length would make an in-progress insertion eligible for
+        // HIT before finish. Let the cache infer actual length on completion.
+        .surrogate_keys([identity.hash])
+        .user_metadata(metadata.into())
+        .execute_and_stream_back()
+}
+
+fn replay_prefix(
+    mut bytes: Vec<u8>,
+    stats: BufferStats,
+    remainder: Body,
+    reason: &'static str,
+) -> Buffered {
+    bytes.truncate(stats.bytes);
+    let mut prefix = Body::from(bytes);
+    prefix.append(remainder);
+    Buffered::Streaming(prefix, reason, stats)
 }
 
 #[allow(deprecated)] // Raw unbuffered body handles keep each read deadline-bounded.
@@ -276,33 +332,47 @@ fn buffer(body: Body, size: u64, deadline: Instant) -> Buffered {
     // The eligibility check guarantees size <= MAX_CACHE_BYTES. Reserve the
     // exact bounded space to avoid Vec's doubling on the final excess byte.
     let limit = size as usize + 1;
-    let mut bytes = Vec::with_capacity(limit);
-    let mut chunk = [0; 16 * 1024];
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut stats = BufferStats { bytes: 0, reads: 0 };
+    if bytes.try_reserve_exact(limit).is_err() {
+        return Buffered::Streaming(body.into(), "allocation", stats);
+    }
+    // Read requires initialized memory. Reading directly into this one buffer
+    // removes the staging copy, without unsafe uninitialized slices.
+    // SAFETY: try_reserve_exact established capacity >= limit, the allocation
+    // has no aliases, and every u8 is initialized before increasing length.
+    // Use the bulk-memory intrinsic: an element-by-element debug resize can
+    // itself exhaust the admission budget before the first origin read.
+    unsafe {
+        bytes.as_mut_ptr().write_bytes(0, limit);
+        bytes.set_len(limit);
+    }
     loop {
         if !cpu_budget_available() {
-            let mut prefix = Body::from(bytes);
-            prefix.append(body.into());
-            return Buffered::Streaming(prefix, "cpu_buffer");
+            return replay_prefix(bytes, stats, body.into(), "cpu_buffer");
         }
         // SAFETY: this is a borrowed live body handle retained until after wait.
         if let Err(error) = wait_for_demand_io(unsafe { body.as_u32() }, deadline) {
             if error.kind() != io::ErrorKind::TimedOut {
                 return Buffered::Unavailable;
             }
-            let mut prefix = Body::from(bytes);
-            prefix.append(body.into());
-            return Buffered::Streaming(prefix, "buffer_timeout");
+            return replay_prefix(bytes, stats, body.into(), "buffer_timeout");
         }
-        let capacity = (limit - bytes.len()).min(chunk.len());
-        match body.read(&mut chunk[..capacity]) {
-            Ok(0) => return Buffered::Complete(bytes),
-            Ok(read) => bytes.extend_from_slice(&chunk[..read]),
+        let capacity = (limit - stats.bytes).min(BUFFER_READ_BYTES);
+        stats.reads += 1;
+        match body.read(&mut bytes[stats.bytes..stats.bytes + capacity]) {
+            Ok(0) => {
+                bytes.truncate(stats.bytes);
+                return Buffered::Complete(bytes, stats);
+            }
+            Ok(read) => stats.bytes += read,
             Err(_) => return Buffered::Unavailable,
         }
-        if bytes.len() as u64 > size {
+        if stats.bytes as u64 > size {
             // Reaching this bound contradicts the verified advertised length.
             // Return the complete prefix for the caller's integrity rejection.
-            return Buffered::Complete(bytes);
+            bytes.truncate(stats.bytes);
+            return Buffered::Complete(bytes, stats);
         }
     }
 }
@@ -321,7 +391,7 @@ pub(crate) fn read(
         return fetch().map(|origin| marked(origin, "BYPASS", "cpu_before_lookup"));
     }
     let digest = identity.digest();
-    let transaction = match lookup(format!("divine-demand-playback-v1:{digest}"), deadline) {
+    let transaction = match lookup(format!("{CACHE_NAMESPACE}:{digest}"), deadline) {
         Ok(transaction) => transaction,
         Err(reason) => return fetch().map(|origin| marked(origin, "BYPASS", reason)),
     };
@@ -388,8 +458,12 @@ pub(crate) fn read(
         identity.size,
         deadline.min(Instant::now() + BUFFER_BUDGET),
     ) {
-        Buffered::Complete(bytes) => bytes,
-        Buffered::Streaming(body, reason) => {
+        Buffered::Complete(bytes, stats) => {
+            stats.attach(&mut response);
+            bytes
+        }
+        Buffered::Streaming(body, reason, stats) => {
+            stats.attach(&mut response);
             response.set_body(body);
             return Ok(marked(CanaryOrigin::Delivered(response), "BYPASS", reason));
         }
@@ -410,27 +484,33 @@ pub(crate) fn read(
     }
     // No cache reader sees a body until the complete expected size has arrived.
     // Keep the Vec for delivery so cache-write failures are harmless.
-    let inserted = transaction
-        .0
-        .take()
-        .expect("owned transaction")
-        .insert(CACHE_TTL)
-        .stale_while_revalidate(Duration::ZERO)
-        .known_length(identity.size)
-        .surrogate_keys([identity.hash])
-        .user_metadata(encoded.into())
-        .execute()
-        .map_err(|_| "insert_unavailable")
-        .and_then(|mut writer| {
-            writer.write_all(&bytes).map_err(|_| "insert_write")?;
-            writer.finish().map_err(|_| "insert_finish")
-        });
-    response.set_body(bytes);
-    Ok(marked(
-        CanaryOrigin::Delivered(response),
-        if inserted.is_ok() { "MISS" } else { "BYPASS" },
-        inserted.err().unwrap_or("inserted"),
-    ))
+    let inserted = begin_insert(
+        transaction.0.take().expect("owned transaction"),
+        encoded,
+        &identity,
+    )
+    .map_err(|_| "insert_unavailable")
+    .and_then(|(mut writer, found)| {
+        writer.write_all(&bytes).map_err(|_| "insert_write")?;
+        writer.finish().map_err(|_| "insert_finish")?;
+        // This insertion-owned handle snapshots metadata before finish and can
+        // retain an unknown length. Successful complete write+finish authorizes
+        // this full stream; future lookups still require the inferred length.
+        found.to_stream().map_err(|_| "insert_stream")
+    });
+    let (marker, reason) = match inserted {
+        Ok(body) => {
+            // Cache has the complete body already; returning its host stream
+            // avoids another whole-buffer guest-to-host delivery copy.
+            response.set_body(body);
+            ("MISS", "inserted")
+        }
+        Err(reason) => {
+            response.set_body(bytes);
+            ("BYPASS", reason)
+        }
+    };
+    Ok(marked(CanaryOrigin::Delivered(response), marker, reason))
 }
 
 #[cfg(test)]
@@ -451,10 +531,89 @@ mod tests {
 
     #[test]
     #[ignore = "requires Viceroy Core Cache; scripts/run-b2-canary-tests.py"]
+    fn incomplete_cache_insertion_is_not_a_hit() {
+        begin_request();
+        let cache_identity = identity();
+        let digest = cache_identity.digest();
+        let encoded = serde_json::to_vec(&Metadata {
+            identity: digest.clone(),
+            size: cache_identity.size,
+            etag: None,
+            last_modified: None,
+        })
+        .unwrap();
+        let transaction =
+            Transaction::lookup(format!("{CACHE_NAMESPACE}:{digest}").into_bytes().into())
+                .execute()
+                .unwrap();
+        let (mut writer, found) = begin_insert(transaction, encoded, &cache_identity).unwrap();
+        writer.write_all(b"first").unwrap();
+        writer.flush().unwrap();
+        let before = read(
+            identity(),
+            &Method::HEAD,
+            None,
+            Instant::now() + Duration::from_secs(1),
+            || {
+                Ok(CanaryOrigin::Delivered(Response::from_status(
+                    StatusCode::OK,
+                )))
+            },
+        )
+        .unwrap();
+        let CanaryOrigin::Delivered(before) = before else {
+            panic!("origin response required")
+        };
+        assert_eq!(
+            before.get_header_str("X-Divine-Storage-Cache"),
+            Some("BYPASS")
+        );
+        assert_eq!(found.known_length(), None);
+        writer.write_all(b" second").unwrap();
+        writer.finish().unwrap();
+        assert_eq!(found.to_stream().unwrap().into_bytes(), b"first second");
+        // Handles snapshot length at lookup. Host collection can complete
+        // asynchronously, so observe completion only through fresh lookups.
+        let mut complete = false;
+        for _ in 0..50 {
+            let fresh =
+                Transaction::lookup(format!("{CACHE_NAMESPACE}:{digest}").into_bytes().into())
+                    .execute()
+                    .unwrap();
+            if fresh
+                .found()
+                .is_some_and(|item| item.known_length() == Some(12))
+            {
+                complete = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            complete,
+            "finished insertion must acquire inferred exact length"
+        );
+        let after = read(
+            identity(),
+            &Method::GET,
+            None,
+            Instant::now() + Duration::from_secs(1),
+            || panic!("completed cache item should be a HIT"),
+        )
+        .unwrap();
+        let CanaryOrigin::Delivered(mut after) = after else {
+            panic!("cache response required")
+        };
+        assert_eq!(after.get_header_str("X-Divine-Storage-Cache"), Some("HIT"));
+        assert_eq!(after.take_body().into_bytes(), b"first second");
+    }
+
+    #[test]
+    #[ignore = "requires Viceroy Core Cache; scripts/run-b2-canary-tests.py"]
     fn cache_lookup_wait_is_bounded() {
         begin_request();
         let identity = identity();
-        let key = format!("divine-demand-playback-v1:{}", identity.digest());
+        let key = format!("{CACHE_NAMESPACE}:{}", identity.digest());
         let leader = Transaction::lookup(key.into_bytes().into())
             .execute()
             .unwrap();
@@ -539,6 +698,102 @@ mod tests {
         assert!(!identity.eligible());
         identity.hash = "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789";
         assert!(!identity.eligible());
+    }
+
+    #[test]
+    fn normal_video_sizes_through_32mib_are_cache_eligible() {
+        for size in [8, 16, 32] {
+            let mut identity = identity();
+            identity.size = size * 1024 * 1024;
+            assert!(identity.eligible(), "{size} MiB must be admitted");
+        }
+        let mut identity = identity();
+        identity.size = 32 * 1024 * 1024 + 1;
+        assert!(!identity.eligible());
+    }
+
+    #[test]
+    fn initialized_buffer_truncates_short_reads_and_caps_excess() {
+        begin_request();
+        let Buffered::Complete(bytes, stats) = buffer(
+            Body::from("abc"),
+            12,
+            Instant::now() + Duration::from_secs(1),
+        ) else {
+            panic!("short body must reach complete-length validation")
+        };
+        assert_eq!(bytes, b"abc");
+        assert_eq!(stats.bytes, 3);
+        assert!(stats.reads > 0);
+        let Buffered::Complete(bytes, stats) = buffer(
+            Body::from(vec![7; 64]),
+            12,
+            Instant::now() + Duration::from_secs(1),
+        ) else {
+            panic!("oversized body must reach complete-length validation")
+        };
+        assert_eq!(bytes, vec![7; 13]);
+        assert_eq!(stats.bytes, 13);
+    }
+
+    #[test]
+    fn replay_discards_initialized_unread_capacity() {
+        let mut bytes = vec![0; 33];
+        bytes[..3].copy_from_slice(b"abc");
+        let Buffered::Streaming(body, reason, stats) = replay_prefix(
+            bytes,
+            BufferStats { bytes: 3, reads: 1 },
+            Body::from("def"),
+            "buffer_timeout",
+        ) else {
+            panic!("prefix replay must stream")
+        };
+        assert_eq!(body.into_bytes(), b"abcdef");
+        assert_eq!(reason, "buffer_timeout");
+        assert_eq!(stats.bytes, 3);
+    }
+
+    #[test]
+    #[ignore = "requires Viceroy Core Cache; scripts/run-b2-canary-tests.py"]
+    fn aborted_cache_insert_never_serves_a_partial_hit() {
+        begin_request();
+        let cache_identity = identity();
+        let digest = cache_identity.digest();
+        let encoded = serde_json::to_vec(&Metadata {
+            identity: digest.clone(),
+            size: 12,
+            etag: None,
+            last_modified: None,
+        })
+        .unwrap();
+        let transaction =
+            Transaction::lookup(format!("{CACHE_NAMESPACE}:{digest}").into_bytes().into())
+                .execute()
+                .unwrap();
+        let (mut writer, _found) = begin_insert(transaction, encoded, &cache_identity).unwrap();
+        writer.write_all(b"first").unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        let response = read(
+            identity(),
+            &Method::GET,
+            None,
+            Instant::now() + Duration::from_secs(1),
+            || {
+                let mut origin = Response::from_body("first second");
+                origin.set_header("Content-Length", "12");
+                Ok(CanaryOrigin::Delivered(origin))
+            },
+        )
+        .unwrap();
+        let CanaryOrigin::Delivered(mut response) = response else {
+            panic!("complete origin required")
+        };
+        assert_ne!(
+            response.get_header_str("X-Divine-Storage-Cache"),
+            Some("HIT")
+        );
+        assert_eq!(response.take_body().into_bytes(), b"first second");
     }
 
     #[test]

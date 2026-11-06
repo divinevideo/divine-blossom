@@ -355,7 +355,15 @@ mod tests {
         let url = format!("https://media-b2.divine.video/{hash}");
         let mut first = handle_main(Request::get(&url)).unwrap();
         assert_eq!(first.get_status(), StatusCode::OK);
-        assert_eq!(first.get_header_str("X-Divine-Storage-Cache"), Some("MISS"));
+        assert_eq!(
+            first.get_header_str("X-Divine-Storage-Cache"),
+            Some("MISS"),
+            "reason={:?} reads={:?} bytes={:?} cpu={:?}",
+            first.get_header_str("X-Divine-Storage-Cache-Reason"),
+            first.get_header_str("X-Divine-Storage-Cache-Buffer-Reads"),
+            first.get_header_str("X-Divine-Storage-Cache-Buffered-Bytes"),
+            first.get_header_str("X-Divine-Storage-Cache-Cpu-Ms")
+        );
         assert_eq!(
             first.get_header_str("X-Divine-Storage-Cache-Reason"),
             Some("inserted")
@@ -367,6 +375,35 @@ mod tests {
         assert!(first
             .get_header_str("X-Divine-Storage-Cache-Compute")
             .is_some());
+        assert_eq!(
+            first.get_header_str("X-Divine-Storage-Cache-Buffered-Bytes"),
+            Some(size.to_string().as_str())
+        );
+        let reads = first
+            .get_header_str("X-Divine-Storage-Cache-Buffer-Reads")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!(reads > 0);
+        let memory = first
+            .get_header_str("X-Divine-Storage-Cache-Linear-Memory-Bytes")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!(
+            memory <= 128 * 1024 * 1024,
+            "committed linear memory exceeds platform heap envelope"
+        );
+        let cpu = first
+            .get_header_str("X-Divine-Storage-Cache-Cpu-Ms")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        // Keep the observation, but do not treat Viceroy CPU across different
+        // hosts/runs as proof of production CPU-limit viability.
+        println!(
+            "\nCACHE_FILL size_bytes={size} cpu_ms={cpu} read_calls={reads} linear_bytes={memory}"
+        );
         let bytes = first.take_body().into_bytes();
         assert_eq!(bytes.len(), size);
         assert_eq!(hex::encode(Sha256::digest(bytes)), hash);
@@ -383,6 +420,53 @@ mod tests {
             Some(format!("bytes 0-31/{size}").as_str())
         );
         assert_eq!(part.take_body().into_bytes(), vec![b'A'; 32]);
+    }
+
+    #[test]
+    #[ignore = "requires demand fixtures; scripts/run-b2-canary-tests.py"]
+    fn demand_cached_oversize_streams_without_fill() {
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+        let config = fastly::config_store::ConfigStore::open("blossom_config");
+        let hash = config.get("test_hash").unwrap();
+        let size = config.get("test_size").unwrap().parse::<usize>().unwrap();
+        assert_eq!(size, 32 * 1024 * 1024 + 1);
+        let url = format!("https://media-b2.divine.video/{hash}");
+        let mut response = handle_main(Request::get(&url)).unwrap();
+        assert_eq!(response.get_status(), StatusCode::OK);
+        assert_eq!(
+            response.get_header_str("X-Divine-Storage-Cache"),
+            Some("BYPASS")
+        );
+        assert_eq!(
+            response.get_header_str("X-Divine-Storage-Cache-Reason"),
+            Some("ineligible")
+        );
+        assert!(response
+            .get_header("X-Divine-Storage-Cache-Buffered-Bytes")
+            .is_none());
+        // Model streaming delivery; collecting 32MiB+1 with read_to_end can
+        // double a test consumer's Vec and exhaust its unrelated guest heap.
+        let mut body = response.take_body();
+        let mut digest = Sha256::new();
+        let mut received = 0;
+        let mut chunk = vec![0; 64 * 1024];
+        loop {
+            let count = body.read(&mut chunk).unwrap();
+            if count == 0 {
+                break;
+            }
+            digest.update(&chunk[..count]);
+            received += count;
+        }
+        assert_eq!(received, size);
+        assert_eq!(hex::encode(digest.finalize()), hash);
+        let head = handle_main(Request::new("HEAD", url)).unwrap();
+        assert_eq!(head.get_status(), StatusCode::OK);
+        assert_eq!(
+            head.get_header_str("X-Divine-Storage-Cache"),
+            Some("BYPASS")
+        );
     }
 
     #[test]

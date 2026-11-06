@@ -192,21 +192,28 @@ private/no-store, and the direct hostname continues bypassing outer VCL. This
 tests cached video bytes, not an outer cache that could skip Compute policy.
 
 Entries are isolated by provider, host, bucket, key, hash, verified size and
-exact B2 version. GCS fallback entries are distinct. Only complete GETs up to
-16 MiB populate the cache, after existing origin version/size and full-length verification. They
+exact B2 version. GCS fallback entries are distinct. The
+`divine-demand-playback-v2` namespace excludes older in-flight insertion semantics.
+Only complete GETs up to 32 MiB (33,554,432 bytes) populate the cache, after
+existing origin version/size and full-length verification. They
 expire after one hour, without stale serving, and use the normal bare-hash
 surrogate key so existing erasure purges cover every version. Larger originals
 stay available through the uncached path.
 
 A full warm GET supplies later GET/HEAD/range responses. A cold HEAD or range
 request goes to the real origin and does not fill the cache. Cache coordination
-waits at most 50 ms; body verification buffers at most 16 MiB plus one byte for
+waits at most 50 ms; body verification buffers at most 32 MiB plus one byte for
 up to three seconds within the remaining I/O budget. A 25 ms per-request CPU
 guard reserves capacity for insertion and final policy checks. If either budget expires,
 the consumed prefix and remaining body resume as uncached streaming. Cache
 errors do not grant access or convert an available origin into a cache-only
 failure. Wrong version/size and complete-body length mismatches remain integrity
-failures. Video bodies are not rehashed at the edge: admission trusts the
+failures. Reads use one initialized buffer with windows up to 256 KiB; short
+reads continue with fresh deadline checks. Successful fills stream back from
+the finished cache write instead of copying the whole buffer again for delivery.
+Insertion does not advertise a length until completion; HIT admission requires
+the inferred exact completed length, excluding partial writes. These guards
+also apply when a cache writer fails. Video bodies are not rehashed at the edge: admission trusts the
 worker-verified immutable B2 version or authoritative GCS content-addressed
 object, matching existing origin delivery. Same-length bad content with valid
 headers can remain cached for one hour. The operator's checksum verification
@@ -219,8 +226,11 @@ not proof of a media-origin request during this attempt. B2 authorization is
 still a fresh network request, so a cache hit does not remove all overhead.
 
 Before warming a cohort, prove a real MISS→HIT with matching checksum, warm
-HEAD/ranges/416, surrogate invalidation, a representative 8 MiB cold fill, and
+HEAD/ranges/416, surrogate invalidation, representative 8/16/32 MiB cold fills, and
 denial after moderation or erasure.
+Record request CPU, actual buffer reads, memory and header/full-download times
+at each size. A normal-size CPU bypass is failed caching acceptance. Local
+Viceroy CPU counters do not establish production resource viability.
 Then refresh the private cohort manifest's policy, size, source generation,
 readiness and gate state; mirror only missing eligible originals with a bounded
 worker; perform one full checksum-verified warm GET followed by one small hit
@@ -240,6 +250,11 @@ read, and `X-Divine-Storage-Cache-Cpu-Ms` reports request CPU consumed when
 available. A false flag includes unavailable configuration reads. None of these
 observations is stored in cache metadata. Record them on the actual probe:
 control-plane activation alone does not establish POP propagation or admission.
+`X-Divine-Storage-Cache-Buffer-Reads` and
+`X-Divine-Storage-Cache-Buffered-Bytes` describe this attempt's buffering only;
+`X-Divine-Storage-Cache-Linear-Memory-Bytes` is committed WASM linear memory,
+including allocator free space, rather than live heap or host cache/delivery
+memory. A larger read window does not guarantee a larger actual read.
 
 Turning this flag off restores strict B2-only mode, including its 503 behavior.
 For ordinary GCS playback, turn off the device flag. Pause worker intake or the
