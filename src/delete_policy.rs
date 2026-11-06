@@ -297,9 +297,12 @@ fn handle_phased_creator_delete(
         epochs.insert(candidate.clone(), epoch);
     }
     soft_delete_blob_metadata(hash, metadata, reason, false)?;
-    let physical: Vec<String> = hashes.iter()
-        .filter(|candidate| crate::storage::vanish_needs_physical(candidate))
-        .cloned().collect();
+    let mut physical = Vec::new();
+    for candidate in &hashes {
+        if crate::storage::vanish_needs_physical(candidate)? {
+            physical.push(candidate.clone());
+        }
+    }
     if !physical.is_empty() {
         let result = crate::storage::erase_vanish_batch(&physical);
         for candidate in &physical {
@@ -310,9 +313,7 @@ fn handle_phased_creator_delete(
     }
     // A crash after recording absence but before enqueue must remain retryable.
     for candidate in &hashes {
-        if crate::b2_cdn_phase::final_purge_pending(candidate)? {
-            crate::b2_cdn_purge::enqueue(candidate, crate::b2_cdn_purge::Phase::Final)?;
-        }
+        crate::b2_cdn_phase::ensure_final_intent(candidate)?;
     }
     if hashes.iter().any(|candidate| !crate::storage::vanish_complete(candidate)) {
         return Err(BlossomError::Conflict(

@@ -595,6 +595,7 @@ fn creator_physical_delete_retains_audio_discovery_until_both_final_receipts() {
         let epoch = storage::begin_vanish_phase(candidate).unwrap().unwrap();
         b2_cdn_phase::record_physical(candidate, &epoch, b2_cdn_phase::Physical::Absent).unwrap();
         if candidate != &audio {
+            b2_cdn_phase::ensure_final_intent(candidate).unwrap();
             assert!(b2_cdn_phase::mark_final_purged(&store, candidate, &epoch).unwrap());
         }
     }
