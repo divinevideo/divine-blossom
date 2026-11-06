@@ -294,6 +294,17 @@ class Worker:
         self.max_object_bytes = max_object_bytes
         self.chunk_bytes, self.max_spool_bytes = chunk_bytes, max_spool_bytes
         self.metrics = Counter()
+        self.failure_stage = None
+
+    def observe(self, stage, operation, *args, **kwargs):
+        """Remember only a fixed call-site label, never SDK diagnostics or keys."""
+        try:
+            return operation(*args, **kwargs)
+        except Exception:
+            # A gate-release failure must not hide the earlier transfer failure.
+            if self.failure_stage is None:
+                self.failure_stage = stage
+            raise
 
     def invalidate(self, key, info=None, *, observed, allowed=lambda: True, attempt=None):
         """Invalidate the observed record under the shared gate, never 'delete latest'."""
@@ -305,20 +316,20 @@ class Worker:
             return True
         owned = attempt is not None
         attempt = attempt or str(uuid.uuid4())
-        if not owned and not self.kv.claim_copy(key, attempt):
+        if not owned and not self.observe("gate_claim", self.kv.claim_copy, key, attempt):
             self.state.defer_gate(key)
             return False
         try:
-            if (self.kv.get("b2-sync:v1:" + key) != {"state": "copying", "attempt_id": attempt}
-                    or self.kv.snapshot("b2-ready:" + key) != observed or not allowed()):
+            if (self.observe("policy_or_gate_read", self.kv.get, "b2-sync:v1:" + key) != {"state": "copying", "attempt_id": attempt}
+                    or self.observe("readiness_read", self.kv.snapshot, "b2-ready:" + key) != observed or not allowed()):
                 return False
-            if observed is not None and not self.kv.delete_if_generation("b2-ready:" + key, observed[1]):
+            if observed is not None and not self.observe("readiness_delete", self.kv.delete_if_generation, "b2-ready:" + key, observed[1]):
                 return False
             self.state.reset(key, info)
             return True
         finally:
             if not owned:
-                self.kv.release_copy(key, attempt)
+                self.observe("gate_release", self.kv.release_copy, key, attempt)
 
     def process(self, key, budget, reconcile=False):
         if not HEX.fullmatch(key):
@@ -326,23 +337,23 @@ class Worker:
         generation, size, ready = self.state.row(key)
         # Observe readiness BEFORE policy/source. A later publication can never
         # become the deletion target of this observer's stale denial/miss.
-        observed = self.kv.snapshot("b2-ready:" + key)
-        existing_gate = self.kv.get("b2-sync:v1:" + key)
+        observed = self.observe("readiness_read", self.kv.snapshot, "b2-ready:" + key)
+        existing_gate = self.observe("policy_or_gate_read", self.kv.get, "b2-sync:v1:" + key)
         if existing_gate is not None:
             self.state.defer_gate(key)
             if existing_gate == {"state": "erasing"}:
                 self.state.reset(key)
             return "terminal" if reconcile and existing_gate == {"state": "erasing"} else "locked"
         self.state.clear_gate_backoff(key)
-        meta = approved_metadata(self.kv, key)
+        meta = self.observe("policy_read", approved_metadata, self.kv, key)
         if meta is None:
             invalidated = self.invalidate(key, observed=observed,
-                allowed=lambda: approved_metadata(self.kv, key) is None)
+                allowed=lambda: self.observe("policy_read", approved_metadata, self.kv, key) is None)
             if not invalidated:
                 return "changed"
-            return demand_policy(self.kv, key) if reconcile else "blocked"
-        info = self.source.head(key)
-        same_inputs = lambda: approved_metadata(self.kv, key) == meta and self.source.head(key) == info
+            return self.observe("policy_read", demand_policy, self.kv, key) if reconcile else "blocked"
+        info = self.observe("source_head", self.source.head, key)
+        same_inputs = lambda: self.observe("policy_read", approved_metadata, self.kv, key) == meta and self.observe("source_head", self.source.head, key) == info
         if info is None:
             return "missing" if self.invalidate(key, observed=observed, allowed=same_inputs) else "changed"
         if info["size"] <= 0 or info["size"] > self.max_object_bytes:
@@ -350,7 +361,7 @@ class Worker:
         if type(meta.get("size")) is not int or meta["size"] != info["size"]:
             self.invalidate(key, observed=observed, allowed=same_inputs)
             return "changed"
-        gate = self.kv.get("b2-sync:v1:" + key)
+        gate = self.observe("policy_or_gate_read", self.kv.get, "b2-sync:v1:" + key)
         if gate is not None:
             return "terminal" if reconcile and gate == {"state": "erasing"} else "locked"
         missing_version = False
@@ -358,15 +369,15 @@ class Worker:
             record = observed[0]
             if not readiness_identity_matches(record, key, info, self.source.bucket, self.destination.bucket):
                 raise ValueError("remote readiness cannot be adopted or repaired")
-            present = self.destination.exists(key, record["destination_version_id"], info["size"])
+            present = self.observe("destination_head", self.destination.exists, key, record["destination_version_id"], info["size"])
             missing_version = not present
-            if approved_metadata(self.kv, key) != meta:
+            if self.observe("policy_read", approved_metadata, self.kv, key) != meta:
                 self.invalidate(key, observed=observed,
-                    allowed=lambda: approved_metadata(self.kv, key) is None)
-                return demand_policy(self.kv, key)
-            if self.source.head(key) != info or self.kv.snapshot("b2-ready:" + key) != observed:
+                    allowed=lambda: self.observe("policy_read", approved_metadata, self.kv, key) is None)
+                return self.observe("policy_read", demand_policy, self.kv, key)
+            if self.observe("source_head", self.source.head, key) != info or self.observe("readiness_read", self.kv.snapshot, "b2-ready:" + key) != observed:
                 return "changed"
-            if self.kv.get("b2-sync:v1:" + key) is not None:
+            if self.observe("policy_or_gate_read", self.kv.get, "b2-sync:v1:" + key) is not None:
                 return "locked"
             if present and record["source_generation"] == info["generation"]:
                 self.state.reset(key, info)
@@ -404,7 +415,7 @@ class Worker:
                 if self.metrics["spool_gate_probes"] >= 16:
                     return "pending"
                 self.metrics["spool_gate_probes"] += 1
-                if self.kv.get("b2-sync:v1:" + part.stem) is None:
+                if self.observe("policy_or_gate_read", self.kv.get, "b2-sync:v1:" + part.stem) is None:
                     return "pending"
                 self.state.defer_gate(part.stem)
         if offset > 0 and size - offset > self.max_spool_bytes - spool_bytes:
@@ -419,7 +430,7 @@ class Worker:
             if count <= 0:
                 return "pending"
             budget.spend(count)
-            data = self.source.read(key, generation, offset, count)
+            data = self.observe("source_read", self.source.read, key, generation, offset, count)
             if len(data) != count:
                 raise ValueError("source range length mismatch")
             with path.open("ab") as handle:
@@ -435,23 +446,23 @@ class Worker:
             raise ValueError("source checksum mismatch")
         if budget.remaining < 2 * size:
             return "pending"
-        if self.source.head(key) != info:
+        if self.observe("source_head", self.source.head, key) != info:
             self.state.reset(key)
             return "changed"
-        if approved_metadata(self.kv, key) != meta:
+        if self.observe("policy_read", approved_metadata, self.kv, key) != meta:
             self.invalidate(key, observed=observed,
-                allowed=lambda: approved_metadata(self.kv, key) is None)
-            return demand_policy(self.kv, key) if reconcile else "blocked"
+                allowed=lambda: self.observe("policy_read", approved_metadata, self.kv, key) is None)
+            return self.observe("policy_read", demand_policy, self.kv, key) if reconcile else "blocked"
         attempt = str(uuid.uuid4())
-        if not self.kv.claim_copy(key, attempt):
+        if not self.observe("gate_claim", self.kv.claim_copy, key, attempt):
             return "locked"
         upload_state = {"uncertain": False}
         try:
             if not same_inputs():
                 self.invalidate(key, observed=observed, attempt=attempt,
-                    allowed=lambda: approved_metadata(self.kv, key) is None)
-                return demand_policy(self.kv, key) if reconcile else "blocked"
-            if self.kv.snapshot("b2-ready:" + key) != observed:
+                    allowed=lambda: self.observe("policy_read", approved_metadata, self.kv, key) is None)
+                return self.observe("policy_read", demand_policy, self.kv, key) if reconcile else "blocked"
+            if self.observe("readiness_read", self.kv.snapshot, "b2-ready:" + key) != observed:
                 return "changed"
             if observed is not None:
                 if reconcile:
@@ -464,20 +475,20 @@ class Worker:
                 with self.state.db:
                     self.state.db.execute("UPDATE objects SET generation=?,size=?,ready=NULL WHERE hash=?",
                                           (info["generation"], info["size"], key))
-                if not self.kv.delete_if_generation("b2-ready:" + key, observed[1]):
+                if not self.observe("readiness_delete", self.kv.delete_if_generation, "b2-ready:" + key, observed[1]):
                     return "changed"
             result = self.transfer(key, budget, path, size, generation, info, meta, upload_state, attempt)
             if reconcile and missing_version and result == "ready":
                 self.metrics["repairs_completed"] += 1
-            return demand_policy(self.kv, key) if reconcile and result == "blocked" else result
+            return self.observe("policy_read", demand_policy, self.kv, key) if reconcile and result == "blocked" else result
         finally:
             if not upload_state["uncertain"]:
-                self.kv.release_copy(key, attempt)
+                self.observe("gate_release", self.kv.release_copy, key, attempt)
 
     def transfer(self, key, budget, path, size, generation, info, meta, upload_state, attempt):
         budget.spend(size)
         upload_state["uncertain"] = True
-        version = self.destination.upload(key, path, size)
+        version = self.observe("destination_upload", self.destination.upload, key, path, size)
         upload_state["uncertain"] = False
         if not isinstance(version, str) or not version or version == "null":
             raise ValueError("destination did not return immutable version")
@@ -485,32 +496,32 @@ class Worker:
         for start in range(0, size, self.chunk_bytes):
             count = min(self.chunk_bytes, size - start)
             budget.spend(count)
-            data = self.destination.read(key, version, start, count, size)
+            data = self.observe("destination_read", self.destination.read, key, version, start, count, size)
             if len(data) != count:
                 raise ValueError("destination range length mismatch")
             digest.update(data)
         if digest.hexdigest() != key:
             self.invalidate(key, info, observed=None, attempt=attempt)
             raise ValueError("destination checksum mismatch")
-        if self.source.head(key) != info:
+        if self.observe("source_head", self.source.head, key) != info:
             self.invalidate(key, observed=None, attempt=attempt)
             return "changed"
-        if approved_metadata(self.kv, key) != meta:
+        if self.observe("policy_read", approved_metadata, self.kv, key) != meta:
             self.invalidate(key, observed=None, attempt=attempt)
             return "blocked"
         record = {"version": 1, "sha256": key, "verified_sha256": key,
                   "source_bucket": self.source.bucket, "source_generation": generation,
                   "bucket": self.destination.bucket, "key": key, "size": size,
                   "destination_version_id": version, "verified_at": int(time.time())}
-        self.kv.put("b2-ready:" + key, record)
-        published = self.kv.snapshot("b2-ready:" + key)
+        self.observe("readiness_write", self.kv.put, "b2-ready:" + key, record)
+        published = self.observe("readiness_read", self.kv.snapshot, "b2-ready:" + key)
         if published is None or published[0] != record:
             raise ValueError("readiness publication not confirmed")
         # No cross-service transaction exists. Endpoint independently gates policy on
         # every request, including a vanish between this last check and publication.
-        if approved_metadata(self.kv, key) != meta:
+        if self.observe("policy_read", approved_metadata, self.kv, key) != meta:
             self.invalidate(key, observed=published, attempt=attempt,
-                allowed=lambda: approved_metadata(self.kv, key) is None)
+                allowed=lambda: self.observe("policy_read", approved_metadata, self.kv, key) is None)
             return "blocked"
         self.state.ready(key, record)
         self.metrics["copies_completed"] += 1
@@ -532,7 +543,7 @@ class Worker:
                     report[label + "_errors"] += 1
                     report["errors"] += 1
         try:
-            keys, cursor = self.source.page(self.state.setting("cursor"), discovery_limit or max_objects)
+            keys, cursor = self.observe("source_list", self.source.page, self.state.setting("cursor"), discovery_limit or max_objects)
             for key in keys:
                 if HEX.fullmatch(key):
                     self.state.remember(key)
@@ -586,13 +597,14 @@ class Worker:
             generation = upload_generations.get(key)
             reconciles = key in demands
             result = "errors"
+            self.failure_stage = None
             try:
-                image_observed = self.kv.snapshot("b2-ready:" + key) if generation is not None and self.kv is not None else None
-                metadata = self.kv.get("blob:" + key) if generation is not None and self.kv is not None else None
+                image_observed = self.observe("readiness_read", self.kv.snapshot, "b2-ready:" + key) if generation is not None and self.kv is not None else None
+                metadata = self.observe("policy_or_gate_read", self.kv.get, "blob:" + key) if generation is not None and self.kv is not None else None
                 mime = metadata.get("type") if isinstance(metadata, dict) else None
                 if isinstance(mime, str) and "/" in mime and not mime.startswith("video/"):
                     removed = self.invalidate(key, observed=image_observed,
-                        allowed=lambda: self.kv.get("blob:" + key) == metadata)
+                        allowed=lambda: self.observe("policy_or_gate_read", self.kv.get, "blob:" + key) == metadata)
                     result = "ignored" if removed else "changed"
                 elif reconciles:
                     result = self.process(key, budget, reconcile=True)
@@ -600,8 +612,10 @@ class Worker:
                     result = self.process(key, budget)
                 report[result] += 1
             except Exception:
-                # SDK exceptions may contain signed URLs or identifiers.
+                # SDK exceptions may contain signed URLs or identifiers. Only
+                # fixed operation names cross the aggregate report boundary.
                 report["errors"] += 1
+                report["failure_" + (self.failure_stage or "validation_or_state")] += 1
             finally:
                 if result == "locked":
                     self.state.defer_gate(key)
