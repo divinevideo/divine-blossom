@@ -38,6 +38,12 @@
       "priority": 100
     },
     {
+      "file": "log_b2_probe.vcl",
+      "name": "Synthetic B2 outer delivery evidence",
+      "type": "log",
+      "priority": 110
+    },
+    {
       "file": "log_5xx.vcl",
       "name": "Client-facing skipped 5xx diagnostics",
       "type": "log",

@@ -7,7 +7,7 @@ set req.http.X-Original-Host = req.http.Host;
 # B2 outer request correlation is generated at the client-facing boundary.
 # Caller IDs never identify an outer request; a shield continuation preserves
 # the trusted edge ID rather than creating another one for the same request.
-if (fastly.ff.visits_this_service == 0 &&
+if (fastly.ff.visits_this_service == 0 && req.restarts == 0 &&
     req.http.Host ~ "(?i)^media-b2(-cdn)?[.]divine[.]video(:[0-9]+)?$") {
   set req.http.X-Request-Id = uuid.version4();
 }
