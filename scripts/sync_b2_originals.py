@@ -543,7 +543,7 @@ class Worker:
                     report[label + "_errors"] += 1
                     report["errors"] += 1
         try:
-            keys, cursor = self.observe("source_list", self.source.page, self.state.setting("cursor"), discovery_limit or max_objects)
+            keys, cursor = self.source.page(self.state.setting("cursor"), discovery_limit or max_objects)
             for key in keys:
                 if HEX.fullmatch(key):
                     self.state.remember(key)
