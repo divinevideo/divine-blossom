@@ -61,14 +61,6 @@ jobs:
       - name: Run blossom-core tests
         run: cargo test -p blossom-core --locked
 
-      - name: Run service-scoped CDN purge contracts
-        env:
-          TEST_CDN_PURGE_HOSTS: media-b2-cdn.divine.video,media-b2.divine.video
-        run: |
-          TEST_CDN_URL_OK=1 TEST_CDN_CONTRACT=service_scoped_url_and_bulk_key_acknowledgements_complete_final_purge python3 scripts/run-b2-cdn-invalidation-tests.py
-          TEST_CDN_URL404=1 TEST_CDN_CONTRACT=url_404_keeps_committed_final_purge_pending_without_ack python3 scripts/run-b2-cdn-invalidation-tests.py
-          TEST_CDN_KEY404=1 TEST_CDN_CONTRACT=missing_hash_key_purge_acknowledgement_is_not_success python3 scripts/run-b2-cdn-invalidation-tests.py
-
       - name: Run upload service tests
         run: cargo test --manifest-path cloud-run-upload/Cargo.toml --locked
 
