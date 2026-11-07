@@ -638,8 +638,45 @@ fn cdn_drain_service_token_is_not_an_admin_credential() {
 
 #[test]
 #[ignore = "requires failing then recovering local purge backend"]
-fn retained_unbound_host_does_not_cancel_successful_key_eviction() {
-    storage::invalidate_b2_cdn(&[hash()]).unwrap();
+fn raw_url_and_bulk_key_acknowledgements_complete_final_purge() {
+    let epoch = b2_cdn_phase::begin_erase(&hash()).unwrap();
+    assert!(b2_cdn_phase::record_physical(&hash(), &epoch, b2_cdn_phase::Physical::Absent).unwrap());
+    assert!(b2_cdn_phase::ensure_final_intent(&hash()).unwrap());
+    let mut response = call(request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=1", true));
+    assert_eq!(response.get_status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&response.take_body_str()).unwrap();
+    assert_eq!(body["result"], 1);
+    assert_eq!(body["errors"], 0);
+    assert_eq!(body["pending"], 0);
+    assert!(b2_cdn_phase::final_acked(&hash()).unwrap());
+    assert!(b2_cdn_phase::complete_ready(&hash()).unwrap());
+}
+
+#[test]
+#[ignore = "requires local URL404 and successful bulk purge backend"]
+fn url_404_keeps_committed_final_purge_pending_without_ack() {
+    let epoch = b2_cdn_phase::begin_erase(&hash()).unwrap();
+    assert!(b2_cdn_phase::record_physical(&hash(), &epoch, b2_cdn_phase::Physical::Absent).unwrap());
+    assert!(b2_cdn_phase::ensure_final_intent(&hash()).unwrap());
+    let mut response = call(request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=1", true));
+    assert_eq!(response.get_status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&response.take_body_str()).unwrap();
+    assert_eq!(body["result"], 0);
+    assert_eq!(body["errors"], 1);
+    assert_eq!(body["pending"], 1);
+    assert!(!b2_cdn_phase::final_acked(&hash()).unwrap());
+    assert!(!b2_cdn_phase::complete_ready(&hash()).unwrap());
+    let store = open_store().unwrap();
+    let entries = store.build_list().prefix("b2-cdn-purge").execute().unwrap();
+    let mut retained = 0;
+    for key in entries.keys() {
+        if !key.starts_with("b2-cdn-purge:v1:") { continue; }
+        let mut entry = store.lookup(key).unwrap();
+        let record: serde_json::Value = serde_json::from_str(&entry.take_body().into_string()).unwrap();
+        assert_eq!(record["state"], "committed");
+        retained += 1;
+    }
+    assert_eq!(retained, 1);
 }
 
 #[test]

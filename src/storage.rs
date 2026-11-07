@@ -2325,12 +2325,10 @@ pub(crate) fn invalidate_b2_cdn(hashes: &[String]) -> Result<()> {
     let mut requests = Vec::new();
     for hash in hashes {
         for url in b2_cdn_purge_urls(hash, &hosts, &current_host)? {
-            let encoded: String = url.bytes().map(|byte| {
-                if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-                    (byte as char).to_string()
-                } else { format!("%{byte:02X}") }
-            }).collect();
-            requests.push(Request::post(format!("https://api.fastly.com/purge/{encoded}")));
+            // Fastly embeds the cached URL directly in this endpoint. Encoding
+            // its scheme/path delimiters changes the API route. Hosts and the
+            // lowercase hash path have already been validated above.
+            requests.push(Request::post(format!("https://api.fastly.com/purge/{url}")));
         }
     }
     let token = get_secret("fastly_api_token")?;
@@ -2358,16 +2356,9 @@ pub(crate) fn invalidate_b2_cdn(hashes: &[String]) -> Result<()> {
         while !pending.is_empty() {
             let (response, remaining) = fastly::http::request::select(pending);
             pending = remaining;
-            let acknowledged = match response {
-                Ok(response) if response.get_status().is_success() => true,
-                // A retained host may already be unbound during rollback. The
-                // URL has no current route to evict; both service-targeted hash
-                // key purges must still acknowledge in this same round.
-                Ok(response) if response.get_status() == StatusCode::NOT_FOUND => response
-                    .get_backend_request()
-                    .is_some_and(|request| request.get_path().starts_with("/purge/https%3A%2F%2F")),
-                _ => false,
-            };
+            // A 404 does not prove that a retained host is unbound or evicted.
+            // Every URL and service-key request must independently acknowledge.
+            let acknowledged = matches!(response, Ok(response) if response.get_status().is_success());
             if !acknowledged { failed = true; }
         }
         if round == 0 { wait_b2_cdn_purge_interval()?; }

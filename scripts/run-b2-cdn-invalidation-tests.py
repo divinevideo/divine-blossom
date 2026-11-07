@@ -22,13 +22,23 @@ class Purge(BaseHTTPRequestHandler):
         self.rfile.read(length)
         self.server.calls.append((self.path, self.headers.get("Surrogate-Key")))
         if os.environ.get("TEST_CDN_URL404") == "1":
-            self.send_response(404 if self.path.startswith("/purge/") else 200)
+            status = 404 if self.path.startswith("/purge/") else 200
+        elif os.environ.get("TEST_CDN_URL_OK") == "1":
+            # Match Fastly's actual URL route. A fully encoded URL is not this route.
+            status = 200 if self.path.startswith(("/purge/https://", "/service/")) else 404
         elif os.environ.get("TEST_CDN_KEY404") == "1":
-            self.send_response(404 if self.path.startswith("/service/") else 200)
+            status = 404 if self.path.startswith("/service/") else 200
         else:
-            self.send_response(503 if len(self.server.calls) <= 6 else 200)
-        self.send_header("Content-Length", "0")
+            status = 503 if len(self.server.calls) <= 6 else 200
+        # Bulk purge responds with key -> purge ID, not {status:ok}.
+        keys = self.headers.get("Surrogate-Key", "").split()
+        body = json.dumps({key: "synthetic-purge-id" for key in keys} if keys else
+                          {"status": "ok", "id": "synthetic-url-id"}).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
+        self.wfile.write(body)
 
 
 def main():
@@ -78,7 +88,7 @@ blossom_secrets = [{{key="b2_cdn_purge_drain_token",data="synthetic-drain-token"
                 if result.returncode or "test result: ok. 1 passed; 0 failed; 0 ignored;" not in result.stdout:
                     raise RuntimeError(result.stdout + result.stderr + f"\nSynthetic purge count: {len(server.calls)}")
                 expected = [
-                    (f"/purge/https%3A%2F%2Fmedia-b2-cdn.divine.video%2F{'a' * 64}", None),
+                    (f"/purge/https://media-b2-cdn.divine.video/{'a' * 64}", None),
                     ("/service/ML7R82HKfmTaqTpHExIDVN/purge", "a" * 64),
                     ("/service/pOvEEWykEbpnylqst1KTrR/purge", "a" * 64),
                 ]
@@ -96,12 +106,14 @@ blossom_secrets = [{{key="b2_cdn_purge_drain_token",data="synthetic-drain-token"
                     assert not server.calls
                     print(f"PASS {os.environ['TEST_CDN_CONTRACT']}: no inline purge requests")
                     return
-                if os.environ.get("TEST_CDN_URL404") == "1" or os.environ.get("TEST_CDN_KEY404") == "1":
+                if any(os.environ.get(key) == "1" for key in ("TEST_CDN_URL404", "TEST_CDN_KEY404", "TEST_CDN_URL_OK")):
                     assert len(server.calls) == 6, len(server.calls)
                     for start in range(0, 6, 3):
                         assert sorted(server.calls[start:start + 3]) == sorted(expected)
                     if os.environ.get("TEST_CDN_URL404") == "1":
-                        print("PASS retained unbound host: URL404 plus both service key acknowledgements")
+                        print("PASS URL404: both rounds' bulk key acknowledgements cannot clear durable final purge")
+                    elif os.environ.get("TEST_CDN_URL_OK") == "1":
+                        print("PASS raw cached URL: real bulk-key map acknowledgements complete final purge")
                     else:
                         print("PASS missing key acknowledgement: URL success cannot acknowledge eviction")
                     return
