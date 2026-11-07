@@ -144,10 +144,18 @@ Policy writes first persist a distinct per-attempt intent in
 mutation; committed intents survive failed eviction. Prepared or foreign records
 are not automatically cleared. A checked purge must succeed before a committed
 intent can be marked cleared, and a receipt is bound to its exact attempt.
-Missing records do not imply acknowledgement. A URL purge404 for a retained,
-already-unbound hostname is a no-op only while both hash-key service purges
-acknowledge; a key-purge404, authentication failure or provider error still
-fails the checked eviction and retains the intent.
+Missing records do not imply acknowledgement. Every URL and service-key request
+in both rounds must return2xx. A URL404 does not establish that a retained host
+is unbound or that eviction happened, even when all service-key requests succeed.
+Any URL/key404, authentication failure or provider error fails the checked
+operation and retains the committed intent and pending final acknowledgement.
+
+Fastly's URL endpoint is `POST /purge/https://<validated-host>/<hash>`; do not
+percent-encode the entire cached URL. Bulk surrogate-key success responses are
+maps of keys to purge IDs, not a `status:ok` object. These API acknowledgements
+do not prove end-to-end eviction or in-flight-fill exclusion: live acceptance
+must separately verify that `FASTLYPURGE` traverses the VCL cache path (and
+`PURGE` is forwarded in Compute when applicable), with matching cache identity.
 
 The authenticated POST `/admin/api/b2-cdn-purge/drain?max=2` drains at most two
 hashes per execution. A recurring worker may use the dedicated Secret Store key
