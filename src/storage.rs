@@ -2325,10 +2325,12 @@ pub(crate) fn invalidate_b2_cdn(hashes: &[String]) -> Result<()> {
     let mut requests = Vec::new();
     for hash in hashes {
         for url in b2_cdn_purge_urls(hash, &hosts, &current_host)? {
-            // Fastly embeds the cached URL directly in this endpoint. Encoding
-            // its scheme/path delimiters changes the API route. Hosts and the
-            // lowercase hash path have already been validated above.
-            requests.push(Request::post(format!("https://api.fastly.com/purge/{url}")));
+            // Modern domains require the outer service ID and a scheme-free
+            // target. Both retained hosts belong to that same outer service;
+            // the host and lowercase hash path were validated above.
+            let target = url.strip_prefix("https://").ok_or_else(||
+                BlossomError::StorageError("B2 CDN purge target invalid".into()))?;
+            requests.push(Request::post(format!("https://api.fastly.com/service/ML7R82HKfmTaqTpHExIDVN/purge_url/{target}")));
         }
     }
     let token = get_secret("fastly_api_token")?;

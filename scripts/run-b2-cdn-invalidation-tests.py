@@ -9,6 +9,18 @@ import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+OUTER_SERVICE = "ML7R82HKfmTaqTpHExIDVN"
+COMPUTE_SERVICE = "pOvEEWykEbpnylqst1KTrR"
+HASH = "a" * 64
+
+
+def expected_requests():
+    hosts = os.environ.get("TEST_CDN_PURGE_HOSTS", "media-b2-cdn.divine.video").split(",")
+    return [
+        (f"/service/{OUTER_SERVICE}/purge_url/{host}/{HASH}", None)
+        for host in hosts
+    ] + [(f"/service/{service}/purge", HASH) for service in (OUTER_SERVICE, COMPUTE_SERVICE)]
+
 
 class Purge(BaseHTTPRequestHandler):
     def log_message(self, *_):
@@ -21,15 +33,20 @@ class Purge(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         self.rfile.read(length)
         self.server.calls.append((self.path, self.headers.get("Surrogate-Key")))
-        if os.environ.get("TEST_CDN_URL404") == "1":
-            status = 404 if self.path.startswith("/purge/") else 200
+        # Modern domains require a service-scoped host/path URL purge. Legacy
+        # raw/encoded URLs, a target scheme, or the wrong service all get 404.
+        valid = (self.path, self.headers.get("Surrogate-Key")) in expected_requests()
+        is_url = "/purge_url/" in self.path
+        if not valid:
+            status = 404
+        elif os.environ.get("TEST_CDN_URL404") == "1":
+            status = 404 if is_url else 200
         elif os.environ.get("TEST_CDN_URL_OK") == "1":
-            # Match Fastly's actual URL route. A fully encoded URL is not this route.
-            status = 200 if self.path.startswith(("/purge/https://", "/service/")) else 404
+            status = 200
         elif os.environ.get("TEST_CDN_KEY404") == "1":
-            status = 404 if self.path.startswith("/service/") else 200
+            status = 200 if is_url else 404
         else:
-            status = 503 if len(self.server.calls) <= 6 else 200
+            status = 503 if len(self.server.calls) <= 2 * len(expected_requests()) else 200
         # Bulk purge responds with key -> purge ID, not {status:ok}.
         keys = self.headers.get("Surrogate-Key", "").split()
         body = json.dumps({key: "synthetic-purge-id" for key in keys} if keys else
@@ -53,7 +70,7 @@ def main():
                 values = {
                     "b2_cdn_enabled": os.environ.get("TEST_CDN_ADMISSION", "true"),
                     "b2_cdn_host": "media-b2-cdn.divine.video",
-                    "b2_cdn_purge_hosts": "media-b2-cdn.divine.video",
+                    "b2_cdn_purge_hosts": os.environ.get("TEST_CDN_PURGE_HOSTS", "media-b2-cdn.divine.video"),
                 }
                 if os.environ.get("TEST_CDN_ABSENT") == "1":
                     values = {}
@@ -87,11 +104,8 @@ blossom_secrets = [{{key="b2_cdn_purge_drain_token",data="synthetic-drain-token"
                 ], cwd=repo, env=env, text=True, capture_output=True, timeout=900)
                 if result.returncode or "test result: ok. 1 passed; 0 failed; 0 ignored;" not in result.stdout:
                     raise RuntimeError(result.stdout + result.stderr + f"\nSynthetic purge count: {len(server.calls)}")
-                expected = [
-                    (f"/purge/https://media-b2-cdn.divine.video/{'a' * 64}", None),
-                    ("/service/ML7R82HKfmTaqTpHExIDVN/purge", "a" * 64),
-                    ("/service/pOvEEWykEbpnylqst1KTrR/purge", "a" * 64),
-                ]
+                expected = expected_requests()
+                per_round = len(expected)
                 if os.environ.get("TEST_CDN_CONTRACT") in (
                     "cdn_purge_drain_requires_admin_and_rejects_oversized_batches",
                     "cdn_drain_service_token_is_not_an_admin_credential",
@@ -107,19 +121,19 @@ blossom_secrets = [{{key="b2_cdn_purge_drain_token",data="synthetic-drain-token"
                     print(f"PASS {os.environ['TEST_CDN_CONTRACT']}: no inline purge requests")
                     return
                 if any(os.environ.get(key) == "1" for key in ("TEST_CDN_URL404", "TEST_CDN_KEY404", "TEST_CDN_URL_OK")):
-                    assert len(server.calls) == 6, len(server.calls)
-                    for start in range(0, 6, 3):
-                        assert sorted(server.calls[start:start + 3]) == sorted(expected)
+                    assert len(server.calls) == 2 * per_round, len(server.calls)
+                    for start in range(0, len(server.calls), per_round):
+                        assert sorted(server.calls[start:start + per_round]) == sorted(expected)
                     if os.environ.get("TEST_CDN_URL404") == "1":
                         print("PASS URL404: both rounds' bulk key acknowledgements cannot clear durable final purge")
                     elif os.environ.get("TEST_CDN_URL_OK") == "1":
-                        print("PASS raw cached URL: real bulk-key map acknowledgements complete final purge")
+                        print("PASS service-scoped URL: both retained hosts and real bulk-key map acknowledgements complete final purge")
                     else:
                         print("PASS missing key acknowledgement: URL success cannot acknowledge eviction")
                     return
-                assert len(server.calls) == 18, len(server.calls)
-                for start in range(0, 18, 3):
-                    assert sorted(server.calls[start:start + 3]) == sorted(expected)
+                assert len(server.calls) == 6 * per_round, len(server.calls)
+                for start in range(0, len(server.calls), per_round):
+                    assert sorted(server.calls[start:start + per_round]) == sorted(expected)
                 print(f"PASS {os.environ.get('TEST_CDN_CONTRACT', 'quarantine_cdn_purge_failure_remains_denied_and_idempotently_retries')}: checked failure and bounded retry")
         finally:
             server.shutdown()
