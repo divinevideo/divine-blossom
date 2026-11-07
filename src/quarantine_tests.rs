@@ -637,8 +637,8 @@ fn cdn_drain_service_token_is_not_an_admin_credential() {
 }
 
 #[test]
-#[ignore = "requires failing then recovering local purge backend"]
-fn raw_url_and_bulk_key_acknowledgements_complete_final_purge() {
+#[ignore = "requires successful local service-scoped URL and realistic bulk-map purge backend"]
+fn service_scoped_url_and_bulk_key_acknowledgements_complete_final_purge() {
     let epoch = b2_cdn_phase::begin_erase(&hash()).unwrap();
     assert!(b2_cdn_phase::record_physical(&hash(), &epoch, b2_cdn_phase::Physical::Absent).unwrap());
     assert!(b2_cdn_phase::ensure_final_intent(&hash()).unwrap());

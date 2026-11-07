@@ -1,5 +1,16 @@
 # URL purge forwarding
 
+Modern-domain URL invalidation uses
+`POST /service/{outer_service_id}/purge_url/{host}/{hash}` on the Fastly API,
+with a scheme-free target and the existing purge credential. Both configured
+retained hosts target the same outer service. Fastly's March2026
+[domain-management announcement](https://www.fastly.com/blog/domains-reimagined-faster-safer-fully-independent-from-service)
+documents the service ID requirement; the legacy unscoped URL endpoint does
+not establish compatibility with that domain model. Both purge rounds and the
+bulk-key purges remain required. Any non-2xx leaves the durable intent pending.
+The loopback contracts enforce this route and exercise final receipts in real
+local Viceroy KV; they do not establish live eviction.
+
 Fastly's [standard VCL boilerplate](https://www.fastly.com/documentation/guides/full-site-delivery/fastly-vcl/about-fastly-vcl/)
 exempts its internal `FASTLYPURGE` method from the non-GET/HEAD pass guard.
 The recv snippet follows that path through the existing host/path checks and

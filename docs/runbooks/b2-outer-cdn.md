@@ -150,8 +150,12 @@ is unbound or that eviction happened, even when all service-key requests succeed
 Any URL/key404, authentication failure or provider error fails the checked
 operation and retains the committed intent and pending final acknowledgement.
 
-Fastly's URL endpoint is `POST /purge/https://<validated-host>/<hash>`; do not
-percent-encode the entire cached URL. Bulk surrogate-key success responses are
+For modern domains, Fastly's URL endpoint is
+`POST /service/<outer-service-id>/purge_url/<validated-host>/<hash>` with a
+scheme-free target; do not percent-encode the entire host/path. Both retained
+hosts target the same outer service, as required by the
+[modern domain contract](https://www.fastly.com/blog/domains-reimagined-faster-safer-fully-independent-from-service).
+Bulk surrogate-key success responses are
 maps of keys to purge IDs, not a `status:ok` object. These API acknowledgements
 do not prove end-to-end eviction or in-flight-fill exclusion: live acceptance
 must separately verify that `FASTLYPURGE` traverses the VCL cache path (and
