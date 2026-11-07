@@ -28,8 +28,15 @@ if (std.strlen(req.http.X-Divine-Edge-Request-Id) == 0) {
 # Force all traffic to the Compute backend
 set req.backend = F_compute_origin;
 
+# Purge authentication is enforced by Fastly at the generated cache path.
+# Override caller input: the special method is not itself an authorization grant.
+if (req.method == "FASTLYPURGE") {
+  set req.http.Fastly-Purge-Requires-Auth = "1";
+}
+
 # Only cache GET and HEAD requests
-if (req.method != "GET" && req.method != "HEAD") {
+# Let Fastly's authenticated purge method follow the same cache-key path.
+if (req.method != "GET" && req.method != "HEAD" && req.method != "FASTLYPURGE") {
   return(pass);
 }
 

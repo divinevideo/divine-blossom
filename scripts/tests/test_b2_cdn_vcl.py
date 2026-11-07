@@ -1,11 +1,56 @@
 """Source contracts for B2 cache admission; runtime VCL validation is an operator gate."""
 from pathlib import Path
+import re
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 class B2CdnVclContractTests(unittest.TestCase):
+    def test_source_method_guard_preserves_purge_maintenance_path(self):
+        recv = (ROOT / "vcl/recv.vcl").read_text()
+        match = re.search(r'if \((req[.]method[^\n]+)\) \{\s*return\(pass\);', recv)
+        self.assertIsNotNone(match)
+        # Evaluate only this source predicate's simple conjunction, not VCL's
+        # runtime, authentication, generated boilerplate or cache behavior.
+        terms = match[1].split(" && ")
+        allowed = []
+        for term in terms:
+            comparison = re.fullmatch(r'req[.]method != "([A-Z]+)"', term)
+            self.assertIsNotNone(comparison)
+            allowed.append(comparison[1])
+        for method in ["GET", "HEAD", "FASTLYPURGE", "POST", "PUT", "DELETE", "OPTIONS", "PURGE"]:
+            with self.subTest(method=method):
+                self.assertEqual(all(method != value for value in allowed),
+                                 method not in {"GET", "HEAD", "FASTLYPURGE"})
+        self.assertNotIn("return(lookup)", recv)
+        self.assertLess(match.start(), recv.index("# B2 original delivery"))
+
+    def test_source_purge_auth_requirement_overrides_caller_value(self):
+        recv = (ROOT / "vcl/recv.vcl").read_text()
+        match = re.search(r'if \(req[.]method == "FASTLYPURGE"\) \{\s*'
+                          r'set req[.]http[.]Fastly-Purge-Requires-Auth = "([^"]+)";\s*\}', recv)
+        self.assertIsNotNone(match)
+        for caller_value in [None, "0", "1", "untrusted"]:
+            with self.subTest(caller_value=caller_value):
+                # The source sets a constant unconditionally inside this
+                # method branch; it never derives a grant from caller input.
+                self.assertEqual(match[1], "1")
+        self.assertLess(match.start(), recv.index('# Only cache GET and HEAD'))
+
+    def test_source_purge_and_reads_share_original_key_normalization(self):
+        recv = (ROOT / "vcl/recv.vcl").read_text()
+        pattern = re.search(r'set req[.]url = regsub\(req[.]url, "([^"]+)", "([^"]+)"\);', recv)
+        self.assertIsNotNone(pattern)
+        sha = "a" * 64
+        for method in ["GET", "HEAD", "FASTLYPURGE"]:
+            for suffix in ["", ".mp4", "?synthetic=1", ".mp4?synthetic=1"]:
+                with self.subTest(method=method, suffix=suffix):
+                    self.assertEqual(re.sub(pattern[1], pattern[2], f"/{sha}{suffix}"), f"/{sha}")
+        self.assertIn('if (req.http.Authorization)', recv)
+        self.assertIn('req.http.Cookie', recv)
+        self.assertIn('set req.backend = F_compute_origin;', recv)
+
     def test_b2_paths_are_narrow_and_normalized_before_lookup(self):
         recv = (ROOT / "vcl/recv.vcl").read_text()
         self.assertIn("# B2 original delivery", recv)
