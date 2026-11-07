@@ -276,6 +276,16 @@ class UploadQueueTests(unittest.TestCase):
         self.assertIsNotNone(kv.get('b2-ready:'+HASH))
 
 class WorkerTests(unittest.TestCase):
+    def test_lost_readiness_write_response_retains_parent_gate(self):
+        def lost_response():
+            raise OSError("synthetic lost acknowledgement")
+        self.kv.after_put = lost_response
+        report = self.worker.cycle(max_objects=1, max_bytes=1000)
+        self.assertEqual(report["errors"], 1)
+        self.assertIsNotNone(self.kv.get("b2-sync:v1:" + HASH))
+        self.assertEqual(self.kv.get("b2-sync:v1:" + HASH)["state"], "copying")
+        self.assertEqual(self.kv.get("b2-ready:" + HASH)["sha256"], HASH)
+
     def test_cycle_reports_safe_source_failure_stage_and_resets_after_success(self):
         self.source.interrupt = True
         report = self.worker.cycle(max_objects=1, max_bytes=1000)
@@ -652,6 +662,83 @@ class PreflightTests(unittest.TestCase):
 
 
 class FastlyHTTPTests(unittest.TestCase):
+    def test_released_parent_gate_cas_over_real_http(self):
+        state = {"value": None, "generation": 0, "erase_on_release": False}
+        mutations = []
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+            def reply(self, status, value=None):
+                body = json.dumps(value).encode() if value is not None else b""
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("generation", str(state["generation"]))
+                self.end_headers()
+                self.wfile.write(body)
+            def do_GET(self):
+                self.reply(404) if state["value"] is None else self.reply(200, state["value"])
+            def do_PUT(self):
+                value = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                condition = self.headers.get("if-generation-match")
+                mutations.append((value, condition))
+                if state["erase_on_release"] and value.get("state") == "released":
+                    state.update(value={"state": "erasing"}, generation=state["generation"] + 1)
+                if condition is not None and condition != str(state["generation"]):
+                    return self.reply(412)
+                if parse_qs(urlsplit(self.path).query).get("add") == ["true"] and state["value"] is not None:
+                    return self.reply(412)
+                state.update(value=value, generation=state["generation"] + 1)
+                self.reply(200)
+            def do_DELETE(self):
+                self.reply(500)  # New protocol must never delete.
+        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            kv = mirror.FastlyKV("synthetic", "synthetic-token", released_parent_gates=True)
+            kv.base = f"http://127.0.0.1:{server.server_port}/keys/"
+            try:
+                self.assertTrue(kv.claim_copy(HASH, "first-attempt"))
+                kv.release_copy(HASH, "first-attempt")
+                self.assertTrue(mirror.released_parent_gate(state["value"]))
+                self.assertTrue(mirror.parent_gate_available(kv, state["value"]))
+                legacy = mirror.FastlyKV("synthetic", "synthetic-token")
+                self.assertFalse(mirror.parent_gate_available(legacy, state["value"]))
+                self.assertFalse(kv.claim_copy(HASH, "first-attempt"))
+                self.assertTrue(kv.claim_copy(HASH, "second-attempt"))
+                state["erase_on_release"] = True
+                with self.assertRaises(RuntimeError):
+                    kv.release_copy(HASH, "second-attempt")
+                self.assertEqual(state["value"], {"state": "erasing"})
+                self.assertFalse(kv.claim_copy(HASH, "third-attempt"))
+                self.assertEqual([g for v, g in mutations if v["state"] == "released"], ["1", "3"])
+                for record in [None, {}, {**state["value"], "version": 1},
+                               {"state": "released", "version": 1, "settled_attempt_id": "x", "released_from_generation": "01"}]:
+                    self.assertFalse(mirror.released_parent_gate(record))
+            finally:
+                server.shutdown()
+                thread.join()
+
+    def test_present_null_parent_gate_is_not_absence_over_real_http(self):
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", "4")
+                self.send_header("generation", "1")
+                self.end_headers()
+                self.wfile.write(b"null")
+        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            kv = mirror.FastlyKV("synthetic", "synthetic-token")
+            kv.base = f"http://127.0.0.1:{server.server_port}/keys/"
+            try:
+                self.assertIsNotNone(kv.get("b2-sync:v1:" + HASH))
+            finally:
+                server.shutdown()
+                thread.join()
+
     def test_control_json_rejects_duplicate_quarantine_fields(self):
         class Handler(BaseHTTPRequestHandler):
             body = b"{}"

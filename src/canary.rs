@@ -72,7 +72,7 @@ fn approved_metadata_with_limit(hash: &str, bounded: bool) -> Result<BlobMetadat
 }
 /// Known copy intent means temporary unavailability, after policy is approved.
 /// Erasing or malformed intent remains a terminal denial.
-fn copy_in_progress(hash: &str) -> Result<bool> {
+pub(crate) fn copy_in_progress(hash: &str) -> Result<bool> {
     let mut lookup = match open_store()?.lookup(&format!("b2-sync:v1:{hash}")) {
         Ok(lookup) => lookup,
         Err(KVStoreError::ItemNotFound) => return Ok(false),
@@ -83,17 +83,10 @@ fn copy_in_progress(hash: &str) -> Result<bool> {
         }
     };
     let denied = || BlossomError::NotFound("Blob not found".into());
-    let gate: serde_json::Value =
-        serde_json::from_str(&lookup.take_body().into_string()).map_err(|_| denied())?;
-    if gate.get("state").and_then(serde_json::Value::as_str) == Some("copying")
-        && gate
-            .get("attempt_id")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|id| !id.is_empty() && id.len() <= 128)
-    {
-        Ok(true)
-    } else {
-        Err(denied())
+    match crate::parent_gate::parse(&lookup.take_body().into_bytes()) {
+        Some(crate::parent_gate::Gate::Copying { .. }) => Ok(true),
+        Some(crate::parent_gate::Gate::Released { .. }) => Ok(false),
+        _ => Err(denied()),
     }
 }
 
