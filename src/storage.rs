@@ -10,7 +10,6 @@ use blossom_core::read_through::{
 use blossom_core::storage_origin::{MediaReadPolicy, StorageProvider};
 use fastly::http::{Method, StatusCode};
 use fastly::{Backend, Body, Request, Response};
-use hmac::{Hmac, Mac};
 use md5::Md5;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -69,12 +68,6 @@ pub(crate) fn with_uncached_storage_for_test<T>(operation: impl FnOnce() -> T) -
     let _reset = Reset(TEST_STORAGE_CACHE_BYPASS.with(|value| value.replace(true)));
     operation()
 }
-
-/// AWS signature version (works with GCS HMAC)
-const AWS_ALGORITHM: &str = "AWS4-HMAC-SHA256";
-
-/// S3 service name (GCS uses s3 for S3-compat mode)
-const SERVICE: &str = "s3";
 
 /// GCS region for signing (use "auto" for path-style)
 const GCS_REGION: &str = "auto";
@@ -3394,7 +3387,15 @@ fn sign_copy_request(req: &mut Request, config: &S3Config, copy_source: &str) ->
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
+    sign_copy_request_at(req, config, copy_source, now)
+}
 
+fn sign_copy_request_at(
+    req: &mut Request,
+    config: &S3Config,
+    copy_source: &str,
+    now: Duration,
+) -> Result<()> {
     let secs = now.as_secs();
     let days_since_epoch = secs / 86400;
     let time_of_day = secs % 86400;
@@ -3437,30 +3438,16 @@ fn sign_copy_request(req: &mut Request, config: &S3Config, copy_source: &str) ->
         method, uri, query, canonical_headers, signed_headers, payload_hash
     );
 
-    // Create string to sign
-    let credential_scope = format!(
-        "{}/{}/{}/aws4_request",
-        date_stamp,
+    let authorization = blossom_core::s3_signing::authorization(
+        &config.access_key,
+        &config.secret_key,
         config.region(),
-        SERVICE
-    );
-
-    let canonical_request_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
-
-    let string_to_sign = format!(
-        "{}\n{}\n{}\n{}",
-        AWS_ALGORITHM, amz_date, credential_scope, canonical_request_hash
-    );
-
-    // Calculate signature
-    let signing_key = get_signing_key(&config.secret_key, &date_stamp, config.region())?;
-    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes())?);
-
-    // Create authorization header
-    let authorization = format!(
-        "{} Credential={}/{}, SignedHeaders={}, Signature={}",
-        AWS_ALGORITHM, config.access_key, credential_scope, signed_headers, signature
-    );
+        &date_stamp,
+        &amz_date,
+        &canonical_request,
+        signed_headers,
+    )
+    .map_err(|error| BlossomError::Internal(error.into()))?;
 
     req.set_header("Authorization", authorization);
 
@@ -3622,30 +3609,16 @@ fn sign_request_at(
         method, uri, query, canonical_headers, signed_headers, payload_hash
     );
 
-    // Create string to sign
-    let credential_scope = format!(
-        "{}/{}/{}/aws4_request",
-        date_stamp,
+    let authorization = blossom_core::s3_signing::authorization(
+        &config.access_key,
+        &config.secret_key,
         config.region(),
-        SERVICE
-    );
-
-    let canonical_request_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
-
-    let string_to_sign = format!(
-        "{}\n{}\n{}\n{}",
-        AWS_ALGORITHM, amz_date, credential_scope, canonical_request_hash
-    );
-
-    // Calculate signature
-    let signing_key = get_signing_key(&config.secret_key, &date_stamp, config.region())?;
-    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes())?);
-
-    // Create authorization header
-    let authorization = format!(
-        "{} Credential={}/{}, SignedHeaders={}, Signature={}",
-        AWS_ALGORITHM, config.access_key, credential_scope, signed_headers, signature
-    );
+        &date_stamp,
+        &amz_date,
+        &canonical_request,
+        signed_headers,
+    )
+    .map_err(|error| BlossomError::Internal(error.into()))?;
 
     req.set_header("Authorization", authorization);
 
@@ -3664,7 +3637,16 @@ fn sign_request_with_owner(
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
+    sign_request_with_owner_at(req, config, payload_hash, owner, now)
+}
 
+fn sign_request_with_owner_at(
+    req: &mut Request,
+    config: &S3Config,
+    payload_hash: Option<String>,
+    owner: &str,
+    now: Duration,
+) -> Result<()> {
     let secs = now.as_secs();
     let days_since_epoch = secs / 86400;
     let time_of_day = secs % 86400;
@@ -3706,57 +3688,20 @@ fn sign_request_with_owner(
         method, uri, query, canonical_headers, signed_headers, payload_hash
     );
 
-    // Create string to sign
-    let credential_scope = format!(
-        "{}/{}/{}/aws4_request",
-        date_stamp,
+    let authorization = blossom_core::s3_signing::authorization(
+        &config.access_key,
+        &config.secret_key,
         config.region(),
-        SERVICE
-    );
-
-    let canonical_request_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
-
-    let string_to_sign = format!(
-        "{}\n{}\n{}\n{}",
-        AWS_ALGORITHM, amz_date, credential_scope, canonical_request_hash
-    );
-
-    // Calculate signature
-    let signing_key = get_signing_key(&config.secret_key, &date_stamp, config.region())?;
-    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes())?);
-
-    // Create authorization header
-    let authorization = format!(
-        "{} Credential={}/{}, SignedHeaders={}, Signature={}",
-        AWS_ALGORITHM, config.access_key, credential_scope, signed_headers, signature
-    );
+        &date_stamp,
+        &amz_date,
+        &canonical_request,
+        signed_headers,
+    )
+    .map_err(|error| BlossomError::Internal(error.into()))?;
 
     req.set_header("Authorization", authorization);
 
     Ok(())
-}
-
-/// Generate AWS v4 signing key
-fn get_signing_key(secret_key: &str, date_stamp: &str, region: &str) -> Result<Vec<u8>> {
-    let k_date = hmac_sha256(
-        format!("AWS4{}", secret_key).as_bytes(),
-        date_stamp.as_bytes(),
-    )?;
-    let k_region = hmac_sha256(&k_date, region.as_bytes())?;
-    let k_service = hmac_sha256(&k_region, SERVICE.as_bytes())?;
-    let k_signing = hmac_sha256(&k_service, b"aws4_request")?;
-    Ok(k_signing)
-}
-
-/// HMAC-SHA256
-fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
-    type HmacSha256 = Hmac<Sha256>;
-
-    let mut mac = HmacSha256::new_from_slice(key)
-        .map_err(|e| BlossomError::Internal(format!("HMAC error: {}", e)))?;
-
-    mac.update(data);
-    Ok(mac.finalize().into_bytes().to_vec())
 }
 
 /// Placeholder for body hash during signing
@@ -5654,6 +5599,86 @@ mod tests {
             .get_header_str("Authorization")
             .expect("signed authorization")
             .contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date"));
+    }
+
+    #[test]
+    fn shared_signer_preserves_edge_golden_requests_and_unsigned_ranges() {
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("../blossom-core/tests/s3_signing_golden.json")).unwrap();
+        let config = S3Config {
+            access_key: "synthetic-access".into(),
+            secret_key: "synthetic-secret".into(),
+            bucket: "private-test".into(),
+            host: "s3.us-west-004.backblazeb2.com".into(),
+            region: "us-west-004".into(),
+        };
+        let now = Duration::from_secs(1_794_013_323);
+        for case in cases.as_array().unwrap() {
+            let canonical = case["canonical_request"].as_str().unwrap();
+            let lines: Vec<_> = canonical.split('\n').collect();
+            let host = lines[3].strip_prefix("host:").unwrap();
+            let url = format!("https://{}{}?{}", config.host, lines[1], lines[2]);
+            for range in ["bytes=0-3", "bytes=4-"] {
+                let mut req = Request::new(lines[0], &url);
+                req.set_header("Host", host);
+                req.set_header("Range", range);
+                let payload = Some(lines.last().unwrap().to_string());
+                match case["name"].as_str().unwrap() {
+                    "owner_metadata" => super::sign_request_with_owner_at(
+                        &mut req,
+                        &config,
+                        payload,
+                        &"c".repeat(64),
+                        now,
+                    )
+                    .unwrap(),
+                    "copy_metadata" => {
+                        super::sign_copy_request_at(&mut req, &config, "/source/key%2Bvalue", now)
+                            .unwrap()
+                    }
+                    _ => sign_request_at(&mut req, &config, payload, now).unwrap(),
+                }
+                assert_eq!(
+                    req.get_header_str("Authorization"),
+                    case["authorization"].as_str(),
+                    "{} {range}",
+                    case["name"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_signer_bad_configuration_never_adds_authorization() {
+        let now = Duration::from_secs(1_794_013_323);
+        for (access_key, secret_key, region) in [
+            ("", "synthetic-secret", "us-west-004"),
+            ("synthetic-access", "", "us-west-004"),
+            ("synthetic-access", "synthetic-secret", ""),
+        ] {
+            let config = S3Config {
+                access_key: access_key.into(),
+                secret_key: secret_key.into(),
+                bucket: "private-test".into(),
+                host: "synthetic.example".into(),
+                region: region.into(),
+            };
+            let mut req = Request::get("https://synthetic.example/object");
+            req.set_header("Host", "synthetic.example");
+            assert!(sign_request_at(&mut req, &config, None, now).is_err());
+            assert!(!req.contains_header("Authorization"));
+        }
+        let config = S3Config {
+            access_key: "synthetic-access".into(),
+            secret_key: "synthetic-secret".into(),
+            bucket: "private-test".into(),
+            host: "synthetic.example".into(),
+            region: "us-west-004".into(),
+        };
+        let mut req = Request::get("https://synthetic.example/object");
+        req.remove_header("Host");
+        assert!(sign_request_at(&mut req, &config, None, now).is_err());
+        assert!(!req.contains_header("Authorization"));
     }
 
     #[test]

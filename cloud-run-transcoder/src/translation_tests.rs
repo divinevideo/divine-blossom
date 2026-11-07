@@ -98,11 +98,13 @@ impl StorageDouble {
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
+        let gcs_client = GcsClient::new(ClientConfig {
+            storage_endpoint: endpoint,
+            ..ClientConfig::default().anonymous()
+        });
         let state = Arc::new(AppState {
-            gcs_client: GcsClient::new(ClientConfig {
-                storage_endpoint: endpoint,
-                ..ClientConfig::default().anonymous()
-            }),
+            media_storage: object_storage::MediaStorage::gcs(gcs_client.clone(), "test".into()),
+            gcs_client,
             config: Config::from_lookup(|key| (key == "GCS_BUCKET").then(|| "test".to_string())),
             provider_semaphore: Arc::new(Semaphore::new(4)),
         });
@@ -337,6 +339,7 @@ async fn translation_route_auth_runs_before_json_extraction() {
     let state = Arc::new(AppState {
         config,
         gcs_client: storage.state.gcs_client.clone(),
+        media_storage: storage.state.media_storage.clone(),
         provider_semaphore: Arc::new(Semaphore::new(1)),
     });
     let app = Router::new()

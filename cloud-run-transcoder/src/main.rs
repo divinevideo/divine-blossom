@@ -18,9 +18,7 @@ use google_cloud_storage::{
         delete::DeleteObjectRequest,
         download::Range as DownloadRange,
         get::GetObjectRequest,
-        patch::PatchObjectRequest,
         upload::{Media, UploadObjectRequest, UploadType},
-        Object,
     },
 };
 use hyper_util::rt::TokioIo;
@@ -45,6 +43,7 @@ use tracing::{error, info, warn};
 
 mod media_command;
 mod mp4;
+mod object_storage;
 mod sound_classification;
 mod transcription_google_stt_v2;
 mod translation_google_v3;
@@ -372,6 +371,7 @@ fn report_derivative_failure_to_sentry(
 // App state shared across handlers
 struct AppState {
     gcs_client: GcsClient,
+    media_storage: object_storage::MediaStorage,
     config: Config,
     provider_semaphore: Arc<Semaphore>,
 }
@@ -752,10 +752,16 @@ async fn main() -> Result<()> {
     // Initialize GCS client
     let gcs_config = ClientConfig::default().with_auth().await?;
     let gcs_client = GcsClient::new(gcs_config);
+    let media_storage = object_storage::MediaStorage::configured(
+        object_storage::StorageConfiguration::parse(|name| std::env::var(name).ok())?,
+        Some(gcs_client.clone()),
+        config.gcs_bucket.clone(),
+    )?;
     let provider_semaphore = Arc::new(Semaphore::new(config.transcription_max_in_flight));
 
     let state = Arc::new(AppState {
         gcs_client,
+        media_storage,
         config,
         provider_semaphore,
     });
@@ -1151,7 +1157,7 @@ async fn handle_backfill_fmp4(
             .into_response();
     }
 
-    // Remove .ts files from temp dir so upload_hls_to_gcs only uploads .mp4
+    // Remove .ts files from temp dir so upload_hls only uploads .mp4
     for variant in &["stream_720p", "stream_480p"] {
         let ts_path = temp_path.join(format!("{}.ts", variant));
         let _ = tokio::fs::remove_file(&ts_path).await;
@@ -1159,9 +1165,11 @@ async fn handle_backfill_fmp4(
 
     // Upload only the new .mp4 files
     let source_metadata = SourceObjectMetadata::default();
-    if let Err(e) = upload_hls_to_gcs(
-        &state.gcs_client,
-        &state.config.gcs_bucket,
+    if let Err(e) = upload_hls(
+        &object_storage::MediaStorage::gcs(
+            state.gcs_client.clone(),
+            state.config.gcs_bucket.clone(),
+        ),
         &hash,
         temp_path,
         &source_metadata,
@@ -1231,14 +1239,8 @@ async fn process_audio_extract(
     let temp_dir = TempDir::new()?;
     let input_path = temp_dir.path().join("input");
 
-    // Download source video from GCS
-    download_from_gcs(
-        &state.gcs_client,
-        &state.config.gcs_bucket,
-        &hash,
-        &input_path,
-    )
-    .await?;
+    // Download and verify the pinned source object
+    download_media_original(&state.media_storage, &hash, &input_path).await?;
 
     // Verify it's a video with an audio track using ffprobe
     let probe_output = Command::new("ffprobe")
@@ -1322,48 +1324,39 @@ async fn process_audio_extract(
     let audio_sha256 = hex::encode(Sha256::digest(&audio_data));
     let size = audio_data.len() as u64;
 
-    // Upload to GCS if not already present
-    if !check_gcs_exists(&state.gcs_client, &state.config.gcs_bucket, &audio_sha256).await? {
-        let mut custom_metadata = HashMap::new();
-        custom_metadata.insert("source_sha256".to_string(), hash.clone());
-        custom_metadata.insert("derivative".to_string(), "audio".to_string());
-        custom_metadata.insert("owner".to_string(), request.owner.clone());
-
-        let mut media = Media::new(audio_sha256.clone());
-        media.content_type = "audio/mp4".into();
-        let upload_type = UploadType::Simple(media);
-
-        let req = UploadObjectRequest {
-            bucket: state.config.gcs_bucket.clone(),
-            ..Default::default()
-        };
-
+    // Shared audio keeps existing provenance; reuse only after pinned SHA verification.
+    if let Some(existing) = state.media_storage.stat(&audio_sha256).await? {
+        if existing.content_type != "audio/mp4" {
+            return Err(anyhow!("Existing audio MIME does not match"));
+        }
         state
-            .gcs_client
-            .upload_object(&req, Bytes::from(audio_data), &upload_type)
-            .await
-            .map_err(|e| anyhow!("Failed to upload audio to GCS: {}", e))?;
-
-        // Set custom metadata on the uploaded object
-        let patch_req = PatchObjectRequest {
-            bucket: state.config.gcs_bucket.clone(),
-            object: audio_sha256.clone(),
-            metadata: Some(Object {
-                metadata: Some(custom_metadata),
-                cache_control: Some("public, max-age=31536000, immutable".to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let _ = state.gcs_client.patch_object(&patch_req).await;
-
+            .media_storage
+            .verify_sha256(&existing, &audio_sha256)
+            .await?;
+        info!(
+            "Audio {} already exists in selected media storage",
+            audio_sha256
+        );
+    } else {
+        let custom_metadata = HashMap::from([
+            ("source_sha256".to_string(), hash.clone()),
+            ("derivative".to_string(), "audio".to_string()),
+            ("owner".to_string(), request.owner.clone()),
+        ]);
+        state
+            .media_storage
+            .put_verified(
+                &audio_sha256,
+                Bytes::from(audio_data),
+                "audio/mp4",
+                custom_metadata,
+                Some("public, max-age=31536000, immutable".to_string()),
+            )
+            .await?;
         info!(
             "Uploaded audio {} ({} bytes) for source {}",
             audio_sha256, size, hash
         );
-    } else {
-        info!("Audio {} already exists in GCS", audio_sha256);
     }
 
     Ok(AudioExtractResponse {
@@ -1388,12 +1381,11 @@ async fn process_transcode(
     }
     // Repairs operate only on existing HLS, never race initial generation.
     // Operators must verify the original job completed before submitting a repair.
-    if !check_gcs_exists(
-        &state.gcs_client,
-        &state.config.gcs_bucket,
-        &format!("{}/hls/master.m3u8", hash),
-    )
-    .await?
+    if state
+        .media_storage
+        .stat(&format!("{}/hls/master.m3u8", hash))
+        .await?
+        .is_none()
     {
         return Err(anyhow!("Repair requires an existing HLS master"));
     }
@@ -1442,9 +1434,7 @@ async fn process_transcode_inner(
 
     // Ordinary requests remain idempotent; repairs can replace existing derivatives.
     let master_path = format!("{}/hls/master.m3u8", hash);
-    if !request.force
-        && check_gcs_exists(&state.gcs_client, &state.config.gcs_bucket, &master_path).await?
-    {
+    if !request.force && state.media_storage.stat(&master_path).await?.is_some() {
         info!("HLS already exists for {}, skipping transcode", hash);
         // Still update status to complete in case it was pending (no size change for already-transcoded)
         send_status_webhook(
@@ -1501,48 +1491,38 @@ async fn process_transcode_inner(
     let temp_dir = TempDir::new()?;
     let temp_path = temp_dir.path();
 
-    // Download original video from GCS
+    // Download and verify the pinned original video
     let input_path = temp_path.join("input.mp4");
-    let download_result = download_from_gcs(
-        &state.gcs_client,
-        &state.config.gcs_bucket,
-        &hash,
-        &input_path,
-    )
-    .await;
+    let download_result = download_media_original(&state.media_storage, &hash, &input_path).await;
 
-    if let Err(e) = download_result {
-        send_status_webhook(
-            &state.config,
-            &hash,
-            "failed",
-            None,
-            None,
-            Some("download_failed"),
-            Some(&e.to_string()),
-            None,
-            status_event_generation(attempt_generation, STATUS_EVENT_TERMINAL),
-            false,
-        )
-        .await;
-        return Err(e);
-    }
-
-    info!("Downloaded video to {:?}", input_path);
-
-    // Read source metadata once so HLS derivatives can preserve provenance.
-    let mut source_metadata = match get_source_object_metadata(
-        &state.gcs_client,
-        &state.config.gcs_bucket,
-        &hash,
-    )
-    .await
-    {
-        Ok(meta) => meta,
+    let verified_source = match download_result {
+        Ok(source) => source,
         Err(e) => {
-            warn!("Failed to load source metadata for {}: {}", hash, e);
-            SourceObjectMetadata::default()
+            send_status_webhook(
+                &state.config,
+                &hash,
+                "failed",
+                None,
+                None,
+                Some("download_failed"),
+                Some(&e.to_string()),
+                None,
+                status_event_generation(attempt_generation, STATUS_EVENT_TERMINAL),
+                false,
+            )
+            .await;
+            return Err(e);
         }
+    };
+
+    info!(
+        "Downloaded verified video {} to {:?}",
+        verified_source.sha256, input_path
+    );
+    // Metadata belongs to the exact version whose bytes were verified.
+    let mut source_metadata = SourceObjectMetadata {
+        content_type: Some(verified_source.object.content_type),
+        custom: verified_source.object.custom,
     };
     if let Some(owner) = request.owner.clone() {
         source_metadata
@@ -1667,14 +1647,8 @@ async fn process_transcode_inner(
     }
 
     // Upload all HLS files to GCS
-    let upload_result = upload_hls_to_gcs(
-        &state.gcs_client,
-        &state.config.gcs_bucket,
-        &hash,
-        &output_dir,
-        &source_metadata,
-    )
-    .await;
+    let upload_result =
+        upload_hls(&state.media_storage, &hash, &output_dir, &source_metadata).await;
 
     if let Err(e) = upload_result {
         send_status_webhook(
@@ -1942,14 +1916,7 @@ async fn process_transcribe(
     let temp_path = temp_dir.path();
 
     let input_path = temp_path.join("input_media");
-    if let Err(e) = download_from_gcs(
-        &state.gcs_client,
-        &state.config.gcs_bucket,
-        &hash,
-        &input_path,
-    )
-    .await
-    {
+    if let Err(e) = download_media_original(&state.media_storage, &hash, &input_path).await {
         if let Err(lock_error) = delete_transcript_lock(
             &state.gcs_client,
             &state.config.gcs_bucket,
@@ -7147,7 +7114,7 @@ async fn remux_ts_to_fmp4(hls_dir: &Path) -> Result<()> {
         if let Err(e) = remux_variant(&ts_path, &mp4_path, variant).await {
             warn!("MP4 remux failed for {}: {}", variant, e);
             // ffmpeg truncates its output the moment it opens it, so a failed
-            // run leaves a zero-byte .mp4 here. upload_hls_to_gcs uploads
+            // run leaves a zero-byte .mp4 here. upload_hls uploads
             // whatever the directory holds, with a year of immutable caching,
             // so leaving it would publish an unplayable variant — and on
             // /backfill-fmp4 it would replace a working one.
@@ -7256,26 +7223,23 @@ async fn clamp_movie_duration(mp4_path: &Path, data: &mut [u8], duration: u64) -
     Ok(())
 }
 
-async fn upload_hls_to_gcs(
-    client: &GcsClient,
-    bucket: &str,
+/// Upload immutable media bytes and return pinned verification receipts.
+/// Completion authority and any family manifest belong to the job coordinator.
+async fn upload_hls(
+    storage: &object_storage::MediaStorage,
     hash: &str,
     hls_dir: &Path,
     source_metadata: &SourceObjectMetadata,
-) -> Result<()> {
-    // Read directory and upload each file
+) -> Result<Vec<object_storage::VerifiedObject>> {
     let mut entries = tokio::fs::read_dir(hls_dir).await?;
-
+    let mut verified = Vec::new();
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
         if !path.is_file() {
             continue;
         }
-
         let filename = path.file_name().unwrap().to_string_lossy();
-        let gcs_path = format!("{}/hls/{}", hash, filename);
-
-        // Determine content type
+        let key = format!("{}/hls/{}", hash, filename);
         let content_type = if filename.ends_with(".m3u8") {
             "application/vnd.apple.mpegurl"
         } else if filename.ends_with(".ts") {
@@ -7285,73 +7249,42 @@ async fn upload_hls_to_gcs(
         } else {
             "application/octet-stream"
         };
-
-        // Read file
-        let data = tokio::fs::read(&path).await?;
-
-        // Upload to GCS
-        let mut media = Media::new(gcs_path.clone());
-        media.content_type = content_type.into();
-        let upload_type = UploadType::Simple(media);
-
-        let req = UploadObjectRequest {
-            bucket: bucket.to_string(),
-            ..Default::default()
-        };
-
-        client
-            .upload_object(&req, Bytes::from(data), &upload_type)
-            .await
-            .map_err(|e| anyhow!("Failed to upload {}: {}", gcs_path, e))?;
-
-        let mut derivative_metadata = source_metadata.custom.clone();
-        derivative_metadata.insert("source_sha256".to_string(), hash.to_string());
-        derivative_metadata.insert("derivative".to_string(), "hls".to_string());
-        derivative_metadata.insert("hls_filename".to_string(), filename.to_string());
+        let mut metadata = source_metadata.custom.clone();
+        metadata.insert("source_sha256".to_string(), hash.to_string());
+        metadata.insert("derivative".to_string(), "hls".to_string());
+        metadata.insert("hls_filename".to_string(), filename.to_string());
         if let Some(src_ct) = &source_metadata.content_type {
-            derivative_metadata
+            metadata
                 .entry("source_content_type".to_string())
                 .or_insert_with(|| src_ct.clone());
         }
-
-        let patch_req = PatchObjectRequest {
-            bucket: bucket.to_string(),
-            object: gcs_path.clone(),
-            metadata: Some(Object {
-                metadata: Some(derivative_metadata),
-                cache_control: Some("public, max-age=31536000, immutable".to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        if let Err(e) = client.patch_object(&patch_req).await {
-            warn!("Failed to patch metadata for {}: {}", gcs_path, e);
-        }
-
-        info!("Uploaded {}", gcs_path);
+        verified.push(
+            storage
+                .put_verified(
+                    &key,
+                    Bytes::from(tokio::fs::read(&path).await?),
+                    content_type,
+                    metadata,
+                    Some("public, max-age=31536000, immutable".to_string()),
+                )
+                .await?,
+        );
+        info!("Uploaded {}", key);
     }
-
-    Ok(())
+    Ok(verified)
 }
 
-async fn get_source_object_metadata(
-    client: &GcsClient,
-    bucket: &str,
+/// Resolve once, then require the same provider, version, metadata and SHA on read.
+async fn download_media_original(
+    storage: &object_storage::MediaStorage,
     hash: &str,
-) -> Result<SourceObjectMetadata> {
-    let obj = client
-        .get_object(&GetObjectRequest {
-            bucket: bucket.to_string(),
-            object: hash.to_string(),
-            ..Default::default()
-        })
-        .await
-        .map_err(|e| anyhow!("Failed to read source object metadata: {}", e))?;
-
-    Ok(SourceObjectMetadata {
-        content_type: obj.content_type,
-        custom: obj.metadata.unwrap_or_default(),
-    })
+    path: &Path,
+) -> Result<object_storage::VerifiedObject> {
+    let object = storage
+        .stat(hash)
+        .await?
+        .ok_or_else(|| anyhow!("Original not found"))?;
+    storage.download_original(&object, hash, path).await
 }
 
 /// Send transcode status update to the Fastly edge webhook
