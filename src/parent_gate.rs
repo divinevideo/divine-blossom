@@ -16,7 +16,7 @@ pub(crate) enum Gate {
     Copying {
         attempt_id: String,
     },
-    Erasing,
+    Erasing {},
     Released {
         version: u32,
         settled_attempt_id: String,
@@ -47,7 +47,7 @@ pub(crate) fn parse(body: &[u8]) -> Option<Gate> {
     let gate: Gate = serde_json::from_slice(body).ok()?;
     let valid = match &gate {
         Gate::Copying { attempt_id } => identity(attempt_id),
-        Gate::Erasing => true,
+        Gate::Erasing {} => true,
         Gate::Released {
             version,
             settled_attempt_id,
@@ -119,15 +119,15 @@ pub(crate) fn claim_erasure(store: &KVStore, hash: &str) -> Result<()> {
         return Err(unavailable());
     }
     match lookup(store, hash)? {
-        None => insert(store, hash, &Gate::Erasing, None),
+        None => insert(store, hash, &Gate::Erasing {}, None),
         Some(Observed {
-            gate: Gate::Erasing,
+            gate: Gate::Erasing {},
             ..
         }) => Ok(()),
         Some(Observed {
             gate: Gate::Released { .. },
             generation: g,
-        }) => insert(store, hash, &Gate::Erasing, generation(&g)),
+        }) => insert(store, hash, &Gate::Erasing {}, generation(&g)),
         Some(_) => Err(stale()),
     }
 }
@@ -177,7 +177,7 @@ fn eligible(hash: &str) -> Result<()> {
 #[derive(Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 enum Expected {
-    Missing,
+    Missing {},
     Released {
         generation: String,
         settled_attempt_id: String,
@@ -222,7 +222,7 @@ fn execute(store: &KVStore, op: &str, wire: &Wire) -> Result<serde_json::Value> 
             // OriginalWrite intentionally has no admission hook or caller-selected bypass.
             eligible(&wire.parent)?;
             let expected = match (&wire.expected, &observed) {
-                (Some(Expected::Missing), None) => None,
+                (Some(Expected::Missing {}), None) => None,
                 (
                     Some(Expected::Released {
                         generation: g,
@@ -414,6 +414,12 @@ mod tests {
         }
         assert!(parse(br#"{"state":"released","version":1,"settled_attempt_id":"legacy-attempt","released_from_generation":"18446744073709551615"}"#).is_some());
         assert!(generation("18446744073709551616").is_none());
+        for expected in [
+            serde_json::json!({"state":"missing","unexpected":true}),
+            serde_json::json!({"state":"released","generation":"1","settled_attempt_id":A,"unexpected":true}),
+        ] {
+            assert!(serde_json::from_value::<Wire>(serde_json::json!({"version":1,"parent":"a".repeat(64),"attempt_id":A,"purpose":"existing_family","expected":expected})).is_err());
+        }
     }
     #[test]
     #[ignore = "requires local KV fixture; scripts/run-parent-gate-tests.py"]
@@ -457,7 +463,7 @@ mod tests {
         assert!(insert(
             &store,
             &parent,
-            &Gate::Erasing,
+            &Gate::Erasing {},
             generation(&released.generation)
         )
         .is_err());
@@ -485,7 +491,7 @@ mod tests {
         .is_err());
         assert_eq!(
             lookup(&store, &parent).unwrap().unwrap().gate,
-            Gate::Erasing
+            Gate::Erasing {}
         );
         assert!(execute(&store, "release", &release).is_err());
     }
