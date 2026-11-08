@@ -58,10 +58,10 @@ if (req.http.Host ~ "(?i)^media-b2(-cdn)?[.]divine[.]video(:[0-9]+)?$") {
     set beresp.ttl = 0s;
     return(pass);
   }
-  if (segmented_caching.is_inner_req) {
+  if (beresp.status == 206) {
     # Only Compute's final guarded response can issue this version-bound marker.
     # Native segmented caching requires length framing, never chunked encoding.
-    if (!req.enable_segmented_caching || beresp.status != 206 ||
+    if (
         beresp.http.X-Divine-B2-CDN-Admission != "original-segment-v1" ||
         beresp.http.X-Divine-Source != "b2" ||
         beresp.http.Content-Length !~ "^[0-9]+\z" ||

@@ -20,9 +20,15 @@ class B2CdnVclContractTests(unittest.TestCase):
         self.assertIn('set req.http.Fastly-Purge-Requires-Auth = "1";', recv)
         self.assertNotIn('return(lookup)', recv)
 
+    def test_segmented_variables_stay_in_documented_subroutines(self):
+        for name in ['miss', 'fetch', 'deliver', 'error', 'pass']:
+            source = (ROOT / f'vcl/{name}.vcl').read_text()
+            self.assertNotIn('req.enable_segmented_caching', source)
+            self.assertNotIn('segmented_caching.is_inner_req', source)
+
     def test_native_range_fetches_are_not_overwritten_by_whole_object_miss_policy(self):
         miss = (ROOT / "vcl/miss.vcl").read_text()
-        guarded = re.search(r'if \(req[.]http[.]Host !~ "\^media-b2\(-cdn\)\?\[\.\]divine\[\.\]video\$" \|\| !req[.]enable_segmented_caching\) \{\s*unset bereq[.]http[.]Range;\s*\}', miss)
+        guarded = re.search(r'if \(req[.]http[.]Host !~ "\^media-b2\(-cdn\)\?\[\.\]divine\[\.\]video\$"\) \{\s*unset bereq[.]http[.]Range;\s*\}', miss)
         self.assertIsNotNone(guarded)
         self.assertEqual(miss.count('unset bereq.http.Range;'), 1)
 
@@ -30,7 +36,7 @@ class B2CdnVclContractTests(unittest.TestCase):
         fetch = (ROOT / "vcl/fetch.vcl").read_text()
         block = fetch.split('# B2 original admission', 1)[1].split('# Origin owns', 1)[0]
         for required in [
-            'segmented_caching.is_inner_req', 'beresp.status != 206',
+            'if (beresp.status == 206)',
             '"original-segment-v1"', 'beresp.http.Content-Length',
             'beresp.http.Content-Range', 'beresp.http.Transfer-Encoding',
             'beresp.http.ETag', 'beresp.http.Content-Encoding',

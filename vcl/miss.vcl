@@ -20,7 +20,7 @@
 
 # Keep native segmented inner ranges intact. Canonical/non-segmented fills
 # retain the existing full-object behavior.
-if (req.http.Host !~ "^media-b2(-cdn)?[.]divine[.]video$" || !req.enable_segmented_caching) {
+if (req.http.Host !~ "^media-b2(-cdn)?[.]divine[.]video$") {
   unset bereq.http.Range;
 }
 
