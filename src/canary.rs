@@ -7,6 +7,14 @@ use blossom_core::delivery_telemetry::{Cache, Fallback, Provider};
 use fastly::kv_store::KVStoreError;
 use fastly::{Request, Response};
 
+pub(crate) const VERIFIED_SEGMENT_HEADER: &str = "X-Divine-B2-Verified-Segment";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DemandMode {
+    Direct,
+    Cdn,
+}
+
 pub(crate) fn route(req: &Request) -> CanaryRoute {
     let configured = crate::storage::get_config("b2_canary_host").ok();
     let authority = req.get_url().host_str().unwrap_or("");
@@ -106,6 +114,7 @@ pub(crate) fn handle(req: Request) -> Result<Response> {
             req,
             crate::storage::download_demand_b2,
             crate::storage::download_demand_gcs,
+            DemandMode::Direct,
         );
     }
     handle_with_origin(req, crate::storage::download_canary_original)
@@ -120,6 +129,7 @@ pub(crate) fn handle_cdn(req: Request) -> Result<Response> {
         req,
         crate::storage::download_demand_b2,
         crate::storage::download_demand_gcs,
+        DemandMode::Cdn,
     )
 }
 
@@ -210,6 +220,7 @@ fn handle_demand(
         Option<&str>,
         std::time::Instant,
     ) -> Result<crate::storage::CanaryOrigin>,
+    mode: DemandMode,
 ) -> Result<Response> {
     use crate::storage::CanaryOrigin;
     use std::time::{Duration, Instant};
@@ -219,7 +230,9 @@ fn handle_demand(
     let metadata = approved_metadata_with_limit(&hash, true)?;
     let copying = copy_in_progress(&hash)?;
     let eligible = metadata.size <= canary::MAX_DEMAND_BYTES;
-    let range = if *req.get_method() == fastly::http::Method::HEAD {
+    let range = if *req.get_method() == fastly::http::Method::HEAD
+        || (mode == DemandMode::Cdn && req.get_header_all("Range").count() != 1)
+    {
         None
     } else {
         canary::single_range(req.get_header_str("Range"))
@@ -265,12 +278,57 @@ fn handle_demand(
             Err(_) => return Ok(unavailable()),
         };
         if let Some(ready) = ready {
-            let outcome = fetch_b2(&ready, req.get_method(), range, deadline);
+            let identity = blossom_core::b2_cdn::SegmentedOriginal {
+                sha256: &hash,
+                destination_version_id: &ready.destination_version_id,
+                size: metadata.size,
+            };
+            let selected_range = if mode == DemandMode::Cdn {
+                if req.get_header_all("If-Range").count() > 1 {
+                    None
+                } else {
+                    identity.selected_range(
+                        req.get_method_str(),
+                        range,
+                        req.get_header_str("If-Range"),
+                    )
+                }
+            } else {
+                range
+            };
+            let outcome = fetch_b2(&ready, req.get_method(), selected_range, deadline);
             // Recheck even on errors: denial always beats availability/config.
             copying_seen |= recheck_demand(&hash, &metadata)?;
             match outcome? {
                 CanaryOrigin::Delivered(response) if !copying_seen => {
-                    return Ok(demand_headers(response, &hash, &metadata, "b2"))
+                    let mut response = demand_headers(response, &hash, &metadata, "b2");
+                    if mode == DemandMode::Cdn {
+                        let tag = identity.entity_tag().ok_or_else(|| {
+                            BlossomError::StorageError("B2 representation identity invalid".into())
+                        })?;
+                        response.set_header("ETag", &tag);
+                        let view = blossom_core::b2_cdn::SegmentedResponse {
+                            method: req.get_method_str(),
+                            source: Some("b2"),
+                            status: response.get_status().as_u16(),
+                            content_length: response.get_header_str("Content-Length"),
+                            content_range: response.get_header_str("Content-Range"),
+                            entity_tag: response.get_header_str("ETag"),
+                            content_encoding: response.get_header_str("Content-Encoding"),
+                            transfer_encoding: response.get_header_str("Transfer-Encoding"),
+                            set_cookie: response.contains_header("Set-Cookie"),
+                        };
+                        if response.get_header_all("Content-Length").count() == 1
+                            && response.get_header_all("Content-Range").count() <= 1
+                            && identity.admits(&view, selected_range)
+                        {
+                            // Response-only evidence from the verified handler;
+                            // FinalPolicy removes it and issues admission only
+                            // after the final fresh policy guard has succeeded.
+                            response.set_header(VERIFIED_SEGMENT_HEADER, tag);
+                        }
+                    }
+                    return Ok(response);
                 }
                 CanaryOrigin::Missing => {
                     hint = Some(Some(ready.destination_version_id));
@@ -288,7 +346,19 @@ fn handle_demand(
     if copying_seen {
         crate::delivery_telemetry::fallback(Fallback::Copying);
     }
-    let outcome = fetch_gcs(&hash, metadata.size, req.get_method(), range, deadline);
+    // A B2 representation validator is not authority to serve a GCS range.
+    let fallback_range = if mode == DemandMode::Cdn && req.contains_header("If-Range") {
+        None
+    } else {
+        range
+    };
+    let outcome = fetch_gcs(
+        &hash,
+        metadata.size,
+        req.get_method(),
+        fallback_range,
+        deadline,
+    );
     copying_seen |= recheck_demand(&hash, &metadata)?;
     match outcome? {
         CanaryOrigin::Delivered(response) => {
@@ -724,6 +794,7 @@ mod tests {
                 }
                 outcome
             },
+            super::DemandMode::Direct,
         );
         if change == "copying" {
             assert_eq!(
