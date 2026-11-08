@@ -68,6 +68,30 @@ class RevisionTests(unittest.TestCase):
         for ref in [None, dict(REF, version='latest'), dict(REF, key=PARENT + '/hls/master.m3u8')]:
             with self.subTest(ref=ref), self.assertRaises(ValueError): validate(*fixture(), ref=ref)
 
+    def test_marker_identity_and_fences_match_consistent_receipt_and_plan(self):
+        for field, value in [('producer_job_id', 'd' * 64), ('pipeline_version', 2),
+                             ('lease_generation', 3), ('input_revision', 2),
+                             ('parent_sha256', 'e' * 64), ('revision_id', 'c' * 32)]:
+            args = list(fixture())
+            args[2][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                validate(*args)
+
+    def test_matching_noncanonical_processing_identity_is_rejected(self):
+        receipt, attempt, marker, playlists = fixture()
+        receipt['processing_job_id'] = attempt['processing_job_id'] = marker['producer_job_id'] = 'd' * 64
+        with self.assertRaises(ValueError):
+            validate(receipt, attempt, marker, playlists)
+
+    def test_plan_target_mime_and_metadata_are_checked_independently(self):
+        for field, value in [('target', dict(provider='b2', bucket='foreign-private',
+                                           key=f'{PARENT}/revisions/v1/{NONCE}/{NAMES[0]}')),
+                             ('content_type', 'text/plain'), ('metadata', {})]:
+            args = list(fixture())
+            args[1]['artifacts'][0][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                validate(*args)
+
     def test_marker_json_rejects_duplicates_unknown_keys_and_wrong_scalar_types(self):
         receipt, attempt, marker, playlists = fixture()
         raw = json.dumps(marker).encode()
