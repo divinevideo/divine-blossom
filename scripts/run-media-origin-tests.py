@@ -37,6 +37,7 @@ class Storage(BaseHTTPRequestHandler):
             status, body = 206, body[1:4]
         self.send_response(status)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Divine-Source", "untrusted-origin-label")
         if bucket == "b2":
             self.send_header("x-amz-meta-c2pa-manifest-id", "synthetic-manifest")
             self.send_header("x-amz-meta-source-sha256", "a" * 64)
@@ -76,6 +77,7 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                 ])
                 cases = [
                     ("derived_origin_b2_without_gcs_contract", "gcs", "true"),
+                    ("derived_body_cache_source_contract", "gcs", "true"),
                     ("derived_origin_default_independent_contract", "b2", "true"),
                     ("derived_origin_fallback_contract", "gcs", "true"),
                     ("derived_origin_invalid_config_contract", "gcs", "true"),
@@ -95,7 +97,7 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                         del values["media_read_primary"]
                     if test == "media_origin_gcs_missing_config_contract":
                         del values["gcs_bucket"]
-                    if test == "derived_origin_b2_without_gcs_contract":
+                    if test in ("derived_origin_b2_without_gcs_contract", "derived_body_cache_source_contract"):
                         values.update(derived_media_read_primary="b2", derived_media_gcs_fallback_enabled="false")
                         del values["gcs_bucket"]
                     elif test == "derived_origin_fallback_contract":
@@ -120,6 +122,9 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                             ("b2", "fixture/vtt/main.vtt", None),
                             ("b2", "fixture/audio/analysis.json", None),
                             ("b2", "missing", None), ("b2", "forbidden", None)], reads
+                    elif test == "derived_body_cache_source_contract":
+                        assert reads == [("b2", "fixture/hls/master.m3u8", None),
+                                         ("b2", "fixture/vtt/main.vtt", None)], reads
                     elif test == "derived_origin_default_independent_contract":
                         assert reads == [("gcs", "fixture/hls/720p.mp4", None)], reads
                     elif test == "derived_origin_fallback_contract":

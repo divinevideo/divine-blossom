@@ -1513,6 +1513,8 @@ fn download_hls_content(gcs_path: &str, range: Option<&str>) -> Result<Response>
     if let Ok(Some(body)) = simple_cache::get(cache_key.clone()) {
         let mut resp = Response::from_status(StatusCode::OK);
         resp.set_body(body);
+        // This cache stores bytes only; it cannot attest their provider.
+        resp.set_header("X-Divine-Source", "unknown");
         return Ok(resp);
     }
 
@@ -1527,6 +1529,9 @@ fn download_hls_content(gcs_path: &str, range: Option<&str>) -> Result<Response>
 
     // Reconstruct response with the body and preserve GCS metadata headers
     let mut resp = Response::from_status(gcs_resp.get_status());
+    if let Some(source) = gcs_resp.get_header_str("X-Divine-Source") {
+        resp.set_header("X-Divine-Source", source);
+    }
     // Preserve provenance headers from GCS
     if let Some(val) = gcs_resp.get_header_str("x-goog-meta-c2pa-manifest-id") {
         resp.set_header("x-goog-meta-c2pa-manifest-id", val);
@@ -1555,6 +1560,7 @@ fn download_transcript_content(gcs_path: &str) -> Result<Response> {
         if !is_corrupted {
             let mut resp = Response::from_status(StatusCode::OK);
             resp.set_body(body_bytes);
+            resp.set_header("X-Divine-Source", "unknown");
             return Ok(resp);
         }
         // Corrupted VTT in cache — purge and fetch fresh from GCS
@@ -1571,6 +1577,9 @@ fn download_transcript_content(gcs_path: &str) -> Result<Response> {
     let _ = simple_cache::get_or_set(cache_key, body_bytes.as_slice(), TRANSCRIPT_CACHE_TTL);
 
     let mut resp = Response::from_status(gcs_resp.get_status());
+    if let Some(source) = gcs_resp.get_header_str("X-Divine-Source") {
+        resp.set_header("X-Divine-Source", source);
+    }
     resp.set_body(body_bytes);
     Ok(resp)
 }
@@ -9139,3 +9148,26 @@ mod upload_routing_tests;
 #[cfg(test)]
 #[path = "hls_alias_tests.rs"]
 mod hls_alias_tests;
+
+#[cfg(test)]
+mod derived_origin_provenance_tests {
+    #[test]
+    #[ignore = "requires synthetic private origins; run-media-origin-tests.py"]
+    fn derived_body_cache_source_contract() {
+        for path in ["fixture/hls/master.m3u8", "fixture/vtt/main.vtt"] {
+            let fetch = || {
+                if path.ends_with(".m3u8") {
+                    super::download_hls_content(path, None)
+                } else {
+                    super::download_transcript_content(path)
+                }
+            };
+            let mut first = fetch().unwrap();
+            assert_eq!(first.get_header_str("X-Divine-Source"), Some("b2"));
+            assert_eq!(first.take_body().into_string(), "b2 bytes");
+            let mut hit = fetch().unwrap();
+            assert_eq!(hit.get_header_str("X-Divine-Source"), Some("unknown"));
+            assert_eq!(hit.take_body().into_string(), "b2 bytes");
+        }
+    }
+}

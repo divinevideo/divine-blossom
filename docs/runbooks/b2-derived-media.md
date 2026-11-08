@@ -26,6 +26,21 @@ Public translated-subtitle source reads use the same selected origin but bypass
 backend caching. Internal translation job records retain their current GCS writer
 origin until the coordination migration; they are a documented GCS dependency.
 
+## Provider labels
+
+Derived storage responses overwrite any origin-supplied `X-Divine-Source` with
+the selected `b2` or `gcs` transport. A B2 miss followed by GCS fallback therefore
+remains labelled GCS. Optimized MP4/TS responses retain that label, and HLS and
+subtitle body reconstruction preserves it on a cache miss. The existing
+body-only Simple Cache does not retain provider provenance; its hits explicitly
+use `unknown` rather than inferring a provider from current configuration.
+
+These labels describe selected transport or cached fill provenance, not a new
+origin read on every downstream HIT. They do not prove immutable family
+readiness, current revision, B2-only coverage, byte-weighted offload or billing.
+Missing labels on response paths that reconstruct other representations remain
+unattributed; do not substitute a provider from hostname or rollout flags.
+
 ## Activation prerequisites
 
 Verify all required artifact families, their metadata and current source versions
