@@ -227,23 +227,35 @@ impl MediaStorage {
     pub async fn stat(&self, key: &str) -> Result<Option<ObjectMetadata>> {
         self.stat_pinned(key, None).await
     }
-    /// Existing-output shortcuts must not hide a failed required backup write.
-    pub async fn reusable_output(&self, key: &str) -> Result<Option<ObjectMetadata>> {
-        let primary = self.stat(key).await?;
-        if let (Some(primary), Some(backup)) = (&primary, &self.required_backup) {
-            let Some(replica) = backup.stat(key).await? else {
-                return Ok(None);
-            };
-            if primary.size != replica.size
-                || primary.content_type != replica.content_type
-                || primary.custom != replica.custom
-                || primary.cache_control != replica.cache_control
-                || self.hash_body(primary, None).await? != backup.hash_body(&replica, None).await?
-            {
-                return Ok(None);
+    pub fn can_reuse_hls_master(&self) -> bool {
+        // A master alone cannot prove that a prior segment backup succeeded.
+        self.required_backup.is_none()
+    }
+    /// Preserve the primary's provenance when shared audio needs a backup.
+    pub async fn ensure_existing_backup(
+        &self,
+        primary: &ObjectMetadata,
+        body: Bytes,
+    ) -> Result<()> {
+        if let Some(backup) = &self.required_backup {
+            self.validate_reference(&primary.reference)?;
+            let sha = hex::encode(Sha256::digest(&body));
+            if primary.size != body.len() as u64 {
+                bail!("Existing output size does not match backup bytes");
             }
+            self.verify_sha256(primary, &sha).await?;
+            backup
+                .put_single_verified(
+                    &primary.reference.key,
+                    body,
+                    &primary.content_type,
+                    primary.custom.clone(),
+                    primary.cache_control.clone(),
+                )
+                .await
+                .context("Required GCS backup of existing output was not verified")?;
         }
-        Ok(primary)
+        Ok(())
     }
     /// Read exactly an event-supplied object version; never resolve latest.
     pub async fn stat_reference(&self, reference: &ObjectRef) -> Result<Option<ObjectMetadata>> {

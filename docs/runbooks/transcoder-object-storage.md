@@ -11,9 +11,11 @@ B2 settings plus the existing authenticated GCS client and nonempty GCS bucket.
 Both immutable provider versions and their bytes/metadata are verified before
 `put_verified` succeeds; its receipt includes `required_backup`. A failed backup
 returns an error even if B2 already accepted the primary. It does not delete
-that primary or report the output complete. Existing-output shortcuts in this
-mode also require matching verified backup bytes and metadata; a missing backup
-causes ordinary regeneration. Legacy `gcs` and `b2` modes retain their behavior.
+that primary or report the output complete. The new mode disables the master-only HLS shortcut: an earlier attempt can have
+written its master before a segment backup failed, so master presence alone
+cannot acknowledge completion. Shared-audio backup repair verifies the existing
+primary bytes and writes the backup with the existing provenance, leaving the
+primary version unchanged. Legacy `gcs` and `b2` modes retain their behavior.
 
 This is synchronous replication through the existing processing paths. It adds
 no database, queue, credentials, or processing service. It does not activate a

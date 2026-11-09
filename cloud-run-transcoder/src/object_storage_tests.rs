@@ -468,11 +468,6 @@ async fn b2_primary_writes_and_verifies_required_gcs_backup_before_success() {
     assert_eq!(replica.reference.version.as_deref(), Some("123456789"));
     assert_eq!(replica.size, receipt.object.size);
     drop(backup);
-    assert!(store
-        .reusable_output("artifact.mp4")
-        .await
-        .unwrap()
-        .is_some());
     task.abort();
 }
 
@@ -510,27 +505,50 @@ async fn b2_primary_cannot_acknowledge_failed_or_corrupt_required_backup() {
 }
 
 #[tokio::test]
-async fn existing_primary_without_verified_backup_is_not_reusable() {
+async fn existing_audio_backup_repair_preserves_primary_version_and_provenance() {
     let origin = Origin::start().await;
     let (backup, client, task) = gcs_origin().await;
-    origin
+    let bytes = Bytes::from_static(b"shared media");
+    let custom = HashMap::from([
+        ("owner".into(), "original-owner".into()),
+        ("source_sha256".into(), "original-source".into()),
+    ]);
+    let primary = origin
         .store()
         .put_verified(
-            "artifact.mp4",
-            Bytes::from_static(b"media"),
-            "video/mp4",
-            HashMap::new(),
+            "audio.mp4",
+            bytes.clone(),
+            "audio/mp4",
+            custom.clone(),
             None,
         )
         .await
         .unwrap();
     let store = b2_primary_store(&origin, client);
-    backup.lock().await.fail = Some(StatusCode::NOT_FOUND);
-    assert!(store
-        .reusable_output("artifact.mp4")
+    assert!(!store.can_reuse_hls_master());
+    let before = origin.objects.lock().await.requests.len();
+    store
+        .ensure_existing_backup(&primary.object, bytes)
         .await
-        .unwrap()
-        .is_none());
+        .unwrap();
+    let objects = origin.objects.lock().await;
+    assert_eq!(
+        objects.requests.len(),
+        before + 1,
+        "repair only verifies the pinned primary, without another primary PUT"
+    );
+    assert_eq!(
+        objects.latest["audio.mp4"],
+        primary.object.reference.version.unwrap()
+    );
+    assert_eq!(
+        backup.lock().await.object.as_ref().unwrap()["metadata"]["owner"],
+        "original-owner"
+    );
+    assert_eq!(
+        backup.lock().await.object.as_ref().unwrap()["metadata"]["source_sha256"],
+        "original-source"
+    );
     task.abort();
 }
 
