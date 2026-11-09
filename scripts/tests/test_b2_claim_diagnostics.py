@@ -7,6 +7,9 @@ from pathlib import Path
 import tempfile
 import unittest
 from urllib.parse import unquote, urlsplit
+from unittest.mock import patch
+
+from test_b2_claim_confirmation import Clock
 
 from test_sync_b2_originals import DATA, HASH, KV, Source, Destination, mirror
 
@@ -41,6 +44,11 @@ class ClaimHTTP:
 
 
 class ClaimDiagnosticsTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = Clock()
+        self.enterContext(patch.object(mirror.time, "monotonic", self.clock.monotonic))
+        self.enterContext(patch.object(mirror.time, "sleep", self.clock.sleep))
+
     def run_failure(self, caller, phase, reply):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)

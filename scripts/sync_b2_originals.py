@@ -48,19 +48,19 @@ def validation_error(kind, message):
 
 
 def confirm_readback(read):
-    """Retry only absent reads, at most three, within one acceptance deadline.
+    """Confirm an acknowledged write with at most 30 reads in one 30s window.
 
     `read(timeout)` must distinguish HTTP 404 (None) from present malformed
     values. Socket timeouts cannot guarantee total transport wall time; check
     the monotonic deadline before scheduling and after every returned read.
     """
-    deadline = time.monotonic() + 3.0
-    for attempt in range(3):
+    deadline = time.monotonic() + 30.0
+    for attempt in range(30):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("KV confirmation deadline expired")
         if attempt:
-            time.sleep(min(0.25, remaining))
+            time.sleep(min(1.0, remaining))
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("KV confirmation deadline expired")

@@ -26,6 +26,7 @@ class Opener:
     """Real JsonHTTP with deterministic transport responses and elapsed time."""
     def __init__(self, clock, replies):
         self.clock, self.replies, self.calls = clock, deque(replies), []
+        self.response_headers = {"generation": "7"}
     def open(self, request, timeout):
         self.calls.append((request.method, timeout))
         if request.method == 'PUT':
@@ -45,7 +46,9 @@ class Opener:
             def __enter__(self): return self
             def __exit__(self, *_): pass
             def read(self, size): return body[:size]
-        return Response()
+        response = Response()
+        response.headers = self.response_headers
+        return response
 
 
 class ConfirmationTests(unittest.TestCase):
@@ -62,18 +65,26 @@ class ConfirmationTests(unittest.TestCase):
         kv, clock, opener = self.setup_claim([(0, 'absent'), (0, 'match')])
         self.assertTrue(kv.claim_copy(HASH, 'synthetic'))
         self.assertEqual(opener.calls, [('PUT', 30), ('GET', 1), ('GET', 1)])
-        self.assertEqual(clock.sleeps, [0.25])
+        self.assertEqual(clock.sleeps, [1.0])
         self.assertIsNone(kv.claim_failure)
 
+    def test_visibility_after_three_reads_confirms_without_repeating_add(self):
+        kv, clock, opener = self.setup_claim([(0, 'absent')] * 6 + [(0, 'match')])
+        self.assertTrue(kv.claim_copy(HASH, 'synthetic'))
+        self.assertEqual([method for method, _ in opener.calls], ['PUT'] + ['GET'] * 7)
+        self.assertGreaterEqual(clock.now, 6)
+        self.assertLess(clock.now, 30)
+        self.assertTrue(all(timeout <= 1 for method, timeout in opener.calls if method == 'GET'))
+
     def test_initial_slow_match_expires_without_acceptance(self):
-        kv, clock, opener = self.setup_claim([(4, 'match')])
+        kv, clock, opener = self.setup_claim([(31, 'match')])
         with self.assertRaises(TimeoutError):
             kv.claim_copy(HASH, 'synthetic')
         self.assertEqual(opener.calls, [('PUT', 30), ('GET', 1)])
         self.assertEqual(clock.sleeps, [])
 
     def test_initial_slow_absence_expires_without_another_read(self):
-        kv, clock, opener = self.setup_claim([(4, 'absent'), (0, 'match')])
+        kv, clock, opener = self.setup_claim([(31, 'absent'), (0, 'match')])
         with self.assertRaises(TimeoutError):
             kv.claim_copy(HASH, 'synthetic')
         self.assertEqual(opener.calls, [('PUT', 30), ('GET', 1)])
@@ -88,12 +99,12 @@ class ConfirmationTests(unittest.TestCase):
         self.assertEqual(clock.sleeps, [])
 
     def test_absent_exhaustion_keeps_category_and_limits_attempts(self):
-        kv, clock, opener = self.setup_claim([(0, 'absent')] * 3 + [(0, 'match')])
+        kv, clock, opener = self.setup_claim([(0, 'absent')] * 30 + [(0, 'match')])
         with self.assertRaises(ValueError):
             kv.claim_copy(HASH, 'synthetic')
         self.assertEqual(kv.claim_failure, 'confirm_absent')
-        self.assertEqual(opener.calls, [('PUT', 30), ('GET', 1), ('GET', 1), ('GET', 1)])
-        self.assertEqual(clock.sleeps, [0.25, 0.25])
+        self.assertEqual(opener.calls, [('PUT', 30)] + [('GET', 1)] * 30)
+        self.assertEqual(clock.sleeps, [1.0] * 29)
         self.assertEqual(len(opener.replies), 1)
 
     def test_mismatch_or_error_stops_even_when_later_response_would_match(self):
@@ -112,37 +123,48 @@ class ConfirmationTests(unittest.TestCase):
                     self.assertEqual([m for m, _ in opener.calls], ['PUT'] + ['GET'] * (len(prefix) + 1))
                     self.assertEqual(len(opener.replies), 1)
 
+    def test_invalid_generation_is_terminal_without_another_read_or_add(self):
+        for generation in (None, '0', 'invalid'):
+            with self.subTest(generation=generation):
+                kv, _, opener = self.setup_claim([(0, 'match'), (0, 'match')])
+                opener.response_headers = {'generation': generation}
+                with self.assertRaises(ValueError):
+                    kv.claim_copy(HASH, 'synthetic')
+                self.assertEqual(kv.claim_failure, 'confirm_response_invalid')
+                self.assertEqual([method for method, _ in opener.calls], ['PUT', 'GET'])
+                self.assertEqual(len(opener.replies), 1)
+
     def test_remaining_budget_caps_timeout_and_late_match_is_rejected(self):
         # First retry's transport overruns its socket timeout; acceptance still expires.
-        kv, clock, opener = self.setup_claim([(0, 'absent'), (2.25, 'absent'), (0.3, 'match')])
+        kv, clock, opener = self.setup_claim([(0, 'absent'), (27.25, 'absent'), (0.8, 'match')])
         with self.assertRaises(TimeoutError):
             kv.claim_copy(HASH, 'synthetic')
         self.assertEqual(kv.claim_failure, 'confirm_transport')
-        self.assertEqual(opener.calls, [('PUT', 30), ('GET', 1), ('GET', 1), ('GET', 0.25)])
-        self.assertEqual(clock.sleeps, [0.25, 0.25])
+        self.assertEqual(opener.calls, [('PUT', 30), ('GET', 1), ('GET', 1), ('GET', 0.75)])
+        self.assertEqual(clock.sleeps, [1.0, 1.0])
 
     def test_late_nonmatching_gate_is_also_rejected_at_deadline(self):
         for value, category in [({'state': 'erasing'}, 'confirm_erasing'),
                                 ({'state': 'copying', 'attempt_id': 'other'}, 'confirm_wrong_owner')]:
             with self.subTest(category=category):
-                kv, _, opener = self.setup_claim([(0, 'absent'), (3, value), (0, 'match')])
+                kv, _, opener = self.setup_claim([(0, 'absent'), (30, value), (0, 'match')])
                 with self.assertRaises(TimeoutError):
                     kv.claim_copy(HASH, 'synthetic')
                 self.assertEqual(kv.claim_failure, 'confirm_transport')
                 self.assertEqual(opener.calls, [('PUT', 30), ('GET', 1), ('GET', 1)])
 
     def test_expired_deadline_prevents_another_get(self):
-        kv, clock, opener = self.setup_claim([(0, 'absent'), (3, 'absent'), (0, 'match')])
+        kv, clock, opener = self.setup_claim([(0, 'absent'), (30, 'absent'), (0, 'match')])
         with self.assertRaises(TimeoutError):
             kv.claim_copy(HASH, 'synthetic')
         self.assertEqual(kv.claim_failure, 'confirm_transport')
         self.assertEqual(opener.calls, [('PUT', 30), ('GET', 1), ('GET', 1)])
-        self.assertEqual(clock.sleeps, [0.25])
+        self.assertEqual(clock.sleeps, [1.0])
 
     def test_sleep_overshoot_does_not_start_a_read_after_deadline(self):
         kv, clock, opener = self.setup_claim([(0, 'absent'), (0, 'match')])
         def delayed_sleep(delay):
-            clock.now += 4
+            clock.now += 31
         with patch.object(mirror.time, 'sleep', delayed_sleep):
             with self.assertRaises(TimeoutError):
                 kv.claim_copy(HASH, 'synthetic')
