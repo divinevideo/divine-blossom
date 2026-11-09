@@ -275,7 +275,13 @@ globally purged to change which origin is selected on a cache miss.
 It defaults off. The edge flag does not start this worker; the worker flag does
 not enable a hostname. Committed demand is processed even when new intake is off.
 Use `--max-pending-demand` (default 10,000; maximum 100,000) to bound local pending
-requests. With demand, notifications and history configured, use at least three
+requests. To run only requested copies alongside a separate bulk backfill,
+use `--demand-intake --demand-only`. This mode does not list GCS or schedule
+remembered history or upload-notification work; it permits one object slot.
+It still preserves durable demand, retry deadlines, source/version verification,
+and copy/erase gates. Upload notifications cannot be combined with this mode.
+Keep its SQLite state durable and separate from any other running worker.
+With demand, notifications and history configured, use at least three
 object slots; demand and history require at least two. Object slots are capped
 at 1,000; demand intake reads at most 100 keys, each value at most 4 KiB.
 
