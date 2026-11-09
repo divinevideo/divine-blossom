@@ -98,6 +98,15 @@ shared gate; repeated retries will never steal an existing gate.
 Control API redirects fail closed without forwarding authentication headers, and
 the worker's HTTP client does not change the process-wide urllib opener.
 
+
+After an acknowledged copy-gate or readiness write, confirmation makes at most
+30 read attempts within one 30-second monotonic deadline, with at most one-second
+read timeouts. Only actual HTTP 404 observations wait for visibility. A present
+foreign owner, mismatched publication, null/malformed value, invalid generation,
+HTTP error or transport failure stops confirmation. The write is never replayed,
+and a late response cannot extend the deadline or authorize follow-up effects.
+Unconfirmed operations retain their existing exclusion and durable retry state.
+
 ## Keep new uploads mirrored while backfilling
 
 Both Blossom and the upload data plane currently finalize canonical bytes in GCS.

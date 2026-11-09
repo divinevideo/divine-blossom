@@ -59,11 +59,20 @@ class ReadinessConfirmationTests(unittest.TestCase):
         self.assertEqual(self.reads, [1, 1])
         self.assertIsNotNone(self.state.row(HASH)[2])
 
+    def test_delayed_visibility_confirms_exact_record_without_another_effect(self):
+        self.responses([(0, None)] * 6 + [(0, 'match')])
+        self.assertEqual(self.process(), 'ready')
+        self.assertEqual((len(self.uploads), len(self.puts)), (1, 1))
+        self.assertEqual(len(self.reads), 7)
+        self.assertGreaterEqual(self.clock.now, 6)
+        self.assertLess(self.clock.now, 30)
+        self.assertIsNotNone(self.state.row(HASH)[2])
+
     def test_absence_exhaustion_never_marks_ready_or_replays_writes(self):
-        self.responses([(0, None)] * 3)
+        self.responses([(0, None)] * 30)
         with self.assertRaises(ValueError):
             self.process()
-        self.assertEqual(len(self.reads), 3)
+        self.assertEqual(len(self.reads), 30)
         self.assertEqual((len(self.uploads), len(self.puts)), (1, 1))
         self.assertIsNone(self.state.row(HASH)[2])
 
@@ -83,14 +92,14 @@ class ReadinessConfirmationTests(unittest.TestCase):
                     fixture.doCleanups()
 
     def test_late_first_match_is_not_ready(self):
-        self.responses([(4, 'match')])
+        self.responses([(31, 'match')])
         with self.assertRaises(TimeoutError):
             self.process()
         self.assertIsNone(self.state.row(HASH)[2])
         self.assertEqual(len(self.reads), 1)
 
     def test_confirmation_deadline_retains_existing_read_failure_stage(self):
-        self.responses([(4, 'match')])
+        self.responses([(31, 'match')])
         report = self.worker.cycle(max_objects=1, max_bytes=1000)
         self.assertEqual(report.get('failure_readiness_read'), 1)
         self.assertEqual(report.get('errors'), 1)
