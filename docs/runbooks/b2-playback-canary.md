@@ -32,13 +32,15 @@ authenticated bucket name matches b2_media_bucket. A configured assertion alone
 cannot enable delivery outside the actual erasure mapping. This adds a native
 authorization request per origin read, intentionally uncached for this canary.
 
-The S3 reader needs both `readFiles` and `listFiles`, restricted to the exact
+The S3 reader needs both `readFiles` and `listBuckets`, restricted to the exact
 private media bucket. A `readFiles`-only key can read an existing object but
-returns `403 AccessDenied` for an absent object. With `listFiles`, the absent
-object returns `404 NoSuchKey`, allowing the configured migration fallback.
+returns `403 AccessDenied` for an absent object. `listBuckets` permits the S3
+bucket-existence check; the absent object then returns `404 NoSuchKey`, allowing
+the configured migration fallback. `listFiles` alone does not fix this.
 Verify both an existing object's ranged GET and an independently confirmed
 missing object's GET with the actual replacement credential before binding it.
-Do not grant write, delete, or account-wide bucket access to the reader.
+Do not grant write, delete, file listing, or account-wide bucket access to the
+reader; it does not need `listAllBucketNames`.
 
 Reader-key rotation must update both `b2_media_access_key` and
 `b2_media_secret_key`; preserve the previous provider key while the pair
