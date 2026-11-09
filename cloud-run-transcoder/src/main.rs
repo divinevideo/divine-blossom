@@ -1325,7 +1325,7 @@ async fn process_audio_extract(
     let size = audio_data.len() as u64;
 
     // Shared audio keeps existing provenance; reuse only after pinned SHA verification.
-    if let Some(existing) = state.media_storage.stat(&audio_sha256).await? {
+    if let Some(existing) = state.media_storage.reusable_output(&audio_sha256).await? {
         if existing.content_type != "audio/mp4" {
             return Err(anyhow!("Existing audio MIME does not match"));
         }
@@ -1434,7 +1434,13 @@ async fn process_transcode_inner(
 
     // Ordinary requests remain idempotent; repairs can replace existing derivatives.
     let master_path = format!("{}/hls/master.m3u8", hash);
-    if !request.force && state.media_storage.stat(&master_path).await?.is_some() {
+    if !request.force
+        && state
+            .media_storage
+            .reusable_output(&master_path)
+            .await?
+            .is_some()
+    {
         info!("HLS already exists for {}, skipping transcode", hash);
         // Still update status to complete in case it was pending (no size change for already-transcoded)
         send_status_webhook(

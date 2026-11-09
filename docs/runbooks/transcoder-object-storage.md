@@ -5,6 +5,21 @@ The transcoder's private byte adapter defaults to GCS. Explicit
 and extracted audio. This source change does not activate that setting or
 change public media URLs. Derived-media readers have separate configuration.
 
+`MEDIA_STORAGE_PROVIDER=b2_primary` uses B2 for those media reads and requires
+verified GCS backups for every write through this adapter. It requires the same
+B2 settings plus the existing authenticated GCS client and nonempty GCS bucket.
+Both immutable provider versions and their bytes/metadata are verified before
+`put_verified` succeeds; its receipt includes `required_backup`. A failed backup
+returns an error even if B2 already accepted the primary. It does not delete
+that primary or report the output complete. Existing-output shortcuts in this
+mode also require matching verified backup bytes and metadata; a missing backup
+causes ordinary regeneration. Legacy `gcs` and `b2` modes retain their behavior.
+
+This is synchronous replication through the existing processing paths. It adds
+no database, queue, credentials, or processing service. It does not activate a
+provider setting, change uploader storage, or convert the separate GCS-only
+artifact writers listed below.
+
 B2 selection requires `B2_MEDIA_BUCKET`, `B2_REGION`, `B2_ACCESS_KEY_ID`, and
 `B2_SECRET_ACCESS_KEY`. The private HTTPS endpoint is derived from the region;
 production has no endpoint override. Redirects are disabled. Connection,
@@ -56,9 +71,10 @@ covered only by generic adapter tests.
 
 Receipts prove individual object bytes and metadata. They do not grant job
 execution authority, establish family completeness or publish a producer
-completion marker. The existing master-presence shortcut and status webhooks
-retain their legacy meaning. Durable completion and family readiness require
-coordinator integration before provider activation.
+completion marker. The master-presence shortcut retains its legacy family-completeness limits;
+checking its backup does not establish that every playlist/segment exists.
+Status webhooks retain their legacy meaning. These object receipts do not
+establish durable processing dispatch.
 
 Mutable jobs, locks, translation state, transcription/VTT and sound analysis
 remain on their existing GCS APIs. The legacy fMP4 backfill explicitly reads

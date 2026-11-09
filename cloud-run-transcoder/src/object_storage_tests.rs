@@ -377,6 +377,183 @@ fn storage_configuration_is_default_gcs_and_explicit_b2_fail_closed() {
     .is_err());
 }
 
+#[test]
+fn b2_primary_configuration_requires_b2_credentials_and_gcs_backup() {
+    let values = HashMap::from([
+        ("MEDIA_STORAGE_PROVIDER", "b2_primary"),
+        ("B2_MEDIA_BUCKET", "synthetic-bucket"),
+        ("B2_REGION", "us-west-004"),
+        ("B2_ACCESS_KEY_ID", "synthetic-access"),
+        ("B2_SECRET_ACCESS_KEY", "synthetic-secret"),
+    ]);
+    let configured = StorageConfiguration::parse(|name| values.get(name).map(|v| (*v).into()));
+    assert!(
+        configured.is_ok(),
+        "explicit B2-primary with required backup must be supported"
+    );
+    assert!(MediaStorage::configured(configured.unwrap(), None, "synthetic-gcs".into()).is_err());
+    for missing in [
+        "B2_MEDIA_BUCKET",
+        "B2_REGION",
+        "B2_ACCESS_KEY_ID",
+        "B2_SECRET_ACCESS_KEY",
+    ] {
+        assert!(
+            StorageConfiguration::parse(|name| {
+                (name != missing)
+                    .then(|| values.get(name).map(|v| (*v).into()))
+                    .flatten()
+            })
+            .is_err(),
+            "missing {missing} must not select a partial writer"
+        );
+    }
+}
+
+fn b2_primary_store(origin: &Origin, gcs: GcsClient) -> MediaStorage {
+    let values = HashMap::from([
+        ("MEDIA_STORAGE_PROVIDER", "b2_primary"),
+        ("B2_MEDIA_BUCKET", "synthetic-bucket"),
+        ("B2_REGION", "us-west-004"),
+        ("B2_ACCESS_KEY_ID", "synthetic-access"),
+        ("B2_SECRET_ACCESS_KEY", "synthetic-secret"),
+    ]);
+    let config = StorageConfiguration::parse(|name| values.get(name).map(|v| (*v).into())).unwrap();
+    let mut store = MediaStorage::configured(config, Some(gcs), "synthetic-gcs".into()).unwrap();
+    if let Backend::B2 { endpoint, .. } = &mut store.backend {
+        *endpoint = origin.endpoint.clone();
+    } else {
+        panic!("B2 must remain the primary backend");
+    }
+    store
+}
+
+#[tokio::test]
+async fn b2_primary_writes_and_verifies_required_gcs_backup_before_success() {
+    let origin = Origin::start().await;
+    let (backup, client, task) = gcs_origin().await;
+    let store = b2_primary_store(&origin, client);
+    let bytes = Bytes::from_static(b"replicated media");
+    let receipt = store
+        .put_verified(
+            "artifact.mp4",
+            bytes.clone(),
+            "video/mp4",
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt.object.reference.provider, StorageProvider::B2);
+    assert_eq!(receipt.sha256, hex::encode(Sha256::digest(&bytes)));
+    let backup = backup.lock().await;
+    assert_eq!(
+        backup
+            .requests
+            .iter()
+            .filter(|(method, _)| method == "POST")
+            .count(),
+        1
+    );
+    assert!(backup.requests.iter().any(|(method, uri)| method == "GET"
+        && uri.contains("alt=media")
+        && uri.contains("generation=123456789")
+        && uri.contains("ifMetagenerationMatch=1")));
+    assert_eq!(backup.bytes.as_bytes(), bytes.as_ref());
+    let replica = receipt
+        .required_backup
+        .as_ref()
+        .expect("verified backup identity must be returned");
+    assert_eq!(replica.reference.provider, StorageProvider::Gcs);
+    assert_eq!(replica.reference.version.as_deref(), Some("123456789"));
+    assert_eq!(replica.size, receipt.object.size);
+    drop(backup);
+    assert!(store
+        .reusable_output("artifact.mp4")
+        .await
+        .unwrap()
+        .is_some());
+    task.abort();
+}
+
+#[tokio::test]
+async fn b2_primary_cannot_acknowledge_failed_or_corrupt_required_backup() {
+    for corrupt in [false, true] {
+        let origin = Origin::start().await;
+        let (backup, client, task) = gcs_origin().await;
+        {
+            let mut state = backup.lock().await;
+            state.fail = (!corrupt).then_some(StatusCode::FORBIDDEN);
+            state.corrupt = corrupt;
+        }
+        let store = b2_primary_store(&origin, client);
+        assert!(
+            store
+                .put_verified(
+                    "artifact.mp4",
+                    Bytes::from_static(b"replicated media"),
+                    "video/mp4",
+                    HashMap::new(),
+                    None
+                )
+                .await
+                .is_err(),
+            "backup corruption={corrupt} must not become successful processing output"
+        );
+        assert_eq!(
+            origin.objects.lock().await.requests.len(),
+            3,
+            "primary must have been verified before backup is attempted"
+        );
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn existing_primary_without_verified_backup_is_not_reusable() {
+    let origin = Origin::start().await;
+    let (backup, client, task) = gcs_origin().await;
+    origin
+        .store()
+        .put_verified(
+            "artifact.mp4",
+            Bytes::from_static(b"media"),
+            "video/mp4",
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+    let store = b2_primary_store(&origin, client);
+    backup.lock().await.fail = Some(StatusCode::NOT_FOUND);
+    assert!(store
+        .reusable_output("artifact.mp4")
+        .await
+        .unwrap()
+        .is_none());
+    task.abort();
+}
+
+#[tokio::test]
+async fn b2_primary_never_writes_backup_when_primary_verification_fails() {
+    let origin = Origin::start().await;
+    origin.objects.lock().await.corrupt = true;
+    let (backup, client, task) = gcs_origin().await;
+    let store = b2_primary_store(&origin, client);
+    assert!(store
+        .put_verified(
+            "artifact.mp4",
+            Bytes::from_static(b"replicated media"),
+            "video/mp4",
+            HashMap::new(),
+            None
+        )
+        .await
+        .is_err());
+    assert!(backup.lock().await.requests.is_empty());
+    task.abort();
+}
+
 #[tokio::test]
 async fn full_reads_reject_partial_responses_and_preserve_destination() {
     let origin = Origin::start().await;
@@ -534,95 +711,113 @@ async fn production_helpers_preserve_hls_provenance_without_gcs() {
     }
 }
 
-#[tokio::test]
-async fn default_gcs_uses_atomic_metadata_and_pinned_verified_reads() {
-    #[derive(Default)]
-    struct GcsObjects {
-        object: Option<serde_json::Value>,
-        bytes: String,
-        patch_after_metadata: bool,
-        requests: Vec<(String, String)>,
-    }
-    async fn gcs_request(
-        State(state): State<Arc<Mutex<GcsObjects>>>,
-        req: Request,
-    ) -> Response<Body> {
-        let method = req.method().to_string();
-        let uri = req.uri().to_string();
-        let mut state = state.lock().await;
-        state.requests.push((method.clone(), uri.clone()));
-        if method == "POST" {
-            assert!(uri.starts_with("/upload/storage/v1/b/synthetic-gcs/o?uploadType=multipart"));
-            let content_type = req.headers()["content-type"].to_str().unwrap();
-            let boundary = content_type.split("boundary=").nth(1).unwrap().to_string();
-            let body = String::from_utf8(
-                to_bytes(req.into_body(), 1024 * 1024)
-                    .await
-                    .unwrap()
-                    .to_vec(),
-            )
-            .unwrap();
-            let parts: Vec<_> = body.split(&format!("--{boundary}")).collect();
-            let metadata = parts[1]
-                .split_once("\r\n\r\n")
-                .unwrap()
-                .1
-                .trim_end_matches("\r\n");
-            let mut object: serde_json::Value = serde_json::from_str(metadata).unwrap();
-            state.bytes = parts[2]
-                .split_once("\r\n\r\n")
-                .unwrap()
-                .1
-                .trim_end_matches("\r\n")
-                .into();
-            let map = object.as_object_mut().unwrap();
-            for key in ["selfLink", "mediaLink", "etag", "id"] {
-                map.insert(key.into(), "synthetic".into());
-            }
-            map.insert("generation".into(), "123456789".into());
-            map.insert("metageneration".into(), "1".into());
-            map.insert("size".into(), state.bytes.len().to_string().into());
-            map.insert("bucket".into(), "synthetic-gcs".into());
-            state.object = Some(object);
-        } else {
-            assert_eq!(method, "GET");
-            assert!(uri.starts_with("/storage/v1/b/synthetic-gcs/o/"));
-            assert!(uri.contains("generation=123456789"));
-            if uri.contains("alt=media") {
-                let url = reqwest::Url::parse(&format!("http://synthetic{uri}")).unwrap();
-                let supplied = url
-                    .query_pairs()
-                    .find(|(name, _)| name == "ifMetagenerationMatch")
-                    .map(|(_, value)| value.into_owned());
-                if supplied.is_some_and(|value| {
-                    value
-                        != state.object.as_ref().unwrap()["metageneration"]
-                            .as_str()
-                            .unwrap()
-                }) {
-                    return Response::builder()
-                        .status(412)
-                        .header("content-type", "application/json")
-                        .body(Body::from(
-                            r#"{"error":{"code":412,"message":"synthetic precondition mismatch"}}"#,
-                        ))
-                        .unwrap();
-                }
-                return Response::new(Body::from(state.bytes.clone()));
-            }
-        }
-        let body = state.object.as_ref().unwrap().to_string();
-        if state.patch_after_metadata {
-            state.patch_after_metadata = false;
-            let object = state.object.as_mut().unwrap();
-            object["metadata"]["owner"] = "d".repeat(64).into();
-            object["metageneration"] = "3".into();
-        }
-        Response::builder()
+#[derive(Default)]
+struct GcsObjects {
+    object: Option<serde_json::Value>,
+    bytes: String,
+    patch_after_metadata: bool,
+    fail: Option<StatusCode>,
+    corrupt: bool,
+    requests: Vec<(String, String)>,
+}
+async fn gcs_request(State(state): State<Arc<Mutex<GcsObjects>>>, req: Request) -> Response<Body> {
+    let method = req.method().to_string();
+    let uri = req.uri().to_string();
+    let mut state = state.lock().await;
+    state.requests.push((method.clone(), uri.clone()));
+    if let Some(status) = state.fail {
+        return Response::builder()
+            .status(status)
             .header("content-type", "application/json")
-            .body(Body::from(body))
-            .unwrap()
+            .body(Body::from(format!(
+                "{{\"error\":{{\"code\":{},\"message\":\"synthetic failure\",\"errors\":[]}}}}",
+                status.as_u16()
+            )))
+            .unwrap();
     }
+    if method == "POST" {
+        assert!(uri.starts_with("/upload/storage/v1/b/synthetic-gcs/o?uploadType=multipart"));
+        let content_type = req.headers()["content-type"].to_str().unwrap();
+        let boundary = content_type.split("boundary=").nth(1).unwrap().to_string();
+        let body = String::from_utf8(
+            to_bytes(req.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let parts: Vec<_> = body.split(&format!("--{boundary}")).collect();
+        let metadata = parts[1]
+            .split_once("\r\n\r\n")
+            .unwrap()
+            .1
+            .trim_end_matches("\r\n");
+        let mut object: serde_json::Value = serde_json::from_str(metadata).unwrap();
+        state.bytes = parts[2]
+            .split_once("\r\n\r\n")
+            .unwrap()
+            .1
+            .trim_end_matches("\r\n")
+            .into();
+        let map = object.as_object_mut().unwrap();
+        for key in ["selfLink", "mediaLink", "etag", "id"] {
+            map.insert(key.into(), "synthetic".into());
+        }
+        map.insert("generation".into(), "123456789".into());
+        map.insert("metageneration".into(), "1".into());
+        map.insert("size".into(), state.bytes.len().to_string().into());
+        map.insert("bucket".into(), "synthetic-gcs".into());
+        state.object = Some(object);
+    } else {
+        assert_eq!(method, "GET");
+        assert!(uri.starts_with("/storage/v1/b/synthetic-gcs/o/"));
+        assert!(uri.contains("generation=123456789"));
+        if uri.contains("alt=media") {
+            let url = reqwest::Url::parse(&format!("http://synthetic{uri}")).unwrap();
+            let supplied = url
+                .query_pairs()
+                .find(|(name, _)| name == "ifMetagenerationMatch")
+                .map(|(_, value)| value.into_owned());
+            if supplied.is_some_and(|value| {
+                value
+                    != state.object.as_ref().unwrap()["metageneration"]
+                        .as_str()
+                        .unwrap()
+            }) {
+                return Response::builder()
+                    .status(412)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"error":{"code":412,"message":"synthetic precondition mismatch"}}"#,
+                    ))
+                    .unwrap();
+            }
+            let body = if state.corrupt {
+                "x".repeat(state.bytes.len())
+            } else {
+                state.bytes.clone()
+            };
+            return Response::new(Body::from(body));
+        }
+    }
+    let body = state.object.as_ref().unwrap().to_string();
+    if state.patch_after_metadata {
+        state.patch_after_metadata = false;
+        let object = state.object.as_mut().unwrap();
+        object["metadata"]["owner"] = "d".repeat(64).into();
+        object["metageneration"] = "3".into();
+    }
+    Response::builder()
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+async fn gcs_origin() -> (
+    Arc<Mutex<GcsObjects>>,
+    GcsClient,
+    tokio::task::JoinHandle<()>,
+) {
     let state = Arc::new(Mutex::new(GcsObjects::default()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -637,9 +832,15 @@ async fn default_gcs_uses_atomic_metadata_and_pinned_verified_reads() {
         ..Default::default()
     }
     .anonymous();
+    (state, GcsClient::new(config), task)
+}
+
+#[tokio::test]
+async fn default_gcs_uses_atomic_metadata_and_pinned_verified_reads() {
+    let (state, client, task) = gcs_origin().await;
     let store = MediaStorage::configured(
         StorageConfiguration::parse(|_| None).unwrap(),
-        Some(GcsClient::new(config)),
+        Some(client),
         "synthetic-gcs".into(),
     )
     .unwrap();
