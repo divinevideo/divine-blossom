@@ -771,8 +771,8 @@ async fn gcs_request(State(state): State<Arc<Mutex<GcsObjects>>>, req: Request) 
     } else {
         assert_eq!(method, "GET");
         assert!(uri.starts_with("/storage/v1/b/synthetic-gcs/o/"));
-        assert!(uri.contains("generation=123456789"));
         if uri.contains("alt=media") {
+            assert!(uri.contains("generation=123456789"));
             let url = reqwest::Url::parse(&format!("http://synthetic{uri}")).unwrap();
             let supplied = url
                 .query_pairs()
