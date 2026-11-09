@@ -832,6 +832,9 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         range.as_deref(),
         metadata.as_ref().map(|meta| meta.size),
     )?;
+    if result.b2_missing {
+        canary::queue_canonical_b2_miss(&req, &hash, &result.response);
+    }
     let diagnostics = result.diagnostics;
     let mut resp = result.response;
     if let Some(diagnostics) = diagnostics {
