@@ -230,6 +230,37 @@ namespace, change it using an unconditional write, or restart copying during thi
 recovery. Automated recovery is deliberately absent because the worker cannot
 prove that another process or a timed-out remote PUT has drained.
 
+### Durable evidence for new attempts
+
+The worker appends private `attempt_events` to its existing SQLite database.
+An attempt starts with its UUID, content hash, source generation/size and the
+accepted source/destination/store mapping. Intent is committed before the copy
+claim, destination PUT, readiness PUT/deletion and gate release. Subsequent
+events retain only observed receipts: claim ACK and confirmed generation,
+returned immutable destination version, verified checksum, exact readiness
+payload/confirmed generation, and conditional-release ACK. These reuse existing
+responses without adding HTTP requests or changing the gate protocol.
+
+SQLite uses `synchronous=FULL`; each evidence commit also syncs the state
+directory. A failed evidence commit or directory sync prevents the next effect
+and latches further journal writes off for that process. Startup migrates and
+binds the database before any provider request, so migration failure cannot
+start copying. Existing queued work and source/destination bindings survive
+reopening. Older workers can reopen the database, but do not produce this
+evidence. The worker never invents attempt records for pre-existing gates.
+
+An intent without its receipt remains uncertain. An ACK records a returned
+response, not a guarantee that a timed-out earlier request cannot finish later.
+In particular, the release receipt's generation is the conditional update's
+**input** generation; no new generation is inferred from its ACK. The journal
+does not authorize takeover, release, replay, or automatic settlement. Existing
+unproven gates still require the scoped recovery procedure above.
+
+Keep the database and backups private alongside the spool. Journal entries
+exclude credentials, blob owners, raw metadata and provider error text; public
+reports remain numeric aggregates. Preserve the append-only evidence during
+recovery and monitor PVC capacity; the worker does not truncate it automatically.
+
 ## Local validation
 
 ```sh
