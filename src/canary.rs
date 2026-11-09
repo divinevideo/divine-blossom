@@ -132,6 +132,39 @@ fn recheck_demand(hash: &str, metadata: &BlobMetadata) -> Result<bool> {
     Ok(copying)
 }
 
+/// Canonical B2-first playback uses the same durable copy hints as the B2
+/// endpoint. A hint never grants write authority; the worker rechecks policy,
+/// exact source/destination versions and the existing copy/erase gate.
+pub(crate) fn queue_canonical_b2_miss(req: &Request, hash: &str, response: &Response) {
+    if !crate::storage::get_config("b2_demand_mirror_enabled").is_ok_and(|value| value == "true")
+        || req.get_method_str() != "GET"
+        || req.contains_header("Authorization")
+        || req.contains_header("Cookie")
+    {
+        return;
+    }
+    let Ok(metadata) = approved_metadata_with_limit(hash, true) else {
+        return;
+    };
+    if metadata.size > canary::MAX_DEMAND_BYTES
+        || !matches!(copy_in_progress(hash), Ok(false))
+        || !canary::demand_origin_matches(
+            response.get_status().as_u16(),
+            response.get_header_str("Content-Length"),
+            response.get_header_str("Content-Range"),
+            metadata.size,
+            canary::single_range(req.get_header_str("Range")),
+        )
+    {
+        return;
+    }
+    insert_demand_hint(
+        hash,
+        None,
+        std::time::Instant::now() + std::time::Duration::from_millis(50),
+    );
+}
+
 fn demand_headers(
     mut response: Response,
     hash: &str,
@@ -373,6 +406,29 @@ mod tests {
             std::time::Instant::now() + std::time::Duration::from_millis(250),
         ));
     }
+    #[test]
+    #[ignore = "requires canonical fixtures; scripts/run-b2-canonical-demand-tests.py"]
+    fn canonical_b2_miss_queues_copy_contract() {
+        let config = fastly::config_store::ConfigStore::open("blossom_config");
+        let expected = config.get("test_expected_status").unwrap().parse::<u16>().unwrap();
+        let hash = "a".repeat(64);
+        let mut request = Request::get(format!("https://media.divine.video/{hash}"));
+        if let Some(range) = config.get("test_range") { request.set_header("Range", range); }
+        if let Some(value) = config.get("test_authorization") { request.set_header("Authorization", value); }
+        if let Some(value) = config.get("test_cookie") { request.set_header("Cookie", value); }
+        let mut response = crate::storage::with_uncached_storage_for_test(|| handle_main(request)).unwrap();
+        assert_eq!(response.get_status().as_u16(), expected);
+        if expected == 200 || expected == 206 {
+            assert_eq!(response.take_body().into_string(),config.get("test_body").unwrap());
+        }
+        let hint = crate::metadata::open_store().unwrap().lookup(&format!("b2-demand:v1:{hash}"));
+        if config.get("test_hint").as_deref() == Some("true") {
+            let value:serde_json::Value = serde_json::from_str(&hint.expect("canonical GCS fallback after a B2 miss must queue a copy").take_body().into_string()).unwrap();
+            assert_eq!(value["sha256"],hash);
+            assert_eq!(value["reason"],"missing_readiness");
+        } else { assert!(hint.is_err(),"non-missing or denied reads must not enqueue migration"); }
+    }
+
     #[test]
     #[ignore = "requires demand fixtures; scripts/run-b2-canary-tests.py"]
     fn demand_cached_large_contract() {
