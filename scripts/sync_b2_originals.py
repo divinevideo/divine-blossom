@@ -306,7 +306,11 @@ class State:
                     "bucket", "key", "size", "destination_version_id", "verified_at"}
                     or not readiness_identity_matches(value, key, {"size": value.get("size")}, value.get("source_bucket"), value.get("bucket"))):
                 raise ValueError("invalid readiness evidence")
-        started = self.db.execute("SELECT hash,payload FROM attempt_events WHERE attempt_id=? ORDER BY sequence LIMIT 1", (attempt,)).fetchone()
+        try:
+            started = self.db.execute("SELECT hash,payload FROM attempt_events WHERE attempt_id=? ORDER BY sequence LIMIT 1", (attempt,)).fetchone()
+        except BaseException:
+            self.journal_failed = True
+            raise
         if (phase == "attempt_started" and started is not None) or (
                 phase != "attempt_started" and (started is None or started[0] != key)):
             raise ValueError("attempt identity not established")

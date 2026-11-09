@@ -157,6 +157,19 @@ class AttemptJournalTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.state.attempt_event(HASH, self.attempt, 'release_intent', {})
 
+    def test_journal_query_failure_latches_even_if_database_access_recovers(self):
+        self.begin()
+        def deny_read(action, table, *_):
+            return sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_READ and table == 'attempt_events' else sqlite3.SQLITE_OK
+        self.state.db.set_authorizer(deny_read)
+        try:
+            with self.assertRaises(sqlite3.DatabaseError):
+                self.state.attempt_event(HASH, self.attempt, 'claim_intent', {})
+        finally:
+            self.state.db.set_authorizer(None)
+        with self.assertRaises(RuntimeError):
+            self.state.attempt_event(HASH, self.attempt, 'release_intent', {})
+
     def test_failed_put_intent_retains_claim_without_upload_or_release(self):
         self.state.db.execute("CREATE TRIGGER fail_journal BEFORE INSERT ON attempt_events WHEN NEW.phase='destination_put_intent' BEGIN SELECT RAISE(ABORT,'synthetic disk failure'); END")
         self.state.db.commit()
