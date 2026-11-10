@@ -60,6 +60,23 @@ async fn storage_request(State(objects): State<Objects>, request: Request) -> Re
         )
             .into_response()
     };
+    if path.ends_with("/vtt/main.vtt")
+        && method == Method::GET
+        && !query.contains_key("alt")
+        && objects.remove("__fail_vtt_metadata_once").is_some()
+    {
+        return error(503);
+    }
+    if method == Method::DELETE {
+        if query
+            .get("ifGenerationMatch")
+            .is_some_and(|v| Some(v.parse::<i64>().unwrap()) != existing.as_ref().map(|(_, g)| *g))
+        {
+            return error(412);
+        }
+        objects.remove(&path);
+        return StatusCode::NO_CONTENT.into_response();
+    }
     if path.starts_with("forbidden/") {
         return error(403);
     }
@@ -179,13 +196,15 @@ async fn selected_and_legacy_transcripts_reach_translation_and_transcription_ded
             .unwrap();
         }
         let state = with_media(&storage, media);
-        assert_eq!(
-            process_transcribe(state.clone(), transcribe_request())
-                .await
-                .unwrap()
-                .status,
-            "already_exists"
-        );
+        let cached = process_transcribe(state.clone(), transcribe_request()).await;
+        if legacy {
+            // Translation may read an old GCS transcript, but that read cannot
+            // acknowledge output absent from the selected primary. This fixture
+            // has no original, so attempted regeneration fails before a provider.
+            assert!(cached.is_err());
+        } else {
+            assert_eq!(cached.unwrap().status, "already_exists");
+        }
         let translated = process_translate_with(state, request(SOURCE), |_, texts| async move {
             assert_eq!(texts, ["Hello"]);
             Ok(vec!["Olá".into()])
@@ -206,7 +225,8 @@ async fn selected_and_legacy_transcripts_reach_translation_and_transcription_ded
         assert!(origin
             .requests
             .iter()
-            .all(|(_, key, _)| key.ends_with("/vtt/main.vtt")));
+            .all(|(method, key, _)| key.ends_with("/vtt/main.vtt")
+                || (legacy && method == "HEAD" && key == &"a".repeat(64))));
         if !legacy {
             assert!(origin
                 .requests
@@ -580,4 +600,150 @@ async fn translation_unsupported_language_never_creates_job_or_calls_provider() 
     .unwrap();
     assert_eq!(error.to_string(), "Invalid target language");
     assert!(storage.objects.lock().await.is_empty());
+}
+
+async fn review360_status_state(
+    storage: &StorageDouble,
+    media: object_storage::MediaStorage,
+) -> (
+    Arc<AppState>,
+    tokio::sync::mpsc::Receiver<serde_json::Value>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let app = Router::new().route(
+        "/status",
+        axum::routing::post(move |Json(payload): Json<serde_json::Value>| {
+            let tx = tx.clone();
+            async move {
+                tx.send(payload).await.unwrap();
+                StatusCode::OK
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/status", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let config = Config::from_lookup(|key| match key {
+        "GCS_BUCKET" => Some("test".into()),
+        "TRANSCRIPT_WEBHOOK_URL" => Some(endpoint.clone()),
+        _ => None,
+    });
+    (
+        Arc::new(AppState {
+            media_storage: media,
+            gcs_client: storage.state.gcs_client.clone(),
+            config,
+            provider_semaphore: Arc::new(Semaphore::new(4)),
+        }),
+        rx,
+        task,
+    )
+}
+
+#[tokio::test]
+async fn review360_cache_lookup_failure_delivers_terminal_status() {
+    let storage = StorageDouble::new().await;
+    let origin = object_storage::tests::Origin::start().await;
+    origin.objects.lock().await.fail = Some(StatusCode::FORBIDDEN);
+    let (state, mut rx, task) = review360_status_state(&storage, origin.store()).await;
+    assert!(process_transcribe(state, transcribe_request())
+        .await
+        .is_err());
+    task.abort();
+    let status = rx.try_recv().expect("cache failure must deliver a terminal webhook even when edge drops the worker HTTP response");
+    assert_eq!(status["status"], "failed");
+    assert_eq!(status["error_code"], "cache_validation_failed");
+    assert!(status["error_message"]
+        .as_str()
+        .unwrap()
+        .contains("metadata response required"));
+}
+
+#[tokio::test]
+async fn review360_default_gcs_metadata_error_falls_through_to_locked_processing() {
+    let storage = StorageDouble::new().await;
+    storage.source(SOURCE).await;
+    storage
+        .objects
+        .lock()
+        .await
+        .insert("__fail_vtt_metadata_once".into(), (vec![], 1));
+    let (state, mut rx, task) =
+        review360_status_state(&storage, storage.state.media_storage.clone()).await;
+    assert!(process_transcribe(state, transcribe_request())
+        .await
+        .is_err()); // No original in this fixture.
+    task.abort();
+    let status = rx.try_recv().expect("GCS cache lookup failure must fall through to ordinary processing under the transcript lock");
+    assert_eq!(status["status"], "processing");
+    assert_eq!(rx.try_recv().unwrap()["status"], "failed");
+}
+
+#[tokio::test]
+async fn review360_failed_output_status_retains_sanitized_cause_chain() {
+    let storage = StorageDouble::new().await;
+    let origin = object_storage::tests::Origin::start().await;
+    origin.objects.lock().await.fail = Some(StatusCode::FORBIDDEN);
+    let (state, mut rx, task) = review360_status_state(&storage, origin.store()).await;
+    assert!(finalize_transcript(
+        &state,
+        &"a".repeat(64),
+        None,
+        None,
+        ParsedVtt::empty(1),
+        &format!("{}/vtt/main.vtt", "a".repeat(64)),
+        1
+    )
+    .await
+    .is_err());
+    task.abort();
+    let status = rx.try_recv().unwrap();
+    assert_eq!(status["status"], "failed");
+    assert!(
+        status["error_message"].as_str().unwrap().contains("403"),
+        "status must preserve the adapter's sanitized provider status cause"
+    );
+}
+
+#[tokio::test]
+async fn review360_force_requires_existing_repair_credential_and_bypasses_selected_cache() {
+    for case in ["unconfigured", "wrong", "valid"] {
+        let storage = StorageDouble::new().await;
+        storage.source(SOURCE).await;
+        let mut state = with_media(&storage, storage.state.media_storage.clone());
+        if case != "unconfigured" {
+            Arc::get_mut(&mut state)
+                .unwrap()
+                .config
+                .transcode_repair_secret = Some("synthetic-repair".into());
+        }
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-divine-repair-secret",
+            if case == "valid" {
+                "synthetic-repair"
+            } else {
+                "wrong"
+            }
+            .parse()
+            .unwrap(),
+        );
+        let mut request = transcribe_request();
+        request.force = true;
+        let app = Router::new()
+            .route("/transcribe", axum::routing::post(handle_transcribe))
+            .with_state(state);
+        let body = serde_json::json!({"hash":request.hash,"force":true});
+        use tower::ServiceExt;
+        let mut req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/transcribe")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        req.headers_mut().extend(headers);
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), match case {"unconfigured"=>StatusCode::SERVICE_UNAVAILABLE,"wrong"=>StatusCode::UNAUTHORIZED,_=>StatusCode::INTERNAL_SERVER_ERROR}, "force case {case}; authorized force must attempt regeneration (fixture original is missing), never return cached complete");
+    }
 }

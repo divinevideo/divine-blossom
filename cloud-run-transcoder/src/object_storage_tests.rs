@@ -1,9 +1,10 @@
 use super::*;
+use axum::response::IntoResponse;
 use axum::{
     body::{to_bytes, Body},
     extract::{Request, State},
     http::{Response, StatusCode},
-    Router,
+    Json, Router,
 };
 use blossom_core::storage_origin::StorageProvider;
 use bytes::Bytes;
@@ -998,11 +999,68 @@ struct GcsObjects {
     fail_upload: Option<StatusCode>,
     corrupt: bool,
     requests: Vec<(String, String)>,
+    locks: HashMap<String, (Vec<u8>, i64)>,
+    lock_requests: Vec<String>,
+    require_transcript_lock: bool,
+    race_on_repair: bool,
 }
 async fn gcs_request(State(state): State<Arc<Mutex<GcsObjects>>>, req: Request) -> Response<Body> {
     let method = req.method().to_string();
     let uri = req.uri().to_string();
     let mut state = state.lock().await;
+    let url = reqwest::Url::parse(&format!("http://synthetic{uri}")).unwrap();
+    let query: HashMap<String, String> = url.query_pairs().into_owned().collect();
+    let encoded = uri
+        .split("/o/")
+        .nth(1)
+        .unwrap_or("")
+        .split('?')
+        .next()
+        .unwrap();
+    let key = query.get("name").cloned().unwrap_or_else(|| {
+        reqwest::Url::parse(&format!("http://synthetic/?name={encoded}"))
+            .unwrap()
+            .query_pairs()
+            .next()
+            .unwrap()
+            .1
+            .into_owned()
+    });
+    let error = |code: u16| {
+        Response::builder()
+            .status(code)
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                "{{\"error\":{{\"code\":{code},\"message\":\"synthetic failure\",\"errors\":[]}}}}"
+            )))
+            .unwrap()
+    };
+    if key.ends_with("/vtt/.lock") {
+        state.lock_requests.push(method.clone());
+        let current = state.locks.get(&key).cloned();
+        let generation = current.as_ref().map(|(_, g)| *g).unwrap_or(0);
+        if query
+            .get("ifGenerationMatch")
+            .is_some_and(|v| v != &generation.to_string())
+        {
+            return error(412);
+        }
+        if method == "DELETE" {
+            state.locks.remove(&key);
+            return Response::builder().status(204).body(Body::empty()).unwrap();
+        }
+        if method == "POST" {
+            let bytes = to_bytes(req.into_body(), 1_000_000).await.unwrap().to_vec();
+            state.locks.insert(key.clone(), (bytes, generation + 1));
+        } else if current.is_none() {
+            return error(404);
+        }
+        let (bytes, generation) = &state.locks[&key];
+        if query.get("alt").is_some_and(|v| v == "media") {
+            return Response::new(Body::from(bytes.clone()));
+        }
+        return Json(serde_json::json!({"name":key,"bucket":"synthetic-gcs","generation":generation.to_string(),"metageneration":"1","size":bytes.len().to_string(),"contentType":"application/json","selfLink":"test","mediaLink":"test","etag":"test","id":"test"})).into_response();
+    }
     state.requests.push((method.clone(), uri.clone()));
     if let Some(status) = state
         .fail
@@ -1019,6 +1077,26 @@ async fn gcs_request(State(state): State<Arc<Mutex<GcsObjects>>>, req: Request) 
     }
     if method == "POST" {
         assert!(uri.starts_with("/upload/storage/v1/b/synthetic-gcs/o?uploadType=multipart"));
+        if state.require_transcript_lock && state.locks.is_empty() {
+            return error(409);
+        }
+        if state.race_on_repair && query.contains_key("ifGenerationMatch") {
+            state.race_on_repair = false;
+            state.object.as_mut().unwrap()["generation"] = "123456790".into();
+            state.bytes = "concurrent writer".into();
+        }
+        let generation = state
+            .object
+            .as_ref()
+            .and_then(|o| o["generation"].as_str())
+            .unwrap_or("0");
+        if query
+            .get("ifGenerationMatch")
+            .is_some_and(|v| v != generation)
+        {
+            return error(412);
+        }
+        let next_generation = generation.parse::<u64>().unwrap().max(123456788) + 1;
         let content_type = req.headers()["content-type"].to_str().unwrap();
         let boundary = content_type.split("boundary=").nth(1).unwrap().to_string();
         let body = String::from_utf8(
@@ -1045,7 +1123,7 @@ async fn gcs_request(State(state): State<Arc<Mutex<GcsObjects>>>, req: Request) 
         for key in ["selfLink", "mediaLink", "etag", "id"] {
             map.insert(key.into(), "synthetic".into());
         }
-        map.insert("generation".into(), "123456789".into());
+        map.insert("generation".into(), next_generation.to_string().into());
         map.insert("metageneration".into(), "1".into());
         map.insert("size".into(), state.bytes.len().to_string().into());
         map.insert("bucket".into(), "synthetic-gcs".into());
@@ -1063,7 +1141,12 @@ async fn gcs_request(State(state): State<Arc<Mutex<GcsObjects>>>, req: Request) 
                 .unwrap();
         }
         if uri.contains("alt=media") {
-            assert!(uri.contains("generation=123456789"));
+            assert!(uri.contains(&format!(
+                "generation={}",
+                state.object.as_ref().unwrap()["generation"]
+                    .as_str()
+                    .unwrap()
+            )));
             let url = reqwest::Url::parse(&format!("http://synthetic{uri}")).unwrap();
             let supplied = url
                 .query_pairs()
@@ -1356,4 +1439,237 @@ async fn transcript_output_propagates_failed_provider_verification() {
     )
     .await
     .is_err());
+}
+
+#[tokio::test]
+async fn review360_missing_primary_never_acknowledges_backup_as_complete() {
+    let origin = Origin::start().await;
+    let (_, client, task) = gcs_origin().await;
+    let legacy = MediaStorage::gcs(client.clone(), "synthetic-gcs".into());
+    legacy
+        .put_verified(
+            &format!("{}/vtt/main.vtt", "a".repeat(64)),
+            Bytes::from_static(b"WEBVTT\n"),
+            "text/vtt",
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+    let result = deduplicate_transcript(transcript_state(
+        b2_primary_store(&origin, client.clone()),
+        client,
+    ))
+    .await;
+    task.abort();
+    assert!(
+        result.is_err(),
+        "missing selected primary must reach regeneration, not return complete from its GCS backup"
+    );
+}
+
+#[tokio::test]
+async fn review360_backup_repair_requires_transcript_lock() {
+    let origin = Origin::start().await;
+    let (backup, client, task) = gcs_origin().await;
+    let store = b2_primary_store(&origin, client.clone());
+    let key = format!("{}/vtt/main.vtt", "a".repeat(64));
+    origin
+        .store()
+        .put_verified(
+            &key,
+            Bytes::from_static(b"WEBVTT\n"),
+            "text/vtt",
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+    backup.lock().await.require_transcript_lock = true;
+    let before = origin
+        .objects
+        .lock()
+        .await
+        .requests
+        .iter()
+        .filter(|(method, _, _)| method == "GET")
+        .count();
+    let result = deduplicate_transcript(transcript_state(store, client)).await;
+    task.abort();
+    assert_eq!(result.unwrap(), "already_exists");
+    assert_eq!(backup.lock().await.lock_requests, ["POST", "DELETE"]);
+    assert!(backup
+        .lock()
+        .await
+        .requests
+        .iter()
+        .any(|(method, uri)| method == "POST" && uri.contains("ifGenerationMatch=0")));
+    assert_eq!(
+        origin
+            .objects
+            .lock()
+            .await
+            .requests
+            .iter()
+            .filter(|(method, _, _)| method == "GET")
+            .count()
+            - before,
+        1,
+        "repair reuses the already read pinned primary bytes"
+    );
+}
+
+#[tokio::test]
+async fn review360_backup_cas_preserves_concurrent_generation() {
+    let origin = Origin::start().await;
+    let (backup, client, task) = gcs_origin().await;
+    let store = b2_primary_store(&origin, client);
+    let key = format!("{}/vtt/main.vtt", "a".repeat(64));
+    let primary = origin
+        .store()
+        .put_verified(
+            &key,
+            Bytes::from_static(b"primary"),
+            "text/vtt",
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap()
+        .object;
+    store.ensure_required_backup(&primary).await.unwrap();
+    {
+        let mut b = backup.lock().await;
+        b.bytes = "changed".into();
+        b.race_on_repair = true;
+    }
+    let result = store.ensure_required_backup(&primary).await;
+    task.abort();
+    assert!(
+        result.is_err(),
+        "repair must not overwrite a different concurrently written GCS generation"
+    );
+    assert_eq!(backup.lock().await.bytes, "concurrent writer");
+}
+
+#[tokio::test]
+async fn review360_existing_writer_lock_blocks_duplicate_cache_repair() {
+    let origin = Origin::start().await;
+    let (backup, client, task) = gcs_origin().await;
+    let store = b2_primary_store(&origin, client.clone());
+    let hash = "a".repeat(64);
+    origin
+        .store()
+        .put_verified(
+            &format!("{hash}/vtt/main.vtt"),
+            Bytes::from_static(b"WEBVTT\n"),
+            "text/vtt",
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+    let owner = crate::acquire_transcript_lock(&client, "synthetic-gcs", &hash, 900)
+        .await
+        .unwrap()
+        .unwrap();
+    let state = transcript_state(store, client.clone());
+    assert_eq!(
+        deduplicate_transcript(state.clone()).await.unwrap(),
+        "already_processing"
+    );
+    assert!(
+        backup.lock().await.object.is_none(),
+        "duplicate must not repair before owning the transcript lock"
+    );
+    crate::delete_transcript_lock(&client, "synthetic-gcs", &owner)
+        .await
+        .unwrap();
+    assert_eq!(
+        deduplicate_transcript(state).await.unwrap(),
+        "already_exists"
+    );
+    assert!(backup.lock().await.object.is_some());
+    task.abort();
+}
+
+#[tokio::test]
+async fn review360_forced_selected_cache_and_backup_failures_report_terminal_status() {
+    for case in ["b2_force", "primary_force", "backup_failure"] {
+        let origin = Origin::start().await;
+        let (backup, client, task) = gcs_origin().await;
+        let hash = "a".repeat(64);
+        origin
+            .store()
+            .put_verified(
+                &format!("{hash}/vtt/main.vtt"),
+                Bytes::from_static(b"bad cached transcript"),
+                "text/vtt",
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let media = if case == "b2_force" {
+            origin.store()
+        } else {
+            b2_primary_store(&origin, client.clone())
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = Router::new().route(
+            "/status",
+            axum::routing::post(move |Json(payload): Json<serde_json::Value>| {
+                let tx = tx.clone();
+                async move {
+                    tx.send(payload).await.unwrap();
+                    StatusCode::OK
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/status", listener.local_addr().unwrap());
+        let status_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut state = transcript_state(media, client);
+        let config = &mut Arc::get_mut(&mut state).unwrap().config;
+        config.transcript_webhook_url = Some(endpoint);
+        config.transcode_repair_secret = Some("synthetic-repair".into());
+        let force = case != "backup_failure";
+        if !force {
+            backup.lock().await.fail = Some(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-divine-repair-secret",
+            "synthetic-repair".parse().unwrap(),
+        );
+        let response = crate::handle_transcribe(
+            State(state),
+            headers,
+            Json(crate::TranscodeRequest {
+                hash,
+                force,
+                owner: None,
+                job_id: None,
+                lang: None,
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "fixture has no original / denies required backup"
+        );
+        let mut statuses = vec![];
+        while let Ok(status) = rx.try_recv() {
+            statuses.push(status);
+        }
+        assert_eq!(statuses.last().unwrap()["status"], "failed");
+        assert!(statuses.iter().all(|s| s["status"] != "complete"));
+        assert!(
+            backup.lock().await.object.is_none(),
+            "force must not copy the known-bad cached B2 transcript back to GCS"
+        );
+        task.abort();
+        status_task.abort();
+    }
 }
