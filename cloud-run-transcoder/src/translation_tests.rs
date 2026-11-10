@@ -7,6 +7,8 @@ use std::sync::atomic::AtomicUsize;
 use tokio::sync::Mutex;
 
 const SOURCE: &[u8] = b"WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n";
+const PRIVATE_LOCK_ERROR: &str =
+    "synthetic-private-provider-body https://provider.invalid/private-lock";
 type Objects = Arc<Mutex<HashMap<String, (Vec<u8>, i64)>>>;
 
 struct StorageDouble {
@@ -61,7 +63,18 @@ async fn storage_request(State(objects): State<Objects>, request: Request) -> Re
             .into_response()
     };
     if path.ends_with("/vtt/.lock") && objects.contains_key("__fail_transcript_lock") {
-        return error(if method == Method::POST { 503 } else { 404 });
+        let code = if method == Method::POST { 503 } else { 404 };
+        return (
+            StatusCode::from_u16(code).unwrap(),
+            Json(serde_json::json!({
+                "error": { "code": code, "message": PRIVATE_LOCK_ERROR, "errors": [] }
+            })),
+        )
+            .into_response();
+    }
+    if objects.contains_key("__fail_transcript_lock") {
+        objects.insert("__unexpected_non_lock_request".into(), (vec![], 1));
+        return error(500);
     }
     if path.ends_with("/vtt/main.vtt")
         && method == Method::GET
@@ -760,18 +773,48 @@ async fn review360_lock_failure_reports_terminal_job_generation() {
         .lock()
         .await
         .insert("__fail_transcript_lock".into(), (vec![], 1));
-    let (state, mut rx, task) =
-        review360_status_state(&storage, storage.state.media_storage.clone()).await;
+    let origin = object_storage::tests::Origin::start().await;
+    let media = origin.store();
+    upload_transcript_to_storage(
+        &media,
+        &"a".repeat(64),
+        std::str::from_utf8(SOURCE).unwrap(),
+    )
+    .await
+    .unwrap();
+    origin.objects.lock().await.requests.clear();
+    let (state, mut rx, task) = review360_status_state(&storage, media).await;
     let mut request = transcribe_request();
     request.job_id = Some("synthetic-subtitle-job".into());
-    assert!(process_transcribe(state, request).await.is_err());
+    request.lang = Some("de-CH".into());
+    let before_attempt = next_status_generation();
+    let error = process_transcribe(state, request)
+        .await
+        .err()
+        .expect("lock failure must return an error");
+    let after_attempt = next_status_generation();
     task.abort();
     let status = rx
         .try_recv()
         .expect("a failed mandatory lock must not leave the edge job processing forever");
     assert_eq!(status["status"], "failed");
+    assert_eq!(status["error_code"], "lock_failed");
     assert_eq!(status["job_id"], "synthetic-subtitle-job");
-    assert!(status["generation"].as_u64().unwrap() > 0);
+    assert_eq!(status["language"], "de-CH");
+    assert_eq!(status["sha256"], "a".repeat(64));
+    assert_ne!(status["terminal"], true);
+    let generation = status["generation"].as_u64().unwrap();
+    assert_eq!(generation % 10, STATUS_EVENT_TERMINAL);
+    assert!(generation > status_event_generation(before_attempt, STATUS_EVENT_TERMINAL));
+    assert!(generation < status_event_generation(after_attempt, STATUS_EVENT_TERMINAL));
+    let message = status["error_message"].as_str().unwrap();
+    assert_eq!(
+        message,
+        "Transcript lock acquisition failed: storage HTTP 503"
+    );
+    assert_eq!(format!("{error:#}"), message);
+    assert!(!message.contains(PRIVATE_LOCK_ERROR));
+    assert!(!message.contains("provider.invalid"));
     assert!(
         rx.try_recv().is_err(),
         "one failed path emits one terminal status"
@@ -780,5 +823,9 @@ async fn review360_lock_failure_reports_terminal_job_generation() {
         storage.objects.lock().await.len(),
         2,
         "no transcript or lock was written"
+    );
+    assert!(
+        origin.objects.lock().await.requests.is_empty(),
+        "no selected cache/media/STT source access"
     );
 }

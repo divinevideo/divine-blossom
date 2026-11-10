@@ -1,7 +1,7 @@
 // ABOUTME: GPU video transcoding Cloud Run service for HLS generation
 // ABOUTME: Downloads video from GCS, transcodes to HLS with NVENC, uploads segments
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use axum::{
     extract::{DefaultBodyLimit, Query, Request, State},
     http::{header, Method, StatusCode},
@@ -1857,7 +1857,7 @@ async fn process_transcribe(
     {
         Ok(result) => result,
         Err(error) => {
-            let message = format!("Transcript lock acquisition failed: {error:#}");
+            let message = sanitized_transcript_lock_failure(&error);
             send_transcript_status_webhook(
                 &state.config,
                 &hash,
@@ -1874,7 +1874,7 @@ async fn process_transcribe(
                 false,
             )
             .await;
-            return Err(error);
+            return Err(anyhow!(message));
         }
     };
     let transcript_lock = match lock_result {
@@ -2893,6 +2893,25 @@ fn transcript_lock_path(hash: &str) -> String {
     format!("{}/vtt/.lock", hash)
 }
 
+fn sanitized_transcript_lock_failure(error: &anyhow::Error) -> String {
+    let storage_error = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<google_cloud_storage::http::Error>());
+    let status = match storage_error {
+        Some(google_cloud_storage::http::Error::Response(response)) => Some(response.code),
+        Some(google_cloud_storage::http::Error::HttpClient(error)) => {
+            error.status().map(|status| status.as_u16())
+        }
+        _ => None,
+    };
+    match status {
+        Some(status) => format!("Transcript lock acquisition failed: storage HTTP {status}"),
+        None => {
+            "Transcript lock acquisition failed: storage unavailable or invalid lock state".into()
+        }
+    }
+}
+
 async fn fetch_transcript_lock(
     client: &GcsClient,
     bucket: &str,
@@ -2921,7 +2940,7 @@ async fn fetch_transcript_lock(
             &DownloadRange::default(),
         )
         .await
-        .map_err(|e| anyhow!("Failed to download transcript lock: {}", e))?;
+        .context("Failed to download transcript lock")?;
     let state = serde_json::from_slice::<TranscriptLockState>(&raw)
         .map_err(|e| anyhow!("Failed to parse transcript lock: {}", e))?;
 
@@ -2952,7 +2971,7 @@ async fn write_transcript_lock(
             &UploadType::Simple(media),
         )
         .await
-        .map_err(|e| anyhow!("Failed to write transcript lock: {}", e))?;
+        .context("Failed to write transcript lock")?;
 
     Ok(TranscriptLockHandle {
         path,
@@ -2973,7 +2992,7 @@ async fn delete_transcript_lock(
             ..Default::default()
         })
         .await
-        .map_err(|e| anyhow!("Failed to delete transcript lock: {}", e))?;
+        .context("Failed to delete transcript lock")?;
     Ok(())
 }
 
