@@ -653,7 +653,7 @@ def llm_judge_transcript(
 def trigger_retranscription(
     media_url: str, sha: str, timeout: int, *, transcoder_url: str | None = None, repair_secret_file: str | None = None
 ) -> tuple[int, dict[str, Any]]:
-    if transcoder_url or repair_secret_file:
+    if transcoder_url is not None or repair_secret_file is not None:
         if not transcoder_url or not repair_secret_file:
             raise ValueError("authenticated repair requires both worker URL and existing credential file")
         from repair_recent_bad_vtts import trigger_authenticated_retranscription
@@ -786,7 +786,7 @@ def merged_unique(*lists: Iterable[str]) -> list[str]:
 
 def main() -> int:
     args = parse_args()
-    if bool(args.transcoder_url) != bool(args.repair_secret_file):
+    if (args.transcoder_url is not None or args.repair_secret_file is not None) and (not args.transcoder_url or not args.repair_secret_file):
         print("authenticated repair requires both worker URL and existing credential file", file=sys.stderr)
         return 2
     sources = {s.strip() for s in args.sources.split(",") if s.strip()}

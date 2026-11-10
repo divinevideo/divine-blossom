@@ -60,6 +60,9 @@ async fn storage_request(State(objects): State<Objects>, request: Request) -> Re
         )
             .into_response()
     };
+    if path.ends_with("/vtt/.lock") && objects.contains_key("__fail_transcript_lock") {
+        return error(if method == Method::POST { 503 } else { 404 });
+    }
     if path.ends_with("/vtt/main.vtt")
         && method == Method::GET
         && !query.contains_key("alt")
@@ -746,4 +749,36 @@ async fn review360_force_requires_existing_repair_credential_and_bypasses_select
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), match case {"unconfigured"=>StatusCode::SERVICE_UNAVAILABLE,"wrong"=>StatusCode::UNAUTHORIZED,_=>StatusCode::INTERNAL_SERVER_ERROR}, "force case {case}; authorized force must attempt regeneration (fixture original is missing), never return cached complete");
     }
+}
+
+#[tokio::test]
+async fn review360_lock_failure_reports_terminal_job_generation() {
+    let storage = StorageDouble::new().await;
+    storage.source(SOURCE).await;
+    storage
+        .objects
+        .lock()
+        .await
+        .insert("__fail_transcript_lock".into(), (vec![], 1));
+    let (state, mut rx, task) =
+        review360_status_state(&storage, storage.state.media_storage.clone()).await;
+    let mut request = transcribe_request();
+    request.job_id = Some("synthetic-subtitle-job".into());
+    assert!(process_transcribe(state, request).await.is_err());
+    task.abort();
+    let status = rx
+        .try_recv()
+        .expect("a failed mandatory lock must not leave the edge job processing forever");
+    assert_eq!(status["status"], "failed");
+    assert_eq!(status["job_id"], "synthetic-subtitle-job");
+    assert!(status["generation"].as_u64().unwrap() > 0);
+    assert!(
+        rx.try_recv().is_err(),
+        "one failed path emits one terminal status"
+    );
+    assert_eq!(
+        storage.objects.lock().await.len(),
+        2,
+        "no transcript or lock was written"
+    );
 }

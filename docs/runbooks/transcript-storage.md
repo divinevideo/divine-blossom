@@ -8,7 +8,7 @@ B2 output exists. A missing selected transcript enters normal regeneration.
 Cache validation and required-backup repair hold the existing transcript lock.
 Repair creates an absent GCS backup with `ifGenerationMatch=0`, or replaces only
 the observed generation. A conflicting writer causes failure without replacing
-that writer's generation. Provider/verification failures send a failed status
+that writer's generation. Lock-acquisition and provider/verification failures send a failed status
 webhook, including the adapter's sanitized cause. Default GCS metadata lookup
 errors retain the existing fall-through to locked processing.
 
@@ -44,7 +44,9 @@ not bypass a selected-provider cache. Deleting only a GCS VTT cannot force
 regeneration of a surviving B2 transcript.
 
 The existing `--dry-run` flag also applies to `--repair-hash`: it reads no repair
-credential and makes no worker request. Authenticated execution performs one
+credential and makes no worker request. An explicitly empty single-hash target
+or authenticated configuration is rejected; it cannot select a batch scan or
+legacy job path. Authenticated execution performs one
 request, refuses redirects, and reports
 success only for a matching hash and completed worker response. It does not
 retry a failed or uncertain request. A timed-out caller does not cancel forced

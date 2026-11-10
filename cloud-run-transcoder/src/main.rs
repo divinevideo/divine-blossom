@@ -1847,39 +1847,66 @@ async fn process_transcribe(
     info!("Starting transcription for {}", hash);
 
     let vtt_path = format!("{}/vtt/main.vtt", hash);
-    let transcript_lock =
-        match acquire_transcript_lock(&state.gcs_client, &state.config.gcs_bucket, &hash, 900)
-            .await?
-        {
-            Ok(handle) => handle,
-            Err(TranscriptLockAction::AlreadyProcessing) => {
-                info!(
-                    "Transcript already processing for {}, skipping duplicate request",
-                    hash
-                );
-                return Ok(TranscribeResponse {
-                    hash,
-                    status: "already_processing".to_string(),
-                    vtt_path,
-                    transcript_confidence: None,
-                });
-            }
-            Err(TranscriptLockAction::CoolingDown) => {
-                info!(
-                    "Transcript cooldown active for {}, skipping duplicate request",
-                    hash
-                );
-                return Ok(TranscribeResponse {
-                    hash,
-                    status: "cooling_down".to_string(),
-                    vtt_path,
-                    transcript_confidence: None,
-                });
-            }
-            Err(TranscriptLockAction::StartWork | TranscriptLockAction::ReclaimStaleLock) => {
-                unreachable!("acquire_transcript_lock resolves start/reclaim internally")
-            }
-        };
+    let lock_result = match acquire_transcript_lock(
+        &state.gcs_client,
+        &state.config.gcs_bucket,
+        &hash,
+        900,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            let message = format!("Transcript lock acquisition failed: {error:#}");
+            send_transcript_status_webhook(
+                &state.config,
+                &hash,
+                "failed",
+                job_id.as_deref(),
+                requested_lang.as_deref(),
+                None,
+                None,
+                None,
+                None,
+                Some("lock_failed"),
+                Some(&message),
+                status_event_generation(attempt_generation, STATUS_EVENT_TERMINAL),
+                false,
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    let transcript_lock = match lock_result {
+        Ok(handle) => handle,
+        Err(TranscriptLockAction::AlreadyProcessing) => {
+            info!(
+                "Transcript already processing for {}, skipping duplicate request",
+                hash
+            );
+            return Ok(TranscribeResponse {
+                hash,
+                status: "already_processing".to_string(),
+                vtt_path,
+                transcript_confidence: None,
+            });
+        }
+        Err(TranscriptLockAction::CoolingDown) => {
+            info!(
+                "Transcript cooldown active for {}, skipping duplicate request",
+                hash
+            );
+            return Ok(TranscribeResponse {
+                hash,
+                status: "cooling_down".to_string(),
+                vtt_path,
+                transcript_confidence: None,
+            });
+        }
+        Err(TranscriptLockAction::StartWork | TranscriptLockAction::ReclaimStaleLock) => {
+            unreachable!("acquire_transcript_lock resolves start/reclaim internally")
+        }
+    };
 
     // Cache repair is a writer and must share the same lock as finalization.
     // Translation's historical GCS read compatibility cannot grant completion

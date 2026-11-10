@@ -255,7 +255,7 @@ def trigger_authenticated_retranscription(
 def trigger_retranscription(
     media_url: str, media_hash: str, timeout: int, *, transcoder_url: str | None = None, repair_secret_file: str | None = None
 ) -> tuple[int, dict[str, Any]]:
-    if transcoder_url or repair_secret_file:
+    if transcoder_url is not None or repair_secret_file is not None:
         if not transcoder_url or not repair_secret_file:
             raise ValueError("authenticated repair requires both worker URL and existing credential file")
         return trigger_authenticated_retranscription(transcoder_url, media_hash, timeout, repair_secret_file)
@@ -340,14 +340,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if args.repair_hash:
+    if args.repair_hash is not None:
+        if len(args.repair_hash) != 64 or any(c not in string.hexdigits for c in args.repair_hash):
+            print("repair requires exactly one SHA-256 hash", file=sys.stderr)
+            return 2
         if not args.transcoder_url or not args.repair_secret_file:
             print("single-hash repair requires worker URL and existing repair credential file", file=sys.stderr)
             return 2
         if args.dry_run:
-            if len(args.repair_hash) != 64 or any(c not in string.hexdigits for c in args.repair_hash):
-                print("repair requires exactly one SHA-256 hash", file=sys.stderr)
-                return 2
             print(json.dumps({"hash": args.repair_hash.lower(), "status": "dry_run"}))
             return 0
         try:
@@ -357,7 +357,7 @@ def main() -> int:
             return 1
         print(json.dumps(payload))
         return 0
-    if bool(args.transcoder_url) != bool(args.repair_secret_file):
+    if (args.transcoder_url is not None or args.repair_secret_file is not None) and (not args.transcoder_url or not args.repair_secret_file):
         print("authenticated repair requires both worker URL and existing credential file", file=sys.stderr)
         return 2
     cutoff = datetime.now(timezone.utc) - timedelta(days=args.days)

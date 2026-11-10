@@ -9,6 +9,10 @@ UPLOAD_URL="${UPLOAD_URL:-https://blossom-upload-rust-149672065768.us-central1.r
 BUCKET="${BUCKET:-divine-blossom-media}"
 WAIT_FOR_TRANSCRIPT="${WAIT_FOR_TRANSCRIPT:-false}"
 DELETE_VTT_FIRST="${DELETE_VTT_FIRST:-false}"
+AUTHENTICATED_REPAIR_REQUESTED=false
+if [[ "${TRANSCODER_URL+x}" == "x" || "${TRANSCODE_REPAIR_SECRET_FILE+x}" == "x" ]]; then
+    AUTHENTICATED_REPAIR_REQUESTED=true
+fi
 TRANSCODER_URL="${TRANSCODER_URL:-}"
 TRANSCODE_REPAIR_SECRET_FILE="${TRANSCODE_REPAIR_SECRET_FILE:-}"
 POLL_INTERVAL="${POLL_INTERVAL:-5}"
@@ -106,6 +110,11 @@ for hash in "${hashes[@]}"; do
     fi
 done
 
+if [[ "$repair_transcript" == "true" && "$AUTHENTICATED_REPAIR_REQUESTED" == "true" && ( -z "$TRANSCODER_URL" || -z "$TRANSCODE_REPAIR_SECRET_FILE" ) ]]; then
+    echo "ERROR: authenticated repair requires worker URL and existing credential file" >&2
+    exit 1
+fi
+
 if ! command -v curl >/dev/null 2>&1; then
     echo "ERROR: curl is required" >&2
     exit 1
@@ -155,7 +164,7 @@ poll_subtitle_job() {
 force_retranscribe() {
     local hash="$1"
 
-    if [[ -n "$TRANSCODER_URL" || -n "$TRANSCODE_REPAIR_SECRET_FILE" ]]; then
+    if [[ "$AUTHENTICATED_REPAIR_REQUESTED" == "true" ]]; then
         if [[ -z "$TRANSCODER_URL" || -z "$TRANSCODE_REPAIR_SECRET_FILE" ]]; then
             echo "ERROR: authenticated repair requires worker URL and existing credential file" >&2
             return 1
