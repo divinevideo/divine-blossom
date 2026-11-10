@@ -429,6 +429,170 @@ fn b2_primary_store(origin: &Origin, gcs: GcsClient) -> MediaStorage {
 }
 
 #[tokio::test]
+async fn processing_reads_missing_primary_from_pinned_legacy_gcs_original() {
+    let origin = Origin::start().await;
+    let (backup, client, task) = gcs_origin().await;
+    let bytes = Bytes::from_static(b"legacy original still awaiting bulk copy");
+    let hash = hex::encode(Sha256::digest(&bytes));
+    let gcs = MediaStorage::gcs(client.clone(), "synthetic-gcs".into());
+    gcs.put_verified(
+        &hash,
+        bytes.clone(),
+        "video/mp4",
+        HashMap::from([("owner".into(), "c".repeat(64))]),
+        None,
+    )
+    .await
+    .unwrap();
+    backup.lock().await.requests.clear();
+    let store = b2_primary_store(&origin, client);
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("original");
+    let verified = crate::download_media_original(&store, &hash, &output)
+        .await
+        .expect("a missing B2 original must preserve legacy GCS processing");
+    assert_eq!(tokio::fs::read(output).await.unwrap(), bytes);
+    assert_eq!(verified.object.reference.provider, StorageProvider::Gcs);
+    assert_eq!(
+        verified.object.reference.version.as_deref(),
+        Some("123456789")
+    );
+    assert_eq!(verified.object.custom["owner"], "c".repeat(64));
+    assert_eq!(verified.sha256, hash);
+    assert_eq!(
+        origin.objects.lock().await.requests,
+        vec![("HEAD".into(), hash, None)]
+    );
+    let backup = backup.lock().await;
+    assert!(backup.requests.iter().all(|(method, _)| method == "GET"));
+    assert!(backup
+        .requests
+        .iter()
+        .any(|(_, uri)| uri.contains("alt=media")
+            && uri.contains("generation=123456789")
+            && uri.contains("ifMetagenerationMatch=1")));
+    task.abort();
+}
+
+#[tokio::test]
+async fn processing_prefers_primary_and_never_masks_primary_errors_with_gcs() {
+    for failure in [
+        "none",
+        "forbidden",
+        "unavailable",
+        "corrupt",
+        "lost_version",
+    ] {
+        let origin = Origin::start().await;
+        let (backup, client, task) = gcs_origin().await;
+        let store = b2_primary_store(&origin, client);
+        let bytes = Bytes::from_static(b"verified primary original");
+        let hash = hex::encode(Sha256::digest(&bytes));
+        store
+            .put_verified(&hash, bytes.clone(), "video/mp4", HashMap::new(), None)
+            .await
+            .unwrap();
+        backup.lock().await.requests.clear();
+        {
+            let mut state = origin.objects.lock().await;
+            state.fail = match failure {
+                "forbidden" => Some(StatusCode::FORBIDDEN),
+                "unavailable" => Some(StatusCode::SERVICE_UNAVAILABLE),
+                _ => None,
+            };
+            state.corrupt = failure == "corrupt";
+            state.get_status = (failure == "lost_version").then_some(StatusCode::NOT_FOUND);
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("original");
+        let result = crate::download_media_original(&store, &hash, &output).await;
+        if failure == "none" {
+            assert_eq!(
+                result.unwrap().object.reference.provider,
+                StorageProvider::B2
+            );
+            assert_eq!(tokio::fs::read(output).await.unwrap(), bytes);
+        } else {
+            assert!(result.is_err(), "primary {failure} must fail closed");
+            assert!(!output.exists());
+        }
+        assert!(
+            backup.lock().await.requests.is_empty(),
+            "unexpected GCS read for {failure}"
+        );
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn processing_legacy_fallback_still_rejects_corrupt_or_changed_gcs_source() {
+    for corrupt in [false, true] {
+        let origin = Origin::start().await;
+        let (backup, client, task) = gcs_origin().await;
+        let bytes = Bytes::from_static(b"legacy source must remain verified");
+        let hash = hex::encode(Sha256::digest(&bytes));
+        MediaStorage::gcs(client.clone(), "synthetic-gcs".into())
+            .put_verified(&hash, bytes, "video/mp4", HashMap::new(), None)
+            .await
+            .unwrap();
+        {
+            let mut state = backup.lock().await;
+            state.requests.clear();
+            state.corrupt = corrupt;
+            state.patch_after_metadata = !corrupt;
+        }
+        let store = b2_primary_store(&origin, client);
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("original");
+        assert!(crate::download_media_original(&store, &hash, &output)
+            .await
+            .is_err());
+        assert!(!output.exists());
+        assert!(
+            !backup.lock().await.requests.is_empty(),
+            "legacy source was never checked"
+        );
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn processing_legacy_fallback_does_not_hide_missing_or_unavailable_gcs() {
+    for status in [
+        StatusCode::NOT_FOUND,
+        StatusCode::FORBIDDEN,
+        StatusCode::SERVICE_UNAVAILABLE,
+    ] {
+        let origin = Origin::start().await;
+        let (backup, client, task) = gcs_origin().await;
+        backup.lock().await.fail = Some(status);
+        let store = b2_primary_store(&origin, client);
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("original");
+        assert!(
+            crate::download_media_original(&store, &"a".repeat(64), &output)
+                .await
+                .is_err()
+        );
+        assert!(!output.exists());
+        assert!(backup
+            .lock()
+            .await
+            .requests
+            .iter()
+            .all(|(method, _)| method == "GET"));
+        assert!(origin
+            .objects
+            .lock()
+            .await
+            .requests
+            .iter()
+            .all(|(method, _, _)| method == "HEAD"));
+        task.abort();
+    }
+}
+
+#[tokio::test]
 async fn b2_primary_writes_and_verifies_required_gcs_backup_before_success() {
     let origin = Origin::start().await;
     let (backup, client, task) = gcs_origin().await;
