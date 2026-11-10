@@ -8,9 +8,15 @@ nonvideo is handled inline. Any other value or unavailable configuration
 store fails before upload body forwarding/storage. Explicit local synthetic
 mode retains its inline behavior.
 
-The existing BUD authentication check runs first. Proxy requests retain the
-same auth, content type, size, body and request correlation. The existing
-upload-service response validation/public descriptor publication is reused.
+The existing BUD authentication check runs first. Newly proxied small bodies
+are bounded, hashed and checked against tombstones before forwarding; unavailable
+policy storage fails closed. Their service response must match the computed hash.
+Existing-record deduplication keeps inline policy semantics without rewriting a
+stale full metadata record or accepting enrichment over a concurrent deletion.
+
+Proxy requests retain the same auth, content type, size, body and request
+correlation. Existing upload-service response validation and public descriptor
+publication are reused.
 An upstream failure never selects inline GCS as a retry or fallback. The flag
 does not alter resumable sessions or internal thumbnail/VTT/audio/audit writes.
 
@@ -31,10 +37,10 @@ finalization consumer. The approved-only playback replica is not an upload
 destination. Existing GCS-finalize processing/transcoding consumers must not
 be assumed to implement the upload server's `media-finalized-v1` contract.
 
-The inline route previously performed checks after buffering/hash calculation;
-this mode uses the existing proxy's policy/publication boundaries. Complete
-writer/processing erasure exclusion and durable finalization remain required
-before B2 activation. This routing flag alone does not prove migration safety.
+The new route preserves the small inline path's pre-storage body/tombstone
+checks and deduplication policy; existing large/video proxy behavior is unchanged.
+Complete writer/processing erasure exclusion and durable finalization remain
+required before B2 activation. This routing flag alone does not prove migration safety.
 
 ## Staged rollout
 
@@ -65,5 +71,7 @@ The loopback fixture executes the real canonical handler with signed synthetic
 auth and verifies a small image reaches the service exactly once, byte-for-byte,
 without GCS credentials configured. It preserves upstream failure, rejects
 invalid config/auth before dispatch and checks default/disabled routing and
-missing-store failure. These tests do not establish live storage, processing,
-capacity or native playback parity.
+missing-store failure. Eleven cases also cover pre-storage tombstone/policy
+failures, bounded body-size validation, returned-hash mismatch and deduplication
+without rewriting the metadata generation. These tests do not establish live
+storage, processing, capacity or native playback parity.

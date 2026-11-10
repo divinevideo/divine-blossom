@@ -3181,6 +3181,48 @@ fn should_proxy_direct_upload(size: u64, mime: &str) -> Result<bool> {
         .map_err(|message| BlossomError::Internal(message.into()))
 }
 
+/// Preserve the old inline path's body identity and pre-storage tombstone
+/// check for newly proxied small nonvideo requests. Reads are strictly bounded.
+fn preflight_small_proxied_upload(
+    req: &mut Request,
+    size: u64,
+    auth: &crate::blossom::BlossomAuthEvent,
+) -> Result<String> {
+    use std::io::Read;
+    let limit = blossom_core::upload_routing::INLINE_UPLOAD_MAX_BYTES;
+    if size > limit {
+        return Err(BlossomError::BadRequest(
+            "Small upload preflight exceeds limit".into(),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    req.take_body()
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| BlossomError::BadRequest("Upload body could not be read".into()))?;
+    if bytes.len() as u64 != size {
+        return Err(BlossomError::BadRequest(
+            "Content-Length doesn't match body size".into(),
+        ));
+    }
+    let hash = hex::encode(Sha256::digest(&bytes));
+    if auth
+        .get_hash()
+        .is_some_and(|expected| !expected.eq_ignore_ascii_case(&hash))
+    {
+        return Err(BlossomError::AuthInvalid(
+            "Upload hash does not match authorization".into(),
+        ));
+    }
+    if get_tombstone(&hash)?.is_some() {
+        return Err(BlossomError::Forbidden(
+            "This content has been removed and cannot be re-uploaded".into(),
+        ));
+    }
+    req.set_body(bytes);
+    Ok(hash)
+}
+
 /// Upload service backend name (must match a backend configured in the
 /// Fastly dashboard whose address is `upload.divine.video`).
 const UPLOAD_SERVICE_BACKEND: &str = "upload_service";
@@ -3620,6 +3662,18 @@ fn handle_upload(mut req: Request, record: &mut UploadLogRecord) -> Result<Respo
     if !crate::storage::is_local_mode()
         && should_proxy_direct_upload(content_length, &content_type)?
     {
+        let expected_hash =
+            if !blossom_core::upload_routing::should_proxy(None, content_length, &content_type)
+                .map_err(|message| BlossomError::Internal(message.into()))?
+            {
+                Some(preflight_small_proxied_upload(
+                    &mut req,
+                    content_length,
+                    &auth,
+                )?)
+            } else {
+                None
+            };
         return handle_upload_service_proxy(
             req,
             auth,
@@ -3627,6 +3681,7 @@ fn handle_upload(mut req: Request, record: &mut UploadLogRecord) -> Result<Respo
             content_length,
             base_url,
             record,
+            expected_hash.as_deref(),
         );
     }
 
@@ -3952,6 +4007,15 @@ fn publish_upload_service_upload(
     base_url: String,
     upload: UploadServicePublishedUpload,
 ) -> Result<Response> {
+    publish_upload_service_upload_with_policy(auth, base_url, upload, false)
+}
+
+fn publish_upload_service_upload_with_policy(
+    auth: crate::blossom::BlossomAuthEvent,
+    base_url: String,
+    upload: UploadServicePublishedUpload,
+    preserve_inline_dedupe: bool,
+) -> Result<Response> {
     let hash = upload.sha256;
     let size = upload.size;
     let content_type = upload.content_type;
@@ -3986,6 +4050,19 @@ fn publish_upload_service_upload(
         let _ = add_to_user_list(&auth.pubkey, &hash);
         let _ = add_to_blob_refs(&hash, &auth.pubkey);
 
+        // Newly proxied small requests retain inline dedupe semantics. Do not
+        // insert a stale full metadata snapshot over a concurrent deletion.
+        if preserve_inline_dedupe {
+            eagerly_trigger_transcription_if_needed(
+                &hash,
+                &auth.pubkey,
+                &metadata.mime_type,
+                metadata.transcript_status,
+            );
+            let mut response = json_response(StatusCode::OK, &metadata.to_descriptor(&base_url));
+            add_cors_headers(&mut response);
+            return Ok(response);
+        }
         if thumbnail_url.is_some() && metadata.thumbnail.is_none() {
             metadata.thumbnail = thumbnail_url.clone();
         }
@@ -4468,6 +4545,7 @@ fn handle_upload_service_proxy(
     content_length: u64,
     base_url: String,
     record: &mut UploadLogRecord,
+    expected_hash: Option<&str>,
 ) -> Result<Response> {
     let auth_header = extract_authorization_header(&req)?;
 
@@ -4502,7 +4580,12 @@ fn handle_upload_service_proxy(
         .map_err(|e| BlossomError::Internal(format!("Invalid Cloud Run response: {}", e)))?;
     let upload = parse_upload_service_response(&cloud_run_resp, &content_type, content_length)?;
 
-    publish_upload_service_upload(auth, base_url, upload)
+    if expected_hash.is_some_and(|expected| expected != upload.sha256) {
+        return Err(BlossomError::StorageError(
+            "Upload service returned a different content hash".into(),
+        ));
+    }
+    publish_upload_service_upload_with_policy(auth, base_url, upload, expected_hash.is_some())
 }
 
 /// HEAD /upload - BUD-06 upload pre-validation

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Actual canonical upload handler against loopback-only provider service."""
+import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -14,17 +16,24 @@ class UploadService(BaseHTTPRequestHandler):
         pass
 
     def do_PUT(self):
+        self.connection.settimeout(5)
         body = self.rfile.read(int(self.headers['Content-Length']))
         self.server.observed.append((self.path, body, self.headers.get('Content-Type'),
                                      bool(self.headers.get('Authorization', '').startswith('Nostr '))))
-        self.send_response(503)
+        mismatch = self.server.case == 'hash_mismatch'
+        payload = json.dumps({'sha256': 'a'*64, 'size': 15, 'content_type': 'image/jpeg'}).encode() if mismatch else b'{"error":"fixture busy"}'
+        self.send_response(200 if mismatch else 503)
         self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', str(len(b'{"error":"fixture busy"}')))
+        self.send_header('Content-Length', str(len(payload)))
         self.end_headers()
-        self.wfile.write(b'{"error":"fixture busy"}')
+        self.wfile.write(payload)
 
 
 def main():
+    cases = ['enabled', 'default', 'disabled', 'invalid', 'invalid_auth', 'missing_store', 'tombstone', 'missing_policy', 'dedupe', 'bad_size', 'hash_mismatch']
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--case', choices=cases)
+    selected = parser.parse_args().case
     repo = Path(__file__).resolve().parent.parent
     with ThreadingHTTPServer(('127.0.0.1', 0), UploadService) as server:
         server.observed = []
@@ -33,13 +42,21 @@ def main():
         try:
             with tempfile.TemporaryDirectory(prefix='upload-routing-') as directory:
                 root = Path(directory)
-                settings, config, case_file = root/'settings.json', root/'fastly.toml', root/'case.json'
-                for case in ['enabled', 'default', 'disabled', 'invalid', 'invalid_auth', 'missing_store']:
+                settings, config, case_file, kv = root/'settings.json', root/'fastly.toml', root/'case.json', root/'kv.json'
+                for case in ([selected] if selected else cases):
                     values = {'local_mode': 'false'}
                     if case != 'default':
                         values['upload_service_all_uploads'] = {'disabled': 'false', 'invalid': 'invalid'}.get(case, 'true')
                     settings.write_text(json.dumps(values))
                     case_file.write_text(json.dumps({'test_case': case}))
+                    values_kv = {}
+                    if case == 'tombstone':
+                        values_kv['tombstone:' + hashlib.sha256(b'synthetic image').hexdigest()] = json.dumps({'reason': 'synthetic removal'})
+                    kv.write_text(json.dumps(values_kv))
+                    policy = '' if case == 'missing_policy' else f'''[local_server.kv_stores.blossom_metadata]
+file = "{kv}"
+format = "json"
+'''
                     optional = '' if case == 'missing_store' else f'''[local_server.config_stores.blossom_config]
 file = "{settings}"
 format = "json"
@@ -52,17 +69,18 @@ url = "http://127.0.0.1:{server.server_port}"
 [local_server.config_stores.routing_test]
 file = "{case_file}"
 format = "json"
-{optional}''')
+{optional}{policy}''')
                     env = os.environ.copy()
                     # Cargo's environment runner is whitespace-split, not a
                     # shell command; TOML array preserves paths containing spaces.
                     env.pop('CARGO_TARGET_WASM32_WASIP1_RUNNER', None)
                     runner = json.dumps([env.get('VICEROY', 'viceroy'), 'run', '-C', str(config), '--'])
                     before = len(server.observed)
+                    server.case = case
                     subprocess.run(['cargo', '--config', f'target.wasm32-wasip1.runner={runner}', 'test', '--locked', '--target', 'wasm32-wasip1',
                                     '--bin', 'fastly-blossom', 'canonical_upload_routing_contract',
-                                    '--', '--ignored', '--nocapture'], cwd=repo, env=env, check=True)
-                    expected = [('/upload', b'synthetic image', 'image/jpeg', True)] if case == 'enabled' else []
+                                    '--', '--ignored', '--nocapture'], cwd=repo, env=env, check=True, timeout=120)
+                    expected = [('/upload', b'synthetic image', 'image/jpeg', True)] if case in ('enabled', 'hash_mismatch') else []
                     if server.observed[before:] != expected:
                         raise AssertionError(f'{case}: unexpected loopback upload calls')
                     print(f'PASS canonical upload routing: {case}', flush=True)
