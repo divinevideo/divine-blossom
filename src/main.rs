@@ -11,6 +11,7 @@ mod blossom;
 mod canary;
 mod playback_cache;
 mod delete_policy;
+mod hls_manifest;
 mod delivery_telemetry;
 mod error;
 mod media_auth_log;
@@ -1033,12 +1034,11 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
         return Err(BlossomError::NotFound("Content not found".into()));
     }
 
-    // Try GCS first — many videos have HLS in GCS but metadata wasn't updated.
-    // GCS is the source of truth: if the manifest exists, serve it.
+    // The configured derived-media origin can have HLS before metadata is updated.
     let gcs_path = format!("{}/hls/master.m3u8", hash);
     match download_hls_content(&gcs_path, None) {
-        Ok(result) => {
-            // HLS exists in GCS — serve it and fix metadata if needed
+        Ok(mut result) => {
+            // The master exists: serve it with canonical URI paths and repair stale metadata.
             let meta = metadata.as_ref().unwrap();
             if meta.transcode_status != Some(TranscodeStatus::Complete) {
                 eprintln!(
@@ -1048,15 +1048,30 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
                 use crate::metadata::update_transcode_status;
                 let _ = update_transcode_status(&hash, TranscodeStatus::Complete);
             }
-            let mut resp = result;
-
-            let c2pa_manifest_id = resp
+            let c2pa_manifest_id = result
                 .get_header_str("x-goog-meta-c2pa-manifest-id")
                 .map(|s| s.to_string());
-            let source_sha256 = resp
+            let source_sha256 = result
                 .get_header_str("x-goog-meta-source-sha256")
                 .map(|s| s.to_string());
 
+            use std::io::Read;
+            let mut body = Vec::new();
+            result
+                .take_body()
+                .take(hls_manifest::MAX_MASTER_BYTES + 1)
+                .read_to_end(&mut body)
+                .map_err(|_| BlossomError::StorageError("Could not read HLS master".into()))?;
+            if body.len() as u64 > hls_manifest::MAX_MASTER_BYTES {
+                return Err(BlossomError::StorageError("HLS master exceeds size limit".into()));
+            }
+            let body = std::str::from_utf8(&body)
+                .map_err(|_| BlossomError::StorageError("HLS master is not UTF-8".into()))?;
+            let body = hls_manifest::for_alias(body, &hash)
+                .map_err(|message| BlossomError::StorageError(message.into()))?;
+            // Keep the signed alias URL and avoid forwarding an origin ETag for rewritten bytes.
+            let mut resp = Response::from_status(StatusCode::OK);
+            resp.set_body(body);
             resp.set_header("Content-Type", "application/vnd.apple.mpegurl");
             if is_admin || status_requires_private_response(meta.status) {
                 add_private_cache_headers(&mut resp, &hash);
@@ -1075,7 +1090,7 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
             Ok(resp)
         }
         Err(BlossomError::NotFound(_)) => {
-            // HLS not in GCS — check metadata and trigger transcoding if needed
+            // No master was found: check metadata and trigger transcoding if needed
             let meta = metadata.as_ref().unwrap();
             match decide_transcode_fetch_action(
                 meta.transcode_status,
@@ -9071,3 +9086,7 @@ mod subtitle_translation_tests;
 
 #[cfg(test)]
 mod upload_routing_tests;
+
+#[cfg(test)]
+#[path = "hls_alias_tests.rs"]
+mod hls_alias_tests;

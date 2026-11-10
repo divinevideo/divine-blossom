@@ -472,3 +472,17 @@ deploy-landed check reads the serving revision, because that is what production
 is answering with. Do not substitute one for the other — during a pinned window
 they give different answers, and each is the wrong answer to the other's
 question.
+
+## HLS short URL verification
+
+A ready `/<hash>.hls` response keeps HTTP 200 and expands relative rendition
+URIs to `/<hash>/hls/...`, including quoted URI attributes. This preserves
+URL-bound viewer authentication at the alias. The canonical master and media
+playlists retain their existing relative paths, access checks, and cache policy.
+Pending requests still return 202.
+
+After deploying this route correction, fetch an owned short HLS URL, resolve
+its returned rendition and segment URLs normally, and decode/seek the video.
+If the exact tested alias retains its older cached body, use the
+operator-approved exact URL purge procedure; do not globally purge the catalogue
+or enumerate aliases.
