@@ -1333,6 +1333,10 @@ async fn process_audio_extract(
             .media_storage
             .verify_sha256(&existing, &audio_sha256)
             .await?;
+        state
+            .media_storage
+            .ensure_existing_backup(&existing, Bytes::from(audio_data.clone()))
+            .await?;
         info!(
             "Audio {} already exists in selected media storage",
             audio_sha256
@@ -1432,9 +1436,9 @@ async fn process_transcode_inner(
     let attempt_generation = next_status_generation();
     info!("Starting transcode for {}", hash);
 
-    // Ordinary requests remain idempotent; repairs can replace existing derivatives.
+    // Reuse only when the selected mode's required output copies are present.
     let master_path = format!("{}/hls/master.m3u8", hash);
-    if !request.force && state.media_storage.stat(&master_path).await?.is_some() {
+    if !request.force && state.media_storage.can_reuse_hls(&hash).await? {
         info!("HLS already exists for {}, skipping transcode", hash);
         // Still update status to complete in case it was pending (no size change for already-transcoded)
         send_status_webhook(

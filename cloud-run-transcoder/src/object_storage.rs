@@ -36,26 +36,45 @@ pub enum StorageConfiguration {
         access_key: String,
         secret_key: String,
     },
+    B2Primary {
+        bucket: String,
+        region: String,
+        access_key: String,
+        secret_key: String,
+    },
 }
 impl StorageConfiguration {
     pub fn parse(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self> {
         let provider = lookup("MEDIA_STORAGE_PROVIDER");
         match provider.as_deref().unwrap_or("gcs") {
             "gcs" => Ok(Self::Gcs),
-            "b2" => {
+            "b2" | "b2_primary" => {
                 let mut required = |name| {
                     lookup(name)
                         .filter(|v| !v.is_empty())
                         .ok_or_else(|| anyhow!("Missing {name}"))
                 };
-                Ok(Self::B2 {
-                    bucket: required("B2_MEDIA_BUCKET")?,
-                    region: required("B2_REGION")?,
-                    access_key: required("B2_ACCESS_KEY_ID")?,
-                    secret_key: required("B2_SECRET_ACCESS_KEY")?,
+                let bucket = required("B2_MEDIA_BUCKET")?;
+                let region = required("B2_REGION")?;
+                let access_key = required("B2_ACCESS_KEY_ID")?;
+                let secret_key = required("B2_SECRET_ACCESS_KEY")?;
+                Ok(if provider.as_deref() == Some("b2_primary") {
+                    Self::B2Primary {
+                        bucket,
+                        region,
+                        access_key,
+                        secret_key,
+                    }
+                } else {
+                    Self::B2 {
+                        bucket,
+                        region,
+                        access_key,
+                        secret_key,
+                    }
                 })
             }
-            _ => bail!("MEDIA_STORAGE_PROVIDER must be gcs or b2"),
+            _ => bail!("MEDIA_STORAGE_PROVIDER must be gcs, b2 or b2_primary"),
         }
     }
 }
@@ -63,6 +82,7 @@ impl StorageConfiguration {
 #[derive(Clone)]
 pub struct MediaStorage {
     backend: Backend,
+    required_backup: Option<Box<MediaStorage>>,
 }
 #[derive(Clone)]
 enum Backend {
@@ -91,6 +111,8 @@ pub struct ObjectMetadata {
 pub struct VerifiedObject {
     pub object: ObjectMetadata,
     pub sha256: String,
+    /// Present only after the required GCS replica was independently verified.
+    pub required_backup: Option<ObjectMetadata>,
 }
 
 struct B2Request<'a> {
@@ -107,6 +129,7 @@ impl MediaStorage {
     pub fn gcs(client: GcsClient, bucket: String) -> Self {
         Self {
             backend: Backend::Gcs { client, bucket },
+            required_backup: None,
         }
     }
     pub fn configured(
@@ -114,6 +137,7 @@ impl MediaStorage {
         gcs: Option<GcsClient>,
         gcs_bucket: String,
     ) -> Result<Self> {
+        let backup_required = matches!(&config, StorageConfiguration::B2Primary { .. });
         match config {
             StorageConfiguration::Gcs => {
                 if gcs_bucket.is_empty() {
@@ -129,7 +153,24 @@ impl MediaStorage {
                 region,
                 access_key,
                 secret_key,
+            }
+            | StorageConfiguration::B2Primary {
+                bucket,
+                region,
+                access_key,
+                secret_key,
             } => {
+                let required_backup = if backup_required {
+                    if gcs_bucket.is_empty() {
+                        bail!("GCS backup bucket required for B2 primary");
+                    }
+                    Some(Box::new(Self::gcs(
+                        gcs.ok_or_else(|| anyhow!("GCS backup client required for B2 primary"))?,
+                        gcs_bucket,
+                    )))
+                } else {
+                    None
+                };
                 if bucket.is_empty()
                     || !bucket
                         .bytes()
@@ -161,6 +202,7 @@ impl MediaStorage {
                         endpoint: format!("https://{host}"),
                         client,
                     },
+                    required_backup,
                 })
             }
         }
@@ -184,6 +226,73 @@ impl MediaStorage {
     }
     pub async fn stat(&self, key: &str) -> Result<Option<ObjectMetadata>> {
         self.stat_pinned(key, None).await
+    }
+    pub async fn can_reuse_hls(&self, hash: &str) -> Result<bool> {
+        let prefix = format!("{hash}/hls");
+        let Some(backup) = &self.required_backup else {
+            return Ok(self.stat(&format!("{prefix}/master.m3u8")).await?.is_some());
+        };
+        // The encoder emits two single-file TS variants. A master alone cannot
+        // prove their backups succeeded, and regenerating every duplicate job
+        // would discard the existing at-least-once dispatch's idempotency.
+        for (filename, required) in [
+            ("master.m3u8", true),
+            ("stream_720p.m3u8", true),
+            ("stream_480p.m3u8", true),
+            ("stream_720p.ts", true),
+            ("stream_480p.ts", true),
+            ("stream_720p.mp4", false),
+            ("stream_480p.mp4", false),
+        ] {
+            let key = format!("{prefix}/{filename}");
+            let Some(primary) = self.stat(&key).await? else {
+                if required {
+                    return Ok(false);
+                }
+                // Progressive remux is best-effort; absent MP4s are not HLS
+                // failures, but any MP4 actually written needs its backup.
+                continue;
+            };
+            let Some(replica) = backup.stat(&key).await? else {
+                return Ok(false);
+            };
+            if primary.size != replica.size
+                || primary.content_type != replica.content_type
+                || primary.custom != replica.custom
+                || primary.cache_control != replica.cache_control
+                || self.hash_body(&primary, None).await?
+                    != backup.hash_body(&replica, None).await?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    /// Preserve the primary's provenance when shared audio needs a backup.
+    pub async fn ensure_existing_backup(
+        &self,
+        primary: &ObjectMetadata,
+        body: Bytes,
+    ) -> Result<()> {
+        if let Some(backup) = &self.required_backup {
+            self.validate_reference(&primary.reference)?;
+            let sha = hex::encode(Sha256::digest(&body));
+            if primary.size != body.len() as u64 {
+                bail!("Existing output size does not match backup bytes");
+            }
+            self.verify_sha256(primary, &sha).await?;
+            backup
+                .put_single_verified(
+                    &primary.reference.key,
+                    body,
+                    &primary.content_type,
+                    primary.custom.clone(),
+                    primary.cache_control.clone(),
+                )
+                .await
+                .context("Required GCS backup of existing output was not verified")?;
+        }
+        Ok(())
     }
     /// Read exactly an event-supplied object version; never resolve latest.
     pub async fn stat_reference(&self, reference: &ObjectRef) -> Result<Option<ObjectMetadata>> {
@@ -361,6 +470,7 @@ impl MediaStorage {
         Ok(VerifiedObject {
             object: object.clone(),
             sha256,
+            required_backup: None,
         })
     }
     pub async fn verify_sha256(&self, object: &ObjectMetadata, expected_sha: &str) -> Result<()> {
@@ -370,6 +480,37 @@ impl MediaStorage {
         Ok(())
     }
     pub async fn put_verified(
+        &self,
+        key: &str,
+        body: Bytes,
+        mime: &str,
+        custom: HashMap<String, String>,
+        cache_control: Option<String>,
+    ) -> Result<VerifiedObject> {
+        let mut primary = self
+            .put_single_verified(
+                key,
+                body.clone(),
+                mime,
+                custom.clone(),
+                cache_control.clone(),
+            )
+            .await?;
+        if let Some(backup) = &self.required_backup {
+            let replica = backup
+                .put_single_verified(key, body, mime, custom, cache_control)
+                .await
+                .context(
+                    "Required GCS backup was not verified; primary must not be acknowledged",
+                )?;
+            if replica.sha256 != primary.sha256 {
+                bail!("Required GCS backup identity mismatch");
+            }
+            primary.required_backup = Some(replica.object);
+        }
+        Ok(primary)
+    }
+    async fn put_single_verified(
         &self,
         key: &str,
         body: Bytes,
@@ -443,7 +584,11 @@ impl MediaStorage {
             bail!("Written media metadata verification failed");
         }
         self.verify_sha256(&object, &sha256).await?;
-        Ok(VerifiedObject { object, sha256 })
+        Ok(VerifiedObject {
+            object,
+            sha256,
+            required_backup: None,
+        })
     }
     async fn b2_request(&self, request: B2Request<'_>) -> Result<reqwest::Response> {
         let B2Request {
