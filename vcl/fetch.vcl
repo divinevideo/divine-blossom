@@ -67,7 +67,7 @@ if (req.http.Host ~ "(?i)^media-b2(-cdn)?[.]divine[.]video(:[0-9]+)?$") {
         beresp.http.Content-Length !~ "^[0-9]+\z" ||
         beresp.http.Content-Range !~ "^bytes [0-9]+-[0-9]+/[0-9]+\z" ||
         beresp.http.X-Content-Length !~ "^[0-9]+\z" ||
-        beresp.http.ETag !~ "^\"b2-[0-9a-f]{64}\"\z" ||
+        beresp.http.ETag !~ "^\"b2-[0-9a-f]{64}\"$"  ||
         beresp.http.Transfer-Encoding ||
         (beresp.http.Content-Encoding && beresp.http.Content-Encoding != "identity")) {
       set beresp.ttl = 0s;
