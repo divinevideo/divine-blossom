@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ABOUTME: Fetch recent videos from relay.divine.video, detect corrupted VTTs, and force retranscription
-# ABOUTME: Reuses the public subtitles job API instead of modifying storage directly
+# ABOUTME: Supports authenticated worker regeneration; legacy public job mode does not bypass worker cache
 
 from __future__ import annotations
 
@@ -209,9 +209,56 @@ def fetch_vtt(media_url: str, media_hash: str, timeout: int) -> tuple[int, str]:
     )
 
 
-def trigger_retranscription(
-    media_url: str, media_hash: str, timeout: int
+def trigger_authenticated_retranscription(
+    transcoder_url: str, media_hash: str, timeout: int, repair_secret_file: str
 ) -> tuple[int, dict[str, Any]]:
+    """One trusted forced-worker request; never delete artifacts or retry it."""
+    endpoint = parse.urlsplit(transcoder_url)
+    local = endpoint.hostname in {"127.0.0.1", "::1", "localhost"}
+    if (endpoint.scheme != "https" and not (endpoint.scheme == "http" and local)) or not endpoint.hostname or endpoint.username or endpoint.password or endpoint.query or endpoint.fragment or endpoint.path not in {"", "/"}:
+        raise ValueError("use the approved HTTPS worker base URL without credentials or query")
+    if len(media_hash) != 64 or any(c not in string.hexdigits for c in media_hash):
+        raise ValueError("repair requires exactly one SHA-256 hash")
+    if not 0 < timeout <= 900:
+        raise ValueError("repair timeout must be between 1 and 900 seconds")
+    with Path(repair_secret_file).open() as secret_file:
+        secret = secret_file.read(4097).strip()
+    if not secret or len(secret) > 4096 or any(ord(c) < 33 or ord(c) > 126 for c in secret):
+        raise ValueError("repair credential file must contain one nonempty header-safe token")
+
+    class NoRedirect(request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    req = request.Request(transcoder_url.rstrip("/") + "/transcribe", method="POST",
+        headers={"Content-Type": "application/json", "x-divine-repair-secret": secret},
+        data=json.dumps({"hash": media_hash.lower(), "force": True}).encode("utf-8"))
+    try:
+        with request.build_opener(NoRedirect()).open(req, timeout=timeout) as response:
+            raw = response.read(65537)
+            if response.status != 200 or len(raw) > 65536:
+                raise RuntimeError("worker repair response was not a bounded success")
+    except error.HTTPError as exc:
+        raise RuntimeError(f"worker repair rejected with HTTP {exc.code}; no retry issued") from None
+    except (error.URLError, TimeoutError, OSError):
+        raise RuntimeError("worker repair outcome unknown; inspect worker status before retrying") from None
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise RuntimeError("worker repair response was not valid JSON") from None
+    if not isinstance(payload, dict) or payload.get("hash") != media_hash.lower() or payload.get("status") != "complete":
+        raise RuntimeError("worker repair has not completed; inspect status before retrying")
+    # Never print arbitrary worker response fields beside a private credential.
+    return 200, {"hash": media_hash.lower(), "status": "complete"}
+
+
+def trigger_retranscription(
+    media_url: str, media_hash: str, timeout: int, *, transcoder_url: str | None = None, repair_secret_file: str | None = None
+) -> tuple[int, dict[str, Any]]:
+    if transcoder_url is not None or repair_secret_file is not None:
+        if not transcoder_url or not repair_secret_file:
+            raise ValueError("authenticated repair requires both worker URL and existing credential file")
+        return trigger_authenticated_retranscription(transcoder_url, media_hash, timeout, repair_secret_file)
     status, body = http_request(
         f"{media_url.rstrip('/')}/v1/subtitles/jobs",
         method="POST",
@@ -274,6 +321,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--relay-api", default=RELAY_API)
     parser.add_argument("--media-url", default=MEDIA_URL)
+    parser.add_argument("--transcoder-url", help="Approved worker base URL for authenticated regeneration")
+    parser.add_argument("--repair-secret-file", help="File containing the existing TRANSCODE_REPAIR_SECRET; never pass its value")
+    parser.add_argument("--repair-hash", help="Repair one exact hash through the authenticated worker without scanning")
     parser.add_argument("--days", type=int, default=7)
     parser.add_argument("--page-size", type=int, default=100)
     parser.add_argument("--limit-videos", type=int)
@@ -290,6 +340,26 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.repair_hash is not None:
+        if len(args.repair_hash) != 64 or any(c not in string.hexdigits for c in args.repair_hash):
+            print("repair requires exactly one SHA-256 hash", file=sys.stderr)
+            return 2
+        if not args.transcoder_url or not args.repair_secret_file:
+            print("single-hash repair requires worker URL and existing repair credential file", file=sys.stderr)
+            return 2
+        if args.dry_run:
+            print(json.dumps({"hash": args.repair_hash.lower(), "status": "dry_run"}))
+            return 0
+        try:
+            _, payload = trigger_authenticated_retranscription(args.transcoder_url, args.repair_hash, args.timeout, args.repair_secret_file)
+        except (ValueError, OSError, RuntimeError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(json.dumps(payload))
+        return 0
+    if (args.transcoder_url is not None or args.repair_secret_file is not None) and (not args.transcoder_url or not args.repair_secret_file):
+        print("authenticated repair requires both worker URL and existing credential file", file=sys.stderr)
+        return 2
     cutoff = datetime.now(timezone.utc) - timedelta(days=args.days)
     cutoff_unix = int(cutoff.timestamp())
 
@@ -338,7 +408,8 @@ def main() -> int:
             continue
 
         status, payload = trigger_retranscription(
-            args.media_url, media_hash, args.timeout
+            args.media_url, media_hash, args.timeout,
+            transcoder_url=args.transcoder_url, repair_secret_file=args.repair_secret_file,
         )
         if status not in (200, 202):
             summary.failed_repairs += 1

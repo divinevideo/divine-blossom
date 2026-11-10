@@ -2,7 +2,7 @@
 
 The transcoder's private byte adapter defaults to GCS. Explicit
 `MEDIA_STORAGE_PROVIDER=b2` selects B2 for original downloads, new HLS files,
-and extracted audio. This source change does not activate that setting or
+extracted audio, and newly generated transcript VTT. This source change does not activate that setting or
 change public media URLs. Derived-media readers have separate configuration.
 
 `MEDIA_STORAGE_PROVIDER=b2_primary` uses B2 for those media reads and requires
@@ -54,6 +54,8 @@ remaining coordination and compatibility operations.
   metadata changes. The original key must equal the full lowercase SHA-256.
 - `verify_sha256(metadata, expected_sha256)` verifies pinned bytes without saving
   a file.
+- `read(metadata)` returns pinned bytes, checking metadata, streamed length and
+  body-stall deadlines without imposing an additional transcript size limit.
 - `put_verified(key, bytes, mime, custom_metadata, cache_control)` writes metadata
   atomically with bytes, requires an actual generation/version, then verifies
   pinned metadata and readback before returning a receipt. Content-addressed
@@ -87,8 +89,26 @@ layout requires updating the reuse check alongside the encoder.
 Status webhooks retain their legacy meaning. These object receipts do not
 establish durable processing dispatch.
 
-Mutable jobs, locks, translation state, transcription/VTT and sound analysis
-remain on their existing GCS APIs. The legacy fMP4 backfill explicitly reads
+Mutable jobs, locks, translation output/state and sound analysis remain on their
+existing GCS APIs. Newly generated VTT uses the media
+adapter at its unchanged `{hash}/vtt/main.vtt` key with `text/vtt`; status completion
+follows successful pinned verification. Transcription deduplication requires the
+selected-provider transcript: a GCS-only copy cannot acknowledge missing B2
+output. Default GCS metadata lookup errors preserve the legacy fall-through to
+locked processing. Translation source lookup retains historical GCS read
+compatibility only when the selected object is absent; selected-provider errors
+and failed pinned reads do not use that compatibility path.
+Before transcription deduplication acknowledges an existing B2-primary transcript,
+it holds the existing transcript lock and verifies the required backup's pinned
+metadata and bytes. Missing or mismatched backups are repaired from pinned primary
+bytes with their existing provenance and GCS generation preconditions. Matching
+backups are not rewritten. A failed cache check or repair sends a failed status
+without acknowledging completion or rewriting the primary. Plain B2 and GCS
+require no backup check. See [transcript regeneration and rollout](transcript-storage.md).
+Translation reads the selected version through
+the adapter and verifies the requested source digest before claiming work. Default
+GCS selection does not repeat the lookup in a fallback store. This reader adjustment
+preserves cached GCS sources; it does not migrate mutable state. The legacy fMP4 backfill explicitly reads
 and writes GCS. B2 adapter tests can run without GCS; this does not make the
 whole transcoder pipeline GCS independent or complete GCS retirement.
 

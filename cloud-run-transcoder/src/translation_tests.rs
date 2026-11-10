@@ -7,6 +7,8 @@ use std::sync::atomic::AtomicUsize;
 use tokio::sync::Mutex;
 
 const SOURCE: &[u8] = b"WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n";
+const PRIVATE_LOCK_ERROR: &str =
+    "synthetic-private-provider-body https://provider.invalid/private-lock";
 type Objects = Arc<Mutex<HashMap<String, (Vec<u8>, i64)>>>;
 
 struct StorageDouble {
@@ -21,10 +23,11 @@ impl Drop for StorageDouble {
     }
 }
 
-fn object_response(path: String, generation: i64) -> Response {
+fn object_response(path: String, generation: i64, size: usize) -> Response {
     let value = serde_json::json!({
         "kind": "storage#object", "id": path, "name": path, "bucket": "test",
-        "generation": generation.to_string(), "metageneration": "1", "size": "0",
+        "generation": generation.to_string(), "metageneration": "1", "size": size.to_string(),
+        "contentType": "text/vtt",
         "selfLink": "http://storage/object", "mediaLink": "http://storage/object?alt=media",
         "etag": "synthetic", "storageClass": "STANDARD", "crc32c": "synthetic", "md5Hash": "synthetic"
     });
@@ -59,6 +62,37 @@ async fn storage_request(State(objects): State<Objects>, request: Request) -> Re
         )
             .into_response()
     };
+    if path.ends_with("/vtt/.lock") && objects.contains_key("__fail_transcript_lock") {
+        let code = if method == Method::POST { 503 } else { 404 };
+        return (
+            StatusCode::from_u16(code).unwrap(),
+            Json(serde_json::json!({
+                "error": { "code": code, "message": PRIVATE_LOCK_ERROR, "errors": [] }
+            })),
+        )
+            .into_response();
+    }
+    if objects.contains_key("__fail_transcript_lock") {
+        objects.insert("__unexpected_non_lock_request".into(), (vec![], 1));
+        return error(500);
+    }
+    if path.ends_with("/vtt/main.vtt")
+        && method == Method::GET
+        && !query.contains_key("alt")
+        && objects.remove("__fail_vtt_metadata_once").is_some()
+    {
+        return error(503);
+    }
+    if method == Method::DELETE {
+        if query
+            .get("ifGenerationMatch")
+            .is_some_and(|v| Some(v.parse::<i64>().unwrap()) != existing.as_ref().map(|(_, g)| *g))
+        {
+            return error(412);
+        }
+        objects.remove(&path);
+        return StatusCode::NO_CONTENT.into_response();
+    }
     if path.starts_with("forbidden/") {
         return error(403);
     }
@@ -75,16 +109,23 @@ async fn storage_request(State(objects): State<Objects>, request: Request) -> Re
             return error(412);
         }
         let generation = generation + 1;
+        let size = body.len();
         objects.insert(path.clone(), (body.to_vec(), generation));
-        return object_response(path, generation);
+        return object_response(path, generation, size);
     }
     let Some((body, generation)) = existing else {
         return error(404);
     };
+    if query
+        .get("generation")
+        .is_some_and(|value| value != &generation.to_string())
+    {
+        return error(404);
+    }
     if query.get("alt").map(String::as_str) == Some("media") {
         return Response::new(Body::from(body));
     }
-    object_response(path, generation)
+    object_response(path, generation, body.len())
 }
 
 impl StorageDouble {
@@ -129,6 +170,190 @@ fn request(source: &[u8]) -> TranslateRequest {
         source_digest: hex::encode(Sha256::digest(source)),
         lang: "pt-BR".into(),
     }
+}
+
+fn with_media(
+    storage: &StorageDouble,
+    media_storage: object_storage::MediaStorage,
+) -> Arc<AppState> {
+    Arc::new(AppState {
+        media_storage,
+        gcs_client: storage.state.gcs_client.clone(),
+        config: Config::from_lookup(|key| (key == "GCS_BUCKET").then(|| "test".to_string())),
+        provider_semaphore: Arc::new(Semaphore::new(4)),
+    })
+}
+
+fn transcribe_request() -> TranscodeRequest {
+    TranscodeRequest {
+        hash: "a".repeat(64),
+        force: false,
+        owner: None,
+        job_id: None,
+        lang: None,
+    }
+}
+
+#[tokio::test]
+async fn selected_and_legacy_transcripts_reach_translation_and_transcription_dedup() {
+    for legacy in [false, true] {
+        let storage = StorageDouble::new().await;
+        let origin = object_storage::tests::Origin::start().await;
+        let media = origin.store();
+        if legacy {
+            storage.source(SOURCE).await;
+        } else {
+            upload_transcript_to_storage(
+                &media,
+                &"a".repeat(64),
+                std::str::from_utf8(SOURCE).unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        let state = with_media(&storage, media);
+        let cached = process_transcribe(state.clone(), transcribe_request()).await;
+        if legacy {
+            // Translation may read an old GCS transcript, but that read cannot
+            // acknowledge output absent from the selected primary. This fixture
+            // has no original, so attempted regeneration fails before a provider.
+            assert!(cached.is_err());
+        } else {
+            assert_eq!(cached.unwrap().status, "already_exists");
+        }
+        let translated = process_translate_with(state, request(SOURCE), |_, texts| async move {
+            assert_eq!(texts, ["Hello"]);
+            Ok(vec!["Olá".into()])
+        })
+        .await
+        .unwrap();
+        assert_eq!(translated.status, "complete");
+        // Translation output and coordination records remain in GCS, not B2.
+        let objects = storage.objects.lock().await;
+        assert!(objects.contains_key(&translated.vtt_path));
+        assert!(objects.contains_key(&format!("{}.json", translated.vtt_path)));
+        assert_eq!(
+            objects.contains_key(&format!("{}/vtt/main.vtt", "a".repeat(64))),
+            legacy
+        );
+        drop(objects);
+        let origin = origin.objects.lock().await;
+        assert!(origin
+            .requests
+            .iter()
+            .all(|(method, key, _)| key.ends_with("/vtt/main.vtt")
+                || (legacy && method == "HEAD" && key == &"a".repeat(64))));
+        if !legacy {
+            assert!(origin
+                .requests
+                .iter()
+                .filter(|(method, _, _)| method == "GET")
+                .all(|(_, _, version)| version.is_some()));
+        }
+    }
+}
+
+#[tokio::test]
+async fn selected_transcript_errors_never_use_available_legacy_source() {
+    for status in [StatusCode::FORBIDDEN, StatusCode::INTERNAL_SERVER_ERROR] {
+        let storage = StorageDouble::new().await;
+        storage.source(SOURCE).await;
+        let origin = object_storage::tests::Origin::start().await;
+        origin.objects.lock().await.fail = Some(status);
+        let state = with_media(&storage, origin.store());
+        assert!(process_transcribe(state.clone(), transcribe_request())
+            .await
+            .is_err());
+        assert!(
+            process_translate_with(state, request(SOURCE), |_, _| async {
+                panic!("selected source failure reached translation provider")
+            })
+            .await
+            .is_err()
+        );
+        assert_eq!(storage.objects.lock().await.len(), 1);
+    }
+    // Even a 404 from the pinned byte GET is not absence at source selection.
+    for status in [
+        StatusCode::NOT_FOUND,
+        StatusCode::FORBIDDEN,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    ] {
+        let storage = StorageDouble::new().await;
+        storage.source(SOURCE).await;
+        let origin = object_storage::tests::Origin::start().await;
+        let media = origin.store();
+        upload_transcript_to_storage(
+            &media,
+            &"a".repeat(64),
+            std::str::from_utf8(SOURCE).unwrap(),
+        )
+        .await
+        .unwrap();
+        origin.objects.lock().await.get_status = Some(status);
+        assert!(process_translate_with(
+            with_media(&storage, media),
+            request(SOURCE),
+            |_, _| async { panic!("pinned read failure reached translation provider") }
+        )
+        .await
+        .is_err());
+        assert_eq!(storage.objects.lock().await.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn selected_source_digest_and_pinned_revision_control_translation() {
+    let storage = StorageDouble::new().await;
+    // A matching legacy digest must not override an available selected source.
+    storage.source(SOURCE).await;
+    let origin = object_storage::tests::Origin::start().await;
+    let media = origin.store();
+    let key = format!("{}/vtt/main.vtt", "a".repeat(64));
+    upload_transcript_to_storage(
+        &media,
+        &"a".repeat(64),
+        std::str::from_utf8(SOURCE).unwrap(),
+    )
+    .await
+    .unwrap();
+    let state = with_media(&storage, media.clone());
+    let (_, pinned) = find_transcript(&state, &key).await.unwrap().unwrap();
+    let revised = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nRevised\n";
+    upload_transcript_to_storage(&media, &"a".repeat(64), revised)
+        .await
+        .unwrap();
+    assert_eq!(media.read(&pinned).await.unwrap(), SOURCE);
+    assert_eq!(
+        process_translate_with(state.clone(), request(SOURCE), |_, _| async {
+            panic!("stale digest reached translation provider")
+        })
+        .await
+        .unwrap()
+        .status,
+        "source_changed"
+    );
+    origin.objects.lock().await.corrupt = true;
+    assert_eq!(
+        process_translate_with(state.clone(), request(revised.as_bytes()), |_, _| async {
+            panic!("corrupt pinned bytes reached translation provider")
+        })
+        .await
+        .unwrap()
+        .status,
+        "source_changed"
+    );
+    origin.objects.lock().await.corrupt = false;
+    assert_eq!(
+        process_translate_with(state, request(revised.as_bytes()), |_, texts| async {
+            assert_eq!(texts, ["Revised"]);
+            Ok(texts)
+        })
+        .await
+        .unwrap()
+        .status,
+        "complete"
+    );
 }
 
 #[tokio::test]
@@ -391,4 +616,216 @@ async fn translation_unsupported_language_never_creates_job_or_calls_provider() 
     .unwrap();
     assert_eq!(error.to_string(), "Invalid target language");
     assert!(storage.objects.lock().await.is_empty());
+}
+
+async fn review360_status_state(
+    storage: &StorageDouble,
+    media: object_storage::MediaStorage,
+) -> (
+    Arc<AppState>,
+    tokio::sync::mpsc::Receiver<serde_json::Value>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let app = Router::new().route(
+        "/status",
+        axum::routing::post(move |Json(payload): Json<serde_json::Value>| {
+            let tx = tx.clone();
+            async move {
+                tx.send(payload).await.unwrap();
+                StatusCode::OK
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/status", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let config = Config::from_lookup(|key| match key {
+        "GCS_BUCKET" => Some("test".into()),
+        "TRANSCRIPT_WEBHOOK_URL" => Some(endpoint.clone()),
+        _ => None,
+    });
+    (
+        Arc::new(AppState {
+            media_storage: media,
+            gcs_client: storage.state.gcs_client.clone(),
+            config,
+            provider_semaphore: Arc::new(Semaphore::new(4)),
+        }),
+        rx,
+        task,
+    )
+}
+
+#[tokio::test]
+async fn review360_cache_lookup_failure_delivers_terminal_status() {
+    let storage = StorageDouble::new().await;
+    let origin = object_storage::tests::Origin::start().await;
+    origin.objects.lock().await.fail = Some(StatusCode::FORBIDDEN);
+    let (state, mut rx, task) = review360_status_state(&storage, origin.store()).await;
+    assert!(process_transcribe(state, transcribe_request())
+        .await
+        .is_err());
+    task.abort();
+    let status = rx.try_recv().expect("cache failure must deliver a terminal webhook even when edge drops the worker HTTP response");
+    assert_eq!(status["status"], "failed");
+    assert_eq!(status["error_code"], "cache_validation_failed");
+    assert!(status["error_message"]
+        .as_str()
+        .unwrap()
+        .contains("metadata response required"));
+}
+
+#[tokio::test]
+async fn review360_default_gcs_metadata_error_falls_through_to_locked_processing() {
+    let storage = StorageDouble::new().await;
+    storage.source(SOURCE).await;
+    storage
+        .objects
+        .lock()
+        .await
+        .insert("__fail_vtt_metadata_once".into(), (vec![], 1));
+    let (state, mut rx, task) =
+        review360_status_state(&storage, storage.state.media_storage.clone()).await;
+    assert!(process_transcribe(state, transcribe_request())
+        .await
+        .is_err()); // No original in this fixture.
+    task.abort();
+    let status = rx.try_recv().expect("GCS cache lookup failure must fall through to ordinary processing under the transcript lock");
+    assert_eq!(status["status"], "processing");
+    assert_eq!(rx.try_recv().unwrap()["status"], "failed");
+}
+
+#[tokio::test]
+async fn review360_failed_output_status_retains_sanitized_cause_chain() {
+    let storage = StorageDouble::new().await;
+    let origin = object_storage::tests::Origin::start().await;
+    origin.objects.lock().await.fail = Some(StatusCode::FORBIDDEN);
+    let (state, mut rx, task) = review360_status_state(&storage, origin.store()).await;
+    assert!(finalize_transcript(
+        &state,
+        &"a".repeat(64),
+        None,
+        None,
+        ParsedVtt::empty(1),
+        &format!("{}/vtt/main.vtt", "a".repeat(64)),
+        1
+    )
+    .await
+    .is_err());
+    task.abort();
+    let status = rx.try_recv().unwrap();
+    assert_eq!(status["status"], "failed");
+    assert!(
+        status["error_message"].as_str().unwrap().contains("403"),
+        "status must preserve the adapter's sanitized provider status cause"
+    );
+}
+
+#[tokio::test]
+async fn review360_force_requires_existing_repair_credential_and_bypasses_selected_cache() {
+    for case in ["unconfigured", "wrong", "valid"] {
+        let storage = StorageDouble::new().await;
+        storage.source(SOURCE).await;
+        let mut state = with_media(&storage, storage.state.media_storage.clone());
+        if case != "unconfigured" {
+            Arc::get_mut(&mut state)
+                .unwrap()
+                .config
+                .transcode_repair_secret = Some("synthetic-repair".into());
+        }
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-divine-repair-secret",
+            if case == "valid" {
+                "synthetic-repair"
+            } else {
+                "wrong"
+            }
+            .parse()
+            .unwrap(),
+        );
+        let mut request = transcribe_request();
+        request.force = true;
+        let app = Router::new()
+            .route("/transcribe", axum::routing::post(handle_transcribe))
+            .with_state(state);
+        let body = serde_json::json!({"hash":request.hash,"force":true});
+        use tower::ServiceExt;
+        let mut req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/transcribe")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        req.headers_mut().extend(headers);
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), match case {"unconfigured"=>StatusCode::SERVICE_UNAVAILABLE,"wrong"=>StatusCode::UNAUTHORIZED,_=>StatusCode::INTERNAL_SERVER_ERROR}, "force case {case}; authorized force must attempt regeneration (fixture original is missing), never return cached complete");
+    }
+}
+
+#[tokio::test]
+async fn review360_lock_failure_reports_terminal_job_generation() {
+    let storage = StorageDouble::new().await;
+    storage.source(SOURCE).await;
+    storage
+        .objects
+        .lock()
+        .await
+        .insert("__fail_transcript_lock".into(), (vec![], 1));
+    let origin = object_storage::tests::Origin::start().await;
+    let media = origin.store();
+    upload_transcript_to_storage(
+        &media,
+        &"a".repeat(64),
+        std::str::from_utf8(SOURCE).unwrap(),
+    )
+    .await
+    .unwrap();
+    origin.objects.lock().await.requests.clear();
+    let (state, mut rx, task) = review360_status_state(&storage, media).await;
+    let mut request = transcribe_request();
+    request.job_id = Some("synthetic-subtitle-job".into());
+    request.lang = Some("de-CH".into());
+    let before_attempt = next_status_generation();
+    let error = process_transcribe(state, request)
+        .await
+        .err()
+        .expect("lock failure must return an error");
+    let after_attempt = next_status_generation();
+    task.abort();
+    let status = rx
+        .try_recv()
+        .expect("a failed mandatory lock must not leave the edge job processing forever");
+    assert_eq!(status["status"], "failed");
+    assert_eq!(status["error_code"], "lock_failed");
+    assert_eq!(status["job_id"], "synthetic-subtitle-job");
+    assert_eq!(status["language"], "de-CH");
+    assert_eq!(status["sha256"], "a".repeat(64));
+    assert_ne!(status["terminal"], true);
+    let generation = status["generation"].as_u64().unwrap();
+    assert_eq!(generation % 10, STATUS_EVENT_TERMINAL);
+    assert!(generation > status_event_generation(before_attempt, STATUS_EVENT_TERMINAL));
+    assert!(generation < status_event_generation(after_attempt, STATUS_EVENT_TERMINAL));
+    let message = status["error_message"].as_str().unwrap();
+    assert_eq!(
+        message,
+        "Transcript lock acquisition failed: storage HTTP 503"
+    );
+    assert_eq!(format!("{error:#}"), message);
+    assert!(!message.contains(PRIVATE_LOCK_ERROR));
+    assert!(!message.contains("provider.invalid"));
+    assert!(
+        rx.try_recv().is_err(),
+        "one failed path emits one terminal status"
+    );
+    assert_eq!(
+        storage.objects.lock().await.len(),
+        2,
+        "no transcript or lock was written"
+    );
+    assert!(
+        origin.objects.lock().await.requests.is_empty(),
+        "no selected cache/media/STT source access"
+    );
 }

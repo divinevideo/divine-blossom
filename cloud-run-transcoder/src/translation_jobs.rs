@@ -230,11 +230,10 @@ where
         return Ok(response("already_exists", 0));
     }
     let source_path = format!("{hash}/vtt/main.vtt");
-    let Some(source) =
-        read_translation_object(&state.gcs_client, &state.config.gcs_bucket, &source_path).await?
-    else {
+    let Some((storage, object)) = find_transcript(&state, &source_path).await? else {
         return Ok(response("no_source", 0));
     };
+    let source = storage.read(&object).await?;
     if hex::encode(Sha256::digest(&source)) != source_digest {
         return Ok(response("source_changed", 0));
     }

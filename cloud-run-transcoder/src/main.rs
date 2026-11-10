@@ -1,7 +1,7 @@
 // ABOUTME: GPU video transcoding Cloud Run service for HLS generation
 // ABOUTME: Downloads video from GCS, transcodes to HLS with NVENC, uploads segments
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use axum::{
     extract::{DefaultBodyLimit, Query, Request, State},
     http::{header, Method, StatusCode},
@@ -936,15 +936,26 @@ fn repair_outcome<T>(result: Result<T>, release: Result<()>) -> Result<(T, Optio
 
 async fn handle_transcribe(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<TranscodeRequest>,
 ) -> Response {
+    // Public job creation is not repair authority. Reuse the existing dedicated
+    // derivative-repair credential, including its unconfigured fail-closed case.
+    if let Err(rejection) = authorize_transcode_repair(&state.config, &headers, request.force) {
+        return rejection;
+    }
     // Every audio upload reaches /transcribe, so sound classification starts
     // here; it checks the content type itself and skips videos.
     sound_classification::spawn_classification(state.clone(), request.hash.to_lowercase());
-    match process_transcribe(state, request).await {
+    let result = if request.force {
+        await_repair(process_transcribe(state, request)).await
+    } else {
+        process_transcribe(state, request).await
+    };
+    match result {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => {
-            error!("Transcribe error: {}", e);
+            error!("Transcribe error: {:#}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -977,7 +988,7 @@ struct TranscribeAudioParams {
 /// Synchronous "raw audio bytes -> WebVTT" transcription.
 ///
 /// Unlike [`handle_transcribe`] (by-hash: reads a stored blob, writes the VTT
-/// back to GCS, holds a lock), this transcribes the audio in the request body
+/// through the configured media provider, holds a lock), this transcribes the audio in the request body
 /// inline via the configured provider and returns the WebVTT directly — no GCS
 /// read/write, no lock, no idempotency cache. It exists for the editor's
 /// pre-publish caption generation, reached through the upload-server's
@@ -1836,68 +1847,139 @@ async fn process_transcribe(
     info!("Starting transcription for {}", hash);
 
     let vtt_path = format!("{}/vtt/main.vtt", hash);
-    if check_gcs_exists(&state.gcs_client, &state.config.gcs_bucket, &vtt_path).await? {
-        info!(
-            "Transcript already exists for {}, skipping transcription",
-            hash
-        );
-        send_transcript_status_webhook(
-            &state.config,
-            &hash,
-            "complete",
-            job_id.as_deref(),
-            requested_lang.as_deref(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            status_event_generation(attempt_generation, STATUS_EVENT_TERMINAL),
-            false,
-        )
-        .await;
-        return Ok(TranscribeResponse {
-            hash,
-            status: "already_exists".to_string(),
-            vtt_path,
-            transcript_confidence: None,
-        });
-    }
+    let lock_result = match acquire_transcript_lock(
+        &state.gcs_client,
+        &state.config.gcs_bucket,
+        &hash,
+        900,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            let message = sanitized_transcript_lock_failure(&error);
+            send_transcript_status_webhook(
+                &state.config,
+                &hash,
+                "failed",
+                job_id.as_deref(),
+                requested_lang.as_deref(),
+                None,
+                None,
+                None,
+                None,
+                Some("lock_failed"),
+                Some(&message),
+                status_event_generation(attempt_generation, STATUS_EVENT_TERMINAL),
+                false,
+            )
+            .await;
+            return Err(anyhow!(message));
+        }
+    };
+    let transcript_lock = match lock_result {
+        Ok(handle) => handle,
+        Err(TranscriptLockAction::AlreadyProcessing) => {
+            info!(
+                "Transcript already processing for {}, skipping duplicate request",
+                hash
+            );
+            return Ok(TranscribeResponse {
+                hash,
+                status: "already_processing".to_string(),
+                vtt_path,
+                transcript_confidence: None,
+            });
+        }
+        Err(TranscriptLockAction::CoolingDown) => {
+            info!(
+                "Transcript cooldown active for {}, skipping duplicate request",
+                hash
+            );
+            return Ok(TranscribeResponse {
+                hash,
+                status: "cooling_down".to_string(),
+                vtt_path,
+                transcript_confidence: None,
+            });
+        }
+        Err(TranscriptLockAction::StartWork | TranscriptLockAction::ReclaimStaleLock) => {
+            unreachable!("acquire_transcript_lock resolves start/reclaim internally")
+        }
+    };
 
-    let transcript_lock =
-        match acquire_transcript_lock(&state.gcs_client, &state.config.gcs_bucket, &hash, 900)
-            .await?
-        {
-            Ok(handle) => handle,
-            Err(TranscriptLockAction::AlreadyProcessing) => {
-                info!(
-                    "Transcript already processing for {}, skipping duplicate request",
-                    hash
+    // Cache repair is a writer and must share the same lock as finalization.
+    // Translation's historical GCS read compatibility cannot grant completion
+    // of an output missing from the selected primary.
+    let cached = async {
+        if request.force {
+            return Ok(false);
+        }
+        let object = match state.media_storage.stat(&vtt_path).await {
+            Ok(object) => object,
+            Err(error) if state.media_storage.is_gcs() => {
+                // Preserve the legacy default-mode cache miss behavior. Actual
+                // processing remains protected by the lock and normal errors.
+                warn!(
+                    "GCS transcript cache lookup failed; continuing locked processing: {error:#}"
                 );
-                return Ok(TranscribeResponse {
-                    hash,
-                    status: "already_processing".to_string(),
-                    vtt_path,
-                    transcript_confidence: None,
-                });
+                None
             }
-            Err(TranscriptLockAction::CoolingDown) => {
-                info!(
-                    "Transcript cooldown active for {}, skipping duplicate request",
-                    hash
-                );
-                return Ok(TranscribeResponse {
-                    hash,
-                    status: "cooling_down".to_string(),
-                    vtt_path,
-                    transcript_confidence: None,
-                });
-            }
-            Err(TranscriptLockAction::StartWork | TranscriptLockAction::ReclaimStaleLock) => {
-                unreachable!("acquire_transcript_lock resolves start/reclaim internally")
-            }
+            Err(error) => return Err(error),
         };
+        if let Some(object) = object {
+            state.media_storage.ensure_required_backup(&object).await?;
+            Ok::<_, anyhow::Error>(true)
+        } else {
+            Ok(false)
+        }
+    }
+    .await;
+    match cached {
+        Ok(false) => {}
+        result => {
+            if let Err(error) = delete_transcript_lock(
+                &state.gcs_client,
+                &state.config.gcs_bucket,
+                &transcript_lock,
+            )
+            .await
+            {
+                warn!("Failed to release transcript cache lock: {error:#}");
+            }
+            let (status, error_message) = match &result {
+                Ok(true) => ("complete", None),
+                Err(error) => (
+                    "failed",
+                    Some(format!("Transcript cache validation failed: {error:#}")),
+                ),
+                Ok(false) => unreachable!(),
+            };
+            send_transcript_status_webhook(
+                &state.config,
+                &hash,
+                status,
+                job_id.as_deref(),
+                requested_lang.as_deref(),
+                None,
+                None,
+                None,
+                None,
+                error_message.as_ref().map(|_| "cache_validation_failed"),
+                error_message.as_deref(),
+                status_event_generation(attempt_generation, STATUS_EVENT_TERMINAL),
+                false,
+            )
+            .await;
+            result?;
+            return Ok(TranscribeResponse {
+                hash,
+                status: "already_exists".into(),
+                vtt_path,
+                transcript_confidence: None,
+            });
+        }
+    }
 
     send_transcript_status_webhook(
         &state.config,
@@ -2431,6 +2513,25 @@ async fn check_gcs_exists(client: &GcsClient, bucket: &str, object: &str) -> Res
     }
 }
 
+/// Read compatibility for historical translation sources. This lookup never
+/// grants transcript completion; that path requires selected-primary output.
+async fn find_transcript(
+    state: &AppState,
+    key: &str,
+) -> Result<Option<(object_storage::MediaStorage, object_storage::ObjectMetadata)>> {
+    if let Some(object) = state.media_storage.stat(key).await? {
+        return Ok(Some((state.media_storage.clone(), object)));
+    }
+    if state.media_storage.is_gcs() {
+        return Ok(None);
+    }
+    let legacy = object_storage::MediaStorage::gcs(
+        state.gcs_client.clone(),
+        state.config.gcs_bucket.clone(),
+    );
+    Ok(legacy.stat(key).await?.map(|object| (legacy, object)))
+}
+
 async fn download_from_gcs(
     client: &GcsClient,
     bucket: &str,
@@ -2792,6 +2893,25 @@ fn transcript_lock_path(hash: &str) -> String {
     format!("{}/vtt/.lock", hash)
 }
 
+fn sanitized_transcript_lock_failure(error: &anyhow::Error) -> String {
+    let storage_error = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<google_cloud_storage::http::Error>());
+    let status = match storage_error {
+        Some(google_cloud_storage::http::Error::Response(response)) => Some(response.code),
+        Some(google_cloud_storage::http::Error::HttpClient(error)) => {
+            error.status().map(|status| status.as_u16())
+        }
+        _ => None,
+    };
+    match status {
+        Some(status) => format!("Transcript lock acquisition failed: storage HTTP {status}"),
+        None => {
+            "Transcript lock acquisition failed: storage unavailable or invalid lock state".into()
+        }
+    }
+}
+
 async fn fetch_transcript_lock(
     client: &GcsClient,
     bucket: &str,
@@ -2820,7 +2940,7 @@ async fn fetch_transcript_lock(
             &DownloadRange::default(),
         )
         .await
-        .map_err(|e| anyhow!("Failed to download transcript lock: {}", e))?;
+        .context("Failed to download transcript lock")?;
     let state = serde_json::from_slice::<TranscriptLockState>(&raw)
         .map_err(|e| anyhow!("Failed to parse transcript lock: {}", e))?;
 
@@ -2851,7 +2971,7 @@ async fn write_transcript_lock(
             &UploadType::Simple(media),
         )
         .await
-        .map_err(|e| anyhow!("Failed to write transcript lock: {}", e))?;
+        .context("Failed to write transcript lock")?;
 
     Ok(TranscriptLockHandle {
         path,
@@ -2872,7 +2992,7 @@ async fn delete_transcript_lock(
             ..Default::default()
         })
         .await
-        .map_err(|e| anyhow!("Failed to delete transcript lock: {}", e))?;
+        .context("Failed to delete transcript lock")?;
     Ok(())
 }
 
@@ -4294,13 +4414,8 @@ async fn finalize_transcript(
     vtt_path: &str,
     attempt_generation: u64,
 ) -> Result<TranscribeResponse> {
-    if let Err(e) = upload_transcript_to_gcs(
-        &state.gcs_client,
-        &state.config.gcs_bucket,
-        hash,
-        &parsed_vtt.content,
-    )
-    .await
+    if let Err(e) =
+        upload_transcript_to_storage(&state.media_storage, hash, &parsed_vtt.content).await
     {
         send_transcript_status_webhook(
             &state.config,
@@ -6558,32 +6673,23 @@ fn first_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-async fn upload_transcript_to_gcs(
-    client: &GcsClient,
-    bucket: &str,
+async fn upload_transcript_to_storage(
+    storage: &object_storage::MediaStorage,
     hash: &str,
     vtt_content: &str,
 ) -> Result<()> {
-    let gcs_path = format!("{}/vtt/main.vtt", hash);
-    let mut media = Media::new(gcs_path.clone());
-    media.content_type = "text/vtt".into();
-    let upload_type = UploadType::Simple(media);
-
-    let req = UploadObjectRequest {
-        bucket: bucket.to_string(),
-        ..Default::default()
-    };
-
-    client
-        .upload_object(
-            &req,
-            Bytes::from(vtt_content.as_bytes().to_vec()),
-            &upload_type,
+    let key = format!("{hash}/vtt/main.vtt");
+    storage
+        .put_verified(
+            &key,
+            Bytes::copy_from_slice(vtt_content.as_bytes()),
+            "text/vtt",
+            HashMap::new(),
+            None,
         )
         .await
-        .map_err(|e| anyhow!("Failed to upload transcript {}: {}", gcs_path, e))?;
-
-    info!("Uploaded transcript {}", gcs_path);
+        .map_err(|error| anyhow!("Failed to store transcript {key}: {error:#}"))?;
+    info!("Uploaded transcript {}", key);
     Ok(())
 }
 

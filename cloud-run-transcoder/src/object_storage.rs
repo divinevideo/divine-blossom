@@ -213,6 +213,9 @@ impl MediaStorage {
             Backend::B2 { bucket, .. } => (StorageProvider::B2, bucket),
         }
     }
+    pub fn is_gcs(&self) -> bool {
+        matches!(self.backend, Backend::Gcs { .. })
+    }
     fn validate_reference(&self, reference: &ObjectRef) -> Result<()> {
         validate_key(&reference.key)?;
         let (provider, bucket) = self.provider_bucket();
@@ -256,42 +259,88 @@ impl MediaStorage {
             let Some(replica) = backup.stat(&key).await? else {
                 return Ok(false);
             };
-            if primary.size != replica.size
-                || primary.content_type != replica.content_type
-                || primary.custom != replica.custom
-                || primary.cache_control != replica.cache_control
-                || self.hash_body(&primary, None).await?
-                    != backup.hash_body(&replica, None).await?
+            if !backup_metadata_matches(&primary, &replica)
+                || self.hash_body(&primary, None).await? != backup.hash_body(&replica, None).await?
             {
                 return Ok(false);
             }
         }
         Ok(true)
     }
-    /// Preserve the primary's provenance when shared audio needs a backup.
+    /// Verify or repair a required backup without rewriting the pinned primary.
+    /// Callers that may write the same artifact must hold its existing job lock.
+    pub async fn ensure_required_backup(&self, primary: &ObjectMetadata) -> Result<()> {
+        let Some(backup) = &self.required_backup else {
+            return Ok(());
+        };
+        // Detect control failures before downloading the primary's full bytes.
+        let replica = backup.stat(&primary.reference.key).await?;
+        let body = Bytes::from(self.read(primary).await?);
+        self.ensure_backup_bytes(primary, body, replica.as_ref())
+            .await
+    }
+
+    /// Preserve the primary's provenance when an existing output needs a backup.
     pub async fn ensure_existing_backup(
         &self,
         primary: &ObjectMetadata,
         body: Bytes,
     ) -> Result<()> {
-        if let Some(backup) = &self.required_backup {
-            self.validate_reference(&primary.reference)?;
-            let sha = hex::encode(Sha256::digest(&body));
-            if primary.size != body.len() as u64 {
-                bail!("Existing output size does not match backup bytes");
-            }
-            self.verify_sha256(primary, &sha).await?;
-            backup
-                .put_single_verified(
-                    &primary.reference.key,
-                    body,
-                    &primary.content_type,
-                    primary.custom.clone(),
-                    primary.cache_control.clone(),
-                )
-                .await
-                .context("Required GCS backup of existing output was not verified")?;
+        let Some(backup) = &self.required_backup else {
+            return Ok(());
+        };
+        self.validate_reference(&primary.reference)?;
+        if primary.size != body.len() as u64 {
+            bail!("Existing output size does not match backup bytes");
         }
+        let replica = backup.stat(&primary.reference.key).await?;
+        self.verify_sha256(primary, &hex::encode(Sha256::digest(&body)))
+            .await?;
+        self.ensure_backup_bytes(primary, body, replica.as_ref())
+            .await
+    }
+
+    // `body` came either from our pinned read or from an independently verified
+    // existing primary. Never resolve a new latest version during repair.
+    async fn ensure_backup_bytes(
+        &self,
+        primary: &ObjectMetadata,
+        body: Bytes,
+        replica: Option<&ObjectMetadata>,
+    ) -> Result<()> {
+        let backup = self
+            .required_backup
+            .as_ref()
+            .ok_or_else(|| anyhow!("Required backup unavailable"))?;
+        let sha = hex::encode(Sha256::digest(&body));
+        if let Some(replica) = replica {
+            if backup_metadata_matches(primary, replica)
+                && sha == backup.hash_body(replica, None).await?
+            {
+                return Ok(());
+            }
+        }
+        let expected = match replica {
+            None => 0,
+            Some(replica) => replica
+                .reference
+                .version
+                .as_deref()
+                .ok_or_else(|| anyhow!("Pinned GCS backup generation required"))?
+                .parse::<i64>()
+                .context("Invalid GCS backup generation")?,
+        };
+        backup
+            .put_single_verified_if_generation(
+                &primary.reference.key,
+                body,
+                &primary.content_type,
+                primary.custom.clone(),
+                primary.cache_control.clone(),
+                Some(expected),
+            )
+            .await
+            .context("Required GCS backup of existing output was not verified")?;
         Ok(())
     }
     /// Read exactly an event-supplied object version; never resolve latest.
@@ -415,6 +464,32 @@ impl MediaStorage {
                     .boxed())
             }
         }
+    }
+    /// Read pinned bytes, rejecting stalled streams and mismatched object lengths.
+    pub async fn read(&self, object: &ObjectMetadata) -> Result<Vec<u8>> {
+        let mut body = self.body(object).await?;
+        let mut bytes = Vec::new();
+        let mut length = 0u64;
+        while let Some(chunk) = tokio::time::timeout(STREAM_STALL_TIMEOUT, body.next())
+            .await
+            .context("Media body stalled")?
+        {
+            let chunk = chunk?;
+            length = length
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| anyhow!("Media length overflow"))?;
+            if length > object.size {
+                bail!("Media exceeded pinned object size");
+            }
+            bytes
+                .try_reserve(chunk.len())
+                .context("Media allocation failed")?;
+            bytes.extend_from_slice(&chunk);
+        }
+        if length != object.size {
+            bail!("Media body does not match pinned size");
+        }
+        Ok(bytes)
     }
     async fn hash_body(
         &self,
@@ -543,6 +618,18 @@ impl MediaStorage {
         custom: HashMap<String, String>,
         cache_control: Option<String>,
     ) -> Result<VerifiedObject> {
+        self.put_single_verified_if_generation(key, body, mime, custom, cache_control, None)
+            .await
+    }
+    async fn put_single_verified_if_generation(
+        &self,
+        key: &str,
+        body: Bytes,
+        mime: &str,
+        custom: HashMap<String, String>,
+        cache_control: Option<String>,
+        gcs_generation: Option<i64>,
+    ) -> Result<VerifiedObject> {
         validate_key(key)?;
         let sha256 = hex::encode(Sha256::digest(&body));
         if is_sha256(key) && key != sha256 {
@@ -562,6 +649,7 @@ impl MediaStorage {
                     client.upload_object(
                         &UploadObjectRequest {
                             bucket: bucket.clone(),
+                            if_generation_match: gcs_generation,
                             ..Default::default()
                         },
                         body.clone(),
@@ -574,6 +662,9 @@ impl MediaStorage {
                 from_gcs(bucket, key, object)?.reference
             }
             Backend::B2 { .. } => {
+                if gcs_generation.is_some() {
+                    bail!("GCS generation precondition requires a GCS backup");
+                }
                 let response = self
                     .b2_request(B2Request {
                         method: Method::PUT,
@@ -879,4 +970,11 @@ fn encode(value: &str) -> String {
 
 #[cfg(test)]
 #[path = "object_storage_tests.rs"]
-mod tests;
+pub(crate) mod tests;
+
+fn backup_metadata_matches(primary: &ObjectMetadata, replica: &ObjectMetadata) -> bool {
+    primary.size == replica.size
+        && primary.content_type == replica.content_type
+        && primary.custom == replica.custom
+        && primary.cache_control == replica.cache_control
+}

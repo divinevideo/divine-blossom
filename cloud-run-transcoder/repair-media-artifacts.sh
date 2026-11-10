@@ -9,6 +9,12 @@ UPLOAD_URL="${UPLOAD_URL:-https://blossom-upload-rust-149672065768.us-central1.r
 BUCKET="${BUCKET:-divine-blossom-media}"
 WAIT_FOR_TRANSCRIPT="${WAIT_FOR_TRANSCRIPT:-false}"
 DELETE_VTT_FIRST="${DELETE_VTT_FIRST:-false}"
+AUTHENTICATED_REPAIR_REQUESTED=false
+if [[ "${TRANSCODER_URL+x}" == "x" || "${TRANSCODE_REPAIR_SECRET_FILE+x}" == "x" ]]; then
+    AUTHENTICATED_REPAIR_REQUESTED=true
+fi
+TRANSCODER_URL="${TRANSCODER_URL:-}"
+TRANSCODE_REPAIR_SECRET_FILE="${TRANSCODE_REPAIR_SECRET_FILE:-}"
 POLL_INTERVAL="${POLL_INTERVAL:-5}"
 POLL_ATTEMPTS="${POLL_ATTEMPTS:-24}"
 
@@ -32,6 +38,8 @@ Env:
   BUCKET                   GCS bucket containing blobs
   WAIT_FOR_TRANSCRIPT      true/false
   DELETE_VTT_FIRST         true/false
+  TRANSCODER_URL           Approved worker base URL for authenticated repair
+  TRANSCODE_REPAIR_SECRET_FILE Existing repair credential file (never its value)
   POLL_INTERVAL            Seconds between subtitle job polls
   POLL_ATTEMPTS            Max subtitle job polls
 
@@ -102,6 +110,11 @@ for hash in "${hashes[@]}"; do
     fi
 done
 
+if [[ "$repair_transcript" == "true" && "$AUTHENTICATED_REPAIR_REQUESTED" == "true" && ( -z "$TRANSCODER_URL" || -z "$TRANSCODE_REPAIR_SECRET_FILE" ) ]]; then
+    echo "ERROR: authenticated repair requires worker URL and existing credential file" >&2
+    exit 1
+fi
+
 if ! command -v curl >/dev/null 2>&1; then
     echo "ERROR: curl is required" >&2
     exit 1
@@ -112,7 +125,7 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
-if [[ "$repair_thumbnail" == "true" || "$DELETE_VTT_FIRST" == "true" ]]; then
+if [[ "$repair_thumbnail" == "true" || ( "$DELETE_VTT_FIRST" == "true" && -z "$TRANSCODER_URL" ) ]]; then
     if ! command -v gsutil >/dev/null 2>&1; then
         echo "ERROR: gsutil is required for thumbnail repair and --delete-vtt-first" >&2
         exit 1
@@ -150,6 +163,16 @@ poll_subtitle_job() {
 
 force_retranscribe() {
     local hash="$1"
+
+    if [[ "$AUTHENTICATED_REPAIR_REQUESTED" == "true" ]]; then
+        if [[ -z "$TRANSCODER_URL" || -z "$TRANSCODE_REPAIR_SECRET_FILE" ]]; then
+            echo "ERROR: authenticated repair requires worker URL and existing credential file" >&2
+            return 1
+        fi
+        python3 "$(dirname "$0")/repair_recent_bad_vtts.py" --repair-hash "$hash" \
+            --transcoder-url "$TRANSCODER_URL" --repair-secret-file "$TRANSCODE_REPAIR_SECRET_FILE" --timeout 900
+        return
+    fi
 
     if [[ "$DELETE_VTT_FIRST" == "true" ]]; then
         gsutil -q rm "gs://${BUCKET}/${hash}/vtt/main.vtt" 2>/dev/null || true

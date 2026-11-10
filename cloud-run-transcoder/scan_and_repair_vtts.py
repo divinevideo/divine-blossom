@@ -651,8 +651,13 @@ def llm_judge_transcript(
 
 
 def trigger_retranscription(
-    media_url: str, sha: str, timeout: int
+    media_url: str, sha: str, timeout: int, *, transcoder_url: str | None = None, repair_secret_file: str | None = None
 ) -> tuple[int, dict[str, Any]]:
+    if transcoder_url is not None or repair_secret_file is not None:
+        if not transcoder_url or not repair_secret_file:
+            raise ValueError("authenticated repair requires both worker URL and existing credential file")
+        from repair_recent_bad_vtts import trigger_authenticated_retranscription
+        return trigger_authenticated_retranscription(transcoder_url, sha, timeout, repair_secret_file)
     status, body = http_request(
         f"{media_url.rstrip('/')}/v1/subtitles/jobs",
         method="POST",
@@ -682,6 +687,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--relay-api", default=RELAY_API)
     parser.add_argument("--media-url", default=MEDIA_URL)
+    parser.add_argument("--transcoder-url", help="Approved worker base URL for authenticated regeneration")
+    parser.add_argument("--repair-secret-file", help="File containing the existing repair credential; never pass its value")
 
     parser.add_argument(
         "--sources",
@@ -779,6 +786,9 @@ def merged_unique(*lists: Iterable[str]) -> list[str]:
 
 def main() -> int:
     args = parse_args()
+    if (args.transcoder_url is not None or args.repair_secret_file is not None) and (not args.transcoder_url or not args.repair_secret_file):
+        print("authenticated repair requires both worker URL and existing credential file", file=sys.stderr)
+        return 2
     sources = {s.strip() for s in args.sources.split(",") if s.strip()}
     unknown = sources - {"recent", "popular"}
     if unknown:
@@ -890,7 +900,7 @@ def main() -> int:
         if args.dry_run:
             continue
 
-        rstatus, payload = trigger_retranscription(args.media_url, sha, args.timeout)
+        rstatus, payload = trigger_retranscription(args.media_url, sha, args.timeout, transcoder_url=args.transcoder_url, repair_secret_file=args.repair_secret_file)
         if rstatus not in (200, 202):
             summary.failed_repairs += 1
             print(f"  FAILED repair: status={rstatus} payload={payload}")
