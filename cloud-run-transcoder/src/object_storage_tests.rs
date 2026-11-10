@@ -428,6 +428,160 @@ fn b2_primary_store(origin: &Origin, gcs: GcsClient) -> MediaStorage {
     store
 }
 
+async fn deduplicate_transcript(state: Arc<crate::AppState>) -> anyhow::Result<String> {
+    let response = crate::process_transcribe(
+        state,
+        crate::TranscodeRequest {
+            hash: "a".repeat(64),
+            force: false,
+            owner: None,
+            job_id: None,
+            lang: None,
+        },
+    )
+    .await?;
+    Ok(response.status)
+}
+
+fn transcript_state(store: MediaStorage, client: GcsClient) -> Arc<crate::AppState> {
+    Arc::new(crate::AppState {
+        media_storage: store,
+        gcs_client: client,
+        config: crate::Config::from_lookup(|key| {
+            (key == "GCS_BUCKET").then(|| "synthetic-gcs".to_string())
+        }),
+        provider_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+    })
+}
+
+#[tokio::test]
+async fn transcription_dedup_repairs_required_backup_without_rewriting_primary_or_matching_backup()
+{
+    for damage in ["missing", "bytes", "metadata"] {
+        let origin = Origin::start().await;
+        let (backup, client, task) = gcs_origin().await;
+        let store = b2_primary_store(&origin, client.clone());
+        let key = format!("{}/vtt/main.vtt", "a".repeat(64));
+        let bytes = Bytes::from_static(b"WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n");
+        let custom = HashMap::from([("source_sha256".into(), "a".repeat(64))]);
+        let primary = origin
+            .store()
+            .put_verified(
+                &key,
+                bytes.clone(),
+                "text/vtt",
+                custom.clone(),
+                Some("no-cache".into()),
+            )
+            .await
+            .unwrap()
+            .object;
+        if damage != "missing" {
+            store.ensure_required_backup(&primary).await.unwrap();
+            let mut backup = backup.lock().await;
+            if damage == "bytes" {
+                // Same length and unchanged metadata: only a pinned byte comparison detects this.
+                backup.bytes = "x".repeat(bytes.len());
+            } else {
+                backup.object.as_mut().unwrap()["metadata"]["source_sha256"] =
+                    "b".repeat(64).into();
+            }
+        }
+        let state = transcript_state(store.clone(), client);
+        assert_eq!(
+            deduplicate_transcript(state.clone()).await.unwrap(),
+            "already_exists"
+        );
+        let writes = {
+            let backup = backup.lock().await;
+            assert_eq!(backup.bytes.as_bytes(), bytes.as_ref());
+            assert_eq!(
+                backup.object.as_ref().unwrap()["metadata"]["source_sha256"],
+                custom["source_sha256"]
+            );
+            assert_eq!(backup.object.as_ref().unwrap()["cacheControl"], "no-cache");
+            backup
+                .requests
+                .iter()
+                .filter(|(method, _)| method == "POST")
+                .count()
+        };
+        assert_eq!(
+            deduplicate_transcript(state).await.unwrap(),
+            "already_exists"
+        );
+        assert_eq!(
+            backup
+                .lock()
+                .await
+                .requests
+                .iter()
+                .filter(|(method, _)| method == "POST")
+                .count(),
+            writes
+        );
+        assert_eq!(store.stat(&key).await.unwrap().unwrap(), primary);
+        assert_eq!(
+            origin
+                .objects
+                .lock()
+                .await
+                .requests
+                .iter()
+                .filter(|(method, _, _)| method == "PUT")
+                .count(),
+            1
+        );
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn transcription_dedup_cannot_acknowledge_failed_backup_and_repairs_on_retry() {
+    let origin = Origin::start().await;
+    let (backup, client, task) = gcs_origin().await;
+    let store = b2_primary_store(&origin, client.clone());
+    let key = format!("{}/vtt/main.vtt", "a".repeat(64));
+    let bytes = Bytes::from_static(b"WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n");
+    backup.lock().await.fail_upload = Some(StatusCode::FORBIDDEN);
+    // Reproduce the partial write left behind by a failed required-backup upload.
+    assert!(store
+        .put_verified(&key, bytes.clone(), "text/vtt", HashMap::new(), None)
+        .await
+        .is_err());
+    let primary = store.stat(&key).await.unwrap().unwrap();
+    let state = transcript_state(store.clone(), client);
+    assert!(deduplicate_transcript(state.clone()).await.is_err());
+    assert!(backup.lock().await.object.is_none());
+    backup.lock().await.fail_upload = None;
+    assert_eq!(
+        deduplicate_transcript(state.clone()).await.unwrap(),
+        "already_exists"
+    );
+    assert_eq!(backup.lock().await.bytes.as_bytes(), bytes.as_ref());
+    // Read failures also fail closed rather than treating a backup as absent.
+    backup.lock().await.fail = Some(StatusCode::FORBIDDEN);
+    assert!(deduplicate_transcript(state.clone()).await.is_err());
+    backup.lock().await.fail = None;
+    assert_eq!(
+        deduplicate_transcript(state).await.unwrap(),
+        "already_exists"
+    );
+    assert_eq!(store.stat(&key).await.unwrap().unwrap(), primary);
+    assert_eq!(
+        origin
+            .objects
+            .lock()
+            .await
+            .requests
+            .iter()
+            .filter(|(method, _, _)| method == "PUT")
+            .count(),
+        1
+    );
+    task.abort();
+}
+
 #[tokio::test]
 async fn b2_primary_writes_and_verifies_required_gcs_backup_before_success() {
     let origin = Origin::start().await;
@@ -841,6 +995,7 @@ struct GcsObjects {
     bytes: String,
     patch_after_metadata: bool,
     fail: Option<StatusCode>,
+    fail_upload: Option<StatusCode>,
     corrupt: bool,
     requests: Vec<(String, String)>,
 }
@@ -849,7 +1004,10 @@ async fn gcs_request(State(state): State<Arc<Mutex<GcsObjects>>>, req: Request) 
     let uri = req.uri().to_string();
     let mut state = state.lock().await;
     state.requests.push((method.clone(), uri.clone()));
-    if let Some(status) = state.fail {
+    if let Some(status) = state
+        .fail
+        .or_else(|| (method == "POST").then_some(state.fail_upload).flatten())
+    {
         return Response::builder()
             .status(status)
             .header("content-type", "application/json")
@@ -895,6 +1053,15 @@ async fn gcs_request(State(state): State<Arc<Mutex<GcsObjects>>>, req: Request) 
     } else {
         assert_eq!(method, "GET");
         assert!(uri.starts_with("/storage/v1/b/synthetic-gcs/o/"));
+        if state.object.is_none() {
+            return Response::builder()
+                .status(404)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"error":{"code":404,"message":"synthetic missing object","errors":[]}}"#,
+                ))
+                .unwrap();
+        }
         if uri.contains("alt=media") {
             assert!(uri.contains("generation=123456789"));
             let url = reqwest::Url::parse(&format!("http://synthetic{uri}")).unwrap();

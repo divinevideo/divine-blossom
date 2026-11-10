@@ -1836,7 +1836,8 @@ async fn process_transcribe(
     info!("Starting transcription for {}", hash);
 
     let vtt_path = format!("{}/vtt/main.vtt", hash);
-    if find_transcript(&state, &vtt_path).await?.is_some() {
+    if let Some((storage, object)) = find_transcript(&state, &vtt_path).await? {
+        storage.ensure_required_backup(&object).await?;
         info!(
             "Transcript already exists for {}, skipping transcription",
             hash

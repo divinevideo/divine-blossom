@@ -93,7 +93,13 @@ adapter at its unchanged `{hash}/vtt/main.vtt` key with `text/vtt`; status compl
 follows successful pinned verification. Transcription deduplication and translation
 source lookup check the selected media provider first, falling back to legacy GCS
 only when that metadata lookup returns 404. Errors, including a failed pinned byte
-read, fail closed without fallback. Translation reads the selected version through
+read, fail closed without fallback. Before transcription deduplication acknowledges
+an existing B2-primary transcript, it verifies the required GCS backup's pinned
+metadata and bytes. Missing or mismatched backups are repaired from pinned primary
+bytes with their existing provenance; matching backups are not rewritten. A failed
+backup check or repair fails the request without acknowledging completion, rewriting
+the primary, or invoking speech-to-text. Plain B2 and GCS require no backup check.
+Translation reads the selected version through
 the adapter and verifies the requested source digest before claiming work. Default
 GCS selection does not repeat the lookup in a fallback store. This reader adjustment
 preserves cached GCS sources; it does not migrate mutable state. The legacy fMP4 backfill explicitly reads

@@ -263,15 +263,34 @@ impl MediaStorage {
                 || primary.content_type != replica.content_type
                 || primary.custom != replica.custom
                 || primary.cache_control != replica.cache_control
-                || self.hash_body(&primary, None).await?
-                    != backup.hash_body(&replica, None).await?
+                || self.hash_body(&primary, None).await? != backup.hash_body(&replica, None).await?
             {
                 return Ok(false);
             }
         }
         Ok(true)
     }
-    /// Preserve the primary's provenance when shared audio needs a backup.
+    /// Verify or repair a required backup without rewriting the pinned primary.
+    pub async fn ensure_required_backup(&self, primary: &ObjectMetadata) -> Result<()> {
+        let Some(backup) = &self.required_backup else {
+            return Ok(());
+        };
+        let body = self.read(primary).await?;
+        if let Some(replica) = backup.stat(&primary.reference.key).await? {
+            if primary.size == replica.size
+                && primary.content_type == replica.content_type
+                && primary.custom == replica.custom
+                && primary.cache_control == replica.cache_control
+                && hex::encode(Sha256::digest(&body)) == backup.hash_body(&replica, None).await?
+            {
+                return Ok(());
+            }
+        }
+        self.ensure_existing_backup(primary, Bytes::from(body))
+            .await
+    }
+
+    /// Preserve the primary's provenance when an existing output needs a backup.
     pub async fn ensure_existing_backup(
         &self,
         primary: &ObjectMetadata,
