@@ -2,7 +2,7 @@
 
 The transcoder's private byte adapter defaults to GCS. Explicit
 `MEDIA_STORAGE_PROVIDER=b2` selects B2 for original downloads, new HLS files,
-and extracted audio. This source change does not activate that setting or
+extracted audio, and newly generated transcript VTT. This source change does not activate that setting or
 change public media URLs. Derived-media readers have separate configuration.
 
 `MEDIA_STORAGE_PROVIDER=b2_primary` uses B2 for those media reads and requires
@@ -85,8 +85,11 @@ layout requires updating the reuse check alongside the encoder.
 Status webhooks retain their legacy meaning. These object receipts do not
 establish durable processing dispatch.
 
-Mutable jobs, locks, translation state, transcription/VTT and sound analysis
-remain on their existing GCS APIs. The legacy fMP4 backfill explicitly reads
+Mutable jobs, locks, translation state, existing-transcript cache reads and sound
+analysis remain on their existing GCS APIs. Newly generated VTT uses the media
+adapter at its unchanged `{hash}/vtt/main.vtt` key with `text/vtt`; status completion
+follows successful pinned verification. Existing cached transcripts retain their
+legacy GCS read path. The legacy fMP4 backfill explicitly reads
 and writes GCS. B2 adapter tests can run without GCS; this does not make the
 whole transcoder pipeline GCS independent or complete GCS retirement.
 

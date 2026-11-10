@@ -1155,3 +1155,38 @@ async fn unversioned_sentinel_never_returns_a_verification_receipt() {
         .await
         .is_err());
 }
+
+#[tokio::test]
+async fn transcript_output_uses_selected_media_provider_and_pinned_verification() {
+    let origin = Origin::start().await;
+    let store = origin.store();
+    let hash = "a".repeat(64);
+    let vtt = "WEBVTT\n\n00:00.000 --> 00:01.000\nSynthetic subtitle\n";
+    super::super::upload_transcript_to_storage(&store, &hash, vtt)
+        .await
+        .unwrap();
+    let objects = origin.objects.lock().await;
+    let key = format!("{hash}/vtt/main.vtt");
+    let version = &objects.latest[&key];
+    let written = &objects.versions[&(key.clone(), version.clone())];
+    assert_eq!(written.bytes.as_ref(), vtt.as_bytes());
+    assert_eq!(written.mime, "text/vtt");
+    assert_eq!(
+        objects.requests.len(),
+        3,
+        "PUT, pinned HEAD and pinned byte verification"
+    );
+}
+
+#[tokio::test]
+async fn transcript_output_propagates_failed_provider_verification() {
+    let origin = Origin::start().await;
+    origin.objects.lock().await.corrupt = true;
+    assert!(super::super::upload_transcript_to_storage(
+        &origin.store(),
+        &"a".repeat(64),
+        "WEBVTT\n"
+    )
+    .await
+    .is_err());
+}

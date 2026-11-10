@@ -1,7 +1,7 @@
 // ABOUTME: GPU video transcoding Cloud Run service for HLS generation
 // ABOUTME: Downloads video from GCS, transcodes to HLS with NVENC, uploads segments
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use axum::{
     extract::{DefaultBodyLimit, Query, Request, State},
     http::{header, Method, StatusCode},
@@ -4294,13 +4294,8 @@ async fn finalize_transcript(
     vtt_path: &str,
     attempt_generation: u64,
 ) -> Result<TranscribeResponse> {
-    if let Err(e) = upload_transcript_to_gcs(
-        &state.gcs_client,
-        &state.config.gcs_bucket,
-        hash,
-        &parsed_vtt.content,
-    )
-    .await
+    if let Err(e) =
+        upload_transcript_to_storage(&state.media_storage, hash, &parsed_vtt.content).await
     {
         send_transcript_status_webhook(
             &state.config,
@@ -6558,32 +6553,23 @@ fn first_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-async fn upload_transcript_to_gcs(
-    client: &GcsClient,
-    bucket: &str,
+async fn upload_transcript_to_storage(
+    storage: &object_storage::MediaStorage,
     hash: &str,
     vtt_content: &str,
 ) -> Result<()> {
-    let gcs_path = format!("{}/vtt/main.vtt", hash);
-    let mut media = Media::new(gcs_path.clone());
-    media.content_type = "text/vtt".into();
-    let upload_type = UploadType::Simple(media);
-
-    let req = UploadObjectRequest {
-        bucket: bucket.to_string(),
-        ..Default::default()
-    };
-
-    client
-        .upload_object(
-            &req,
-            Bytes::from(vtt_content.as_bytes().to_vec()),
-            &upload_type,
+    let key = format!("{hash}/vtt/main.vtt");
+    storage
+        .put_verified(
+            &key,
+            Bytes::copy_from_slice(vtt_content.as_bytes()),
+            "text/vtt",
+            HashMap::new(),
+            None,
         )
         .await
-        .map_err(|e| anyhow!("Failed to upload transcript {}: {}", gcs_path, e))?;
-
-    info!("Uploaded transcript {}", gcs_path);
+        .context("Failed to verify transcript output")?;
+    info!("Uploaded transcript {}", key);
     Ok(())
 }
 
