@@ -344,6 +344,12 @@ def main() -> int:
         if not args.transcoder_url or not args.repair_secret_file:
             print("single-hash repair requires worker URL and existing repair credential file", file=sys.stderr)
             return 2
+        if args.dry_run:
+            if len(args.repair_hash) != 64 or any(c not in string.hexdigits for c in args.repair_hash):
+                print("repair requires exactly one SHA-256 hash", file=sys.stderr)
+                return 2
+            print(json.dumps({"hash": args.repair_hash.lower(), "status": "dry_run"}))
+            return 0
         try:
             _, payload = trigger_authenticated_retranscription(args.transcoder_url, args.repair_hash, args.timeout, args.repair_secret_file)
         except (ValueError, OSError, RuntimeError) as exc:

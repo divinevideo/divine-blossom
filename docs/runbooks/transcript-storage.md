@@ -43,7 +43,9 @@ Legacy public-job mode remains available for existing GCS workflows but does
 not bypass a selected-provider cache. Deleting only a GCS VTT cannot force
 regeneration of a surviving B2 transcript.
 
-Authenticated tooling performs one request, refuses redirects, and reports
+The existing `--dry-run` flag also applies to `--repair-hash`: it reads no repair
+credential and makes no worker request. Authenticated execution performs one
+request, refuses redirects, and reports
 success only for a matching hash and completed worker response. It does not
 retry a failed or uncertain request. A timed-out caller does not cancel forced
 work: the worker retains its lock and task through storage and release. Inspect

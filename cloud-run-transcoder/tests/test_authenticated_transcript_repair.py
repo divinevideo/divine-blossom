@@ -113,3 +113,17 @@ class AuthenticatedTranscriptRepairTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(captured), 1)
         self.assertNotIn('synthetic-private-repair', result.stdout + result.stderr)
+
+    def test_single_hash_dry_run_neither_reads_secret_nor_issues_request(self):
+        for existing_secret in (False, True):
+            with tempfile.TemporaryDirectory() as folder, server() as (endpoint, captured):
+                secret = Path(folder) / 'credential'
+                if existing_secret:
+                    secret.write_text('synthetic-private-repair')
+                result = subprocess.run([sys.executable, str(SCRIPT), '--repair-hash', 'a' * 64,
+                                         '--transcoder-url', endpoint, '--repair-secret-file', str(secret),
+                                         '--dry-run'], capture_output=True, text=True)
+                self.assertEqual(captured, [], 'dry-run must never request regeneration')
+            self.assertEqual(result.returncode, 0, 'dry-run must not open even a missing credential file')
+            self.assertEqual(json.loads(result.stdout)['status'], 'dry_run')
+            self.assertNotIn('synthetic-private-repair', result.stdout + result.stderr)

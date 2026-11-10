@@ -90,15 +90,19 @@ establish durable processing dispatch.
 Mutable jobs, locks, translation output/state and sound analysis remain on their
 existing GCS APIs. Newly generated VTT uses the media
 adapter at its unchanged `{hash}/vtt/main.vtt` key with `text/vtt`; status completion
-follows successful pinned verification. Transcription deduplication and translation
-source lookup check the selected media provider first, falling back to legacy GCS
-only when that metadata lookup returns 404. Errors, including a failed pinned byte
-read, fail closed without fallback. Before transcription deduplication acknowledges
-an existing B2-primary transcript, it verifies the required GCS backup's pinned
+follows successful pinned verification. Transcription deduplication requires the
+selected-provider transcript: a GCS-only copy cannot acknowledge missing B2
+output. Default GCS metadata lookup errors preserve the legacy fall-through to
+locked processing. Translation source lookup retains historical GCS read
+compatibility only when the selected object is absent; selected-provider errors
+and failed pinned reads do not use that compatibility path.
+Before transcription deduplication acknowledges an existing B2-primary transcript,
+it holds the existing transcript lock and verifies the required backup's pinned
 metadata and bytes. Missing or mismatched backups are repaired from pinned primary
-bytes with their existing provenance; matching backups are not rewritten. A failed
-backup check or repair fails the request without acknowledging completion, rewriting
-the primary, or invoking speech-to-text. Plain B2 and GCS require no backup check.
+bytes with their existing provenance and GCS generation preconditions. Matching
+backups are not rewritten. A failed cache check or repair sends a failed status
+without acknowledging completion or rewriting the primary. Plain B2 and GCS
+require no backup check. See [transcript regeneration and rollout](transcript-storage.md).
 Translation reads the selected version through
 the adapter and verifies the requested source digest before claiming work. Default
 GCS selection does not repeat the lookup in a fallback store. This reader adjustment
