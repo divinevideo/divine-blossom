@@ -31,7 +31,7 @@ if (beresp.status >= 500 && beresp.status < 600) {
       {""status":"} beresp.status {","}
       {""error_reason":""} json.escape(beresp.response) {"","}
       {""pop":""} json.escape(server.datacenter) {"","}
-      {""backend":""} json.escape(req.backend.name) {"","}
+      {""backend":""} json.escape(beresp.backend.name) {"","}
       {""backend_hop":""} json.escape(var.backend_hop) {"","}
       {""cache_state":""} json.escape(fastly_info.state) {"","}
       {""ff_visits":"} fastly.ff.visits_this_service {","}
