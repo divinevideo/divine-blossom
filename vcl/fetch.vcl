@@ -2,6 +2,10 @@
 # ABOUTME: Enforces long edge caching while preserving explicit browser cache policy
 
 declare local var.backend_hop STRING;
+declare local var.b2_segment_start INTEGER;
+declare local var.b2_segment_end INTEGER;
+declare local var.b2_segment_total INTEGER;
+declare local var.b2_segment_length INTEGER;
 
 # Strip any anti-caching headers leaked from GCS through Compute
 unset beresp.http.Pragma;
@@ -47,12 +51,48 @@ if (req.http.Host ~ "(?i)^media-b2(-cdn)?[.]divine[.]video(:[0-9]+)?$") {
       req.url !~ "^/[0-9a-f]{64}$" ||
       (req.method != "GET" && req.method != "HEAD") ||
       req.http.Authorization || req.http.Cookie ||
-      beresp.status != 200 ||
-      beresp.http.X-Divine-B2-CDN-Admission != "original-v1" ||
       beresp.http.Surrogate-Control != "max-age=31536000, stale-while-revalidate=0, stale-if-error=0" ||
       beresp.http.Surrogate-Key != regsub(req.url, "^/", "") ||
       beresp.http.X-Sha256 != regsub(req.url, "^/", "") ||
-      beresp.http.Content-Range || beresp.http.Set-Cookie) {
+      beresp.http.Set-Cookie) {
+    set beresp.ttl = 0s;
+    return(pass);
+  }
+  if (beresp.status == 206) {
+    # Only Compute's final guarded response can issue this version-bound marker.
+    # Native segmented caching requires length framing, never chunked encoding.
+    if (
+        beresp.http.X-Divine-B2-CDN-Admission != "original-segment-v1" ||
+        beresp.http.X-Divine-Source != "b2" ||
+        beresp.http.Content-Length !~ "^[0-9]+\z" ||
+        beresp.http.Content-Range !~ "^bytes [0-9]+-[0-9]+/[0-9]+\z" ||
+        beresp.http.X-Content-Length !~ "^[0-9]+\z" ||
+        beresp.http.ETag !~ "^\"b2-[0-9a-f]{64}\"\z" ||
+        beresp.http.Transfer-Encoding ||
+        (beresp.http.Content-Encoding && beresp.http.Content-Encoding != "identity")) {
+      set beresp.ttl = 0s;
+      return(pass);
+    }
+    set var.b2_segment_start = std.atoi(regsub(beresp.http.Content-Range, "^bytes ([0-9]+)-([0-9]+)/([0-9]+)\z", "\1"));
+    set var.b2_segment_end = std.atoi(regsub(beresp.http.Content-Range, "^bytes ([0-9]+)-([0-9]+)/([0-9]+)\z", "\2"));
+    set var.b2_segment_total = std.atoi(regsub(beresp.http.Content-Range, "^bytes ([0-9]+)-([0-9]+)/([0-9]+)\z", "\3"));
+    set var.b2_segment_length = std.atoi(beresp.http.Content-Length);
+    # Round-trip every integer so overflow/fallback parsing cannot admit bytes.
+    if (std.itoa(var.b2_segment_start) != regsub(beresp.http.Content-Range, "^bytes ([0-9]+)-([0-9]+)/([0-9]+)\z", "\1") ||
+        std.itoa(var.b2_segment_end) != regsub(beresp.http.Content-Range, "^bytes ([0-9]+)-([0-9]+)/([0-9]+)\z", "\2") ||
+        std.itoa(var.b2_segment_total) != regsub(beresp.http.Content-Range, "^bytes ([0-9]+)-([0-9]+)/([0-9]+)\z", "\3") ||
+        std.itoa(var.b2_segment_length) != beresp.http.Content-Length ||
+        std.itoa(var.b2_segment_total) != beresp.http.X-Content-Length ||
+        var.b2_segment_start < 0 || var.b2_segment_end < var.b2_segment_start ||
+        var.b2_segment_total <= var.b2_segment_end || var.b2_segment_length <= 0 ||
+        var.b2_segment_end - var.b2_segment_start + 1 != var.b2_segment_length) {
+      set beresp.ttl = 0s;
+      return(pass);
+    }
+  } else if (beresp.status != 200 ||
+      beresp.http.X-Divine-B2-CDN-Admission != "original-v1" ||
+      beresp.http.Content-Range) {
+    # Preserve ordinary admission during the coordinated Compute/VCL rollout.
     set beresp.ttl = 0s;
     return(pass);
   }

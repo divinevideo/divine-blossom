@@ -53,8 +53,8 @@ cache policy are unchanged.
 
 ## Admission and cache keys
 
-After every routing and final policy guard has returned, only a successful
-full verified B2 200 receives all of:
+After every routing and final policy guard has returned, a successful full
+verified B2 200 within the ordinary limit receives all of:
 
 - `X-Divine-B2-CDN-Admission: original-v1`.
 - `Surrogate-Key: {lowercase-64-hex}` (the bare hash).
@@ -64,8 +64,15 @@ The outer VCL requires this marker, status 200, the exact policy and hash key,
 matching `X-Sha256`, and absence of Content-Range or Set-Cookie. Missing
 admission means pass, including errors and cached negative responses. B2
 entries have a 365-day purgeable TTL, zero grace, zero stale-while-revalidate
-and zero stale-if-error. No denial or fallback is cached. A cold range or HEAD
-lookup fetches a complete GET; Fastly handles client HEAD and warm ranges.
+and zero stale-if-error. No denial or fallback is cached.
+
+Native segmented requests use a separate `original-segment-v1` admission marker.
+Only inner 206 responses with verified B2 provenance, a strong version-bound
+ETag, decimal Content-Length, exact Content-Range/total and identity framing
+are admitted. Chunked or conflicting framing is rejected. Conditional ranges
+require a matching strong If-Range tag; other validators select a full read.
+The ordinary 200 rules remain unchanged. See the
+[segment admission contract](b2-segmented-admission-contract.md).
 
 The normalized URL keys are `https://media-b2-cdn.divine.video/{hash}` and,
 only when that hostname is actually migrated to this service,
@@ -86,14 +93,16 @@ must show distinct outer request IDs.
 
 ## Manual activation and rollback
 
-The currently inspected outer service has a 20 MiB ordinary/streaming-miss
-object limit. This route does not raise that limit. Initial acceptance must
-stay below it; larger originals remain uncached and 32 MiB outer caching is
-not supported by this change. Fastly's
-documented segmented-caching option changes origin range requests and cache
-identity, so it needs separate admission and invalidation tests before use.
-Do not invent a settings API field or override generated VCL pragmas. An
-oversize response can fail instead of merely remaining uncached.
+The inspected ordinary/streaming-miss limit is 20 MiB. Native segmented caching
+avoids treating a larger original as one ordinary cache object; it must be
+released and verified separately. Do not invent a size configuration field or
+override generated VCL pragmas. Source tests with 32 MiB bodies establish
+Compute integrity, not provider caching. Before activation, compile and inspect
+the full generated VCL, then prove native 8/16/32 MiB delivery, disjoint ranges,
+If-Range/version identity and authenticated all-range URL invalidation at every
+retained hostname. Prove pre-header and mid-body delayed-fill denial with a
+Content-Length origin. Prior chunked ordinary-cache fixtures do not satisfy
+this native segmented requirement.
 
 1. Finish independent review and the separate moderation/erasure purge slice.
    Prove targeted invalidation on both ordinary warm entries and a blocked
@@ -112,12 +121,16 @@ oversize response can fail instead of merely remaining uncached.
    version separately, and enable the configuration only after the above
    proofs. Verify cold 200, warm/range/HEAD delivery, body checksum, no browser
    caching, distinct warm request IDs and no extra Compute/provider events.
-5. To stop admitting new entries, set `b2_cdn_enabled` off. Existing warm HITs
-   skip Compute, so this setting alone does not stop their delivery. Restore
-   the reviewed pre-activation outer/domain routing as the rollback plan
-   requires and target-purge every affected normalized URL/hash across retained
-   host bindings. Confirm erasure with independent requests after outstanding
-   fills drain. Do not use a global purge for routine rollback.
+5. Prepare and review a rollback against the actual segmented release before
+   activation. For an already outer-bound B2 hostname, use GET/HEAD pass before
+   lookup while preserving native authenticated FASTLYPURGE maintenance, the
+   binding, origin, selected host, enabled flag and retained purge-host list.
+   Switching the flag off alone leaves old HITs available and makes forwarded
+   misses fail. Rebinding prematurely can change URL-purge ownership. Do not
+   blindly activate an older ordinary-only rollback after segmented caching
+   has been enabled. Target-purge the affected normalized URLs/keys and verify
+   denial after outstanding fills settle; routine rollback never uses global
+   purge.
 
 ## Local validation
 

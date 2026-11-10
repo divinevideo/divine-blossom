@@ -56,6 +56,9 @@ if (req.http.Host ~ "(?i)^media-b2(-cdn)?[.]divine[.]video(:[0-9]+)?$") {
     return(pass);
   }
   set req.url = regsub(req.url, "^/([0-9a-f]{64})([.]mp4)?([?].*)?$", "/\1");
+  # Native range objects share this neutral URL and authenticated purge path.
+  # The response admission boundary still decides whether bytes may be stored.
+  set req.enable_segmented_caching = true;
 }
 
 # Cache hash-based content paths: /{64-char-hex}[.ext], /{hash}.hls,

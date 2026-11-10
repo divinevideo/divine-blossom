@@ -7,6 +7,45 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class B2CdnVclContractTests(unittest.TestCase):
+    def test_native_segments_are_enabled_only_after_anonymous_b2_key_validation(self):
+        recv = (ROOT / "vcl/recv.vcl").read_text()
+        self.assertIn('set req.enable_segmented_caching = true;', recv)
+        enabled = recv.index('set req.enable_segmented_caching = true;')
+        key = recv.index('set req.url = regsub(')
+        self.assertLess(key, enabled)
+        self.assertLess(recv.index('req.http.Authorization'), key)
+        self.assertLess(recv.index('req.http.Cookie'), key)
+        block = recv.split('# B2 original delivery', 1)[1]
+        self.assertIn('set req.enable_segmented_caching = true;', block)
+        self.assertIn('set req.http.Fastly-Purge-Requires-Auth = "1";', recv)
+        self.assertNotIn('return(lookup)', recv)
+
+    def test_segmented_variables_stay_in_documented_subroutines(self):
+        for name in ['miss', 'fetch', 'deliver', 'error', 'pass']:
+            source = (ROOT / f'vcl/{name}.vcl').read_text()
+            self.assertNotIn('req.enable_segmented_caching', source)
+            self.assertNotIn('segmented_caching.is_inner_req', source)
+
+    def test_native_range_fetches_are_not_overwritten_by_whole_object_miss_policy(self):
+        miss = (ROOT / "vcl/miss.vcl").read_text()
+        guarded = re.search(r'if \(req[.]http[.]Host !~ "\^media-b2\(-cdn\)\?\[\.\]divine\[\.\]video\$"\) \{\s*unset bereq[.]http[.]Range;\s*\}', miss)
+        self.assertIsNotNone(guarded)
+        self.assertEqual(miss.count('unset bereq.http.Range;'), 1)
+
+    def test_native_partial_admission_requires_verified_framing_and_version_tag(self):
+        fetch = (ROOT / "vcl/fetch.vcl").read_text()
+        block = fetch.split('# B2 original admission', 1)[1].split('# Origin owns', 1)[0]
+        for required in [
+            'if (beresp.status == 206)',
+            '"original-segment-v1"', 'beresp.http.Content-Length',
+            'beresp.http.Content-Range', 'beresp.http.Transfer-Encoding',
+            'beresp.http.ETag', 'beresp.http.Content-Encoding',
+        ]:
+            self.assertIn(required, block)
+        self.assertIn('"original-v1"', block)
+        self.assertIn('set beresp.grace = 0s;', block)
+        self.assertIn('set beresp.stale_while_revalidate = 0s;', block)
+
     def test_source_method_guard_preserves_purge_maintenance_path(self):
         recv = (ROOT / "vcl/recv.vcl").read_text()
         match = re.search(r'if \((req[.]method[^\n]+)\) \{\s*return\(pass\);', recv)

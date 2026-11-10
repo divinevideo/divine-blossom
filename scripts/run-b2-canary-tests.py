@@ -54,7 +54,7 @@ class Origin(BaseHTTPRequestHandler):
             current_hash = getattr(self.server, "hash", HASH)
             is_gcs = parsed.path == f"/gcs-test/{current_hash}"
             assert is_gcs or parsed.path == f"/private-test/{current_hash}", self.path
-            assert parse_qs(parsed.query) == ({} if is_gcs else {"versionId": [VERSION]}), self.path
+            assert parse_qs(parsed.query) == ({} if is_gcs else {"versionId": [getattr(self.server, "expected_request_version", VERSION)]}), self.path
             assert ("/auto/s3/aws4_request" if is_gcs else "/us-west-004/s3/aws4_request") in self.headers.get("Authorization", "")
             assert self.headers.get("Host") == ("storage.googleapis.com" if is_gcs else "s3.us-west-004.backblazeb2.com")
             if not is_gcs and self.server.status == "disconnect":
@@ -84,11 +84,23 @@ class Origin(BaseHTTPRequestHandler):
             elif self.headers.get("Range"):
                 status, body = 206, body[1:4]
             version = self.server.version
+            if getattr(self.server, "normalized_resource_ranges", False) and requested:
+                complete = self.server.body_override
+                start, end = requested.removeprefix("bytes=").split("-", 1)
+                start = int(start)
+                end = min(int(end) if end else len(complete) - 1, len(complete) - 1)
+                if start >= len(complete):
+                    status, body, content_range = 416, b"", f"bytes */{len(complete)}"
+                else:
+                    status, body, content_range = 206, complete[start:end + 1], f"bytes {start}-{end}/{len(complete)}"
             if getattr(self.server, "wrong_version_once", False):
                 self.server.wrong_version_once = False
                 version = "unverified-version"
             self.send_response(status)
             self.send_header("x-amz-version-id", version)
+            if not is_gcs:
+                for name, value in getattr(self.server, "media_extra_headers", []):
+                    self.send_header(name, value)
             if status == 206:
                 self.send_header("Content-Range", content_range)
             elif status == 416 and self.server.range_mode != "missing":
@@ -101,12 +113,13 @@ class Origin(BaseHTTPRequestHandler):
             try:
                 body_gate = getattr(self.server, "media_body_gate", None)
                 if self.path != "/b2api/v4/b2_authorize_account" and body_gate is not None:
-                    self.wfile.write(body[:3])
+                    prefix = getattr(self.server, "media_prefix_bytes", 3)
+                    self.wfile.write(body[:prefix])
                     self.wfile.flush()
                     self.server.gate_started.set()
                     if not body_gate.wait(timeout=10):
                         self.server.gate_timed_out = True
-                    self.wfile.write(body[3:])
+                    self.wfile.write(body[prefix:])
                 elif self.path != "/b2api/v4/b2_authorize_account" and getattr(self.server, "slow_body_once", False):
                     self.server.slow_body_once = False
                     self.wfile.write(body[:3])

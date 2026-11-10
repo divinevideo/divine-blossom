@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run real Compute CDN route/admission against synthetic private B2/GCS only."""
 import copy
+import hashlib
 import importlib.util
 import json
 import os
@@ -17,6 +18,11 @@ spec.loader.exec_module(fixture)
 HASH, OWNER, VERSION = fixture.HASH, fixture.OWNER, fixture.VERSION
 HOST = "media-b2-cdn.divine.video"
 ORIGIN = "synthetic.edgecompute.app"
+
+
+def entity_tag(version=VERSION, size=9, sha256=HASH):
+    identity = json.dumps(["b2-original-segment-v1", sha256, version, size], separators=(",", ":")).encode()
+    return '"b2-' + hashlib.sha256(identity).hexdigest() + '"'
 
 
 def main():
@@ -55,7 +61,8 @@ blossom_secrets = [{{key="fastly_api_token",data="synthetic"}},{{key="gcs_access
                             test_source="b2", test_body="b2 bytes!")
                 metadata = dict(sha256=HASH, size=9, type="video/mp4", uploaded="2026-01-01T00:00:00Z", owner=OWNER, status="active")
                 ready = dict(version=1, sha256=HASH, verified_sha256=HASH, bucket="private-test", key=HASH, size=9, verified_at=1, destination_version_id=VERSION)
-                cases = ["missing_purge", "missing_token", "wrong_purge", "forwarded", "head", "direct", "mp4_query", "disabled", "malformed_flag", "missing_host", "missing_origin", "unknown_origin", "unknown_forwarded", "mismatched_authority", "port", "authorization", "empty_authorization", "cookie", "empty_cookie", "upload", "admin", "derivative", "uppercase", "range", "gcs_fallback", "b2_missing_fallback", "wrong_version", "wrong_size", "native_auth", "restricted", "deleted", "vanish", "quarantine", "erasing", "copying", "missing_metadata", "forwarded_canary", "direct_canary", "configured_canary"]
+                cases = ["missing_purge", "missing_token", "wrong_purge", "forwarded", "head", "direct", "mp4_query", "disabled", "malformed_flag", "missing_host", "missing_origin", "unknown_origin", "unknown_forwarded", "mismatched_authority", "port", "authorization", "empty_authorization", "cookie", "empty_cookie", "upload", "admin", "derivative", "uppercase", "range", "if_range_match", "if_range_mismatch", "if_range_weak", "if_range_date", "if_range_gcs_fallback", "encoded_origin", "duplicate_length", "new_version", "size_8", "size_16", "size_32", "gcs_fallback", "b2_missing_fallback", "wrong_version", "wrong_size", "native_auth", "restricted", "deleted", "vanish", "quarantine", "erasing", "copying", "missing_metadata", "forwarded_canary", "direct_canary", "configured_canary"]
+                cases += ["full_8", "full_16", "full_32", "if_range_duplicate", "range_duplicate"]
                 for case in cases:
                     if os.environ.get("B2_CDN_CASE") not in (None, case):
                         continue
@@ -65,6 +72,11 @@ blossom_secrets = [{{key="fastly_api_token",data="synthetic"}},{{key="gcs_access
                     server.bucket_name, server.bucket_id = "private-test", "synthetic-bucket-id"
                     server.status, server.version, server.auth_status = 200, VERSION, 200
                     server.gcs_status, server.gcs_size, server.range_mode = 200, 9, "normal"
+                    server.expected_request_version = VERSION
+                    server.media_extra_headers = []
+                    server.body_override = None
+                    server.normalized_resource_ranges = False
+                    server.hash = HASH
                     if case == "head": values["test_method"] = "HEAD"; values["test_body"] = ""
                     if case in ("direct", "mp4_query", "port", "mismatched_authority"):
                         values.pop("test_forwarded")
@@ -89,7 +101,40 @@ blossom_secrets = [{{key="fastly_api_token",data="synthetic"}},{{key="gcs_access
                         path = {"upload": "/upload", "admin": "/admin", "derivative": f"/{HASH}/720p", "uppercase": f"/{HASH.upper()}"}[case]
                         values["test_url"] = f"https://{ORIGIN}{path}"
                         if case == "upload": values["test_method"] = "PUT"
-                    if case == "range": values.update(test_range="bytes=1-3", test_status="206", test_admitted="false", test_body="2 b")
+                    if case in ("range", "if_range_match"):
+                        values.update(test_range="bytes=1-3", test_status="206", test_admitted="true", test_admission="original-segment-v1", test_body="2 b", test_etag=entity_tag())
+                        if case == "if_range_match": values["test_if_range"] = entity_tag()
+                    if case in ("if_range_mismatch", "if_range_weak", "if_range_date"):
+                        values.update(test_range="bytes=1-3", test_etag=entity_tag())
+                        values["test_if_range"] = {"if_range_mismatch": '"unrelated"', "if_range_weak": "W/" + entity_tag(), "if_range_date": "Sun, 08 Nov 2026 00:00:00 GMT"}[case]
+                    if case == "if_range_gcs_fallback":
+                        data.pop(f"b2-ready:{HASH}")
+                        values.update(test_range="bytes=1-3", test_if_range=entity_tag(), test_source="gcs", test_body="gcsbytes!", test_admitted="false")
+                    if case == "if_range_duplicate":
+                        values.update(test_range="bytes=1-3", test_if_range=entity_tag(), test_if_range_second='"unrelated"', test_etag=entity_tag())
+                    if case == "range_duplicate":
+                        values.update(test_range="bytes=1-3", test_range_second="bytes=4-5", test_etag=entity_tag())
+                    if case in ("encoded_origin", "duplicate_length"):
+                        server.media_extra_headers = [("Content-Encoding", "gzip")] if case == "encoded_origin" else [("Content-Length", "9")]
+                        values.update(test_status="502", test_admitted="false", test_untrusted_segment="original-segment-v1")
+                    if case == "new_version":
+                        server.version = server.expected_request_version = "another-verified-version"
+                        data[f"b2-ready:{HASH}"]["destination_version_id"] = server.version
+                        values["test_etag"] = entity_tag(server.version)
+                    if case.startswith(("size_", "full_")):
+                        size = int(case.split("_")[1]) * 1024 * 1024
+                        body = (b"native-B2-segment\n" * (size // 18 + 1))[:size]
+                        assert len(body) == size
+                        sha = hashlib.sha256(body).hexdigest()
+                        server.hash, server.body_override, server.normalized_resource_ranges = sha, body, True
+                        blob = dict(metadata, sha256=sha, size=size)
+                        readiness = dict(ready, sha256=sha, verified_sha256=sha, key=sha, size=size)
+                        data = {f"blob:{sha}": blob, f"b2-ready:{sha}": readiness}
+                        values.update(test_url=f"https://{ORIGIN}/{sha}", test_hash=sha, test_etag=entity_tag(size=size, sha256=sha))
+                        if case.startswith("size_"):
+                            values.update(test_range="bytes=1048576-2097151", test_status="206", test_admission="original-segment-v1", test_body_sha256=hashlib.sha256(body[1048576:2097152]).hexdigest(), test_body_length="1048576")
+                        else:
+                            values.update(test_admission="original-v1" if size <= 20 * 1024 * 1024 else "original-segment-v1", test_body_sha256=sha, test_body_length=str(size))
                     if case in ("gcs_fallback", "b2_missing_fallback", "copying"):
                         values.update(test_source="gcs", test_body="gcsbytes!", test_admitted="false")
                         if case == "gcs_fallback": data.pop(f"b2-ready:{HASH}")

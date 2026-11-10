@@ -1,9 +1,12 @@
 # Verified B2 segment admission contract
 
 `blossom_core::b2_cdn::SegmentedOriginal` defines the verification contract for
-an original before a future segmented delivery path admits it. It does not
-enable Fastly segmented caching, change `original-v1`, remove the ordinary
-20 MiB limit, or change any runtime configuration.
+an original before the guarded delivery path admits it. Compute applies this
+contract after native version verification and final policy checks. The outer
+VCL enables native segmented caching on the anonymous B2 original route and
+admits verified inner 206 responses separately from `original-v1`. The ordinary
+20 MiB limit remains unchanged. These source changes do not activate a live
+service or change runtime configuration.
 
 The identity consists of the content hash, the verified destination version,
 and the complete object size. A strong entity tag hashes a versioned canonical
@@ -26,13 +29,19 @@ fresh policy guards. They do not authenticate a caller, verify body bytes, or
 establish quiescence. Duplicate/conflicting wire headers must be rejected by the
 transport boundary before constructing the response view.
 
-## Remaining integration and runtime acceptance
+## Integration and remaining runtime acceptance
 
-Wire the contract into the guarded Compute delivery path and native Fastly
-segmented caching together. Preserve authenticated URL purges for every segment,
-neutral object keys, shield selection, browser no-store, explicit GCS fallback
-labels, and final policy rechecks. Do not treat the contract tests as provider
-VCL execution or evidence that the live feature is enabled.
+The CDN handler mints a private admission hint only after native B2 version and
+framing verification. Final policy checks consume and remove it before delivery.
+Verified native inner 206 responses receive `original-segment-v1`; ordinary
+full responses retain their existing admission rules. The outer VCL preserves
+native range requests, normalized object keys, generated shield selection,
+browser no-store and authenticated maintenance purges. GCS fallback retains its
+GCS label and cannot receive either B2 admission marker.
+
+Loopback Compute tests cover 8/16/32 MiB bodies, conditional ranges, framing
+rejection and delayed policy changes across real HTTP streams. Those tests do
+not execute Fastly native caching, compile provider VCL, or prove live eviction.
 
 The live matrix must verify complete bytes at 8, 16 and 32 MiB, disjoint and
 conditional ranges, version changes, all-range purge, and denial of future

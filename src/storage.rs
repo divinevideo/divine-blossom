@@ -762,6 +762,20 @@ fn demand_delivery(
     if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
         return Ok(CanaryOrigin::Unavailable);
     }
+    if version.is_some()
+        && status != StatusCode::RANGE_NOT_SATISFIABLE
+        && (response.get_header_all("Content-Length").count() != 1
+            || response.get_header_all("Content-Range").count() > 1
+            || response.contains_header("Transfer-Encoding")
+            || !matches!(
+                response.get_header_str("Content-Encoding"),
+                None | Some("identity")
+            ))
+    {
+        return Err(BlossomError::StorageError(
+            "B2 representation framing invalid".into(),
+        ));
+    }
     if !blossom_core::canary::demand_origin_matches(
         status.as_u16(),
         response.get_header_str("Content-Length"),

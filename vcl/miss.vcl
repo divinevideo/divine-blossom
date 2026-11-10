@@ -1,5 +1,5 @@
 # ABOUTME: VCL miss snippet for Divine Blossom VCL caching layer
-# ABOUTME: Fetches full objects on cache fill so Fastly can synthesize 206s from cache
+# ABOUTME: Preserves native B2 segments and fills complete canonical objects
 #
 # Applied via the Fastly API/CLI as a VCL snippet in the vcl_miss subroutine.
 #
@@ -13,19 +13,20 @@
 # /{64-hex}... without an Authorization header. Restricted and authenticated
 # traffic takes the pass path and never reaches here.
 #
-# Safe to strip unconditionally: the largest object in a 1/256 sample of the
-# bucket is 27.9 MB (p50 0.17 MB, p99 3.4 MB), so a full fetch on a one-byte
-# probe is cheap and bounded.
-#
-# Expected behavior change: the FIRST client to request a cold object with a
-# Range header receives a full 200 rather than a 206. Players handle this
-# correctly. Subsequent range requests are synthesized from cache as 206s.
+# Canonical fills keep their existing full-object behavior. B2 native segmented
+# fills carry the range selected by Fastly; stripping it would defeat native
+# segmentation and could turn a bounded range into a large full-object fetch.
+# The provider integration tests must verify actual cold and warm client ranges.
 
-unset bereq.http.Range;
+# Keep native segmented inner ranges intact. Canonical/non-segmented fills
+# retain the existing full-object behavior.
+if (req.http.Host !~ "^media-b2(-cdn)?[.]divine[.]video$") {
+  unset bereq.http.Range;
+}
 
 
-# A B2 HEAD miss fills the same complete object as GET, never a headers-only
-# entry. Fastly suppresses the client body for HEAD after cache delivery.
+# A B2 HEAD miss uses a body-bearing GET fill, never a headers-only entry.
+# Fastly selects native segments and suppresses the client body on HEAD.
 if (req.http.Host ~ "^media-b2(-cdn)?[.]divine[.]video$") {
   set bereq.method = "GET";
 }

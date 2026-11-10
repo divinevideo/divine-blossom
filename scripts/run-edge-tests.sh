@@ -114,6 +114,7 @@ TEST_CDN_MISSING_STORE=1 TEST_CDN_CONTRACT=unavailable_config_store_cannot_disab
 
 # Streaming fills must outlive guest exit and remain safe under 1KiB fragmentation.
 VICEROY="$VICEROY" python3 scripts/run-b2-native-stream-tests.py
+VICEROY="$VICEROY" python3 scripts/run-b2-segmented-policy-races.py
 
 # Named media holds preserve base policy and enforce every derived route.
 VICEROY="$VICEROY" python3 scripts/run-quarantine-tests.py

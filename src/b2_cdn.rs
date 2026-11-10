@@ -71,6 +71,10 @@ impl FinalPolicy {
         }
     }
     pub(crate) fn apply(self, response: &mut Response) {
+        let prepared_tag = response
+            .get_header_str(crate::canary::VERIFIED_SEGMENT_HEADER)
+            .map(str::to_owned);
+        response.remove_header(crate::canary::VERIFIED_SEGMENT_HEADER);
         if self.route == Route::Unrelated {
             return;
         }
@@ -78,7 +82,7 @@ impl FinalPolicy {
         crate::canary::no_store(response);
         if self.route == Route::Delivery {
             if let Some(hash) = self.hash {
-                if b2_cdn::admit(
+                let ordinary = b2_cdn::admit(
                     response.get_status().as_u16(),
                     response.get_header_str("X-Divine-Source"),
                     response.contains_header("Content-Range"),
@@ -86,14 +90,54 @@ impl FinalPolicy {
                     && b2_cdn::outer_cacheable_length(response.get_header_str("Content-Length"))
                     && response.get_header_str("Content-Length")
                         == response.get_header_str("X-Content-Length")
+                    && !response.contains_header("Set-Cookie");
+                let size = response
+                    .get_header_str("X-Content-Length")
+                    .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                    .and_then(|v| v.parse::<u64>().ok());
+                let segmented = prepared_tag.as_deref().is_some_and(|tag| {
+                    let strong = tag
+                        .strip_prefix("\"b2-")
+                        .and_then(|v| v.strip_suffix('"'))
+                        .is_some_and(|v| {
+                            v.len() == 64
+                                && v.bytes()
+                                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                        });
+                    strong && response.get_header_str("ETag") == Some(tag)
+                }) && response.get_header_str("X-Divine-Source") == Some("b2")
+                    && response.get_header_str("X-Sha256") == Some(hash.as_str())
                     && !response.contains_header("Set-Cookie")
-                {
+                    && response.get_header_all("Content-Length").count() == 1
+                    && response.get_header_all("Content-Range").count() <= 1
+                    && !response.contains_header("Transfer-Encoding")
+                    && matches!(
+                        response.get_header_str("Content-Encoding"),
+                        None | Some("identity")
+                    )
+                    && size.is_some_and(|size| {
+                        size > 0
+                            && blossom_core::canary::origin_size_matches(
+                                response.get_status().as_u16(),
+                                response.get_header_str("Content-Length"),
+                                response.get_header_str("Content-Range"),
+                                size,
+                            )
+                    });
+                if ordinary || segmented {
                     response.set_header(
                         "Surrogate-Control",
                         "max-age=31536000, stale-while-revalidate=0, stale-if-error=0",
                     );
                     response.set_header("Surrogate-Key", hash);
-                    response.set_header("X-Divine-B2-CDN-Admission", "original-v1");
+                    response.set_header(
+                        "X-Divine-B2-CDN-Admission",
+                        if ordinary {
+                            "original-v1"
+                        } else {
+                            "original-segment-v1"
+                        },
+                    );
                 }
             }
         }
@@ -161,14 +205,11 @@ mod tests {
         let req = Request::get(format!("https://synthetic.edgecompute.app/{hash}"))
             .with_header("X-Original-Host", "media-b2-cdn.divine.video");
         let final_policy = super::FinalPolicy::for_request(&req);
-        let result = crate::with_quarantine_response_guard(req, |_| {
-            // This represents a verified original prepared before a concurrent
-            // hold becomes visible to the final, uncached response guard.
-            let mut response = fastly::Response::from_status(StatusCode::OK).with_body("b2 bytes!");
-            response.set_header("X-Divine-Source", "b2");
-            response.set_header("X-Sha256", &hash);
-            response.set_header("Content-Length", "9");
-            response.set_header("X-Content-Length", "9");
+        let result = crate::with_quarantine_response_guard(req, |req| {
+            // Exercise the actual verified HTTP-origin handler before a hold
+            // becomes visible to the final, uncached response guard.
+            let response = crate::canary::handle_cdn(req)?;
+            assert!(response.contains_header(crate::canary::VERIFIED_SEGMENT_HEADER));
             crate::metadata::open_store()
                 .unwrap()
                 .insert(
@@ -186,6 +227,7 @@ mod tests {
             Some("no-store")
         );
         assert!(!response.contains_header("X-Divine-B2-CDN-Admission"));
+        assert!(!response.contains_header(crate::canary::VERIFIED_SEGMENT_HEADER));
     }
     #[test]
     #[ignore = "requires synthetic private origin; scripts/run-b2-cdn-tests.py"]
@@ -205,6 +247,18 @@ mod tests {
         if let Some(range) = config.get("test_range") {
             req.set_header("Range", range);
         }
+        if let Some(value) = config.get("test_if_range") {
+            req.set_header("If-Range", value);
+        }
+        if let Some(value) = config.get("test_if_range_second") {
+            req.append_header("If-Range", value);
+        }
+        if let Some(value) = config.get("test_range_second") {
+            req.append_header("Range", value);
+        }
+        if let Some(value) = config.get("test_untrusted_segment") {
+            req.set_header("X-Divine-B2-Verified-Segment", value);
+        }
         for (config_name, header) in [("test_auth", "Authorization"), ("test_cookie", "Cookie")] {
             if let Some(value) = config.get(config_name) {
                 req.set_header(header, value);
@@ -218,9 +272,12 @@ mod tests {
             Some("private, no-store")
         );
         if config.get("test_admitted").as_deref() == Some("true") {
+            let expected_admission = config
+                .get("test_admission")
+                .unwrap_or_else(|| "original-v1".into());
             assert_eq!(
                 response.get_header_str("X-Divine-B2-CDN-Admission"),
-                Some("original-v1")
+                Some(expected_admission.as_str())
             );
             assert_eq!(
                 response.get_header_str("Surrogate-Control"),
@@ -228,7 +285,12 @@ mod tests {
             );
             assert_eq!(
                 response.get_header_str("Surrogate-Key"),
-                Some("a".repeat(64).as_str())
+                Some(
+                    config
+                        .get("test_hash")
+                        .unwrap_or_else(|| "a".repeat(64))
+                        .as_str()
+                )
             );
         } else {
             assert!(!response.contains_header("X-Divine-B2-CDN-Admission"));
@@ -238,15 +300,38 @@ mod tests {
             );
         }
         if status == 200 || status == 206 {
+            if let Some(expected_tag) = config.get("test_etag") {
+                assert_eq!(response.get_header_str("ETag"), Some(expected_tag.as_str()));
+            }
+            assert!(!response.contains_header("X-Divine-B2-Verified-Segment"));
             assert_eq!(
                 response.get_header_str("X-Divine-Source"),
                 config.get("test_source").as_deref()
             );
-            let body = response.take_body().into_string();
             if method == "HEAD" {
-                assert_eq!(body, "");
+                assert!(response.take_body().into_bytes().is_empty());
+            } else if let Some(expected_sha) = config.get("test_body_sha256") {
+                use sha2::{Digest, Sha256};
+                use std::io::Read;
+                let mut body = response.take_body();
+                let mut digest = Sha256::new();
+                let mut length = 0u64;
+                let mut chunk = [0u8; 65536];
+                loop {
+                    let read = body.read(&mut chunk).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    digest.update(&chunk[..read]);
+                    length += read as u64;
+                }
+                assert_eq!(hex::encode(digest.finalize()), expected_sha);
+                assert_eq!(length.to_string(), config.get("test_body_length").unwrap());
             } else {
-                assert_eq!(body, config.get("test_body").unwrap());
+                assert_eq!(
+                    response.take_body().into_bytes(),
+                    config.get("test_body").unwrap().into_bytes()
+                );
             }
         }
     }
