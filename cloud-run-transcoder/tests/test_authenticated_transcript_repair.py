@@ -63,12 +63,13 @@ class AuthenticatedTranscriptRepairTests(unittest.TestCase):
         self.assertNotIn('synthetic-private-repair', result.stdout + result.stderr)
 
     def test_redirect_never_forwards_repair_credential(self):
-        with server() as (other, leaked), server(307, other + '/transcribe') as (endpoint, captured):
-            result = self.run_repair(endpoint)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(len(captured), 1)
-        self.assertEqual(leaked, [])
-        self.assertNotIn('synthetic-private-repair', result.stdout + result.stderr)
+        for code in (301, 302, 303, 307, 308):
+            with self.subTest(code=code), server() as (other, leaked), server(code, other + '/transcribe') as (endpoint, captured):
+                result = self.run_repair(endpoint)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(len(captured), 1)
+            self.assertEqual(leaked, [])
+            self.assertNotIn('synthetic-private-repair', result.stdout + result.stderr)
 
     def test_invalid_secret_or_hash_has_no_network_effect(self):
         for token, media_hash in [('', 'a' * 64), ('line\nbreak', 'a' * 64), ('valid', 'invalid')]:
