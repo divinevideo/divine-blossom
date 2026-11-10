@@ -472,3 +472,15 @@ deploy-landed check reads the serving revision, because that is what production
 is answering with. Do not substitute one for the other — during a pinned window
 they give different answers, and each is the wrong answer to the other's
 question.
+
+## HLS short URL verification
+
+A ready `/<hash>.hls` request redirects with HTTP 307 to
+`/<hash>/hls/master.m3u8`. The canonical master retains its relative variant
+paths, which now resolve inside the same video's directory. Existing access
+checks, private responses, and pending 202 responses still apply.
+
+After deploying this route correction, verify the short URL by following its
+redirect, then fetch one returned variant and its segments. If an exact known
+short URL still has the old cached 200 response, use the operator-approved exact
+URL purge procedure; do not globally purge the catalogue or enumerate aliases.

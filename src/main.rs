@@ -1033,12 +1033,11 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
         return Err(BlossomError::NotFound("Content not found".into()));
     }
 
-    // Try GCS first — many videos have HLS in GCS but metadata wasn't updated.
-    // GCS is the source of truth: if the manifest exists, serve it.
+    // The configured derived-media origin can have HLS before metadata is updated.
     let gcs_path = format!("{}/hls/master.m3u8", hash);
     match download_hls_content(&gcs_path, None) {
         Ok(result) => {
-            // HLS exists in GCS — serve it and fix metadata if needed
+            // The master exists: redirect to its canonical directory and repair stale metadata.
             let meta = metadata.as_ref().unwrap();
             if meta.transcode_status != Some(TranscodeStatus::Complete) {
                 eprintln!(
@@ -1048,15 +1047,17 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
                 use crate::metadata::update_transcode_status;
                 let _ = update_transcode_status(&hash, TranscodeStatus::Complete);
             }
-            let mut resp = result;
-
-            let c2pa_manifest_id = resp
+            let c2pa_manifest_id = result
                 .get_header_str("x-goog-meta-c2pa-manifest-id")
                 .map(|s| s.to_string());
-            let source_sha256 = resp
+            let source_sha256 = result
                 .get_header_str("x-goog-meta-source-sha256")
                 .map(|s| s.to_string());
 
+            // Relative variant URIs must resolve inside this video's HLS directory.
+            // Redirect only after the existing access and manifest-existence checks.
+            let mut resp = Response::from_status(StatusCode::TEMPORARY_REDIRECT);
+            resp.set_header("Location", format!("/{hash}/hls/master.m3u8"));
             resp.set_header("Content-Type", "application/vnd.apple.mpegurl");
             if is_admin || status_requires_private_response(meta.status) {
                 add_private_cache_headers(&mut resp, &hash);
@@ -1075,7 +1076,7 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
             Ok(resp)
         }
         Err(BlossomError::NotFound(_)) => {
-            // HLS not in GCS — check metadata and trigger transcoding if needed
+            // No master was found: check metadata and trigger transcoding if needed
             let meta = metadata.as_ref().unwrap();
             match decide_transcode_fetch_action(
                 meta.transcode_status,
@@ -9071,3 +9072,7 @@ mod subtitle_translation_tests;
 
 #[cfg(test)]
 mod upload_routing_tests;
+
+#[cfg(test)]
+#[path = "hls_alias_tests.rs"]
+mod hls_alias_tests;
