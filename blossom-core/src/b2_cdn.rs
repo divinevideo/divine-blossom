@@ -101,6 +101,112 @@ pub fn outer_cacheable_length(value: Option<&str>) -> bool {
     })
 }
 
+/// A worker-verified original identity. This contract alone does not enable
+/// segmented caching or replace the ordinary original-v1 admission boundary.
+#[derive(Clone, Copy)]
+pub struct SegmentedOriginal<'a> {
+    pub sha256: &'a str,
+    pub destination_version_id: &'a str,
+    pub size: u64,
+}
+
+/// Delivery metadata after native version, policy and framing verification.
+/// Callers must reject duplicate/conflicting framing before constructing this
+/// view; one parsed header value is not proof of the upstream wire framing.
+pub struct SegmentedResponse<'a> {
+    pub method: &'a str,
+    pub source: Option<&'a str>,
+    pub status: u16,
+    pub content_length: Option<&'a str>,
+    pub content_range: Option<&'a str>,
+    pub entity_tag: Option<&'a str>,
+    pub content_encoding: Option<&'a str>,
+    pub transfer_encoding: Option<&'a str>,
+    pub set_cookie: bool,
+}
+
+impl SegmentedOriginal<'_> {
+    /// Opaque strong validator for one verified, immutable representation.
+    /// Tuple serialization prevents ambiguous concatenation of identity fields.
+    pub fn entity_tag(&self) -> Option<String> {
+        use sha2::{Digest, Sha256};
+        if self.size == 0
+            || self.sha256.len() != 64
+            || !self
+                .sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || self.destination_version_id.is_empty()
+            || self.destination_version_id.len() > 1024
+            || !self
+                .destination_version_id
+                .bytes()
+                .all(|b| (33..=126).contains(&b))
+        {
+            return None;
+        }
+        let identity = serde_json::to_vec(&(
+            "b2-original-segment-v1",
+            self.sha256,
+            self.destination_version_id,
+            self.size,
+        ))
+        .ok()?;
+        Some(format!("\"b2-{}\"", hex::encode(Sha256::digest(identity))))
+    }
+
+    /// An unproven If-Range validator conservatively selects the full response.
+    /// In particular, no Last-Modified evidence is available to validate dates.
+    pub fn selected_range<'a>(
+        &self,
+        method: &str,
+        range: Option<&'a str>,
+        if_range: Option<&str>,
+    ) -> Option<&'a str> {
+        let tag = self.entity_tag()?;
+        if method != "GET" || if_range.is_some_and(|value| value != tag) {
+            return None;
+        }
+        crate::canary::single_range(range)
+    }
+
+    /// Check final verified metadata against the already selected origin range.
+    /// Actual byte verification, authorization and final policy checks remain
+    /// obligations of the delivery boundary, not consequences of this result.
+    pub fn admits(&self, response: &SegmentedResponse<'_>, range: Option<&str>) -> bool {
+        let Some(tag) = self.entity_tag() else {
+            return false;
+        };
+        if !matches!(response.method, "GET" | "HEAD")
+            || response.source != Some("b2")
+            || response.entity_tag != Some(tag.as_str())
+            || response.set_cookie
+            || !matches!(response.content_encoding, None | Some("identity"))
+            || response.transfer_encoding.is_some()
+        {
+            return false;
+        }
+        let Some(length) = response
+            .content_length
+            .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            return false;
+        };
+        match response.status {
+            200 => range.is_none() && response.content_range.is_none() && length == self.size,
+            206 if response.method == "GET" => range
+                .and_then(|value| crate::canary::requested_span(value, self.size))
+                .is_some_and(|(start, end)| {
+                    (end - start).checked_add(1) == Some(length)
+                        && response.content_range
+                            == Some(format!("bytes {start}-{end}/{}", self.size).as_str())
+                }),
+            _ => false,
+        }
+    }
+}
+
 /// Hosts bound to the outer service and retained for targeted URL purges.
 /// Only the delivery names managed by this VCL source are eligible.
 pub fn purge_hosts<'a>(
