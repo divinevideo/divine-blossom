@@ -227,9 +227,46 @@ impl MediaStorage {
     pub async fn stat(&self, key: &str) -> Result<Option<ObjectMetadata>> {
         self.stat_pinned(key, None).await
     }
-    pub fn can_reuse_hls_master(&self) -> bool {
-        // A master alone cannot prove that a prior segment backup succeeded.
-        self.required_backup.is_none()
+    pub async fn can_reuse_hls(&self, hash: &str) -> Result<bool> {
+        let prefix = format!("{hash}/hls");
+        let Some(backup) = &self.required_backup else {
+            return Ok(self.stat(&format!("{prefix}/master.m3u8")).await?.is_some());
+        };
+        // The encoder emits two single-file TS variants. A master alone cannot
+        // prove their backups succeeded, and regenerating every duplicate job
+        // would discard the existing at-least-once dispatch's idempotency.
+        for (filename, required) in [
+            ("master.m3u8", true),
+            ("stream_720p.m3u8", true),
+            ("stream_480p.m3u8", true),
+            ("stream_720p.ts", true),
+            ("stream_480p.ts", true),
+            ("stream_720p.mp4", false),
+            ("stream_480p.mp4", false),
+        ] {
+            let key = format!("{prefix}/{filename}");
+            let Some(primary) = self.stat(&key).await? else {
+                if required {
+                    return Ok(false);
+                }
+                // Progressive remux is best-effort; absent MP4s are not HLS
+                // failures, but any MP4 actually written needs its backup.
+                continue;
+            };
+            let Some(replica) = backup.stat(&key).await? else {
+                return Ok(false);
+            };
+            if primary.size != replica.size
+                || primary.content_type != replica.content_type
+                || primary.custom != replica.custom
+                || primary.cache_control != replica.cache_control
+                || self.hash_body(&primary, None).await?
+                    != backup.hash_body(&replica, None).await?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
     /// Preserve the primary's provenance when shared audio needs a backup.
     pub async fn ensure_existing_backup(

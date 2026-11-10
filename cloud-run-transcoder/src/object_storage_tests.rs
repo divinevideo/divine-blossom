@@ -525,7 +525,6 @@ async fn existing_audio_backup_repair_preserves_primary_version_and_provenance()
         .await
         .unwrap();
     let store = b2_primary_store(&origin, client);
-    assert!(!store.can_reuse_hls_master());
     let before = origin.objects.lock().await.requests.len();
     store
         .ensure_existing_backup(&primary.object, bytes)
@@ -570,6 +569,113 @@ async fn b2_primary_never_writes_backup_when_primary_verification_fails() {
         .is_err());
     assert!(backup.lock().await.requests.is_empty());
     task.abort();
+}
+
+#[tokio::test]
+async fn hls_reuse_checks_all_required_copies_without_rewriting_them() {
+    let primary = Origin::start().await;
+    let replica = Origin::start().await;
+    // Use two versioned loopback stores for the backend-independent family
+    // comparison; the GCS-specific backup wire path is covered above.
+    let mut store = primary.store();
+    store.required_backup = Some(Box::new(replica.store()));
+    let hash = "a".repeat(64);
+    let prefix = format!("{hash}/hls");
+    let files = [
+        "master.m3u8",
+        "stream_720p.m3u8",
+        "stream_480p.m3u8",
+        "stream_720p.ts",
+        "stream_480p.ts",
+    ];
+    for filename in files {
+        assert!(!store.can_reuse_hls(&hash).await.unwrap());
+        store
+            .put_verified(
+                &format!("{prefix}/{filename}"),
+                Bytes::from_static(b"synthetic media"),
+                "application/octet-stream",
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    // The best-effort progressive outputs need not exist, but every produced
+    // copy must match. A successful duplicate performs reads only.
+    let writes_before = primary.objects.lock().await.versions.len();
+    let replicas_before = replica.objects.lock().await.versions.len();
+    assert!(store.can_reuse_hls(&hash).await.unwrap());
+    assert_eq!(primary.objects.lock().await.versions.len(), writes_before);
+    assert_eq!(replica.objects.lock().await.versions.len(), replicas_before);
+
+    let key = format!("{prefix}/stream_480p.ts");
+    replica.objects.lock().await.latest.remove(&key);
+    assert!(!store.can_reuse_hls(&hash).await.unwrap());
+    // A primary overwrite whose backup failed cannot be acknowledged merely
+    // because the old backup and master still exist.
+    primary
+        .store()
+        .put_verified(
+            &key,
+            Bytes::from_static(b"altered media!!"),
+            "application/octet-stream",
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+    let old_version = replica
+        .objects
+        .lock()
+        .await
+        .versions
+        .keys()
+        .find(|(name, _)| name == &key)
+        .unwrap()
+        .1
+        .clone();
+    replica.objects.lock().await.latest.insert(key, old_version);
+    assert!(!store.can_reuse_hls(&hash).await.unwrap());
+}
+
+#[tokio::test]
+async fn hls_reuse_requires_backups_for_present_progressive_outputs() {
+    let primary = Origin::start().await;
+    let replica = Origin::start().await;
+    let mut store = primary.store();
+    store.required_backup = Some(Box::new(replica.store()));
+    let hash = "b".repeat(64);
+    for filename in [
+        "master.m3u8",
+        "stream_720p.m3u8",
+        "stream_480p.m3u8",
+        "stream_720p.ts",
+        "stream_480p.ts",
+        "stream_720p.mp4",
+        "stream_480p.mp4",
+    ] {
+        store
+            .put_verified(
+                &format!("{hash}/hls/{filename}"),
+                Bytes::from_static(b"synthetic media"),
+                "application/octet-stream",
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    assert!(store.can_reuse_hls(&hash).await.unwrap());
+    replica
+        .objects
+        .lock()
+        .await
+        .latest
+        .remove(&format!("{hash}/hls/stream_480p.mp4"));
+    assert!(!store.can_reuse_hls(&hash).await.unwrap());
+    // Legacy modes retain master-only reuse even with missing variants.
+    assert!(primary.store().can_reuse_hls(&hash).await.unwrap());
 }
 
 #[tokio::test]
