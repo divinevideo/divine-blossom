@@ -6,6 +6,7 @@ declare local var.b2_segment_start INTEGER;
 declare local var.b2_segment_end INTEGER;
 declare local var.b2_segment_total INTEGER;
 declare local var.b2_segment_length INTEGER;
+declare local var.b2_segment_range_length INTEGER;
 
 # Strip any anti-caching headers leaked from GCS through Compute
 unset beresp.http.Pragma;
@@ -77,6 +78,7 @@ if (req.http.Host ~ "(?i)^media-b2(-cdn)?[.]divine[.]video(:[0-9]+)?$") {
     set var.b2_segment_end = std.atoi(regsub(beresp.http.Content-Range, "^bytes ([0-9]+)-([0-9]+)/([0-9]+)\z", "\2"));
     set var.b2_segment_total = std.atoi(regsub(beresp.http.Content-Range, "^bytes ([0-9]+)-([0-9]+)/([0-9]+)\z", "\3"));
     set var.b2_segment_length = std.atoi(beresp.http.Content-Length);
+    set var.b2_segment_range_length = var.b2_segment_end - var.b2_segment_start + 1;
     # Round-trip every integer so overflow/fallback parsing cannot admit bytes.
     if (std.itoa(var.b2_segment_start) != regsub(beresp.http.Content-Range, "^bytes ([0-9]+)-([0-9]+)/([0-9]+)\z", "\1") ||
         std.itoa(var.b2_segment_end) != regsub(beresp.http.Content-Range, "^bytes ([0-9]+)-([0-9]+)/([0-9]+)\z", "\2") ||
@@ -85,7 +87,7 @@ if (req.http.Host ~ "(?i)^media-b2(-cdn)?[.]divine[.]video(:[0-9]+)?$") {
         std.itoa(var.b2_segment_total) != beresp.http.X-Content-Length ||
         var.b2_segment_start < 0 || var.b2_segment_end < var.b2_segment_start ||
         var.b2_segment_total <= var.b2_segment_end || var.b2_segment_length <= 0 ||
-        var.b2_segment_end - var.b2_segment_start + 1 != var.b2_segment_length) {
+        var.b2_segment_range_length != var.b2_segment_length) {
       set beresp.ttl = 0s;
       return(pass);
     }
