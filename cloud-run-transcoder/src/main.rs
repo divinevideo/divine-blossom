@@ -7284,11 +7284,7 @@ async fn download_media_original(
     hash: &str,
     path: &Path,
 ) -> Result<object_storage::VerifiedObject> {
-    let object = storage
-        .stat(hash)
-        .await?
-        .ok_or_else(|| anyhow!("Original not found"))?;
-    storage.download_original(&object, hash, path).await
+    storage.download_processing_original(hash, path).await
 }
 
 /// Send transcode status update to the Fastly edge webhook

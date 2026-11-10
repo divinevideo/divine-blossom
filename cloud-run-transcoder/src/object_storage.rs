@@ -445,6 +445,31 @@ impl MediaStorage {
         }
         Ok(hex::encode(hash.finalize()))
     }
+    /// Prefer the selected provider. During a B2-primary migration, only an
+    /// absent original may fall back to its legacy GCS location; provider
+    /// failures or failed verification must never select another source.
+    pub async fn download_processing_original(
+        &self,
+        expected_sha: &str,
+        path: &Path,
+    ) -> Result<VerifiedObject> {
+        if !is_sha256(expected_sha) {
+            bail!("Original SHA-256 identity invalid");
+        }
+        if let Some(object) = self.stat(expected_sha).await? {
+            return self.download_original(&object, expected_sha, path).await;
+        }
+        let legacy = self
+            .required_backup
+            .as_deref()
+            .ok_or_else(|| anyhow!("Original not found"))?;
+        let object = legacy
+            .stat(expected_sha)
+            .await?
+            .ok_or_else(|| anyhow!("Original not found"))?;
+        legacy.download_original(&object, expected_sha, path).await
+    }
+
     pub async fn download_original(
         &self,
         object: &ObjectMetadata,

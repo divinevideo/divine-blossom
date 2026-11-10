@@ -8,6 +8,8 @@ change public media URLs. Derived-media readers have separate configuration.
 `MEDIA_STORAGE_PROVIDER=b2_primary` uses B2 for those media reads and requires
 verified GCS backups for every write through this adapter. It requires the same
 B2 settings plus the existing authenticated GCS client and nonempty GCS bucket.
+Processing originals fall back to the pinned, verified legacy GCS copy only
+when the B2 metadata lookup reports absence; all other failures remain errors.
 Both immutable provider versions and their bytes/metadata are verified before
 `put_verified` succeeds; its receipt includes `required_backup`. A failed backup
 returns an error even if B2 already accepted the primary. It does not delete
