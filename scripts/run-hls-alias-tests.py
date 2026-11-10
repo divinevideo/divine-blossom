@@ -68,9 +68,9 @@ blossom_secrets = [{{key="admin_token",data="synthetic-admin-token"}},{{key="gcs
                     env.get("VICEROY", "viceroy"), "run", "-C", str(config), "--"])
                 result = subprocess.run([
                     "cargo", "test", "--locked", "--target", "wasm32-wasip1", "--bin", "fastly-blossom",
-                    "hls_alias_relative_playlist_http_contract", "--", "--ignored", "--nocapture"],
+                    "hls_alias_", "--", "--ignored", "--nocapture"],
                     cwd=repo, env=env, capture_output=True, text=True, timeout=900)
-                if result.returncode or "test result: ok. 1 passed; 0 failed; 0 ignored;" not in result.stdout:
+                if result.returncode or "test result: ok. 2 passed; 0 failed; 0 ignored;" not in result.stdout:
                     raise RuntimeError(result.stdout + result.stderr)
                 prefix = f"/hls-test/{'a' * 64}/hls/"
                 required = {
@@ -80,9 +80,9 @@ blossom_secrets = [{{key="admin_token",data="synthetic-admin-token"}},{{key="gcs
                     (prefix + "stream_480p.mp4", "bytes=0-3"),
                     (f"/hls-test/{'c' * 64}/hls/master.m3u8", None),
                 }
-                # Alias, canonical and admin requests may share the cached origin master.
-                assert set(origin.reads) == required and len(origin.reads) <= 7, origin.reads
-                print("PASS HLS alias follows canonical playlists/segments and ranged MP4 while preserving access and cache policy")
+                # Alias, canonical, admin and signed requests may share the cached origin master.
+                assert set(origin.reads) == required and len(origin.reads) <= 11, origin.reads
+                print("PASS HLS alias resolves canonical playlists/segments and ranged MP4 while preserving access and cache policy")
         finally:
             origin.shutdown()
             thread.join()

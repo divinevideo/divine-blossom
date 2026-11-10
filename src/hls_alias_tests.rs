@@ -30,16 +30,11 @@ fn hls_alias_relative_playlist_http_contract() {
         .get_header_str("Cache-Control")
         .unwrap()
         .contains("public"));
-    let (base, mut master) = if status == StatusCode::TEMPORARY_REDIRECT {
-        let location = initial.get_header_str("Location").unwrap();
-        assert_eq!(location, format!("/{hash}/hls/master.m3u8"));
-        assert!(initial.get_header_str("ETag").is_none());
-        let target = Request::get(&alias).get_url().join(location).unwrap();
-        let base = target.clone();
-        (base, response(Request::get(target.as_str())))
-    } else {
-        (Request::get(&alias).get_url().clone(), initial)
-    };
+    assert_eq!(status, StatusCode::OK);
+    assert!(initial.get_header_str("Location").is_none());
+    assert!(initial.get_header_str("ETag").is_none());
+    let base = Request::get(&alias).get_url().clone();
+    let mut master = initial;
     assert_eq!(master.get_status(), StatusCode::OK);
     let body = master.take_body_str();
     assert!(body.starts_with("#EXTM3U"));
@@ -53,7 +48,7 @@ fn hls_alias_relative_playlist_http_contract() {
         variant.path().starts_with(&format!("/{hash}/hls/")),
         "playlist escaped its video directory: {variant}"
     );
-    assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(status, StatusCode::OK);
     let mut playlist = response(Request::get(variant.as_str()));
     assert_eq!(playlist.get_status(), StatusCode::OK);
     let body = playlist.take_body_str();
@@ -76,7 +71,13 @@ fn hls_alias_relative_playlist_http_contract() {
     );
     assert_eq!(segment.take_body_bytes(), b"segm");
 
-    // A redirect is not an access grant; denied requests never reach the origin.
+    let mut canonical = response(Request::get(format!(
+        "https://media.example.test/{hash}/hls/master.m3u8"
+    )));
+    assert_eq!(canonical.get_status(), StatusCode::OK);
+    assert!(canonical.take_body_str().contains("\nstream_480p.m3u8\n"));
+
+    // Rewriting is not an access grant; denied requests never reach the origin.
     metadata(&hash, "banned", "complete");
     assert_eq!(
         response(Request::get(&alias)).get_status(),
@@ -85,7 +86,7 @@ fn hls_alias_relative_playlist_http_contract() {
     let mut admin = Request::get(&alias);
     admin.set_header("Authorization", "Bearer synthetic-admin-token");
     let admin = response(admin);
-    assert_eq!(admin.get_status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(admin.get_status(), StatusCode::OK);
     assert!(admin
         .get_header_str("Cache-Control")
         .unwrap()
@@ -98,4 +99,65 @@ fn hls_alias_relative_playlist_http_contract() {
     )));
     assert_eq!(pending.get_status(), StatusCode::ACCEPTED);
     assert!(pending.get_header_str("Location").is_none());
+}
+
+#[test]
+#[ignore = "requires local synthetic metadata and HLS origin"]
+fn hls_alias_url_bound_viewer_http_contract() {
+    use base64::Engine;
+    use k256::schnorr::{signature::hazmat::PrehashSigner, SigningKey};
+    let key = SigningKey::from_bytes(&[7u8; 32]).unwrap();
+    let owner = hex::encode(key.verifying_key().to_bytes());
+    let hash = "a".repeat(64);
+    let alias = format!("https://media.example.test/{hash}.hls");
+    for status in ["age_restricted", "restricted"] {
+        let value: BlobMetadata = serde_json::from_value(serde_json::json!({
+            "sha256": hash, "size": 10, "type": "video/mp4", "owner": owner,
+            "uploaded": "2026-01-01T00:00:00Z", "status": status,
+            "transcode_status": "complete"
+        }))
+        .unwrap();
+        put_blob_metadata(&value).unwrap();
+        let now = unix_timestamp_secs();
+        let mut event = crate::blossom::BlossomAuthEvent {
+            id: String::new(),
+            pubkey: owner.clone(),
+            created_at: now,
+            kind: 27235,
+            tags: vec![
+                vec!["u".into(), alias.clone()],
+                vec!["method".into(), "GET".into()],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        let canonical = serde_json::json!([0, event.pubkey, now, 27235, event.tags, ""]);
+        let id = Sha256::digest(serde_json::to_vec(&canonical).unwrap());
+        let signature: k256::schnorr::Signature = key.sign_prehash(&id).unwrap();
+        event.id = hex::encode(id);
+        event.sig = hex::encode(signature.to_bytes());
+        let mut request = Request::get(&alias);
+        request.set_header(
+            "Authorization",
+            format!(
+                "Nostr {}",
+                base64::engine::general_purpose::STANDARD
+                    .encode(serde_json::to_vec(&event).unwrap())
+            ),
+        );
+        let mut response = response(request);
+        assert_eq!(
+            response.get_status(),
+            StatusCode::OK,
+            "URL-bound viewer must receive the alias manifest without re-signing a redirect"
+        );
+        assert!(response
+            .get_header_str("Cache-Control")
+            .unwrap()
+            .contains("private"));
+        assert!(response.get_header_str("Location").is_none());
+        assert!(response
+            .take_body_str()
+            .contains(&format!("/{hash}/hls/stream_480p.m3u8")));
+    }
 }

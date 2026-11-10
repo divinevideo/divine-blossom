@@ -475,12 +475,14 @@ question.
 
 ## HLS short URL verification
 
-A ready `/<hash>.hls` request redirects with HTTP 307 to
-`/<hash>/hls/master.m3u8`. The canonical master retains its relative variant
-paths, which now resolve inside the same video's directory. Existing access
-checks, private responses, and pending 202 responses still apply.
+A ready `/<hash>.hls` response keeps HTTP 200 and expands relative rendition
+URIs to `/<hash>/hls/...`, including quoted URI attributes. This preserves
+URL-bound viewer authentication at the alias. The canonical master and media
+playlists retain their existing relative paths, access checks, and cache policy.
+Pending requests still return 202.
 
-After deploying this route correction, verify the short URL by following its
-redirect, then fetch one returned variant and its segments. If an exact known
-short URL still has the old cached 200 response, use the operator-approved exact
-URL purge procedure; do not globally purge the catalogue or enumerate aliases.
+After deploying this route correction, fetch an owned short HLS URL, resolve
+its returned rendition and segment URLs normally, and decode/seek the video.
+If the exact tested alias retains its older cached body, use the
+operator-approved exact URL purge procedure; do not globally purge the catalogue
+or enumerate aliases.

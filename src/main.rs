@@ -11,6 +11,7 @@ mod blossom;
 mod canary;
 mod playback_cache;
 mod delete_policy;
+mod hls_manifest;
 mod delivery_telemetry;
 mod error;
 mod media_auth_log;
@@ -1036,8 +1037,8 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
     // The configured derived-media origin can have HLS before metadata is updated.
     let gcs_path = format!("{}/hls/master.m3u8", hash);
     match download_hls_content(&gcs_path, None) {
-        Ok(result) => {
-            // The master exists: redirect to its canonical directory and repair stale metadata.
+        Ok(mut result) => {
+            // The master exists: serve it with canonical URI paths and repair stale metadata.
             let meta = metadata.as_ref().unwrap();
             if meta.transcode_status != Some(TranscodeStatus::Complete) {
                 eprintln!(
@@ -1054,10 +1055,23 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
                 .get_header_str("x-goog-meta-source-sha256")
                 .map(|s| s.to_string());
 
-            // Relative variant URIs must resolve inside this video's HLS directory.
-            // Redirect only after the existing access and manifest-existence checks.
-            let mut resp = Response::from_status(StatusCode::TEMPORARY_REDIRECT);
-            resp.set_header("Location", format!("/{hash}/hls/master.m3u8"));
+            use std::io::Read;
+            let mut body = Vec::new();
+            result
+                .take_body()
+                .take(hls_manifest::MAX_MASTER_BYTES + 1)
+                .read_to_end(&mut body)
+                .map_err(|_| BlossomError::StorageError("Could not read HLS master".into()))?;
+            if body.len() as u64 > hls_manifest::MAX_MASTER_BYTES {
+                return Err(BlossomError::StorageError("HLS master exceeds size limit".into()));
+            }
+            let body = std::str::from_utf8(&body)
+                .map_err(|_| BlossomError::StorageError("HLS master is not UTF-8".into()))?;
+            let body = hls_manifest::for_alias(body, &hash)
+                .map_err(|message| BlossomError::StorageError(message.into()))?;
+            // Keep the signed alias URL and avoid forwarding an origin ETag for rewritten bytes.
+            let mut resp = Response::from_status(StatusCode::OK);
+            resp.set_body(body);
             resp.set_header("Content-Type", "application/vnd.apple.mpegurl");
             if is_admin || status_requires_private_response(meta.status) {
                 add_private_cache_headers(&mut resp, &hash);
