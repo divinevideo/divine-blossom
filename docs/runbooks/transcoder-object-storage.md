@@ -5,6 +5,28 @@ The transcoder's private byte adapter defaults to GCS. Explicit
 and extracted audio. This source change does not activate that setting or
 change public media URLs. Derived-media readers have separate configuration.
 
+`MEDIA_STORAGE_PROVIDER=b2_primary` uses B2 for those media reads and requires
+verified GCS backups for every write through this adapter. It requires the same
+B2 settings plus the existing authenticated GCS client and nonempty GCS bucket.
+Both immutable provider versions and their bytes/metadata are verified before
+`put_verified` succeeds; its receipt includes `required_backup`. A failed backup
+returns an error even if B2 already accepted the primary. It does not delete
+that primary or report the output complete. HLS reuse in the new mode checks
+both copies of the master, both variant playlists and both single-file TS
+variants, including pinned bytes and metadata. Any progressive MP4 present in
+B2 also needs a matching backup; absent best-effort MP4s do not block HLS reuse.
+An earlier attempt can have written its master before a segment backup failed,
+so master presence alone cannot acknowledge completion. Successful duplicate
+requests read and compare those outputs instead of encoding or writing again;
+incomplete or mismatched copies require regeneration. Shared-audio backup repair verifies the existing
+primary bytes and writes the backup with the existing provenance, leaving the
+primary version unchanged. Legacy `gcs` and `b2` modes retain their behavior.
+
+This is synchronous replication through the existing processing paths. It adds
+no database, queue, credentials, or processing service. It does not activate a
+provider setting, change uploader storage, or convert the separate GCS-only
+artifact writers listed below.
+
 B2 selection requires `B2_MEDIA_BUCKET`, `B2_REGION`, `B2_ACCESS_KEY_ID`, and
 `B2_SECRET_ACCESS_KEY`. The private HTTPS endpoint is derived from the region;
 production has no endpoint override. Redirects are disabled. Connection,
@@ -56,9 +78,12 @@ covered only by generic adapter tests.
 
 Receipts prove individual object bytes and metadata. They do not grant job
 execution authority, establish family completeness or publish a producer
-completion marker. The existing master-presence shortcut and status webhooks
-retain their legacy meaning. Durable completion and family readiness require
-coordinator integration before provider activation.
+completion marker. Legacy modes keep their master-only shortcut. B2-primary
+reuse checks the current encoder's fixed two single-file TS variants, not an
+arbitrary HLS family or an atomic cross-object generation. Changing that output
+layout requires updating the reuse check alongside the encoder.
+Status webhooks retain their legacy meaning. These object receipts do not
+establish durable processing dispatch.
 
 Mutable jobs, locks, translation state, transcription/VTT and sound analysis
 remain on their existing GCS APIs. The legacy fMP4 backfill explicitly reads

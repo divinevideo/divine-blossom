@@ -129,3 +129,6 @@ VICEROY="$VICEROY" python3 scripts/run-playback-cache-telemetry-tests.py
 
 # Canonical direct uploads can reuse the provider-aware service for small images.
 VICEROY="$VICEROY" python3 scripts/run-upload-routing-tests.py
+
+# Canonical B2 misses queue the verified mirror after GCS fallback, never on outage.
+VICEROY="$VICEROY" python3 scripts/run-b2-canonical-demand-tests.py

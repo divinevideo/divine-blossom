@@ -48,19 +48,19 @@ def validation_error(kind, message):
 
 
 def confirm_readback(read):
-    """Retry only absent reads, at most three, within one acceptance deadline.
+    """Confirm an acknowledged write with at most 30 reads in one 30s window.
 
     `read(timeout)` must distinguish HTTP 404 (None) from present malformed
     values. Socket timeouts cannot guarantee total transport wall time; check
     the monotonic deadline before scheduling and after every returned read.
     """
-    deadline = time.monotonic() + 3.0
-    for attempt in range(3):
+    deadline = time.monotonic() + 30.0
+    for attempt in range(30):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("KV confirmation deadline expired")
         if attempt:
-            time.sleep(min(0.25, remaining))
+            time.sleep(min(1.0, remaining))
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("KV confirmation deadline expired")
@@ -597,12 +597,14 @@ class Worker:
         self.metrics["copies_completed"] += 1
         return "ready"
 
-    def cycle(self, *, max_objects, max_bytes, discovery_limit=None, notifications=None, demand=None):
+    def cycle(self, *, max_objects, max_bytes, discovery_limit=None, notifications=None, demand=None, demand_only=False):
+        if demand_only and notifications is not None:
+            raise ValueError("demand-only cannot consume upload notifications")
         report = Counter()
         self.metrics.clear()
         demand_enabled = demand is not None or bool(self.state.db.execute("SELECT 1 FROM demand_queue LIMIT 1").fetchone())
         upload_enabled = notifications is not None or bool(self.state.db.execute("SELECT 1 FROM upload_queue LIMIT 1").fetchone())
-        lanes = (["demand"] if demand_enabled else []) + (["uploads"] if upload_enabled else []) + ["history"]
+        lanes = ["demand"] if demand_only else (["demand"] if demand_enabled else []) + (["uploads"] if upload_enabled else []) + ["history"]
         if max_objects < len(lanes):
             raise ValueError("scheduling needs one object slot per configured lane")
         for intake, label in [(demand, "demand"), (notifications, "notification")]:
@@ -612,15 +614,16 @@ class Worker:
                 except Exception:
                     report[label + "_errors"] += 1
                     report["errors"] += 1
-        try:
-            keys, cursor = self.source.page(self.state.setting("cursor"), discovery_limit or max_objects)
-            for key in keys:
-                if HEX.fullmatch(key):
-                    self.state.remember(key)
-            self.state.set_setting("cursor", cursor)
-        except Exception:
-            report["discovery_errors"] += 1
-            report["errors"] += 1
+        if not demand_only:
+            try:
+                keys, cursor = self.source.page(self.state.setting("cursor"), discovery_limit or max_objects)
+                for key in keys:
+                    if HEX.fullmatch(key):
+                        self.state.remember(key)
+                self.state.set_setting("cursor", cursor)
+            except Exception:
+                report["discovery_errors"] += 1
+                report["errors"] += 1
         now = int(time.time())
         # A hint cannot bypass an upload's existing backoff, or vice versa.
         demands = [key for key in self.state.queued_demands(max_objects, now)
@@ -629,25 +632,26 @@ class Worker:
                    if not self.state.db.execute("SELECT 1 FROM demand_queue WHERE hash=? AND available_at>?", (key, now)).fetchone()]
         upload_generations = dict(uploads)
         partials = {p.stem for p in self.state.directory.glob("*.part") if HEX.fullmatch(p.stem)}
-        history_partials = [key for key in sorted(partials) if not self.state.gate_deferred(key) and self.state.db.execute(
-            "SELECT 1 FROM objects WHERE hash=? AND NOT EXISTS (SELECT 1 FROM upload_queue WHERE hash=?) AND NOT EXISTS (SELECT 1 FROM demand_queue WHERE hash=?)",
-            (key, key, key)).fetchone()]
-        historical = [row[0] for row in self.state.db.execute(
-            "SELECT hash FROM objects WHERE NOT EXISTS (SELECT 1 FROM upload_queue WHERE upload_queue.hash=objects.hash) AND NOT EXISTS (SELECT 1 FROM demand_queue WHERE demand_queue.hash=objects.hash) AND NOT EXISTS (SELECT 1 FROM gate_backoff WHERE gate_backoff.hash=objects.hash AND available_at>?) ORDER BY checked,hash LIMIT ?",
-            (now, max_objects))]
-        # Alternate history's resumable and checked-order lanes independently
-        # of wall-clock retry expiry. An hourly timer must not repeatedly pick
-        # the same locked partial prefix ahead of every healthy original.
-        history_groups = [history_partials, historical]
-        history_turn = int(self.state.setting("history_turn") or 0) % 2
-        self.state.set_setting("history_turn", str(1 - history_turn))
-        if history_turn:
-            history_groups.reverse()
         history_order = []
-        for index in range(max_objects):
-            for group in history_groups:
-                if index < len(group) and group[index] not in history_order:
-                    history_order.append(group[index])
+        if not demand_only:
+            history_partials = [key for key in sorted(partials) if not self.state.gate_deferred(key) and self.state.db.execute(
+                "SELECT 1 FROM objects WHERE hash=? AND NOT EXISTS (SELECT 1 FROM upload_queue WHERE hash=?) AND NOT EXISTS (SELECT 1 FROM demand_queue WHERE hash=?)",
+                (key, key, key)).fetchone()]
+            historical = [row[0] for row in self.state.db.execute(
+                "SELECT hash FROM objects WHERE NOT EXISTS (SELECT 1 FROM upload_queue WHERE upload_queue.hash=objects.hash) AND NOT EXISTS (SELECT 1 FROM demand_queue WHERE demand_queue.hash=objects.hash) AND NOT EXISTS (SELECT 1 FROM gate_backoff WHERE gate_backoff.hash=objects.hash AND available_at>?) ORDER BY checked,hash LIMIT ?",
+                (now, max_objects))]
+            # Alternate history's resumable and checked-order lanes independently
+            # of wall-clock retry expiry. An hourly timer must not repeatedly pick
+            # the same locked partial prefix ahead of every healthy original.
+            history_groups = [history_partials, historical]
+            history_turn = int(self.state.setting("history_turn") or 0) % 2
+            self.state.set_setting("history_turn", str(1 - history_turn))
+            if history_turn:
+                history_groups.reverse()
+            for index in range(max_objects):
+                for group in history_groups:
+                    if index < len(group) and group[index] not in history_order:
+                        history_order.append(group[index])
         groups = {"demand": demands, "uploads": [key for key, _ in uploads],
                   "history": history_order[:max_objects]}
         for lane in ("demand", "uploads"):
@@ -1137,6 +1141,7 @@ def main(argv=None):
     parser.add_argument("--state-dir", required=True, type=Path)
     parser.add_argument("--notification-subscription", help="Dedicated GCS OBJECT_FINALIZE subscription; disabled by default")
     parser.add_argument("--demand-intake", action="store_true", help="Intake bounded demand hints; disabled by default. Committed demand is processed even when intake is off.")
+    parser.add_argument("--demand-only", action="store_true", help="Process demand only, without source listing or history; requires --demand-intake and excludes upload notifications")
     parser.add_argument("--released-parent-gates", action="store_true", help="Use reviewed shared-gate CAS protocol; disabled until all consumers/writers are compatible and legacy releases drained")
     parser.add_argument("--max-pending-demand", type=int, default=10000)
     parser.add_argument("--discovery-limit", type=int, help="Source names discovered per pass (1..1000); defaults to max-objects")
@@ -1160,8 +1165,10 @@ def main(argv=None):
         parser.error("notification scheduling requires at least two object slots")
     if not 1 <= args.max_objects <= 1000 or not 1 <= args.max_pending_demand <= 100000:
         parser.error("object slots must be 1..1000 and pending demand cap 1..100000")
-    if args.demand_intake and args.max_objects < (3 if args.notification_subscription else 2):
+    if args.demand_intake and not args.demand_only and args.max_objects < (3 if args.notification_subscription else 2):
         parser.error("demand scheduling needs one object slot per configured lane")
+    if args.demand_only and (not args.demand_intake or args.notification_subscription):
+        parser.error("demand-only requires --demand-intake and excludes upload notifications")
     os.umask(0o077)
     args.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     with (args.state_dir / "worker.lock").open("a") as lock:
@@ -1197,7 +1204,8 @@ def main(argv=None):
                 notifications = PubSubNotifications(args.notification_subscription,args.source_bucket,credentials)
             report = worker.cycle(max_objects=args.max_objects, max_bytes=args.max_bytes,
                                   discovery_limit=args.discovery_limit, notifications=notifications,
-                                  demand=DemandHints(worker.kv, args.max_pending_demand) if args.demand_intake else None)
+                                  demand=DemandHints(worker.kv, args.max_pending_demand) if args.demand_intake else None,
+                                  demand_only=args.demand_only)
             print(json.dumps(report, sort_keys=True))
             return 1 if report.get("errors") else 0
         finally:

@@ -98,6 +98,15 @@ shared gate; repeated retries will never steal an existing gate.
 Control API redirects fail closed without forwarding authentication headers, and
 the worker's HTTP client does not change the process-wide urllib opener.
 
+
+After an acknowledged copy-gate or readiness write, confirmation makes at most
+30 read attempts within one 30-second monotonic deadline, with at most one-second
+read timeouts. Only actual HTTP 404 observations wait for visibility. A present
+foreign owner, mismatched publication, null/malformed value, invalid generation,
+HTTP error or transport failure stops confirmation. The write is never replayed,
+and a late response cannot extend the deadline or authorize follow-up effects.
+Unconfirmed operations retain their existing exclusion and durable retry state.
+
 ## Keep new uploads mirrored while backfilling
 
 Both Blossom and the upload data plane currently finalize canonical bytes in GCS.
@@ -251,11 +260,37 @@ documents the `generation` response header and `if-generation-match` delete head
 
 ## Demand intake and missing-version repair
 
+### Canonical B2-first serving
+
+The main media origin can use the existing `media_read_primary=b2` and
+`gcs_fallback_enabled=true` policy. With `b2_demand_mirror_enabled=true`, an
+anonymous canonical original GET that confirms a B2 404 and successfully serves
+verified-size GCS bytes also inserts the existing coalesced demand hint. The
+copy is asynchronous; playback does not wait for transfer. B2 outages, auth or
+configuration failures, failed GCS delivery, and credentialed requests do not
+enqueue a copy. Current uncached public-video policy, size/reference limits and
+copy/erase coordination still govern hint eligibility and worker execution.
+
+The running worker must actually consume `--demand-intake` with durable state;
+changing the serving flags alone does not start copying. Keep GCS and its reader
+credentials available. Verify `fos_read_enabled` is off when selecting B2 as the
+main origin, because a separately enabled FOS mirror otherwise precedes origin
+selection. Original hints do not migrate derivative families or objects outside
+the existing original-video limits; those retain their separate bulk/derived
+origin migration. Existing edge hits require no GCS origin read and need not be
+globally purged to change which origin is selected on a cache miss.
+
 `--demand-intake` separately enables one bounded KV demand page per invocation.
 It defaults off. The edge flag does not start this worker; the worker flag does
 not enable a hostname. Committed demand is processed even when new intake is off.
 Use `--max-pending-demand` (default 10,000; maximum 100,000) to bound local pending
-requests. With demand, notifications and history configured, use at least three
+requests. To run only requested copies alongside a separate bulk backfill,
+use `--demand-intake --demand-only`. This mode does not list GCS or schedule
+remembered history or upload-notification work; it permits one object slot.
+It still preserves durable demand, retry deadlines, source/version verification,
+and copy/erase gates. Upload notifications cannot be combined with this mode.
+Keep its SQLite state durable and separate from any other running worker.
+With demand, notifications and history configured, use at least three
 object slots; demand and history require at least two. Object slots are capped
 at 1,000; demand intake reads at most 100 keys, each value at most 4 KiB.
 

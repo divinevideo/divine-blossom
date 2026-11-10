@@ -199,6 +199,92 @@ class DemandTests(WorkerFixture):
         self.assertEqual(self.state.row(HASH)[2], ready)
 
 
+class DemandOnlyTests(WorkerFixture):
+    def forbid_inventory(self):
+        self.source.page = lambda *args: self.fail("demand-only must not list GCS")
+
+    def test_durable_demand_copies_without_history_or_upload_work(self):
+        other = "b" * 64
+        self.state.remember(other)
+        self.state.queue_upload(other, "7")
+        self.state.queue_demand(HASH, hint())
+        self.state.set_setting("cursor", "retained-history-cursor")
+        self.forbid_inventory()
+        report = self.worker.cycle(max_objects=1, max_bytes=200, demand_only=True)
+        self.assertEqual(report.get("ready"), 1)
+        self.assertEqual(self.dest.versions["version-1"], DATA)
+        self.assertIsNotNone(self.kv.get("b2-ready:" + HASH))
+        self.assertEqual(self.state.queued_demands(10), [])
+        self.assertEqual(self.state.queued_uploads(10), [(other, "7")])
+        self.assertEqual(self.state.setting("cursor"), "retained-history-cursor")
+        self.assertIsNone(self.state.setting("history_turn"))
+        self.assertEqual(self.state.db.execute("SELECT checked FROM objects WHERE hash=?", (other,)).fetchone()[0], 0)
+
+    def test_intake_durably_acknowledges_and_copies_requested_original(self):
+        key = "b2-demand:v1:" + HASH
+        self.kv.values[key] = hint()
+        self.kv.demand_page = lambda *args: ([key], None)
+        self.forbid_inventory()
+        report = self.worker.cycle(max_objects=1, max_bytes=200,
+                                   demand=mirror.DemandHints(self.kv), demand_only=True)
+        self.assertEqual(report.get("ready"), 1)
+        self.assertNotIn(key, self.kv.values)
+        self.assertEqual(self.state.queued_demands(10), [])
+        self.assertEqual(self.dest.versions["version-1"], DATA)
+
+    def test_empty_demand_does_not_process_remembered_history(self):
+        self.state.remember(HASH)
+        self.forbid_inventory()
+        self.source.head = lambda *args: self.fail("history must remain idle")
+        report = self.worker.cycle(max_objects=1, max_bytes=200, demand_only=True)
+        self.assertEqual(report.get("ready", 0), 0)
+        self.assertEqual(self.dest.versions, {})
+
+    def test_deferred_demand_keeps_retry_deadline_without_history_fallback(self):
+        import time
+        self.state.queue_demand(HASH, hint())
+        self.state.defer_demand(HASH, now=int(time.time()))
+        deadline = self.state.db.execute("SELECT available_at FROM demand_queue").fetchone()[0]
+        self.forbid_inventory()
+        self.source.head = lambda *args: self.fail("deferred work must wait")
+        report = self.worker.cycle(max_objects=1, max_bytes=200, demand_only=True)
+        self.assertEqual(report["demand_pending"], 1)
+        self.assertEqual(self.state.db.execute("SELECT available_at FROM demand_queue").fetchone()[0], deadline)
+
+    def test_notification_intake_cannot_be_combined_with_demand_only(self):
+        with self.assertRaisesRegex(ValueError, "demand-only"):
+            self.worker.cycle(max_objects=1, max_bytes=200, demand_only=True, notifications=object())
+
+
+    def test_cli_rejects_incompatible_demand_only_flags_before_provider_access(self):
+        from contextlib import redirect_stderr
+        from io import StringIO
+        base = ["--source-bucket", "synthetic-gcs", "--destination-bucket", "synthetic-b2",
+                "--destination-bucket-id", "synthetic-id", "--erasure-bucket", "synthetic-b2",
+                "--erasure-bucket-id", "synthetic-id", "--kv-store-id", "synthetic-kv",
+                "--state-dir", str(self.state.directory), "--demand-only"]
+        for extra in ([], ["--demand-intake", "--notification-subscription", "synthetic"]):
+            with self.subTest(extra=extra), redirect_stderr(StringIO()) as errors:
+                with self.assertRaises(SystemExit) as stopped:
+                    mirror.main(base + extra)
+                self.assertEqual(stopped.exception.code, 2)
+                self.assertIn("demand-only requires --demand-intake", errors.getvalue())
+
+    @unittest.skipIf(boto3 is None, "install scripts/requirements-b2-sync.txt for CLI dependency coverage")
+    def test_cli_accepts_one_slot_for_demand_only(self):
+        import os
+        from unittest.mock import patch
+        args = ["--source-bucket", "synthetic-gcs", "--destination-bucket", "synthetic-b2",
+                "--destination-bucket-id", "synthetic-id", "--erasure-bucket", "synthetic-b2",
+                "--erasure-bucket-id", "synthetic-id", "--kv-store-id", "synthetic-kv",
+                "--state-dir", str(self.state.directory), "--demand-only", "--demand-intake",
+                "--max-objects", "1"]
+        with patch.dict(os.environ, {"B2_APPLICATION_KEY_ID":"synthetic", "B2_APPLICATION_KEY":"synthetic"}), \
+             patch.object(mirror, "private_b2_endpoint", side_effect=RuntimeError("validated arguments")):
+            with self.assertRaisesRegex(RuntimeError, "validated arguments"):
+                mirror.main(args)
+
+
 class IntakeTests(unittest.TestCase):
     def test_unreadable_first_hint_does_not_strand_later_pages(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -327,7 +327,28 @@ fn download_object_with_policy(
     immutable: bool,
     uncached: bool,
 ) -> Result<(Response, &'static str)> {
+    download_object_with_policy_details(policy, key, range, immutable, uncached)
+        .map(|result| (result.response, result.source))
+}
+
+struct MediaDownload {
+    response: Response,
+    source: &'static str,
+    b2_missing: bool,
+}
+
+fn download_object_with_policy_details(
+    policy: MediaReadPolicy,
+    key: &str,
+    range: Option<&str>,
+    immutable: bool,
+    uncached: bool,
+) -> Result<MediaDownload> {
     let response = fetch_media_origin(policy.primary, key, range, immutable, uncached);
+    let b2_missing = policy.primary == StorageProvider::B2
+        && response
+            .as_ref()
+            .is_ok_and(|response| response.get_status() == StatusCode::NOT_FOUND);
     let should_fallback = match &response {
         Ok(resp) => policy.should_fallback(resp.get_status().as_u16()),
         Err(MediaFetchError::Transport) => policy.should_fallback(503),
@@ -341,10 +362,18 @@ fn download_object_with_policy(
         eprintln!("[MEDIA_ORIGIN] primary=b2 fallback=gcs cause={cause}");
         let resp = fetch_media_origin(StorageProvider::Gcs, key, range, immutable, uncached)
             .map_err(MediaFetchError::into_storage_error)?;
-        return Ok((resp, SOURCE_GCS));
+        return Ok(MediaDownload {
+            response: resp,
+            source: SOURCE_GCS,
+            b2_missing,
+        });
     }
     response
-        .map(|resp| (resp, policy.primary.name()))
+        .map(|response| MediaDownload {
+            response,
+            source: policy.primary.name(),
+            b2_missing: false,
+        })
         .map_err(MediaFetchError::into_storage_error)
 }
 
@@ -922,6 +951,9 @@ pub struct FallbackDownloadResult {
     pub response: Response,
     pub source: String, // "gcs" or the backend name that served the content
     pub diagnostics: Option<BlobFetchDiagnostics>,
+    /// Only a confirmed B2 404 followed by successful GCS delivery may enqueue
+    /// migration. Outages and origin/configuration failures are not absence.
+    pub b2_missing: bool,
 }
 
 /// Privacy-safe phase timings for one bare-blob origin fetch.
@@ -951,15 +983,20 @@ fn download_blob_with_fallback_impl(
     range: Option<&str>,
     immutable: bool,
 ) -> Result<FallbackDownloadResult> {
-    let primary = media_read_policy()?.primary;
-    match download_media_object(hash, range, immutable, false)
-        .and_then(|(resp, source)| blob_download_response(resp).map(|resp| (resp, source)))
+    let policy = media_read_policy()?;
+    let primary = policy.primary;
+    match download_object_with_policy_details(policy, hash, range, immutable, false)
+        .and_then(|result| {
+            blob_download_response(result.response)
+                .map(|response| (response, result.source, result.b2_missing))
+        })
     {
-        Ok((resp, source)) => {
+        Ok((resp, source, b2_missing)) => {
             return Ok(FallbackDownloadResult {
                 response: resp,
                 source: source.to_string(),
                 diagnostics: None,
+                b2_missing,
             });
         }
         Err(BlossomError::NotFound(_)) => {
@@ -983,6 +1020,7 @@ fn download_blob_with_fallback_impl(
                     response: resp,
                     source: backend_name.to_string(),
                     diagnostics: None,
+                    b2_missing: false,
                 });
             }
             Err(_) => {
@@ -1322,6 +1360,7 @@ pub fn download_blob_read_through(
                 response,
                 source: SOURCE_FOS.to_string(),
                 diagnostics: Some(diagnostics),
+                b2_missing: false,
             });
         }
         diagnostics.fos_lookup_ms = Some(started.elapsed().as_millis());
