@@ -52,6 +52,8 @@ remaining coordination and compatibility operations.
   metadata changes. The original key must equal the full lowercase SHA-256.
 - `verify_sha256(metadata, expected_sha256)` verifies pinned bytes without saving
   a file.
+- `read(metadata)` returns pinned bytes, checking metadata, streamed length and
+  body-stall deadlines without imposing an additional transcript size limit.
 - `put_verified(key, bytes, mime, custom_metadata, cache_control)` writes metadata
   atomically with bytes, requires an actual generation/version, then verifies
   pinned metadata and readback before returning a receipt. Content-addressed
@@ -85,11 +87,16 @@ layout requires updating the reuse check alongside the encoder.
 Status webhooks retain their legacy meaning. These object receipts do not
 establish durable processing dispatch.
 
-Mutable jobs, locks, translation state, existing-transcript cache reads and sound
-analysis remain on their existing GCS APIs. Newly generated VTT uses the media
+Mutable jobs, locks, translation output/state and sound analysis remain on their
+existing GCS APIs. Newly generated VTT uses the media
 adapter at its unchanged `{hash}/vtt/main.vtt` key with `text/vtt`; status completion
-follows successful pinned verification. Existing cached transcripts retain their
-legacy GCS read path. The legacy fMP4 backfill explicitly reads
+follows successful pinned verification. Transcription deduplication and translation
+source lookup check the selected media provider first, falling back to legacy GCS
+only when that metadata lookup returns 404. Errors, including a failed pinned byte
+read, fail closed without fallback. Translation reads the selected version through
+the adapter and verifies the requested source digest before claiming work. Default
+GCS selection does not repeat the lookup in a fallback store. This reader adjustment
+preserves cached GCS sources; it does not migrate mutable state. The legacy fMP4 backfill explicitly reads
 and writes GCS. B2 adapter tests can run without GCS; this does not make the
 whole transcoder pipeline GCS independent or complete GCS retirement.
 

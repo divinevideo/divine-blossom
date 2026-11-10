@@ -20,22 +20,22 @@ struct Stored {
     cache_control: Option<String>,
 }
 #[derive(Default)]
-struct Objects {
+pub(crate) struct Objects {
     versions: HashMap<(String, String), Stored>,
     latest: HashMap<String, String>,
-    requests: Vec<(String, String, Option<String>)>,
-    fail: Option<StatusCode>,
+    pub(crate) requests: Vec<(String, String, Option<String>)>,
+    pub(crate) fail: Option<StatusCode>,
     missing_version: bool,
-    corrupt: bool,
-    get_status: Option<StatusCode>,
+    pub(crate) corrupt: bool,
+    pub(crate) get_status: Option<StatusCode>,
     head_status: Option<StatusCode>,
     content_range: bool,
     wrong_get_metadata: bool,
     next_version: Option<String>,
 }
-struct Origin {
+pub(crate) struct Origin {
     endpoint: String,
-    objects: Arc<Mutex<Objects>>,
+    pub(crate) objects: Arc<Mutex<Objects>>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Origin {
@@ -44,7 +44,7 @@ impl Drop for Origin {
     }
 }
 impl Origin {
-    async fn start() -> Self {
+    pub(crate) async fn start() -> Self {
         let objects = Arc::new(Mutex::new(Objects::default()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -58,7 +58,7 @@ impl Origin {
             task,
         }
     }
-    fn store(&self) -> MediaStorage {
+    pub(crate) fn store(&self) -> MediaStorage {
         MediaStorage::b2_for_test(&self.endpoint, "synthetic-bucket").unwrap()
     }
 }

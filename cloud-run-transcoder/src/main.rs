@@ -1836,7 +1836,7 @@ async fn process_transcribe(
     info!("Starting transcription for {}", hash);
 
     let vtt_path = format!("{}/vtt/main.vtt", hash);
-    if check_gcs_exists(&state.gcs_client, &state.config.gcs_bucket, &vtt_path).await? {
+    if find_transcript(&state, &vtt_path).await?.is_some() {
         info!(
             "Transcript already exists for {}, skipping transcription",
             hash
@@ -2429,6 +2429,24 @@ async fn check_gcs_exists(client: &GcsClient, bucket: &str, object: &str) -> Res
         Ok(_) => Ok(true),
         Err(_) => Ok(false),
     }
+}
+
+/// Resolve new transcripts first, retaining legacy GCS sources only on absence.
+async fn find_transcript(
+    state: &AppState,
+    key: &str,
+) -> Result<Option<(object_storage::MediaStorage, object_storage::ObjectMetadata)>> {
+    if let Some(object) = state.media_storage.stat(key).await? {
+        return Ok(Some((state.media_storage.clone(), object)));
+    }
+    if state.media_storage.is_gcs() {
+        return Ok(None);
+    }
+    let legacy = object_storage::MediaStorage::gcs(
+        state.gcs_client.clone(),
+        state.config.gcs_bucket.clone(),
+    );
+    Ok(legacy.stat(key).await?.map(|object| (legacy, object)))
 }
 
 async fn download_from_gcs(

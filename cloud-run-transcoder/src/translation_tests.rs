@@ -21,10 +21,11 @@ impl Drop for StorageDouble {
     }
 }
 
-fn object_response(path: String, generation: i64) -> Response {
+fn object_response(path: String, generation: i64, size: usize) -> Response {
     let value = serde_json::json!({
         "kind": "storage#object", "id": path, "name": path, "bucket": "test",
-        "generation": generation.to_string(), "metageneration": "1", "size": "0",
+        "generation": generation.to_string(), "metageneration": "1", "size": size.to_string(),
+        "contentType": "text/vtt",
         "selfLink": "http://storage/object", "mediaLink": "http://storage/object?alt=media",
         "etag": "synthetic", "storageClass": "STANDARD", "crc32c": "synthetic", "md5Hash": "synthetic"
     });
@@ -75,16 +76,23 @@ async fn storage_request(State(objects): State<Objects>, request: Request) -> Re
             return error(412);
         }
         let generation = generation + 1;
+        let size = body.len();
         objects.insert(path.clone(), (body.to_vec(), generation));
-        return object_response(path, generation);
+        return object_response(path, generation, size);
     }
     let Some((body, generation)) = existing else {
         return error(404);
     };
+    if query
+        .get("generation")
+        .is_some_and(|value| value != &generation.to_string())
+    {
+        return error(404);
+    }
     if query.get("alt").map(String::as_str) == Some("media") {
         return Response::new(Body::from(body));
     }
-    object_response(path, generation)
+    object_response(path, generation, body.len())
 }
 
 impl StorageDouble {
@@ -129,6 +137,187 @@ fn request(source: &[u8]) -> TranslateRequest {
         source_digest: hex::encode(Sha256::digest(source)),
         lang: "pt-BR".into(),
     }
+}
+
+fn with_media(
+    storage: &StorageDouble,
+    media_storage: object_storage::MediaStorage,
+) -> Arc<AppState> {
+    Arc::new(AppState {
+        media_storage,
+        gcs_client: storage.state.gcs_client.clone(),
+        config: Config::from_lookup(|key| (key == "GCS_BUCKET").then(|| "test".to_string())),
+        provider_semaphore: Arc::new(Semaphore::new(4)),
+    })
+}
+
+fn transcribe_request() -> TranscodeRequest {
+    TranscodeRequest {
+        hash: "a".repeat(64),
+        force: false,
+        owner: None,
+        job_id: None,
+        lang: None,
+    }
+}
+
+#[tokio::test]
+async fn selected_and_legacy_transcripts_reach_translation_and_transcription_dedup() {
+    for legacy in [false, true] {
+        let storage = StorageDouble::new().await;
+        let origin = object_storage::tests::Origin::start().await;
+        let media = origin.store();
+        if legacy {
+            storage.source(SOURCE).await;
+        } else {
+            upload_transcript_to_storage(
+                &media,
+                &"a".repeat(64),
+                std::str::from_utf8(SOURCE).unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        let state = with_media(&storage, media);
+        assert_eq!(
+            process_transcribe(state.clone(), transcribe_request())
+                .await
+                .unwrap()
+                .status,
+            "already_exists"
+        );
+        let translated = process_translate_with(state, request(SOURCE), |_, texts| async move {
+            assert_eq!(texts, ["Hello"]);
+            Ok(vec!["Olá".into()])
+        })
+        .await
+        .unwrap();
+        assert_eq!(translated.status, "complete");
+        // Translation output and coordination records remain in GCS, not B2.
+        let objects = storage.objects.lock().await;
+        assert!(objects.contains_key(&translated.vtt_path));
+        assert!(objects.contains_key(&format!("{}.json", translated.vtt_path)));
+        assert_eq!(
+            objects.contains_key(&format!("{}/vtt/main.vtt", "a".repeat(64))),
+            legacy
+        );
+        drop(objects);
+        let origin = origin.objects.lock().await;
+        assert!(origin
+            .requests
+            .iter()
+            .all(|(_, key, _)| key.ends_with("/vtt/main.vtt")));
+        if !legacy {
+            assert!(origin
+                .requests
+                .iter()
+                .filter(|(method, _, _)| method == "GET")
+                .all(|(_, _, version)| version.is_some()));
+        }
+    }
+}
+
+#[tokio::test]
+async fn selected_transcript_errors_never_use_available_legacy_source() {
+    for status in [StatusCode::FORBIDDEN, StatusCode::INTERNAL_SERVER_ERROR] {
+        let storage = StorageDouble::new().await;
+        storage.source(SOURCE).await;
+        let origin = object_storage::tests::Origin::start().await;
+        origin.objects.lock().await.fail = Some(status);
+        let state = with_media(&storage, origin.store());
+        assert!(process_transcribe(state.clone(), transcribe_request())
+            .await
+            .is_err());
+        assert!(
+            process_translate_with(state, request(SOURCE), |_, _| async {
+                panic!("selected source failure reached translation provider")
+            })
+            .await
+            .is_err()
+        );
+        assert_eq!(storage.objects.lock().await.len(), 1);
+    }
+    // Even a 404 from the pinned byte GET is not absence at source selection.
+    for status in [
+        StatusCode::NOT_FOUND,
+        StatusCode::FORBIDDEN,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    ] {
+        let storage = StorageDouble::new().await;
+        storage.source(SOURCE).await;
+        let origin = object_storage::tests::Origin::start().await;
+        let media = origin.store();
+        upload_transcript_to_storage(
+            &media,
+            &"a".repeat(64),
+            std::str::from_utf8(SOURCE).unwrap(),
+        )
+        .await
+        .unwrap();
+        origin.objects.lock().await.get_status = Some(status);
+        assert!(process_translate_with(
+            with_media(&storage, media),
+            request(SOURCE),
+            |_, _| async { panic!("pinned read failure reached translation provider") }
+        )
+        .await
+        .is_err());
+        assert_eq!(storage.objects.lock().await.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn selected_source_digest_and_pinned_revision_control_translation() {
+    let storage = StorageDouble::new().await;
+    // A matching legacy digest must not override an available selected source.
+    storage.source(SOURCE).await;
+    let origin = object_storage::tests::Origin::start().await;
+    let media = origin.store();
+    let key = format!("{}/vtt/main.vtt", "a".repeat(64));
+    upload_transcript_to_storage(
+        &media,
+        &"a".repeat(64),
+        std::str::from_utf8(SOURCE).unwrap(),
+    )
+    .await
+    .unwrap();
+    let state = with_media(&storage, media.clone());
+    let (_, pinned) = find_transcript(&state, &key).await.unwrap().unwrap();
+    let revised = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nRevised\n";
+    upload_transcript_to_storage(&media, &"a".repeat(64), revised)
+        .await
+        .unwrap();
+    assert_eq!(media.read(&pinned).await.unwrap(), SOURCE);
+    assert_eq!(
+        process_translate_with(state.clone(), request(SOURCE), |_, _| async {
+            panic!("stale digest reached translation provider")
+        })
+        .await
+        .unwrap()
+        .status,
+        "source_changed"
+    );
+    origin.objects.lock().await.corrupt = true;
+    assert_eq!(
+        process_translate_with(state.clone(), request(revised.as_bytes()), |_, _| async {
+            panic!("corrupt pinned bytes reached translation provider")
+        })
+        .await
+        .unwrap()
+        .status,
+        "source_changed"
+    );
+    origin.objects.lock().await.corrupt = false;
+    assert_eq!(
+        process_translate_with(state, request(revised.as_bytes()), |_, texts| async {
+            assert_eq!(texts, ["Revised"]);
+            Ok(texts)
+        })
+        .await
+        .unwrap()
+        .status,
+        "complete"
+    );
 }
 
 #[tokio::test]

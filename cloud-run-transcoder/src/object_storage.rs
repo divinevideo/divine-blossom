@@ -213,6 +213,9 @@ impl MediaStorage {
             Backend::B2 { bucket, .. } => (StorageProvider::B2, bucket),
         }
     }
+    pub fn is_gcs(&self) -> bool {
+        matches!(self.backend, Backend::Gcs { .. })
+    }
     fn validate_reference(&self, reference: &ObjectRef) -> Result<()> {
         validate_key(&reference.key)?;
         let (provider, bucket) = self.provider_bucket();
@@ -415,6 +418,32 @@ impl MediaStorage {
                     .boxed())
             }
         }
+    }
+    /// Read pinned bytes, rejecting stalled streams and mismatched object lengths.
+    pub async fn read(&self, object: &ObjectMetadata) -> Result<Vec<u8>> {
+        let mut body = self.body(object).await?;
+        let mut bytes = Vec::new();
+        let mut length = 0u64;
+        while let Some(chunk) = tokio::time::timeout(STREAM_STALL_TIMEOUT, body.next())
+            .await
+            .context("Media body stalled")?
+        {
+            let chunk = chunk?;
+            length = length
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| anyhow!("Media length overflow"))?;
+            if length > object.size {
+                bail!("Media exceeded pinned object size");
+            }
+            bytes
+                .try_reserve(chunk.len())
+                .context("Media allocation failed")?;
+            bytes.extend_from_slice(&chunk);
+        }
+        if length != object.size {
+            bail!("Media body does not match pinned size");
+        }
+        Ok(bytes)
     }
     async fn hash_body(
         &self,
@@ -854,4 +883,4 @@ fn encode(value: &str) -> String {
 
 #[cfg(test)]
 #[path = "object_storage_tests.rs"]
-mod tests;
+pub(crate) mod tests;
