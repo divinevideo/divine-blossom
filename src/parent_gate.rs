@@ -426,6 +426,30 @@ pub(crate) fn archive_settle_current(hash:&str,attempt:&str)->Result<()> {
     Ok(())
 }
 
+/// A successful generic settlement is not evidence that this copy released its gate.
+pub(crate) fn archive_copy_settlement_precheck(hash: &str, attempt: &str, expected: &str) -> Result<()> {
+    generation(expected).ok_or_else(stale)?;
+    match lookup(&crate::metadata::open_store()?, hash)? {
+        Some(Observed {gate: Gate::Copying {attempt_id}, generation}) if attempt_id == attempt && generation == expected => Ok(()),
+        Some(Observed {gate: Gate::Released {settled_attempt_id, released_from_generation, ..}, ..}) if settled_attempt_id == attempt && released_from_generation == expected => Ok(()),
+        Some(Observed {gate: Gate::Erasing {}, ..}) => Err(BlossomError::Forbidden("Parent is erasing".into())),
+        _ => Err(stale()),
+    }
+}
+
+pub(crate) fn archive_copy_release_proof(hash: &str, attempt: &str, expected: &str) -> Result<serde_json::Value> {
+    generation(expected).ok_or_else(stale)?;
+    match lookup(&crate::metadata::open_store()?, hash)? {
+        Some(Observed { gate: Gate::Released { version: 1, settled_attempt_id, released_from_generation }, generation })
+            if settled_attempt_id == attempt && released_from_generation == expected =>
+                Ok(serde_json::json!({"version":1,"sha256":hash,"attempt":attempt,
+                    "state":"released","admission_generation":expected,
+                    "released_from_generation":released_from_generation,"parent_generation":generation})),
+        Some(Observed {gate: Gate::Erasing {}, ..}) => Err(BlossomError::Forbidden("Parent is erasing".into())),
+        _ => Err(stale()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
