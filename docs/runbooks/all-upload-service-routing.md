@@ -19,8 +19,9 @@ correlation. Existing upload-service response validation and public descriptor
 publication are reused.
 An upstream failure never selects inline GCS as a retry or fallback. The flag
 does not alter resumable sessions or internal thumbnail/VTT/audio/audit writes.
-For canonical direct uploads, the edge returns upstream HTTP 503 with its
-usual JSON error body and a valid `Retry-After` when available.
+For canonical direct uploads and resumable completion, the edge returns
+upstream HTTP 503 with its usual JSON error body and a valid `Retry-After`
+when available.
 
 ## Reuse existing writer and finalization support
 

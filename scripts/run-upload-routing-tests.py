@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Actual canonical upload handler against loopback-only provider service."""
+"""Actual upload handlers against a loopback-only provider service."""
 import argparse
 import hashlib
 import json
@@ -16,23 +16,36 @@ class UploadService(BaseHTTPRequestHandler):
         pass
 
     def do_PUT(self):
+        self.handle_upload()
+
+    def do_POST(self):
+        self.handle_upload()
+
+    def handle_upload(self):
         self.connection.settimeout(5)
         body = self.rfile.read(int(self.headers['Content-Length']))
-        self.server.observed.append((self.path, body, self.headers.get('Content-Type'),
+        self.server.observed.append((self.command, self.path, body, self.headers.get('Content-Type'),
                                      bool(self.headers.get('Authorization', '').startswith('Nostr '))))
         mismatch = self.server.case == 'hash_mismatch'
         payload = json.dumps({'sha256': 'a'*64, 'size': 15, 'content_type': 'image/jpeg'}).encode() if mismatch else b'{"error":"fixture busy"}'
         if self.server.case == 'busy_without_retry_after':
             payload = b''
-        status = 200 if mismatch else 500 if self.server.case == 'origin_error' else 503
+        if self.server.case == 'busy_non_utf8':
+            payload = b'\xff'
+        status = 200 if mismatch else 500 if self.server.case.endswith('origin_error') else 503
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(payload)))
         retry_after = {
             'enabled': '5',
             'busy_retry_date': 'Wed, 11 Nov 2026 00:00:00 GMT',
+            'busy_rfc850_date': 'Sunday, 06-Nov-94 08:49:37 GMT',
+            'busy_malformed_date': 'Sunday, 06-Nov-94X08:49:37 GMT',
+            'busy_non_utf8': '5',
             'busy_invalid_retry_after': '+5',
             'origin_error': '5',
+            'complete_busy': '5',
+            'complete_origin_error': '5',
         }.get(self.server.case)
         if retry_after is not None:
             self.send_header('Retry-After', retry_after)
@@ -41,11 +54,13 @@ class UploadService(BaseHTTPRequestHandler):
 
 
 def main():
-    proxied_cases = [
-        'enabled', 'busy_retry_date', 'busy_invalid_retry_after',
-        'busy_without_retry_after', 'origin_error', 'hash_mismatch',
+    direct_cases = [
+        'enabled', 'busy_retry_date', 'busy_rfc850_date', 'busy_malformed_date',
+        'busy_non_utf8', 'busy_invalid_retry_after', 'busy_without_retry_after',
+        'origin_error', 'hash_mismatch',
     ]
-    cases = proxied_cases + ['default', 'disabled', 'invalid', 'invalid_auth', 'missing_store', 'tombstone', 'missing_policy', 'dedupe', 'bad_size']
+    complete_cases = ['complete_busy', 'complete_origin_error']
+    cases = direct_cases + complete_cases + ['default', 'disabled', 'invalid', 'invalid_auth', 'missing_store', 'tombstone', 'missing_policy', 'dedupe', 'bad_size']
     parser = argparse.ArgumentParser()
     parser.add_argument('--case', choices=cases)
     selected = parser.parse_args().case
@@ -95,7 +110,12 @@ format = "json"
                     subprocess.run(['cargo', '--config', f'target.wasm32-wasip1.runner={runner}', 'test', '--locked', '--target', 'wasm32-wasip1',
                                     '--bin', 'fastly-blossom', 'canonical_upload_routing_contract',
                                     '--', '--ignored', '--nocapture'], cwd=repo, env=env, check=True, timeout=120)
-                    expected = [('/upload', b'synthetic image', 'image/jpeg', True)] if case in proxied_cases else []
+                    expected = []
+                    if case in direct_cases:
+                        expected = [('PUT', '/upload', b'synthetic image', 'image/jpeg', True)]
+                    elif case in complete_cases:
+                        body = json.dumps({'sha256': 'a' * 64}, separators=(',', ':')).encode()
+                        expected = [('POST', '/upload/synthetic/complete', body, 'application/json', True)]
                     if server.observed[before:] != expected:
                         raise AssertionError(f'{case}: unexpected loopback upload calls')
                     print(f'PASS canonical upload routing: {case}', flush=True)
