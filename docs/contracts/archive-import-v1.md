@@ -6,7 +6,8 @@ bytes and performs no provider verification downloads. A dedicated
 this interface. `archive_import_enabled=true` enables admissions. Existing
 registration, reconciliation and settlement remain available when admissions pause.
 
-`admit`, `admit-copy`, `check`, `register`, `reconcile`, and `settle` accept:
+`admit`, `admit-copy`, `check`, `register`, `reconcile`, `settle`, and
+`settle-copy` accept:
 
 ```json
 {"version":1,"items":[{"sha256":"<64 lowercase hex>","owner":"<64 lowercase hex>","attempt":"<32 lowercase hex>","source":"<immutable source identity>","provenance":"<approved archive manifest identity>","size":99,"content_type":"video/mp4"}]}
@@ -27,6 +28,48 @@ before releasing the gate. `reconcile` returns any existing admission and owner 
 registered. `settle` releases only the matching attempt; the durable CloudSQL authority
 must establish that all physical effects have finished or were explicitly rejected.
 Never use settlement to time out an uncertain write.
+
+For `settle-copy`, add the `generation` returned by `admit-copy` to the original
+admitted item. Every item field must match the admission, or the exact item retained
+by an earlier copy settlement. The generation must be a canonical, nonzero decimal
+`u64` string. Before retiring the attempt, the operation requires either its exact
+copying gate or the released gate for that same attempt and admission generation.
+
+A successful item returns this object in `items[n].result`:
+
+```json
+{
+  "settled": true,
+  "copy_settlement": {
+    "version": 1,
+    "sha256": "<64 lowercase hex>",
+    "owner": "<64 lowercase hex>",
+    "attempt": "<32 lowercase hex>",
+    "state": "released",
+    "admission_generation": "<admitted generation>",
+    "released_from_generation": "<same admitted generation>",
+    "parent_generation": "<observed released-gate generation>"
+  }
+}
+```
+
+Retirement atomically retains the admitted item and clears the active admission.
+The operation conditionally releases the owning gate, rechecks current policy, and
+returns proof only after observing that exact released gate. `owner` comes from the
+retained item. Both `admission_generation` and `released_from_generation` equal the
+supplied generation; `parent_generation` identifies the observed released gate.
+All three are canonical, nonzero decimal `u64` strings used as equality fences.
+
+Retry the identical item after a lost response; the retained binding is reused,
+and proof still requires the exact released gate and current policy. A missing
+gate, a different attempt or admission generation, or an erasing parent cannot
+produce this proof. Retired copy attempts cannot be readmitted with `admit-copy`.
+Legacy `settle` returns only `{"settled":true}`; that acknowledgment
+is not a copy-release proof, and a historical settlement without a retained copy
+item cannot be upgraded to one by replaying `settle-copy`.
+
+See the [archive handler and synthetic contract](../../src/archive_import.rs) and
+[parent-gate helpers](../../src/parent_gate.rs) for the implementation.
 
 Registration preserves moderation status and existing ownership. New records start
 pending. An `archive_storage` receipt makes bare original GET and Range use B2 even
