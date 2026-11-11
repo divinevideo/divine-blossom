@@ -680,6 +680,113 @@ async fn processing_prefers_primary_and_never_masks_primary_errors_with_gcs() {
 }
 
 #[tokio::test]
+async fn backfill_segments_use_pinned_b2_and_fall_back_only_when_missing() {
+    let origin = Origin::start().await;
+    let (gcs_state, client, task) = gcs_origin().await;
+    let legacy = MediaStorage::gcs(client.clone(), "synthetic-gcs".into());
+    let store = b2_primary_store(&origin, client);
+    let prefix = format!("{}/hls", "a".repeat(64));
+    let primary_key = format!("{prefix}/stream_720p.ts");
+    let legacy_key = format!("{prefix}/stream_480p.ts");
+    let primary = origin
+        .store()
+        .put_verified(
+            &primary_key,
+            Bytes::from_static(b"B2 segment"),
+            "video/mp2t",
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+    legacy
+        .put_verified(
+            &primary_key,
+            Bytes::from_static(b"GCS segment"),
+            "video/mp2t",
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+    gcs_state.lock().await.requests.clear();
+    origin.objects.lock().await.requests.clear();
+
+    let dir = tempfile::tempdir().unwrap();
+    let b2_file = dir.path().join("720p.ts");
+    assert!(store
+        .download_processing_segment(&primary_key, &b2_file)
+        .await
+        .unwrap());
+    assert_eq!(tokio::fs::read(&b2_file).await.unwrap(), b"B2 segment");
+    assert!(gcs_state.lock().await.requests.is_empty());
+    assert!(origin.objects.lock().await.requests.contains(&(
+        "GET".into(),
+        primary_key.clone(),
+        primary.object.reference.version,
+    )));
+
+    origin.objects.lock().await.get_status = Some(StatusCode::NOT_FOUND);
+    let lost_version = dir.path().join("lost.ts");
+    assert!(store
+        .download_processing_segment(&primary_key, &lost_version)
+        .await
+        .is_err());
+    assert!(!lost_version.exists());
+    assert!(gcs_state.lock().await.requests.is_empty());
+
+    legacy
+        .put_verified(
+            &legacy_key,
+            Bytes::from_static(b"GCS segment"),
+            "video/mp2t",
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+    gcs_state.lock().await.requests.clear();
+    let legacy_file = dir.path().join("480p.ts");
+    assert!(store
+        .download_processing_segment(&legacy_key, &legacy_file)
+        .await
+        .unwrap());
+    assert_eq!(tokio::fs::read(&legacy_file).await.unwrap(), b"GCS segment");
+    assert!(gcs_state
+        .lock()
+        .await
+        .requests
+        .iter()
+        .any(|(method, path)| method == "GET" && path.contains("stream_480p.ts")));
+    task.abort();
+}
+
+#[tokio::test]
+async fn backfill_cannot_report_success_without_a_segment_in_either_store() {
+    let origin = Origin::start().await;
+    let (gcs_state, client, task) = gcs_origin().await;
+    let store = b2_primary_store(&origin, client);
+    let error = crate::backfill_fmp4(&store, &"b".repeat(64))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("did not produce any MP4"));
+    assert!(origin
+        .objects
+        .lock()
+        .await
+        .requests
+        .iter()
+        .all(|(method, _, _)| method == "HEAD"));
+    assert!(gcs_state
+        .lock()
+        .await
+        .requests
+        .iter()
+        .all(|(method, _)| method == "GET"));
+    task.abort();
+}
+
+#[tokio::test]
 async fn processing_legacy_fallback_still_rejects_corrupt_or_changed_gcs_source() {
     for corrupt in [false, true] {
         let origin = Origin::start().await;

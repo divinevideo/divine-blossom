@@ -1137,56 +1137,14 @@ async fn handle_backfill_fmp4(
     Json(request): Json<TranscodeRequest>,
 ) -> Response {
     let hash = request.hash.to_lowercase();
-
-    // Download .ts files from GCS
-    let temp_dir = TempDir::new().unwrap();
-    let temp_path = temp_dir.path();
-
-    for variant in &["stream_720p", "stream_480p"] {
-        let gcs_key = format!("{}/hls/{}.ts", hash, variant);
-        let ts_path = temp_path.join(format!("{}.ts", variant));
-
-        if let Err(e) = download_from_gcs(
-            &state.gcs_client,
-            &state.config.gcs_bucket,
-            &gcs_key,
-            &ts_path,
-        )
-        .await
-        {
-            warn!("Backfill: {} not found for {}: {}", variant, hash, e);
-            continue;
-        }
-    }
-
-    // Remux .ts to .mp4
-    if let Err(e) = remux_ts_to_fmp4(temp_path).await {
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid hash format"})),
         )
             .into_response();
     }
-
-    // Remove .ts files from temp dir so upload_hls only uploads .mp4
-    for variant in &["stream_720p", "stream_480p"] {
-        let ts_path = temp_path.join(format!("{}.ts", variant));
-        let _ = tokio::fs::remove_file(&ts_path).await;
-    }
-
-    // Upload only the new .mp4 files
-    let source_metadata = SourceObjectMetadata::default();
-    if let Err(e) = upload_hls(
-        &object_storage::MediaStorage::gcs(
-            state.gcs_client.clone(),
-            state.config.gcs_bucket.clone(),
-        ),
-        &hash,
-        temp_path,
-        &source_metadata,
-    )
-    .await
-    {
+    if let Err(e) = backfill_fmp4(&state.media_storage, &hash).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -1195,6 +1153,33 @@ async fn handle_backfill_fmp4(
     }
 
     Json(serde_json::json!({"status": "ok", "hash": hash})).into_response()
+}
+
+async fn backfill_fmp4(storage: &object_storage::MediaStorage, hash: &str) -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let temp_path = temp_dir.path();
+    let mut segments = Vec::new();
+    for variant in ["stream_720p", "stream_480p"] {
+        let filename = format!("{variant}.ts");
+        let path = temp_path.join(&filename);
+        let key = format!("{hash}/hls/{filename}");
+        if storage.download_processing_segment(&key, &path).await? {
+            segments.push(path);
+        }
+    }
+
+    remux_ts_to_fmp4(temp_path).await?;
+    // Never pass input segments to the publisher, including legacy GCS inputs.
+    for segment in segments {
+        tokio::fs::remove_file(segment).await?;
+    }
+    if upload_hls(storage, hash, temp_path, &SourceObjectMetadata::default())
+        .await?
+        .is_empty()
+    {
+        return Err(anyhow!("Backfill did not produce any MP4 variants"));
+    }
+    Ok(())
 }
 
 async fn handle_audio_extract(
@@ -2530,28 +2515,6 @@ async fn find_transcript(
         state.config.gcs_bucket.clone(),
     );
     Ok(legacy.stat(key).await?.map(|object| (legacy, object)))
-}
-
-async fn download_from_gcs(
-    client: &GcsClient,
-    bucket: &str,
-    object: &str,
-    output_path: &Path,
-) -> Result<()> {
-    let data = client
-        .download_object(
-            &GetObjectRequest {
-                bucket: bucket.to_string(),
-                object: object.to_string(),
-                ..Default::default()
-            },
-            &DownloadRange::default(),
-        )
-        .await
-        .map_err(|e| anyhow!("Failed to download from GCS: {}", e))?;
-
-    tokio::fs::write(output_path, &data).await?;
-    Ok(())
 }
 
 /// Extract mono 16kHz PCM WAV audio for transcription.

@@ -520,9 +520,26 @@ impl MediaStorage {
         }
         Ok(hex::encode(hash.finalize()))
     }
-    /// Prefer the selected provider. During a B2-primary migration, only an
-    /// absent original may fall back to its legacy GCS location; provider
-    /// failures or failed verification must never select another source.
+    /// An absent input may use the legacy store in B2-primary mode. Provider
+    /// failures and failed verification must never select another source.
+    async fn find_processing_input(&self, key: &str) -> Result<Option<(&Self, ObjectMetadata)>> {
+        if let Some(object) = self.stat(key).await? {
+            return Ok(Some((self, object)));
+        }
+        match self.required_backup.as_deref() {
+            Some(legacy) => Ok(legacy.stat(key).await?.map(|object| (legacy, object))),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn download_processing_segment(&self, key: &str, path: &Path) -> Result<bool> {
+        let Some((store, object)) = self.find_processing_input(key).await? else {
+            return Ok(false);
+        };
+        store.download_pinned(&object, None, path).await?;
+        Ok(true)
+    }
+
     pub async fn download_processing_original(
         &self,
         expected_sha: &str,
@@ -531,18 +548,11 @@ impl MediaStorage {
         if !is_sha256(expected_sha) {
             bail!("Original SHA-256 identity invalid");
         }
-        if let Some(object) = self.stat(expected_sha).await? {
-            return self.download_original(&object, expected_sha, path).await;
-        }
-        let legacy = self
-            .required_backup
-            .as_deref()
-            .ok_or_else(|| anyhow!("Original not found"))?;
-        let object = legacy
-            .stat(expected_sha)
+        let (store, object) = self
+            .find_processing_input(expected_sha)
             .await?
             .ok_or_else(|| anyhow!("Original not found"))?;
-        legacy.download_original(&object, expected_sha, path).await
+        store.download_original(&object, expected_sha, path).await
     }
 
     pub async fn download_original(
@@ -554,19 +564,28 @@ impl MediaStorage {
         if !is_sha256(expected_sha) || object.reference.key != expected_sha {
             bail!("Original SHA-256 identity invalid");
         }
+        self.download_pinned(object, Some(expected_sha), path).await
+    }
+
+    async fn download_pinned(
+        &self,
+        object: &ObjectMetadata,
+        expected_sha: Option<&str>,
+        path: &Path,
+    ) -> Result<VerifiedObject> {
         let directory = path
             .parent()
-            .ok_or_else(|| anyhow!("Original output directory missing"))?;
+            .ok_or_else(|| anyhow!("Media output directory missing"))?;
         let temp = tempfile::NamedTempFile::new_in(directory)?;
         let mut writer = tokio::fs::File::from_std(temp.reopen()?);
         let sha256 = self.hash_body(object, Some(&mut writer)).await?;
-        if sha256 != expected_sha {
+        if expected_sha.is_some_and(|expected| sha256 != expected) {
             bail!("Original SHA-256 verification failed");
         }
         writer.flush().await?;
         drop(writer);
         temp.persist(path)
-            .map_err(|_| anyhow!("Verified original could not be published"))?;
+            .map_err(|_| anyhow!("Verified media could not be published"))?;
         Ok(VerifiedObject {
             object: object.clone(),
             sha256,
