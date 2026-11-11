@@ -60,3 +60,9 @@ blob-reference arrays remain as generation fences, containing no ownership assoc
 expiring/deleting those keys would allow a delayed add-only request to recreate them.
 This retirement applies to archive import authority; ordinary signed uploads retain their
 existing account policy.
+
+Erased blob metadata is stored as JSON `null`, which public lookup treats as absent.
+Archive admission records are cleared of identity and provenance while their KV
+generation remains. These empty records prevent a request prepared before erasure
+from succeeding as an add-only insertion after erasure. Admission and metadata
+mutations check owner policy and the writer generation inside every CAS retry.

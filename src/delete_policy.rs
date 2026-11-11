@@ -150,7 +150,7 @@ impl DefaultVanishWaveOps {
 
 impl VanishWaveOps for DefaultVanishWaveOps {
     type EvidenceHandle = PendingInsertHandle;
-    type MetadataHandle = PendingDeleteHandle;
+    type MetadataHandle = PendingInsertHandle;
     type ArtifactHandle = PendingDeleteHandle;
     type SubtitleLookupHandle = PendingLookupHandle;
 

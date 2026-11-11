@@ -170,10 +170,11 @@ fn parse_blob_metadata_lookup(
     match lookup {
         Ok(mut lookup_result) => {
             let body = lookup_result.take_body().into_string();
-            let metadata: BlobMetadata = serde_json::from_str(&body).map_err(|e| {
+            // JSON null retains a generation fence after erasure without identity data.
+            let metadata: Option<BlobMetadata> = serde_json::from_str(&body).map_err(|e| {
                 BlossomError::MetadataError(format!("Failed to parse metadata: {}", e))
             })?;
-            Ok(Some(metadata))
+            Ok(metadata)
         }
         Err(KVStoreError::ItemNotFound) => Ok(None),
         Err(e) => Err(BlossomError::MetadataError(format!(
@@ -357,10 +358,12 @@ pub(crate) fn finish_vanish_erasure_evidence(
 pub(crate) fn start_vanish_metadata_delete(
     store: &KVStore,
     hash: &str,
-) -> Result<PendingDeleteHandle> {
+) -> Result<PendingInsertHandle> {
     crate::archive_import::erase_record(hash)?;
     let key = format!("{}{}", BLOB_PREFIX, hash.to_lowercase());
-    store.build_delete().execute_async(&key).map_err(|error| {
+    // Retain only a null CAS fence: deleting permits a delayed add-only registration
+    // to recreate metadata after physical erasure has already completed.
+    store.build_insert().execute_async(&key,"null").map_err(|error| {
         BlossomError::MetadataError(format!("Failed to start metadata delete: {error}"))
     })
 }
@@ -368,9 +371,9 @@ pub(crate) fn start_vanish_metadata_delete(
 pub(crate) fn finish_vanish_metadata_delete(
     store: &KVStore,
     hash: &str,
-    handle: PendingDeleteHandle,
+    handle: PendingInsertHandle,
 ) -> Result<()> {
-    store.pending_delete_wait(handle).map_err(|error| {
+    store.pending_insert_wait(handle).map_err(|error| {
         BlossomError::MetadataError(format!("Failed to delete metadata: {error}"))
     })?;
     invalidate_metadata_cache(hash);

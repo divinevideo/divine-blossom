@@ -82,10 +82,20 @@ fn read(hash: &str) -> Result<Record> {
     }
 }
 pub(crate) fn erase_record(hash: &str) -> Result<()> {
-    match metadata::open_store()?.delete(&key(hash)) {
-        Ok(()) | Err(KVStoreError::ItemNotFound) => Ok(()),
-        Err(_) => Err(unavailable()),
-    }
+    // Clear identity/provenance while retaining a generation fence against delayed
+    // add-only admission requests. Physical erasure permanently closes the parent gate.
+    metadata::update_json_conditionally(
+        &key(hash),
+        5,
+        "clear archive record",
+        |_: Option<Record>| {
+            Ok(Mutation::Write {
+                value: Record::default(),
+                result: (),
+                time_to_live: None,
+            })
+        },
+    )
 }
 fn validate(i: &Item) -> Result<()> {
     if !hex(&i.sha256, 64)
@@ -117,9 +127,7 @@ pub(crate) fn unlink_owner(hash: &str, owner: &str) -> Result<()> {
         .insert(&removed_owner_key(hash, owner), "true")
         .map_err(|_| unavailable())?;
     metadata::update_json_conditionally(&key(hash), 5, "archive owner removal", |current| {
-        let Some(mut record): Option<Record> = current else {
-            return Ok(Mutation::Complete(()));
-        };
+        let mut record: Record = current.unwrap_or_default();
         record.receipts.remove(owner);
         record.provenance.remove(owner);
         if record.admission.as_ref().is_some_and(|a| a.owner == owner) {
@@ -229,6 +237,9 @@ fn admit_for(i: &Item, copy: bool) -> Result<serde_json::Value> {
     let mut admitted = i.clone();
     admitted.generation = Some(generation.clone());
     metadata::update_json_conditionally(&key(&i.sha256), 5, "archive admission", |current| {
+        owner_allowed(&i.sha256, &i.owner).map_err(|e| e.to_string())?;
+        parent_gate::archive_check(&i.sha256, &i.attempt, &generation)
+            .map_err(|e| e.to_string())?;
         let mut record: Record = current.unwrap_or_default();
         if record.admission.as_ref() == Some(&admitted) {
             return Ok(Mutation::Complete(()));
@@ -301,7 +312,11 @@ fn register(i: &Item) -> Result<serde_json::Value> {
         &format!("blob:{}", i.sha256),
         5,
         "archive metadata",
-        |current| {
+        |current: Option<Option<BlobMetadata>>| {
+            owner_allowed(&i.sha256, &i.owner).map_err(|e| e.to_string())?;
+            parent_gate::archive_check(&i.sha256, &i.attempt, generation)
+                .map_err(|e| e.to_string())?;
+            let current = current.flatten();
             let is_new = current.is_none();
             let mut meta: BlobMetadata = current.unwrap_or_else(|| new_metadata.clone());
             if !matches!(meta.status, BlobStatus::Active | BlobStatus::Pending)
@@ -315,7 +330,7 @@ fn register(i: &Item) -> Result<serde_json::Value> {
             }
             meta.archive_storage = Some(storage.clone());
             Ok(Mutation::Write {
-                value: meta,
+                value: Some(meta),
                 result: (),
                 time_to_live: None,
             })
@@ -687,6 +702,10 @@ mod tests {
         let list_key = format!("list:{}", delayed.owner);
         let refs_key = format!("refs:{}", delayed.sha256);
         // Pause the writer after its CAS lookup and policy check, before insert.
+        let record_key = key(&delayed.sha256);
+        let mut record_snapshot = store.lookup(&record_key).unwrap();
+        let record_generation = record_snapshot.current_generation();
+        let stale_record = record_snapshot.take_body().into_string();
         let list_generation = store.lookup(&list_key).unwrap().current_generation();
         let refs_generation = store.lookup(&refs_key).unwrap().current_generation();
         owner_allowed(&delayed.sha256, &delayed.owner).unwrap();
@@ -698,6 +717,7 @@ mod tests {
         assert_eq!(call(&delayed, "settle")["items"][0]["ok"], true);
         // Resume the stale writes after erasure and settlement both returned.
         for (key, generation, value) in [
+            (record_key, record_generation, stale_record),
             (
                 list_key,
                 list_generation,
@@ -722,6 +742,7 @@ mod tests {
         );
         assert!(metadata::add_archive_blob_ref(&delayed.sha256, &delayed.owner).is_err());
         assert!(register(&delayed).is_err());
+        assert!(read(&delayed.sha256).unwrap().admission.is_none());
         assert!(metadata::get_user_blobs(&delayed.owner).unwrap().is_empty());
         assert_eq!(
             metadata::get_blob_refs(&delayed.sha256).unwrap(),
@@ -746,7 +767,61 @@ mod tests {
             Err(KVStoreError::ItemPreconditionFailed)
         ));
         assert!(admit(&late).is_err());
+        unlink_owner(&late.sha256, &late.owner).unwrap();
+        assert!(matches!(
+            store
+                .build_insert()
+                .mode(fastly::kv_store::InsertMode::Add)
+                .execute(&format!("archive:v1:{}", late.sha256), "{}"),
+            Err(KVStoreError::ItemPreconditionFailed)
+        ));
+        erase_record(&late.sha256).unwrap();
+        assert!(matches!(
+            store
+                .build_insert()
+                .mode(fastly::kv_store::InsertMode::Add)
+                .execute(&format!("archive:v1:{}", late.sha256), "{}"),
+            Err(KVStoreError::ItemPreconditionFailed)
+        ));
         assert!(metadata::get_user_blobs(&late.owner).unwrap().is_empty());
+        let erased = sample("9", "8", "7");
+        let admission = admit(&erased).unwrap();
+        assert!(metadata::get_blob_metadata_uncached(&erased.sha256)
+            .unwrap()
+            .is_none());
+        let meta_key = format!("blob:{}", erased.sha256);
+        owner_allowed(&erased.sha256, &erased.owner).unwrap();
+        parent_gate::archive_check(
+            &erased.sha256,
+            &erased.attempt,
+            admission["generation"].as_str().unwrap(),
+        )
+        .unwrap();
+        metadata::mark_vanish_in_progress(&erased.owner).unwrap();
+        assert_eq!(call(&erased, "settle")["items"][0]["ok"], true);
+        parent_gate::claim_erasure(&store, &erased.sha256).unwrap();
+        metadata::delete_blob_metadata(&erased.sha256).unwrap();
+        // Resume an absent-key insert prepared by the original registration request.
+        assert!(matches!(
+            store
+                .build_insert()
+                .mode(fastly::kv_store::InsertMode::Add)
+                .execute(&meta_key, "{}"),
+            Err(KVStoreError::ItemPreconditionFailed)
+        ));
+        assert_eq!(
+            store.lookup(&meta_key).unwrap().take_body().into_string(),
+            "null"
+        );
+        assert!(metadata::get_blob_metadata_uncached(&erased.sha256)
+            .unwrap()
+            .is_none());
+        let mut request = Request::get(format!("https://fixture.invalid/{}", erased.sha256));
+        request.set_header("Host", "media.divine.video");
+        assert!(matches!(
+            crate::handle_get_blob(request, &format!("/{}", erased.sha256)),
+            Err(BlossomError::NotFound(_))
+        ));
     }
     #[test]
     #[ignore = "requires admission-disabled synthetic KV; scripts/run-archive-import-tests.py"]
