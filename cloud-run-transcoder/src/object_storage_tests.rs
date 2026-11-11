@@ -766,10 +766,10 @@ async fn backfill_cannot_report_success_without_a_segment_in_either_store() {
     let origin = Origin::start().await;
     let (gcs_state, client, task) = gcs_origin().await;
     let store = b2_primary_store(&origin, client);
-    let error = crate::backfill_fmp4(&store, &"b".repeat(64))
+    let error = crate::backfill_fmp4(&store, &"b".repeat(64), false, copy_backfill_input)
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("did not produce any MP4"));
+    assert!(error.to_string().contains("no input segments"));
     assert!(origin
         .objects
         .lock()
@@ -1943,4 +1943,309 @@ async fn review360_forced_selected_cache_and_backup_failures_report_terminal_sta
         task.abort();
         status_task.abort();
     }
+}
+
+async fn seed_backfill(store: &MediaStorage, variant: &str, extension: &str) {
+    store
+        .put_verified(
+            &format!("{}/hls/{variant}.{extension}", "a".repeat(64)),
+            Bytes::from_static(b"synthetic-media"),
+            "video/mp4",
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+}
+
+async fn copy_backfill_input(
+    ts: std::path::PathBuf,
+    mp4: std::path::PathBuf,
+    _: &'static str,
+) -> anyhow::Result<()> {
+    tokio::fs::copy(ts, mp4).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn backfill_existing_outputs_return_without_download_remux_or_writes() {
+    let origin = Origin::start().await;
+    let store = origin.store();
+    for variant in ["stream_720p", "stream_480p"] {
+        seed_backfill(&store, variant, "mp4").await;
+    }
+    origin.objects.lock().await.requests.clear();
+    assert_eq!(
+        crate::backfill_fmp4(&store, &"a".repeat(64), false, |_, _, _| async {
+            panic!("existing outputs must not remux");
+            #[allow(unreachable_code)]
+            Ok(())
+        })
+        .await
+        .unwrap(),
+        "already_exists"
+    );
+    let objects = origin.objects.lock().await;
+    assert_eq!(objects.requests.len(), 2);
+    assert!(objects
+        .requests
+        .iter()
+        .all(|(method, _, _)| method == "HEAD"));
+}
+
+#[tokio::test]
+async fn backfill_missing_output_preserves_existing_sibling_and_repeated_call() {
+    let origin = Origin::start().await;
+    let store = origin.store();
+    seed_backfill(&store, "stream_720p", "mp4").await;
+    seed_backfill(&store, "stream_480p", "ts").await;
+    let key = format!("{}/hls/stream_720p.mp4", "a".repeat(64));
+    let existing = store.stat(&key).await.unwrap().unwrap();
+    origin.objects.lock().await.requests.clear();
+    assert_eq!(
+        crate::backfill_fmp4(&store, &"a".repeat(64), false, copy_backfill_input)
+            .await
+            .unwrap(),
+        "ok"
+    );
+    assert_eq!(store.stat(&key).await.unwrap().unwrap(), existing);
+    let requests = origin.objects.lock().await.requests.clone();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|(method, _, _)| method == "PUT")
+            .count(),
+        1
+    );
+    assert!(requests
+        .iter()
+        .filter(|(method, _, _)| method == "PUT")
+        .all(|(_, key, _)| key.ends_with("stream_480p.mp4")));
+    assert!(!requests
+        .iter()
+        .any(|(_, key, _)| key.ends_with("stream_720p.ts")));
+    assert_eq!(
+        crate::backfill_fmp4(&store, &"a".repeat(64), false, copy_backfill_input)
+            .await
+            .unwrap(),
+        "already_exists"
+    );
+}
+
+#[tokio::test]
+async fn backfill_force_replaces_both_primary_versions_and_required_backups() {
+    let primary = Origin::start().await;
+    let backup = Origin::start().await;
+    let mut store = primary.store();
+    store.required_backup = Some(Box::new(backup.store()));
+    for variant in ["stream_720p", "stream_480p"] {
+        seed_backfill(&store, variant, "ts").await;
+        seed_backfill(&store, variant, "mp4").await;
+    }
+    let before = store
+        .stat(&format!("{}/hls/stream_720p.mp4", "a".repeat(64)))
+        .await
+        .unwrap()
+        .unwrap();
+    primary.objects.lock().await.requests.clear();
+    backup.objects.lock().await.requests.clear();
+    assert_eq!(
+        crate::backfill_fmp4(&store, &"a".repeat(64), true, copy_backfill_input)
+            .await
+            .unwrap(),
+        "ok"
+    );
+    let after = store.stat(&before.reference.key).await.unwrap().unwrap();
+    assert_ne!(before.reference.version, after.reference.version);
+    for origin in [&primary, &backup] {
+        let objects = origin.objects.lock().await;
+        assert_eq!(
+            objects
+                .requests
+                .iter()
+                .filter(|(method, _, _)| method == "PUT")
+                .count(),
+            2
+        );
+        assert!(objects
+            .requests
+            .iter()
+            .filter(|(method, _, _)| method == "PUT")
+            .all(|(_, key, _)| key.ends_with(".mp4")));
+    }
+}
+
+#[tokio::test]
+async fn backfill_partial_remux_failure_keeps_success_and_never_publishes_failed_artifact() {
+    let origin = Origin::start().await;
+    let store = origin.store();
+    for variant in ["stream_720p", "stream_480p"] {
+        seed_backfill(&store, variant, "ts").await;
+    }
+    origin.objects.lock().await.requests.clear();
+    let result = crate::backfill_fmp4(
+        &store,
+        &"a".repeat(64),
+        false,
+        |ts, mp4, variant| async move {
+            if variant == "stream_480p" {
+                tokio::fs::write(mp4, b"failed-partial-output").await?;
+                anyhow::bail!("synthetic remux failure");
+            }
+            copy_backfill_input(ts, mp4, variant).await
+        },
+    )
+    .await;
+    assert!(result.unwrap_err().to_string().contains("1 of 2"));
+    let objects = origin.objects.lock().await;
+    let writes: Vec<_> = objects
+        .requests
+        .iter()
+        .filter(|(method, _, _)| method == "PUT")
+        .collect();
+    assert_eq!(writes.len(), 1);
+    assert!(writes[0].1.ends_with("stream_720p.mp4"));
+}
+
+#[tokio::test]
+async fn backfill_zero_inputs_or_empty_output_cannot_report_success() {
+    let origin = Origin::start().await;
+    let store = origin.store();
+    assert!(
+        crate::backfill_fmp4(&store, &"a".repeat(64), false, copy_backfill_input)
+            .await
+            .is_err()
+    );
+    seed_backfill(&store, "stream_720p", "ts").await;
+    origin.objects.lock().await.requests.clear();
+    assert!(
+        crate::backfill_fmp4(&store, &"a".repeat(64), false, |_, mp4, _| async move {
+            tokio::fs::write(mp4, b"").await?;
+            Ok(())
+        })
+        .await
+        .is_err()
+    );
+    assert!(origin
+        .objects
+        .lock()
+        .await
+        .requests
+        .iter()
+        .all(|(method, _, _)| method != "PUT"));
+}
+
+#[tokio::test]
+async fn backfill_storage_failures_do_not_become_absence_or_success() {
+    let primary = Origin::start().await;
+    let backup = Origin::start().await;
+    let mut store = primary.store();
+    primary.objects.lock().await.fail = Some(StatusCode::FORBIDDEN);
+    assert!(
+        crate::backfill_fmp4(&store, &"a".repeat(64), false, copy_backfill_input)
+            .await
+            .is_err()
+    );
+    assert!(primary
+        .objects
+        .lock()
+        .await
+        .requests
+        .iter()
+        .all(|(method, _, _)| method == "HEAD"));
+    primary.objects.lock().await.fail = None;
+    seed_backfill(&store, "stream_720p", "ts").await;
+    store.required_backup = Some(Box::new(backup.store()));
+    backup.objects.lock().await.fail = Some(StatusCode::FORBIDDEN);
+    assert!(
+        crate::backfill_fmp4(&store, &"a".repeat(64), false, copy_backfill_input)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn backfill_legacy_segment_is_read_without_republishing_input() {
+    let primary = Origin::start().await;
+    let legacy = Origin::start().await;
+    seed_backfill(&legacy.store(), "stream_720p", "ts").await;
+    let mut store = primary.store();
+    // The provider-independent fallback is exercised with versioned origins;
+    // GCS pinned download and required backup paths have separate wire tests.
+    store.required_backup = Some(Box::new(legacy.store()));
+    legacy.objects.lock().await.requests.clear();
+    assert_eq!(
+        crate::backfill_fmp4(&store, &"a".repeat(64), false, copy_backfill_input)
+            .await
+            .unwrap(),
+        "ok"
+    );
+    assert!(primary
+        .objects
+        .lock()
+        .await
+        .requests
+        .iter()
+        .filter(|(method, _, _)| method == "PUT")
+        .all(|(_, key, _)| key.ends_with(".mp4")));
+    assert!(legacy
+        .objects
+        .lock()
+        .await
+        .requests
+        .iter()
+        .any(|(method, key, _)| method == "GET" && key.ends_with(".ts")));
+}
+
+#[tokio::test]
+async fn backfill_handler_authorizes_force_before_storage() {
+    let origin = Origin::start().await;
+    let (_, client, task) = gcs_origin().await;
+    for (secret, header, expected) in [
+        (None, None, StatusCode::SERVICE_UNAVAILABLE),
+        (Some("synthetic-repair"), None, StatusCode::UNAUTHORIZED),
+        (
+            Some("synthetic-repair"),
+            Some("incorrect"),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            Some("synthetic-repair"),
+            Some("synthetic-repair"),
+            StatusCode::OK,
+        ),
+    ] {
+        let mut state = transcript_state(origin.store(), client.clone());
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .transcode_repair_secret = secret.map(String::from);
+        let mut headers = axum::http::HeaderMap::new();
+        if let Some(header) = header {
+            headers.insert("x-divine-repair-secret", header.parse().unwrap());
+        }
+        // Invalid hash returns 400 only after successful authorization, before I/O.
+        let response = crate::handle_backfill_fmp4(
+            axum::extract::State(state),
+            headers,
+            Json(crate::TranscodeRequest {
+                hash: "invalid".into(),
+                force: true,
+                owner: None,
+                job_id: None,
+                lang: None,
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            if expected == StatusCode::OK {
+                StatusCode::BAD_REQUEST
+            } else {
+                expected
+            }
+        );
+        assert!(origin.objects.lock().await.requests.is_empty());
+    }
+    task.abort();
 }
