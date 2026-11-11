@@ -132,24 +132,57 @@ pub(crate) fn unlink_owner(hash: &str, owner: &str) -> Result<()> {
         })
     })
 }
+fn removed_account_key(owner: &str) -> String {
+    format!(
+        "archive-account-removed:v1:{}",
+        hex::encode(Sha256::digest(owner.to_lowercase()))
+    )
+}
+
+/// Retire archive authority before the eraser enumerates the creator's list.
+/// The same-key generation advance rejects additions prepared before this fence.
+pub(crate) fn fence_account(owner: &str) -> Result<()> {
+    metadata::open_store()?
+        .insert(&removed_account_key(owner), "true")
+        .map_err(|_| unavailable())?;
+    metadata::update_json_conditionally(
+        &format!("list:{}", owner.to_lowercase()),
+        5,
+        "archive account fence",
+        |current: Option<Vec<String>>| {
+            Ok(Mutation::Write {
+                value: current.unwrap_or_default(),
+                result: (),
+                time_to_live: None,
+            })
+        },
+    )
+}
+
+/// Called inside each ownership CAS mutation, after its generation was observed.
+pub(crate) fn owner_allowed(hash: &str, owner: &str) -> Result<()> {
+    let store = metadata::open_store()?;
+    for key in [
+        removed_owner_key(hash, owner),
+        removed_account_key(owner),
+        format!("vanish_in_progress:v1:{owner}"),
+    ] {
+        match store.lookup(&key) {
+            Ok(_) => return Err(denied()),
+            Err(KVStoreError::ItemNotFound) => {}
+            Err(_) => return Err(unavailable()),
+        }
+    }
+    Ok(())
+}
 fn policy(i: &Item) -> Result<()> {
+    owner_allowed(&i.sha256, &i.owner)?;
     if metadata::get_tombstone(&i.sha256)?.is_some()
         || !metadata::get_quarantine_holds(&i.sha256)?
             .active_ids()
             .is_empty()
     {
         return Err(denied());
-    }
-    let store = metadata::open_store()?;
-    match store.lookup(&removed_owner_key(&i.sha256, &i.owner)) {
-        Ok(_) => return Err(denied()),
-        Err(KVStoreError::ItemNotFound) => {}
-        Err(_) => return Err(unavailable()),
-    }
-    match store.lookup(&format!("vanish_in_progress:v1:{}", i.owner)) {
-        Ok(_) => return Err(denied()),
-        Err(KVStoreError::ItemNotFound) => {}
-        Err(_) => return Err(unavailable()),
     }
     if let Some(meta) = metadata::get_blob_metadata_uncached(&i.sha256)? {
         if !matches!(meta.status, BlobStatus::Active | BlobStatus::Pending)
@@ -185,7 +218,7 @@ fn admit_for(i: &Item, copy: bool) -> Result<serde_json::Value> {
         return Err(denied());
     }
     // Register ownership before bytes are admitted so vanish can discover the in-flight hash.
-    metadata::add_to_user_list(&i.owner, &i.sha256)?;
+    metadata::add_archive_user_hashes(&i.owner, std::slice::from_ref(&i.sha256))?;
     let generation = parent_gate::archive_claim(&i.sha256, &i.attempt)?;
     if read(&i.sha256)?.settled.contains(&i.attempt) {
         parent_gate::archive_settle_current(&i.sha256, &i.attempt)?;
@@ -288,8 +321,8 @@ fn register(i: &Item) -> Result<serde_json::Value> {
             })
         },
     )?;
-    metadata::add_to_user_list(&i.owner, &i.sha256)?;
-    metadata::add_to_blob_refs(&i.sha256, &i.owner)?;
+    metadata::add_archive_user_hashes(&i.owner, std::slice::from_ref(&i.sha256))?;
+    metadata::add_archive_blob_ref(&i.sha256, &i.owner)?;
     policy(i)?;
     let receipt = Registration {
         version: 1,
@@ -635,6 +668,85 @@ mod tests {
             "a late retry must not reopen a retired admission"
         );
         parent_gate::claim_erasure(&metadata::open_store().unwrap(), &i.sha256).unwrap();
+    }
+    #[test]
+    #[ignore = "requires synthetic KV; scripts/run-archive-import-tests.py"]
+    fn archive_ownership_cas_rejects_writes_prepared_before_unlink() {
+        let mut original = sample("a", "b", "c");
+        let admission = admit(&original).unwrap();
+        original.generation = Some(admission["generation"].as_str().unwrap().into());
+        original.file_id = Some("fixture-version".into());
+        original.bucket = Some("b2".into());
+        register(&original).unwrap();
+        let mut delayed = sample("a", "d", "e");
+        let admission = admit(&delayed).unwrap();
+        delayed.generation = Some(admission["generation"].as_str().unwrap().into());
+        delayed.file_id = original.file_id.clone();
+        delayed.bucket = original.bucket.clone();
+        let store = metadata::open_store().unwrap();
+        let list_key = format!("list:{}", delayed.owner);
+        let refs_key = format!("refs:{}", delayed.sha256);
+        // Pause the writer after its CAS lookup and policy check, before insert.
+        let list_generation = store.lookup(&list_key).unwrap().current_generation();
+        let refs_generation = store.lookup(&refs_key).unwrap().current_generation();
+        owner_allowed(&delayed.sha256, &delayed.owner).unwrap();
+        metadata::mark_vanish_in_progress(&delayed.owner).unwrap();
+        metadata::remove_from_blob_refs(&delayed.sha256, &delayed.owner).unwrap();
+        metadata::update_user_list_for_vanish(&delayed.owner, &[delayed.sha256.clone()], &[])
+            .unwrap();
+        metadata::clear_vanish_in_progress(&delayed.owner).unwrap();
+        assert_eq!(call(&delayed, "settle")["items"][0]["ok"], true);
+        // Resume the stale writes after erasure and settlement both returned.
+        for (key, generation, value) in [
+            (
+                list_key,
+                list_generation,
+                serde_json::json!([delayed.sha256]).to_string(),
+            ),
+            (
+                refs_key,
+                refs_generation,
+                serde_json::json!([original.owner, delayed.owner]).to_string(),
+            ),
+        ] {
+            assert!(matches!(
+                store
+                    .build_insert()
+                    .if_generation_match(generation)
+                    .execute(&key, value),
+                Err(KVStoreError::ItemPreconditionFailed)
+            ));
+        }
+        assert!(
+            metadata::add_archive_user_hashes(&delayed.owner, &[delayed.sha256.clone()]).is_err()
+        );
+        assert!(metadata::add_archive_blob_ref(&delayed.sha256, &delayed.owner).is_err());
+        assert!(register(&delayed).is_err());
+        assert!(metadata::get_user_blobs(&delayed.owner).unwrap().is_empty());
+        assert_eq!(
+            metadata::get_blob_refs(&delayed.sha256).unwrap(),
+            vec![original.owner]
+        );
+        // A brand-new admission paused while the account list was absent is also fenced.
+        let late = sample("f", "e", "f");
+        let key = format!("list:{}", late.owner);
+        assert!(matches!(
+            store.lookup(&key),
+            Err(KVStoreError::ItemNotFound)
+        ));
+        owner_allowed(&late.sha256, &late.owner).unwrap();
+        metadata::mark_vanish_in_progress(&late.owner).unwrap();
+        metadata::update_user_list_for_vanish(&late.owner, &[], &[]).unwrap();
+        metadata::clear_vanish_in_progress(&late.owner).unwrap();
+        assert!(matches!(
+            store
+                .build_insert()
+                .mode(fastly::kv_store::InsertMode::Add)
+                .execute(&key, serde_json::json!([late.sha256]).to_string()),
+            Err(KVStoreError::ItemPreconditionFailed)
+        ));
+        assert!(admit(&late).is_err());
+        assert!(metadata::get_user_blobs(&late.owner).unwrap().is_empty());
     }
     #[test]
     #[ignore = "requires admission-disabled synthetic KV; scripts/run-archive-import-tests.py"]

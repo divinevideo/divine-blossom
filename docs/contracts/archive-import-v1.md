@@ -52,3 +52,11 @@ archive record. Neither ordinary retries nor enabling the feature can override e
 Run `scripts/run-archive-import-tests.py` with Viceroy for real synthetic KV, ownership,
 replay, authorization, aggregate idempotency, erasure and signed Range tests. Registration
 must generate no media reads; the fixture permits exactly one explicit Range request.
+
+Archive ownership mutations check permanent owner/hash and account-erasure fences inside
+the generation-conditional update. Starting account erasure retires archive authority
+and advances the creator list generation before enumeration. Empty creator lists and
+blob-reference arrays remain as generation fences, containing no ownership associations;
+expiring/deleting those keys would allow a delayed add-only request to recreate them.
+This retirement applies to archive import authority; ordinary signed uploads retain their
+existing account policy.

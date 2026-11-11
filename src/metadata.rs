@@ -35,11 +35,6 @@ const QUARANTINE_PREFIX: &str = "quarantine:v1:";
 /// Key prefix for user blob lists
 const LIST_PREFIX: &str = "list:";
 
-/// Fastly deletes cannot carry a generation precondition, so expire the empty
-/// value written by the guarded update instead of risking deletion of a list
-/// concurrently changed by an upload.
-const VANISH_EMPTY_LIST_TTL: Duration = Duration::from_secs(1);
-
 /// Key for global statistics
 const STATS_KEY: &str = "stats:global";
 
@@ -395,9 +390,8 @@ fn auth_event_keys(hash: &str) -> [String; 2] {
 }
 
 pub(crate) fn vanish_blob_artifact_delete_keys(hash: &str) -> Vec<String> {
-    let mut keys = vec![blob_refs_key(hash)];
-    keys.extend(auth_event_keys(hash));
-    keys
+    // Keep the empty reference value as a CAS fence against delayed imports.
+    auth_event_keys(hash).to_vec()
 }
 
 fn subtitle_hash_key(hash: &str) -> String {
@@ -526,7 +520,8 @@ pub fn mark_vanish_in_progress(pubkey: &str) -> Result<()> {
             BlossomError::MetadataError(format!(
                 "Failed to store vanish in-progress state: {error}"
             ))
-        })
+        })?;
+    crate::archive_import::fence_account(pubkey)
 }
 
 /// Clear account-erasure state after the complete operation has succeeded.
@@ -815,7 +810,10 @@ pub(crate) fn add_archive_user_hashes(owner:&str, hashes:&[String])->Result<()> 
     let key=format!("list:{}",owner.to_lowercase());
     update_json_conditionally(&key,5,"archive user list",|current| {
         let mut list:Vec<String>=current.unwrap_or_default();let before=list.len();
-        for hash in hashes {if !list.contains(hash){list.push(hash.clone());}}
+        for hash in hashes {
+            crate::archive_import::owner_allowed(hash,owner).map_err(|e| e.to_string())?;
+            if !list.contains(hash){list.push(hash.clone());}
+        }
         if list.len()==before {return Ok(ConditionalJsonMutation::Complete(()));}
         Ok(ConditionalJsonMutation::Write{value:list,result:(),time_to_live:None})
     })
@@ -826,15 +824,8 @@ pub fn remove_from_user_list(pubkey: &str, hash: &str) -> Result<()> {
     let hash_lower = hash.to_lowercase();
     let key = format!("{}{}", LIST_PREFIX, pubkey.to_lowercase());
     update_json_conditionally(&key, 5, "user list removal", |current| {
-        let Some(mut hashes): Option<Vec<String>> = current else {
-            return Ok(ConditionalJsonMutation::Complete(()));
-        };
-        if !hashes
-            .iter()
-            .any(|entry| entry.eq_ignore_ascii_case(&hash_lower))
-        {
-            return Ok(ConditionalJsonMutation::Complete(()));
-        }
+        let mut hashes:Vec<String> = current.unwrap_or_default();
+        // A removal also fences an add prepared while this entry was absent.
         hashes.retain(|entry| !entry.eq_ignore_ascii_case(&hash_lower));
         Ok(ConditionalJsonMutation::Write {
             value: hashes,
@@ -881,9 +872,7 @@ pub fn update_user_list_for_vanish(
         MAX_ATTEMPTS,
         "list for vanish update",
         |current: Option<Vec<String>>| {
-            let Some(mut hashes) = current else {
-                return Ok(ConditionalJsonMutation::Complete(true));
-            };
+            let mut hashes = current.unwrap_or_default();
             let original = hashes.clone();
             apply_vanish_user_list_update(&mut hashes, removals, retry_hashes);
             if hashes == original && !hashes.is_empty() {
@@ -893,7 +882,9 @@ pub fn update_user_list_for_vanish(
             Ok(ConditionalJsonMutation::Write {
                 value: hashes,
                 result: list_empty,
-                time_to_live: list_empty.then_some(VANISH_EMPTY_LIST_TTL),
+                // Retain an empty generation fence; deleting/expiring the key would
+                // let a delayed add-only import recreate an erased creator's list.
+                time_to_live: None,
             })
         },
     )
@@ -1674,7 +1665,7 @@ pub fn remove_from_blob_refs(hash: &str, pubkey: &str) -> Result<Vec<String>> {
     let owner = pubkey.to_lowercase();
     update_json_conditionally(&blob_refs_key(hash), 5, "blob refs remove", |current| {
         let mut refs: Vec<String> = current.unwrap_or_default();
-        if !refs.contains(&owner) { return Ok(ConditionalJsonMutation::Complete(refs)); }
+        // Advance even when absent: an importer may have prepared an add-only write.
         refs.retain(|p| p != &owner);
         Ok(ConditionalJsonMutation::Write {value: refs.clone(), result: refs, time_to_live: None})
     })
@@ -1682,17 +1673,9 @@ pub fn remove_from_blob_refs(hash: &str, pubkey: &str) -> Result<Vec<String>> {
 
 /// Delete the entire blob refs entry
 pub fn delete_blob_refs(hash: &str) -> Result<()> {
-    let store = open_store()?;
-    let key = blob_refs_key(hash);
-
-    match store.delete(&key) {
-        Ok(()) => Ok(()),
-        Err(KVStoreError::ItemNotFound) => Ok(()),
-        Err(e) => Err(BlossomError::MetadataError(format!(
-            "Failed to delete blob refs: {}",
-            e
-        ))),
-    }
+    update_json_conditionally(&blob_refs_key(hash),5,"clear blob refs",|_:Option<Vec<String>>| {
+        Ok(ConditionalJsonMutation::Write {value:Vec::<String>::new(),result:(),time_to_live:None})
+    })
 }
 
 /// Delete auth events for a hash (both upload and delete provenance)
@@ -1782,6 +1765,18 @@ pub fn add_to_blob_refs(hash: &str, pubkey: &str) -> Result<()> {
         if refs.contains(&owner) { return Ok(ConditionalJsonMutation::Complete(())); }
         refs.push(owner.clone());
         Ok(ConditionalJsonMutation::Write {value: refs, result: (), time_to_live: None})
+    })
+}
+
+/// Archive associations check the permanent fence within the same CAS generation
+/// observed by removal. A stale in-flight mutation must retry and see the fence.
+pub(crate) fn add_archive_blob_ref(hash:&str, owner:&str)->Result<()> {
+    update_json_conditionally(&blob_refs_key(hash),5,"archive blob refs",|current| {
+        crate::archive_import::owner_allowed(hash,owner).map_err(|e|e.to_string())?;
+        let mut refs:Vec<String>=current.unwrap_or_default();
+        if refs.iter().any(|p|p==owner){return Ok(ConditionalJsonMutation::Complete(()));}
+        refs.push(owner.to_string());
+        Ok(ConditionalJsonMutation::Write{value:refs,result:(),time_to_live:None})
     })
 }
 
