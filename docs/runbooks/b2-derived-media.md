@@ -42,8 +42,13 @@ These are internal fill-provenance labels. The outer VCL strips
 `X-Divine-Source` on client-facing delivery for every host, while preserving it
 on shield hops for internal cache admission. This requires the separate outer
 VCL validation and activation procedure in [Outer VCL](outer-vcl.md); publishing
-Compute alone does not deploy the stripping rule. Until that VCL is activated,
-the main host can expose a cached fill-time label; it is never a fresh-read signal.
+Compute alone does not deploy the stripping rule. Follow the
+[deployment order](rollback.md#choose-the-deployment-order): activate the reviewed
+outer VCL first, before merging this change can publish Compute from `main`.
+Rolling back the pair reverses that order, Compute first and outer VCL second.
+Do not rely on a temporary public-label window: publishing Compute before the
+stripping rule is active can expose a cached fill-time label on the main host,
+not a fresh-read signal. No live activation is established by these source tests.
 
 Missing labels on rebuilt responses remain unattributed, even when their body
 bytes are unchanged. In particular, sound-analysis JSON is returned in a new
