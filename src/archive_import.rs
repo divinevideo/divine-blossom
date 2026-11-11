@@ -542,7 +542,7 @@ pub(crate) fn handle(mut req: Request, op: &str) -> Response {
             if matches!(op,"admit"|"admit-copy") && !crate::storage::get_config("archive_import_enabled").is_ok_and(|v|v=="true") {
                 let existing_receipt=op=="admit" && read(&i.sha256)?.receipts.contains_key(&i.owner);
                 if !existing_receipt && !parent_gate::archive_owned(&i.sha256,&i.attempt)? {
-                    return Err(BlossomError::StorageError("Archive admissions paused".into()));
+                    return with_stage(Stage::AdmissionPaused, || Err(BlossomError::StorageError("Archive admissions paused".into())));
                 }
             }
             match op {
@@ -833,10 +833,10 @@ mod tests {
         let admitted = admit(&i).unwrap();
         let resumed = call(&i, "admit");
         assert_eq!(resumed["items"][0]["ok"], true);
-        assert_eq!(
-            call(&sample("f", "e", "b"), "admit")["items"][0]["ok"],
-            false
-        );
+        let paused = call(&sample("f", "e", "b"), "admit");
+        assert_eq!(paused["items"][0]["ok"], false);
+        assert_eq!(paused["items"][0]["error"], "retry");
+        assert_eq!(paused["items"][0]["diagnostic"], serde_json::json!({"stage":"admission_paused"}));
         i.generation = Some(admitted["generation"].as_str().unwrap().into());
         i.file_id = Some("fixture-version".into());
         i.bucket = Some("b2".into());
