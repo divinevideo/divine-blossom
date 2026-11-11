@@ -18,6 +18,7 @@ mod media_auth_log;
 mod metadata;
 mod parent_gate;
 mod archive_import;
+mod archive_diagnostics;
 mod rate_limit;
 mod req_id;
 mod request_log;
