@@ -1134,8 +1134,12 @@ async fn process_transcribe_audio(
 
 async fn handle_backfill_fmp4(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<TranscodeRequest>,
 ) -> Response {
+    if let Err(rejection) = authorize_transcode_repair(&state.config, &headers, request.force) {
+        return rejection;
+    }
     let hash = request.hash.to_lowercase();
     if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return (
@@ -1144,42 +1148,97 @@ async fn handle_backfill_fmp4(
         )
             .into_response();
     }
-    if let Err(e) = backfill_fmp4(&state.media_storage, &hash).await {
-        return (
+    match backfill_fmp4(
+        &state.media_storage,
+        &hash,
+        request.force,
+        |ts, mp4, variant| async move { remux_variant(&ts, &mp4, variant).await },
+    )
+    .await
+    {
+        Ok(status) => Json(serde_json::json!({"status": status, "hash": hash})).into_response(),
+        Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
         )
-            .into_response();
+            .into_response(),
     }
-
-    Json(serde_json::json!({"status": "ok", "hash": hash})).into_response()
 }
 
-async fn backfill_fmp4(storage: &object_storage::MediaStorage, hash: &str) -> Result<()> {
+async fn backfill_fmp4<F, Fut>(
+    storage: &object_storage::MediaStorage,
+    hash: &str,
+    force: bool,
+    remux: F,
+) -> Result<&'static str>
+where
+    F: Fn(std::path::PathBuf, std::path::PathBuf, &'static str) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut selected = Vec::new();
+    for variant in ["stream_720p", "stream_480p"] {
+        if force
+            || storage
+                .stat(&format!("{hash}/hls/{variant}.mp4"))
+                .await?
+                .is_none()
+        {
+            selected.push(variant);
+        }
+    }
+    if selected.is_empty() {
+        return Ok("already_exists");
+    }
     let temp_dir = TempDir::new()?;
     let temp_path = temp_dir.path();
     let mut segments = Vec::new();
-    for variant in ["stream_720p", "stream_480p"] {
+    for variant in selected {
         let filename = format!("{variant}.ts");
         let path = temp_path.join(&filename);
         let key = format!("{hash}/hls/{filename}");
         if storage.download_processing_segment(&key, &path).await? {
-            segments.push(path);
+            segments.push((variant, path));
         }
     }
 
-    remux_ts_to_fmp4(temp_path).await?;
-    // Never pass input segments to the publisher, including legacy GCS inputs.
-    for segment in segments {
-        tokio::fs::remove_file(segment).await?;
+    if segments.is_empty() {
+        return Err(anyhow!(
+            "Backfill found no input segments for missing or forced MP4s"
+        ));
     }
-    if upload_hls(storage, hash, temp_path, &SourceObjectMetadata::default())
-        .await?
-        .is_empty()
-    {
-        return Err(anyhow!("Backfill did not produce any MP4 variants"));
+    let expected_count = segments.len();
+    let mut published_count = 0;
+    for (variant, segment) in segments {
+        // Publish only a successful remux, never input TS or failed output files.
+        let output_dir = temp_path.join(variant);
+        tokio::fs::create_dir(&output_dir).await?;
+        let output = output_dir.join(format!("{variant}.mp4"));
+        if let Err(e) = remux(segment, output.clone(), variant).await {
+            warn!("Backfill remux failed for {}: {}", variant, e);
+            continue;
+        }
+        if !tokio::fs::metadata(&output)
+            .await
+            .is_ok_and(|file| file.is_file() && file.len() > 0)
+        {
+            continue;
+        }
+        let published =
+            upload_hls(storage, hash, &output_dir, &SourceObjectMetadata::default()).await?;
+        let expected = format!("{hash}/hls/{variant}.mp4");
+        if published
+            .iter()
+            .any(|receipt| receipt.object.reference.key == expected && receipt.object.size > 0)
+        {
+            published_count += 1;
+        }
     }
-    Ok(())
+    if published_count != expected_count {
+        return Err(anyhow!(
+            "Backfill published {published_count} of {expected_count} MP4 variants"
+        ));
+    }
+    Ok("ok")
 }
 
 async fn handle_audio_extract(

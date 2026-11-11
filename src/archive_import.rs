@@ -1,6 +1,7 @@
 //! Private, default-off archive control plane. No media bytes or provider probes.
 use crate::blossom::{ArchiveStorage, BlobMetadata, BlobStatus};
 use crate::error::{BlossomError, Result};
+use crate::archive_diagnostics::{self, observe_kv, with_stage, KvOperation, Stage};
 use crate::{metadata, parent_gate};
 use blossom_core::conditional_update::ConditionalJsonMutation as Mutation;
 use fastly::http::{Method, StatusCode};
@@ -77,7 +78,7 @@ fn key(hash: &str) -> String {
     format!("archive:v1:{hash}")
 }
 fn read(hash: &str) -> Result<Record> {
-    match metadata::open_store()?.lookup(&key(hash)) {
+    match observe_kv(KvOperation::Lookup, metadata::open_store()?.lookup(&key(hash))) {
         Ok(mut r) => serde_json::from_str(&r.take_body().into_string()).map_err(|_| unavailable()),
         Err(KVStoreError::ItemNotFound) => Ok(Record::default()),
         Err(_) => Err(unavailable()),
@@ -178,7 +179,7 @@ pub(crate) fn owner_allowed(hash: &str, owner: &str) -> Result<()> {
         removed_account_key(owner),
         format!("vanish_in_progress:v1:{owner}"),
     ] {
-        match store.lookup(&key) {
+        match observe_kv(KvOperation::Lookup, store.lookup(&key)) {
             Ok(_) => return Err(denied()),
             Err(KVStoreError::ItemNotFound) => {}
             Err(_) => return Err(unavailable()),
@@ -209,19 +210,19 @@ fn admit(i: &Item) -> Result<serde_json::Value> {
     admit_for(i, false)
 }
 fn admit_for(i: &Item, copy: bool) -> Result<serde_json::Value> {
-    policy(i)?;
-    let record = read(&i.sha256)?;
+    with_stage(Stage::Policy, || policy(i))?;
+    let record = with_stage(Stage::ArchiveRead, || read(&i.sha256))?;
     if let Some(receipt) = record.receipts.get(&i.owner).filter(|_| !copy) {
         if let Some(a) = record
             .admission
             .as_ref()
             .filter(|a| a.owner == i.owner && a.attempt == i.attempt)
         {
-            parent_gate::archive_release(
+            with_stage(Stage::ParentRelease, || parent_gate::archive_release(
                 &i.sha256,
                 &a.attempt,
                 a.generation.as_deref().ok_or_else(invalid)?,
-            )?;
+            ))?;
         }
         return Ok(serde_json::json!({"receipt":receipt}));
     }
@@ -229,17 +230,17 @@ fn admit_for(i: &Item, copy: bool) -> Result<serde_json::Value> {
         return Err(denied());
     }
     // Register ownership before bytes are admitted so vanish can discover the in-flight hash.
-    metadata::add_archive_user_hashes(&i.owner, std::slice::from_ref(&i.sha256))?;
-    let generation = parent_gate::archive_claim(&i.sha256, &i.attempt)?;
-    if read(&i.sha256)?.settled.contains(&i.attempt) {
+    with_stage(Stage::OwnerList, || metadata::add_archive_user_hashes(&i.owner, std::slice::from_ref(&i.sha256)))?;
+    let generation = with_stage(Stage::ParentClaim, || parent_gate::archive_claim(&i.sha256, &i.attempt))?;
+    if with_stage(Stage::ArchiveRead, || read(&i.sha256))?.settled.contains(&i.attempt) {
         parent_gate::archive_settle_current(&i.sha256, &i.attempt)?;
         return Err(denied());
     }
-    policy(i)?;
-    let created = metadata::get_blob_metadata_uncached(&i.sha256)?.is_none();
+    with_stage(Stage::Policy, || policy(i))?;
+    let created = with_stage(Stage::BlobRead, || metadata::get_blob_metadata_uncached(&i.sha256))?.is_none();
     let mut admitted = i.clone();
     admitted.generation = Some(generation.clone());
-    metadata::update_json_conditionally(&key(&i.sha256), 5, "archive admission", |current| {
+    with_stage(Stage::ArchiveAdmissionCas, || metadata::update_json_conditionally(&key(&i.sha256), 5, "archive admission", |current| {
         owner_allowed(&i.sha256, &i.owner).map_err(|e| e.to_string())?;
         parent_gate::archive_check(&i.sha256, &i.attempt, &generation)
             .map_err(|e| e.to_string())?;
@@ -264,8 +265,8 @@ fn admit_for(i: &Item, copy: bool) -> Result<serde_json::Value> {
             result: (),
             time_to_live: None,
         })
-    })?;
-    let storage = metadata::get_blob_metadata_uncached(&i.sha256)?.and_then(|m| m.archive_storage);
+    }))?;
+    let storage = with_stage(Stage::BlobRead, || metadata::get_blob_metadata_uncached(&i.sha256))?.and_then(|m| m.archive_storage);
     Ok(serde_json::json!({"generation":generation,"storage":storage}))
 }
 fn register(i: &Item) -> Result<serde_json::Value> {
@@ -584,11 +585,11 @@ pub(crate) fn handle(mut req: Request, op: &str) -> Response {
         }
     }
     let items:Vec<_>=batch.items.iter().map(|i| {
-        let result=validate(i).and_then(|_|{
+        let (result,diagnostic)=archive_diagnostics::item(|| validate(i).and_then(|_|{
             if matches!(op,"admit"|"admit-copy") && !crate::storage::get_config("archive_import_enabled").is_ok_and(|v|v=="true") {
                 let existing_receipt=op=="admit" && read(&i.sha256)?.receipts.contains_key(&i.owner);
                 if !existing_receipt && !parent_gate::archive_owned(&i.sha256,&i.attempt)? {
-                    return Err(BlossomError::StorageError("Archive admissions paused".into()));
+                    return with_stage(Stage::AdmissionPaused, || Err(BlossomError::StorageError("Archive admissions paused".into())));
                 }
             }
             match op {
@@ -613,10 +614,12 @@ pub(crate) fn handle(mut req: Request, op: &str) -> Response {
             operation if operation.starts_with("process-") => process(i,operation.trim_start_matches("process-")),
             "reconcile"=>{policy(i)?;let r=read(&i.sha256)?;Ok(serde_json::json!({"receipt":r.receipts.get(&i.owner),"admission":r.admission}))},
             _=>Err(invalid()),
-        }});
+        }}));
         match result {Ok(value)=>serde_json::json!({"sha256":i.sha256,"owner":i.owner,"ok":true,"result":value}),Err(e)=>{
             let code=match e {BlossomError::Forbidden(_)=>"policy_denied",BlossomError::BadRequest(_)=>"invalid",_=>"retry"};
-            serde_json::json!({"sha256":i.sha256,"owner":i.owner,"ok":false,"error":code})
+            let mut value=serde_json::json!({"sha256":i.sha256,"owner":i.owner,"ok":false,"error":code});
+            if let Some(diagnostic)=diagnostic { value["diagnostic"]=serde_json::json!(diagnostic); }
+            value
         }}
     }).collect();
     reply(
@@ -1061,10 +1064,10 @@ mod tests {
         let admitted = admit(&i).unwrap();
         let resumed = call(&i, "admit");
         assert_eq!(resumed["items"][0]["ok"], true);
-        assert_eq!(
-            call(&sample("f", "e", "b"), "admit")["items"][0]["ok"],
-            false
-        );
+        let paused = call(&sample("f", "e", "b"), "admit");
+        assert_eq!(paused["items"][0]["ok"], false);
+        assert_eq!(paused["items"][0]["error"], "retry");
+        assert_eq!(paused["items"][0]["diagnostic"], serde_json::json!({"stage":"admission_paused"}));
         i.generation = Some(admitted["generation"].as_str().unwrap().into());
         i.file_id = Some("fixture-version".into());
         i.bucket = Some("b2".into());
@@ -1106,4 +1109,52 @@ mod tests {
         assert_eq!(stats.total_size_bytes, 18);
         assert_eq!(stats.archive_import_cursor, 1);
     }
+    #[test]
+    #[ignore = "requires synthetic KV; scripts/run-archive-import-tests.py"]
+    fn archive_diagnostics_are_private_static_and_isolated_between_batch_items() {
+        let mut unauthenticated = Request::post("https://fixture.invalid/internal/archive/v1/admit");
+        unauthenticated.set_body("synthetic-private-body");
+        let response = handle(unauthenticated, "admit");
+        assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.into_body().into_string(), r#"{"error":"archive import unavailable"}"#);
+        let mut wrong_token = Request::post("https://fixture.invalid/internal/archive/v1/admit");
+        wrong_token.set_header("Authorization", "Bearer fixture-admin");
+        wrong_token.set_body("synthetic-private-body");
+        let response = handle(wrong_token, "admit");
+        assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
+        assert!(!response.into_body().into_string().contains("diagnostic"));
+
+        let first = sample("1", "2", "3");
+        let mut second = sample("4", "5", "6");
+        second.size = 0;
+        let store = metadata::open_store().unwrap();
+        // A malformed synthetic owner list fails in the real conditional-read path.
+        store.insert(&format!("list:{}", first.owner), "synthetic-private-source-token-generation").unwrap();
+        let mut request = Request::post("https://fixture.invalid/internal/archive/v1/admit");
+        request.set_header("Authorization", "Bearer fixture-importer");
+        request.set_body(serde_json::json!({"version":1,"items":[first,second]}).to_string());
+        let response = handle(request, "admit");
+        assert_eq!(response.get_status(), StatusCode::OK);
+        assert_eq!(response.get_header_str("Cache-Control"), Some("private, no-store"));
+        let value:serde_json::Value=serde_json::from_str(&response.into_body().into_string()).unwrap();
+        assert_eq!(value["items"][0]["error"], "retry");
+        assert_eq!(value["items"][0]["diagnostic"], serde_json::json!({"stage":"owner_list"}));
+        assert_eq!(value["items"][1]["error"], "invalid");
+        assert_eq!(value["items"][1]["diagnostic"], serde_json::json!({"stage":"operation"}));
+        let diagnostic=value["items"][0]["diagnostic"].to_string();
+        for sensitive in [&first.sha256,&first.owner,&first.attempt,&first.source,&first.provenance,"synthetic-private-source-token-generation"] {
+            assert!(!diagnostic.contains(sensitive));
+        }
+        assert!(read(&first.sha256).unwrap().admission.is_none());
+        assert!(!parent_gate::archive_owned(&first.sha256,&first.attempt).unwrap());
+        store.insert(&format!("list:{}", first.owner), "[]").unwrap();
+        let success=call(&first,"reconcile");
+        assert_eq!(success["items"][0]["ok"],true);
+        assert!(success["items"][0].get("diagnostic").is_none());
+        fence_account(&first.owner).unwrap();
+        let denied=call(&first,"admit");
+        assert_eq!(denied["items"][0]["error"],"policy_denied");
+        assert_eq!(denied["items"][0]["diagnostic"],serde_json::json!({"stage":"policy"}));
+    }
+
 }

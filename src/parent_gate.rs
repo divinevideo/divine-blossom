@@ -1,5 +1,6 @@
 //! Shared no-TTL writer/erasure exclusion. Generations are equality fences.
 use crate::error::{BlossomError, Result};
+use crate::archive_diagnostics::{observe_kv, KvOperation};
 use fastly::http::{Method, StatusCode};
 use fastly::kv_store::{InsertMode, KVStore, KVStoreError};
 use fastly::{Request, Response};
@@ -78,7 +79,7 @@ fn key(hash: &str) -> String {
 }
 
 fn lookup(store: &KVStore, hash: &str) -> Result<Option<Observed>> {
-    let mut entry = match store.lookup(&key(hash)) {
+    let mut entry = match observe_kv(KvOperation::Lookup, store.lookup(&key(hash))) {
         Ok(entry) => entry,
         Err(KVStoreError::ItemNotFound) => return Ok(None),
         Err(_) => return Err(unavailable()),
@@ -107,7 +108,7 @@ fn insert(store: &KVStore, hash: &str, gate: &Gate, expected: Option<u64>) -> Re
         Some(generation) => builder.if_generation_match(generation),
         None => builder.mode(InsertMode::Add),
     };
-    builder.execute(&key(hash), body).map_err(|e| match e {
+    observe_kv(if expected.is_some() { KvOperation::InsertCas } else { KvOperation::InsertAdd }, builder.execute(&key(hash), body)).map_err(|e| match e {
         KVStoreError::ItemPreconditionFailed => stale(),
         _ => unavailable(),
     })

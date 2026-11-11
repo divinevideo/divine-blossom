@@ -5,6 +5,7 @@ use crate::blossom::{
     AudioMapping, BlobMetadata, BlobStatus, GlobalStats, RecentIndex, SubtitleJob, UserIndex,
 };
 use crate::error::{BlossomError, Result};
+use crate::archive_diagnostics::{observe_kv, KvOperation};
 use blossom_core::conditional_update::{
     update_json_conditionally_with_io, ConditionalJsonMutation,
 };
@@ -60,7 +61,7 @@ where
         max_attempts,
         operation,
         mutate,
-        || match store.lookup(key) {
+        || match observe_kv(KvOperation::Lookup, store.lookup(key)) {
             Ok(mut lookup) => {
                 let generation = lookup.current_generation();
                 Ok(Some((lookup.take_body().into_string(), generation)))
@@ -77,7 +78,7 @@ where
                 Some(ttl) => insert.time_to_live(ttl),
                 None => insert,
             };
-            match insert.execute(key, value) {
+            match observe_kv(if generation.is_some() { KvOperation::InsertCas } else { KvOperation::InsertAdd }, insert.execute(key, value)) {
                 Ok(()) => Ok(true),
                 Err(KVStoreError::ItemPreconditionFailed) => Ok(false),
                 Err(error) => Err(format!("Failed to store {operation}: {error}")),
@@ -127,7 +128,7 @@ const AUDIO_REFS_PREFIX: &str = "audio_refs:";
 
 /// Open the metadata KV store
 pub(crate) fn open_store() -> Result<KVStore> {
-    KVStore::open(KV_STORE_NAME)
+    observe_kv(KvOperation::Open, KVStore::open(KV_STORE_NAME))
         .map_err(|e| BlossomError::MetadataError(format!("Failed to open KV store: {}", e)))?
         .ok_or_else(|| BlossomError::MetadataError("KV store not found".into()))
 }
@@ -167,7 +168,7 @@ pub fn get_blob_metadata(hash: &str) -> Result<Option<BlobMetadata>> {
 fn parse_blob_metadata_lookup(
     lookup: std::result::Result<LookupResponse, KVStoreError>,
 ) -> Result<Option<BlobMetadata>> {
-    match lookup {
+    match observe_kv(KvOperation::Lookup, lookup) {
         Ok(mut lookup_result) => {
             let body = lookup_result.take_body().into_string();
             // JSON null retains a generation fence after erasure without identity data.
@@ -213,7 +214,7 @@ pub fn get_blob_metadata_uncached(hash: &str) -> Result<Option<BlobMetadata>> {
 /// Review holds are never read through the POP-local metadata cache.
 pub fn get_quarantine_holds(hash: &str) -> Result<QuarantineHolds> {
     let key = format!("{}{}", QUARANTINE_PREFIX, hash.to_lowercase());
-    let holds: QuarantineHolds = match open_store()?.lookup(&key) {
+    let holds: QuarantineHolds = match observe_kv(KvOperation::Lookup, open_store()?.lookup(&key)) {
         Ok(mut lookup) => {
             serde_json::from_str(&lookup.take_body().into_string()).map_err(|error| {
                 BlossomError::MetadataError(format!("Invalid quarantine holds: {error}"))
@@ -1638,7 +1639,7 @@ pub fn get_tombstone(hash: &str) -> Result<Option<String>> {
     let store = open_store()?;
     let key = format!("{}{}", TOMBSTONE_PREFIX, hash.to_lowercase());
 
-    match store.lookup(&key) {
+    match observe_kv(KvOperation::Lookup, store.lookup(&key)) {
         Ok(mut lookup_result) => {
             let body = lookup_result.take_body().into_string();
             Ok(Some(body))
