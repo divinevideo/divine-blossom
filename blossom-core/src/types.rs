@@ -36,6 +36,9 @@ pub struct BlobDescriptor {
 /// Blob metadata stored in KV store
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlobMetadata {
+    /// Private canonical B2 receipt for a trusted archive original.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_storage: Option<ArchiveStorage>,
     /// SHA-256 hash (hex encoded)
     pub sha256: String,
     /// Size in bytes
@@ -110,6 +113,12 @@ pub struct BlobMetadata {
     /// Ordering token from the last applied transcript status callback.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transcript_generation: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveStorage {
+    pub bucket: String,
+    pub file_id: String,
 }
 
 /// Moderation status for blobs
@@ -499,6 +508,8 @@ impl BlossomAuthEvent {
 /// Global statistics for admin dashboard
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GlobalStats {
+    #[serde(default)]
+    pub archive_import_cursor: u64,
     /// Total number of blobs
     pub total_blobs: u64,
     /// Total size of all blobs in bytes
@@ -903,6 +914,7 @@ mod tests {
     /// Helper to build a BlobMetadata for testing
     fn test_metadata(mime_type: &str) -> BlobMetadata {
         BlobMetadata {
+            archive_storage: None,
             sha256: "a".repeat(64),
             size: 1024,
             mime_type: mime_type.to_string(),
@@ -1085,6 +1097,7 @@ mod tests {
 
     fn fixture_metadata(status: BlobStatus, owner: &str) -> BlobMetadata {
         BlobMetadata {
+            archive_storage: None,
             sha256: "x".into(),
             size: 1,
             mime_type: "video/mp4".into(),

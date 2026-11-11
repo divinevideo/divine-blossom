@@ -50,7 +50,7 @@ const RECENT_INDEX_KEY: &str = "index:recent";
 ///
 /// Existing values use their generation as a precondition. Missing values use
 /// add-only insertion, so a concurrent creator also forces a fresh read.
-fn update_json_conditionally<T, R, F>(
+pub(crate) fn update_json_conditionally<T, R, F>(
     key: &str,
     max_attempts: usize,
     operation: &str,
@@ -146,7 +146,7 @@ pub fn get_blob_metadata(hash: &str) -> Result<Option<BlobMetadata>> {
     if let Ok(Some(body)) = simple_cache::get(cache_key.clone()) {
         let json = body.into_string();
         if json == "null" {
-            return overlay_quarantine_holds(&hash_lower, None);
+            invalidate_metadata_cache(&hash_lower);
         }
         if let Ok(metadata) = serde_json::from_str::<BlobMetadata>(&json) {
             return overlay_quarantine_holds(&hash_lower, Some(metadata));
@@ -162,7 +162,7 @@ pub fn get_blob_metadata(hash: &str) -> Result<Option<BlobMetadata>> {
         Some(m) => serde_json::to_string(m).unwrap_or_default(),
         None => "null".to_string(),
     };
-    if !json.is_empty() {
+    if result.is_some() && !json.is_empty() {
         let _ = simple_cache::get_or_set(cache_key.clone(), json, METADATA_CACHE_TTL);
     }
 
@@ -363,6 +363,7 @@ pub(crate) fn start_vanish_metadata_delete(
     store: &KVStore,
     hash: &str,
 ) -> Result<PendingDeleteHandle> {
+    crate::archive_import::erase_record(hash)?;
     let key = format!("{}{}", BLOB_PREFIX, hash.to_lowercase());
     store.build_delete().execute_async(&key).map_err(|error| {
         BlossomError::MetadataError(format!("Failed to start metadata delete: {error}"))
@@ -806,6 +807,17 @@ pub fn add_to_user_list(pubkey: &str, hash: &str) -> Result<()> {
             result: (),
             time_to_live: None,
         })
+    })
+}
+
+/// Coalesce archive admissions for a creator into one generation-conditional write.
+pub(crate) fn add_archive_user_hashes(owner:&str, hashes:&[String])->Result<()> {
+    let key=format!("list:{}",owner.to_lowercase());
+    update_json_conditionally(&key,5,"archive user list",|current| {
+        let mut list:Vec<String>=current.unwrap_or_default();let before=list.len();
+        for hash in hashes {if !list.contains(hash){list.push(hash.clone());}}
+        if list.len()==before {return Ok(ConditionalJsonMutation::Complete(()));}
+        Ok(ConditionalJsonMutation::Write{value:list,result:(),time_to_live:None})
     })
 }
 
@@ -1377,7 +1389,11 @@ pub fn increment_unique_uploaders() -> Result<()> {
 
 /// Replace global stats entirely (used for backfill)
 pub fn replace_global_stats(stats: &GlobalStats) -> Result<()> {
-    put_global_stats(stats)
+    update_json_conditionally(STATS_KEY,5,"replace statistics",|current:Option<GlobalStats>| {
+        let mut next=stats.clone();
+        next.archive_import_cursor=current.map(|s|s.archive_import_cursor).unwrap_or_default();
+        Ok(ConditionalJsonMutation::Write{value:next,result:(),time_to_live:None})
+    })
 }
 
 // ============================================================================
@@ -1654,40 +1670,14 @@ pub fn get_blob_refs(hash: &str) -> Result<Vec<String>> {
 
 /// Remove a pubkey from the blob's references list. Returns the remaining refs.
 pub fn remove_from_blob_refs(hash: &str, pubkey: &str) -> Result<Vec<String>> {
-    let pubkey_lower = pubkey.to_lowercase();
-
-    for attempt in 0..5 {
-        let mut refs = get_blob_refs(hash)?;
-
-        if !refs.contains(&pubkey_lower) {
-            return Ok(refs);
-        }
-
-        refs.retain(|p| p != &pubkey_lower);
-
-        let store = open_store()?;
-        let key = format!("{}{}", REFS_PREFIX, hash.to_lowercase());
-        let json = serde_json::to_string(&refs)
-            .map_err(|e| BlossomError::MetadataError(format!("Failed to serialize refs: {}", e)))?;
-
-        match store.insert(&key, json) {
-            Ok(()) => return Ok(refs),
-            Err(e) if attempt < 4 => {
-                eprintln!("[KV] Retry {} for refs removal: {}", attempt + 1, e);
-                continue;
-            }
-            Err(e) => {
-                return Err(BlossomError::MetadataError(format!(
-                    "Failed to store refs: {}",
-                    e
-                )))
-            }
-        }
-    }
-
-    Err(BlossomError::MetadataError(
-        "Max retries exceeded for refs removal".into(),
-    ))
+    crate::archive_import::unlink_owner(hash,&pubkey.to_lowercase())?;
+    let owner = pubkey.to_lowercase();
+    update_json_conditionally(&blob_refs_key(hash), 5, "blob refs remove", |current| {
+        let mut refs: Vec<String> = current.unwrap_or_default();
+        if !refs.contains(&owner) { return Ok(ConditionalJsonMutation::Complete(refs)); }
+        refs.retain(|p| p != &owner);
+        Ok(ConditionalJsonMutation::Write {value: refs.clone(), result: refs, time_to_live: None})
+    })
 }
 
 /// Delete the entire blob refs entry
@@ -1786,40 +1776,13 @@ pub fn remove_from_user_index(pubkey: &str) -> Result<()> {
 
 /// Add a pubkey to the blob's references list
 pub fn add_to_blob_refs(hash: &str, pubkey: &str) -> Result<()> {
-    let pubkey_lower = pubkey.to_lowercase();
-
-    for attempt in 0..5 {
-        let mut refs = get_blob_refs(hash)?;
-
-        if refs.contains(&pubkey_lower) {
-            return Ok(());
-        }
-
-        refs.push(pubkey_lower.clone());
-
-        let store = open_store()?;
-        let key = format!("{}{}", REFS_PREFIX, hash.to_lowercase());
-        let json = serde_json::to_string(&refs)
-            .map_err(|e| BlossomError::MetadataError(format!("Failed to serialize refs: {}", e)))?;
-
-        match store.insert(&key, json) {
-            Ok(()) => return Ok(()),
-            Err(e) if attempt < 4 => {
-                eprintln!("[KV] Retry {} for refs update: {}", attempt + 1, e);
-                continue;
-            }
-            Err(e) => {
-                return Err(BlossomError::MetadataError(format!(
-                    "Failed to store refs: {}",
-                    e
-                )))
-            }
-        }
-    }
-
-    Err(BlossomError::MetadataError(
-        "Max retries exceeded for refs update".into(),
-    ))
+    let owner = pubkey.to_lowercase();
+    update_json_conditionally(&blob_refs_key(hash), 5, "blob refs add", |current| {
+        let mut refs: Vec<String> = current.unwrap_or_default();
+        if refs.contains(&owner) { return Ok(ConditionalJsonMutation::Complete(())); }
+        refs.push(owner.clone());
+        Ok(ConditionalJsonMutation::Write {value: refs, result: (), time_to_live: None})
+    })
 }
 
 /// Get audio mapping by source video hash

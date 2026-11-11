@@ -133,3 +133,6 @@ VICEROY="$VICEROY" python3 scripts/run-upload-routing-tests.py
 
 # Canonical B2 misses queue the verified mirror after GCS fallback, never on outage.
 VICEROY="$VICEROY" python3 scripts/run-b2-canonical-demand-tests.py
+
+# Trusted archive imports register without media readback and share erasure exclusion.
+VICEROY="$VICEROY" python3 scripts/run-archive-import-tests.py
