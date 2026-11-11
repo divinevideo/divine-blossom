@@ -11,6 +11,7 @@ mod blossom;
 mod canary;
 mod playback_cache;
 mod delete_policy;
+mod hls_cache;
 mod hls_manifest;
 mod delivery_telemetry;
 mod error;
@@ -1507,13 +1508,24 @@ fn download_hls_content(gcs_path: &str, range: Option<&str>) -> Result<Response>
         return download_hls_from_gcs(gcs_path, range);
     }
 
-    let cache_key = format!("hls:{}", gcs_path);
+    // Entries hold the provenance headers with the body (see hls_cache).
+    let cache_key = hls_cache::key(gcs_path);
 
     // Try Simple Cache first
-    if let Ok(Some(body)) = simple_cache::get(cache_key.clone()) {
-        let mut resp = Response::from_status(StatusCode::OK);
-        resp.set_body(body);
-        return Ok(resp);
+    if let Ok(Some(mut cached)) = simple_cache::get(cache_key.clone()) {
+        let mut entry = Vec::new();
+        let read = std::io::Read::read_to_end(&mut cached, &mut entry);
+        if let Some((headers, body)) = read.ok().and_then(|_| hls_cache::decode(&entry)) {
+            let mut resp = Response::from_status(StatusCode::OK);
+            for (name, value) in headers {
+                resp.set_header(name, value);
+            }
+            resp.set_body(body);
+            return Ok(resp);
+        }
+        // Unreadable entry: serve from storage below and purge it so the
+        // refill can replace it once the purge lands.
+        let _ = simple_cache::purge(cache_key.clone());
     }
 
     // Cache miss: fetch from GCS
@@ -1521,18 +1533,20 @@ fn download_hls_content(gcs_path: &str, range: Option<&str>) -> Result<Response>
 
     // Extract body, cache it, return a new response
     let body_bytes = gcs_resp.take_body().into_bytes();
+    let headers: Vec<(&str, &str)> = hls_cache::PRESERVED_HEADERS
+        .into_iter()
+        .filter_map(|name| gcs_resp.get_header_str(name).map(|value| (name, value)))
+        .collect();
 
-    // Cache the manifest content
-    let _ = simple_cache::get_or_set(cache_key, body_bytes.as_slice(), HLS_CACHE_TTL);
+    // Cache the manifest content with its provenance headers
+    let entry = hls_cache::encode(&headers, &body_bytes);
+    let _ = simple_cache::get_or_set(cache_key, entry, HLS_CACHE_TTL);
 
     // Reconstruct response with the body and preserve GCS metadata headers
     let mut resp = Response::from_status(gcs_resp.get_status());
-    // Preserve provenance headers from GCS
-    if let Some(val) = gcs_resp.get_header_str("x-goog-meta-c2pa-manifest-id") {
-        resp.set_header("x-goog-meta-c2pa-manifest-id", val);
-    }
-    if let Some(val) = gcs_resp.get_header_str("x-goog-meta-source-sha256") {
-        resp.set_header("x-goog-meta-source-sha256", val);
+    // Preserve provenance headers from GCS, matching what a cache hit restores
+    for (name, value) in headers {
+        resp.set_header(name, value);
     }
     resp.set_body(body_bytes);
     Ok(resp)

@@ -9,6 +9,9 @@ import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# Playlists under this video carry storage C2PA metadata.
+PROVENANCE_PREFIX = f"/hls-test/{'d' * 64}/hls/"
+
 
 class Origin(BaseHTTPRequestHandler):
     def log_message(self, *_):
@@ -19,11 +22,15 @@ class Origin(BaseHTTPRequestHandler):
         self.server.reads.append((self.path, self.headers.get("Range")))
         hash_value = "a" * 64
         prefix = f"/hls-test/{hash_value}/hls/"
+        master = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100\nstream_480p.m3u8\n"
+        variant = b"#EXTM3U\n#EXTINF:4,\nsegment_0.ts\n#EXT-X-ENDLIST\n"
         bodies = {
-            prefix + "master.m3u8": b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100\nstream_480p.m3u8\n",
-            prefix + "stream_480p.m3u8": b"#EXTM3U\n#EXTINF:4,\nsegment_0.ts\n#EXT-X-ENDLIST\n",
+            prefix + "master.m3u8": master,
+            prefix + "stream_480p.m3u8": variant,
             prefix + "segment_0.ts": b"segment-bytes",
             prefix + "stream_480p.mp4": b"segment-bytes",
+            PROVENANCE_PREFIX + "master.m3u8": master,
+            PROVENANCE_PREFIX + "stream_480p.m3u8": variant,
         }
         status, body = (200, bodies[self.path]) if self.path in bodies else (404, b"missing")
         if status == 200 and self.headers.get("Range") == "bytes=0-3":
@@ -31,6 +38,9 @@ class Origin(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("ETag", '"synthetic-origin-body"')
+        if self.path.startswith(PROVENANCE_PREFIX):
+            self.send_header("x-goog-meta-c2pa-manifest-id", "synthetic-manifest")
+            self.send_header("x-goog-meta-source-sha256", "e" * 64)
         if status == 206:
             self.send_header("Content-Range", "bytes 0-3/13")
         self.end_headers()
@@ -70,18 +80,25 @@ blossom_secrets = [{{key="admin_token",data="synthetic-admin-token"}},{{key="gcs
                     "cargo", "test", "--locked", "--target", "wasm32-wasip1", "--bin", "fastly-blossom",
                     "hls_alias_", "--", "--ignored", "--nocapture"],
                     cwd=repo, env=env, capture_output=True, text=True, timeout=900)
-                if result.returncode or "test result: ok. 2 passed; 0 failed; 0 ignored;" not in result.stdout:
+                if result.returncode or "test result: ok. 3 passed; 0 failed; 0 ignored;" not in result.stdout:
                     raise RuntimeError(result.stdout + result.stderr)
                 prefix = f"/hls-test/{'a' * 64}/hls/"
+                provenance = [(PROVENANCE_PREFIX + "master.m3u8", None),
+                              (PROVENANCE_PREFIX + "stream_480p.m3u8", None)]
                 required = {
                     (prefix + "master.m3u8", None),
                     (prefix + "stream_480p.m3u8", None),
                     (prefix + "segment_0.ts", None),
                     (prefix + "stream_480p.mp4", "bytes=0-3"),
                     (f"/hls-test/{'c' * 64}/hls/master.m3u8", None),
+                    *provenance,
                 }
                 # Alias, canonical, admin and signed requests may share the cached origin master.
-                assert set(origin.reads) == required and len(origin.reads) <= 11, origin.reads
+                assert set(origin.reads) == required and len(origin.reads) <= 13, origin.reads
+                # One storage read per playlist proves the provenance repeats were cache hits,
+                # and that the refill replaced the seeded unreadable variant entry.
+                for read in provenance:
+                    assert origin.reads.count(read) == 1, origin.reads
                 print("PASS HLS alias resolves canonical playlists/segments and ranged MP4 while preserving access and cache policy")
         finally:
             origin.shutdown()
