@@ -10,6 +10,7 @@ use std::cell::RefCell;
 pub(crate) enum Stage {
     #[default]
     Operation,
+    AdmissionPaused,
     Policy,
     ArchiveRead,
     OwnerList,
