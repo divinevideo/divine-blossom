@@ -29,6 +29,15 @@ registered. `settle` releases only the matching attempt; the durable CloudSQL au
 must establish that all physical effects have finished or were explicitly rejected.
 Never use settlement to time out an uncertain write.
 
+Cleanup MUST continue to use legacy `settle` once the durable authority establishes
+that physical effects have finished or were explicitly rejected. This includes
+policy-denied copies (vanish, quarantine or tombstone) and partial admissions that
+claimed a gate without returning a generation or retaining an admission. Legacy
+settlement drains only its owning attempt without requiring serving policy or
+returning a copy proof. `settle-copy` obtains proof before processing; it MUST NOT
+replace this generic cleanup drain. A policy-denied proof request leaves its gate
+for legacy settlement to drain and does not authorize processing.
+
 For `settle-copy`, add the `generation` returned by `admit-copy` to the original
 admitted item. Every item field must match the admission, or the exact item retained
 by an earlier copy settlement. The generation must be a canonical, nonzero decimal
@@ -60,6 +69,13 @@ retained item. Both `admission_generation` and `released_from_generation` equal 
 supplied generation; `parent_generation` identifies the observed released gate.
 All three are canonical, nonzero decimal `u64` strings used as equality fences.
 
+This is a statement of current gate state, not durable release history. A later
+attempt can claim the released gate, making this attempt's proof unobtainable.
+Missing or changed admission/binding, or a gate that no longer matches the attempt
+and generation, returns `invalid`. These permanent refusals require reconciliation,
+not retrying the same proof request. `retry` remains for unavailable KV state and
+conditional-update contention; policy refusal remains `policy_denied`.
+
 Retry the identical item after a lost response; the retained binding is reused,
 and proof still requires the exact released gate and current policy. A missing
 gate, a different attempt or admission generation, or an erasing parent cannot
@@ -67,6 +83,11 @@ produce this proof. Retired copy attempts cannot be readmitted with `admit-copy`
 Legacy `settle` returns only `{"settled":true}`; that acknowledgment
 is not a copy-release proof, and a historical settlement without a retained copy
 item cannot be upgraded to one by replaying `settle-copy`.
+
+Rollback compatibility: edge versions predating retained `settled_copies` bindings
+ignore that field and drop it when rewriting an archive record. Rolling forward
+does not restore those bindings: an affected historical settlement cannot obtain
+a typed proof and returns `invalid`. Legacy `settle` remains the cleanup drain.
 
 See the [archive handler and synthetic contract](../../src/archive_import.rs) and
 [parent-gate helpers](../../src/parent_gate.rs) for the implementation.
