@@ -17,6 +17,7 @@ description = "Blossom media server for Nostr running on Fastly Compute"
 fastly = "=0.11.12"
 # Timed readiness waits for the optional delivery probe (same SDK host ABI).
 fastly-sys = "=0.11.12"
+httpdate = "1.0"
 
 # Request-boundary telemetry IDs, backed by WASI random_get
 getrandom = "0.2"

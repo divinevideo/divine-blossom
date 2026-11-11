@@ -1,4 +1,4 @@
-//! Loopback-only canonical upload routing integration (no provider credentials).
+//! Loopback-only upload routing integration (no provider credentials).
 use super::*;
 use base64::Engine;
 use k256::schnorr::{signature::hazmat::PrehashSigner, Signature, SigningKey};
@@ -107,15 +107,80 @@ fn canonical_upload_routing_contract() {
         request.set_body(vec![0u8; 512_002]);
         request.set_header("Content-Length", "15");
     }
-    let mut record = UploadLogRecord::new(UploadRoute::DirectPut, "synthetic-routing".into(), 0);
-    let error = handle_upload(request, &mut record)
-        .expect_err("fixture backend fails; never fall back to GCS");
+    let is_complete = case.starts_with("complete_");
+    let route = if is_complete {
+        UploadRoute::ResumableComplete
+    } else {
+        UploadRoute::DirectPut
+    };
+    let mut record = UploadLogRecord::new(route, "synthetic-routing".into(), 0);
+    let result = if is_complete {
+        let mut completion = Request::post("https://media.divine.video/upload/synthetic/complete");
+        completion.set_header(
+            header::AUTHORIZATION,
+            request.get_header(header::AUTHORIZATION).unwrap(),
+        );
+        completion.set_body(serde_json::json!({"sha256": "a".repeat(64)}).to_string());
+        handle_upload_complete(completion, "/upload/synthetic/complete", &mut record)
+    } else {
+        handle_upload(request, &mut record)
+    };
+    let error = result.expect_err("fixture backend fails; never fall back to GCS");
     match case.as_str() {
-        "enabled" => {
-            assert!(record.proxied_body);
+        "enabled"
+        | "busy_retry_date"
+        | "busy_rfc850_date"
+        | "busy_malformed_date"
+        | "busy_non_utf8"
+        | "busy_invalid_retry_after"
+        | "busy_without_retry_after"
+        | "complete_busy" => {
+            assert_eq!(record.proxied_body, !is_complete);
             assert_eq!(record.origin_status, Some(503));
-            assert!(error.message().contains("fixture busy"));
-            assert_eq!(error.status_code(), StatusCode::BAD_GATEWAY);
+            record_failure(&mut record, &error);
+            assert_eq!(record.response_status, 503);
+            assert_eq!(record.error_kind, Some("service_unavailable"));
+
+            let expected_retry = match case.as_str() {
+                "enabled" | "busy_non_utf8" | "complete_busy" => Some("5"),
+                "busy_retry_date" => Some("Wed, 11 Nov 2026 00:00:00 GMT"),
+                "busy_rfc850_date" => Some("Sunday, 06-Nov-94 08:49:37 GMT"),
+                _ => None,
+            };
+            let mut response = error_response(&error);
+            assert_eq!(response.get_status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.get_header_str("Retry-After"), expected_retry);
+            assert_eq!(response.get_header_str("Cache-Control"), Some("no-store"));
+            assert_eq!(
+                response.get_header_str("Content-Type"),
+                Some("application/json")
+            );
+            assert_eq!(
+                response.get_header_str("Access-Control-Allow-Origin"),
+                Some("*")
+            );
+            assert!(response
+                .get_header_str("Access-Control-Expose-Headers")
+                .unwrap()
+                .split(", ")
+                .any(|name| name == "Retry-After"));
+            let body: serde_json::Value =
+                serde_json::from_str(&response.take_body().into_string()).unwrap();
+            let expected_error = if matches!(
+                case.as_str(),
+                "busy_without_retry_after" | "busy_non_utf8"
+            ) {
+                "Upload service unavailable"
+            } else {
+                "fixture busy"
+            };
+            assert_eq!(body, serde_json::json!({ "error": expected_error }));
+        }
+        "origin_error" | "complete_origin_error" => {
+            assert_eq!(record.proxied_body, !is_complete);
+            assert_eq!(record.origin_status, Some(500));
+            assert_eq!(error.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(error_response(&error).get_header_str("Retry-After"), None);
         }
         "invalid" => {
             assert!(!record.proxied_body);

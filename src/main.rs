@@ -3975,6 +3975,43 @@ fn map_upload_service_error(status: StatusCode, body: &str) -> BlossomError {
     }
 }
 
+fn valid_upload_retry_after(value: &str) -> bool {
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return true;
+    }
+    // httpdate 1.0.3 does not check the space between the date and time
+    // in the obsolete RFC 850 form, which starts with a full weekday name.
+    if let Some((weekday, date)) = value.split_once(", ") {
+        if weekday.len() > 3 && date.as_bytes().get(9) != Some(&b' ') {
+            return false;
+        }
+    }
+    httpdate::parse_http_date(value).is_ok()
+}
+
+fn map_upload_service_error_with_retry_after(mut response: Response) -> BlossomError {
+    let status = response.get_status();
+    if status != StatusCode::SERVICE_UNAVAILABLE {
+        return map_upload_service_error(status, &response.take_body().into_string());
+    }
+
+    let retry_after = response
+        .get_header(header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| valid_upload_retry_after(value))
+        .map(str::to_owned);
+    let message = std::io::read_to_string(response.take_body())
+        .ok()
+        .map(|body| extract_upload_service_error_message(&body))
+        .filter(|message| !message.is_empty())
+        .unwrap_or_else(|| "Upload service unavailable".into());
+    BlossomError::ServiceUnavailable {
+        message,
+        retry_after,
+    }
+}
+
 fn should_record_upload_service_transcode_failure(
     current_status: Option<TranscodeStatus>,
     incoming_error_code: Option<&str>,
@@ -4430,9 +4467,7 @@ fn handle_upload_complete(
 
     let mut proxy_resp = send_to_upload_service(proxy_req, record)?;
     if !proxy_resp.get_status().is_success() {
-        let status = proxy_resp.get_status();
-        let body = proxy_resp.take_body().into_string();
-        return Err(map_upload_service_error(status, &body));
+        return Err(map_upload_service_error_with_retry_after(proxy_resp));
     }
 
     let response_body = proxy_resp.take_body().into_string();
@@ -4591,11 +4626,8 @@ fn handle_upload_service_proxy(
 
     let mut proxy_resp = send_to_upload_service(proxy_req, record)?;
 
-    // Check for errors from the upload service
     if !proxy_resp.get_status().is_success() {
-        let status = proxy_resp.get_status();
-        let body = proxy_resp.take_body().into_string();
-        return Err(map_upload_service_error(status, &body));
+        return Err(map_upload_service_error_with_retry_after(proxy_resp));
     }
 
     // Parse Cloud Run response to get the hash
@@ -7382,6 +7414,13 @@ fn error_response(error: &BlossomError) -> Response {
     });
     resp.set_body(body.to_string());
     add_cors_headers(&mut resp);
+
+    if let BlossomError::ServiceUnavailable { retry_after, .. } = error {
+        resp.set_header("Cache-Control", "no-store");
+        if let Some(value) = retry_after {
+            resp.set_header(header::RETRY_AFTER, value);
+        }
+    }
 
     // Cap how long CDN caches 404s from access-controlled blobs.
     // Without this, moderation status changes (e.g. Restricted -> Active)

@@ -12,6 +12,10 @@ pub enum BlossomError {
     Gone(String),
     RangeNotSatisfiable(String),
     UnprocessableEntity(String),
+    ServiceUnavailable {
+        message: String,
+        retry_after: Option<String>,
+    },
     StorageError(String),
     MetadataError(String),
     Internal(String),
@@ -33,6 +37,7 @@ impl BlossomError {
             BlossomError::UnprocessableEntity(_) => {
                 StatusCode::from_u16(422).expect("422 is a valid HTTP status code")
             }
+            BlossomError::ServiceUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             BlossomError::StorageError(_) => StatusCode::BAD_GATEWAY,
             BlossomError::MetadataError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             BlossomError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -54,6 +59,7 @@ impl BlossomError {
             BlossomError::Gone(_) => "gone",
             BlossomError::RangeNotSatisfiable(_) => "range_not_satisfiable",
             BlossomError::UnprocessableEntity(_) => "unprocessable_entity",
+            BlossomError::ServiceUnavailable { .. } => "service_unavailable",
             BlossomError::StorageError(_) => "storage_error",
             BlossomError::MetadataError(_) => "metadata_error",
             BlossomError::Internal(_) => "internal",
@@ -71,6 +77,7 @@ impl BlossomError {
             BlossomError::Gone(msg) => msg,
             BlossomError::RangeNotSatisfiable(msg) => msg,
             BlossomError::UnprocessableEntity(msg) => msg,
+            BlossomError::ServiceUnavailable { message, .. } => message,
             BlossomError::StorageError(msg) => msg,
             BlossomError::MetadataError(msg) => msg,
             BlossomError::Internal(msg) => msg,
