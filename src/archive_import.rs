@@ -48,6 +48,8 @@ struct Registration {
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Record {
     #[serde(default)]
+    settled: Vec<String>,
+    #[serde(default)]
     created: bool,
     admission: Option<Item>,
     #[serde(default)]
@@ -120,6 +122,9 @@ pub(crate) fn unlink_owner(hash: &str, owner: &str) -> Result<()> {
         };
         record.receipts.remove(owner);
         record.provenance.remove(owner);
+        if record.admission.as_ref().is_some_and(|a| a.owner == owner) {
+            record.admission = None;
+        }
         Ok(Mutation::Write {
             value: record,
             result: (),
@@ -176,9 +181,16 @@ fn admit_for(i: &Item, copy: bool) -> Result<serde_json::Value> {
         }
         return Ok(serde_json::json!({"receipt":receipt}));
     }
+    if record.settled.contains(&i.attempt) {
+        return Err(denied());
+    }
     // Register ownership before bytes are admitted so vanish can discover the in-flight hash.
     metadata::add_to_user_list(&i.owner, &i.sha256)?;
     let generation = parent_gate::archive_claim(&i.sha256, &i.attempt)?;
+    if read(&i.sha256)?.settled.contains(&i.attempt) {
+        parent_gate::archive_settle_current(&i.sha256, &i.attempt)?;
+        return Err(denied());
+    }
     policy(i)?;
     let created = metadata::get_blob_metadata_uncached(&i.sha256)?.is_none();
     let mut admitted = i.clone();
@@ -188,10 +200,13 @@ fn admit_for(i: &Item, copy: bool) -> Result<serde_json::Value> {
         if record.admission.as_ref() == Some(&admitted) {
             return Ok(Mutation::Complete(()));
         }
+        if record.settled.contains(&i.attempt) {
+            return Err("Archive attempt settled".into());
+        }
         if record
             .admission
             .as_ref()
-            .is_some_and(|a| a.attempt == admitted.attempt)
+            .is_some_and(|a| a.attempt == admitted.attempt && a.generation.is_some())
         {
             return Err("Admission identity changed".into());
         }
@@ -421,11 +436,6 @@ fn reply(status: StatusCode, value: serde_json::Value) -> Response {
 }
 pub(crate) fn handle(mut req: Request, op: &str) -> Response {
     let error = |s| reply(s, serde_json::json!({"error":"archive import unavailable"}));
-    if matches!(op, "admit" | "admit-copy")
-        && !crate::storage::get_config("archive_import_enabled").is_ok_and(|s| s == "true")
-    {
-        return error(StatusCode::SERVICE_UNAVAILABLE);
-    }
     let Some(token) = crate::admin::extract_bearer_token(&req) else {
         return error(StatusCode::UNAUTHORIZED);
     };
@@ -462,7 +472,9 @@ pub(crate) fn handle(mut req: Request, op: &str) -> Response {
     if batch.version != 1 || batch.items.is_empty() || batch.items.len() > 16 {
         return error(StatusCode::BAD_REQUEST);
     }
-    if op == "admit" {
+    if op == "admit"
+        && crate::storage::get_config("archive_import_enabled").is_ok_and(|v| v == "true")
+    {
         let mut owners: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for i in &batch.items {
             if validate(i).and_then(|_| policy(i)).is_ok() {
@@ -477,27 +489,31 @@ pub(crate) fn handle(mut req: Request, op: &str) -> Response {
         }
     }
     let items:Vec<_>=batch.items.iter().map(|i| {
-        let result=validate(i).and_then(|_|match op {
+        let result=validate(i).and_then(|_|{
+            if matches!(op,"admit"|"admit-copy") && !crate::storage::get_config("archive_import_enabled").is_ok_and(|v|v=="true") {
+                let existing_receipt=op=="admit" && read(&i.sha256)?.receipts.contains_key(&i.owner);
+                if !existing_receipt && !parent_gate::archive_owned(&i.sha256,&i.attempt)? {
+                    return Err(BlossomError::StorageError("Archive admissions paused".into()));
+                }
+            }
+            match op {
             "admit"=>admit(i),"admit-copy"=>admit_for(i,true),"register"=>register(i),
             "check"=>{policy(i)?;parent_gate::archive_check(&i.sha256,&i.attempt,i.generation.as_deref().ok_or_else(invalid)?)?;Ok(serde_json::json!({"checked":true}))},
             "settle"=>{
-                if parent_gate::archive_settled(&i.sha256,&i.attempt)? {return Ok(serde_json::json!({"settled":true}));}
-                let record=read(&i.sha256)?;let a=record.admission.ok_or_else(invalid)?;
-                if a.attempt!=i.attempt || a.owner!=i.owner || a.source!=i.source {return Err(invalid());}
-                parent_gate::archive_release(&i.sha256,&i.attempt,a.generation.as_deref().ok_or_else(invalid)?)?;
-                if metadata::open_store()?.lookup(&removed_owner_key(&i.sha256,&i.owner)).is_ok() {
-                    metadata::update_json_conditionally(&key(&i.sha256),5,"drained owner admission",|current| {
-                        let Some(mut record):Option<Record>=current else {return Ok(Mutation::Complete(()));};
-                        if record.admission.as_ref().is_some_and(|a|a.owner==i.owner && a.attempt==i.attempt){record.admission=None;}
-                        Ok(Mutation::Write{value:record,result:(),time_to_live:None})
-                    })?;
-                }
+                metadata::update_json_conditionally(&key(&i.sha256),5,"archive attempt settlement",|current| {
+                    let mut record:Record=current.unwrap_or_default();
+                    if record.settled.contains(&i.attempt){return Ok(Mutation::Complete(()));}
+                    record.settled.push(i.attempt.clone());
+                    if record.admission.as_ref().is_some_and(|a|a.attempt==i.attempt){record.admission=None;}
+                    Ok(Mutation::Write{value:record,result:(),time_to_live:None})
+                })?;
+                parent_gate::archive_settle_current(&i.sha256,&i.attempt)?;
                 Ok(serde_json::json!({"settled":true}))
             },
             operation if operation.starts_with("process-") => process(i,operation.trim_start_matches("process-")),
             "reconcile"=>{policy(i)?;let r=read(&i.sha256)?;Ok(serde_json::json!({"receipt":r.receipts.get(&i.owner),"admission":r.admission}))},
             _=>Err(invalid()),
-        });
+        }});
         match result {Ok(value)=>serde_json::json!({"sha256":i.sha256,"owner":i.owner,"ok":true,"result":value}),Err(e)=>{
             let code=match e {BlossomError::Forbidden(_)=>"policy_denied",BlossomError::BadRequest(_)=>"invalid",_=>"retry"};
             serde_json::json!({"sha256":i.sha256,"owner":i.owner,"ok":false,"error":code})
@@ -593,6 +609,49 @@ mod tests {
         assert!(admit(&third).is_err());
         erase_record(&i.sha256).unwrap();
         assert!(read(&i.sha256).unwrap().receipts.is_empty());
+    }
+    fn call(i: &Item, op: &str) -> serde_json::Value {
+        let mut request =
+            Request::post(format!("https://fixture.invalid/internal/archive/v1/{op}"));
+        request.set_header("Authorization", "Bearer fixture-importer");
+        request.set_body(serde_json::json!({"version":1,"items":[i]}).to_string());
+        let response = handle(request, op);
+        assert_eq!(response.get_status(), StatusCode::OK);
+        serde_json::from_str(&response.into_body().into_string()).unwrap()
+    }
+    #[test]
+    #[ignore = "requires synthetic KV; scripts/run-archive-import-tests.py"]
+    fn archive_partial_admission_can_settle_without_record() {
+        let i = sample("c", "d", "e");
+        parent_gate::archive_claim(&i.sha256, &i.attempt).unwrap();
+        assert!(read(&i.sha256).unwrap().admission.is_none());
+        metadata::mark_vanish_in_progress(&i.owner).unwrap();
+        assert!(admit(&i).is_err());
+        assert_eq!(call(&i, "settle")["items"][0]["ok"], true);
+        assert_eq!(call(&i, "settle")["items"][0]["ok"], true);
+        metadata::clear_vanish_in_progress(&i.owner).unwrap();
+        assert!(
+            admit(&i).is_err(),
+            "a late retry must not reopen a retired admission"
+        );
+        parent_gate::claim_erasure(&metadata::open_store().unwrap(), &i.sha256).unwrap();
+    }
+    #[test]
+    #[ignore = "requires admission-disabled synthetic KV; scripts/run-archive-import-tests.py"]
+    fn archive_paused_routes_drain_existing_admissions() {
+        let mut i = sample("e", "f", "a");
+        let admitted = admit(&i).unwrap();
+        let resumed = call(&i, "admit");
+        assert_eq!(resumed["items"][0]["ok"], true);
+        assert_eq!(
+            call(&sample("f", "e", "b"), "admit")["items"][0]["ok"],
+            false
+        );
+        i.generation = Some(admitted["generation"].as_str().unwrap().into());
+        i.file_id = Some("fixture-version".into());
+        i.bucket = Some("b2".into());
+        assert_eq!(call(&i, "register")["items"][0]["ok"], true);
+        parent_gate::claim_erasure(&metadata::open_store().unwrap(), &i.sha256).unwrap();
     }
     #[test]
     #[ignore = "requires synthetic KV; scripts/run-archive-import-tests.py"]

@@ -414,10 +414,16 @@ pub(crate) fn archive_release(hash: &str, attempt: &str, expected: &str) -> Resu
     insert(&store,hash,&Gate::Released {version:1,settled_attempt_id:attempt.to_owned(),released_from_generation:expected.to_owned()},generation(expected))
 }
 
-pub(crate) fn archive_settled(hash:&str,attempt:&str)->Result<bool> {
-    // A different attempt can own this no-TTL gate only after the old one settled.
-    Ok(!matches!(lookup(&crate::metadata::open_store()?,hash)?,
-        Some(Observed{gate:Gate::Copying{attempt_id},..}) if attempt_id==attempt))
+pub(crate) fn archive_owned(hash:&str,attempt:&str)->Result<bool> {
+    Ok(matches!(lookup(&crate::metadata::open_store()?,hash)?,Some(Observed{gate:Gate::Copying{attempt_id},..}) if attempt_id==attempt))
+}
+
+/// The PG authority first retires the attempt so a late admission cannot authorize bytes.
+pub(crate) fn archive_settle_current(hash:&str,attempt:&str)->Result<()> {
+    if let Some(Observed{gate:Gate::Copying{attempt_id},generation})=lookup(&crate::metadata::open_store()?,hash)? {
+        if attempt_id==attempt {return archive_release(hash,attempt,&generation);}
+    }
+    Ok(())
 }
 
 #[cfg(test)]
