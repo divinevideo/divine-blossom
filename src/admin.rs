@@ -184,6 +184,7 @@ mod tests {
     fn admin_blob_headers_expose_moderation_status_when_metadata_exists() {
         let hash = "b".repeat(64);
         let metadata = BlobMetadata {
+            archive_storage: None,
             sha256: hash.clone(),
             size: 1234,
             mime_type: "video/mp4".to_string(),

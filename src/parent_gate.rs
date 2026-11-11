@@ -384,6 +384,48 @@ pub(crate) fn handle(mut req: Request, op: &str) -> Response {
     }
 }
 
+/// Trusted archive admission shares the same no-TTL exclusion as erasure.
+/// Policy and provenance are checked by archive_import, never by caller-selected flags.
+pub(crate) fn archive_claim(hash: &str, attempt: &str) -> Result<String> {
+    let store = crate::metadata::open_store()?;
+    let expected = match lookup(&store, hash)? {
+        Some(Observed {gate: Gate::Copying {attempt_id}, generation}) if attempt_id == attempt => return Ok(generation),
+        Some(Observed {gate: Gate::Released {..}, generation: g}) => Some(generation(&g).ok_or_else(unavailable)?),
+        None => None,
+        _ => return Err(stale()),
+    };
+    insert(&store, hash, &Gate::Copying {attempt_id: attempt.to_owned()}, expected)?;
+    let current = lookup(&store, hash)?.ok_or_else(unavailable)?;
+    archive_check(hash, attempt, &current.generation)?;
+    Ok(current.generation)
+}
+pub(crate) fn archive_check(hash: &str, attempt: &str, expected: &str) -> Result<()> {
+    match lookup(&crate::metadata::open_store()?, hash)? {
+        Some(Observed {gate: Gate::Copying {attempt_id}, generation}) if attempt_id == attempt && generation == expected => Ok(()),
+        _ => Err(stale()),
+    }
+}
+pub(crate) fn archive_release(hash: &str, attempt: &str, expected: &str) -> Result<()> {
+    let store = crate::metadata::open_store()?;
+    if let Some(Observed {gate: Gate::Released {settled_attempt_id, released_from_generation, ..}, ..}) = lookup(&store,hash)? {
+        if settled_attempt_id == attempt && released_from_generation == expected {return Ok(());}
+    }
+    archive_check(hash,attempt,expected)?;
+    insert(&store,hash,&Gate::Released {version:1,settled_attempt_id:attempt.to_owned(),released_from_generation:expected.to_owned()},generation(expected))
+}
+
+pub(crate) fn archive_owned(hash:&str,attempt:&str)->Result<bool> {
+    Ok(matches!(lookup(&crate::metadata::open_store()?,hash)?,Some(Observed{gate:Gate::Copying{attempt_id},..}) if attempt_id==attempt))
+}
+
+/// The PG authority first retires the attempt so a late admission cannot authorize bytes.
+pub(crate) fn archive_settle_current(hash:&str,attempt:&str)->Result<()> {
+    if let Some(Observed{gate:Gate::Copying{attempt_id},generation})=lookup(&crate::metadata::open_store()?,hash)? {
+        if attempt_id==attempt {return archive_release(hash,attempt,&generation);}
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

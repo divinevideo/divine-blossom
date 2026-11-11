@@ -6070,3 +6070,10 @@ mod tests {
         );
     }
 }
+
+/// Archive originals bypass legacy global origin policy; public policy ran at the caller.
+pub(crate) fn download_archive_original(hash:&str, range:Option<&str>, receipt:&crate::blossom::ArchiveStorage)->Result<FallbackDownloadResult> {
+    if receipt.bucket!=get_config("b2_media_bucket")? {return Err(BlossomError::StorageError("Archive bucket mismatch".into()));}
+    let response=fetch_media_origin(StorageProvider::B2,hash,range,true,false).map_err(MediaFetchError::into_storage_error)?;
+    Ok(FallbackDownloadResult{response:blob_download_response(response)?,source:"b2".into(),diagnostics:None,b2_missing:false})
+}

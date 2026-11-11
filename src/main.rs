@@ -17,6 +17,7 @@ mod error;
 mod media_auth_log;
 mod metadata;
 mod parent_gate;
+mod archive_import;
 mod rate_limit;
 mod req_id;
 mod request_log;
@@ -347,6 +348,11 @@ fn route_request(req: Request) -> Result<Response> {
             admin::handle_github_callback(req)
         }
         (Method::POST, "/admin/logout") => admin::handle_logout(req),
+
+        (_, p) if p.starts_with("/internal/archive/v1/") => {
+            let op=p.trim_start_matches("/internal/archive/v1/").to_owned();
+            Ok(archive_import::handle(req,&op))
+        }
 
         // Admin Dashboard
         (Method::GET, "/admin") => admin::handle_admin_dashboard(req),
@@ -828,11 +834,11 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
 
     // Serve from the FOS mirror when it has the object, otherwise GCS (with
     // CDN fallback) and lazily copy the object into the mirror.
-    let result = download_blob_read_through(
-        &hash,
-        range.as_deref(),
-        metadata.as_ref().map(|meta| meta.size),
-    )?;
+    let result = if let Some(storage) = metadata.as_ref().and_then(|m|m.archive_storage.as_ref()) {
+        crate::storage::download_archive_original(&hash,range.as_deref(),storage)?
+    } else {
+        download_blob_read_through(&hash,range.as_deref(),metadata.as_ref().map(|meta|meta.size))?
+    };
     if result.b2_missing {
         canary::queue_canonical_b2_miss(&req, &hash, &result.response);
     }
@@ -2703,6 +2709,7 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
     // 7. Store audio blob metadata (so /{audio_sha256} works as normal Blossom blob)
     // Do NOT add to user lists or recent indexes for derived blobs.
     let audio_metadata = BlobMetadata {
+        archive_storage: None,
         sha256: audio_sha256.clone(),
         size,
         mime_type: mime_type.clone(),
@@ -3758,6 +3765,7 @@ fn handle_upload(mut req: Request, record: &mut UploadLogRecord) -> Result<Respo
 
     // Store metadata
     let metadata = BlobMetadata {
+        archive_storage: None,
         sha256: hash.clone(),
         size: actual_size,
         mime_type: content_type.clone(),
@@ -4155,6 +4163,7 @@ fn publish_upload_service_upload_with_policy(
     }
 
     let metadata = BlobMetadata {
+        archive_storage: None,
         sha256: hash.clone(),
         size,
         mime_type: content_type.clone(),
@@ -6183,6 +6192,7 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
 
     // Store metadata
     let metadata = BlobMetadata {
+        archive_storage: None,
         sha256: hash.clone(),
         size,
         mime_type: content_type.clone(),
