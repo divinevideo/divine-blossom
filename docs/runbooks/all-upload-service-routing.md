@@ -19,6 +19,8 @@ correlation. Existing upload-service response validation and public descriptor
 publication are reused.
 An upstream failure never selects inline GCS as a retry or fallback. The flag
 does not alter resumable sessions or internal thumbnail/VTT/audio/audit writes.
+For canonical direct uploads, the edge returns upstream HTTP 503 with its
+usual JSON error body and a valid `Retry-After` when available.
 
 ## Reuse existing writer and finalization support
 
@@ -71,7 +73,7 @@ The loopback fixture executes the real canonical handler with signed synthetic
 auth and verifies a small image reaches the service exactly once, byte-for-byte,
 without GCS credentials configured. It preserves upstream failure, rejects
 invalid config/auth before dispatch and checks default/disabled routing and
-missing-store failure. Eleven cases also cover pre-storage tombstone/policy
-failures, bounded body-size validation, returned-hash mismatch and deduplication
-without rewriting the metadata generation. These tests do not establish live
-storage, processing, capacity or native playback parity.
+missing-store failure. The cases also cover retry guidance, pre-storage
+tombstone/policy failures, bounded body-size validation, returned-hash mismatch
+and deduplication without rewriting the metadata generation. These tests do
+not establish live storage, processing, capacity or native playback parity.

@@ -111,11 +111,49 @@ fn canonical_upload_routing_contract() {
     let error = handle_upload(request, &mut record)
         .expect_err("fixture backend fails; never fall back to GCS");
     match case.as_str() {
-        "enabled" => {
+        "enabled" | "busy_retry_date" | "busy_invalid_retry_after" | "busy_without_retry_after" => {
             assert!(record.proxied_body);
             assert_eq!(record.origin_status, Some(503));
-            assert!(error.message().contains("fixture busy"));
-            assert_eq!(error.status_code(), StatusCode::BAD_GATEWAY);
+            record_failure(&mut record, &error);
+            assert_eq!(record.response_status, 503);
+            assert_eq!(record.error_kind, Some("service_unavailable"));
+
+            let expected_retry = match case.as_str() {
+                "enabled" => Some("5"),
+                "busy_retry_date" => Some("Wed, 11 Nov 2026 00:00:00 GMT"),
+                _ => None,
+            };
+            let mut response = error_response(&error);
+            assert_eq!(response.get_status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.get_header_str("Retry-After"), expected_retry);
+            assert_eq!(response.get_header_str("Cache-Control"), Some("no-store"));
+            assert_eq!(
+                response.get_header_str("Content-Type"),
+                Some("application/json")
+            );
+            assert_eq!(
+                response.get_header_str("Access-Control-Allow-Origin"),
+                Some("*")
+            );
+            assert!(response
+                .get_header_str("Access-Control-Expose-Headers")
+                .unwrap()
+                .split(", ")
+                .any(|name| name == "Retry-After"));
+            let body: serde_json::Value =
+                serde_json::from_str(&response.take_body().into_string()).unwrap();
+            let expected_error = if case == "busy_without_retry_after" {
+                "Upload service unavailable"
+            } else {
+                "fixture busy"
+            };
+            assert_eq!(body, serde_json::json!({ "error": expected_error }));
+        }
+        "origin_error" => {
+            assert!(record.proxied_body);
+            assert_eq!(record.origin_status, Some(500));
+            assert_eq!(error.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(error_response(&error).get_header_str("Retry-After"), None);
         }
         "invalid" => {
             assert!(!record.proxied_body);

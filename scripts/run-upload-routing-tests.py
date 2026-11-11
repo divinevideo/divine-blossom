@@ -22,15 +22,30 @@ class UploadService(BaseHTTPRequestHandler):
                                      bool(self.headers.get('Authorization', '').startswith('Nostr '))))
         mismatch = self.server.case == 'hash_mismatch'
         payload = json.dumps({'sha256': 'a'*64, 'size': 15, 'content_type': 'image/jpeg'}).encode() if mismatch else b'{"error":"fixture busy"}'
-        self.send_response(200 if mismatch else 503)
+        if self.server.case == 'busy_without_retry_after':
+            payload = b''
+        status = 200 if mismatch else 500 if self.server.case == 'origin_error' else 503
+        self.send_response(status)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(payload)))
+        retry_after = {
+            'enabled': '5',
+            'busy_retry_date': 'Wed, 11 Nov 2026 00:00:00 GMT',
+            'busy_invalid_retry_after': '+5',
+            'origin_error': '5',
+        }.get(self.server.case)
+        if retry_after is not None:
+            self.send_header('Retry-After', retry_after)
         self.end_headers()
         self.wfile.write(payload)
 
 
 def main():
-    cases = ['enabled', 'default', 'disabled', 'invalid', 'invalid_auth', 'missing_store', 'tombstone', 'missing_policy', 'dedupe', 'bad_size', 'hash_mismatch']
+    proxied_cases = [
+        'enabled', 'busy_retry_date', 'busy_invalid_retry_after',
+        'busy_without_retry_after', 'origin_error', 'hash_mismatch',
+    ]
+    cases = proxied_cases + ['default', 'disabled', 'invalid', 'invalid_auth', 'missing_store', 'tombstone', 'missing_policy', 'dedupe', 'bad_size']
     parser = argparse.ArgumentParser()
     parser.add_argument('--case', choices=cases)
     selected = parser.parse_args().case
@@ -80,7 +95,7 @@ format = "json"
                     subprocess.run(['cargo', '--config', f'target.wasm32-wasip1.runner={runner}', 'test', '--locked', '--target', 'wasm32-wasip1',
                                     '--bin', 'fastly-blossom', 'canonical_upload_routing_contract',
                                     '--', '--ignored', '--nocapture'], cwd=repo, env=env, check=True, timeout=120)
-                    expected = [('/upload', b'synthetic image', 'image/jpeg', True)] if case in ('enabled', 'hash_mismatch') else []
+                    expected = [('/upload', b'synthetic image', 'image/jpeg', True)] if case in proxied_cases else []
                     if server.observed[before:] != expected:
                         raise AssertionError(f'{case}: unexpected loopback upload calls')
                     print(f'PASS canonical upload routing: {case}', flush=True)

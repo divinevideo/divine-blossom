@@ -4582,9 +4582,28 @@ fn handle_upload_service_proxy(
 
     let mut proxy_resp = send_to_upload_service(proxy_req, record)?;
 
-    // Check for errors from the upload service
-    if !proxy_resp.get_status().is_success() {
-        let status = proxy_resp.get_status();
+    let status = proxy_resp.get_status();
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        let retry_after = proxy_resp
+            .get_header(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| {
+                (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+                    || httpdate::parse_http_date(value).is_ok()
+            })
+            .map(str::to_owned);
+        let mut message =
+            extract_upload_service_error_message(&proxy_resp.take_body().into_string());
+        if message.is_empty() {
+            message = "Upload service unavailable".into();
+        }
+        return Err(BlossomError::ServiceUnavailable {
+            message,
+            retry_after,
+        });
+    }
+    if !status.is_success() {
         let body = proxy_resp.take_body().into_string();
         return Err(map_upload_service_error(status, &body));
     }
@@ -7372,6 +7391,13 @@ fn error_response(error: &BlossomError) -> Response {
     });
     resp.set_body(body.to_string());
     add_cors_headers(&mut resp);
+
+    if let BlossomError::ServiceUnavailable { retry_after, .. } = error {
+        resp.set_header("Cache-Control", "no-store");
+        if let Some(value) = retry_after {
+            resp.set_header(header::RETRY_AFTER, value);
+        }
+    }
 
     // Cap how long CDN caches 404s from access-controlled blobs.
     // Without this, moderation status changes (e.g. Restricted -> Active)

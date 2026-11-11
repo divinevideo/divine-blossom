@@ -140,9 +140,9 @@ pub struct PersistedErrorCategories {
 
 /// Categories for a persisted diagnostic record, or `None` when the error
 /// never produces a 5xx response. `BlossomError::status_code` maps only
-/// StorageError (502), MetadataError (500), and Internal (500) into the 5xx
-/// range, so only those three ever receive categories here. The match is
-/// exhaustive with no wildcard on purpose: a variant that newly maps to 5xx
+/// StorageError (502), ServiceUnavailable (503), MetadataError (500), and
+/// Internal (500) into the 5xx range. The match is exhaustive with no wildcard
+/// on purpose: a variant that newly maps to 5xx
 /// fails compilation in this function rather than silently logging
 /// `backend: null` or a category that can never be emitted. The companion
 /// test also catches an existing variant being remapped to 5xx. The category
@@ -150,10 +150,12 @@ pub struct PersistedErrorCategories {
 /// upload log group identical failures under one vocabulary.
 pub fn persisted_error_categories(error: &BlossomError) -> Option<PersistedErrorCategories> {
     match error {
-        BlossomError::StorageError(_) => Some(PersistedErrorCategories {
-            backend: Some("origin"),
-            category: error.kind(),
-        }),
+        BlossomError::StorageError(_) | BlossomError::ServiceUnavailable { .. } => {
+            Some(PersistedErrorCategories {
+                backend: Some("origin"),
+                category: error.kind(),
+            })
+        }
         BlossomError::MetadataError(_) => Some(PersistedErrorCategories {
             backend: Some("metadata"),
             category: error.kind(),
@@ -285,6 +287,10 @@ mod tests {
             BlossomError::Gone("x".into()),
             BlossomError::RangeNotSatisfiable("x".into()),
             BlossomError::UnprocessableEntity("x".into()),
+            BlossomError::ServiceUnavailable {
+                message: "x".into(),
+                retry_after: None,
+            },
             BlossomError::StorageError("x".into()),
             BlossomError::MetadataError("x".into()),
             BlossomError::Internal("x".into()),
