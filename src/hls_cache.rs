@@ -13,9 +13,10 @@ pub const PRESERVED_HEADERS: [&str; 2] =
 
 /// Simple Cache key for a playlist at `path`. Service versions share the POP
 /// cache during a rollout or rollback, so bump the namespace whenever the entry
-/// format or [`PRESERVED_HEADERS`] changes: otherwise each version would
-/// reject and purge the other's entries. Body-only `hls:` entries from before
-/// this format expire within the playlist cache TTL.
+/// format or [`PRESERVED_HEADERS`] changes. Otherwise an older version can
+/// reject and purge a newer version's entries, and a newer version can serve
+/// an older entry without the headers it added. Body-only `hls:` entries from
+/// before this format expire within the playlist cache TTL.
 pub fn key(path: &str) -> String {
     format!("hls-v2:{path}")
 }
