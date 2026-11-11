@@ -103,6 +103,59 @@ fn hls_alias_relative_playlist_http_contract() {
 
 #[test]
 #[ignore = "requires local synthetic metadata and HLS origin"]
+fn hls_alias_cached_playlist_provenance_http_contract() {
+    // The harness asserts storage served each playlist once, so every repeat
+    // below is a POP Simple Cache hit and must keep the storage provenance.
+    let hash = "d".repeat(64);
+    let source = "e".repeat(64);
+    metadata(&hash, "active", "complete");
+    // A body-only entry in the current namespace is unreadable: it must be
+    // served from storage and replaced, never served without provenance.
+    simple_cache::get_or_set(
+        hls_cache::key(&format!("{hash}/hls/stream_480p.m3u8")),
+        &b"#EXTM3U\nstale-body-only-entry\n"[..],
+        HLS_CACHE_TTL,
+    )
+    .unwrap();
+    let alias = format!("https://media.example.test/{hash}.hls");
+    let canonical = format!("https://media.example.test/{hash}/hls/master.m3u8");
+    let variant = format!("https://media.example.test/{hash}/hls/stream_480p.m3u8");
+    let master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100\nstream_480p.m3u8\n";
+    let alias_master =
+        format!("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100\n/{hash}/hls/stream_480p.m3u8\n");
+    let variant_body = "#EXTM3U\n#EXTINF:4,\nsegment_0.ts\n#EXT-X-ENDLIST\n";
+    let mut admin = Request::get(&alias);
+    admin.set_header("Authorization", "Bearer synthetic-admin-token");
+    for (label, request, body) in [
+        ("master miss", Request::get(&alias), alias_master.as_str()),
+        ("master hit", Request::get(&alias), &alias_master),
+        ("canonical master hit", Request::get(&canonical), master),
+        ("admin master hit", admin, &alias_master),
+        (
+            "variant unreadable entry",
+            Request::get(&variant),
+            variant_body,
+        ),
+        ("variant hit", Request::get(&variant), variant_body),
+    ] {
+        let mut response = response(request);
+        assert_eq!(response.get_status(), StatusCode::OK, "{label}");
+        assert_eq!(response.take_body_str(), body, "{label}");
+        assert_eq!(
+            response.get_header_str("X-C2PA-Manifest-Id"),
+            Some("synthetic-manifest"),
+            "{label}"
+        );
+        assert_eq!(
+            response.get_header_str("X-Source-Sha256"),
+            Some(source.as_str()),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires local synthetic metadata and HLS origin"]
 fn hls_alias_url_bound_viewer_http_contract() {
     use base64::Engine;
     use k256::schnorr::{signature::hazmat::PrehashSigner, SigningKey};
