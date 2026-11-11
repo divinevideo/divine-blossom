@@ -308,6 +308,9 @@ fn download_derived_media_object(
     )
     .map_err(|_| BlossomError::StorageError("Invalid derived media origin policy".into()))?;
     let (mut response, source) = download_object_with_policy(policy, key, range, false, uncached)?;
+    // Attribute the selected transport, never an origin-supplied claim. Cached
+    // downstream responses retain fill provenance, not a new provider read.
+    response.set_header("X-Divine-Source", source);
     if source == "b2" {
         // Existing derivative handlers consume the GCS spellings. Preserve the
         // public provenance contract when the private storage provider changes.
@@ -4687,6 +4690,7 @@ mod tests {
             super::download_transcript_uncached("fixture/vtt/main.vtt").unwrap(),
             super::download_sound_analysis_from_gcs("fixture/audio/analysis.json").unwrap(),
         ] {
+            assert_eq!(response.get_header_str("X-Divine-Source"), Some("b2"));
             assert_eq!(response.get_header_str("x-goog-meta-c2pa-manifest-id"), Some("synthetic-manifest"));
             assert_eq!(response.get_header_str("x-goog-meta-source-sha256"), Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
             if response.get_status() == fastly::http::StatusCode::PARTIAL_CONTENT {
@@ -4704,6 +4708,7 @@ mod tests {
     #[ignore = "requires synthetic storage backends; run-media-origin-tests.py"]
     fn derived_origin_default_independent_contract() {
         let mut response = super::download_hls_from_gcs("fixture/hls/720p.mp4", None).unwrap();
+        assert_eq!(response.get_header_str("X-Divine-Source"), Some("gcs"));
         assert_eq!(response.take_body().into_string(), "gcs bytes");
     }
 
@@ -4711,6 +4716,7 @@ mod tests {
     #[ignore = "requires synthetic storage backends; run-media-origin-tests.py"]
     fn derived_origin_fallback_contract() {
         let mut response = super::download_thumbnail("missing").unwrap();
+        assert_eq!(response.get_header_str("X-Divine-Source"), Some("gcs"));
         assert_eq!(response.take_body().into_string(), "gcs bytes");
         assert!(super::download_thumbnail("forbidden").is_err());
         let mut job = super::download_transcript_uncached_from_gcs("fixture/vtt/job.json").unwrap();
