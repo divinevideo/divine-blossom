@@ -14,6 +14,9 @@
 if (fastly.ff.visits_this_service == 0) {
   unset resp.http.Surrogate-Key;
   unset resp.http.Surrogate-Control;
+  # Provider labels describe internal fill provenance, including warm hits.
+  # Preserve them across the shield hop, never expose them on client delivery.
+  unset resp.http.X-Divine-Source;
 }
 unset resp.http.X-Divine-Edge-Request-Id;
 unset resp.http.X-Divine-Internal-Diagnostic-Authorization-Present;
@@ -82,7 +85,6 @@ if (fastly.ff.visits_this_service == 0 &&
   unset resp.http.X-Divine-B2-CDN-Admission;
   unset resp.http.X-Playback-Request-Id;
   unset resp.http.X-Playback-Load-Id;
-  unset resp.http.X-Divine-Source;
   unset resp.http.X-Divine-Storage-Cache;
   unset resp.http.X-Divine-Storage-Cache-Reason;
   unset resp.http.X-Divine-Storage-Cache-Reads;

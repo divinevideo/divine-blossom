@@ -26,7 +26,7 @@ class Storage(BaseHTTPRequestHandler):
             return
         status = 200
         if bucket == "b2":
-            status = {"missing": 404, "transient": 503, "forbidden": 403}.get(key, 200)
+            status = 404 if key.startswith("fixture/fallback/") else {"missing": 404, "transient": 503, "forbidden": 403}.get(key, 200)
         elif key == "transient":
             status = 206
         else:
@@ -78,6 +78,7 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                 cases = [
                     ("derived_origin_b2_without_gcs_contract", "gcs", "true"),
                     ("derived_body_cache_source_contract", "gcs", "true"),
+                    ("derived_body_fallback_source_contract", "gcs", "true"),
                     ("derived_origin_default_independent_contract", "b2", "true"),
                     ("derived_origin_fallback_contract", "gcs", "true"),
                     ("derived_origin_invalid_config_contract", "gcs", "true"),
@@ -100,7 +101,7 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                     if test in ("derived_origin_b2_without_gcs_contract", "derived_body_cache_source_contract"):
                         values.update(derived_media_read_primary="b2", derived_media_gcs_fallback_enabled="false")
                         del values["gcs_bucket"]
-                    elif test == "derived_origin_fallback_contract":
+                    elif test in ("derived_origin_fallback_contract", "derived_body_fallback_source_contract"):
                         values.update(derived_media_read_primary="b2", derived_media_gcs_fallback_enabled="true")
                     elif test == "derived_origin_invalid_config_contract":
                         values["derived_media_read_primary"] = "invalid"
@@ -125,6 +126,10 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                     elif test == "derived_body_cache_source_contract":
                         assert reads == [("b2", "fixture/hls/master.m3u8", None),
                                          ("b2", "fixture/vtt/main.vtt", None)], reads
+                    elif test == "derived_body_fallback_source_contract":
+                        assert reads == [(bucket, key, None)
+                            for key in ("fixture/fallback/master.m3u8", "fixture/fallback/main.vtt")
+                            for bucket in ("b2", "gcs")], reads
                     elif test == "derived_origin_default_independent_contract":
                         assert reads == [("gcs", "fixture/hls/720p.mp4", None)], reads
                     elif test == "derived_origin_fallback_contract":

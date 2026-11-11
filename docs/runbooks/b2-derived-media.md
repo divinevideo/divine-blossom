@@ -38,8 +38,18 @@ use `unknown` rather than inferring a provider from current configuration.
 These labels describe selected transport or cached fill provenance, not a new
 origin read on every downstream HIT. They do not prove immutable family
 readiness, current revision, B2-only coverage, byte-weighted offload or billing.
-Missing labels on response paths that reconstruct other representations remain
-unattributed; do not substitute a provider from hostname or rollout flags.
+These are internal fill-provenance labels. The outer VCL strips
+`X-Divine-Source` on client-facing delivery for every host, while preserving it
+on shield hops for internal cache admission. This requires the separate outer
+VCL validation and activation procedure in [Outer VCL](outer-vcl.md); publishing
+Compute alone does not deploy the stripping rule. Until that VCL is activated,
+the main host can expose a cached fill-time label; it is never a fresh-read signal.
+
+Missing labels on rebuilt responses remain unattributed, even when their body
+bytes are unchanged. In particular, sound-analysis JSON is returned in a new
+response without copying this label. Do not substitute a provider from hostname
+or rollout flags. Body-only Simple Cache hits also lack the HLS C2PA/source
+metadata; the label does not repair that separate metadata-retention limitation.
 
 ## Activation prerequisites
 

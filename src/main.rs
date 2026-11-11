@@ -9153,6 +9153,26 @@ mod hls_alias_tests;
 mod derived_origin_provenance_tests {
     #[test]
     #[ignore = "requires synthetic private origins; run-media-origin-tests.py"]
+    fn derived_body_fallback_source_contract() {
+        for path in ["fixture/fallback/master.m3u8", "fixture/fallback/main.vtt"] {
+            let fetch = || {
+                if path.ends_with(".m3u8") {
+                    super::download_hls_content(path, None)
+                } else {
+                    super::download_transcript_content(path)
+                }
+            };
+            let mut first = fetch().unwrap();
+            assert_eq!(first.get_header_str("X-Divine-Source"), Some("gcs"));
+            assert_eq!(first.take_body().into_string(), "gcs bytes");
+            let mut hit = fetch().unwrap();
+            assert_eq!(hit.get_header_str("X-Divine-Source"), Some("unknown"));
+            assert_eq!(hit.take_body().into_string(), "gcs bytes");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires synthetic private origins; run-media-origin-tests.py"]
     fn derived_body_cache_source_contract() {
         for path in ["fixture/hls/master.m3u8", "fixture/vtt/main.vtt"] {
             let fetch = || {
