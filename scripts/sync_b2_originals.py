@@ -207,6 +207,15 @@ class State:
         self.directory = Path(directory)
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.directory / "state.sqlite3")
+        self.journal_failed = False
+        try:
+            self.db.execute("PRAGMA synchronous=FULL")
+            self.initialize()
+        except BaseException:
+            self.db.close()
+            raise
+
+    def initialize(self):
         self.db.execute("CREATE TABLE IF NOT EXISTS objects (hash TEXT PRIMARY KEY, generation TEXT, size INTEGER, checked INTEGER DEFAULT 0, ready TEXT)")
         self.db.execute("CREATE INDEX IF NOT EXISTS objects_checked ON objects(checked,hash)")
         self.db.execute("CREATE TABLE IF NOT EXISTS upload_queue (hash TEXT PRIMARY KEY, generation TEXT NOT NULL, available_at INTEGER NOT NULL DEFAULT 0)")
@@ -225,6 +234,105 @@ class State:
             self.db.execute("INSERT OR IGNORE INTO object_age SELECT hash,?,? FROM objects", (int(time.time()), int(time.time())))
             self.db.execute("INSERT INTO settings VALUES ('object_age_migrated','true')")
         self.db.commit()
+        self.db.execute("CREATE TABLE IF NOT EXISTS attempt_events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, attempt_id TEXT NOT NULL, hash TEXT NOT NULL, phase TEXT NOT NULL, payload TEXT NOT NULL, recorded_at INTEGER NOT NULL)")
+        if [r[1] for r in self.db.execute("PRAGMA table_info(attempt_events)")] != ["sequence", "attempt_id", "hash", "phase", "payload", "recorded_at"]:
+            raise ValueError("incompatible attempt journal")
+        self.db.execute("CREATE INDEX IF NOT EXISTS attempt_identity ON attempt_events(attempt_id,sequence)")
+        for action in ("UPDATE", "DELETE"):
+            self.db.execute(f"CREATE TRIGGER IF NOT EXISTS attempt_no_{action.lower()} BEFORE {action} ON attempt_events BEGIN SELECT RAISE(ABORT,'attempt evidence is append-only'); END")
+        self.db.commit()
+        self.sync_directory()
+
+    def sync_directory(self):
+        descriptor = os.open(self.directory, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def begin_attempt(self, key, attempt, source, destination, generation, size):
+        binding = self.setting("identity")
+        self.attempt_event(key, attempt, "attempt_started", {
+            "source_bucket": source, "destination_bucket": destination,
+            "source_generation": generation, "size": size,
+            "binding": json.loads(binding) if binding is not None else None})
+
+    def attempt_event(self, key, attempt, phase, payload):
+        """Evidence only: no journal entry grants ownership or permits replay."""
+        if self.journal_failed:
+            raise RuntimeError("attempt journal unavailable")
+        fields = {
+            "attempt_started": {"source_bucket", "destination_bucket", "source_generation", "size", "binding"},
+            "claim_intent": set(), "claim_ack": {"accepted"},
+            "claim_confirmed": {"gate_generation"},
+            "destination_put_intent": set(),
+            "destination_put_returned": {"destination_version_id"},
+            "destination_verified": {"destination_version_id"},
+            "readiness_put_intent": {"record"}, "readiness_put_ack": set(),
+            "readiness_confirmed": {"record", "kv_generation"},
+            "readiness_delete_intent": {"kv_generation"},
+            "readiness_delete_returned": {"deleted"},
+            "release_intent": set(),
+            "release_send": {"gate_generation", "mode"},
+            "release_ack": {"gate_generation", "mode"},
+        }
+        if (not HEX.fullmatch(key) or not isinstance(attempt, str)
+                or str(uuid.UUID(attempt)) != attempt or phase not in fields
+                or not isinstance(payload, dict) or set(payload) != fields[phase]):
+            raise ValueError("invalid attempt evidence")
+        for name, value in payload.items():
+            if name == "binding" and value is not None and (
+                    not isinstance(value, dict) or set(value) != {"source", "destination", "bucket_id", "kv_store"}
+                    or any(not isinstance(v, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,255}", v) for v in value.values())
+                    or value["source"] != payload["source_bucket"] or value["destination"] != payload["destination_bucket"]):
+                raise ValueError("invalid evidence binding")
+            if name.endswith("generation") and value is not None and not valid_generation(value):
+                raise ValueError("invalid evidence generation")
+            if name in {"gate_generation", "kv_generation"} and value is None:
+                raise ValueError("missing evidence generation")
+            if name in {"source_bucket", "destination_bucket"} and value is not None and (
+                    not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,255}", value)):
+                raise ValueError("invalid evidence mapping")
+            if name == "size" and value is not None and (type(value) is not int or value <= 0):
+                raise ValueError("invalid evidence size")
+            if name in {"accepted", "deleted"} and type(value) is not bool:
+                raise ValueError("invalid evidence outcome")
+            if name == "mode" and value not in {"delete", "released"}:
+                raise ValueError("invalid evidence release mode")
+            if name == "destination_version_id" and (not isinstance(value, str) or not 1 <= len(value) <= 1024 or value == "null"):
+                raise ValueError("invalid evidence version")
+            if name == "record" and (not isinstance(value, dict) or set(value) != {
+                    "version", "sha256", "verified_sha256", "source_bucket", "source_generation",
+                    "bucket", "key", "size", "destination_version_id", "verified_at"}
+                    or not readiness_identity_matches(value, key, {"size": value.get("size")}, value.get("source_bucket"), value.get("bucket"))):
+                raise ValueError("invalid readiness evidence")
+        try:
+            started = self.db.execute("SELECT hash,payload FROM attempt_events WHERE attempt_id=? ORDER BY sequence LIMIT 1", (attempt,)).fetchone()
+        except BaseException:
+            self.journal_failed = True
+            raise
+        if (phase == "attempt_started" and started is not None) or (
+                phase != "attempt_started" and (started is None or started[0] != key)):
+            raise ValueError("attempt identity not established")
+        if "record" in payload:
+            pinned = json.loads(started[1])
+            record = payload["record"]
+            if (record["source_bucket"] != pinned["source_bucket"] or record["bucket"] != pinned["destination_bucket"]
+                    or record["source_generation"] != pinned["source_generation"] or record["size"] != pinned["size"]):
+                raise ValueError("readiness evidence changed pinned inputs")
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        if len(encoded.encode()) > 8192:
+            raise ValueError("attempt evidence too large")
+        try:
+            if self.db.execute("PRAGMA synchronous").fetchone()[0] != 2:
+                raise RuntimeError("attempt durability changed")
+            with self.db:
+                self.db.execute("INSERT INTO attempt_events(attempt_id,hash,phase,payload,recorded_at) VALUES (?,?,?,?,?)",
+                                (attempt, key, phase, encoded, int(time.time())))
+            self.sync_directory()
+        except BaseException:
+            self.journal_failed = True
+            raise
 
     def close(self):
         self.db.close()
@@ -356,6 +464,26 @@ class Worker:
         self.metrics = Counter()
         self.failure_stage = None
         self.failure_detail = None
+        if hasattr(kv, "attempt_journal"):
+            kv.attempt_journal = state.attempt_event
+
+    def claim_copy(self, key, attempt):
+        row = self.state.db.execute("SELECT generation,size FROM objects WHERE hash=?", (key,)).fetchone()
+        generation, size = row if row is not None else (None, None)
+        self.state.begin_attempt(key, attempt, getattr(self.source, "bucket", None),
+                                 getattr(self.destination, "bucket", None), generation, size)
+        self.state.attempt_event(key, attempt, "claim_intent", {})
+        return self.observe("gate_claim", self.kv.claim_copy, key, attempt)
+
+    def release_copy(self, key, attempt):
+        self.state.attempt_event(key, attempt, "release_intent", {})
+        return self.observe("gate_release", self.kv.release_copy, key, attempt)
+
+    def delete_readiness(self, key, attempt, generation):
+        self.state.attempt_event(key, attempt, "readiness_delete_intent", {"kv_generation": generation})
+        deleted = self.observe("readiness_delete", self.kv.delete_if_generation, "b2-ready:" + key, generation)
+        self.state.attempt_event(key, attempt, "readiness_delete_returned", {"deleted": deleted})
+        return deleted
 
     def observe(self, stage, operation, *args, **kwargs):
         """Remember only a fixed call-site label, never SDK diagnostics or keys."""
@@ -380,20 +508,20 @@ class Worker:
             return True
         owned = attempt is not None
         attempt = attempt or str(uuid.uuid4())
-        if not owned and not self.observe("gate_claim", self.kv.claim_copy, key, attempt):
+        if not owned and not self.claim_copy(key, attempt):
             self.state.defer_gate(key)
             return False
         try:
             if (self.observe("policy_or_gate_read", self.kv.get, "b2-sync:v1:" + key) != {"state": "copying", "attempt_id": attempt}
                     or self.observe("readiness_read", self.kv.snapshot, "b2-ready:" + key) != observed or not allowed()):
                 return False
-            if observed is not None and not self.observe("readiness_delete", self.kv.delete_if_generation, "b2-ready:" + key, observed[1]):
+            if observed is not None and not self.delete_readiness(key, attempt, observed[1]):
                 return False
             self.state.reset(key, info)
             return True
         finally:
             if not owned:
-                self.observe("gate_release", self.kv.release_copy, key, attempt)
+                self.release_copy(key, attempt)
 
     def process(self, key, budget, reconcile=False):
         if not HEX.fullmatch(key):
@@ -519,7 +647,7 @@ class Worker:
                 allowed=lambda: self.observe("policy_read", approved_metadata, self.kv, key) is None)
             return self.observe("policy_read", demand_policy, self.kv, key) if reconcile else "blocked"
         attempt = str(uuid.uuid4())
-        if not self.observe("gate_claim", self.kv.claim_copy, key, attempt):
+        if not self.claim_copy(key, attempt):
             return "locked"
         upload_state = {"uncertain": False}
         try:
@@ -540,7 +668,7 @@ class Worker:
                 with self.state.db:
                     self.state.db.execute("UPDATE objects SET generation=?,size=?,ready=NULL WHERE hash=?",
                                           (info["generation"], info["size"], key))
-                if not self.observe("readiness_delete", self.kv.delete_if_generation, "b2-ready:" + key, observed[1]):
+                if not self.delete_readiness(key, attempt, observed[1]):
                     return "changed"
             result = self.transfer(key, budget, path, size, generation, info, meta, upload_state, attempt)
             if reconcile and missing_version and result == "ready":
@@ -548,14 +676,16 @@ class Worker:
             return self.observe("policy_read", demand_policy, self.kv, key) if reconcile and result == "blocked" else result
         finally:
             if not upload_state["uncertain"]:
-                self.observe("gate_release", self.kv.release_copy, key, attempt)
+                self.release_copy(key, attempt)
 
     def transfer(self, key, budget, path, size, generation, info, meta, upload_state, attempt):
         budget.spend(size)
         upload_state["uncertain"] = True
+        self.state.attempt_event(key, attempt, "destination_put_intent", {})
         version = self.observe("destination_upload", self.destination.upload, key, path, size)
         if not isinstance(version, str) or not version or version == "null":
             raise validation_error("destination_version", "destination did not return immutable version")
+        self.state.attempt_event(key, attempt, "destination_put_returned", {"destination_version_id": version})
         upload_state["uncertain"] = False
         digest = hashlib.sha256()
         for start in range(0, size, self.chunk_bytes):
@@ -568,6 +698,7 @@ class Worker:
         if digest.hexdigest() != key:
             self.invalidate(key, info, observed=None, attempt=attempt)
             raise validation_error("destination_checksum", "destination checksum mismatch")
+        self.state.attempt_event(key, attempt, "destination_verified", {"destination_version_id": version})
         if self.observe("source_head", self.source.head, key) != info:
             self.invalidate(key, observed=None, attempt=attempt)
             return "changed"
@@ -581,11 +712,14 @@ class Worker:
         # Readiness PUT is another effect: a lost response can leave it in flight.
         # Retain exclusion until this exact publication is positively observed.
         upload_state["uncertain"] = True
+        self.state.attempt_event(key, attempt, "readiness_put_intent", {"record": record})
         self.observe("readiness_write", self.kv.put, "b2-ready:" + key, record)
+        self.state.attempt_event(key, attempt, "readiness_put_ack", {})
         published = self.observe("readiness_read", confirm_readback,
             lambda timeout: self.kv.snapshot("b2-ready:" + key, timeout=timeout))
         if published is None or published[0] != record:
             raise validation_error("readiness_publication", "readiness publication not confirmed")
+        self.state.attempt_event(key, attempt, "readiness_confirmed", {"record": record, "kv_generation": published[1]})
         upload_state["uncertain"] = False
         # No cross-service transaction exists. Endpoint independently gates policy on
         # every request, including a vanish between this last check and publication.
@@ -882,6 +1016,11 @@ class FastlyKV:
         self.http = http or JsonHTTP({"Fastly-Key": token})
         self.claim_failure = None
         self.released_parent_gates = released_parent_gates
+        self.attempt_journal = None
+
+    def journal(self, key, attempt, phase, payload):
+        if self.attempt_journal is not None:
+            self.attempt_journal(key, attempt, phase, payload)
 
     def url(self, key):
         return self.base + urllib.parse.quote(key, safe="")
@@ -969,7 +1108,9 @@ class FastlyKV:
 
     def confirm_claim(self, key, expected):
         """Confirm only this claim; absent reads never repeat the add."""
+        generation = None
         def read(timeout):
+            nonlocal generation
             result = self.http.request(self.url(key), missing=True, include_headers=True,
                                        max_response_bytes=4096, timeout=timeout)
             if result is None:
@@ -977,9 +1118,13 @@ class FastlyKV:
             value, headers = result
             if not valid_generation(headers.get("generation")):
                 raise ValueError("copy gate generation unavailable")
+            generation = headers["generation"]
             # A present null/empty body is terminal malformed state, not 404.
             return {} if value is None else value
-        return confirm_readback(read)
+        observed = confirm_readback(read)
+        if observed == expected:
+            self.journal(key[len("b2-sync:v1:"):], expected["attempt_id"], "claim_confirmed", {"gate_generation": generation})
+        return observed
 
     def claim_copy(self, key, attempt):
         self.claim_failure = None
@@ -998,6 +1143,7 @@ class FastlyKV:
                     raise ValueError("copy gate generation unavailable")
                 url, headers = self.url("b2-sync:v1:" + key), {"if-generation-match": generation}
         result = self.claim_request("add", self.http.request, url, "PUT", value, conflict=True, headers=headers)
+        self.journal(key, attempt, "claim_ack", {"accepted": result is not False})
         if result is False:
             return False
         observed = self.claim_request("confirm", self.confirm_claim, "b2-sync:v1:" + key, value)
@@ -1026,15 +1172,19 @@ class FastlyKV:
         generation = headers.get("generation")
         if not isinstance(generation, str) or not re.fullmatch(r"[0-9]+", generation) or not 0 < int(generation) < 2 ** 64:
             raise ValueError("copy gate generation unavailable")
+        receipt = {"gate_generation": generation, "mode": "released" if self.released_parent_gates else "delete"}
         if self.released_parent_gates:
             if str(int(generation)) != generation:
                 raise ValueError("copy gate generation unavailable")
+            self.journal(key, attempt, "release_send", receipt)
             self.http.request(self.url(gate), "PUT", {
                 "state": "released", "version": 1, "settled_attempt_id": attempt,
                 "released_from_generation": generation,
             }, headers={"if-generation-match": generation})
         else:
+            self.journal(key, attempt, "release_send", receipt)
             self.http.request(self.url(gate), "DELETE", headers={"if-generation-match": generation})
+        self.journal(key, attempt, "release_ack", receipt)
 
 
 class GCSSource:
@@ -1173,21 +1323,21 @@ def main(argv=None):
     args.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     with (args.state_dir / "worker.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        from google.cloud import storage
-        import boto3
-        from botocore.config import Config
-        key_id, key = os.environ["B2_APPLICATION_KEY_ID"], os.environ["B2_APPLICATION_KEY"]
-        endpoint = private_b2_endpoint(args.destination_bucket, args.destination_bucket_id, key_id, key)
-        client = boto3.client("s3", endpoint_url=endpoint,
-                 region_name=endpoint.split(".")[1], aws_access_key_id=key_id,
-                 aws_secret_access_key=key, config=Config(signature_version="s3v4",
-                   retries={"total_max_attempts": 1}, connect_timeout=10, read_timeout=30,
-                   s3={"addressing_style": "path"}, request_checksum_calculation="when_required",
-                   response_checksum_validation="when_required"))
         state = State(args.state_dir)
         try:
             state.bind({"source": args.source_bucket, "destination": args.destination_bucket,
                         "bucket_id": args.destination_bucket_id, "kv_store": args.kv_store_id})
+            from google.cloud import storage
+            import boto3
+            from botocore.config import Config
+            key_id, key = os.environ["B2_APPLICATION_KEY_ID"], os.environ["B2_APPLICATION_KEY"]
+            endpoint = private_b2_endpoint(args.destination_bucket, args.destination_bucket_id, key_id, key)
+            client = boto3.client("s3", endpoint_url=endpoint,
+                     region_name=endpoint.split(".")[1], aws_access_key_id=key_id,
+                     aws_secret_access_key=key, config=Config(signature_version="s3v4",
+                       retries={"total_max_attempts": 1}, connect_timeout=10, read_timeout=30,
+                       s3={"addressing_style": "path"}, request_checksum_calculation="when_required",
+                       response_checksum_validation="when_required"))
             worker = Worker(GCSSource(args.source_bucket, storage.Client()),
                         B2Destination(args.destination_bucket, client),
                         FastlyKV(args.kv_store_id, os.environ["FASTLY_API_TOKEN"], released_parent_gates=args.released_parent_gates), state,
