@@ -59,6 +59,33 @@ impl From<&KVStoreError> for KvErrorClass {
         }
     }
 }
+/// Fixed explanation of why a stage failed, recorded at the deciding branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Reason {
+    /// The parent gate is copying under a different attempt.
+    HeldByOtherAttempt,
+    /// The parent gate is reserved for erasure.
+    Erasing,
+    /// The parent gate was already released.
+    Released,
+    /// A released gate's recorded generation could not be parsed.
+    ReleasedGenerationInvalid,
+    /// This attempt's own gate write could not be read back.
+    MissingAfterWrite,
+    /// The gate is absent when this attempt expected to hold it.
+    GateMissing,
+    /// This attempt holds the gate, but under a different generation.
+    GenerationChanged,
+    /// A gate record exists but reports no generation.
+    GateGenerationMissing,
+    /// A gate record exists but is not a valid gate.
+    GateRecordInvalid,
+    /// Retries re-read the same generation the failed write used.
+    CasStaleRead,
+    /// Another writer changed the value between retries.
+    CasContended,
+}
 #[derive(Clone, Copy, Debug, Serialize)]
 pub(crate) struct Diagnostic {
     stage: Stage,
@@ -66,6 +93,8 @@ pub(crate) struct Diagnostic {
     kv_operation: Option<KvOperation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     kv_error: Option<KvErrorClass>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<Reason>,
 }
 #[derive(Default)]
 struct Context {
@@ -105,6 +134,7 @@ pub(crate) fn item<T>(work: impl FnOnce() -> Result<T>) -> (Result<T>, Option<Di
                 stage: Stage::Operation,
                 kv_operation: None,
                 kv_error: None,
+                reason: None,
             }))
     } else {
         None
@@ -132,12 +162,31 @@ pub(crate) fn with_stage<T>(stage: Stage, work: impl FnOnce() -> Result<T>) -> R
                     stage,
                     kv_operation: None,
                     kv_error: None,
+                    reason: None,
                 });
             }
         }
     });
     drop(scope);
     result
+}
+/// Record why the current stage is failing. Call after its last KV operation;
+/// outside an archive item scope this does nothing.
+pub(crate) fn note(reason: Reason) {
+    ACTIVE.with(|state| {
+        if let Some(context) = state.borrow_mut().as_mut() {
+            let stage = context.stage;
+            context
+                .diagnostic
+                .get_or_insert(Diagnostic {
+                    stage,
+                    kv_operation: None,
+                    kv_error: None,
+                    reason: None,
+                })
+                .reason = Some(reason);
+        }
+    });
 }
 /// Observe the typed provider result at the actual I/O boundary, then return it unchanged.
 /// No key, owner, source, token, body, generation, or raw error text enters this state.
@@ -153,6 +202,7 @@ pub(crate) fn observe_kv<T>(
                     stage: context.stage,
                     kv_operation: Some(operation),
                     kv_error: Some(error.into()),
+                    reason: None,
                 }),
             };
         }
@@ -235,6 +285,42 @@ mod tests {
         assert!(success.is_none());
         assert!(observe_kv::<()>(KvOperation::Lookup, Err(original)).is_err());
         let (_, clean) = item(|| Err::<(), _>(BlossomError::Forbidden("private policy".into())));
+        assert_eq!(
+            serde_json::to_value(clean).unwrap(),
+            serde_json::json!({"stage":"operation"})
+        );
+    }
+
+    #[test]
+    fn archive_diagnostics_reasons_are_static_labels_attached_to_the_failing_stage() {
+        let (_, diagnostic) = item(|| {
+            with_stage(Stage::ParentClaim, || {
+                let _ = observe_kv::<()>(KvOperation::Lookup, Ok(()));
+                note(Reason::HeldByOtherAttempt);
+                Err::<(), _>(BlossomError::StorageError("private gate state".into()))
+            })
+        });
+        assert_eq!(
+            serde_json::to_value(diagnostic).unwrap(),
+            serde_json::json!({"stage":"parent_claim","reason":"held_by_other_attempt"})
+        );
+        let (_, diagnostic) = item(|| {
+            with_stage(Stage::OwnerList, || {
+                let _ = observe_kv::<()>(
+                    KvOperation::InsertCas,
+                    Err(KVStoreError::ItemPreconditionFailed),
+                );
+                note(Reason::CasStaleRead);
+                Err::<(), _>(BlossomError::MetadataError("private list".into()))
+            })
+        });
+        assert_eq!(
+            serde_json::to_value(diagnostic).unwrap(),
+            serde_json::json!({"stage":"owner_list","kv_operation":"insert_cas","kv_error":"item_precondition_failed","reason":"cas_stale_read"})
+        );
+        // Outside an archive item, notes are ignored, and they never leak into the next item.
+        note(Reason::GateRecordInvalid);
+        let (_, clean) = item(|| Err::<(), _>(BlossomError::BadRequest("private input".into())));
         assert_eq!(
             serde_json::to_value(clean).unwrap(),
             serde_json::json!({"stage":"operation"})
