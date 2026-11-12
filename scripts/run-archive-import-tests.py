@@ -49,7 +49,7 @@ blossom_secrets=[{{key="archive_import_token",data="fixture-importer"}},{{key="a
 ''')
                 env = os.environ.copy()
                 env['CARGO_TARGET_WASM32_WASIP1_RUNNER'] = shlex.join([env.get('VICEROY','viceroy'),'run','-C',str(config),'--'])
-                for name in ['archive_registration_retry_ownership_erasure_and_range','archive_routes_require_dedicated_auth_and_batch_results','archive_partial_admission_can_settle_without_record','archive_ownership_cas_rejects_writes_prepared_before_unlink','archive_paused_routes_drain_existing_admissions','archive_diagnostics_are_private_static_and_isolated_between_batch_items']:
+                for name in ['archive_registration_retry_ownership_erasure_and_range','archive_routes_require_dedicated_auth_and_batch_results','archive_partial_admission_can_settle_without_record','archive_ownership_cas_rejects_writes_prepared_before_unlink','archive_paused_routes_drain_existing_admissions','archive_diagnostics_are_private_static_and_isolated_between_batch_items','archive_copy_settlement_requires_exact_release_proof']:
                     kv.write_text('{}')
                     values=json.loads(settings.read_text()); values['archive_import_enabled']='false' if name=='archive_paused_routes_drain_existing_admissions' else 'true'; settings.write_text(json.dumps(values))
                     result = subprocess.run(['cargo','test','--locked','--target','wasm32-wasip1','--bin','fastly-blossom',name,'--','--ignored','--nocapture'],cwd=repo,env=env,capture_output=True,text=True)

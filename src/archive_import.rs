@@ -57,6 +57,8 @@ struct Record {
     receipts: BTreeMap<String, Registration>,
     #[serde(default)]
     provenance: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    settled_copies: BTreeMap<String, Item>,
 }
 fn unavailable() -> BlossomError {
     BlossomError::MetadataError("Archive import unavailable".into())
@@ -131,6 +133,7 @@ pub(crate) fn unlink_owner(hash: &str, owner: &str) -> Result<()> {
         let mut record: Record = current.unwrap_or_default();
         record.receipts.remove(owner);
         record.provenance.remove(owner);
+        record.settled_copies.retain(|_, item| item.owner != owner);
         if record.admission.as_ref().is_some_and(|a| a.owner == owner) {
             record.admission = None;
         }
@@ -373,6 +376,50 @@ fn register(i: &Item) -> Result<serde_json::Value> {
     parent_gate::archive_release(&i.sha256, &i.attempt, generation)?;
     Ok(serde_json::json!({"receipt":receipt}))
 }
+fn retire_attempt(i: &Item) -> Result<()> {
+    metadata::update_json_conditionally(&key(&i.sha256),5,"archive attempt settlement",|current| {
+        let mut record:Record=current.unwrap_or_default();
+        if record.settled.contains(&i.attempt){return Ok(Mutation::Complete(()));}
+        record.settled.push(i.attempt.clone());
+        if record.admission.as_ref().is_some_and(|a|a.attempt==i.attempt){record.admission=None;}
+        Ok(Mutation::Write{value:record,result:(),time_to_live:None})
+    })
+}
+fn retire_copy(i: &Item) -> Result<Item> {
+    metadata::update_json_conditionally(
+        &key(&i.sha256),
+        5,
+        "archive copy settlement",
+        |current: Option<Record>| {
+            if let Err(error) = owner_allowed(&i.sha256, &i.owner) {
+                return Ok(Mutation::Complete(Err(error)));
+            }
+            let Some(mut record) = current else {
+                return Ok(Mutation::Complete(Err(invalid())));
+            };
+            if let Some(bound) = record.settled_copies.get(&i.attempt) {
+                if bound != i {
+                    return Ok(Mutation::Complete(Err(invalid())));
+                }
+                return Ok(Mutation::Complete(Ok(bound.clone())));
+            }
+            if record.admission.as_ref() != Some(i) {
+                return Ok(Mutation::Complete(Err(invalid())));
+            }
+            record.settled_copies.insert(i.attempt.clone(), i.clone());
+            if !record.settled.contains(&i.attempt) {
+                record.settled.push(i.attempt.clone());
+            }
+            record.admission = None;
+            Ok(Mutation::Write {
+                value: record,
+                result: Ok(i.clone()),
+                time_to_live: None,
+            })
+        },
+    )?
+}
+
 fn process(i: &Item, phase: &str) -> Result<serde_json::Value> {
     policy(i)?;
     if !read(&i.sha256)?.receipts.contains_key(&i.owner) {
@@ -549,15 +596,20 @@ pub(crate) fn handle(mut req: Request, op: &str) -> Response {
             "admit"=>admit(i),"admit-copy"=>admit_for(i,true),"register"=>register(i),
             "check"=>{policy(i)?;parent_gate::archive_check(&i.sha256,&i.attempt,i.generation.as_deref().ok_or_else(invalid)?)?;Ok(serde_json::json!({"checked":true}))},
             "settle"=>{
-                metadata::update_json_conditionally(&key(&i.sha256),5,"archive attempt settlement",|current| {
-                    let mut record:Record=current.unwrap_or_default();
-                    if record.settled.contains(&i.attempt){return Ok(Mutation::Complete(()));}
-                    record.settled.push(i.attempt.clone());
-                    if record.admission.as_ref().is_some_and(|a|a.attempt==i.attempt){record.admission=None;}
-                    Ok(Mutation::Write{value:record,result:(),time_to_live:None})
-                })?;
+                retire_attempt(i)?;
                 parent_gate::archive_settle_current(&i.sha256,&i.attempt)?;
                 Ok(serde_json::json!({"settled":true}))
+            },
+            "settle-copy"=>{
+                let expected=i.generation.as_deref().filter(|g|parent_gate::generation(g).is_some()).ok_or_else(invalid)?;
+                policy(i)?;
+                parent_gate::archive_copy_settlement_precheck(&i.sha256,&i.attempt,expected)?;
+                let bound=retire_copy(i)?;
+                parent_gate::archive_release(&i.sha256,&i.attempt,expected)?;
+                policy(&bound)?;
+                let mut proof=parent_gate::archive_copy_release_proof(&i.sha256,&i.attempt,expected)?;
+                proof["owner"]=serde_json::json!(bound.owner);
+                Ok(serde_json::json!({"settled":true,"copy_settlement":proof}))
             },
             operation if operation.starts_with("process-") => process(i,operation.trim_start_matches("process-")),
             "reconcile"=>{policy(i)?;let r=read(&i.sha256)?;Ok(serde_json::json!({"receipt":r.receipts.get(&i.owner),"admission":r.admission}))},
@@ -672,12 +724,191 @@ mod tests {
     }
     #[test]
     #[ignore = "requires synthetic KV; scripts/run-archive-import-tests.py"]
+    fn archive_copy_settlement_requires_exact_release_proof() {
+        let mut original=sample("a","b","c");
+        original.generation=Some(admit(&original).unwrap()["generation"].as_str().unwrap().into());
+        original.file_id=Some("fixture-version".into());original.bucket=Some("b2".into());
+        register(&original).unwrap();
+        let mut copy=sample("a","b","d");
+        copy.generation=Some(admit_for(&copy,true).unwrap()["generation"].as_str().unwrap().into());
+        for generation in ["0","1"] {
+            assert_ne!(copy.generation.as_deref(),Some(generation));
+            let mut wrong=copy.clone();wrong.generation=Some(generation.into());
+            assert_eq!(call(&wrong, "settle-copy")["items"][0]["error"], "invalid");
+            assert!(!read(&copy.sha256).unwrap().settled.contains(&copy.attempt));
+            parent_gate::archive_check(&copy.sha256,&copy.attempt,copy.generation.as_deref().unwrap()).unwrap();
+        }
+        let completed=call(&copy,"settle-copy");
+        assert_eq!(completed["items"][0]["ok"],true);
+        let proof=&completed["items"][0]["result"]["copy_settlement"];
+        assert_eq!(proof["version"],1);assert_eq!(proof["state"],"released");
+        assert_eq!(proof["owner"],copy.owner);assert_eq!(proof["attempt"],copy.attempt);
+        assert_eq!(proof["sha256"],copy.sha256);
+        assert_eq!(proof["admission_generation"].as_str(),copy.generation.as_deref());
+        assert_eq!(proof["released_from_generation"].as_str(),copy.generation.as_deref());
+        assert!(parent_gate::generation(proof["parent_generation"].as_str().unwrap()).is_some());
+        // A lost response retries settlement only, never the retired admission.
+        assert_eq!(call(&copy,"settle-copy"),completed);
+        let mut wrong_owner=copy.clone();wrong_owner.owner="e".repeat(64);
+        assert_eq!(
+            call(&wrong_owner, "settle-copy")["items"][0]["error"],
+            "invalid"
+        );
+        let mut wrong_source=copy.clone();wrong_source.source="gcs:fixture:different".into();
+        assert_eq!(
+            call(&wrong_source, "settle-copy")["items"][0]["error"],
+            "invalid"
+        );
+        let mut wrong_provenance=copy.clone();wrong_provenance.provenance="another-manifest".into();
+        assert_eq!(
+            call(&wrong_provenance, "settle-copy")["items"][0]["error"],
+            "invalid"
+        );
+        assert!(admit_for(&copy,true).is_err());
+        let mut other=sample("a","b","e");
+        other.generation=Some(admit_for(&other,true).unwrap()["generation"].as_str().unwrap().into());
+        assert_eq!(call(&copy, "settle-copy")["items"][0]["error"], "invalid");
+        parent_gate::archive_check(&other.sha256,&other.attempt,other.generation.as_deref().unwrap()).unwrap();
+        assert!(matches!(
+            parent_gate::archive_copy_release_proof(
+                &copy.sha256,
+                &copy.attempt,
+                copy.generation.as_deref().unwrap()
+            ),
+            Err(BlossomError::BadRequest(_))
+        ));
+        assert_eq!(call(&other,"settle-copy")["items"][0]["ok"],true);
+        assert_eq!(call(&copy, "settle-copy")["items"][0]["error"], "invalid");
+        let mut missing=sample("f","b","f");missing.generation=Some("1".into());
+        assert_eq!(
+            call(&missing, "settle-copy")["items"][0]["error"],
+            "invalid"
+        );
+        assert!(!read(&missing.sha256).unwrap().settled.contains(&missing.attempt));
+        let mut erasing=sample("a","b","f");
+        erasing.generation=Some(admit_for(&erasing,true).unwrap()["generation"].as_str().unwrap().into());
+        assert_eq!(call(&erasing,"settle-copy")["items"][0]["ok"],true);
+        parent_gate::claim_erasure(&metadata::open_store().unwrap(),&erasing.sha256).unwrap();
+        let denied=call(&erasing,"settle-copy");
+        assert_eq!(denied["items"][0]["error"],"policy_denied");
+        assert!(parent_gate::archive_claim(&erasing.sha256,&"1".repeat(32)).is_err());
+        let mut unlinked=sample("f","9","8");
+        unlinked.generation=Some(admit(&unlinked).unwrap()["generation"].as_str().unwrap().into());
+        unlinked.file_id=Some("fixture-unlink".into());unlinked.bucket=Some("b2".into());register(&unlinked).unwrap();
+        let mut unlinked_copy=sample("f","9","9");
+        unlinked_copy.generation=Some(admit_for(&unlinked_copy,true).unwrap()["generation"].as_str().unwrap().into());
+        assert_eq!(call(&unlinked_copy,"settle-copy")["items"][0]["ok"],true);
+        unlink_owner(&unlinked_copy.sha256,&unlinked_copy.owner).unwrap();
+        assert!(read(&unlinked_copy.sha256).unwrap().settled_copies.is_empty());
+        assert_eq!(call(&unlinked_copy,"settle-copy")["items"][0]["error"],"policy_denied");
+        let mut forged=unlinked_copy.clone();forged.owner="a".repeat(64);
+        assert_eq!(call(&forged, "settle-copy")["items"][0]["error"], "invalid");
+        let mut historical=sample("8","9","a");
+        historical.generation=Some(admit(&historical).unwrap()["generation"].as_str().unwrap().into());
+        historical.file_id=Some("fixture-historical".into());historical.bucket=Some("b2".into());register(&historical).unwrap();
+        let mut historical_copy=sample("8","9","b");
+        historical_copy.generation=Some(admit_for(&historical_copy,true).unwrap()["generation"].as_str().unwrap().into());
+        assert_eq!(call(&historical_copy,"settle")["items"][0]["ok"],true);
+        assert_eq!(
+            call(&historical_copy, "settle-copy")["items"][0]["error"],
+            "invalid"
+        );
+        assert!(read(&historical_copy.sha256).unwrap().settled_copies.is_empty());
+        let mut partial = sample("2", "b", "3");
+        partial.generation =
+            Some(parent_gate::archive_claim(&partial.sha256, &partial.attempt).unwrap());
+        assert_eq!(
+            call(&partial, "settle-copy")["items"][0]["error"],
+            "invalid"
+        );
+        assert!(!read(&partial.sha256)
+            .unwrap()
+            .settled
+            .contains(&partial.attempt));
+        parent_gate::archive_check(
+            &partial.sha256,
+            &partial.attempt,
+            partial.generation.as_deref().unwrap(),
+        )
+        .unwrap();
+        metadata::open_store()
+            .unwrap()
+            .insert(&key(&partial.sha256), "not valid JSON")
+            .unwrap();
+        assert_eq!(call(&partial, "settle-copy")["items"][0]["error"], "retry");
+        let mut revoked = sample("3", "7", "4");
+        revoked.generation = Some(
+            admit_for(&revoked, true).unwrap()["generation"]
+                .as_str()
+                .unwrap()
+                .into(),
+        );
+        metadata::mark_vanish_in_progress(&revoked.owner).unwrap();
+        assert_eq!(
+            call(&revoked, "settle-copy")["items"][0]["error"],
+            "policy_denied"
+        );
+        assert!(matches!(
+            retire_copy(&revoked),
+            Err(BlossomError::Forbidden(_))
+        ));
+        parent_gate::archive_check(
+            &revoked.sha256,
+            &revoked.attempt,
+            revoked.generation.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(call(&revoked, "settle")["items"][0]["ok"], true);
+        parent_gate::claim_erasure(&metadata::open_store().unwrap(), &revoked.sha256).unwrap();
+        for (hash, reason) in [("4", "quarantine"), ("5", "tombstone")] {
+            let mut blocked = sample(hash, "8", "5");
+            blocked.generation = Some(
+                admit_for(&blocked, true).unwrap()["generation"]
+                    .as_str()
+                    .unwrap()
+                    .into(),
+            );
+            if reason == "quarantine" {
+                metadata::update_quarantine_holds(
+                    &blocked.sha256,
+                    "fixture-hold",
+                    1,
+                    blossom_core::quarantine::QuarantineAction::Hold,
+                )
+                .unwrap();
+            } else {
+                metadata::put_tombstone(&blocked.sha256, "fixture removal").unwrap();
+            }
+            assert_eq!(
+                call(&blocked, "settle-copy")["items"][0]["error"],
+                "policy_denied"
+            );
+            parent_gate::archive_check(
+                &blocked.sha256,
+                &blocked.attempt,
+                blocked.generation.as_deref().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(call(&blocked, "settle")["items"][0]["ok"], true);
+            parent_gate::claim_erasure(&metadata::open_store().unwrap(), &blocked.sha256).unwrap();
+        }
+    }
+    #[test]
+    #[ignore = "requires synthetic KV; scripts/run-archive-import-tests.py"]
     fn archive_partial_admission_can_settle_without_record() {
         let i = sample("c", "d", "e");
         parent_gate::archive_claim(&i.sha256, &i.attempt).unwrap();
         assert!(read(&i.sha256).unwrap().admission.is_none());
         metadata::mark_vanish_in_progress(&i.owner).unwrap();
         assert!(admit(&i).is_err());
+        assert_eq!(call(&i, "settle-copy")["items"][0]["error"], "invalid");
+        let mut proof_request = i.clone();
+        proof_request.generation = Some(parent_gate::archive_claim(&i.sha256, &i.attempt).unwrap());
+        assert_eq!(
+            call(&proof_request, "settle-copy")["items"][0]["error"],
+            "policy_denied"
+        );
+        assert!(parent_gate::claim_erasure(&metadata::open_store().unwrap(), &i.sha256).is_err());
         assert_eq!(call(&i, "settle")["items"][0]["ok"], true);
         assert_eq!(call(&i, "settle")["items"][0]["ok"], true);
         metadata::clear_vanish_in_progress(&i.owner).unwrap();
