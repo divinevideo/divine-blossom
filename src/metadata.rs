@@ -58,11 +58,24 @@ where
 {
     let store = open_store()?;
     let tracker = std::cell::RefCell::new(CasConflictTracker::default());
+    let conflicted = std::cell::Cell::new(false);
     let result = update_json_conditionally_with_io(
         max_attempts,
         operation,
         mutate,
-        || match observe_kv(KvOperation::Lookup, store.lookup(key)) {
+        || {
+            // After a lost write the edge copy may be stale, so re-read from the origin when it is
+            // configured and reachable; otherwise keep reading the edge as before.
+            if conflicted.get() {
+                if let Ok(Some(origin)) = crate::kv_origin::lookup(key) {
+                    let read = origin.map(|entry| {
+                        (String::from_utf8_lossy(&entry.body).into_owned(), entry.generation)
+                    });
+                    tracker.borrow_mut().read(read.as_ref().map(|(_, generation)| *generation));
+                    return Ok(read);
+                }
+            }
+            match observe_kv(KvOperation::Lookup, store.lookup(key)) {
             Ok(mut lookup) => {
                 let generation = lookup.current_generation();
                 tracker.borrow_mut().read(Some(generation));
@@ -73,6 +86,7 @@ where
                 Ok(None)
             }
             Err(error) => Err(format!("Failed to load {operation}: {error}")),
+            }
         },
         |value, generation, time_to_live| {
             let insert = match generation {
@@ -87,6 +101,7 @@ where
                 Ok(()) => Ok(true),
                 Err(KVStoreError::ItemPreconditionFailed) => {
                     tracker.borrow_mut().conflict(generation);
+                    conflicted.set(true);
                     Ok(false)
                 }
                 Err(error) => Err(format!("Failed to store {operation}: {error}")),
