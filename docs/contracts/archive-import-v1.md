@@ -36,7 +36,9 @@ claimed a gate without returning a generation or retaining an admission. Legacy
 settlement drains only its owning attempt without requiring serving policy or
 returning a copy proof. `settle-copy` obtains proof before processing; it MUST NOT
 replace this generic cleanup drain. A policy-denied proof request leaves its gate
-for legacy settlement to drain and does not authorize processing.
+for legacy settlement to drain if policy denies before release. Policy can also
+deny after release, leaving no copying gate to drain; legacy settlement is then
+an idempotent no-op. Neither denial authorizes processing.
 
 For `settle-copy`, add the `generation` returned by `admit-copy` to the original
 admitted item. Every item field must match the admission, or the exact item retained
@@ -71,6 +73,10 @@ All three are canonical, nonzero decimal `u64` strings used as equality fences.
 
 This is a statement of current gate state, not durable release history. A later
 attempt can claim the released gate, making this attempt's proof unobtainable.
+A delayed admission for the same attempt can also pass its initial retirement
+check before settlement, then reclaim and release the gate at a new generation
+after settlement. That changes the release fence even without another attempt,
+so the original proof can become unobtainable and require reconciliation.
 Missing or changed admission/binding, or a gate that no longer matches the attempt
 and generation, returns `invalid`. These permanent refusals require reconciliation,
 not retrying the same proof request. `retry` remains for unavailable KV state and
@@ -109,8 +115,9 @@ monotonic batch cursor; replaying an acknowledged batch does not count it twice.
 work runs separately from registration. Drain the aggregate queue before a full admin
 statistics rebuild. Existing status-change counters remain eventually consistent.
 
-Owner unlink removes archive receipts and provenance and writes a permanent,
-non-identifying owner/hash removal fence. Full metadata erasure removes the private
+Owner unlink removes archive receipts, provenance and retained copy-settlement
+bindings, and writes a permanent, non-identifying owner/hash removal fence.
+Full metadata erasure removes the private
 archive record. Neither ordinary retries nor enabling the feature can override erasure.
 
 Run `scripts/run-archive-import-tests.py` with Viceroy for real synthetic KV, ownership,
