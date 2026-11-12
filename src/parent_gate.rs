@@ -412,10 +412,13 @@ pub(crate) fn archive_claim(hash: &str, attempt: &str) -> Result<String> {
         }
     };
     insert(&store, hash, &Gate::Copying {attempt_id: attempt.to_owned()}, expected)?;
-    let current = lookup(&store, hash)?.ok_or_else(|| {
-        note(Reason::MissingAfterWrite);
-        unavailable()
-    })?;
+    // Our insert succeeded, but edge reads can briefly miss it; wait it out before failing the admit.
+    let delays = blossom_core::read_back::READ_BACK_DELAYS_MS.map(std::time::Duration::from_millis);
+    let current = blossom_core::read_back::read_back(|| lookup(&store, hash), &delays, std::thread::sleep)?
+        .ok_or_else(|| {
+            note(Reason::MissingAfterWrite);
+            unavailable()
+        })?;
     archive_check(hash, attempt, &current.generation)?;
     Ok(current.generation)
 }
