@@ -412,25 +412,45 @@ pub(crate) fn archive_claim(hash: &str, attempt: &str) -> Result<String> {
         }
     };
     insert(&store, hash, &Gate::Copying {attempt_id: attempt.to_owned()}, expected)?;
-    // Our insert succeeded, but edge reads can briefly miss it; wait it out before failing the admit.
-    let delays = blossom_core::read_back::READ_BACK_DELAYS_MS.map(std::time::Duration::from_millis);
-    let current = blossom_core::read_back::read_back(|| lookup(&store, hash), &delays, std::thread::sleep)?
-        .ok_or_else(|| {
+    // Our insert succeeded, but edge reads can miss it for a long time; the origin cannot.
+    let current = match lookup(&store, hash)? {
+        Some(observed) => observed,
+        None => lookup_origin(hash)?.ok_or_else(|| {
             note(Reason::MissingAfterWrite);
             unavailable()
-        })?;
+        })?,
+    };
     archive_check(hash, attempt, &current.generation)?;
     Ok(current.generation)
 }
 pub(crate) fn archive_check(hash: &str, attempt: &str, expected: &str) -> Result<()> {
     let observed = lookup(&crate::metadata::open_store()?, hash)?;
-    match hold_reason(observed.as_ref(), attempt, Some(expected)) {
-        None => Ok(()),
-        Some(reason) => {
-            note(reason);
-            Err(stale())
+    let Some(edge_reason) = hold_reason(observed.as_ref(), attempt, Some(expected)) else {
+        return Ok(());
+    };
+    // A stale edge copy can disagree with a gate this attempt holds; the origin decides.
+    let reason = if crate::kv_origin::enabled() {
+        let origin = lookup_origin(hash)?;
+        match hold_reason(origin.as_ref(), attempt, Some(expected)) {
+            None => return Ok(()),
+            Some(reason) => reason,
         }
-    }
+    } else {
+        edge_reason
+    };
+    note(reason);
+    Err(stale())
+}
+/// The gate as stored at the KV origin; `None` when origin reads are not configured or the gate is absent.
+fn lookup_origin(hash: &str) -> Result<Option<Observed>> {
+    let Some(Some(entry)) = crate::kv_origin::lookup(&key(hash))? else {
+        return Ok(None);
+    };
+    let gate = parse(&entry.body).ok_or_else(|| {
+        note(Reason::GateRecordInvalid);
+        unavailable()
+    })?;
+    Ok(Some(Observed {gate, generation: entry.generation.to_string()}))
 }
 /// Why `attempt` does not hold the gate at `expected` (any generation when `None`).
 /// Returns `None` when it does.

@@ -18,6 +18,7 @@ mod error;
 mod media_auth_log;
 mod metadata;
 mod parent_gate;
+mod kv_origin;
 mod archive_import;
 mod archive_diagnostics;
 mod rate_limit;
