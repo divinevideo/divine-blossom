@@ -5,9 +5,9 @@ use crate::blossom::{
     AudioMapping, BlobMetadata, BlobStatus, GlobalStats, RecentIndex, SubtitleJob, UserIndex,
 };
 use crate::error::{BlossomError, Result};
-use crate::archive_diagnostics::{observe_kv, KvOperation};
+use crate::archive_diagnostics::{note, observe_kv, KvOperation, Reason};
 use blossom_core::conditional_update::{
-    update_json_conditionally_with_io, ConditionalJsonMutation,
+    update_json_conditionally_with_io, CasConflictTracker, CasRetryPattern, ConditionalJsonMutation,
 };
 use blossom_core::quarantine::{
     mutate_holds, QuarantineAction, QuarantineHolds, HOLD_CAPACITY_EXCEEDED, HOLD_VERSION_CONFLICT,
@@ -57,16 +57,21 @@ where
     F: FnMut(Option<T>) -> std::result::Result<ConditionalJsonMutation<T, R>, String>,
 {
     let store = open_store()?;
-    update_json_conditionally_with_io(
+    let tracker = std::cell::RefCell::new(CasConflictTracker::default());
+    let result = update_json_conditionally_with_io(
         max_attempts,
         operation,
         mutate,
         || match observe_kv(KvOperation::Lookup, store.lookup(key)) {
             Ok(mut lookup) => {
                 let generation = lookup.current_generation();
+                tracker.borrow_mut().read(Some(generation));
                 Ok(Some((lookup.take_body().into_string(), generation)))
             }
-            Err(KVStoreError::ItemNotFound) => Ok(None),
+            Err(KVStoreError::ItemNotFound) => {
+                tracker.borrow_mut().read(None);
+                Ok(None)
+            }
             Err(error) => Err(format!("Failed to load {operation}: {error}")),
         },
         |value, generation, time_to_live| {
@@ -80,12 +85,22 @@ where
             };
             match observe_kv(if generation.is_some() { KvOperation::InsertCas } else { KvOperation::InsertAdd }, insert.execute(key, value)) {
                 Ok(()) => Ok(true),
-                Err(KVStoreError::ItemPreconditionFailed) => Ok(false),
+                Err(KVStoreError::ItemPreconditionFailed) => {
+                    tracker.borrow_mut().conflict(generation);
+                    Ok(false)
+                }
                 Err(error) => Err(format!("Failed to store {operation}: {error}")),
             }
         },
-    )
-    .map_err(BlossomError::MetadataError)
+    );
+    if result.is_err() {
+        match tracker.borrow().pattern() {
+            Some(CasRetryPattern::StaleRead) => note(Reason::CasStaleRead),
+            Some(CasRetryPattern::Contended) => note(Reason::CasContended),
+            None => {}
+        }
+    }
+    result.map_err(BlossomError::MetadataError)
 }
 
 /// Key for user index (list of all uploaders)

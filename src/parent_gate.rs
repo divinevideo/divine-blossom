@@ -1,6 +1,6 @@
 //! Shared no-TTL writer/erasure exclusion. Generations are equality fences.
 use crate::error::{BlossomError, Result};
-use crate::archive_diagnostics::{observe_kv, KvOperation};
+use crate::archive_diagnostics::{note, observe_kv, KvOperation, Reason};
 use fastly::http::{Method, StatusCode};
 use fastly::kv_store::{InsertMode, KVStore, KVStoreError};
 use fastly::{Request, Response};
@@ -86,6 +86,7 @@ fn lookup(store: &KVStore, hash: &str) -> Result<Option<Observed>> {
     };
     let generation = entry.current_generation();
     if generation == 0 {
+        note(Reason::GateGenerationMissing);
         return Err(unavailable());
     }
     let mut body = Vec::new();
@@ -93,8 +94,14 @@ fn lookup(store: &KVStore, hash: &str) -> Result<Option<Observed>> {
         .take_body()
         .take(MAX_BODY + 1)
         .read_to_end(&mut body)
-        .map_err(|_| unavailable())?;
-    let gate = parse(&body).ok_or_else(unavailable)?;
+        .map_err(|_| {
+            note(Reason::GateRecordInvalid);
+            unavailable()
+        })?;
+    let gate = parse(&body).ok_or_else(|| {
+        note(Reason::GateRecordInvalid);
+        unavailable()
+    })?;
     Ok(Some(Observed {
         gate,
         generation: generation.to_string(),
@@ -389,21 +396,50 @@ pub(crate) fn handle(mut req: Request, op: &str) -> Response {
 /// Policy and provenance are checked by archive_import, never by caller-selected flags.
 pub(crate) fn archive_claim(hash: &str, attempt: &str) -> Result<String> {
     let store = crate::metadata::open_store()?;
-    let expected = match lookup(&store, hash)? {
+    let observed = lookup(&store, hash)?;
+    let expected = match observed {
         Some(Observed {gate: Gate::Copying {attempt_id}, generation}) if attempt_id == attempt => return Ok(generation),
-        Some(Observed {gate: Gate::Released {..}, generation: g}) => Some(generation(&g).ok_or_else(unavailable)?),
+        Some(Observed {gate: Gate::Released {..}, generation: ref g}) => Some(generation(g).ok_or_else(|| {
+            note(Reason::ReleasedGenerationInvalid);
+            unavailable()
+        })?),
         None => None,
-        _ => return Err(stale()),
+        ref other => {
+            if let Some(reason) = hold_reason(other.as_ref(), attempt, None) {
+                note(reason);
+            }
+            return Err(stale());
+        }
     };
     insert(&store, hash, &Gate::Copying {attempt_id: attempt.to_owned()}, expected)?;
-    let current = lookup(&store, hash)?.ok_or_else(unavailable)?;
+    let current = lookup(&store, hash)?.ok_or_else(|| {
+        note(Reason::MissingAfterWrite);
+        unavailable()
+    })?;
     archive_check(hash, attempt, &current.generation)?;
     Ok(current.generation)
 }
 pub(crate) fn archive_check(hash: &str, attempt: &str, expected: &str) -> Result<()> {
-    match lookup(&crate::metadata::open_store()?, hash)? {
-        Some(Observed {gate: Gate::Copying {attempt_id}, generation}) if attempt_id == attempt && generation == expected => Ok(()),
-        _ => Err(stale()),
+    let observed = lookup(&crate::metadata::open_store()?, hash)?;
+    match hold_reason(observed.as_ref(), attempt, Some(expected)) {
+        None => Ok(()),
+        Some(reason) => {
+            note(reason);
+            Err(stale())
+        }
+    }
+}
+/// Why `attempt` does not hold the gate at `expected` (any generation when `None`).
+/// Returns `None` when it does.
+fn hold_reason(observed: Option<&Observed>, attempt: &str, expected: Option<&str>) -> Option<Reason> {
+    match observed {
+        None => Some(Reason::GateMissing),
+        Some(Observed {gate: Gate::Copying {attempt_id}, generation}) if attempt_id == attempt => {
+            expected.is_some_and(|e| e != generation).then_some(Reason::GenerationChanged)
+        }
+        Some(Observed {gate: Gate::Copying {..}, ..}) => Some(Reason::HeldByOtherAttempt),
+        Some(Observed {gate: Gate::Erasing {}, ..}) => Some(Reason::Erasing),
+        Some(Observed {gate: Gate::Released {..}, ..}) => Some(Reason::Released),
     }
 }
 pub(crate) fn archive_release(hash: &str, attempt: &str, expected: &str) -> Result<()> {
@@ -463,6 +499,20 @@ mod tests {
         ] {
             assert!(serde_json::from_value::<Wire>(serde_json::json!({"version":1,"parent":"a".repeat(64),"attempt_id":A,"purpose":"existing_family","expected":expected})).is_err());
         }
+    }
+    #[test]
+    fn archive_hold_reasons_name_the_observed_gate_without_its_values() {
+        use crate::archive_diagnostics::Reason;
+        let observed = |gate: Gate, generation: &str| Observed {gate, generation: generation.into()};
+        let copying = |attempt: &str| Gate::Copying {attempt_id: attempt.into()};
+        assert_eq!(hold_reason(None, A, None), Some(Reason::GateMissing));
+        assert_eq!(hold_reason(Some(&observed(copying(A), "7")), A, None), None);
+        assert_eq!(hold_reason(Some(&observed(copying(A), "7")), A, Some("7")), None);
+        assert_eq!(hold_reason(Some(&observed(copying(A), "8")), A, Some("7")), Some(Reason::GenerationChanged));
+        assert_eq!(hold_reason(Some(&observed(copying(B), "7")), A, Some("7")), Some(Reason::HeldByOtherAttempt));
+        assert_eq!(hold_reason(Some(&observed(Gate::Erasing {}, "7")), A, None), Some(Reason::Erasing));
+        let released = Gate::Released {version: 1, settled_attempt_id: A.into(), released_from_generation: "6".into()};
+        assert_eq!(hold_reason(Some(&observed(released, "7")), A, None), Some(Reason::Released));
     }
     #[test]
     #[ignore = "requires local KV fixture; scripts/run-parent-gate-tests.py"]

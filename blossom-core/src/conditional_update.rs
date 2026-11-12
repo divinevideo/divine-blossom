@@ -11,6 +11,51 @@ pub enum ConditionalJsonMutation<T, R> {
     },
 }
 
+/// Why a conditional write kept losing, judged from the generations re-read after each loss.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CasRetryPattern {
+    /// Every re-read returned the generation the failed write had used.
+    StaleRead,
+    /// At least one re-read observed a different generation.
+    Contended,
+}
+
+/// Records each lost write and the generation read on the following attempt.
+#[derive(Debug, Default)]
+pub struct CasConflictTracker {
+    lost_with: Option<Option<u64>>,
+    stale_rereads: u32,
+    changed_rereads: u32,
+}
+
+impl CasConflictTracker {
+    /// Call with the generation observed by each read (`None` when the key is absent).
+    pub fn read(&mut self, generation: Option<u64>) {
+        if let Some(lost) = self.lost_with.take() {
+            if lost == generation {
+                self.stale_rereads += 1;
+            } else {
+                self.changed_rereads += 1;
+            }
+        }
+    }
+
+    /// Call when a write conditioned on `generation` lost its precondition.
+    pub fn conflict(&mut self, generation: Option<u64>) {
+        self.lost_with = Some(generation);
+    }
+
+    pub fn pattern(&self) -> Option<CasRetryPattern> {
+        if self.changed_rereads > 0 {
+            Some(CasRetryPattern::Contended)
+        } else if self.stale_rereads > 0 {
+            Some(CasRetryPattern::StaleRead)
+        } else {
+            None
+        }
+    }
+}
+
 /// Run a JSON read-modify-write loop against generation-aware storage.
 ///
 /// `write` returns `false` for a precondition failure, which causes the whole
@@ -98,6 +143,38 @@ mod tests {
         assert_eq!(lookups.get(), 2);
         assert_eq!(writes.get(), 2);
         assert_eq!(*observed_ttls.borrow(), vec![Some(ttl), Some(ttl)]);
+    }
+
+    #[test]
+    fn conflict_tracker_separates_stale_rereads_from_contention() {
+        use super::{CasConflictTracker, CasRetryPattern};
+        let mut untouched = CasConflictTracker::default();
+        untouched.read(Some(4));
+        assert_eq!(untouched.pattern(), None);
+
+        // A lost write followed by re-reading the same generation means the read lagged.
+        let mut stale = CasConflictTracker::default();
+        for _ in 0..3 {
+            stale.read(Some(7));
+            stale.conflict(Some(7));
+        }
+        assert_eq!(stale.pattern(), Some(CasRetryPattern::StaleRead));
+
+        // Any re-read that observes a new generation means another writer is active.
+        let mut contended = CasConflictTracker::default();
+        contended.read(Some(7));
+        contended.conflict(Some(7));
+        contended.read(Some(7));
+        contended.conflict(Some(7));
+        contended.read(Some(8));
+        assert_eq!(contended.pattern(), Some(CasRetryPattern::Contended));
+
+        // An add that lost to a concurrent create sees the key appear on re-read.
+        let mut created = CasConflictTracker::default();
+        created.read(None);
+        created.conflict(None);
+        created.read(Some(1));
+        assert_eq!(created.pattern(), Some(CasRetryPattern::Contended));
     }
 
     #[test]
