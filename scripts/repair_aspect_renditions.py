@@ -219,7 +219,9 @@ def main(argv=None):
         done, failed, review = (read_hashes(path) for path in (done_file, failed_file, review_file))
         # A hash still in flight belongs to a run that was killed mid-repair: its outcome is
         # unknown and its writer may still hold the lock, so it is never resubmitted here.
-        interrupted = sorted(read_hashes(inflight_file) - done - failed - review)
+        # Terminal entries can belong to an older attempt (notably --retry-failed).
+        # They cannot establish the outcome of the request this marker describes.
+        interrupted = sorted(read_hashes(inflight_file))
     except OSError:
         print("Cannot read repair state", file=sys.stderr)
         return 2

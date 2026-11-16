@@ -270,6 +270,16 @@ class MainTests(unittest.TestCase):
             code, submitted, _ = self.invoke(folder)
             self.assertEqual((code, submitted), (0, [A, C]))
 
+    def test_interrupted_retry_is_not_masked_by_previous_failure(self):
+        with tempfile.TemporaryDirectory() as folder:
+            Path(folder, "aspect-repair-failed.txt").write_text(B + "\tprevious error\n")
+            Path(folder, "aspect-repair-inflight.txt").write_text(B + "\n")
+            code, submitted, _ = self.invoke(folder, args=["--retry-failed"])
+            self.assertEqual((code, submitted), (1, []))
+            self.assertEqual(self.state(folder, "review"), [f"{B}\tinterrupted run; outcome unknown"])
+            code, submitted, _ = self.invoke(folder, args=["--retry-failed"])
+            self.assertEqual((code, submitted), (0, [A, C]))
+
     def test_interrupt_during_a_repair_records_it_for_review(self):
         with tempfile.TemporaryDirectory() as folder:
             with self.assertRaises(KeyboardInterrupt):
