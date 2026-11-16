@@ -81,7 +81,8 @@ deleted; unreferenced stale objects may remain.
 `scripts/repair-aspect-renditions.sh` performs the regeneration and origin
 verification above for an audit file, one hash at a time. It reads only records
 that carry a `request` object, so every repair it submits was selected by the
-audit. Use the isolated Python environment from `scripts/requirements-b2-sync.txt`
+audit. Install `ffprobe` on the runner host, as for the audit, and use the isolated
+Python environment from `scripts/requirements-b2-sync.txt`
 and supply the repair credential through `TRANSCODE_REPAIR_SECRET_FILE`, never
 as an argument. Verification reads the unchanged original from GCS (application
 default credentials, `GCS_BUCKET`) and the regenerated outputs from B2
@@ -103,7 +104,8 @@ the full run. For each hash the runner submits one forced request and never
 retries it. On `status:complete` it downloads the original and the four outputs
 the edge serves (`hls/stream_{720,480}p.mp4` and `hls/stream_{720,480}p.ts`),
 probes them with the audit's geometry rules, and records the hash as done only
-when every display ratio is within 1% of the original's. It stops the run, without
+when the original bytes match their content hash and every display ratio is
+within 1% of the original's. It stops the run, without
 recording the hash, when the request is rejected before any work starts (401,
 another 4xx, a redirect, or the worker's own `repair not configured` 503) or the
 worker answers `already_exists`: a revision without repair support ignores
@@ -116,6 +118,9 @@ the run continues with the next hash.
 
 Before each request the runner writes the hash to `aspect-repair-inflight.txt`
 and removes it once the outcome is recorded. Ctrl-C records the hash for review.
+An exclusive advisory lock on `aspect-repair.lock` prevents concurrent runner
+invocations from modifying the same state directory. Keep that lock file in
+place; the operating system releases the lock when the process exits or dies.
 If the process is killed instead, the next run moves the leftover hash to review
 and exits without submitting anything, so a repair whose writer may still be
 active is never resubmitted.

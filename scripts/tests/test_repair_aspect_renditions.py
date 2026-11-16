@@ -1,5 +1,7 @@
 import contextlib
+import fcntl
 from fractions import Fraction
+import hashlib
 import http.server
 import importlib.util
 import io
@@ -169,26 +171,37 @@ class VerifyTests(unittest.TestCase):
                 fetched.append((store, key))
                 if key in missing:
                     raise FileNotFoundError(key)
-                Path(dest).write_text(key)
+                Path(dest).write_text(A if store == "original" else key)
             return inner
 
-        result = repair.verify(fetch("original"), fetch("primary"), A,
-                               lambda path: geometries[Path(path).read_text()])
+        result = repair.verify(fetch("original"), fetch("primary"), hashlib.sha256(A.encode()).hexdigest(),
+                                lambda path: geometries[Path(path).read_text()])
         return result, fetched
 
     def test_all_outputs_matching_the_original_pass(self):
-        geometries = {A: SQUARE, **{f"{A}/{key}": ((720, 720), Fraction(1)) for key in repair.OUTPUTS}}
+        media_hash = hashlib.sha256(A.encode()).hexdigest()
+        geometries = {A: SQUARE, **{f"{media_hash}/{key}": ((720, 720), Fraction(1)) for key in repair.OUTPUTS}}
         result, fetched = self.run_verify(geometries)
         self.assertEqual(result, [])
-        self.assertEqual(fetched[0], ("original", A))
-        self.assertEqual([key for _store, key in fetched[1:]], [f"{A}/{key}" for key in repair.OUTPUTS])
+        self.assertEqual(fetched[0], ("original", media_hash))
+        self.assertEqual([key for _store, key in fetched[1:]], [f"{media_hash}/{key}" for key in repair.OUTPUTS])
         self.assertTrue(all(store == "primary" for store, _key in fetched[1:]))
 
     def test_stretched_or_missing_outputs_are_reported(self):
-        geometries = {A: SQUARE, **{f"{A}/{key}": ((720, 720), Fraction(1)) for key in repair.OUTPUTS}}
-        geometries[f"{A}/hls/stream_480p.ts"] = WIDE
-        result, _ = self.run_verify(geometries, missing={f"{A}/hls/stream_720p.mp4"})
+        media_hash = hashlib.sha256(A.encode()).hexdigest()
+        geometries = {A: SQUARE, **{f"{media_hash}/{key}": ((720, 720), Fraction(1)) for key in repair.OUTPUTS}}
+        geometries[f"{media_hash}/hls/stream_480p.ts"] = WIDE
+        result, _ = self.run_verify(geometries, missing={f"{media_hash}/hls/stream_720p.mp4"})
         self.assertEqual(result, ["hls/stream_720p.mp4", "hls/stream_480p.ts"])
+
+    def test_original_with_wrong_content_hash_is_rejected_before_probing(self):
+        def fetch(_key, dest):
+            Path(dest).write_bytes(b"different original")
+
+        with mock.patch.object(repair, "load_audit") as probe:
+            with self.assertRaisesRegex(ValueError, "content hash"):
+                repair.verify(fetch, fetch, A, probe)
+            probe.assert_not_called()
 
 
 class MainTests(unittest.TestCase):
@@ -279,6 +292,18 @@ class MainTests(unittest.TestCase):
             self.assertEqual(self.state(folder, "review"), [f"{B}\tinterrupted run; outcome unknown"])
             code, submitted, _ = self.invoke(folder, args=["--retry-failed"])
             self.assertEqual((code, submitted), (0, [A, C]))
+
+    def test_concurrent_runner_cannot_read_or_overwrite_active_state(self):
+        with tempfile.TemporaryDirectory() as folder:
+            Path(folder, "aspect-repair-inflight.txt").write_text(B + "\n")
+            with Path(folder, "aspect-repair.lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                code, submitted, _ = self.invoke(folder)
+            self.assertEqual((code, submitted), (2, []))
+            self.assertEqual(self.state(folder, "inflight"), [B])
+            self.assertEqual(self.state(folder, "review"), [])
+            code, submitted, _ = self.invoke(folder)
+            self.assertEqual((code, submitted), (1, []))
 
     def test_interrupt_during_a_repair_records_it_for_review(self):
         with tempfile.TemporaryDirectory() as folder:

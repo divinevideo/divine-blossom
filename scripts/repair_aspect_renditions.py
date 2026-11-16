@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Regenerate audited aspect-distorted renditions one at a time and verify them in storage."""
 import argparse
+import fcntl
 from fractions import Fraction
+import hashlib
 import http.client
 import importlib.util
 import json
@@ -163,6 +165,12 @@ def verify(fetch_original, fetch_output, media_hash, probe):
     with tempfile.TemporaryDirectory() as folder:
         original = Path(folder) / "original"
         fetch_original(media_hash, original)
+        digest = hashlib.sha256()
+        with original.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != media_hash:
+            raise ValueError("original does not match its content hash")
         source_ratio = probe(str(original))[1]
         mismatched = []
         for key in OUTPUTS:
@@ -203,6 +211,24 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if (args.limit is not None and args.limit < 1) or args.timeout < 1:
         parser.error("limit and timeout must be positive")
+    state_dir = args.state_dir or args.audit_file.resolve().parent
+    if args.dry_run:
+        return run(args, state_dir)
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        with (state_dir / "aspect-repair.lock").open("a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print("Another repair runner owns this state directory", file=sys.stderr)
+                return 2
+            return run(args, state_dir)
+    except OSError:
+        print("Cannot lock repair state directory", file=sys.stderr)
+        return 2
+
+
+def run(args, state_dir):
     try:
         endpoint = endpoint_url(args.transcoder_url)
         hashes = candidates(args.audit_file)
@@ -210,7 +236,6 @@ def main(argv=None):
         print(f"Cannot start: {exc}", file=sys.stderr)
         return 2
 
-    state_dir = args.state_dir or args.audit_file.resolve().parent
     done_file = state_dir / "aspect-repair-done.txt"
     failed_file = state_dir / "aspect-repair-failed.txt"
     review_file = state_dir / "aspect-repair-review.txt"
