@@ -76,6 +76,47 @@ versions. Preserve the audit, retry failures, and verify every output at origin
 before invalidating caches or marking a hash repaired. Existing files are not
 deleted; unreferenced stale objects may remain.
 
+## Serial runner
+
+`scripts/repair-aspect-renditions.sh` performs the regeneration and origin
+verification above for an audit file, one hash at a time. It reads only records
+that carry a `request` object, so every repair it submits was selected by the
+audit. Use the isolated Python environment from `scripts/requirements-b2-sync.txt`
+and supply the repair credential through `TRANSCODE_REPAIR_SECRET_FILE`, never
+as an argument. Verification reads the unchanged original from GCS (application
+default credentials, `GCS_BUCKET`) and the regenerated outputs from the B2
+primary (`B2_MEDIA_BUCKET`, `B2_REGION`, `B2_APPLICATION_KEY_ID`,
+`B2_APPLICATION_KEY`); `--original-storage` and `--storage` select other stores.
+
+```sh
+./scripts/repair-aspect-renditions.sh --audit-file /path/to/aspect-audit.jsonl --dry-run
+./scripts/repair-aspect-renditions.sh --audit-file /path/to/aspect-audit.jsonl --limit 1
+./scripts/repair-aspect-renditions.sh --audit-file /path/to/aspect-audit.jsonl
+```
+
+Start with `--limit 1` and inspect that hash at origin and on a client before
+the full run. For each hash the runner submits one forced request and never
+retries it. On `status:complete` it downloads the original and the four outputs
+the edge serves (`hls/stream_{720,480}p.mp4` and `hls/stream_{720,480}p.ts`),
+probes them with the audit's geometry rules, and records the hash as done only
+when every display ratio is within 1% of the original's. It stops the run, without
+recording the hash, when the credential is rejected (401), repair is not
+configured (503), or the worker answers `already_exists`: a revision without
+repair support ignores `force` and leaves the stretched files in place. It stops
+and records the hash for review when the outcome is unknown (no response, a
+gateway error, an unrecognized body), when `repair_lock_warning` is present, or
+when verification fails. A clean worker error (500) is recorded as failed and the
+run continues with the next hash.
+
+Progress lives next to the audit file, or under `--state-dir`, and stays out of
+Git like the audit output. `aspect-repair-done.txt` lists verified hashes only and
+is the input for cache invalidation below. `aspect-repair-failed.txt` and
+`aspect-repair-review.txt` carry a short reason per hash. Done and review entries
+are skipped on later runs; remove a review entry only after an operator has
+inspected its lock and outputs. Failed entries are resubmitted with
+`--retry-failed`. Dry-run lists pending hashes without reading the credential,
+submitting requests, or writing state.
+
 ## Verify and invalidate
 
 Probe both MP4s and both HLS streams at origin after each repair and compare their
