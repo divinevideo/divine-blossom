@@ -84,9 +84,13 @@ that carry a `request` object, so every repair it submits was selected by the
 audit. Use the isolated Python environment from `scripts/requirements-b2-sync.txt`
 and supply the repair credential through `TRANSCODE_REPAIR_SECRET_FILE`, never
 as an argument. Verification reads the unchanged original from GCS (application
-default credentials, `GCS_BUCKET`) and the regenerated outputs from the B2
-primary (`B2_MEDIA_BUCKET`, `B2_REGION`, `B2_APPLICATION_KEY_ID`,
-`B2_APPLICATION_KEY`); `--original-storage` and `--storage` select other stores.
+default credentials, `GCS_BUCKET`) and the regenerated outputs from B2
+(`B2_MEDIA_BUCKET`, `B2_REGION`, `B2_APPLICATION_KEY_ID`, `B2_APPLICATION_KEY`);
+`--original-storage` and `--storage` select other stores. `--storage` must name
+the store the edge reads derivatives from (`derived_media_read_primary`, see
+`b2-derived-media.md`; public responses report it as `x-divine-source`).
+Otherwise a hash can verify in one store while viewers still get the stretched
+copy from the other.
 
 ```sh
 ./scripts/repair-aspect-renditions.sh --audit-file /path/to/aspect-audit.jsonl --dry-run
@@ -100,13 +104,21 @@ retries it. On `status:complete` it downloads the original and the four outputs
 the edge serves (`hls/stream_{720,480}p.mp4` and `hls/stream_{720,480}p.ts`),
 probes them with the audit's geometry rules, and records the hash as done only
 when every display ratio is within 1% of the original's. It stops the run, without
-recording the hash, when the credential is rejected (401), repair is not
-configured (503), or the worker answers `already_exists`: a revision without
-repair support ignores `force` and leaves the stretched files in place. It stops
-and records the hash for review when the outcome is unknown (no response, a
-gateway error, an unrecognized body), when `repair_lock_warning` is present, or
-when verification fails. A clean worker error (500) is recorded as failed and the
-run continues with the next hash.
+recording the hash, when the request is rejected before any work starts (401,
+another 4xx, a redirect, or the worker's own `repair not configured` 503) or the
+worker answers `already_exists`: a revision without repair support ignores
+`force` and leaves the stretched files in place. It stops and records the hash
+for review when the outcome is unknown (no or a truncated response, a gateway
+error or a 503 the worker did not write, an unrecognized body), when the worker's
+error involves the repair lock or `repair_lock_warning` is present, or when
+verification fails. Any other worker error (a JSON 500) is recorded as failed and
+the run continues with the next hash.
+
+Before each request the runner writes the hash to `aspect-repair-inflight.txt`
+and removes it once the outcome is recorded. Ctrl-C records the hash for review.
+If the process is killed instead, the next run moves the leftover hash to review
+and exits without submitting anything, so a repair whose writer may still be
+active is never resubmitted.
 
 Progress lives next to the audit file, or under `--state-dir`, and stays out of
 Git like the audit output. `aspect-repair-done.txt` lists verified hashes only and

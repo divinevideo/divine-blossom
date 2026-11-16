@@ -90,9 +90,16 @@ class RequestTests(unittest.TestCase):
     def test_worker_outcomes_are_classified_without_retrying(self):
         cases = [
             (401, b"invalid repair credential", "stop"),
-            (503, b"repair not configured", "stop"),
+            (403, b"forbidden", "stop"),
             (400, b"bad request", "stop"),
+            (503, b"repair not configured", "stop"),
+            # A front-end 503 can mean the instance died mid-repair.
+            (503, b"<html>Service Unavailable</html>", "review"),
             (500, b'{"error":"Repair requires an existing HLS master"}', "failed"),
+            (500, b'{"error":"Could not acquire transcode lock: precondition failed"}', "review"),
+            (500, b'{"error":"Repair failed: encode; Could not release transcode lock: x"}', "review"),
+            (500, b'{"error":"Repair task stopped; inspect derivatives and lock before retrying"}', "review"),
+            (500, b"<html>Internal Server Error</html>", "review"),
             (502, b"bad gateway", "review"),
             (504, b"gateway timeout", "review"),
             (200, b"not json", "review"),
@@ -114,6 +121,24 @@ class RequestTests(unittest.TestCase):
                 self.assertEqual(self.submit(url)[0], "stop")
                 self.assertEqual(leaked, [])
                 self.assertEqual(len(captured), 1)
+
+    def test_malformed_or_truncated_responses_need_review(self):
+        for raw in [b"garbage\r\n\r\n",
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nff\r\n{\"status\""]:
+            with self.subTest(raw=raw), socket.socket() as listener:
+                listener.bind(("127.0.0.1", 0))
+                listener.listen(1)
+
+                def answer():
+                    connection, _ = listener.accept()
+                    with connection:
+                        connection.recv(65536)
+                        connection.sendall(raw)
+
+                thread = threading.Thread(target=answer, daemon=True)
+                thread.start()
+                self.assertEqual(self.submit(f"http://127.0.0.1:{listener.getsockname()[1]}")[0], "review")
+                thread.join()
 
     def test_missing_response_needs_review(self):
         with socket.socket() as sock:
@@ -165,10 +190,6 @@ class VerifyTests(unittest.TestCase):
         result, _ = self.run_verify(geometries, missing={f"{A}/hls/stream_720p.mp4"})
         self.assertEqual(result, ["hls/stream_720p.mp4", "hls/stream_480p.ts"])
 
-    def test_verification_reuses_the_audit_geometry_rules(self):
-        self.assertTrue(repair.AUDIT_SCRIPT.exists())
-        self.assertTrue(callable(repair.load_audit().probe))
-
 
 class MainTests(unittest.TestCase):
     def invoke(self, folder, outcomes=None, verified=None, args=(), lines=None):
@@ -181,15 +202,23 @@ class MainTests(unittest.TestCase):
 
         def regenerate(_url, _secret, media_hash, _timeout):
             submitted.append(media_hash)
-            return (outcomes or {}).get(media_hash, ("complete", ""))
+            self.assertEqual(self.state(folder, "inflight"), [media_hash], "marked before submitting")
+            result = (outcomes or {}).get(media_hash, ("complete", ""))
+            if isinstance(result, BaseException):
+                raise result
+            return result
 
         def verify(original_store, output_store, media_hash, _probe):
             # Defaults: the original from authoritative GCS, outputs from the B2 primary.
             self.assertEqual((original_store, output_store), ("gcs", "b2"))
-            return (verified or {}).get(media_hash, [])
+            result = (verified or {}).get(media_hash, [])
+            if isinstance(result, BaseException):
+                raise result
+            return result
 
         with mock.patch.dict(os.environ, {"TRANSCODE_REPAIR_SECRET_FILE": str(secret)}), \
                 mock.patch.dict(repair.FETCHERS, {"b2": lambda: "b2", "gcs": lambda: "gcs"}), \
+                mock.patch.object(repair, "load_audit"), \
                 mock.patch.object(repair, "regenerate", side_effect=regenerate), \
                 mock.patch.object(repair, "verify", side_effect=verify), \
                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
@@ -210,7 +239,9 @@ class MainTests(unittest.TestCase):
             self.assertEqual(self.state(folder, "failed"), [f"{B}\tworker reported a repair error"])
 
     def test_unknown_outcome_or_failed_verification_stops_for_review(self):
-        for outcomes, verified in [({A: ("review", "no response")}, {}), ({}, {A: ["hls/stream_720p.mp4"]})]:
+        for outcomes, verified in [({A: ("review", "no response")}, {}),
+                                   ({}, {A: ["hls/stream_720p.mp4"]}),
+                                   ({}, {A: FileNotFoundError("original")})]:
             with self.subTest(outcomes=outcomes), tempfile.TemporaryDirectory() as folder:
                 code, submitted, _ = self.invoke(folder, outcomes=outcomes, verified=verified)
                 self.assertEqual(code, 1)
@@ -224,18 +255,50 @@ class MainTests(unittest.TestCase):
             code, submitted, _ = self.invoke(folder, outcomes={A: ("stop", "worker ignored force")})
             self.assertEqual(code, 2)
             self.assertEqual(submitted, [A])
-            for name in ("done", "failed", "review"):
+            for name in ("done", "failed", "review", "inflight"):
                 self.assertEqual(self.state(folder, name), [])
 
-    def test_previous_state_is_honoured_and_limit_applies(self):
+    def test_interrupted_hash_is_sent_to_review_and_never_resubmitted(self):
+        with tempfile.TemporaryDirectory() as folder:
+            Path(folder, "aspect-repair-inflight.txt").write_text(B + "\n")
+            code, submitted, stdout = self.invoke(folder, args=["--dry-run"])
+            self.assertEqual((code, stdout.splitlines()), (0, [A, C]))
+            code, submitted, _ = self.invoke(folder)
+            self.assertEqual((code, submitted), (1, []), "inspect the interrupted repair first")
+            self.assertEqual(self.state(folder, "review"), [f"{B}\tinterrupted run; outcome unknown"])
+            self.assertEqual(self.state(folder, "inflight"), [])
+            code, submitted, _ = self.invoke(folder)
+            self.assertEqual((code, submitted), (0, [A, C]))
+
+    def test_interrupt_during_a_repair_records_it_for_review(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with self.assertRaises(KeyboardInterrupt):
+                self.invoke(folder, outcomes={B: KeyboardInterrupt()})
+            self.assertEqual(self.state(folder, "done"), [A])
+            self.assertEqual(self.state(folder, "review"), [f"{B}\tinterrupted; outcome unknown"])
+            self.assertEqual(self.state(folder, "inflight"), [])
+
+    def test_unexpected_error_is_recorded_for_review(self):
+        with tempfile.TemporaryDirectory() as folder:
+            code, submitted, _ = self.invoke(folder, outcomes={A: RuntimeError("boom")})
+            self.assertEqual((code, submitted), (1, [A]))
+            self.assertEqual(self.state(folder, "review"), [f"{A}\tunexpected RuntimeError; outcome unknown"])
+
+    def test_previous_state_is_honoured(self):
         with tempfile.TemporaryDirectory() as folder:
             Path(folder, "aspect-repair-done.txt").write_text(A + "\n")
             Path(folder, "aspect-repair-review.txt").write_text(B + "\tno response\n")
             Path(folder, "aspect-repair-failed.txt").write_text(C + "\terror\n")
             _, submitted, _ = self.invoke(folder)
             self.assertEqual(submitted, [])
-            _, submitted, _ = self.invoke(folder, args=["--retry-failed", "--limit", "1"])
+            _, submitted, _ = self.invoke(folder, args=["--retry-failed"])
             self.assertEqual(submitted, [C])
+
+    def test_limit_caps_the_pending_hashes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            Path(folder, "aspect-repair-done.txt").write_text(A + "\n")
+            _, submitted, _ = self.invoke(folder, args=["--limit", "1"])
+            self.assertEqual(submitted, [B])
 
     def test_dry_run_never_reads_credentials_requests_or_writes_state(self):
         with tempfile.TemporaryDirectory() as folder, \

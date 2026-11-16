@@ -2,6 +2,7 @@
 """Regenerate audited aspect-distorted renditions one at a time and verify them in storage."""
 import argparse
 from fractions import Fraction
+import http.client
 import importlib.util
 import json
 import os
@@ -17,6 +18,7 @@ DEFAULT_URL = "https://divine-transcoder-149672065768.us-central1.run.app/transc
 OUTPUTS = ("hls/stream_720p.mp4", "hls/stream_480p.mp4", "hls/stream_720p.ts", "hls/stream_480p.ts")
 AUDIT_SCRIPT = Path(__file__).resolve().parents[1] / "cloud-run-transcoder" / "audit_aspect_renditions.py"
 TOLERANCE = Fraction(1, 100)
+LOCK_ERROR = re.compile(r"\block\b", re.IGNORECASE)
 
 
 def load_audit():
@@ -70,6 +72,28 @@ class NoRedirect(request.HTTPRedirectHandler):
         return None
 
 
+def classify_error(code, body):
+    """Classify an HTTP error. Only bodies the worker itself writes count as definite."""
+    if code == 401:
+        return "stop", "repair credential rejected"
+    if code == 503 and body.strip() == b"repair not configured":
+        return "stop", "repair not configured"
+    if 300 <= code < 500:
+        # Rejected before any work started: a redirect, bad request, or front-end denial.
+        return "stop", f"unexpected HTTP {code}"
+    if code == 500:
+        try:
+            message = json.loads(body).get("error")
+        except (ValueError, AttributeError):
+            message = None
+        if isinstance(message, str):
+            if LOCK_ERROR.search(message):
+                # Lock contention, a failed release, or a stopped task: inspect the lock first.
+                return "review", "worker error involves the repair lock"
+            return "failed", "worker reported a repair error"
+    return "review", f"HTTP {code} without a worker result"
+
+
 def regenerate(endpoint, secret, media_hash, timeout):
     """Submit one forced transcode. Return (outcome, reason).
 
@@ -86,19 +110,14 @@ def regenerate(endpoint, secret, media_hash, timeout):
             raw = response.read(65537)
             status = response.status
     except error.HTTPError as exc:
-        code = exc.code
+        try:
+            body = exc.read(4096)
+        except (OSError, http.client.HTTPException):
+            body = b""
         exc.close()
-        if code == 401:
-            return "stop", "repair credential rejected"
-        if code == 503:
-            return "stop", "repair not configured or worker unavailable"
-        if code == 500:
-            return "failed", "worker reported a repair error"
-        if 300 <= code < 400 or 400 <= code < 500:
-            return "stop", f"unexpected HTTP {code}"
-        return "review", f"HTTP {code} without a worker result"
-    except (error.URLError, OSError) as exc:
-        return "review", f"no response ({type(exc).__name__}); the writer may still be running"
+        return classify_error(exc.code, body)
+    except (error.URLError, OSError, http.client.HTTPException) as exc:
+        return "review", f"no complete response ({type(exc).__name__}); the writer may still be running"
     try:
         payload = json.loads(raw) if status == 200 and len(raw) <= 65536 else None
     except ValueError:
@@ -195,21 +214,25 @@ def main(argv=None):
     done_file = state_dir / "aspect-repair-done.txt"
     failed_file = state_dir / "aspect-repair-failed.txt"
     review_file = state_dir / "aspect-repair-review.txt"
+    inflight_file = state_dir / "aspect-repair-inflight.txt"
     try:
-        # Review entries wait for an operator to clear them; they are never resubmitted here.
-        skip = read_hashes(done_file) | read_hashes(review_file)
-        if not args.retry_failed:
-            skip |= read_hashes(failed_file)
+        done, failed, review = (read_hashes(path) for path in (done_file, failed_file, review_file))
+        # A hash still in flight belongs to a run that was killed mid-repair: its outcome is
+        # unknown and its writer may still hold the lock, so it is never resubmitted here.
+        interrupted = sorted(read_hashes(inflight_file) - done - failed - review)
     except OSError:
         print("Cannot read repair state", file=sys.stderr)
         return 2
+    # Review entries wait for an operator to clear them; they are never resubmitted here.
+    skip = done | review | set(interrupted) | (set() if args.retry_failed else failed)
     pending = [media_hash for media_hash in hashes if media_hash not in skip]
     if args.limit is not None:
         pending = pending[:args.limit]
     if args.dry_run:
         for media_hash in pending:
             print(media_hash)
-        print(json.dumps({"candidates": len(hashes), "pending": len(pending)}), file=sys.stderr)
+        print(json.dumps({"candidates": len(hashes), "pending": len(pending),
+                          "interrupted": len(interrupted)}), file=sys.stderr)
         return 0
 
     try:
@@ -229,19 +252,41 @@ def main(argv=None):
         with path.open("a") as handle:
             handle.write(media_hash + (f"\t{reason}" if reason else "") + "\n")
 
-    exit_code = 0
+    def attempt(media_hash):
+        outcome, reason = regenerate(endpoint, secret, media_hash, args.timeout)
+        if outcome != "complete":
+            return outcome, reason
+        try:
+            mismatched = verify(fetchers[args.original_storage], fetchers[args.storage],
+                                media_hash, probe)
+        except Exception:
+            return "review", "verification could not read or probe the original"
+        if mismatched:
+            return "review", "verification failed: " + ",".join(mismatched)
+        return "complete", ""
+
     try:
+        if interrupted:
+            for media_hash in interrupted:
+                record(review_file, media_hash, "interrupted run; outcome unknown")
+                print(f"REVIEW {media_hash}: interrupted run; outcome unknown", file=sys.stderr)
+            inflight_file.unlink()
+            # Inspect the interrupted repair before submitting anything else (runbook).
+            return 1
+        exit_code = 0
         for media_hash in pending:
-            outcome, reason = regenerate(endpoint, secret, media_hash, args.timeout)
-            if outcome == "complete":
-                try:
-                    mismatched = verify(fetchers[args.original_storage], fetchers[args.storage],
-                                        media_hash, probe)
-                except Exception:
-                    mismatched = ["original"]
-                if mismatched:
-                    outcome, reason = "review", "verification failed: " + ",".join(mismatched)
+            inflight_file.write_text(media_hash + "\n")
+            try:
+                outcome, reason = attempt(media_hash)
+            except Exception as exc:
+                outcome, reason = "review", f"unexpected {type(exc).__name__}; outcome unknown"
+            except BaseException:
+                record(review_file, media_hash, "interrupted; outcome unknown")
+                inflight_file.unlink()
+                raise
             if outcome == "stop":
+                # The worker rejected the request before doing any work.
+                inflight_file.unlink()
                 print(f"STOP {media_hash}: {reason}", file=sys.stderr)
                 exit_code = 2
                 break
@@ -260,6 +305,8 @@ def main(argv=None):
                 counts["review"] += 1
                 exit_code = 1
                 print(f"REVIEW {media_hash}: {reason}", file=sys.stderr)
+            inflight_file.unlink()
+            if outcome == "review":
                 # Inspect the lock and outputs before the next repair (runbook).
                 break
     except OSError:
@@ -267,7 +314,6 @@ def main(argv=None):
         return 2
     print(json.dumps(counts), file=sys.stderr)
     return exit_code
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
