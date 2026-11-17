@@ -237,6 +237,21 @@ fn hls_alias_failed_admission_keeps_playback_retryable() {
     assert_eq!(admitted.get_status(), StatusCode::ACCEPTED);
     assert_eq!(
         get_blob_metadata(&hash).unwrap().unwrap().transcode_status,
-        Some(TranscodeStatus::Pending)
+        Some(TranscodeStatus::Processing)
+    );
+    // Expiring the POP-local guard must not create another queued delivery.
+    simple_cache::purge(format!("hls-admitted:v1:{hash}")).unwrap();
+    assert_eq!(
+        response(Request::get(&alias)).get_status(),
+        StatusCode::ACCEPTED
+    );
+
+    // A terminal callback that beats admission must retain its newer state.
+    let before = get_blob_metadata(&hash).unwrap().unwrap();
+    crate::metadata::update_transcode_status(&hash, TranscodeStatus::Complete).unwrap();
+    crate::metadata::mark_transcode_admitted(&before).unwrap();
+    assert_eq!(
+        get_blob_metadata(&hash).unwrap().unwrap().transcode_status,
+        Some(TranscodeStatus::Complete)
     );
 }

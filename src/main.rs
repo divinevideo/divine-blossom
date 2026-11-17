@@ -3427,13 +3427,20 @@ fn trigger_on_demand_transcoding(hash: &str, owner: &str) -> Result<()> {
         return Ok(());
     }
 
+    // Re-read shared status rather than relying on this POP's cached Pending.
+    // Durable admission owns the queued job even before a worker can dispatch.
+    let before = crate::metadata::get_blob_metadata_uncached(hash)?
+        .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
+    if before.transcode_status == Some(TranscodeStatus::Processing) {
+        return Ok(());
+    }
     if !queue_transcode(hash, owner)? {
         // Support edge-first rollout and rollback when the admission route is absent.
         transcode_dispatch_request("/transcode", hash, owner)
             .send_async(TRANSCODER_BACKEND)
             .map_err(|_| transcode_admission_unavailable())?;
     }
-    // The worker owns status transitions, even during legacy fallback.
+    crate::metadata::mark_transcode_admitted(&before)?;
     let _ = simple_cache::get_or_set(key, "submitted", Duration::from_secs(10));
     Ok(())
 }

@@ -8,6 +8,18 @@ Cloud Tasks retains the delivery. Forced HLS and MP4 repairs keep their
 operator credential and synchronous results. On-demand MP4 remux uses the
 same per-hash claim.
 
+After successful playback admission, the edge records `Processing` so later
+requests do not enqueue the same hash throughout a queue backlog. It leaves
+the status unchanged on failed admission and does not overwrite a worker
+callback that arrived before the admission response. The short POP-local
+cache is only a secondary guard. Completion remains worker-owned.
+
+The trusted archive import `process-transcode` operation also enters this
+queue. Its `accepted:true` response confirms admission, not HLS readiness;
+the worker callback records completion. Include archive followup traffic in
+the representative queue-load check below and control importer admission
+before rollout; synchronous encode latency no longer paces that producer.
+
 ## Storage and recovery
 
 The transcoder creates `.internal/hls-claims/{hash}` in the configured

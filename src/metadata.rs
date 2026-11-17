@@ -1005,6 +1005,39 @@ pub fn update_transcode_status(hash: &str, status: crate::blossom::TranscodeStat
     Ok(())
 }
 
+/// Record admission only while the status observed before dispatch is unchanged.
+/// A fast worker callback must not be overwritten by its slower admission response.
+pub(crate) fn mark_transcode_admitted(before: &BlobMetadata) -> Result<()> {
+    let key = format!("{}{}", BLOB_PREFIX, before.sha256.to_lowercase());
+    update_json_conditionally(
+        &key,
+        5,
+        "transcode admission",
+        |current: Option<BlobMetadata>| {
+            let Some(mut current) = current else {
+                return Ok(ConditionalJsonMutation::Complete(()));
+            };
+            if current.transcode_status != before.transcode_status
+                || current.transcode_generation != before.transcode_generation
+                || current.transcode_last_attempt_at != before.transcode_last_attempt_at
+                || current.transcode_attempt_count != before.transcode_attempt_count
+                || current.transcode_retry_after != before.transcode_retry_after
+                || current.transcode_terminal != before.transcode_terminal
+            {
+                return Ok(ConditionalJsonMutation::Complete(()));
+            }
+            current.transcode_status = Some(crate::blossom::TranscodeStatus::Processing);
+            Ok(ConditionalJsonMutation::Write {
+                value: current,
+                result: (),
+                time_to_live: None,
+            })
+        },
+    )?;
+    invalidate_metadata_cache(&before.sha256);
+    Ok(())
+}
+
 /// Additional metadata recorded alongside transcode status updates.
 #[derive(Debug, Clone, Default)]
 pub struct TranscodeMetadataUpdate {
