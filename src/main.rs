@@ -1049,16 +1049,9 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
     let gcs_path = format!("{}/hls/master.m3u8", hash);
     match download_hls_content(&gcs_path, None) {
         Ok(mut result) => {
-            // The master exists: serve it with canonical URI paths and repair stale metadata.
+            // Playback can use a readable master while the worker is still
+            // verifying its required backup. Readiness is set by the callback.
             let meta = metadata.as_ref().unwrap();
-            if meta.transcode_status != Some(TranscodeStatus::Complete) {
-                eprintln!(
-                    "[HLS] Fixing metadata: {} has HLS in GCS but status was {:?}",
-                    hash, meta.transcode_status
-                );
-                use crate::metadata::update_transcode_status;
-                let _ = update_transcode_status(&hash, TranscodeStatus::Complete);
-            }
             let c2pa_manifest_id = result
                 .get_header_str("x-goog-meta-c2pa-manifest-id")
                 .map(|s| s.to_string());
@@ -1134,12 +1127,7 @@ fn handle_get_hls_master(req: Request, path: &str) -> Result<Response> {
                     retry_after_secs,
                     should_repair,
                 } => {
-                    // Pending, Failed, Complete-but-missing, or None — trigger transcoding
-                    use crate::metadata::update_transcode_status;
-                    if let Err(e) = update_transcode_status(&hash, TranscodeStatus::Processing) {
-                        eprintln!("[HLS] Failed to update transcode status: {}", e);
-                    }
-                    let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
+                    trigger_on_demand_transcoding(&hash, &meta.owner)?;
 
                     let mut resp = Response::from_status(StatusCode::ACCEPTED);
                     resp.set_header("Retry-After", retry_after_secs.to_string());
@@ -1194,15 +1182,10 @@ fn handle_head_hls_master(path: &str) -> Result<Response> {
         BlobAccess::AgeGated => return Err(BlossomError::AuthRequired("age_restricted".into())),
     }
 
-    // Check GCS first (source of truth), then fall back to metadata status
+    // Serve a readable master independently of the completion callback.
     let gcs_path = format!("{}/hls/master.m3u8", hash);
     match download_hls_content(&gcs_path, None) {
         Ok(_) => {
-            // Fix metadata if needed
-            if metadata.transcode_status != Some(TranscodeStatus::Complete) {
-                use crate::metadata::update_transcode_status;
-                let _ = update_transcode_status(&hash, TranscodeStatus::Complete);
-            }
             let mut resp = Response::from_status(StatusCode::OK);
             resp.set_header("Content-Type", "application/vnd.apple.mpegurl");
             add_derivative_cache_headers(&mut resp, &hash);
@@ -1385,9 +1368,7 @@ fn handle_get_hls_content(req: Request, path: &str) -> Result<Response> {
                         retry_after_secs,
                         should_repair,
                     } => {
-                        use crate::metadata::update_transcode_status;
-                        let _ = update_transcode_status(&hash, TranscodeStatus::Processing);
-                        let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
+                        trigger_on_demand_transcoding(&hash, &meta.owner)?;
 
                         let mut resp = Response::from_status(StatusCode::ACCEPTED);
                         resp.set_header("Retry-After", retry_after_secs.to_string());
@@ -2945,9 +2926,7 @@ fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
                 TranscodeFetchAction::Trigger {
                     retry_after_secs, ..
                 } => {
-                    use crate::metadata::update_transcode_status;
-                    let _ = update_transcode_status(&hash, TranscodeStatus::Processing);
-                    let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
+                    trigger_on_demand_transcoding(&hash, &meta.owner)?;
 
                     let mut resp = Response::from_status(StatusCode::ACCEPTED);
                     resp.set_header("Retry-After", retry_after_secs.to_string());
@@ -3102,9 +3081,7 @@ fn handle_admin_quality_variant(req: Request, path: &str) -> Result<Response> {
                 TranscodeFetchAction::Trigger {
                     retry_after_secs, ..
                 } => {
-                    use crate::metadata::update_transcode_status;
-                    let _ = update_transcode_status(&hash, TranscodeStatus::Processing);
-                    let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
+                    trigger_on_demand_transcoding(&hash, &meta.owner)?;
 
                     let mut resp = Response::from_status(StatusCode::ACCEPTED);
                     resp.set_header("Retry-After", retry_after_secs.to_string());
@@ -3199,9 +3176,7 @@ fn handle_admin_hls_content(req: Request, path: &str) -> Result<Response> {
                 TranscodeFetchAction::Trigger {
                     retry_after_secs, ..
                 } => {
-                    use crate::metadata::update_transcode_status;
-                    let _ = update_transcode_status(&hash, TranscodeStatus::Processing);
-                    let _ = trigger_on_demand_transcoding(&hash, &meta.owner);
+                    trigger_on_demand_transcoding(&hash, &meta.owner)?;
 
                     let mut resp = Response::from_status(StatusCode::ACCEPTED);
                     resp.set_header("Retry-After", retry_after_secs.to_string());
@@ -3361,8 +3336,7 @@ fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
     }
 }
 
-/// Trigger on-demand HLS transcoding via Cloud Run transcoder service
-/// This is fire-and-forget - we update metadata to Processing and return immediately
+/// Admit on-demand HLS work before returning an accepted playback response.
 fn trigger_on_demand_transcoding(hash: &str, owner: &str) -> Result<()> {
     if crate::storage::is_local_mode() {
         eprintln!("[HLS][LOCAL] Stubbing transcode for {}", hash);
@@ -3446,29 +3420,52 @@ fn trigger_on_demand_transcoding(hash: &str, owner: &str) -> Result<()> {
         return Ok(());
     }
 
-    let url = format!("https://{}/transcode", CLOUD_RUN_TRANSCODER_HOST);
+    // A short POP-local marker avoids queue churn while a durable task awaits
+    // dispatch. The transcoder's distributed claim owns write exclusion.
+    let key = format!("hls-admitted:v1:{hash}");
+    if matches!(simple_cache::get(key.clone()), Ok(Some(_))) {
+        return Ok(());
+    }
 
-    let body = format!(r#"{{"hash":"{}","owner":"{}"}}"#, hash, owner);
+    if !queue_transcode(hash, owner)? {
+        // Support edge-first rollout and rollback when the admission route is absent.
+        transcode_dispatch_request("/transcode", hash, owner)
+            .send_async(TRANSCODER_BACKEND)
+            .map_err(|_| transcode_admission_unavailable())?;
+    }
+    // The worker owns status transitions, even during legacy fallback.
+    let _ = simple_cache::get_or_set(key, "submitted", Duration::from_secs(10));
+    Ok(())
+}
 
-    let mut proxy_req = Request::new(Method::POST, &url);
-    proxy_req.set_header("Host", CLOUD_RUN_TRANSCODER_HOST);
-    proxy_req.set_header("Content-Type", "application/json");
-    proxy_req.set_body(body);
+fn transcode_dispatch_request(path: &str, hash: &str, owner: &str) -> Request {
+    let mut request = Request::new(
+        Method::POST,
+        format!("https://{CLOUD_RUN_TRANSCODER_HOST}{path}"),
+    );
+    request.set_header("Host", CLOUD_RUN_TRANSCODER_HOST);
+    request.set_header("Content-Type", "application/json");
+    request.set_body(serde_json::json!({"hash":hash,"owner":owner}).to_string());
+    request
+}
 
-    // Fire and forget - we don't wait for transcoding to complete
-    // The transcoder will callback via webhook when done
-    match proxy_req.send_async(TRANSCODER_BACKEND) {
-        Ok(_) => {
-            eprintln!("[HLS] Triggered on-demand transcoding for {}", hash);
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("[HLS] Failed to trigger transcoding for {}: {}", hash, e);
-            Err(BlossomError::Internal(format!(
-                "Failed to trigger transcoding: {}",
-                e
-            )))
-        }
+fn transcode_admission_unavailable() -> BlossomError {
+    BlossomError::ServiceUnavailable {
+        message: "Could not queue transcode, please retry".into(),
+        retry_after: Some("5".into()),
+    }
+}
+
+/// `Ok(true)` requires durable admission. `Ok(false)` identifies a legacy
+/// transcoder that does not implement the queue-only route.
+fn queue_transcode(hash: &str, owner: &str) -> Result<bool> {
+    let response = transcode_dispatch_request("/transcode/queue", hash, owner)
+        .send(TRANSCODER_BACKEND)
+        .map_err(|_| transcode_admission_unavailable())?;
+    match response.get_status() {
+        StatusCode::ACCEPTED => Ok(true),
+        StatusCode::NOT_FOUND => Ok(false),
+        _ => Err(transcode_admission_unavailable()),
     }
 }
 

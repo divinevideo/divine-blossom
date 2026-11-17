@@ -189,7 +189,10 @@ Rotate forward in this order:
    `/admin/api/reset-stuck-transcodes` flow with `older_than_secs: 0`, the full
    affected hash as `hex_prefix`, and `dry_run: true`. Paginate through
    `next_user_offset`; then repeat the matching page with `dry_run: false` and
-   request the derivative again if the result reset it to `Pending`. For a lost
+   request the derivative again if the result reset it to `Pending`. For a
+   readable master, check `verification_requested` and `verification_failed`
+   to confirm worker admission. The worker sets completion after verification.
+   For a lost
    transcript callback, confirm the affected hash in the admin dashboard and use
    its **Regenerate Transcript** action, which posts that exact hash with
    `force: true`. Observe a successful fresh callback before considering either

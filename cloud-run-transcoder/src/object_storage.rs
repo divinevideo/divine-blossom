@@ -1,5 +1,6 @@
 //! Private, version-pinned media I/O. Locks, jobs and readiness use other APIs.
 
+use crate::hls_claim::{gcs_status, Claim, WRITE_ID};
 use anyhow::{anyhow, bail, Context, Result};
 use blossom_core::storage_origin::{ObjectRef, StorageProvider};
 use bytes::Bytes;
@@ -22,6 +23,15 @@ use std::{
 };
 use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt;
+
+pub(crate) const REQUIRED_HLS_FILES: [&str; 5] = [
+    "master.m3u8",
+    "stream_720p.m3u8",
+    "stream_480p.m3u8",
+    "stream_720p.ts",
+    "stream_480p.ts",
+];
+pub(crate) const OPTIONAL_HLS_FILES: [&str; 2] = ["stream_720p.mp4", "stream_480p.mp4"];
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(120);
 const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -113,6 +123,21 @@ pub struct VerifiedObject {
     pub sha256: String,
     /// Present only after the required GCS replica was independently verified.
     pub required_backup: Option<ObjectMetadata>,
+}
+
+enum WriteCondition<'a> {
+    Unconditional,
+    BackupGeneration(i64),
+    Hls(&'a mut Claim),
+}
+
+impl<'a> From<Option<&'a mut Claim>> for WriteCondition<'a> {
+    fn from(claim: Option<&'a mut Claim>) -> Self {
+        match claim {
+            Some(claim) => Self::Hls(claim),
+            None => Self::Unconditional,
+        }
+    }
 }
 
 struct B2Request<'a> {
@@ -232,21 +257,11 @@ impl MediaStorage {
     }
     pub async fn can_reuse_hls(&self, hash: &str) -> Result<bool> {
         let prefix = format!("{hash}/hls");
-        let Some(backup) = &self.required_backup else {
-            return Ok(self.stat(&format!("{prefix}/master.m3u8")).await?.is_some());
-        };
         // The encoder emits two single-file TS variants. A master alone cannot
-        // prove their backups succeeded, and regenerating every duplicate job
-        // would discard the existing at-least-once dispatch's idempotency.
-        for (filename, required) in [
-            ("master.m3u8", true),
-            ("stream_720p.m3u8", true),
-            ("stream_480p.m3u8", true),
-            ("stream_720p.ts", true),
-            ("stream_480p.ts", true),
-            ("stream_720p.mp4", false),
-            ("stream_480p.mp4", false),
-        ] {
+        // prove the set exists. An MP4 is optional, but a present MP4 needs its backup.
+        let required = REQUIRED_HLS_FILES.into_iter().map(|name| (name, true));
+        let optional = OPTIONAL_HLS_FILES.into_iter().map(|name| (name, false));
+        for (filename, required) in required.chain(optional) {
             let key = format!("{prefix}/{filename}");
             let Some(primary) = self.stat(&key).await? else {
                 if required {
@@ -256,16 +271,48 @@ impl MediaStorage {
                 // failures, but any MP4 actually written needs its backup.
                 continue;
             };
-            let Some(replica) = backup.stat(&key).await? else {
-                return Ok(false);
-            };
-            if !backup_metadata_matches(&primary, &replica)
-                || self.hash_body(&primary, None).await? != backup.hash_body(&replica, None).await?
-            {
+            if !required && primary.size == 0 {
+                // Empty historical remux placeholders are absent for HLS;
+                // the MP4 endpoint can regenerate them from the TS variant.
+                continue;
+            }
+            if !self.can_reuse_output(&primary).await? {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+    pub async fn can_reuse_output(&self, primary: &ObjectMetadata) -> Result<bool> {
+        if primary.size == 0 {
+            return Ok(false);
+        }
+        let Some(backup) = &self.required_backup else {
+            return Ok(true);
+        };
+        let Some(replica) = backup.stat(&primary.reference.key).await? else {
+            return Ok(false);
+        };
+        Ok(backup_metadata_matches(primary, &replica)
+            && self.hash_body(primary, None).await? == backup.hash_body(&replica, None).await?)
+    }
+
+    /// A committed PUT must expose the unique attempt marker at the exact
+    /// backend and key recorded before issuing the request.
+    pub async fn hls_write_committed(&self, gcs: bool, key: &str, id: &str) -> Result<bool> {
+        let backend = if gcs && !self.is_gcs() {
+            self.required_backup
+                .as_deref()
+                .context("GCS HLS backup unavailable")?
+        } else {
+            self
+        };
+        if backend.is_gcs() != gcs {
+            bail!("HLS storage mode changed during publication");
+        }
+        Ok(backend
+            .stat(key)
+            .await?
+            .is_some_and(|object| object.custom.get(WRITE_ID).is_some_and(|value| value == id)))
     }
     /// Verify or repair a required backup without rewriting the pinned primary.
     /// Callers that may write the same artifact must hold its existing job lock.
@@ -337,7 +384,7 @@ impl MediaStorage {
                 &primary.content_type,
                 primary.custom.clone(),
                 primary.cache_control.clone(),
-                Some(expected),
+                WriteCondition::BackupGeneration(expected),
             )
             .await
             .context("Required GCS backup of existing output was not verified")?;
@@ -606,18 +653,53 @@ impl MediaStorage {
         custom: HashMap<String, String>,
         cache_control: Option<String>,
     ) -> Result<VerifiedObject> {
+        self.put_with_backup(key, body, mime, custom, cache_control, None)
+            .await
+    }
+
+    pub async fn put_hls_verified(
+        &self,
+        key: &str,
+        body: Bytes,
+        mime: &str,
+        mut custom: HashMap<String, String>,
+        cache_control: Option<String>,
+        claim: &mut Claim,
+    ) -> Result<VerifiedObject> {
+        custom.insert(WRITE_ID.to_owned(), claim.write_id());
+        self.put_with_backup(key, body, mime, custom, cache_control, Some(claim))
+            .await
+    }
+
+    async fn put_with_backup(
+        &self,
+        key: &str,
+        body: Bytes,
+        mime: &str,
+        custom: HashMap<String, String>,
+        cache_control: Option<String>,
+        mut claim: Option<&mut Claim>,
+    ) -> Result<VerifiedObject> {
         let mut primary = self
-            .put_single_verified(
+            .put_single_verified_if_generation(
                 key,
                 body.clone(),
                 mime,
                 custom.clone(),
                 cache_control.clone(),
+                claim.as_deref_mut().into(),
             )
             .await?;
         if let Some(backup) = &self.required_backup {
             let replica = backup
-                .put_single_verified(key, body, mime, custom, cache_control)
+                .put_single_verified_if_generation(
+                    key,
+                    body,
+                    mime,
+                    custom,
+                    cache_control,
+                    claim.into(),
+                )
                 .await
                 .context(
                     "Required GCS backup was not verified; primary must not be acknowledged",
@@ -629,17 +711,7 @@ impl MediaStorage {
         }
         Ok(primary)
     }
-    async fn put_single_verified(
-        &self,
-        key: &str,
-        body: Bytes,
-        mime: &str,
-        custom: HashMap<String, String>,
-        cache_control: Option<String>,
-    ) -> Result<VerifiedObject> {
-        self.put_single_verified_if_generation(key, body, mime, custom, cache_control, None)
-            .await
-    }
+
     async fn put_single_verified_if_generation(
         &self,
         key: &str,
@@ -647,8 +719,13 @@ impl MediaStorage {
         mime: &str,
         custom: HashMap<String, String>,
         cache_control: Option<String>,
-        gcs_generation: Option<i64>,
+        condition: WriteCondition<'_>,
     ) -> Result<VerifiedObject> {
+        let (mut gcs_generation, mut claim) = match condition {
+            WriteCondition::Unconditional => (None, None),
+            WriteCondition::BackupGeneration(generation) => (Some(generation), None),
+            WriteCondition::Hls(claim) => (None, Some(claim)),
+        };
         validate_key(key)?;
         let sha256 = hex::encode(Sha256::digest(&body));
         if is_sha256(key) && key != sha256 {
@@ -663,7 +740,14 @@ impl MediaStorage {
                     cache_control: cache_control.clone(),
                     ..Default::default()
                 };
-                let object = tokio::time::timeout(
+                if let Some(claim) = claim.as_deref_mut() {
+                    gcs_generation = Some(match claim.hold(self.stat(key)).await? {
+                        Some(object) => gcs_generation_from_metadata(&object)?,
+                        None => 0,
+                    });
+                    claim.begin_write(true, key, &custom[WRITE_ID]).await?;
+                }
+                let result = tokio::time::timeout(
                     CONTROL_TIMEOUT,
                     client.upload_object(
                         &UploadObjectRequest {
@@ -676,25 +760,44 @@ impl MediaStorage {
                     ),
                 )
                 .await
-                .context("GCS media write deadline; outcome unconfirmed")?
-                .map_err(|_| anyhow!("GCS media write failed; outcome unconfirmed"))?;
+                .context("GCS media write deadline; outcome unconfirmed")?;
+                if let Some(claim) = claim.as_deref_mut() {
+                    if result.is_ok()
+                        || result
+                            .as_ref()
+                            .err()
+                            .and_then(gcs_status)
+                            .is_some_and(write_rejected)
+                    {
+                        claim.end_write().await?;
+                    }
+                }
+                let object = result.map_err(|_| anyhow!("GCS media write failed"))?;
                 from_gcs(bucket, key, object)?.reference
             }
             Backend::B2 { .. } => {
                 if gcs_generation.is_some() {
                     bail!("GCS generation precondition requires a GCS backup");
                 }
-                let response = self
-                    .b2_request(B2Request {
-                        method: Method::PUT,
-                        key,
-                        version: None,
-                        body: body.clone(),
-                        mime: Some(mime),
-                        cache: cache_control.as_deref(),
-                        custom: &custom,
-                    })
-                    .await?;
+                let request = self.build_b2_request(B2Request {
+                    method: Method::PUT,
+                    key,
+                    version: None,
+                    body: body.clone(),
+                    mime: Some(mime),
+                    cache: cache_control.as_deref(),
+                    custom: &custom,
+                })?;
+                if let Some(claim) = claim.as_deref_mut() {
+                    claim.begin_write(false, key, &custom[WRITE_ID]).await?;
+                }
+                let response = send_b2_request(request).await?;
+                if let Some(claim) = claim.as_deref_mut() {
+                    if response.status().is_success() || write_rejected(response.status().as_u16())
+                    {
+                        claim.end_write().await?;
+                    }
+                }
                 successful(response.status())?;
                 let (_, bucket) = self.provider_bucket();
                 ObjectRef {
@@ -706,26 +809,36 @@ impl MediaStorage {
             }
         };
         self.validate_reference(&reference)?;
-        let object = self
-            .stat_reference(&reference)
-            .await?
-            .ok_or_else(|| anyhow!("Written media version missing"))?;
-        if object.reference != reference
-            || object.size != body.len() as u64
-            || object.content_type != mime
-            || object.custom != custom
-            || object.cache_control != cache_control
-        {
-            bail!("Written media metadata verification failed");
+        let verify = async {
+            let object = self
+                .stat_reference(&reference)
+                .await?
+                .ok_or_else(|| anyhow!("Written media version missing"))?;
+            if object.reference != reference
+                || object.size != body.len() as u64
+                || object.content_type != mime
+                || object.custom != custom
+                || object.cache_control != cache_control
+            {
+                bail!("Written media metadata verification failed");
+            }
+            self.verify_sha256(&object, &sha256).await?;
+            Ok(VerifiedObject {
+                object,
+                sha256,
+                required_backup: None,
+            })
+        };
+        match claim {
+            Some(claim) => claim.hold(verify).await,
+            None => verify.await,
         }
-        self.verify_sha256(&object, &sha256).await?;
-        Ok(VerifiedObject {
-            object,
-            sha256,
-            required_backup: None,
-        })
     }
     async fn b2_request(&self, request: B2Request<'_>) -> Result<reqwest::Response> {
+        send_b2_request(self.build_b2_request(request)?).await
+    }
+
+    fn build_b2_request(&self, request: B2Request<'_>) -> Result<reqwest::RequestBuilder> {
         let B2Request {
             method,
             key,
@@ -836,10 +949,7 @@ impl MediaStorage {
         for (name, value) in headers {
             request = request.header(name, value);
         }
-        tokio::time::timeout(CONTROL_TIMEOUT, request.body(body).send())
-            .await
-            .context("B2 media headers timed out; write outcome may be unconfirmed")?
-            .map_err(|_| anyhow!("B2 media transport failed; write outcome may be unconfirmed"))
+        Ok(request.body(body))
     }
     #[cfg(test)]
     fn b2_for_test(endpoint: &str, bucket: &str) -> Result<Self> {
@@ -865,6 +975,23 @@ impl MediaStorage {
         }
         Ok(store)
     }
+}
+
+async fn send_b2_request(request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+    tokio::time::timeout(CONTROL_TIMEOUT, request.send())
+        .await
+        .context("B2 media headers timed out; write outcome may be unconfirmed")?
+        .map_err(|_| anyhow!("B2 media transport failed; write outcome may be unconfirmed"))
+}
+
+fn write_rejected(status: u16) -> bool {
+    // Explicit refusal. A transport error, 408, or server error may follow
+    // a committed mutation and must keep the journal in Writing.
+    matches!(status, 400 | 401 | 403 | 404 | 409 | 411 | 412 | 413 | 429)
+}
+
+fn gcs_generation_from_metadata(object: &ObjectMetadata) -> Result<i64> {
+    gcs_generation(object.reference.version.as_deref())?.context("Missing GCS generation")
 }
 
 fn from_gcs(bucket: &str, key: &str, object: Object) -> Result<ObjectMetadata> {

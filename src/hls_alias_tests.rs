@@ -18,9 +18,14 @@ fn metadata(hash: &str, status: &str, transcode: &str) {
 #[ignore = "requires local synthetic metadata and HLS origin"]
 fn hls_alias_relative_playlist_http_contract() {
     let hash = "a".repeat(64);
-    metadata(&hash, "active", "complete");
+    metadata(&hash, "active", "processing");
     let alias = format!("https://media.example.test/{hash}.hls");
     let initial = response(Request::get(&alias));
+    assert_eq!(response(Request::head(&alias)).get_status(), StatusCode::OK);
+    assert_eq!(
+        get_blob_metadata(&hash).unwrap().unwrap().transcode_status,
+        Some(TranscodeStatus::Processing)
+    );
     let status = initial.get_status();
     assert_eq!(
         initial.get_header_str("Access-Control-Allow-Origin"),
@@ -213,4 +218,25 @@ fn hls_alias_url_bound_viewer_http_contract() {
             .take_body_str()
             .contains(&format!("/{hash}/hls/stream_480p.m3u8")));
     }
+}
+
+#[test]
+#[ignore = "requires local synthetic metadata, HLS origin and queue admission"]
+fn hls_alias_failed_admission_keeps_playback_retryable() {
+    let hash = "f".repeat(64);
+    metadata(&hash, "active", "pending");
+    let alias = format!("https://media.example.test/{hash}.hls");
+    let failed = response(Request::get(&alias));
+    assert_eq!(failed.get_status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(failed.get_header_str("Retry-After"), Some("5"));
+    assert_eq!(
+        get_blob_metadata(&hash).unwrap().unwrap().transcode_status,
+        Some(TranscodeStatus::Pending)
+    );
+    let admitted = response(Request::get(&alias));
+    assert_eq!(admitted.get_status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        get_blob_metadata(&hash).unwrap().unwrap().transcode_status,
+        Some(TranscodeStatus::Pending)
+    );
 }
