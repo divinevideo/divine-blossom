@@ -1,0 +1,456 @@
+use super::*;
+use serde_json::json;
+
+fn compatible() -> Value {
+    json!({
+        "format": {"format_name":"mov,mp4,m4a,3gp,3g2,mj2", "duration":"6.0"},
+        "streams":[
+            {"codec_type":"video", "codec_name":"h264", "profile":"Constrained Baseline",
+             "level":30, "pix_fmt":"yuv420p", "width":480, "height":480,
+             "sample_aspect_ratio":"1:1", "field_order":"progressive", "has_b_frames":0,
+             "avg_frame_rate":"30/1", "duration":"6.0", "start_time":"0.0"},
+            {"codec_type":"audio", "codec_name":"aac", "profile":"LC", "channels":2,
+             "sample_rate":"44100", "bit_rate":"64000", "duration":"6.02", "start_time":"0.0"}
+        ]
+    })
+}
+
+#[test]
+fn low_bitrate_compatible_media_is_reused_with_or_without_audio() {
+    let mut p = compatible();
+    assert!(eligible(&p, 300_000));
+    p["streams"].as_array_mut().unwrap().pop();
+    assert!(eligible(&p, 300_000));
+    p["streams"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("sample_aspect_ratio");
+    assert!(eligible(&p, 300_000));
+}
+
+#[test]
+fn unknown_or_incompatible_streams_keep_encoding() {
+    let cases = [
+        ("codec_name", json!("hevc")),
+        ("profile", json!("High 10")),
+        ("level", json!(40)),
+        ("pix_fmt", json!("yuv420p10le")),
+        ("width", json!(720)),
+        ("height", json!(720)),
+        ("width", json!(479)),
+        ("sample_aspect_ratio", json!("4:3")),
+        ("sample_aspect_ratio", json!("broken")),
+        ("sample_aspect_ratio", json!(1)),
+        ("side_data_list", json!({})),
+        ("field_order", json!("tt")),
+        ("has_b_frames", json!(2)),
+        ("avg_frame_rate", json!("60/1")),
+        ("avg_frame_rate", json!("0/0")),
+        ("duration", json!("11")),
+        ("start_time", json!("1.0")),
+        ("tags", json!({"rotate":"90"})),
+        ("tags", json!({"rotate":"bad"})),
+        (
+            "side_data_list",
+            json!([{"side_data_type":"Display Matrix", "rotation":0}]),
+        ),
+    ];
+    for (key, value) in cases {
+        let mut p = compatible();
+        p["streams"][0][key] = value;
+        assert!(!eligible(&p, 300_000), "unexpected reuse for {key}");
+    }
+    for key in [
+        "codec_name",
+        "profile",
+        "level",
+        "pix_fmt",
+        "width",
+        "height",
+        "has_b_frames",
+        "avg_frame_rate",
+        "duration",
+        "start_time",
+    ] {
+        let mut p = compatible();
+        p["streams"][0].as_object_mut().unwrap().remove(key);
+        assert!(!eligible(&p, 300_000), "missing {key} accepted");
+    }
+    let mut p = compatible();
+    let extra = p["streams"][0].clone();
+    p["streams"].as_array_mut().unwrap().push(extra);
+    assert!(!eligible(&p, 300_000));
+}
+
+#[test]
+fn high_bitrate_or_unknown_duration_does_not_bypass_compression() {
+    assert!(!eligible(&compatible(), 375_001));
+    assert!(!eligible(&compatible(), 0));
+    for value in [
+        json!(null),
+        json!("0"),
+        json!("NaN"),
+        json!("inf"),
+        json!("11"),
+        json!("5.0"),
+    ] {
+        let mut p = compatible();
+        p["format"]["duration"] = value;
+        assert!(!eligible(&p, 300_000));
+    }
+    let mut p = compatible();
+    p["format"]["format_name"] = json!("matroska,webm");
+    assert!(!eligible(&p, 300_000));
+}
+
+#[test]
+fn incompatible_or_unbounded_audio_keeps_encoding() {
+    for (key, value) in [
+        ("codec_name", json!("opus")),
+        ("profile", json!("HE-AAC")),
+        ("channels", json!(6)),
+        ("sample_rate", json!("96000")),
+        ("bit_rate", json!("128000")),
+        ("bit_rate", json!(null)),
+        ("duration", json!("7")),
+        ("start_time", json!("0.5")),
+    ] {
+        let mut p = compatible();
+        p["streams"][1][key] = value;
+        assert!(!eligible(&p, 300_000), "unexpected reuse for audio {key}");
+    }
+}
+
+fn packets() -> Value {
+    json!({"packets":[
+        {"pts_time":"0.0","dts_time":"0.0","duration_time":"0.04","flags":"K_"},
+        {"pts_time":"0.04","dts_time":"0.04","duration_time":"0.04","flags":"__"}
+    ]})
+}
+
+#[test]
+fn ordered_video_packets_starting_with_a_keyframe_can_be_copied() {
+    assert!(safe_packets(&packets(), 0.08));
+}
+
+#[test]
+fn bad_packets_do_not_reach_stream_copy() {
+    for (index, key, value) in [
+        (0, "flags", json!("__")),
+        (1, "pts_time", json!("0.0")),
+        (1, "dts_time", json!("-0.1")),
+        (1, "duration_time", json!("NaN")),
+        (1, "duration_time", json!("1.0")),
+    ] {
+        let mut p = packets();
+        p["packets"][index][key] = value;
+        assert!(!safe_packets(&p, 0.08));
+    }
+    assert!(!safe_packets(&json!({"packets":[]}), 6.0));
+    assert!(
+        !safe_packets(&packets(), 6.0),
+        "truncated timeline accepted"
+    );
+    let mut gap = packets();
+    gap["packets"][1]["pts_time"] = json!("0.08");
+    gap["packets"][1]["dts_time"] = json!("0.08");
+    assert!(!safe_packets(&gap, 0.12), "timeline gap accepted");
+}
+
+async fn media_tool(name: &str, args: &[&str]) -> std::process::Output {
+    let out = crate::media_command::output(
+        tokio::process::Command::new(name).args(args),
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert!(
+        out.status.success(),
+        "{name}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+
+async fn make_source(path: &Path, audio: bool) {
+    make_source_at_quality(path, audio, "36").await;
+}
+
+async fn make_source_at_quality(path: &Path, audio: bool, crf: &str) {
+    let mut args = vec![
+        "-v",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=320x320:rate=25:duration=2",
+    ];
+    if audio {
+        args.extend([
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100:duration=2",
+        ]);
+    }
+    args.extend([
+        "-c:v",
+        "libx264",
+        "-profile:v",
+        "baseline",
+        "-level:v",
+        "3.0",
+        "-pix_fmt",
+        "yuv420p",
+        "-bf",
+        "0",
+        "-crf",
+        crf,
+        "-preset",
+        "fast",
+        "-g",
+        "25",
+    ]);
+    if audio {
+        args.extend(["-c:a", "aac", "-b:a", "64k"]);
+    }
+    args.extend(["-movflags", "+faststart", path.to_str().unwrap()]);
+    media_tool("ffmpeg", &args).await;
+}
+
+async fn frames(path: &Path) -> Vec<String> {
+    let out = media_tool(
+        "ffmpeg",
+        &[
+            "-v",
+            "error",
+            "-i",
+            path.to_str().unwrap(),
+            "-map",
+            "0:v:0",
+            "-f",
+            "framemd5",
+            "-",
+        ],
+    )
+    .await;
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| l.rsplit(',').next().unwrap().trim().to_string())
+        .collect()
+}
+
+async fn probe(path: &Path) -> Value {
+    let out = media_tool(
+        "ffprobe",
+        &[
+            "-v",
+            "error",
+            "-show_streams",
+            "-show_format",
+            "-of",
+            "json",
+            path.to_str().unwrap(),
+        ],
+    )
+    .await;
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires ffmpeg and ffprobe"]
+async fn stream_copy_preserves_frames_original_and_all_playback_files() {
+    for audio in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("source.mp4");
+        let output = dir.path().join("hls");
+        tokio::fs::create_dir(&output).await.unwrap();
+        make_source(&input, audio).await;
+        let original = tokio::fs::read(&input).await.unwrap();
+        assert!(
+            eligible(&probe(&input).await, original.len() as u64),
+            "fixture must qualify"
+        );
+        assert!(
+            try_reuse(&input, &output).await.unwrap(),
+            "must copy a compatible original"
+        );
+        crate::remux_ts_to_fmp4(&output).await.unwrap();
+        let expected = frames(&input).await;
+        assert_eq!(expected.len(), 50);
+        for variant in ["stream_720p", "stream_480p"] {
+            let mp4 = output.join(format!("{variant}.mp4"));
+            let hls = output.join(format!("{variant}.m3u8"));
+            assert_eq!(frames(&mp4).await, expected);
+            assert_eq!(frames(&hls).await, expected);
+            let actual = probe(&mp4).await;
+            assert_eq!(
+                actual["streams"].as_array().unwrap().len(),
+                if audio { 2 } else { 1 }
+            );
+            let duration = number(&actual["format"]["duration"]).unwrap();
+            assert!((duration - 2.0).abs() < 0.06, "duration {duration}");
+            assert!(tokio::fs::metadata(&mp4).await.unwrap().len() < original.len() as u64 + 8192);
+        }
+        assert_eq!(tokio::fs::read(&input).await.unwrap(), original);
+        assert!(
+            tokio::fs::metadata(output.join("master.m3u8"))
+                .await
+                .unwrap()
+                .len()
+                > 0
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires ffmpeg and ffprobe"]
+async fn failed_candidate_publication_leaves_existing_outputs_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("source.mp4");
+    let output = dir.path().join("hls");
+    make_source(&input, true).await;
+    tokio::fs::create_dir(&output).await.unwrap();
+    tokio::fs::write(output.join("keep"), b"existing")
+        .await
+        .unwrap();
+    assert!(try_reuse(&input, &output).await.is_err());
+    let mut entries = tokio::fs::read_dir(&output).await.unwrap();
+    assert_eq!(
+        entries.next_entry().await.unwrap().unwrap().file_name(),
+        "keep"
+    );
+    assert!(entries.next_entry().await.unwrap().is_none());
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        2,
+        "candidate staging leaked"
+    );
+}
+
+async fn audio_packets(path: &Path) -> Vec<String> {
+    let out = media_tool(
+        "ffprobe",
+        &[
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_packets",
+            "-show_data_hash",
+            "sha256",
+            "-show_entries",
+            "packet=data_hash",
+            "-of",
+            "json",
+            path.to_str().unwrap(),
+        ],
+    )
+    .await;
+    let data: Value = serde_json::from_slice(&out.stdout).unwrap();
+    data["packets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["data_hash"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "requires ffmpeg and ffprobe"]
+async fn generation_reuses_audio_and_video_but_forced_repair_encodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("source.mp4");
+    make_source(&input, true).await;
+    let info = crate::probe_video(&input).await.unwrap();
+    let expected_video = frames(&input).await;
+    let expected_audio = audio_packets(&input).await;
+    assert!(!expected_audio.is_empty());
+    for allow_reuse in [true, false] {
+        let output = dir
+            .path()
+            .join(if allow_reuse { "reuse" } else { "repair" });
+        tokio::fs::create_dir(&output).await.unwrap();
+        let variants = crate::run_ffmpeg_hls(&input, &output, false, &info, allow_reuse)
+            .await
+            .unwrap();
+        assert_eq!(variants.len(), 2);
+        crate::remux_ts_to_fmp4(&output).await.unwrap();
+        crate::require_progressive_outputs(&output).await.unwrap();
+        for name in ["stream_720p.mp4", "stream_480p.mp4"] {
+            let result = output.join(name);
+            if allow_reuse {
+                assert_eq!(frames(&result).await, expected_video);
+                assert_eq!(audio_packets(&result).await, expected_audio);
+                let p = probe(&result).await;
+                let streams = p["streams"].as_array().unwrap();
+                let v = streams.iter().find(|s| s["codec_type"] == "video").unwrap();
+                let a = streams.iter().find(|s| s["codec_type"] == "audio").unwrap();
+                assert!(
+                    (number(&v["start_time"]).unwrap() - number(&a["start_time"]).unwrap()).abs()
+                        < 0.05
+                );
+            } else {
+                assert_ne!(
+                    frames(&result).await,
+                    expected_video,
+                    "repair must run encoder"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn absent_field_order_requires_positive_frame_evidence() {
+    let mut metadata = compatible();
+    metadata["streams"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("field_order");
+    assert!(
+        eligible(&metadata, 300_000),
+        "metadata admission is provisional"
+    );
+    assert!(progressive_frames(
+        &json!({"frames":[{"interlaced_frame":0},{"interlaced_frame":0}]})
+    ));
+    for frames in [
+        json!([]),
+        json!([{}]),
+        json!([{"interlaced_frame":1}]),
+        json!([{"interlaced_frame":0},{"interlaced_frame":1}]),
+    ] {
+        assert!(!progressive_frames(&json!({"frames":frames})));
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires ffmpeg and ffprobe"]
+async fn high_bitrate_source_falls_back_to_compression() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("source.mp4");
+    let output = dir.path().join("hls");
+    make_source_at_quality(&input, true, "18").await;
+    tokio::fs::create_dir(&output).await.unwrap();
+    let original = tokio::fs::read(&input).await.unwrap();
+    assert!(
+        !eligible(&probe(&input).await, original.len() as u64),
+        "fixture must exceed reuse budget"
+    );
+    assert!(!try_reuse(&input, &output).await.unwrap());
+    assert_eq!(std::fs::read_dir(&output).unwrap().count(), 0);
+    let info = crate::probe_video(&input).await.unwrap();
+    crate::run_ffmpeg_hls(&input, &output, false, &info, true)
+        .await
+        .unwrap();
+    crate::remux_ts_to_fmp4(&output).await.unwrap();
+    crate::require_progressive_outputs(&output).await.unwrap();
+    for name in ["stream_720p.mp4", "stream_480p.mp4"] {
+        assert!(std::fs::metadata(output.join(name)).unwrap().len() < original.len() as u64);
+    }
+    assert_eq!(tokio::fs::read(&input).await.unwrap(), original);
+}

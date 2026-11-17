@@ -45,6 +45,7 @@ mod hls_claim;
 mod hls_dispatch;
 use hls_claim::{Claim, ClaimStore, Dirty};
 mod media_command;
+mod media_reuse;
 mod mp4;
 mod object_storage;
 mod sound_classification;
@@ -1802,13 +1803,13 @@ async fn process_transcode_inner(
 
     // Run FFmpeg to generate HLS with orientation-aware scaling
     claim.confirm().await?;
-    hls_claim::count("encode_started");
     let ffmpeg_result = claim
         .hold(run_ffmpeg_hls(
             &input_path,
             &output_dir,
             state.config.use_gpu,
             &video_info,
+            !repair,
         ))
         .await;
 
@@ -7184,6 +7185,30 @@ async fn run_ffmpeg_hls(
     output_dir: &Path,
     use_gpu: bool,
     video_info: &VideoInfo,
+    allow_reuse: bool,
+) -> Result<Vec<HlsVariant>> {
+    if allow_reuse {
+        match media_reuse::try_reuse(input_path, output_dir).await {
+            Ok(true) => {
+                hls_claim::count("stream_copy_completed");
+                return Ok(hls_variants());
+            }
+            Ok(false) => hls_claim::count("stream_copy_rejected"),
+            Err(error) => {
+                warn!(%error, "Stream-copy attempt failed; using normal encoding");
+                hls_claim::count("stream_copy_failed");
+            }
+        }
+    }
+    hls_claim::count("encode_started");
+    encode_hls(input_path, output_dir, use_gpu, video_info).await
+}
+
+async fn encode_hls(
+    input_path: &Path,
+    output_dir: &Path,
+    use_gpu: bool,
+    video_info: &VideoInfo,
 ) -> Result<Vec<HlsVariant>> {
     let input_str = input_path.to_string_lossy();
     let output_pattern = output_dir.join("stream_%v.m3u8");
@@ -7403,7 +7428,11 @@ async fn run_ffmpeg_hls(
         return Err(anyhow!("Master playlist not created"));
     }
 
-    Ok(vec![
+    Ok(hls_variants())
+}
+
+fn hls_variants() -> Vec<HlsVariant> {
+    vec![
         HlsVariant {
             resolution: "720p".to_string(),
             playlist: "stream_720p.m3u8".to_string(),
@@ -7414,7 +7443,7 @@ async fn run_ffmpeg_hls(
             playlist: "stream_480p.m3u8".to_string(),
             bandwidth: 1_000_000,
         },
-    ])
+    ]
 }
 
 /// How the sound track crosses from the .ts into the MP4.
