@@ -201,6 +201,20 @@ class ControlDiagnosticsTests(WorkerFixture):
         self.assertEqual(self.worker.failure_stage, 'readiness_read')
         self.assertEqual(self.worker.control_failure_kind, 'timeout')
 
+    def test_readiness_timeout_also_covers_confirmation_window_expiry(self):
+        reads = []
+
+        def absent(timeout):
+            reads.append(timeout)
+            return None
+
+        with patch.object(mirror.time, 'monotonic', side_effect=[0, 0, 30]):
+            with self.assertRaises(TimeoutError):
+                self.worker.observe('readiness_read', mirror.confirm_readback, absent)
+        self.assertEqual(reads, [1.0])
+        self.assertEqual(self.worker.failure_stage, 'readiness_read')
+        self.assertEqual(self.worker.control_failure_kind, 'timeout')
+
     def test_partial_snapshot_diagnostics_survive_later_intake_abort(self):
         other = 'b' * 64
         listing = {'data': [mirror.DEMAND_PREFIX + other, mirror.DEMAND_PREFIX + HASH]}

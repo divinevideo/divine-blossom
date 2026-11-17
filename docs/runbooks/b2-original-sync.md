@@ -292,8 +292,14 @@ possible names; only observed failures are emitted):
 
 Labels come from HTTP status, exception types and fixed validation sites, never
 exception text, response bodies/headers, URLs, cursors or identifiers. Transport
-reasons supplied only as text remain `transport`; they are not parsed. Counters
-reset each pass and retain demand diagnostics even if intake aborts after earlier
+reasons supplied only as text remain `transport`; they are not parsed. The
+`failure_control_readiness_read_timeout` counter covers both
+transport timeouts and expiry of the existing post-write confirmation window,
+including when reads succeed but readiness remains absent. That counter alone
+does not distinguish network failure from delayed KV visibility and does not
+authorize replaying the write.
+
+Counters reset each pass and retain demand diagnostics even if intake aborts after earlier
 snapshot failures. Consequently they need not sum to the legacy error totals,
 which historically discard partial intake reports. Readiness classification keeps
 the first observed failure, even if later cleanup also fails.
