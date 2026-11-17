@@ -270,6 +270,41 @@ exclude credentials, blob owners, raw metadata and provider error text; public
 reports remain numeric aggregates. Preserve the append-only evidence during
 recovery and monitor PVC capacity; the worker does not truncate it automatically.
 
+### Aggregate control API diagnostics
+
+`failure_control_<operation>_<kind>` counters classify existing demand/readiness
+exceptions without additional requests or retries. They are diagnostics, not a
+provider repair or permission to replay work. Existing error totals, conditional
+acknowledgements, retry deadlines and copy/erasure gates are unchanged. HTTP 404
+snapshot absence and HTTP 409/412 conditional-ack conflicts remain normal outcomes.
+
+The complete reporter whitelist is `CONTROL_DIAGNOSTIC_COUNTERS` in
+`scripts/sync_b2_originals.py`: the Cartesian product of these fixed sets (115
+possible names; only observed failures are emitted):
+
+- Operations: `demand_list`, `demand_snapshot`, `demand_ack`, `demand_state`,
+  `readiness_read`.
+- Kinds: `http_400`, `http_401`, `http_403`, `http_404`, `http_409`, `http_412`,
+  `http_429`, `http_5xx`, `http_other`, `timeout`, `dns`, `tls`, `transport`,
+  `json_invalid`, `json_duplicate`, `response_too_large`, `generation_missing`,
+  `generation_invalid`, `list_invalid`, `cursor_invalid`, `response_invalid`,
+  `state_error`, `other`.
+
+Labels come from HTTP status, exception types and fixed validation sites, never
+exception text, response bodies/headers, URLs, cursors or identifiers. Transport
+reasons supplied only as text remain `transport`; they are not parsed. Counters
+reset each pass and retain demand diagnostics even if intake aborts after earlier
+snapshot failures. Consequently they need not sum to the legacy error totals,
+which historically discard partial intake reports. Readiness classification keeps
+the first observed failure, even if later cleanup also fails.
+
+For the scheduled consumer, the IaC reporter must whitelist these exact names
+and vendor the reviewed worker through its normal source/hash pin update; this
+repository does not activate that integration. First distinguish 401/403 credential
+or scope failures, 400 cursor/request rejection, 429 throttling, typed transport
+failures and malformed JSON/generation contracts before selecting a repair. No
+diagnostic category authorizes changing a retained gate or discarding a request.
+
 ## Local validation
 
 ```sh
