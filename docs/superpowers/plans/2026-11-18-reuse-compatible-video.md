@@ -26,7 +26,7 @@ Eligibility: H.264 yuv420p progressive, no B frames, <=480x480, <=10 seconds, <=
 
 **Files:** Create cloud-run-transcoder/src/media_reuse.rs and media_reuse_tests.rs; modify cloud-run-transcoder/src/main.rs; add docs/runbooks/media-reuse.md.
 
-**Interfaces:** media_reuse::try_reuse(input: &Path, output: &Path) -> Result<bool>; returns false for rejected inputs and errors for failed attempts. Caller falls back to normal encoding; the helper stages candidates privately and only commits a complete output set. run_ffmpeg_hls gains an allow_reuse boolean; forced repairs set it false.
+**Interfaces:** media_reuse::try_reuse(input: &Path, output: &Path) -> Result<bool>; returns false for rejected inputs and errors for failed attempts. Caller falls back to normal encoding; the helper stages candidates privately and only commits a complete output set. run_ffmpeg_hls gains an allow_reuse boolean and returns the generation method alongside variants; repairs set reuse false and verified completion is counted per method.
 
 - [x] Write policy tests against a rejecting stub. Expect accepted synthetic metadata to fail the assertion while unsafe cases reject.
 - [x] Implement eligibility and packet validation; run policy tests until green.

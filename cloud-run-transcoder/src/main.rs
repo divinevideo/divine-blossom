@@ -720,6 +720,26 @@ struct HlsVariant {
     bandwidth: u32,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum HlsMethod {
+    Encode,
+    StreamCopy,
+}
+
+impl HlsMethod {
+    fn completion_counter(&self) -> &'static str {
+        match self {
+            Self::Encode => "encode_completed",
+            Self::StreamCopy => "stream_copy_verified",
+        }
+    }
+}
+
+struct HlsGeneration {
+    variants: Vec<HlsVariant>,
+    method: HlsMethod,
+}
+
 #[derive(Debug, Clone, Default)]
 struct SourceObjectMetadata {
     content_type: Option<String>,
@@ -1813,7 +1833,7 @@ async fn process_transcode_inner(
         ))
         .await;
 
-    let variants = match ffmpeg_result {
+    let generation = match ffmpeg_result {
         Ok(v) => v,
         Err(e) => {
             claim.confirm().await?;
@@ -1854,7 +1874,7 @@ async fn process_transcode_inner(
         }
     };
 
-    info!("Generated HLS with {} variants", variants.len());
+    info!("Generated HLS with {} variants", generation.variants.len());
 
     let remux_result = claim.hold(remux_ts_to_fmp4(&output_dir)).await;
     // The best-effort remuxer can skip failed variants and still return Ok.
@@ -1954,7 +1974,7 @@ async fn process_transcode_inner(
     }
 
     claim.mark_verified().await?;
-    hls_claim::count("encode_completed");
+    hls_claim::count(generation.method.completion_counter());
     info!("Uploaded HLS files for {}", hash);
 
     // Update status to complete with video dimensions for the edge service
@@ -1976,7 +1996,7 @@ async fn process_transcode_inner(
         hash: hash.to_owned(),
         status: "complete".to_string(),
         hls_master: format!("{}/hls/master.m3u8", hash),
-        variants,
+        variants: generation.variants,
         display_width: Some(video_info.display_width),
         display_height: Some(video_info.display_height),
         repair_lock_warning: None,
@@ -7186,12 +7206,15 @@ async fn run_ffmpeg_hls(
     use_gpu: bool,
     video_info: &VideoInfo,
     allow_reuse: bool,
-) -> Result<Vec<HlsVariant>> {
+) -> Result<HlsGeneration> {
     if allow_reuse {
         match media_reuse::try_reuse(input_path, output_dir).await {
             Ok(true) => {
                 hls_claim::count("stream_copy_completed");
-                return Ok(hls_variants());
+                return Ok(HlsGeneration {
+                    variants: hls_variants(),
+                    method: HlsMethod::StreamCopy,
+                });
             }
             Ok(false) => hls_claim::count("stream_copy_rejected"),
             Err(error) => {
@@ -7201,7 +7224,10 @@ async fn run_ffmpeg_hls(
         }
     }
     hls_claim::count("encode_started");
-    encode_hls(input_path, output_dir, use_gpu, video_info).await
+    Ok(HlsGeneration {
+        variants: encode_hls(input_path, output_dir, use_gpu, video_info).await?,
+        method: HlsMethod::Encode,
+    })
 }
 
 async fn encode_hls(

@@ -11,9 +11,9 @@ The original must pass the existing pinned-object download and hash verification
 - Audio, if present: mono or stereo, 44.1 or 48 kHz, at most 96,000 bits/s, and duration/start close to the video timeline.
 - Square or unspecified pixel aspect, no nonzero rotation, and no display matrix. Finite, contiguous video packet timestamps must start with a keyframe and cover the advertised duration without reordering.
 
-Missing required metadata rejects reuse. FFprobe 4.4 can omit `field_order`; when it does, every decoded video frame must explicitly be progressive. Unknown frame properties reject reuse as well. Explicit repairs and recovered repair jobs always use the encoder.
+Missing required metadata rejects reuse. Every decoded frame must retain the admitted dimensions, yuv420p pixel format, square/unspecified aspect and progressive scan. This also handles FFprobe 4.4 omitting stream-level `field_order`. AVC packets must use the original configuration: in-band parameter sets and malformed packet ranges reject reuse. Audio packet timestamps must be contiguous, with at most one ordinary AAC priming frame and one final partial frame; larger edit-list preroll, later skips or discard instructions reject reuse. Explicit repairs and recovered repair jobs always use the encoder.
 
-Packaging happens in a private temporary directory under the existing renewable claim. It produces both `stream_720p` and `stream_480p` playlists and single-file TS assets, even though their underlying streams are identical. One copy is strictly decoded before local publication. Failed or cancelled attempts cannot leave partial candidate files in the encoding output directory. Failures and rejected candidates fall back to normal encoding.
+Packaging happens in a private temporary directory under the existing renewable claim. It produces both `stream_720p` and `stream_480p` playlists and single-file TS assets, even though their underlying streams are identical. Explicit source color information must survive in staged TS; container-only color tags that would be lost force encoding. One copy is strictly decoded before local publication. Failed or cancelled attempts cannot leave partial candidate files in the encoding output directory. Failures and rejected candidates fall back to normal encoding.
 
 The shared progressive MP4 remux (including loop-duration correction and AAC recovery), required-copy verification, provenance, master-last publication and completion callback remain the common path. The rendition names preserve client contracts; they are not a promise to upscale the original.
 
@@ -26,7 +26,7 @@ cargo test --manifest-path cloud-run-transcoder/Cargo.toml --locked -- --include
 python3 -m unittest discover -s cloud-run-transcoder/tests -p 'test_*.py'
 ```
 
-The generated-media tests compare every decoded video frame and compressed AAC packet, verify both playback variants, original preservation, loop timing, forced repair, high-bitrate fallback and staging cleanup. CI installs FFmpeg and runs ignored media integration tests too. Verify with the deployed FFmpeg 4.4 version before rollout; newer host versions alone are insufficient.
+The generated-media tests compare every decoded video frame and compressed AAC packet, verify both playback variants, original preservation, loop timing, forced repair, high-bitrate fallback, color metadata, edited-audio content, changing H.264 configuration and staging cleanup. CI installs FFmpeg and runs ignored media integration tests too. Verify with the deployed FFmpeg 4.4 version before rollout; newer host versions alone are insufficient.
 
 ## Rollout and measurement
 
@@ -34,6 +34,6 @@ This change depends on the single-writer implementation. Follow [the single-writ
 
 During an authorized candidate rollout, use synthetic qualifying, high-bitrate and rotated inputs plus a forced repair. Verify both variant HLS playlists, ranged TS reads, progressive MP4s, duration/orientation, preserved originals, required backups, completion callbacks and subtitle dispatch. Keep any sampled real media and its identifiers private.
 
-The existing `hls_claim` event counters gain `stream_copy_completed`, `stream_copy_rejected` and `stream_copy_failed`. `stream_copy_completed` means local HLS packaging succeeded, not that backup publication or the job completed. `encode_started` now counts only calls that actually enter the encoder. Compare matched windows for these events, successful jobs, media duration, CPU-seconds/job, billed compute, delivery bytes and failures. Rejection still incurs metadata probing; include that overhead in measurements. Do not extrapolate synthetic timing into dollar savings.
+The existing `hls_claim` event counters gain `stream_copy_completed`, `stream_copy_verified`, `stream_copy_rejected` and `stream_copy_failed`. `stream_copy_completed` means local HLS packaging succeeded, not that backup publication or the job completed. `stream_copy_verified` is emitted after required publication verification. `encode_started` and `encode_completed` count only actual encoding and its verified publication. Compare matched windows for these events, successful jobs, media duration, CPU-seconds/job, billed compute, delivery bytes and failures. Rejection still incurs metadata probing, and candidate validation includes decoding; include that overhead in measurements. Do not extrapolate synthetic timing into dollar savings.
 
 If playback or publication regressions appear, roll back this reuse commit in a build that retains the single-writer protocol. Follow its drain/rollback procedure; do not restore an older concurrent writer. No originals or existing derivatives need deletion for rollback.

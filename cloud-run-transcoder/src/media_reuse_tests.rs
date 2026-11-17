@@ -377,7 +377,23 @@ async fn generation_reuses_audio_and_video_but_forced_repair_encodes() {
         let variants = crate::run_ffmpeg_hls(&input, &output, false, &info, allow_reuse)
             .await
             .unwrap();
-        assert_eq!(variants.len(), 2);
+        assert_eq!(variants.variants.len(), 2);
+        assert_eq!(
+            variants.method,
+            if allow_reuse {
+                crate::HlsMethod::StreamCopy
+            } else {
+                crate::HlsMethod::Encode
+            }
+        );
+        assert_eq!(
+            variants.method.completion_counter(),
+            if allow_reuse {
+                "stream_copy_verified"
+            } else {
+                "encode_completed"
+            }
+        );
         crate::remux_ts_to_fmp4(&output).await.unwrap();
         crate::require_progressive_outputs(&output).await.unwrap();
         for name in ["stream_720p.mp4", "stream_480p.mp4"] {
@@ -405,27 +421,28 @@ async fn generation_reuses_audio_and_video_but_forced_repair_encodes() {
 }
 
 #[test]
-fn absent_field_order_requires_positive_frame_evidence() {
-    let mut metadata = compatible();
-    metadata["streams"][0]
-        .as_object_mut()
-        .unwrap()
-        .remove("field_order");
-    assert!(
-        eligible(&metadata, 300_000),
-        "metadata admission is provisional"
-    );
-    assert!(progressive_frames(
-        &json!({"frames":[{"interlaced_frame":0},{"interlaced_frame":0}]})
+fn every_decoded_frame_must_match_the_compatible_video() {
+    let video = json!({"width":320,"height":320});
+    let frame = json!({"width":320,"height":320,"pix_fmt":"yuv420p","interlaced_frame":0,"sample_aspect_ratio":"1:1"});
+    assert!(compatible_frames(
+        &json!({"frames":[frame.clone(),frame.clone()]}),
+        &video
     ));
-    for frames in [
-        json!([]),
-        json!([{}]),
-        json!([{"interlaced_frame":1}]),
-        json!([{"interlaced_frame":0},{"interlaced_frame":1}]),
+    for (key, value) in [
+        ("width", json!(640)),
+        ("pix_fmt", json!("yuv444p")),
+        ("interlaced_frame", json!(1)),
+        ("sample_aspect_ratio", json!("4:3")),
     ] {
-        assert!(!progressive_frames(&json!({"frames":frames})));
+        let mut bad = frame.clone();
+        bad[key] = value;
+        assert!(!compatible_frames(
+            &json!({"frames":[frame.clone(),bad]}),
+            &video
+        ));
     }
+    assert!(!compatible_frames(&json!({"frames":[]}), &video));
+    assert!(!compatible_frames(&json!({"frames":[{}]}), &video));
 }
 
 #[tokio::test]
@@ -453,4 +470,285 @@ async fn high_bitrate_source_falls_back_to_compression() {
         assert!(std::fs::metadata(output.join(name)).unwrap().len() < original.len() as u64);
     }
     assert_eq!(tokio::fs::read(&input).await.unwrap(), original);
+}
+
+#[tokio::test]
+#[ignore = "requires ffmpeg and ffprobe"]
+async fn container_only_color_metadata_survives_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = dir.path().join("source.mp4");
+    let tagged = dir.path().join("tagged.mp4");
+    let output = dir.path().join("hls");
+    make_source(&plain, true).await;
+    media_tool(
+        "ffmpeg",
+        &[
+            "-v",
+            "error",
+            "-i",
+            plain.to_str().unwrap(),
+            "-c",
+            "copy",
+            "-color_primaries",
+            "bt2020",
+            "-color_trc",
+            "smpte2084",
+            "-colorspace",
+            "bt2020nc",
+            "-movflags",
+            "+write_colr",
+            tagged.to_str().unwrap(),
+        ],
+    )
+    .await;
+    let before = probe(&tagged).await;
+    let video = &before["streams"][0];
+    assert_eq!(video["color_primaries"], "bt2020");
+    assert_eq!(video["color_transfer"], "smpte2084");
+    assert!(eligible(&before, std::fs::metadata(&tagged).unwrap().len()));
+    tokio::fs::create_dir(&output).await.unwrap();
+    let info = crate::probe_video(&tagged).await.unwrap();
+    crate::run_ffmpeg_hls(&tagged, &output, false, &info, true)
+        .await
+        .unwrap();
+    crate::remux_ts_to_fmp4(&output).await.unwrap();
+    crate::require_progressive_outputs(&output).await.unwrap();
+    for variant in ["stream_720p", "stream_480p"] {
+        for ext in ["m3u8", "mp4"] {
+            let after = probe(&output.join(format!("{variant}.{ext}"))).await;
+            for field in [
+                "color_primaries",
+                "color_transfer",
+                "color_space",
+                "color_range",
+            ] {
+                assert_eq!(
+                    after["streams"][0][field], video[field],
+                    "lost {field} in {variant}.{ext}"
+                );
+            }
+        }
+    }
+}
+
+async fn audible_frequency(path: &Path) -> f64 {
+    let out = media_tool(
+        "ffmpeg",
+        &[
+            "-v",
+            "error",
+            "-i",
+            path.to_str().unwrap(),
+            "-ss",
+            "0.1",
+            "-t",
+            "0.25",
+            "-map",
+            "0:a:0",
+            "-ac",
+            "1",
+            "-ar",
+            "44100",
+            "-f",
+            "s16le",
+            "-",
+        ],
+    )
+    .await;
+    let samples: Vec<i16> = out
+        .stdout
+        .chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+        .collect();
+    assert!(samples.len() > 10000);
+    let crossings = samples.windows(2).filter(|p| p[0] <= 0 && p[1] > 0).count();
+    crossings as f64 * 44100.0 / samples.len() as f64
+}
+
+#[tokio::test]
+#[ignore = "requires ffmpeg and ffprobe"]
+async fn edited_aac_does_not_restore_trimmed_audio_or_delay_video() {
+    let dir = tempfile::tempdir().unwrap();
+    let video = dir.path().join("video.mp4");
+    let audio = dir.path().join("audio.m4a");
+    let input = dir.path().join("edited.mp4");
+    let output = dir.path().join("hls");
+    make_source(&video, false).await;
+    media_tool(
+        "ffmpeg",
+        &[
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=880:sample_rate=44100:duration=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100:duration=2",
+            "-filter_complex",
+            "[0:a][1:a]concat=n=2:v=0:a=1",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "32k",
+            audio.to_str().unwrap(),
+        ],
+    )
+    .await;
+    media_tool(
+        "ffmpeg",
+        &[
+            "-v",
+            "error",
+            "-i",
+            video.to_str().unwrap(),
+            "-itsoffset",
+            "-2",
+            "-i",
+            audio.to_str().unwrap(),
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-c",
+            "copy",
+            input.to_str().unwrap(),
+        ],
+    )
+    .await;
+    assert!(
+        eligible(
+            &probe(&input).await,
+            std::fs::metadata(&input).unwrap().len()
+        ),
+        "metadata alone misses audio edits"
+    );
+    tokio::fs::create_dir(&output).await.unwrap();
+    assert!(
+        !try_reuse(&input, &output).await.unwrap(),
+        "must not copy discarded audio preroll"
+    );
+    assert_eq!(std::fs::read_dir(&output).unwrap().count(), 0);
+    let info = crate::probe_video(&input).await.unwrap();
+    crate::run_ffmpeg_hls(&input, &output, false, &info, true)
+        .await
+        .unwrap();
+    crate::remux_ts_to_fmp4(&output).await.unwrap();
+    crate::require_progressive_outputs(&output).await.unwrap();
+    let original_frequency = audible_frequency(&input).await;
+    assert!((original_frequency - 440.0).abs() < 40.0);
+    for name in ["stream_720p.mp4", "stream_480p.mp4"] {
+        let result = output.join(name);
+        let p = probe(&result).await;
+        let streams = p["streams"].as_array().unwrap();
+        let v = streams.iter().find(|s| s["codec_type"] == "video").unwrap();
+        let a = streams.iter().find(|s| s["codec_type"] == "audio").unwrap();
+        assert!(
+            number(&v["start_time"]).unwrap() < 0.05,
+            "black video preroll restored"
+        );
+        assert!(
+            number(&a["duration"]).unwrap() < 2.1,
+            "trimmed audio restored"
+        );
+        assert!(
+            (audible_frequency(&result).await - original_frequency).abs() < 40.0,
+            "wrong audible content"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires ffmpeg and ffprobe"]
+async fn changing_h264_configuration_is_not_copied() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("joined.mp4");
+    let output = dir.path().join("hls");
+    let a = dir.path().join("a.ts");
+    let b = dir.path().join("b.ts");
+    for (path, source, profile, pix_fmt) in [
+        (
+            &a,
+            "color=red:size=160x160:rate=25:duration=1",
+            "baseline",
+            "yuv420p",
+        ),
+        (
+            &b,
+            "color=blue:size=640x640:rate=25:duration=1",
+            "high444",
+            "yuv444p",
+        ),
+    ] {
+        media_tool(
+            "ffmpeg",
+            &[
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                source,
+                "-c:v",
+                "libx264",
+                "-profile:v",
+                profile,
+                "-pix_fmt",
+                pix_fmt,
+                "-bf",
+                "0",
+                "-f",
+                "mpegts",
+                path.to_str().unwrap(),
+            ],
+        )
+        .await;
+    }
+    let concat = format!("concat:{}|{}", a.display(), b.display());
+    media_tool(
+        "ffmpeg",
+        &[
+            "-v",
+            "error",
+            "-i",
+            &concat,
+            "-c",
+            "copy",
+            input.to_str().unwrap(),
+        ],
+    )
+    .await;
+    assert!(
+        eligible(
+            &probe(&input).await,
+            std::fs::metadata(&input).unwrap().len()
+        ),
+        "first sequence alone looks compatible"
+    );
+    tokio::fs::create_dir(&output).await.unwrap();
+    assert!(
+        !try_reuse(&input, &output).await.unwrap(),
+        "changed sequence must not be copied"
+    );
+    assert_eq!(std::fs::read_dir(&output).unwrap().count(), 0);
+}
+
+#[test]
+fn avc_configuration_changes_and_invalid_packet_ranges_are_rejected() {
+    let video = json!({"is_avc":"true","nal_length_size":"4"});
+    let packet = json!({"packets":[{"pos":"0","size":"5"}]});
+    assert!(stable_avc_packets(&packet, &[0, 0, 0, 1, 0x65], &video));
+    for header in [0x67, 0x68, 0x6d, 0x6f, 0xe5, 0] {
+        assert!(!stable_avc_packets(&packet, &[0, 0, 0, 1, header], &video));
+    }
+    assert!(!stable_avc_packets(&packet, &[0, 0, 0, 2, 0x65], &video));
+    assert!(!stable_avc_packets(&packet, &[0, 0, 0, 0, 0x65], &video));
+    assert!(!stable_avc_packets(&packet, &[0, 0, 0, 1], &video));
+    assert!(!stable_avc_packets(
+        &json!({"packets":[{"pos":"18446744073709551615","size":"5"}]}),
+        &[0, 0, 0, 1, 0x65],
+        &video
+    ));
 }
