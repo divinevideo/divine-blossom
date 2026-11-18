@@ -9,7 +9,7 @@ use tokio::process::Command;
 /// no visible outputs until the complete HLS set can replace the empty output
 /// directory. Dropping the future kills media children and drops staging.
 pub async fn try_reuse(input: &Path, output: &Path) -> Result<bool> {
-    let metadata = probe(input, None).await?;
+    let metadata = probe(input, false).await?;
     let bytes = tokio::fs::metadata(input).await?.len();
     if !eligible(&metadata, bytes) {
         return Ok(false);
@@ -21,11 +21,26 @@ pub async fn try_reuse(input: &Path, output: &Path) -> Result<bool> {
         .find(|s| s["codec_type"] == "video")
         .unwrap();
     // Stream metadata describes the first sequence, not necessarily all frames.
-    if !probe_compatible_frames(input, video).await? {
+    if !single_avc_config(video) {
+        return Ok(false);
+    }
+    // Decode and inspect all source packets in one bounded pass, rather than
+    // launching separate probes for frames, video packets and audio packets.
+    let inspection = probe(input, true).await?;
+    let items = inspection["packets_and_frames"]
+        .as_array()
+        .context("Missing media inspection")?;
+    let packets_for = |kind: &str| {
+        serde_json::json!({"packets": items.iter()
+        .filter(|item| item["type"] == "packet" && item["codec_type"] == kind).collect::<Vec<_>>()})
+    };
+    let frames = serde_json::json!({"frames": items.iter()
+        .filter(|item| item["type"] == "frame" && item["media_type"] == "video").collect::<Vec<_>>()});
+    if !compatible_frames(&frames, video) {
         return Ok(false);
     }
     let duration = number(&video["duration"]).unwrap();
-    let packets = probe(input, Some("v:0")).await?;
+    let packets = packets_for("video");
     if !safe_packets(&packets, duration)
         || !stable_avc_packets(&packets, &tokio::fs::read(input).await?, video)
     {
@@ -37,7 +52,7 @@ pub async fn try_reuse(input: &Path, output: &Path) -> Result<bool> {
         .iter()
         .find(|s| s["codec_type"] == "audio");
     if let Some(audio) = audio {
-        if !safe_audio_packets(&probe(input, Some("a:0")).await?, audio) {
+        if !safe_audio_packets(&packets_for("audio"), audio) {
             return Ok(false);
         }
     }
@@ -101,8 +116,19 @@ pub async fn try_reuse(input: &Path, output: &Path) -> Result<bool> {
     // MP4 colr metadata is not necessarily present in the H.264 bitstream.
     // Stream copying into TS can silently lose it while retaining identical
     // YUV samples, so a decode-only check cannot establish display fidelity.
-    let copied = probe(&candidate.path().join("stream_720p.ts"), None).await?;
-    if !preserves_color(video, &copied) {
+    let copied = probe(&candidate.path().join("stream_720p.ts"), false).await?;
+    if !preserves_color(video, &copied)
+        || !copied["streams"].as_array().is_some_and(|streams| {
+            streams.iter().any(|s| {
+                s["codec_type"] == "video"
+                    && s["profile"] == video["profile"]
+                    && s["level"] == video["level"]
+                    && s["width"] == video["width"]
+                    && s["height"] == video["height"]
+                    && s["pix_fmt"] == video["pix_fmt"]
+            })
+        })
+    {
         return Ok(false);
     }
     // Decode one identical copy before publication, so damaged source packets
@@ -135,13 +161,13 @@ pub async fn try_reuse(input: &Path, output: &Path) -> Result<bool> {
     Ok(true)
 }
 
-async fn probe(input: &Path, packets: Option<&str>) -> Result<Value> {
+async fn probe(input: &Path, inspect: bool) -> Result<Value> {
     let mut command = Command::new("ffprobe");
     command.args(["-v", "error", "-of", "json"]);
-    if let Some(selector) = packets {
-        command.args(["-select_streams", selector, "-show_packets"]);
+    if inspect {
+        command.args(["-show_packets", "-show_frames"]);
     } else {
-        command.args(["-show_streams", "-show_format"]);
+        command.args(["-show_streams", "-show_format", "-show_data"]);
     }
     let result =
         crate::media_command::output(command.arg(input), crate::media_command::PROBE_TIMEOUT)
@@ -169,29 +195,6 @@ fn preserves_color(source: &Value, candidate: &Value) -> bool {
         None | Some("unknown" | "unspecified") => true,
         Some(value) => video[field].as_str() == Some(value),
     })
-}
-
-async fn probe_compatible_frames(input: &Path, video: &Value) -> Result<bool> {
-    let result = crate::media_command::output(
-        Command::new("ffprobe")
-            .args([
-                "-v",
-                "error",
-                "-select_streams",
-                "v:0",
-                "-show_frames",
-                "-show_entries",
-                "frame=interlaced_frame,width,height,pix_fmt,sample_aspect_ratio",
-                "-of",
-                "json",
-            ])
-            .arg(input),
-        crate::media_command::PROBE_TIMEOUT,
-    )
-    .await?;
-    ensure!(result.status.success(), "Progressive frame probe failed");
-    let value: Value = serde_json::from_slice(&result.stdout)?;
-    Ok(compatible_frames(&value, video))
 }
 
 fn compatible_frames(value: &Value, video: &Value) -> bool {
@@ -434,6 +437,16 @@ fn stable_avc_packets(probe: &Value, bytes: &[u8], video: &Value) -> bool {
         return false;
     };
     for packet in packets {
+        // MP4 can switch sample descriptions (avcC) without embedding SPS/PPS
+        // in the packet bytes. FFprobe reports that as New Extradata. Reject
+        // all packet side data until its copy semantics are explicitly known.
+        if !packet["side_data_list"].is_null()
+            && !packet["side_data_list"]
+                .as_array()
+                .is_some_and(|items| items.is_empty())
+        {
+            return false;
+        }
         let (Some(pos), Some(size)) = (integer(&packet["pos"]), integer(&packet["size"])) else {
             return false;
         };
@@ -467,4 +480,61 @@ fn stable_avc_packets(probe: &Value, bytes: &[u8], video: &Value) -> bool {
         }
     }
     true
+}
+
+// Keep only one initial SPS/PPS as well: multiple configurations can be
+// supplied in avcC before any packet, without New Extradata or in-band SPS.
+fn single_avc_config(video: &Value) -> bool {
+    fn parse(video: &Value) -> Option<()> {
+        let dump = video["extradata"].as_str()?;
+        let mut bytes = Vec::new();
+        for line in dump.lines().filter(|line| !line.trim().is_empty()) {
+            let (_, data) = line.split_once(':')?;
+            let hex = data.trim_start().split("  ").next()?;
+            bytes.extend(hex::decode(hex.split_whitespace().collect::<String>()).ok()?);
+        }
+        if bytes.len() < 7 || bytes[0] != 1 || bytes[5] & 31 != 1 {
+            return None;
+        }
+        let length_size = video["nal_length_size"].as_str()?.parse::<u8>().ok()?;
+        if (bytes[4] & 3) + 1 != length_size {
+            return None;
+        }
+        let mut rest = &bytes[6..];
+        for expected in [7, 8] {
+            let length = u16::from_be_bytes(rest.get(..2)?.try_into().ok()?) as usize;
+            let nal = rest.get(2..2 + length)?;
+            if nal.first()? & 31 != expected {
+                return None;
+            }
+            if expected == 7
+                && (nal.len() < 4
+                    || nal[1] != bytes[1]
+                    || nal[3] != bytes[3]
+                    || video["level"].as_u64() != Some(u64::from(nal[3])))
+            {
+                return None;
+            }
+            rest = &rest[2 + length..];
+            if expected == 7 {
+                if *rest.first()? != 1 {
+                    return None;
+                }
+                rest = &rest[1..];
+            }
+        }
+        // High-profile avcC may append chroma/depth fields with zero SPS
+        // extensions. Other tails or extra parameter sets stay on encoding.
+        let high_extension = bytes[1] == 100
+            && rest.len() == 4
+            && rest[0] & 3 == 1
+            && rest[1] & 7 == 0
+            && rest[2] & 7 == 0
+            && rest[3] == 0;
+        if !(rest.is_empty() || high_extension) {
+            return None;
+        }
+        Some(())
+    }
+    parse(video).is_some()
 }

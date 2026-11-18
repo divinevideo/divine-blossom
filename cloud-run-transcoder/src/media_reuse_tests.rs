@@ -752,3 +752,104 @@ fn avc_configuration_changes_and_invalid_packet_ranges_are_rejected() {
         &video
     ));
 }
+
+#[test]
+fn changed_avc_sample_description_cannot_bypass_parameter_set_checks() {
+    let video = json!({"is_avc":"true","nal_length_size":"4"});
+    for side_data in [
+        json!([{"side_data_type":"New Extradata"}]),
+        json!([{"side_data_type":"unknown"}]),
+        json!({}),
+    ] {
+        let packet = json!({"packets":[{"pos":"0","size":"5","side_data_list":side_data}]});
+        assert!(!stable_avc_packets(&packet, &[0, 0, 0, 1, 0x65], &video));
+    }
+}
+
+fn avcc_metadata(data: &[u8]) -> Value {
+    use std::fmt::Write;
+    let mut dump = String::new();
+    for (i, bytes) in data.chunks(16).enumerate() {
+        write!(dump, "\n{:08x}: {}  fixture", i * 16, hex::encode(bytes)).unwrap();
+    }
+    json!({"extradata":dump,"nal_length_size":"4","level":30})
+}
+
+#[test]
+fn avcc_must_contain_exactly_one_initial_configuration() {
+    // Synthetic avcC structure: one SPS and one PPS. SPS/PPS content is
+    // decoded by ffprobe in production; this check constrains the container.
+    let baseline = [
+        1, 66, 0, 30, 255, 225, 0, 4, 0x67, 66, 0, 30, 1, 0, 2, 0x68, 0,
+    ];
+    assert!(single_avc_config(&avcc_metadata(&baseline)));
+    let mut high = baseline;
+    high[1] = 100;
+    high[9] = 100;
+    assert!(single_avc_config(&avcc_metadata(
+        &[high.as_slice(), &[253, 248, 248, 0]].concat()
+    )));
+    for (index, value) in [(0, 0), (5, 226), (12, 2), (7, 255), (15, 0x67)] {
+        let mut bad = baseline;
+        bad[index] = value;
+        assert!(
+            !single_avc_config(&avcc_metadata(&bad)),
+            "invalid avcC at {index}"
+        );
+    }
+    assert!(!single_avc_config(&json!({})));
+    assert!(!single_avc_config(&json!({"extradata":"not a hexdump"})));
+    assert!(!single_avc_config(&avcc_metadata(&baseline[..16])));
+    assert!(!single_avc_config(&avcc_metadata(
+        &[baseline.as_slice(), &[0]].concat()
+    )));
+}
+
+#[tokio::test]
+#[ignore = "requires ffmpeg and ffprobe"]
+async fn single_main_and_high_profile_configurations_still_copy() {
+    for profile in ["main", "high"] {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("source.mp4");
+        let output = dir.path().join("hls");
+        media_tool(
+            "ffmpeg",
+            &[
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x320:rate=25:duration=2",
+                "-c:v",
+                "libx264",
+                "-profile:v",
+                profile,
+                "-level:v",
+                "3.0",
+                "-pix_fmt",
+                "yuv420p",
+                "-bf",
+                "0",
+                "-crf",
+                "36",
+                input.to_str().unwrap(),
+            ],
+        )
+        .await;
+        let p = probe(&input).await;
+        assert_eq!(
+            p["streams"][0]["profile"],
+            if profile == "main" { "Main" } else { "High" }
+        );
+        tokio::fs::create_dir(&output).await.unwrap();
+        assert!(
+            try_reuse(&input, &output).await.unwrap(),
+            "compatible {profile} config rejected"
+        );
+        assert_eq!(
+            frames(&output.join("stream_480p.m3u8")).await,
+            frames(&input).await
+        );
+    }
+}
