@@ -125,7 +125,7 @@ fn publish(Publication { asset, sha256 }: Publication<'_>) -> Result<&'static st
             let cleanup = storage::remove_bunny_delivery_copies(hash, &check_gate)
                 .and_then(|_| storage::purge_bunny_pilot_hosts(&[hash.to_owned()]));
             if let Err(cleanup_error) = cleanup {
-                parent_gate::handoff_bunny_cleanup(hash, &attempt, &generation)?;
+                parent_gate::handoff_bunny_cleanup(hash, &generation)?;
                 return Err(cleanup_error);
             }
             may_release = true;

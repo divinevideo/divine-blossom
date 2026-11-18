@@ -530,12 +530,14 @@ pub(crate) fn check_bunny_gate(hash: &str, attempt: &str, expected: &str) -> Res
 
 /// A received PUT acknowledgement settles the writer. If verification or
 /// cleanup then fails, a durable outbox retry can take over the exact gate.
-pub(crate) fn handoff_bunny_cleanup(hash: &str, attempt: &str, expected: &str) -> Result<()> {
-    check_bunny_gate(hash, attempt, expected)?;
+pub(crate) fn handoff_bunny_cleanup(hash: &str, expected: &str) -> Result<()> {
+    // The KV generation condition itself fences the writer. Recovery must
+    // also work after the failed cleanup spent the backend request budget.
+    let expected = generation(expected).ok_or_else(unavailable)?;
     crate::b2_cdn_purge::enqueue(hash, crate::b2_cdn_purge::Phase::Single)?;
     insert(
         &crate::metadata::open_store()?, hash,
-        &Gate::Copying { attempt_id: format!("bunny-cleanup-{hash}") }, generation(expected),
+        &Gate::Copying { attempt_id: format!("bunny-cleanup-{hash}") }, Some(expected),
     )
 }
 

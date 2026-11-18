@@ -2118,15 +2118,13 @@ fn retained_bunny_pilot_hosts() -> Result<Option<String>> {
 }
 
 fn bunny_pilot_hosts() -> Result<String> {
-    match retained_bunny_pilot_hosts()? {
-        Some(hosts) => Ok(hosts),
-        None => match optional_config(BUNNY_PILOT_HOSTS)? {
-            Some(hosts) => checked_bunny_hosts(hosts),
-            None => origin_bunny_pilot_hosts()?.ok_or_else(|| {
-                BlossomError::StorageError("Retained Bunny pilot hosts unavailable".into())
-            }),
-        },
+    if let Some(hosts) = retained_bunny_pilot_hosts()? {
+        return Ok(hosts);
     }
+    if let Some(hosts) = origin_bunny_pilot_hosts()? {
+        return Ok(hosts);
+    }
+    checked_bunny_hosts(get_config(BUNNY_PILOT_HOSTS)?)
 }
 
 fn origin_bunny_pilot_hosts() -> Result<Option<String>> {

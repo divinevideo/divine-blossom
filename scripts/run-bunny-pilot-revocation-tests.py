@@ -45,6 +45,13 @@ class Provider(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith('/resources/stores/kv/fixture-store/keys/'):
             assert self.headers.get('Fastly-Key') == 'synthetic-policy-key'
+            if self.path.endswith('/bunny-pilot-retained-hosts:v1'):
+                body = f'{CUSTOM_HOST},{ALIAS}'.encode()
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header('generation', '1')
+                self.end_headers()
+                return self.wfile.write(body)
             assert self.path.endswith(f'/blob:{HASH}')
             return self.reply(200, {'sha256': HASH, 'size': 9, 'type': 'video/mp4',
                                     'uploaded': '2026-01-01T00:00:00Z',
@@ -164,7 +171,7 @@ def main():
                 kv.write_text('{}')
                 settings.write_text(json.dumps({'b2_bucket_id': BUCKET_ID, 'b2_media_bucket': BUCKET,
                                                 'bunny_fixture_local_gate': 'true', 'metadata_kv_store_id': 'fixture-store',
-                                                'bunny_pilot_zone_hosts': f'{CUSTOM_HOST},{ALIAS}'}))
+                                                'bunny_pilot_zone_hosts': f'{CUSTOM_HOST},reconfigured-zone.b-cdn.net'}))
                 config.write_text(manifest(server.server_port, kv, settings))
                 env = os.environ.copy()
                 env['CARGO_TARGET_WASM32_WASIP1_RUNNER'] = shlex.join([
