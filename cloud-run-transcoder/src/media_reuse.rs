@@ -5,12 +5,20 @@ use serde_json::Value;
 use std::{path::Path, time::Duration};
 use tokio::process::Command;
 
+const MAX_SECONDS: f64 = 10.0;
+const MAX_BITS_PER_SECOND: f64 = 500_000.0;
+
 /// Repackage a qualifying original in private staging. No original writes and
 /// no visible outputs until the complete HLS set can replace the empty output
 /// directory. Dropping the future kills media children and drops staging.
 pub async fn try_reuse(input: &Path, output: &Path) -> Result<bool> {
-    let metadata = probe(input, false).await?;
     let bytes = tokio::fs::metadata(input).await?.len();
+    // Even the longest eligible clip cannot fit larger files in the bitrate
+    // budget. Ordinary high-bitrate inputs should not pay for extra probing.
+    if bytes == 0 || bytes as f64 > MAX_SECONDS * MAX_BITS_PER_SECOND / 8.0 {
+        return Ok(false);
+    }
+    let metadata = probe(input, false).await?;
     if !eligible(&metadata, bytes) {
         return Ok(false);
     }
@@ -243,7 +251,7 @@ fn eligible(probe: &Value, file_bytes: u64) -> bool {
         return false;
     }
     let v = videos[0];
-    let Some(duration) = number(&v["duration"]).filter(|d| *d > 0.0 && *d <= 10.0) else {
+    let Some(duration) = number(&v["duration"]).filter(|d| *d > 0.0 && *d <= MAX_SECONDS) else {
         return false;
     };
     let Some(container_duration) = number(&probe["format"]["duration"]) else {
@@ -254,7 +262,7 @@ fn eligible(probe: &Value, file_bytes: u64) -> bool {
         .is_some_and(|s| s.split(',').any(|f| f == "mp4"))
         || (container_duration - duration).abs() > 0.1
         || file_bytes == 0
-        || file_bytes as f64 * 8.0 / duration > 500_000.0
+        || file_bytes as f64 * 8.0 / duration > MAX_BITS_PER_SECOND
     {
         return false;
     }
@@ -310,7 +318,7 @@ fn safe_packets(probe: &Value, duration: f64) -> bool {
     };
     if !duration.is_finite()
         || duration <= 0.0
-        || duration > 10.0
+        || duration > MAX_SECONDS
         || !packets[0]["flags"]
             .as_str()
             .is_some_and(|f| f.contains('K'))

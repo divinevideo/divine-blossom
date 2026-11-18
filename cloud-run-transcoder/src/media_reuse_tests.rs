@@ -853,3 +853,15 @@ async fn single_main_and_high_profile_configurations_still_copy() {
         );
     }
 }
+
+#[tokio::test]
+async fn impossible_file_sizes_skip_media_probing() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("not-media.mp4");
+    for length in [0, 625_001] {
+        tokio::fs::write(&input, vec![0; length]).await.unwrap();
+        assert!(!try_reuse(&input, &dir.path().join("output"))
+            .await
+            .expect("size rejection must not invoke media tools"));
+    }
+}
