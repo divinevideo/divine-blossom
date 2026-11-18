@@ -74,7 +74,7 @@ fn publish(Publication { asset, sha256 }: Publication<'_>) -> Result<&'static st
     getrandom::getrandom(&mut random)
         .map_err(|_| BlossomError::Internal("Bunny publication attempt unavailable".into()))?;
     let hash = asset.hash();
-    let attempt = format!("bunny-pilot-{}", hex::encode(random));
+    let attempt = hex::encode(random);
     let generation = parent_gate::archive_claim(hash, &attempt)?;
     let check_gate = || parent_gate::check_bunny_gate(hash, &attempt, &generation);
     let mut may_release = true;
@@ -98,7 +98,7 @@ fn publish(Publication { asset, sha256 }: Publication<'_>) -> Result<&'static st
             verify_public_metadata(&asset, source_len)?;
             Ok(())
         } else {
-            storage::put_bunny_pilot_asset(&delivery_key, source, sha256, || {
+            let written = storage::put_bunny_pilot_asset(&delivery_key, source, sha256, || {
                 storage::validate_bunny_pilot_publication()?;
                 check_gate()?;
                 verify_public_metadata(&asset, source_len)?;
@@ -106,6 +106,13 @@ fn publish(Publication { asset, sha256 }: Publication<'_>) -> Result<&'static st
                 may_release = false;
                 Ok(())
             })?;
+            if !written {
+                // A definite provider rejection cannot leave a pending writer.
+                may_release = true;
+                return Err(BlossomError::StorageError(
+                    "Bunny delivery write rejected".into(),
+                ));
+            }
             storage::read_bunny_pilot_asset(&delivery_key).and_then(|copy| {
                 if copy.is_some_and(|bytes| verified_bytes(&bytes, sha256)) {
                     Ok(())
@@ -271,7 +278,7 @@ mod tests {
             "active" | "active_rendition" | "appeal" => StatusCode::OK,
             "webhook_token" => StatusCode::UNAUTHORIZED,
             "checksum_mismatch" => StatusCode::CONFLICT,
-            "unverified_retry" => StatusCode::BAD_GATEWAY,
+            "unverified_retry" | "rejected_put" | "uncertain_put" => StatusCode::BAD_GATEWAY,
             "pending" | "age_restricted" | "age_gate_after_put" | "disabled" => {
                 StatusCode::NOT_FOUND
             }
@@ -375,6 +382,15 @@ mod tests {
                 gate,
                 Err(fastly::kv_store::KVStoreError::ItemNotFound)
             ));
+        } else if case == "uncertain_put" {
+            let mut gate = gate.unwrap();
+            let Some(parent_gate::Gate::Copying { attempt_id }) =
+                parent_gate::parse(&gate.take_body().into_bytes())
+            else {
+                panic!("uncertain writer must retain exclusion");
+            };
+            assert_eq!(attempt_id.len(), 32);
+            assert!(attempt_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
         } else {
             let mut gate = gate.unwrap();
             assert!(matches!(

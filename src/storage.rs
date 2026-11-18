@@ -2231,20 +2231,21 @@ pub(crate) fn read_bunny_pilot_asset(key: &str) -> Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
+/// Return false only for a definite provider rejection before upload acceptance.
 pub(crate) fn put_bunny_pilot_asset(
     key: &str,
     bytes: Vec<u8>,
     sha256: &str,
     before_send: impl FnOnce() -> Result<()>,
-) -> Result<()> {
+) -> Result<bool> {
     use blossom_core::bunny_pilot::{Asset, DELIVERY_PREFIX};
     let route = key
         .strip_prefix(DELIVERY_PREFIX)
         .map(|path| format!("/{path}"));
-    let asset = route.as_deref().and_then(Asset::parse).ok_or_else(||
-        BlossomError::BadRequest(
-            "Invalid Bunny delivery key".into(),
-        ))?;
+    let asset = route
+        .as_deref()
+        .and_then(Asset::parse)
+        .ok_or_else(|| BlossomError::BadRequest("Invalid Bunny delivery key".into()))?;
     let mut config = S3Config::load_b2_media()?;
     config.access_key = get_secret("bunny_b2_publish_key_id")?;
     config.secret_key = get_secret("bunny_b2_publish_key")?;
@@ -2285,12 +2286,20 @@ pub(crate) fn put_bunny_pilot_asset(
     let response = request
         .send(B2_MEDIA_BACKEND)
         .map_err(|_| BlossomError::StorageError("Bunny delivery write outcome uncertain".into()))?;
+    // B2 rejects these requests before accepting an upload. Timeouts, transport
+    // failures and server errors remain uncertain and keep the writer fenced.
+    if matches!(
+        response.get_status(),
+        StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+    ) {
+        return Ok(false);
+    }
     if !response.get_status().is_success() {
         return Err(BlossomError::StorageError(
             "Bunny delivery write failed".into(),
         ));
     }
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) fn remove_bunny_delivery_copies(hash: &str, check_gate: &dyn Fn() -> Result<()>) -> Result<()> {

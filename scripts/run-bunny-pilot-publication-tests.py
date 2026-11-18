@@ -24,7 +24,8 @@ CDN_HOSTS = ("media-bunny.divine.video", "fixture-pilot.b-cdn.net")
 B2_API_HOST = "api.backblazeb2.com"
 KV_BASE = "/resources/stores/kv/fixture-store/keys/"
 CASES = ("active", "active_rendition", "pending", "age_restricted", "checksum_mismatch",
-         "age_gate_after_put", "appeal", "unverified_retry", "disabled", "webhook_token")
+         "age_gate_after_put", "appeal", "unverified_retry", "rejected_put", "uncertain_put",
+         "disabled", "webhook_token")
 SECRETS = {
     "admin_token": "fixture-admin",
     "webhook_secret": "fixture-webhook",
@@ -119,6 +120,9 @@ class Origin(BaseHTTPRequestHandler):
         body = self.read_body()
         assert body == BODY
         assert self.server.delivered is None
+        if self.server.case in ("rejected_put", "uncertain_put"):
+            self.server.events.append(("rejected-put", self.path))
+            return self.reply(403 if self.server.case == "rejected_put" else 503)
         self.server.events.append(("put", self.path))
         self.server.delivered = body
         self.reply(200)
@@ -191,6 +195,9 @@ def assert_case(server, case):
     elif case == "unverified_retry":
         assert actions.count("put") == actions.count("delete") == 1, events
         assert actions.count("purge") == 8 and server.delivered is None, events
+    elif case in ("rejected_put", "uncertain_put"):
+        assert actions.count("rejected-put") == 1 and server.delivered is None, events
+        assert "put" not in actions and "delete" not in actions and "purge" not in actions, events
     else:
         assert all(action in ("read", "policy") for action in actions), events
         assert server.delivered is None

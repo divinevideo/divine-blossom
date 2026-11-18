@@ -91,6 +91,13 @@ or enabling the internal mobile flag.
   with Backblaze before operator recovery. Require evidence that no PUT can
   still finish, then verify all-version removal and checked eviction before
   clearing a blocked gate. Keep the drain runner available during recovery.
+  B2 400, 401, and 403 rejections release the attempt without claiming a write.
+  Timeouts, transport failures, and other errors retain exclusion. Publication
+  uses the shared gate protocol's 32-hex attempt identifier. The dedicated
+  coordination authority can inspect it and release its exact generation using
+  the existing parent-gate route only after positively settling every possible
+  storage effect. An admin token is not that authority, and a timeout or elapsed
+  lease is not settlement. Never delete the gate to recover availability.
 - Seed only currently approved, public (`Active`) paths. Test owned fixtures
   that are Pending, age-gated, restricted, quarantined, and erased. Confirm
   they cannot enroll or serve from Bunny. Confirm age gating and authorized
@@ -107,7 +114,7 @@ Retries consult the current policy so an old moderation intent cannot remove
 a copy that has already been restored under a successful appeal.
 Reserve creator deletion and account vanish for their existing erasure flows.
 
-An interrupted publisher can leave a `bunny-pilot-` copy attempt on the
+An interrupted publisher can leave a 32-hex copy attempt on an enrolled
 parent hash. Pause enrollment and disable the pull zone if a revocation is
 waiting on that attempt. Establish the storage outcome and confirm that the
 original PUT has finished before settling the exact recorded gate generation.
