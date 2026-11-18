@@ -17,6 +17,15 @@ class Origin(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
+    def do_POST(self):
+        assert self.path == "/transcode/queue"
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        assert json.loads(body) == {"hash": "f" * 64, "owner": "b" * 64}
+        self.server.admissions += 1
+        self.send_response(503 if self.server.admissions == 1 else 202)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
         assert self.headers.get("Authorization", "").startswith("AWS4-HMAC-SHA256 ")
         self.server.reads.append((self.path, self.headers.get("Range")))
@@ -51,6 +60,7 @@ def main():
     repo = Path(__file__).resolve().parent.parent
     with ThreadingHTTPServer(("127.0.0.1", 0), Origin) as origin:
         origin.reads = []
+        origin.admissions = 0
         thread = threading.Thread(target=origin.serve_forever, daemon=True)
         thread.start()
         try:
@@ -63,6 +73,8 @@ def main():
 name = "hls-alias-test"
 language = "rust"
 [local_server.backends.gcs_storage]
+url = "http://127.0.0.1:{origin.server_port}"
+[local_server.backends.cloud_run_transcoder]
 url = "http://127.0.0.1:{origin.server_port}"
 [local_server.kv_stores.blossom_metadata]
 file = "{kv}"
@@ -80,7 +92,7 @@ blossom_secrets = [{{key="admin_token",data="synthetic-admin-token"}},{{key="gcs
                     "cargo", "test", "--locked", "--target", "wasm32-wasip1", "--bin", "fastly-blossom",
                     "hls_alias_", "--", "--ignored", "--nocapture"],
                     cwd=repo, env=env, capture_output=True, text=True, timeout=900)
-                if result.returncode or "test result: ok. 3 passed; 0 failed; 0 ignored;" not in result.stdout:
+                if result.returncode or "test result: ok. 4 passed; 0 failed; 0 ignored;" not in result.stdout:
                     raise RuntimeError(result.stdout + result.stderr)
                 prefix = f"/hls-test/{'a' * 64}/hls/"
                 provenance = [(PROVENANCE_PREFIX + "master.m3u8", None),
@@ -91,6 +103,7 @@ blossom_secrets = [{{key="admin_token",data="synthetic-admin-token"}},{{key="gcs
                     (prefix + "segment_0.ts", None),
                     (prefix + "stream_480p.mp4", "bytes=0-3"),
                     (f"/hls-test/{'c' * 64}/hls/master.m3u8", None),
+                    (f"/hls-test/{'f' * 64}/hls/master.m3u8", None),
                     *provenance,
                 }
                 # Alias, canonical, admin and signed requests may share the cached origin master.
@@ -99,6 +112,7 @@ blossom_secrets = [{{key="admin_token",data="synthetic-admin-token"}},{{key="gcs
                 # and that the refill replaced the seeded unreadable variant entry.
                 for read in provenance:
                     assert origin.reads.count(read) == 1, origin.reads
+                assert origin.admissions == 2, origin.admissions
                 print("PASS HLS alias resolves canonical playlists/segments and ranged MP4 while preserving access and cache policy")
         finally:
             origin.shutdown()

@@ -14,7 +14,8 @@ DEPLOY_SCRIPT = TRANSCODER_DIR / "deploy.sh"
 
 class TranscoderDeployGuardTest(unittest.TestCase):
     def run_deploy(
-        self, *, project_id: str, service_name: str, gcs_bucket: str
+        self, *, project_id: str, service_name: str, gcs_bucket: str,
+        dispatch_secret_name: str = "synthetic-transcode-dispatch",
     ) -> tuple[subprocess.CompletedProcess[str], str]:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -37,6 +38,11 @@ class TranscoderDeployGuardTest(unittest.TestCase):
                     "SERVICE_ACCOUNT": "runtime@example.invalid",
                     "IMAGE_TAG": "test",
                     "GCS_BUCKET": gcs_bucket,
+                    "TRANSCODE_QUEUE": "projects/synthetic/locations/us-central1/queues/transcode",
+                    "TRANSCODE_WORKER_URL": "https://transcoder.example.invalid",
+                    "TRANSCODE_DISPATCH_SECRET_NAME": dispatch_secret_name,
+                    "TRANSCODE_DISPATCH_SECRET_VERSION": "1",
+                    "TRANSCODE_WRITES_PAUSED": "true",
                 }
             )
 
@@ -77,6 +83,20 @@ class TranscoderDeployGuardTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("builds submit", calls)
         self.assertIn("run deploy divine-transcoder-staging", calls)
+        self.assertIn("--no-traffic", calls)
+        self.assertIn("TRANSCODE_WRITES_PAUSED=true", calls)
+        self.assertIn("TRANSCODE_DISPATCH_SECRET=synthetic-transcode-dispatch:1", calls)
+
+    def test_dispatch_credential_is_independent_of_webhook_rotation(self) -> None:
+        result, calls = self.run_deploy(
+            project_id="example-staging-project",
+            service_name="divine-transcoder-staging",
+            gcs_bucket="synthetic-staging",
+            dispatch_secret_name="webhook_secret",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("builds submit", calls)
 
 
 if __name__ == "__main__":

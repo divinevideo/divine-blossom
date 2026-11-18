@@ -1373,10 +1373,9 @@ pub fn handle_admin_backfill(req: Request) -> Result<Response> {
 /// `POST /admin/api/reset-stuck-transcodes`
 ///
 /// Sweeps `BlobMetadata` records with `transcode_status = Processing` that have
-/// been in that state for longer than `older_than_secs`, and either marks them
-/// `Complete` (if HLS already exists in GCS — lost webhook) or resets them to
-/// `Pending` (so the next client request to `/{hash}/720p.mp4` re-triggers
-/// transcoding).
+/// been in that state for longer than `older_than_secs`. A readable HLS master
+/// triggers verified worker reconciliation, otherwise the next client request
+/// can retrigger a record reset to `Pending`.
 ///
 /// Enumerates blobs via `get_user_index() -> for each pubkey: get_user_blobs`.
 /// There is no KV-native list, so user-index iteration is the only full-coverage
@@ -1401,7 +1400,9 @@ pub fn handle_admin_backfill(req: Request) -> Result<Response> {
 ///   "users_scanned": N,
 ///   "blobs_scanned": N,
 ///   "candidates": N,
-///   "marked_complete": N,
+///   "marked_complete": 0,
+///   "verification_requested": N,
+///   "verification_failed": N,
 ///   "reset_pending": N,
 ///   "skipped_not_stuck": N,
 ///   "skipped_too_recent": N,
@@ -1459,7 +1460,8 @@ pub fn handle_admin_reset_stuck_transcodes(mut req: Request) -> Result<Response>
 
     let mut blobs_scanned: u64 = 0;
     let mut candidates: u64 = 0;
-    let mut marked_complete: u64 = 0;
+    let mut verification_requested: u64 = 0;
+    let mut verification_failed: u64 = 0;
     let mut reset_pending: u64 = 0;
     let mut skipped_not_stuck: u64 = 0;
     let mut skipped_too_recent: u64 = 0;
@@ -1521,17 +1523,16 @@ pub fn handle_admin_reset_stuck_transcodes(mut req: Request) -> Result<Response>
             );
 
             match action {
-                StuckAction::MarkComplete => {
-                    marked_complete += 1;
-                    if !dry_run {
-                        if let Err(e) = crate::metadata::update_transcode_status(
-                            &hash,
-                            crate::blossom::TranscodeStatus::Complete,
-                        ) {
-                            eprintln!(
-                                "[UNSTICK] update_transcode_status(Complete) failed for {}: {}",
-                                hash, e
-                            );
+                StuckAction::VerifyOutputs => {
+                    if dry_run {
+                        verification_requested += 1;
+                    } else {
+                        match crate::queue_transcode(&hash, &meta.owner) {
+                            Ok(true) => verification_requested += 1,
+                            result => {
+                                verification_failed += 1;
+                                eprintln!("[UNSTICK] HLS verification was not admitted for {hash}: {result:?}");
+                            }
                         }
                     }
                 }
@@ -1565,7 +1566,9 @@ pub fn handle_admin_reset_stuck_transcodes(mut req: Request) -> Result<Response>
         "users_scanned": pubkeys_to_process.len(),
         "blobs_scanned": blobs_scanned,
         "candidates": candidates,
-        "marked_complete": marked_complete,
+        "marked_complete": 0,
+        "verification_requested": verification_requested,
+        "verification_failed": verification_failed,
         "reset_pending": reset_pending,
         "skipped_not_stuck": skipped_not_stuck,
         "skipped_too_recent": skipped_too_recent,

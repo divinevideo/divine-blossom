@@ -41,6 +41,9 @@ use tower::Service;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
+mod hls_claim;
+mod hls_dispatch;
+use hls_claim::{Claim, ClaimStore, Dirty};
 mod media_command;
 mod mp4;
 mod object_storage;
@@ -133,6 +136,12 @@ struct Config {
     status_queue_location: String,
     /// Cloud Tasks queue id for durable derivative status callbacks.
     status_queue_name: String,
+    /// Cloud Tasks queue and stable worker origin for durable HLS admission.
+    transcode_queue: Option<String>,
+    transcode_worker_url: Option<String>,
+    transcode_dispatch_secret: Option<String>,
+    /// Admit ordinary jobs during cutover while all rendition writes are paused.
+    transcode_writes_paused: bool,
 }
 
 impl Config {
@@ -283,6 +292,11 @@ impl Config {
             transcode_repair_secret: lookup("TRANSCODE_REPAIR_SECRET")
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty()),
+            transcode_queue: lookup("TRANSCODE_QUEUE").filter(|v| !v.trim().is_empty()),
+            transcode_worker_url: lookup("TRANSCODE_WORKER_URL").filter(|v| !v.trim().is_empty()),
+            transcode_dispatch_secret: lookup("TRANSCODE_DISPATCH_SECRET")
+                .filter(|v| !v.is_empty()),
+            transcode_writes_paused: parse_bool(&mut lookup, "TRANSCODE_WRITES_PAUSED", false),
             status_queue_enabled: parse_bool(&mut lookup, "STATUS_QUEUE_ENABLED", false),
             status_queue_location: lookup("STATUS_QUEUE_LOCATION")
                 .or_else(|| lookup("GCP_REGION"))
@@ -776,7 +790,9 @@ async fn main() -> Result<()> {
     // Build router
     let app = Router::new()
         .route("/transcode", post(handle_transcode))
+        .route(hls_dispatch::route(), post(hls_dispatch::worker))
         .route("/transcode", options(handle_cors_preflight))
+        .route("/transcode/queue", post(handle_queue_transcode))
         .route("/transcribe", post(handle_transcribe))
         .route("/transcribe", options(handle_cors_preflight))
         .route(
@@ -854,30 +870,96 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 async fn handle_transcode(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
-    Json(request): Json<TranscodeRequest>,
+    Json(mut request): Json<TranscodeRequest>,
 ) -> Response {
     if let Err(rejection) = authorize_transcode_repair(&state.config, &headers, request.force) {
         return rejection;
     }
-    let result = if request.force {
-        await_repair(process_transcode(state, request)).await
-    } else {
-        process_transcode(state, request).await
-    };
-    match result {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
-        Err(e) => {
-            error!("Transcode error: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: e.to_string(),
-                }),
-            )
-                .into_response()
+    request.hash.make_ascii_lowercase();
+    if !valid_transcode_hash(&request.hash) {
+        return (StatusCode::BAD_REQUEST, "Invalid hash format").into_response();
+    }
+    if request.force {
+        if state.config.transcode_writes_paused {
+            return paused_transcode_response();
+        }
+        return transcode_response(await_repair(process_transcode(state, request)).await, false);
+    }
+    admit_transcode(state, request).await
+}
+
+async fn handle_queue_transcode(
+    State(state): State<Arc<AppState>>,
+    Json(mut request): Json<TranscodeRequest>,
+) -> Response {
+    request.hash.make_ascii_lowercase();
+    if request.force || !valid_transcode_hash(&request.hash) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Invalid ordinary transcode request",
+        )
+            .into_response();
+    }
+    admit_transcode(state, request).await
+}
+
+async fn admit_transcode(state: Arc<AppState>, request: TranscodeRequest) -> Response {
+    let hash = request.hash.clone();
+    match await_repair(async move { hls_dispatch::enqueue(&state.config, &request).await }).await {
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"status": "queued", "hash": hash})),
+        )
+            .into_response(),
+        Err(error) => {
+            hls_claim::count("admission_failed");
+            error!("Transcode admission failed: {error:#}");
+            (StatusCode::SERVICE_UNAVAILABLE, "Could not queue transcode").into_response()
         }
     }
 }
+
+fn paused_transcode_response() -> Response {
+    (StatusCode::SERVICE_UNAVAILABLE, "Transcode writes paused").into_response()
+}
+
+fn valid_transcode_hash(hash: &str) -> bool {
+    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn transcode_response(result: Result<TranscodeResponse>, retry_busy: bool) -> Response {
+    match result {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => transcode_error_response(error, retry_busy),
+    }
+}
+
+fn transcode_error_response(error: anyhow::Error, retry_busy: bool) -> Response {
+    let status = if error.is::<hls_claim::Busy>() || error.is::<hls_claim::OwnershipLost>() {
+        hls_claim::count("duplicate_deferred");
+        // Non-2xx leaves the task in Cloud Tasks. 503/429 would also throttle
+        // unrelated hashes at the queue level.
+        if retry_busy {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    } else {
+        error!("Transcode error: {error:#}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    (
+        status,
+        Json(ErrorResponse {
+            error: format!("{error:#}"),
+        }),
+    )
+        .into_response()
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct TerminalTranscode(anyhow::Error);
 
 fn authorize_transcode_repair(
     config: &Config,
@@ -1140,6 +1222,9 @@ async fn handle_backfill_fmp4(
     if let Err(rejection) = authorize_transcode_repair(&state.config, &headers, request.force) {
         return rejection;
     }
+    if state.config.transcode_writes_paused {
+        return paused_transcode_response();
+    }
     let hash = request.hash.to_lowercase();
     if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return (
@@ -1148,20 +1233,37 @@ async fn handle_backfill_fmp4(
         )
             .into_response();
     }
-    match backfill_fmp4(
-        &state.media_storage,
-        &hash,
-        request.force,
-        |ts, mp4, variant| async move { remux_variant(&ts, &mp4, variant).await },
-    )
-    .await
-    {
-        Ok(status) => Json(serde_json::json!({"status": status, "hash": hash})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
+    let force = request.force;
+    let result = await_repair(async move {
+        let mut claim = claim_hls(&state, &hash).await?;
+        if claim.dirty() >= Dirty::Hls {
+            claim.finish(false).await?;
+            return Err(hls_claim::Busy.into());
+        }
+        claim.set_intent(Dirty::Mp4);
+        let result = backfill_fmp4(
+            &state.media_storage,
+            &hash,
+            request.force,
+            Some(&mut claim),
+            |ts, mp4, variant| async move { remux_variant(&ts, &mp4, variant).await },
         )
-            .into_response(),
+        .await;
+        let release = claim.finish(result.is_ok()).await;
+        if release.is_err() {
+            hls_claim::count("release_failed");
+        }
+        let (status, warning) = repair_outcome(result, release)?;
+        let mut response = serde_json::json!({"status": status, "hash": hash});
+        if let Some(warning) = warning {
+            response["repair_lock_warning"] = warning.into();
+        }
+        Ok(response)
+    })
+    .await;
+    match result {
+        Ok(body) => Json(body).into_response(),
+        Err(e) => transcode_error_response(e, !force),
     }
 }
 
@@ -1169,6 +1271,7 @@ async fn backfill_fmp4<F, Fut>(
     storage: &object_storage::MediaStorage,
     hash: &str,
     force: bool,
+    mut claim: Option<&mut Claim>,
     remux: F,
 ) -> Result<&'static str>
 where
@@ -1177,14 +1280,25 @@ where
 {
     let mut selected = Vec::new();
     for variant in ["stream_720p", "stream_480p"] {
-        if force
-            || storage
-                .stat(&format!("{hash}/hls/{variant}.mp4"))
-                .await?
-                .is_none()
-        {
-            selected.push(variant);
+        if !force {
+            let key = format!("{hash}/hls/{variant}.mp4");
+            let stat = storage.stat(&key);
+            let existing = match claim.as_deref_mut() {
+                Some(claim) => claim.hold(stat).await?,
+                None => stat.await?,
+            };
+            if let Some(existing) = existing {
+                let check = storage.can_reuse_output(&existing);
+                let verified = match claim.as_deref_mut() {
+                    Some(claim) => claim.hold(check).await?,
+                    None => check.await?,
+                };
+                if verified {
+                    continue;
+                }
+            }
         }
+        selected.push(variant);
     }
     if selected.is_empty() {
         return Ok("already_exists");
@@ -1196,7 +1310,12 @@ where
         let filename = format!("{variant}.ts");
         let path = temp_path.join(&filename);
         let key = format!("{hash}/hls/{filename}");
-        if storage.download_processing_segment(&key, &path).await? {
+        let download = storage.download_processing_segment(&key, &path);
+        let available = match claim.as_deref_mut() {
+            Some(claim) => claim.hold(download).await?,
+            None => download.await?,
+        };
+        if available {
             segments.push((variant, path));
         }
     }
@@ -1213,7 +1332,18 @@ where
         let output_dir = temp_path.join(variant);
         tokio::fs::create_dir(&output_dir).await?;
         let output = output_dir.join(format!("{variant}.mp4"));
-        if let Err(e) = remux(segment, output.clone(), variant).await {
+        if let Some(claim) = claim.as_deref_mut() {
+            claim.confirm().await?;
+        }
+        let remux = remux(segment, output.clone(), variant);
+        let result = match claim.as_deref_mut() {
+            Some(claim) => claim.hold(remux).await,
+            None => remux.await,
+        };
+        if let Err(e) = result {
+            if e.is::<hls_claim::OwnershipLost>() {
+                return Err(e);
+            }
             warn!("Backfill remux failed for {}: {}", variant, e);
             continue;
         }
@@ -1223,8 +1353,14 @@ where
         {
             continue;
         }
-        let published =
-            upload_hls(storage, hash, &output_dir, &SourceObjectMetadata::default()).await?;
+        let published = upload_hls(
+            storage,
+            hash,
+            &output_dir,
+            &SourceObjectMetadata::default(),
+            claim.as_deref_mut(),
+        )
+        .await?;
         let expected = format!("{hash}/hls/{variant}.mp4");
         if published
             .iter()
@@ -1430,87 +1566,97 @@ async fn process_transcode(
     state: Arc<AppState>,
     request: TranscodeRequest,
 ) -> Result<TranscodeResponse> {
-    let hash = request.hash.to_lowercase();
-    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+    let hash = request.hash.to_ascii_lowercase();
+    if !valid_transcode_hash(&hash) {
         return Err(anyhow!("Invalid hash format: must be 64 hex characters"));
     }
-    // Keep the ordinary upload pipeline independent of operator repair locks.
-    if !request.force {
-        return process_transcode_inner(state, request).await;
+    let mut claim = claim_hls(&state, &hash).await?;
+    let force = request.force;
+    let result = process_transcode_inner(&state, request, &hash, &mut claim).await;
+    let release = claim.finish(result.is_ok()).await;
+    if release.is_err() {
+        hls_claim::count("release_failed");
     }
-    // Repairs operate only on existing HLS, never race initial generation.
-    // Operators must verify the original job completed before submitting a repair.
-    if state
-        .media_storage
-        .stat(&format!("{}/hls/master.m3u8", hash))
-        .await?
-        .is_none()
-    {
-        return Err(anyhow!("Repair requires an existing HLS master"));
+    let (mut response, warning) = repair_outcome(result, release)?;
+    if force {
+        response.repair_lock_warning = warning;
     }
-    // Serialize operator repairs across instances. Do not expire a lock
-    // automatically: its writer might still be uploading derivatives.
-    let path = format!("{}/transcode.lock", hash);
-    let mut media = Media::new(path.clone());
-    media.content_type = "text/plain".into();
-    let object = state
-        .gcs_client
-        .upload_object(
-            &UploadObjectRequest {
-                bucket: state.config.gcs_bucket.clone(),
-                if_generation_match: Some(0),
-                ..Default::default()
-            },
-            Bytes::from(current_epoch_secs().to_string()),
-            &UploadType::Simple(media),
-        )
-        .await
-        .map_err(|e| anyhow!("Could not acquire transcode lock: {}", e))?;
-    let result = process_transcode_inner(state.clone(), request).await;
-    let release = state
-        .gcs_client
-        .delete_object(&DeleteObjectRequest {
-            bucket: state.config.gcs_bucket.clone(),
-            object: path,
-            if_generation_match: Some(object.generation),
-            ..Default::default()
-        })
-        .await;
-    let (mut response, warning) = repair_outcome(result, release.map_err(anyhow::Error::from))?;
-    response.repair_lock_warning = warning;
     Ok(response)
 }
 
-async fn process_transcode_inner(
-    state: Arc<AppState>,
-    request: TranscodeRequest,
-) -> Result<TranscodeResponse> {
-    let hash = request.hash.to_lowercase();
+async fn claim_hls(state: &AppState, hash: &str) -> Result<Claim> {
+    let result = ClaimStore::new(state.gcs_client.clone(), &state.config.gcs_bucket)
+        .claim(hash, Some(&state.media_storage))
+        .await;
+    if result
+        .as_ref()
+        .is_err_and(|error| !error.is::<hls_claim::Busy>())
+    {
+        hls_claim::count("claim_failed");
+    }
+    result
+}
 
-    // The outer function validates before either ordinary work or repair locking.
+async fn process_transcode_inner(
+    state: &AppState,
+    request: TranscodeRequest,
+    hash: &str,
+    claim: &mut Claim,
+) -> Result<TranscodeResponse> {
     let attempt_generation = next_status_generation();
+    let repair = request.force || claim.dirty() == Dirty::Repair;
+    claim.set_intent(if repair { Dirty::Repair } else { Dirty::Hls });
+    if repair
+        && claim
+            .hold(state.media_storage.stat(&format!("{hash}/hls/master.m3u8")))
+            .await?
+            .is_none()
+    {
+        return Err(anyhow!("Repair requires an existing HLS master"));
+    }
     info!("Starting transcode for {}", hash);
 
     // Reuse only when the selected mode's required output copies are present.
     let master_path = format!("{}/hls/master.m3u8", hash);
-    if !request.force && state.media_storage.can_reuse_hls(&hash).await? {
+    if !request.force
+        && claim.dirty() <= Dirty::Mp4
+        && claim.hold(state.media_storage.can_reuse_hls(hash)).await?
+    {
+        let dimensions = claim
+            .hold(state.media_storage.stat(&master_path))
+            .await?
+            .and_then(|master| {
+                let width = master.custom.get("hls_display_width")?.parse().ok()?;
+                let height = master.custom.get("hls_display_height")?.parse().ok()?;
+                Some(VideoInfo {
+                    display_width: width,
+                    display_height: height,
+                    width,
+                    height,
+                    rotation: 0,
+                    has_audio: false,
+                    preserve_source_timing: false,
+                })
+            });
+        claim.confirm().await?;
+        hls_claim::count("duplicate_reused");
         info!("HLS already exists for {}, skipping transcode", hash);
-        // Still update status to complete in case it was pending (no size change for already-transcoded)
+        // Re-deliver completion if a previous callback failed.
         send_status_webhook(
             &state.config,
-            &hash,
+            hash,
             "complete",
             None,
-            None,
+            dimensions.as_ref(),
             None,
             None,
             None,
             status_event_generation(attempt_generation, STATUS_EVENT_TERMINAL),
             false,
         )
-        .await;
+        .await?;
         return Ok(TranscodeResponse {
-            hash: hash.clone(),
+            hash: hash.to_owned(),
             status: "already_exists".to_string(),
             hls_master: master_path,
             variants: vec![
@@ -1525,16 +1671,17 @@ async fn process_transcode_inner(
                     bandwidth: 1_000_000,
                 },
             ],
-            display_width: None,
-            display_height: None,
+            display_width: dimensions.as_ref().map(|info| info.display_width),
+            display_height: dimensions.as_ref().map(|info| info.display_height),
             repair_lock_warning: None,
         });
     }
 
-    // Update status to processing
-    send_status_webhook(
+    // Update status to processing.
+    claim.confirm().await?;
+    let _ = send_status_webhook(
         &state.config,
-        &hash,
+        hash,
         "processing",
         None,
         None,
@@ -1552,14 +1699,21 @@ async fn process_transcode_inner(
 
     // Download and verify the pinned original video
     let input_path = temp_path.join("input.mp4");
-    let download_result = download_media_original(&state.media_storage, &hash, &input_path).await;
+    let download_result = claim
+        .hold(download_media_original(
+            &state.media_storage,
+            hash,
+            &input_path,
+        ))
+        .await;
 
     let verified_source = match download_result {
         Ok(source) => source,
         Err(e) => {
-            send_status_webhook(
+            claim.confirm().await?;
+            let _ = send_status_webhook(
                 &state.config,
-                &hash,
+                hash,
                 "failed",
                 None,
                 None,
@@ -1591,13 +1745,15 @@ async fn process_transcode_inner(
     }
 
     // Probe video to get dimensions and rotation metadata
-    let video_info = match probe_video(&input_path).await {
+    let video_info = match claim.hold(probe_video(&input_path)).await {
         Ok(info) => info,
-        Err(e) if request.force => {
+        Err(e) if e.is::<hls_claim::OwnershipLost>() => return Err(e),
+        Err(e) if repair => {
             // A repair must not bake guessed landscape dimensions into the replacement.
-            send_status_webhook(
+            claim.confirm().await?;
+            let _ = send_status_webhook(
                 &state.config,
-                &hash,
+                hash,
                 "failed",
                 None,
                 None,
@@ -1628,6 +1784,15 @@ async fn process_transcode_inner(
         }
     };
 
+    source_metadata.custom.insert(
+        "hls_display_width".into(),
+        video_info.display_width.to_string(),
+    );
+    source_metadata.custom.insert(
+        "hls_display_height".into(),
+        video_info.display_height.to_string(),
+    );
+
     // NOTE: We do NOT modify the original file - SHA256 hash must remain valid for
     // content-addressable storage and ProofMode verification. HLS provides streaming.
 
@@ -1636,12 +1801,21 @@ async fn process_transcode_inner(
     tokio::fs::create_dir_all(&output_dir).await?;
 
     // Run FFmpeg to generate HLS with orientation-aware scaling
-    let ffmpeg_result =
-        run_ffmpeg_hls(&input_path, &output_dir, state.config.use_gpu, &video_info).await;
+    claim.confirm().await?;
+    hls_claim::count("encode_started");
+    let ffmpeg_result = claim
+        .hold(run_ffmpeg_hls(
+            &input_path,
+            &output_dir,
+            state.config.use_gpu,
+            &video_info,
+        ))
+        .await;
 
     let variants = match ffmpeg_result {
         Ok(v) => v,
         Err(e) => {
+            claim.confirm().await?;
             let error_message = e.to_string();
             let (error_code, terminal) =
                 classify_invalid_media_error(&error_message, "transcode_failed");
@@ -1649,7 +1823,7 @@ async fn process_transcode_inner(
                 report_derivative_failure_to_sentry(
                     "divine-transcoder",
                     "hls",
-                    &hash,
+                    hash,
                     error_code,
                     &error_message,
                     true,
@@ -1658,9 +1832,9 @@ async fn process_transcode_inner(
                     Some(1),
                 );
             }
-            send_status_webhook(
+            let callback = send_status_webhook(
                 &state.config,
-                &hash,
+                hash,
                 "failed",
                 None,
                 Some(&video_info),
@@ -1671,25 +1845,30 @@ async fn process_transcode_inner(
                 terminal,
             )
             .await;
+            if terminal && !repair {
+                callback?;
+                return Err(TerminalTranscode(e).into());
+            }
             return Err(e);
         }
     };
 
     info!("Generated HLS with {} variants", variants.len());
 
-    let remux_result = remux_ts_to_fmp4(&output_dir).await;
+    let remux_result = claim.hold(remux_ts_to_fmp4(&output_dir)).await;
     // The best-effort remuxer can skip failed variants and still return Ok.
-    let remux_result = if request.force && remux_result.is_ok() {
+    let remux_result = if repair && remux_result.is_ok() {
         require_progressive_outputs(&output_dir).await
     } else {
         remux_result
     };
     if let Err(e) = remux_result {
-        if request.force {
+        claim.confirm().await?;
+        if repair {
             // Repairs must replace the progressive MP4 aliases as well as HLS.
-            send_status_webhook(
+            let _ = send_status_webhook(
                 &state.config,
-                &hash,
+                hash,
                 "failed",
                 None,
                 Some(&video_info),
@@ -1705,14 +1884,61 @@ async fn process_transcode_inner(
         warn!("fMP4 remux step failed: {} (continuing with .ts only)", e);
     }
 
-    // Upload all HLS files to GCS
-    let upload_result =
-        upload_hls(&state.media_storage, &hash, &output_dir, &source_metadata).await;
+    // Confirm both variants are present before exposing anything. The master
+    // is uploaded last, after the media and variant playlists are verified.
+    for filename in object_storage::REQUIRED_HLS_FILES {
+        if !tokio::fs::metadata(output_dir.join(filename))
+            .await
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+        {
+            return Err(anyhow!("Missing required HLS output: {filename}"));
+        }
+    }
+    for filename in object_storage::OPTIONAL_HLS_FILES {
+        if !tokio::fs::metadata(output_dir.join(filename))
+            .await
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+        {
+            let key = format!("{hash}/hls/{filename}");
+            if let Some(existing) = claim.hold(state.media_storage.stat(&key)).await? {
+                if existing.size > 0
+                    && !claim
+                        .hold(state.media_storage.can_reuse_output(&existing))
+                        .await?
+                {
+                    let bytes = claim.hold(state.media_storage.read(&existing)).await?;
+                    state
+                        .media_storage
+                        .put_hls_verified(
+                            &key,
+                            Bytes::from(bytes),
+                            &existing.content_type,
+                            existing.custom,
+                            existing.cache_control,
+                            claim,
+                        )
+                        .await?;
+                }
+            }
+        }
+    }
+    let upload_result = upload_hls(
+        &state.media_storage,
+        hash,
+        &output_dir,
+        &source_metadata,
+        Some(claim),
+    )
+    .await;
 
     if let Err(e) = upload_result {
-        send_status_webhook(
+        // When a PUT is still unconfirmed, no terminal status can be issued.
+        if claim.confirm().await.is_err() {
+            return Err(e);
+        }
+        let _ = send_status_webhook(
             &state.config,
-            &hash,
+            hash,
             "failed",
             None,
             Some(&video_info),
@@ -1726,12 +1952,14 @@ async fn process_transcode_inner(
         return Err(e);
     }
 
+    claim.mark_verified().await?;
+    hls_claim::count("encode_completed");
     info!("Uploaded HLS files for {}", hash);
 
     // Update status to complete with video dimensions for the edge service
     send_status_webhook(
         &state.config,
-        &hash,
+        hash,
         "complete",
         None,
         Some(&video_info),
@@ -1741,10 +1969,10 @@ async fn process_transcode_inner(
         status_event_generation(attempt_generation, STATUS_EVENT_TERMINAL),
         false,
     )
-    .await;
+    .await?;
 
     Ok(TranscodeResponse {
-        hash: hash.clone(),
+        hash: hash.to_owned(),
         status: "complete".to_string(),
         hls_master: format!("{}/hls/master.m3u8", hash),
         variants,
@@ -6779,6 +7007,7 @@ async fn probe_video(input_path: &Path) -> Result<VideoInfo> {
             "v:0",
             &input_str,
         ])
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| anyhow!("Failed to run ffprobe: {}", e))?;
@@ -7161,7 +7390,7 @@ async fn run_ffmpeg_hls(
 
     info!("Running FFmpeg: {:?}", cmd);
 
-    let output = cmd.output().await?;
+    let output = cmd.kill_on_drop(true).output().await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -7294,7 +7523,7 @@ async fn remux_with_audio(
     cmd.args(audio.ffmpeg_args());
     cmd.args(["-movflags", "+faststart", &mp4_path.to_string_lossy()]);
 
-    let output = cmd.output().await?;
+    let output = cmd.kill_on_drop(true).output().await?;
     if !output.status.success() {
         return Err(anyhow!(
             "ffmpeg exited {}: {}",
@@ -7362,14 +7591,27 @@ async fn upload_hls(
     hash: &str,
     hls_dir: &Path,
     source_metadata: &SourceObjectMetadata,
+    mut claim: Option<&mut Claim>,
 ) -> Result<Vec<object_storage::VerifiedObject>> {
     let mut entries = tokio::fs::read_dir(hls_dir).await?;
-    let mut verified = Vec::new();
+    let mut files = Vec::new();
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
         if !path.is_file() {
             continue;
         }
+        files.push(path);
+    }
+    // Publish referenced objects before each playlist and the master last.
+    files.sort_by_key(
+        |path| match path.file_name().and_then(|name| name.to_str()) {
+            Some("master.m3u8") => 2,
+            Some(name) if name.ends_with(".m3u8") => 1,
+            _ => 0,
+        },
+    );
+    let mut verified = Vec::new();
+    for path in files {
         let filename = path.file_name().unwrap().to_string_lossy();
         let key = format!("{}/hls/{}", hash, filename);
         let content_type = if filename.ends_with(".m3u8") {
@@ -7390,17 +7632,21 @@ async fn upload_hls(
                 .entry("source_content_type".to_string())
                 .or_insert_with(|| src_ct.clone());
         }
-        verified.push(
+        let bytes = Bytes::from(tokio::fs::read(&path).await?);
+        if bytes.is_empty() && filename.ends_with(".mp4") {
+            continue;
+        }
+        let cache = Some("public, max-age=31536000, immutable".to_string());
+        let receipt = if let Some(claim) = claim.as_deref_mut() {
             storage
-                .put_verified(
-                    &key,
-                    Bytes::from(tokio::fs::read(&path).await?),
-                    content_type,
-                    metadata,
-                    Some("public, max-age=31536000, immutable".to_string()),
-                )
-                .await?,
-        );
+                .put_hls_verified(&key, bytes, content_type, metadata, cache, claim)
+                .await?
+        } else {
+            storage
+                .put_verified(&key, bytes, content_type, metadata, cache)
+                .await?
+        };
+        verified.push(receipt);
         info!("Uploaded {}", key);
     }
     Ok(verified)
@@ -7416,7 +7662,6 @@ async fn download_media_original(
 }
 
 /// Send transcode status update to the Fastly edge webhook
-/// This is fire-and-forget - failures are logged but don't fail the transcode
 async fn send_status_webhook(
     config: &Config,
     hash: &str,
@@ -7428,7 +7673,7 @@ async fn send_status_webhook(
     retry_after_secs: Option<u64>,
     generation: u64,
     terminal: bool,
-) {
+) -> Result<()> {
     let webhook_url = match &config.webhook_url {
         Some(url) => url,
         None => {
@@ -7436,7 +7681,7 @@ async fn send_status_webhook(
                 "WEBHOOK_URL not configured, skipping status update for {}",
                 hash
             );
-            return;
+            return Ok(());
         }
     };
 
@@ -7471,7 +7716,7 @@ async fn send_status_webhook(
         payload,
         generation,
     )
-    .await;
+    .await
 }
 
 fn resolve_transcript_webhook_url(config: &Config) -> Option<String> {
@@ -7618,30 +7863,31 @@ async fn deliver_status_payload(
     target_url: &str,
     mut payload: serde_json::Value,
     generation: u64,
-) {
+) -> Result<()> {
     attach_generation(&mut payload, generation);
     let client = status_http_client();
 
     if config.status_queue_enabled {
-        match enqueue_status_task_with_retry(
+        return match enqueue_status_task_with_retry(
             client, config, target_url, label, hash, generation, &payload,
         )
         .await
         {
-            Ok(()) => info!("{} status enqueued for {}: {}", label, hash, status),
+            Ok(()) => {
+                info!("{} status enqueued for {}: {}", label, hash, status);
+                Ok(())
+            }
             Err(e) => {
                 error!(
                     "Failed to enqueue {} status task for {}: {}. status_callback_enqueue_failed=true",
                     label, hash, e
                 );
-                post_status_payload(client, config, target_url, label, hash, status, &payload)
-                    .await;
+                post_status_payload(client, config, target_url, label, hash, status, &payload).await
             }
-        }
-        return;
+        };
     }
 
-    post_status_payload(client, config, target_url, label, hash, status, &payload).await;
+    post_status_payload(client, config, target_url, label, hash, status, &payload).await
 }
 
 async fn post_status_payload(
@@ -7652,7 +7898,7 @@ async fn post_status_payload(
     hash: &str,
     status: &str,
     payload: &serde_json::Value,
-) {
+) -> Result<()> {
     let mut request = client.post(target_url).json(&payload);
     if let Some(secret) = &config.webhook_secret {
         request = request.header("Authorization", format!("Bearer {}", secret));
@@ -7661,6 +7907,7 @@ async fn post_status_payload(
     match request.send().await {
         Ok(response) if response.status().is_success() => {
             info!("{} status webhook sent for {}: {}", label, hash, status);
+            Ok(())
         }
         Ok(response) => {
             error!(
@@ -7670,12 +7917,14 @@ async fn post_status_payload(
                 response.status(),
                 response.text().await.unwrap_or_default()
             );
+            Err(anyhow!("Status webhook rejected the update"))
         }
         Err(e) => {
             error!(
                 "{} status webhook request failed for {}: {}",
                 label, hash, e
             );
+            Err(anyhow!("Status webhook request failed"))
         }
     }
 }
@@ -7884,7 +8133,7 @@ async fn send_transcript_status_webhook(
         payload["terminal"] = serde_json::json!(true);
     }
 
-    deliver_status_payload(
+    let _ = deliver_status_payload(
         config,
         hash,
         "transcript",

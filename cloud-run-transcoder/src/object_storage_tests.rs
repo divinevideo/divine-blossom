@@ -59,6 +59,12 @@ impl Origin {
             task,
         }
     }
+    pub(crate) fn with_gcs_backup(&self, client: GcsClient) -> MediaStorage {
+        let mut storage = self.store();
+        storage.required_backup = Some(Box::new(MediaStorage::gcs(client, "synthetic-gcs".into())));
+        storage
+    }
+
     pub(crate) fn store(&self) -> MediaStorage {
         MediaStorage::b2_for_test(&self.endpoint, "synthetic-bucket").unwrap()
     }
@@ -766,7 +772,7 @@ async fn backfill_cannot_report_success_without_a_segment_in_either_store() {
     let origin = Origin::start().await;
     let (gcs_state, client, task) = gcs_origin().await;
     let store = b2_primary_store(&origin, client);
-    let error = crate::backfill_fmp4(&store, &"b".repeat(64), false, copy_backfill_input)
+    let error = crate::backfill_fmp4(&store, &"b".repeat(64), false, None, copy_backfill_input)
         .await
         .unwrap_err();
     assert!(error.to_string().contains("no input segments"));
@@ -1100,8 +1106,28 @@ async fn hls_reuse_requires_backups_for_present_progressive_outputs() {
         .latest
         .remove(&format!("{hash}/hls/stream_480p.mp4"));
     assert!(!store.can_reuse_hls(&hash).await.unwrap());
-    // Legacy modes retain master-only reuse even with missing variants.
-    assert!(primary.store().can_reuse_hls(&hash).await.unwrap());
+    // Empty historical placeholders are absent for HLS and can be remuxed
+    // later by the progressive MP4 endpoint.
+    primary
+        .store()
+        .put_verified(
+            &format!("{hash}/hls/stream_480p.mp4"),
+            Bytes::new(),
+            "video/mp4",
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(store.can_reuse_hls(&hash).await.unwrap());
+
+    primary
+        .objects
+        .lock()
+        .await
+        .latest
+        .remove(&format!("{hash}/hls/stream_720p.ts"));
+    assert!(!primary.store().can_reuse_hls(&hash).await.unwrap());
 }
 
 #[tokio::test]
@@ -1229,6 +1255,7 @@ async fn production_helpers_preserve_hls_provenance_without_gcs() {
             content_type: Some("video/mp4".into()),
             custom: custom.clone(),
         },
+        None,
     )
     .await
     .unwrap();
@@ -1976,7 +2003,7 @@ async fn backfill_existing_outputs_return_without_download_remux_or_writes() {
     }
     origin.objects.lock().await.requests.clear();
     assert_eq!(
-        crate::backfill_fmp4(&store, &"a".repeat(64), false, |_, _, _| async {
+        crate::backfill_fmp4(&store, &"a".repeat(64), false, None, |_, _, _| async {
             panic!("existing outputs must not remux");
             #[allow(unreachable_code)]
             Ok(())
@@ -2003,7 +2030,7 @@ async fn backfill_missing_output_preserves_existing_sibling_and_repeated_call() 
     let existing = store.stat(&key).await.unwrap().unwrap();
     origin.objects.lock().await.requests.clear();
     assert_eq!(
-        crate::backfill_fmp4(&store, &"a".repeat(64), false, copy_backfill_input)
+        crate::backfill_fmp4(&store, &"a".repeat(64), false, None, copy_backfill_input)
             .await
             .unwrap(),
         "ok"
@@ -2025,7 +2052,7 @@ async fn backfill_missing_output_preserves_existing_sibling_and_repeated_call() 
         .iter()
         .any(|(_, key, _)| key.ends_with("stream_720p.ts")));
     assert_eq!(
-        crate::backfill_fmp4(&store, &"a".repeat(64), false, copy_backfill_input)
+        crate::backfill_fmp4(&store, &"a".repeat(64), false, None, copy_backfill_input)
             .await
             .unwrap(),
         "already_exists"
@@ -2050,7 +2077,7 @@ async fn backfill_force_replaces_both_primary_versions_and_required_backups() {
     primary.objects.lock().await.requests.clear();
     backup.objects.lock().await.requests.clear();
     assert_eq!(
-        crate::backfill_fmp4(&store, &"a".repeat(64), true, copy_backfill_input)
+        crate::backfill_fmp4(&store, &"a".repeat(64), true, None, copy_backfill_input)
             .await
             .unwrap(),
         "ok"
@@ -2087,6 +2114,7 @@ async fn backfill_partial_remux_failure_keeps_success_and_never_publishes_failed
         &store,
         &"a".repeat(64),
         false,
+        None,
         |ts, mp4, variant| async move {
             if variant == "stream_480p" {
                 tokio::fs::write(mp4, b"failed-partial-output").await?;
@@ -2112,14 +2140,18 @@ async fn backfill_zero_inputs_or_empty_output_cannot_report_success() {
     let origin = Origin::start().await;
     let store = origin.store();
     assert!(
-        crate::backfill_fmp4(&store, &"a".repeat(64), false, copy_backfill_input)
+        crate::backfill_fmp4(&store, &"a".repeat(64), false, None, copy_backfill_input)
             .await
             .is_err()
     );
     seed_backfill(&store, "stream_720p", "ts").await;
     origin.objects.lock().await.requests.clear();
-    assert!(
-        crate::backfill_fmp4(&store, &"a".repeat(64), false, |_, mp4, _| async move {
+    assert!(crate::backfill_fmp4(
+        &store,
+        &"a".repeat(64),
+        false,
+        None,
+        |_, mp4, _| async move {
             tokio::fs::write(mp4, b"").await?;
             Ok(())
         })
@@ -2142,7 +2174,7 @@ async fn backfill_storage_failures_do_not_become_absence_or_success() {
     let mut store = primary.store();
     primary.objects.lock().await.fail = Some(StatusCode::FORBIDDEN);
     assert!(
-        crate::backfill_fmp4(&store, &"a".repeat(64), false, copy_backfill_input)
+        crate::backfill_fmp4(&store, &"a".repeat(64), false, None, copy_backfill_input)
             .await
             .is_err()
     );
@@ -2158,7 +2190,7 @@ async fn backfill_storage_failures_do_not_become_absence_or_success() {
     store.required_backup = Some(Box::new(backup.store()));
     backup.objects.lock().await.fail = Some(StatusCode::FORBIDDEN);
     assert!(
-        crate::backfill_fmp4(&store, &"a".repeat(64), false, copy_backfill_input)
+        crate::backfill_fmp4(&store, &"a".repeat(64), false, None, copy_backfill_input)
             .await
             .is_err()
     );
@@ -2175,7 +2207,7 @@ async fn backfill_legacy_segment_is_read_without_republishing_input() {
     store.required_backup = Some(Box::new(legacy.store()));
     legacy.objects.lock().await.requests.clear();
     assert_eq!(
-        crate::backfill_fmp4(&store, &"a".repeat(64), false, copy_backfill_input)
+        crate::backfill_fmp4(&store, &"a".repeat(64), false, None, copy_backfill_input)
             .await
             .unwrap(),
         "ok"

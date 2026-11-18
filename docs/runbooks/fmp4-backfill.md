@@ -2,8 +2,9 @@
 
 `POST /backfill-fmp4` fills missing progressive MP4 variants from existing HLS
 segments. Ordinary requests need only `{"hash":"<sha256>"}`. Existing variants
-in the selected primary store are skipped individually; both present returns
-`{"status":"already_exists","hash":"<sha256>"}` without downloading or writing.
+and their required backups are verified and skipped individually. If both are
+verified, the endpoint returns `{"status":"already_exists","hash":"<sha256>"}`
+without remuxing or writing.
 
 To regenerate existing variants, send `force:true` and the existing
 `x-divine-repair-secret` credential. Forced requests return 401 for missing or
@@ -11,7 +12,9 @@ wrong credentials, or 503 when repair is not configured. No additional caller
 secret is introduced. Successful processing returns `status:ok`; unavailable
 sibling TS variants are skipped, but every downloaded variant must produce a
 verified MP4 or the request returns 500. A partial failure may leave successful
-MP4 writes in place. Concurrent calls are not serialized by this endpoint.
+MP4 writes in place. Remuxes share the HLS generation claim. Busy ordinary
+calls return 409, and forced repairs return a worker error for operator review.
+See [HLS single-writer recovery](hls-single-writer.md).
 
 ## Operator configuration
 

@@ -1261,26 +1261,9 @@ async fn process_upload(
             let owner = auth_event.pubkey.clone();
             let queue = state.config.transcode_queue.clone();
             tokio::spawn(async move {
-                // With a queue configured, the spawn only has to survive long
-                // enough to hand the job over; the queue then owns retries and
-                // survives this instance being terminated. Without one, fall
-                // back to dispatching directly so this is safe to deploy before
-                // the queue exists -- but that path still loses work on churn.
-                if let Some(queue) = queue {
-                    match tasks::enqueue_transcode(&queue, &transcoder_url, &hash, &owner)
-                        .await
-                    {
-                        Ok(()) => return,
-                        Err(e) => {
-                            error!(
-                                "Failed to enqueue transcoding for {}: {} \
-                                 -- falling back to direct dispatch",
-                                hash, e
-                            );
-                        }
-                    }
-                }
-                if let Err(e) = trigger_transcoding(&transcoder_url, &hash, &owner).await {
+                if let Err(e) =
+                    trigger_transcoding(&transcoder_url, &hash, &owner, queue.as_ref()).await
+                {
                     error!("Failed to trigger transcoding for {}: {}", hash, e);
                 }
             });
@@ -2488,7 +2471,12 @@ mod derivative_trigger_tests {
             let count = server
                 .received_requests()
                 .await
-                .map(|v| v.len())
+                .map(|requests| {
+                    requests
+                        .iter()
+                        .filter(|request| request.url.path() != "/transcode/queue")
+                        .count()
+                })
                 .unwrap_or(0);
             if count >= expected {
                 return;
@@ -2499,6 +2487,33 @@ mod derivative_trigger_tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         };
         panic!("timed out waiting for {expected} requests; received {count}");
+    }
+
+    #[tokio::test]
+    async fn coordinated_upload_admission_retries_without_legacy_dispatch() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/transcode/queue"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/transcode/queue"))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/transcode"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        super::trigger_transcoding(&server.uri(), &"a".repeat(64), &"b".repeat(64), None)
+            .await
+            .unwrap();
     }
 
     /// video/mp4 → transcoder /transcode should be called.
@@ -2830,7 +2845,7 @@ async fn maybe_trigger_derivatives(
             let hash = response.sha256.clone();
             let owner = pubkey.to_owned();
             tokio::spawn(async move {
-                if let Err(e) = trigger_transcoding(&transcoder_url, &hash, &owner).await {
+                if let Err(e) = trigger_transcoding(&transcoder_url, &hash, &owner, None).await {
                     error!("Failed to trigger transcoding for {}: {}", hash, e);
                 }
             });
@@ -2894,36 +2909,60 @@ fn classify_invalid_media_signal(
     None
 }
 
-/// Trigger HLS transcoding for a video (fire-and-forget)
-/// Sends a POST request to the divine-transcoder service
-async fn trigger_transcoding(transcoder_url: &str, hash: &str, owner: &str) -> Result<()> {
-    info!(
-        "Triggering HLS transcoding for {} via {}",
-        hash, transcoder_url
-    );
-
+/// Hand HLS work to the coordinated transcoder. A legacy service returns
+/// 404 from the queue-only route, so its existing dispatch path still works.
+async fn trigger_transcoding(
+    transcoder_url: &str,
+    hash: &str,
+    owner: &str,
+    legacy_queue: Option<&tasks::TaskQueueConfig>,
+) -> Result<()> {
+    let base = transcoder_url.trim_end_matches('/');
     let client = reqwest::Client::new();
-    let transcode_request = serde_json::json!({
-        "hash": hash,
-        "owner": owner
-    });
+    let payload = serde_json::json!({"hash": hash, "owner": owner});
+    let admission_url = format!("{base}/transcode/queue");
 
-    let response = client
-        .post(format!("{}/transcode", transcoder_url))
-        .header("Content-Type", "application/json")
-        .json(&transcode_request)
-        .send()
-        .await
-        .map_err(|e| anyhow!("Failed to call transcoder: {}", e))?;
-
-    if response.status().is_success() {
-        info!("Transcoding triggered successfully for {}", hash);
-        Ok(())
-    } else {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        Err(anyhow!("Transcoder returned error {}: {}", status, body))
+    for attempt in 0..3 {
+        let response = client
+            .post(&admission_url)
+            .timeout(std::time::Duration::from_secs(12))
+            .json(&payload)
+            .send()
+            .await;
+        match response {
+            Ok(response) if response.status() == reqwest::StatusCode::ACCEPTED => return Ok(()),
+            Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => break,
+            Ok(response)
+                if !response.status().is_server_error()
+                    && response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS =>
+            {
+                return Err(anyhow!(
+                    "Transcode admission rejected ({})",
+                    response.status()
+                ));
+            }
+            _ if attempt == 2 => return Err(anyhow!("Transcode queue admission unavailable")),
+            _ => tokio::time::sleep(std::time::Duration::from_millis(250 << attempt)).await,
+        }
     }
+
+    if let Some(queue) = legacy_queue {
+        match tasks::enqueue_transcode(queue, base, hash, owner).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                warn!("Legacy queue enqueue failed, falling back to direct dispatch: {error}")
+            }
+        }
+    }
+    let response = client
+        .post(format!("{base}/transcode"))
+        .json(&payload)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        return Err(anyhow!("Legacy transcoder returned {}", response.status()));
+    }
+    Ok(())
 }
 
 /// Trigger transcript generation for audio/video (fire-and-forget)

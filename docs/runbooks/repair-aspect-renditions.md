@@ -33,7 +33,7 @@ inventory coverage. Non-right-angle rotations require manual investigation.
 ## Operator-only regeneration
 
 Confirm that the deployed transcoder supports `force` before proceeding. Normal
-`POST /transcode` requests retain the existing-master shortcut. A request with
+`POST /transcode` requests enter a durable queue and reuse verified outputs. A request with
 `{"hash":"<sha256>","force":true}` bypasses it, re-encodes from the original,
 and replaces generated HLS derivatives without deleting the prefix first.
 Forced repairs abort on an original probe failure rather than guessing 16:9,
@@ -47,27 +47,20 @@ candidates serially and inspect the completed response before advancing. Repairs
 require an existing HLS master. Confirm that initial generation has fully
 completed at origin before submitting one; do not repair an in-progress upload.
 
-Forced transcodes acquire a generation-conditional GCS lock at
-`{hash}/transcode.lock` and release only their own generation. Overlapping repairs
-fail rather than overwrite each other. Normal requests do not take this lock and
-retain their existing-master shortcut, so a failed repair cannot lock the normal
-upload pipeline. Forced jobs run in a separate task so cancellation of the HTTP
-response waiter does not cancel their work or lock release. This is not durable
-execution: instance termination or a task panic can still leave a repair lock.
-A disconnected client, Ctrl-C, or a request timeout gives an unknown outcome;
-the writer may still be active. Do not immediately retry or remove its lock.
-Inspect service logs and outputs at origin, and an operator must
-confirm no writer remains before removing that specific lock. Do not expire locks
-by elapsed time alone. Avoid simultaneous fMP4 backfills during the repair.
+Ordinary transcodes, forced repairs, and MP4 remuxes share a
+generation-conditional GCS claim. See
+[HLS single-writer rollout and recovery](hls-single-writer.md). Forced jobs run
+independently of their HTTP waiter. A disconnect or timeout leaves the outcome
+unknown and the writer may still be active. Inspect the claim and the exact
+storage versions before retrying a repair or resetting ownership.
 
 A successful response may include `repair_lock_warning`: the derivatives were
 uploaded, but lock cleanup failed. Investigate that specific lock before the
 next repair. If repair and cleanup both fail, the error reports both failures.
 Failure callbacks also update the existing video's transcode status and attempt
-count even when the old derivatives remain available. A HEAD of the existing
-master playlist through the edge reconciles status to complete and resets the
-attempt count; verify origin outputs first, since existence does not prove that
-a partial repair produced a consistent set.
+count even when the old derivatives remain available. Use ordinary transcode
+admission to re-verify the set and send the completion callback. A playback
+HEAD can confirm that the master is readable.
 
 The edge's progressive aliases read `hls/stream_720p.mp4` and
 `hls/stream_480p.mp4`; both must be regenerated successfully along with HLS.
