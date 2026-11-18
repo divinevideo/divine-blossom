@@ -478,6 +478,67 @@ pub(crate) fn archive_owned(hash:&str,attempt:&str)->Result<bool> {
     Ok(matches!(lookup(&crate::metadata::open_store()?,hash)?,Some(Observed{gate:Gate::Copying{attempt_id},..}) if attempt_id==attempt))
 }
 
+/// Run a delivery-replica removal with copy exclusion. The permanent erasure
+/// state already excludes every publisher and is never released here.
+pub(crate) fn with_delivery_removal<T>(
+    hash: &str,
+    remove: impl FnOnce(bool, &dyn Fn() -> Result<()>) -> Result<T>,
+) -> Result<T> {
+    let observed = lookup_bunny_gate(hash)?;
+    let forced_attempt = format!("bunny-cleanup-{hash}");
+    let (force, attempt, generation) = match observed {
+        Some(Observed { gate: Gate::Erasing {}, .. }) => return remove(true, &|| Ok(())),
+        Some(Observed { gate: Gate::Copying { attempt_id }, generation }) if attempt_id == forced_attempt => {
+            (true, attempt_id, generation)
+        }
+        _ => {
+            // A retry can resume an interrupted policy revocation. Forced
+            // cleanup instead adopts the settled writer's exact generation.
+            let attempt = format!("bunny-revoke-{hash}");
+            let generation = archive_claim(hash, &attempt)?;
+            (false, attempt, generation)
+        }
+    };
+    let check_gate = || check_bunny_gate(hash, &attempt, &generation);
+    let result = remove(force, &check_gate);
+    if !force || result.is_ok() {
+        archive_release(hash, &attempt, &generation)?;
+    }
+    result
+}
+
+fn lookup_bunny_gate(hash: &str) -> Result<Option<Observed>> {
+    // Loopback provider fixtures cannot share the Viceroy runtime's KV state.
+    #[cfg(test)]
+    if crate::storage::config_flag("bunny_fixture_local_gate") {
+        return lookup(&crate::metadata::open_store()?, hash);
+    }
+    if crate::kv_origin::enabled() {
+        lookup_origin(hash)
+    } else {
+        lookup(&crate::metadata::open_store()?, hash)
+    }
+}
+
+pub(crate) fn check_bunny_gate(hash: &str, attempt: &str, expected: &str) -> Result<()> {
+    let observed = lookup_bunny_gate(hash)?;
+    if hold_reason(observed.as_ref(), attempt, Some(expected)).is_some() {
+        return Err(stale());
+    }
+    Ok(())
+}
+
+/// A received PUT acknowledgement settles the writer. If verification or
+/// cleanup then fails, a durable outbox retry can take over the exact gate.
+pub(crate) fn handoff_bunny_cleanup(hash: &str, attempt: &str, expected: &str) -> Result<()> {
+    check_bunny_gate(hash, attempt, expected)?;
+    crate::b2_cdn_purge::enqueue(hash, crate::b2_cdn_purge::Phase::Single)?;
+    insert(
+        &crate::metadata::open_store()?, hash,
+        &Gate::Copying { attempt_id: format!("bunny-cleanup-{hash}") }, generation(expected),
+    )
+}
+
 /// The PG authority first retires the attempt so a late admission cannot authorize bytes.
 pub(crate) fn archive_settle_current(hash:&str,attempt:&str)->Result<()> {
     if let Some(Observed{gate:Gate::Copying{attempt_id},generation})=lookup(&crate::metadata::open_store()?,hash)? {

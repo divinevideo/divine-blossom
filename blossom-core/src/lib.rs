@@ -1,4 +1,5 @@
 pub mod b2_cdn;
+pub mod bunny_pilot;
 pub mod cache_policy;
 pub mod canary;
 pub mod conditional_update;
