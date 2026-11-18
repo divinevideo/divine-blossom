@@ -8,6 +8,7 @@ mod b2_cdn;
 mod b2_cdn_phase;
 mod b2_cdn_purge;
 mod blossom;
+mod bunny_publish;
 mod canary;
 mod playback_cache;
 mod delete_policy;
@@ -399,6 +400,7 @@ fn route_request(req: Request) -> Result<Response> {
         (_, "/admin/api/b2-cdn-purge/drain") => {
             b2_cdn_purge::handle_drain(req, storage::invalidate_b2_cdn)
         }
+        (_, "/admin/api/bunny-pilot/publish") => Ok(bunny_publish::handle(req)),
         (Method::POST, "/admin/api/quarantine") => admin::handle_admin_quarantine_action(req),
         (Method::GET, p) if p.starts_with("/admin/api/quarantine/") => {
             admin::handle_admin_quarantine_status(

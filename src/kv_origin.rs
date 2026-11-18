@@ -59,9 +59,10 @@ pub(crate) fn lookup(key: &str) -> Result<Option<Option<OriginEntry>>> {
     let Some(settings) = settings() else {
         return Ok(None);
     };
-    let mut response = Request::get(format!("https://{HOST}{}", key_path(&settings.store_id, key)))
-        .with_header("Fastly-Key", settings.token)
-        .send(backend()?)
+    let mut request = Request::get(format!("https://{HOST}{}", key_path(&settings.store_id, key)))
+        .with_header("Fastly-Key", settings.token);
+    request.set_pass(true);
+    let mut response = request.send(backend()?)
         .map_err(|_| BlossomError::MetadataError("KV origin read failed".into()))?;
     let status = response.get_status().as_u16();
     let generation = response.get_header_str("generation").map(str::to_owned);

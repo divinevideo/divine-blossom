@@ -690,3 +690,65 @@ fn missing_hash_key_purge_acknowledgement_is_not_success() {
 fn unavailable_config_store_cannot_disable_durable_eviction() {
     assert!(b2_cdn_purge::configured(), "configuration read failure must not impersonate explicitly absent CDN keys");
 }
+
+#[test]
+#[ignore = "requires synthetic B2 and Bunny providers; scripts/run-bunny-pilot-revocation-tests.py"]
+fn bunny_pilot_age_gate_eviction_retries() {
+    let hash = hash();
+    let metadata = serde_json::from_value(serde_json::json!({
+        "sha256": hash, "size": 9, "type": "video/mp4", "uploaded": "2026-01-01T00:00:00Z",
+        "owner": "b".repeat(64), "status": "active"
+    }))
+    .unwrap();
+    put_blob_metadata(&metadata).unwrap();
+    // A previous runner held revocation but exited before doing any I/O.
+    parent_gate::archive_claim(&hash, &format!("bunny-revoke-{hash}")).unwrap();
+
+    let mut moderate = request(Method::POST, "/admin/api/moderate", true);
+    moderate.set_body(serde_json::json!({"sha256": hash, "action": "AGE_RESTRICT"}).to_string());
+    assert_eq!(call(moderate).get_status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        get_blob_metadata_uncached(&hash).unwrap().unwrap().status,
+        BlobStatus::AgeRestricted
+    );
+    assert_eq!(
+        call(request(Method::GET, &format!("/{hash}"), false)).get_status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let store = open_store().unwrap();
+    let queue = store
+        .build_list()
+        .prefix("b2-cdn-purge:v1:")
+        .execute()
+        .unwrap();
+    assert_eq!(queue.keys().len(), 1);
+    let key = &queue.keys()[0];
+    let intent_state = || {
+        let record: serde_json::Value =
+            serde_json::from_str(&store.lookup(key).unwrap().take_body().into_string()).unwrap();
+        record["state"].clone()
+    };
+    assert_eq!(intent_state(), "committed");
+    let mut retry = call(request(
+        Method::POST,
+        "/admin/api/b2-cdn-purge/drain?max=1",
+        true,
+    ));
+    assert_eq!(retry.get_status(), StatusCode::OK);
+    let reply: serde_json::Value = serde_json::from_str(&retry.take_body_str()).unwrap();
+    assert_eq!(reply["result"], 1);
+    assert_eq!(reply["pending"], 0);
+    assert_eq!(intent_state(), "cleared");
+
+    // Unenrolled hashes must not acquire or interfere with shared mirror gates.
+    let unrelated = "c".repeat(64);
+    crate::storage::invalidate_b2_cdn(&[unrelated.clone()]).unwrap();
+    assert!(matches!(
+        store.lookup(&format!("b2-sync:v1:{unrelated}")),
+        Err(fastly::kv_store::KVStoreError::ItemNotFound)
+    ));
+    parent_gate::archive_claim(&unrelated, "unrelated-mirror").unwrap();
+    crate::storage::invalidate_b2_cdn(&[unrelated.clone()]).unwrap();
+    assert!(parent_gate::archive_owned(&unrelated, "unrelated-mirror").unwrap());
+}

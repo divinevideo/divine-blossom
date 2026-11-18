@@ -241,6 +241,60 @@ pub fn get_blob_metadata_uncached(hash: &str) -> Result<Option<BlobMetadata>> {
     overlay_quarantine_holds(hash, metadata)
 }
 
+/// Replica publication cannot use a POP's stale view of a new age gate or
+/// takedown. Read the current policy at the KV origin before and after the PUT.
+pub(crate) fn bunny_public_metadata(hash: &str) -> Result<BlobMetadata> {
+    let lookup = |key: &str| {
+        crate::kv_origin::lookup(key)?.ok_or_else(|| {
+            BlossomError::MetadataError("Bunny publication policy origin unavailable".into())
+        })
+    };
+    let invalid = || BlossomError::MetadataError("Bunny publication policy invalid".into());
+    let denied = || BlossomError::NotFound("Public MP4 unavailable".into());
+    let entry = lookup(&format!("{BLOB_PREFIX}{hash}"))?.ok_or_else(denied)?;
+    let metadata: BlobMetadata = serde_json::from_slice(&entry.body).map_err(|_| invalid())?;
+    let is_pubkey =
+        |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if metadata.sha256 != hash
+        || metadata.status != BlobStatus::Active
+        || !metadata.mime_type.starts_with("video/")
+        || !metadata.quarantine_hold_ids.is_empty()
+        || metadata.size == 0
+        || !is_pubkey(&metadata.owner)
+        || lookup(&format!("{TOMBSTONE_PREFIX}{hash}"))?.is_some()
+    {
+        return Err(denied());
+    }
+    if let Some(entry) = lookup(&format!("{QUARANTINE_PREFIX}{hash}"))? {
+        let holds: QuarantineHolds = serde_json::from_slice(&entry.body).map_err(|_| invalid())?;
+        holds.validate().map_err(BlossomError::MetadataError)?;
+        if !holds.active_ids().is_empty() {
+            return Err(denied());
+        }
+    }
+    let mut uploaders: Vec<String> = match lookup(&blob_refs_key(hash))? {
+        Some(entry) => serde_json::from_slice(&entry.body).map_err(|_| invalid())?,
+        None => Vec::new(),
+    };
+    uploaders.push(metadata.owner.clone());
+    uploaders
+        .iter_mut()
+        .for_each(|uploader| uploader.make_ascii_lowercase());
+    uploaders.sort_unstable();
+    uploaders.dedup();
+    // Two passes plus B2, purge and gate reads must fit the Compute subrequest
+    // budget, even on the policy-race cleanup path. This is a bounded pilot.
+    if uploaders.len() > 3 {
+        return Err(denied());
+    }
+    for uploader in uploaders {
+        if !is_pubkey(&uploader) || lookup(&vanish_in_progress_key(&uploader))?.is_some() {
+            return Err(denied());
+        }
+    }
+    Ok(metadata)
+}
+
 /// Review holds are never read through the POP-local metadata cache.
 pub fn get_quarantine_holds(hash: &str) -> Result<QuarantineHolds> {
     let key = format!("{}{}", QUARANTINE_PREFIX, hash.to_lowercase());

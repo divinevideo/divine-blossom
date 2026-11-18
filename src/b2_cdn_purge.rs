@@ -172,20 +172,17 @@ pub(crate) struct DrainOutcome {
 /// lose their only eviction path. A missing credential is a drain-time failure,
 /// never a reason to pretend the queue is disabled.
 pub(crate) fn configured() -> bool {
-    // Only successful reads proving BOTH keys absent can select the legacy
+    // Only successful reads proving all CDN targets absent can select the legacy
     // default. A store outage must not disable durable revocation while old
     // outer objects may still be serving. Checked purging then reports the
     // unavailable configuration and retains the intent instead of acknowledging.
-    let Ok(store) = fastly::config_store::ConfigStore::try_open("blossom_config") else {
-        return true;
-    };
-    let (Ok(flag), Ok(hosts)) = (
-        store.try_get("b2_cdn_enabled"),
-        store.try_get("b2_cdn_purge_hosts"),
-    ) else {
-        return true;
-    };
-    configured_from(flag.as_deref(), hosts.as_deref())
+    fastly_configured().unwrap_or(true) || crate::storage::bunny_pilot_configured().unwrap_or(true)
+}
+
+pub(crate) fn fastly_configured() -> Result<bool> {
+    let flag = crate::storage::optional_config("b2_cdn_enabled")?;
+    let hosts = crate::storage::optional_config("b2_cdn_purge_hosts")?;
+    Ok(configured_from(flag.as_deref(), hosts.as_deref()))
 }
 
 /// Pure core of [`configured`].
@@ -876,7 +873,12 @@ pub(crate) fn handle_drain(
     if req.get_method() != Method::POST {
         return Err(BlossomError::BadRequest("POST required".into()));
     }
-    let limit = parse_drain_limit(req.get_query_parameter("max"))?;
+    let mut limit = parse_drain_limit(req.get_query_parameter("max"))?;
+    if crate::storage::bunny_pilot_configured().unwrap_or(true) {
+        // A single hash can need two provider purge rounds plus version
+        // listing and deletion. Two such hashes may exhaust the execution.
+        limit = 1;
+    }
     let store = open_store()?;
     let outcome = drain(&store, limit, purge)?;
     let body = serde_json::json!({
