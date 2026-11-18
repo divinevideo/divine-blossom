@@ -67,6 +67,15 @@ or enabling the internal mobile flag.
   can evict from both hostnames with the publisher disabled.
   The first write retains this target set in Blossom KV. A replacement zone
   needs a coordinated retirement of the previous zone and its cache entries.
+  Each attempted publication also retains a per-parent enrollment record before
+  sending the PUT. Revocation reads that record at the KV origin and leaves
+  unrelated media and its mirror gates alone. Preserve these records on rollback.
+  Before activation, inventory shared parent-gate consumers and drain legacy
+  delete-based writers as required by `docs/contracts/parent-gate-v1.md`; mirror
+  runners must support released sentinels before pilot publishers emit them.
+  Discovery of retained targets uses the KV origin even when publication is off.
+  An unreadable origin retains revocation work instead of acknowledging eviction;
+  canonical Fastly invalidation is still attempted independently.
 - Verify `b2_replica_enabled` is `true` for the existing bucket. Enable
   `bunny_pilot_publish_enabled` for the fixture pass only. Use the
   authenticated `POST /admin/api/bunny-pilot/publish` request with `path` and

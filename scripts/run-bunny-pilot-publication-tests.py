@@ -69,6 +69,8 @@ class Origin(BaseHTTPRequestHandler):
             key = self.path.removeprefix(KV_BASE)
             if key == "bunny-pilot-retained-hosts:v1":
                 return self.reply(200, ",".join(CDN_HOSTS).encode(), {"generation": "1"})
+            if key == f"bunny-pilot-enrolled:v1:{HASH}":
+                return self.reply(200, b"1", {"generation": "1"})
             if key != f"blob:{HASH}":
                 assert key in {f"tombstone:{HASH}", f"quarantine:v1:{HASH}", f"refs:{HASH}",
                                f"vanish_in_progress:v1:{OWNER}"}, key

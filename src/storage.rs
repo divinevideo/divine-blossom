@@ -2088,7 +2088,18 @@ pub(crate) fn erase_b2_creator_replica(hash: &str) -> Result<()> {
 const BUNNY_PUBLISH_FLAG: &str = "bunny_pilot_publish_enabled";
 const BUNNY_PILOT_HOSTS: &str = "bunny_pilot_zone_hosts";
 const BUNNY_RETAINED_HOSTS: &str = "bunny-pilot-retained-hosts:v1";
+const BUNNY_ENROLLED_PREFIX: &str = "bunny-pilot-enrolled:v1:";
 const BUNNY_PILOT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+fn bunny_pilot_enrolled(hash: &str) -> Result<bool> {
+    let entry = crate::kv_origin::lookup(&format!("{BUNNY_ENROLLED_PREFIX}{hash}"))?
+        .ok_or_else(|| BlossomError::MetadataError("Bunny enrollment origin unavailable".into()))?;
+    match entry {
+        None => Ok(false),
+        Some(entry) if entry.body == b"1" => Ok(true),
+        Some(_) => Err(BlossomError::MetadataError("Invalid Bunny enrollment record".into())),
+    }
+}
 
 pub(crate) fn bunny_pilot_configured() -> Result<bool> {
     Ok(optional_config(BUNNY_PILOT_HOSTS)?.is_some()
@@ -2230,11 +2241,10 @@ pub(crate) fn put_bunny_pilot_asset(
     let route = key
         .strip_prefix(DELIVERY_PREFIX)
         .map(|path| format!("/{path}"));
-    if route.as_deref().and_then(Asset::parse).is_none() {
-        return Err(BlossomError::BadRequest(
+    let asset = route.as_deref().and_then(Asset::parse).ok_or_else(||
+        BlossomError::BadRequest(
             "Invalid Bunny delivery key".into(),
-        ));
-    }
+        ))?;
     let mut config = S3Config::load_b2_media()?;
     config.access_key = get_secret("bunny_b2_publish_key_id")?;
     config.secret_key = get_secret("bunny_b2_publish_key")?;
@@ -2266,6 +2276,11 @@ pub(crate) fn put_bunny_pilot_asset(
         return Err(BlossomError::StorageError("Bunny erasure bucket mismatch".into()));
     }
     retain_bunny_pilot_hosts()?;
+    // Retain enrollment before any PUT can escape. Revocation must distinguish
+    // this bounded pilot from unrelated blobs without a stale POP-local miss.
+    crate::metadata::open_store()?
+        .insert(&format!("{BUNNY_ENROLLED_PREFIX}{}", asset.hash()), "1")
+        .map_err(|_| BlossomError::MetadataError("Bunny enrollment record unavailable".into()))?;
     before_send()?;
     let response = request
         .send(B2_MEDIA_BACKEND)
@@ -2704,6 +2719,9 @@ fn invalidate_bunny_pilot(hashes: &[String]) -> Result<()> {
         // Keep copy exclusion through eviction. Successful purge must follow
         // observed absence, including an all-version check at the origin.
         let hash = hash.to_ascii_lowercase();
+        if !bunny_pilot_enrolled(&hash)? {
+            continue;
+        }
         crate::parent_gate::with_delivery_removal(&hash, |force, check_gate| {
             if !force {
                 // An older denial or a prepared intent can survive a successful

@@ -45,6 +45,10 @@ class Provider(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith('/resources/stores/kv/fixture-store/keys/'):
             assert self.headers.get('Fastly-Key') == 'synthetic-policy-key'
+            if '/bunny-pilot-enrolled:v1:' in self.path:
+                if self.path.endswith(f':{HASH}'):
+                    return self.reply(200, 1, '1')
+                return self.reply(404, {})
             if self.path.endswith('/bunny-pilot-retained-hosts:v1'):
                 body = f'{CUSTOM_HOST},{ALIAS}'.encode()
                 self.send_response(200)
@@ -121,7 +125,7 @@ class Provider(BaseHTTPRequestHandler):
     def fastly(self, path):
         assert self.headers.get('Host') == 'api.fastly.com'
         assert self.headers.get('Fastly-Key') == 'synthetic-fastly-key'
-        assert self.headers.get('Surrogate-Key') == HASH
+        assert self.headers.get('Surrogate-Key') in (HASH, 'c' * 64)
         service = path.removeprefix('/service/').removesuffix('/purge')
         assert service in FASTLY_SERVICES and path == f'/service/{service}/purge'
         self.server.events.append(('fastly', service))
@@ -186,7 +190,7 @@ def main():
                 assert server.versions == unrelated, server.versions
                 assert Counter(entry for event, entry in server.events if event == 'delete') == Counter(VERSIONS)
                 assert server.bunny_counts == {CUSTOM_HOST: 4, ALIAS: 4}, server.events
-                assert Counter(entry for event, entry in server.events if event == 'fastly') == dict.fromkeys(FASTLY_SERVICES, 4), server.events
+                assert Counter(entry for event, entry in server.events if event == 'fastly') == dict.fromkeys(FASTLY_SERVICES, 8), server.events
                 print('PASS Bunny age gate, all-version replica removal, checked canonical and Bunny purges, durable retry')
         finally:
             server.shutdown()

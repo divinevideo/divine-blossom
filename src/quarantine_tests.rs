@@ -740,4 +740,15 @@ fn bunny_pilot_age_gate_eviction_retries() {
     assert_eq!(reply["result"], 1);
     assert_eq!(reply["pending"], 0);
     assert_eq!(intent_state(), "cleared");
+
+    // Unenrolled hashes must not acquire or interfere with shared mirror gates.
+    let unrelated = "c".repeat(64);
+    crate::storage::invalidate_b2_cdn(&[unrelated.clone()]).unwrap();
+    assert!(matches!(
+        store.lookup(&format!("b2-sync:v1:{unrelated}")),
+        Err(fastly::kv_store::KVStoreError::ItemNotFound)
+    ));
+    parent_gate::archive_claim(&unrelated, "unrelated-mirror").unwrap();
+    crate::storage::invalidate_b2_cdn(&[unrelated.clone()]).unwrap();
+    assert!(parent_gate::archive_owned(&unrelated, "unrelated-mirror").unwrap());
 }
