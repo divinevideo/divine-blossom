@@ -177,6 +177,11 @@ async fn make_source(path: &Path, audio: bool) {
 }
 
 async fn make_source_at_quality(path: &Path, audio: bool, crf: &str) {
+    make_source_with_sar(path, audio, crf, "1").await;
+}
+
+async fn make_source_with_sar(path: &Path, audio: bool, crf: &str, sar: &str) {
+    let filter = format!("setsar={sar}");
     let mut args = vec![
         "-v",
         "error",
@@ -195,6 +200,8 @@ async fn make_source_at_quality(path: &Path, audio: bool, crf: &str) {
         ]);
     }
     args.extend([
+        "-vf",
+        &filter,
         "-c:v",
         "libx264",
         "-profile:v",
@@ -304,6 +311,34 @@ async fn stream_copy_preserves_frames_original_and_all_playback_files() {
                 > 0
         );
     }
+}
+
+#[tokio::test]
+#[ignore = "requires ffmpeg and ffprobe"]
+async fn stream_copy_accepts_unspecified_pixel_aspect() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("source.mp4");
+    let output = dir.path().join("hls");
+    tokio::fs::create_dir(&output).await.unwrap();
+    make_source_with_sar(&input, false, "36", "0").await;
+
+    let inspection = super::probe(&input, true).await.unwrap();
+    let video_frames: Vec<_> = inspection["packets_and_frames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["type"] == "frame" && item["media_type"] == "video")
+        .collect();
+    assert_eq!(video_frames.len(), 50);
+    assert!(video_frames.iter().all(|frame| {
+        frame["sample_aspect_ratio"].is_null()
+            || matches!(frame["sample_aspect_ratio"].as_str(), Some("0:1" | "N/A"))
+    }));
+    assert!(try_reuse(&input, &output).await.unwrap());
+    assert_eq!(
+        frames(&input).await,
+        frames(&output.join("stream_720p.m3u8")).await
+    );
 }
 
 #[tokio::test]

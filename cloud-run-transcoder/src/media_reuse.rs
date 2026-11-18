@@ -205,6 +205,11 @@ fn preserves_color(source: &Value, candidate: &Value) -> bool {
     })
 }
 
+fn square_or_unspecified_sar(sar: &Value) -> bool {
+    // FFprobe's default JSON writer omits unspecified SAR fields.
+    sar.is_null() || matches!(sar.as_str(), Some("1:1" | "0:1" | "N/A"))
+}
+
 fn compatible_frames(value: &Value, video: &Value) -> bool {
     value["frames"].as_array().is_some_and(|frames| {
         !frames.is_empty()
@@ -213,10 +218,7 @@ fn compatible_frames(value: &Value, video: &Value) -> bool {
                     && frame["width"] == video["width"]
                     && frame["height"] == video["height"]
                     && frame["pix_fmt"] == "yuv420p"
-                    && matches!(
-                        frame["sample_aspect_ratio"].as_str(),
-                        Some("1:1" | "0:1" | "N/A")
-                    )
+                    && square_or_unspecified_sar(&frame["sample_aspect_ratio"])
             })
     })
 }
@@ -286,11 +288,7 @@ fn eligible(probe: &Value, file_bytes: u64) -> bool {
     }
     // Unspecified SAR defaults to square pixels. A display matrix can also
     // reflect/shear, so even a reported zero rotation is not sufficient.
-    if (!v["sample_aspect_ratio"].is_null()
-        && !matches!(
-            v["sample_aspect_ratio"].as_str(),
-            Some("1:1" | "0:1" | "N/A")
-        ))
+    if !square_or_unspecified_sar(&v["sample_aspect_ratio"])
         || (!v["side_data_list"].is_null() && !v["side_data_list"].is_array())
         || (!v["tags"]["rotate"].is_null() && number(&v["tags"]["rotate"]) != Some(0.0))
         || v["side_data_list"].as_array().is_some_and(|items| {
