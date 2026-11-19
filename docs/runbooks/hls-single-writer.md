@@ -32,9 +32,20 @@ Preparation has a renewable 90-second lease, with 20-second heartbeats
 during long operations. Each stable-key PUT is journaled before it is sent,
 with an attempt marker carried on the object. A stale journal with a PUT in
 flight can be replaced when the recorded provider and key show that marker.
-An explicit rejection allows the same owner to release immediately. An
-ambiguous write with no matching marker stays fenced. The provider may still
-commit it after the client times out.
+An explicit rejection lets the same owner settle the write and release the
+claim. An ambiguous write with no matching marker stays fenced. The provider
+may still commit it after the client times out.
+
+Cloud Storage limits mutations of an object name to one per second. The
+worker spaces its claim mutations and retries explicit 429 responses within a
+bounded deadline. Each acknowledged provider write keeps its existing journal
+entry until the next conditional mutation. Heartbeats still renew ownership
+during longer operations. With both progressive aliases, a fresh publication
+needs at least 10 claim mutations for GCS-only and 17 for B2-primary with GCS
+verification, including acquisition, verified completion, and release. Allow
+for that pacing when measuring queue capacity, playback readiness, and
+allocated CPU time. Verify these budgets with the actual storage topology
+before enabling the writer.
 
 Keep the queue's retries, and alert on `recovery_failed`, `release_failed`,
 `admission_failed`, and exhausted task delivery. If automatic retries run

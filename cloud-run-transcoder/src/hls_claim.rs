@@ -18,6 +18,7 @@ use google_cloud_storage::{
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, future::Future, time::Duration};
+use tokio::time::Instant;
 
 use crate::object_storage::MediaStorage;
 
@@ -26,6 +27,8 @@ const HEARTBEAT: Duration = Duration::from_secs(20);
 // Work must stop preparing new mutations after the dispatch deadline.
 const ATTEMPT_BUDGET: Duration = Duration::from_secs(900);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
+// Cloud Storage limits mutations of an object name to one per second.
+const MUTATION_INTERVAL: Duration = Duration::from_secs(1);
 const STATE: &str = "hls_claim_v1";
 pub(crate) const WRITE_ID: &str = "hls_write_id";
 
@@ -76,8 +79,13 @@ pub(crate) struct Claim {
     generation: i64,
     journal: Journal,
     intent: Dirty,
-    deadline: tokio::time::Instant,
-    next_heartbeat: tokio::time::Instant,
+    deadline: Instant,
+    next_heartbeat: Instant,
+    next_mutation: Instant,
+    // A provider success proves this PUT settled for the active worker. The
+    // durable Writing entry stays until the next CAS, so recovery can prove
+    // settlement independently by finding the same marker on the provider.
+    write_acknowledged: bool,
 }
 
 impl std::fmt::Debug for Claim {
@@ -119,28 +127,16 @@ impl ClaimStore {
 
     pub(crate) async fn claim(&self, hash: &str, storage: Option<&MediaStorage>) -> Result<Claim> {
         let key = lock_key(hash);
+        // Active contenders only read the journal. The conditional create
+        // still arbitrates concurrent observations of an absent object.
         let mut journal = Journal::default();
-        let mut previous = 0;
-        let initial = self.replace(&key, previous, &journal).await?;
-        let generation = if let Some(generation) = initial {
-            generation
-        } else {
-            let object = match tokio::time::timeout(
-                CONTROL_TIMEOUT,
-                self.client.get_object(&GetObjectRequest {
-                    bucket: self.bucket.clone(),
-                    object: key.clone(),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .context("Transcode lock lookup timed out")?
-            {
-                Ok(object) => object,
-                Err(error) if gcs_status(&error) == Some(404) => return Err(Busy.into()),
-                Err(error) => return Err(error).context("Transcode lock lookup failed"),
-            };
-            previous = object.generation;
+        let mut prior_generation = 0;
+        let mut not_before = Instant::now();
+        if let Some(object) = self.lookup(&key, None).await? {
+            prior_generation = object.generation;
+            if prior_generation <= 0 {
+                bail!("Transcode lock generation missing");
+            }
             let Some(encoded) = object
                 .metadata
                 .as_ref()
@@ -177,26 +173,61 @@ impl ClaimStore {
                 _ => return Err(Busy.into()),
             }
             journal.phase = Phase::Preparing;
-            let Some(generation) = self.replace(&key, previous, &journal).await? else {
-                return Err(Busy.into());
-            };
+            let age = object
+                .time_created
+                .and_then(|created| {
+                    Duration::try_from(time::OffsetDateTime::now_utc() - created).ok()
+                })
+                .unwrap_or_default();
+            not_before = Instant::now() + MUTATION_INTERVAL.saturating_sub(age);
+        }
+        let generation = self
+            .replace(&key, prior_generation, &journal, not_before, None)
+            .await?
+            .ok_or(Busy)?;
+        if prior_generation != 0 {
             count("claim_recovered");
-            generation
-        };
-
+        }
         count("claim_acquired");
+        let now = Instant::now();
         Ok(Claim {
             store: self.clone(),
             key,
             generation,
             journal,
             intent: Dirty::Hls,
-            deadline: tokio::time::Instant::now() + ATTEMPT_BUDGET,
-            next_heartbeat: tokio::time::Instant::now() + HEARTBEAT,
+            deadline: now + ATTEMPT_BUDGET,
+            next_heartbeat: now + HEARTBEAT,
+            next_mutation: now + MUTATION_INTERVAL,
+            write_acknowledged: false,
         })
     }
 
-    async fn replace(&self, key: &str, previous: i64, journal: &Journal) -> Result<Option<i64>> {
+    async fn lookup(&self, key: &str, generation: Option<i64>) -> Result<Option<Object>> {
+        let request = GetObjectRequest {
+            bucket: self.bucket.clone(),
+            object: key.to_owned(),
+            if_generation_match: generation,
+            ..Default::default()
+        };
+        let result = tokio::time::timeout(CONTROL_TIMEOUT, self.client.get_object(&request))
+            .await
+            .context("Transcode lock lookup timed out")?;
+        match result {
+            Ok(object) => Ok(Some(object)),
+            Err(error) if matches!(gcs_status(&error), Some(404 | 412)) => Ok(None),
+            Err(error) => Err(error).context("Transcode lock lookup failed"),
+        }
+    }
+
+    async fn replace(
+        &self,
+        key: &str,
+        previous: i64,
+        journal: &Journal,
+        not_before: Instant,
+        work_deadline: Option<Instant>,
+    ) -> Result<Option<i64>> {
         let metadata = Object {
             name: key.to_owned(),
             content_type: Some("application/octet-stream".to_owned()),
@@ -206,18 +237,15 @@ impl ClaimStore {
             )])),
             ..Default::default()
         };
-        let result = tokio::time::timeout(
-            CONTROL_TIMEOUT,
-            self.client.upload_object(
-                &UploadObjectRequest {
-                    bucket: self.bucket.clone(),
-                    if_generation_match: Some(previous),
-                    ..Default::default()
-                },
-                Bytes::new(),
-                &UploadType::Multipart(Box::new(metadata)),
-            ),
-        )
+        let request = UploadObjectRequest {
+            bucket: self.bucket.clone(),
+            if_generation_match: Some(previous),
+            ..Default::default()
+        };
+        let upload = UploadType::Multipart(Box::new(metadata));
+        let result = mutate_claim(not_before, work_deadline, || {
+            self.client.upload_object(&request, Bytes::new(), &upload)
+        })
         .await
         .context("Transcode lock update timed out")?;
         match result {
@@ -226,6 +254,43 @@ impl ClaimStore {
             Err(error) if gcs_status(&error) == Some(412) => Ok(None),
             Err(error) => Err(error).context("Transcode lock update failed"),
         }
+    }
+}
+
+/// Only an explicit throttle is retried. A timeout or ambiguous response may
+/// have committed, so the caller must keep the existing recovery semantics.
+async fn mutate_claim<T, F>(
+    not_before: Instant,
+    work_deadline: Option<Instant>,
+    mut operation: impl FnMut() -> F,
+) -> Result<std::result::Result<T, Error>>
+where
+    F: Future<Output = std::result::Result<T, Error>>,
+{
+    let mut start_deadline = Instant::now() + CONTROL_TIMEOUT;
+    if let Some(work_deadline) = work_deadline {
+        start_deadline = start_deadline.min(work_deadline);
+    }
+    tokio::time::timeout_at(start_deadline, tokio::time::sleep_until(not_before)).await?;
+    let mut backoff = MUTATION_INTERVAL;
+    loop {
+        if Instant::now() >= start_deadline {
+            bail!("Transcode lock mutation exceeded its admission deadline");
+        }
+        // A request admitted before the deadline still needs its normal
+        // response window. Canceling a committed intent early can leave a
+        // durable Writing record for a media PUT the worker never started.
+        let result = tokio::time::timeout(CONTROL_TIMEOUT, operation()).await?;
+        if result.as_ref().err().and_then(gcs_status) != Some(429) {
+            return Ok(result);
+        }
+        count("claim_mutation_throttled");
+        let delay = backoff.mul_f64(1.0 + 0.25 * crate::retry_jitter_ratio());
+        if Instant::now() + delay >= start_deadline {
+            return Ok(result);
+        }
+        tokio::time::sleep(delay).await;
+        backoff *= 2;
     }
 }
 
@@ -242,15 +307,28 @@ impl Claim {
         self.generation.to_string()
     }
 
-    async fn transition(&mut self, journal: Journal) -> Result<()> {
+    async fn transition(&mut self, journal: Journal, work_deadline: Option<Instant>) -> Result<()> {
         self.generation = self
             .store
-            .replace(&self.key, self.generation, &journal)
+            .replace(
+                &self.key,
+                self.generation,
+                &journal,
+                self.next_mutation,
+                work_deadline,
+            )
             .await?
             .ok_or(OwnershipLost)?;
         self.journal = journal;
-        self.next_heartbeat = tokio::time::Instant::now() + HEARTBEAT;
+        self.write_acknowledged = false;
+        let now = Instant::now();
+        self.next_heartbeat = now + HEARTBEAT;
+        self.next_mutation = now + MUTATION_INTERVAL;
         Ok(())
+    }
+
+    fn has_unconfirmed_write(&self) -> bool {
+        matches!(self.journal.phase, Phase::Writing { .. }) && !self.write_acknowledged
     }
 
     fn check_deadline(&self) -> Result<()> {
@@ -262,10 +340,29 @@ impl Claim {
 
     pub(crate) async fn confirm(&mut self) -> Result<()> {
         self.check_deadline()?;
-        if !matches!(self.journal.phase, Phase::Preparing) {
+        if self.has_unconfirmed_write() {
             bail!("Transcode has an unconfirmed publication");
         }
-        self.transition(self.journal.clone()).await
+        if Instant::now() >= self.next_heartbeat {
+            return self
+                .transition(
+                    Journal {
+                        phase: Phase::Preparing,
+                        ..self.journal.clone()
+                    },
+                    Some(self.deadline),
+                )
+                .await;
+        }
+        let object = tokio::time::timeout_at(
+            self.deadline,
+            self.store.lookup(&self.key, Some(self.generation)),
+        )
+        .await??;
+        if object.is_none_or(|object| object.generation != self.generation) {
+            return Err(OwnershipLost.into());
+        }
+        Ok(())
     }
 
     /// Renew only during cancellable preparation or read-only verification.
@@ -286,38 +383,50 @@ impl Claim {
     }
 
     pub(crate) async fn mark_verified(&mut self) -> Result<()> {
-        if !matches!(self.journal.phase, Phase::Preparing) {
+        if self.has_unconfirmed_write() {
             bail!("Cannot verify an unconfirmed publication");
         }
-        self.transition(Journal::default()).await
+        self.transition(Journal::default(), None).await
     }
 
     pub(crate) async fn begin_write(&mut self, gcs: bool, key: &str, id: &str) -> Result<()> {
         self.check_deadline()?;
-        if !matches!(self.journal.phase, Phase::Preparing) {
+        if self.has_unconfirmed_write() {
             bail!("Cannot begin another write with an unconfirmed publication");
         }
-        self.transition(Journal {
-            dirty: self.journal.dirty.max(self.intent),
-            phase: Phase::Writing {
-                gcs,
-                key: key.to_owned(),
-                id: id.to_owned(),
+        self.transition(
+            Journal {
+                dirty: self.journal.dirty.max(self.intent),
+                phase: Phase::Writing {
+                    gcs,
+                    key: key.to_owned(),
+                    id: id.to_owned(),
+                },
             },
-        })
+            Some(self.deadline),
+        )
         .await
     }
 
-    pub(crate) async fn end_write(&mut self) -> Result<()> {
-        self.transition(Journal {
-            phase: Phase::Preparing,
-            ..self.journal.clone()
-        })
+    pub(crate) fn acknowledge_write(&mut self) {
+        self.write_acknowledged = true;
+    }
+
+    /// A definite rejection settles the request without an object to prove it.
+    /// Persist that outcome so a crash cannot leave recovery waiting for it.
+    pub(crate) async fn reject_write(&mut self) -> Result<()> {
+        self.transition(
+            Journal {
+                phase: Phase::Preparing,
+                ..self.journal.clone()
+            },
+            None,
+        )
         .await
     }
 
     pub(crate) async fn finish(mut self, success: bool) -> Result<()> {
-        if matches!(self.journal.phase, Phase::Writing { .. }) {
+        if self.has_unconfirmed_write() {
             count("recovery_failed");
             return Err(anyhow!(
                 "Publication outcome unconfirmed; retained transcode lock"
@@ -325,21 +434,24 @@ impl Claim {
         }
         if !success && self.journal.dirty != Dirty::Clean {
             return self
-                .transition(Journal {
-                    phase: Phase::Retry,
-                    ..self.journal.clone()
-                })
+                .transition(
+                    Journal {
+                        phase: Phase::Retry,
+                        ..self.journal.clone()
+                    },
+                    None,
+                )
                 .await;
         }
-        let deletion = tokio::time::timeout(
-            CONTROL_TIMEOUT,
-            self.store.client.delete_object(&DeleteObjectRequest {
-                bucket: self.store.bucket.clone(),
-                object: self.key,
-                if_generation_match: Some(self.generation),
-                ..Default::default()
-            }),
-        )
+        let request = DeleteObjectRequest {
+            bucket: self.store.bucket.clone(),
+            object: self.key,
+            if_generation_match: Some(self.generation),
+            ..Default::default()
+        };
+        let deletion = mutate_claim(self.next_mutation, None, || {
+            self.store.client.delete_object(&request)
+        })
         .await
         .context("Transcode lock release timed out")?;
         match deletion {

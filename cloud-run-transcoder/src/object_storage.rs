@@ -762,14 +762,15 @@ impl MediaStorage {
                 .await
                 .context("GCS media write deadline; outcome unconfirmed")?;
                 if let Some(claim) = claim.as_deref_mut() {
-                    if result.is_ok()
-                        || result
-                            .as_ref()
-                            .err()
-                            .and_then(gcs_status)
-                            .is_some_and(write_rejected)
+                    if result.is_ok() {
+                        claim.acknowledge_write();
+                    } else if result
+                        .as_ref()
+                        .err()
+                        .and_then(gcs_status)
+                        .is_some_and(write_rejected)
                     {
-                        claim.end_write().await?;
+                        claim.reject_write().await?;
                     }
                 }
                 let object = result.map_err(|_| anyhow!("GCS media write failed"))?;
@@ -793,9 +794,10 @@ impl MediaStorage {
                 }
                 let response = send_b2_request(request).await?;
                 if let Some(claim) = claim.as_deref_mut() {
-                    if response.status().is_success() || write_rejected(response.status().as_u16())
-                    {
-                        claim.end_write().await?;
+                    if response.status().is_success() {
+                        claim.acknowledge_write();
+                    } else if write_rejected(response.status().as_u16()) {
+                        claim.reject_write().await?;
                     }
                 }
                 successful(response.status())?;
