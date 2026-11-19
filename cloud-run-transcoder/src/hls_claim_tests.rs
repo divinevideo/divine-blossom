@@ -17,6 +17,12 @@ struct Objects {
     live: HashMap<String, Value>,
     media: HashMap<String, Bytes>,
     fail_key: Option<String>,
+    claim_write_interval: Option<Duration>,
+    last_claim_write: HashMap<String, tokio::time::Instant>,
+    claim_writes: HashMap<String, usize>,
+    claim_throttles: usize,
+    throttle_next_claim_write: bool,
+    delay_next_claim_ack: Option<Duration>,
 }
 
 struct Origin {
@@ -112,6 +118,12 @@ async fn gcs(State(objects): State<Arc<Mutex<Objects>>>, req: Request) -> Respon
     let live = objects.live.get(&key);
     if method == "GET" {
         let Some(live) = live else { return error(404) };
+        if query
+            .get("ifGenerationMatch")
+            .is_some_and(|expected| Some(expected.as_str()) != live["generation"].as_str())
+        {
+            return error(412);
+        }
         if let Some(generation) = query.get("generation") {
             if Some(generation.as_str()) != live["generation"].as_str() {
                 return error(404);
@@ -128,9 +140,35 @@ async fn gcs(State(objects): State<Arc<Mutex<Objects>>>, req: Request) -> Respon
     let current = live
         .and_then(|value| value["generation"].as_str())
         .unwrap_or("0");
-    assert!(query.contains_key("ifGenerationMatch"));
-    if query["ifGenerationMatch"] != current {
+    let is_claim = key.starts_with(".internal/hls-claims/");
+    let precondition = query.get("ifGenerationMatch");
+    if is_claim
+        || new_object
+            .as_ref()
+            .is_some_and(|(metadata, _)| metadata["metadata"][WRITE_ID].is_string())
+    {
+        assert!(
+            precondition.is_some(),
+            "coordinated writes must carry the live generation"
+        );
+    }
+    if precondition.is_some_and(|generation| generation != current) {
         return error(412);
+    }
+    if is_claim {
+        let now = tokio::time::Instant::now();
+        let too_soon = objects.claim_write_interval.is_some_and(|interval| {
+            objects
+                .last_claim_write
+                .get(&key)
+                .is_some_and(|last| now - *last < interval)
+        });
+        if too_soon || std::mem::take(&mut objects.throttle_next_claim_write) {
+            objects.claim_throttles += 1;
+            return error(429);
+        }
+        objects.last_claim_write.insert(key.clone(), now);
+        *objects.claim_writes.entry(key.clone()).or_default() += 1;
     }
     if let Some((mut object, bytes)) = new_object {
         objects.next_generation += 1;
@@ -147,6 +185,15 @@ async fn gcs(State(objects): State<Arc<Mutex<Objects>>>, req: Request) -> Respon
         }
         objects.media.insert(key.clone(), bytes);
         objects.live.insert(key, object.clone());
+        let ack_delay = if is_claim {
+            objects.delay_next_claim_ack.take()
+        } else {
+            None
+        };
+        drop(objects);
+        if let Some(delay) = ack_delay {
+            tokio::time::sleep(delay).await;
+        }
         return Json(object).into_response();
     }
     assert_eq!(method, "DELETE");
@@ -186,6 +233,7 @@ async fn stale_encoding_cannot_publish_or_release_the_replacement_lock() {
     let mut old = origin.store().claim(A, None).await.unwrap();
     origin.age(A).await;
     let replacement = origin.store().claim(A, None).await.unwrap();
+    assert!(old.confirm().await.unwrap_err().is::<OwnershipLost>());
     assert!(old
         .begin_write(true, &format!("{A}/hls/master.m3u8"), "old")
         .await
@@ -215,7 +263,7 @@ async fn stale_unconfirmed_write_retains_exclusive_publication_rights() {
         .await
         .unwrap_err()
         .is::<Busy>());
-    old.end_write().await.unwrap();
+    old.reject_write().await.unwrap();
     old.finish(false).await.unwrap();
     assert!(origin.store().claim(A, None).await.unwrap().dirty() == Dirty::Hls);
 }
@@ -281,13 +329,21 @@ async fn webhook() -> (String, Arc<Callbacks>, JoinHandle<()>) {
 }
 
 async fn seed_video(origin: &crate::object_storage::tests::Origin, color: &str) -> String {
+    seed_generated_video(
+        &origin.store(),
+        &format!("color={color}:s=144x256:d=0.6:r=12"),
+    )
+    .await
+}
+
+async fn seed_generated_video(storage: &MediaStorage, filter: &str) -> String {
     use sha2::{Digest, Sha256};
 
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("synthetic.mp4");
     let ffmpeg = tokio::process::Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
-        .arg(format!("color={color}:s=144x256:d=0.6:r=12"))
+        .arg(filter)
         .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
         .arg(&file)
         .output()
@@ -300,8 +356,7 @@ async fn seed_video(origin: &crate::object_storage::tests::Origin, color: &str) 
     );
     let body = Bytes::from(tokio::fs::read(&file).await.unwrap());
     let hash = hex::encode(Sha256::digest(&body));
-    origin
-        .store()
+    storage
         .put_verified(
             &hash,
             body,
@@ -481,7 +536,12 @@ async fn a_committed_b2_put_can_recover_after_worker_crash_without_unfencing_the
     locks.age(A).await;
     let replacement = locks.store().claim(A, Some(&storage)).await.unwrap();
     assert_eq!(replacement.dirty(), Dirty::Hls);
-    assert!(owner.end_write().await.unwrap_err().is::<OwnershipLost>());
+    owner.acknowledge_write();
+    assert!(owner
+        .begin_write(true, &key, &id)
+        .await
+        .unwrap_err()
+        .is::<OwnershipLost>());
     assert!(owner.finish(false).await.is_err());
     assert!(locks
         .store()
@@ -508,7 +568,7 @@ async fn cancelling_the_response_waiter_does_not_interrupt_a_claimed_job() {
         claim
             .begin_write(true, &format!("{A}/hls/master.m3u8"), "synthetic")
             .await?;
-        claim.end_write().await?;
+        claim.acknowledge_write();
         claim.finish(true).await?;
         released_tx.send(()).unwrap();
         Ok(())
@@ -523,7 +583,7 @@ async fn cancelling_the_response_waiter_does_not_interrupt_a_claimed_job() {
         .unwrap_err()
         .is::<Busy>());
     work_tx.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(2), released_rx)
+    tokio::time::timeout(Duration::from_secs(5), released_rx)
         .await
         .unwrap()
         .unwrap();
@@ -545,4 +605,208 @@ async fn expired_preparation_budget_stops_work_without_touching_renditions() {
         .is_err());
     claim.finish(false).await.unwrap();
     assert!(origin.store().claim(A, None).await.is_ok());
+}
+
+#[tokio::test]
+async fn claim_lifecycle_obeys_the_provider_mutation_limit() {
+    let origin = Origin::start().await;
+    origin.objects.lock().await.claim_write_interval = Some(Duration::from_secs(1));
+    let mut owner = origin.store().claim(A, None).await.unwrap();
+    owner.confirm().await.unwrap();
+    owner
+        .begin_write(true, &format!("{A}/hls/master.m3u8"), "synthetic")
+        .await
+        .unwrap();
+    owner.acknowledge_write();
+    owner.mark_verified().await.unwrap();
+    owner.finish(true).await.unwrap();
+    let state = origin.objects.lock().await;
+    assert_eq!(
+        state.claim_throttles, 0,
+        "normal ownership must not depend on 429 retries"
+    );
+    assert_eq!(state.claim_writes[&lock_key(A)], 4);
+    assert!(!state.live.contains_key(&lock_key(A)));
+}
+
+#[tokio::test]
+async fn explicit_429_is_retried_for_claim_creation_and_release() {
+    let origin = Origin::start().await;
+    origin.objects.lock().await.throttle_next_claim_write = true;
+    let owner = origin.store().claim(A, None).await.unwrap();
+    origin.objects.lock().await.throttle_next_claim_write = true;
+    owner.finish(true).await.unwrap();
+    let state = origin.objects.lock().await;
+    assert_eq!(state.claim_throttles, 2);
+    assert_eq!(state.claim_writes[&lock_key(A)], 2);
+    assert!(!state.live.contains_key(&lock_key(A)));
+}
+
+#[tokio::test]
+#[ignore = "requires ffmpeg and ffprobe with libx264"]
+async fn short_media_meets_the_same_key_quota_in_both_storage_modes() {
+    let gcs = Origin::start().await;
+    gcs.objects.lock().await.claim_write_interval = Some(Duration::from_secs(1));
+    let b2 = crate::object_storage::tests::Origin::start().await;
+
+    let (single, dual) = tokio::join!(
+        measured_pipeline(
+            &gcs,
+            MediaStorage::gcs(gcs.client(), "synthetic-gcs".into()),
+            "testsrc2=size=640x360:rate=24:duration=6",
+            10
+        ),
+        measured_pipeline(
+            &gcs,
+            b2.with_gcs_backup(gcs.client()),
+            "testsrc2=size=640x352:rate=24:duration=6",
+            17
+        ),
+    );
+    eprintln!("6s FFmpeg fixtures with loopback storage: GCS-only {single:?}; B2-primary {dual:?}");
+    assert_eq!(gcs.objects.lock().await.claim_throttles, 0);
+}
+
+async fn measured_pipeline(
+    gcs: &Origin,
+    storage: MediaStorage,
+    filter: &str,
+    expected_claim_writes: usize,
+) -> Duration {
+    let hash = seed_generated_video(&storage, filter).await;
+    let (url, callbacks, webhook) = webhook().await;
+    let state = Arc::new(crate::AppState {
+        media_storage: storage,
+        gcs_client: gcs.client(),
+        config: crate::Config::from_lookup(|key| match key {
+            "GCS_BUCKET" => Some("synthetic-gcs".into()),
+            "WEBHOOK_URL" => Some(url.clone()),
+            _ => None,
+        }),
+        provider_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+    });
+    let started = Instant::now();
+    let result = crate::process_transcode(state.clone(), request(&hash, false))
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(result.status, "complete");
+    assert!(state.media_storage.can_reuse_hls(&hash).await.unwrap());
+    let state = gcs.objects.lock().await;
+    assert_eq!(state.claim_writes[&lock_key(&hash)], expected_claim_writes);
+    assert!(!state.live.contains_key(&lock_key(&hash)));
+    let events = callbacks.events.lock().await;
+    assert_eq!(events.last().unwrap()["status"], "complete");
+    webhook.abort();
+    elapsed
+}
+
+#[tokio::test]
+async fn a_release_throttled_before_takeover_cannot_delete_the_replacement() {
+    let origin = Origin::start().await;
+    let mut owner = origin.store().claim(A, None).await.unwrap();
+    // Let deletion reach the fake provider immediately. Age the claim for
+    // takeover only after the provider has rejected that first attempt.
+    owner.next_mutation = Instant::now();
+    origin.objects.lock().await.throttle_next_claim_write = true;
+    let release = tokio::spawn(owner.finish(true));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while origin.objects.lock().await.claim_throttles == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    origin.age(A).await;
+    let replacement = origin.store().claim(A, None).await.unwrap();
+    assert!(release.await.unwrap().is_err());
+    assert!(origin
+        .store()
+        .claim(A, None)
+        .await
+        .unwrap_err()
+        .is::<Busy>());
+    replacement.finish(true).await.unwrap();
+}
+
+#[tokio::test]
+async fn mutation_pacing_cannot_admit_a_put_past_the_attempt_deadline() {
+    let origin = Origin::start().await;
+    let mut owner = origin.store().claim(A, None).await.unwrap();
+    owner.deadline = Instant::now() + Duration::from_millis(20);
+    assert!(owner
+        .begin_write(true, &format!("{A}/hls/master.m3u8"), "synthetic")
+        .await
+        .is_err());
+    let state = origin.objects.lock().await;
+    assert_eq!(state.claim_writes[&lock_key(A)], 1);
+    drop(state);
+    owner.finish(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_predeadline_intent_cas_can_acknowledge_after_the_admission_deadline() {
+    let origin = Origin::start().await;
+    let mut owner = origin.store().claim(A, None).await.unwrap();
+    owner.next_mutation = Instant::now();
+    owner.deadline = Instant::now() + Duration::from_millis(200);
+    origin.objects.lock().await.delay_next_claim_ack = Some(Duration::from_millis(400));
+    owner
+        .begin_write(true, &format!("{A}/hls/master.m3u8"), "synthetic")
+        .await
+        .unwrap();
+    assert!(Instant::now() >= owner.deadline);
+    assert_eq!(
+        origin.objects.lock().await.live[&lock_key(A)]["generation"],
+        owner.generation.to_string(),
+    );
+    owner.reject_write().await.unwrap();
+    owner.finish(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_throttled_marker_based_takeover_cannot_replace_an_advanced_intent() {
+    let locks = Origin::start().await;
+    let media = crate::object_storage::tests::Origin::start().await;
+    let storage = media.with_gcs_backup(locks.client());
+    let mut owner = locks.store().claim(A, Some(&storage)).await.unwrap();
+    let key = format!("{A}/hls/master.m3u8");
+    let id = owner.write_id();
+    owner.begin_write(false, &key, &id).await.unwrap();
+    media
+        .store()
+        .put_verified(
+            &key,
+            Bytes::from_static(b"synthetic"),
+            "application/vnd.apple.mpegurl",
+            HashMap::from([(WRITE_ID.into(), id.clone())]),
+            None,
+        )
+        .await
+        .unwrap();
+    owner.acknowledge_write();
+
+    locks.age(A).await;
+    locks.objects.lock().await.throttle_next_claim_write = true;
+    let contender = locks.store();
+    let recovery = tokio::spawn(async move { contender.claim(A, Some(&storage)).await });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while locks.objects.lock().await.claim_throttles == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // The simulated old generation has aged past the write interval. Advance
+    // its durable journal before the contender retries the old generation.
+    owner.next_mutation = Instant::now();
+    owner.begin_write(true, &key, &id).await.unwrap();
+    assert!(recovery.await.unwrap().unwrap_err().is::<Busy>());
+    assert_eq!(
+        locks.objects.lock().await.live[&lock_key(A)]["generation"],
+        owner.generation.to_string(),
+    );
+    owner.reject_write().await.unwrap();
+    owner.finish(false).await.unwrap();
 }
