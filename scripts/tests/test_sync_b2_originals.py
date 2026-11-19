@@ -17,7 +17,7 @@ try:
     from google.auth.credentials import AnonymousCredentials
     from google.cloud import storage
 except ImportError:
-    boto3 = None
+    boto3 = Config = None
 
 SPEC = importlib.util.spec_from_file_location(
     "sync_b2_originals", Path(__file__).parents[1] / "sync_b2_originals.py")

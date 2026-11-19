@@ -270,6 +270,59 @@ exclude credentials, blob owners, raw metadata and provider error text; public
 reports remain numeric aggregates. Preserve the append-only evidence during
 recovery and monitor PVC capacity; the worker does not truncate it automatically.
 
+### Aggregate control API diagnostics
+
+`failure_control_<operation>_<kind>` counters classify existing demand/readiness
+exceptions without additional requests or retries. They are diagnostics, not a
+provider repair or permission to replay work. Existing error totals, conditional
+acknowledgements, retry deadlines and copy/erasure gates are unchanged. HTTP 404
+snapshot absence and HTTP 409/412 conditional-ack conflicts remain normal outcomes.
+
+The complete reporter whitelist is `CONTROL_DIAGNOSTIC_COUNTERS` in
+`scripts/sync_b2_originals.py`: the Cartesian product of these fixed sets (115
+possible names; only observed failures are emitted):
+
+- Operations: `demand_list`, `demand_snapshot`, `demand_ack`, `demand_state`,
+  `readiness_read`.
+- Kinds: `http_400`, `http_401`, `http_403`, `http_404`, `http_409`, `http_412`,
+  `http_429`, `http_5xx`, `http_other`, `timeout`, `dns`, `tls`, `transport`,
+  `json_invalid`, `json_duplicate`, `response_too_large`, `generation_missing`,
+  `generation_invalid`, `list_invalid`, `cursor_invalid`, `response_invalid`,
+  `state_error`, `other`.
+
+Labels come from HTTP status, exception types and fixed validation sites, never
+exception text, response bodies/headers, URLs, cursors or identifiers. Transport
+reasons supplied only as text remain `transport`; they are not parsed. The
+`failure_control_readiness_read_timeout` counter covers both
+transport timeouts and expiry of the existing post-write confirmation window,
+including when reads succeed but readiness remains absent. If all 30 reads
+finish before the deadline without a record, confirmation instead returns no
+record and increments `failure_validation_readiness_publication`. Read these
+two counters together when investigating delayed KV visibility: persistent
+absence can take either path depending on read latency and sleep timing.
+The timeout counter alone does not distinguish network failure from delayed
+KV visibility. Neither counter authorizes replaying the write.
+
+`response_invalid` can also include local request validation failures, such as
+a malformed API-token header, and is not proof of a malformed provider response.
+The worker does not normalize credentials or report their contents.
+
+Counters reset each pass and retain demand diagnostics even if intake aborts after earlier
+snapshot failures. Consequently they need not sum to the legacy error totals,
+which historically discard partial intake reports. Readiness classification keeps
+the first observed failure, even if later cleanup also fails.
+Demand intake instead classifies the exception that escapes the operation:
+if an HTTP 400 cursor rejection is followed by a failed SQLite cursor reset,
+only `failure_control_demand_state_state_error` is retained, not the earlier
+`failure_control_demand_list_http_400`.
+
+For the scheduled consumer, the IaC reporter must whitelist these exact names
+and vendor the reviewed worker through its normal source/hash pin update; this
+repository does not activate that integration. First distinguish 401/403 credential
+or scope failures, 400 cursor/request rejection, 429 throttling, typed transport
+failures and malformed JSON/generation contracts before selecting a repair. No
+diagnostic category authorizes changing a retained gate or discarding a request.
+
 ## Local validation
 
 ```sh
