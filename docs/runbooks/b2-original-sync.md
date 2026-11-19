@@ -295,9 +295,13 @@ exception text, response bodies/headers, URLs, cursors or identifiers. Transport
 reasons supplied only as text remain `transport`; they are not parsed. The
 `failure_control_readiness_read_timeout` counter covers both
 transport timeouts and expiry of the existing post-write confirmation window,
-including when reads succeed but readiness remains absent. That counter alone
-does not distinguish network failure from delayed KV visibility and does not
-authorize replaying the write.
+including when reads succeed but readiness remains absent. If all 30 reads
+finish before the deadline without a record, confirmation instead returns no
+record and increments `failure_validation_readiness_publication`. Read these
+two counters together when investigating delayed KV visibility: persistent
+absence can take either path depending on read latency and sleep timing.
+The timeout counter alone does not distinguish network failure from delayed
+KV visibility. Neither counter authorizes replaying the write.
 
 Counters reset each pass and retain demand diagnostics even if intake aborts after earlier
 snapshot failures. Consequently they need not sum to the legacy error totals,
