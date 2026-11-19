@@ -45,6 +45,7 @@ mod hls_claim;
 mod hls_dispatch;
 use hls_claim::{Claim, ClaimStore, Dirty};
 mod media_command;
+mod media_reuse;
 mod mp4;
 mod object_storage;
 mod sound_classification;
@@ -717,6 +718,26 @@ struct HlsVariant {
     resolution: String,
     playlist: String,
     bandwidth: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HlsMethod {
+    Encode,
+    StreamCopy,
+}
+
+impl HlsMethod {
+    fn completion_counter(&self) -> &'static str {
+        match self {
+            Self::Encode => "encode_completed",
+            Self::StreamCopy => "stream_copy_verified",
+        }
+    }
+}
+
+struct HlsGeneration {
+    variants: Vec<HlsVariant>,
+    method: HlsMethod,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1802,17 +1823,17 @@ async fn process_transcode_inner(
 
     // Run FFmpeg to generate HLS with orientation-aware scaling
     claim.confirm().await?;
-    hls_claim::count("encode_started");
     let ffmpeg_result = claim
         .hold(run_ffmpeg_hls(
             &input_path,
             &output_dir,
             state.config.use_gpu,
             &video_info,
+            !repair,
         ))
         .await;
 
-    let variants = match ffmpeg_result {
+    let generation = match ffmpeg_result {
         Ok(v) => v,
         Err(e) => {
             claim.confirm().await?;
@@ -1853,7 +1874,7 @@ async fn process_transcode_inner(
         }
     };
 
-    info!("Generated HLS with {} variants", variants.len());
+    info!("Generated HLS with {} variants", generation.variants.len());
 
     let remux_result = claim.hold(remux_ts_to_fmp4(&output_dir)).await;
     // The best-effort remuxer can skip failed variants and still return Ok.
@@ -1953,7 +1974,7 @@ async fn process_transcode_inner(
     }
 
     claim.mark_verified().await?;
-    hls_claim::count("encode_completed");
+    hls_claim::count(generation.method.completion_counter());
     info!("Uploaded HLS files for {}", hash);
 
     // Update status to complete with video dimensions for the edge service
@@ -1975,7 +1996,7 @@ async fn process_transcode_inner(
         hash: hash.to_owned(),
         status: "complete".to_string(),
         hls_master: format!("{}/hls/master.m3u8", hash),
-        variants,
+        variants: generation.variants,
         display_width: Some(video_info.display_width),
         display_height: Some(video_info.display_height),
         repair_lock_warning: None,
@@ -7184,6 +7205,36 @@ async fn run_ffmpeg_hls(
     output_dir: &Path,
     use_gpu: bool,
     video_info: &VideoInfo,
+    allow_reuse: bool,
+) -> Result<HlsGeneration> {
+    if allow_reuse {
+        match media_reuse::try_reuse(input_path, output_dir).await {
+            Ok(true) => {
+                hls_claim::count("stream_copy_completed");
+                return Ok(HlsGeneration {
+                    variants: hls_variants(),
+                    method: HlsMethod::StreamCopy,
+                });
+            }
+            Ok(false) => hls_claim::count("stream_copy_rejected"),
+            Err(error) => {
+                warn!(%error, "Stream-copy attempt failed; using normal encoding");
+                hls_claim::count("stream_copy_failed");
+            }
+        }
+    }
+    hls_claim::count("encode_started");
+    Ok(HlsGeneration {
+        variants: encode_hls(input_path, output_dir, use_gpu, video_info).await?,
+        method: HlsMethod::Encode,
+    })
+}
+
+async fn encode_hls(
+    input_path: &Path,
+    output_dir: &Path,
+    use_gpu: bool,
+    video_info: &VideoInfo,
 ) -> Result<Vec<HlsVariant>> {
     let input_str = input_path.to_string_lossy();
     let output_pattern = output_dir.join("stream_%v.m3u8");
@@ -7403,7 +7454,11 @@ async fn run_ffmpeg_hls(
         return Err(anyhow!("Master playlist not created"));
     }
 
-    Ok(vec![
+    Ok(hls_variants())
+}
+
+fn hls_variants() -> Vec<HlsVariant> {
+    vec![
         HlsVariant {
             resolution: "720p".to_string(),
             playlist: "stream_720p.m3u8".to_string(),
@@ -7414,7 +7469,7 @@ async fn run_ffmpeg_hls(
             playlist: "stream_480p.m3u8".to_string(),
             bandwidth: 1_000_000,
         },
-    ])
+    ]
 }
 
 /// How the sound track crosses from the .ts into the MP4.

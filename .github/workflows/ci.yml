@@ -64,8 +64,11 @@ jobs:
       - name: Run upload service tests
         run: cargo test --manifest-path cloud-run-upload/Cargo.toml --locked
 
+      - name: Install FFmpeg for generated-media regression tests
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
       - name: Run transcoder service tests
-        run: cargo test --manifest-path cloud-run-transcoder/Cargo.toml --locked
+        run: cargo test --manifest-path cloud-run-transcoder/Cargo.toml --locked -- --include-ignored
 
       - name: Run transcoder Python tests
         working-directory: cloud-run-transcoder
