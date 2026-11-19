@@ -303,10 +303,18 @@ absence can take either path depending on read latency and sleep timing.
 The timeout counter alone does not distinguish network failure from delayed
 KV visibility. Neither counter authorizes replaying the write.
 
+`response_invalid` can also include local request validation failures, such as
+a malformed API-token header, and is not proof of a malformed provider response.
+The worker does not normalize credentials or report their contents.
+
 Counters reset each pass and retain demand diagnostics even if intake aborts after earlier
 snapshot failures. Consequently they need not sum to the legacy error totals,
 which historically discard partial intake reports. Readiness classification keeps
 the first observed failure, even if later cleanup also fails.
+Demand intake instead classifies the exception that escapes the operation:
+if an HTTP 400 cursor rejection is followed by a failed SQLite cursor reset,
+only `failure_control_demand_state_state_error` is retained, not the earlier
+`failure_control_demand_list_http_400`.
 
 For the scheduled consumer, the IaC reporter must whitelist these exact names
 and vendor the reviewed worker through its normal source/hash pin update; this
