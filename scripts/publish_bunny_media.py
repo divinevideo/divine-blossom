@@ -78,6 +78,14 @@ class Deferred(Exception):
     pass
 
 
+class Ineligible(Deferred):
+    """A completed negative inspection. A later catalog scan can reconsider it."""
+
+
+class RetryableNoWrite(Exception):
+    """The server confirmed no PUT and released this attempt's gate."""
+
+
 class QueueFull(Exception):
     pass
 
@@ -104,6 +112,17 @@ class State:
         if previous is not None and previous != expected:
             self.close()
             raise ValueError('journal belongs to another source scope')
+        if 'scheduled' not in {r[1] for r in self.db.execute('pragma table_info(jobs)')}:
+            # SQLite DDL needs an explicit transaction. A restart must see
+            # either the complete legacy journal or the complete migration.
+            self.db.execute('begin')
+            self.db.execute('alter table jobs add column scheduled integer not null default 1')
+            self.db.execute("update jobs set scheduled=0 where status in ('ready','refused','uncertain')")
+            refused = self.db.execute("select parent from jobs where status='refused'").fetchall()
+            for (parent,) in refused:
+                progress = self.data(parent)
+                if not progress.get('ready') and not progress.get('published'):
+                    self.db.execute("update jobs set status='observed' where parent=?", (parent,))
         self.set_setting('binding', expected)
         self.db.execute("update jobs set status='uncertain' where status='inflight'")
         self.db.commit()
@@ -121,22 +140,26 @@ class State:
         self.db.execute('insert or replace into settings values (?,?)', (key, value))
         self.db.commit()
 
-    def page(self, parents, cursor):
+    def page(self, parents, cursor, *, dry_run=False):
         with self.db:
             for parent in parents:
                 if not HEX.fullmatch(parent):
                     raise ValueError('invalid discovered parent')
                 row = self.db.execute('select status from jobs where parent=?', (parent,)).fetchone()
                 if row is not None:
-                    if row[0] != 'uncertain':
-                        self.db.execute("update jobs set status='queued' where parent=?", (parent,))
+                    if row[0] not in ('uncertain', 'inflight'):
+                        self.db.execute("update jobs set scheduled=1 where parent=?", (parent,))
                     continue
                 if self.db.execute('select count(*) from jobs').fetchone()[0] >= 10000:
-                    self.db.execute("delete from jobs where parent=(select parent from jobs where status='ready' order by seq limit 1)")
+                    self.db.execute("""
+                        delete from jobs where parent=(
+                            select parent from jobs where status='observed' or (status='ready' and ?)
+                            order by seq limit 1)
+                    """, (not dry_run,))
                     if self.db.execute('select count(*) from jobs').fetchone()[0] >= 10000:
                         raise QueueFull('journal queue saturated')
                 seq = self.db.execute('select coalesce(max(seq),0)+1 from jobs').fetchone()[0]
-                self.db.execute("insert into jobs values (?,'queued','{}',?)", (parent, seq))
+                self.db.execute("insert into jobs(parent,status,data,seq) values (?,'queued','{}',?)", (parent, seq))
             self.db.execute('insert or replace into settings values (?,?)', ('cursor', cursor))
 
     def status(self, parent):
@@ -147,11 +170,26 @@ class State:
         row = self.db.execute('select data from jobs where parent=?', (parent,)).fetchone()
         return json.loads(row[0]) if row else {}
 
-    def save(self, parent, status, data):
-        seq = self.db.execute('select coalesce(max(seq),0)+1 from jobs').fetchone()[0]
-        self.db.execute('update jobs set status=?,data=?,seq=? where parent=?',
-                        (status, json.dumps(data, sort_keys=True), seq, parent))
+    def save(self, parent, status, data, *, scheduled=None):
+        if scheduled is None:
+            scheduled = status in ('pending', 'observed')
+        self.db.execute('update jobs set status=?,data=?,scheduled=?,seq=(select max(seq)+1 from jobs) where parent=?',
+                        (status, json.dumps(data, sort_keys=True), scheduled, parent))
         self.db.commit()
+
+    def rotate(self, parent):
+        self.db.execute('update jobs set seq=(select max(seq)+1 from jobs) where parent=?', (parent,))
+        self.db.commit()
+
+    def observed(self, parent, dry_run):
+        progress = self.data(parent)
+        if not progress.get('published') and not progress.get('ready'):
+            self.save(parent, 'observed', progress)
+        elif dry_run:
+            self.rotate(parent)
+        else:
+            # Keep acknowledged pins for a later successful reinspection.
+            self.save(parent, 'pending', progress)
 
     def export_ready(self, path):
         row = self.db.execute("select data from jobs where status='ready' order by seq desc limit 1").fetchone()
@@ -170,7 +208,7 @@ class State:
 
     def pending(self, limit):
         return [r[0] for r in self.db.execute(
-            "select parent from jobs where status in ('queued','pending') order by seq limit ?", (limit,))]
+            "select parent from jobs where scheduled=1 and status not in ('uncertain','inflight') order by seq limit ?", (limit,))]
 
 
 class Reconciler:
@@ -182,23 +220,32 @@ class Reconciler:
         record = self.kv.metadata(parent)
         if (not isinstance(record, dict) or record.get('sha256') != parent
                 or record.get('status') != 'active' or record.get('transcode_status') != 'complete'
-                or not self.producer.idle(parent)):
-            raise Deferred()
+                or not isinstance(record.get('type'), str) or not record['type'].startswith('video/')
+                or type(record.get('transcode_generation')) is not int or record['transcode_generation'] <= 0):
+            raise Ineligible()
+        if not self.producer.idle(parent):
+            raise Ineligible()
         # Keep uploader identities and other sensitive metadata out of the journal.
-        return {key: record.get(key) for key in ('sha256', 'status', 'transcode_status', 'transcode_generation')}
+        return {key: record.get(key) for key in ('sha256', 'type', 'size', 'status', 'transcode_status', 'transcode_generation',
+                                                    'transcode_last_attempt_at', 'transcode_attempt_count')}
 
     def _prepare(self, parent, budget):
         metadata = self._metadata(parent)
         identities, sources = {}, {}
         for suffix in SUFFIXES:
+            if not suffix and (metadata['type'] != 'video/mp4' or type(metadata['size']) is not int
+                               or not 0 < metadata['size'] <= MAX_OBJECT):
+                continue
             source = self.derived if suffix else self.original
             key = source_key(parent, suffix)
             identity = source.head(key)
             if identity is None:
                 if suffix in HLS:
-                    raise Deferred()
+                    raise Ineligible()
                 continue
             size = identity.get('size')
+            if not suffix and size != metadata['size']:
+                continue
             maximum = MAX_PLAYLIST if suffix.endswith('.m3u8') else MAX_OBJECT
             if type(size) is not int or not 0 < size <= maximum:
                 if suffix in ('', '720p.mp4', '480p.mp4'):
@@ -206,11 +253,18 @@ class Reconciler:
                 raise ValueError('source exceeds family bounds')
             validate_source_identity({k: v for k, v in identity.items() if k != 'size'}, key)
             identities[suffix], sources[suffix] = identity, source
-        if not all(s in identities for s in HLS):
-            raise Deferred()
-        fingerprint = digest(json.dumps({'metadata': metadata, 'sources': identities}, sort_keys=True).encode())
+        def snapshot_id(fields):
+            return digest(json.dumps({'metadata': fields, 'sources': identities}, sort_keys=True).encode())
+
+        fingerprint = snapshot_id(metadata)
         saved = self.state.data(parent)
-        if saved.get('fingerprint') == fingerprint and saved.get('ready'):
+        same_snapshot = saved.get('fingerprint') == fingerprint
+        if not same_snapshot and saved.get('fingerprint'):
+            # V1 receipts pinned these four metadata fields and every source version.
+            legacy = {k: metadata[k] for k in ('sha256', 'status', 'transcode_status', 'transcode_generation')}
+            same_snapshot = saved['fingerprint'] == snapshot_id(legacy)
+        if same_snapshot and saved.get('ready'):
+            saved['fingerprint'] = fingerprint
             self._check_snapshot(parent, metadata, identities, sources)
             reserved = 3 * sum(MAX_PLAYLIST if s.endswith('.m3u8') else MAX_OBJECT for s in identities)
             if reserved > budget.remaining:
@@ -240,7 +294,7 @@ class Reconciler:
             delivery = normalized(parent, suffix, body, sizes)
             assets[suffix] = {'path': path, 'source_sha256': digest(body), 'delivery_sha256': digest(delivery)}
         self._check_snapshot(parent, metadata, identities, sources)
-        prior = saved.get('published', []) if saved.get('fingerprint') == fingerprint else []
+        prior = saved.get('published', []) if same_snapshot else []
         inventory = {'version': 1, 'parent': parent, 'assets': [
             {**pin, 'delivery_size': len(normalized(parent, suffix, bodies[suffix], sizes))}
             for suffix, pin in assets.items()]}
@@ -260,13 +314,7 @@ class Reconciler:
             self.state.save(parent, 'inflight', progress)
             pins = [{key: pin[key] for key in ('path', 'source_sha256', 'delivery_sha256')}
                     for pin in progress['inventory']['assets']]
-            try:
-                reply = self.api.finalize({'version': 1, 'parent': parent, 'assets': pins})
-            except APIRefused as error:
-                if error.status == 409:
-                    progress.pop('ready', None)
-                    progress['published'] = []
-                raise
+            reply = self.api.finalize({'version': 1, 'parent': parent, 'assets': pins})
             if reply != {'result': 'ready'}:
                 raise TimeoutError('ready family revalidation unverified')
             self.state.save(parent, 'ready', progress)
@@ -311,7 +359,7 @@ class Reconciler:
         for _ in range(max_pages):
             parents, cursor = self.kv.page(self.state.setting('cursor'), page_size)
             try:
-                self.state.page(parents, cursor)
+                self.state.page(parents, cursor, dry_run=dry_run)
             except QueueFull:
                 report['saturated'] += 1
                 break
@@ -324,20 +372,37 @@ class Reconciler:
             try:
                 prepared, progress, size = self._prepare(parent, budget)
                 report[self._publish(parent, prepared, progress, dry_run)] += 1
-            except Deferred:
-                self.state.save(parent, 'pending', progress)
+                if dry_run:
+                    self.state.rotate(parent)
+            except Ineligible:
+                self.state.observed(parent, dry_run)
                 report['deferred'] += 1
-            except APIRefused:
-                self.state.save(parent, 'refused', progress)
+            except RetryableNoWrite:
+                self.state.save(parent, 'pending', progress)
+                report['retryable_no_write'] += 1
+            except Deferred:
+                self.state.rotate(parent)
+                report['deferred'] += 1
+            except APIRefused as error:
+                if error.status == 409:
+                    progress.pop('ready', None)
+                    progress['published'] = []
+                protected = progress.get('ready') or progress.get('published')
+                self.state.save(parent, 'refused' if protected else 'observed', progress, scheduled=False)
                 report['refused'] += 1
-            except (TimeoutError, ConnectionError):
-                uncertain = self.state.status(parent) == 'inflight'
-                self.state.save(parent, 'uncertain' if uncertain else 'pending', progress)
-                report['uncertain' if uncertain else 'errors'] += 1
-            except Exception:
-                # A crash after the write intent cannot be silently retried.
-                status = 'uncertain' if self.state.status(parent) == 'inflight' else 'pending'
-                self.state.save(parent, status, progress)
+            except Exception as error:
+                if self.state.status(parent) == 'inflight':
+                    # Includes malformed JSON after dispatch. Only a definite
+                    # protocol result can release the local write fence.
+                    self.state.save(parent, 'uncertain', progress)
+                    report['uncertain'] += 1
+                    continue
+                if isinstance(error, ValueError):
+                    self.state.observed(parent, dry_run)
+                elif dry_run:
+                    self.state.rotate(parent)
+                else:
+                    self.state.save(parent, 'pending', progress)
                 report['errors'] += 1
         report['reserved_media_bytes'] = budget.used
         return dict(report)
@@ -388,9 +453,12 @@ class BunnyAdmin:
 
     def _post(self, operation, payload):
         try:
-            return self.http.request('https://media.divine.video/admin/api/bunny-pilot/' + operation,
+            reply = self.http.request('https://media.divine.video/admin/api/bunny-pilot/' + operation,
                 'POST', payload, headers={'Authorization': 'Bearer ' + self.token},
                 max_response_bytes=32768, timeout=150)
+            if reply == {'result': 'retryable_no_write'}:
+                raise RetryableNoWrite()
+            return reply
         except ControlAPIError as error:
             if error.status >= 500:
                 raise ConnectionError('publication outcome uncertain') from None

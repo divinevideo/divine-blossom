@@ -259,12 +259,12 @@ pub(crate) fn bunny_playback_policy(hash: &str) -> Result<Option<BlobMetadata>> 
     let invalid = || BlossomError::MetadataError("Bunny publication policy invalid".into());
     let denied = || BlossomError::NotFound("Public MP4 unavailable".into());
     let entry = lookup(&format!("{BLOB_PREFIX}{hash}"))?.ok_or_else(denied)?;
-    let metadata: BlobMetadata = serde_json::from_slice(&entry.body).map_err(|_| invalid())?;
+    let metadata: BlobMetadata = serde_json::from_slice::<Option<BlobMetadata>>(&entry.body)
+        .map_err(|_| invalid())?.ok_or_else(denied)?;
     let is_pubkey =
         |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
     if metadata.sha256 != hash
-        || metadata.status != BlobStatus::Active
-        || !metadata.quarantine_hold_ids.is_empty()
+        || metadata.access_for(None, false) != crate::blossom::BlobAccess::Allowed
         || !is_pubkey(&metadata.owner)
         || lookup(&format!("{TOMBSTONE_PREFIX}{hash}"))?.is_some()
     {
@@ -289,13 +289,16 @@ pub(crate) fn bunny_playback_policy(hash: &str) -> Result<Option<BlobMetadata>> 
     uploaders.dedup();
     // Two passes plus B2, purge and gate reads must fit the Compute subrequest
     // budget, even on the policy-race cleanup path. This is a bounded pilot.
-    if uploaders.len() > 3 || !metadata.mime_type.starts_with("video/") || metadata.size == 0 {
+    if uploaders.len() > 3 {
         return Ok(None);
     }
     for uploader in uploaders {
         if !is_pubkey(&uploader) || lookup(&vanish_in_progress_key(&uploader))?.is_some() {
             return Err(denied());
         }
+    }
+    if metadata.status != BlobStatus::Active || !metadata.mime_type.starts_with("video/") || metadata.size == 0 {
+        return Ok(None);
     }
     Ok(Some(metadata))
 }

@@ -118,8 +118,10 @@ or enabling the internal mobile flag.
   sets this hint. Its next invocation spends the standalone credential
   on both Fastly rounds, then clears the hint and leaves the original CDN intent
   pending. Conversely, a 401/403 from the standalone credential for an enrolled
-  parent schedules the packed Fastly token first on the next drain. That
-  preference survives partial Bunny cleanup. The outbox clears after both
+  parent schedules the packed Fastly token first on the next drain. A failed
+  dedicated standalone attempt, including a missing token or a sustained Fastly
+  5xx, also schedules the packed path so Bunny origin deletion and eviction
+  can advance independently. That preference survives partial Bunny cleanup. The outbox clears after both
   canonical rounds and all required Bunny work succeed.
   Expect one extra drain interval for credential recovery.
   Repair the pilot binding and drain through origin absence and both CDN rounds.
@@ -129,7 +131,9 @@ or enabling the internal mobile flag.
   `sha256`. The hash in `path` identifies the parent blob. `sha256` is the
   lowercase SHA-256 of the exact selected bytes and differs from the parent
   hash for a rendition. The pilot accepts files up to 16 MiB. Verify the
-  publisher's returned success for each object. A manifest is limited to
+  publisher's returned success for each object. Either admin operation can
+  report `{"result":"retryable_no_write"}` after a confirmed pre-write worker
+  failure and settled gate. Retry it on the next enrollment pass. A manifest is limited to
   64 KiB. Publish the two TS files first, their two playlists second, then
   the master. Finalize the entire family before testing production selection.
   Retire a changed rendition, verify removal and both cache evictions, then

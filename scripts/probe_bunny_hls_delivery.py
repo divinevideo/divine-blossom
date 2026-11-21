@@ -102,6 +102,39 @@ class Probe:
         if not reply.headers.get('server', '').lower().startswith('bunnycdn'):
             raise ValueError('unexpected CDN')
 
+    def _client_policy(self, reply):
+        self._bunny(reply)
+        directives = {v.strip().lower() for v in reply.headers.get('cache-control', '').split(',')}
+        if not {'private', 'no-store'} <= directives or 'public' in directives:
+            raise ValueError('unexpected client cache policy')
+
+    @staticmethod
+    def _denied(reply, pin, method):
+        if (reply.status not in (401, 403, 404) or 'content-range' in reply.headers
+                or reply.headers.get('accept-ranges', 'none').strip().lower() != 'none'):
+            return False
+        mime = reply.headers.get('content-type', '').split(';', 1)[0].strip().lower()
+        if mime not in ('', 'text/html', 'text/plain', 'application/json', 'application/problem+json'):
+            return False
+        if not reply.body:
+            return True
+        if (method == 'HEAD' or not mime or hashlib.sha256(reply.body).hexdigest() == pin['delivery_sha256']
+                or reply.body.lstrip().startswith(b'#EXTM3U') or reply.body[4:8] == b'ftyp'):
+            return False
+        # Error bodies should be readable text, never a binary segment or byte range.
+        try:
+            text = reply.body.decode('utf-8')
+        except UnicodeDecodeError:
+            return False
+        if not all(c.isprintable() or c in '\r\n\t' for c in text):
+            return False
+        if mime == 'text/html':
+            return text.lstrip().lower().startswith(('<!doctype html', '<html'))
+        if mime in ('application/json', 'application/problem+json'):
+            return isinstance(json.loads(text), dict)
+        return any(reason in text.lower() for reason in
+                   (str(reply.status), 'denied', 'unauthorized', 'forbidden', 'not found'))
+
     @staticmethod
     def _mime(path, reply):
         mime = reply.headers.get('content-type', '').split(';', 1)[0].lower()
@@ -112,8 +145,9 @@ class Probe:
 
     def _range(self, host, path, body, start, end):
         reply = self._request(host, path, byte_range=(start, end), limit=end - start + 1)
-        self._bunny(reply)
-        if (reply.status != 206 or reply.headers.get('content-range') != f'bytes {start}-{end}/{len(body)}'
+        self._client_policy(reply)
+        self._mime(path, reply)
+        if (reply.status != 206 or reply.headers.get('content-length') != str(end - start + 1) or reply.headers.get('content-range') != f'bytes {start}-{end}/{len(body)}'
                 or reply.body != body[start:end + 1]):
             raise ValueError('range proof failed')
 
@@ -159,7 +193,8 @@ class Probe:
                     for path in self.pins:
                         for method, byte_range in (('GET', None), ('HEAD', None), ('GET', (0, 0))):
                             reply = self._request(host, path, method, byte_range, limit=8192)
-                            if reply.status not in (401, 403, 404):
+                            self._client_policy(reply)
+                            if not self._denied(reply, self.pins[path], method):
                                 report['failures'] += 1
                             else:
                                 report['denied_requests'] += 1
@@ -167,7 +202,7 @@ class Probe:
                 bodies = {}
                 for path, pin in self.pins.items():
                     first = self._request(host, path, limit=pin['delivery_size'])
-                    self._bunny(first)
+                    self._client_policy(first)
                     self._mime(path, first)
                     if (first.status != 200 or len(first.body) != pin['delivery_size']
                             or hashlib.sha256(first.body).hexdigest() != pin['delivery_sha256']):
@@ -175,11 +210,13 @@ class Probe:
                     if require_cold and first.headers.get('cdn-cache', '').upper() != 'MISS':
                         raise ValueError('fixture was not cold')
                     head = self._request(host, path, method='HEAD', limit=0)
-                    self._bunny(head)
+                    self._client_policy(head)
+                    self._mime(path, head)
                     if head.status != 200 or head.headers.get('content-length') != str(len(first.body)):
                         raise ValueError('HEAD proof failed')
                     warm = self._request(host, path, limit=pin['delivery_size'])
-                    self._bunny(warm)
+                    self._client_policy(warm)
+                    self._mime(path, warm)
                     if (warm.status != 200 or warm.body != first.body
                             or warm.headers.get('cdn-cache', '').upper() != 'HIT'):
                         raise ValueError('warm cache proof failed')

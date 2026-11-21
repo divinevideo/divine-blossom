@@ -18,7 +18,31 @@ struct Ready {
     bucket: String,
     prefix: String,
     hosts: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    producer: Option<CompletedTranscode>,
     assets: Vec<Verified>,
+}
+
+// A terminal callback generation identifies the winning producer attempt.
+#[derive(PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompletedTranscode {
+    generation: u64,
+    attempt_count: u32,
+    last_attempt_at: Option<String>,
+}
+
+impl CompletedTranscode {
+    fn current(policy: &crate::blossom::BlobMetadata) -> Option<Self> {
+        if policy.transcode_status != Some(crate::blossom::TranscodeStatus::Complete) {
+            return None;
+        }
+        Some(Self {
+            generation: policy.transcode_generation.filter(|g| *g > 0)?,
+            attempt_count: policy.transcode_attempt_count,
+            last_attempt_at: policy.transcode_last_attempt_at.clone(),
+        })
+    }
 }
 
 fn key(parent: &str) -> String {
@@ -57,15 +81,16 @@ pub(crate) fn finalize(body: &[u8]) -> Result<Value> {
         return Err(invalid());
     }
     with_gate(parent, |_, _, check_gate, may_release| {
-        let verified = verify_family(&inventory, check_gate);
-        let ready = match verified {
-            Ok(ready) => ready,
-            Err(error) => {
+        let ready = match verify_family(&inventory, check_gate) {
+            Ok(Some(ready)) => ready,
+            incomplete => {
                 *may_release = false;
                 check_gate()?;
                 invalidate(parent)?;
                 *may_release = true;
-                return Err(error);
+                // Only a confirmed worker no-write can become a retry after the
+                // stale inventory is retired and with_gate releases the claim.
+                return incomplete.map(|_| json!({"result":"retryable_no_write"}));
             }
         };
         let store = metadata::open_store()?;
@@ -80,9 +105,21 @@ pub(crate) fn finalize(body: &[u8]) -> Result<Value> {
     })
 }
 
-fn verify_family(inventory: &Inventory, check_gate: &dyn Fn() -> Result<()>) -> Result<Ready> {
+fn verify_family(
+    inventory: &Inventory,
+    check_gate: &dyn Fn() -> Result<()>,
+) -> Result<Option<Ready>> {
     let parent = &inventory.parent;
-    metadata::bunny_public_metadata(parent)?;
+    let policy = metadata::bunny_public_metadata(parent)?;
+    let has_derivatives = inventory
+        .assets
+        .iter()
+        .any(|p| Asset::parse(&p.path).is_some_and(|a| !a.is_original()));
+    let producer = if has_derivatives {
+        Some(CompletedTranscode::current(&policy).ok_or_else(changed)?)
+    } else {
+        None
+    };
     let hosts = storage::get_config("bunny_pilot_zone_hosts")?;
     if !storage::bunny_pilot_enrolled(parent)?
         || storage::origin_bunny_pilot_hosts()?.as_deref() != Some(&hosts)
@@ -97,6 +134,7 @@ fn verify_family(inventory: &Inventory, check_gate: &dyn Fn() -> Result<()>) -> 
         },
     )? {
         Outcome::Verified { assets } => assets,
+        Outcome::Unavailable => return Ok(None),
         Outcome::SourceChanged | Outcome::SourceMissing | Outcome::DeliveryConflict => {
             return Err(changed())
         }
@@ -116,20 +154,24 @@ fn verify_family(inventory: &Inventory, check_gate: &dyn Fn() -> Result<()>) -> 
     }
     check_gate()?;
     let policy = metadata::bunny_public_metadata(parent)?;
+    if has_derivatives && producer != CompletedTranscode::current(&policy) {
+        return Err(changed());
+    }
     if assets.iter().any(|v| {
         Asset::parse(&v.asset.path).is_some_and(|a| a.is_original())
             && (policy.size != v.delivery_size as u64 || policy.mime_type != "video/mp4")
     }) {
         return Err(changed());
     }
-    Ok(Ready {
+    Ok(Some(Ready {
         version: 1,
         parent: parent.clone(),
         bucket: scope.b2_bucket,
         hosts,
         prefix: DELIVERY_PREFIX.to_owned(),
+        producer,
         assets,
-    })
+    }))
 }
 
 fn cohort(
@@ -154,18 +196,18 @@ fn cohort(
         && u32::from_str_radix(&parent[..8], 16).is_ok_and(|bucket| bucket % 100 < n as u32)
 }
 
-fn read_paths(parent: &str) -> Result<Vec<(String, usize)>> {
+fn read_ready(parent: &str) -> Result<Option<Ready>> {
     let read = crate::kv_origin::lookup(&key(parent))?
         .ok_or_else(|| BlossomError::MetadataError("Bunny readiness origin unavailable".into()))?;
     let Some(entry) = read else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     // Eight assets with two bounded version IDs each fit comfortably in 32 KiB.
     if entry.body.len() > 32 * 1024 {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     let Ok(ready) = serde_json::from_slice::<Ready>(&entry.body) else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     if ready.version != 1
         || ready.parent != parent
@@ -175,20 +217,14 @@ fn read_paths(parent: &str) -> Result<Vec<(String, usize)>> {
         || ready.hosts != storage::get_config("bunny_pilot_zone_hosts")?
         || !complete(parent, ready.assets.iter().map(|v| &v.asset))
     {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     let scope = storage::bunny_scope()?;
-    let mut paths = Vec::new();
-    for v in ready.assets {
-        let asset = Asset::parse(&v.asset.path).ok_or_else(invalid)?;
-        if !scope.matches(&v) {
-            return Ok(Vec::new());
-        }
-        if asset.is_top_level() {
-            paths.push((v.asset.path, v.delivery_size));
-        }
-    }
-    Ok(paths)
+    Ok(ready
+        .assets
+        .iter()
+        .all(|asset| scope.matches(asset))
+        .then_some(ready))
 }
 
 fn selection(req: &Request, parent: &str, country: Option<&str>) -> Result<Value> {
@@ -205,23 +241,32 @@ fn selection(req: &Request, parent: &str, country: Option<&str>) -> Result<Value
     } else {
         None
     };
-    let candidates = if before.is_some() {
-        read_paths(parent)
+    let ready = if before.is_some() {
+        read_ready(parent)
     } else {
-        Ok(Vec::new())
+        Ok(None)
     };
+    // Read current policy after the inventory, including when the cohort is disabled.
     let policy = metadata::bunny_playback_policy(parent)?;
     let mut paths = Vec::new();
     if let (Some(policy), Some(before)) = (policy, before) {
-        let candidates = candidates?;
-        if !candidates.is_empty()
-            && crate::parent_gate::bunny_settled_generation(parent)?.as_ref() == Some(&before)
-        {
-            paths.extend(candidates.into_iter().filter_map(|(path, size)| {
-                let original = Asset::parse(&path)?.is_original();
-                (!original || (policy.mime_type == "video/mp4" && policy.size == size as u64))
-                    .then_some(path)
-            }));
+        if let Some(ready) = ready? {
+            if crate::parent_gate::bunny_settled_generation(parent)?.as_ref() == Some(&before) {
+                let derivatives_current = ready.producer.is_some()
+                    && ready.producer == CompletedTranscode::current(&policy);
+                for verified in ready.assets {
+                    let asset = Asset::parse(&verified.asset.path).ok_or_else(invalid)?;
+                    let selectable = if asset.is_original() {
+                        policy.mime_type == "video/mp4"
+                            && policy.size == verified.delivery_size as u64
+                    } else {
+                        derivatives_current && asset.is_top_level()
+                    };
+                    if selectable {
+                        paths.push(verified.asset.path);
+                    }
+                }
+            }
         }
     }
     Ok(json!({"version":1,"host":DELIVERY_HOST,"paths":paths}))

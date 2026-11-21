@@ -813,6 +813,17 @@ fn bunny_legacy_canonical_fallback() {
         serde_json::from_str::<serde_json::Value>(&response.take_body_str()).unwrap()["result"]
             .clone()
     };
+    if storage::config_flag("fixture_failed_standalone_hint") {
+        let store = open_store().unwrap();
+        store.insert(&format!("canonical-purge-priority:v1:{hash}"), "1").unwrap();
+        let key = store.build_list().prefix("b2-cdn-purge:v1:").execute().unwrap().keys()[0].clone();
+        for _ in 0..7 {
+            assert_eq!(drain("synthetic-drain-token"), 0);
+            let body = store.lookup(&key).unwrap().take_body().into_string();
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["state"], "committed");
+        }
+        return;
+    }
     if storage::config_flag("fixture_standalone_rejected") {
         let store = open_store().unwrap();
         let records = store

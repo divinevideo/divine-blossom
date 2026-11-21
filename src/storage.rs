@@ -2676,9 +2676,18 @@ pub(crate) fn invalidate_b2_cdn(hashes: &[String]) -> Result<()> {
             }
         }
         if !standalone_priority.is_empty() {
-            let token = get_secret("fastly_api_token")?;
-            let retry = bunny_configured.then_some(CanonicalCredential::Packed);
-            invalidate_fastly_cdn(hashes, targets?, &token, retry)?;
+            let canonical = get_secret("fastly_api_token").and_then(|token| {
+                invalidate_fastly_cdn(hashes, targets?, &token, None)
+            });
+            if let Err(error) = canonical {
+                // This dedicated retry reserves its secret budget for Fastly.
+                // Even a missing key or sustained 5xx must give the independent
+                // eraser and Bunny purges the next bounded execution.
+                if bunny_configured {
+                    stage_canonical_priority(hashes, CanonicalCredential::Packed)?;
+                }
+                return Err(error);
+            }
             clear_canonical_priority(&store, &standalone_priority)?;
             return Err(BlossomError::StorageError(
                 "Canonical eviction completed; CDN intent pending".into(),

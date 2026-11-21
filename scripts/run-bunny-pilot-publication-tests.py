@@ -29,7 +29,7 @@ PREFIX = "bunny-delivery/"
 CDN_HOSTS = ("media-bunny.divine.video", "fixture-pilot.b-cdn.net")
 B2_API_HOST = "api.backblazeb2.com"
 KV_BASE = "/resources/stores/kv/fixture-store/keys/"
-CASES = ("lost_permit_reply", "denied_during_prep", "ready_delete_failure", "permit_contract", "delayed_publish", "hls_family", "disabled_four", "active", "active_rendition", "pending", "age_restricted", "checksum_mismatch",
+CASES = ("source_unavailable", "pending_zero", "lost_permit_reply", "denied_during_prep", "ready_delete_failure", "permit_contract", "delayed_publish", "hls_family", "disabled_four", "active", "active_rendition", "pending", "age_restricted", "checksum_mismatch",
          "age_gate_after_put", "appeal", "unverified_retry", "rejected_put", "uncertain_put",
          "disabled", "webhook_token", "wrong_writer_scope", "lost_worker_reply", "invalid_worker_evidence", "wrong_worker_primary")
 SECRETS = {
@@ -119,6 +119,11 @@ class Origin(BaseHTTPRequestHandler):
                 return self.reply(200, ",".join(CDN_HOSTS).encode(), {"generation": "1"})
             if key == f"bunny-pilot-enrolled:v1:{HASH}":
                 return self.reply(200, b"1", {"generation": "1"})
+            if self.server.policy_blocker == "quarantine" and key == f"quarantine:v1:{HASH}":
+                return self.reply_json({"version":1,"holds":{"fixture":{"version":1,"active":True}}}, {"generation":"1"})
+            if ((self.server.policy_blocker == "tombstone" and key == f"tombstone:{HASH}") or
+                (self.server.policy_blocker == "vanish" and key == f"vanish_in_progress:v1:{OWNER}")):
+                return self.reply_json(1, {"generation":"1"})
             if self.server.case in ("hls_family","disabled_four"):
                 if key == f"bunny-ready:v1:{HASH}":
                     captured = self.server.ready
@@ -149,6 +154,7 @@ class Origin(BaseHTTPRequestHandler):
                 "uploaded": "2026-01-01T00:00:00Z",
                 "owner": OWNER,
                 "status": status,
+                **self.server.transcode,
             }, {"generation": "1"})
 
         if self.path == "/b2api/v4/b2_authorize_account":
@@ -171,6 +177,8 @@ class Origin(BaseHTTPRequestHandler):
             body, mime = self.server.objects[self.path]
             return self.reply(200, body, {"Content-Type": mime, **({"x-goog-generation": self.server.source_version} if reader == "fixture-gcs-id" else {"x-amz-version-id": "fixture-version-1" if self.path in self.server.destinations else self.server.source_version})})
         if self.path == f"/{BUCKET}/{self.server.source_key}":
+            if self.server.case == "source_unavailable":
+                return self.reply(503)
             if self.server.case == "denied_during_prep":
                 self.server.policy_status = "age_restricted"
             if self.server.case == "delayed_publish" and self.server.delivered is None:
@@ -241,6 +249,9 @@ class Origin(BaseHTTPRequestHandler):
                 response = worker.getresponse()
                 payload = response.read()
                 self.server.permit_gate = None
+                if op["operation"] == "finalize" and self.server.repair_during_finalize:
+                    self.server.transcode["transcode_generation"] += 1
+                    self.server.repair_during_finalize = False
                 self.server.worker_times.append((json.loads(body)["operation"]["operation"],time.monotonic() - started))
                 if self.server.case == "lost_worker_reply":
                     return self.reply(503)
@@ -270,6 +281,12 @@ class Origin(BaseHTTPRequestHandler):
             body = self.read_body()
             self.server.objects[key] = (BODY if body == b"restore-original" else body, "video/mp4")
             return self.reply(200)
+        if parsed.path == "/fixture/transcode":
+            self.server.transcode = json.loads(self.read_body())
+            return self.reply(200)
+        if parsed.path == "/fixture/repair-during-finalize":
+            self.server.repair_during_finalize = True
+            return self.reply(200)
         if parsed.path == "/fixture/source-version":
             self.server.source_version = self.read_body().decode()
             return self.reply(200)
@@ -277,10 +294,13 @@ class Origin(BaseHTTPRequestHandler):
             self.server.ready_generation = 10
             self.server.ready = self.read_body()
             return self.reply(200)
+        if parsed.path == "/fixture/policy-blocker":
+            self.server.policy_blocker = self.read_body().decode()
+            return self.reply(200)
         if parsed.path == "/fixture/policy-status":
             assert self.server.case in ("appeal", "hls_family")
             self.server.policy_status = self.read_body().decode()
-            assert self.server.policy_status in ("active", "age_restricted")
+            assert self.server.policy_status in ("active", "age_restricted", "pending")
             return self.reply(200)
 
         if parsed.path.startswith("/service/"):
@@ -316,6 +336,44 @@ class Origin(BaseHTTPRequestHandler):
         self.server.events.append(("delete", params["fileName"]))
         self.server.delivered = None
         self.reply_json({})
+
+
+def check_enrollment_reply(directory, operation, status, body, retryable):
+    """Pass the actual routed Compute status/body through the operator and SQLite."""
+    from publish_bunny_media import BunnyAdmin, Reconciler, State
+    from sync_b2_originals import ControlAPIError
+    from tests.test_publish_bunny_media import API, KV, PARENT, Producer, Source
+
+    source, catalog = Source(), KV()
+    delivery = API(source)
+    catalog.pages = [([PARENT], None)]
+
+    class Transport:
+        def request(self, url, method, payload, **kwargs):
+            op = url.rsplit('/', 1)[-1]
+            assert method == "POST"
+            if op != operation:
+                return getattr(delivery, op)(payload)
+            if status >= 400:
+                raise ControlAPIError(status)
+            return json.loads(body)
+
+    with tempfile.TemporaryDirectory(dir=directory) as journal:
+        state = State(Path(journal) / "journal.sqlite", {})
+        try:
+            runner = Reconciler(catalog, source, source, Producer(), BunnyAdmin("fixture-admin", Transport()), state)
+            bounds = dict(max_pages=1, page_size=1, max_parents=1, max_bytes=1024**3)
+            result = runner.cycle(**bounds)
+            assert result.get("retryable_no_write" if retryable else "uncertain") == 1, result
+            acknowledged = len(delivery.order)
+            runner.api = delivery
+            second = runner.cycle(**bounds)
+            if retryable:
+                assert second.get("ready") == 1 and len(delivery.order) == 6
+            else:
+                assert state.status(PARENT) == "uncertain" and len(delivery.order) == acknowledged
+        finally:
+            state.close()
 
 
 def assert_case(server, case):
@@ -445,7 +503,10 @@ format = "json"
 blossom_secrets = [{secrets}]
 ''')
 
-        server.policy_status = case if case in ("pending", "age_restricted") else "active"
+        server.transcode = {"transcode_status": "complete", "transcode_generation": 17}
+        server.repair_during_finalize = False
+        server.policy_blocker = ""
+        server.policy_status = "pending" if case == "pending_zero" else case if case in ("pending", "age_restricted") else "active"
         server.source_key = f"{HASH}/hls/stream_720p.mp4" if case == "active_rendition" else HASH
         server.delivery_key = f"{PREFIX}{HASH}/720p.mp4" if case == "active_rendition" else f"{PREFIX}{HASH}"
         server.delivered = None
@@ -466,7 +527,7 @@ blossom_secrets = [{secrets}]
             "gcs_bucket": "fixture-gcs",
             "media_read_primary": "b2",
             "derived_media_read_primary": "gcs" if label == "hls_family" else "b2",
-            "bunny_playback_rollout_percent": "0" if case == "disabled_four" else "100",
+            "bunny_playback_rollout_percent": "0" if case in ("disabled_four", "pending_zero") else "100",
             "bunny_playback_countries": "US",
             "bunny_fixture_local_gate": "true",
             "bunny_fixture_meter_gate": "true" if case == "hls_family" else "false",
@@ -481,7 +542,7 @@ blossom_secrets = [{secrets}]
         with permit_edge(repo, config, server), native_worker(executable,directory,server,bindings):
             result = subprocess.run([
                 "cargo", "test", "--locked", "--target", "wasm32-wasip1", "--bin", "fastly-blossom",
-                {"hls_family":"bunny_hls_family_contract","disabled_four":"bunny_disabled_four_uploaders","permit_contract":"bunny_worker_permit_contract"}.get(case,
+                {"pending_zero":"pending_bunny_playback_falls_back","hls_family":"bunny_hls_family_contract","disabled_four":"bunny_disabled_four_uploaders","permit_contract":"bunny_worker_permit_contract"}.get(case,
                     "bunny_publication_respects_authoritative_policy_and_releases_clean_attempts"),
                 "--", "--ignored", "--nocapture",
             ], cwd=repo, env=env, capture_output=True, text=True, timeout=240)
@@ -490,6 +551,10 @@ blossom_secrets = [{secrets}]
         for report in result.stderr.splitlines():
             if report.startswith("BUNNY_QUOTA "):
                 print(report)
+            if report.startswith("BUNNY_ADMIN_REPLY "):
+                _, operation, status, body = report.split(" ", 3)
+                check_enrollment_reply(directory, operation, int(status), body, case == "source_unavailable")
+                print(f"PASS routed {case} {operation} to enrollment journal")
         for phase, count in server.meter:
             if phase not in ("outside", "start"):
                 assert count <= 32, (label, phase, count)

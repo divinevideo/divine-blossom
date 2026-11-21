@@ -26,12 +26,12 @@ class HTTP:
         if path == '/':
             return Response(200, {'content-type': 'text/html', 'server': 'BunnyCDN'}, b'<html>Divine Blossom Server</html>')
         if self.denied:
-            return Response(403, {'server': 'BunnyCDN'}, b'')
+            return Response(403, {'server': 'BunnyCDN', 'cache-control':'private, no-store'}, b'')
         body = self.override.get(path, self.objects[path])
         mime = 'application/vnd.apple.mpegurl' if path.endswith('.m3u8') else 'video/mp2t' if path.endswith('.ts') else 'video/mp4'
         warm = (host, path) in self.warmed
         self.warmed.add((host, path))
-        headers = {'server': 'BunnyCDN', 'content-type': mime, 'content-length': str(len(body)), 'cdn-cache': 'HIT' if warm else 'MISS'}
+        headers = {'server': 'BunnyCDN', 'cache-control': 'private, no-store', 'content-type': mime, 'content-length': str(len(body)), 'cdn-cache': 'HIT' if warm else 'MISS'}
         status = 200
         if byte_range is not None and not self.range_broken:
             start, end = byte_range
@@ -84,6 +84,45 @@ class ProbeTests(unittest.TestCase):
         self.assertTrue(set(http.objects) <= requested)
         http.denied = False
         self.assertFalse(Probe(pins, HOSTS, http).run(denied=True).get('ok'))
+
+    def test_hls_only_requires_cache_policy_on_each_response_from_either_host(self):
+        for host in HOSTS:
+            for phase in ('MISS', 'HIT', 'HEAD', 'range', 'segment'):
+                for invalid in ('private', 'no-store', 'public, max-age=300'):
+                    with self.subTest(host=host, phase=phase, invalid=invalid):
+                        http = HTTP()
+                        del http.objects['/' + PARENT]
+                        origin = http.request
+                        def corrupt(h, p, m, r, limit):
+                            reply = origin(h, p, m, r, limit)
+                            kind = ('HEAD' if m == 'HEAD' else 'segment' if r == (0, 187) else
+                                    'range' if r else reply.headers.get('cdn-cache'))
+                            if h == host and p.endswith('stream_480p.ts') and kind == phase:
+                                reply.headers['cache-control'] = invalid
+                            return reply
+                        http.request = corrupt
+                        self.assertFalse(Probe(inventory(http), HOSTS, http).run(require_cold=True)['ok'])
+
+    def test_denied_hls_child_requires_cdn_and_nonmedia_on_each_method(self):
+        for method, byte_range in [('GET', None), ('HEAD', None), ('GET',(0,0))]:
+            for headers, body in [({'server':'other'}, b''), ({'content-range':'bytes 0-0/188'}, b''),
+                                  ({'accept-ranges':'bytes'}, b''), ({'content-type':'text/plain'}, b't'),
+                                  ({'content-type':'application/vnd.apple.mpegurl'}, b''),
+                                  ({'content-type':'video/mp2t'}, b''), ({}, b'#EXTM3U\n'),
+                                  ({'cache-control':'public'}, b'')]:
+                with self.subTest(method=method, byte_range=byte_range, headers=headers, body=body):
+                    http = HTTP()
+                    del http.objects['/' + PARENT]
+                    http.denied = True
+                    origin = http.request
+                    def corrupt(h, p, m, r, limit):
+                        reply = origin(h, p, m, r, limit)
+                        if h == HOSTS[1] and p.endswith('stream_480p.m3u8') and (m,r) == (method,byte_range):
+                            reply.headers.update(headers)
+                            reply.body = body
+                        return reply
+                    http.request = corrupt
+                    self.assertFalse(Probe(inventory(http), HOSTS, http).run(denied=True)['ok'])
 
     def test_bounds_requests_and_rejects_foreign_inventory(self):
         http = HTTP()

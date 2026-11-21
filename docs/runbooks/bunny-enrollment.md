@@ -61,38 +61,54 @@ paths or owner data.
 Metadata discovery is paginated with an atomic SQLite queue/cursor checkpoint.
 A pass is bounded to 100 pages of 100 names, 1,000 processed parents and a supplied
 byte ceiling, with one family in flight at a time. The queue retains at most
-10,000 parents, reuses completed slots and stops advancing a saturated page while
-continuing previously committed work. An expired provider cursor restarts discovery without discarding committed jobs.
-Repeated passes wrap the scan to discover
+10,000 parents. Confirmed negative observations make room for new catalog pages.
+Rediscovery rechecks these parents as eligibility changes. The journal retains
+uncertain jobs and partial copy receipts. A saturated page keeps its cursor while
+the runner processes earlier work. Dry runs rotate through candidates and
+preserve verified exports and acknowledged copies. An expired provider cursor
+restarts discovery with the committed jobs intact. Repeated passes wrap the scan to discover
 new completed clips and source changes. Stable ready source identities avoid
 local re-download and republishing, but still request server re-verification of
 source/destination bytes and current scope. A confirmed missing/changed delivery
-family resets acknowledged copy progress for a subsequent bounded repair pass;
-conflicting existing bytes are never overwritten.
+family or dependency (HTTP 409) resets acknowledged copy progress, including
+before first readiness. The next bounded enrollment pass verifies or republishes
+each child. Conflicting immutable destination bytes require checked withdrawal.
 
-Eligibility requires current active/complete metadata, no existing
+Derivative eligibility requires current active/complete metadata with a positive
+transcode generation, no existing
 `.internal/hls-claims/<parent>` object and stable immutable source versions,
 checked again after reads and before each publication/finalization. Five HLS
-objects are required; original and progressive MP4s are optional and must fit
-the bounds. Dependencies publish before their playlists, with the master last.
+objects are required. A bare original is optional and requires canonical
+`video/mp4` metadata and a matching bounded source size. WebM and QuickTime
+uploads can enroll their complete derivative families. Progressive MP4s are
+optional within the same object bound. Dependencies publish before their
+playlists, with the master last.
 Canonical absolute references are normalized to relative references. The server
-independently rechecks current policy, source/destination bytes, scope and gates;
-only its verified finalization response grants readiness. No client inventory
-can assert readiness on its own.
+independently rechecks current policy, source/destination bytes, scope and gates.
+It binds verified derivatives to the completed producer attempt before and
+after worker verification. Selection checks that attempt against current policy.
+Pending public uploads use canonical playback. A new transcode attempt or an
+older readiness record without producer evidence can still select a separately
+verified content-addressed original of the current MIME and size. Only the
+server’s verified finalization response grants readiness.
 
 The journal binds its schema and source scope and persists acknowledged object
 receipts. Restarting between acknowledged objects resumes that family. A crash
 or lost response during an external write/finalization becomes `uncertain` and
 is never automatically retried or cleared. A source read timeout before a write
-can retry. A confirmed immutable-object conflict is reported and never
-overwritten. Inspect the private journal and the existing gate/outbox recovery
-procedure, establish the settled provider outcome, finish any required eviction,
+can retry. Either admin operation can return HTTP 200 with
+`{"result":"retryable_no_write"}` after the native worker confirms a pre-write
+failure and Compute settles its gate. The runner keeps its receipts and retries
+that operation on a later pass. A finalize retry may already have retired
+stale readiness. Unknown or malformed responses remain uncertain. A confirmed
+immutable-object conflict requires withdrawal before replacement. Inspect the
+private journal and the existing gate/outbox recovery procedure, establish the settled provider outcome, finish any required eviction,
 and only then explicitly repair local progress. Do not delete the journal or
 release a server gate to make an uncertain pass appear successful.
 
 Schedule the same bounded command periodically through the existing operator
 runner after fixture acceptance. Its lock prevents overlapping invocations.
-Monitor aggregate ready/unchanged, deferred, refused, uncertain, errors,
+Monitor aggregate ready/unchanged, deferred, retryable_no_write, refused, uncertain, errors,
 saturated and reservation counts plus the existing durable erasure outbox.
 Nonzero exit signals refusal, uncertainty or error. Deferred clips and queued
 work are reconsidered; a persistent producer claim or unsupported family needs
@@ -115,6 +131,8 @@ python scripts/probe_bunny_hls_delivery.py \
 Use a fresh fixture or targeted invalidation for cold proof. It verifies the
 informational HTML against canonical root, CDN identity, MIME, full body digests,
 HEAD length, warm hits, byte ranges and every referenced HLS segment range.
+Each media GET, HEAD and Range must carry the expected MIME and both
+`private` and `no-store` cache directives.
 Incomplete trees, foreign references, bad bytes, redirects and ignored ranges
 fail. There are at most 5,000 requests by default (hard ceiling 10,000); request
 and body-byte budgets span the whole invocation. No probe sends authorization,
@@ -136,7 +154,8 @@ python scripts/probe_bunny_hls_delivery.py \
 
 The 330-second example assumes a 300-second edge TTL plus 30 seconds of margin;
 use the actual configured window and adequate budgets. GET, HEAD and Range must
-all deny each known object; a denied master alone is insufficient. Repeat from
+all return a CDN denial for each known object, with the client cache directives,
+a non-media error response and no range evidence. Repeat from
 independent regions/POPs and record aggregate evidence. One vantage, local
 fixtures or closed-zone denials cannot establish global live revocation.
 

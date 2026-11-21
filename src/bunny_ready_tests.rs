@@ -178,6 +178,74 @@ fn bunny_hls_family_contract() {
     for row in &rows[5..] {
         assert!(paths.contains(&row["path"]));
     }
+    // These snapshots are returned by the authoritative producer callback store.
+    control(
+        "transcode",
+        r#"{"transcode_status":"complete","transcode_generation":18}"#,
+    );
+    let repaired_paths = forward(&hop(parent, "US", now), "media.divine.video");
+    control(
+        "transcode",
+        r#"{"transcode_status":"processing","transcode_generation":17}"#,
+    );
+    let processing_paths = forward(&hop(parent, "US", now), "media.divine.video");
+    control(
+        "transcode",
+        r#"{"transcode_status":"complete","transcode_generation":17}"#,
+    );
+    control("repair-during-finalize", "");
+    let interleaved = finalize(rows).get_status();
+    let mut legacy: Value = serde_json::from_str(&record).unwrap();
+    legacy.as_object_mut().unwrap().remove("producer");
+    control("ready", &legacy.to_string());
+    let legacy_paths = forward(&hop(parent, "US", now), "media.divine.video");
+    control("transcode", r#"{"transcode_status":"complete"}"#);
+    let unversioned = finalize(rows).get_status();
+    let original_only = finalize(&rows[5..6]).get_status();
+    control(
+        "transcode",
+        r#"{"transcode_status":"complete","transcode_generation":17}"#,
+    );
+    control("ready", &record);
+    control("policy-status", "pending");
+    let mut pending = crate::request_bindings::metered(
+        Request::get(format!(
+            "https://compute.fixture.example/api/bunny-playback/{parent}"
+        ))
+        .with_header("X-Original-Host", "media.divine.video")
+        .with_header("X-Divine-Bunny-Market", hop(parent, "US", now)),
+    );
+    assert_eq!(
+        (
+            repaired_paths,
+            processing_paths,
+            legacy_paths,
+            interleaved,
+            unversioned,
+            original_only,
+            pending.get_status()
+        ),
+        (
+            json!([rows[5]["path"]]),
+            json!([rows[5]["path"]]),
+            json!([rows[5]["path"]]),
+            StatusCode::CONFLICT,
+            StatusCode::CONFLICT,
+            StatusCode::OK,
+            StatusCode::OK
+        )
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&pending.take_body_bytes()).unwrap()["paths"],
+        json!([])
+    );
+    for blocker in ["quarantine", "tombstone", "vanish"] {
+        control("policy-blocker", blocker);
+        let response = crate::request_bindings::metered(selection.clone_without_body());
+        assert_eq!(response.get_status(), StatusCode::NOT_FOUND, "{blocker}");
+    }
+    control("policy-blocker", "");
+    control("policy-status", "active");
     let authenticated = selection
         .clone_without_body()
         .with_header("Authorization", "Bearer synthetic");
@@ -267,4 +335,17 @@ fn bunny_disabled_four_uploaders() {
     ));
     let value = super::selection(&req, ORIGINAL_HASH, Some("US")).unwrap();
     assert_eq!(value["paths"], json!([]));
+}
+
+#[test]
+#[ignore = "requires zero-rollout synthetic policy origin"]
+fn pending_bunny_playback_falls_back() {
+    let mut res = crate::request_bindings::metered(Request::get(format!(
+        "https://media.divine.video/api/bunny-playback/{ORIGINAL_HASH}"
+    )));
+    assert_eq!(res.get_status(), StatusCode::OK);
+    assert_eq!(
+        serde_json::from_str::<Value>(&res.take_body_str()).unwrap()["paths"],
+        json!([])
+    );
 }

@@ -1,6 +1,7 @@
 """Behavioral enrollment tests with immutable synthetic storage and a real journal."""
 import hashlib
 import json
+import sqlite3
 from pathlib import Path
 import tempfile
 import unittest
@@ -54,7 +55,8 @@ class Source:
 class KV:
     def __init__(self):
         self.record = {'sha256': PARENT, 'status': 'active',
-                       'transcode_status': 'complete', 'transcode_generation': 7}
+                       'transcode_status': 'complete', 'transcode_generation': 7,
+                       'type': 'video/mp4', 'size': len(BODY)}
         self.pages = [([PARENT], 'page2'), ([], None)]
         self.calls = []
 
@@ -91,8 +93,9 @@ class API:
         body = self.source.objects[key]
         for dep in payload.get('dependencies', []):
             if dep['path'] not in self.published:
-                raise ValueError('published playlist before its child')
-        delivery = body.replace(f'https://media.divine.video/{ROOT}'.encode(), b'').replace(f'/{ROOT}'.encode(), b'') if path.endswith('.m3u8') else body
+                raise APIRefused(409)
+        prefix = '/' + path.split('/')[1] + '/hls/'
+        delivery = body.replace(('https://media.divine.video' + prefix).encode(), b'').replace(prefix.encode(), b'') if path.endswith('.m3u8') else body
         self.ready = False
         if path in self.published and self.published[path] != delivery:
             raise APIRefused(409)
@@ -155,6 +158,18 @@ class EnrollmentTests(unittest.TestCase):
         self.cycle()
         self.assertEqual(len(self.api.order), 1)
         self.assertFalse(self.api.ready)
+
+    def test_malformed_reply_after_put_is_reported_and_retained_as_uncertain(self):
+        publish = self.api.publish
+        def malformed(payload):
+            publish(payload)
+            raise ValueError('invalid control response JSON')
+        self.api.publish = malformed
+        self.assertEqual(self.cycle().get('uncertain'), 1)
+        self.assertEqual(self.state.status(PARENT), 'uncertain')
+        self.assertEqual(len(self.api.order), 1)
+        self.cycle()
+        self.assertEqual(len(self.api.order), 1)
 
     def test_budget_is_reserved_before_any_source_download_or_publication(self):
         report = self.worker.cycle(max_pages=1, page_size=100, max_parents=1, max_bytes=1)
@@ -263,6 +278,145 @@ class EnrollmentTests(unittest.TestCase):
         self.assertEqual(report.get('saturated'), 1)
         self.assertEqual(report.get('ready'), 1)
         self.assertIsNone(self.state.setting('cursor'))
+
+    def test_dry_runs_rotate_two_candidates_and_preserve_ready_export(self):
+        other = 'f' * 64
+        self.kv.pages = [([PARENT, other], None)]
+        seen = []
+        def metadata(parent):
+            if not seen or seen[-1] != parent:
+                seen.append(parent)
+            return {**self.kv.record, 'sha256': parent, 'type': 'video/webm'}
+        self.kv.metadata = metadata
+        for key, body in fixture().items():
+            if key != PARENT:
+                second = key.replace(PARENT, other)
+                self.source.objects[second] = body.replace(PARENT.encode(), other.encode())
+                self.source.versions[second] = 'v1'
+        self.assertEqual(self.cycle().get('ready'), 1)
+        before = self.state.data(PARENT)
+        seen.clear()
+        for _ in range(3):
+            self.cycle(dry_run=True)
+            self.assertEqual(self.state.data(PARENT), before)
+            self.assertTrue(self.state.export_ready(Path(self.tmp.name) / 'ready.json'))
+        self.assertEqual(seen, [other, PARENT, other])
+        self.assertFalse(self.state.data(other).get('published'))
+        for _ in range(2):
+            self.cycle()
+        self.assertTrue(self.state.data(other)['ready'])
+
+    def test_omits_non_mp4_and_metadata_size_mismatches_from_hls_inventory(self):
+        for mime, size in [('video/webm', len(BODY)), ('video/mp4', len(BODY) + 1)]:
+            with self.subTest(mime=mime):
+                self.kv.pages = [([PARENT], None)]
+                self.kv.record.update(type=mime, size=size)
+                self.cycle()
+                pins = self.state.data(PARENT)['inventory']['assets']
+                self.assertEqual(len(pins), 5)
+                self.assertTrue(all('/hls/' in p['path'] for p in pins))
+                self.assertTrue(self.state.data(PARENT)['ready'])
+
+    def test_missing_acknowledged_child_recovers_before_first_finalize(self):
+        self.kv.pages = [([PARENT], None)]
+        publish = self.api.publish
+        removed = False
+        def withdraw(payload):
+            nonlocal removed
+            if payload.get('dependencies') and not removed:
+                removed = True
+                del self.api.published[payload['dependencies'][0]['path']]
+            return publish(payload)
+        self.api.publish = withdraw
+        self.assertEqual(self.cycle().get('refused'), 1)
+        self.assertFalse(self.api.ready)
+        self.assertEqual(self.cycle().get('ready'), 1)
+        self.assertTrue(self.api.ready)
+
+    def test_lost_child_before_initial_finalize_is_repaired(self):
+        finalize = self.api.finalize
+        def withdraw(payload):
+            del self.api.published['/' + ROOT + 'stream_720p.ts']
+            self.api.finalize = finalize
+            return finalize(payload)
+        self.api.finalize = withdraw
+        self.kv.pages = [([PARENT], None)]
+        self.assertEqual(self.cycle().get('refused'), 1)
+        self.assertEqual(self.cycle().get('ready'), 1)
+
+    def test_capped_journal_advances_and_rediscovers_changed_eligibility(self):
+        earlier = [format(i, '064x') for i in range(9999)]
+        later = 'f' * 64
+        self.state.page(earlier + [later], 'next')
+        self.state.save(earlier[0], 'uncertain', {'published': []})
+        self.state.save(earlier[1], 'pending', {'published': [{'path': 'acknowledged'}]})
+        self.kv.page = lambda cursor, limit: ([PARENT], None) if cursor == 'next' else ([earlier[2]], 'next')
+        eligible = {PARENT}
+        def metadata(parent):
+            if parent in eligible:
+                return {**self.kv.record, 'type':'video/webm', 'sha256':parent}
+            return {**self.kv.record, 'sha256':parent, **(
+                {'type':'image/png'} if int(parent,16) % 3 == 0 else
+                {'status':'banned'} if int(parent,16) % 3 == 1 else {'transcode_status':'processing'})}
+        self.kv.metadata = metadata
+        def passes(n):
+            for _ in range(n):
+                self.worker.cycle(max_pages=1, page_size=100, max_parents=1000, max_bytes=1024**3)
+        passes(14)
+        self.assertTrue(self.state.data(PARENT).get('ready'))
+        for key, body in fixture().items():
+            if key != PARENT:
+                second = key.replace(PARENT, earlier[2])
+                self.source.objects[second] = body.replace(PARENT.encode(), earlier[2].encode())
+                self.source.versions[second] = 'v1'
+        eligible.add(earlier[2])
+        passes(14)
+        self.assertTrue(self.state.data(earlier[2]).get('ready'))
+        self.assertEqual(self.state.status(earlier[0]), 'uncertain')
+        self.assertEqual(self.state.data(earlier[1])['published'], [{'path':'acknowledged'}])
+        self.assertLessEqual(self.state.db.execute('select count(*) from jobs').fetchone()[0], 10000)
+
+    def test_upgrade_resumes_partial_receipts_and_keeps_uncertain_jobs_fenced(self):
+        # A v1 journal used the four original metadata fields in its snapshot.
+        def stop_after_ack(parent, status, data):
+            State.save(self.state, parent, status, data)
+            if status == 'pending':
+                raise KeyboardInterrupt()
+        self.state.save = stop_after_ack
+        with self.assertRaises(KeyboardInterrupt):
+            self.cycle()
+        progress = self.state.data(PARENT)
+        identities = {}
+        for key in self.source.objects:
+            suffix = key.removeprefix(PARENT).lstrip('/')
+            identities[suffix] = self.source.head(key)
+        old_metadata = {k:self.kv.record[k] for k in ('sha256','status','transcode_status','transcode_generation')}
+        snapshot = json.dumps({'metadata':old_metadata, 'sources':identities}, sort_keys=True).encode()
+        progress['fingerprint'] = hashlib.sha256(snapshot).hexdigest()
+        path = Path(self.tmp.name) / 'v1.sqlite'
+        with sqlite3.connect(path) as db:
+            db.execute('create table jobs (parent text primary key,status text,data text,seq integer)')
+            db.executemany('insert into jobs values(?,?,?,?)', [
+                (PARENT, 'pending', json.dumps(progress), 1), ('a'*64, 'inflight', '{}', 2),
+                ('b'*64, 'refused', '{}', 3), ('c'*64, 'refused', json.dumps(progress), 4)])
+        path.chmod(0o600)
+        upgraded = State(path, {'source':'fixture'})
+        self.addCleanup(upgraded.close)
+        self.worker.state = upgraded
+        self.assertEqual(self.cycle().get('ready'), 1)
+        self.assertEqual(upgraded.status('a'*64), 'uncertain')
+        self.assertEqual(upgraded.status('b'*64), 'observed')
+        self.assertEqual(upgraded.data('c'*64), progress)
+        self.assertEqual(len(self.api.order), 6)
+
+    def test_saturated_dry_run_preserves_the_only_ready_export(self):
+        self.state.page([PARENT] + [format(i, '064x') for i in range(9999)], None)
+        self.cycle()
+        self.kv.pages = [(['c' * 64], None)]
+        self.state.set_setting('cursor', None)
+        self.cycle(dry_run=True)
+        self.assertTrue(self.state.export_ready(Path(self.tmp.name) / 'verified.json'))
+        self.assertEqual(self.state.status(PARENT), 'ready')
 
     def test_journal_cannot_be_reused_for_another_source_scope(self):
         with self.assertRaises(ValueError):

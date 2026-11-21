@@ -145,6 +145,9 @@ class Provider(BaseHTTPRequestHandler):
         if self.server.fallback and "rejected" in self.server.fallback and self.headers.get('Fastly-Key') == 'synthetic-expired':
             self.server.expired_requests += 1
             return 403, {}
+        if self.server.fallback in ("standalone-5xx", "standalone-missing"):
+            self.server.expired_requests += 1
+            return 503, {}
         if self.server.fallback == "standalone-rejected":
             if self.headers.get('Fastly-Key') == 'synthetic-legacy-key':
                 self.server.expired_requests += 1
@@ -177,9 +180,10 @@ def manifest(port, kv, settings, fallback=None):
     pilot = json.dumps({"eraser":{"id":"synthetic-b2-id","key":"synthetic-b2-key"},"bunny_api_key":"synthetic-bunny-key","fastly_api_token":"synthetic-fastly-key"})
     if fallback in ("rejected-cold", "rejected-immediate"):
         pilot = json.dumps({**json.loads(pilot), "fastly_api_token":"synthetic-expired"})
-    elif fallback and fallback != "standalone-rejected":
+    elif fallback and not fallback.startswith("standalone-"):
         pilot = "invalid-json" if "malformed" in fallback else None
     pilot_binding = f"{{key=\"bunny_pilot_cleanup_v1\",data='{pilot}'}}, " if pilot is not None else ""
+    standalone = '' if fallback == "standalone-missing" else '{key="fastly_api_token",data="synthetic-legacy-key"},'
     return f'''manifest_version = 3
 name = "synthetic-bunny-revocation"
 language = "rust"
@@ -195,7 +199,7 @@ blossom_secrets = [
   {{key="b2_cdn_purge_drain_token",data="synthetic-drain-token"}},
   {{key="webhook_secret",data="synthetic-webhook-token"}},
   {{key="admin_token",data="synthetic-admin-token"}},
-  {pilot_binding}{{key="fastly_api_token",data="synthetic-legacy-key"}},
+  {pilot_binding}{standalone}
   {{key="kv_origin_read_token",data="synthetic-policy-key"}}
 ]
 '''
@@ -227,6 +231,7 @@ def run(versions, resume, fallback=None):
                 if not resume:
                     configuration.pop('bunny_pilot_zone_hosts')
                 if fallback:
+                    configuration["fixture_failed_standalone_hint"] = str(fallback in ("standalone-5xx","standalone-missing")).lower()
                     configuration["fixture_standalone_rejected"] = str(fallback == "standalone-rejected").lower()
                     configuration["fixture_unenrolled"] = str("unrelated" in fallback).lower()
                     configuration["fixture_immediate"] = str("immediate" in fallback or "unrelated" in fallback).lower()
@@ -247,7 +252,11 @@ def run(versions, resume, fallback=None):
                     parent = 'c' * 64 if "unrelated" in fallback else HASH
                     targets = [f'/service/ML7R82HKfmTaqTpHExIDVN/purge_url/{host}/{parent}' for host in ("media-b2-cdn.divine.video","media-b2.divine.video")]
                     targets += [f'/service/{service}/purge' for service in FASTLY_SERVICES]
-                    if fallback == "standalone-rejected":
+                    if fallback in ("standalone-5xx", "standalone-missing"):
+                        assert server.versions == unrelated, "Bunny origin cleanup starved by canonical retry"
+                        assert min(server.bunny_counts[h] for h in (CUSTOM_HOST, ALIAS)) >= 4
+                        assert server.expired_requests >= 8
+                    elif fallback == "standalone-rejected":
                         assert len(server.packed_rounds) == 2
                         for acknowledged in server.packed_rounds.values():
                             assert Counter(acknowledged) == Counter(targets * 2), acknowledged
@@ -285,7 +294,7 @@ def run(versions, resume, fallback=None):
 
 
 if __name__ == '__main__':
-    for case in sys.argv[1:] or ("standalone-rejected","missing-cold","rejected-cold","rejected-immediate","malformed-immediate","missing-unrelated-immediate","missing-unrelated-webhook","paged","single"):
+    for case in sys.argv[1:] or ("standalone-5xx","standalone-missing","standalone-rejected","missing-cold","rejected-cold","rejected-immediate","malformed-immediate","missing-unrelated-immediate","missing-unrelated-webhook","paged","single"):
         if case in ("paged","single"):
             run(VERSIONS if case == "paged" else {(PREFIX,"original-v1")}, case == "paged")
         else:

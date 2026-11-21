@@ -127,6 +127,12 @@ fn publish(publication: Publication) -> Result<Value> {
         let (already, verified) = match result {
             Outcome::AlreadyPublished { verified } => (true, verified),
             Outcome::Published { verified } => (false, verified),
+            Outcome::Unavailable => {
+                // The native worker only emits Unavailable before sending a PUT.
+                // with_gate returns this result only after the release CAS succeeds.
+                *may_release = true;
+                return Ok(json!({"result":"retryable_no_write"}));
+            }
             Outcome::ReadbackFailed => {
                 queue_cleanup(parent, generation)?;
                 return Err(BlossomError::StorageError(
@@ -377,6 +383,7 @@ mod tests {
 
         let expected = match case.as_str() {
             "active" | "active_rendition" | "delayed_publish" | "appeal" => StatusCode::OK,
+            "source_unavailable" | "lost_permit_reply" => StatusCode::OK,
             "webhook_token" => StatusCode::UNAUTHORIZED,
             "checksum_mismatch" => StatusCode::CONFLICT,
             "unverified_retry"
@@ -385,7 +392,6 @@ mod tests {
             | "wrong_writer_scope"
             | "wrong_worker_primary"
             | "lost_worker_reply"
-            | "lost_permit_reply"
             | "invalid_worker_evidence" => StatusCode::BAD_GATEWAY,
             "pending"
             | "age_restricted"
@@ -417,6 +423,11 @@ mod tests {
             crate::bunny_ready::FAIL_NEXT_DELETE.set(true);
         }
         let mut response = publish();
+        if matches!(case.as_str(), "source_unavailable" | "lost_worker_reply" | "invalid_worker_evidence") {
+            let body = response.take_body_str();
+            eprintln!("BUNNY_ADMIN_REPLY publish {} {}", response.get_status().as_u16(), body);
+            response.set_body(body);
+        }
         assert_eq!(
             response.get_status(),
             expected,
@@ -459,7 +470,19 @@ mod tests {
                 Err(fastly::kv_store::KVStoreError::ItemNotFound)
             ));
         }
-        if expected == StatusCode::OK {
+        if matches!(case.as_str(), "source_unavailable" | "lost_permit_reply") {
+            assert_eq!(response.take_body_str(), r#"{"result":"retryable_no_write"}"#);
+            if case == "source_unavailable" {
+                let request = Request::post("https://media.divine.video/admin/api/bunny-pilot/finalize")
+                    .with_header("Authorization", "Bearer fixture-admin")
+                    .with_body(json!({"version":1,"parent":ORIGINAL_HASH,"assets":[{"path":path,"source_sha256":ORIGINAL_HASH,"delivery_sha256":ORIGINAL_HASH}]}).to_string());
+                let mut finalize = crate::request_bindings::metered(request);
+                let body = finalize.take_body_str();
+                eprintln!("BUNNY_ADMIN_REPLY finalize {} {}", finalize.get_status().as_u16(), body);
+                assert_eq!(finalize.get_status(), StatusCode::OK);
+                assert_eq!(body, r#"{"result":"retryable_no_write"}"#);
+            }
+        } else if expected == StatusCode::OK {
             assert_eq!(response.take_body_str(), r#"{"result":"published"}"#);
             if case == "appeal" {
                 let moderate = |action, status: &str| {
