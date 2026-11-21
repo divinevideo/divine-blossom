@@ -1,6 +1,6 @@
 # Bunny HLS and MP4 delivery
 
-Status: proposed design, awaiting Rabble's approval before implementation.
+Status: approved by Rabble in session on 2026-11-21; implement behind test flags.
 
 ## Intent and scope
 
@@ -27,8 +27,8 @@ repository; the delivered-byte measurements will establish actual savings.
 
 Recommendation: approach 1, including production enrollment and rollout rather
 than stopping at an internal canary. Approaches 2 and 3 are not prerequisites
-for serving public HLS. This choice is proposed by the agent;
-the user has approved the delivery objective, not this document yet.
+for serving public HLS. Rabble approved proceeding with the migration and a
+mobile feature flag to test the alternate hostname before cutting over.
 
 ## Current implementation
 
@@ -209,6 +209,8 @@ DNS alone. A failed revocation drill disables the zone pending reconciliation.
 The builder chooses exact internal types, bounded request/inventory schemas,
 test organization and helper placement using existing repository patterns.
 They must demonstrate the backend-request budget before finalizing the API.
-The user decision is whether to approve this public HLS-and-MP4 migration,
-including production enrollment and cohort controls. Protected viewer-specific
-playback remains a separate subsequent migration.
+Preserve the current upload control/data path: canonical Blossom handles upload
+authorization and metadata; the existing upload service handles video bytes.
+Signed posts keep canonical URLs while the test flag chooses ready Bunny
+equivalents for viewing, including freshly published media after enrollment.
+Protected viewer-specific playback remains a separate subsequent migration.
