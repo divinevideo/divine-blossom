@@ -289,8 +289,11 @@ fn bunny_hls_family_contract() {
     );
     for blocker in ["quarantine", "tombstone", "vanish"] {
         control("policy-blocker", blocker);
-        let response = crate::request_bindings::metered(selection.clone_without_body());
-        assert_eq!(response.get_status(), StatusCode::NOT_FOUND, "{blocker}");
+        assert_eq!(
+            super::selection(&selection, parent, Some("US")).unwrap_err().status_code(),
+            StatusCode::NOT_FOUND,
+            "{blocker}"
+        );
     }
     control("policy-blocker", "");
     control("policy-status", "active");
@@ -374,7 +377,7 @@ fn bunny_hls_family_contract() {
     assert_eq!(selected(&selection), json!([]));
     control("policy-status", "banned");
     assert_eq!(
-        crate::request_bindings::metered(selection).get_status(),
+        super::selection(&selection, parent, Some("US")).unwrap_err().status_code(),
         StatusCode::NOT_FOUND
     );
     control("policy-status", "active");
