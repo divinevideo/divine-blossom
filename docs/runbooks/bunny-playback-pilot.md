@@ -117,7 +117,11 @@ or enabling the internal mobile flag.
   canonical-priority hint. A provider 401/403 on the packed purge credential also
   sets this hint. Its next invocation spends the standalone credential
   on both Fastly rounds, then clears the hint and leaves the original CDN intent
-  pending. Expect one extra drain interval for canonical eviction in this case.
+  pending. Conversely, a 401/403 from the standalone credential for an enrolled
+  parent schedules the packed Fastly token first on the next drain. That
+  preference survives partial Bunny cleanup. The outbox clears after both
+  canonical rounds and all required Bunny work succeed.
+  Expect one extra drain interval for credential recovery.
   Repair the pilot binding and drain through origin absence and both CDN rounds.
 - Verify `b2_replica_enabled` is `true` for the existing bucket. Enable
   `bunny_pilot_publish_enabled` for the fixture pass only. Use the

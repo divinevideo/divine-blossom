@@ -813,6 +813,42 @@ fn bunny_legacy_canonical_fallback() {
         serde_json::from_str::<serde_json::Value>(&response.take_body_str()).unwrap()["result"]
             .clone()
     };
+    if storage::config_flag("fixture_standalone_rejected") {
+        let store = open_store().unwrap();
+        let records = store
+            .build_list()
+            .prefix("b2-cdn-purge:v1:")
+            .execute()
+            .unwrap();
+        assert_eq!(records.keys().len(), 1);
+        let state = || {
+            let body = store
+                .lookup(&records.keys()[0])
+                .unwrap()
+                .take_body()
+                .into_string();
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["state"].clone()
+        };
+        assert_eq!(drain("synthetic-drain-token"), 0);
+        assert_eq!(state(), "committed");
+        assert_eq!(
+            drain("synthetic-drain-token"),
+            0,
+            "Bunny failure must keep the outbox pending after canonical success"
+        );
+        assert_eq!(state(), "committed");
+        assert_eq!(
+            drain("synthetic-drain-token"),
+            1,
+            "the other valid purge credential must finish both rounds"
+        );
+        assert_eq!(state(), "cleared");
+        assert!(matches!(
+            store.lookup(&format!("canonical-purge-priority:v1:{hash}")),
+            Err(fastly::kv_store::KVStoreError::ItemNotFound)
+        ));
+        return;
+    }
     let key = format!("canonical-purge-priority:v1:{hash}");
     if !storage::config_flag("fixture_immediate") {
         assert_eq!(drain("synthetic-webhook-token"), 0);

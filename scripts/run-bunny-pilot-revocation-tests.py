@@ -135,7 +135,8 @@ class Provider(BaseHTTPRequestHandler):
         assert ('versions', 0) in self.server.events
         self.server.events.append(('bunny', target.netloc))
         self.server.bunny_counts[target.netloc] += 1
-        if target.netloc == CUSTOM_HOST and self.server.bunny_counts[target.netloc] <= 2:
+        failed_purges = 4 if self.server.fallback == "standalone-rejected" else 2
+        if target.netloc == CUSTOM_HOST and self.server.bunny_counts[target.netloc] <= failed_purges:
             return 503, {}
         return 200, {}
 
@@ -144,11 +145,18 @@ class Provider(BaseHTTPRequestHandler):
         if self.server.fallback and "rejected" in self.server.fallback and self.headers.get('Fastly-Key') == 'synthetic-expired':
             self.server.expired_requests += 1
             return 403, {}
-        if self.server.fallback:
+        if self.server.fallback == "standalone-rejected":
+            if self.headers.get('Fastly-Key') == 'synthetic-legacy-key':
+                self.server.expired_requests += 1
+                return 403, {}
+            assert self.headers.get('Fastly-Key') == 'synthetic-fastly-key'
+        elif self.server.fallback:
             assert self.headers.get('Fastly-Key') == 'synthetic-legacy-key'
         else:
             assert self.headers.get('Fastly-Key') in ('synthetic-fastly-key', 'synthetic-legacy-key')
         self.server.legacy_targets.append(path)
+        if self.server.fallback == "standalone-rejected":
+            self.server.packed_rounds.setdefault(len(self.server.meter), []).append(path)
         if '/purge_url/' in path:
             assert path.startswith('/service/ML7R82HKfmTaqTpHExIDVN/purge_url/')
             return 200, {}
@@ -167,9 +175,9 @@ def manifest(port, kv, settings, fallback=None):
         for name in backends
     )
     pilot = json.dumps({"eraser":{"id":"synthetic-b2-id","key":"synthetic-b2-key"},"bunny_api_key":"synthetic-bunny-key","fastly_api_token":"synthetic-fastly-key"})
-    if fallback and "rejected" in fallback:
+    if fallback in ("rejected-cold", "rejected-immediate"):
         pilot = json.dumps({**json.loads(pilot), "fastly_api_token":"synthetic-expired"})
-    elif fallback:
+    elif fallback and fallback != "standalone-rejected":
         pilot = "invalid-json" if "malformed" in fallback else None
     pilot_binding = f"{{key=\"bunny_pilot_cleanup_v1\",data='{pilot}'}}, " if pilot is not None else ""
     return f'''manifest_version = 3
@@ -199,6 +207,7 @@ def run(versions, resume, fallback=None):
         server.lock = threading.Lock()
         server.fallback = fallback
         server.legacy_targets = []
+        server.packed_rounds = {}
         server.expired_requests = 0
         server.meter = [['setup', 0]]
         server.versions = versions | unrelated
@@ -218,6 +227,7 @@ def run(versions, resume, fallback=None):
                 if not resume:
                     configuration.pop('bunny_pilot_zone_hosts')
                 if fallback:
+                    configuration["fixture_standalone_rejected"] = str(fallback == "standalone-rejected").lower()
                     configuration["fixture_unenrolled"] = str("unrelated" in fallback).lower()
                     configuration["fixture_immediate"] = str("immediate" in fallback or "unrelated" in fallback).lower()
                     configuration["fixture_webhook"] = str("webhook" in fallback).lower()
@@ -237,10 +247,18 @@ def run(versions, resume, fallback=None):
                     parent = 'c' * 64 if "unrelated" in fallback else HASH
                     targets = [f'/service/ML7R82HKfmTaqTpHExIDVN/purge_url/{host}/{parent}' for host in ("media-b2-cdn.divine.video","media-b2.divine.video")]
                     targets += [f'/service/{service}/purge' for service in FASTLY_SERVICES]
-                    assert Counter(server.legacy_targets) == Counter(targets * 2), server.legacy_targets
-                    if fallback == "rejected-cold":
-                        assert server.expired_requests == 4, server.expired_requests
-                    assert not server.bunny_counts
+                    if fallback == "standalone-rejected":
+                        assert len(server.packed_rounds) == 2
+                        for acknowledged in server.packed_rounds.values():
+                            assert Counter(acknowledged) == Counter(targets * 2), acknowledged
+                        assert server.expired_requests == 4
+                        assert server.versions == unrelated
+                        assert server.bunny_counts == {CUSTOM_HOST: 6, ALIAS: 6}
+                    else:
+                        assert Counter(server.legacy_targets) == Counter(targets * 2), server.legacy_targets
+                        assert not server.bunny_counts
+                        if fallback == "rejected-cold":
+                            assert server.expired_requests == 4, server.expired_requests
                     assert max(n for _,n in server.meter)<=32, server.meter
                     if fallback == "missing-cold":
                         reads = [line.split()[-2:] for line in result.stderr.splitlines()
@@ -267,8 +285,8 @@ def run(versions, resume, fallback=None):
 
 
 if __name__ == '__main__':
-    for case in sys.argv[1:] or ("missing-cold","rejected-cold","rejected-immediate","malformed-immediate","missing-unrelated-immediate","missing-unrelated-webhook","paged","single"):
+    for case in sys.argv[1:] or ("standalone-rejected","missing-cold","rejected-cold","rejected-immediate","malformed-immediate","missing-unrelated-immediate","missing-unrelated-webhook","paged","single"):
         if case in ("paged","single"):
             run(VERSIONS if case == "paged" else {(PREFIX,"original-v1")}, case == "paged")
         else:
-            run(VERSIONS, False, case)
+            run({(PREFIX,"original-v1")} if case == "standalone-rejected" else VERSIONS, False, case)

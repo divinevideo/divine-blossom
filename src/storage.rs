@@ -2662,25 +2662,24 @@ pub(crate) fn invalidate_b2_cdn(hashes: &[String]) -> Result<()> {
 
     // Stale or missing priority hints never authorize clearing an intent.
     // A lost hint simply repeats the checked fallback on another drain.
+    let mut packed_priority = Vec::new();
     if let Ok(store) = crate::metadata::open_store() {
-        let priority: Vec<_> = hashes
-            .iter()
-            .map(|h| canonical_priority_key(h))
-            .filter(|k| store.lookup(k).is_ok())
-            .collect();
-        if !priority.is_empty() {
-            let token = get_secret("fastly_api_token")?;
-            invalidate_fastly_cdn(hashes, targets?, &token, false)?;
-            for key in priority {
-                match crate::metadata::retry_throttled_write(|| store.delete(&key)) {
-                    Ok(()) | Err(fastly::kv_store::KVStoreError::ItemNotFound) => {}
-                    Err(_) => {
-                        return Err(BlossomError::MetadataError(
-                            "Canonical purge checkpoint unavailable".into(),
-                        ))
-                    }
+        let mut standalone_priority = Vec::new();
+        for hash in hashes {
+            let key = canonical_priority_key(hash);
+            if let Ok(mut record) = store.lookup(&key) {
+                match record.take_body().into_bytes().as_slice() {
+                    b"packed" => packed_priority.push(key),
+                    b"1" => standalone_priority.push(key),
+                    _ => {}
                 }
             }
+        }
+        if !standalone_priority.is_empty() {
+            let token = get_secret("fastly_api_token")?;
+            let retry = bunny_configured.then_some(CanonicalCredential::Packed);
+            invalidate_fastly_cdn(hashes, targets?, &token, retry)?;
+            clear_canonical_priority(&store, &standalone_priority)?;
             return Err(BlossomError::StorageError(
                 "Canonical eviction completed; CDN intent pending".into(),
             ));
@@ -2704,19 +2703,50 @@ pub(crate) fn invalidate_b2_cdn(hashes: &[String]) -> Result<()> {
     });
     let needs_bundle = bunny_configured && !matches!(&enrolled, Ok(parents) if parents.is_empty());
     let fastly_result = targets.and_then(|include_b2| {
-        let (token, from_pilot) = canonical_purge_token(hashes, needs_bundle)?;
-        invalidate_fastly_cdn(hashes, include_b2, &token, from_pilot)
+        let (token, retry) =
+            canonical_purge_token(hashes, needs_bundle, !packed_priority.is_empty())?;
+        invalidate_fastly_cdn(hashes, include_b2, &token, retry)
     });
     enrolled
         .and_then(|parents| invalidate_bunny_pilot(&parents))
-        .and(fastly_result)
+        .and(fastly_result)?;
+    // The packed Fastly key and Bunny cleanup capabilities share one native
+    // lookup. Keep this preference across partial cleanup until both succeed.
+    if !packed_priority.is_empty() {
+        clear_canonical_priority(&crate::metadata::open_store()?, &packed_priority)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum CanonicalCredential {
+    Standalone,
+    Packed,
+}
+
+fn clear_canonical_priority(store: &fastly::kv_store::KVStore, keys: &[String]) -> Result<()> {
+    for key in keys {
+        match crate::metadata::retry_throttled_write(|| store.delete(key)) {
+            Ok(()) | Err(fastly::kv_store::KVStoreError::ItemNotFound) => {}
+            Err(_) => {
+                return Err(BlossomError::MetadataError(
+                    "Canonical purge checkpoint unavailable".into(),
+                ))
+            }
+        }
+    }
+    Ok(())
 }
 
 fn canonical_priority_key(hash: &str) -> String {
     format!("canonical-purge-priority:v1:{}", hash.to_ascii_lowercase())
 }
 
-fn canonical_purge_token(hashes: &[String], use_pilot: bool) -> Result<(String, bool)> {
+fn canonical_purge_token(
+    hashes: &[String],
+    use_pilot: bool,
+    prefer_packed: bool,
+) -> Result<(String, Option<CanonicalCredential>)> {
     #[derive(Deserialize)]
     struct FastlyPurge {
         fastly_api_token: String,
@@ -2729,29 +2759,39 @@ fn canonical_purge_token(hashes: &[String], use_pilot: bool) -> Result<(String, 
     } else {
         None
     };
-    if crate::request_bindings::can_read_secret("fastly_api_token") {
+    if (!prefer_packed || bundled.is_none())
+        && crate::request_bindings::can_read_secret("fastly_api_token")
+    {
         match get_secret("fastly_api_token") {
-            Ok(token) if !token.trim().is_empty() => return Ok((token, false)),
+            Ok(token) if !token.trim().is_empty() => {
+                return Ok((token, use_pilot.then_some(CanonicalCredential::Packed)))
+            }
             Err(error) if bundled.is_none() => return Err(error),
             _ => {}
         }
     }
     if let Some(token) = bundled {
-        return Ok((token, true));
+        return Ok((token, Some(CanonicalCredential::Standalone)));
     }
-    stage_canonical_priority(hashes)?;
+    stage_canonical_priority(hashes, CanonicalCredential::Standalone)?;
     Err(BlossomError::StorageError(
         "Canonical eviction pending dedicated retry".into(),
     ))
 }
 
-fn stage_canonical_priority(hashes: &[String]) -> Result<()> {
+fn stage_canonical_priority(hashes: &[String], credential: CanonicalCredential) -> Result<()> {
+    let preference = match credential {
+        CanonicalCredential::Standalone => "1", // existing v1 checkpoints
+        CanonicalCredential::Packed => "packed",
+    };
     let store = crate::metadata::open_store()?;
     for hash in hashes {
-        crate::metadata::retry_throttled_write(|| store.insert(&canonical_priority_key(hash), "1"))
-            .map_err(|_| {
-                BlossomError::MetadataError("Canonical purge checkpoint unavailable".into())
-            })?;
+        crate::metadata::retry_throttled_write(|| {
+            store.insert(&canonical_priority_key(hash), preference)
+        })
+        .map_err(|_| {
+            BlossomError::MetadataError("Canonical purge checkpoint unavailable".into())
+        })?;
     }
     Ok(())
 }
@@ -2786,7 +2826,12 @@ fn invalidate_bunny_pilot(hashes: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn invalidate_fastly_cdn(hashes: &[String], include_b2_hosts: bool, token: &str, from_pilot: bool) -> Result<()> {
+fn invalidate_fastly_cdn(
+    hashes: &[String],
+    include_b2_hosts: bool,
+    token: &str,
+    retry: Option<CanonicalCredential>,
+) -> Result<()> {
     let mut requests = Vec::new();
     if include_b2_hosts {
         let hosts = get_config("b2_cdn_purge_hosts")?;
@@ -2826,7 +2871,7 @@ fn invalidate_fastly_cdn(hashes: &[String], include_b2_hosts: bool, token: &str,
         }
     }
     let mut failed = false;
-    let mut pilot_token_rejected = false;
+    let mut token_rejected = false;
     for round in 0..2 {
         let mut pending = Vec::new();
         for template in &requests {
@@ -2844,8 +2889,9 @@ fn invalidate_fastly_cdn(hashes: &[String], include_b2_hosts: bool, token: &str,
             pending = remaining;
             // A 404 does not prove that a retained host is unbound or evicted.
             // Every URL and service-key request must independently acknowledge.
-            if from_pilot && matches!(&response, Ok(r) if matches!(r.get_status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)) {
-                pilot_token_rejected = true;
+            if matches!(&response, Ok(r) if matches!(r.get_status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN))
+            {
+                token_rejected = true;
             }
             let acknowledged =
                 matches!(response, Ok(response) if response.get_status().is_success());
@@ -2853,11 +2899,15 @@ fn invalidate_fastly_cdn(hashes: &[String], include_b2_hosts: bool, token: &str,
                 failed = true;
             }
         }
-        if pilot_token_rejected {
-            // All outstanding handles were drained. The next request has room
-            // for the independent canonical credential and two complete rounds.
-            stage_canonical_priority(hashes)?;
-            return Err(BlossomError::StorageError("Pilot purge credential rejected; canonical retry pending".into()));
+        if token_rejected {
+            if let Some(credential) = retry {
+                // All handles from this round have settled. A fresh request can
+                // spend its quota on two complete rounds with the alternate.
+                stage_canonical_priority(hashes, credential)?;
+                return Err(BlossomError::StorageError(
+                    "Canonical purge credential rejected; retry pending".into(),
+                ));
+            }
         }
         if round == 0 {
             wait_b2_cdn_purge_interval()?;
