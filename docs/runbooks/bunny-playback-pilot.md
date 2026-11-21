@@ -214,7 +214,9 @@ The canonical endpoint `GET /api/bunny-playback/<parent>` returns
 `version`, `host` and a `paths` array. In an eligible cohort the array
 contains the verified original, progressive MP4s and/or HLS master. A
 disabled cohort, authenticated request or missing readiness yields an empty
-array. A policy denial returns 404. Control-plane errors leave the client on
+array. Out-of-cohort requests skip authoritative policy reads. In-cohort age
+and owner gates stay on canonical playback; hard policy denials return 404.
+Control-plane errors leave the client on
 its canonical route. Responses carry CORS and private no-store headers.
 
 Selection sends up to seven parallel, cache-bypassing HEADs directly to the

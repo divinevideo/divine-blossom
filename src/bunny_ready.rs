@@ -80,13 +80,15 @@ pub(crate) fn finalize(body: &[u8]) -> Result<Value> {
     if inventory.version != 1 || !complete(parent, inventory.assets.iter()) {
         return Err(invalid());
     }
-    with_gate(parent, |_, _, check_gate, may_release| {
+    with_gate(parent, |_, generation, check_gate, may_release| {
         let ready = match verify_family(&inventory, check_gate) {
             Ok(Some(ready)) => ready,
             incomplete => {
                 *may_release = false;
-                check_gate()?;
-                invalidate(parent)?;
+                if let Err(error) = check_gate().and_then(|_| invalidate(parent)) {
+                    crate::parent_gate::handoff_bunny_cleanup(parent, generation)?;
+                    return Err(error);
+                }
                 *may_release = true;
                 // Only a confirmed worker no-write can become a retry after the
                 // stale inventory is retired and with_gate releases the claim.
@@ -95,11 +97,13 @@ pub(crate) fn finalize(body: &[u8]) -> Result<Value> {
         };
         let store = metadata::open_store()?;
         let body = serde_json::to_vec(&ready).map_err(|_| invalid())?;
-        // On an uncertain overwrite, keep exclusion until the operator verifies
-        // which readiness is durable. Never expose an earlier inventory.
+        // An uncertain overwrite must not expose an earlier inventory. There
+        // is no in-flight media PUT, so the cleanup drain can take the fence.
         *may_release = false;
-        metadata::retry_throttled_write(|| store.insert(&key(parent), body.clone()))
-            .map_err(|_| BlossomError::MetadataError("Bunny readiness write failed".into()))?;
+        if metadata::retry_throttled_write(|| store.insert(&key(parent), body.clone())).is_err() {
+            crate::parent_gate::handoff_bunny_cleanup(parent, generation)?;
+            return Err(BlossomError::MetadataError("Bunny readiness write failed".into()));
+        }
         *may_release = true;
         Ok(json!({"result":"ready"}))
     })
@@ -238,11 +242,12 @@ fn selection(req: &Request, parent: &str, country: Option<&str>) -> Result<Value
             storage::optional_config("bunny_playback_countries")?.as_deref(),
             country,
         );
-    let before = if selected {
-        crate::parent_gate::bunny_settled_generation(parent)?
-    } else {
-        None
-    };
+    if !selected {
+        // Canonical delivery enforces its own policy; a disabled lookup does
+        // not need to spend authoritative KV reads to decline an alternate.
+        return Ok(json!({"version":1,"host":DELIVERY_HOST,"paths":[]}));
+    }
+    let before = crate::parent_gate::bunny_settled_generation(parent)?;
     let ready = if before.is_some() {
         read_ready(parent)
     } else {
@@ -257,7 +262,7 @@ fn selection(req: &Request, parent: &str, country: Option<&str>) -> Result<Value
         .and_then(|record| {
             storage::BunnySourceHeads::start(parent, &record.assets, source_deadline)
         });
-    // Read current policy after the inventory, including when the cohort is disabled.
+    // Read current policy after the inventory and before offering an alternate.
     let policy = metadata::bunny_playback_policy(parent)?;
     let mut paths = Vec::new();
     if let (Some(policy), Some(before)) = (policy, before) {

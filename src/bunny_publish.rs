@@ -146,7 +146,10 @@ fn publish(publication: Publication) -> Result<Value> {
             }
             outcome => {
                 if matches!(outcome, Outcome::DeliveryConflict) {
-                    crate::bunny_ready::invalidate(parent)?;
+                    if let Err(error) = crate::bunny_ready::invalidate(parent) {
+                        parent_gate::handoff_bunny_cleanup(parent, generation)?;
+                        return Err(error);
+                    }
                 }
                 *may_release = true;
                 return Err(match outcome {

@@ -105,6 +105,8 @@ class Origin(BaseHTTPRequestHandler):
         if self.path == "/":  # Viceroy backend health probe
             return self.reply(200)
         if self.path.startswith(KV_BASE):
+            if self.server.case in ("pending_zero", "disabled_four"):
+                self.server.events.append(("unexpected KV read", self.path))
             assert self.headers.get("Fastly-Key") == SECRETS["kv_origin_read_token"]
             key = self.path.removeprefix(KV_BASE)
             if key == f"b2-sync:v1:{HASH}":
@@ -609,6 +611,8 @@ blossom_secrets = [{secrets}]
             ], cwd=repo, env=env, capture_output=True, text=True, timeout=240)
         if result.returncode or "test result: ok. 1 passed" not in result.stdout:
             raise RuntimeError(f"{case}: {result.stdout}{result.stderr}\nFixture events: {server.events}")
+        if case in ("pending_zero", "disabled_four"):
+            assert not server.events, f"{case} reached a backend: {server.events}"
         for report in result.stderr.splitlines():
             if report.startswith("BUNNY_QUOTA "):
                 print(report)

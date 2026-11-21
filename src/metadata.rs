@@ -264,7 +264,8 @@ pub(crate) fn bunny_playback_policy(hash: &str) -> Result<Option<BlobMetadata>> 
     let is_pubkey =
         |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
     if metadata.sha256 != hash
-        || metadata.access_for(None, false) != crate::blossom::BlobAccess::Allowed
+        || matches!(metadata.status, BlobStatus::Banned | BlobStatus::Deleted)
+        || !metadata.quarantine_hold_ids.is_empty()
         || !is_pubkey(&metadata.owner)
         || lookup(&format!("{TOMBSTONE_PREFIX}{hash}"))?.is_some()
     {
@@ -297,6 +298,7 @@ pub(crate) fn bunny_playback_policy(hash: &str) -> Result<Option<BlobMetadata>> 
             return Err(denied());
         }
     }
+    // Let canonical delivery perform the viewer challenge or owner check.
     if metadata.status != BlobStatus::Active || !metadata.mime_type.starts_with("video/") || metadata.size == 0 {
         return Ok(None);
     }

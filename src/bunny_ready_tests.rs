@@ -324,9 +324,9 @@ fn bunny_hls_family_contract() {
         .map(|value| value["paths"].clone())
         .map_err(|e| e.status_code());
     control("policy-status", "age_restricted");
-    let denial = super::selection(&selection, parent, Some("US"))
-        .unwrap_err()
-        .status_code();
+    let age_fallback = super::selection(&selection, parent, Some("US"))
+        .map(|value| value["paths"].clone())
+        .map_err(|e| e.status_code());
     control("uploaders", "cd");
     control("ready", &record);
     control("retire-during-read", "");
@@ -346,7 +346,7 @@ fn bunny_hls_family_contract() {
         (
             four,
             four_missing,
-            denial,
+            age_fallback,
             stale,
             conflict,
             retired,
@@ -355,7 +355,7 @@ fn bunny_hls_family_contract() {
         (
             Ok(json!([])),
             Ok(json!([])),
-            StatusCode::NOT_FOUND,
+            Ok(json!([])),
             json!([]),
             StatusCode::CONFLICT,
             true,
@@ -369,9 +369,27 @@ fn bunny_hls_family_contract() {
     control("source-version", "123");
     control("policy-status", "age_restricted");
     assert_eq!(finalize(rows).get_status(), StatusCode::NOT_FOUND);
+    assert_eq!(selected(&selection), json!([]));
+    control("policy-status", "restricted");
+    assert_eq!(selected(&selection), json!([]));
+    control("policy-status", "banned");
     assert_eq!(
         crate::request_bindings::metered(selection).get_status(),
         StatusCode::NOT_FOUND
+    );
+    control("policy-status", "active");
+    control("source-version", "null");
+    super::FAIL_NEXT_DELETE.set(true);
+    assert_ne!(finalize(rows).get_status(), StatusCode::OK);
+    let mut gate = metadata::open_store()
+        .unwrap()
+        .lookup(&format!("b2-sync:v1:{parent}"))
+        .unwrap();
+    assert_eq!(
+        crate::parent_gate::parse(&gate.take_body().into_bytes()),
+        Some(crate::parent_gate::Gate::Copying {
+            attempt_id: format!("bunny-cleanup-{parent}")
+        })
     );
 }
 
