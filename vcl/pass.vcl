@@ -39,3 +39,10 @@ if ((req.method == "DELETE" && req.url ~ "^/vanish([?]|$)") ||
     (req.method == "POST" && req.url ~ "^/admin/api/vanish([?]|$)")) {
   set bereq.first_byte_timeout = 60s;
 }
+
+# The synchronous worker has a 45s deadline. Compute authenticates the bearer
+# and checks policy both before dispatch and during settlement.
+if (req.method == "POST" && req.http.Authorization ~ "^Bearer [^ ]+$" &&
+    req.url ~ "^/admin/api/bunny-pilot/(publish|finalize)$") {
+  set bereq.first_byte_timeout = 120s;
+}

@@ -406,7 +406,7 @@ fn route_request(req: Request) -> Result<Response> {
         (_, "/admin/api/b2-cdn-purge/drain") => {
             b2_cdn_purge::handle_drain(req, storage::invalidate_b2_cdn)
         }
-        (_, "/admin/api/bunny-pilot/publish" | "/admin/api/bunny-pilot/finalize") => {
+        (_, "/admin/api/bunny-pilot/publish" | "/admin/api/bunny-pilot/finalize" | blossom_core::bunny_worker::PERMIT_PATH) => {
             Ok(bunny_publish::handle(req))
         }
         (Method::POST, "/admin/api/quarantine") => admin::handle_admin_quarantine_action(req),

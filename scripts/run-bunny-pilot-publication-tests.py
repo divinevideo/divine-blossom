@@ -8,8 +8,11 @@ import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import re
 from pathlib import Path
 import shlex
+import socket
+import sys
 import subprocess
 import tempfile
 import threading
@@ -26,7 +29,7 @@ PREFIX = "bunny-delivery/"
 CDN_HOSTS = ("media-bunny.divine.video", "fixture-pilot.b-cdn.net")
 B2_API_HOST = "api.backblazeb2.com"
 KV_BASE = "/resources/stores/kv/fixture-store/keys/"
-CASES = ("hls_family", "disabled_four", "active", "active_rendition", "pending", "age_restricted", "checksum_mismatch",
+CASES = ("lost_permit_reply", "denied_during_prep", "ready_delete_failure", "permit_contract", "delayed_publish", "hls_family", "disabled_four", "active", "active_rendition", "pending", "age_restricted", "checksum_mismatch",
          "age_gate_after_put", "appeal", "unverified_retry", "rejected_put", "uncertain_put",
          "disabled", "webhook_token", "wrong_writer_scope", "lost_worker_reply", "invalid_worker_evidence", "wrong_worker_primary")
 SECRETS = {
@@ -78,8 +81,11 @@ def basic(key_type):
 
 class Origin(BaseHTTPRequestHandler):
     def log_message(self, *_args):
-        if not self.path.startswith("/fixture/") and self.headers.get("User-Agent") != "divine-bunny-worker/1":
-            self.server.meter[-1][1] += 1
+        if self.path != "/" and not self.path.startswith("/fixture/") and self.headers.get("User-Agent") != "divine-bunny-worker/1":
+            if self.server.in_permit:
+                self.server.permit_queries[-1] += 1
+            else:
+                self.server.meter[-1][1] += 1
 
     def reply(self, status, body=b"", headers=None):
         self.send_response(status)
@@ -96,10 +102,15 @@ class Origin(BaseHTTPRequestHandler):
         return self.rfile.read(int(self.headers.get("Content-Length", "0")))
 
     def do_GET(self):
+        if self.path == "/":  # Viceroy backend health probe
+            return self.reply(200)
         if self.path.startswith(KV_BASE):
             assert self.headers.get("Fastly-Key") == SECRETS["kv_origin_read_token"]
             key = self.path.removeprefix(KV_BASE)
             if key == f"b2-sync:v1:{HASH}":
+                if self.server.permit_gate:
+                    attempt, generation = self.server.permit_gate
+                    return self.reply_json({"state":"copying","attempt_id":attempt},{"generation":generation})
                 if self.server.ready_generation:
                     return self.reply_json({"state":"released","version":1,"settled_attempt_id":"fixture-published",
                         "released_from_generation":"1"}, {"generation":str(self.server.ready_generation)})
@@ -128,7 +139,7 @@ class Origin(BaseHTTPRequestHandler):
                                f"vanish_in_progress:v1:{OWNER}"}, key
                 return self.reply(404)
             status = self.server.policy_status
-            if self.server.case == "age_gate_after_put" and self.server.delivered is not None:
+            if self.server.case in ("age_gate_after_put", "ready_delete_failure") and self.server.delivered is not None:
                 status = "age_restricted"
             self.server.events.append(("policy", status))
             return self.reply_json({
@@ -150,7 +161,7 @@ class Origin(BaseHTTPRequestHandler):
                             "capabilities": (["writeFiles","listFiles"] if self.server.case == "wrong_writer_scope" else ["writeFiles"]) if is_writer else ["listFiles", "deleteFiles"]},
             }}})
 
-        assert self.headers.get("User-Agent") == "divine-bunny-worker/1"
+        assert self.headers.get("User-Agent") == "divine-bunny-worker/1", self.path
         reader = "fixture-gcs-id" if self.path.startswith("/fixture-gcs/") else "fixture-reader-id"
         assert f"Credential={reader}/" in self.headers.get("Authorization", "")
         self.server.events.append(("read", self.path))
@@ -160,6 +171,10 @@ class Origin(BaseHTTPRequestHandler):
             body, mime = self.server.objects[self.path]
             return self.reply(200, body, {"Content-Type": mime, **({"x-goog-generation": self.server.source_version} if reader == "fixture-gcs-id" else {"x-amz-version-id": "fixture-version-1" if self.path in self.server.destinations else self.server.source_version})})
         if self.path == f"/{BUCKET}/{self.server.source_key}":
+            if self.server.case == "denied_during_prep":
+                self.server.policy_status = "age_restricted"
+            if self.server.case == "delayed_publish" and self.server.delivered is None:
+                time.sleep(16)
             body = b"wrong bytes" if self.server.case == "checksum_mismatch" else BODY
         else:
             assert self.path == f"/{BUCKET}/{self.server.delivery_key}", self.path
@@ -196,14 +211,36 @@ class Origin(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlsplit(self.path)
-        if parsed.path == "/internal/bunny-pilot/v1":
+        if parsed.path == "/admin/api/bunny-pilot/permit":
+            assert self.headers.get("Host") == "media.divine.video"
+            assert self.headers.get("User-Agent") == "divine-bunny-worker/1"
             assert self.headers.get("Authorization") == "Bearer " + SECRETS["bunny_pilot_worker_token"]
             body = self.read_body()
+            self.server.permit_queries.append(0)
+            self.server.in_permit = True
+            try:
+                with closing(HTTPConnection("127.0.0.1", self.server.permit_port, timeout=15)) as edge:
+                    edge.request("POST", parsed.path, body, {"Host":"media.divine.video","Authorization":self.headers["Authorization"]})
+                    response = edge.getresponse()
+                    payload = response.read()
+                    if self.server.case == "lost_permit_reply":
+                        return self.reply(503)
+                    return self.reply(response.status, payload)
+            finally:
+                self.server.in_permit = False
+        if parsed.path == "/internal/bunny-pilot/v1":
+            assert self.headers.get("Host") == "blossom-upload-rust-149672065768.us-central1.run.app"
+            assert self.headers.get("Authorization") == "Bearer " + SECRETS["bunny_pilot_worker_token"]
+            body = self.read_body()
+            op = json.loads(body)["operation"]
+            if op["operation"] == "publish":
+                self.server.permit_gate = (op["attempt"],op["generation"])
             with closing(HTTPConnection("127.0.0.1", self.server.worker_port, timeout=90)) as worker:
                 worker.request("POST", parsed.path, body, {"Authorization": self.headers["Authorization"]})
                 started = time.monotonic()
                 response = worker.getresponse()
                 payload = response.read()
+                self.server.permit_gate = None
                 self.server.worker_times.append((json.loads(body)["operation"]["operation"],time.monotonic() - started))
                 if self.server.case == "lost_worker_reply":
                     return self.reply(503)
@@ -212,8 +249,15 @@ class Origin(BaseHTTPRequestHandler):
                     evidence["result"]["verified"]["source"]["key"] = "outside-scope"
                     payload = json.dumps(evidence).encode()
                 return self.reply(response.status, payload, {"Content-Type":"application/json"})
+        if parsed.path == "/fixture/permit-gate":
+            self.server.permit_gate = json.loads(self.read_body())
+            return self.reply(200)
         if parsed.path == "/fixture/meter":
-            self.server.meter.append([self.read_body().decode(), 0])
+            phase = self.read_body().decode()
+            if phase == "outside" and self.server.meter[-1][0] == "publish":
+                self.server.publish_times.append(time.monotonic() - self.server.request_started)
+            self.server.request_started = time.monotonic()
+            self.server.meter.append([phase, 0])
             return self.reply(200)
         if parsed.path == "/fixture/uploaders":
             self.server.uploaders = self.read_body().decode()
@@ -240,7 +284,7 @@ class Origin(BaseHTTPRequestHandler):
             return self.reply(200)
 
         if parsed.path.startswith("/service/"):
-            assert self.server.case in ("appeal", "unverified_retry", "age_gate_after_put")
+            assert self.server.case in ("appeal", "unverified_retry", "age_gate_after_put", "ready_delete_failure")
             assert parsed.path.endswith("/purge")
             assert self.headers.get("Fastly-Key") == SECRETS["bunny_pilot_cleanup_v1"]["fastly_api_token"]
             assert self.headers.get("Surrogate-Key") == HASH
@@ -285,17 +329,21 @@ def assert_case(server, case):
             print(f"Maximum {operation} backend requests: {max(counts)}")
     elif case in ("lost_worker_reply","invalid_worker_evidence"):
         assert actions.count("put") == 1 and server.delivered == BODY, events
-    elif case in ("active", "active_rendition"):
+    elif case == "denied_during_prep":
+        assert actions.count("put") == 0 and server.delivered is None, events
+        assert [value for action,value in events if action == "policy"] == ["active","age_restricted"], events
+    elif case in ("active", "active_rendition", "delayed_publish"):
         assert actions.count("put") == 1 and server.delivered == BODY, events
-        assert [status for name, status in events if name == "policy"] == ["active"] * 4, events
+        assert [status for name, status in events if name == "policy"] == ["active"] * 5, events
         assert not any(action in actions for action in ("delete", "purge")), events
-    elif case == "age_gate_after_put":
+    elif case in ("age_gate_after_put", "ready_delete_failure"):
         critical = [(name, value) for name, value in events if name != "read"]
-        assert critical[:4] == [
+        assert critical[:5] == [
+            ("policy", "active"),
             ("policy", "active"), ("put", f"/{BUCKET}/{server.delivery_key}"),
             ("policy", "age_restricted"), ("delete", server.delivery_key),
         ], events
-        assert sorted(critical[4:]) == sorted(
+        assert sorted(critical[5:]) == sorted(
             ("purge", f"https://{host}/{HASH}*") for host in CDN_HOSTS for _ in range(2)
         ), events
         assert server.delivered is None
@@ -355,20 +403,26 @@ def run(server, repo, directory):
                       if (obj := json.loads(line)).get("executable"))
     settings, kv, config = (directory / name for name in ("settings.json", "kv.json", "fastly.toml"))
     dynamic_b2 = f"b2-api-{hashlib.sha256(B2_API_HOST.encode()).hexdigest()[:16]}"
-    backend_names = ("upload_service","gcs_storage", "b2_storage", "b2_api", "bunny_api", "kv-origin-api", dynamic_b2, "fastly_api", "fixture_control")
+    backend_names = ("cloud_run_upload","gcs_storage", "b2_storage", "b2_api", "bunny_api", "kv-origin-api", dynamic_b2, "fastly_api", "fixture_control")
     backends = "\n".join(
         f'[local_server.backends."{name}"]\nurl = "http://127.0.0.1:{server.server_port}"'
         for name in backend_names
     )
+    backends += f'\n[local_server.backends.upload_service]\nurl = "http://127.0.0.1:{server.trap.server_port}"'
+    subprocess.run(["cargo","build","--locked","--target","wasm32-wasip1","--bin","fastly-blossom"],cwd=repo,check=True)
     env = os.environ.copy()
     env["CARGO_TARGET_WASM32_WASIP1_RUNNER"] = shlex.join([
         env.get("VICEROY", "viceroy"), "run", "-C", str(config), "--",
     ])
-    for label in ("hls_family_b2", *CASES):
+    for label in (sys.argv[1:] or ("hls_family_b2", *CASES)):
         maximum = label == "hls_family_b2"
         BODY = b"b" * (16*1024*1024) if maximum else b"abc"
         HASH = hashlib.sha256(BODY).hexdigest()
+        server.publish_times = []
         server.worker_times = []
+        server.permit_gate = None
+        server.permit_queries = []
+        server.in_permit = False
         case = "hls_family" if label == "hls_family_b2" else label
         server.case = case
         server.derived_bucket = "fixture-gcs" if label == "hls_family" else BUCKET
@@ -424,10 +478,10 @@ blossom_secrets = [{secrets}]
             "b2_media_region": "us-west-004",
             "metadata_kv_store_id": "fixture-store",
         }))
-        with native_worker(executable,directory,server,bindings):
+        with permit_edge(repo, config, server), native_worker(executable,directory,server,bindings):
             result = subprocess.run([
                 "cargo", "test", "--locked", "--target", "wasm32-wasip1", "--bin", "fastly-blossom",
-                {"hls_family":"bunny_hls_family_contract","disabled_four":"bunny_disabled_four_uploaders"}.get(case,
+                {"hls_family":"bunny_hls_family_contract","disabled_four":"bunny_disabled_four_uploaders","permit_contract":"bunny_worker_permit_contract"}.get(case,
                     "bunny_publication_respects_authoritative_policy_and_releases_clean_attempts"),
                 "--", "--ignored", "--nocapture",
             ], cwd=repo, env=env, capture_output=True, text=True, timeout=240)
@@ -440,15 +494,62 @@ blossom_secrets = [{secrets}]
             if phase not in ("outside", "start"):
                 assert count <= 32, (label, phase, count)
                 print(f"BUNNY_HTTP {phase} {count}")
+        assert server.trap.hits == 0, "unexpected job sent to GKE"
+        assert all(0 < count <= 32 for count in server.permit_queries)
+        if server.permit_queries:
+            print(f"BUNNY_HTTP worker permit max {max(server.permit_queries)}")
+        if case == "delayed_publish":
+            snippet = (repo / "vcl/pass.vcl").read_text().split('req.url ~ "^/admin/api/bunny-pilot/(publish|finalize)$"')[1]
+            outer_timeout = int(re.match(r'\) \{\s+set bereq.first_byte_timeout = (\d+)s;', snippet)[1])
+            inner = max(t for op,t in server.worker_times)
+            outer = max(server.publish_times)
+            assert 15 < inner < 45 and inner <= outer < outer_timeout, (inner, outer)
+            print(f"Delayed publication worker {inner:.3f}s, complete admin request {outer:.3f}s, VCL allowance {outer_timeout}s")
         assert_case(server, case)
         if maximum:
             print(f"Maximum-size 8-object worker finalize wall time {max(t for op,t in server.worker_times if op == 'finalize'):.3f}s")
         print(f"PASS {label}")
 
 
+@contextmanager
+def permit_edge(repo, config, server):
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1",0))
+        server.permit_port = sock.getsockname()[1]
+    addr = f"127.0.0.1:{server.permit_port}"
+    with subprocess.Popen([os.environ.get("VICEROY","viceroy"),"serve","--addr",addr,"-C",str(config),
+                           str(repo/"target/wasm32-wasip1/debug/fastly-blossom.wasm")],
+                          cwd=repo,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL) as proc:
+        try:
+            deadline = time.monotonic()+45
+            while True:
+                try:
+                    with socket.create_connection(("127.0.0.1",server.permit_port), timeout=1):
+                        break
+                except OSError:
+                    if time.monotonic()>deadline or proc.poll() is not None:
+                        raise RuntimeError("permit edge failed to listen")
+                    time.sleep(.1)
+            yield
+        finally:
+            proc.terminate()
+
+
+class GkeTrap(BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.server.hits += 1
+        self.send_error(503)
+
+    def log_message(self, *_args):
+        pass
+
+
 def main():
     repo = Path(__file__).resolve().parent.parent
-    with ThreadingHTTPServer(("127.0.0.1", 0), Origin) as server:
+    with ThreadingHTTPServer(("127.0.0.1", 0), Origin) as server, ThreadingHTTPServer(("127.0.0.1", 0), GkeTrap) as trap:
+        trap.hits = 0
+        server.trap = trap
+        threading.Thread(target=trap.serve_forever,daemon=True).start()
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
             with tempfile.TemporaryDirectory(prefix="bunny-pilot-publication-") as directory:

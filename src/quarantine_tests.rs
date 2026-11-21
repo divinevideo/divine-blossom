@@ -794,3 +794,60 @@ fn bunny_pilot_age_gate_eviction_retries() {
     crate::storage::invalidate_b2_cdn(&[unrelated.clone()]).unwrap();
     assert!(parent_gate::archive_owned(&unrelated, "unrelated-mirror").unwrap());
 }
+
+
+#[test]
+#[ignore = "requires retained pilot with missing/malformed bundle"]
+fn bunny_legacy_canonical_fallback() {
+    let hash = if storage::config_flag("fixture_unenrolled") {
+        "c".repeat(64)
+    } else {
+        hash()
+    };
+    b2_cdn_purge::enqueue(&hash, b2_cdn_purge::Phase::Single).unwrap();
+    let drain = |auth| {
+        let req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=1", false)
+            .with_header("Authorization", format!("Bearer {auth}"));
+        let mut response = crate::request_bindings::metered(req);
+        assert_eq!(response.get_status(), StatusCode::OK);
+        serde_json::from_str::<serde_json::Value>(&response.take_body_str()).unwrap()["result"]
+            .clone()
+    };
+    let key = format!("canonical-purge-priority:v1:{hash}");
+    if !storage::config_flag("fixture_immediate") {
+        assert_eq!(drain("synthetic-webhook-token"), 0);
+        assert!(
+            open_store().unwrap().lookup(&key).is_ok(),
+            "retry must reserve canonical priority"
+        );
+        assert_eq!(
+            drain("synthetic-webhook-token"),
+            0,
+            "canonical-only retry cannot acknowledge Bunny"
+        );
+        assert!(open_store().unwrap().lookup(&key).is_err());
+        let store = open_store().unwrap();
+        let records = store
+            .build_list()
+            .prefix("b2-cdn-purge:v1:")
+            .execute()
+            .unwrap();
+        assert_eq!(records.keys().len(), 1);
+        let record = store
+            .lookup(&records.keys()[0])
+            .unwrap()
+            .take_body()
+            .into_string();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&record).unwrap()["state"],
+            "committed"
+        );
+    } else {
+        let result = drain(if storage::config_flag("fixture_webhook") {
+            "synthetic-webhook-token"
+        } else {
+            "synthetic-drain-token"
+        });
+        assert_eq!(result, u8::from(storage::config_flag("fixture_unenrolled")));
+    }
+}

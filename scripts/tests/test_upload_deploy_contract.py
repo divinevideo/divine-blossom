@@ -29,7 +29,7 @@ class UploadDeployContractTest(unittest.TestCase):
             self.assertIn("COPY blossom-core /blossom-core", (staged / "Dockerfile").read_text())
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         self.assertIn("-- cloud-run-upload blossom-core; then", workflow)
-        self.assertIn('and .bunny_pilot_worker == "verified-v1"', workflow)
+        self.assertIn('and .bunny_pilot_worker == "verified-v2"', workflow)
         self.assertIn('--source "${BUILD_CONTEXT}"', self.script)
 
     def test_deploy_owns_the_cleanup_bucket_configuration(self) -> None:

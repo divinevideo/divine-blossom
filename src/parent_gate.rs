@@ -611,6 +611,14 @@ pub(crate) fn bunny_settled_generation(hash: &str) -> Result<Option<String>> {
     }))
 }
 
+pub(crate) fn check_bunny_origin_gate(hash: &str, attempt: &str, expected: &str) -> Result<()> {
+    let observed = lookup_origin(hash)?;
+    if hold_reason(observed.as_ref(), attempt, Some(expected)).is_some() {
+        return Err(stale());
+    }
+    Ok(())
+}
+
 pub(crate) fn check_bunny_gate(hash: &str, attempt: &str, expected: &str) -> Result<()> {
     let observed = lookup_bunny_gate(hash)?;
     if hold_reason(observed.as_ref(), attempt, Some(expected)).is_some() {

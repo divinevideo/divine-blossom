@@ -11,8 +11,8 @@ use blossom_core::{
     bunny_hls::normalize,
     bunny_pilot::{Asset, DELIVERY_PREFIX},
     bunny_worker::{
-        complete, version_valid, Inventory, Job, Operation, Outcome, Pin, Publication, Reply,
-        Scope, Verified,
+        complete, version_valid, Inventory, Job, Operation, Outcome, Permit, Pin, Publication,
+        Reply, Scope, Verified, PERMIT_HOST, PERMIT_PATH,
     },
     storage_origin::{MediaReadPolicy, ObjectRef, StorageProvider},
 };
@@ -261,7 +261,38 @@ impl Worker {
         Ok(())
     }
 
-    async fn publish(&self, p: &Publication, original_size: Option<u64>) -> Work<Outcome> {
+    async fn permit(&self, permit: &Permit, token: &str) -> Work<()> {
+        let response = HTTP
+            .post(self.url(PERMIT_HOST, PERMIT_PATH))
+            .header("Host", PERMIT_HOST)
+            .bearer_auth(token)
+            .json(permit)
+            .send()
+            .await
+            .map_err(|_| Outcome::Unavailable)?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(Outcome::Denied);
+        }
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(Outcome::Unavailable);
+        }
+        let reply: serde_json::Value = serde_json::from_slice(&bounded_bytes(response, 128).await?)
+            .map_err(|_| Outcome::Unavailable)?;
+        if reply != serde_json::json!({"result":"permitted"}) {
+            return Err(Outcome::Unavailable);
+        }
+        Ok(())
+    }
+
+    async fn publish(
+        &self,
+        p: &Publication,
+        original_size: Option<u64>,
+        attempt: String,
+        generation: String,
+        token: &str,
+        timeout_outcome: &mut Outcome,
+    ) -> Work<Outcome> {
         let asset = p.asset().ok_or(Outcome::Rejected)?;
         let source = self
             .get(&asset, false)
@@ -272,6 +303,7 @@ impl Worker {
         {
             return Err(Outcome::SourceChanged);
         }
+        let source_size = source.bytes.len();
         let mut child_size = 0;
         for d in &p.dependencies {
             let child = Asset::parse(&d.path).ok_or(Outcome::Rejected)?;
@@ -297,7 +329,7 @@ impl Worker {
             existing
         } else {
             self.authorize_writer().await?;
-            let res = self
+            let put = self
                 .signed(
                     StorageProvider::B2,
                     Method::PUT,
@@ -308,16 +340,26 @@ impl Worker {
                 )?
                 .header("Content-Type", asset.mime())
                 .header("Cache-Control", "private, no-store")
-                .body(bytes)
-                .send()
-                .await
-                .map_err(|_| Outcome::Uncertain)?;
+                .body(bytes);
+            self.permit(
+                &Permit {
+                    path: p.path.clone(),
+                    source_size,
+                    attempt,
+                    generation,
+                },
+                token,
+            )
+            .await?;
+            *timeout_outcome = Outcome::Uncertain;
+            let res = put.send().await.map_err(|_| Outcome::Uncertain)?;
             if matches!(res.status().as_u16(), 400 | 401 | 403) {
                 return Err(Outcome::Rejected);
             }
             if !res.status().is_success() {
                 return Err(Outcome::Uncertain);
             }
+            *timeout_outcome = Outcome::ReadbackFailed;
             let written_version = res
                 .headers()
                 .get("x-amz-version-id")
@@ -394,18 +436,18 @@ impl Worker {
 }
 
 pub(crate) async fn handle(req: Request) -> Response {
-    let token = env::var("BUNNY_PILOT_WORKER_TOKEN")
+    let Some(token) = env::var("BUNNY_PILOT_WORKER_TOKEN")
         .ok()
-        .filter(|t| t.len() >= 32);
+        .filter(|t| t.len() >= 32)
+    else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
     let provided = req
         .headers()
         .get("authorization")
         .and_then(|h| h.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "));
-    if !provided
-        .zip(token.as_deref())
-        .is_some_and(|(a, b)| bool::from(a.as_bytes().ct_eq(b.as_bytes())))
-    {
+    if !provided.is_some_and(|provided| bool::from(provided.as_bytes().ct_eq(token.as_bytes()))) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let Ok(body) = to_bytes(req.into_body(), 16 * 1024).await else {
@@ -436,9 +478,24 @@ pub(crate) async fn handle(req: Request) -> Response {
         Operation::Publish {
             publication,
             original_size,
-        } => tokio::time::timeout(deadline, worker.publish(&publication, original_size))
+            attempt,
+            generation,
+        } => {
+            let mut timeout_outcome = Outcome::Unavailable;
+            tokio::time::timeout(
+                deadline,
+                worker.publish(
+                    &publication,
+                    original_size,
+                    attempt,
+                    generation,
+                    &token,
+                    &mut timeout_outcome,
+                ),
+            )
             .await
-            .unwrap_or(Err(Outcome::Uncertain)),
+            .unwrap_or(Err(timeout_outcome))
+        }
         Operation::Finalize { inventory } => {
             tokio::time::timeout(deadline, worker.finalize(inventory))
                 .await

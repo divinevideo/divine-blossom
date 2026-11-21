@@ -25,7 +25,18 @@ fn key(parent: &str) -> String {
     format!("bunny-ready:v1:{parent}")
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_NEXT_DELETE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub(crate) fn invalidate(parent: &str) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_DELETE.replace(false) {
+        return Err(BlossomError::MetadataError(
+            "fixture readiness delete failed".into(),
+        ));
+    }
     let store = metadata::open_store()?;
     match metadata::retry_throttled_write(|| store.delete(&key(parent))) {
         Ok(()) | Err(KVStoreError::ItemNotFound) => Ok(()),
@@ -45,7 +56,7 @@ pub(crate) fn finalize(body: &[u8]) -> Result<Value> {
     if inventory.version != 1 || !complete(parent, inventory.assets.iter()) {
         return Err(invalid());
     }
-    with_gate(parent, |_, check_gate, may_release| {
+    with_gate(parent, |_, _, check_gate, may_release| {
         let verified = verify_family(&inventory, check_gate);
         let ready = match verified {
             Ok(ready) => ready,

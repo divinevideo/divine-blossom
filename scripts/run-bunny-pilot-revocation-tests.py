@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import shlex
+import sys
 import subprocess
 import tempfile
 import threading
@@ -140,7 +141,14 @@ class Provider(BaseHTTPRequestHandler):
 
     def fastly(self, path):
         assert self.headers.get('Host') == 'api.fastly.com'
-        assert self.headers.get('Fastly-Key') == 'synthetic-fastly-key'
+        if self.server.fallback and "rejected" in self.server.fallback and self.headers.get('Fastly-Key') == 'synthetic-expired':
+            self.server.expired_requests += 1
+            return 403, {}
+        if self.server.fallback:
+            assert self.headers.get('Fastly-Key') == 'synthetic-legacy-key'
+        else:
+            assert self.headers.get('Fastly-Key') in ('synthetic-fastly-key', 'synthetic-legacy-key')
+        self.server.legacy_targets.append(path)
         if '/purge_url/' in path:
             assert path.startswith('/service/ML7R82HKfmTaqTpHExIDVN/purge_url/')
             return 200, {}
@@ -151,13 +159,19 @@ class Provider(BaseHTTPRequestHandler):
         return 200, {HASH: 'synthetic-purge-id'}
 
 
-def manifest(port, kv, settings):
+def manifest(port, kv, settings, fallback=None):
     native_backend = 'b2-api-' + hashlib.sha256(B2_HOST.encode()).hexdigest()[:16]
     backends = ('b2_api', native_backend, 'bunny_api', 'fastly_api', 'kv-origin-api', 'fixture_control')
     backend_sections = '\n'.join(
         f'[local_server.backends."{name}"]\nurl = "http://127.0.0.1:{port}"'
         for name in backends
     )
+    pilot = json.dumps({"eraser":{"id":"synthetic-b2-id","key":"synthetic-b2-key"},"bunny_api_key":"synthetic-bunny-key","fastly_api_token":"synthetic-fastly-key"})
+    if fallback and "rejected" in fallback:
+        pilot = json.dumps({**json.loads(pilot), "fastly_api_token":"synthetic-expired"})
+    elif fallback:
+        pilot = "invalid-json" if "malformed" in fallback else None
+    pilot_binding = f"{{key=\"bunny_pilot_cleanup_v1\",data='{pilot}'}}, " if pilot is not None else ""
     return f'''manifest_version = 3
 name = "synthetic-bunny-revocation"
 language = "rust"
@@ -173,16 +187,19 @@ blossom_secrets = [
   {{key="b2_cdn_purge_drain_token",data="synthetic-drain-token"}},
   {{key="webhook_secret",data="synthetic-webhook-token"}},
   {{key="admin_token",data="synthetic-admin-token"}},
-  {{key="bunny_pilot_cleanup_v1",data='{json.dumps({"eraser":{"id":"synthetic-b2-id","key":"synthetic-b2-key"},"bunny_api_key":"synthetic-bunny-key","fastly_api_token":"synthetic-fastly-key"})}'}},
+  {pilot_binding}{{key="fastly_api_token",data="synthetic-legacy-key"}},
   {{key="kv_origin_read_token",data="synthetic-policy-key"}}
 ]
 '''
 
 
-def run(versions, resume):
+def run(versions, resume, fallback=None):
     unrelated = {(HASH, 'canonical-original'), (f'bunny-delivery/{"b" * 64}', 'other-pilot-asset')}
     with ThreadingHTTPServer(('127.0.0.1', 0), Provider) as server:
         server.lock = threading.Lock()
+        server.fallback = fallback
+        server.legacy_targets = []
+        server.expired_requests = 0
         server.meter = [['setup', 0]]
         server.versions = versions | unrelated
         server.events, server.errors = [], []
@@ -200,18 +217,40 @@ def run(versions, resume):
                                                 'bunny_pilot_zone_hosts': f'{CUSTOM_HOST},reconfigured-zone.b-cdn.net'}
                 if not resume:
                     configuration.pop('bunny_pilot_zone_hosts')
+                if fallback:
+                    configuration["fixture_unenrolled"] = str("unrelated" in fallback).lower()
+                    configuration["fixture_immediate"] = str("immediate" in fallback or "unrelated" in fallback).lower()
+                    configuration["fixture_webhook"] = str("webhook" in fallback).lower()
                 settings.write_text(json.dumps(configuration))
-                config.write_text(manifest(server.server_port, kv, settings))
+                config.write_text(manifest(server.server_port, kv, settings, fallback))
                 env = os.environ.copy()
                 env['CARGO_TARGET_WASM32_WASIP1_RUNNER'] = shlex.join([
                     env.get('VICEROY', 'viceroy'), 'run', '-C', str(config), '--',
                 ])
                 result = subprocess.run([
                     'cargo', 'test', '--locked', '--target', 'wasm32-wasip1', '--bin', 'fastly-blossom',
-                    TEST, '--', '--ignored', '--exact', '--nocapture',
+                    'quarantine_tests::bunny_legacy_canonical_fallback' if fallback else TEST, '--', '--ignored', '--exact', '--nocapture',
                 ], cwd=ROOT, env=env, capture_output=True, text=True, timeout=900)
                 if result.returncode or '1 passed; 0 failed' not in result.stdout or server.errors:
                     raise RuntimeError(result.stdout + result.stderr + repr(server.errors))
+                if fallback:
+                    parent = 'c' * 64 if "unrelated" in fallback else HASH
+                    targets = [f'/service/ML7R82HKfmTaqTpHExIDVN/purge_url/{host}/{parent}' for host in ("media-b2-cdn.divine.video","media-b2.divine.video")]
+                    targets += [f'/service/{service}/purge' for service in FASTLY_SERVICES]
+                    assert Counter(server.legacy_targets) == Counter(targets * 2), server.legacy_targets
+                    if fallback == "rejected-cold":
+                        assert server.expired_requests == 4, server.expired_requests
+                    assert not server.bunny_counts
+                    assert max(n for _,n in server.meter)<=32, server.meter
+                    if fallback == "missing-cold":
+                        reads = [line.split()[-2:] for line in result.stderr.splitlines()
+                                 if line.startswith("BUNNY_QUOTA ")]
+                        assert reads == [["5","4"], ["5","5"]], reads
+                    print(f"PASS {fallback} {server.meter}")
+                    for report in result.stderr.splitlines():
+                        if report.startswith("BUNNY_QUOTA "):
+                            print(report)
+                    return
                 assert server.versions == unrelated, server.versions
                 assert Counter(entry for event, entry in server.events if event == 'delete') == Counter(versions)
                 assert server.bunny_counts == {CUSTOM_HOST: 4, ALIAS: 4}, server.events
@@ -228,5 +267,8 @@ def run(versions, resume):
 
 
 if __name__ == '__main__':
-    run(VERSIONS, True)
-    run({(PREFIX, "original-v1")}, False)
+    for case in sys.argv[1:] or ("missing-cold","rejected-cold","rejected-immediate","malformed-immediate","missing-unrelated-immediate","missing-unrelated-webhook","paged","single"):
+        if case in ("paged","single"):
+            run(VERSIONS if case == "paged" else {(PREFIX,"original-v1")}, case == "paged")
+        else:
+            run(VERSIONS, False, case)

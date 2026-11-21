@@ -55,7 +55,7 @@ or enabling the internal mobile flag.
 ## Configure Blossom and enroll fixtures
 
 - Deploy the upload-service revision first. Its existing
-  `/delete-blobs/ready` endpoint must advertise `bunny_pilot_worker=verified-v1`.
+  `/delete-blobs/ready` endpoint must advertise `bunny_pilot_worker=verified-v2`.
   Configure Cloud Run with `BUNNY_ORIGINAL_PRIMARY` and `BUNNY_DERIVED_PRIMARY`
   equal to the Compute media and derivative primaries (`b2` or `gcs`).
   Supply the exact `B2_REGION`, `B2_MEDIA_BUCKET`, `B2_BUCKET_ID`, and,
@@ -68,17 +68,29 @@ or enabling the internal mobile flag.
   | --- | --- | --- |
   | `BUNNY_PILOT_READERS_V1` | Upload | JSON `{"b2":{"id":"…","key":"…"},"gcs":{"id":"…","key":"…"}}`. B2 reads canonical and delivery objects. GCS reads canonical objects. Omit `gcs` when both primaries are B2. |
   | `BUNNY_PILOT_WRITER_V1` | Upload | JSON `{"id":"…","key":"…"}`. Restrict the writer to one bucket, the exact delivery prefix and only `writeFiles`. The worker checks native authorization before PUT. |
-  | `BUNNY_PILOT_WORKER_TOKEN` and `bunny_pilot_worker_token` | Upload and Compute respectively | Identical dedicated random bearer, at least 32 bytes. Only the fixed `upload_service` backend uses this bearer. |
+  | `BUNNY_PILOT_WORKER_TOKEN` and `bunny_pilot_worker_token` | Upload and Compute respectively | Identical dedicated random bearer, at least 32 bytes. Compute sends jobs to the fixed `cloud_run_upload` backend. The worker sends pre-PUT permits to the fixed canonical `https://media.divine.video/admin/api/bunny-pilot/permit` route. Both hops use this dedicated bearer. |
   | `bunny_pilot_cleanup_v1` | Compute | JSON `{"eraser":{"id":"…","key":"…"},"bunny_api_key":"…","fastly_api_token":"…"}`. Existing bucket-scoped native `listFiles` and `deleteFiles` authority and the two targeted purge credentials. |
 
   The worker hard-codes provider hosts from its configured S3 region and uses
   its own readers and writer. Compute checks the worker's scope and immutable
   evidence, owns parent exclusion, and reads policy at the KV origin with the
   existing `kv_origin_read_token` and `metadata_kv_store_id`. Configure
-  the `bunny_api` Fastly backend for the Bunny Core API. Verify the fixed
-  upload backend has a first-byte timeout exceeding the worker's 45-second
-  operation deadline, including startup time. On timeout a potential write
-  retains its gate. The worker admits one publication job per instance.
+  the `bunny_api` Fastly backend for the Bunny Core API. The deployed
+  `cloud_run_upload` backend uses the companion's run.app authority for TLS and
+  SNI, a 120 s first-byte timeout and a 30 s between-bytes timeout. Compute
+  sets the same HTTP Host explicitly. The worker admits one job per instance
+  and enforces a 45 s operation deadline. After source, dependency, destination
+  and writer-scope checks, the worker asks Compute to verify its exact parent,
+  attempt and generation at the KV origin, current moderation and original
+  size. It issues the PUT only after an affirmative permit. Compute forces pass on jobs, sends no-store on permits,
+  and the worker refuses redirects. A lost job reply keeps
+  the fence; an acknowledged verified write can hand off to the durable drain.
+- Before fixture enrollment, validate and activate the separate outer VCL draft
+  using [the outer VCL runbook](outer-vcl.md). Its `compute_origin` backend
+  defaults to 15 s first byte and 10 s between bytes. The pass snippet gives
+  the two exact bearer-bearing publication/finalization POST routes 120 s
+  for startup, worker execution and edge settlement. Compute authenticates
+  the caller. Recheck both backend settings during activation.
   Prove version listing, deletion, purge on both hosts and verified publication
   against owned fixtures. Retain worker bindings through rollback until all
   attempts settle. Retain the cleanup bundle, target records and drain through
@@ -98,7 +110,15 @@ or enabling the internal mobile flag.
   runners must support released sentinels before pilot publishers emit them.
   Discovery of retained targets uses the KV origin even when publication is off.
   An unreadable origin retains revocation work instead of acknowledging eviction;
-  canonical Fastly invalidation is still attempted independently.
+  canonical Fastly invalidation prefers the standalone `fastly_api_token` when
+  it fits the request budget. Keep this binding through rollback. A missing
+  or malformed pilot bundle cannot suppress its independent purges.
+  If the five secret lookups are already spent, the drain writes a per-parent
+  canonical-priority hint. A provider 401/403 on the packed purge credential also
+  sets this hint. Its next invocation spends the standalone credential
+  on both Fastly rounds, then clears the hint and leaves the original CDN intent
+  pending. Expect one extra drain interval for canonical eviction in this case.
+  Repair the pilot binding and drain through origin absence and both CDN rounds.
 - Verify `b2_replica_enabled` is `true` for the existing bucket. Enable
   `bunny_pilot_publish_enabled` for the fixture pass only. Use the
   authenticated `POST /admin/api/bunny-pilot/publish` request with `path` and

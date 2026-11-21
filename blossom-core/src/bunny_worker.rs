@@ -147,12 +147,27 @@ impl Scope {
     }
 }
 
+/// Only the native worker requests a permit, after reading and hashing the source.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Permit {
+    pub path: String,
+    pub source_size: usize,
+    pub attempt: String,
+    pub generation: String,
+}
+
+pub const PERMIT_HOST: &str = "media.divine.video";
+pub const PERMIT_PATH: &str = "/admin/api/bunny-pilot/permit";
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     Publish {
         publication: Publication,
         original_size: Option<u64>,
+        attempt: String,
+        generation: String,
     },
     Finalize {
         inventory: Inventory,
@@ -179,6 +194,7 @@ pub enum Outcome {
         assets: Vec<Verified>,
     },
     /// Every outcome below except the final two guarantees no PUT was accepted.
+    Denied,
     SourceMissing,
     SourceChanged,
     DeliveryConflict,

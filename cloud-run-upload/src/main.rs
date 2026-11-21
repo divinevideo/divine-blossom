@@ -830,7 +830,7 @@ async fn handle_delete_blobs_ready() -> impl IntoResponse {
         "max_hashes": MAX_BATCH_CLEANUP_HASHES,
         "deadline_seconds": cleanup::CLEANUP_REQUEST_DEADLINE.as_secs(),
         "vanish_audit": "authenticated-v1",
-        "bunny_pilot_worker": "verified-v1",
+        "bunny_pilot_worker": "verified-v2",
         "delivery_probe": "authenticated-v1",
     }))
 }

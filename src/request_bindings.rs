@@ -151,6 +151,16 @@ pub(crate) fn config(key: &str) -> Result<Option<String>> {
     lookup(|bindings| bindings.config(key))
 }
 
+/// The exceptional purge fallback must leave a native read slot for any
+/// credential still needed by this execution.
+pub(crate) fn can_read_secret(key: &str) -> bool {
+    CURRENT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_none_or(|bindings| bindings.secrets.contains_key(key) || bindings.secrets.len() < 5)
+    })
+}
+
 pub(crate) fn secret(key: &str) -> Result<Option<String>> {
     lookup(|bindings| bindings.secret(key))
 }
