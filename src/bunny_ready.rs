@@ -228,6 +228,8 @@ fn read_ready(parent: &str) -> Result<Option<Ready>> {
 }
 
 fn selection(req: &Request, parent: &str, country: Option<&str>) -> Result<Value> {
+    // Reserve half the mobile lookup window for policy, gate and network latency.
+    let source_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
     let selected = !req.contains_header("Authorization")
         && !req.contains_header("Cookie")
         && cohort(
@@ -246,14 +248,24 @@ fn selection(req: &Request, parent: &str, country: Option<&str>) -> Result<Value
     } else {
         Ok(None)
     };
+    // Overlap current-version HEADs with the mandatory policy reads.
+    let heads = ready
+        .as_ref()
+        .ok()
+        .and_then(Option::as_ref)
+        .filter(|record| record.producer.is_some())
+        .and_then(|record| {
+            storage::BunnySourceHeads::start(parent, &record.assets, source_deadline)
+        });
     // Read current policy after the inventory, including when the cohort is disabled.
     let policy = metadata::bunny_playback_policy(parent)?;
     let mut paths = Vec::new();
     if let (Some(policy), Some(before)) = (policy, before) {
         if let Some(ready) = ready? {
+            let derivatives_current = ready.producer.is_some()
+                && ready.producer == CompletedTranscode::current(&policy)
+                && heads.is_some_and(|heads| heads.matches(source_deadline));
             if crate::parent_gate::bunny_settled_generation(parent)?.as_ref() == Some(&before) {
-                let derivatives_current = ready.producer.is_some()
-                    && ready.producer == CompletedTranscode::current(&policy);
                 for verified in ready.assets {
                     let asset = Asset::parse(&verified.asset.path).ok_or_else(invalid)?;
                     let selectable = if asset.is_original() {

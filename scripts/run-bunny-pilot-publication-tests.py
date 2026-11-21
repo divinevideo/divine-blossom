@@ -81,7 +81,7 @@ def basic(key_type):
 
 class Origin(BaseHTTPRequestHandler):
     def log_message(self, *_args):
-        if self.path != "/" and not self.path.startswith("/fixture/") and self.headers.get("User-Agent") != "divine-bunny-worker/1":
+        if self.command != "HEAD" and self.path != "/" and not self.path.startswith("/fixture/") and self.headers.get("User-Agent") != "divine-bunny-worker/1":
             if self.server.in_permit:
                 self.server.permit_queries[-1] += 1
             else:
@@ -175,7 +175,10 @@ class Origin(BaseHTTPRequestHandler):
             if self.path not in self.server.objects:
                 return self.reply(404)
             body, mime = self.server.objects[self.path]
-            return self.reply(200, body, {"Content-Type": mime, **({"x-goog-generation": self.server.source_version} if reader == "fixture-gcs-id" else {"x-amz-version-id": "fixture-version-1" if self.path in self.server.destinations else self.server.source_version})})
+            version = self.server.source_versions.get(self.path, self.server.source_version)
+            version_header = "x-goog-generation" if reader == "fixture-gcs-id" else "x-amz-version-id"
+            return self.reply(200, body, {"Content-Type": mime, version_header:
+                "fixture-version-1" if self.path in self.server.destinations else version})
         if self.path == f"/{BUCKET}/{self.server.source_key}":
             if self.server.case == "source_unavailable":
                 return self.reply(503)
@@ -192,6 +195,42 @@ class Origin(BaseHTTPRequestHandler):
         if body is None:
             return self.reply(404)
         return self.reply(200, body, {"Content-Type": "video/mp4", "x-amz-version-id": "fixture-version-1"})
+
+    def do_HEAD(self):
+        server = self.server
+        # Count at arrival, including responses completing after the edge deadline.
+        with server.arrivals_lock:
+            server.meter[-1][1] += 1
+        prefix = f"/{server.derived_bucket}/{HASH}/hls/"
+        assert self.path.startswith(prefix) and self.path in server.objects, self.path
+        assert not urlsplit(self.path).query
+        gcs = server.derived_bucket == "fixture-gcs"
+        host = "storage.googleapis.com" if gcs else "s3.us-west-004.backblazeb2.com"
+        assert self.headers["Host"] == host
+        assert "Credential=fixture-canonical-reader/" in self.headers["Authorization"]
+        fault = server.head_fault
+        if fault == "batch":
+            with server.arrivals_lock:
+                server.batch_keys.add(self.path)
+                if len(server.batch_keys) == 7:
+                    server.batch_arrived.set()
+            server.batch_arrived.wait(1)
+        status = 200
+        version = server.source_versions.get(self.path, server.source_version)
+        # Fault a leaf, while all top-level files still match.
+        if self.path.endswith("/stream_480p.ts"):
+            if fault == "slow":
+                time.sleep(1.1)
+            status = {"missing":404, "unreadable":503}.get(fault, 200)
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(server.objects[self.path][0])))
+        self.send_header("Cache-Control", "public, max-age=600")
+        name = "x-goog-generation" if gcs else "x-amz-version-id"
+        if not (fault == "unversioned" and self.path.endswith("/stream_480p.ts")):
+            self.send_header(name, version)
+        if fault == "duplicate" and self.path.endswith("/stream_480p.ts"):
+            self.send_header(name, "999")
+        self.end_headers()
 
     def do_PUT(self):
         assert self.headers.get("User-Agent") == "divine-bunny-worker/1"
@@ -267,6 +306,8 @@ class Origin(BaseHTTPRequestHandler):
             phase = self.read_body().decode()
             if phase == "outside" and self.server.meter[-1][0] == "publish":
                 self.server.publish_times.append(time.monotonic() - self.server.request_started)
+            if phase == "outside" and self.server.meter[-1][0] == "selection" and self.server.head_fault:
+                self.server.probe_times[self.server.head_fault] = time.monotonic() - self.server.request_started
             self.server.request_started = time.monotonic()
             self.server.meter.append([phase, 0])
             return self.reply(200)
@@ -279,7 +320,15 @@ class Origin(BaseHTTPRequestHandler):
         if parsed.path == "/fixture/repair":
             key = f"/{self.server.derived_bucket}/{HASH}/hls/stream_720p.mp4"
             body = self.read_body()
-            self.server.objects[key] = (BODY if body == b"restore-original" else body, "video/mp4")
+            if body in (b"restore-original", b"restore-with-new-version"):
+                self.server.objects[key] = (BODY, "video/mp4")
+                self.server.source_versions[key] = "123" if body == b"restore-original" else "125"
+            else:
+                self.server.objects[key] = (body, "video/mp4")
+                self.server.source_versions[key] = "124"
+            return self.reply(200)
+        if parsed.path == "/fixture/head-fault":
+            self.server.head_fault = self.read_body().decode()
             return self.reply(200)
         if parsed.path == "/fixture/transcode":
             self.server.transcode = json.loads(self.read_body())
@@ -381,7 +430,10 @@ def assert_case(server, case):
     actions = [name for name, _ in events]
     if case == "hls_family":
         assert all(server.objects.get(k) == v for k, v in server.destinations.items())
-        for operation in ("publish", "finalize"):
+        assert len(server.batch_keys) == 7
+        assert server.probe_times["batch"] < 1 and server.probe_times["slow"] < 1, server.probe_times
+        print(f"Routed full-family source HEAD batch {server.probe_times['batch']:.3f}s; slow-origin fallback {server.probe_times['slow']:.3f}s")
+        for operation in ("publish", "finalize", "selection"):
             counts = [n for name, n in server.meter if name == operation]
             assert max(counts) <= 32, server.meter
             print(f"Maximum {operation} backend requests: {max(counts)}")
@@ -485,6 +537,9 @@ def run(server, repo, directory):
         server.case = case
         server.derived_bucket = "fixture-gcs" if label == "hls_family" else BUCKET
         bindings = dict(SECRETS)
+        canonical_reader = "gcs" if server.derived_bucket == "fixture-gcs" else "b2_media"
+        bindings[canonical_reader + "_access_key"] = "fixture-canonical-reader"
+        bindings[canonical_reader + "_secret_key"] = "fixture-canonical-secret"
         if server.derived_bucket == BUCKET:
             bindings["bunny_pilot_readers_v1"] = {"b2": SECRETS["bunny_pilot_readers_v1"]["b2"]}
         secrets = ", ".join(f'{{ key = "{key}", data = {json.dumps(json.dumps(value) if isinstance(value, dict) else value)} }}'
@@ -513,6 +568,12 @@ blossom_secrets = [{secrets}]
         inventory, server.objects, server.destinations = family(server.derived_bucket,maximum)
         server.meter = [["start", 0]]
         server.source_version = "123"
+        server.source_versions = {}
+        server.head_fault = ""
+        server.batch_keys = set()
+        server.arrivals_lock = threading.Lock()
+        server.batch_arrived = threading.Event()
+        server.probe_times = {}
         server.uploaders = "cde" if case == "disabled_four" else "cd"
         server.ready_generation = 0
         server.retire_during_read = False

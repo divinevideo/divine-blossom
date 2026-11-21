@@ -64,10 +64,12 @@ byte ceiling, with one family in flight at a time. The queue retains at most
 10,000 parents. Confirmed negative observations make room for new catalog pages.
 Rediscovery rechecks these parents as eligibility changes. The journal retains
 uncertain jobs and partial copy receipts. A saturated page keeps its cursor while
-the runner processes earlier work. Dry runs rotate through candidates and
-preserve verified exports and acknowledged copies. An expired provider cursor
-restarts discovery with the committed jobs intact. Repeated passes wrap the scan to discover
-new completed clips and source changes. Stable ready source identities avoid
+the runner processes earlier work. A successful dry inspection with no prior
+write receipts frees a slot for the next catalog page. Rediscovery keeps it
+eligible for real enrollment. Dry runs preserve verified exports and partial
+copy receipts. An expired provider cursor restarts discovery with the committed
+jobs intact. Repeated passes wrap the scan to discover new completed clips and
+source changes. Stable ready source identities avoid
 local re-download and republishing, but still request server re-verification of
 source/destination bytes and current scope. A confirmed missing/changed delivery
 family or dependency (HTTP 409) resets acknowledged copy progress, including
@@ -86,7 +88,9 @@ playlists, with the master last.
 Canonical absolute references are normalized to relative references. The server
 independently rechecks current policy, source/destination bytes, scope and gates.
 It binds verified derivatives to the completed producer attempt before and
-after worker verification. Selection checks that attempt against current policy.
+after worker verification. Selection checks that attempt against current policy
+and checks every derivative’s current source version using parallel HEADs
+on the configured primary. A delayed callback cannot authorize a replaced source.
 Pending public uploads use canonical playback. A new transcode attempt or an
 older readiness record without producer evidence can still select a separately
 verified content-addressed original of the current MIME and size. Only the

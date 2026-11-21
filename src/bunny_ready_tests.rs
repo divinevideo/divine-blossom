@@ -178,6 +178,54 @@ fn bunny_hls_family_contract() {
     for row in &rows[5..] {
         assert!(paths.contains(&row["path"]));
     }
+    // The producer replaced a canonical object, but neither queued callback has
+    // reached metadata yet. Every new signed selection observes current versions.
+    control("repair", "repair while callbacks are queued");
+    assert_eq!(
+        forward(&hop(parent, "US", now), "media.divine.video"),
+        json!([rows[5]["path"]]),
+        "stale derivative selected while producer callbacks lag"
+    );
+    // Even restoring matching bytes has a new immutable source version.
+    control("repair", "restore-with-new-version");
+    assert_eq!(
+        forward(&hop(parent, "US", now), "media.divine.video"),
+        json!([rows[5]["path"]])
+    );
+    assert_eq!(finalize(rows).get_status(), StatusCode::OK);
+    let updated = metadata::open_store()
+        .unwrap()
+        .lookup(&key)
+        .unwrap()
+        .take_body()
+        .into_string();
+    control("ready", &updated);
+    assert_eq!(
+        forward(&hop(parent, "US", now), "media.divine.video")
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    control("repair", "restore-original");
+    control("ready", &record);
+    for fault in ["missing", "unreadable", "unversioned", "duplicate", "slow"] {
+        control("head-fault", fault);
+        assert_eq!(
+            forward(&hop(parent, "US", now), "media.divine.video"),
+            json!([rows[5]["path"]]),
+            "{fault}"
+        );
+    }
+    control("head-fault", "batch");
+    assert_eq!(
+        forward(&hop(parent, "US", now), "media.divine.video")
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    control("head-fault", "");
     // These snapshots are returned by the authoritative producer callback store.
     control(
         "transcode",

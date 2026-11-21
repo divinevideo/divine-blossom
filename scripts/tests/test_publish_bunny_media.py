@@ -376,6 +376,49 @@ class EnrollmentTests(unittest.TestCase):
         self.assertEqual(self.state.data(earlier[1])['published'], [{'path':'acknowledged'}])
         self.assertLessEqual(self.state.db.execute('select count(*) from jobs').fetchone()[0], 10000)
 
+    def test_full_eligible_dry_run_reaches_next_page_and_can_enroll_rediscovered_parent(self):
+        self.assertEqual(self.cycle().get('ready'), 1)
+        ready = self.state.data(PARENT)
+        parents = [format(i, '064x') for i in range(10000)]
+        candidates, later = parents[:-1], parents[-1]
+        self.state.page(candidates, 'next')
+        self.state.save(candidates[0], 'uncertain', {})
+        partial = {'published': [{'path': '/' + candidates[1] + '/hls/stream_720p.ts'}]}
+        self.state.save(candidates[1], 'pending', partial)
+        for key, body in fixture().items():
+            if key == PARENT:
+                continue
+            suffix = key[len(PARENT):]
+            relative = body.replace(f'https://media.divine.video/{ROOT}'.encode(), b'').replace(f'/{ROOT}'.encode(), b'')
+            for parent in parents:
+                self.source.objects[parent + suffix] = relative
+                self.source.versions[parent + suffix] = 'v1'
+        self.kv.page = lambda cursor, limit: ([later], 'wrapped')
+        inspected = set()
+        def metadata(parent):
+            inspected.add(parent)
+            return {**self.kv.record, 'type':'video/webm', 'sha256':parent}
+        self.kv.metadata = metadata
+        bounds = dict(max_pages=1, page_size=100, max_parents=1000, max_bytes=1024**4)
+        inspected_count = sum(self.worker.cycle(**bounds, dry_run=True).get('would_publish', 0)
+                              for _ in range(11))
+        self.assertEqual(inspected_count, 11000)
+        self.assertTrue(later in inspected, "next eligible catalog page was never inspected")
+        self.assertEqual(self.state.setting('cursor'), 'wrapped')
+        self.assertEqual(self.state.status(candidates[0]), 'uncertain')
+        self.assertEqual(self.state.data(candidates[1]), partial)
+        self.assertEqual(self.state.data(PARENT), ready)
+        self.assertTrue(self.state.export_ready(Path(self.tmp.name) / 'verified.json'))
+        self.assertEqual(len(self.api.order), 6)
+        evicted, = [p for p in candidates if self.state.status(p) is None]
+        self.kv.page = lambda cursor, limit: ([evicted], None)
+        self.kv.metadata = lambda parent: metadata(parent) if parent == evicted else None
+        for _ in range(11):
+            if self.worker.cycle(**bounds).get('ready'):
+                break
+        self.assertTrue(self.state.data(evicted)['ready'])
+        self.assertEqual(self.state.db.execute('select count(*) from jobs').fetchone()[0], 10000)
+
     def test_upgrade_resumes_partial_receipts_and_keeps_uncertain_jobs_fenced(self):
         # A v1 journal used the four original metadata fields in its snapshot.
         def stop_after_ack(parent, status, data):

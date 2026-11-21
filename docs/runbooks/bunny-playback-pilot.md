@@ -217,6 +217,15 @@ disabled cohort, authenticated request or missing readiness yields an empty
 array. A policy denial returns 404. Control-plane errors leave the client on
 its canonical route. Responses carry CORS and private no-store headers.
 
+Selection sends up to seven parallel, cache-bypassing HEADs directly to the
+configured derivative primary using its existing B2 or GCS canonical reader.
+It compares the current version of every derivative against the verified family.
+A changed version, missing version, provider failure or expired deadline
+withdraws the derivative paths from that response. An independently verified
+content-addressed original stays eligible. Source checks overlap policy reads
+and share a 500 ms deadline measured from the start of selection. The final
+gate check still applies to every advertised path.
+
 Set `bunny_playback_rollout_percent` to an integer from 0 to 100 (default
 0) and `bunny_playback_countries` to comma-separated uppercase two-letter
 country codes (default empty). Rollout buckets use the first eight hex digits

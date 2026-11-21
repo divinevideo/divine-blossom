@@ -2221,6 +2221,83 @@ pub(crate) fn bunny_scope() -> Result<blossom_core::bunny_worker::Scope> {
     })
 }
 
+/// HEAD only the current canonical derivatives of a scope-validated ready record.
+/// The producer can replace them before either queued status callback arrives.
+pub(crate) struct BunnySourceHeads {
+    header: &'static str,
+    requests: Vec<(fastly::handle::PendingRequestHandle, String)>,
+}
+
+impl BunnySourceHeads {
+    #[allow(deprecated)] // Use the pending handle to enforce one deadline across all HEADs.
+    pub(crate) fn start(
+        parent: &str,
+        assets: &[blossom_core::bunny_worker::Verified],
+        deadline: Instant,
+    ) -> Option<Self> {
+        let mut sources = assets
+            .iter()
+            .map(|v| &v.source)
+            .filter(|s| s.key != parent)
+            .peekable();
+        let provider = sources.peek()?.provider;
+        let (config, backend, header) = match provider {
+            StorageProvider::B2 => (
+                S3Config::load_b2_media().ok()?,
+                B2_MEDIA_BACKEND,
+                "x-amz-version-id",
+            ),
+            StorageProvider::Gcs => (S3Config::load_gcs().ok()?, GCS_BACKEND, "x-goog-generation"),
+        };
+        let mut requests = Vec::new();
+        for source in sources {
+            if Instant::now() >= deadline
+                || source.provider != provider
+                || source.bucket != config.bucket
+            {
+                return None;
+            }
+            let expected = source.version.clone()?;
+            let mut request = Request::head(format!(
+                "{}{}",
+                config.endpoint(),
+                config.object_path(&source.key)
+            ));
+            request.set_header("Host", config.host());
+            request.set_pass(true);
+            sign_request(&mut request, &config, Some("UNSIGNED-PAYLOAD".into())).ok()?;
+            let (request, body) = request.into_handles();
+            let pending = request
+                .send_async(
+                    body.unwrap_or_else(fastly::handle::BodyHandle::new),
+                    backend,
+                )
+                .ok()?;
+            requests.push((pending, expected));
+        }
+        Some(Self { header, requests })
+    }
+
+    #[allow(deprecated)]
+    pub(crate) fn matches(self, deadline: Instant) -> bool {
+        self.requests.into_iter().all(|(pending, expected)| {
+            if wait_for_probe_io(pending.as_u32(), deadline).is_err() {
+                return false;
+            }
+            let Ok((response, body)) = pending.wait() else {
+                return false;
+            };
+            let response = Response::from_handles(response, body);
+            let mut versions = response.get_header_all(self.header);
+            response.get_status() == StatusCode::OK
+                && versions
+                    .next()
+                    .is_some_and(|v| v.as_bytes() == expected.as_bytes())
+                && versions.next().is_none()
+        })
+    }
+}
+
 /// Retain every target and verify erasure capability before asking the worker to write.
 pub(crate) fn enroll_bunny_parent(hash: &str) -> Result<()> {
     if authorize_pilot_erasure()?.bucket_name.as_deref() != Some(&get_config("b2_media_bucket")?) {

@@ -373,7 +373,7 @@ class Reconciler:
                 prepared, progress, size = self._prepare(parent, budget)
                 report[self._publish(parent, prepared, progress, dry_run)] += 1
                 if dry_run:
-                    self.state.rotate(parent)
+                    self.state.observed(parent, dry_run=True)
             except Ineligible:
                 self.state.observed(parent, dry_run)
                 report['deferred'] += 1
