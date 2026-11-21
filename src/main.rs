@@ -9,6 +9,7 @@ mod b2_cdn_phase;
 mod b2_cdn_purge;
 mod blossom;
 mod bunny_publish;
+mod bunny_ready;
 mod canary;
 mod playback_cache;
 mod delete_policy;
@@ -255,6 +256,9 @@ fn route_request(req: Request) -> Result<Response> {
     }
     let method = req.get_method().clone();
     let path = req.get_path().to_string();
+    if let Some(parent) = path.strip_prefix("/api/bunny-playback/") {
+        return Ok(bunny_ready::playback(req, parent));
+    }
     match (method, path.as_str()) {
         // Landing page
         (Method::GET, "/") => Ok(handle_landing_page()),
@@ -400,7 +404,9 @@ fn route_request(req: Request) -> Result<Response> {
         (_, "/admin/api/b2-cdn-purge/drain") => {
             b2_cdn_purge::handle_drain(req, storage::invalidate_b2_cdn)
         }
-        (_, "/admin/api/bunny-pilot/publish") => Ok(bunny_publish::handle(req)),
+        (_, "/admin/api/bunny-pilot/publish" | "/admin/api/bunny-pilot/finalize") => {
+            Ok(bunny_publish::handle(req))
+        }
         (Method::POST, "/admin/api/quarantine") => admin::handle_admin_quarantine_action(req),
         (Method::GET, p) if p.starts_with("/admin/api/quarantine/") => {
             admin::handle_admin_quarantine_status(

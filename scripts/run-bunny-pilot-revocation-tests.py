@@ -25,12 +25,17 @@ ALIAS = 'divine-media-pilot.b-cdn.net'
 FASTLY_SERVICES = {'ML7R82HKfmTaqTpHExIDVN', 'pOvEEWykEbpnylqst1KTrR'}
 TEST = 'quarantine_tests::bunny_pilot_age_gate_eviction_retries'
 VERSIONS = {(PREFIX, 'original-v1'), (f'{PREFIX}/720p.mp4', '720p-v1'),
-            (f'{PREFIX}/720p.mp4', '720p-v2')}
+            (f'{PREFIX}/720p.mp4', '720p-v2'), (f'{PREFIX}/480p.mp4', '480p-v1'),
+            *((PREFIX, f'original-v{n}') for n in range(2, 6)),
+            *((f'{PREFIX}/hls/{name}', 'hls-v1') for name in ('master.m3u8', 'stream_720p.m3u8',
+              'stream_480p.m3u8', 'stream_720p.ts', 'stream_480p.ts'))}
 
 
 class Provider(BaseHTTPRequestHandler):
     def log_message(self, *_):
-        pass
+        if self.path != "/fixture/meter":
+            with self.server.lock:
+                self.server.meter[-1][1] += 1
 
     def reply(self, status, payload, generation=None):
         body = json.dumps(payload).encode()
@@ -56,10 +61,18 @@ class Provider(BaseHTTPRequestHandler):
                 self.send_header('generation', '1')
                 self.end_headers()
                 return self.wfile.write(body)
+            if self.path.endswith(f'/b2-sync:v1:{HASH}'):
+                return self.reply(404, {})
+            if self.path.endswith(f'/refs:{HASH}'):
+                return self.reply(200, ['c' * 64, 'd' * 64], '1')
+            if self.path.endswith(f'/vanish_in_progress:v1:{"d" * 64}'):
+                return self.reply(200, 1, '1')
+            if not self.path.endswith(f'/blob:{HASH}'):
+                return self.reply(404, {})
             assert self.path.endswith(f'/blob:{HASH}')
             return self.reply(200, {'sha256': HASH, 'size': 9, 'type': 'video/mp4',
                                     'uploaded': '2026-01-01T00:00:00Z',
-                                    'owner': 'b' * 64, 'status': 'age_restricted'}, '1')
+                                    'owner': 'b' * 64, 'status': 'active'}, '1')
         if self.path != '/b2api/v4/b2_authorize_account':
             return self.reply(404, {})
         assert self.headers.get('Host') == B2_HOST
@@ -73,6 +86,9 @@ class Provider(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get('Content-Length', '0'))
         raw = self.rfile.read(length)
+        if self.path == "/fixture/meter":
+            self.server.meter.append([raw.decode(), 0])
+            return self.reply(200, {})
         with self.server.lock:
             try:
                 status, payload = self.dispatch(raw)
@@ -125,6 +141,9 @@ class Provider(BaseHTTPRequestHandler):
     def fastly(self, path):
         assert self.headers.get('Host') == 'api.fastly.com'
         assert self.headers.get('Fastly-Key') == 'synthetic-fastly-key'
+        if '/purge_url/' in path:
+            assert path.startswith('/service/ML7R82HKfmTaqTpHExIDVN/purge_url/')
+            return 200, {}
         assert self.headers.get('Surrogate-Key') in (HASH, 'c' * 64)
         service = path.removeprefix('/service/').removesuffix('/purge')
         assert service in FASTLY_SERVICES and path == f'/service/{service}/purge'
@@ -134,7 +153,7 @@ class Provider(BaseHTTPRequestHandler):
 
 def manifest(port, kv, settings):
     native_backend = 'b2-api-' + hashlib.sha256(B2_HOST.encode()).hexdigest()[:16]
-    backends = ('b2_api', native_backend, 'bunny_api', 'fastly_api', 'kv-origin-api')
+    backends = ('b2_api', native_backend, 'bunny_api', 'fastly_api', 'kv-origin-api', 'fixture_control')
     backend_sections = '\n'.join(
         f'[local_server.backends."{name}"]\nurl = "http://127.0.0.1:{port}"'
         for name in backends
@@ -161,11 +180,12 @@ blossom_secrets = [
 '''
 
 
-def main():
+def run(versions, resume):
     unrelated = {(HASH, 'canonical-original'), (f'bunny-delivery/{"b" * 64}', 'other-pilot-asset')}
     with ThreadingHTTPServer(('127.0.0.1', 0), Provider) as server:
         server.lock = threading.Lock()
-        server.versions = VERSIONS | unrelated
+        server.meter = [['setup', 0]]
+        server.versions = versions | unrelated
         server.events, server.errors = [], []
         server.bunny_counts = Counter()
         threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -173,9 +193,15 @@ def main():
             with tempfile.TemporaryDirectory(prefix='bunny-pilot-revocation-') as directory:
                 config, kv, settings = (Path(directory) / name for name in ('fastly.toml', 'kv.json', 'settings.json'))
                 kv.write_text('{}')
-                settings.write_text(json.dumps({'b2_bucket_id': BUCKET_ID, 'b2_media_bucket': BUCKET,
-                                                'bunny_fixture_local_gate': 'true', 'metadata_kv_store_id': 'fixture-store',
-                                                'bunny_pilot_zone_hosts': f'{CUSTOM_HOST},reconfigured-zone.b-cdn.net'}))
+                configuration = {'b2_bucket_id': BUCKET_ID, 'b2_media_bucket': BUCKET,
+                                                'bunny_fixture_resume_revoke': 'true' if resume else 'false',
+                                                'bunny_fixture_local_gate': 'true', 'bunny_fixture_meter_gate': 'true',
+                                                'b2_cdn_host': 'media-b2-cdn.divine.video',
+                                                'b2_cdn_purge_hosts': 'media-b2-cdn.divine.video,media-b2.divine.video', 'metadata_kv_store_id': 'fixture-store',
+                                                'bunny_pilot_zone_hosts': f'{CUSTOM_HOST},reconfigured-zone.b-cdn.net'}
+                if not resume:
+                    configuration.pop('bunny_pilot_zone_hosts')
+                settings.write_text(json.dumps(configuration))
                 config.write_text(manifest(server.server_port, kv, settings))
                 env = os.environ.copy()
                 env['CARGO_TARGET_WASM32_WASIP1_RUNNER'] = shlex.join([
@@ -188,13 +214,17 @@ def main():
                 if result.returncode or '1 passed; 0 failed' not in result.stdout or server.errors:
                     raise RuntimeError(result.stdout + result.stderr + repr(server.errors))
                 assert server.versions == unrelated, server.versions
-                assert Counter(entry for event, entry in server.events if event == 'delete') == Counter(VERSIONS)
+                assert Counter(entry for event, entry in server.events if event == 'delete') == Counter(versions)
                 assert server.bunny_counts == {CUSTOM_HOST: 4, ALIAS: 4}, server.events
-                assert Counter(entry for event, entry in server.events if event == 'fastly') == dict.fromkeys(FASTLY_SERVICES, 8), server.events
+                assert Counter(entry for event, entry in server.events if event == 'fastly') == dict.fromkeys(FASTLY_SERVICES, 14 if resume else 8), server.events
+                counts = [count for phase, count in server.meter if phase in ("moderate", "drain")]
+                assert max(counts) <= 32, server.meter
+                print(f"Revocation backend requests by execution: {counts}")
                 print('PASS Bunny age gate, all-version replica removal, checked canonical and Bunny purges, durable retry')
         finally:
             server.shutdown()
 
 
 if __name__ == '__main__':
-    main()
+    run(VERSIONS, True)
+    run({(PREFIX, "original-v1")}, False)

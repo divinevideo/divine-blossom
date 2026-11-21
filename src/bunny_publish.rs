@@ -10,39 +10,64 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 
-const MAX_BODY: u64 = 1024;
+const MAX_BODY: u64 = 8192;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Dependency<'a> {
+    path: &'a str,
+    sha256: &'a str,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PublishBody<'a> {
     path: &'a str,
     sha256: &'a str,
+    #[serde(default, borrow)]
+    dependencies: Vec<Dependency<'a>>,
 }
 
 struct Publication<'a> {
     asset: Asset<'a>,
     sha256: &'a str,
+    dependencies: Vec<Dependency<'a>>,
 }
 
-fn invalid() -> BlossomError {
+pub(crate) fn invalid() -> BlossomError {
     BlossomError::BadRequest("Invalid Bunny publication request".into())
 }
 
 fn parse_publication(body: &[u8]) -> Result<Publication<'_>> {
-    let PublishBody { path, sha256 } = serde_json::from_slice(body).map_err(|_| invalid())?;
+    let PublishBody {
+        path,
+        sha256,
+        dependencies,
+    } = serde_json::from_slice(body).map_err(|_| invalid())?;
     let asset = Asset::parse(path).ok_or_else(invalid)?;
-    if sha256.len() != 64
-        || !sha256
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    if !blossom_core::bunny_pilot::digest(sha256)
         || (asset.is_original() && sha256 != asset.hash())
+        || dependencies.len() != asset.child_names().len()
     {
         return Err(invalid());
     }
-    Ok(Publication { asset, sha256 })
+    for child in asset.child_names() {
+        let path = format!("/{}/hls/{child}", asset.hash());
+        if !dependencies
+            .iter()
+            .any(|d| d.path == path && blossom_core::bunny_pilot::digest(d.sha256))
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(Publication {
+        asset,
+        sha256,
+        dependencies,
+    })
 }
 
-fn verified_bytes(bytes: &[u8], sha256: &str) -> bool {
+pub(crate) fn verified_bytes(bytes: &[u8], sha256: &str) -> bool {
     !bytes.is_empty() && hex::encode(Sha256::digest(bytes)) == sha256
 }
 
@@ -68,53 +93,91 @@ fn verify_public_metadata(asset: &Asset<'_>, source_len: u64) -> Result<()> {
     Ok(())
 }
 
-fn publish(Publication { asset, sha256 }: Publication<'_>) -> Result<&'static str> {
+/// A PUT with an unknown outcome keeps its fence. A settled write whose
+/// verification fails hands exclusion to the durable erasure worker.
+pub(crate) fn with_gate<T>(
+    hash: &str,
+    action: impl FnOnce(&str, &dyn Fn() -> Result<()>, &mut bool) -> Result<T>,
+) -> Result<T> {
     storage::validate_bunny_pilot_publication()?;
     let mut random = [0; 16];
     getrandom::getrandom(&mut random)
         .map_err(|_| BlossomError::Internal("Bunny publication attempt unavailable".into()))?;
-    let hash = asset.hash();
     let attempt = hex::encode(random);
-    let generation = parent_gate::archive_claim(hash, &attempt)?;
+    let generation = parent_gate::bunny_claim(hash, &attempt)?;
     let check_gate = || parent_gate::check_bunny_gate(hash, &attempt, &generation);
     let mut may_release = true;
 
-    let result = (|| {
-        let source = storage::read_bunny_pilot_asset(&asset.source_key())?
+    let result = action(&generation, &check_gate, &mut may_release);
+    if may_release {
+        parent_gate::bunny_release(hash, &attempt, &generation)?;
+    }
+    result
+}
+
+fn publish(
+    Publication {
+        asset,
+        sha256,
+        dependencies,
+    }: Publication<'_>,
+) -> Result<Value> {
+    let hash = asset.hash();
+    with_gate(hash, |generation, check_gate, may_release| {
+        let source = storage::read_bunny_object(&asset, false)?
             .ok_or_else(|| BlossomError::NotFound("Bunny publication source unavailable".into()))?;
-        if !verified_bytes(&source, sha256) {
+        if !verified_bytes(&source.bytes, sha256) {
             return Err(BlossomError::Conflict(
                 "Bunny publication source digest changed".into(),
             ));
         }
-        let source_len = source.len() as u64;
-        let delivery_key = asset.delivery_key();
-        let already_published = existing_matches(
-            storage::read_bunny_pilot_asset(&delivery_key)?.as_deref(),
-            sha256,
-        )?;
-        let readback = if already_published {
-            check_gate()?;
-            verify_public_metadata(&asset, source_len)?;
+        let source_len = source.bytes.len() as u64;
+        let mut child_size = 0;
+        for dep in dependencies {
+            let child = Asset::parse(dep.path).ok_or_else(invalid)?;
+            let copy = storage::read_bunny_object(&child, true)?
+                .filter(|obj| verified_bytes(&obj.bytes, dep.sha256))
+                .ok_or_else(|| {
+                    BlossomError::Conflict(
+                        "Bunny playlist dependency unavailable or changed".into(),
+                    )
+                })?;
+            child_size = copy.bytes.len();
+        }
+        let bytes = if asset.is_playlist() {
+            blossom_core::bunny_hls::normalize(&asset, &source.bytes, child_size)
+                .ok_or_else(invalid)?
+        } else {
+            source.bytes
+        };
+        let delivery_sha = hex::encode(Sha256::digest(&bytes));
+        let existing = storage::read_bunny_object(&asset, true)?;
+        let already =
+            existing_matches(existing.as_ref().map(|o| o.bytes.as_slice()), &delivery_sha)?;
+        let readback = if already {
             Ok(())
         } else {
-            let written = storage::put_bunny_pilot_asset(&delivery_key, source, sha256, || {
-                storage::validate_bunny_pilot_publication()?;
-                check_gate()?;
-                verify_public_metadata(&asset, source_len)?;
-                // Erasure must wait while an interrupted PUT could still land.
-                may_release = false;
-                Ok(())
-            })?;
+            let written = storage::put_bunny_pilot_asset(
+                &asset.delivery_key(),
+                bytes,
+                &delivery_sha,
+                || {
+                    storage::validate_bunny_pilot_publication()?;
+                    check_gate()?;
+                    verify_public_metadata(&asset, source_len)?;
+                    crate::bunny_ready::invalidate(hash)?;
+                    *may_release = false;
+                    Ok(())
+                },
+            )?;
             if !written {
-                // A definite provider rejection cannot leave a pending writer.
-                may_release = true;
+                *may_release = true;
                 return Err(BlossomError::StorageError(
                     "Bunny delivery write rejected".into(),
                 ));
             }
-            storage::read_bunny_pilot_asset(&delivery_key).and_then(|copy| {
-                if copy.is_some_and(|bytes| verified_bytes(&bytes, sha256)) {
+            storage::read_bunny_object(&asset, true).and_then(|copy| {
+                if copy.is_some_and(|o| verified_bytes(&o.bytes, &delivery_sha)) {
                     Ok(())
                 } else {
                     Err(BlossomError::StorageError(
@@ -123,36 +186,25 @@ fn publish(Publication { asset, sha256 }: Publication<'_>) -> Result<&'static st
                 }
             })
         };
-
-        let verified = check_gate()
+        if let Err(error) = check_gate()
             .and_then(|_| verify_public_metadata(&asset, source_len))
-            .and(readback);
-        if let Err(error) = verified {
-            may_release = false;
-            let cleanup = storage::remove_bunny_delivery_copies(hash, &check_gate)
-                .and_then(|_| storage::purge_bunny_pilot_hosts(&[hash.to_owned()]));
-            if let Err(cleanup_error) = cleanup {
-                parent_gate::handoff_bunny_cleanup(hash, &generation)?;
-                return Err(cleanup_error);
-            }
-            may_release = true;
+            .and(readback)
+        {
+            *may_release = false;
+            parent_gate::handoff_bunny_cleanup(hash, generation)?;
+            crate::bunny_ready::invalidate(hash)?;
             return Err(error);
         }
-        may_release = true;
-        Ok(if already_published {
-            "already_published"
-        } else {
-            "published"
-        })
-    })();
-
-    if may_release {
-        parent_gate::archive_release(hash, &attempt, &generation)?;
-    }
-    result
+        *may_release = true;
+        let mut result = json!({"result": if already { "already_published" } else { "published" }});
+        if asset.is_playlist() {
+            result["delivery_sha256"] = json!(delivery_sha);
+        }
+        Ok(result)
+    })
 }
 
-fn reply(status: StatusCode, body: Value) -> Response {
+pub(crate) fn reply(status: StatusCode, body: Value) -> Response {
     let mut response = Response::from_status(status);
     response.set_header("Content-Type", "application/json");
     canary::no_store(&mut response);
@@ -194,8 +246,13 @@ pub(crate) fn handle(mut req: Request) -> Response {
         );
     }
 
-    match parse_publication(&body).and_then(publish) {
-        Ok(result) => reply(StatusCode::OK, json!({"result": result})),
+    let result = if req.get_path() == "/admin/api/bunny-pilot/finalize" {
+        crate::bunny_ready::finalize(&body)
+    } else {
+        parse_publication(&body).and_then(publish)
+    };
+    match result {
+        Ok(body) => reply(StatusCode::OK, body),
         Err(error) => reply(error.status_code(), json!({"error": error.message()})),
     }
 }
@@ -302,7 +359,7 @@ mod tests {
             "{}",
             response.take_body_str()
         );
-        if case == "unverified_retry" {
+        if matches!(case.as_str(), "unverified_retry" | "age_gate_after_put") {
             let store = metadata::open_store().unwrap();
             let mut entry = store
                 .lookup(&format!("b2-sync:v1:{ORIGINAL_HASH}"))
@@ -313,13 +370,16 @@ mod tests {
                     attempt_id: format!("bunny-cleanup-{ORIGINAL_HASH}")
                 }),
             );
-            let request =
-                Request::post("https://media.divine.video/admin/api/b2-cdn-purge/drain?max=1")
-                    .with_header("Authorization", "Bearer fixture-admin");
-            let mut retry = crate::route_request(request).unwrap();
-            assert_eq!(retry.get_status(), StatusCode::OK);
-            let reply: Value = serde_json::from_str(&retry.take_body_str()).unwrap();
-            assert_eq!(reply["result"], 1);
+            let attempts = if case == "unverified_retry" { 2 } else { 1 };
+            for i in 1..=attempts {
+                let request =
+                    Request::post("https://media.divine.video/admin/api/b2-cdn-purge/drain?max=1")
+                        .with_header("Authorization", "Bearer fixture-admin");
+                let mut retry = crate::route_request(request).unwrap();
+                assert_eq!(retry.get_status(), StatusCode::OK);
+                let reply: Value = serde_json::from_str(&retry.take_body_str()).unwrap();
+                assert_eq!(reply["result"], u8::from(i == attempts));
+            }
         }
         if expected == StatusCode::OK {
             assert_eq!(response.take_body_str(), r#"{"result":"published"}"#);

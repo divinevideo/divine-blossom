@@ -23,12 +23,15 @@ PREFIX = "bunny-delivery/"
 CDN_HOSTS = ("media-bunny.divine.video", "fixture-pilot.b-cdn.net")
 B2_API_HOST = "api.backblazeb2.com"
 KV_BASE = "/resources/stores/kv/fixture-store/keys/"
-CASES = ("active", "active_rendition", "pending", "age_restricted", "checksum_mismatch",
+CASES = ("hls_family", "active", "active_rendition", "pending", "age_restricted", "checksum_mismatch",
          "age_gate_after_put", "appeal", "unverified_retry", "rejected_put", "uncertain_put",
          "disabled", "webhook_token")
 SECRETS = {
+    "bunny_playback_geo_key": "synthetic-test-key-with-32-or-more-bytes",
     "admin_token": "fixture-admin",
     "webhook_secret": "fixture-webhook",
+    "gcs_access_key": "fixture-gcs-id",
+    "gcs_secret_key": "fixture-gcs-key",
     "b2_media_access_key": "fixture-reader-id",
     "b2_media_secret_key": "fixture-reader-key",
     "bunny_b2_publish_key_id": "fixture-writer-id",
@@ -41,6 +44,31 @@ SECRETS = {
 }
 
 
+def family():
+    source = {}
+    root = f"/{HASH}/hls/"
+    master = "#EXTM3U\n#EXT-X-VERSION:4\n"
+    for r in ("720p", "480p"):
+        source[root + f"stream_{r}.ts"] = (r.encode() * 47, "video/mp2t")
+    for r in ("720p", "480p"):
+        playlist = (f"#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-TARGETDURATION:6\n#EXT-X-PLAYLIST-TYPE:VOD\n"
+                    f"#EXTINF:5.980,\n#EXT-X-BYTERANGE:188@0\n{root}stream_{r}.ts\n#EXT-X-ENDLIST\n")
+        source[root + f"stream_{r}.m3u8"] = (playlist.encode(), "application/vnd.apple.mpegurl")
+        master += f"#EXT-X-STREAM-INF:BANDWIDTH=1000\n{root}stream_{r}.m3u8\n"
+    source[root + "master.m3u8"] = (master.encode(), "application/vnd.apple.mpegurl")
+    for path in (f"/{HASH}", f"/{HASH}/720p.mp4", f"/{HASH}/480p.mp4"):
+        source[path] = (BODY, "video/mp4")
+    inventory, objects, destinations = [], {}, {}
+    for path, (body, mime) in source.items():
+        delivery = body.replace(root.encode(), b"") if path.endswith(".m3u8") else body
+        source_key = path.replace("/720p.mp4", "/hls/stream_720p.mp4").replace("/480p.mp4", "/hls/stream_480p.mp4")
+        objects[f"/fixture-gcs{source_key}"] = (body, mime)
+        destinations[f"/{BUCKET}/{PREFIX}{path[1:]}"] = (delivery, mime)
+        inventory.append({"path": path, "source_sha256": hashlib.sha256(body).hexdigest(),
+                          "delivery_sha256": hashlib.sha256(delivery).hexdigest()})
+    return inventory, objects, destinations
+
+
 def basic(key_type):
     plain = f"fixture-{key_type}-id:fixture-{key_type}-key".encode()
     return f"Basic {b64encode(plain).decode()}"
@@ -48,7 +76,8 @@ def basic(key_type):
 
 class Origin(BaseHTTPRequestHandler):
     def log_message(self, *_args):
-        pass
+        if self.server.case == "hls_family" and not self.path.startswith("/fixture/"):
+            self.server.meter[-1][1] += 1
 
     def reply(self, status, body=b"", headers=None):
         self.send_response(status)
@@ -68,10 +97,19 @@ class Origin(BaseHTTPRequestHandler):
         if self.path.startswith(KV_BASE):
             assert self.headers.get("Fastly-Key") == SECRETS["kv_origin_read_token"]
             key = self.path.removeprefix(KV_BASE)
+            if key == f"b2-sync:v1:{HASH}":
+                return self.reply(404)
             if key == "bunny-pilot-retained-hosts:v1":
                 return self.reply(200, ",".join(CDN_HOSTS).encode(), {"generation": "1"})
             if key == f"bunny-pilot-enrolled:v1:{HASH}":
                 return self.reply(200, b"1", {"generation": "1"})
+            if self.server.case == "hls_family":
+                if key == f"bunny-ready:v1:{HASH}":
+                    return self.reply(200, self.server.ready, {"generation": "1"}) if self.server.ready else self.reply(404)
+                if key == f"refs:{HASH}":
+                    return self.reply_json(["c" * 64, "d" * 64], {"generation": "1"})
+                if key.startswith("vanish_in_progress:v1:"):
+                    return self.reply(404)
             if key != f"blob:{HASH}":
                 assert key in {f"tombstone:{HASH}", f"quarantine:v1:{HASH}", f"refs:{HASH}",
                                f"vanish_in_progress:v1:{OWNER}"}, key
@@ -99,8 +137,14 @@ class Origin(BaseHTTPRequestHandler):
                             "capabilities": ["writeFiles"] if is_writer else ["listFiles", "deleteFiles"]},
             }}})
 
-        assert "Credential=fixture-reader-id/" in self.headers.get("Authorization", "")
+        reader = "fixture-gcs-id" if self.path.startswith("/fixture-gcs/") else "fixture-reader-id"
+        assert f"Credential={reader}/" in self.headers.get("Authorization", "")
         self.server.events.append(("read", self.path))
+        if self.server.case == "hls_family":
+            if self.path not in self.server.objects:
+                return self.reply(404)
+            body, mime = self.server.objects[self.path]
+            return self.reply(200, body, {"Content-Type": mime, **({"x-goog-generation": self.server.source_version} if reader == "fixture-gcs-id" else {"x-amz-version-id":"fixture-version-1"})})
         if self.path == f"/{BUCKET}/{self.server.source_key}":
             body = b"wrong bytes" if self.server.case == "checksum_mismatch" else BODY
         else:
@@ -113,6 +157,14 @@ class Origin(BaseHTTPRequestHandler):
         return self.reply(200, body, {"Content-Type": "video/mp4"})
 
     def do_PUT(self):
+        if self.server.case == "hls_family":
+            body, mime = self.server.destinations[self.path]
+            assert self.path not in self.server.objects
+            assert self.read_body() == body and self.headers.get("Content-Type") == mime
+            assert self.headers.get("x-amz-content-sha256") == hashlib.sha256(body).hexdigest()
+            assert "Credential=fixture-writer-id/" in self.headers.get("Authorization", "")
+            self.server.objects[self.path] = (body, mime)
+            return self.reply(200)
         assert self.path == f"/{BUCKET}/{self.server.delivery_key}"
         assert "Credential=fixture-writer-id/" in self.headers.get("Authorization", "")
         assert self.headers.get("x-amz-content-sha256") == HASH
@@ -129,14 +181,23 @@ class Origin(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlsplit(self.path)
+        if parsed.path == "/fixture/meter":
+            self.server.meter.append([self.read_body().decode(), 0])
+            return self.reply(200)
+        if parsed.path == "/fixture/source-version":
+            self.server.source_version = self.read_body().decode()
+            return self.reply(200)
+        if parsed.path == "/fixture/ready":
+            self.server.ready = self.read_body()
+            return self.reply(200)
         if parsed.path == "/fixture/policy-status":
-            assert self.server.case == "appeal"
+            assert self.server.case in ("appeal", "hls_family")
             self.server.policy_status = self.read_body().decode()
             assert self.server.policy_status in ("active", "age_restricted")
             return self.reply(200)
 
         if parsed.path.startswith("/service/"):
-            assert self.server.case in ("appeal", "unverified_retry")
+            assert self.server.case in ("appeal", "unverified_retry", "age_gate_after_put")
             assert parsed.path.endswith("/purge")
             assert self.headers.get("Fastly-Key") == SECRETS["fastly_api_token"]
             assert self.headers.get("Surrogate-Key") == HASH
@@ -173,9 +234,15 @@ class Origin(BaseHTTPRequestHandler):
 def assert_case(server, case):
     events = server.events
     actions = [name for name, _ in events]
-    if case in ("active", "active_rendition"):
+    if case == "hls_family":
+        assert all(server.objects.get(k) == v for k, v in server.destinations.items())
+        for operation in ("publish", "finalize"):
+            counts = [n for name, n in server.meter if name == operation]
+            assert max(counts) <= 32, server.meter
+            print(f"Maximum {operation} backend requests: {max(counts)}")
+    elif case in ("active", "active_rendition"):
         assert actions.count("put") == 1 and server.delivered == BODY, events
-        assert [status for name, status in events if name == "policy"] == ["active"] * 4, events
+        assert [status for name, status in events if name == "policy"] == ["active"] * 3, events
         assert not any(action in actions for action in ("delete", "purge")), events
     elif case == "age_gate_after_put":
         critical = [(name, value) for name, value in events if name != "read"]
@@ -210,7 +277,7 @@ def assert_case(server, case):
 def run(server, repo, directory):
     settings, kv, config = (directory / name for name in ("settings.json", "kv.json", "fastly.toml"))
     dynamic_b2 = f"b2-api-{hashlib.sha256(B2_API_HOST.encode()).hexdigest()[:16]}"
-    backend_names = ("b2_storage", "b2_api", "bunny_api", "kv-origin-api", dynamic_b2, "fastly_api", "fixture_control")
+    backend_names = ("gcs_storage", "b2_storage", "b2_api", "bunny_api", "kv-origin-api", dynamic_b2, "fastly_api", "fixture_control")
     backends = "\n".join(
         f'[local_server.backends."{name}"]\nurl = "http://127.0.0.1:{server.server_port}"'
         for name in backend_names
@@ -239,11 +306,23 @@ blossom_secrets = [{secrets}]
         server.source_key = f"{HASH}/hls/stream_720p.mp4" if case == "active_rendition" else HASH
         server.delivery_key = f"{PREFIX}{HASH}/720p.mp4" if case == "active_rendition" else f"{PREFIX}{HASH}"
         server.delivered = None
+        inventory, server.objects, server.destinations = family()
+        server.meter = [["start", 0]]
+        server.source_version = "123"
+        server.ready = None
         server.events = []
         kv.write_text("{}")
         settings.write_text(json.dumps({
             "bunny_fixture_case": case,
+            "bunny_playback_compute_host": "compute.fixture.example",
+            "fixture_inventory": json.dumps(inventory),
+            "gcs_bucket": "fixture-gcs",
+            "media_read_primary": "gcs" if case == "hls_family" else "b2",
+            "derived_media_read_primary": "gcs" if case == "hls_family" else "b2",
+            "bunny_playback_rollout_percent": "100",
+            "bunny_playback_countries": "US",
             "bunny_fixture_local_gate": "true",
+            "bunny_fixture_meter_gate": "true" if case == "hls_family" else "false",
             "bunny_pilot_publish_enabled": "false" if case == "disabled" else "true",
             "bunny_pilot_zone_hosts": ",".join(CDN_HOSTS),
             "b2_replica_enabled": "true",
@@ -254,7 +333,7 @@ blossom_secrets = [{secrets}]
         }))
         result = subprocess.run([
             "cargo", "test", "--locked", "--target", "wasm32-wasip1", "--bin", "fastly-blossom",
-            "bunny_publication_respects_authoritative_policy_and_releases_clean_attempts",
+            "bunny_hls_family_contract" if case == "hls_family" else "bunny_publication_respects_authoritative_policy_and_releases_clean_attempts",
             "--", "--ignored", "--nocapture",
         ], cwd=repo, env=env, capture_output=True, text=True, timeout=240)
         if result.returncode or "test result: ok. 1 passed" not in result.stdout:

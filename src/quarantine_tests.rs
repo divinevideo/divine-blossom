@@ -702,8 +702,24 @@ fn bunny_pilot_age_gate_eviction_retries() {
     .unwrap();
     put_blob_metadata(&metadata).unwrap();
     // A previous runner held revocation but exited before doing any I/O.
-    parent_gate::archive_claim(&hash, &format!("bunny-revoke-{hash}")).unwrap();
+    if storage::config_flag("bunny_fixture_resume_revoke") {
+        parent_gate::archive_claim(&hash, &format!("bunny-revoke-{hash}")).unwrap();
+    }
 
+    let ready_key = format!("bunny-ready:v1:{hash}");
+    open_store()
+        .unwrap()
+        .insert(&ready_key, "previous readiness")
+        .unwrap();
+
+    let meter = |phase: &str| {
+        let response = Request::post("http://fixture.invalid/fixture/meter")
+            .with_body(phase)
+            .send("fixture_control")
+            .unwrap();
+        assert_eq!(response.get_status(), StatusCode::OK);
+    };
+    meter("moderate");
     let mut moderate = request(Method::POST, "/admin/api/moderate", true);
     moderate.set_body(serde_json::json!({"sha256": hash, "action": "AGE_RESTRICT"}).to_string());
     assert_eq!(call(moderate).get_status(), StatusCode::BAD_GATEWAY);
@@ -717,6 +733,10 @@ fn bunny_pilot_age_gate_eviction_retries() {
     );
 
     let store = open_store().unwrap();
+    assert!(matches!(
+        store.lookup(&ready_key),
+        Err(fastly::kv_store::KVStoreError::ItemNotFound)
+    ));
     let queue = store
         .build_list()
         .prefix("b2-cdn-purge:v1:")
@@ -730,17 +750,25 @@ fn bunny_pilot_age_gate_eviction_retries() {
         record["state"].clone()
     };
     assert_eq!(intent_state(), "committed");
-    let mut retry = call(request(
-        Method::POST,
-        "/admin/api/b2-cdn-purge/drain?max=1",
-        true,
-    ));
-    assert_eq!(retry.get_status(), StatusCode::OK);
-    let reply: serde_json::Value = serde_json::from_str(&retry.take_body_str()).unwrap();
-    assert_eq!(reply["result"], 1);
-    assert_eq!(reply["pending"], 0);
+    // Four version deletes per execution. The first verified empty listing
+    // reaches the configured transient purge failure and stays pending.
+    for _ in 0..6 {
+        meter("drain");
+        let mut retry = call(request(
+            Method::POST,
+            "/admin/api/b2-cdn-purge/drain?max=1",
+            true,
+        ));
+        assert_eq!(retry.get_status(), StatusCode::OK);
+        let reply: serde_json::Value = serde_json::from_str(&retry.take_body_str()).unwrap();
+        if reply["result"] == 1 {
+            break;
+        }
+        assert_eq!(intent_state(), "committed");
+    }
     assert_eq!(intent_state(), "cleared");
 
+    meter("unrelated");
     // Unenrolled hashes must not acquire or interfere with shared mirror gates.
     let unrelated = "c".repeat(64);
     crate::storage::invalidate_b2_cdn(&[unrelated.clone()]).unwrap();

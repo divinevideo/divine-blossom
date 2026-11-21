@@ -1,6 +1,6 @@
 # Bunny playback pilot
 
-The pilot serves approved progressive MP4s on `media-bunny.divine.video`.
+The pilot serves approved MP4s and complete two-rendition HLS VOD families on `media-bunny.divine.video`.
 Blossom keeps the canonical media paths, publishing flow, and viewer access
 rules. Applying an age gate removes the Bunny delivery copy and evicts the
 edge caches. Authorized age-gated playback uses the canonical endpoint. Use
@@ -11,9 +11,9 @@ or enabling the internal mobile flag.
 
 1. Verify the existing `b2_media_bucket` is private and matches the exact name,
    ID, and S3 region used by Blossom delivery and native erasure. The new Bunny
-   origin uses `bunny-delivery/` in the same bucket. The two public path shapes
-   are `/<lowercase-sha256>` and `/<lowercase-sha256>/720p.mp4`. They map to the
-   same paths below `bunny-delivery/`.
+   origin uses `bunny-delivery/` in the same bucket. All public paths map to the same path below `bunny-delivery/`. Allow only a
+   lowercase SHA-256 original, its `720p.mp4` and `480p.mp4` children, and
+   the five HLS children under `/<sha256>/hls/` listed below.
 2. Provision the Bunny signing key with only `readFiles`, restricted to the
    single bucket and exact `bunny-delivery/` prefix. Give the publisher a separate
    key with only `writeFiles` in that prefix. Blossom uses its existing B2 media
@@ -29,11 +29,11 @@ or enabling the internal mobile flag.
    requests. Use verified origin TLS. [Backblaze’s Bunny integration](https://www.backblaze.com/docs/cloud-storage-integrate-bunnynet-with-backblaze-b2)
 4. Apply the allowlist on both the custom hostname and the assigned
    `b-cdn.net` hostname before cache lookup. Allow anonymous `GET` and `HEAD`
-   for the two exact paths. Deny root and bucket listing, query strings, other
+   for the exact published paths. Deny root and bucket listing, query strings, other
    methods, authorization and cookie headers, escaped or normalized alternate
    paths, and unrecognized hosts. Bunny patterns use Lua syntax. For a
    64-character hash match, repeat `[0-9a-f]` 64 times between the path anchors.
-   Use separate allow patterns for the original and rendition. Validate actual
+   Use separate anchored allow patterns for each exact suffix. Validate actual
    pattern behavior on warm cache as well as on misses. In particular, a
    versioned S3 GET must never be forwarded. [Bunny Edge Rules patterns](https://bunny.net/docs/cdn/edge-rules/pattern-matching)
 5. Set a five-minute CDN cache TTL and `Cache-Control: private, no-store` on
@@ -82,10 +82,11 @@ or enabling the internal mobile flag.
   `sha256`. The hash in `path` identifies the parent blob. `sha256` is the
   lowercase SHA-256 of the exact selected bytes and differs from the parent
   hash for a rendition. The pilot accepts files up to 16 MiB. Verify the
-  publisher's returned success for each path before adding it to the app test
-  allowlist. Enrollment is manual. Before repairing a 720p rendition under the
-  same parent hash, remove that clip from the pilot and verify eviction of the
-  old replica. Re-enroll explicitly with the rebuilt rendition digest.
+  publisher's returned success for each object. A manifest is limited to
+  64 KiB. Publish the two TS files first, their two playlists second, then
+  the master. Finalize the entire family before testing production selection.
+  Retire a changed rendition, verify removal and both cache evictions, then
+  re-enroll the repaired family.
 - An interrupted or inconclusive PUT can retain the parent copy gate. Pause
   publication and keep the affected copy out of service. Reconcile the write
   with Backblaze before operator recovery. Require evidence that no PUT can
@@ -104,6 +105,93 @@ or enabling the internal mobile flag.
   viewer playback through the canonical endpoint. The app never sends viewer
   credentials to Bunny. Confirm the exact installed flag and approved path
   list on each QA device. Leave the flag off for all other devices.
+
+### Publish and finalize
+
+Canonical source reads use `media_read_primary` for originals and
+`derived_media_read_primary` for derivatives. Each defaults to GCS. The
+publisher reads the configured primary directly and retries on unavailability.
+The delivery destination always uses the private B2 prefix. A progressive path
+such as `/<parent>/480p.mp4` reads `<parent>/hls/stream_480p.mp4` at the
+source. An HLS path uses the same key at both providers.
+
+| HLS filename under `/<parent>/hls/` | Published children |
+| --- | --- |
+| `stream_720p.ts`, `stream_480p.ts` | None |
+| `stream_720p.m3u8` | `stream_720p.ts` |
+| `stream_480p.m3u8` | `stream_480p.ts` |
+| `master.m3u8` | Both rendition playlists |
+
+A publisher sends one authenticated POST per object. The following example
+builds a variant payload from a private inventory. `playlist_sha` pins the
+current source bytes and `ts_sha` pins the child's delivery bytes.
+
+```sh
+jq -n --arg p "$parent" --arg src "$playlist_sha" --arg ts "$ts_sha" \
+  '{path:("/"+$p+"/hls/stream_720p.m3u8"),sha256:$src,
+    dependencies:[{path:("/"+$p+"/hls/stream_720p.ts"),sha256:$ts}]}'
+```
+
+The response includes `result` (`published` or `already_published`). A
+playlist also returns `delivery_sha256` for its normalized relative-URI
+representation. Use that value for the master dependency. The leaf and MP4
+responses keep their earlier shape. A missing or changed child returns 409.
+Unsupported tags, external URI attributes and invalid ranges reject the
+manifest. Canonical source bytes keep their original references.
+
+Submit `POST /admin/api/bunny-pilot/finalize` with the same administrator
+credential and the JSON shape below. Each inventory row contains exactly
+`path`, `source_sha256`, and `delivery_sha256`. The command shows the body
+for a verified original-only fixture. For HLS include all five HLS rows and
+any verified progressive renditions or original, at most eight rows in total.
+
+```sh
+jq -n --arg p "$parent" \
+  '{version:1,parent:$p,assets:[{path:("/"+$p),source_sha256:$p,delivery_sha256:$p}]}'
+```
+
+A successful finalization returns `{"result":"ready"}`. Under parent
+exclusion Blossom reads and hashes each current source and delivery object,
+checks immutable GCS generations or B2 version IDs and revalidates the HLS
+closure. It checks policy immediately before recording readiness. Its record
+binds the source provider, bucket, key and version, destination bucket and
+version, prefix, host pair and both digests.
+
+### Select a cohort
+
+The canonical endpoint `GET /api/bunny-playback/<parent>` returns
+`version`, `host` and a `paths` array. In an eligible cohort the array
+contains the verified original, progressive MP4s and/or HLS master. A
+disabled cohort, authenticated request or missing readiness yields an empty
+array. A policy denial returns 404. Control-plane errors leave the client on
+its canonical route. Responses carry CORS and private no-store headers.
+
+Set `bunny_playback_rollout_percent` to an integer from 0 to 100 (default
+0) and `bunny_playback_countries` to comma-separated uppercase two-letter
+country codes (default empty). Rollout buckets use the first eight hex digits
+of the parent modulo 100. Country selection uses trusted edge geolocation.
+On the outer VCL service, provision a **private, write-only** edge dictionary
+named `bunny_playback_geo` before validating the VCL draft. Provision its
+`hmac_key` item and the Compute secret `bunny_playback_geo_key` with the same
+random 64-character hex string through the approved secret runner. Both
+layers use the printable string as the HMAC key. Configure
+`bunny_playback_compute_host` with the exact lowercase backend authority used
+by the outer service when forwarding to Compute. Inspect the actual backend
+binding before setting this value. Keep the rollout at zero while applying
+the separately reviewed VCL and Compute changes. An empty signing dictionary,
+missing verifier secret or invalid proof disables forwarded market selection.
+
+The first client-facing POP replaces caller input and signs the canonical GET
+path, host, country and time. The shield preserves that assertion. Compute
+checks the HMAC and a 30-second lifetime. Repeat GETs can use a proof for the
+same parent within that window and still recheck current policy. Direct
+requests on the canonical authority use the SDK's downstream IP geolocation.
+The shared signing key only authenticates the market for rollout. See the
+[outer VCL runbook](outer-vcl.md) and [Fastly service chaining documentation](https://www.fastly.com/documentation/guides/getting-started/services/service-chaining/).
+
+Monitor actual selection and both CDN hostnames with owned fixtures before
+enabling a market. Verify the default-off app production flag, publisher
+flag and server cohort independently.
 
 For appealable moderation, use status changes or a review hold. Moderation
 removes every version of the Bunny delivery copies and evicts their cached
@@ -187,7 +275,7 @@ providers. [Bunny CDN logging](https://bunny.net/docs/cdn/logging)
 
 ## Roll back
 
-Turn off the device flag and verify canonical source selection. Turn off
+Set `bunny_playback_rollout_percent` to 0 and turn off the device flag. Verify canonical source selection. Turn off
 publication when enrollment is complete or needs to pause. If any revocation
 check fails, disable the zone and verify both public names deny delivery.
 Keep the retained purge configuration and drain active until the copies,

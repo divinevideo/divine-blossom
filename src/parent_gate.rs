@@ -478,39 +478,120 @@ pub(crate) fn archive_owned(hash:&str,attempt:&str)->Result<bool> {
     Ok(matches!(lookup(&crate::metadata::open_store()?,hash)?,Some(Observed{gate:Gate::Copying{attempt_id},..}) if attempt_id==attempt))
 }
 
+/// Use authoritative reads on both sides of the CAS so a cold POP costs
+/// exactly the same backend requests as a warm one.
+pub(crate) fn bunny_claim(hash: &str, attempt: &str) -> Result<String> {
+    claim_observed_bunny_gate(hash, attempt, lookup_bunny_gate(hash)?)
+}
+
+fn claim_observed_bunny_gate(
+    hash: &str,
+    attempt: &str,
+    observed: Option<Observed>,
+) -> Result<String> {
+    let previous = match observed {
+        Some(Observed {
+            gate: Gate::Copying { attempt_id },
+            generation,
+        }) if attempt_id == attempt => return Ok(generation),
+        Some(Observed {
+            gate: Gate::Released { .. },
+            generation: previous,
+        }) => Some(generation(&previous).ok_or_else(unavailable)?),
+        None => None,
+        _ => return Err(stale()),
+    };
+    insert(
+        &crate::metadata::open_store()?,
+        hash,
+        &Gate::Copying {
+            attempt_id: attempt.to_owned(),
+        },
+        previous,
+    )?;
+    let current = lookup_bunny_gate(hash)?.ok_or_else(unavailable)?;
+    if hold_reason(Some(&current), attempt, None).is_some() {
+        return Err(stale());
+    }
+    Ok(current.generation)
+}
+
+/// The generation was read at origin for this exact attempt. A takeover or
+/// erasure changes it, so the conditional write itself fences settlement.
+pub(crate) fn bunny_release(hash: &str, attempt: &str, expected: &str) -> Result<()> {
+    insert(
+        &crate::metadata::open_store()?,
+        hash,
+        &Gate::Released {
+            version: 1,
+            settled_attempt_id: attempt.to_owned(),
+            released_from_generation: expected.to_owned(),
+        },
+        Some(generation(expected).ok_or_else(unavailable)?),
+    )
+}
+
 /// Run a delivery-replica removal with copy exclusion. The permanent erasure
 /// state already excludes every publisher and is never released here.
 pub(crate) fn with_delivery_removal<T>(
     hash: &str,
+    should_revoke: impl FnOnce() -> Result<bool>,
     remove: impl FnOnce(bool, &dyn Fn() -> Result<()>) -> Result<T>,
-) -> Result<T> {
+) -> Result<Option<T>> {
     let observed = lookup_bunny_gate(hash)?;
-    let forced_attempt = format!("bunny-cleanup-{hash}");
-    let (force, attempt, generation) = match observed {
-        Some(Observed { gate: Gate::Erasing {}, .. }) => return remove(true, &|| Ok(())),
-        Some(Observed { gate: Gate::Copying { attempt_id }, generation }) if attempt_id == forced_attempt => {
-            (true, attempt_id, generation)
-        }
-        _ => {
-            // A retry can resume an interrupted policy revocation. Forced
-            // cleanup instead adopts the settled writer's exact generation.
-            let attempt = format!("bunny-revoke-{hash}");
-            let generation = archive_claim(hash, &attempt)?;
-            (false, attempt, generation)
+    let attempt = format!("bunny-cleanup-{hash}");
+    let (generation, newly_denied) = match observed {
+        Some(Observed {
+            gate: Gate::Erasing {},
+            ..
+        }) => return remove(false, &|| Ok(())).map(Some),
+        Some(Observed {
+            gate: Gate::Copying { attempt_id },
+            generation,
+        }) if attempt_id == attempt => (generation, false),
+        observed => {
+            let revoke = format!("bunny-revoke-{hash}");
+            let previous = claim_observed_bunny_gate(hash, &revoke, observed)?;
+            match should_revoke() {
+                Ok(true) => {}
+                decision => {
+                    bunny_release(hash, &revoke, &previous)?;
+                    return decision.map(|_| None);
+                }
+            }
+            // Pin the obligation before the first delete. Even an appeal
+            // between paged deletion attempts must finish erasure and eviction.
+            insert(
+                &crate::metadata::open_store()?,
+                hash,
+                &Gate::Copying {
+                    attempt_id: attempt.clone(),
+                },
+                Some(generation(&previous).ok_or_else(unavailable)?),
+            )?;
+            let current = lookup_bunny_gate(hash)?.ok_or_else(unavailable)?;
+            if hold_reason(Some(&current), &attempt, None).is_some() {
+                return Err(stale());
+            }
+            (current.generation, true)
         }
     };
-    let check_gate = || check_bunny_gate(hash, &attempt, &generation);
-    let result = remove(force, &check_gate);
-    if !force || result.is_ok() {
-        archive_release(hash, &attempt, &generation)?;
-    }
-    result
+    let result = remove(newly_denied, &|| {
+        check_bunny_gate(hash, &attempt, &generation)
+    })?;
+    bunny_release(hash, &attempt, &generation)?;
+    Ok(Some(result))
 }
 
 fn lookup_bunny_gate(hash: &str) -> Result<Option<Observed>> {
     // Loopback provider fixtures cannot share the Viceroy runtime's KV state.
     #[cfg(test)]
     if crate::storage::config_flag("bunny_fixture_local_gate") {
+        if crate::storage::config_flag("bunny_fixture_meter_gate") {
+            // Meter the production origin GET. The fixture API and Viceroy's
+            // native KV write store are distinct, so read the actual fence locally.
+            crate::kv_origin::lookup(&key(hash))?;
+        }
         return lookup(&crate::metadata::open_store()?, hash);
     }
     if crate::kv_origin::enabled() {
@@ -518,6 +599,10 @@ fn lookup_bunny_gate(hash: &str) -> Result<Option<Observed>> {
     } else {
         lookup(&crate::metadata::open_store()?, hash)
     }
+}
+
+pub(crate) fn bunny_settled(hash: &str) -> Result<bool> {
+    Ok(matches!(lookup_bunny_gate(hash)?, Some(Observed { gate: Gate::Released { .. }, .. })))
 }
 
 pub(crate) fn check_bunny_gate(hash: &str, attempt: &str, expected: &str) -> Result<()> {

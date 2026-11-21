@@ -140,7 +140,7 @@ pub fn is_local_mode() -> bool {
 }
 
 /// Get secret value
-fn get_secret(key: &str) -> Result<String> {
+pub(crate) fn get_secret(key: &str) -> Result<String> {
     let store = fastly::secret_store::SecretStore::open(SECRET_STORE)
         .map_err(|e| BlossomError::Internal(format!("Failed to open secret store: {}", e)))?;
 
@@ -2089,9 +2089,8 @@ const BUNNY_PUBLISH_FLAG: &str = "bunny_pilot_publish_enabled";
 const BUNNY_PILOT_HOSTS: &str = "bunny_pilot_zone_hosts";
 const BUNNY_RETAINED_HOSTS: &str = "bunny-pilot-retained-hosts:v1";
 const BUNNY_ENROLLED_PREFIX: &str = "bunny-pilot-enrolled:v1:";
-const BUNNY_PILOT_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
-fn bunny_pilot_enrolled(hash: &str) -> Result<bool> {
+pub(crate) fn bunny_pilot_enrolled(hash: &str) -> Result<bool> {
     let entry = crate::kv_origin::lookup(&format!("{BUNNY_ENROLLED_PREFIX}{hash}"))?
         .ok_or_else(|| BlossomError::MetadataError("Bunny enrollment origin unavailable".into()))?;
     match entry {
@@ -2138,7 +2137,7 @@ fn bunny_pilot_hosts() -> Result<String> {
     checked_bunny_hosts(get_config(BUNNY_PILOT_HOSTS)?)
 }
 
-fn origin_bunny_pilot_hosts() -> Result<Option<String>> {
+pub(crate) fn origin_bunny_pilot_hosts() -> Result<Option<String>> {
     let Some(Some(entry)) = crate::kv_origin::lookup(BUNNY_RETAINED_HOSTS)? else {
         return Ok(None);
     };
@@ -2189,8 +2188,50 @@ pub(crate) fn validate_bunny_pilot_publication() -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn read_bunny_pilot_asset(key: &str) -> Result<Option<Vec<u8>>> {
-    let mut response = fetch_media_origin(StorageProvider::B2, key, None, false, true)
+pub(crate) struct BunnyObject {
+    pub bytes: Vec<u8>,
+    pub identity: blossom_core::storage_origin::ObjectRef,
+}
+
+pub(crate) fn bunny_source_location(
+    asset: &blossom_core::bunny_pilot::Asset<'_>,
+) -> Result<(StorageProvider, String)> {
+    let setting = if asset.is_original() {
+        "media_read_primary"
+    } else {
+        "derived_media_read_primary"
+    };
+    let provider = MediaReadPolicy::parse(optional_config(setting)?.as_deref(), None)
+        .map_err(|_| BlossomError::StorageError("Invalid Bunny source provider".into()))?
+        .primary;
+    let bucket_setting = match provider {
+        StorageProvider::B2 => "b2_media_bucket",
+        StorageProvider::Gcs => "gcs_bucket",
+    };
+    Ok((provider, get_config(bucket_setting)?))
+}
+
+/// Read the current authoritative primary once. Falling back could bind a stale
+/// source version to a newly ready family and double the finalization budget.
+pub(crate) fn read_bunny_object(
+    asset: &blossom_core::bunny_pilot::Asset<'_>,
+    delivery: bool,
+) -> Result<Option<BunnyObject>> {
+    let (provider, bucket, key) = if delivery {
+        (
+            StorageProvider::B2,
+            get_config("b2_media_bucket")?,
+            asset.delivery_key(),
+        )
+    } else {
+        let (provider, bucket) = bunny_source_location(asset)?;
+        (provider, bucket, asset.source_key())
+    };
+    let version_header = match provider {
+        StorageProvider::B2 => "x-amz-version-id",
+        StorageProvider::Gcs => "x-goog-generation",
+    };
+    let mut response = fetch_media_origin(provider, &key, None, false, true)
         .map_err(MediaFetchError::into_storage_error)?;
     if response.get_status() == StatusCode::NOT_FOUND {
         return Ok(None);
@@ -2201,13 +2242,13 @@ pub(crate) fn read_bunny_pilot_asset(key: &str) -> Result<Option<Vec<u8>>> {
     let size = response
         .get_header_str("Content-Length")
         .and_then(|value| value.parse::<u64>().ok());
-    let Some(size) = size.filter(|size| (1..=BUNNY_PILOT_MAX_BYTES).contains(size)) else {
+    let Some(size) = size.filter(|size| (1..=asset.max_size() as u64).contains(size)) else {
         return Err(BlossomError::StorageError(
             "Invalid Bunny source size".into(),
         ));
     };
     if response.get_status() != StatusCode::OK
-        || content_type != Some("video/mp4")
+        || !content_type.is_some_and(|mime| mime.eq_ignore_ascii_case(asset.mime()))
         || response.contains_header("Content-Range")
         || response
             .get_header_str("Content-Encoding")
@@ -2228,7 +2269,13 @@ pub(crate) fn read_bunny_pilot_asset(key: &str) -> Result<Option<Vec<u8>>> {
             "Bunny source length changed".into(),
         ));
     }
-    Ok(Some(bytes))
+    let identity = blossom_core::storage_origin::ObjectRef {
+        provider,
+        bucket,
+        key,
+        version: response.get_header_str(version_header).map(str::to_owned),
+    };
+    Ok(Some(BunnyObject { bytes, identity }))
 }
 
 /// Return false only for a definite provider rejection before upload acceptance.
@@ -2267,7 +2314,7 @@ pub(crate) fn put_bunny_pilot_asset(
     let url = format!("{}{}", config.endpoint(), config.object_path(key));
     let mut request = Request::new(Method::PUT, url)
         .with_header("Host", config.host())
-        .with_header("Content-Type", "video/mp4")
+        .with_header("Content-Type", asset.mime())
         .with_header("Content-Length", bytes.len().to_string())
         .with_header("Cache-Control", "private, no-store");
     request.set_pass(true);
@@ -2302,11 +2349,16 @@ pub(crate) fn put_bunny_pilot_asset(
     Ok(true)
 }
 
-pub(crate) fn remove_bunny_delivery_copies(hash: &str, check_gate: &dyn Fn() -> Result<()>) -> Result<()> {
+fn remove_bunny_delivery_copies(
+    hash: &str,
+    delete_limit: usize,
+    check_gate: &dyn Fn() -> Result<()>,
+) -> Result<()> {
     use blossom_core::bunny_pilot::{Asset, DELIVERY_PREFIX};
     let path = format!("/{hash}");
     let asset = Asset::parse(&path)
         .ok_or_else(|| BlossomError::BadRequest("Invalid Bunny revocation hash".into()))?;
+    crate::bunny_ready::invalidate(hash)?;
     let prefix = asset.delivery_key();
     let authorization = authorize_b2_vanish()?;
     let bucket = get_config("b2_media_bucket")?;
@@ -2332,7 +2384,7 @@ pub(crate) fn remove_bunny_delivery_copies(hash: &str, check_gate: &dyn Fn() -> 
             "Unexpected Bunny delivery key".into(),
         ));
     }
-    let count = versions.len().min(B2_ERASE_DELETES_PER_HASH);
+    let count = versions.len().min(delete_limit);
     check_gate()?;
     delete_b2_version_page(&authorization, &versions[..count])?;
     if count < versions.len() || next.is_some() {
@@ -2360,10 +2412,9 @@ fn bunny_pilot_purge_key() -> Result<String> {
     Ok(key)
 }
 
-pub(crate) fn purge_bunny_pilot_hosts(hashes: &[String]) -> Result<()> {
+fn purge_bunny_pilot_hosts(hashes: &[String], raw_hosts: &str) -> Result<()> {
     validate_b2_cdn_purge_batch(hashes)?;
-    let raw_hosts = bunny_pilot_hosts()?;
-    let hosts = blossom_core::bunny_pilot::zone_hosts(&raw_hosts)
+    let hosts = blossom_core::bunny_pilot::zone_hosts(raw_hosts)
         .ok_or_else(|| BlossomError::StorageError("Invalid retained Bunny pilot hosts".into()))?;
     let key = bunny_pilot_purge_key()?;
     let requests = hashes
@@ -2723,7 +2774,7 @@ pub(crate) fn invalidate_b2_cdn(hashes: &[String]) -> Result<()> {
 }
 
 fn invalidate_bunny_pilot(hashes: &[String]) -> Result<()> {
-    bunny_pilot_hosts()?;
+    let hosts = bunny_pilot_hosts()?;
     for hash in hashes {
         // Keep copy exclusion through eviction. Successful purge must follow
         // observed absence, including an all-version check at the origin.
@@ -2731,19 +2782,25 @@ fn invalidate_bunny_pilot(hashes: &[String]) -> Result<()> {
         if !bunny_pilot_enrolled(&hash)? {
             continue;
         }
-        crate::parent_gate::with_delivery_removal(&hash, |force, check_gate| {
-            if !force {
-                // An older denial or a prepared intent can survive a successful
-                // appeal. Only current authoritative policy can revoke bytes.
-                match crate::metadata::bunny_public_metadata(&hash) {
-                    Ok(_) => return Ok(()),
-                    Err(BlossomError::NotFound(_)) => {},
-                    Err(error) => return Err(error),
-                }
-            }
-            remove_bunny_delivery_copies(&hash, check_gate)?;
-            purge_bunny_pilot_hosts(std::slice::from_ref(&hash))
-        })?;
+        crate::parent_gate::with_delivery_removal(
+            &hash,
+            || match crate::metadata::bunny_public_metadata(&hash) {
+                Ok(_) => Ok(false),
+                Err(BlossomError::NotFound(_)) => Ok(true),
+                Err(error) => Err(error),
+            },
+            |newly_denied, check_gate| {
+                // The first execution may also spend seven policy reads and two
+                // gate-claim reads. Subsequent pages resume the forced gate.
+                let limit = if newly_denied {
+                    1
+                } else {
+                    B2_ERASE_DELETES_PER_HASH
+                };
+                remove_bunny_delivery_copies(&hash, limit, check_gate)?;
+                purge_bunny_pilot_hosts(std::slice::from_ref(&hash), &hosts)
+            },
+        )?;
     }
     Ok(())
 }
