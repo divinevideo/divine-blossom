@@ -465,11 +465,13 @@ pub(crate) fn commit(store: &KVStore, token: &Token) -> Result<CommitOutcome> {
         state: RecordState::Committed,
         ..snapshot.record
     };
-    match store
-        .build_insert()
-        .mode(InsertMode::Overwrite)
-        .if_generation_match(snapshot.generation)
-        .execute(&snapshot.key, encode(&committed))
+    match crate::metadata::retry_throttled_write(|| {
+        store
+            .build_insert()
+            .mode(InsertMode::Overwrite)
+            .if_generation_match(snapshot.generation)
+            .execute(&snapshot.key, encode(&committed))
+    })
     {
         Ok(()) => Ok(CommitOutcome::Committed),
         Err(KVStoreError::ItemPreconditionFailed) => Ok(CommitOutcome::Superseded),
@@ -487,11 +489,13 @@ fn complete_observed(store: &KVStore, snapshot: &Snapshot) -> Result<bool> {
         state: RecordState::Cleared,
         ..snapshot.record.clone()
     };
-    match store
-        .build_insert()
-        .mode(InsertMode::Overwrite)
-        .if_generation_match(snapshot.generation)
-        .execute(&snapshot.key, encode(&cleared))
+    match crate::metadata::retry_throttled_write(|| {
+        store
+            .build_insert()
+            .mode(InsertMode::Overwrite)
+            .if_generation_match(snapshot.generation)
+            .execute(&snapshot.key, encode(&cleared))
+    })
     {
         Ok(()) => Ok(true),
         Err(KVStoreError::ItemPreconditionFailed) => Ok(false),

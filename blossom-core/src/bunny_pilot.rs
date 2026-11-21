@@ -3,41 +3,93 @@
 pub const DELIVERY_PREFIX: &str = "bunny-delivery/";
 pub const DELIVERY_HOST: &str = "media-bunny.divine.video";
 
+pub const MAX_PLAYLIST: usize = 64 * 1024;
+pub const MAX_OBJECT: usize = 16 * 1024 * 1024;
+pub const HLS_PATHS: [&str; 5] = [
+    "hls/stream_720p.ts",
+    "hls/stream_480p.ts",
+    "hls/stream_720p.m3u8",
+    "hls/stream_480p.m3u8",
+    "hls/master.m3u8",
+];
+
+pub fn digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 pub struct Asset<'a> {
+    path: &'a str,
     hash: &'a str,
-    rendition: bool,
+    suffix: &'a str,
 }
 
 impl<'a> Asset<'a> {
     pub fn parse(path: &'a str) -> Option<Self> {
-        let path = path.strip_prefix('/')?;
-        let (hash, rendition) = match path.strip_suffix("/720p.mp4") {
-            Some(hash) => (hash, true),
-            None => (path, false),
+        let key = path.strip_prefix('/')?;
+        let (hash, suffix) = match key.split_once('/') {
+            Some((hash, suffix))
+                if matches!(suffix, "720p.mp4" | "480p.mp4") || HLS_PATHS.contains(&suffix) =>
+            {
+                (hash, suffix)
+            }
+            Some(_) => return None,
+            None => (key, ""),
         };
-        (hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
-            .then_some(Self { hash, rendition })
+        digest(hash).then_some(Self { hash, suffix, path })
     }
 
     pub fn hash(&self) -> &'a str {
         self.hash
     }
-
-    pub fn is_original(&self) -> bool {
-        !self.rendition
+    pub fn suffix(&self) -> &'a str {
+        self.suffix
     }
-
-    pub fn source_key(&self) -> String {
-        if self.rendition {
-            format!("{}/hls/stream_720p.mp4", self.hash)
+    pub fn is_original(&self) -> bool {
+        self.suffix.is_empty()
+    }
+    pub fn is_playlist(&self) -> bool {
+        self.suffix.ends_with(".m3u8")
+    }
+    pub fn is_top_level(&self) -> bool {
+        !self.suffix.starts_with("hls/") || self.suffix == "hls/master.m3u8"
+    }
+    pub fn mime(&self) -> &'static str {
+        if self.is_playlist() {
+            "application/vnd.apple.mpegurl"
+        } else if self.suffix.ends_with(".ts") {
+            "video/mp2t"
         } else {
-            self.hash.to_owned()
+            "video/mp4"
+        }
+    }
+    pub fn max_size(&self) -> usize {
+        if self.is_playlist() {
+            MAX_PLAYLIST
+        } else {
+            MAX_OBJECT
         }
     }
 
+    pub fn child_names(&self) -> &'static [&'static str] {
+        match self.suffix {
+            "hls/master.m3u8" => &["stream_720p.m3u8", "stream_480p.m3u8"],
+            "hls/stream_720p.m3u8" => &["stream_720p.ts"],
+            "hls/stream_480p.m3u8" => &["stream_480p.ts"],
+            _ => &[],
+        }
+    }
+    pub fn source_key(&self) -> String {
+        if matches!(self.suffix, "720p.mp4" | "480p.mp4") {
+            format!("{}/hls/stream_{}", self.hash, self.suffix)
+        } else {
+            self.path[1..].to_owned()
+        }
+    }
     pub fn delivery_key(&self) -> String {
-        let suffix = if self.rendition { "/720p.mp4" } else { "" };
-        format!("{DELIVERY_PREFIX}{}{suffix}", self.hash)
+        format!("{DELIVERY_PREFIX}{}", &self.path[1..])
     }
 }
 
@@ -59,7 +111,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn serves_only_exact_original_and_720p_paths() {
+    fn serves_only_exact_playback_paths() {
         let hash = "a".repeat(64);
         let original = format!("/{hash}");
         let rendition = format!("/{hash}/720p.mp4");
@@ -72,9 +124,25 @@ mod tests {
             Asset::parse(&rendition).unwrap().delivery_key(),
             format!("bunny-delivery{rendition}")
         );
+        for suffix in [
+            "480p.mp4",
+            "hls/master.m3u8",
+            "hls/stream_720p.m3u8",
+            "hls/stream_480p.m3u8",
+            "hls/stream_720p.ts",
+            "hls/stream_480p.ts",
+        ] {
+            let path = format!("/{hash}/{suffix}");
+            assert_eq!(
+                Asset::parse(&path)
+                    .expect("supported playback path")
+                    .delivery_key(),
+                format!("bunny-delivery{path}")
+            );
+        }
         for path in [
             format!("/{hash}.mp4"),
-            format!("/{hash}/480p.mp4"),
+            format!("/{hash}/1080p.mp4"),
             format!("/{hash}?versionId=1"),
             format!("/{hash}/"),
             format!("/{}", hash.to_uppercase()),

@@ -694,6 +694,24 @@ fn unavailable_config_store_cannot_disable_durable_eviction() {
 #[test]
 #[ignore = "requires synthetic B2 and Bunny providers; scripts/run-bunny-pilot-revocation-tests.py"]
 fn bunny_pilot_age_gate_eviction_retries() {
+    // Viceroy does not rate-limit writes. Inject the provider's 1/s rejection
+    // before executing a real generation-conditional insert.
+    let throttle_store = open_store().unwrap();
+    let throttle_key = "fixture-bunny-kv-throttle";
+    throttle_store.insert(throttle_key, "before").unwrap();
+    let observed = throttle_store.lookup(throttle_key).unwrap().current_generation();
+    let written = std::time::Instant::now();
+    let mut attempts = 0;
+    crate::metadata::retry_throttled_write(|| {
+        attempts += 1;
+        if written.elapsed() < std::time::Duration::from_secs(1) {
+            return Err(fastly::kv_store::KVStoreError::TooManyRequests);
+        }
+        throttle_store.build_insert().if_generation_match(observed).execute(throttle_key,"after")
+    }).unwrap();
+    assert_eq!(attempts, 2);
+    assert_eq!(throttle_store.lookup(throttle_key).unwrap().take_body().into_string(), "after");
+
     let hash = hash();
     let metadata = serde_json::from_value(serde_json::json!({
         "sha256": hash, "size": 9, "type": "video/mp4", "uploaded": "2026-01-01T00:00:00Z",
@@ -702,11 +720,26 @@ fn bunny_pilot_age_gate_eviction_retries() {
     .unwrap();
     put_blob_metadata(&metadata).unwrap();
     // A previous runner held revocation but exited before doing any I/O.
-    parent_gate::archive_claim(&hash, &format!("bunny-revoke-{hash}")).unwrap();
+    if storage::config_flag("bunny_fixture_resume_revoke") {
+        parent_gate::archive_claim(&hash, &format!("bunny-revoke-{hash}")).unwrap();
+    }
 
+    let ready_key = format!("bunny-ready:v1:{hash}");
+    open_store()
+        .unwrap()
+        .insert(&ready_key, "previous readiness")
+        .unwrap();
+
+    let meter = |phase: &str| {
+        let response = Request::post("http://fixture.invalid/fixture/meter")
+            .with_body(phase)
+            .send("fixture_control")
+            .unwrap();
+        assert_eq!(response.get_status(), StatusCode::OK);
+    };
     let mut moderate = request(Method::POST, "/admin/api/moderate", true);
     moderate.set_body(serde_json::json!({"sha256": hash, "action": "AGE_RESTRICT"}).to_string());
-    assert_eq!(call(moderate).get_status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(crate::request_bindings::metered(moderate).get_status(), StatusCode::BAD_GATEWAY);
     assert_eq!(
         get_blob_metadata_uncached(&hash).unwrap().unwrap().status,
         BlobStatus::AgeRestricted
@@ -717,6 +750,10 @@ fn bunny_pilot_age_gate_eviction_retries() {
     );
 
     let store = open_store().unwrap();
+    assert!(matches!(
+        store.lookup(&ready_key),
+        Err(fastly::kv_store::KVStoreError::ItemNotFound)
+    ));
     let queue = store
         .build_list()
         .prefix("b2-cdn-purge:v1:")
@@ -730,17 +767,22 @@ fn bunny_pilot_age_gate_eviction_retries() {
         record["state"].clone()
     };
     assert_eq!(intent_state(), "committed");
-    let mut retry = call(request(
-        Method::POST,
-        "/admin/api/b2-cdn-purge/drain?max=1",
-        true,
-    ));
-    assert_eq!(retry.get_status(), StatusCode::OK);
-    let reply: serde_json::Value = serde_json::from_str(&retry.take_body_str()).unwrap();
-    assert_eq!(reply["result"], 1);
-    assert_eq!(reply["pending"], 0);
+    // Four version deletes per execution. The first verified empty listing
+    // reaches the configured transient purge failure and stays pending.
+    for _ in 0..6 {
+        let req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=1", false)
+            .with_header("Authorization", "Bearer synthetic-webhook-token");
+        let mut retry = crate::request_bindings::metered(req);
+        assert_eq!(retry.get_status(), StatusCode::OK);
+        let reply: serde_json::Value = serde_json::from_str(&retry.take_body_str()).unwrap();
+        if reply["result"] == 1 {
+            break;
+        }
+        assert_eq!(intent_state(), "committed");
+    }
     assert_eq!(intent_state(), "cleared");
 
+    meter("unrelated");
     // Unenrolled hashes must not acquire or interfere with shared mirror gates.
     let unrelated = "c".repeat(64);
     crate::storage::invalidate_b2_cdn(&[unrelated.clone()]).unwrap();
@@ -751,4 +793,108 @@ fn bunny_pilot_age_gate_eviction_retries() {
     parent_gate::archive_claim(&unrelated, "unrelated-mirror").unwrap();
     crate::storage::invalidate_b2_cdn(&[unrelated.clone()]).unwrap();
     assert!(parent_gate::archive_owned(&unrelated, "unrelated-mirror").unwrap());
+}
+
+
+#[test]
+#[ignore = "requires retained pilot with missing/malformed bundle"]
+fn bunny_legacy_canonical_fallback() {
+    let hash = if storage::config_flag("fixture_unenrolled") {
+        "c".repeat(64)
+    } else {
+        hash()
+    };
+    b2_cdn_purge::enqueue(&hash, b2_cdn_purge::Phase::Single).unwrap();
+    let drain = |auth| {
+        let req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=1", false)
+            .with_header("Authorization", format!("Bearer {auth}"));
+        let mut response = crate::request_bindings::metered(req);
+        assert_eq!(response.get_status(), StatusCode::OK);
+        serde_json::from_str::<serde_json::Value>(&response.take_body_str()).unwrap()["result"]
+            .clone()
+    };
+    if storage::config_flag("fixture_failed_standalone_hint") {
+        let store = open_store().unwrap();
+        store.insert(&format!("canonical-purge-priority:v1:{hash}"), "1").unwrap();
+        let key = store.build_list().prefix("b2-cdn-purge:v1:").execute().unwrap().keys()[0].clone();
+        for _ in 0..7 {
+            assert_eq!(drain("synthetic-drain-token"), 0);
+            let body = store.lookup(&key).unwrap().take_body().into_string();
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["state"], "committed");
+        }
+        return;
+    }
+    if storage::config_flag("fixture_standalone_rejected") {
+        let store = open_store().unwrap();
+        let records = store
+            .build_list()
+            .prefix("b2-cdn-purge:v1:")
+            .execute()
+            .unwrap();
+        assert_eq!(records.keys().len(), 1);
+        let state = || {
+            let body = store
+                .lookup(&records.keys()[0])
+                .unwrap()
+                .take_body()
+                .into_string();
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["state"].clone()
+        };
+        assert_eq!(drain("synthetic-drain-token"), 0);
+        assert_eq!(state(), "committed");
+        assert_eq!(
+            drain("synthetic-drain-token"),
+            0,
+            "Bunny failure must keep the outbox pending after canonical success"
+        );
+        assert_eq!(state(), "committed");
+        assert_eq!(
+            drain("synthetic-drain-token"),
+            1,
+            "the other valid purge credential must finish both rounds"
+        );
+        assert_eq!(state(), "cleared");
+        assert!(matches!(
+            store.lookup(&format!("canonical-purge-priority:v1:{hash}")),
+            Err(fastly::kv_store::KVStoreError::ItemNotFound)
+        ));
+        return;
+    }
+    let key = format!("canonical-purge-priority:v1:{hash}");
+    if !storage::config_flag("fixture_immediate") {
+        assert_eq!(drain("synthetic-webhook-token"), 0);
+        assert!(
+            open_store().unwrap().lookup(&key).is_ok(),
+            "retry must reserve canonical priority"
+        );
+        assert_eq!(
+            drain("synthetic-webhook-token"),
+            0,
+            "canonical-only retry cannot acknowledge Bunny"
+        );
+        assert!(open_store().unwrap().lookup(&key).is_err());
+        let store = open_store().unwrap();
+        let records = store
+            .build_list()
+            .prefix("b2-cdn-purge:v1:")
+            .execute()
+            .unwrap();
+        assert_eq!(records.keys().len(), 1);
+        let record = store
+            .lookup(&records.keys()[0])
+            .unwrap()
+            .take_body()
+            .into_string();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&record).unwrap()["state"],
+            "committed"
+        );
+    } else {
+        let result = drain(if storage::config_flag("fixture_webhook") {
+            "synthetic-webhook-token"
+        } else {
+            "synthetic-drain-token"
+        });
+        assert_eq!(result, u8::from(storage::config_flag("fixture_unenrolled")));
+    }
 }

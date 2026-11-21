@@ -4,6 +4,29 @@
 # Pass original host to Compute so it can generate correct URLs
 set req.http.X-Original-Host = req.http.Host;
 
+# Authenticate the viewer country across the VCL-to-Compute service chain.
+# A shield keeps the first POP's proof. An unconfigured signing key leaves
+# the market unknown and Compute selects canonical playback.
+if (fastly.ff.visits_this_service == 0 && req.restarts == 0 &&
+    req.url.path ~ "^/api/bunny-playback/") {
+  declare local var.bunny_geo_key STRING;
+  declare local var.bunny_geo_time STRING;
+  declare local var.bunny_geo_country STRING;
+  unset req.http.X-Divine-Bunny-Market;
+  if (req.method == "GET" && req.http.Host == "media.divine.video" &&
+      req.url ~ "^/api/bunny-playback/[0-9a-f]{64}$" &&
+      !req.http.Authorization && !req.http.Cookie) {
+    set var.bunny_geo_key = table.lookup(bunny_playback_geo, "hmac_key");
+    set var.bunny_geo_country = client.geo.country_code;
+    if (std.strlen(var.bunny_geo_key) >= 32 && var.bunny_geo_country ~ "^[A-Z]{2}$") {
+      set var.bunny_geo_time = now.sec;
+      set req.http.X-Divine-Bunny-Market = var.bunny_geo_time + ":" + var.bunny_geo_country + ":" +
+        digest.hmac_sha256(var.bunny_geo_key, "bunny-playback-v1|GET|" + req.http.Host +
+          "|" + req.url.path + "|" + var.bunny_geo_time + "|" + var.bunny_geo_country);
+    }
+  }
+}
+
 # B2 outer request correlation is generated at the client-facing boundary.
 # Caller IDs never identify an outer request; a shield continuation preserves
 # the trusted edge ID rather than creating another one for the same request.

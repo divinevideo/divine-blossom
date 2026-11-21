@@ -1,0 +1,7 @@
+{
+  "original": {"provider": "b2", "bucket": "example-private-media"},
+  "derived": {"provider": "b2", "bucket": "example-private-media"},
+  "b2_region": "us-east-005",
+  "coordination_bucket": "example-transcoder-coordination",
+  "kv_store_id": "example-metadata-store"
+}

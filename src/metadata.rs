@@ -244,6 +244,13 @@ pub fn get_blob_metadata_uncached(hash: &str) -> Result<Option<BlobMetadata>> {
 /// Replica publication cannot use a POP's stale view of a new age gate or
 /// takedown. Read the current policy at the KV origin before and after the PUT.
 pub(crate) fn bunny_public_metadata(hash: &str) -> Result<BlobMetadata> {
+    bunny_playback_policy(hash)?
+        .ok_or_else(|| BlossomError::NotFound("Outside Bunny publication limits".into()))
+}
+
+/// A public parent outside the publication limits stays eligible for canonical
+/// playback. Only an observed access denial is a terminal selection response.
+pub(crate) fn bunny_playback_policy(hash: &str) -> Result<Option<BlobMetadata>> {
     let lookup = |key: &str| {
         crate::kv_origin::lookup(key)?.ok_or_else(|| {
             BlossomError::MetadataError("Bunny publication policy origin unavailable".into())
@@ -252,14 +259,12 @@ pub(crate) fn bunny_public_metadata(hash: &str) -> Result<BlobMetadata> {
     let invalid = || BlossomError::MetadataError("Bunny publication policy invalid".into());
     let denied = || BlossomError::NotFound("Public MP4 unavailable".into());
     let entry = lookup(&format!("{BLOB_PREFIX}{hash}"))?.ok_or_else(denied)?;
-    let metadata: BlobMetadata = serde_json::from_slice(&entry.body).map_err(|_| invalid())?;
+    let metadata: BlobMetadata = serde_json::from_slice::<Option<BlobMetadata>>(&entry.body)
+        .map_err(|_| invalid())?.ok_or_else(denied)?;
     let is_pubkey =
         |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
     if metadata.sha256 != hash
-        || metadata.status != BlobStatus::Active
-        || !metadata.mime_type.starts_with("video/")
-        || !metadata.quarantine_hold_ids.is_empty()
-        || metadata.size == 0
+        || metadata.access_for(None, false) != crate::blossom::BlobAccess::Allowed
         || !is_pubkey(&metadata.owner)
         || lookup(&format!("{TOMBSTONE_PREFIX}{hash}"))?.is_some()
     {
@@ -285,14 +290,17 @@ pub(crate) fn bunny_public_metadata(hash: &str) -> Result<BlobMetadata> {
     // Two passes plus B2, purge and gate reads must fit the Compute subrequest
     // budget, even on the policy-race cleanup path. This is a bounded pilot.
     if uploaders.len() > 3 {
-        return Err(denied());
+        return Ok(None);
     }
     for uploader in uploaders {
         if !is_pubkey(&uploader) || lookup(&vanish_in_progress_key(&uploader))?.is_some() {
             return Err(denied());
         }
     }
-    Ok(metadata)
+    if metadata.status != BlobStatus::Active || !metadata.mime_type.starts_with("video/") || metadata.size == 0 {
+        return Ok(None);
+    }
+    Ok(Some(metadata))
 }
 
 /// Review holds are never read through the POP-local metadata cache.
@@ -2391,5 +2399,65 @@ mod tests {
             vanish_in_progress_key(&pubkey),
             vanish_in_progress_key(&pubkey.to_lowercase())
         );
+    }
+}
+
+/// Fastly allows one write per second to an individual KV item. Keep the
+/// original generation condition on the single retry; an uncertain failure
+/// or a lost precondition must reach the caller without replaying the write.
+pub(crate) fn retry_throttled_write(
+    mut write: impl FnMut() -> std::result::Result<(), KVStoreError>,
+) -> std::result::Result<(), KVStoreError> {
+    match write() {
+        Err(
+            KVStoreError::TooManyRequests
+            | KVStoreError::Unexpected(fastly_shared::FastlyStatus::LIMITEXCEEDED),
+        ) => {
+            std::thread::sleep(Duration::from_millis(1050));
+            write()
+        }
+        result => result,
+    }
+}
+
+#[cfg(test)]
+mod kv_write_rate_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn immediately_repeated_item_writes_wait_for_the_rate_window() {
+        let mut stored = "before";
+        let start = Instant::now();
+        let mut attempts = 0;
+        let mut write = || {
+            attempts += 1;
+            if start.elapsed() < Duration::from_secs(1) {
+                return Err(KVStoreError::TooManyRequests);
+            }
+            stored = "after";
+            Ok(())
+        };
+        retry_throttled_write(&mut write).unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(stored, "after");
+        let mut attempts = 0;
+        assert!(matches!(
+            retry_throttled_write(|| {
+                attempts += 1;
+                Err(KVStoreError::TooManyRequests)
+            }),
+            Err(KVStoreError::TooManyRequests)
+        ));
+        assert_eq!(attempts, 2);
+        let mut attempts = 0;
+        assert!(matches!(
+            retry_throttled_write(|| {
+                attempts += 1;
+                Err(KVStoreError::ItemPreconditionFailed)
+            }),
+            Err(KVStoreError::ItemPreconditionFailed)
+        ));
+        assert_eq!(attempts, 1);
     }
 }
