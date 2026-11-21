@@ -86,18 +86,11 @@ pub fn extract_bearer_token(req: &Request) -> Option<String> {
 }
 
 pub fn validate_bearer_token_against_secret_keys(provided: &str, keys: &[&str]) -> Result<()> {
-    let store = fastly::secret_store::SecretStore::open("blossom_secrets")
-        .map_err(|_| BlossomError::Forbidden("Secret store not available".into()))?;
-
     for key in keys {
-        if let Some(secret) = store.get(key) {
-            let token = String::from_utf8(secret.plaintext().to_vec())
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            if !token.is_empty() && provided == token {
-                return Ok(());
-            }
+        let token = crate::request_bindings::secret(key)
+            .map_err(|_| BlossomError::Forbidden("Secret store not available".into()))?;
+        if token.as_deref().map(str::trim).is_some_and(|token| !token.is_empty() && provided == token) {
+            return Ok(());
         }
     }
 
@@ -323,7 +316,7 @@ fn create_session(provider: &str, identity: &str) -> Result<String> {
 
 /// Get config value from Fastly config store
 pub(crate) fn get_config(key: &str) -> Option<String> {
-    fastly::config_store::ConfigStore::open("blossom_config").get(key)
+    crate::storage::optional_config(key).ok().flatten()
 }
 
 /// Get secret value from Fastly secret store

@@ -19,10 +19,7 @@ struct Settings {
 }
 
 fn settings() -> Option<Settings> {
-    let token = fastly::secret_store::SecretStore::open("blossom_secrets")
-        .ok()?
-        .get(TOKEN_SECRET)
-        .and_then(|secret| String::from_utf8(secret.plaintext().to_vec()).ok())
+    let token = crate::storage::get_secret(TOKEN_SECRET).ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())?;
     let store_id = crate::admin::get_config(STORE_ID_CONFIG)

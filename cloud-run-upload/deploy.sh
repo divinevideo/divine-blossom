@@ -56,11 +56,15 @@ for binding in TRANSCODER_URL TRANSCRIBER_URL TRANSCODE_QUEUE TRANSCODE_QUEUE_IN
   fi
 done
 
+BUILD_CONTEXT="$(mktemp -d)"
+trap 'rm -rf "${BUILD_CONTEXT}"' EXIT
+bash "${SCRIPT_DIR}/prepare-build-context.sh" "${BUILD_CONTEXT}"
+
 echo "Deploying ${SERVICE_NAME} from source..."
 gcloud run deploy "${SERVICE_NAME}" \
   --project "${PROJECT_ID}" \
   --region "${REGION}" \
-  --source "${SCRIPT_DIR}" \
+  --source "${BUILD_CONTEXT}" \
   --allow-unauthenticated \
   --service-account "${SERVICE_ACCOUNT}" \
   --cpu 1 \

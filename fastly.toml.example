@@ -134,6 +134,11 @@ language = "rust"
     address = "image.nostr.build"
     port = 443
 
+    [setup.backends.cloud_run_upload]
+    description = "Cloud Run upload companion for authenticated storage and publication jobs"
+    address = "blossom-upload-rust-149672065768.us-central1.run.app"
+    port = 443
+
     [setup.backends.upload_service]
     description = "GKE upload/migration/resumable session service"
     address = "upload.divine.video"

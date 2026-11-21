@@ -16,6 +16,22 @@ class UploadDeployContractTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
 
+    def test_build_context_contains_only_worker_and_shared_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            subprocess.run(["bash", str(DEPLOY_SCRIPT.with_name("prepare-build-context.sh")), directory], check=True)
+            staged = Path(directory)
+            self.assertEqual({p.name for p in staged.iterdir()},
+                             {"Cargo.toml", "Cargo.lock", "Dockerfile", "src", "blossom-core"})
+            self.assertEqual((staged / "src/bunny_worker.rs").read_bytes(),
+                             (ROOT / "cloud-run-upload/src/bunny_worker.rs").read_bytes())
+            self.assertEqual((staged / "blossom-core/src/bunny_worker.rs").read_bytes(),
+                             (ROOT / "blossom-core/src/bunny_worker.rs").read_bytes())
+            self.assertIn("COPY blossom-core /blossom-core", (staged / "Dockerfile").read_text())
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        self.assertIn("-- cloud-run-upload blossom-core; then", workflow)
+        self.assertIn('and .bunny_pilot_worker == "verified-v2"', workflow)
+        self.assertIn('--source "${BUILD_CONTEXT}"', self.script)
+
     def test_deploy_owns_the_cleanup_bucket_configuration(self) -> None:
         self.assertIn('GCS_BUCKET="${GCS_BUCKET:-divine-blossom-media}"', self.script)
         self.assertIn("GCS_BUCKET=${GCS_BUCKET}", self.script)

@@ -135,10 +135,18 @@ def readiness_checks(host: str, path: str, body: bytes) -> list[dict]:
 
 
 def guard_checks(host: str, path: str) -> list[dict]:
-    checks = []
+    baseline = fetch(CANONICAL_HOST, 'GET', '/')
+    landing = fetch(host, 'GET', '/')
+    html = landing.headers.get('content-type', '').split(';', 1)[0].lower() == 'text/html'
+    checks = [report('landing-get', landing, baseline.status == landing.status == 200
+                     and html and bool(baseline.body) and landing.body == baseline.body)]
+    head = fetch(host, 'HEAD', '/', read_body=False)
+    checks.append(report('landing-head', head, head.status == 200
+                         and head.headers.get('content-length') == str(len(baseline.body))
+                         and head.headers.get('content-type', '').split(';', 1)[0].lower() == 'text/html'))
     escaped_path = f'/%{ord(path[1]):02X}{path[2:]}'
     for control, method, target, headers in (
-        ('block-root', 'GET', '/', {}),
+        ('block-root-method', 'POST', '/', {}),
         ('block-query', 'GET', path + '?probe=1', {}),
         ('block-version-query', 'GET', path + '?versionId=pilot-probe-placeholder', {}),
         ('block-escaped-alias', 'GET', escaped_path, {}),
