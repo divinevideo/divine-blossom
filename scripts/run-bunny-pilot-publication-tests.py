@@ -351,7 +351,7 @@ class Origin(BaseHTTPRequestHandler):
         if parsed.path == "/fixture/policy-status":
             assert self.server.case in ("appeal", "hls_family")
             self.server.policy_status = self.read_body().decode()
-            assert self.server.policy_status in ("active", "age_restricted", "pending")
+            assert self.server.policy_status in ("active", "age_restricted", "pending", "restricted", "banned")
             return self.reply(200)
 
         if parsed.path.startswith("/service/"):
