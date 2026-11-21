@@ -110,12 +110,15 @@ fn lookup(store: &KVStore, hash: &str) -> Result<Option<Observed>> {
 
 fn insert(store: &KVStore, hash: &str, gate: &Gate, expected: Option<u64>) -> Result<()> {
     let body = serde_json::to_string(gate).map_err(|_| unavailable())?;
-    let builder = store.build_insert();
-    let builder = match expected {
-        Some(generation) => builder.if_generation_match(generation),
-        None => builder.mode(InsertMode::Add),
-    };
-    observe_kv(if expected.is_some() { KvOperation::InsertCas } else { KvOperation::InsertAdd }, builder.execute(&key(hash), body)).map_err(|e| match e {
+    let op = if expected.is_some() { KvOperation::InsertCas } else { KvOperation::InsertAdd };
+    crate::metadata::retry_throttled_write(|| {
+        let builder = store.build_insert();
+        let builder = match expected {
+            Some(generation) => builder.if_generation_match(generation),
+            None => builder.mode(InsertMode::Add),
+        };
+        observe_kv(op, builder.execute(&key(hash), body.clone()))
+    }).map_err(|e| match e {
         KVStoreError::ItemPreconditionFailed => stale(),
         _ => unavailable(),
     })
@@ -601,8 +604,11 @@ fn lookup_bunny_gate(hash: &str) -> Result<Option<Observed>> {
     }
 }
 
-pub(crate) fn bunny_settled(hash: &str) -> Result<bool> {
-    Ok(matches!(lookup_bunny_gate(hash)?, Some(Observed { gate: Gate::Released { .. }, .. })))
+pub(crate) fn bunny_settled_generation(hash: &str) -> Result<Option<String>> {
+    Ok(lookup_origin(hash)?.and_then(|observed| match observed.gate {
+        Gate::Released { .. } => Some(observed.generation),
+        _ => None,
+    }))
 }
 
 pub(crate) fn check_bunny_gate(hash: &str, attempt: &str, expected: &str) -> Result<()> {

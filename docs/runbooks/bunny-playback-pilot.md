@@ -16,9 +16,9 @@ or enabling the internal mobile flag.
    the five HLS children under `/<sha256>/hls/` listed below.
 2. Provision the Bunny signing key with only `readFiles`, restricted to the
    single bucket and exact `bunny-delivery/` prefix. Give the publisher a separate
-   key with only `writeFiles` in that prefix. Blossom uses its existing B2 media
-   read credentials to verify publication with a GET. Native erasure uses the
-   existing separately scoped credential. Check the actual capabilities and
+   key with only `writeFiles` in that prefix. The private upload-service worker
+   verifies reads with its own read-only bindings. Compute independently checks
+   its bucket-scoped native erasure credential. Check the actual capabilities and
    confirm the signing key cannot list objects or read a known fixture outside
    the delivery prefix. [Backblaze application key capabilities](https://www.backblaze.com/docs/cloud-storage-s3-compatible-app-keys)
 3. Create a **Volume** pull zone and set its HTTPS origin to
@@ -29,7 +29,10 @@ or enabling the internal mobile flag.
    requests. Use verified origin TLS. [Backblaze’s Bunny integration](https://www.backblaze.com/docs/cloud-storage-integrate-bunnynet-with-backblaze-b2)
 4. Apply the allowlist on both the custom hostname and the assigned
    `b-cdn.net` hostname before cache lookup. Allow anonymous `GET` and `HEAD`
-   for the exact published paths. Deny root and bucket listing, query strings, other
+   for the exact published paths. Serve the informational landing page on exact
+   root GET and HEAD by routing that one URL to `https://media.divine.video`
+   on both hostnames. Reject other root methods and never forward the root
+   to the B2 bucket or allow bucket listing. Reject query strings, other
    methods, authorization and cookie headers, escaped or normalized alternate
    paths, and unrecognized hosts. Bunny patterns use Lua syntax. For a
    64-character hash match, repeat `[0-9a-f]` 64 times between the path anchors.
@@ -51,15 +54,35 @@ or enabling the internal mobile flag.
 
 ## Configure Blossom and enroll fixtures
 
-- Wire the `bunny_api` Fastly backend to the Bunny Core API and inject
-  `bunny_api_key`, `bunny_b2_publish_key_id`, and `bunny_b2_publish_key` using
-  the approved secret runner. The publisher requires the existing
-  `kv_origin_read_token` and `metadata_kv_store_id` for its authoritative
-  policy checks and the existing B2 media credentials with GET access. Keep
-  secret values out of command arguments, shell history, and output.
-  Prove that the native erasure binding lists and deletes versions in the
-  delivery prefix and that targeted purges work on each hostname before
-  publishing any real paths.
+- Deploy the upload-service revision first. Its existing
+  `/delete-blobs/ready` endpoint must advertise `bunny_pilot_worker=verified-v1`.
+  Configure Cloud Run with `BUNNY_ORIGINAL_PRIMARY` and `BUNNY_DERIVED_PRIMARY`
+  equal to the Compute media and derivative primaries (`b2` or `gcs`).
+  Supply the exact `B2_REGION`, `B2_MEDIA_BUCKET`, `B2_BUCKET_ID`, and,
+  for a GCS source, `GCS_BUCKET`. The two services reject a scope mismatch.
+- Bind the following values using each service's approved secret runner.
+  Use private secret bindings, keep values out of shell arguments and logs,
+  and preserve existing unrelated standalone bindings.
+
+  | Binding | Service | Contents |
+  | --- | --- | --- |
+  | `BUNNY_PILOT_READERS_V1` | Upload | JSON `{"b2":{"id":"…","key":"…"},"gcs":{"id":"…","key":"…"}}`. B2 reads canonical and delivery objects. GCS reads canonical objects. Omit `gcs` when both primaries are B2. |
+  | `BUNNY_PILOT_WRITER_V1` | Upload | JSON `{"id":"…","key":"…"}`. Restrict the writer to one bucket, the exact delivery prefix and only `writeFiles`. The worker checks native authorization before PUT. |
+  | `BUNNY_PILOT_WORKER_TOKEN` and `bunny_pilot_worker_token` | Upload and Compute respectively | Identical dedicated random bearer, at least 32 bytes. Only the fixed `upload_service` backend uses this bearer. |
+  | `bunny_pilot_cleanup_v1` | Compute | JSON `{"eraser":{"id":"…","key":"…"},"bunny_api_key":"…","fastly_api_token":"…"}`. Existing bucket-scoped native `listFiles` and `deleteFiles` authority and the two targeted purge credentials. |
+
+  The worker hard-codes provider hosts from its configured S3 region and uses
+  its own readers and writer. Compute checks the worker's scope and immutable
+  evidence, owns parent exclusion, and reads policy at the KV origin with the
+  existing `kv_origin_read_token` and `metadata_kv_store_id`. Configure
+  the `bunny_api` Fastly backend for the Bunny Core API. Verify the fixed
+  upload backend has a first-byte timeout exceeding the worker's 45-second
+  operation deadline, including startup time. On timeout a potential write
+  retains its gate. The worker admits one publication job per instance.
+  Prove version listing, deletion, purge on both hosts and verified publication
+  against owned fixtures. Retain worker bindings through rollback until all
+  attempts settle. Retain the cleanup bundle, target records and drain through
+  verified removal and cache eviction.
 - Set `bunny_pilot_zone_hosts` to the exact custom hostname followed by the
   assigned Bunny hostname, comma-separated. Keep the complete target set,
   active bindings, credentials, and the monitored
@@ -110,7 +133,7 @@ or enabling the internal mobile flag.
 
 Canonical source reads use `media_read_primary` for originals and
 `derived_media_read_primary` for derivatives. Each defaults to GCS. The
-publisher reads the configured primary directly and retries on unavailability.
+worker reads the configured primary directly. An unavailable input fails verification.
 The delivery destination always uses the private B2 prefix. A progressive path
 such as `/<parent>/480p.mp4` reads `<parent>/hls/stream_480p.mp4` at the
 source. An HLS path uses the same key at both providers.
@@ -151,9 +174,9 @@ jq -n --arg p "$parent" \
 ```
 
 A successful finalization returns `{"result":"ready"}`. Under parent
-exclusion Blossom reads and hashes each current source and delivery object,
+exclusion the authenticated upload-service worker reads and hashes each current source and delivery object,
 checks immutable GCS generations or B2 version IDs and revalidates the HLS
-closure. It checks policy immediately before recording readiness. Its record
+closure. Compute validates the returned identities, exact requested pins and policy before recording readiness. The record
 binds the source provider, bucket, key and version, destination bucket and
 version, prefix, host pair and both digests.
 

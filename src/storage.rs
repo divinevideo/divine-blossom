@@ -44,12 +44,6 @@ pub(crate) const DELIVERY_PROBE_LIMIT: usize = 3;
 /// instead of reintroducing legacy hosts into the hot delivery path.
 const FALLBACK_BACKENDS: &[(&str, &str, &str)] = &[];
 
-/// Config store name
-const CONFIG_STORE: &str = "blossom_config";
-
-/// Secret store name
-const SECRET_STORE: &str = "blossom_secrets";
-
 #[cfg(test)]
 std::thread_local! {
     static TEST_STORAGE_CACHE_BYPASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -126,10 +120,7 @@ pub(crate) fn get_config(key: &str) -> Result<String> {
 }
 
 pub(crate) fn optional_config(key: &str) -> Result<Option<String>> {
-    let store = fastly::config_store::ConfigStore::try_open(CONFIG_STORE)
-        .map_err(|_| BlossomError::Internal("Config store unavailable".into()))?;
-    store.try_get(key)
-        .map_err(|_| BlossomError::Internal("Config lookup unavailable".into()))
+    crate::request_bindings::config(key)
 }
 
 /// Check if running in local/e2e mode (stubs external services)
@@ -141,17 +132,7 @@ pub fn is_local_mode() -> bool {
 
 /// Get secret value
 pub(crate) fn get_secret(key: &str) -> Result<String> {
-    let store = fastly::secret_store::SecretStore::open(SECRET_STORE)
-        .map_err(|e| BlossomError::Internal(format!("Failed to open secret store: {}", e)))?;
-
-    let secret = store
-        .get(key)
-        .ok_or_else(|| BlossomError::Internal(format!("Missing secret: {}", key)))?;
-
-    // Convert Bytes to String
-    let plaintext_bytes = secret.plaintext();
-    String::from_utf8(plaintext_bytes.to_vec())
-        .map_err(|e| BlossomError::Internal(format!("Secret is not valid UTF-8: {}", e)))
+    crate::request_bindings::secret(key)?.ok_or_else(|| BlossomError::Internal(format!("Missing secret: {key}")))
 }
 
 /// Credentials and addressing for one S3-compatible origin.
@@ -165,6 +146,30 @@ struct S3Config {
     bucket: String,
     host: String,
     region: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PilotKey {
+    id: String,
+    key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PilotCleanup {
+    eraser: PilotKey,
+    bunny_api_key: String,
+    fastly_api_token: String,
+}
+
+fn pilot_binding<T: serde::de::DeserializeOwned>(name: &str) -> Result<T> {
+    serde_json::from_str(&get_secret(name)?)
+        .map_err(|_| BlossomError::StorageError(format!("Invalid pilot credential binding {name}")))
+}
+
+fn pilot_cleanup() -> Result<PilotCleanup> {
+    pilot_binding("bunny_pilot_cleanup_v1")
 }
 
 impl S3Config {
@@ -182,7 +187,7 @@ impl S3Config {
     }
 
     fn load_gcs() -> Result<Self> {
-        Ok(S3Config {
+        Ok(Self {
             access_key: get_secret("gcs_access_key")?,
             secret_key: get_secret("gcs_secret_key")?,
             bucket: get_config("gcs_bucket")?,
@@ -1090,9 +1095,7 @@ fn try_fallback_download(
 
 /// Read a feature flag from the config store. Absent or unparseable is off.
 pub(crate) fn config_flag(key: &str) -> bool {
-    let value = fastly::config_store::ConfigStore::try_open(CONFIG_STORE)
-        .ok()
-        .and_then(|store| store.try_get(key).ok().flatten());
+    let value = optional_config(key).ok().flatten();
     parse_bool_flag(value.as_deref())
 }
 
@@ -2150,10 +2153,12 @@ fn retain_bunny_pilot_hosts() -> Result<()> {
     use fastly::kv_store::{InsertMode, KVStoreError};
     let hosts = checked_bunny_hosts(get_config(BUNNY_PILOT_HOSTS)?)?;
     let store = crate::metadata::open_store()?;
-    match store
-        .build_insert()
-        .mode(InsertMode::Add)
-        .execute(BUNNY_RETAINED_HOSTS, hosts.clone())
+    match crate::metadata::retry_throttled_write(|| {
+        store
+            .build_insert()
+            .mode(InsertMode::Add)
+            .execute(BUNNY_RETAINED_HOSTS, hosts.clone())
+    })
     {
         Ok(()) => Ok(()),
         Err(KVStoreError::ItemPreconditionFailed) => {
@@ -2184,169 +2189,59 @@ pub(crate) fn validate_bunny_pilot_publication() -> Result<()> {
             "Bunny targets differ from the retained pilot".into(),
         ));
     }
+    if pilot_cleanup()?.fastly_api_token.trim().is_empty() {
+        return Err(BlossomError::StorageError("Canonical purge credential unavailable".into()));
+    }
     bunny_pilot_purge_key()?;
+    if get_secret("bunny_pilot_worker_token")?.len() < 32 {
+        return Err(BlossomError::StorageError("Bunny worker token unavailable".into()));
+    }
     Ok(())
 }
 
-pub(crate) struct BunnyObject {
-    pub bytes: Vec<u8>,
-    pub identity: blossom_core::storage_origin::ObjectRef,
+pub(crate) fn bunny_scope() -> Result<blossom_core::bunny_worker::Scope> {
+    let primary = |key| {
+        MediaReadPolicy::parse(optional_config(key)?.as_deref(), None)
+            .map(|p| p.primary)
+            .map_err(|_| BlossomError::StorageError("Invalid Bunny source primary".into()))
+    };
+    let original = primary("media_read_primary")?;
+    let derivative = primary("derived_media_read_primary")?;
+    Ok(blossom_core::bunny_worker::Scope {
+        original,
+        derivative,
+        gcs_bucket: if [original, derivative].contains(&StorageProvider::Gcs) {
+            Some(get_config("gcs_bucket")?)
+        } else {
+            None
+        },
+        b2_bucket: get_config("b2_media_bucket")?,
+        b2_bucket_id: get_config("b2_bucket_id")?,
+        b2_region: get_config("b2_media_region")?,
+    })
 }
 
-pub(crate) fn bunny_source_location(
-    asset: &blossom_core::bunny_pilot::Asset<'_>,
-) -> Result<(StorageProvider, String)> {
-    let setting = if asset.is_original() {
-        "media_read_primary"
-    } else {
-        "derived_media_read_primary"
-    };
-    let provider = MediaReadPolicy::parse(optional_config(setting)?.as_deref(), None)
-        .map_err(|_| BlossomError::StorageError("Invalid Bunny source provider".into()))?
-        .primary;
-    let bucket_setting = match provider {
-        StorageProvider::B2 => "b2_media_bucket",
-        StorageProvider::Gcs => "gcs_bucket",
-    };
-    Ok((provider, get_config(bucket_setting)?))
-}
-
-/// Read the current authoritative primary once. Falling back could bind a stale
-/// source version to a newly ready family and double the finalization budget.
-pub(crate) fn read_bunny_object(
-    asset: &blossom_core::bunny_pilot::Asset<'_>,
-    delivery: bool,
-) -> Result<Option<BunnyObject>> {
-    let (provider, bucket, key) = if delivery {
-        (
-            StorageProvider::B2,
-            get_config("b2_media_bucket")?,
-            asset.delivery_key(),
-        )
-    } else {
-        let (provider, bucket) = bunny_source_location(asset)?;
-        (provider, bucket, asset.source_key())
-    };
-    let version_header = match provider {
-        StorageProvider::B2 => "x-amz-version-id",
-        StorageProvider::Gcs => "x-goog-generation",
-    };
-    let mut response = fetch_media_origin(provider, &key, None, false, true)
-        .map_err(MediaFetchError::into_storage_error)?;
-    if response.get_status() == StatusCode::NOT_FOUND {
-        return Ok(None);
-    }
-    let content_type = response
-        .get_header_str("Content-Type")
-        .and_then(|value| value.split(';').next());
-    let size = response
-        .get_header_str("Content-Length")
-        .and_then(|value| value.parse::<u64>().ok());
-    let Some(size) = size.filter(|size| (1..=asset.max_size() as u64).contains(size)) else {
+/// Retain every target and verify erasure capability before asking the worker to write.
+pub(crate) fn enroll_bunny_parent(hash: &str) -> Result<()> {
+    if authorize_pilot_erasure()?.bucket_name.as_deref() != Some(&get_config("b2_media_bucket")?) {
         return Err(BlossomError::StorageError(
-            "Invalid Bunny source size".into(),
+            "Bunny erasure bucket mismatch".into(),
         ));
-    };
-    if response.get_status() != StatusCode::OK
-        || !content_type.is_some_and(|mime| mime.eq_ignore_ascii_case(asset.mime()))
-        || response.contains_header("Content-Range")
-        || response
-            .get_header_str("Content-Encoding")
-            .is_some_and(|encoding| encoding != "identity")
-    {
-        return Err(BlossomError::StorageError(
-            "Invalid Bunny source response".into(),
-        ));
-    }
-    let mut bytes = Vec::with_capacity(size as usize);
-    response
-        .take_body()
-        .take(size + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| BlossomError::StorageError("Bunny source read failed".into()))?;
-    if bytes.len() as u64 != size {
-        return Err(BlossomError::StorageError(
-            "Bunny source length changed".into(),
-        ));
-    }
-    let identity = blossom_core::storage_origin::ObjectRef {
-        provider,
-        bucket,
-        key,
-        version: response.get_header_str(version_header).map(str::to_owned),
-    };
-    Ok(Some(BunnyObject { bytes, identity }))
-}
-
-/// Return false only for a definite provider rejection before upload acceptance.
-pub(crate) fn put_bunny_pilot_asset(
-    key: &str,
-    bytes: Vec<u8>,
-    sha256: &str,
-    before_send: impl FnOnce() -> Result<()>,
-) -> Result<bool> {
-    use blossom_core::bunny_pilot::{Asset, DELIVERY_PREFIX};
-    let route = key
-        .strip_prefix(DELIVERY_PREFIX)
-        .map(|path| format!("/{path}"));
-    let asset = route
-        .as_deref()
-        .and_then(Asset::parse)
-        .ok_or_else(|| BlossomError::BadRequest("Invalid Bunny delivery key".into()))?;
-    let mut config = S3Config::load_b2_media()?;
-    config.access_key = get_secret("bunny_b2_publish_key_id")?;
-    config.secret_key = get_secret("bunny_b2_publish_key")?;
-    let authorization = request_b2_authorization(&config.access_key, &config.secret_key, None)?
-        .ok_or_else(|| {
-            BlossomError::StorageError("Bunny publisher authorization unavailable".into())
-        })?;
-    let allowed = authorization.api_info.storage_api.allowed;
-    if allowed.buckets.len() != 1
-        || allowed.buckets[0].id != get_config("b2_bucket_id")?
-        || allowed.buckets[0].name.as_deref() != Some(config.bucket.as_str())
-        || allowed.name_prefix.as_deref() != Some(DELIVERY_PREFIX)
-        || allowed.capabilities != ["writeFiles"]
-    {
-        return Err(BlossomError::StorageError(
-            "Bunny publisher key has incorrect scope".into(),
-        ));
-    }
-    let url = format!("{}{}", config.endpoint(), config.object_path(key));
-    let mut request = Request::new(Method::PUT, url)
-        .with_header("Host", config.host())
-        .with_header("Content-Type", asset.mime())
-        .with_header("Content-Length", bytes.len().to_string())
-        .with_header("Cache-Control", "private, no-store");
-    request.set_pass(true);
-    request.set_body(bytes);
-    sign_request(&mut request, &config, Some(sha256.to_owned()))?;
-    if authorize_b2_vanish()?.bucket_name.as_deref() != Some(config.bucket.as_str()) {
-        return Err(BlossomError::StorageError("Bunny erasure bucket mismatch".into()));
     }
     retain_bunny_pilot_hosts()?;
-    // Retain enrollment before any PUT can escape. Revocation must distinguish
-    // this bounded pilot from unrelated blobs without a stale POP-local miss.
-    crate::metadata::open_store()?
-        .insert(&format!("{BUNNY_ENROLLED_PREFIX}{}", asset.hash()), "1")
-        .map_err(|_| BlossomError::MetadataError("Bunny enrollment record unavailable".into()))?;
-    before_send()?;
-    let response = request
-        .send(B2_MEDIA_BACKEND)
-        .map_err(|_| BlossomError::StorageError("Bunny delivery write outcome uncertain".into()))?;
-    // B2 rejects these requests before accepting an upload. Timeouts, transport
-    // failures and server errors remain uncertain and keep the writer fenced.
-    if matches!(
-        response.get_status(),
-        StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
-    ) {
-        return Ok(false);
-    }
-    if !response.get_status().is_success() {
-        return Err(BlossomError::StorageError(
-            "Bunny delivery write failed".into(),
-        ));
-    }
-    Ok(true)
+    let store = crate::metadata::open_store()?;
+    let enrollment = format!("{BUNNY_ENROLLED_PREFIX}{hash}");
+    crate::metadata::retry_throttled_write(|| store.insert(&enrollment, "1"))
+        .map_err(|_| BlossomError::MetadataError("Bunny enrollment record unavailable".into()))
+}
+
+fn authorize_pilot_erasure() -> Result<B2Authorization> {
+    let eraser = pilot_cleanup()?.eraser;
+    let authorization =
+        request_b2_authorization(&eraser.id, &eraser.key, None)?.ok_or_else(|| {
+            BlossomError::StorageError("Pilot erasure authorization unavailable".into())
+        })?;
+    validate_b2_authorization(authorization, &get_config("b2_bucket_id")?)
 }
 
 fn remove_bunny_delivery_copies(
@@ -2360,7 +2255,7 @@ fn remove_bunny_delivery_copies(
         .ok_or_else(|| BlossomError::BadRequest("Invalid Bunny revocation hash".into()))?;
     crate::bunny_ready::invalidate(hash)?;
     let prefix = asset.delivery_key();
-    let authorization = authorize_b2_vanish()?;
+    let authorization = authorize_pilot_erasure()?;
     let bucket = get_config("b2_media_bucket")?;
     if authorization.bucket_name.as_deref() != Some(bucket.as_str()) {
         return Err(BlossomError::StorageError(
@@ -2403,7 +2298,7 @@ fn remove_bunny_delivery_copies(
 }
 
 fn bunny_pilot_purge_key() -> Result<String> {
-    let key = get_secret("bunny_api_key")?;
+    let key = pilot_cleanup()?.bunny_api_key;
     if key.is_empty() {
         return Err(BlossomError::StorageError(
             "Bunny purge credential unavailable".into(),
@@ -2758,8 +2653,8 @@ pub(crate) fn invalidate_b2_cdn(hashes: &[String]) -> Result<()> {
     // Canonical Fastly cache entries are independently purgeable. Bunny
     // failure cannot leave an already-moderated blob cached on Fastly too.
     let fastly_result = match fastly {
-        Ok(true) => invalidate_fastly_cdn(hashes, true),
-        Ok(false) if bunny_configured => invalidate_fastly_cdn(hashes, false),
+        Ok(true) => invalidate_fastly_cdn(hashes, true, bunny_configured),
+        Ok(false) if bunny_configured => invalidate_fastly_cdn(hashes, false, true),
         Ok(false) => Err(BlossomError::StorageError(
             "CDN purge configuration unavailable".into(),
         )),
@@ -2805,7 +2700,7 @@ fn invalidate_bunny_pilot(hashes: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn invalidate_fastly_cdn(hashes: &[String], include_b2_hosts: bool) -> Result<()> {
+fn invalidate_fastly_cdn(hashes: &[String], include_b2_hosts: bool, bunny_configured: bool) -> Result<()> {
     let mut requests = Vec::new();
     if include_b2_hosts {
         let hosts = get_config("b2_cdn_purge_hosts")?;
@@ -2824,7 +2719,15 @@ fn invalidate_fastly_cdn(hashes: &[String], include_b2_hosts: bool) -> Result<()
             }
         }
     }
-    let token = get_secret("fastly_api_token")?;
+    let token = if bunny_configured {
+        // An invalid eraser or missing Bunny API binding cannot suppress the
+        // independently owed canonical Fastly purges.
+        #[derive(Deserialize)]
+        struct FastlyPurge { fastly_api_token: String }
+        pilot_binding::<FastlyPurge>("bunny_pilot_cleanup_v1")?.fastly_api_token
+    } else {
+        get_secret("fastly_api_token")?
+    };
     if token.is_empty() {
         return Err(BlossomError::StorageError(
             "B2 CDN purge credential unavailable".into(),

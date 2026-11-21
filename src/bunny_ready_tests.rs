@@ -1,4 +1,5 @@
 use super::*;
+use sha2::Digest;
 
 const ORIGINAL_HASH: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 const OTHER_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -26,6 +27,8 @@ fn cohort_rejects_malformed_rollouts_and_missing_geography() {
 #[test]
 #[ignore = "requires HLS loopback backends"]
 fn bunny_hls_family_contract() {
+    let fixture_parent = storage::get_config("fixture_parent").unwrap();
+    let parent = fixture_parent.as_str();
     let base = "https://media.divine.video";
     let control = |name: &str, body: &str| {
         let res = Request::post(format!("http://fixture.invalid/fixture/{name}"))
@@ -35,11 +38,10 @@ fn bunny_hls_family_contract() {
         assert_eq!(res.get_status(), StatusCode::OK);
     };
     let call = |route: &str, body: Value| {
-        control("meter", route);
         let req = Request::post(format!("{base}/admin/api/bunny-pilot/{route}"))
             .with_header("Authorization", "Bearer fixture-admin")
             .with_body(body.to_string());
-        crate::route_request(req).unwrap_or_else(|e| crate::error_response(&e))
+        crate::request_bindings::metered(req)
     };
     let inventory: Value =
         serde_json::from_str(&storage::get_config("fixture_inventory").unwrap()).unwrap();
@@ -53,7 +55,7 @@ fn bunny_hls_family_contract() {
     let finalize = |rows: &[Value]| {
         call(
             "finalize",
-            json!({"version":1,"parent":ORIGINAL_HASH,"assets":rows}),
+            json!({"version":1,"parent":parent,"assets":rows}),
         )
     };
     let child = |i: usize| json!({"path":rows[i]["path"],"sha256":rows[i]["delivery_sha256"]});
@@ -98,18 +100,17 @@ fn bunny_hls_family_contract() {
         "{}",
         response.take_body_str()
     );
-    let key = format!("bunny-ready:v1:{ORIGINAL_HASH}");
+    let key = format!("bunny-ready:v1:{parent}");
     let record = metadata::open_store()
         .unwrap()
         .lookup(&key)
         .unwrap()
         .take_body()
         .into_string();
-    control("meter", "selection");
     control("ready", &record);
-    let selection = Request::get(format!("{base}/api/bunny-playback/{ORIGINAL_HASH}"))
+    let selection = Request::get(format!("{base}/api/bunny-playback/{parent}"))
         .with_header("Fastly-Client-Country", "US");
-    let mut response = crate::route_request(selection.clone_without_body()).unwrap();
+    let mut response = crate::request_bindings::metered(selection.clone_without_body());
     assert_eq!(
         response.get_header_str("Cache-Control"),
         Some("private, no-store")
@@ -124,9 +125,8 @@ fn bunny_hls_family_contract() {
         json!([]),
         "client-controlled country header admitted playback"
     );
-    let selected = |request: &Request| {
-        super::selection(request, ORIGINAL_HASH, Some("US")).unwrap()["paths"].clone()
-    };
+    let selected =
+        |request: &Request| super::selection(request, parent, Some("US")).unwrap()["paths"].clone();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -147,16 +147,16 @@ fn bunny_hls_family_contract() {
     };
     let forward = |token: &str, original: &str| {
         let req = Request::get(format!(
-            "https://compute.fixture.example/api/bunny-playback/{ORIGINAL_HASH}"
+            "https://compute.fixture.example/api/bunny-playback/{parent}"
         ))
         .with_header("X-Original-Host", original)
         .with_header("X-Divine-Bunny-Market", token);
-        let mut res = crate::route_request(req).unwrap();
+        let mut res = crate::request_bindings::metered(req);
         assert_eq!(res.get_status(), StatusCode::OK);
         serde_json::from_str::<Value>(&res.take_body_str()).unwrap()["paths"].clone()
     };
     assert_eq!(
-        forward(&hop(ORIGINAL_HASH, "US", now), "media.divine.video")
+        forward(&hop(parent, "US", now), "media.divine.video")
             .as_array()
             .unwrap()
             .len(),
@@ -165,9 +165,9 @@ fn bunny_hls_family_contract() {
     for token in [
         "spoof".into(),
         hop(OTHER_HASH, "US", now),
-        hop(ORIGINAL_HASH, "US", now - 60),
-        hop(ORIGINAL_HASH, "US", now + 60),
-        hop(ORIGINAL_HASH, "CA", now),
+        hop(parent, "US", now - 60),
+        hop(parent, "US", now + 60),
+        hop(parent, "CA", now),
     ] {
         assert_eq!(forward(&token, "media.divine.video"), json!([]));
     }
@@ -186,7 +186,7 @@ fn bunny_hls_family_contract() {
         ("/version", json!(2)),
         ("/prefix", json!("other/")),
         ("/assets/0/source/version", json!("null")),
-        ("/assets/0/source/provider", json!("b2")),
+        ("/assets/0/source/bucket", json!("unconfigured-bucket")),
         ("/assets/0/destination_version", json!("")),
         ("/assets/0/asset/delivery_sha256", json!("invalid")),
     ] {
@@ -198,13 +198,73 @@ fn bunny_hls_family_contract() {
     control("ready", "");
     assert_eq!(selected(&selection), json!([]));
     control("ready", &record);
+    control("uploaders", "cde");
+    // Accumulate independent regressions to report all outcomes in one run.
+    let four = super::selection(&selection, parent, Some("US"))
+        .map(|value| value["paths"].clone())
+        .map_err(|e| e.status_code());
+    control("ready", "");
+    let four_missing = super::selection(&selection, parent, Some("US"))
+        .map(|value| value["paths"].clone())
+        .map_err(|e| e.status_code());
+    control("policy-status", "age_restricted");
+    let denial = super::selection(&selection, parent, Some("US"))
+        .unwrap_err()
+        .status_code();
+    control("uploaders", "cd");
+    control("ready", &record);
+    control("retire-during-read", "");
+    let stale = selected(&selection);
+    control("ready", &record);
+    control("repair", "rebuilt rendition");
+    let mut repaired = rows[6].clone();
+    repaired["source_sha256"] = json!(hex::encode(sha2::Sha256::digest(b"rebuilt rendition")));
+    let conflict = publish(&repaired, json!([])).get_status();
+    let retired = matches!(
+        metadata::open_store().unwrap().lookup(&key),
+        Err(KVStoreError::ItemNotFound)
+    );
+    control("ready", if retired { "" } else { &record });
+    let after_conflict = selected(&selection);
+    assert_eq!(
+        (
+            four,
+            four_missing,
+            denial,
+            stale,
+            conflict,
+            retired,
+            after_conflict
+        ),
+        (
+            Ok(json!([])),
+            Ok(json!([])),
+            StatusCode::NOT_FOUND,
+            json!([]),
+            StatusCode::CONFLICT,
+            true,
+            json!([])
+        )
+    );
+    control("repair", "restore-original");
+    control("ready", &record);
     control("source-version", "null");
     assert_eq!(finalize(rows).get_status(), StatusCode::CONFLICT);
     control("source-version", "123");
     control("policy-status", "age_restricted");
     assert_eq!(finalize(rows).get_status(), StatusCode::NOT_FOUND);
     assert_eq!(
-        crate::route_request(selection).unwrap().get_status(),
+        crate::request_bindings::metered(selection).get_status(),
         StatusCode::NOT_FOUND
     );
+}
+
+#[test]
+#[ignore = "requires synthetic four-uploader policy origin"]
+fn bunny_disabled_four_uploaders() {
+    let req = Request::get(format!(
+        "https://media.divine.video/api/bunny-playback/{ORIGINAL_HASH}"
+    ));
+    let value = super::selection(&req, ORIGINAL_HASH, Some("US")).unwrap();
+    assert_eq!(value["paths"], json!([]));
 }

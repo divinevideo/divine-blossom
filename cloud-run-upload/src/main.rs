@@ -2,6 +2,7 @@
 // ABOUTME: Handles Nostr auth validation, streaming upload to GCS, and SHA-256 hashing
 
 mod cleanup;
+mod bunny_worker;
 mod mp4;
 mod resumable;
 mod tasks;
@@ -406,6 +407,7 @@ async fn main() -> Result<()> {
         .route("/delete-blob", post(handle_delete_blob))
         .route("/delete-blobs", post(handle_delete_blobs))
         .route("/delete-blobs/ready", get(handle_delete_blobs_ready))
+        .route("/internal/bunny-pilot/v1", post(bunny_worker::handle))
         .route("/probe-delivery", post(handle_probe_delivery))
         .route("/delete-blob/health", get(handle_delete_blob_health))
         .route("/thumbnail/:hash", get(handle_thumbnail_generate))
@@ -828,6 +830,7 @@ async fn handle_delete_blobs_ready() -> impl IntoResponse {
         "max_hashes": MAX_BATCH_CLEANUP_HASHES,
         "deadline_seconds": cleanup::CLEANUP_REQUEST_DEADLINE.as_secs(),
         "vanish_audit": "authenticated-v1",
+        "bunny_pilot_worker": "verified-v1",
         "delivery_probe": "authenticated-v1",
     }))
 }

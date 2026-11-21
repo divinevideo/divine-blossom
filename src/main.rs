@@ -26,6 +26,7 @@ mod archive_diagnostics;
 mod rate_limit;
 mod req_id;
 mod request_log;
+mod request_bindings;
 mod storage;
 mod upload_log;
 mod viewer_auth;
@@ -128,6 +129,7 @@ fn main() -> std::result::Result<(), Error> {
 }
 
 fn handle_main(mut req: Request) -> std::result::Result<Response, Error> {
+    let _bindings = request_bindings::begin();
     playback_cache::begin_request();
     // Route Rust panics to the persistent diagnostics endpoint so a
     // non-returning guest failure still leaves a record. The message is the
@@ -7522,11 +7524,7 @@ fn add_no_cache_headers(resp: &mut Response) {
 /// by Surrogate-Key. Calls POST /service/{id}/purge/{key} on api.fastly.com
 /// for each service. Best-effort: logs errors but never fails the calling request.
 pub(crate) fn purge_edge_cache(surrogate_key: &str) {
-    let api_token = match fastly::secret_store::SecretStore::open("blossom_secrets")
-        .ok()
-        .and_then(|store| store.get("fastly_api_token"))
-        .map(|secret| String::from_utf8(secret.plaintext().to_vec()).unwrap_or_default())
-    {
+    let api_token = match storage::get_secret("fastly_api_token").ok() {
         Some(token) if !token.is_empty() => token,
         _ => {
             eprintln!("[PURGE] fastly_api_token not configured, skipping cache purge");

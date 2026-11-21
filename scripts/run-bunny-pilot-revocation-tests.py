@@ -170,12 +170,11 @@ file = "{settings}"
 format = "json"
 [local_server.secret_stores]
 blossom_secrets = [
+  {{key="b2_cdn_purge_drain_token",data="synthetic-drain-token"}},
+  {{key="webhook_secret",data="synthetic-webhook-token"}},
   {{key="admin_token",data="synthetic-admin-token"}},
-  {{key="b2_vanish_application_key_id",data="synthetic-b2-id"}},
-  {{key="b2_vanish_application_key",data="synthetic-b2-key"}},
-  {{key="bunny_api_key",data="synthetic-bunny-key"}},
-  {{key="kv_origin_read_token",data="synthetic-policy-key"}},
-  {{key="fastly_api_token",data="synthetic-fastly-key"}}
+  {{key="bunny_pilot_cleanup_v1",data='{json.dumps({"eraser":{"id":"synthetic-b2-id","key":"synthetic-b2-key"},"bunny_api_key":"synthetic-bunny-key","fastly_api_token":"synthetic-fastly-key"})}'}},
+  {{key="kv_origin_read_token",data="synthetic-policy-key"}}
 ]
 '''
 
@@ -217,6 +216,9 @@ def run(versions, resume):
                 assert Counter(entry for event, entry in server.events if event == 'delete') == Counter(versions)
                 assert server.bunny_counts == {CUSTOM_HOST: 4, ALIAS: 4}, server.events
                 assert Counter(entry for event, entry in server.events if event == 'fastly') == dict.fromkeys(FASTLY_SERVICES, 14 if resume else 8), server.events
+                for report in result.stderr.splitlines():
+                    if report.startswith("BUNNY_QUOTA "):
+                        print(report)
                 counts = [count for phase, count in server.meter if phase in ("moderate", "drain")]
                 assert max(counts) <= 32, server.meter
                 print(f"Revocation backend requests by execution: {counts}")

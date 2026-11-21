@@ -1,96 +1,68 @@
 //! Publish verified, anonymous public media to the private Bunny origin prefix.
-use crate::blossom::BlobMetadata;
 use crate::error::{BlossomError, Result};
 use crate::{admin, canary, metadata, parent_gate, storage};
-use blossom_core::bunny_pilot::Asset;
+use blossom_core::bunny_worker::{Job, Operation, Outcome, Publication, Reply, Scope};
+
 use fastly::http::{Method, StatusCode};
 use fastly::{Request, Response};
-use serde::Deserialize;
+
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
+
 use std::io::Read;
 
 const MAX_BODY: u64 = 8192;
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Dependency<'a> {
-    path: &'a str,
-    sha256: &'a str,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PublishBody<'a> {
-    path: &'a str,
-    sha256: &'a str,
-    #[serde(default, borrow)]
-    dependencies: Vec<Dependency<'a>>,
-}
-
-struct Publication<'a> {
-    asset: Asset<'a>,
-    sha256: &'a str,
-    dependencies: Vec<Dependency<'a>>,
-}
 
 pub(crate) fn invalid() -> BlossomError {
     BlossomError::BadRequest("Invalid Bunny publication request".into())
 }
 
-fn parse_publication(body: &[u8]) -> Result<Publication<'_>> {
-    let PublishBody {
-        path,
-        sha256,
-        dependencies,
-    } = serde_json::from_slice(body).map_err(|_| invalid())?;
-    let asset = Asset::parse(path).ok_or_else(invalid)?;
-    if !blossom_core::bunny_pilot::digest(sha256)
-        || (asset.is_original() && sha256 != asset.hash())
-        || dependencies.len() != asset.child_names().len()
-    {
-        return Err(invalid());
-    }
-    for child in asset.child_names() {
-        let path = format!("/{}/hls/{child}", asset.hash());
-        if !dependencies
-            .iter()
-            .any(|d| d.path == path && blossom_core::bunny_pilot::digest(d.sha256))
-        {
-            return Err(invalid());
-        }
-    }
-    Ok(Publication {
-        asset,
-        sha256,
-        dependencies,
-    })
+fn parse_publication(body: &[u8]) -> Result<Publication> {
+    let publication: Publication = serde_json::from_slice(body).map_err(|_| invalid())?;
+    publication.asset().ok_or_else(invalid)?;
+    Ok(publication)
 }
 
-pub(crate) fn verified_bytes(bytes: &[u8], sha256: &str) -> bool {
-    !bytes.is_empty() && hex::encode(Sha256::digest(bytes)) == sha256
-}
-
-fn existing_matches(bytes: Option<&[u8]>, sha256: &str) -> Result<bool> {
-    match bytes {
-        None => Ok(false),
-        Some(bytes) if verified_bytes(bytes, sha256) => Ok(true),
-        Some(_) => Err(BlossomError::Conflict(
-            "Bunny publication would replace different bytes".into(),
-        )),
+pub(crate) fn worker(scope: &Scope, operation: Operation) -> Result<Outcome> {
+    let unavailable = || BlossomError::StorageError("Bunny worker response unverified".into());
+    let job = Job {
+        scope: scope.clone(),
+        operation,
+    };
+    let mut request = Request::post(format!(
+        "https://{}/internal/bunny-pilot/v1",
+        crate::UPLOAD_SERVICE_HOST
+    ))
+    .with_header("Host", crate::UPLOAD_SERVICE_HOST)
+    .with_header(
+        "Authorization",
+        format!(
+            "Bearer {}",
+            storage::get_secret("bunny_pilot_worker_token")?
+        ),
+    )
+    .with_header("Content-Type", "application/json")
+    .with_body(serde_json::to_vec(&job).map_err(|_| invalid())?);
+    request.set_pass(true);
+    let mut response = request
+        .send(crate::UPLOAD_SERVICE_BACKEND)
+        .map_err(|_| unavailable())?;
+    if response.get_status() != StatusCode::OK {
+        return Err(unavailable());
     }
-}
-
-fn verify_public_metadata(asset: &Asset<'_>, source_len: u64) -> Result<()> {
-    let BlobMetadata {
-        mime_type, size, ..
-    } = metadata::bunny_public_metadata(asset.hash())?;
-    if asset.is_original() && (mime_type != "video/mp4" || size != source_len) {
-        return Err(BlossomError::NotFound(
-            "Bunny publication unavailable".into(),
-        ));
+    let mut bytes = Vec::new();
+    response
+        .take_body()
+        .take(32769)
+        .read_to_end(&mut bytes)
+        .map_err(|_| unavailable())?;
+    if bytes.len() > 32768 {
+        return Err(unavailable());
     }
-    Ok(())
+    let reply: Reply = serde_json::from_slice(&bytes).map_err(|_| unavailable())?;
+    if reply.scope != *scope {
+        return Err(unavailable());
+    }
+    Ok(reply.result)
 }
 
 /// A PUT with an unknown outcome keeps its fence. A settled write whose
@@ -115,90 +87,96 @@ pub(crate) fn with_gate<T>(
     result
 }
 
-fn publish(
-    Publication {
-        asset,
-        sha256,
-        dependencies,
-    }: Publication<'_>,
-) -> Result<Value> {
-    let hash = asset.hash();
-    with_gate(hash, |generation, check_gate, may_release| {
-        let source = storage::read_bunny_object(&asset, false)?
-            .ok_or_else(|| BlossomError::NotFound("Bunny publication source unavailable".into()))?;
-        if !verified_bytes(&source.bytes, sha256) {
-            return Err(BlossomError::Conflict(
-                "Bunny publication source digest changed".into(),
-            ));
-        }
-        let source_len = source.bytes.len() as u64;
-        let mut child_size = 0;
-        for dep in dependencies {
-            let child = Asset::parse(dep.path).ok_or_else(invalid)?;
-            let copy = storage::read_bunny_object(&child, true)?
-                .filter(|obj| verified_bytes(&obj.bytes, dep.sha256))
-                .ok_or_else(|| {
-                    BlossomError::Conflict(
-                        "Bunny playlist dependency unavailable or changed".into(),
-                    )
-                })?;
-            child_size = copy.bytes.len();
-        }
-        let bytes = if asset.is_playlist() {
-            blossom_core::bunny_hls::normalize(&asset, &source.bytes, child_size)
-                .ok_or_else(invalid)?
+/// Retire the current inventory while this writer still owns the gate. Transfer
+/// the durable removal even if immediate invalidation hit a provider error.
+fn queue_cleanup(parent: &str, generation: &str) -> Result<()> {
+    let retired = crate::bunny_ready::invalidate(parent);
+    parent_gate::handoff_bunny_cleanup(parent, generation)?;
+    retired
+}
+
+fn publish(publication: Publication) -> Result<Value> {
+    let asset = publication.asset().ok_or_else(invalid)?;
+    let parent = asset.hash();
+    with_gate(parent, |generation, check_gate, may_release| {
+        let policy = metadata::bunny_public_metadata(parent)?;
+        let original_size = if asset.is_original() {
+            if policy.mime_type != "video/mp4" {
+                return Err(BlossomError::NotFound("Bunny original unavailable".into()));
+            }
+            Some(policy.size)
         } else {
-            source.bytes
+            None
         };
-        let delivery_sha = hex::encode(Sha256::digest(&bytes));
-        let existing = storage::read_bunny_object(&asset, true)?;
-        let already =
-            existing_matches(existing.as_ref().map(|o| o.bytes.as_slice()), &delivery_sha)?;
-        let readback = if already {
-            Ok(())
-        } else {
-            let written = storage::put_bunny_pilot_asset(
-                &asset.delivery_key(),
-                bytes,
-                &delivery_sha,
-                || {
-                    storage::validate_bunny_pilot_publication()?;
-                    check_gate()?;
-                    verify_public_metadata(&asset, source_len)?;
-                    crate::bunny_ready::invalidate(hash)?;
-                    *may_release = false;
-                    Ok(())
-                },
-            )?;
-            if !written {
-                *may_release = true;
+        let scope = storage::bunny_scope()?;
+        storage::enroll_bunny_parent(parent)?;
+        check_gate()?;
+        // After dispatch a timeout or an unreadable reply is an uncertain PUT.
+        *may_release = false;
+        let result = worker(
+            &scope,
+            Operation::Publish {
+                publication: publication.clone(),
+                original_size,
+            },
+        )?;
+        let (already, verified) = match result {
+            Outcome::AlreadyPublished { verified } => (true, verified),
+            Outcome::Published { verified } => (false, verified),
+            Outcome::ReadbackFailed => {
+                queue_cleanup(parent, generation)?;
                 return Err(BlossomError::StorageError(
-                    "Bunny delivery write rejected".into(),
+                    "Bunny readback unverified".into(),
                 ));
             }
-            storage::read_bunny_object(&asset, true).and_then(|copy| {
-                if copy.is_some_and(|o| verified_bytes(&o.bytes, &delivery_sha)) {
-                    Ok(())
-                } else {
-                    Err(BlossomError::StorageError(
-                        "Bunny publication readback unverified".into(),
-                    ))
+            Outcome::Uncertain | Outcome::Verified { .. } => {
+                return Err(BlossomError::StorageError(
+                    "Bunny writer outcome uncertain".into(),
+                ))
+            }
+            outcome => {
+                if matches!(outcome, Outcome::DeliveryConflict) {
+                    crate::bunny_ready::invalidate(parent)?;
                 }
-            })
+                *may_release = true;
+                return Err(match outcome {
+                    Outcome::SourceChanged | Outcome::DeliveryConflict => {
+                        BlossomError::Conflict("Bunny source or delivery object changed".into())
+                    }
+                    Outcome::SourceMissing => {
+                        BlossomError::NotFound("Bunny source unavailable".into())
+                    }
+                    _ => BlossomError::StorageError("Bunny publication rejected".into()),
+                });
+            }
         };
-        if let Err(error) = check_gate()
-            .and_then(|_| verify_public_metadata(&asset, source_len))
-            .and(readback)
+        if !scope.matches(&verified)
+            || verified.asset.path != publication.path
+            || verified.asset.source_sha256 != publication.sha256
         {
-            *may_release = false;
-            parent_gate::handoff_bunny_cleanup(hash, generation)?;
-            crate::bunny_ready::invalidate(hash)?;
+            return Err(BlossomError::StorageError(
+                "Bunny worker evidence mismatched".into(),
+            ));
+        }
+        if !already {
+            crate::bunny_ready::invalidate(parent)?;
+        }
+        if let Err(error) = check_gate().and_then(|_| {
+            let policy = metadata::bunny_public_metadata(parent)?;
+            if asset.is_original()
+                && (policy.size != verified.delivery_size as u64 || policy.mime_type != "video/mp4")
+            {
+                return Err(BlossomError::NotFound("Bunny original unavailable".into()));
+            }
+            Ok(())
+        }) {
+            queue_cleanup(parent, generation)?;
             return Err(error);
         }
         *may_release = true;
-        let mut result = json!({"result": if already { "already_published" } else { "published" }});
+        let mut result = json!({"result":if already { "already_published" } else { "published" }});
         if asset.is_playlist() {
-            result["delivery_sha256"] = json!(delivery_sha);
+            result["delivery_sha256"] = json!(verified.asset.delivery_sha256);
         }
         Ok(result)
     })
@@ -268,7 +246,7 @@ mod tests {
     fn accepts_exact_path_and_digest() {
         let body = format!(r#"{{"path":"/{OTHER_HASH}/720p.mp4","sha256":"{ORIGINAL_HASH}"}}"#);
         let publication = parse_publication(body.as_bytes()).unwrap();
-        assert_eq!(publication.asset.hash(), OTHER_HASH);
+        assert_eq!(publication.asset().unwrap().hash(), OTHER_HASH);
         assert_eq!(publication.sha256, ORIGINAL_HASH);
     }
 
@@ -291,19 +269,6 @@ mod tests {
     }
 
     #[test]
-    fn requires_the_verified_digest_and_only_reuses_identical_objects() {
-        assert!(verified_bytes(b"abc", ORIGINAL_HASH));
-        assert!(!verified_bytes(b"modified", ORIGINAL_HASH));
-        assert!(!verified_bytes(b"", ORIGINAL_HASH));
-        assert!(!existing_matches(None, ORIGINAL_HASH).unwrap());
-        assert!(existing_matches(Some(b"abc"), ORIGINAL_HASH).unwrap());
-        assert!(matches!(
-            existing_matches(Some(b"modified"), ORIGINAL_HASH),
-            Err(BlossomError::Conflict(_))
-        ));
-    }
-
-    #[test]
     #[ignore = "requires loopback policy/B2/CDN backends; scripts/run-bunny-pilot-publication-tests.py"]
     fn bunny_publication_respects_authoritative_policy_and_releases_clean_attempts() {
         let case = storage::get_config("bunny_fixture_case").unwrap();
@@ -323,7 +288,7 @@ mod tests {
                 Request::post("https://media.divine.video/admin/api/bunny-pilot/publish")
                     .with_header("Authorization", format!("Bearer {token}"));
             request.set_body(json!({"path": path, "sha256": ORIGINAL_HASH}).to_string());
-            let response = crate::route_request(request).unwrap();
+            let response = crate::request_bindings::metered(request);
             assert_eq!(
                 response.get_header_str("Cache-Control"),
                 Some("private, no-store")
@@ -335,7 +300,13 @@ mod tests {
             "active" | "active_rendition" | "appeal" => StatusCode::OK,
             "webhook_token" => StatusCode::UNAUTHORIZED,
             "checksum_mismatch" => StatusCode::CONFLICT,
-            "unverified_retry" | "rejected_put" | "uncertain_put" => StatusCode::BAD_GATEWAY,
+            "unverified_retry"
+            | "rejected_put"
+            | "uncertain_put"
+            | "wrong_writer_scope"
+            | "wrong_worker_primary"
+            | "lost_worker_reply"
+            | "invalid_worker_evidence" => StatusCode::BAD_GATEWAY,
             "pending" | "age_restricted" | "age_gate_after_put" | "disabled" => {
                 StatusCode::NOT_FOUND
             }
@@ -375,7 +346,7 @@ mod tests {
                 let request =
                     Request::post("https://media.divine.video/admin/api/b2-cdn-purge/drain?max=1")
                         .with_header("Authorization", "Bearer fixture-admin");
-                let mut retry = crate::route_request(request).unwrap();
+                let mut retry = crate::request_bindings::metered(request);
                 assert_eq!(retry.get_status(), StatusCode::OK);
                 let reply: Value = serde_json::from_str(&retry.take_body_str()).unwrap();
                 assert_eq!(reply["result"], u8::from(i == attempts));
@@ -396,7 +367,7 @@ mod tests {
                     let request = Request::post("https://media.divine.video/admin/api/moderate")
                         .with_header("Authorization", "Bearer fixture-admin")
                         .with_body(json!({"sha256": ORIGINAL_HASH, "action": action}).to_string());
-                    let mut response = crate::route_request(request).unwrap();
+                    let mut response = crate::request_bindings::metered(request);
                     assert_eq!(response.get_status(), StatusCode::OK);
                     let body: Value = serde_json::from_str(&response.take_body_str()).unwrap();
                     assert_eq!(body["new_status"], status);
@@ -422,7 +393,7 @@ mod tests {
                         "https://media.divine.video/admin/api/b2-cdn-purge/drain?max=1",
                     )
                     .with_header("Authorization", "Bearer fixture-admin");
-                    let mut response = crate::route_request(request).unwrap();
+                    let mut response = crate::request_bindings::metered(request);
                     assert_eq!(response.get_status(), StatusCode::OK);
                     let body: Value = serde_json::from_str(&response.take_body_str()).unwrap();
                     assert_eq!(body["errors"], 0);
@@ -442,7 +413,10 @@ mod tests {
                 gate,
                 Err(fastly::kv_store::KVStoreError::ItemNotFound)
             ));
-        } else if case == "uncertain_put" {
+        } else if matches!(
+            case.as_str(),
+            "uncertain_put" | "lost_worker_reply" | "invalid_worker_evidence"
+        ) {
             let mut gate = gate.unwrap();
             let Some(parent_gate::Gate::Copying { attempt_id }) =
                 parent_gate::parse(&gate.take_body().into_bytes())

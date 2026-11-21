@@ -1,42 +1,14 @@
 //! Verified playback inventory. Only the finalizer writes a ready record.
-use crate::bunny_publish::{invalid, reply, verified_bytes, with_gate};
+use crate::bunny_publish::{invalid, reply, with_gate};
 use crate::error::{BlossomError, Result};
 use crate::{metadata, storage};
-use blossom_core::bunny_pilot::{
-    digest, zone_hosts, Asset, DELIVERY_HOST, DELIVERY_PREFIX, HLS_PATHS,
-};
-use blossom_core::storage_origin::{ObjectRef, StorageProvider};
+use blossom_core::bunny_pilot::{digest, zone_hosts, Asset, DELIVERY_HOST, DELIVERY_PREFIX};
+use blossom_core::bunny_worker::{complete, Inventory, Operation, Outcome, Verified};
 use fastly::http::{Method, StatusCode};
 use fastly::kv_store::KVStoreError;
 use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet};
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Pin {
-    path: String,
-    source_sha256: String,
-    delivery_sha256: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Inventory {
-    version: u8,
-    parent: String,
-    assets: Vec<Pin>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Verified {
-    asset: Pin,
-    source: ObjectRef,
-    destination_version: String,
-    delivery_size: usize,
-}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -49,46 +21,13 @@ struct Ready {
     assets: Vec<Verified>,
 }
 
-fn complete<'a>(parent: &str, pins: impl Iterator<Item = &'a Pin>) -> bool {
-    let mut suffixes = BTreeSet::new();
-    for pin in pins {
-        let Some(asset) = Asset::parse(&pin.path) else {
-            return false;
-        };
-        if asset.hash() != parent
-            || !digest(&pin.source_sha256)
-            || !digest(&pin.delivery_sha256)
-            || (asset.is_original() && pin.source_sha256 != parent)
-            || (!asset.is_playlist() && pin.source_sha256 != pin.delivery_sha256)
-            || !suffixes.insert(asset.suffix())
-        {
-            return false;
-        }
-    }
-    !suffixes.is_empty()
-        && suffixes.len() <= 8
-        && (!suffixes.iter().any(|s| s.starts_with("hls/"))
-            || HLS_PATHS.iter().all(|s| suffixes.contains(s)))
-}
-
-fn version_valid(provider: StorageProvider, value: &str) -> bool {
-    match provider {
-        StorageProvider::Gcs => crate::parent_gate::generation(value).is_some(),
-        StorageProvider::B2 => {
-            (1..=1024).contains(&value.len())
-                && value != "null"
-                && !value.contains("://")
-                && value.bytes().all(|b| b.is_ascii_graphic())
-        }
-    }
-}
-
 fn key(parent: &str) -> String {
     format!("bunny-ready:v1:{parent}")
 }
 
 pub(crate) fn invalidate(parent: &str) -> Result<()> {
-    match metadata::open_store()?.delete(&key(parent)) {
+    let store = metadata::open_store()?;
+    match metadata::retry_throttled_write(|| store.delete(&key(parent))) {
         Ok(()) | Err(KVStoreError::ItemNotFound) => Ok(()),
         Err(_) => Err(BlossomError::MetadataError(
             "Bunny readiness invalidation failed".into(),
@@ -101,90 +40,84 @@ fn changed() -> BlossomError {
 }
 
 pub(crate) fn finalize(body: &[u8]) -> Result<Value> {
-    let mut inventory: Inventory = serde_json::from_slice(body).map_err(|_| invalid())?;
+    let inventory: Inventory = serde_json::from_slice(body).map_err(|_| invalid())?;
     let parent = &inventory.parent;
     if inventory.version != 1 || !complete(parent, inventory.assets.iter()) {
         return Err(invalid());
     }
-    // Segment sizes must be known before validating byte ranges in playlists.
-    inventory
-        .assets
-        .sort_by_key(|pin| pin.path.ends_with(".m3u8"));
-    with_gate(parent, |_, check_gate, _| {
-        invalidate(parent)?;
-        let hosts = storage::get_config("bunny_pilot_zone_hosts")?;
-        if !storage::bunny_pilot_enrolled(parent)?
-            || storage::origin_bunny_pilot_hosts()?.as_deref() != Some(&hosts)
-        {
-            return Err(changed());
-        }
-        let bucket = storage::get_config("b2_media_bucket")?;
-        let mut assets = Vec::new();
-        let mut sizes = BTreeMap::new();
-        let mut original_size = None;
-        for pin in inventory.assets {
-            let asset = Asset::parse(&pin.path).ok_or_else(invalid)?;
-            let source = storage::read_bunny_object(&asset, false)?.ok_or_else(changed)?;
-            let copy = storage::read_bunny_object(&asset, true)?.ok_or_else(changed)?;
-            let version = copy
-                .identity
-                .version
-                .filter(|v| version_valid(StorageProvider::B2, v))
-                .ok_or_else(changed)?;
-            if !source
-                .identity
-                .version
-                .as_ref()
-                .is_some_and(|v| version_valid(source.identity.provider, v))
-                || !verified_bytes(&source.bytes, &pin.source_sha256)
-                || !verified_bytes(&copy.bytes, &pin.delivery_sha256)
-            {
-                return Err(changed());
+    with_gate(parent, |_, check_gate, may_release| {
+        let verified = verify_family(&inventory, check_gate);
+        let ready = match verified {
+            Ok(ready) => ready,
+            Err(error) => {
+                *may_release = false;
+                check_gate()?;
+                invalidate(parent)?;
+                *may_release = true;
+                return Err(error);
             }
-            if asset.is_playlist() {
-                let size = match asset.child_names() {
-                    [child] => *sizes
-                        .get(&format!("/{parent}/hls/{child}"))
-                        .ok_or_else(changed)?,
-                    _ => 0,
-                };
-                let normalized = blossom_core::bunny_hls::normalize(&asset, &source.bytes, size)
-                    .ok_or_else(changed)?;
-                if normalized != copy.bytes {
-                    return Err(changed());
-                }
-            }
-            if asset.is_original() {
-                original_size = Some(source.bytes.len() as u64);
-            }
-            sizes.insert(pin.path.clone(), copy.bytes.len());
-            assets.push(Verified {
-                asset: pin,
-                source: source.identity,
-                destination_version: version,
-                delivery_size: copy.bytes.len(),
-            });
-        }
-        check_gate()?;
-        let policy = metadata::bunny_public_metadata(parent)?;
-        if original_size.is_some_and(|n| policy.size != n || policy.mime_type != "video/mp4") {
-            return Err(changed());
-        }
-        let ready = Ready {
-            version: 1,
-            parent: parent.to_owned(),
-            bucket,
-            hosts,
-            prefix: DELIVERY_PREFIX.to_owned(),
-            assets,
         };
-        metadata::open_store()?
-            .insert(
-                &key(parent),
-                serde_json::to_vec(&ready).map_err(|_| invalid())?,
-            )
+        let store = metadata::open_store()?;
+        let body = serde_json::to_vec(&ready).map_err(|_| invalid())?;
+        // On an uncertain overwrite, keep exclusion until the operator verifies
+        // which readiness is durable. Never expose an earlier inventory.
+        *may_release = false;
+        metadata::retry_throttled_write(|| store.insert(&key(parent), body.clone()))
             .map_err(|_| BlossomError::MetadataError("Bunny readiness write failed".into()))?;
+        *may_release = true;
         Ok(json!({"result":"ready"}))
+    })
+}
+
+fn verify_family(inventory: &Inventory, check_gate: &dyn Fn() -> Result<()>) -> Result<Ready> {
+    let parent = &inventory.parent;
+    metadata::bunny_public_metadata(parent)?;
+    let hosts = storage::get_config("bunny_pilot_zone_hosts")?;
+    if !storage::bunny_pilot_enrolled(parent)?
+        || storage::origin_bunny_pilot_hosts()?.as_deref() != Some(&hosts)
+    {
+        return Err(changed());
+    }
+    let scope = storage::bunny_scope()?;
+    let assets = match crate::bunny_publish::worker(
+        &scope,
+        Operation::Finalize {
+            inventory: inventory.clone(),
+        },
+    )? {
+        Outcome::Verified { assets } => assets,
+        Outcome::SourceChanged | Outcome::SourceMissing | Outcome::DeliveryConflict => {
+            return Err(changed())
+        }
+        _ => {
+            return Err(BlossomError::StorageError(
+                "Bunny verification unavailable".into(),
+            ))
+        }
+    };
+    if assets.len() != inventory.assets.len()
+        || !complete(parent, assets.iter().map(|v| &v.asset))
+        || !assets
+            .iter()
+            .all(|v| scope.matches(v) && inventory.assets.contains(&v.asset))
+    {
+        return Err(changed());
+    }
+    check_gate()?;
+    let policy = metadata::bunny_public_metadata(parent)?;
+    if assets.iter().any(|v| {
+        Asset::parse(&v.asset.path).is_some_and(|a| a.is_original())
+            && (policy.size != v.delivery_size as u64 || policy.mime_type != "video/mp4")
+    }) {
+        return Err(changed());
+    }
+    Ok(Ready {
+        version: 1,
+        parent: parent.clone(),
+        bucket: scope.b2_bucket,
+        hosts,
+        prefix: DELIVERY_PREFIX.to_owned(),
+        assets,
     })
 }
 
@@ -233,29 +166,16 @@ fn read_paths(parent: &str) -> Result<Vec<(String, usize)>> {
     {
         return Ok(Vec::new());
     }
+    let scope = storage::bunny_scope()?;
     let mut paths = Vec::new();
     for v in ready.assets {
         let asset = Asset::parse(&v.asset.path).ok_or_else(invalid)?;
-        let (provider, bucket) = storage::bunny_source_location(&asset)?;
-        if v.source.provider != provider
-            || v.source.bucket != bucket
-            || v.source.key != asset.source_key()
-            || !v
-                .source
-                .version
-                .as_ref()
-                .is_some_and(|s| version_valid(provider, s))
-            || !(1..=asset.max_size()).contains(&v.delivery_size)
-            || !version_valid(StorageProvider::B2, &v.destination_version)
-        {
+        if !scope.matches(&v) {
             return Ok(Vec::new());
         }
         if asset.is_top_level() {
             paths.push((v.asset.path, v.delivery_size));
         }
-    }
-    if !crate::parent_gate::bunny_settled(parent)? {
-        paths.clear();
     }
     Ok(paths)
 }
@@ -269,20 +189,30 @@ fn selection(req: &Request, parent: &str, country: Option<&str>) -> Result<Value
             storage::optional_config("bunny_playback_countries")?.as_deref(),
             country,
         );
-    let paths = if selected {
+    let before = if selected {
+        crate::parent_gate::bunny_settled_generation(parent)?
+    } else {
+        None
+    };
+    let candidates = if before.is_some() {
         read_paths(parent)
     } else {
         Ok(Vec::new())
     };
-    let policy = metadata::bunny_public_metadata(parent)?;
-    let paths: Vec<String> = paths?
-        .into_iter()
-        .filter_map(|(path, size)| {
-            let original = Asset::parse(&path)?.is_original();
-            (!original || (policy.mime_type == "video/mp4" && policy.size == size as u64))
-                .then_some(path)
-        })
-        .collect();
+    let policy = metadata::bunny_playback_policy(parent)?;
+    let mut paths = Vec::new();
+    if let (Some(policy), Some(before)) = (policy, before) {
+        let candidates = candidates?;
+        if !candidates.is_empty()
+            && crate::parent_gate::bunny_settled_generation(parent)?.as_ref() == Some(&before)
+        {
+            paths.extend(candidates.into_iter().filter_map(|(path, size)| {
+                let original = Asset::parse(&path)?.is_original();
+                (!original || (policy.mime_type == "video/mp4" && policy.size == size as u64))
+                    .then_some(path)
+            }));
+        }
+    }
     Ok(json!({"version":1,"host":DELIVERY_HOST,"paths":paths}))
 }
 

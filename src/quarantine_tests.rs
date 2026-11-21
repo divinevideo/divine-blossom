@@ -694,6 +694,24 @@ fn unavailable_config_store_cannot_disable_durable_eviction() {
 #[test]
 #[ignore = "requires synthetic B2 and Bunny providers; scripts/run-bunny-pilot-revocation-tests.py"]
 fn bunny_pilot_age_gate_eviction_retries() {
+    // Viceroy does not rate-limit writes. Inject the provider's 1/s rejection
+    // before executing a real generation-conditional insert.
+    let throttle_store = open_store().unwrap();
+    let throttle_key = "fixture-bunny-kv-throttle";
+    throttle_store.insert(throttle_key, "before").unwrap();
+    let observed = throttle_store.lookup(throttle_key).unwrap().current_generation();
+    let written = std::time::Instant::now();
+    let mut attempts = 0;
+    crate::metadata::retry_throttled_write(|| {
+        attempts += 1;
+        if written.elapsed() < std::time::Duration::from_secs(1) {
+            return Err(fastly::kv_store::KVStoreError::TooManyRequests);
+        }
+        throttle_store.build_insert().if_generation_match(observed).execute(throttle_key,"after")
+    }).unwrap();
+    assert_eq!(attempts, 2);
+    assert_eq!(throttle_store.lookup(throttle_key).unwrap().take_body().into_string(), "after");
+
     let hash = hash();
     let metadata = serde_json::from_value(serde_json::json!({
         "sha256": hash, "size": 9, "type": "video/mp4", "uploaded": "2026-01-01T00:00:00Z",
@@ -719,10 +737,9 @@ fn bunny_pilot_age_gate_eviction_retries() {
             .unwrap();
         assert_eq!(response.get_status(), StatusCode::OK);
     };
-    meter("moderate");
     let mut moderate = request(Method::POST, "/admin/api/moderate", true);
     moderate.set_body(serde_json::json!({"sha256": hash, "action": "AGE_RESTRICT"}).to_string());
-    assert_eq!(call(moderate).get_status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(crate::request_bindings::metered(moderate).get_status(), StatusCode::BAD_GATEWAY);
     assert_eq!(
         get_blob_metadata_uncached(&hash).unwrap().unwrap().status,
         BlobStatus::AgeRestricted
@@ -753,12 +770,9 @@ fn bunny_pilot_age_gate_eviction_retries() {
     // Four version deletes per execution. The first verified empty listing
     // reaches the configured transient purge failure and stays pending.
     for _ in 0..6 {
-        meter("drain");
-        let mut retry = call(request(
-            Method::POST,
-            "/admin/api/b2-cdn-purge/drain?max=1",
-            true,
-        ));
+        let req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=1", false)
+            .with_header("Authorization", "Bearer synthetic-webhook-token");
+        let mut retry = crate::request_bindings::metered(req);
         assert_eq!(retry.get_status(), StatusCode::OK);
         let reply: serde_json::Value = serde_json::from_str(&retry.take_body_str()).unwrap();
         if reply["result"] == 1 {

@@ -2,6 +2,8 @@
 """Exercise Bunny publication with synthetic policy, storage, and CDN backends."""
 
 from base64 import b64encode
+from contextlib import closing, contextmanager
+from http.client import HTTPConnection
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -11,6 +13,7 @@ import shlex
 import subprocess
 import tempfile
 import threading
+import time
 from urllib.parse import parse_qs, urlsplit
 
 
@@ -23,46 +26,45 @@ PREFIX = "bunny-delivery/"
 CDN_HOSTS = ("media-bunny.divine.video", "fixture-pilot.b-cdn.net")
 B2_API_HOST = "api.backblazeb2.com"
 KV_BASE = "/resources/stores/kv/fixture-store/keys/"
-CASES = ("hls_family", "active", "active_rendition", "pending", "age_restricted", "checksum_mismatch",
+CASES = ("hls_family", "disabled_four", "active", "active_rendition", "pending", "age_restricted", "checksum_mismatch",
          "age_gate_after_put", "appeal", "unverified_retry", "rejected_put", "uncertain_put",
-         "disabled", "webhook_token")
+         "disabled", "webhook_token", "wrong_writer_scope", "lost_worker_reply", "invalid_worker_evidence", "wrong_worker_primary")
 SECRETS = {
     "bunny_playback_geo_key": "synthetic-test-key-with-32-or-more-bytes",
+    "bunny_pilot_worker_token": "synthetic-private-worker-token-at-least-32-characters",
     "admin_token": "fixture-admin",
     "webhook_secret": "fixture-webhook",
-    "gcs_access_key": "fixture-gcs-id",
-    "gcs_secret_key": "fixture-gcs-key",
-    "b2_media_access_key": "fixture-reader-id",
-    "b2_media_secret_key": "fixture-reader-key",
-    "bunny_b2_publish_key_id": "fixture-writer-id",
-    "bunny_b2_publish_key": "fixture-writer-key",
-    "b2_vanish_application_key_id": "fixture-eraser-id",
-    "b2_vanish_application_key": "fixture-eraser-key",
-    "bunny_api_key": "fixture-purge",
-    "fastly_api_token": "fixture-fastly-purge",
+    "bunny_pilot_readers_v1": {"b2": {"id":"fixture-reader-id", "key":"fixture-reader-key"},
+                              "gcs": {"id":"fixture-gcs-id", "key":"fixture-gcs-key"}},
+    "bunny_pilot_writer_v1": {"id":"fixture-writer-id", "key":"fixture-writer-key"},
+    "bunny_pilot_cleanup_v1": {"eraser":{"id":"fixture-eraser-id", "key":"fixture-eraser-key"},
+                              "bunny_api_key":"fixture-purge", "fastly_api_token":"fixture-fastly-purge"},
     "kv_origin_read_token": "fixture-policy-reader",
 }
 
 
-def family():
+def family(derived_bucket, maximum):
     source = {}
     root = f"/{HASH}/hls/"
     master = "#EXTM3U\n#EXT-X-VERSION:4\n"
     for r in ("720p", "480p"):
-        source[root + f"stream_{r}.ts"] = (r.encode() * 47, "video/mp2t")
+        source[root + f"stream_{r}.ts"] = (b"t" * (16 * 1024 * 1024) if maximum else r.encode() * 47, "video/mp2t")
     for r in ("720p", "480p"):
         playlist = (f"#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-TARGETDURATION:6\n#EXT-X-PLAYLIST-TYPE:VOD\n"
-                    f"#EXTINF:5.980,\n#EXT-X-BYTERANGE:188@0\n{root}stream_{r}.ts\n#EXT-X-ENDLIST\n")
+                    f"#EXTINF:5.980,\n#EXT-X-BYTERANGE:{len(source[root + f'stream_{r}.ts'][0])}@0\n{root}stream_{r}.ts\n#EXT-X-ENDLIST\n")
         source[root + f"stream_{r}.m3u8"] = (playlist.encode(), "application/vnd.apple.mpegurl")
         master += f"#EXT-X-STREAM-INF:BANDWIDTH=1000\n{root}stream_{r}.m3u8\n"
     source[root + "master.m3u8"] = (master.encode(), "application/vnd.apple.mpegurl")
     for path in (f"/{HASH}", f"/{HASH}/720p.mp4", f"/{HASH}/480p.mp4"):
         source[path] = (BODY, "video/mp4")
+    # Normal-size media must never be hashed or transported through Compute.
+    source[f"/{HASH}/480p.mp4"] = (b"s" * (16 * 1024 * 1024), "video/mp4")
     inventory, objects, destinations = [], {}, {}
     for path, (body, mime) in source.items():
         delivery = body.replace(root.encode(), b"") if path.endswith(".m3u8") else body
         source_key = path.replace("/720p.mp4", "/hls/stream_720p.mp4").replace("/480p.mp4", "/hls/stream_480p.mp4")
-        objects[f"/fixture-gcs{source_key}"] = (body, mime)
+        source_bucket = BUCKET if path == f"/{HASH}" else derived_bucket
+        objects[f"/{source_bucket}{source_key}"] = (body, mime)
         destinations[f"/{BUCKET}/{PREFIX}{path[1:]}"] = (delivery, mime)
         inventory.append({"path": path, "source_sha256": hashlib.sha256(body).hexdigest(),
                           "delivery_sha256": hashlib.sha256(delivery).hexdigest()})
@@ -76,7 +78,7 @@ def basic(key_type):
 
 class Origin(BaseHTTPRequestHandler):
     def log_message(self, *_args):
-        if self.server.case == "hls_family" and not self.path.startswith("/fixture/"):
+        if not self.path.startswith("/fixture/") and self.headers.get("User-Agent") != "divine-bunny-worker/1":
             self.server.meter[-1][1] += 1
 
     def reply(self, status, body=b"", headers=None):
@@ -98,16 +100,27 @@ class Origin(BaseHTTPRequestHandler):
             assert self.headers.get("Fastly-Key") == SECRETS["kv_origin_read_token"]
             key = self.path.removeprefix(KV_BASE)
             if key == f"b2-sync:v1:{HASH}":
+                if self.server.ready_generation:
+                    return self.reply_json({"state":"released","version":1,"settled_attempt_id":"fixture-published",
+                        "released_from_generation":"1"}, {"generation":str(self.server.ready_generation)})
                 return self.reply(404)
             if key == "bunny-pilot-retained-hosts:v1":
                 return self.reply(200, ",".join(CDN_HOSTS).encode(), {"generation": "1"})
             if key == f"bunny-pilot-enrolled:v1:{HASH}":
                 return self.reply(200, b"1", {"generation": "1"})
-            if self.server.case == "hls_family":
+            if self.server.case in ("hls_family","disabled_four"):
                 if key == f"bunny-ready:v1:{HASH}":
-                    return self.reply(200, self.server.ready, {"generation": "1"}) if self.server.ready else self.reply(404)
+                    captured = self.server.ready
+                    if self.server.retire_during_read:
+                        # The read captured a prior inventory. Before returning it, removal
+                        # completed and an appeal is active under a newer released gate.
+                        self.server.ready = None
+                        self.server.ready_generation += 1
+                        self.server.policy_status = "active"
+                        self.server.retire_during_read = False
+                    return self.reply(200, captured, {"generation":"1"}) if captured else self.reply(404)
                 if key == f"refs:{HASH}":
-                    return self.reply_json(["c" * 64, "d" * 64], {"generation": "1"})
+                    return self.reply_json([c * 64 for c in self.server.uploaders], {"generation":"1"})
                 if key.startswith("vanish_in_progress:v1:"):
                     return self.reply(404)
             if key != f"blob:{HASH}":
@@ -134,9 +147,10 @@ class Origin(BaseHTTPRequestHandler):
                 "apiUrl": f"https://{B2_API_HOST}",
                 "allowed": {"buckets": [{"id": BUCKET_ID, "name": BUCKET}],
                             "namePrefix": PREFIX if is_writer else None,
-                            "capabilities": ["writeFiles"] if is_writer else ["listFiles", "deleteFiles"]},
+                            "capabilities": (["writeFiles","listFiles"] if self.server.case == "wrong_writer_scope" else ["writeFiles"]) if is_writer else ["listFiles", "deleteFiles"]},
             }}})
 
+        assert self.headers.get("User-Agent") == "divine-bunny-worker/1"
         reader = "fixture-gcs-id" if self.path.startswith("/fixture-gcs/") else "fixture-reader-id"
         assert f"Credential={reader}/" in self.headers.get("Authorization", "")
         self.server.events.append(("read", self.path))
@@ -144,7 +158,7 @@ class Origin(BaseHTTPRequestHandler):
             if self.path not in self.server.objects:
                 return self.reply(404)
             body, mime = self.server.objects[self.path]
-            return self.reply(200, body, {"Content-Type": mime, **({"x-goog-generation": self.server.source_version} if reader == "fixture-gcs-id" else {"x-amz-version-id":"fixture-version-1"})})
+            return self.reply(200, body, {"Content-Type": mime, **({"x-goog-generation": self.server.source_version} if reader == "fixture-gcs-id" else {"x-amz-version-id": "fixture-version-1" if self.path in self.server.destinations else self.server.source_version})})
         if self.path == f"/{BUCKET}/{self.server.source_key}":
             body = b"wrong bytes" if self.server.case == "checksum_mismatch" else BODY
         else:
@@ -154,9 +168,10 @@ class Origin(BaseHTTPRequestHandler):
                 return self.reply(503)
         if body is None:
             return self.reply(404)
-        return self.reply(200, body, {"Content-Type": "video/mp4"})
+        return self.reply(200, body, {"Content-Type": "video/mp4", "x-amz-version-id": "fixture-version-1"})
 
     def do_PUT(self):
+        assert self.headers.get("User-Agent") == "divine-bunny-worker/1"
         if self.server.case == "hls_family":
             body, mime = self.server.destinations[self.path]
             assert self.path not in self.server.objects
@@ -164,7 +179,7 @@ class Origin(BaseHTTPRequestHandler):
             assert self.headers.get("x-amz-content-sha256") == hashlib.sha256(body).hexdigest()
             assert "Credential=fixture-writer-id/" in self.headers.get("Authorization", "")
             self.server.objects[self.path] = (body, mime)
-            return self.reply(200)
+            return self.reply(200, headers={"x-amz-version-id": "fixture-version-1"})
         assert self.path == f"/{BUCKET}/{self.server.delivery_key}"
         assert "Credential=fixture-writer-id/" in self.headers.get("Authorization", "")
         assert self.headers.get("x-amz-content-sha256") == HASH
@@ -177,17 +192,45 @@ class Origin(BaseHTTPRequestHandler):
             return self.reply(403 if self.server.case == "rejected_put" else 503)
         self.server.events.append(("put", self.path))
         self.server.delivered = body
-        self.reply(200)
+        self.reply(200, headers={"x-amz-version-id": "fixture-version-1"})
 
     def do_POST(self):
         parsed = urlsplit(self.path)
+        if parsed.path == "/internal/bunny-pilot/v1":
+            assert self.headers.get("Authorization") == "Bearer " + SECRETS["bunny_pilot_worker_token"]
+            body = self.read_body()
+            with closing(HTTPConnection("127.0.0.1", self.server.worker_port, timeout=90)) as worker:
+                worker.request("POST", parsed.path, body, {"Authorization": self.headers["Authorization"]})
+                started = time.monotonic()
+                response = worker.getresponse()
+                payload = response.read()
+                self.server.worker_times.append((json.loads(body)["operation"]["operation"],time.monotonic() - started))
+                if self.server.case == "lost_worker_reply":
+                    return self.reply(503)
+                if self.server.case == "invalid_worker_evidence":
+                    evidence = json.loads(payload)
+                    evidence["result"]["verified"]["source"]["key"] = "outside-scope"
+                    payload = json.dumps(evidence).encode()
+                return self.reply(response.status, payload, {"Content-Type":"application/json"})
         if parsed.path == "/fixture/meter":
             self.server.meter.append([self.read_body().decode(), 0])
+            return self.reply(200)
+        if parsed.path == "/fixture/uploaders":
+            self.server.uploaders = self.read_body().decode()
+            return self.reply(200)
+        if parsed.path == "/fixture/retire-during-read":
+            self.server.retire_during_read = True
+            return self.reply(200)
+        if parsed.path == "/fixture/repair":
+            key = f"/{self.server.derived_bucket}/{HASH}/hls/stream_720p.mp4"
+            body = self.read_body()
+            self.server.objects[key] = (BODY if body == b"restore-original" else body, "video/mp4")
             return self.reply(200)
         if parsed.path == "/fixture/source-version":
             self.server.source_version = self.read_body().decode()
             return self.reply(200)
         if parsed.path == "/fixture/ready":
+            self.server.ready_generation = 10
             self.server.ready = self.read_body()
             return self.reply(200)
         if parsed.path == "/fixture/policy-status":
@@ -199,12 +242,12 @@ class Origin(BaseHTTPRequestHandler):
         if parsed.path.startswith("/service/"):
             assert self.server.case in ("appeal", "unverified_retry", "age_gate_after_put")
             assert parsed.path.endswith("/purge")
-            assert self.headers.get("Fastly-Key") == SECRETS["fastly_api_token"]
+            assert self.headers.get("Fastly-Key") == SECRETS["bunny_pilot_cleanup_v1"]["fastly_api_token"]
             assert self.headers.get("Surrogate-Key") == HASH
             return self.reply_json({HASH: "fixture-purge-id"})
 
         if parsed.path == "/purge":
-            assert self.headers.get("AccessKey") == SECRETS["bunny_api_key"]
+            assert self.headers.get("AccessKey") == SECRETS["bunny_pilot_cleanup_v1"]["bunny_api_key"]
             target = parse_qs(parsed.query)["url"][0]
             assert target in {f"https://{host}/{HASH}*" for host in CDN_HOSTS}
             assert self.server.delivered is None, "Purge must follow replica deletion"
@@ -240,9 +283,11 @@ def assert_case(server, case):
             counts = [n for name, n in server.meter if name == operation]
             assert max(counts) <= 32, server.meter
             print(f"Maximum {operation} backend requests: {max(counts)}")
+    elif case in ("lost_worker_reply","invalid_worker_evidence"):
+        assert actions.count("put") == 1 and server.delivered == BODY, events
     elif case in ("active", "active_rendition"):
         assert actions.count("put") == 1 and server.delivered == BODY, events
-        assert [status for name, status in events if name == "policy"] == ["active"] * 3, events
+        assert [status for name, status in events if name == "policy"] == ["active"] * 4, events
         assert not any(action in actions for action in ("delete", "purge")), events
     elif case == "age_gate_after_put":
         critical = [(name, value) for name, value in events if name != "read"]
@@ -274,16 +319,65 @@ def assert_case(server, case):
             assert [(name, value) for name, value in events if name == "policy"] == [("policy", case)], events
 
 
+@contextmanager
+def native_worker(executable, directory, server, bindings):
+    port_file = directory / "worker.port"
+    port_file.unlink(missing_ok=True)
+    env = dict(os.environ, BUNNY_PILOT_WORKER_TOKEN=SECRETS["bunny_pilot_worker_token"],
+               BUNNY_ORIGINAL_PRIMARY="gcs" if server.case == "wrong_worker_primary" else "b2", BUNNY_DERIVED_PRIMARY="b2" if server.derived_bucket == BUCKET else "gcs",
+               B2_MEDIA_BUCKET=BUCKET, B2_BUCKET_ID=BUCKET_ID, B2_REGION="us-west-004", GCS_BUCKET="fixture-gcs",
+               BUNNY_PILOT_READERS_V1=json.dumps(bindings["bunny_pilot_readers_v1"]),
+               BUNNY_PILOT_WRITER_V1=json.dumps(bindings["bunny_pilot_writer_v1"]),
+               BUNNY_TEST_ORIGIN=f"http://127.0.0.1:{server.server_port}", BUNNY_TEST_PORT_FILE=str(port_file))
+    proc = subprocess.Popen([executable, "bunny_worker::tests::serve_fixture", "--exact", "--ignored"],
+                            env=env, stdout=subprocess.DEVNULL)
+    try:
+        for _ in range(100):
+            if port_file.exists() and port_file.read_text():
+                server.worker_port = int(port_file.read_text())
+                break
+            if proc.poll() is not None:
+                raise RuntimeError("fixture worker exited before listening")
+            time.sleep(0.05)
+        else:
+            raise RuntimeError("fixture worker did not start")
+        yield
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
 def run(server, repo, directory):
+    global BODY, HASH
+    build = subprocess.run(["cargo","test","--locked","--manifest-path","cloud-run-upload/Cargo.toml","--no-run","--message-format=json"],
+                           cwd=repo,check=True,capture_output=True,text=True)
+    executable = next(obj["executable"] for line in build.stdout.splitlines()
+                      if (obj := json.loads(line)).get("executable"))
     settings, kv, config = (directory / name for name in ("settings.json", "kv.json", "fastly.toml"))
     dynamic_b2 = f"b2-api-{hashlib.sha256(B2_API_HOST.encode()).hexdigest()[:16]}"
-    backend_names = ("gcs_storage", "b2_storage", "b2_api", "bunny_api", "kv-origin-api", dynamic_b2, "fastly_api", "fixture_control")
+    backend_names = ("upload_service","gcs_storage", "b2_storage", "b2_api", "bunny_api", "kv-origin-api", dynamic_b2, "fastly_api", "fixture_control")
     backends = "\n".join(
         f'[local_server.backends."{name}"]\nurl = "http://127.0.0.1:{server.server_port}"'
         for name in backend_names
     )
-    secrets = ", ".join(f'{{ key = "{key}", data = "{value}" }}' for key, value in SECRETS.items())
-    config.write_text(f'''manifest_version = 3
+    env = os.environ.copy()
+    env["CARGO_TARGET_WASM32_WASIP1_RUNNER"] = shlex.join([
+        env.get("VICEROY", "viceroy"), "run", "-C", str(config), "--",
+    ])
+    for label in ("hls_family_b2", *CASES):
+        maximum = label == "hls_family_b2"
+        BODY = b"b" * (16*1024*1024) if maximum else b"abc"
+        HASH = hashlib.sha256(BODY).hexdigest()
+        server.worker_times = []
+        case = "hls_family" if label == "hls_family_b2" else label
+        server.case = case
+        server.derived_bucket = "fixture-gcs" if label == "hls_family" else BUCKET
+        bindings = dict(SECRETS)
+        if server.derived_bucket == BUCKET:
+            bindings["bunny_pilot_readers_v1"] = {"b2": SECRETS["bunny_pilot_readers_v1"]["b2"]}
+        secrets = ", ".join(f'{{ key = "{key}", data = {json.dumps(json.dumps(value) if isinstance(value, dict) else value)} }}'
+                            for key, value in bindings.items() if key not in ("bunny_pilot_readers_v1","bunny_pilot_writer_v1"))
+        config.write_text(f'''manifest_version = 3
 name = "bunny-pilot-publication-fixture"
 language = "rust"
 {backends}
@@ -296,30 +390,29 @@ format = "json"
 [local_server.secret_stores]
 blossom_secrets = [{secrets}]
 ''')
-    env = os.environ.copy()
-    env["CARGO_TARGET_WASM32_WASIP1_RUNNER"] = shlex.join([
-        env.get("VICEROY", "viceroy"), "run", "-C", str(config), "--",
-    ])
-    for case in CASES:
-        server.case = case
+
         server.policy_status = case if case in ("pending", "age_restricted") else "active"
         server.source_key = f"{HASH}/hls/stream_720p.mp4" if case == "active_rendition" else HASH
         server.delivery_key = f"{PREFIX}{HASH}/720p.mp4" if case == "active_rendition" else f"{PREFIX}{HASH}"
         server.delivered = None
-        inventory, server.objects, server.destinations = family()
+        inventory, server.objects, server.destinations = family(server.derived_bucket,maximum)
         server.meter = [["start", 0]]
         server.source_version = "123"
+        server.uploaders = "cde" if case == "disabled_four" else "cd"
+        server.ready_generation = 0
+        server.retire_during_read = False
         server.ready = None
         server.events = []
         kv.write_text("{}")
         settings.write_text(json.dumps({
             "bunny_fixture_case": case,
             "bunny_playback_compute_host": "compute.fixture.example",
+            "fixture_parent": HASH,
             "fixture_inventory": json.dumps(inventory),
             "gcs_bucket": "fixture-gcs",
-            "media_read_primary": "gcs" if case == "hls_family" else "b2",
-            "derived_media_read_primary": "gcs" if case == "hls_family" else "b2",
-            "bunny_playback_rollout_percent": "100",
+            "media_read_primary": "b2",
+            "derived_media_read_primary": "gcs" if label == "hls_family" else "b2",
+            "bunny_playback_rollout_percent": "0" if case == "disabled_four" else "100",
             "bunny_playback_countries": "US",
             "bunny_fixture_local_gate": "true",
             "bunny_fixture_meter_gate": "true" if case == "hls_family" else "false",
@@ -331,15 +424,26 @@ blossom_secrets = [{secrets}]
             "b2_media_region": "us-west-004",
             "metadata_kv_store_id": "fixture-store",
         }))
-        result = subprocess.run([
-            "cargo", "test", "--locked", "--target", "wasm32-wasip1", "--bin", "fastly-blossom",
-            "bunny_hls_family_contract" if case == "hls_family" else "bunny_publication_respects_authoritative_policy_and_releases_clean_attempts",
-            "--", "--ignored", "--nocapture",
-        ], cwd=repo, env=env, capture_output=True, text=True, timeout=240)
+        with native_worker(executable,directory,server,bindings):
+            result = subprocess.run([
+                "cargo", "test", "--locked", "--target", "wasm32-wasip1", "--bin", "fastly-blossom",
+                {"hls_family":"bunny_hls_family_contract","disabled_four":"bunny_disabled_four_uploaders"}.get(case,
+                    "bunny_publication_respects_authoritative_policy_and_releases_clean_attempts"),
+                "--", "--ignored", "--nocapture",
+            ], cwd=repo, env=env, capture_output=True, text=True, timeout=240)
         if result.returncode or "test result: ok. 1 passed" not in result.stdout:
             raise RuntimeError(f"{case}: {result.stdout}{result.stderr}\nFixture events: {server.events}")
+        for report in result.stderr.splitlines():
+            if report.startswith("BUNNY_QUOTA "):
+                print(report)
+        for phase, count in server.meter:
+            if phase not in ("outside", "start"):
+                assert count <= 32, (label, phase, count)
+                print(f"BUNNY_HTTP {phase} {count}")
         assert_case(server, case)
-        print(f"PASS {case}")
+        if maximum:
+            print(f"Maximum-size 8-object worker finalize wall time {max(t for op,t in server.worker_times if op == 'finalize'):.3f}s")
+        print(f"PASS {label}")
 
 
 def main():
