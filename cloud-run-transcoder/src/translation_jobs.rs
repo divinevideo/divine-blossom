@@ -200,8 +200,10 @@ where
         vtt_path: target_path.clone(),
         cue_count,
     };
-    if state.media_storage.stat(&target_path).await?.is_some() {
-        return Ok(response("already_exists", 0));
+    if let Some(existing) = state.media_storage.stat(&target_path).await? {
+        if state.media_storage.can_reuse_output(&existing).await? {
+            return Ok(response("already_exists", 0));
+        }
     }
     let source_path = format!("{hash}/vtt/main.vtt");
     let Some((storage, object)) = find_transcript(&state, &source_path).await? else {
@@ -215,10 +217,17 @@ where
     let Some(generation) = claim_translation(&state, &job_path).await? else {
         return Ok(response("pending_or_failed", 0));
     };
-    // Recheck after the claim: a preceding worker may have completed between reads.
+    // Recheck after the claim: a preceding worker may have completed between reads
+    // or left a primary copy whose required GCS backup needs repair.
     let result = tokio::time::timeout(Duration::from_secs(100), async {
-        if state.media_storage.stat(&target_path).await?.is_some() {
-            return Ok(response("already_exists", 0));
+        if let Some(existing) = state.media_storage.stat(&target_path).await? {
+            if existing.size > 0 {
+                state
+                    .media_storage
+                    .ensure_required_backup(&existing)
+                    .await?;
+                return Ok(response("already_exists", 0));
+            }
         }
         let source = String::from_utf8(source)?;
         let cues = translation_google_v3::parse_vtt_cues(&source);

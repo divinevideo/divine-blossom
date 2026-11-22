@@ -23,9 +23,9 @@ impl Drop for StorageDouble {
     }
 }
 
-fn object_response(path: String, generation: i64, size: usize) -> Response {
+fn object_response(bucket: &str, path: String, generation: i64, size: usize) -> Response {
     let value = serde_json::json!({
-        "kind": "storage#object", "id": path, "name": path, "bucket": "test",
+        "kind": "storage#object", "id": path, "name": path, "bucket": bucket,
         "generation": generation.to_string(), "metageneration": "1", "size": size.to_string(),
         "contentType": "text/vtt",
         "selfLink": "http://storage/object", "mediaLink": "http://storage/object?alt=media",
@@ -52,6 +52,13 @@ fn parse_gcs_multipart(body: &[u8]) -> Option<(String, Vec<u8>)> {
 async fn storage_request(State(objects): State<Objects>, request: Request) -> Response {
     let method = request.method().clone();
     let url = reqwest::Url::parse(&format!("http://storage{}", request.uri())).unwrap();
+    let bucket = url
+        .path()
+        .split("/b/")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or("test")
+        .to_string();
     let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
     let body = to_bytes(request.into_body(), 1_000_000).await.unwrap();
     let (path, payload) = if method == Method::POST {
@@ -131,7 +138,7 @@ async fn storage_request(State(objects): State<Objects>, request: Request) -> Re
         let generation = generation + 1;
         let size = payload.len();
         objects.insert(path.clone(), (payload, generation));
-        return object_response(path, generation, size);
+        return object_response(&bucket, path, generation, size);
     }
     let Some((body, generation)) = existing else {
         return error(404);
@@ -145,7 +152,7 @@ async fn storage_request(State(objects): State<Objects>, request: Request) -> Re
     if query.get("alt").map(String::as_str) == Some("media") {
         return Response::new(Body::from(body));
     }
-    object_response(path, generation, body.len())
+    object_response(&bucket, path, generation, body.len())
 }
 
 impl StorageDouble {
@@ -286,6 +293,40 @@ async fn selected_and_legacy_transcripts_reach_translation_and_transcription_ded
                 .all(|(_, _, version)| version.is_some()));
         }
     }
+}
+
+#[tokio::test]
+async fn b2_primary_translation_dedup_repairs_missing_gcs_backup_without_retranslating() {
+    let storage = StorageDouble::new().await;
+    let origin = object_storage::tests::Origin::start().await;
+    let media = origin.with_gcs_backup(storage.state.gcs_client.clone());
+    upload_transcript_to_storage(&media, &"a".repeat(64), std::str::from_utf8(SOURCE).unwrap())
+        .await
+        .unwrap();
+    let req = request(SOURCE);
+    let target_path = translated_vtt_path(&req.hash, &req.source_digest, &req.lang);
+    // Simulate an earlier B2 write whose required GCS backup failed before completion.
+    origin
+        .store()
+        .put_verified(
+            &target_path,
+            Bytes::from_static(b"WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nOl\xc3\xa1\n"),
+            "text/vtt",
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(!storage.objects.lock().await.contains_key(&target_path));
+
+    let state = with_media(&storage, media);
+    let repaired = process_translate_with(state, req, |_, _| async move {
+        panic!("backup repair must not call translation provider");
+    })
+    .await
+    .unwrap();
+    assert_eq!(repaired.status, "already_exists");
+    assert!(storage.objects.lock().await.contains_key(&target_path));
 }
 
 #[tokio::test]

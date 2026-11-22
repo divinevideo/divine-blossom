@@ -28,7 +28,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::{fetch_gcp_identity_token, find_media_object, AppState};
+use crate::{fetch_gcp_identity_token, AppState};
 
 /// The analyzer rejects bodies above 50 MB; skip those before downloading them.
 const MAX_SOUND_BYTES: i64 = 50 * 1024 * 1024;
@@ -167,11 +167,13 @@ where
     let Some(_claim) = InFlightClaim::try_claim(hash) else {
         return Ok(ClassifyOutcome::InProgress.into());
     };
-    let Some((source_storage, object)) = find_media_object(state, hash)
-        .await
-        .map_err(|e| anyhow!("Failed to read source object metadata: {}", e))?
-    else {
-        return Ok(ClassifyOutcome::Missing.into());
+    let (source_storage, object) = match state.media_storage.find_processing_input(hash).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return Ok(ClassifyOutcome::Missing.into()),
+        Err(e) if e.to_string().contains("MIME missing") => {
+            return Ok(ClassifyOutcome::NotAudio.into());
+        }
+        Err(e) => return Err(anyhow!("Failed to read source object metadata: {}", e)),
     };
     let size = i64::try_from(object.size).unwrap_or(i64::MAX);
     if let Some(skip) = skip_reason(&object.content_type, size) {
@@ -179,8 +181,16 @@ where
     }
 
     let path = analysis_object_path(hash);
-    if !force && state.media_storage.stat(&path).await?.is_some() {
-        return Ok(ClassifyOutcome::AlreadyExists.into());
+    if !force {
+        if let Some(existing) = state.media_storage.stat(&path).await? {
+            if existing.size > 0 {
+                state
+                    .media_storage
+                    .ensure_required_backup(&existing)
+                    .await?;
+                return Ok(ClassifyOutcome::AlreadyExists.into());
+            }
+        }
     }
 
     let audio = source_storage
@@ -458,5 +468,13 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(second, ClassifyOutcome::AlreadyExists.into());
+
+        // Missing source in pure B2 mode returns Missing without touching GCS.
+        let missing = classify_sound_with(&state, &"f".repeat(64), false, |_, _| async {
+            panic!("missing source must not reach analyzer");
+        })
+        .await
+        .unwrap();
+        assert_eq!(missing, ClassifyOutcome::Missing.into());
     }
 }

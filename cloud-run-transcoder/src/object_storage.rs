@@ -569,7 +569,10 @@ impl MediaStorage {
     }
     /// An absent input may use the legacy store in B2-primary mode. Provider
     /// failures and failed verification must never select another source.
-    async fn find_processing_input(&self, key: &str) -> Result<Option<(&Self, ObjectMetadata)>> {
+    pub(crate) async fn find_processing_input(
+        &self,
+        key: &str,
+    ) -> Result<Option<(&Self, ObjectMetadata)>> {
         if let Some(object) = self.stat(key).await? {
             return Ok(Some((self, object)));
         }
