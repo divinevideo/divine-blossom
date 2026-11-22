@@ -4999,6 +4999,9 @@ fn local_derivative_cleanup_result(
 }
 
 pub(crate) fn delete_blob_gcs_artifacts(hash: &str) -> Result<()> {
+    if !crate::storage::gcs_erasure_enabled()? {
+        return Ok(());
+    }
     let paths = [
         format!("{}.jpg", hash),
         format!("{}/hls/master.m3u8", hash),

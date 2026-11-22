@@ -15,6 +15,23 @@ class Storage(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
+    def do_HEAD(self):
+        bucket, key = self.path.strip("/").split("/", 1)
+        self.server.reads.append(("HEAD", bucket, key))
+        scope = "/us-west-004/s3/aws4_request" if bucket == "b2" else "/auto/s3/aws4_request"
+        assert scope in self.headers.get("Authorization", "")
+        if key == "disconnect" or (bucket == "b2" and key == "transport"):
+            self.connection.shutdown(socket.SHUT_RDWR)
+            self.connection.close()
+            return
+        if bucket == "b2":
+            status = {"missing": 404, "transient": 503, "forbidden": 403}.get(key, 200)
+        else:
+            status = {"forbidden": 403, "unavailable": 503}.get(key, 200)
+        self.send_response(status)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
         bucket, key = self.path.strip("/").split("/", 1)
         self.server.reads.append((bucket, key, self.headers.get("Range")))
@@ -84,6 +101,8 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                     ("derived_origin_invalid_config_contract", "gcs", "true"),
                     ("media_origin_routing_contract", "b2", "true"),
                     ("media_origin_disabled_fallback_contract", "b2", "false"),
+                    ("blob_exists_b2_without_gcs_contract", "b2", "false"),
+                    ("blob_exists_b2_with_gcs_fallback_contract", "b2", "true"),
                     ("media_origin_invalid_config_contract", "invalid", "true"),
                     ("media_origin_gcs_errors_contract", None, "true"),
                     ("media_origin_gcs_missing_config_contract", None, "true"),
@@ -100,6 +119,13 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                         del values["gcs_bucket"]
                     if test in ("derived_origin_b2_without_gcs_contract", "derived_body_cache_source_contract"):
                         values.update(derived_media_read_primary="b2", derived_media_gcs_fallback_enabled="false")
+                        del values["gcs_bucket"]
+                    elif test == "blob_exists_b2_without_gcs_contract":
+                        values.update(
+                            b2_replica_enabled="true",
+                            gcs_erasure_enabled="false",
+                            fos_erasure_enabled="false",
+                        )
                         del values["gcs_bucket"]
                     elif test in ("derived_origin_fallback_contract", "derived_body_fallback_source_contract"):
                         values.update(derived_media_read_primary="b2", derived_media_gcs_fallback_enabled="true")
@@ -144,6 +170,24 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                         ], reads
                     elif test == "media_origin_disabled_fallback_contract":
                         assert reads == [("b2", "missing", None)], reads
+                    elif test == "blob_exists_b2_without_gcs_contract":
+                        assert reads == [
+                            ("HEAD", "b2", "hit"),
+                            ("HEAD", "b2", "missing"),
+                            ("HEAD", "b2", "forbidden"),
+                            ("HEAD", "b2", "transient"),
+                        ], reads
+                    elif test == "blob_exists_b2_with_gcs_fallback_contract":
+                        assert reads == [
+                            ("HEAD", "b2", "hit"),
+                            ("HEAD", "b2", "missing"),
+                            ("HEAD", "gcs", "missing"),
+                            ("HEAD", "b2", "transient"),
+                            ("HEAD", "gcs", "transient"),
+                            ("HEAD", "b2", "transport"),
+                            ("HEAD", "gcs", "transport"),
+                            ("HEAD", "b2", "forbidden"),
+                        ], reads
                     elif test == "media_origin_gcs_errors_contract":
                         assert reads == [("gcs", key, None) for key in
                                          ("forbidden", "unavailable", "invalid-range", "disconnect")], reads
