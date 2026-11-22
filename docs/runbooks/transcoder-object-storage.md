@@ -89,8 +89,7 @@ layout requires updating the reuse check alongside the encoder.
 Status webhooks retain their legacy meaning. These object receipts do not
 establish durable processing dispatch.
 
-Mutable jobs, locks, translation output/state and sound analysis remain on their
-existing GCS APIs. Newly generated VTT uses the media
+Mutable job state and write locks remain on GCS. Newly generated VTT uses the media
 adapter at its unchanged `{hash}/vtt/main.vtt` key with `text/vtt`; status completion
 follows successful pinned verification. Transcription deduplication requires the
 selected-provider transcript: a GCS-only copy cannot acknowledge missing B2
@@ -107,8 +106,11 @@ without acknowledging completion or rewriting the primary. Plain B2 and GCS
 require no backup check. See [transcript regeneration and rollout](transcript-storage.md).
 Translation reads the selected version through
 the adapter and verifies the requested source digest before claiming work. Default
-GCS selection does not repeat the lookup in a fallback store. This reader adjustment
-preserves cached GCS sources; it does not migrate mutable state. The legacy fMP4 backfill explicitly reads
+GCS selection does not repeat the lookup in a fallback store. Translated VTTs and
+sound-analysis JSON are written through the selected media adapter. Translation
+repairs a missing or mismatched required GCS backup under its existing job claim.
+When sound analysis requires both B2 and GCS writes, a separate GCS write journal
+serializes publication across worker instances. The legacy fMP4 backfill explicitly reads
 and writes GCS. B2 adapter tests can run without GCS; this does not make the
 whole transcoder pipeline GCS independent or complete GCS retirement.
 

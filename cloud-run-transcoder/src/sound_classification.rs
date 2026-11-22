@@ -28,7 +28,12 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::{fetch_gcp_identity_token, AppState};
+use crate::{
+    fetch_gcp_identity_token,
+    hls_claim::{Busy, ClaimStore},
+    object_storage::MissingGcsMime,
+    AppState,
+};
 
 /// The analyzer rejects bodies above 50 MB; skip those before downloading them.
 const MAX_SOUND_BYTES: i64 = 50 * 1024 * 1024;
@@ -44,7 +49,7 @@ pub(crate) enum ClassifyOutcome {
     NotConfigured,
     /// No source blob under this hash (deleted, or never stored).
     Missing,
-    /// Another request on this instance is classifying the same hash.
+    /// Another request is classifying the same hash.
     InProgress,
 }
 
@@ -170,7 +175,7 @@ where
     let (source_storage, object) = match state.media_storage.find_processing_input(hash).await {
         Ok(Some(found)) => found,
         Ok(None) => return Ok(ClassifyOutcome::Missing.into()),
-        Err(e) if e.to_string().contains("MIME missing") => {
+        Err(e) if e.is::<MissingGcsMime>() => {
             return Ok(ClassifyOutcome::NotAudio.into());
         }
         Err(e) => return Err(anyhow!("Failed to read source object metadata: {}", e)),
@@ -181,22 +186,57 @@ where
     }
 
     let path = analysis_object_path(hash);
-    if !force {
-        if let Some(existing) = state.media_storage.stat(&path).await? {
-            if state.media_storage.can_reuse_output(&existing).await? {
-                return Ok(ClassifyOutcome::AlreadyExists.into());
-            }
-        }
+    if !force && reusable_analysis(state, &path).await? {
+        return Ok(ClassifyOutcome::AlreadyExists.into());
     }
 
-    let audio = source_storage
-        .read(&object)
-        .await
-        .map_err(|e| anyhow!("Failed to download source audio: {}", e))?;
-    let (verdict, silent) = analyze(object.content_type.clone(), audio).await?;
-
-    state
-        .media_storage
+    let prepare = async {
+        let audio = source_storage
+            .read(&object)
+            .await
+            .map_err(|e| anyhow!("Failed to download source audio: {}", e))?;
+        analyze(object.content_type.clone(), audio).await
+    };
+    let storage = &state.media_storage;
+    if storage.requires_backup() {
+        // A local guard cannot order both provider writes across instances.
+        let store = ClaimStore::new(state.gcs_client.clone(), &state.config.gcs_bucket);
+        let mut claim = match store.claim_sound(hash, storage).await {
+            Ok(claim) => claim,
+            Err(error) if error.is::<Busy>() => return Ok(ClassifyOutcome::InProgress.into()),
+            Err(error) => return Err(error),
+        };
+        let result: Result<Classification> = async {
+            if !force {
+                let reusable = claim.hold(reusable_analysis(state, &path)).await?;
+                if reusable {
+                    return Ok(ClassifyOutcome::AlreadyExists.into());
+                }
+            }
+            let (verdict, silent) = claim.hold(prepare).await?;
+            storage
+                .put_claimed_verified(
+                    &path,
+                    verdict,
+                    "application/json",
+                    HashMap::new(),
+                    None,
+                    &mut claim,
+                )
+                .await?;
+            Ok(Classification {
+                status: ClassifyOutcome::Classified,
+                silent: Some(silent),
+            })
+        }
+        .await;
+        let release = claim.finish(result.is_ok()).await;
+        let classification = result?;
+        release?;
+        return Ok(classification);
+    }
+    let (verdict, silent) = prepare.await?;
+    storage
         .put_verified(&path, verdict, "application/json", HashMap::new(), None)
         .await
         .map_err(|e| anyhow!("Failed to upload {}: {}", path, e))?;
@@ -204,6 +244,14 @@ where
         status: ClassifyOutcome::Classified,
         silent: Some(silent),
     })
+}
+
+async fn reusable_analysis(state: &AppState, path: &str) -> Result<bool> {
+    let storage = &state.media_storage;
+    match storage.stat(path).await? {
+        Some(existing) => storage.can_reuse_output(&existing).await,
+        None => Ok(false),
+    }
 }
 
 /// The analyzer's verdict body and its `silent` flag.
@@ -474,5 +522,59 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(missing, ClassifyOutcome::Missing.into());
+    }
+
+    #[tokio::test]
+    async fn sound_writer_cannot_publish_while_another_instance_holds_the_claim() {
+        use crate::{hls_claim, object_storage, Config};
+        use sha2::{Digest, Sha256};
+        use tokio::sync::Semaphore;
+
+        let b2 = object_storage::tests::Origin::start().await;
+        let gcs = hls_claim::tests::Origin::start().await;
+        let media_storage = b2.with_gcs_backup(gcs.client());
+        let audio = Bytes::from_static(b"sound-dual-provider-fixture");
+        let hash = hex::encode(Sha256::digest(&audio));
+        object_storage::MediaStorage::gcs(gcs.client(), "synthetic-gcs".into())
+            .put_verified(&hash, audio, "audio/mpeg", HashMap::new(), None)
+            .await
+            .unwrap();
+        let state = AppState {
+            media_storage,
+            gcs_client: gcs.client(),
+            config: Config::from_lookup(|key| {
+                (key == "GCS_BUCKET").then(|| "synthetic-gcs".into())
+            }),
+            provider_semaphore: Arc::new(Semaphore::new(2)),
+        };
+        // Acquire directly, independently of the process-local InFlightClaim.
+        let other = ClaimStore::new(gcs.client(), "synthetic-gcs")
+            .claim_sound(&hash, &state.media_storage)
+            .await
+            .unwrap();
+        let contender = classify_sound_with(&state, &hash, true, |_, _| async {
+            panic!("another writer owns this verdict");
+        })
+        .await
+        .unwrap();
+        assert_eq!(contender, ClassifyOutcome::InProgress.into());
+        other.finish(true).await.unwrap();
+
+        let verdict = Bytes::from_static(br#"{"silent":false,"tags":[]}"#);
+        let classification = classify_sound_with(&state, &hash, true, |mime, audio| {
+            let verdict = verdict.clone();
+            async move {
+                assert_eq!(mime, "audio/mpeg");
+                assert_eq!(audio, b"sound-dual-provider-fixture");
+                Ok((verdict, false))
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(classification.status, ClassifyOutcome::Classified);
+        let path = analysis_object_path(&hash);
+        assert!(reusable_analysis(&state, &path).await.unwrap());
+        let primary = state.media_storage.stat(&path).await.unwrap().unwrap();
+        assert_eq!(state.media_storage.read(&primary).await.unwrap(), verdict);
     }
 }

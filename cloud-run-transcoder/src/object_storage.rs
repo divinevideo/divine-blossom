@@ -36,6 +36,10 @@ pub(crate) const OPTIONAL_HLS_FILES: [&str; 2] = ["stream_720p.mp4", "stream_480
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(120);
 const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Debug, thiserror::Error)]
+#[error("GCS object MIME missing")]
+pub(crate) struct MissingGcsMime;
+
 // No Debug: credentials must never enter diagnostics.
 #[derive(Clone)]
 pub enum StorageConfiguration {
@@ -240,6 +244,9 @@ impl MediaStorage {
     }
     pub fn is_gcs(&self) -> bool {
         matches!(self.backend, Backend::Gcs { .. })
+    }
+    pub(crate) fn requires_backup(&self) -> bool {
+        self.required_backup.is_some()
     }
     fn validate_reference(&self, reference: &ObjectRef) -> Result<()> {
         validate_key(&reference.key)?;
@@ -665,6 +672,19 @@ impl MediaStorage {
         key: &str,
         body: Bytes,
         mime: &str,
+        custom: HashMap<String, String>,
+        cache_control: Option<String>,
+        claim: &mut Claim,
+    ) -> Result<VerifiedObject> {
+        self.put_claimed_verified(key, body, mime, custom, cache_control, claim)
+            .await
+    }
+
+    pub(crate) async fn put_claimed_verified(
+        &self,
+        key: &str,
+        body: Bytes,
+        mime: &str,
         mut custom: HashMap<String, String>,
         cache_control: Option<String>,
         claim: &mut Claim,
@@ -1015,9 +1035,7 @@ fn from_gcs(bucket: &str, key: &str, object: Object) -> Result<ObjectMetadata> {
             version: Some(object.generation.to_string()),
         },
         size: object.size as u64,
-        content_type: object
-            .content_type
-            .ok_or_else(|| anyhow!("GCS object MIME missing"))?,
+        content_type: object.content_type.ok_or(MissingGcsMime)?,
         custom: object.metadata.unwrap_or_default(),
         cache_control: object.cache_control,
     })

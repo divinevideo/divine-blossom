@@ -25,14 +25,14 @@ struct Objects {
     delay_next_claim_ack: Option<Duration>,
 }
 
-struct Origin {
+pub(crate) struct Origin {
     endpoint: String,
     objects: Arc<Mutex<Objects>>,
     task: JoinHandle<()>,
 }
 
 impl Origin {
-    async fn start() -> Self {
+    pub(crate) async fn start() -> Self {
         let objects = Arc::new(Mutex::new(Objects::default()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -45,7 +45,7 @@ impl Origin {
         }
     }
 
-    fn client(&self) -> GcsClient {
+    pub(crate) fn client(&self) -> GcsClient {
         GcsClient::new(
             google_cloud_storage::client::ClientConfig {
                 storage_endpoint: self.endpoint.clone(),
@@ -140,7 +140,8 @@ async fn gcs(State(objects): State<Arc<Mutex<Objects>>>, req: Request) -> Respon
     let current = live
         .and_then(|value| value["generation"].as_str())
         .unwrap_or("0");
-    let is_claim = key.starts_with(".internal/hls-claims/");
+    let is_claim = key.starts_with(".internal/hls-claims/")
+        || key.starts_with(".internal/sound-claims/");
     let precondition = query.get("ifGenerationMatch");
     if is_claim
         || new_object

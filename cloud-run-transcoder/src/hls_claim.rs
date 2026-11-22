@@ -126,7 +126,20 @@ impl ClaimStore {
     }
 
     pub(crate) async fn claim(&self, hash: &str, storage: Option<&MediaStorage>) -> Result<Claim> {
-        let key = lock_key(hash);
+        self.claim_key(lock_key(hash), storage).await
+    }
+
+    pub(crate) async fn claim_sound(
+        &self,
+        hash: &str,
+        storage: &MediaStorage,
+    ) -> Result<Claim> {
+        // Keep the write journal outside the media prefix, like the HLS claim.
+        self.claim_key(format!(".internal/sound-claims/{hash}"), Some(storage))
+            .await
+    }
+
+    async fn claim_key(&self, key: String, storage: Option<&MediaStorage>) -> Result<Claim> {
         // Active contenders only read the journal. The conditional create
         // still arbitrates concurrent observations of an absent object.
         let mut journal = Journal::default();
@@ -464,4 +477,4 @@ impl Claim {
 
 #[cfg(test)]
 #[path = "hls_claim_tests.rs"]
-mod tests;
+pub(crate) mod tests;
