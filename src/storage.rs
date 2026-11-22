@@ -1579,6 +1579,7 @@ pub fn blob_exists(hash: &str) -> Result<bool> {
             return Ok(true);
         }
     }
+    let primary_absent = matches!(&response, Ok(resp) if resp.get_status() == StatusCode::NOT_FOUND);
     let should_fallback = match &response {
         Ok(resp) => policy.should_fallback(resp.get_status().as_u16()),
         Err(MediaFetchError::Transport) => policy.should_fallback(503),
@@ -1592,7 +1593,17 @@ pub fn blob_exists(hash: &str) -> Result<bool> {
         eprintln!("[MEDIA_ORIGIN] op=head primary=b2 fallback=gcs cause={cause}");
         let fallback = head_media_origin(StorageProvider::Gcs, hash)
             .map_err(MediaFetchError::into_storage_error)?;
-        return head_exists_status(fallback.get_status());
+        return match fallback.get_status() {
+            StatusCode::OK => Ok(true),
+            StatusCode::NOT_FOUND if primary_absent => Ok(false),
+            // Primary errored (5xx or transport) and GCS returned 404: absence is
+            // not proven, so fail closed with the primary error.
+            StatusCode::NOT_FOUND => {
+                let resp = response.map_err(MediaFetchError::into_storage_error)?;
+                head_exists_status(resp.get_status())
+            }
+            other => head_exists_status(other),
+        };
     }
     let resp = response.map_err(MediaFetchError::into_storage_error)?;
     head_exists_status(resp.get_status())
@@ -6183,8 +6194,11 @@ mod tests {
     fn blob_exists_b2_with_gcs_fallback_contract() {
         assert!(super::blob_exists("hit").unwrap());
         assert!(super::blob_exists("missing").unwrap());
+        assert!(!super::blob_exists("absent_everywhere").unwrap());
         assert!(super::blob_exists("transient").unwrap());
+        assert!(super::blob_exists("transient_b2_only").is_err());
         assert!(super::blob_exists("transport").unwrap());
+        assert!(super::blob_exists("transport_b2_only").is_err());
         assert!(super::blob_exists("forbidden").is_err());
     }
 

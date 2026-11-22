@@ -20,14 +20,26 @@ class Storage(BaseHTTPRequestHandler):
         self.server.reads.append(("HEAD", bucket, key))
         scope = "/us-west-004/s3/aws4_request" if bucket == "b2" else "/auto/s3/aws4_request"
         assert scope in self.headers.get("Authorization", "")
-        if key == "disconnect" or (bucket == "b2" and key == "transport"):
+        if key == "disconnect" or (bucket == "b2" and key in ("transport", "transport_b2_only")):
             self.connection.shutdown(socket.SHUT_RDWR)
             self.connection.close()
             return
         if bucket == "b2":
-            status = {"missing": 404, "transient": 503, "forbidden": 403}.get(key, 200)
+            status = {
+                "missing": 404,
+                "absent_everywhere": 404,
+                "transient": 503,
+                "transient_b2_only": 503,
+                "forbidden": 403,
+            }.get(key, 200)
         else:
-            status = {"forbidden": 403, "unavailable": 503}.get(key, 200)
+            status = {
+                "absent_everywhere": 404,
+                "transient_b2_only": 404,
+                "transport_b2_only": 404,
+                "forbidden": 403,
+                "unavailable": 503,
+            }.get(key, 200)
         self.send_response(status)
         self.send_header("Content-Length", "0")
         self.end_headers()
@@ -185,10 +197,16 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                             ("HEAD", "b2", "hit"),
                             ("HEAD", "b2", "missing"),
                             ("HEAD", "gcs", "missing"),
+                            ("HEAD", "b2", "absent_everywhere"),
+                            ("HEAD", "gcs", "absent_everywhere"),
                             ("HEAD", "b2", "transient"),
                             ("HEAD", "gcs", "transient"),
+                            ("HEAD", "b2", "transient_b2_only"),
+                            ("HEAD", "gcs", "transient_b2_only"),
                             ("HEAD", "b2", "transport"),
                             ("HEAD", "gcs", "transport"),
+                            ("HEAD", "b2", "transport_b2_only"),
+                            ("HEAD", "gcs", "transport_b2_only"),
                             ("HEAD", "b2", "forbidden"),
                         ], reads
                     elif test == "media_origin_gcs_errors_contract":
