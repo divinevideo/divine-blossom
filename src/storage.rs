@@ -1608,16 +1608,37 @@ pub fn blob_exists_in_gcs(hash: &str) -> Result<bool> {
 pub fn erasure_policy() -> Result<ErasurePolicy> {
     let gcs_erasure = optional_config("gcs_erasure_enabled")?;
     let fos_erasure = optional_config("fos_erasure_enabled")?;
-    let b2_replica = optional_config(B2_REPLICA_FLAG)?;
-    let media_read_primary = optional_config("media_read_primary")?;
-    let gcs_fallback_enabled = optional_config("gcs_fallback_enabled")?;
-    let derived_media_read_primary = optional_config("derived_media_read_primary")?;
-    let derived_media_gcs_fallback_enabled =
-        optional_config("derived_media_gcs_fallback_enabled")?;
-    let upload_service_all_uploads = optional_config("upload_service_all_uploads")?;
-    let b2_demand_mirror_enabled = optional_config("b2_demand_mirror_enabled")?;
-    let fos_read = optional_config(FOS_READ_FLAG)?;
-    let fos_write_back = optional_config(FOS_WRITE_BACK_FLAG)?;
+    let (
+        b2_replica,
+        media_read_primary,
+        gcs_fallback_enabled,
+        derived_media_read_primary,
+        derived_media_gcs_fallback_enabled,
+        upload_service_all_uploads,
+        b2_demand_mirror_enabled,
+        b2_cdn_enabled,
+    ) = if gcs_erasure.as_deref() == Some("false") {
+        (
+            optional_config(B2_REPLICA_FLAG)?,
+            optional_config("media_read_primary")?,
+            optional_config("gcs_fallback_enabled")?,
+            optional_config("derived_media_read_primary")?,
+            optional_config("derived_media_gcs_fallback_enabled")?,
+            optional_config("upload_service_all_uploads")?,
+            optional_config("b2_demand_mirror_enabled")?,
+            optional_config("b2_cdn_enabled")?,
+        )
+    } else {
+        (None, None, None, None, None, None, None, None)
+    };
+    let (fos_read, fos_write_back) = if fos_erasure.as_deref() == Some("false") {
+        (
+            optional_config(FOS_READ_FLAG)?,
+            optional_config(FOS_WRITE_BACK_FLAG)?,
+        )
+    } else {
+        (None, None)
+    };
     ErasurePolicy::parse(ErasurePolicyInputs {
         gcs_erasure: gcs_erasure.as_deref(),
         fos_erasure: fos_erasure.as_deref(),
@@ -1628,6 +1649,7 @@ pub fn erasure_policy() -> Result<ErasurePolicy> {
         derived_media_gcs_fallback_enabled: derived_media_gcs_fallback_enabled.as_deref(),
         upload_service_all_uploads: upload_service_all_uploads.as_deref(),
         b2_demand_mirror_enabled: b2_demand_mirror_enabled.as_deref(),
+        b2_cdn_enabled: b2_cdn_enabled.as_deref(),
         fos_read_enabled: fos_read.as_deref(),
         fos_write_back_enabled: fos_write_back.as_deref(),
     })
@@ -2229,8 +2251,18 @@ fn erase_b2_hash_versions(authorization: &B2Authorization, hash: &str) -> Result
 
 /// Returns `(failed, remaining)` hashes. `remaining` hashes made bounded
 /// progress and are counted as pending, not failed.
-fn erase_b2_replica_hashes(hashes: &[String]) -> (HashSet<String>, HashSet<String>) {
-    if !b2_replica_enabled() || hashes.is_empty() {
+fn erase_b2_replica_hashes(
+    hashes: &[String],
+    require_media_bucket_match: bool,
+) -> (HashSet<String>, HashSet<String>) {
+    if hashes.is_empty() {
+        return (HashSet::new(), HashSet::new());
+    }
+    if !b2_replica_enabled() {
+        if require_media_bucket_match {
+            eprintln!("[VANISH] B2 erasure required while gcs_erasure_enabled=false");
+            return (hashes.iter().cloned().collect(), HashSet::new());
+        }
         return (HashSet::new(), HashSet::new());
     }
     let authorization = match authorize_b2_vanish() {
@@ -2240,6 +2272,19 @@ fn erase_b2_replica_hashes(hashes: &[String]) -> (HashSet<String>, HashSet<Strin
             return (hashes.iter().cloned().collect(), HashSet::new());
         }
     };
+    if require_media_bucket_match {
+        let media_bucket = match get_config("b2_media_bucket") {
+            Ok(bucket) => bucket,
+            Err(error) => {
+                eprintln!("[VANISH] B2 media bucket lookup failed error={error}");
+                return (hashes.iter().cloned().collect(), HashSet::new());
+            }
+        };
+        if authorization.bucket_name.as_deref() != Some(media_bucket.as_str()) {
+            eprintln!("[VANISH] B2 read and erasure buckets do not match");
+            return (hashes.iter().cloned().collect(), HashSet::new());
+        }
+    }
     let mut failed = HashSet::new();
     let mut remaining = HashSet::new();
     for hash in hashes {
@@ -2259,7 +2304,9 @@ fn erase_b2_replica_hashes(hashes: &[String]) -> (HashSet<String>, HashSet<Strin
 
 /// Creator deletion must erase the same B2 version set as account vanish.
 pub(crate) fn erase_b2_creator_replica(hash: &str) -> Result<()> {
-    let (failed, remaining) = erase_b2_replica_hashes(&[hash.to_string()]);
+    let require_media_bucket_match = !gcs_erasure_enabled()?;
+    let (failed, remaining) =
+        erase_b2_replica_hashes(&[hash.to_string()], require_media_bucket_match);
     if failed.is_empty() && remaining.is_empty() {
         Ok(())
     } else {
@@ -4317,7 +4364,7 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
     }
 
     let b2_started = Instant::now();
-    let (b2_failures, b2_remaining) = erase_b2_replica_hashes(hashes);
+    let (b2_failures, b2_remaining) = erase_b2_replica_hashes(hashes, !erasure.gcs_enabled);
     result.timings.b2_replica_ms = elapsed_ms(b2_started);
     result.failed_hashes.extend(b2_failures.iter().cloned());
     main_origin_failures.extend(b2_failures);

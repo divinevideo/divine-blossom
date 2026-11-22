@@ -84,6 +84,7 @@ pub struct ErasurePolicyInputs<'a> {
     pub derived_media_gcs_fallback_enabled: Option<&'a str>,
     pub upload_service_all_uploads: Option<&'a str>,
     pub b2_demand_mirror_enabled: Option<&'a str>,
+    pub b2_cdn_enabled: Option<&'a str>,
     pub fos_read_enabled: Option<&'a str>,
     pub fos_write_back_enabled: Option<&'a str>,
 }
@@ -124,8 +125,11 @@ impl ErasurePolicy {
             if inputs.upload_service_all_uploads != Some("true") {
                 return Err("gcs_erasure_enabled=false requires upload_service_all_uploads=true");
             }
-            if inputs.b2_demand_mirror_enabled == Some("true") {
+            if crate::read_through::parse_bool_flag(inputs.b2_demand_mirror_enabled) {
                 return Err("gcs_erasure_enabled=false requires b2_demand_mirror_enabled to be off");
+            }
+            if crate::read_through::parse_bool_flag(inputs.b2_cdn_enabled) {
+                return Err("gcs_erasure_enabled=false requires b2_cdn_enabled to be off");
             }
         }
         let fos_enabled = match inputs.fos_erasure.unwrap_or("true") {
@@ -134,8 +138,8 @@ impl ErasurePolicy {
             _ => return Err("fos_erasure_enabled must be true or false"),
         };
         if !fos_enabled
-            && (inputs.fos_read_enabled == Some("true")
-                || inputs.fos_write_back_enabled == Some("true"))
+            && (crate::read_through::parse_bool_flag(inputs.fos_read_enabled)
+                || crate::read_through::parse_bool_flag(inputs.fos_write_back_enabled))
         {
             return Err(
                 "fos_erasure_enabled=false requires FOS read and write-back to be disabled",
@@ -163,6 +167,7 @@ mod tests {
             derived_media_gcs_fallback_enabled: Some("false"),
             upload_service_all_uploads: Some("true"),
             b2_demand_mirror_enabled: None,
+            b2_cdn_enabled: None,
             fos_read_enabled: None,
             fos_write_back_enabled: None,
         }
@@ -190,12 +195,23 @@ mod tests {
         })
         .is_err());
         assert!(ErasurePolicy::parse(ErasurePolicyInputs {
+            media_read_primary: Some("gcs"),
+            gcs_fallback_enabled: Some("false"),
+            ..b2_only_inputs()
+        })
+        .is_err());
+        assert!(ErasurePolicy::parse(ErasurePolicyInputs {
             gcs_fallback_enabled: Some("true"),
             ..b2_only_inputs()
         })
         .is_err());
         assert!(ErasurePolicy::parse(ErasurePolicyInputs {
             derived_media_read_primary: Some("gcs"),
+            ..b2_only_inputs()
+        })
+        .is_err());
+        assert!(ErasurePolicy::parse(ErasurePolicyInputs {
+            derived_media_gcs_fallback_enabled: Some("true"),
             ..b2_only_inputs()
         })
         .is_err());
@@ -210,15 +226,28 @@ mod tests {
         })
         .is_err());
         assert!(ErasurePolicy::parse(ErasurePolicyInputs {
-            fos_read_enabled: Some("true"),
+            b2_cdn_enabled: Some("true"),
             ..b2_only_inputs()
         })
         .is_err());
-        assert!(ErasurePolicy::parse(ErasurePolicyInputs {
-            fos_write_back_enabled: Some("true"),
-            ..b2_only_inputs()
-        })
-        .is_err());
+        for truthy in ["true", "TRUE", " true ", "1", "yes", "on"] {
+            assert!(
+                ErasurePolicy::parse(ErasurePolicyInputs {
+                    fos_read_enabled: Some(truthy),
+                    ..b2_only_inputs()
+                })
+                .is_err(),
+                "fos_read_enabled={truthy:?} must fail closed"
+            );
+            assert!(
+                ErasurePolicy::parse(ErasurePolicyInputs {
+                    fos_write_back_enabled: Some(truthy),
+                    ..b2_only_inputs()
+                })
+                .is_err(),
+                "fos_write_back_enabled={truthy:?} must fail closed"
+            );
+        }
         assert!(ErasurePolicy::parse(ErasurePolicyInputs {
             gcs_erasure: Some("invalid"),
             ..b2_only_inputs()
