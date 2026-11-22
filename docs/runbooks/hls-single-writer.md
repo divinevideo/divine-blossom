@@ -41,8 +41,9 @@ worker spaces its claim mutations and retries explicit 429 responses within a
 bounded deadline. Each acknowledged provider write keeps its existing journal
 entry until the next conditional mutation. Heartbeats still renew ownership
 during longer operations. With both progressive aliases, a fresh publication
-needs at least 10 claim mutations for GCS-only and 17 for B2-primary with GCS
-verification, including acquisition, verified completion, and release. Allow
+needs at least 10 claim mutations for GCS-only or B2-primary with
+`MEDIA_GCS_BACKUP_ENABLED=false`, and 17 for B2-primary with GCS backups
+enabled (the default), including acquisition, verified completion, and release. Allow
 for that pacing when measuring queue capacity, playback readiness, and
 allocated CPU time. Verify these budgets with the actual storage topology
 before enabling the writer.
@@ -69,7 +70,11 @@ time as insufficient evidence for clearing an uncertain write.
    variable-frame-rate sources in an isolated service with isolated buckets and
    a test queue. Exercise simultaneous independent dispatch, completion replay,
    forced repair, MP4 aliases, a worker killed before publication, and a backup
-   write failure. Verify both provider copies, provenance, and callback order.
+   write failure when backups are enabled. With backups disabled, verify no
+   media backup writes occur, B2 artifacts remain complete, missing B2 originals
+   can still use verified GCS inputs, and older GCS write journals still recover
+   only from matching attempt markers. Verify every configured output copy,
+   provenance, and callback order.
    Test the queue admission and retry behavior under representative burst
    concurrency, including queue depth and oldest task age.
 2. Confirm the existing transcode queue is dedicated to HLS and its runtime
@@ -111,7 +116,7 @@ time as insufficient evidence for clearing an uncertain write.
    termination or publication outcome is unresolved.
 5. Route all writer traffic to the new unpaused revision. Resume existing queue
    dispatch. Use synthetic and sampled authorized read-only checks to verify
-   serving revision, durable dispatch, publication and backup readiness,
+   serving revision, durable dispatch, publication and any enabled backup readiness,
    playback, subtitles, and terminal callbacks. Keep old writer revisions
    off all usable write paths. Existing originals, derivatives, and CDN URLs
    are used in place. No backfill is part of this rollout.
@@ -156,6 +161,6 @@ mix, and task arrival rate. Report privately:
   spend. Report freed committed capacity separately from cash savings.
 
 A lower duplicate count accompanied by falling distinct throughput, rising
-queue age, slower playback readiness, or weaker backup verification fails
+queue age, slower playback readiness, or weaker verification of configured copies fails
 the rollout acceptance check. The existing dispatch limit and added storage
 operations must be exercised under representative load before promotion.

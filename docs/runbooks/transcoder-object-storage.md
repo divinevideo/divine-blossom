@@ -24,6 +24,36 @@ incomplete or mismatched copies require regeneration. Shared-audio backup repair
 primary bytes and writes the backup with the existing provenance, leaving the
 primary version unchanged. Legacy `gcs` and `b2` modes retain their behavior.
 
+### Disable GCS media backups while retaining legacy reads
+
+For `MEDIA_STORAGE_PROVIDER=b2_primary`, set `MEDIA_GCS_BACKUP_ENABLED=false`
+on the candidate revision to publish new adapter-managed HLS, progressive MP4,
+audio and transcript objects only to B2. Omission or `true` retains replication;
+other values fail startup. The switch has no effect in `gcs` or plain `b2` mode.
+Use `--update-env-vars` to preserve other runtime configuration. The deploy script
+preserves existing storage settings; set this switch explicitly on the candidate
+before promoting it under [the single-writer runbook](hls-single-writer.md).
+
+This removes backup uploads, backup readback verification and backup repair for
+existing primary outputs. B2 writes still require pinned version, metadata and
+byte verification. HLS reuse still requires every required nonempty B2 artifact;
+a master alone is insufficient. Existing GCS objects are not deleted or changed
+by disabling backups.
+
+The legacy GCS reader remains configured separately from the optional writer.
+An original or processing segment missing from B2 can still be read from GCS,
+with the same pinned-version and integrity checks. GCS is also retained for
+locks and for reconciling an earlier journaled backup write. Disabling backups
+never clears an uncertain write: the recorded provider/key must still expose
+the matching attempt marker before recovery. Keep the GCS bucket/client and
+permissions needed for these reads and coordination.
+
+This is not whole-service GCS retirement: mutable job state, translation output
+and sound analysis keep their existing paths. Re-enabling backups restores
+required-copy checks for subsequent work and can cause regeneration or backup
+repair for artifacts produced while backups were off. It does not bulk-copy
+historical output at startup.
+
 This is synchronous replication through the existing processing paths. It adds
 no database, queue, credentials, or processing service. It does not activate a
 provider setting, change uploader storage, or convert the separate GCS-only

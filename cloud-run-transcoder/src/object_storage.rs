@@ -47,6 +47,7 @@ pub enum StorageConfiguration {
         secret_key: String,
     },
     B2Primary {
+        gcs_backup_enabled: bool,
         bucket: String,
         region: String,
         access_key: String,
@@ -69,7 +70,13 @@ impl StorageConfiguration {
                 let access_key = required("B2_ACCESS_KEY_ID")?;
                 let secret_key = required("B2_SECRET_ACCESS_KEY")?;
                 Ok(if provider.as_deref() == Some("b2_primary") {
+                    let gcs_backup_enabled = match lookup("MEDIA_GCS_BACKUP_ENABLED").as_deref() {
+                        None | Some("true") => true,
+                        Some("false") => false,
+                        _ => bail!("MEDIA_GCS_BACKUP_ENABLED must be true or false"),
+                    };
                     Self::B2Primary {
+                        gcs_backup_enabled,
                         bucket,
                         region,
                         access_key,
@@ -93,6 +100,8 @@ impl StorageConfiguration {
 pub struct MediaStorage {
     backend: Backend,
     required_backup: Option<Box<MediaStorage>>,
+    // Legacy inputs and already-journaled writes remain readable when replication is off.
+    legacy_gcs: Option<Box<MediaStorage>>,
 }
 #[derive(Clone)]
 enum Backend {
@@ -155,6 +164,7 @@ impl MediaStorage {
         Self {
             backend: Backend::Gcs { client, bucket },
             required_backup: None,
+            legacy_gcs: None,
         }
     }
     pub fn configured(
@@ -162,7 +172,14 @@ impl MediaStorage {
         gcs: Option<GcsClient>,
         gcs_bucket: String,
     ) -> Result<Self> {
-        let backup_required = matches!(&config, StorageConfiguration::B2Primary { .. });
+        let legacy_required = matches!(&config, StorageConfiguration::B2Primary { .. });
+        let backup_required = matches!(
+            &config,
+            StorageConfiguration::B2Primary {
+                gcs_backup_enabled: true,
+                ..
+            }
+        );
         match config {
             StorageConfiguration::Gcs => {
                 if gcs_bucket.is_empty() {
@@ -184,13 +201,14 @@ impl MediaStorage {
                 region,
                 access_key,
                 secret_key,
+                ..
             } => {
-                let required_backup = if backup_required {
+                let legacy_gcs = if legacy_required {
                     if gcs_bucket.is_empty() {
-                        bail!("GCS backup bucket required for B2 primary");
+                        bail!("GCS legacy bucket required for B2 primary");
                     }
                     Some(Box::new(Self::gcs(
-                        gcs.ok_or_else(|| anyhow!("GCS backup client required for B2 primary"))?,
+                        gcs.ok_or_else(|| anyhow!("GCS legacy client required for B2 primary"))?,
                         gcs_bucket,
                     )))
                 } else {
@@ -227,7 +245,12 @@ impl MediaStorage {
                         endpoint: format!("https://{host}"),
                         client,
                     },
-                    required_backup,
+                    required_backup: if backup_required {
+                        legacy_gcs.clone()
+                    } else {
+                        None
+                    },
+                    legacy_gcs,
                 })
             }
         }
@@ -300,9 +323,9 @@ impl MediaStorage {
     /// backend and key recorded before issuing the request.
     pub async fn hls_write_committed(&self, gcs: bool, key: &str, id: &str) -> Result<bool> {
         let backend = if gcs && !self.is_gcs() {
-            self.required_backup
+            self.legacy_gcs
                 .as_deref()
-                .context("GCS HLS backup unavailable")?
+                .context("GCS HLS recovery store unavailable")?
         } else {
             self
         };
@@ -573,7 +596,7 @@ impl MediaStorage {
         if let Some(object) = self.stat(key).await? {
             return Ok(Some((self, object)));
         }
-        match self.required_backup.as_deref() {
+        match self.legacy_gcs.as_deref() {
             Some(legacy) => Ok(legacy.stat(key).await?.map(|object| (legacy, object))),
             None => Ok(None),
         }
