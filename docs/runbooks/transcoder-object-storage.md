@@ -109,8 +109,14 @@ the adapter and verifies the requested source digest before claiming work. Defau
 GCS selection does not repeat the lookup in a fallback store. Translated VTTs and
 sound-analysis JSON are written through the selected media adapter. Translation
 repairs a missing or mismatched required GCS backup under its existing job claim.
-When sound analysis requires both B2 and GCS writes, a separate GCS write journal
-serializes publication across worker instances. The legacy fMP4 backfill explicitly reads
+When sound analysis requires both B2 and GCS writes, the GCS journal at
+`.internal/sound-claims/{hash}` serializes publication across worker instances.
+Keep this namespace outside lifecycle deletion and manual cleanup while writers
+are active. As with the [HLS write journal](hls-single-writer.md), a timed-out PUT
+remains fenced until the recorded provider and key show its attempt marker.
+Sound retries report `in_progress` while fenced, even with `force`. The two
+journals currently emit the same `hls_counter` events, so a recovery event alone
+does not identify which journal to inspect. The legacy fMP4 backfill explicitly reads
 and writes GCS. B2 adapter tests can run without GCS; this does not make the
 whole transcoder pipeline GCS independent or complete GCS retirement.
 
