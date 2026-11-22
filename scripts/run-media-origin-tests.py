@@ -122,6 +122,9 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                         del values["gcs_bucket"]
                     elif test == "blob_exists_b2_without_gcs_contract":
                         values.update(
+                            derived_media_read_primary="b2",
+                            derived_media_gcs_fallback_enabled="false",
+                            upload_service_all_uploads="true",
                             b2_replica_enabled="true",
                             gcs_erasure_enabled="false",
                             fos_erasure_enabled="false",

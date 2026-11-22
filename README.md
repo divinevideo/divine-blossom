@@ -123,6 +123,8 @@ Configuration is split across the Fastly config store (non-secret) and secret st
 | `b2_media_region` | Verified account region used for B2 S3 signing and its endpoint. The `b2_storage` backend must target that endpoint with matching TLS/SNI. |
 | `funnelcake_api_url` | Funnelcake permission API base URL |
 | `b2_replica_enabled` | Enables the approved-only B2 replica and makes Native API version erasure plus bunny cache purge mandatory for vanish. Defaults off. |
+| `gcs_erasure_enabled` | `true` (default) or `false`. Setting `false` skips GCS deletion and Cloud Run GCS cleanup during creator delete and vanish; fails closed unless `b2_replica_enabled=true`, `media_read_primary=b2`, `gcs_fallback_enabled=false`, `derived_media_read_primary=b2`, `derived_media_gcs_fallback_enabled=false`, `upload_service_all_uploads=true`, and `b2_demand_mirror_enabled` is off. |
+| `fos_erasure_enabled` | `true` (default) or `false`. Setting `false` skips Fastly Object Storage deletion during creator delete and vanish; fails closed unless both `fos_read_enabled` and `fos_write_back_enabled` are disabled. |
 | `b2_bucket_id` | Bucket ID for the approved-only B2 replica. |
 | `bunny_delivery_zones` | One or two comma-separated delivery hostnames that must be purged when B2 replica content is erased. |
 | `ENABLE_PHYSICAL_DELETE` | When `"true"`, creator-delete via `/admin/api/moderate` physically removes bytes from GCS and purges edge caches; when `"false"` (default), it flips status only. Admin DMCA via `/admin/api/delete` is always a soft-delete regardless of this flag. |

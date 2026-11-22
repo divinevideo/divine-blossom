@@ -662,9 +662,11 @@ pub(crate) fn cleanup_derived_audio_for_source(source_hash: &str) -> Result<()> 
         let _ = storage_delete(&mapping.audio_sha256);
         let derivative_result = delete_blob_gcs_artifacts(&mapping.audio_sha256);
         let replica_result = storage::delete_blob_from_fos(&mapping.audio_sha256);
+        let b2_result = storage::erase_b2_creator_replica(&mapping.audio_sha256);
         purge_edge_cache(&mapping.audio_sha256);
         derivative_result?;
         replica_result?;
+        b2_result?;
         delete_blob_kv_artifacts(&mapping.audio_sha256);
         delete_blob_metadata(&mapping.audio_sha256)?;
     }
@@ -3935,8 +3937,8 @@ fn handle_upload(mut req: Request, record: &mut UploadLogRecord) -> Result<Respo
         ));
     }
 
-    // Check if blob already exists (first-uploader-wins)
-    if blob_exists(&hash)? {
+    // Check if blob already exists (first-uploader-wins) on this inline GCS path
+    if storage::blob_exists_in_gcs(&hash)? {
         // Return existing blob descriptor but track this re-uploader
         if let Some(mut metadata) = get_blob_metadata(&hash)? {
             if !encoding_requested && metadata.video_encoding_allowed {

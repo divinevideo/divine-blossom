@@ -7,7 +7,9 @@ use blossom_core::read_through::{
     check_mirror_response, object_path, parse_bool_flag, replica_delete_outcome,
     write_back_decision, ReplicaDeleteOutcome, MAX_WRITE_BACK_BYTES, SOURCE_FOS, SOURCE_GCS,
 };
-use blossom_core::storage_origin::{ErasurePolicy, MediaReadPolicy, StorageProvider};
+use blossom_core::storage_origin::{
+    ErasurePolicy, ErasurePolicyInputs, MediaReadPolicy, StorageProvider,
+};
 use fastly::http::{Method, StatusCode};
 use fastly::{Backend, Body, Request, Response};
 use md5::Md5;
@@ -1596,13 +1598,39 @@ pub fn blob_exists(hash: &str) -> Result<bool> {
     head_exists_status(resp.get_status())
 }
 
+/// Check if a blob exists directly in GCS (used by legacy GCS-writing paths).
+pub fn blob_exists_in_gcs(hash: &str) -> Result<bool> {
+    let resp = head_media_origin(StorageProvider::Gcs, hash)
+        .map_err(MediaFetchError::into_storage_error)?;
+    head_exists_status(resp.get_status())
+}
+
 pub fn erasure_policy() -> Result<ErasurePolicy> {
-    ErasurePolicy::parse(
-        optional_config("gcs_erasure_enabled")?.as_deref(),
-        optional_config("fos_erasure_enabled")?.as_deref(),
-        b2_replica_enabled(),
-        fos_read_enabled() || fos_write_back_enabled(),
-    )
+    let gcs_erasure = optional_config("gcs_erasure_enabled")?;
+    let fos_erasure = optional_config("fos_erasure_enabled")?;
+    let b2_replica = optional_config(B2_REPLICA_FLAG)?;
+    let media_read_primary = optional_config("media_read_primary")?;
+    let gcs_fallback_enabled = optional_config("gcs_fallback_enabled")?;
+    let derived_media_read_primary = optional_config("derived_media_read_primary")?;
+    let derived_media_gcs_fallback_enabled =
+        optional_config("derived_media_gcs_fallback_enabled")?;
+    let upload_service_all_uploads = optional_config("upload_service_all_uploads")?;
+    let b2_demand_mirror_enabled = optional_config("b2_demand_mirror_enabled")?;
+    let fos_read = optional_config(FOS_READ_FLAG)?;
+    let fos_write_back = optional_config(FOS_WRITE_BACK_FLAG)?;
+    ErasurePolicy::parse(ErasurePolicyInputs {
+        gcs_erasure: gcs_erasure.as_deref(),
+        fos_erasure: fos_erasure.as_deref(),
+        b2_replica_enabled: b2_replica.as_deref(),
+        media_read_primary: media_read_primary.as_deref(),
+        gcs_fallback_enabled: gcs_fallback_enabled.as_deref(),
+        derived_media_read_primary: derived_media_read_primary.as_deref(),
+        derived_media_gcs_fallback_enabled: derived_media_gcs_fallback_enabled.as_deref(),
+        upload_service_all_uploads: upload_service_all_uploads.as_deref(),
+        b2_demand_mirror_enabled: b2_demand_mirror_enabled.as_deref(),
+        fos_read_enabled: fos_read.as_deref(),
+        fos_write_back_enabled: fos_write_back.as_deref(),
+    })
     .map_err(|error| BlossomError::StorageError(error.into()))
 }
 
@@ -4167,7 +4195,11 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
             return result;
         }
     };
-    let run_primary_multi_delete = local_mode || erasure.fos_enabled;
+    let run_primary_multi_delete = if local_mode {
+        erasure.gcs_enabled
+    } else {
+        erasure.fos_enabled
+    };
     if run_primary_multi_delete {
         let (storage_config, storage_backend) = if local_mode {
             (S3Config::load_gcs(), GCS_BACKEND)
@@ -4620,7 +4652,7 @@ fn upload_blob_streaming_simple(
     let hash = compute_hash_from_gcs(temp_key)?;
 
     // Check if blob already exists at final location
-    if blob_exists(&hash)? {
+    if blob_exists_in_gcs(&hash)? {
         let _ = delete_blob(temp_key);
         return Ok(hash);
     }
@@ -4718,7 +4750,7 @@ fn upload_blob_streaming_multipart(
     let hash = compute_hash_from_gcs(temp_key)?;
 
     // Check if blob already exists at final location
-    if blob_exists(&hash)? {
+    if blob_exists_in_gcs(&hash)? {
         let _ = delete_blob(temp_key);
         return Ok(hash);
     }
