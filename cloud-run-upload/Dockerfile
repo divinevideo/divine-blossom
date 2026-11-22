@@ -9,6 +9,8 @@ WORKDIR /app
 # Install build dependencies
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 
+COPY blossom-core /blossom-core
+
 # Copy manifests
 COPY Cargo.toml Cargo.lock* ./
 

@@ -66,6 +66,20 @@ class TestAcceptance(unittest.TestCase):
             checks = probe.readiness_checks('test-zone.b-cdn.net', path, body)
         self.assertFalse(checks[1]['ok'], checks)
 
+    def test_guard_checks_allow_only_the_matching_public_landing_page(self):
+        import probe_bunny_delivery as probe
+        body = b'<html>Divine Blossom Server</html>'
+        def fetch(host, method, path, headers=None, **kwargs):
+            if path == '/' and method in ('GET', 'HEAD'):
+                return probe.Reply(200, {'content-type': 'text/html; charset=utf-8',
+                    'content-length': str(len(body))}, body if method == 'GET' else b'')
+            return probe.Reply(403, {}, b'')
+        with patch.object(probe, 'fetch', side_effect=fetch):
+            checks = probe.guard_checks('test-zone.b-cdn.net', f'/{HASH}')
+        self.assertTrue(all(check['ok'] for check in checks), checks)
+        self.assertIn('landing-get', [check['operation'] for check in checks])
+        self.assertIn('landing-head', [check['operation'] for check in checks])
+
     def test_redirect_errors_and_served_mp4_are_not_proof_of_denial(self):
         import probe_bunny_delivery as probe
 

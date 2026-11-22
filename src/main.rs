@@ -9,6 +9,7 @@ mod b2_cdn_phase;
 mod b2_cdn_purge;
 mod blossom;
 mod bunny_publish;
+mod bunny_ready;
 mod canary;
 mod playback_cache;
 mod delete_policy;
@@ -25,6 +26,7 @@ mod archive_diagnostics;
 mod rate_limit;
 mod req_id;
 mod request_log;
+mod request_bindings;
 mod storage;
 mod upload_log;
 mod viewer_auth;
@@ -127,6 +129,7 @@ fn main() -> std::result::Result<(), Error> {
 }
 
 fn handle_main(mut req: Request) -> std::result::Result<Response, Error> {
+    let _bindings = request_bindings::begin();
     playback_cache::begin_request();
     // Route Rust panics to the persistent diagnostics endpoint so a
     // non-returning guest failure still leaves a record. The message is the
@@ -255,6 +258,9 @@ fn route_request(req: Request) -> Result<Response> {
     }
     let method = req.get_method().clone();
     let path = req.get_path().to_string();
+    if let Some(parent) = path.strip_prefix("/api/bunny-playback/") {
+        return Ok(bunny_ready::playback(req, parent));
+    }
     match (method, path.as_str()) {
         // Landing page
         (Method::GET, "/") => Ok(handle_landing_page()),
@@ -400,7 +406,9 @@ fn route_request(req: Request) -> Result<Response> {
         (_, "/admin/api/b2-cdn-purge/drain") => {
             b2_cdn_purge::handle_drain(req, storage::invalidate_b2_cdn)
         }
-        (_, "/admin/api/bunny-pilot/publish") => Ok(bunny_publish::handle(req)),
+        (_, "/admin/api/bunny-pilot/publish" | "/admin/api/bunny-pilot/finalize" | blossom_core::bunny_worker::PERMIT_PATH) => {
+            Ok(bunny_publish::handle(req))
+        }
         (Method::POST, "/admin/api/quarantine") => admin::handle_admin_quarantine_action(req),
         (Method::GET, p) if p.starts_with("/admin/api/quarantine/") => {
             admin::handle_admin_quarantine_status(
@@ -7516,11 +7524,7 @@ fn add_no_cache_headers(resp: &mut Response) {
 /// by Surrogate-Key. Calls POST /service/{id}/purge/{key} on api.fastly.com
 /// for each service. Best-effort: logs errors but never fails the calling request.
 pub(crate) fn purge_edge_cache(surrogate_key: &str) {
-    let api_token = match fastly::secret_store::SecretStore::open("blossom_secrets")
-        .ok()
-        .and_then(|store| store.get("fastly_api_token"))
-        .map(|secret| String::from_utf8(secret.plaintext().to_vec()).unwrap_or_default())
-    {
+    let api_token = match storage::get_secret("fastly_api_token").ok() {
         Some(token) if !token.is_empty() => token,
         _ => {
             eprintln!("[PURGE] fastly_api_token not configured, skipping cache purge");

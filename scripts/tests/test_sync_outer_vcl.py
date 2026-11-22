@@ -91,6 +91,10 @@ class ManifestContractTest(unittest.TestCase):
         self.assertEqual(unmanaged, {"log_cdn_views.vcl"})
         self.assertEqual(manifest["service_id"], "ML7R82HKfmTaqTpHExIDVN")
 
+    def test_pilot_wait_requires_exact_admin_post(self):
+        content = (ROOT / "vcl/pass.vcl").read_text()
+        self.assertIn('if (req.method == "POST" && req.http.Authorization ~ "^Bearer [^ ]+$" &&\n    req.url ~ "^/admin/api/bunny-pilot/(publish|finalize)$") {\n  set bereq.first_byte_timeout = 120s;', content)
+
     def test_live_upload_timeout_snippet_is_tracked(self) -> None:
         names = {item["name"] for item in load_manifest()["snippets"]}
         self.assertIn("Upload origin timeout", names)
