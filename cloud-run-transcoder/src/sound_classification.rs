@@ -183,11 +183,7 @@ where
     let path = analysis_object_path(hash);
     if !force {
         if let Some(existing) = state.media_storage.stat(&path).await? {
-            if existing.size > 0 {
-                state
-                    .media_storage
-                    .ensure_required_backup(&existing)
-                    .await?;
+            if state.media_storage.can_reuse_output(&existing).await? {
                 return Ok(ClassifyOutcome::AlreadyExists.into());
             }
         }
@@ -427,9 +423,11 @@ mod tests {
             .await
             .unwrap();
 
+        let mut gcs_config = ClientConfig::default().anonymous();
+        gcs_config.storage_endpoint = "http://127.0.0.1:1".into();
         let state = AppState {
             media_storage,
-            gcs_client: GcsClient::new(ClientConfig::default().anonymous()),
+            gcs_client: GcsClient::new(gcs_config),
             config: Config::from_lookup(|key| match key {
                 "GCS_BUCKET" => Some("unused-gcs".to_string()),
                 "AUDIO_ANALYZER_URL" => Some("https://analyzer.invalid".to_string()),
