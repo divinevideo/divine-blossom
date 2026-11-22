@@ -644,12 +644,12 @@ async fn explicit_429_is_retried_for_claim_creation_and_release() {
 
 #[tokio::test]
 #[ignore = "requires ffmpeg and ffprobe with libx264"]
-async fn short_media_meets_the_same_key_quota_in_both_storage_modes() {
+async fn short_media_meets_the_same_key_quota_with_and_without_backups() {
     let gcs = Origin::start().await;
     gcs.objects.lock().await.claim_write_interval = Some(Duration::from_secs(1));
     let b2 = crate::object_storage::tests::Origin::start().await;
 
-    let (single, dual) = tokio::join!(
+    let (single, dual, primary_only) = tokio::join!(
         measured_pipeline(
             &gcs,
             MediaStorage::gcs(gcs.client(), "synthetic-gcs".into()),
@@ -662,8 +662,14 @@ async fn short_media_meets_the_same_key_quota_in_both_storage_modes() {
             "testsrc2=size=640x352:rate=24:duration=6",
             17
         ),
+        measured_pipeline(
+            &gcs,
+            b2.with_gcs_input_only(gcs.client()),
+            "testsrc2=size=640x344:rate=24:duration=6",
+            10
+        ),
     );
-    eprintln!("6s FFmpeg fixtures with loopback storage: GCS-only {single:?}; B2-primary {dual:?}");
+    eprintln!("6s FFmpeg fixtures with loopback storage: GCS-only {single:?}; B2 with backup {dual:?}; B2 without backup {primary_only:?}");
     assert_eq!(gcs.objects.lock().await.claim_throttles, 0);
 }
 
@@ -809,4 +815,57 @@ async fn a_throttled_marker_based_takeover_cannot_replace_an_advanced_intent() {
     );
     owner.reject_write().await.unwrap();
     owner.finish(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn disabling_backups_recovers_old_gcs_writes_only_with_matching_commit_markers() {
+    for committed in [false, true] {
+        let locks = Origin::start().await;
+        let media = crate::object_storage::tests::Origin::start().await;
+        let storage = media.with_gcs_input_only(locks.client());
+        let mut owner = locks.store().claim(A, Some(&storage)).await.unwrap();
+        let key = format!("{A}/hls/master.m3u8");
+        let id = owner.write_id();
+        owner.begin_write(true, &key, &id).await.unwrap();
+        locks
+            .client()
+            .upload_object(
+                &UploadObjectRequest {
+                    bucket: "synthetic-gcs".into(),
+                    if_generation_match: Some(0),
+                    ..Default::default()
+                },
+                Bytes::from_static(b"synthetic previous backup"),
+                &UploadType::Multipart(Box::new(Object {
+                    name: key.clone(),
+                    content_type: Some("text/plain".into()),
+                    metadata: Some(HashMap::from([(
+                        WRITE_ID.into(),
+                        if committed {
+                            id.clone()
+                        } else {
+                            "other-attempt".into()
+                        },
+                    )])),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .unwrap();
+        locks.age(A).await;
+        let replacement = locks.store().claim(A, Some(&storage)).await;
+        if committed {
+            let replacement = replacement.unwrap();
+            assert_eq!(replacement.dirty(), Dirty::Hls);
+            assert!(owner.confirm().await.is_err());
+            assert!(owner.finish(false).await.is_err());
+            replacement.finish(false).await.unwrap();
+        } else {
+            assert!(
+                replacement.is_err(),
+                "unknown earlier writes must remain fenced"
+            );
+            assert!(locks.objects.lock().await.live.contains_key(&lock_key(A)));
+        }
+    }
 }
