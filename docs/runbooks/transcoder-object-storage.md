@@ -6,11 +6,11 @@ extracted audio, and newly generated transcript VTT. This source change does not
 change public media URLs. Derived-media readers have separate configuration.
 
 `MEDIA_STORAGE_PROVIDER=b2_primary` uses B2 for those media reads and requires
-verified GCS backups for every write through this adapter. It requires the same
+verified GCS backups for every write through this adapter by default. It requires the same
 B2 settings plus the existing authenticated GCS client and nonempty GCS bucket.
 Processing originals fall back to the pinned, verified legacy GCS copy only
 when the B2 metadata lookup reports absence; all other failures remain errors.
-Both immutable provider versions and their bytes/metadata are verified before
+With backups enabled, both immutable provider versions and their bytes/metadata are verified before
 `put_verified` succeeds; its receipt includes `required_backup`. A failed backup
 returns an error even if B2 already accepted the primary. It does not delete
 that primary or report the output complete. HLS reuse in the new mode checks
@@ -128,8 +128,8 @@ output. Default GCS metadata lookup errors preserve the legacy fall-through to
 locked processing. Translation source lookup retains historical GCS read
 compatibility only when the selected object is absent; selected-provider errors
 and failed pinned reads do not use that compatibility path.
-Before transcription deduplication acknowledges an existing B2-primary transcript,
-it holds the existing transcript lock and verifies the required backup's pinned
+With backups enabled, before transcription deduplication acknowledges an existing
+B2-primary transcript, it holds the existing transcript lock and verifies the required backup's pinned
 metadata and bytes. Missing or mismatched backups are repaired from pinned primary
 bytes with their existing provenance and GCS generation preconditions. Matching
 backups are not rewritten. A failed cache check or repair sends a failed status
