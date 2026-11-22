@@ -11,7 +11,8 @@
 //! `X-Divine-Transcribe-Secret` header as `/transcribe/audio`.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
+    future::Future,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
@@ -24,15 +25,10 @@ use axum::{
     Json,
 };
 use bytes::Bytes;
-use google_cloud_storage::http::objects::{
-    download::Range as DownloadRange,
-    get::GetObjectRequest,
-    upload::{Media, UploadObjectRequest, UploadType},
-};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::{check_gcs_exists, fetch_gcp_identity_token, AppState};
+use crate::{fetch_gcp_identity_token, find_media_object, AppState};
 
 /// The analyzer rejects bodies above 50 MB; skip those before downloading them.
 const MAX_SOUND_BYTES: i64 = 50 * 1024 * 1024;
@@ -152,51 +148,50 @@ pub(crate) async fn classify_sound(
     let Some(base_url) = state.config.audio_analyzer_url.as_deref() else {
         return Ok(ClassifyOutcome::NotConfigured.into());
     };
+    classify_sound_with(state, hash, force, |content_type, audio| async move {
+        call_analyzer(base_url, &content_type, audio).await
+    })
+    .await
+}
+
+async fn classify_sound_with<F, Fut>(
+    state: &AppState,
+    hash: &str,
+    force: bool,
+    analyze: F,
+) -> Result<Classification>
+where
+    F: FnOnce(String, Vec<u8>) -> Fut,
+    Fut: Future<Output = Result<(Bytes, bool)>>,
+{
     let Some(_claim) = InFlightClaim::try_claim(hash) else {
         return Ok(ClassifyOutcome::InProgress.into());
     };
-    let bucket = &state.config.gcs_bucket;
-    let source = GetObjectRequest {
-        bucket: bucket.clone(),
-        object: hash.to_string(),
-        ..Default::default()
+    let Some((source_storage, object)) = find_media_object(state, hash)
+        .await
+        .map_err(|e| anyhow!("Failed to read source object metadata: {}", e))?
+    else {
+        return Ok(ClassifyOutcome::Missing.into());
     };
-    let object = match state.gcs_client.get_object(&source).await {
-        Ok(object) => object,
-        Err(google_cloud_storage::http::Error::Response(e)) if e.code == 404 => {
-            return Ok(ClassifyOutcome::Missing.into());
-        }
-        Err(e) => return Err(anyhow!("Failed to read source object metadata: {}", e)),
-    };
-    let content_type = object.content_type.unwrap_or_default();
-    if let Some(skip) = skip_reason(&content_type, object.size) {
+    let size = i64::try_from(object.size).unwrap_or(i64::MAX);
+    if let Some(skip) = skip_reason(&object.content_type, size) {
         return Ok(skip.into());
     }
 
     let path = analysis_object_path(hash);
-    if !force && check_gcs_exists(&state.gcs_client, bucket, &path).await? {
+    if !force && state.media_storage.stat(&path).await?.is_some() {
         return Ok(ClassifyOutcome::AlreadyExists.into());
     }
 
-    let audio = state
-        .gcs_client
-        .download_object(&source, &DownloadRange::default())
+    let audio = source_storage
+        .read(&object)
         .await
-        .map_err(|e| anyhow!("Failed to download from GCS: {}", e))?;
-    let (verdict, silent) = call_analyzer(base_url, &content_type, audio).await?;
+        .map_err(|e| anyhow!("Failed to download source audio: {}", e))?;
+    let (verdict, silent) = analyze(object.content_type.clone(), audio).await?;
 
-    let mut media = Media::new(path.clone());
-    media.content_type = "application/json".into();
     state
-        .gcs_client
-        .upload_object(
-            &UploadObjectRequest {
-                bucket: bucket.clone(),
-                ..Default::default()
-            },
-            verdict,
-            &UploadType::Simple(media),
-        )
+        .media_storage
+        .put_verified(&path, verdict, "application/json", HashMap::new(), None)
         .await
         .map_err(|e| anyhow!("Failed to upload {}: {}", path, e))?;
     Ok(Classification {
@@ -404,5 +399,64 @@ mod tests {
             serde_json::to_string(&ClassifyOutcome::AlreadyExists).unwrap(),
             "\"already_exists\""
         );
+    }
+
+    #[tokio::test]
+    async fn classify_sound_stores_and_deduplicates_on_selected_b2_storage() {
+        use crate::{object_storage, Config};
+        use google_cloud_storage::client::{Client as GcsClient, ClientConfig};
+        use sha2::{Digest, Sha256};
+        use tokio::sync::Semaphore;
+
+        let origin = object_storage::tests::Origin::start().await;
+        let media_storage = origin.store();
+        let audio = Bytes::from_static(b"synthetic-audio-bytes");
+        let hash = hex::encode(Sha256::digest(&audio));
+        media_storage
+            .put_verified(&hash, audio.clone(), "audio/mpeg", HashMap::new(), None)
+            .await
+            .unwrap();
+
+        let state = AppState {
+            media_storage,
+            gcs_client: GcsClient::new(ClientConfig::default().anonymous()),
+            config: Config::from_lookup(|key| match key {
+                "GCS_BUCKET" => Some("unused-gcs".to_string()),
+                "AUDIO_ANALYZER_URL" => Some("https://analyzer.invalid".to_string()),
+                _ => None,
+            }),
+            provider_semaphore: Arc::new(Semaphore::new(2)),
+        };
+
+        let verdict = Bytes::from_static(br#"{"silent":false,"kind":"music","tags":["music"]}"#);
+        let first = classify_sound_with(&state, &hash, false, |mime, bytes| {
+            let verdict = verdict.clone();
+            async move {
+                assert_eq!(mime, "audio/mpeg");
+                assert_eq!(bytes, b"synthetic-audio-bytes");
+                Ok((verdict, false))
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            first,
+            Classification {
+                status: ClassifyOutcome::Classified,
+                silent: Some(false),
+            }
+        );
+
+        let path = analysis_object_path(&hash);
+        let stored = state.media_storage.stat(&path).await.unwrap().unwrap();
+        assert_eq!(stored.content_type, "application/json");
+        assert_eq!(state.media_storage.read(&stored).await.unwrap(), verdict);
+
+        let second = classify_sound_with(&state, &hash, false, |_, _| async {
+            panic!("cached B2 verdict should skip analyzer");
+        })
+        .await
+        .unwrap();
+        assert_eq!(second, ClassifyOutcome::AlreadyExists.into());
     }
 }

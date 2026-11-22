@@ -34,23 +34,43 @@ fn object_response(path: String, generation: i64, size: usize) -> Response {
     Json(value).into_response()
 }
 
+fn parse_gcs_multipart(body: &[u8]) -> Option<(String, Vec<u8>)> {
+    let find = |haystack: &[u8], needle: &[u8]| {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    };
+    let meta_start = find(body, b"\r\n\r\n")? + 4;
+    let meta_end = meta_start + find(&body[meta_start..], b"\r\n--")?;
+    let meta: serde_json::Value = serde_json::from_slice(&body[meta_start..meta_end]).ok()?;
+    let name = meta["name"].as_str()?.to_string();
+    let data_start = meta_end + find(&body[meta_end..], b"\r\n\r\n")? + 4;
+    let data_end = body.windows(4).rposition(|window| window == b"\r\n--")?;
+    Some((name, body[data_start..data_end].to_vec()))
+}
+
 async fn storage_request(State(objects): State<Objects>, request: Request) -> Response {
     let method = request.method().clone();
     let url = reqwest::Url::parse(&format!("http://storage{}", request.uri())).unwrap();
     let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
-    let path = if method == Method::POST {
-        query["name"].clone()
+    let body = to_bytes(request.into_body(), 1_000_000).await.unwrap();
+    let (path, payload) = if method == Method::POST {
+        if query.get("uploadType").map(String::as_str) == Some("multipart") {
+            parse_gcs_multipart(&body).expect("valid multipart upload")
+        } else {
+            (query["name"].clone(), body.to_vec())
+        }
     } else {
         let encoded = url.path().split("/o/").nth(1).unwrap();
-        reqwest::Url::parse(&format!("http://storage/?name={encoded}"))
+        let decoded = reqwest::Url::parse(&format!("http://storage/?name={encoded}"))
             .unwrap()
             .query_pairs()
             .next()
             .unwrap()
             .1
-            .into_owned()
+            .into_owned();
+        (decoded, body.to_vec())
     };
-    let body = to_bytes(request.into_body(), 1_000_000).await.unwrap();
     let mut objects = objects.lock().await;
     let existing = objects.get(&path).cloned();
     let error = |code: u16| {
@@ -109,8 +129,8 @@ async fn storage_request(State(objects): State<Objects>, request: Request) -> Re
             return error(412);
         }
         let generation = generation + 1;
-        let size = body.len();
-        objects.insert(path.clone(), (body.to_vec(), generation));
+        let size = payload.len();
+        objects.insert(path.clone(), (payload, generation));
         return object_response(path, generation, size);
     }
     let Some((body, generation)) = existing else {
@@ -221,28 +241,43 @@ async fn selected_and_legacy_transcripts_reach_translation_and_transcription_ded
         } else {
             assert_eq!(cached.unwrap().status, "already_exists");
         }
-        let translated = process_translate_with(state, request(SOURCE), |_, texts| async move {
-            assert_eq!(texts, ["Hello"]);
-            Ok(vec!["Olá".into()])
-        })
-        .await
-        .unwrap();
+        let translated =
+            process_translate_with(state.clone(), request(SOURCE), |_, texts| async move {
+                assert_eq!(texts, ["Hello"]);
+                Ok(vec!["Olá".into()])
+            })
+            .await
+            .unwrap();
         assert_eq!(translated.status, "complete");
-        // Translation output and coordination records remain in GCS, not B2.
+        // Translated VTT output lands in selected B2 storage; coordination claims stay in GCS.
         let objects = storage.objects.lock().await;
-        assert!(objects.contains_key(&translated.vtt_path));
+        assert!(!objects.contains_key(&translated.vtt_path));
         assert!(objects.contains_key(&format!("{}.json", translated.vtt_path)));
         assert_eq!(
             objects.contains_key(&format!("{}/vtt/main.vtt", "a".repeat(64))),
             legacy
         );
         drop(objects);
+        let stored_vtt = state
+            .media_storage
+            .stat(&translated.vtt_path)
+            .await
+            .unwrap()
+            .expect("translated VTT must be stored in selected B2 storage");
+        assert_eq!(stored_vtt.content_type, "text/vtt");
+        let cached_translation =
+            process_translate_with(state, request(SOURCE), |_, _| async move {
+                panic!("cached B2 translation must not invoke translation provider")
+            })
+            .await
+            .unwrap();
+        assert_eq!(cached_translation.status, "already_exists");
         let origin = origin.objects.lock().await;
-        assert!(origin
-            .requests
-            .iter()
-            .all(|(method, key, _)| key.ends_with("/vtt/main.vtt")
-                || (legacy && method == "HEAD" && key == &"a".repeat(64))));
+        assert!(origin.requests.iter().all(|(method, key, _)| {
+            key.ends_with("/vtt/main.vtt")
+                || key == &translated.vtt_path
+                || (legacy && method == "HEAD" && key == &"a".repeat(64))
+        }));
         if !legacy {
             assert!(origin
                 .requests
@@ -482,11 +517,12 @@ async fn translation_missing_source_and_storage_permission_failures_are_distinct
     .await
     .unwrap();
     assert_eq!(result.status, "no_source");
-    assert!(
-        read_translation_object(&storage.state.gcs_client, "test", "forbidden/object")
-            .await
-            .is_err()
-    );
+    assert!(storage
+        .state
+        .media_storage
+        .stat("forbidden/object")
+        .await
+        .is_err());
 }
 
 #[test]

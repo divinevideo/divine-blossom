@@ -2792,23 +2792,9 @@ async fn process_transcribe(
     result
 }
 
-async fn check_gcs_exists(client: &GcsClient, bucket: &str, object: &str) -> Result<bool> {
-    match client
-        .get_object(&GetObjectRequest {
-            bucket: bucket.to_string(),
-            object: object.to_string(),
-            ..Default::default()
-        })
-        .await
-    {
-        Ok(_) => Ok(true),
-        Err(_) => Ok(false),
-    }
-}
-
-/// Read compatibility for historical translation sources. This lookup never
-/// grants transcript completion; that path requires selected-primary output.
-async fn find_transcript(
+/// Read compatibility for historical inputs/sources. This lookup never grants
+/// output completion; completion requires selected-primary output.
+pub(crate) async fn find_media_object(
     state: &AppState,
     key: &str,
 ) -> Result<Option<(object_storage::MediaStorage, object_storage::ObjectMetadata)>> {
@@ -2823,6 +2809,15 @@ async fn find_transcript(
         state.config.gcs_bucket.clone(),
     );
     Ok(legacy.stat(key).await?.map(|object| (legacy, object)))
+}
+
+/// Read compatibility for historical translation sources. This lookup never
+/// grants transcript completion; that path requires selected-primary output.
+async fn find_transcript(
+    state: &AppState,
+    key: &str,
+) -> Result<Option<(object_storage::MediaStorage, object_storage::ObjectMetadata)>> {
+    find_media_object(state, key).await
 }
 
 /// Extract mono 16kHz PCM WAV audio for transcription.

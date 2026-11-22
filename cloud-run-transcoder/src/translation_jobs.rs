@@ -87,29 +87,6 @@ fn gcs_error_status(error: &google_cloud_storage::http::Error) -> Option<u16> {
     }
 }
 
-/// Return only genuine 404s as absent. Preserve all other storage failures.
-async fn read_translation_object(
-    client: &GcsClient,
-    bucket: &str,
-    path: &str,
-) -> Result<Option<Vec<u8>>> {
-    match client
-        .download_object(
-            &GetObjectRequest {
-                bucket: bucket.into(),
-                object: path.into(),
-                ..Default::default()
-            },
-            &DownloadRange::default(),
-        )
-        .await
-    {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(error) if gcs_error_status(&error) == Some(404) => Ok(None),
-        Err(error) => Err(anyhow!("Translation storage read failed: {}", error)),
-    }
-}
-
 async fn write_translation_job(
     state: &AppState,
     path: &str,
@@ -223,10 +200,7 @@ where
         vtt_path: target_path.clone(),
         cue_count,
     };
-    if read_translation_object(&state.gcs_client, &state.config.gcs_bucket, &target_path)
-        .await?
-        .is_some()
-    {
+    if state.media_storage.stat(&target_path).await?.is_some() {
         return Ok(response("already_exists", 0));
     }
     let source_path = format!("{hash}/vtt/main.vtt");
@@ -243,10 +217,7 @@ where
     };
     // Recheck after the claim: a preceding worker may have completed between reads.
     let result = tokio::time::timeout(Duration::from_secs(100), async {
-        if read_translation_object(&state.gcs_client, &state.config.gcs_bucket, &target_path)
-            .await?
-            .is_some()
-        {
+        if state.media_storage.stat(&target_path).await?.is_some() {
             return Ok(response("already_exists", 0));
         }
         let source = String::from_utf8(source)?;
@@ -296,13 +267,18 @@ where
             }
         };
         let rendered = translation_google_v3::render_vtt(&cues, &translated, &lang)?;
-        upload_transcript_variant_to_gcs(
-            &state.gcs_client,
-            &state.config.gcs_bucket,
-            &target_path,
-            &rendered,
-        )
-        .await?;
+        state
+            .media_storage
+            .put_verified(
+                &target_path,
+                Bytes::from(rendered.into_bytes()),
+                "text/vtt",
+                HashMap::new(),
+                None,
+            )
+            .await
+            .map_err(|e| anyhow!("Failed to upload transcript {}: {}", target_path, e))?;
+        info!("Uploaded transcript {}", target_path);
         Ok(response("complete", cues.len() as u32))
     })
     .await
@@ -331,35 +307,6 @@ where
         .await?;
     }
     result
-}
-
-/// Upload a translated VTT to its source-versioned object path.
-async fn upload_transcript_variant_to_gcs(
-    client: &GcsClient,
-    bucket: &str,
-    gcs_path: &str,
-    vtt_content: &str,
-) -> Result<()> {
-    let mut media = Media::new(gcs_path.to_string());
-    media.content_type = "text/vtt".into();
-    let upload_type = UploadType::Simple(media);
-
-    let req = UploadObjectRequest {
-        bucket: bucket.to_string(),
-        ..Default::default()
-    };
-
-    client
-        .upload_object(
-            &req,
-            Bytes::from(vtt_content.as_bytes().to_vec()),
-            &upload_type,
-        )
-        .await
-        .map_err(|e| anyhow!("Failed to upload transcript {}: {}", gcs_path, e))?;
-
-    info!("Uploaded transcript {}", gcs_path);
-    Ok(())
 }
 
 #[cfg(test)]
