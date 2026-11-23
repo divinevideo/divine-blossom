@@ -1872,7 +1872,7 @@ Deno.test("upload hardening: quarantine holds, restricted privacy, encoding poli
 
     // 10. Restore clears cleanupPending so a subsequent admin soft-delete + drain does NOT erase B2 bytes
     await blobs.write(mirrorHash, mirrorBytes, "video/mp4");
-    await app(
+    const modDelRes = await app(
       new Request(`${origin}/admin/api/moderate`, {
         method: "POST",
         headers: {
@@ -1882,8 +1882,9 @@ Deno.test("upload hardening: quarantine holds, restricted privacy, encoding poli
         body: JSON.stringify({ sha256: mirrorHash, action: "DELETE" }),
       }),
     );
+    equal(modDelRes.status, 200);
     equal((await catalog.get(mirrorHash))?.cleanupPending, true);
-    await app(
+    const restoreRes = await app(
       new Request(`${origin}/admin/api/restore`, {
         method: "POST",
         headers: {
@@ -1893,8 +1894,9 @@ Deno.test("upload hardening: quarantine holds, restricted privacy, encoding poli
         body: JSON.stringify({ sha256: mirrorHash, status: "active" }),
       }),
     );
+    equal(restoreRes.status, 200);
     equal((await catalog.get(mirrorHash))?.cleanupPending, false);
-    await app(
+    const softDelRes = await app(
       new Request(`${origin}/admin/api/delete`, {
         method: "POST",
         headers: {
@@ -1904,16 +1906,32 @@ Deno.test("upload hardening: quarantine holds, restricted privacy, encoding poli
         body: JSON.stringify({ sha256: mirrorHash, reason: "soft-only" }),
       }),
     );
-    await app(
+    equal(softDelRes.status, 200);
+    const softDelRow = await catalog.get(mirrorHash);
+    equal(softDelRow?.status, "deleted");
+    equal(softDelRow?.cleanupPending, false);
+    const drainAfterRestore = await app(
       new Request(`${origin}/admin/api/b2-cdn-purge/drain?max=10`, {
         method: "POST",
         headers: { authorization: `Bearer ${adminToken}` },
       }),
     );
+    equal(drainAfterRestore.status, 200);
+    const drainAfterRestoreBody = await drainAfterRestore.json() as {
+      drained: number;
+      completed: number;
+      deferred: number;
+      skipped_held: number;
+    };
+    equal(drainAfterRestoreBody.drained >= 2, true);
+    equal(drainAfterRestoreBody.completed, drainAfterRestoreBody.drained);
+    equal(drainAfterRestoreBody.deferred, 0);
+    equal(drainAfterRestoreBody.skipped_held >= 1, true);
     equal(blobs.store.has(mirrorHash), true);
 
-    // 11. /upload/:id/complete preserves Cloud Run 409 ("Upload incomplete"), conflicting SHA headers return 400,
-    //     and mixed-case Video/MP4 thumbnail fallback runs policy re-check before returning 422
+    // 11. /upload/:id/complete preserves Cloud Run 409 ("Upload incomplete"), /upload/init returns 400/503 on
+    //     deleted/gated blobs (never 409), conflicting SHA headers return 400, and mixed-case Video/MP4
+    //     thumbnail fallback runs policy re-check before returning 422
     customUpstreamHandler = () =>
       new Response(JSON.stringify({ error: "Upload incomplete: 10 of 20 bytes committed" }), {
         status: 409,
@@ -1930,6 +1948,51 @@ Deno.test("upload hardening: quarantine holds, restricted privacy, encoding poli
       }),
     );
     equal(incompleteRes.status, 409);
+
+    // /upload/init returns 503 on gated/unavailable blobs and 400 on settled owner-deleted blobs
+    const gatedInitRes = await app(
+      new Request(`${origin}/upload/init`, {
+        method: "POST",
+        headers: {
+          authorization: blossomAuth(sk1, "upload", now, gatedHash),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ sha256: gatedHash, size: 64, contentType: "video/mp4" }),
+      }),
+    );
+    equal(gatedInitRes.status, 503);
+    equal(gatedInitRes.headers.get("retry-after"), "5");
+
+    const settledOwnerDeletedHash = "4".repeat(64);
+    await catalog.cas(settledOwnerDeletedHash, null, {
+      revision: 1,
+      hash: settledOwnerDeletedHash,
+      size: 64,
+      type: "video/mp4",
+      uploaded: now,
+      owners: [],
+      status: "deleted",
+      ageRestricted: false,
+      held: false,
+      gate: null,
+      cleanupPending: false,
+      ownerDeleted: true,
+    });
+    const settledDeletedInitRes = await app(
+      new Request(`${origin}/upload/init`, {
+        method: "POST",
+        headers: {
+          authorization: blossomAuth(sk1, "upload", now, settledOwnerDeletedHash),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          sha256: settledOwnerDeletedHash,
+          size: 64,
+          contentType: "video/mp4",
+        }),
+      }),
+    );
+    equal(settledDeletedInitRes.status, 400);
 
     const conflictShaRes = await app(
       new Request(`${origin}/upload`, {
@@ -1959,13 +2022,31 @@ Deno.test("upload hardening: quarantine holds, restricted privacy, encoding poli
       cleanupPending: false,
     });
     await blobs.write(mixedHash, new Uint8Array([9, 9, 9]), "Video/MP4");
-    customUpstreamHandler = async () => {
+    let thumbUpstreamCalls = 0;
+    customUpstreamHandler = (reqUrl) => {
+      equal(reqUrl, `https://upload.divine.video/thumbnail/${mixedHash}`);
+      thumbUpstreamCalls++;
+      return new Response(null, { status: 422 });
+    };
+    const unprocThumbRes = await app(new Request(`${origin}/${mixedHash}.jpg`));
+    equal(unprocThumbRes.status, 422);
+    equal(thumbUpstreamCalls, 1);
+
+    customUpstreamHandler = async (reqUrl) => {
+      equal(reqUrl, `https://upload.divine.video/thumbnail/${mixedHash}`);
+      thumbUpstreamCalls++;
       // Simulate concurrent quarantine while Cloud Run generates the thumbnail and returns 422.
       await catalog.addQuarantineHold(mixedHash, "mid-flight-hold", now);
       return new Response(null, { status: 422 });
     };
     const revokedThumbRes = await app(new Request(`${origin}/${mixedHash}.jpg`));
     equal(revokedThumbRes.status, 404);
+    equal(
+      (await revokedThumbRes.json() as { error: string }).error,
+      "policy changed during origin read",
+    );
+    equal(thumbUpstreamCalls, 2);
+    equal((await catalog.getQuarantineHolds(mixedHash)).includes("mid-flight-hold"), true);
     customUpstreamHandler = null;
   } finally {
     db.close();
