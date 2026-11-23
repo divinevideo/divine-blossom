@@ -88,6 +88,7 @@ function allowsVideoEncoding(record: BlobRecord): boolean {
 function limitStreamBytes(
   stream: ReadableStream<Uint8Array>,
   maxBytes: number,
+  onExceeded: () => void,
 ): ReadableStream<Uint8Array> {
   let seen = 0;
   return stream.pipeThrough(
@@ -95,6 +96,7 @@ function limitStreamBytes(
       transform(chunk, controller) {
         seen += chunk.byteLength;
         if (seen > maxBytes) {
+          onExceeded();
           controller.error(new RangeError("body limit"));
           return;
         }
@@ -102,6 +104,26 @@ function limitStreamBytes(
       },
     }),
   );
+}
+
+function normalizeThumbnailForOrigin(
+  rawThumbnail: unknown,
+  hash: string,
+  origin: string,
+): string | undefined {
+  if (typeof rawThumbnail !== "string") return undefined;
+  const trimmed = rawThumbnail.trim();
+  if (!trimmed) return undefined;
+  try {
+    const parsed = new URL(trimmed, origin);
+    const lowerPath = parsed.pathname.toLowerCase();
+    if (lowerPath === `/${hash}.jpg` || lowerPath === `/${hash}/thumbnail`) {
+      return `${origin}${lowerPath}`;
+    }
+  } catch {
+    // Fall through to trimmed value if not a parseable URL.
+  }
+  return trimmed;
 }
 
 function trustedUploadServiceTerminalError(
@@ -498,9 +520,13 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
     });
   }
 
+  function effectiveMaxUploadBytes(): number {
+    return config.upstreams?.uploadServiceUrl ? maxUpload : maxDirectUpload;
+  }
+
   function uploadCapabilityHeaders(): Record<string, string> {
     const out: Record<string, string> = {
-      "x-content-length": String(maxUpload),
+      "x-content-length": String(effectiveMaxUploadBytes()),
       "x-divine-upload-extensions": DIVINE_UPLOAD_EXTENSION_RESUMABLE,
       "x-divine-upload-control-host": originHost,
       "cache-control": "private, no-store",
@@ -512,12 +538,21 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
     return out;
   }
 
-  async function uploadPrecheckStatus(hash: string): Promise<"forbidden" | "unavailable" | null> {
+  async function uploadPrecheckStatus(
+    hash: string,
+    actorPubkey?: string,
+  ): Promise<"forbidden" | "unavailable" | null> {
     const [existing, holds] = await Promise.all([
       config.catalog.get(hash),
       config.catalog.getQuarantineHolds(hash),
     ]);
-    if (existing?.held || existing?.status === "banned" || holds.length > 0) {
+    if (
+      existing?.held ||
+      existing?.status === "banned" ||
+      holds.length > 0 ||
+      (existing?.status === "restricted" &&
+        (!actorPubkey || !existing.owners.includes(actorPubkey)))
+    ) {
       return "forbidden";
     }
     if (existing?.status === "deleted" || existing?.gate) {
@@ -591,21 +626,32 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
     }
     const hasBody = !["GET", "HEAD"].includes(req.method.toUpperCase());
     let body: BodyInit | undefined;
+    let bodyLimitExceeded = false;
     if (options && "body" in options) {
       body = options.body ?? undefined;
       headers.delete("content-length");
     } else if (hasBody && req.body) {
       body = options?.maxBodyBytes !== undefined
-        ? limitStreamBytes(req.body, options.maxBodyBytes)
+        ? limitStreamBytes(req.body, options.maxBodyBytes, () => {
+          bodyLimitExceeded = true;
+        })
         : req.body;
     }
-    return await fetcher(targetUrl, {
-      method: req.method,
-      headers,
-      body,
-      redirect: "error",
-      signal: AbortSignal.timeout(options?.timeoutMs ?? 60_000),
-    });
+    try {
+      return await fetcher(targetUrl, {
+        method: req.method,
+        headers,
+        body,
+        redirect: "error",
+        signal: AbortSignal.timeout(options?.timeoutMs ?? 60_000),
+      });
+    } catch (error) {
+      // Standard WHATWG/Deno fetch wraps stream errors as TypeError; preserve our explicit body-limit signal.
+      if (bodyLimitExceeded) {
+        throw new RangeError("body limit");
+      }
+      throw error;
+    }
   }
 
   async function proxyUpstream(
@@ -700,6 +746,9 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       }
       if (existing?.status === "banned") {
         return jsonResp(403, { error: "content banned" });
+      }
+      if (existing?.status === "restricted" && !existing.owners.includes(owner)) {
+        return jsonResp(403, { error: "content blocked" });
       }
       if (existing?.status === "deleted" || existing?.gate) {
         return jsonResp(409, { error: "parent unavailable" });
@@ -819,21 +868,28 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
 
   async function handleDirectUpload(
     req: Request,
-    owner: string,
     encodingRequested: boolean,
+    declaredSha: string | null,
   ): Promise<Response> {
-    if (fixture && !fixture.owners.includes(owner)) {
-      return jsonResp(403, { error: "fixture signer required" });
-    }
     const body = await boundedBody(req, maxDirectUpload);
+    if (body.length === 0) {
+      return jsonResp(400, { error: "File cannot be empty" });
+    }
     const hash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", body)));
+    if (declaredSha && hash !== declaredSha) {
+      return jsonResp(400, { error: "Declared X-Sha256 does not match uploaded content" });
+    }
     if (fixture && hash !== fixture.hash) {
       return jsonResp(403, { error: "fixture digest required" });
     }
+    let owner: string;
     try {
-      requireNostrAuth(req, "upload", now(), hash, { publicOrigin: origin });
+      owner = requireNostrAuth(req, "upload", now(), hash, { publicOrigin: origin });
     } catch {
       return jsonResp(401, { error: "upload hash mismatch" });
+    }
+    if (fixture && !fixture.owners.includes(owner)) {
+      return jsonResp(403, { error: "fixture signer required" });
     }
 
     const [old, holds] = await Promise.all([
@@ -845,6 +901,9 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
     }
     if (old?.status === "banned") {
       return jsonResp(403, { error: "content banned" });
+    }
+    if (old?.status === "restricted" && !old.owners.includes(owner)) {
+      return jsonResp(403, { error: "content blocked" });
     }
     if (old?.status === "deleted" || old?.gate) {
       return jsonResp(409, { error: "parent unavailable" });
@@ -1021,12 +1080,16 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
               },
             });
           }
-          if (
-            existing &&
-            existing.status !== "deleted" &&
-            existing.status !== "restricted" &&
-            !existing.gate
-          ) {
+          if (existing?.status === "deleted" || existing?.gate) {
+            return new Response(null, {
+              status: 409,
+              headers: {
+                ...capHeaders,
+                "x-reason": "Parent unavailable",
+              },
+            });
+          }
+          if (existing && existing.status !== "restricted") {
             return new Response(null, {
               status: 200,
               headers: {
@@ -1040,6 +1103,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         if (preLenRaw !== null) {
           const trimmedLen = preLenRaw.trim();
           const parsedLen = /^\d+$/.test(trimmedLen) ? Number(trimmedLen) : NaN;
+          const allowedMax = effectiveMaxUploadBytes();
           if (!Number.isSafeInteger(parsedLen) || parsedLen === 0) {
             return new Response(null, {
               status: 400,
@@ -1051,12 +1115,12 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
               },
             });
           }
-          if (parsedLen > maxUpload) {
+          if (parsedLen > allowedMax) {
             return new Response(null, {
               status: 413,
               headers: {
                 ...capHeaders,
-                "x-reason": `File too large. Maximum size is ${maxUpload} bytes`,
+                "x-reason": `File too large. Maximum size is ${allowedMax} bytes`,
               },
             });
           }
@@ -1073,9 +1137,9 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       return jsonResp(
         200,
         {
-          max_size: maxUpload,
+          max_size: effectiveMaxUploadBytes(),
           allowed_types: null,
-          extensions: [DIVINE_UPLOAD_EXTENSION_RESUMABLE],
+          extensions: config.upstreams?.uploadServiceUrl ? [DIVINE_UPLOAD_EXTENSION_RESUMABLE] : [],
         },
         capHeaders,
       );
@@ -1120,7 +1184,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         if (HASH.test(authHash)) precheckHashes.add(authHash);
       }
       for (const candidate of precheckHashes) {
-        const blocked = await uploadPrecheckStatus(candidate);
+        const blocked = await uploadPrecheckStatus(candidate, auth.pubkey);
         if (blocked === "forbidden") {
           return jsonResp(403, { error: "content blocked" });
         }
@@ -1186,6 +1250,9 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         if (declaredSha && sha256 !== declaredSha) {
           return jsonResp(400, { error: "Declared X-Sha256 does not match uploaded content" });
         }
+        if (body.size === 0) {
+          return jsonResp(400, { error: "File cannot be empty" });
+        }
         const size = typeof body.size === "number" && Number.isInteger(body.size) && body.size > 0
           ? body.size
           : declaredContentLength ?? -1;
@@ -1202,7 +1269,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
           sha256,
           size,
           contentType: resolvedType,
-          thumbnailUrl: typeof body.thumbnail_url === "string" ? body.thumbnail_url : undefined,
+          thumbnailUrl: normalizeThumbnailForOrigin(body.thumbnail_url, sha256, origin),
           dim: typeof body.dim === "string" ? body.dim : undefined,
           derivativesEvaluated: isVideoMimeType(resolvedType),
           transcodeErrorCode,
@@ -1223,7 +1290,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
           ),
         });
       }
-      return await handleDirectUpload(req, auth.pubkey, encodingRequested);
+      return await handleDirectUpload(req, encodingRequested, declaredSha);
     }
 
     // Resumable upload control plane
@@ -1286,7 +1353,12 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         config.catalog.get(hash),
         config.catalog.getQuarantineHolds(hash),
       ]);
-      if (existing?.held || existing?.status === "banned" || holds.length > 0) {
+      if (
+        existing?.held ||
+        existing?.status === "banned" ||
+        holds.length > 0 ||
+        (existing?.status === "restricted" && !existing.owners.includes(auth.pubkey))
+      ) {
         return jsonResp(403, {
           error: "This content has been removed and cannot be re-uploaded",
         });
@@ -1295,9 +1367,6 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         return jsonResp(409, { error: "parent unavailable" }, capHeaders);
       }
       if (existing) {
-        if (existing.status === "restricted" && !existing.owners.includes(auth.pubkey)) {
-          return jsonResp(409, { error: "Blob already exists" }, capHeaders);
-        }
         return jsonResp(
           409,
           { error: "Blob already exists", descriptor: buildDescriptor(existing, origin) },
@@ -1393,7 +1462,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         if (HASH.test(authHash)) completePrecheckHashes.add(authHash);
       }
       for (const candidate of completePrecheckHashes) {
-        const blocked = await uploadPrecheckStatus(candidate);
+        const blocked = await uploadPrecheckStatus(candidate, auth.pubkey);
         if (blocked === "forbidden") {
           return jsonResp(403, { error: "content blocked" });
         }
@@ -1450,9 +1519,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
           ? rawContentType.trim()
           : "application/octet-stream";
       const rawThumb = rawComplete.thumbnailUrl ?? rawComplete.thumbnail_url;
-      const resolvedThumb = typeof rawThumb === "string" && rawThumb.trim().length > 0
-        ? rawThumb.trim()
-        : undefined;
+      const resolvedThumb = normalizeThumbnailForOrigin(rawThumb, completeHash, origin);
 
       return await publishDelegatedUpload(auth.pubkey, auth.hashes, encodingRequested, {
         sha256: completeHash,

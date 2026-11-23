@@ -758,9 +758,11 @@ Deno.test("delegated PUT /upload publishes to SQL catalog, supports chunked bodi
     const videoDesc = await videoRes.json() as {
       url: string;
       sha256: string;
+      thumbnail?: string;
       dim?: string;
     };
     equal(videoDesc.url, `${origin}/${videoHash}`);
+    equal(videoDesc.thumbnail, `${origin}/${videoHash}.jpg`);
     equal(videoDesc.dim, "720x1280");
     equal(modScans.length, 1);
     equal(modScans[0].sha256, videoHash);
@@ -1105,11 +1107,13 @@ Deno.test("BUD-06 HEAD /upload pre-validation and Divine resumable init/complete
       url: string;
       sha256: string;
       size: number;
+      thumbnail?: string;
       dim?: string;
     };
     equal(completeDesc.url, `${origin}/${videoHash}`);
     equal(completeDesc.sha256, videoHash);
     equal(completeDesc.size, videoBytes.length);
+    equal(completeDesc.thumbnail, `${origin}/${videoHash}.jpg`);
     equal(completeDesc.dim, "1080x1920");
 
     // 4. Subsequent HEAD /upload reports X-Exists: true, POST /upload/init returns 409 with descriptor
@@ -1331,12 +1335,13 @@ Deno.test("upload hardening: quarantine holds, restricted privacy, encoding poli
     equal(upstreamCalls, callsBeforeQuarantine);
     equal((await catalog.get(qHash))?.owners, [pub1]);
 
-    // 3. Restricted blob does not advertise X-Exists on HEAD /upload and hides descriptor from non-owner on /upload/init
-    const rHash = "a".repeat(64);
+    // 3. Restricted blob does not advertise X-Exists on HEAD /upload and blocks non-owner init/upload/complete (403, no owner grant)
+    const rBytes = new TextEncoder().encode("synthetic-restricted-video-bytes-only-owner");
+    const rHash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", rBytes)));
     await catalog.cas(rHash, null, {
       revision: 1,
       hash: rHash,
-      size: 256,
+      size: rBytes.length,
       type: "video/mp4",
       uploaded: now,
       owners: [pub1],
@@ -1362,12 +1367,85 @@ Deno.test("upload hardening: quarantine holds, restricted privacy, encoding poli
           authorization: blossomAuth(sk2, "upload", now, rHash),
           "content-type": "application/json",
         },
-        body: JSON.stringify({ sha256: rHash, size: 256, contentType: "video/mp4" }),
+        body: JSON.stringify({ sha256: rHash, size: rBytes.length, contentType: "video/mp4" }),
       }),
     );
-    equal(restrictedInit.status, 409);
+    equal(restrictedInit.status, 403);
     const restrictedInitJson = await restrictedInit.json() as Record<string, unknown>;
     equal("descriptor" in restrictedInitJson, false);
+
+    // Non-owner PUT /upload (even without x tag!) and POST /complete must NOT append pub2 to owners
+    const restrictedPut = await app(
+      new Request(`${origin}/upload`, {
+        method: "PUT",
+        body: rBytes,
+        headers: {
+          "content-type": "video/mp4",
+          authorization: blossomAuth(sk2, "upload", now),
+        },
+      }),
+    );
+    equal(restrictedPut.status, 403);
+    const restrictedComplete = await app(
+      new Request(`${origin}/upload/up_restr/complete`, {
+        method: "POST",
+        headers: {
+          authorization: blossomAuth(sk2, "upload", now, rHash),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ sha256: rHash }),
+      }),
+    );
+    equal(restrictedComplete.status, 403);
+    equal((await catalog.get(rHash))?.owners, [pub1]);
+
+    // HEAD /upload returns 409 for deleted and gated blobs instead of "Upload would be accepted"
+    const deletedHash = "9".repeat(64);
+    await catalog.cas(deletedHash, null, {
+      revision: 1,
+      hash: deletedHash,
+      size: 64,
+      type: "video/mp4",
+      uploaded: now,
+      owners: [],
+      status: "deleted",
+      ageRestricted: false,
+      held: false,
+      gate: null,
+      cleanupPending: true,
+    });
+    equal(
+      (await app(
+        new Request(`${origin}/upload`, {
+          method: "HEAD",
+          headers: { "x-sha-256": deletedHash },
+        }),
+      )).status,
+      409,
+    );
+    const gatedHash = "8".repeat(64);
+    await catalog.cas(gatedHash, null, {
+      revision: 1,
+      hash: gatedHash,
+      size: 64,
+      type: "video/mp4",
+      uploaded: now,
+      owners: [],
+      status: "pending",
+      ageRestricted: false,
+      held: false,
+      gate: "in-flight-gate",
+      cleanupPending: false,
+    });
+    equal(
+      (await app(
+        new Request(`${origin}/upload`, {
+          method: "HEAD",
+          headers: { "x-sha-256": gatedHash },
+        }),
+      )).status,
+      409,
+    );
 
     // 4. X-Divine-Video-Processing rejects "encode" with 400 on PUT /upload, POST /upload/init, POST /complete, PUT /mirror
     for (
@@ -1457,7 +1535,30 @@ Deno.test("upload hardening: quarantine holds, restricted privacy, encoding poli
     );
     equal(lowerAuthRes.status, 200);
 
-    // 6. Chunked PUT exceeding maxUpload (32 KiB) returns 413; missing size on chunked response returns 502
+    // 6. Chunked PUT exceeding maxUpload (32 KiB) returns 413 even when fetch() wraps stream errors as TypeError
+    const origFetcher = customUpstreamHandler;
+    customUpstreamHandler = null;
+    const typeErrorWrappingApp = createApp({
+      origin,
+      catalog,
+      blobs,
+      secrets: { adminToken },
+      upstreams: {
+        uploadServiceUrl: "https://upload.divine.video",
+        fetcher: async (_input, init) => {
+          try {
+            await new Response(init?.body as BodyInit).arrayBuffer();
+          } catch {
+            // Simulate WHATWG/Deno fetch() wrapping request-body stream errors in TypeError.
+            throw new TypeError("request body stream errored");
+          }
+          return new Response("{}", { status: 200 });
+        },
+      },
+      writesEnabled: true,
+      maxUploadBytes: 32 * 1024,
+      now: () => now,
+    });
     const bigStream = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(new Uint8Array(20 * 1024));
@@ -1465,7 +1566,7 @@ Deno.test("upload hardening: quarantine holds, restricted privacy, encoding poli
         controller.close();
       },
     });
-    const tooBigChunked = await app(
+    const tooBigChunked = await typeErrorWrappingApp(
       new Request(`${origin}/upload`, {
         method: "PUT",
         body: bigStream,
@@ -1476,6 +1577,7 @@ Deno.test("upload hardening: quarantine holds, restricted privacy, encoding poli
       }),
     );
     equal(tooBigChunked.status, 413);
+    customUpstreamHandler = origFetcher;
 
     customUpstreamHandler = (_u, _m, _h, body) =>
       Promise.resolve(
@@ -1614,6 +1716,28 @@ Deno.test("upload hardening: quarantine holds, restricted privacy, encoding poli
     equal(errRec?.transcodeTerminal, false);
     equal(errRec?.transcriptStatus, "failed");
     equal(errRec?.transcriptTerminal, true);
+    customUpstreamHandler = null;
+
+    // 9. PUT /mirror with copy-only sets videoEncodingAllowed: false and blocks non-owner restricted access
+    const mirrorBytes = new TextEncoder().encode("synthetic-mirrored-copy-only-video");
+    const mirrorHash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", mirrorBytes)));
+    customUpstreamHandler = () =>
+      new Response(mirrorBytes, { status: 200, headers: { "content-type": "video/mp4" } });
+    const mirrorRes = await app(
+      new Request(`${origin}/mirror`, {
+        method: "PUT",
+        headers: {
+          authorization: blossomAuth(sk1, "mirror", now),
+          "content-type": "application/json",
+          "x-divine-video-processing": "copy-only",
+        },
+        body: JSON.stringify({ url: "https://cdn.example.com/clip.mp4" }),
+      }),
+    );
+    equal(mirrorRes.status, 200);
+    const mirrorRec = await catalog.get(mirrorHash);
+    equal(mirrorRec?.videoEncodingAllowed, false);
+    equal(mirrorRec?.transcodeStatus, "pending");
     customUpstreamHandler = null;
   } finally {
     db.close();
