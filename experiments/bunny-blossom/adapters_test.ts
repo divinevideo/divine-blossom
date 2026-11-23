@@ -92,6 +92,20 @@ Deno.test("SQL adapter executes atomic CAS, indexed owner pagination, quarantine
     // Quarantine holds
     await catalog.addQuarantineHold(HASH, "hold-1", 1800000100);
     equal(await catalog.getQuarantineHolds(HASH), ["hold-1"]);
+    // Uploads must not publish if a hold arrived after the admission read.
+    equal(
+      await catalog.cas(HASH, 2, { ...ROW, revision: 3 }, { requireUnquarantined: true }),
+      false,
+    );
+    const heldNewHash = "e".repeat(64);
+    await catalog.addQuarantineHold(heldNewHash, "hold-2", 1800000100);
+    equal(
+      await catalog.cas(heldNewHash, null, { ...ROW, hash: heldNewHash }, {
+        requireUnquarantined: true,
+      }),
+      false,
+    );
+    equal(await catalog.get(heldNewHash), null);
     await catalog.removeQuarantineHold(HASH, "hold-1");
     equal(await catalog.getQuarantineHolds(HASH), []);
 
@@ -251,6 +265,10 @@ Deno.test("B2 Native deletePrefix erases all versions and BunnyPurger purges exa
       throw new Error(`unexpected fetch ${url}`);
     },
   );
+  const withdrawn = await blobs.deletePrefix(HASH, () => Promise.resolve(false));
+  equal(withdrawn, { deleted: 0, remaining: true });
+  equal(deletedIds, []);
+
   const erased = await blobs.deletePrefix(HASH);
   equal(erased, { deleted: 2, remaining: false });
   equal(deletedIds, ["f1", "f2"]);

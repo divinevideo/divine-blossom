@@ -91,12 +91,17 @@ export function verifySignedNostrEvent(event: unknown): event is ParsedNostrEven
   }
 }
 
+function paddedStandardBase64(value: string): string {
+  const normalized = value.replaceAll("-", "+").replaceAll("_", "/");
+  return normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+}
+
 function decodeNostrHeader(headerValue: string): ParsedNostrEvent | null {
   const trimmed = headerValue.trim();
   if (trimmed.length > MAX_AUTH_HEADER || !/^nostr\s+/i.test(trimmed)) return null;
   const b64 = trimmed.replace(/^nostr\s+/i, "").trim();
   try {
-    const binary = atob(b64);
+    const binary = atob(paddedStandardBase64(b64));
     const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
     const jsonText = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     const event = JSON.parse(jsonText) as ParsedNostrEvent;
@@ -185,6 +190,40 @@ function validateEventForAction(
   return true;
 }
 
+export interface AuthenticatedNostrRequest {
+  pubkey: string;
+  event: ParsedNostrEvent;
+  hashes: string[];
+  /** Normalized `"Nostr <base64>"` header value suitable for forwarding upstream. */
+  headerValue: string;
+}
+
+/**
+ * Require a valid Nostr auth header and return both the lowercase hex pubkey and signed event metadata.
+ */
+export function requireNostrAuthEvent(
+  req: Request,
+  action: BlossomAction,
+  now: number,
+  hash?: string,
+  options?: { allowLegacyOptionalExpiry?: boolean; publicOrigin?: string },
+): AuthenticatedNostrRequest {
+  const candidates = splitAuthorizationHeaders(req);
+  for (const candidate of candidates) {
+    const event = decodeNostrHeader(candidate);
+    if (event && validateEventForAction(event, req, action, now, hash, options)) {
+      const b64 = candidate.replace(/^nostr\s+/i, "").trim();
+      return {
+        pubkey: event.pubkey.toLowerCase(),
+        event,
+        hashes: tagValues(event, "x").map((x) => x.toLowerCase()),
+        headerValue: `Nostr ${paddedStandardBase64(b64)}`,
+      };
+    }
+  }
+  throw new Error("unauthorized");
+}
+
 /**
  * Require a valid Nostr auth header for a management action (upload, delete, vanish, mirror, list, media).
  * Returns the authenticated lowercase hex pubkey or throws.
@@ -196,14 +235,7 @@ export function requireNostrAuth(
   hash?: string,
   options?: { allowLegacyOptionalExpiry?: boolean; publicOrigin?: string },
 ): string {
-  const candidates = splitAuthorizationHeaders(req);
-  for (const candidate of candidates) {
-    const event = decodeNostrHeader(candidate);
-    if (event && validateEventForAction(event, req, action, now, hash, options)) {
-      return event.pubkey.toLowerCase();
-    }
-  }
-  throw new Error("unauthorized");
+  return requireNostrAuthEvent(req, action, now, hash, options).pubkey;
 }
 
 /**
