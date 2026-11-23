@@ -1,5 +1,6 @@
 // Comprehensive unit & integration tests for native Bunny Blossom route parity.
 
+import { Buffer } from "node:buffer";
 import { DatabaseSync } from "node:sqlite";
 import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools/pure";
 import { SqlCatalog } from "./adapters.ts";
@@ -179,10 +180,11 @@ Deno.test("full media lifecycle: upload, transcode webhook, HLS/MP4/VTT/Range ca
         },
       }),
     );
-    equal(up.status, 200);
-    const desc = await up.json() as { sha256: string; url: string };
+    equal(up.status, 201);
+    const desc = await up.json() as { sha256: string; url: string; uploaded: number };
     equal(desc.sha256, hash);
-    equal(desc.url, `${ctx.origin}/${hash}`);
+    equal(desc.url, `${ctx.origin}/${hash}.mp4`);
+    equal(desc.uploaded, ctx.now);
 
     // Pending blob serves privately (never publicly cached before approval)
     const pendingGet = await ctx.app(new Request(`${ctx.origin}/${hash}`));
@@ -656,6 +658,9 @@ Deno.test("delegated PUT /upload publishes to SQL catalog, supports chunked bodi
       }
       const hash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", bodyBytes)));
       const contentType = headers.get("content-type") ?? "application/octet-stream";
+      const signed = headers.get("authorization")?.slice("Nostr ".length) ?? "";
+      // The current Cloud Run upload service accepts padded standard base64.
+      if (btoa(atob(signed)) !== signed) return new Response(null, { status: 401 });
       await blobs.write(hash, bodyBytes, contentType);
       return new Response(
         JSON.stringify({
@@ -712,29 +717,39 @@ Deno.test("delegated PUT /upload publishes to SQL catalog, supports chunked bodi
         controller.close();
       },
     });
+    const authEvent = finalizeEvent({
+      kind: 24242,
+      created_at: now,
+      tags: [["t", "upload"], ["x", thumbHash], ["expiration", String(now + 60)]],
+      content: "Upload 📷️ 📷️ 📷️",
+    }, sk1);
+    const base64url = Buffer.from(JSON.stringify(authEvent)).toString("base64url");
+    equal(/[-_]/.test(base64url), true);
     const thumbRes = await app(
       new Request(`${origin}/upload`, {
         method: "PUT",
         body: thumbStream,
         headers: {
           "content-type": "image/jpeg",
-          authorization: blossomAuth(sk1, "upload", now, thumbHash),
+          authorization: `Nostr ${base64url}`,
         },
       }),
     );
-    equal(thumbRes.status, 200);
+    equal(thumbRes.status, 201);
     const thumbDesc = await thumbRes.json() as {
       url: string;
       sha256: string;
       size: number;
       type: string;
+      uploaded: number;
     };
-    equal(thumbDesc.url, `${origin}/${thumbHash}`);
+    equal(thumbDesc.url, `${origin}/${thumbHash}.jpeg`);
+    equal(thumbDesc.uploaded, now);
     equal(thumbDesc.sha256, thumbHash);
     equal(thumbDesc.size, thumbBytes.length);
     equal(thumbDesc.type, "image/jpeg");
     // Immediately readable via Blossom GET /<sha256> and GET /list/<pubkey>
-    equal((await app(new Request(`${origin}/${thumbHash}`))).status, 200);
+    equal((await app(new Request(thumbDesc.url))).status, 200);
     equal((await (await app(new Request(`${origin}/list/${pub1}`))).json() as unknown[]).length, 1);
     // Image uploads do not trigger video moderation scans
     equal(modScans.length, 0);
@@ -754,14 +769,14 @@ Deno.test("delegated PUT /upload publishes to SQL catalog, supports chunked bodi
         },
       }),
     );
-    equal(videoRes.status, 200);
+    equal(videoRes.status, 201);
     const videoDesc = await videoRes.json() as {
       url: string;
       sha256: string;
       thumbnail?: string;
       dim?: string;
     };
-    equal(videoDesc.url, `${origin}/${videoHash}`);
+    equal(videoDesc.url, `${origin}/${videoHash}.mp4`);
     equal(videoDesc.thumbnail, `${origin}/${videoHash}.jpg`);
     equal(videoDesc.dim, "720x1280");
     equal(modScans.length, 1);
@@ -1104,13 +1119,13 @@ Deno.test("BUD-06 HEAD /upload pre-validation and Divine resumable init/complete
     );
     equal(completeRes.status, 200);
     const completeDesc = await completeRes.json() as {
+      thumbnail?: string;
       url: string;
       sha256: string;
       size: number;
-      thumbnail?: string;
       dim?: string;
     };
-    equal(completeDesc.url, `${origin}/${videoHash}`);
+    equal(completeDesc.url, `${origin}/${videoHash}.mp4`);
     equal(completeDesc.sha256, videoHash);
     equal(completeDesc.size, videoBytes.length);
     equal(completeDesc.thumbnail, `${origin}/${videoHash}.jpg`);
@@ -1143,7 +1158,7 @@ Deno.test("BUD-06 HEAD /upload pre-validation and Divine resumable init/complete
     equal(dupInit.status, 409);
     const dupBody = await dupInit.json() as { descriptor: { sha256: string; url: string } };
     equal(dupBody.descriptor.sha256, videoHash);
-    equal(dupBody.descriptor.url, `${origin}/${videoHash}`);
+    equal(dupBody.descriptor.url, `${origin}/${videoHash}.mp4`);
 
     // 5. Blob is immediately readable, listed for owner, and selectable by Track 1 /api/bunny-playback after approval
     equal((await app(new Request(`${origin}/${videoHash}`))).status, 200);
@@ -1533,7 +1548,7 @@ Deno.test("upload hardening: quarantine holds, restricted privacy, encoding poli
         },
       }),
     );
-    equal(lowerAuthRes.status, 200);
+    equal(lowerAuthRes.status, 201);
 
     // 6. Chunked PUT exceeding maxUpload (32 KiB) returns 413 even when fetch() wraps stream errors as TypeError
     const origFetcher = customUpstreamHandler;
@@ -1710,7 +1725,7 @@ Deno.test("upload hardening: quarantine holds, restricted privacy, encoding poli
         },
       }),
     );
-    equal(errRes.status, 200);
+    equal(errRes.status, 201);
     const errRec = await catalog.get(errHash);
     equal(errRec?.transcodeStatus, "failed");
     equal(errRec?.transcodeTerminal, false);

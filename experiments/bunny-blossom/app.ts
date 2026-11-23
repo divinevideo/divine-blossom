@@ -720,6 +720,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
     authHashes: string[],
     encodingRequested: boolean,
     upload: DelegatedUploadPayload,
+    createdStatus: 200 | 201,
   ): Promise<Response> {
     const hash = upload.sha256.toLowerCase();
     if (!HASH.test(hash) || !Number.isInteger(upload.size) || upload.size < 0) {
@@ -860,7 +861,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         if (isVideo) {
           await triggerModerationScan(hash, owner);
         }
-        return jsonResp(200, buildDescriptor(fresh, origin));
+        return jsonResp(createdStatus, buildDescriptor(fresh, origin));
       }
     }
     return jsonResp(409, { error: "concurrent parent change" });
@@ -971,7 +972,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
     if (isVideo) {
       await triggerModerationScan(hash, owner);
     }
-    return jsonResp(200, buildDescriptor(ready, origin));
+    return jsonResp(201, buildDescriptor(ready, origin));
   }
 
   async function route(req: Request): Promise<Response> {
@@ -1288,7 +1289,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
             transcriptErrorCode,
             Boolean(body.transcript_terminal),
           ),
-        });
+        }, 201);
       }
       return await handleDirectUpload(req, encodingRequested, declaredSha);
     }
@@ -1533,7 +1534,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         derivativesEvaluated: false,
         transcodeTerminal: false,
         transcriptTerminal: false,
-      });
+      }, 200);
     }
 
     // Synchronous transcription proxy

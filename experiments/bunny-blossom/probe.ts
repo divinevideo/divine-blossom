@@ -239,7 +239,7 @@ export async function runtimeProbe(req: Request): Promise<Response> {
   const bodyChecksPassed = upJson.sha256 === hash && upJson.size === body.length &&
     hex(getBytes) === hex(body) && listJson.length === 1 && listJson[0].sha256 === hash &&
     delJson.status === "cleanup_pending" && typeof deniedJson.error === "string";
-  const passed = up.status === 200 && get.status === 200 && head.status === 200 &&
+  const passed = up.status === 201 && get.status === 200 && head.status === 200 &&
     list.status === 200 && del.status === 202 && denied.status === 404 && bodyChecksPassed;
 
   return new Response(

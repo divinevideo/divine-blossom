@@ -91,14 +91,17 @@ export function verifySignedNostrEvent(event: unknown): event is ParsedNostrEven
   }
 }
 
+function paddedStandardBase64(value: string): string {
+  const normalized = value.replaceAll("-", "+").replaceAll("_", "/");
+  return normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+}
+
 function decodeNostrHeader(headerValue: string): ParsedNostrEvent | null {
   const trimmed = headerValue.trim();
   if (trimmed.length > MAX_AUTH_HEADER || !/^nostr\s+/i.test(trimmed)) return null;
-  const rawB64 = trimmed.replace(/^nostr\s+/i, "").trim();
-  const normalizedB64 = rawB64.replace(/-/g, "+").replace(/_/g, "/");
-  const paddedB64 = normalizedB64.padEnd(Math.ceil(normalizedB64.length / 4) * 4, "=");
+  const b64 = trimmed.replace(/^nostr\s+/i, "").trim();
   try {
-    const binary = atob(paddedB64);
+    const binary = atob(paddedStandardBase64(b64));
     const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
     const jsonText = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     const event = JSON.parse(jsonText) as ParsedNostrEvent;
@@ -214,7 +217,7 @@ export function requireNostrAuthEvent(
         pubkey: event.pubkey.toLowerCase(),
         event,
         hashes: tagValues(event, "x").map((x) => x.toLowerCase()),
-        headerValue: `Nostr ${b64}`,
+        headerValue: `Nostr ${paddedStandardBase64(b64)}`,
       };
     }
   }

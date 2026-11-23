@@ -70,7 +70,7 @@ export interface BlobDescriptor {
   sha256: string;
   size: number;
   type?: string;
-  uploaded?: string;
+  uploaded?: number;
   thumbnail?: string;
   hls?: string;
   dim?: string;
@@ -250,14 +250,30 @@ export function evaluateAccess(
   return "allowed";
 }
 
+const ORIGINAL_EXTENSIONS: ReadonlyMap<string, string> = new Map([
+  ["video/mp4", "mp4"],
+  ["video/quicktime", "mov"],
+  ["video/webm", "webm"],
+  ["audio/mpeg", "mp3"],
+  ["audio/mp4", "m4a"],
+  ["audio/wav", "wav"],
+  ["audio/ogg", "ogg"],
+  ["image/jpeg", "jpeg"],
+  ["image/png", "png"],
+  ["image/webp", "webp"],
+  ["image/gif", "gif"],
+  ["application/pdf", "pdf"],
+]);
+
 export function buildDescriptor(record: BlobRecord, origin: string): BlobDescriptor {
-  const uploadedIso = new Date(record.uploaded * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
+  const mime = record.type.split(";", 1)[0].trim().toLowerCase();
+  const extension = ORIGINAL_EXTENSIONS.get(mime) ?? "bin";
   const desc: BlobDescriptor = {
-    url: `${origin}/${record.hash}`,
+    url: `${origin}/${record.hash}.${extension}`,
     sha256: record.hash,
     size: record.size,
     type: record.type,
-    uploaded: uploadedIso,
+    uploaded: record.uploaded,
   };
   if (record.thumbnail) {
     desc.thumbnail = record.thumbnail.startsWith("http")
