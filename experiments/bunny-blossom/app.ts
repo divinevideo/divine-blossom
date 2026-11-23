@@ -164,6 +164,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       }
       const body = await boundedBody(req, config.maxUploadBytes ?? 4 * 1024 * 1024);
       const hash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", body)));
+      if (hash !== fixture!.hash) return response(403, { error: "fixture digest required" });
       try {
         auth(req, "upload", now(), hash);
       } catch {

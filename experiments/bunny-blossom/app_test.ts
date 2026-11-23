@@ -277,6 +277,17 @@ Deno.test("persistent fixture writes reject an unapproved signer before mutation
   equal(f.catalog.rows.size, 0);
 });
 
+Deno.test("a signed multi-hash batch cannot expand the configured fixture digest", async () => {
+  const f = fixture();
+  const otherBody = new TextEncoder().encode("another synthetic object");
+  const otherHash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", otherBody)));
+  const authorization = signed("upload", HASH, KEY, [["x", otherHash]]);
+  equal((await f.app(f.request("/upload", "PUT", authorization, otherBody))).status, 403);
+  equal(f.catalog.reads, 0);
+  equal(f.catalog.rows.size, 0);
+  equal(f.blobs.writes, 0);
+});
+
 Deno.test("policy revision changed without a hold still withdraws upload publication", async () => {
   const f = fixture();
   f.blobs.writeHook = async () => {
