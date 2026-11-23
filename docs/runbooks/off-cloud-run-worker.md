@@ -100,9 +100,12 @@ The worker may continue receiving Cloud Tasks at `/internal/transcode` while
 Cloud Run accepts new jobs. To move admission separately, deploy a worker with
 `TRANSCODE_ADMISSION_AUTH_REQUIRED=true` and a dedicated
 `TRANSCODE_ADMISSION_SECRET` before opening admission in the reverse proxy.
-The bundled Compose and Caddy configuration uses the same required-auth flag
-to enable `/transcode/queue`. If the host has a custom Caddyfile, keep its
-existing route restrictions and opt in to the two HLS intake routes explicitly.
+The bundled Compose and Caddy configuration checks the admission credential
+before forwarding either route in required-auth mode, including if an older
+worker image is restored. Use the literal lowercase `true` in Compose. Keep
+forced repairs on a private route when this mode is enabled. If the host has
+a custom Caddyfile, retain its existing allowlist and apply equivalent
+credential checks before opening either route.
 
 Configure queue-scoped enqueue access for the worker identity only after
 verifying that external unauthenticated admission is blocked. Ordinary requests
@@ -111,6 +114,14 @@ separate from task delivery and forced repair. Verify that missing and wrong
 credentials return 401 and that a synthetic authenticated request returns 202
 and becomes playable before moving any caller. Keep non-HLS routes on their
 existing origin.
+
+To roll back admission, return every moved producer to Cloud Run intake and
+confirm new jobs are being accepted there before shutting down, downgrading or
+closing off-GCP intake. Keep the worker serving the jobs it already accepted
+until those jobs drain. If also rolling back the writer, follow the queue
+pause and target-override procedure below after the producer cutback. Revoke
+the off-GCP queue grant before removing the admission credential or returning
+to a legacy proxy configuration.
 
 ## 3. Single-writer cutover & rollback (Cloud Tasks URL-safe)
 
