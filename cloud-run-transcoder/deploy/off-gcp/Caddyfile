@@ -1,6 +1,6 @@
 {$TRANSCODER_DOMAIN} {
 	@worker_routes {
-		path /health /internal/transcode /transcode /backfill-fmp4 /transcribe /translate /extract-audio
+		path /health /internal/transcode /transcode /backfill-fmp4 /transcribe /translate
 	}
 
 	handle @worker_routes {

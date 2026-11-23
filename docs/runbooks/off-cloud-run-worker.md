@@ -57,7 +57,7 @@ gcloud services enable iamcredentials.googleapis.com \
 
 Create a dedicated service account (for example `divine-transcoder-worker@rich-compiler-479518-d2.iam.gserviceaccount.com`) with least-privilege roles:
 
-- `roles/storage.objectViewer` on `gs://divine-blossom-media` plus an IAM-conditioned `roles/storage.objectAdmin` scoped to the `hls_claim` / lock prefix (or bucket-scoped `roles/storage.objectAdmin` if legacy GCS writes are needed — note the broader blast radius of a static key on an off-GCP VM).
+- `roles/storage.objectViewer` on `gs://divine-blossom-media` plus an IAM-conditioned `roles/storage.objectAdmin` scoped to the `.internal/hls-claims/` prefix (or bucket-scoped `roles/storage.objectAdmin` if legacy GCS writes are needed — note the broader blast radius of a static key on an off-GCP VM).
 - `roles/aiplatform.user` (only if Vertex AI Gemini transcription runs on the worker).
 - `roles/cloudtasks.enqueuer` (only if `STATUS_QUEUE_ENABLED=true` or the worker enqueues follow-up tasks).
 - `roles/iam.serviceAccountTokenCreator` **on itself** (required by `fetch_gcp_identity_token` via `iamcredentials.googleapis.com:generateIdToken` to mint OIDC tokens for private Cloud Run sidecars).
@@ -131,21 +131,28 @@ queued tasks never strand or overlap:
 
 ### Rollback (off-GCP -> Cloud Run)
 
+Never purge `divine-transcode` or discard a write journal blindly (see
+`docs/runbooks/hls-single-writer.md`).
+
 1. Pause `divine-transcode`:
    ```sh
    gcloud tasks queues pause divine-transcode \
      --location=us-central1 --project=rich-compiler-479518-d2
    ```
-2. Set `TRANSCODE_WRITES_PAUSED=true` in `/opt/divine-transcoder/.env` and
-   reload `transcoder` (or wait for in-flight jobs to drain to **0** before
-   stopping the worker; do not run Cloud Run unpaused while off-GCP jobs are
-   still executing).
+2. Wait for all in-flight off-GCP transcode jobs to drain to **0** first (do not
+   recreate/SIGTERM `transcoder` while jobs are executing), then set
+   `TRANSCODE_WRITES_PAUSED=true` in `/opt/divine-transcoder/.env` and run
+   `docker compose up -d transcoder` (or `docker compose stop transcoder`).
 3. Update Cloud Run back to its own origin and unpause Cloud Run writes:
    ```sh
    gcloud run services update divine-transcoder \
      --region=us-central1 --project=rich-compiler-479518-d2 \
      --update-env-vars "TRANSCODE_WORKER_URL=https://divine-transcoder-nr3owfkrxa-uc.a.run.app,TRANSCODE_WRITES_PAUSED=false"
    ```
-4. Resume `divine-transcode`. Any residual tasks enqueued with the off-GCP URL
-   will hit the paused off-GCP worker (`503`) and cannot write concurrently with
-   Cloud Run; re-enqueue or purge stale off-GCP-targeted tasks if needed.
+4. While `divine-transcode` is still paused, if residual queued tasks still
+   target the off-GCP origin, set a queue-level HTTP URI override pointing at
+   `https://divine-transcoder-nr3owfkrxa-uc.a.run.app` (per
+   `docs/runbooks/hls-single-writer.md`) and wait 1 minute for queue config
+   propagation before resuming.
+5. Resume `divine-transcode` (and clear any temporary URI override once queued
+   tasks have drained).
