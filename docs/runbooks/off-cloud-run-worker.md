@@ -103,6 +103,14 @@ queued tasks never strand or overlap:
 
 ### Cutover (Cloud Run -> off-GCP)
 
+Before the steps below, deploy the copy-only upload-service dispatch suppression,
+then edge metadata/policy lookup, then the policy-aware worker image. Configure
+`MEDIA_PROCESSING_POLICY_URL=https://media.divine.video/internal/media-policy`
+with the existing webhook secret. The edge must have `kv_origin_read_token` and
+`metadata_kv_store_id` configured: missing origin configuration retries instead
+of granting encoding permission. See [media processing policy](../../cloud-run-transcoder/MEDIA_POLICY.md).
+Keep archive publishing paused until its separate maintainer hold is lifted.
+
 1. Confirm the off-GCP worker is healthy with **`TRANSCODE_WRITES_PAUSED=true`**.
 2. Point Cloud Run's `TRANSCODE_WORKER_URL` to the off-GCP origin while leaving
    Cloud Run's `TRANSCODE_WRITES_PAUSED=false` briefly so tasks *already* in

@@ -45,7 +45,9 @@ mod hls_claim;
 mod hls_dispatch;
 use hls_claim::{Claim, ClaimStore, Dirty};
 mod media_command;
+mod media_policy;
 mod media_reuse;
+use media_policy::MediaPolicy;
 mod mp4;
 mod object_storage;
 mod sound_classification;
@@ -63,6 +65,8 @@ struct Config {
     webhook_url: Option<String>,
     /// Secret for authenticating webhook calls
     webhook_secret: Option<String>,
+    /// Authoritative per-hash permission; absent means stream copy only.
+    media_processing_policy_url: Option<String>,
     /// URL of transcription provider API (e.g. OpenAI /audio/transcriptions endpoint)
     transcription_api_url: Option<String>,
     /// API key for the transcription provider
@@ -186,6 +190,7 @@ impl Config {
             webhook_url: lookup("WEBHOOK_URL"),
             // Secret for webhook authentication
             webhook_secret: lookup("WEBHOOK_SECRET"),
+            media_processing_policy_url: lookup("MEDIA_PROCESSING_POLICY_URL"),
             // Transcription provider URL (defaults to OpenAI transcription endpoint)
             transcription_api_url: lookup("TRANSCRIPTION_API_URL")
                 .or_else(|| lookup("OPENAI_API_URL"))
@@ -461,6 +466,9 @@ struct TranscodeResponse {
     /// Repair completed, but its lock needs operator investigation before retrying.
     #[serde(skip_serializing_if = "Option::is_none")]
     repair_lock_warning: Option<String>,
+    /// Copy-only HLS succeeded, but these optional MP4 aliases were not regenerated.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    skipped_progressive_aliases: Vec<String>,
 }
 
 // Transcript response
@@ -1256,6 +1264,7 @@ async fn handle_backfill_fmp4(
     }
     let force = request.force;
     let result = await_repair(async move {
+        let policy = media_policy::resolve(&state.config, &hash).await?;
         let mut claim = claim_hls(&state, &hash).await?;
         if claim.dirty() >= Dirty::Hls {
             claim.finish(false).await?;
@@ -1267,7 +1276,7 @@ async fn handle_backfill_fmp4(
             &hash,
             request.force,
             Some(&mut claim),
-            |ts, mp4, variant| async move { remux_variant(&ts, &mp4, variant).await },
+            |ts, mp4, variant| async move { remux_variant(&ts, &mp4, variant, policy).await },
         )
         .await;
         let result = match result {
@@ -1606,9 +1615,20 @@ async fn process_transcode(
     if !valid_transcode_hash(&hash) {
         return Err(anyhow!("Invalid hash format: must be 64 hex characters"));
     }
+    let policy = media_policy::resolve(&state.config, &hash).await?;
+    process_transcode_authorized(state, request, hash, policy).await
+}
+
+// Only the trusted lookup above admits production requests to this transaction.
+async fn process_transcode_authorized(
+    state: Arc<AppState>,
+    request: TranscodeRequest,
+    hash: String,
+    policy: MediaPolicy,
+) -> Result<TranscodeResponse> {
     let mut claim = claim_hls(&state, &hash).await?;
     let force = request.force;
-    let result = match process_transcode_inner(&state, request, &hash, &mut claim).await {
+    let result = match process_transcode_inner(&state, request, &hash, &mut claim, policy).await {
         Err(error) if error.is::<hls_claim::OwnershipLost>() => return Err(error),
         other => other,
     };
@@ -1641,6 +1661,7 @@ async fn process_transcode_inner(
     request: TranscodeRequest,
     hash: &str,
     claim: &mut Claim,
+    policy: MediaPolicy,
 ) -> Result<TranscodeResponse> {
     let attempt_generation = next_status_generation();
     let repair = request.force || claim.dirty() == Dirty::Repair;
@@ -1713,6 +1734,7 @@ async fn process_transcode_inner(
             display_width: dimensions.as_ref().map(|info| info.display_width),
             display_height: dimensions.as_ref().map(|info| info.display_height),
             repair_lock_warning: None,
+            skipped_progressive_aliases: vec![],
         });
     }
 
@@ -1848,6 +1870,7 @@ async fn process_transcode_inner(
             state.config.use_gpu,
             &video_info,
             !repair,
+            policy,
         ))
         .await;
 
@@ -1856,8 +1879,11 @@ async fn process_transcode_inner(
         Err(e) => {
             claim.confirm().await?;
             let error_message = e.to_string();
-            let (error_code, terminal) =
-                classify_invalid_media_error(&error_message, "transcode_failed");
+            let (error_code, terminal) = if e.is::<TerminalTranscode>() {
+                ("archive_remux_incompatible", true)
+            } else {
+                classify_invalid_media_error(&error_message, "transcode_failed")
+            };
             if terminal {
                 report_derivative_failure_to_sentry(
                     "divine-transcoder",
@@ -1884,7 +1910,7 @@ async fn process_transcode_inner(
                 terminal,
             )
             .await;
-            if terminal && !repair {
+            if terminal && (!repair || e.is::<TerminalTranscode>()) {
                 callback?;
                 return Err(TerminalTranscode(e).into());
             }
@@ -1894,17 +1920,17 @@ async fn process_transcode_inner(
 
     info!("Generated HLS with {} variants", generation.variants.len());
 
-    let remux_result = claim.hold(remux_ts_to_fmp4(&output_dir)).await;
+    let remux_result = claim.hold(remux_ts_to_fmp4(&output_dir, policy)).await;
     // The best-effort remuxer can skip failed variants and still return Ok.
-    let remux_result = if repair && remux_result.is_ok() {
+    let remux_result = if repair && policy == MediaPolicy::AllowEncode && remux_result.is_ok() {
         require_progressive_outputs(&output_dir).await
     } else {
         remux_result
     };
     if let Err(e) = remux_result {
         claim.confirm().await?;
-        if repair {
-            // Repairs must replace the progressive MP4 aliases as well as HLS.
+        if repair && policy == MediaPolicy::AllowEncode {
+            // Encoding-permitted repairs must replace the progressive MP4 aliases as well as HLS.
             let _ = send_status_webhook(
                 &state.config,
                 hash,
@@ -1934,11 +1960,15 @@ async fn process_transcode_inner(
         }
     }
     let mut extra_uploads = Vec::new();
+    let mut skipped_progressive_aliases = Vec::new();
     for filename in object_storage::OPTIONAL_HLS_FILES {
         if !tokio::fs::metadata(output_dir.join(filename))
             .await
             .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
         {
+            if policy == MediaPolicy::CopyOnly {
+                skipped_progressive_aliases.push(filename.to_string());
+            }
             let key = format!("{hash}/hls/{filename}");
             if let Some(existing) = claim.hold(state.media_storage.stat(&key)).await? {
                 if existing.size > 0
@@ -2017,6 +2047,7 @@ async fn process_transcode_inner(
         display_width: Some(video_info.display_width),
         display_height: Some(video_info.display_height),
         repair_lock_warning: None,
+        skipped_progressive_aliases,
     })
 }
 
@@ -7314,7 +7345,9 @@ stream_480p.m3u8
         crate::encode_hls(&input, &output, false, &info)
             .await
             .unwrap();
-        crate::remux_ts_to_fmp4(&output).await.unwrap();
+        crate::remux_ts_to_fmp4(&output, crate::MediaPolicy::AllowEncode)
+            .await
+            .unwrap();
         crate::require_progressive_outputs(&output).await.unwrap();
         assert_eq!(
             tokio::fs::read(output.join("stream_720p.mp4"))
@@ -7403,7 +7436,9 @@ stream_480p.m3u8
             "single-variant <=480p encode should mirror stream_480p.ts to stream_720p.ts"
         );
 
-        crate::remux_ts_to_fmp4(&output).await.unwrap();
+        crate::remux_ts_to_fmp4(&output, crate::MediaPolicy::AllowEncode)
+            .await
+            .unwrap();
         crate::require_progressive_outputs(&output).await.unwrap();
         assert_eq!(
             tokio::fs::read(output.join("stream_720p.mp4"))
@@ -7461,7 +7496,9 @@ stream_480p.m3u8
         crate::encode_hls(&input, &output, false, &info)
             .await
             .unwrap();
-        crate::remux_ts_to_fmp4(&output).await.unwrap();
+        crate::remux_ts_to_fmp4(&output, crate::MediaPolicy::AllowEncode)
+            .await
+            .unwrap();
         crate::require_progressive_outputs(&output).await.unwrap();
 
         assert_ne!(
@@ -7798,8 +7835,9 @@ async fn run_ffmpeg_hls(
     use_gpu: bool,
     video_info: &VideoInfo,
     allow_reuse: bool,
+    policy: MediaPolicy,
 ) -> Result<HlsGeneration> {
-    if allow_reuse {
+    if allow_reuse || policy == MediaPolicy::CopyOnly {
         match media_reuse::try_reuse(input_path, output_dir).await {
             Ok(true) => {
                 hls_claim::count("stream_copy_completed");
@@ -7808,7 +7846,11 @@ async fn run_ffmpeg_hls(
                     method: HlsMethod::StreamCopy,
                 });
             }
+            Ok(false) if policy == MediaPolicy::CopyOnly => {
+                return Err(TerminalTranscode(anyhow!("archive_remux_incompatible")).into());
+            }
             Ok(false) => hls_claim::count("stream_copy_rejected"),
+            Err(error) if policy == MediaPolicy::CopyOnly => return Err(error),
             Err(error) => {
                 warn!(%error, "Stream-copy attempt failed; using normal encoding");
                 hls_claim::count("stream_copy_failed");
@@ -8286,13 +8328,13 @@ async fn files_identical(a: &Path, b: &Path) -> bool {
     )
 }
 
-async fn remux_ts_to_fmp4(hls_dir: &Path) -> Result<()> {
+async fn remux_ts_to_fmp4(hls_dir: &Path, policy: MediaPolicy) -> Result<()> {
     let ts_720 = hls_dir.join("stream_720p.ts");
     let ts_480 = hls_dir.join("stream_480p.ts");
     if files_identical(&ts_720, &ts_480).await {
         let mp4_720 = hls_dir.join("stream_720p.mp4");
         let mp4_480 = hls_dir.join("stream_480p.mp4");
-        match remux_variant(&ts_720, &mp4_720, "stream_720p").await {
+        match remux_variant(&ts_720, &mp4_720, "stream_720p", policy).await {
             Ok(()) => {
                 info!("Remuxed stream_720p to MP4");
                 match tokio::fs::copy(&mp4_720, &mp4_480).await {
@@ -8304,7 +8346,9 @@ async fn remux_ts_to_fmp4(hls_dir: &Path) -> Result<()> {
                         warn!("Failed to mirror stream_720p.mp4 to stream_480p.mp4: {}", e);
                         let _ = tokio::fs::remove_file(&mp4_480).await;
                         // Fall back to remuxing stream_480p directly without redoing stream_720p.
-                        if let Err(e) = remux_variant(&ts_480, &mp4_480, "stream_480p").await {
+                        if let Err(e) =
+                            remux_variant(&ts_480, &mp4_480, "stream_480p", policy).await
+                        {
                             warn!("MP4 remux failed for stream_480p: {}", e);
                             let _ = tokio::fs::remove_file(&mp4_480).await;
                         } else {
@@ -8336,7 +8380,7 @@ async fn remux_ts_to_fmp4(hls_dir: &Path) -> Result<()> {
             continue;
         }
 
-        if let Err(e) = remux_variant(&ts_path, &mp4_path, variant).await {
+        if let Err(e) = remux_variant(&ts_path, &mp4_path, variant, policy).await {
             warn!("MP4 remux failed for {}: {}", variant, e);
             // ffmpeg truncates its output the moment it opens it, so a failed
             // run leaves a zero-byte .mp4 here. upload_hls uploads
@@ -8358,9 +8402,15 @@ async fn remux_ts_to_fmp4(hls_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn remux_variant(ts_path: &Path, mp4_path: &Path, variant: &str) -> Result<()> {
+async fn remux_variant(
+    ts_path: &Path,
+    mp4_path: &Path,
+    variant: &str,
+    policy: MediaPolicy,
+) -> Result<()> {
     match remux_with_audio(ts_path, mp4_path, variant, AudioRemux::Copy).await {
         Ok(()) => Ok(()),
+        Err(e) if policy == MediaPolicy::CopyOnly => Err(e),
         Err(e) => {
             // The copy path needs the .ts to carry well-formed ADTS. If it
             // does not, a missing or unplayable variant would be worse than

@@ -529,6 +529,7 @@ mod tests {
     fn sample_metadata(status: BlobStatus) -> BlobMetadata {
         BlobMetadata {
             archive_storage: None,
+            video_encoding_allowed: false,
             sha256: "0".repeat(64),
             size: 123,
             mime_type: "video/mp4".into(),

@@ -255,3 +255,19 @@ fn hls_alias_failed_admission_keeps_playback_retryable() {
         Some(TranscodeStatus::Complete)
     );
 }
+
+#[test]
+#[ignore = "requires local synthetic metadata and HLS origin"]
+fn hls_alias_copy_only_missing_mp4_uses_original_fallback() {
+    let hash = "9".repeat(64);
+    metadata(&hash, "active", "complete");
+    let url = format!("https://media.example.test/{hash}/480p.mp4");
+    for req in [Request::get(&url), Request::head(&url),
+        Request::get(format!("https://media.example.test/admin/api/blob/{hash}/480p.mp4"))
+            .with_header("Authorization", "Bearer synthetic-admin-token")] {
+        let resp = response(req);
+        assert_eq!(resp.get_status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(resp.get_header_str("Cache-Control").unwrap().contains("no-store"));
+        assert!(resp.get_header_str("Retry-After").is_none());
+    }
+}
