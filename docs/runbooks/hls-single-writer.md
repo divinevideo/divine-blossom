@@ -29,24 +29,33 @@ media prefix. Exclude it from age-based deletion and manual cleanup while
 writers are active.
 
 Preparation has a renewable 90-second lease, with 20-second heartbeats
-during long operations. Each stable-key PUT is journaled before it is sent,
-with an attempt marker carried on the object. A stale journal with a PUT in
-flight can be replaced when the recorded provider and key show that marker.
-An explicit rejection lets the same owner settle the write and release the
-claim. An ambiguous write with no matching marker stays fenced. The provider
-may still commit it after the client times out.
+during long operations. Stable-key HLS/MP4 publication journals the full target
+set (all configured backends and keys) in a single `Publishing` claim mutation
+before issuing provider PUTs in ordered tiers (media segments and progressive
+MP4s in parallel, then variant playlists in parallel, then `master.m3u8` last),
+with one shared attempt marker carried on every object. A stale `Publishing`
+journal can be replaced only when every recorded provider and key shows that
+marker; legacy single-write `Writing` journals retain the same single-target
+marker check. Transient B2 5xx/transport failures first check via `HEAD` whether
+the attempt already committed with the matching attempt marker; if not, they
+retry with HTTP timeouts clamped strictly inside the conservative 45-second
+lease margin (half of the 90-second lease, stamped before each claim CAS) and
+stop immediately if heartbeat renewal loses ownership. An explicit rejection on
+every failed PUT (with zero ambiguous attempts anywhere in the batch) lets the
+same owner settle the write and release the claim to `Retry`. Any ambiguous
+write with no matching marker stays fenced. The provider may still commit it
+after the client times out.
 
 Cloud Storage limits mutations of an object name to one per second. The
-worker spaces its claim mutations and retries explicit 429 responses within a
-bounded deadline. Each acknowledged provider write keeps its existing journal
-entry until the next conditional mutation. Heartbeats still renew ownership
-during longer operations. With both progressive aliases, a fresh publication
-needs at least 10 claim mutations for GCS-only or B2-primary with
-`MEDIA_GCS_BACKUP_ENABLED=false`, and 17 for B2-primary with GCS backups
-enabled (the default), including acquisition, verified completion, and release. Allow
-for that pacing when measuring queue capacity, playback readiness, and
-allocated CPU time. Verify these budgets with the actual storage topology
-before enabling the writer.
+worker spaces its claim mutations slightly above 1 second and retries explicit
+429 responses within a bounded deadline. Because publication journals the full
+output set once, a fresh publication needs 4 claim mutations (acquisition,
+batch publication intent, verified completion, and release) across GCS-only,
+B2-primary with `MEDIA_GCS_BACKUP_ENABLED=false`, and B2-primary with GCS
+backups enabled, plus 20-second heartbeats during long uploads. Allow for that
+pacing when measuring queue capacity, playback readiness, and allocated CPU
+time. Verify these budgets with the actual storage topology before enabling the
+writer.
 
 Keep the queue's retries, and alert on `recovery_failed`, `release_failed`,
 `admission_failed`, and exhausted task delivery. If automatic retries run
@@ -55,14 +64,17 @@ failure is resolved. Uploads still preserve the original even when the
 initial derivative handoff fails. Bounded upload admission retries run before
 the publisher logs an error. An operator can replay that hash through ordinary
 admission, and a subsequent HLS playback request can admit a pending item.
-For a fenced ambiguous write, inspect the exact provider
-object and attempt marker privately. Allow automatic recovery if the marker
-appears. Otherwise keep the item fenced until the old worker has stopped and
-the provider confirms the write cannot still commit. Any manual reset must
-compare the exact current claim generation and preserve its dirty state as
-`Retry`. An ordinary job must re-verify or regenerate the set before it sends
-a completion callback. Treat a CDN response, a missing object, and elapsed
-time as insufficient evidence for clearing an uncertain write.
+For a fenced ambiguous write, inspect the exact provider object(s) and attempt
+marker privately. For a legacy `Writing` claim, automatic recovery succeeds if
+that single object's marker appears; for a batched `Publishing` claim, automatic
+recovery requires every recorded target to show the attempt marker, so a
+mid-batch crash or Tier 0/1 ambiguous failure will remain fenced until operators
+confirm the old worker has stopped and the provider confirms no write can still
+commit. Any manual reset must compare the exact current claim generation and
+preserve its dirty state as `Retry`. An ordinary job must re-verify or
+regenerate the set before it sends a completion callback. Treat a CDN response,
+a missing object, and elapsed time as insufficient evidence for clearing an
+uncertain write.
 
 ## Rollout
 

@@ -1031,7 +1031,7 @@ fn repair_outcome<T>(result: Result<T>, release: Result<()>) -> Result<(T, Optio
             warn!("{}", warning);
             match result {
                 Ok(value) => Ok((value, Some(warning))),
-                Err(error) => Err(anyhow!("Repair failed: {:#}; {}", error, warning)),
+                Err(error) => Err(error.context(format!("Repair failed; {warning}"))),
             }
         }
     }
@@ -1270,6 +1270,10 @@ async fn handle_backfill_fmp4(
             |ts, mp4, variant| async move { remux_variant(&ts, &mp4, variant).await },
         )
         .await;
+        let result = match result {
+            Err(error) if error.is::<hls_claim::OwnershipLost>() => return Err(error),
+            other => other,
+        };
         let release = claim.finish(result.is_ok()).await;
         if release.is_err() {
             hls_claim::count("release_failed");
@@ -1347,12 +1351,15 @@ where
         ));
     }
     let expected_count = segments.len();
-    let mut published_count = 0;
+    let publish_dir = temp_path.join("publish");
+    tokio::fs::create_dir(&publish_dir).await?;
+    let mut ready_variants = Vec::new();
     for (variant, segment) in segments {
         // Publish only a successful remux, never input TS or failed output files.
-        let output_dir = temp_path.join(variant);
-        tokio::fs::create_dir(&output_dir).await?;
-        let output = output_dir.join(format!("{variant}.mp4"));
+        let work_dir = temp_path.join(variant);
+        tokio::fs::create_dir(&work_dir).await?;
+        let filename = format!("{variant}.mp4");
+        let output = work_dir.join(&filename);
         if let Some(claim) = claim.as_deref_mut() {
             claim.confirm().await?;
         }
@@ -1374,22 +1381,30 @@ where
         {
             continue;
         }
+        tokio::fs::rename(&output, publish_dir.join(&filename)).await?;
+        ready_variants.push(variant);
+    }
+    let published_count = if ready_variants.is_empty() {
+        0
+    } else {
         let published = upload_hls(
             storage,
             hash,
-            &output_dir,
+            &publish_dir,
             &SourceObjectMetadata::default(),
             claim.as_deref_mut(),
         )
         .await?;
-        let expected = format!("{hash}/hls/{variant}.mp4");
-        if published
-            .iter()
-            .any(|receipt| receipt.object.reference.key == expected && receipt.object.size > 0)
-        {
-            published_count += 1;
-        }
-    }
+        ready_variants
+            .into_iter()
+            .filter(|variant| {
+                let expected = format!("{hash}/hls/{variant}.mp4");
+                published.iter().any(|receipt| {
+                    receipt.object.reference.key == expected && receipt.object.size > 0
+                })
+            })
+            .count()
+    };
     if published_count != expected_count {
         return Err(anyhow!(
             "Backfill published {published_count} of {expected_count} MP4 variants"
@@ -1593,7 +1608,10 @@ async fn process_transcode(
     }
     let mut claim = claim_hls(&state, &hash).await?;
     let force = request.force;
-    let result = process_transcode_inner(&state, request, &hash, &mut claim).await;
+    let result = match process_transcode_inner(&state, request, &hash, &mut claim).await {
+        Err(error) if error.is::<hls_claim::OwnershipLost>() => return Err(error),
+        other => other,
+    };
     let release = claim.finish(result.is_ok()).await;
     if release.is_err() {
         hls_claim::count("release_failed");
@@ -1915,6 +1933,7 @@ async fn process_transcode_inner(
             return Err(anyhow!("Missing required HLS output: {filename}"));
         }
     }
+    let mut extra_uploads = Vec::new();
     for filename in object_storage::OPTIONAL_HLS_FILES {
         if !tokio::fs::metadata(output_dir.join(filename))
             .await
@@ -1928,26 +1947,24 @@ async fn process_transcode_inner(
                         .await?
                 {
                     let bytes = claim.hold(state.media_storage.read(&existing)).await?;
-                    state
-                        .media_storage
-                        .put_hls_verified(
-                            &key,
-                            Bytes::from(bytes),
-                            &existing.content_type,
-                            existing.custom,
-                            existing.cache_control,
-                            claim,
-                        )
-                        .await?;
+                    extra_uploads.push(object_storage::HlsUploadItem {
+                        tier: 0,
+                        key,
+                        body: Bytes::from(bytes),
+                        mime: existing.content_type,
+                        custom: existing.custom,
+                        cache_control: existing.cache_control,
+                    });
                 }
             }
         }
     }
-    let upload_result = upload_hls(
+    let upload_result = upload_hls_with_extra(
         &state.media_storage,
         hash,
         &output_dir,
         &source_metadata,
+        extra_uploads,
         Some(claim),
     )
     .await;
@@ -8438,7 +8455,18 @@ async fn upload_hls(
     hash: &str,
     hls_dir: &Path,
     source_metadata: &SourceObjectMetadata,
-    mut claim: Option<&mut Claim>,
+    claim: Option<&mut Claim>,
+) -> Result<Vec<object_storage::VerifiedObject>> {
+    upload_hls_with_extra(storage, hash, hls_dir, source_metadata, Vec::new(), claim).await
+}
+
+async fn upload_hls_with_extra(
+    storage: &object_storage::MediaStorage,
+    hash: &str,
+    hls_dir: &Path,
+    source_metadata: &SourceObjectMetadata,
+    mut items: Vec<object_storage::HlsUploadItem>,
+    claim: Option<&mut Claim>,
 ) -> Result<Vec<object_storage::VerifiedObject>> {
     let mut entries = tokio::fs::read_dir(hls_dir).await?;
     let mut files = Vec::new();
@@ -8450,14 +8478,15 @@ async fn upload_hls(
         files.push(path);
     }
     // Publish referenced objects before each playlist and the master last.
-    files.sort_by_key(
-        |path| match path.file_name().and_then(|name| name.to_str()) {
-            Some("master.m3u8") => 2,
-            Some(name) if name.ends_with(".m3u8") => 1,
-            _ => 0,
-        },
-    );
-    let mut verified = Vec::new();
+    files.sort_by_key(|path| {
+        let name = path.file_name().and_then(|name| name.to_str());
+        let tier = match name {
+            Some("master.m3u8") => 2u8,
+            Some(name) if name.ends_with(".m3u8") => 1u8,
+            _ => 0u8,
+        };
+        (tier, name.unwrap_or_default().to_owned())
+    });
     for path in files {
         let filename = path.file_name().unwrap().to_string_lossy();
         let key = format!("{}/hls/{}", hash, filename);
@@ -8469,6 +8498,13 @@ async fn upload_hls(
             "video/mp4"
         } else {
             "application/octet-stream"
+        };
+        let tier = if filename == "master.m3u8" {
+            2
+        } else if filename.ends_with(".m3u8") {
+            1
+        } else {
+            0
         };
         let mut metadata = source_metadata.custom.clone();
         metadata.insert("source_sha256".to_string(), hash.to_string());
@@ -8484,17 +8520,35 @@ async fn upload_hls(
             continue;
         }
         let cache = Some("public, max-age=31536000, immutable".to_string());
-        let receipt = if let Some(claim) = claim.as_deref_mut() {
-            storage
-                .put_hls_verified(&key, bytes, content_type, metadata, cache, claim)
-                .await?
-        } else {
-            storage
-                .put_verified(&key, bytes, content_type, metadata, cache)
-                .await?
-        };
+        items.push(object_storage::HlsUploadItem {
+            tier,
+            key,
+            body: bytes,
+            mime: content_type.to_string(),
+            custom: metadata,
+            cache_control: cache,
+        });
+    }
+    if let Some(claim) = claim {
+        let verified = storage.put_hls_batch_verified(items, claim).await?;
+        for receipt in &verified {
+            info!("Uploaded {}", receipt.object.reference.key);
+        }
+        return Ok(verified);
+    }
+    let mut verified = Vec::new();
+    for item in items {
+        let receipt = storage
+            .put_verified(
+                &item.key,
+                item.body,
+                &item.mime,
+                item.custom,
+                item.cache_control,
+            )
+            .await?;
+        info!("Uploaded {}", receipt.object.reference.key);
         verified.push(receipt);
-        info!("Uploaded {}", key);
     }
     Ok(verified)
 }
