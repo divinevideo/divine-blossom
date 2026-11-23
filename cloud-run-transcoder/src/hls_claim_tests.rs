@@ -1110,3 +1110,168 @@ async fn batch_publish_keeps_claim_fenced_when_any_sibling_put_is_unconfirmed() 
         .unwrap_err()
         .is::<Busy>());
 }
+
+#[tokio::test]
+async fn batch_publish_keeps_claim_fenced_when_500_is_followed_by_explicit_403() {
+    let locks = Origin::start().await;
+    let media = crate::object_storage::tests::Origin::start().await;
+    let storage = media.with_gcs_input_only(locks.client());
+    let k_seg = format!("{A}/hls/stream_720p.ts");
+    let k_master = format!("{A}/hls/master.m3u8");
+    // Attempt 0 returns ambiguous 500; retry Attempt 1 gets explicit 403.
+    // Because Attempt 0's outcome was unconfirmed, reject_write MUST NOT clear the fence.
+    media.objects.lock().await.fail_put_by_key.insert(
+        k_seg.clone(),
+        vec![
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::http::StatusCode::FORBIDDEN,
+        ],
+    );
+    let mut claim = locks.store().claim(A, Some(&storage)).await.unwrap();
+    assert!(storage
+        .put_hls_batch_verified(
+            vec![
+                crate::object_storage::HlsUploadItem {
+                    tier: 0,
+                    key: k_seg,
+                    body: Bytes::from_static(b"segment"),
+                    mime: "video/mp2t".into(),
+                    custom: HashMap::new(),
+                    cache_control: None,
+                },
+                crate::object_storage::HlsUploadItem {
+                    tier: 2,
+                    key: k_master.clone(),
+                    body: Bytes::from_static(b"master"),
+                    mime: "application/vnd.apple.mpegurl".into(),
+                    custom: HashMap::new(),
+                    cache_control: None,
+                },
+            ],
+            &mut claim,
+        )
+        .await
+        .is_err());
+    assert!(media.store().stat(&k_master).await.unwrap().is_none());
+    assert!(claim.finish(false).await.is_err());
+    locks.age(A).await;
+    assert!(locks
+        .store()
+        .claim(A, Some(&storage))
+        .await
+        .unwrap_err()
+        .is::<Busy>());
+}
+
+#[tokio::test]
+async fn batch_publish_reuses_committed_b2_object_after_500_without_duplicate_put() {
+    let locks = Origin::start().await;
+    let media = crate::object_storage::tests::Origin::start().await;
+    let storage = media.with_gcs_input_only(locks.client());
+    let k_seg = format!("{A}/hls/stream_720p.ts");
+    // Simulate B2 committing Attempt 0 before returning HTTP 500.
+    media
+        .objects
+        .lock()
+        .await
+        .commit_then_fail_put_once
+        .insert(k_seg.clone(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    let mut claim = locks.store().claim(A, Some(&storage)).await.unwrap();
+    let receipts = storage
+        .put_hls_batch_verified(
+            vec![crate::object_storage::HlsUploadItem {
+                tier: 0,
+                key: k_seg.clone(),
+                body: Bytes::from_static(b"segment"),
+                mime: "video/mp2t".into(),
+                custom: HashMap::new(),
+                cache_control: None,
+            }],
+            &mut claim,
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipts.len(), 1);
+    let put_count = media
+        .objects
+        .lock()
+        .await
+        .requests
+        .iter()
+        .filter(|(method, key, _)| method == "PUT" && key == &k_seg)
+        .count();
+    assert_eq!(
+        put_count, 1,
+        "must detect Attempt 0 commit via stat instead of sending a duplicate PUT"
+    );
+    claim.mark_verified().await.unwrap();
+    claim.finish(true).await.unwrap();
+}
+
+#[tokio::test]
+async fn publish_lease_refuses_retries_and_new_tiers_once_invalidated_or_expired() {
+    let lease = PublishLease::new(Instant::now());
+    assert!(lease.remaining_after(Duration::from_millis(200)).is_some());
+    lease.invalidate();
+    assert!(lease.remaining_after(Duration::ZERO).is_none());
+
+    let expired = PublishLease::new(Instant::now() - B2_RETRY_LEASE_MARGIN);
+    assert!(expired.remaining_after(Duration::ZERO).is_none());
+}
+
+#[tokio::test]
+async fn hold_publishing_ownership_loss_invalidates_lease_and_surfaces_ownership_lost() {
+    let locks = Origin::start().await;
+    let media = crate::object_storage::tests::Origin::start().await;
+    let storage = media.with_gcs_input_only(locks.client());
+    let mut owner = locks.store().claim(A, Some(&storage)).await.unwrap();
+    let k_seg = format!("{A}/hls/stream_720p.ts");
+    let id = owner.write_id();
+    owner
+        .begin_publication(
+            vec![WriteTarget {
+                gcs: false,
+                key: k_seg.clone(),
+            }],
+            &id,
+        )
+        .await
+        .unwrap();
+    // Commit target and simulate replacement takeover while owner is publishing.
+    media
+        .store()
+        .put_verified(
+            &k_seg,
+            Bytes::from_static(b"segment"),
+            "video/mp2t",
+            HashMap::from([(WRITE_ID.into(), id)]),
+            None,
+        )
+        .await
+        .unwrap();
+    locks.age(A).await;
+    let replacement = locks.store().claim(A, Some(&storage)).await.unwrap();
+
+    // Force immediate heartbeat on the stale owner.
+    owner.next_heartbeat = Instant::now();
+    owner.next_mutation = Instant::now();
+    let lease = PublishLease::new(owner.lease_renewed_at());
+    let lease_observer = lease.clone();
+    let (saw_invalidated, hb_err) = owner
+        .hold_publishing(lease, async move {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while lease_observer.remaining_after(Duration::ZERO).is_some() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok()
+        })
+        .await;
+    assert!(
+        saw_invalidated,
+        "lease must invalidate immediately on OwnershipLost"
+    );
+    assert!(hb_err.unwrap().is::<OwnershipLost>());
+    replacement.finish(false).await.unwrap();
+}

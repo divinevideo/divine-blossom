@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     future::Future,
+    pin::Pin,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -36,8 +37,52 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 // Cloud Storage limits mutations of an object name to one per second; a small
 // buffer avoids clock/RTT jitter tripping 429s on consecutive transitions.
 const MUTATION_INTERVAL: Duration = Duration::from_millis(1100);
+// GCS limits total custom object metadata to 8 KiB; keep the serialized
+// journal safely below that limit with headroom for key name and overhead.
+const MAX_JOURNAL_BYTES: usize = 7_500;
 const STATE: &str = "hls_claim_v1";
 pub(crate) const WRITE_ID: &str = "hls_write_id";
+
+/// Shared publication lease handle observed by tiered uploads and bounded
+/// retries. `renewed_at` is stamped conservatively *before* each claim CAS
+/// leaves the client and invalidated immediately when ownership is lost or
+/// heartbeat renewal fails past the safe lease margin.
+#[derive(Clone)]
+pub(crate) struct PublishLease {
+    state: Arc<Mutex<Option<Instant>>>,
+}
+
+impl PublishLease {
+    pub(crate) fn new(renewed_at: Instant) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(Some(renewed_at))),
+        }
+    }
+
+    pub(crate) fn renew(&self, renewed_at: Instant) {
+        if let Ok(mut guard) = self.state.lock() {
+            if guard.is_some() {
+                *guard = Some(renewed_at);
+            }
+        }
+    }
+
+    pub(crate) fn invalidate(&self) {
+        if let Ok(mut guard) = self.state.lock() {
+            *guard = None;
+        }
+    }
+
+    /// Remaining time strictly inside the conservative lease margin
+    /// (`renewed_at + B2_RETRY_LEASE_MARGIN`), or `None` if invalidated or
+    /// expired.
+    pub(crate) fn remaining_after(&self, delay: Duration) -> Option<Duration> {
+        let renewed = (*self.state.lock().ok()?)?;
+        let limit = renewed + B2_RETRY_LEASE_MARGIN;
+        let start = Instant::now() + delay;
+        limit.checked_duration_since(start)
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("Could not acquire transcode lock: rendition set is busy")]
@@ -172,6 +217,10 @@ impl ClaimStore {
                 Phase::Retry => {}
                 Phase::Preparing if stale => {}
                 Phase::Writing { gcs, key, id } if stale => {
+                    if id.is_empty() {
+                        count("invalid_lock_blocked");
+                        return Err(Busy.into());
+                    }
                     let committed = if let Some(storage) = storage {
                         storage.hls_write_committed(*gcs, key, id).await
                     } else {
@@ -190,7 +239,7 @@ impl ClaimStore {
                     }
                 }
                 Phase::Publishing { id, writes } if stale => {
-                    if writes.is_empty() {
+                    if writes.is_empty() || id.is_empty() {
                         count("invalid_lock_blocked");
                         return Err(Busy.into());
                     }
@@ -226,7 +275,7 @@ impl ClaimStore {
                 .unwrap_or_default();
             not_before = Instant::now() + MUTATION_INTERVAL.saturating_sub(age);
         }
-        let generation = self
+        let (generation, started_at) = self
             .replace(&key, prior_generation, &journal, not_before, None)
             .await?
             .ok_or(Busy)?;
@@ -242,8 +291,8 @@ impl ClaimStore {
             journal,
             intent: Dirty::Hls,
             deadline: now + ATTEMPT_BUDGET,
-            lease_renewed_at: now,
-            next_heartbeat: now + HEARTBEAT,
+            lease_renewed_at: started_at,
+            next_heartbeat: started_at + HEARTBEAT,
             next_mutation: now + MUTATION_INTERVAL,
             write_acknowledged: false,
         })
@@ -273,14 +322,18 @@ impl ClaimStore {
         journal: &Journal,
         not_before: Instant,
         work_deadline: Option<Instant>,
-    ) -> Result<Option<i64>> {
+    ) -> Result<Option<(i64, Instant)>> {
+        let encoded = serde_json::to_string(journal)?;
+        if encoded.len() > MAX_JOURNAL_BYTES {
+            bail!(
+                "Transcode lock journal exceeds metadata size limit ({} > {MAX_JOURNAL_BYTES})",
+                encoded.len()
+            );
+        }
         let metadata = Object {
             name: key.to_owned(),
             content_type: Some("application/octet-stream".to_owned()),
-            metadata: Some(HashMap::from([(
-                STATE.to_owned(),
-                serde_json::to_string(journal)?,
-            )])),
+            metadata: Some(HashMap::from([(STATE.to_owned(), encoded)])),
             ..Default::default()
         };
         let request = UploadObjectRequest {
@@ -289,13 +342,13 @@ impl ClaimStore {
             ..Default::default()
         };
         let upload = UploadType::Multipart(Box::new(metadata));
-        let result = mutate_claim(not_before, work_deadline, || {
+        let (result, started_at) = mutate_claim(not_before, work_deadline, || {
             self.client.upload_object(&request, Bytes::new(), &upload)
         })
         .await
         .context("Transcode lock update timed out")?;
         match result {
-            Ok(object) if object.generation > 0 => Ok(Some(object.generation)),
+            Ok(object) if object.generation > 0 => Ok(Some((object.generation, started_at))),
             Ok(_) => bail!("Transcode lock generation missing"),
             Err(error) if gcs_status(&error) == Some(412) => Ok(None),
             Err(error) => Err(error).context("Transcode lock update failed"),
@@ -309,7 +362,7 @@ async fn mutate_claim<T, F>(
     not_before: Instant,
     work_deadline: Option<Instant>,
     mut operation: impl FnMut() -> F,
-) -> Result<std::result::Result<T, Error>>
+) -> Result<(std::result::Result<T, Error>, Instant)>
 where
     F: Future<Output = std::result::Result<T, Error>>,
 {
@@ -323,17 +376,20 @@ where
         if Instant::now() >= start_deadline {
             bail!("Transcode lock mutation exceeded its admission deadline");
         }
+        // Stamp the conservative lease start *before* the request leaves the
+        // client so GCS `timeCreated` is never earlier than our local clock.
+        let attempt_started = Instant::now();
         // A request admitted before the deadline still needs its normal
         // response window. Canceling a committed intent early can leave a
         // durable Writing record for a media PUT the worker never started.
         let result = tokio::time::timeout(CONTROL_TIMEOUT, operation()).await?;
         if result.as_ref().err().and_then(gcs_status) != Some(429) {
-            return Ok(result);
+            return Ok((result, attempt_started));
         }
         count("claim_mutation_throttled");
         let delay = backoff.mul_f64(1.0 + 0.25 * crate::retry_jitter_ratio());
         if Instant::now() + delay >= start_deadline {
-            return Ok(result);
+            return Ok((result, attempt_started));
         }
         tokio::time::sleep(delay).await;
         backoff *= 2;
@@ -362,7 +418,7 @@ impl Claim {
     }
 
     async fn transition(&mut self, journal: Journal, work_deadline: Option<Instant>) -> Result<()> {
-        self.generation = self
+        let (generation, started_at) = self
             .store
             .replace(
                 &self.key,
@@ -373,11 +429,12 @@ impl Claim {
             )
             .await?
             .ok_or(OwnershipLost)?;
+        self.generation = generation;
         self.journal = journal;
         self.write_acknowledged = false;
         let now = Instant::now();
-        self.lease_renewed_at = now;
-        self.next_heartbeat = now + HEARTBEAT;
+        self.lease_renewed_at = started_at;
+        self.next_heartbeat = started_at + HEARTBEAT;
         self.next_mutation = now + MUTATION_INTERVAL;
         Ok(())
     }
@@ -459,6 +516,9 @@ impl Claim {
         if writes.is_empty() {
             bail!("Publication batch must include at least one target");
         }
+        if id.is_empty() {
+            bail!("Publication batch write id must not be empty");
+        }
         self.transition(
             Journal {
                 dirty: self.journal.dirty.max(self.intent),
@@ -472,40 +532,99 @@ impl Claim {
         .await
     }
 
-    /// Renew an active `Publishing` lease without ever cancelling or dropping
-    /// in-flight provider PUT futures. Any heartbeat failure is returned after
-    /// `work` completes so callers accurately observe whether every PUT settled.
+    /// Renew an active `Publishing` lease concurrently alongside `work` without
+    /// ever cancelling or dropping in-flight provider PUT futures. On
+    /// `OwnershipLost` or lease-margin expiry, `lease` is invalidated immediately
+    /// so `work` launches no further tiers, backups, or retries while letting
+    /// already-started PUTs settle.
     pub(crate) async fn hold_publishing<T>(
         &mut self,
-        lease_clock: Arc<Mutex<Instant>>,
+        lease: PublishLease,
         work: impl Future<Output = T>,
     ) -> (T, Option<anyhow::Error>) {
+        type HeartbeatFuture = Pin<Box<dyn Future<Output = Result<Option<(i64, Instant)>>> + Send>>;
         tokio::pin!(work);
         let mut heartbeat_error: Option<anyhow::Error> = None;
+        let mut in_flight: Option<HeartbeatFuture> = None;
         loop {
             if heartbeat_error.is_some() {
                 return (work.await, heartbeat_error);
             }
-            tokio::select! {
-                biased;
-                result = &mut work => return (result, None),
-                () = tokio::time::sleep_until(self.next_heartbeat) => {
-                    let renewed = match self.check_deadline() {
-                        Ok(()) => {
-                            let journal = self.journal.clone();
-                            self.transition(journal, Some(self.deadline)).await
-                        }
-                        Err(error) => Err(error),
-                    };
-                    match renewed {
-                        Ok(()) => {
-                            if let Ok(mut guard) = lease_clock.lock() {
-                                *guard = self.lease_renewed_at;
+            if let Some(hb) = in_flight.as_mut() {
+                tokio::select! {
+                    biased;
+                    result = &mut work => {
+                        // Await any already-dispatched heartbeat so self.generation
+                        // reflects the live GCS generation before mark_verified/reject.
+                        if let Some(hb) = in_flight.take() {
+                            match hb.await {
+                                Ok(Some((generation, started_at))) => {
+                                    self.generation = generation;
+                                    self.lease_renewed_at = started_at;
+                                    self.next_heartbeat = started_at + HEARTBEAT;
+                                    self.next_mutation = Instant::now() + MUTATION_INTERVAL;
+                                    lease.renew(started_at);
+                                }
+                                Ok(None) => {
+                                    lease.invalidate();
+                                    heartbeat_error = Some(OwnershipLost.into());
+                                }
+                                Err(error) => {
+                                    lease.invalidate();
+                                    heartbeat_error = Some(error);
+                                }
                             }
                         }
-                        Err(error) => {
-                            heartbeat_error = Some(error);
+                        return (result, heartbeat_error);
+                    }
+                    hb_result = hb.as_mut() => {
+                        in_flight = None;
+                        match hb_result {
+                            Ok(Some((generation, started_at))) => {
+                                self.generation = generation;
+                                self.lease_renewed_at = started_at;
+                                self.next_heartbeat = started_at + HEARTBEAT;
+                                self.next_mutation = Instant::now() + MUTATION_INTERVAL;
+                                lease.renew(started_at);
+                            }
+                            Ok(None) => {
+                                lease.invalidate();
+                                heartbeat_error = Some(OwnershipLost.into());
+                            }
+                            Err(error) => {
+                                // A single transient GCS hiccup early in the lease
+                                // should retry rather than guaranteeing expiry at 90 s.
+                                if lease.remaining_after(MUTATION_INTERVAL).is_some() {
+                                    self.next_heartbeat = Instant::now() + MUTATION_INTERVAL;
+                                } else {
+                                    lease.invalidate();
+                                    heartbeat_error = Some(error);
+                                }
+                            }
                         }
+                    }
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    result = &mut work => return (result, None),
+                    () = tokio::time::sleep_until(self.next_heartbeat) => {
+                        if let Err(error) = self.check_deadline() {
+                            lease.invalidate();
+                            heartbeat_error = Some(error);
+                            continue;
+                        }
+                        let store = self.store.clone();
+                        let key = self.key.clone();
+                        let generation = self.generation;
+                        let journal = self.journal.clone();
+                        let not_before = self.next_mutation;
+                        let deadline = self.deadline;
+                        in_flight = Some(Box::pin(async move {
+                            store
+                                .replace(&key, generation, &journal, not_before, Some(deadline))
+                                .await
+                        }));
                     }
                 }
             }
@@ -573,7 +692,7 @@ impl Claim {
             if_generation_match: Some(self.generation),
             ..Default::default()
         };
-        let deletion = mutate_claim(self.next_mutation, None, || {
+        let (deletion, _) = mutate_claim(self.next_mutation, None, || {
             self.store.client.delete_object(&request)
         })
         .await

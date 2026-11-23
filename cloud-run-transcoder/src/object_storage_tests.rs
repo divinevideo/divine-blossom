@@ -27,6 +27,7 @@ pub(crate) struct Objects {
     pub(crate) requests: Vec<(String, String, Option<String>)>,
     pub(crate) fail: Option<StatusCode>,
     pub(crate) fail_put_by_key: HashMap<String, Vec<StatusCode>>,
+    pub(crate) commit_then_fail_put_once: HashMap<String, StatusCode>,
     missing_version: bool,
     pub(crate) corrupt: bool,
     pub(crate) get_status: Option<StatusCode>,
@@ -195,7 +196,7 @@ async fn request(State(state): State<Arc<Mutex<Objects>>>, req: Request) -> Resp
             .unwrap_or_else(|| format!("synthetic-version-{}", state.versions.len() + 1));
         state.latest.insert(key.clone(), v.clone());
         state.versions.insert(
-            (key, v.clone()),
+            (key.clone(), v.clone()),
             Stored {
                 bytes: body,
                 mime,
@@ -203,6 +204,12 @@ async fn request(State(state): State<Arc<Mutex<Objects>>>, req: Request) -> Resp
                 cache_control,
             },
         );
+        if let Some(status) = state.commit_then_fail_put_once.remove(&key) {
+            return Response::builder()
+                .status(status)
+                .body(Body::empty())
+                .unwrap();
+        }
         let mut response = Response::builder().status(200);
         if !state.missing_version {
             response = response.header("x-amz-version-id", v);

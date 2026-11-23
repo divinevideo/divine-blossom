@@ -1,6 +1,6 @@
 //! Private, version-pinned media I/O. Locks, jobs and readiness use other APIs.
 
-use crate::hls_claim::{gcs_status, Claim, WriteTarget, B2_RETRY_LEASE_MARGIN, WRITE_ID};
+use crate::hls_claim::{gcs_status, Claim, OwnershipLost, PublishLease, WriteTarget, WRITE_ID};
 use anyhow::{anyhow, bail, Context, Result};
 use blossom_core::storage_origin::{ObjectRef, StorageProvider};
 use bytes::Bytes;
@@ -19,7 +19,6 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::Path,
-    sync::{Arc, Mutex},
     time::Duration,
 };
 use time::OffsetDateTime;
@@ -38,6 +37,7 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(120);
 const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 const B2_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 const B2_RETRY_BACKOFFS: [Duration; 2] = [Duration::from_millis(200), Duration::from_millis(500)];
+const MIN_B2_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
 pub struct HlsUploadItem {
@@ -71,6 +71,7 @@ impl BatchWriteError {
 }
 
 enum B2SendError {
+    Connect(anyhow::Error),
     Transport(anyhow::Error),
     Timeout(anyhow::Error),
 }
@@ -760,7 +761,7 @@ impl MediaStorage {
         };
 
         claim.begin_publication(targets, &write_id).await?;
-        let lease_clock = Arc::new(Mutex::new(claim.lease_renewed_at()));
+        let lease = PublishLease::new(claim.lease_renewed_at());
         let deadline = claim.deadline();
         let mut tiers: BTreeMap<u8, Vec<HlsUploadItem>> = BTreeMap::new();
         for item in items {
@@ -768,32 +769,51 @@ impl MediaStorage {
         }
 
         let (batch_result, heartbeat_error) = claim
-            .hold_publishing(lease_clock.clone(), async {
+            .hold_publishing(lease.clone(), async {
                 let mut verified = Vec::new();
+                let mut batch_had_ambiguous = false;
                 for (_tier, tier_items) in tiers {
                     if Instant::now() >= deadline {
-                        return Err(BatchWriteError::settled(anyhow!(
-                            "Transcode attempt exceeded its preparation deadline"
-                        )));
+                        let err = anyhow!("Transcode attempt exceeded its preparation deadline");
+                        return Err(if batch_had_ambiguous {
+                            BatchWriteError::unconfirmed(err)
+                        } else {
+                            BatchWriteError::settled(err)
+                        });
+                    }
+                    if lease.remaining_after(Duration::ZERO).is_none() {
+                        let err =
+                            anyhow!("Transcode lease lost or expired before tier publication");
+                        return Err(if batch_had_ambiguous {
+                            BatchWriteError::unconfirmed(err)
+                        } else {
+                            BatchWriteError::settled(err)
+                        });
                     }
                     // Always await every started PUT in the tier (join_all,
                     // never try_join_all) so we never drop an in-flight PUT
                     // and misclassify an unconfirmed write as settled.
-                    let results = futures::future::join_all(tier_items.into_iter().map(|item| {
-                        let gcs_gen = gcs_generations.get(&item.key).copied();
-                        let lease_clock = lease_clock.clone();
-                        async move {
-                            self.put_batch_item_with_backup(item, gcs_gen, &lease_clock)
-                                .await
-                        }
-                    }))
-                    .await;
+                    let results =
+                        futures::future::join_all(
+                            tier_items.into_iter().map(|item| {
+                                let gcs_gen = gcs_generations.get(&item.key).copied();
+                                let lease = lease.clone();
+                                async move {
+                                    self.put_batch_item_with_backup(item, gcs_gen, &lease).await
+                                }
+                            }),
+                        )
+                        .await;
                     let mut first_error: Option<anyhow::Error> = None;
-                    let mut any_unconfirmed = false;
+                    let mut any_unconfirmed = batch_had_ambiguous;
                     let mut tier_verified = Vec::with_capacity(results.len());
                     for result in results {
                         match result {
-                            Ok(receipt) => tier_verified.push(receipt),
+                            Ok((receipt, item_ambiguous)) => {
+                                batch_had_ambiguous |= item_ambiguous;
+                                any_unconfirmed |= item_ambiguous;
+                                tier_verified.push(receipt);
+                            }
                             Err(err) => {
                                 if first_error.is_none() {
                                     first_error = Some(err.error);
@@ -823,7 +843,13 @@ impl MediaStorage {
                 Ok(verified)
             }
             Err(err) => {
-                if !err.unconfirmed && heartbeat_error.is_none() {
+                if let Some(hb_err) = heartbeat_error {
+                    if hb_err.is::<OwnershipLost>() {
+                        return Err(hb_err);
+                    }
+                    return Err(err.error);
+                }
+                if !err.unconfirmed {
                     claim.reject_write().await?;
                 }
                 Err(err.error)
@@ -835,9 +861,9 @@ impl MediaStorage {
         &self,
         item: HlsUploadItem,
         gcs_generation: Option<i64>,
-        lease_clock: &Arc<Mutex<Instant>>,
-    ) -> std::result::Result<VerifiedObject, BatchWriteError> {
-        let mut primary = self
+        lease: &PublishLease,
+    ) -> std::result::Result<(VerifiedObject, bool), BatchWriteError> {
+        let (mut primary, mut had_ambiguous) = self
             .put_single_batch_item(
                 &item.key,
                 item.body.clone(),
@@ -845,11 +871,19 @@ impl MediaStorage {
                 item.custom.clone(),
                 item.cache_control.clone(),
                 if self.is_gcs() { gcs_generation } else { None },
-                lease_clock,
+                lease,
             )
             .await?;
         if let Some(backup) = &self.required_backup {
-            let replica = backup
+            if lease.remaining_after(Duration::ZERO).is_none() {
+                let err = anyhow!("Transcode lease lost or expired before backup publication");
+                return Err(if had_ambiguous {
+                    BatchWriteError::unconfirmed(err)
+                } else {
+                    BatchWriteError::settled(err)
+                });
+            }
+            let (replica, backup_ambiguous) = backup
                 .put_single_batch_item(
                     &item.key,
                     item.body,
@@ -857,23 +891,28 @@ impl MediaStorage {
                     item.custom,
                     item.cache_control,
                     gcs_generation,
-                    lease_clock,
+                    lease,
                 )
                 .await
                 .map_err(|mut err| {
                     err.error = err.error.context(
                         "Required GCS backup was not verified; primary must not be acknowledged",
                     );
+                    err.unconfirmed |= had_ambiguous;
                     err
                 })?;
+            had_ambiguous |= backup_ambiguous;
             if replica.sha256 != primary.sha256 {
-                return Err(BatchWriteError::settled(anyhow!(
-                    "Required GCS backup identity mismatch"
-                )));
+                let err = anyhow!("Required GCS backup identity mismatch");
+                return Err(if had_ambiguous {
+                    BatchWriteError::unconfirmed(err)
+                } else {
+                    BatchWriteError::settled(err)
+                });
             }
             primary.required_backup = Some(replica.object);
         }
-        Ok(primary)
+        Ok((primary, had_ambiguous))
     }
 
     async fn put_single_batch_item(
@@ -884,9 +923,17 @@ impl MediaStorage {
         custom: HashMap<String, String>,
         cache_control: Option<String>,
         gcs_generation: Option<i64>,
-        lease_clock: &Arc<Mutex<Instant>>,
-    ) -> std::result::Result<VerifiedObject, BatchWriteError> {
+        lease: &PublishLease,
+    ) -> std::result::Result<(VerifiedObject, bool), BatchWriteError> {
         let sha256 = hex::encode(Sha256::digest(&body));
+        let mut had_ambiguous_attempt = false;
+        let classify_settled = |had_ambiguous: bool, err: anyhow::Error| {
+            if had_ambiguous {
+                BatchWriteError::unconfirmed(err)
+            } else {
+                BatchWriteError::settled(err)
+            }
+        };
         let reference = match &self.backend {
             Backend::Gcs { client, bucket } => {
                 let metadata = Object {
@@ -933,6 +980,8 @@ impl MediaStorage {
             }
             Backend::B2 { .. } => {
                 let mut attempt = 0usize;
+                let mut timeout = CONTROL_TIMEOUT;
+                let write_id = custom.get(WRITE_ID).map(String::as_str);
                 loop {
                     let request = self
                         .build_b2_request(B2Request {
@@ -944,14 +993,14 @@ impl MediaStorage {
                             cache: cache_control.as_deref(),
                             custom: &custom,
                         })
-                        .map_err(BatchWriteError::settled)?;
-                    match send_b2_request_classified(request).await {
+                        .map_err(|err| classify_settled(had_ambiguous_attempt, err))?;
+                    match send_b2_request_classified(request, timeout).await {
                         Ok(response) => {
                             let status = response.status();
                             if status.is_success() {
                                 let (_, bucket) = self.provider_bucket();
                                 let version = required(response.headers(), "x-amz-version-id")
-                                    .map_err(BatchWriteError::settled)?;
+                                    .map_err(|err| classify_settled(had_ambiguous_attempt, err))?;
                                 break ObjectRef {
                                     provider: StorageProvider::B2,
                                     bucket: bucket.into(),
@@ -960,32 +1009,98 @@ impl MediaStorage {
                                 };
                             }
                             let code = status.as_u16();
-                            if (b2_transient_status(status) || code == 429)
-                                && attempt < B2_RETRY_BACKOFFS.len()
-                                && can_retry_within_lease(lease_clock, B2_RETRY_BACKOFFS[attempt])
-                            {
+                            let transient_5xx = b2_transient_status(status);
+                            if transient_5xx {
+                                had_ambiguous_attempt = true;
+                            }
+                            if (transient_5xx || code == 429) && attempt < B2_RETRY_BACKOFFS.len() {
                                 let delay = B2_RETRY_BACKOFFS[attempt];
-                                attempt += 1;
-                                crate::hls_claim::count("b2_write_retried");
-                                tokio::time::sleep(delay).await;
-                                continue;
+                                if lease
+                                    .remaining_after(delay)
+                                    .is_some_and(|rem| rem >= MIN_B2_RETRY_TIMEOUT)
+                                {
+                                    attempt += 1;
+                                    tokio::time::sleep(delay).await;
+                                    // If a 5xx arrived after B2 actually committed
+                                    // this attempt, verify the committed object
+                                    // directly instead of issuing a duplicate PUT.
+                                    if transient_5xx {
+                                        if let Ok(Some(existing)) = self.stat(key).await {
+                                            if write_id.is_some()
+                                                && existing.custom.get(WRITE_ID).map(String::as_str)
+                                                    == write_id
+                                            {
+                                                break existing.reference;
+                                            }
+                                        }
+                                    }
+                                    if let Some(rem) = lease
+                                        .remaining_after(Duration::ZERO)
+                                        .filter(|rem| *rem >= MIN_B2_RETRY_TIMEOUT)
+                                    {
+                                        timeout = rem.min(CONTROL_TIMEOUT);
+                                        crate::hls_claim::count("b2_write_retried");
+                                        continue;
+                                    }
+                                }
                             }
                             let err = successful(status).unwrap_err();
-                            return Err(if write_rejected(code) {
+                            return Err(if !had_ambiguous_attempt && write_rejected(code) {
                                 BatchWriteError::settled(err)
                             } else {
                                 BatchWriteError::unconfirmed(err)
                             });
                         }
-                        Err(B2SendError::Transport(err)) => {
-                            if attempt < B2_RETRY_BACKOFFS.len()
-                                && can_retry_within_lease(lease_clock, B2_RETRY_BACKOFFS[attempt])
-                            {
+                        Err(B2SendError::Connect(err)) => {
+                            // TCP connect failed before any HTTP bytes left the
+                            // client, so this attempt could not have committed.
+                            if attempt < B2_RETRY_BACKOFFS.len() {
                                 let delay = B2_RETRY_BACKOFFS[attempt];
-                                attempt += 1;
-                                crate::hls_claim::count("b2_write_retried");
-                                tokio::time::sleep(delay).await;
-                                continue;
+                                if lease
+                                    .remaining_after(delay)
+                                    .is_some_and(|rem| rem >= MIN_B2_RETRY_TIMEOUT)
+                                {
+                                    attempt += 1;
+                                    tokio::time::sleep(delay).await;
+                                    if let Some(rem) = lease
+                                        .remaining_after(Duration::ZERO)
+                                        .filter(|rem| *rem >= MIN_B2_RETRY_TIMEOUT)
+                                    {
+                                        timeout = rem.min(CONTROL_TIMEOUT);
+                                        crate::hls_claim::count("b2_write_retried");
+                                        continue;
+                                    }
+                                }
+                            }
+                            return Err(classify_settled(had_ambiguous_attempt, err));
+                        }
+                        Err(B2SendError::Transport(err)) => {
+                            had_ambiguous_attempt = true;
+                            if attempt < B2_RETRY_BACKOFFS.len() {
+                                let delay = B2_RETRY_BACKOFFS[attempt];
+                                if lease
+                                    .remaining_after(delay)
+                                    .is_some_and(|rem| rem >= MIN_B2_RETRY_TIMEOUT)
+                                {
+                                    attempt += 1;
+                                    tokio::time::sleep(delay).await;
+                                    if let Ok(Some(existing)) = self.stat(key).await {
+                                        if write_id.is_some()
+                                            && existing.custom.get(WRITE_ID).map(String::as_str)
+                                                == write_id
+                                        {
+                                            break existing.reference;
+                                        }
+                                    }
+                                    if let Some(rem) = lease
+                                        .remaining_after(Duration::ZERO)
+                                        .filter(|rem| *rem >= MIN_B2_RETRY_TIMEOUT)
+                                    {
+                                        timeout = rem.min(CONTROL_TIMEOUT);
+                                        crate::hls_claim::count("b2_write_retried");
+                                        continue;
+                                    }
+                                }
                             }
                             return Err(BatchWriteError::unconfirmed(err));
                         }
@@ -996,33 +1111,42 @@ impl MediaStorage {
                 }
             }
         };
-        // The PUT already returned a committed version; any subsequent read-back
-        // verification error is settled (no PUT remains in flight on the wire).
+        // Read-back verification is settled only if no earlier PUT attempt on
+        // this item had an ambiguous outcome.
         self.validate_reference(&reference)
-            .map_err(BatchWriteError::settled)?;
+            .map_err(|err| classify_settled(had_ambiguous_attempt, err))?;
         let object = self
             .stat_reference(&reference)
             .await
-            .map_err(BatchWriteError::settled)?
-            .ok_or_else(|| BatchWriteError::settled(anyhow!("Written media version missing")))?;
+            .map_err(|err| classify_settled(had_ambiguous_attempt, err))?
+            .ok_or_else(|| {
+                classify_settled(
+                    had_ambiguous_attempt,
+                    anyhow!("Written media version missing"),
+                )
+            })?;
         if object.reference != reference
             || object.size != body.len() as u64
             || object.content_type != mime
             || object.custom != custom
             || object.cache_control != cache_control
         {
-            return Err(BatchWriteError::settled(anyhow!(
-                "Written media metadata verification failed"
-            )));
+            return Err(classify_settled(
+                had_ambiguous_attempt,
+                anyhow!("Written media metadata verification failed"),
+            ));
         }
         self.verify_sha256(&object, &sha256)
             .await
-            .map_err(BatchWriteError::settled)?;
-        Ok(VerifiedObject {
-            object,
-            sha256,
-            required_backup: None,
-        })
+            .map_err(|err| classify_settled(had_ambiguous_attempt, err))?;
+        Ok((
+            VerifiedObject {
+                object,
+                sha256,
+                required_backup: None,
+            },
+            had_ambiguous_attempt,
+        ))
     }
 
     async fn put_with_backup(
@@ -1170,9 +1294,12 @@ impl MediaStorage {
                 cache: None,
                 custom: &HashMap::new(),
             })?;
-            match send_b2_request_classified(request).await {
+            match send_b2_request_classified(request, CONTROL_TIMEOUT).await {
                 Ok(response) => {
-                    if b2_transient_status(response.status()) && attempt < B2_RETRY_BACKOFFS.len() {
+                    if (b2_transient_status(response.status())
+                        || response.status() == StatusCode::TOO_MANY_REQUESTS)
+                        && attempt < B2_RETRY_BACKOFFS.len()
+                    {
                         let delay = B2_RETRY_BACKOFFS[attempt];
                         attempt += 1;
                         tokio::time::sleep(delay).await;
@@ -1180,7 +1307,7 @@ impl MediaStorage {
                     }
                     return Ok(response);
                 }
-                Err(B2SendError::Transport(err)) => {
+                Err(B2SendError::Connect(err) | B2SendError::Transport(err)) => {
                     if attempt < B2_RETRY_BACKOFFS.len() {
                         let delay = B2_RETRY_BACKOFFS[attempt];
                         attempt += 1;
@@ -1334,17 +1461,23 @@ impl MediaStorage {
 }
 
 async fn send_b2_request(request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
-    match send_b2_request_classified(request).await {
+    match send_b2_request_classified(request, CONTROL_TIMEOUT).await {
         Ok(response) => Ok(response),
-        Err(B2SendError::Transport(err) | B2SendError::Timeout(err)) => Err(err),
+        Err(
+            B2SendError::Connect(err) | B2SendError::Transport(err) | B2SendError::Timeout(err),
+        ) => Err(err),
     }
 }
 
 async fn send_b2_request_classified(
     request: reqwest::RequestBuilder,
+    timeout: Duration,
 ) -> std::result::Result<reqwest::Response, B2SendError> {
-    match tokio::time::timeout(CONTROL_TIMEOUT, request.send()).await {
+    match tokio::time::timeout(timeout, request.send()).await {
         Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) if error.is_connect() => Err(B2SendError::Connect(anyhow!(
+            "B2 media connection failed before request dispatch"
+        ))),
         Ok(Err(_)) => Err(B2SendError::Transport(anyhow!(
             "B2 media transport failed; write outcome may be unconfirmed"
         ))),
@@ -1356,13 +1489,6 @@ async fn send_b2_request_classified(
 
 fn b2_transient_status(status: StatusCode) -> bool {
     matches!(status.as_u16(), 500 | 502 | 503 | 504)
-}
-
-fn can_retry_within_lease(lease_clock: &Arc<Mutex<Instant>>, delay: Duration) -> bool {
-    lease_clock
-        .lock()
-        .ok()
-        .is_some_and(|renewed| Instant::now() + delay < *renewed + B2_RETRY_LEASE_MARGIN)
 }
 
 fn write_rejected(status: u16) -> bool {
