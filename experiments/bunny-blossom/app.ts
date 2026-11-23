@@ -544,10 +544,12 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
     }
 
     if (thumbError) {
+      await storageResp.body?.cancel().catch(() => {});
       return jsonResp(thumbError.status, { error: thumbError.message }, thumbError.headers);
     }
 
     if (storageResp.status === 404) {
+      await storageResp.body?.cancel().catch(() => {});
       return jsonResp(404, { error: "blob bytes not found" });
     }
 
@@ -1134,7 +1136,22 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         return new Response(null, { status: 503 });
       }
       const capHeaders = uploadCapabilityHeaders();
-      const preSha = req.headers.get("x-sha-256") ?? req.headers.get("x-sha256");
+      const preHyphenatedSha = req.headers.get("x-sha-256");
+      const preCompactSha = req.headers.get("x-sha256");
+      if (
+        preHyphenatedSha !== null &&
+        preCompactSha !== null &&
+        preHyphenatedSha.trim().toLowerCase() !== preCompactSha.trim().toLowerCase()
+      ) {
+        return new Response(null, {
+          status: 400,
+          headers: {
+            ...capHeaders,
+            "x-reason": "Conflicting X-SHA-256 and X-Sha256 headers",
+          },
+        });
+      }
+      const preSha = preHyphenatedSha ?? preCompactSha;
       const preLenRaw = req.headers.get("x-content-length");
       const preType = req.headers.get("x-content-type");
 
@@ -2247,9 +2264,9 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         revision: row.revision + 1,
         status: newStatus,
         ageRestricted: newStatus === "age_restricted",
-        cleanupPending: mapped === "delete" ? true : row.cleanupPending,
+        cleanupPending: mapped === "delete",
         deleteReason: body.reason ?? row.deleteReason,
-        deletedAt: mapped === "delete" ? now() : row.deletedAt,
+        deletedAt: mapped === "delete" ? now() : undefined,
         ownerDeleted: undefined,
       };
       if (

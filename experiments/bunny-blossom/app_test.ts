@@ -1847,7 +1847,7 @@ Deno.test("upload hardening: quarantine holds, restricted privacy, encoding poli
     equal(mirrorRec?.videoEncodingAllowed, false);
     equal(mirrorRec?.transcodeStatus, "pending");
 
-    await app(
+    const restrictRes = await app(
       new Request(`${origin}/admin/api/moderate`, {
         method: "POST",
         headers: {
@@ -1857,6 +1857,7 @@ Deno.test("upload hardening: quarantine holds, restricted privacy, encoding poli
         body: JSON.stringify({ sha256: mirrorHash, action: "RESTRICT" }),
       }),
     );
+    equal(restrictRes.status, 200);
     equal((await app(new Request(`${origin}/${mirrorHash}`))).status, 404);
     const nonOwnerMirror = await app(
       new Request(`${origin}/mirror`, {
@@ -1869,8 +1870,10 @@ Deno.test("upload hardening: quarantine holds, restricted privacy, encoding poli
       }),
     );
     equal(nonOwnerMirror.status, 403);
+    customUpstreamHandler = null;
 
-    // 10. Restore clears cleanupPending so a subsequent admin soft-delete + drain does NOT erase B2 bytes
+    // 10. Both /admin/api/restore and /admin/api/moderate APPROVE clear cleanupPending so a subsequent
+    //     admin soft-delete + drain does NOT erase B2 bytes
     await blobs.write(mirrorHash, mirrorBytes, "video/mp4");
     const modDelRes = await app(
       new Request(`${origin}/admin/api/moderate`, {
@@ -1883,6 +1886,31 @@ Deno.test("upload hardening: quarantine holds, restricted privacy, encoding poli
       }),
     );
     equal(modDelRes.status, 200);
+    equal((await catalog.get(mirrorHash))?.cleanupPending, true);
+    const modApproveRes = await app(
+      new Request(`${origin}/admin/api/moderate`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${adminToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ sha256: mirrorHash, action: "APPROVE" }),
+      }),
+    );
+    equal(modApproveRes.status, 200);
+    equal((await catalog.get(mirrorHash))?.cleanupPending, false);
+    equal((await catalog.get(mirrorHash))?.deletedAt, undefined);
+    const modDelAgain = await app(
+      new Request(`${origin}/admin/api/moderate`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${adminToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ sha256: mirrorHash, action: "DELETE" }),
+      }),
+    );
+    equal(modDelAgain.status, 200);
     equal((await catalog.get(mirrorHash))?.cleanupPending, true);
     const restoreRes = await app(
       new Request(`${origin}/admin/api/restore`, {
@@ -1948,6 +1976,10 @@ Deno.test("upload hardening: quarantine holds, restricted privacy, encoding poli
       }),
     );
     equal(incompleteRes.status, 409);
+    equal(
+      (await incompleteRes.json() as { error: string }).error,
+      "Upload incomplete: 10 of 20 bytes committed",
+    );
 
     // /upload/init returns 503 on gated/unavailable blobs and 400 on settled owner-deleted blobs
     const gatedInitRes = await app(
@@ -2006,6 +2038,16 @@ Deno.test("upload hardening: quarantine holds, restricted privacy, encoding poli
       }),
     );
     equal(conflictShaRes.status, 400);
+    const conflictHeadShaRes = await app(
+      new Request(`${origin}/upload`, {
+        method: "HEAD",
+        headers: {
+          "x-sha-256": "5".repeat(64),
+          "x-sha256": "6".repeat(64),
+        },
+      }),
+    );
+    equal(conflictHeadShaRes.status, 400);
 
     const mixedHash = "f".repeat(64);
     await catalog.cas(mixedHash, null, {
