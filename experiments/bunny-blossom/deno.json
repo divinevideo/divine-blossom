@@ -8,7 +8,7 @@
   "tasks": {
     "check": "deno check app.ts adapters.ts bunny.ts app_test.ts adapters_test.ts probe.ts probe_bunny.ts probe_test.ts",
     "test": "deno test --allow-read=schema.sql app_test.ts adapters_test.ts probe_test.ts",
-    "verify": "deno fmt --check && deno lint && deno task check && deno task test"
+    "verify": "deno fmt --check && deno lint && deno task check && deno task test && python3 inventory_test.py"
   },
   "fmt": { "lineWidth": 100 }
 }

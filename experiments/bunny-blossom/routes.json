@@ -1,6 +1,23 @@
 {
   "source": "src/main.rs:route_request",
   "source_sha256": "3c946b4cfe56e8744c9b6b43a863a02875ca9a36e99dcb57d8ba0f2866219eff",
+  "pre_match_dispatches": [
+    {
+      "source_line": 245,
+      "matcher": "match b2_cdn::route(&req) {",
+      "parity": "not established"
+    },
+    {
+      "source_line": 252,
+      "matcher": "match canary::route(&req) {",
+      "parity": "not established"
+    },
+    {
+      "source_line": 261,
+      "matcher": "if let Some(parent) = path.strip_prefix(\"/api/bunny-playback/\") {",
+      "parity": "not established"
+    }
+  ],
   "routes": [
     {
       "source_line": 266,

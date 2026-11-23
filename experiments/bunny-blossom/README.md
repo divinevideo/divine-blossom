@@ -134,3 +134,22 @@ Observed on Bunny on 2026-11-23: all six expected statuses passed on the first r
 subsequent probes. These samples are not a latency benchmark or a billing measurement. The provider
 also changed the requested client cache header to `no-cache`; final header and cache behavior still
 require explicit zone configuration and live verification before any real content.
+
+## Fixture and delivery boundaries
+
+For a persistent fixture deployment, enabling writes also requires `SPIKE_FIXTURE_SHA256` and
+`SPIKE_FIXTURE_OWNERS` (one to four comma-separated full public keys). Only those signers may mutate
+that one fixture hash. This restriction is checked before metadata or storage mutations. Use a newly
+created, operator-owned test identity, never a real account.
+
+The inventory includes three dispatches before the 64 tuple matchers: the B2 delivery host route,
+canary host route, and canonical playback-selection prefix. These are separate migration surfaces,
+not implemented parity.
+
+The isolated probe now checks descriptor fields, returned bytes, the owner listing, cleanup state
+and denied-read body as well as HTTP statuses. Its in-memory state is discarded after every probe
+call.
+
+The experiment-specific workflow does not deploy. Merging any change in this repository still
+invokes normal mainline CI, including its existing Fastly publish policy. This spike does not change
+that policy and must not be described as a merge with no possible production deployment activity.

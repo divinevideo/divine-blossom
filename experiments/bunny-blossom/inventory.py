@@ -8,6 +8,12 @@ root = Path(__file__).resolve().parents[2]
 source = (root / "src/main.rs").read_text()
 start = source.index("fn route_request(")
 match_start = source.index("match (", start)
+pre_match = []
+prefix_lines = source[start:match_start].splitlines()
+prefix_offset = source[:start].count("\n") + 1
+for number, line in enumerate(prefix_lines, prefix_offset):
+    if any(marker in line for marker in ("match b2_cdn::route", "match canary::route", 'path.strip_prefix("/api/bunny-playback/")')):
+        pre_match.append({"source_line": number, "matcher": line.strip(), "parity": "not established"})
 end = source.index("\nfn ", match_start)
 lines = source[match_start:end].splitlines()
 offset = source[:match_start].count("\n") + 1
@@ -25,6 +31,6 @@ for number, line in enumerate(lines, offset):
         pending = []
 
 (Path(__file__).parent / "routes.json").write_text(
-    json.dumps({"source": "src/main.rs:route_request", "source_sha256": hashlib.sha256(source.encode()).hexdigest(), "routes": routes}, indent=2) + "\n"
+    json.dumps({"source": "src/main.rs:route_request", "source_sha256": hashlib.sha256(source.encode()).hexdigest(), "pre_match_dispatches": pre_match, "routes": routes}, indent=2) + "\n"
 )
 print(f"Recorded {len(routes)} canonical route matchers; no parity claims inferred.")

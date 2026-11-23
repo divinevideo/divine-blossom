@@ -25,10 +25,15 @@ export async function runtimeProbe(req: Request): Promise<Response> {
         );
       },
     };
+    const body = new TextEncoder().encode("synthetic Bunny runtime conformance fixture");
+    const hash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", body)));
+    // Public synthetic test key, controlling only this call's ephemeral data.
+    const key = new Uint8Array(32).fill(3);
     const app = createApp({
       origin: "https://bunny-spike.invalid",
       catalog,
       writesEnabled: true,
+      fixture: { hash, owners: [getPublicKey(key)] },
       blobs: {
         read(key, request) {
           const body = bytes.get(key);
@@ -42,10 +47,6 @@ export async function runtimeProbe(req: Request): Promise<Response> {
         },
       },
     });
-    const body = new TextEncoder().encode("synthetic Bunny runtime conformance fixture");
-    const hash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", body)));
-    // Deliberately public synthetic test key; it controls no persistent object or account.
-    const key = new Uint8Array(32).fill(3);
     const now = Math.floor(Date.now() / 1000);
     const authorization = (action: string) =>
       "Nostr " + btoa(JSON.stringify(finalizeEvent({
@@ -66,6 +67,7 @@ export async function runtimeProbe(req: Request): Promise<Response> {
         ),
       );
     const checks: number[] = [];
+    const bodyChecks: boolean[] = [];
     for (
       const [path, method, action, payload] of [
         ["/upload", "PUT", "upload", body],
@@ -77,17 +79,36 @@ export async function runtimeProbe(req: Request): Promise<Response> {
       ] as const
     ) {
       const result = await invoke(path, method, action, payload);
+      const phase = checks.length;
       checks.push(result.status);
-      await result.body?.cancel();
+      if (phase === 1) {
+        bodyChecks.push(await result.text() === new TextDecoder().decode(body));
+      } else if (phase === 2) {
+        bodyChecks.push(await result.text() === "");
+      } else {
+        const value = await result.json();
+        bodyChecks.push(
+          phase === 0
+            ? value.sha256 === hash && value.size === body.length &&
+              value.url === `https://bunny-spike.invalid/${hash}`
+            : phase === 3
+            ? Array.isArray(value) && value.length === 1 && value[0].sha256 === hash
+            : phase === 4
+            ? value.status === "cleanup_pending" && rows.get(hash)?.cleanupPending === true
+            : value.error === "not found",
+        );
+      }
     }
     const expected = [200, 200, 200, 200, 202, 404];
-    const passed = JSON.stringify(checks) === JSON.stringify(expected);
+    const bodyChecksPassed = bodyChecks.length === 6 && bodyChecks.every(Boolean);
+    const passed = JSON.stringify(checks) === JSON.stringify(expected) && bodyChecksPassed;
     return new Response(
       req.method === "HEAD" ? null : JSON.stringify({
         probe: "bunny-blossom-runtime-v1",
         passed,
         checks,
         expected,
+        bodyChecksPassed,
         persistentStorageTested: false,
         productionReady: false,
         elapsedWallMs: Math.round((performance.now() - start) * 100) / 100,

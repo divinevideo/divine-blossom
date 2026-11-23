@@ -73,6 +73,29 @@ const B2_CONFIG = {
   key: "synthetic-secret",
 };
 
+Deno.test("missing/range errors do not expose provider diagnostic payloads", async () => {
+  for (const status of [404, 416]) {
+    const blobs = new B2Blobs(
+      B2_CONFIG,
+      () =>
+        Promise.resolve(
+          new Response("provider diagnostics", {
+            status,
+            headers: {
+              "content-length": "20",
+              "content-type": "application/xml",
+              "content-range": "bytes */3",
+            },
+          }),
+        ),
+    );
+    const result = await blobs.read(HASH, new Request("https://spike.invalid"));
+    equal(result.status, status);
+    equal(await result.text(), "");
+    equal(result.headers.get("content-length"), null);
+  }
+});
+
 Deno.test("S3 read signs fixed fixture key and range, strips viewer credentials and provider headers", async () => {
   let calls = 0;
   const blobs = new B2Blobs(B2_CONFIG, (input, init) => {

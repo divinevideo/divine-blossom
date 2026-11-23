@@ -4,7 +4,8 @@ Deno.test("ephemeral runtime probe checks native handlers without persistent dat
   const result = await runtimeProbe(new Request("https://probe.invalid/health"));
   const body = await result.json();
   if (
-    result.status !== 200 || !body.passed || body.persistentStorageTested || body.productionReady
+    result.status !== 200 || !body.passed || !body.bodyChecksPassed ||
+    body.persistentStorageTested || body.productionReady
   ) {
     throw new Error("runtime conformance failed or overclaimed");
   }

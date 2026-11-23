@@ -34,6 +34,7 @@ export type Config = {
   now?: () => number;
   // Writes are off in the Bunny entry point unless explicitly enabled for an owned fixture.
   writesEnabled?: boolean;
+  fixture?: { hash: string; owners: string[] };
   maxUploadBytes?: number;
 };
 
@@ -59,7 +60,10 @@ function auth(
 ): string {
   const header = req.headers.get("authorization") ?? "";
   if (header.length > MAX_AUTH || !/^nostr\s+/i.test(header)) throw new Error("unauthorized");
-  const event = JSON.parse(atob(header.replace(/^nostr\s+/i, "")));
+  const encoded = atob(header.replace(/^nostr\s+/i, ""));
+  const event = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(
+    Uint8Array.from(encoded, (c) => c.charCodeAt(0)),
+  ));
   if (!verifyEvent(event)) throw new Error("unauthorized");
   const tags = (key: string): string[] =>
     event.tags.filter((t: string[]) => t[0] === key && t.length >= 2).map((t: string[]) => t[1]);
@@ -126,6 +130,15 @@ async function boundedBody(req: Request, max: number): Promise<Uint8Array<ArrayB
 export function createApp(config: Config): (req: Request) => Promise<Response> {
   const origin = new URL(config.origin).origin;
   if (!origin.startsWith("https://")) throw new Error("HTTPS public origin required");
+  const fixture = config.fixture;
+  if (
+    config.writesEnabled && (!fixture || !HASH.test(fixture.hash) ||
+      !fixture.owners.length || fixture.owners.length > 4 || fixture.owners.some((key) =>
+        !HASH.test(key)
+      ))
+  ) {
+    throw new Error("explicit owned fixture scope required for writes");
+  }
   const now = config.now ?? (() => Math.floor(Date.now() / 1000));
   async function route(req: Request): Promise<Response> {
     const url = new URL(req.url);
@@ -142,9 +155,12 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       if (!config.writesEnabled) return response(503, { error: "fixture writes disabled" });
       let owner: string;
       try {
-        owner = auth(req, "upload", now());
+        owner = auth(req, "upload", now(), fixture!.hash);
       } catch {
         return response(401, { error: "invalid upload authorization" });
+      }
+      if (!fixture!.owners.includes(owner)) {
+        return response(403, { error: "fixture signer required" });
       }
       const body = await boundedBody(req, config.maxUploadBytes ?? 4 * 1024 * 1024);
       const hash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", body)));
@@ -177,7 +193,10 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       // Any lost storage reply retains the gate. There is no automatic release or mutation replay.
       await config.blobs.write(hash, body, row.type);
       const current = await config.catalog.get(hash);
-      if (!current || current.gate !== gate || current.status === "Deleted" || current.held) {
+      if (
+        !current || current.revision !== row.revision || current.gate !== gate ||
+        current.status === "Deleted" || current.held
+      ) {
         return response(409, { error: "publication withdrawn" });
       }
       const ready = {
@@ -212,6 +231,9 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         owner = auth(req, "delete", now(), deletion[1]);
       } catch {
         return response(401, { error: "invalid delete authorization" });
+      }
+      if (deletion[1] !== fixture!.hash || !fixture!.owners.includes(owner)) {
+        return response(403, { error: "fixture signer required" });
       }
       const row = await config.catalog.get(deletion[1]);
       if (!row) return response(404, { error: "not found" });
@@ -251,12 +273,18 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         (suffix) => HASH.test(url.pathname.slice(1, -suffix.length)) ? "" : suffix,
       );
       const result = await config.blobs.read(key, req);
-      const latest = await config.catalog.get(media[1]);
+      let latest: RecordState | null;
+      try {
+        latest = await config.catalog.get(media[1]);
+      } catch (error) {
+        await result.body?.cancel().catch(() => {});
+        throw error;
+      }
       if (
         !latest || latest.revision !== row.revision || latest.status === "Deleted" || latest.held ||
         latest.gate
       ) {
-        await result.body?.cancel();
+        await result.body?.cancel().catch(() => {});
         return response(404, { error: "policy changed during origin read" });
       }
       return result;

@@ -87,6 +87,7 @@ function fixture() {
     blobs,
     now: () => NOW,
     writesEnabled: true,
+    fixture: { hash: HASH, owners: [OWNER, getPublicKey(OTHER)] },
     maxUploadBytes: 4096,
   });
   const request = (path: string, method = "GET", authorization?: string, body?: BodyInit) =>
@@ -267,4 +268,58 @@ Deno.test("write entry point stays off unless explicitly enabled", async () => {
   const app = createApp({ origin: ORIGIN, catalog: f.catalog, blobs: f.blobs, now: () => NOW });
   equal((await app(f.request("/upload", "PUT", signed("upload"), BODY))).status, 503);
   equal(f.blobs.writes, 0);
+});
+
+Deno.test("persistent fixture writes reject an unapproved signer before mutation", async () => {
+  const f = fixture();
+  equal((await f.upload(new Uint8Array(32).fill(3))).status, 403);
+  equal(f.blobs.writes, 0);
+  equal(f.catalog.rows.size, 0);
+});
+
+Deno.test("policy revision changed without a hold still withdraws upload publication", async () => {
+  const f = fixture();
+  f.blobs.writeHook = async () => {
+    const row = (await f.catalog.get(HASH))!;
+    await f.catalog.cas(HASH, row.revision, {
+      ...row,
+      ageRestricted: true,
+      revision: row.revision + 1,
+    });
+  };
+  equal((await f.upload()).status, 409);
+  equal(!!(await f.catalog.get(HASH))!.gate, true);
+});
+
+Deno.test("UTF-8 signed event content interoperates with standard Nostr JSON bytes", async () => {
+  const f = fixture();
+  const event = finalizeEvent({
+    kind: 24242,
+    created_at: NOW,
+    content: "création 🎬",
+    tags: [["t", "upload"], ["x", HASH], ["expiration", String(NOW + 60)]],
+  }, KEY);
+  const utf8 = new TextEncoder().encode(JSON.stringify(event));
+  const header = "Nostr " + btoa(String.fromCharCode(...utf8));
+  equal((await f.app(f.request("/upload", "PUT", header, BODY))).status, 200);
+});
+
+Deno.test("database failure after origin headers cancels the unconsumed origin stream", async () => {
+  const f = fixture();
+  await f.upload();
+  let cancelled = false;
+  f.blobs.read = () => {
+    f.catalog.failReads = true;
+    return Promise.resolve(
+      new Response(
+        new ReadableStream({
+          cancel() {
+            cancelled = true;
+          },
+        }),
+      ),
+    );
+  };
+  equal((await f.app(f.request(`/${HASH}`))).status, 503);
+  equal(cancelled, true);
 });

@@ -122,6 +122,13 @@ export class B2Blobs implements Blobs {
       const value = result.headers.get(name);
       if (value !== null) safe.set(name, value);
     }
+    if (result.status === 404 || result.status === 416) {
+      await result.body?.cancel();
+      safe.delete("content-length");
+      safe.delete("content-type");
+      safe.delete("etag");
+      return new Response(null, { status: result.status, headers: safe });
+    }
     return new Response(result.body, { status: result.status, headers: safe });
   }
   async write(key: string, body: Uint8Array<ArrayBuffer>, type: string): Promise<void> {
