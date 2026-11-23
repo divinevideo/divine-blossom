@@ -3366,9 +3366,19 @@ fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
                 "Thumbnail cannot be generated for this video".into(),
             ))
         }
-        StatusCode::SERVICE_UNAVAILABLE => Err(BlossomError::StorageError(
-            "Thumbnail generation is busy".into(),
-        )),
+        StatusCode::SERVICE_UNAVAILABLE => {
+            let retry_after = resp
+                .get_header(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| valid_upload_retry_after(value))
+                .map(str::to_owned)
+                .or_else(|| Some("5".into()));
+            Err(BlossomError::ServiceUnavailable {
+                message: "Thumbnail generation is busy".into(),
+                retry_after,
+            })
+        }
         status => Err(BlossomError::StorageError(format!(
             "Thumbnail generation failed with status: {}",
             status
