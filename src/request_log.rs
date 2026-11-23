@@ -234,9 +234,84 @@ pub(crate) fn emit(
     eprintln!("[COMPUTE_DIAGNOSTIC] {}", line);
 }
 
+/// Failure-only counts: deliberately accepts no key, generation, payload, or
+/// provider error text. This works outside archive-control diagnostic scopes.
+pub(crate) fn emit_transcode_cas_failure(
+    pattern: Option<blossom_core::conditional_update::CasRetryPattern>,
+    conflicts: u32,
+    origin_reads: u32,
+    origin_errors: u32,
+    origin_unconfigured: u32,
+) {
+    let record = transcode_cas_failure_record(
+        pattern,
+        conflicts,
+        origin_reads,
+        origin_errors,
+        origin_unconfigured,
+    );
+    let Ok(line) = serde_json::to_string(&record) else {
+        return;
+    };
+    if let Ok(mut endpoint) = Endpoint::try_from_name(ENDPOINT_NAME) {
+        let _ = endpoint.write_all(line.as_bytes());
+    }
+    eprintln!("[TRANSCODE_CAS_DIAGNOSTIC] {line}");
+}
+
+fn transcode_cas_failure_record(
+    pattern: Option<blossom_core::conditional_update::CasRetryPattern>,
+    conflicts: u32,
+    origin_reads: u32,
+    origin_errors: u32,
+    origin_unconfigured: u32,
+) -> serde_json::Value {
+    use blossom_core::conditional_update::CasRetryPattern;
+    serde_json::json!({
+        "schema": "divine.blossom.transcode_cas_failure.v1",
+        "route": "transcode_status",
+        "read_pattern": match pattern {
+            Some(CasRetryPattern::StaleRead) => "unchanged_generation",
+            Some(CasRetryPattern::Contended) => "changed_generation",
+            None => "unobserved",
+        },
+        "conflicts": conflicts,
+        "origin_reads": origin_reads,
+        "origin_errors": origin_errors,
+        "origin_unconfigured": origin_unconfigured,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcode_cas_diagnostic_distinguishes_rereads_from_origin_failures() {
+        use blossom_core::conditional_update::CasRetryPattern;
+        let stale = transcode_cas_failure_record(Some(CasRetryPattern::StaleRead), 8, 7, 0, 0);
+        assert_eq!(
+            stale,
+            serde_json::json!({
+                "schema": "divine.blossom.transcode_cas_failure.v1", "route": "transcode_status",
+                "read_pattern": "unchanged_generation", "conflicts": 8,
+                "origin_reads": 7, "origin_errors": 0, "origin_unconfigured": 0,
+            })
+        );
+        let unavailable =
+            transcode_cas_failure_record(Some(CasRetryPattern::StaleRead), 8, 0, 7, 0);
+        assert_eq!(unavailable["origin_reads"], 0);
+        assert_eq!(unavailable["origin_errors"], 7);
+        assert_eq!(
+            transcode_cas_failure_record(Some(CasRetryPattern::Contended), 2, 1, 0, 0)
+                ["read_pattern"],
+            "changed_generation"
+        );
+        assert_eq!(
+            transcode_cas_failure_record(None, 1, 0, 0, 1)["read_pattern"],
+            "unobserved"
+        );
+    }
 
     #[test]
     fn blob_phase_headers_are_removed_before_delivery() {
