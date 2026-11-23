@@ -713,4 +713,4 @@ impl Claim {
 
 #[cfg(test)]
 #[path = "hls_claim_tests.rs"]
-mod tests;
+pub(crate) mod tests;

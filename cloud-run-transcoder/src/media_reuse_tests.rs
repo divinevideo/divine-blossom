@@ -292,7 +292,9 @@ async fn stream_copy_preserves_frames_original_and_all_playback_files() {
             try_reuse(&input, &output).await.unwrap(),
             "must copy a compatible original"
         );
-        crate::remux_ts_to_fmp4(&output).await.unwrap();
+        crate::remux_ts_to_fmp4(&output, crate::MediaPolicy::AllowEncode)
+            .await
+            .unwrap();
         let expected = frames(&input).await;
         assert_eq!(expected.len(), 50);
         for variant in ["stream_720p", "stream_480p"] {
@@ -416,9 +418,16 @@ async fn generation_reuses_audio_and_video_but_forced_repair_encodes() {
             .path()
             .join(if allow_reuse { "reuse" } else { "repair" });
         tokio::fs::create_dir(&output).await.unwrap();
-        let variants = crate::run_ffmpeg_hls(&input, &output, false, &info, allow_reuse)
-            .await
-            .unwrap();
+        let variants = crate::run_ffmpeg_hls(
+            &input,
+            &output,
+            false,
+            &info,
+            allow_reuse,
+            crate::MediaPolicy::AllowEncode,
+        )
+        .await
+        .unwrap();
         assert_eq!(variants.variants.len(), 2);
         assert_eq!(
             variants.method,
@@ -436,7 +445,9 @@ async fn generation_reuses_audio_and_video_but_forced_repair_encodes() {
                 "encode_completed"
             }
         );
-        crate::remux_ts_to_fmp4(&output).await.unwrap();
+        crate::remux_ts_to_fmp4(&output, crate::MediaPolicy::AllowEncode)
+            .await
+            .unwrap();
         crate::require_progressive_outputs(&output).await.unwrap();
         for name in ["stream_720p.mp4", "stream_480p.mp4"] {
             let result = output.join(name);
@@ -549,10 +560,19 @@ async fn high_bitrate_source_falls_back_to_compression() {
     assert!(!try_reuse(&input, &output).await.unwrap());
     assert_eq!(std::fs::read_dir(&output).unwrap().count(), 0);
     let info = crate::probe_video(&input).await.unwrap();
-    crate::run_ffmpeg_hls(&input, &output, false, &info, true)
+    crate::run_ffmpeg_hls(
+        &input,
+        &output,
+        false,
+        &info,
+        true,
+        crate::MediaPolicy::AllowEncode,
+    )
+    .await
+    .unwrap();
+    crate::remux_ts_to_fmp4(&output, crate::MediaPolicy::AllowEncode)
         .await
         .unwrap();
-    crate::remux_ts_to_fmp4(&output).await.unwrap();
     crate::require_progressive_outputs(&output).await.unwrap();
     for name in ["stream_720p.mp4", "stream_480p.mp4"] {
         assert!(std::fs::metadata(output.join(name)).unwrap().len() < original.len() as u64);
@@ -623,7 +643,9 @@ async fn typical_480x480_1mbps_source_is_reused() {
         try_reuse(&input, &output).await.unwrap(),
         "compatible 480x480 ~1 Mbps source should be reused"
     );
-    crate::remux_ts_to_fmp4(&output).await.unwrap();
+    crate::remux_ts_to_fmp4(&output, crate::MediaPolicy::AllowEncode)
+        .await
+        .unwrap();
     crate::require_progressive_outputs(&output).await.unwrap();
     assert_eq!(
         frames(&output.join("stream_720p.mp4")).await,
@@ -676,10 +698,19 @@ async fn container_only_color_metadata_survives_generation() {
     assert!(eligible(&before, std::fs::metadata(&tagged).unwrap().len()));
     tokio::fs::create_dir(&output).await.unwrap();
     let info = crate::probe_video(&tagged).await.unwrap();
-    crate::run_ffmpeg_hls(&tagged, &output, false, &info, true)
+    crate::run_ffmpeg_hls(
+        &tagged,
+        &output,
+        false,
+        &info,
+        true,
+        crate::MediaPolicy::AllowEncode,
+    )
+    .await
+    .unwrap();
+    crate::remux_ts_to_fmp4(&output, crate::MediaPolicy::AllowEncode)
         .await
         .unwrap();
-    crate::remux_ts_to_fmp4(&output).await.unwrap();
     crate::require_progressive_outputs(&output).await.unwrap();
     for variant in ["stream_720p", "stream_480p"] {
         for ext in ["m3u8", "mp4"] {
@@ -800,10 +831,19 @@ async fn edited_aac_does_not_restore_trimmed_audio_or_delay_video() {
     );
     assert_eq!(std::fs::read_dir(&output).unwrap().count(), 0);
     let info = crate::probe_video(&input).await.unwrap();
-    crate::run_ffmpeg_hls(&input, &output, false, &info, true)
+    crate::run_ffmpeg_hls(
+        &input,
+        &output,
+        false,
+        &info,
+        true,
+        crate::MediaPolicy::AllowEncode,
+    )
+    .await
+    .unwrap();
+    crate::remux_ts_to_fmp4(&output, crate::MediaPolicy::AllowEncode)
         .await
         .unwrap();
-    crate::remux_ts_to_fmp4(&output).await.unwrap();
     crate::require_progressive_outputs(&output).await.unwrap();
     let original_frequency = audible_frequency(&input).await;
     assert!((original_frequency - 440.0).abs() < 40.0);
@@ -1032,4 +1072,238 @@ async fn impossible_file_sizes_skip_media_probing() {
             .await
             .expect("size rejection must not invoke media tools"));
     }
+}
+
+#[tokio::test]
+async fn archive_copy_only_rejection_is_terminal_without_encoding() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("incompatible.mp4");
+    tokio::fs::write(&input, []).await.unwrap();
+    let output = dir.path().join("hls");
+    tokio::fs::create_dir(&output).await.unwrap();
+    let info = crate::VideoInfo {
+        width: 480,
+        height: 480,
+        display_width: 480,
+        display_height: 480,
+        rotation: 0,
+        has_audio: false,
+        preserve_source_timing: false,
+    };
+    for allow_reuse in [true, false] {
+        let error = crate::run_ffmpeg_hls(
+            &input,
+            &output,
+            false,
+            &info,
+            allow_reuse,
+            crate::MediaPolicy::CopyOnly,
+        )
+        .await
+        .err()
+        .expect("incompatible archive must be rejected");
+        assert!(
+            error.is::<crate::TerminalTranscode>(),
+            "archive must stop before encoding: {error:#}"
+        );
+        assert_eq!(error.to_string(), "archive_remux_incompatible");
+    }
+}
+
+/// Runs tool interception in its own process so PATH/failure injection cannot
+/// affect concurrent media tests. Fixtures and ffmpeg are real; only the
+/// audio-copy failure is injected at the process boundary.
+#[tokio::test]
+#[ignore = "requires ffmpeg and ffprobe"]
+async fn archive_policy_encoder_boundaries() {
+    const CHILD: &str = "DIVINE_POLICY_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let real = std::process::Command::new("which")
+            .arg("ffmpeg")
+            .output()
+            .unwrap();
+        assert!(real.status.success());
+        let real = String::from_utf8(real.stdout).unwrap();
+        let wrapper = dir.path().join("ffmpeg");
+        std::fs::write(&wrapper, r#"#!/bin/sh
+printf '%s\n' "$@" >> "$DIVINE_POLICY_TEST_CALLS"
+previous=''
+for arg in "$@"; do
+    if [ "$previous" = '-c:a' ] && [ "$arg" = 'copy' ] && [ "$DIVINE_POLICY_TEST_FAIL_COPY" = '1' ]; then
+        printf 'injected audio-copy failure\n' >&2
+        exit 1
+    fi
+    previous="$arg"
+done
+exec "$DIVINE_POLICY_TEST_FFMPEG" "$@"
+"#).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "media_reuse::tests::archive_policy_encoder_boundaries",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("DIVINE_POLICY_TEST_CALLS", dir.path().join("calls"))
+            .env("DIVINE_POLICY_TEST_FFMPEG", real.trim())
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    dir.path().display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        return;
+    }
+    use crate::MediaPolicy::{AllowEncode, CopyOnly};
+    let calls = std::path::PathBuf::from(std::env::var_os("DIVINE_POLICY_TEST_CALLS").unwrap());
+    let clear = || std::fs::write(&calls, []).unwrap();
+    let assert_no_encoder = || {
+        let args = std::fs::read_to_string(&calls).unwrap();
+        assert!(
+            !args
+                .lines()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .any(|pair| (pair[0] == "-c"
+                    || pair[0].starts_with("-c:")
+                    || pair[0].starts_with("-codec"))
+                    && pair[1] != "copy"),
+            "encoder invoked: {args}"
+        );
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("source.mp4");
+    make_source(&input, true).await;
+    let original = tokio::fs::read(&input).await.unwrap();
+    let info = crate::probe_video(&input).await.unwrap();
+    let expected_frames = frames(&input).await;
+    let expected_audio = audio_packets(&input).await;
+    clear();
+    for allow_reuse in [true, false] {
+        let output = dir.path().join(format!("copy-{allow_reuse}"));
+        tokio::fs::create_dir(&output).await.unwrap();
+        let generation =
+            crate::run_ffmpeg_hls(&input, &output, false, &info, allow_reuse, CopyOnly)
+                .await
+                .unwrap();
+        assert_eq!(generation.method, crate::HlsMethod::StreamCopy);
+        crate::remux_ts_to_fmp4(&output, CopyOnly).await.unwrap();
+        for name in ["stream_720p.mp4", "stream_480p.mp4"] {
+            assert_eq!(frames(&output.join(name)).await, expected_frames);
+            assert_eq!(audio_packets(&output.join(name)).await, expected_audio);
+        }
+        assert_eq!(tokio::fs::read(&input).await.unwrap(), original);
+    }
+    assert_no_encoder();
+    let incompatible = dir.path().join("non-square-pixels.mp4");
+    make_source_with_sar(&incompatible, true, "36", "4/3").await;
+    let incompatible_original = tokio::fs::read(&incompatible).await.unwrap();
+    clear();
+    for allow_reuse in [true, false] {
+        let output = dir.path().join(format!("reject-{allow_reuse}"));
+        tokio::fs::create_dir(&output).await.unwrap();
+        let error =
+            crate::run_ffmpeg_hls(&incompatible, &output, false, &info, allow_reuse, CopyOnly)
+                .await
+                .err()
+                .unwrap();
+        assert!(error.is::<crate::TerminalTranscode>());
+        assert_eq!(std::fs::read_dir(output).unwrap().count(), 0);
+        assert_eq!(
+            tokio::fs::read(&incompatible).await.unwrap(),
+            incompatible_original
+        );
+    }
+    assert_no_encoder();
+    // A real probe failure is retryable rather than archive incompatibility.
+    tokio::fs::write(&incompatible, b"not media").await.unwrap();
+    let error = crate::run_ffmpeg_hls(
+        &incompatible,
+        &dir.path().join("broken"),
+        false,
+        &info,
+        false,
+        CopyOnly,
+    )
+    .await
+    .err()
+    .unwrap();
+    assert!(!error.is::<crate::TerminalTranscode>());
+    assert_no_encoder();
+
+    let source_hls = dir.path().join("copy-false");
+    for name in ["stream_720p.mp4", "stream_480p.mp4"] {
+        tokio::fs::remove_file(source_hls.join(name)).await.unwrap();
+    }
+    std::env::set_var("DIVINE_POLICY_TEST_FAIL_COPY", "1");
+    clear();
+    crate::remux_ts_to_fmp4(&source_hls, CopyOnly)
+        .await
+        .unwrap();
+    assert!(source_hls.join("master.m3u8").is_file());
+    assert!(!source_hls.join("stream_720p.mp4").exists());
+    assert!(!source_hls.join("stream_480p.mp4").exists());
+    assert_no_encoder();
+
+    crate::hls_claim::tests::assert_copy_only_forced_repair_skips_optional_aliases(
+        bytes::Bytes::from(original.clone()),
+    )
+    .await;
+    assert_no_encoder();
+
+    clear();
+    crate::hls_claim::tests::assert_copy_only_backfill_never_encodes([
+        bytes::Bytes::from(
+            tokio::fs::read(source_hls.join("stream_720p.ts"))
+                .await
+                .unwrap(),
+        ),
+        bytes::Bytes::from(
+            tokio::fs::read(source_hls.join("stream_480p.ts"))
+                .await
+                .unwrap(),
+        ),
+    ])
+    .await;
+    assert_no_encoder();
+    // The same audio-copy failure may encode only after explicit permission.
+    clear();
+    crate::remux_variant(
+        &source_hls.join("stream_720p.ts"),
+        &dir.path().join("allowed.mp4"),
+        "stream_720p",
+        AllowEncode,
+    )
+    .await
+    .unwrap();
+    assert!(std::fs::read_to_string(&calls)
+        .unwrap()
+        .lines()
+        .any(|arg| arg == "aac"));
+    std::env::remove_var("DIVINE_POLICY_TEST_FAIL_COPY");
+    clear();
+    let output = dir.path().join("allowed-encode");
+    tokio::fs::create_dir(&output).await.unwrap();
+    let result = crate::run_ffmpeg_hls(&input, &output, false, &info, false, AllowEncode)
+        .await
+        .unwrap();
+    assert_eq!(result.method, crate::HlsMethod::Encode);
+    assert!(std::fs::read_to_string(&calls)
+        .unwrap()
+        .lines()
+        .any(|arg| arg == "libx264"));
 }

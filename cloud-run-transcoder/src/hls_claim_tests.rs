@@ -300,12 +300,17 @@ fn instance(
 struct Callbacks {
     events: Mutex<Vec<Value>>,
     wait_at_processing: std::sync::atomic::AtomicBool,
+    reject_terminal: std::sync::atomic::AtomicBool,
     processing: tokio::sync::Notify,
     resume: tokio::sync::Notify,
 }
 
 async fn webhook() -> (String, Arc<Callbacks>, JoinHandle<()>) {
-    async fn callback(State(callbacks): State<Arc<Callbacks>>, Json(event): Json<Value>) {
+    async fn callback(
+        State(callbacks): State<Arc<Callbacks>>,
+        Json(event): Json<Value>,
+    ) -> axum::http::StatusCode {
+        let terminal = event["terminal"] == true;
         let processing = event["status"] == "processing";
         callbacks.events.lock().await.push(event);
         if processing
@@ -315,6 +320,15 @@ async fn webhook() -> (String, Arc<Callbacks>, JoinHandle<()>) {
         {
             callbacks.processing.notify_one();
             callbacks.resume.notified().await;
+        }
+        if terminal
+            && callbacks
+                .reject_terminal
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            axum::http::StatusCode::OK
         }
     }
 
@@ -391,28 +405,26 @@ async fn service_instances_encode_once_while_other_hashes_and_repairs_keep_their
     let first = {
         let state = instance(&locks, &media, &url);
         let request = request(&hash.to_ascii_uppercase(), false);
-        tokio::spawn(crate::process_transcode(state, request))
+        tokio::spawn(allowed_transcode(state, request))
     };
     tokio::time::timeout(Duration::from_secs(5), callbacks.processing.notified())
         .await
         .unwrap();
     let independent = instance(&locks, &media, &url);
     assert!(
-        crate::process_transcode(independent.clone(), request(&hash, false))
+        allowed_transcode(independent.clone(), request(&hash, false))
             .await
             .err()
             .unwrap()
             .is::<Busy>()
     );
-    assert!(
-        crate::process_transcode(independent.clone(), request(&hash, true))
-            .await
-            .err()
-            .unwrap()
-            .is::<Busy>()
-    );
+    assert!(allowed_transcode(independent.clone(), request(&hash, true))
+        .await
+        .err()
+        .unwrap()
+        .is::<Busy>());
     assert_eq!(
-        crate::process_transcode(independent.clone(), request(&other, false))
+        allowed_transcode(independent.clone(), request(&other, false))
             .await
             .unwrap()
             .status,
@@ -421,7 +433,7 @@ async fn service_instances_encode_once_while_other_hashes_and_repairs_keep_their
     callbacks.resume.notify_one();
     assert_eq!(first.await.unwrap().unwrap().status, "complete");
     assert_eq!(
-        crate::process_transcode(independent, request(&hash, false))
+        allowed_transcode(independent, request(&hash, false))
             .await
             .unwrap()
             .status,
@@ -479,8 +491,7 @@ async fn primary_master_without_backup_fails_then_recovers_before_complete_callb
     let (url, callbacks, webhook) = webhook().await;
     let master = format!("{hash}/hls/master.m3u8");
     locks.objects.lock().await.fail_key = Some(master.clone());
-    let first =
-        crate::process_transcode(instance(&locks, &media, &url), request(&hash, false)).await;
+    let first = allowed_transcode(instance(&locks, &media, &url), request(&hash, false)).await;
     assert!(first.is_err());
     assert!(media.store().stat(&master).await.unwrap().is_some());
     assert!(!locks.objects.lock().await.live.contains_key(&master));
@@ -493,7 +504,7 @@ async fn primary_master_without_backup_fails_then_recovers_before_complete_callb
     locks.objects.lock().await.fail_key = None;
     let replacement = instance(&locks, &media, &url);
     assert_eq!(
-        crate::process_transcode(replacement.clone(), request(&hash, false))
+        allowed_transcode(replacement.clone(), request(&hash, false))
             .await
             .unwrap()
             .status,
@@ -692,7 +703,7 @@ async fn measured_pipeline(
         provider_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
     });
     let started = Instant::now();
-    let result = crate::process_transcode(state.clone(), request(&hash, false))
+    let result = allowed_transcode(state.clone(), request(&hash, false))
         .await
         .unwrap();
     let elapsed = started.elapsed();
@@ -1281,4 +1292,244 @@ async fn hold_publishing_ownership_loss_invalidates_lease_and_surfaces_ownership
     let response = crate::transcode_error_response(wrapped, true);
     assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
     replacement.finish(false).await.unwrap();
+}
+
+fn delivery_headers() -> axum::http::HeaderMap {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"divine-transcoder:dispatch:v1\0synthetic-dispatch");
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "x-divine-transcode-worker",
+        hex::encode(digest.finalize()).parse().unwrap(),
+    );
+    headers
+}
+
+#[tokio::test]
+async fn policy_lookup_failure_retries_legacy_queued_jobs_without_claiming_or_publishing() {
+    let locks = Origin::start().await;
+    let media = crate::object_storage::tests::Origin::start().await;
+    let (url, callbacks, webhook) = webhook().await;
+    let mut state = instance(&locks, &media, &url);
+    let config = &mut Arc::get_mut(&mut state).unwrap().config;
+    config.transcode_dispatch_secret = Some("synthetic-dispatch".into());
+    config.webhook_secret = Some("synthetic-webhook".into());
+    // A configured but unreachable HTTPS policy service cannot grant permission.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    config.media_processing_policy_url =
+        Some(format!("https://{}/policy", listener.local_addr().unwrap()));
+    drop(listener);
+    for _ in 0..2 {
+        // Legacy task bodies still deserialize; extra untrusted permission is ignored.
+        let request = serde_json::from_value(json!({"hash": A, "policy": "allow_encode"})).unwrap();
+        let response =
+            crate::hls_dispatch::worker(State(state.clone()), delivery_headers(), Json(request))
+                .await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("Media policy lookup failed"));
+    }
+    assert!(locks.objects.lock().await.claim_writes.is_empty());
+    assert!(media.objects.lock().await.requests.is_empty());
+    assert!(callbacks.events.lock().await.is_empty());
+    webhook.abort();
+}
+
+#[tokio::test]
+async fn incompatible_archive_queue_delivery_acknowledges_terminal_callback_without_publication() {
+    use sha2::{Digest, Sha256};
+    let locks = Origin::start().await;
+    let media = crate::object_storage::tests::Origin::start().await;
+    // Rejected by the stream-copy size bound before it can reach any encoder.
+    let bytes = Bytes::new();
+    let hash = hex::encode(Sha256::digest(&bytes));
+    media
+        .store()
+        .put_verified(&hash, bytes.clone(), "video/mp4", HashMap::new(), None)
+        .await
+        .unwrap();
+    let (url, callbacks, webhook) = webhook().await;
+    let mut state = instance(&locks, &media, &url);
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .config
+        .transcode_dispatch_secret = Some("synthetic-dispatch".into());
+    callbacks
+        .reject_terminal
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let retry = crate::hls_dispatch::worker(
+        State(state.clone()),
+        delivery_headers(),
+        Json(request(&hash, false)),
+    )
+    .await;
+    assert_eq!(
+        retry.status(),
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    callbacks
+        .reject_terminal
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let response = crate::hls_dispatch::worker(
+        State(state),
+        delivery_headers(),
+        Json(request(&hash, false)),
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let events = callbacks.events.lock().await;
+    let terminal = events.last().unwrap();
+    assert_eq!(terminal["status"], "failed");
+    assert_eq!(terminal["error_code"], "archive_remux_incompatible");
+    assert_eq!(terminal["terminal"], true);
+    assert!(!events.iter().any(|event| event["status"] == "complete"));
+    assert!(!media
+        .objects
+        .lock()
+        .await
+        .requests
+        .iter()
+        .any(|(method, key, _)| method == "PUT" && key.contains("/hls/")));
+    let original = media.store().stat(&hash).await.unwrap().unwrap();
+    assert_eq!(media.store().read(&original).await.unwrap(), bytes);
+    webhook.abort();
+}
+
+// Existing publication/ownership fixtures intentionally exercise encoding.
+// Public-route tests below continue to use the authoritative resolver.
+async fn allowed_transcode(
+    state: Arc<crate::AppState>,
+    request: crate::TranscodeRequest,
+) -> Result<crate::TranscodeResponse> {
+    let hash = request.hash.to_ascii_lowercase();
+    crate::process_transcode_authorized(state, request, hash, crate::MediaPolicy::AllowEncode).await
+}
+
+pub(crate) async fn assert_copy_only_forced_repair_skips_optional_aliases(source: Bytes) {
+    use sha2::{Digest, Sha256};
+    let locks = Origin::start().await;
+    let media = crate::object_storage::tests::Origin::start().await;
+    let hash = hex::encode(Sha256::digest(&source));
+    media
+        .store()
+        .put_verified(&hash, source.clone(), "video/mp4", HashMap::new(), None)
+        .await
+        .unwrap();
+    for name in ["master.m3u8", "stream_720p.mp4", "stream_480p.mp4"] {
+        media
+            .store()
+            .put_verified(
+                &format!("{hash}/hls/{name}"),
+                Bytes::from_static(b"previous derivative"),
+                "application/octet-stream",
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let (url, callbacks, webhook) = webhook().await;
+    let mut state = instance(&locks, &media, &url);
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .config
+        .transcode_repair_secret = Some("synthetic-repair".into());
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "x-divine-repair-secret",
+        "synthetic-repair".parse().unwrap(),
+    );
+    let response = crate::handle_transcode(State(state), headers, Json(request(&hash, true))).await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["status"], "complete");
+    assert_eq!(
+        body["skipped_progressive_aliases"],
+        json!(["stream_720p.mp4", "stream_480p.mp4"])
+    );
+    assert_eq!(
+        callbacks.events.lock().await.last().unwrap()["status"],
+        "complete"
+    );
+    for name in ["stream_720p.mp4", "stream_480p.mp4"] {
+        let existing = media
+            .store()
+            .stat(&format!("{hash}/hls/{name}"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            media.store().read(&existing).await.unwrap(),
+            Bytes::from_static(b"previous derivative")
+        );
+    }
+    let original = media.store().stat(&hash).await.unwrap().unwrap();
+    assert_eq!(media.store().read(&original).await.unwrap(), source);
+    let requests = media.objects.lock().await;
+    let writes: Vec<_> = requests
+        .requests
+        .iter()
+        .filter(|(method, key, _)| method == "PUT" && key.contains("/hls/"))
+        .collect();
+    assert!(writes.last().unwrap().1.ends_with("/master.m3u8"));
+    webhook.abort();
+}
+
+pub(crate) async fn assert_copy_only_backfill_never_encodes(segments: [Bytes; 2]) {
+    let locks = Origin::start().await;
+    let media = crate::object_storage::tests::Origin::start().await;
+    for (variant, segment) in ["stream_720p", "stream_480p"].into_iter().zip(segments) {
+        media
+            .store()
+            .put_verified(
+                &format!("{A}/hls/{variant}.ts"),
+                segment,
+                "video/mp2t",
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let (url, _, webhook) = webhook().await;
+    let mut state = instance(&locks, &media, &url);
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .config
+        .transcode_repair_secret = Some("synthetic-repair".into());
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "x-divine-repair-secret",
+        "synthetic-repair".parse().unwrap(),
+    );
+    for force in [false, true] {
+        let response = crate::handle_backfill_fmp4(
+            State(state.clone()),
+            headers.clone(),
+            Json(request(A, force)),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        for variant in ["stream_720p", "stream_480p"] {
+            assert!(media
+                .store()
+                .stat(&format!("{A}/hls/{variant}.mp4"))
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+    webhook.abort();
 }
