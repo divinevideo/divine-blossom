@@ -586,3 +586,535 @@ Deno.test("archive import and GDPR vanish work end-to-end", async () => {
     ctx.db.close();
   }
 });
+
+Deno.test("delegated PUT /upload publishes to SQL catalog, supports chunked bodies, dedupe, ProofMode forwarding, and hold enforcement", async () => {
+  const db = new DatabaseSync(":memory:");
+  db.exec(await Deno.readTextFile("schema.sql"));
+  const catalog = new SqlCatalog("https://primary.invalid", "synthetic", {
+    execute({ sql, args }) {
+      return Promise.resolve({
+        rows: db.prepare(sql).all(...args) as Record<string, unknown>[],
+      });
+    },
+  });
+  const blobs = new FakeBlobs();
+  const purger = new FakePurger();
+  const now = 1800000100;
+  const origin = "https://media-bunny.divine.video";
+  const adminToken = "synthetic-admin-token-1234567890";
+
+  const seenRequests: { url: string; method: string; headers: Headers; bodyLen: number }[] = [];
+  const modScans: { sha256: string; pubkey: string }[] = [];
+  let nextUpstreamResponse: (() => Response) | null = null;
+
+  const fakeFetcher: typeof fetch = async (input, init) => {
+    const reqUrl = typeof input === "string"
+      ? input
+      : input instanceof URL
+      ? input.toString()
+      : input.url;
+    const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+    const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : {}));
+    const bodyBytes = init?.body
+      ? new Uint8Array(
+        await new Response(init.body as BodyInit).arrayBuffer(),
+      )
+      : new Uint8Array();
+    seenRequests.push({ url: reqUrl, method, headers, bodyLen: bodyBytes.length });
+
+    if (reqUrl === "https://moderation-api.divine.video/api/v1/scan") {
+      const parsed = JSON.parse(new TextDecoder().decode(bodyBytes)) as {
+        sha256: string;
+        pubkey: string;
+      };
+      modScans.push(parsed);
+      return new Response(JSON.stringify({ queued: true }), { status: 202 });
+    }
+
+    if (nextUpstreamResponse) {
+      const fn = nextUpstreamResponse;
+      nextUpstreamResponse = null;
+      return fn();
+    }
+
+    if (reqUrl === "https://upload.divine.video/upload" && method === "PUT") {
+      const hash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", bodyBytes)));
+      const contentType = headers.get("content-type") ?? "application/octet-stream";
+      await blobs.write(hash, bodyBytes, contentType);
+      return new Response(
+        JSON.stringify({
+          sha256: hash,
+          size: bodyBytes.length,
+          type: contentType,
+          uploaded: now,
+          // Cloud Run returns its canonical CDN_BASE_URL; Bunny Blossom must still return its own origin in descriptor.url.
+          url: `https://media.divine.video/${hash}`,
+          thumbnail_url: contentType.startsWith("video/")
+            ? `https://media.divine.video/${hash}.jpg`
+            : undefined,
+          dim: contentType.startsWith("video/") ? "720x1280" : undefined,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+
+    return new Response(JSON.stringify({ error: "unexpected upstream route" }), { status: 500 });
+  };
+
+  const app = createApp({
+    origin,
+    catalog,
+    blobs,
+    purger,
+    secrets: { adminToken },
+    upstreams: {
+      uploadServiceUrl: "https://upload.divine.video",
+      moderationApiUrl: "https://moderation-api.divine.video",
+      moderationApiToken: "synthetic-mod-token",
+      fetcher: fakeFetcher,
+    },
+    cache: { publicMediaCaching: true },
+    writesEnabled: true,
+    bunnyDeliveryHost: "media-bunny.divine.video",
+    now: () => now,
+  });
+
+  try {
+    const sk1 = generateSecretKey();
+    const pub1 = getPublicKey(sk1);
+    const sk2 = generateSecretKey();
+    const pub2 = getPublicKey(sk2);
+
+    // 1. Streaming/chunked thumbnail PUT (> 8 KB, NO Content-Length header) like divine-mobile ThumbnailLegUploader
+    const thumbBytes = new Uint8Array(16 * 1024);
+    thumbBytes.fill(0xab);
+    const thumbHash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", thumbBytes)));
+    const thumbStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(thumbBytes.slice(0, 8192));
+        controller.enqueue(thumbBytes.slice(8192));
+        controller.close();
+      },
+    });
+    const thumbRes = await app(
+      new Request(`${origin}/upload`, {
+        method: "PUT",
+        body: thumbStream,
+        headers: {
+          "content-type": "image/jpeg",
+          authorization: blossomAuth(sk1, "upload", now, thumbHash),
+        },
+      }),
+    );
+    equal(thumbRes.status, 200);
+    const thumbDesc = await thumbRes.json() as {
+      url: string;
+      sha256: string;
+      size: number;
+      type: string;
+    };
+    equal(thumbDesc.url, `${origin}/${thumbHash}`);
+    equal(thumbDesc.sha256, thumbHash);
+    equal(thumbDesc.size, thumbBytes.length);
+    equal(thumbDesc.type, "image/jpeg");
+    // Immediately readable via Blossom GET /<sha256> and GET /list/<pubkey>
+    equal((await app(new Request(`${origin}/${thumbHash}`))).status, 200);
+    equal((await (await app(new Request(`${origin}/list/${pub1}`))).json() as unknown[]).length, 1);
+    // Image uploads do not trigger video moderation scans
+    equal(modScans.length, 0);
+
+    // 2. Video PUT with ProofMode + copy-only headers
+    const videoBytes = new TextEncoder().encode("synthetic-delegated-video-bytes-abcdef0123456789");
+    const videoHash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", videoBytes)));
+    const videoRes = await app(
+      new Request(`${origin}/upload`, {
+        method: "PUT",
+        body: videoBytes,
+        headers: {
+          "content-type": "video/mp4",
+          "x-divine-video-processing": "copy-only",
+          "x-proofmode-manifest": "synthetic-proof-manifest",
+          authorization: blossomAuth(sk1, "upload", now, videoHash),
+        },
+      }),
+    );
+    equal(videoRes.status, 200);
+    const videoDesc = await videoRes.json() as {
+      url: string;
+      sha256: string;
+      dim?: string;
+    };
+    equal(videoDesc.url, `${origin}/${videoHash}`);
+    equal(videoDesc.dim, "720x1280");
+    equal(modScans.length, 1);
+    equal(modScans[0].sha256, videoHash);
+    const forwardedPut = seenRequests.find((r) =>
+      r.url === "https://upload.divine.video/upload" &&
+      r.headers.get("x-proofmode-manifest") === "synthetic-proof-manifest"
+    );
+    equal(Boolean(forwardedPut), true);
+    equal(forwardedPut?.headers.get("x-divine-video-processing"), "copy-only");
+
+    const storedVideo = await catalog.get(videoHash);
+    equal(storedVideo?.videoEncodingAllowed, false);
+    equal(storedVideo?.transcodeStatus, "pending");
+    equal(storedVideo?.transcriptStatus, "pending");
+
+    // 3. Re-upload dedupe by second owner adds second owner without duplicating moderation scan
+    const reupRes = await app(
+      new Request(`${origin}/upload`, {
+        method: "PUT",
+        body: videoBytes,
+        headers: {
+          "content-type": "video/mp4",
+          authorization: blossomAuth(sk2, "upload", now, videoHash),
+        },
+      }),
+    );
+    equal(reupRes.status, 200);
+    equal(modScans.length, 1);
+    const deduped = await catalog.get(videoHash);
+    equal(deduped?.owners, [pub1, pub2]);
+
+    // 4. Auth x-tag mismatch rejected with 401
+    const wrongHash = "1".repeat(64);
+    const mismatchRes = await app(
+      new Request(`${origin}/upload`, {
+        method: "PUT",
+        body: videoBytes,
+        headers: {
+          "content-type": "video/mp4",
+          authorization: blossomAuth(sk1, "upload", now, wrongHash),
+        },
+      }),
+    );
+    equal(mismatchRes.status, 401);
+
+    // 5. Legal-held blob rejected with 403 BOTH pre-proxy (with x tag) and post-proxy (without x tag)
+    await app(
+      new Request(`${origin}/admin/api/delete`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${adminToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ sha256: videoHash, reason: "legal", legal_hold: true }),
+      }),
+    );
+    const reqCountBefore = seenRequests.length;
+    const heldPrecheck = await app(
+      new Request(`${origin}/upload`, {
+        method: "PUT",
+        body: videoBytes,
+        headers: {
+          "content-type": "video/mp4",
+          authorization: blossomAuth(sk1, "upload", now, videoHash),
+        },
+      }),
+    );
+    equal(heldPrecheck.status, 403);
+    // Blocked before hitting Cloud Run!
+    equal(seenRequests.length, reqCountBefore);
+
+    const heldNoXTag = await app(
+      new Request(`${origin}/upload`, {
+        method: "PUT",
+        body: videoBytes,
+        headers: {
+          "content-type": "video/mp4",
+          authorization: blossomAuth(sk1, "upload", now),
+        },
+      }),
+    );
+    equal(heldNoXTag.status, 403);
+
+    // 6. Upstream 503 preserves Retry-After header
+    nextUpstreamResponse = () =>
+      new Response(JSON.stringify({ error: "overloaded" }), {
+        status: 503,
+        headers: { "content-type": "application/json", "retry-after": "12" },
+      });
+    const busyBytes = new TextEncoder().encode("synthetic-busy-upload");
+    const busyHash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", busyBytes)));
+    const busyRes = await app(
+      new Request(`${origin}/upload`, {
+        method: "PUT",
+        body: busyBytes,
+        headers: {
+          "content-type": "video/mp4",
+          authorization: blossomAuth(sk1, "upload", now, busyHash),
+        },
+      }),
+    );
+    equal(busyRes.status, 503);
+    equal(busyRes.headers.get("retry-after"), "12");
+  } finally {
+    db.close();
+  }
+});
+
+Deno.test("BUD-06 HEAD /upload pre-validation and Divine resumable init/complete publish to SQL catalog and Track 1 playback", async () => {
+  const db = new DatabaseSync(":memory:");
+  db.exec(await Deno.readTextFile("schema.sql"));
+  const catalog = new SqlCatalog("https://primary.invalid", "synthetic", {
+    execute({ sql, args }) {
+      return Promise.resolve({
+        rows: db.prepare(sql).all(...args) as Record<string, unknown>[],
+      });
+    },
+  });
+  const blobs = new FakeBlobs();
+  const now = 1800000200;
+  const origin = "https://media-bunny.divine.video";
+  const adminToken = "synthetic-admin-token-1234567890";
+
+  const videoBytes = new TextEncoder().encode("synthetic-resumable-video-stream-payload-9999");
+  const videoHash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", videoBytes)));
+
+  const fakeFetcher: typeof fetch = async (input, init) => {
+    const reqUrl = typeof input === "string"
+      ? input
+      : input instanceof URL
+      ? input.toString()
+      : input.url;
+    const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+
+    if (reqUrl === "https://upload.divine.video/upload/init" && method === "POST") {
+      return new Response(
+        JSON.stringify({
+          uploadId: "up_0123456789abcdef01234567",
+          uploadUrl: "https://upload.divine.video/sessions/up_0123456789abcdef01234567",
+          expiresAt: "2026-11-25T00:00:00Z",
+          chunkSize: 8 * 1024 * 1024,
+          nextOffset: 0,
+          requiredHeaders: { "X-Upload-Token": "tok" },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+
+    if (
+      reqUrl === "https://upload.divine.video/upload/up_0123456789abcdef01234567/complete" &&
+      method === "POST"
+    ) {
+      await blobs.write(videoHash, videoBytes, "video/mp4");
+      return new Response(
+        JSON.stringify({
+          sha256: videoHash,
+          size: videoBytes.length,
+          contentType: "video/mp4",
+          thumbnailUrl: `https://media.divine.video/${videoHash}.jpg`,
+          dim: "1080x1920",
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+
+    return new Response(JSON.stringify({ error: "unexpected route" }), { status: 500 });
+  };
+
+  const app = createApp({
+    origin,
+    catalog,
+    blobs,
+    secrets: { adminToken },
+    upstreams: {
+      uploadServiceUrl: "https://upload.divine.video",
+      fetcher: fakeFetcher,
+    },
+    cache: { publicMediaCaching: true },
+    writesEnabled: true,
+    maxUploadBytes: 1024 * 1024,
+    bunnyDeliveryHost: "media-bunny.divine.video",
+    now: () => now,
+  });
+
+  try {
+    const sk = generateSecretKey();
+    const pub = getPublicKey(sk);
+
+    // 1. BUD-06 HEAD /upload capability discovery and pre-validation
+    const capRes = await app(new Request(`${origin}/upload`, { method: "HEAD" }));
+    equal(capRes.status, 200);
+    equal(capRes.headers.get("x-divine-upload-extensions"), "resumable-v1");
+    equal(capRes.headers.get("x-divine-upload-control-host"), "media-bunny.divine.video");
+    equal(capRes.headers.get("x-divine-upload-data-host"), "upload.divine.video");
+
+    const badShaHead = await app(
+      new Request(`${origin}/upload`, {
+        method: "HEAD",
+        headers: { "x-sha-256": "not-a-hash" },
+      }),
+    );
+    equal(badShaHead.status, 400);
+
+    const zeroLenHead = await app(
+      new Request(`${origin}/upload`, {
+        method: "HEAD",
+        headers: { "x-content-length": "0" },
+      }),
+    );
+    equal(zeroLenHead.status, 400);
+
+    const tooLargeHead = await app(
+      new Request(`${origin}/upload`, {
+        method: "HEAD",
+        headers: { "x-content-length": String(2 * 1024 * 1024) },
+      }),
+    );
+    equal(tooLargeHead.status, 413);
+
+    const okPreHead = await app(
+      new Request(`${origin}/upload`, {
+        method: "HEAD",
+        headers: {
+          "x-sha-256": videoHash,
+          "x-content-length": String(videoBytes.length),
+          "x-content-type": "video/mp4",
+        },
+      }),
+    );
+    equal(okPreHead.status, 200);
+    equal(okPreHead.headers.get("x-exists"), null);
+
+    // 2. POST /upload/init rejects copy-only, auth hash mismatch, invalid size; accepts valid init
+    const copyOnlyInit = await app(
+      new Request(`${origin}/upload/init`, {
+        method: "POST",
+        headers: {
+          authorization: blossomAuth(sk, "upload", now, videoHash),
+          "content-type": "application/json",
+          "x-divine-video-processing": "copy-only",
+        },
+        body: JSON.stringify({
+          sha256: videoHash,
+          size: videoBytes.length,
+          contentType: "video/mp4",
+        }),
+      }),
+    );
+    equal(copyOnlyInit.status, 400);
+
+    const mismatchInit = await app(
+      new Request(`${origin}/upload/init`, {
+        method: "POST",
+        headers: {
+          authorization: blossomAuth(sk, "upload", now, "2".repeat(64)),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          sha256: videoHash,
+          size: videoBytes.length,
+          contentType: "video/mp4",
+        }),
+      }),
+    );
+    equal(mismatchInit.status, 401);
+
+    const initRes = await app(
+      new Request(`${origin}/upload/init`, {
+        method: "POST",
+        headers: {
+          authorization: blossomAuth(sk, "upload", now, videoHash),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          sha256: videoHash,
+          size: videoBytes.length,
+          contentType: "video/mp4",
+          fileName: "clip.mp4",
+        }),
+      }),
+    );
+    equal(initRes.status, 200);
+    equal(initRes.headers.get("x-divine-upload-data-host"), "upload.divine.video");
+    const initJson = await initRes.json() as { uploadId: string; uploadUrl: string };
+    equal(initJson.uploadId, "up_0123456789abcdef01234567");
+
+    // 3. POST /upload/<id>/complete rejects path traversal and hash mismatch, then succeeds and publishes to catalog
+    const badIdRes = await app(
+      new Request(`${origin}/upload/bad..id/complete`, {
+        method: "POST",
+        headers: {
+          authorization: blossomAuth(sk, "upload", now, videoHash),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ sha256: videoHash }),
+      }),
+    );
+    equal(badIdRes.status, 400);
+
+    const completeRes = await app(
+      new Request(`${origin}/upload/up_0123456789abcdef01234567/complete`, {
+        method: "POST",
+        headers: {
+          authorization: blossomAuth(sk, "upload", now, videoHash),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ sha256: videoHash }),
+      }),
+    );
+    equal(completeRes.status, 200);
+    const completeDesc = await completeRes.json() as {
+      url: string;
+      sha256: string;
+      size: number;
+      dim?: string;
+    };
+    equal(completeDesc.url, `${origin}/${videoHash}`);
+    equal(completeDesc.sha256, videoHash);
+    equal(completeDesc.size, videoBytes.length);
+    equal(completeDesc.dim, "1080x1920");
+
+    // 4. Subsequent HEAD /upload reports X-Exists: true, POST /upload/init returns 409 with descriptor
+    const existsHead = await app(
+      new Request(`${origin}/upload`, {
+        method: "HEAD",
+        headers: { "x-sha-256": videoHash },
+      }),
+    );
+    equal(existsHead.status, 200);
+    equal(existsHead.headers.get("x-exists"), "true");
+
+    const dupInit = await app(
+      new Request(`${origin}/upload/init`, {
+        method: "POST",
+        headers: {
+          authorization: blossomAuth(sk, "upload", now, videoHash),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          sha256: videoHash,
+          size: videoBytes.length,
+          contentType: "video/mp4",
+        }),
+      }),
+    );
+    equal(dupInit.status, 409);
+    const dupBody = await dupInit.json() as { descriptor: { sha256: string; url: string } };
+    equal(dupBody.descriptor.sha256, videoHash);
+    equal(dupBody.descriptor.url, `${origin}/${videoHash}`);
+
+    // 5. Blob is immediately readable, listed for owner, and selectable by Track 1 /api/bunny-playback after approval
+    equal((await app(new Request(`${origin}/${videoHash}`))).status, 200);
+    equal((await (await app(new Request(`${origin}/list/${pub}`))).json() as unknown[]).length, 1);
+
+    await app(
+      new Request(`${origin}/admin/api/moderate`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${adminToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ sha256: videoHash, action: "APPROVE" }),
+      }),
+    );
+    const pbRes = await app(new Request(`${origin}/api/bunny-playback/${videoHash}`));
+    equal(pbRes.status, 200);
+    const pbBody = await pbRes.json() as { host: string; paths: string[] };
+    equal(pbBody.host, "media-bunny.divine.video");
+    equal(pbBody.paths, [`/${videoHash}`]);
+  } finally {
+    db.close();
+  }
+});

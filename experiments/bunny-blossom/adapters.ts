@@ -88,6 +88,9 @@ function decodeRecord(raw: unknown, expectedHash?: string): BlobRecord {
     c2paManifestId: typeof parsed.c2paManifestId === "string" ? parsed.c2paManifestId : undefined,
     moderation: parsed.moderation as BlobRecord["moderation"],
     archiveStorage: parsed.archiveStorage as BlobRecord["archiveStorage"],
+    videoEncodingAllowed: typeof parsed.videoEncodingAllowed === "boolean"
+      ? parsed.videoEncodingAllowed
+      : undefined,
     transcodeStatus: parsed.transcodeStatus as BlobRecord["transcodeStatus"],
     transcodeGeneration: typeof parsed.transcodeGeneration === "number"
       ? parsed.transcodeGeneration

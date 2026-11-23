@@ -46,6 +46,7 @@ export interface BlobRecord {
   c2paManifestId?: string;
   moderation?: ModerationResult;
   archiveStorage?: ArchiveStorage;
+  videoEncodingAllowed?: boolean;
   transcodeStatus?: TranscodeStatus;
   transcodeGeneration?: number;
   transcodeErrorCode?: string;

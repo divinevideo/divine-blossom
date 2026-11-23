@@ -9,6 +9,7 @@ import {
   isTranscodeWebhook,
   optionalViewerPubkey,
   requireNostrAuth,
+  requireNostrAuthEvent,
   verifySignedNostrEvent,
 } from "./auth.ts";
 import { LANDING_HTML } from "./landing.ts";
@@ -50,13 +51,45 @@ function corsHeaders(existing?: Headers): Headers {
   headers.set("access-control-allow-methods", "GET, HEAD, PUT, POST, DELETE, OPTIONS");
   headers.set(
     "access-control-allow-headers",
-    "Authorization, Content-Type, Range, X-Sha256, X-Request-Id, X-Content-Length",
+    "Authorization, Content-Type, Range, X-Sha256, X-SHA-256, X-Request-Id, X-Content-Length, X-Content-Type, X-Divine-Video-Processing, X-ProofMode-Manifest, X-ProofMode-Signature, X-ProofMode-Pubkey, X-ProofMode-Attestation, X-C2PA-Manifest-Id",
   );
   headers.set(
     "access-control-expose-headers",
-    "Content-Length, Content-Range, Accept-Ranges, X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256, X-Content-SHA256, X-Audio-Duration, X-Audio-Size, X-Divine-Upload-Extensions, X-Divine-Upload-Control-Host, X-Divine-Upload-Data-Host, Retry-After, Content-Language, X-Divine-Machine-Translated",
+    "Content-Length, Content-Range, Accept-Ranges, X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256, X-Content-SHA256, X-Audio-Duration, X-Audio-Size, X-Divine-Upload-Extensions, X-Divine-Upload-Control-Host, X-Divine-Upload-Data-Host, X-Reason, X-Exists, Retry-After, Content-Language, X-Divine-Machine-Translated",
   );
   return headers;
+}
+
+function isVideoMimeType(mime: string): boolean {
+  return mime.trim().toLowerCase().startsWith("video/");
+}
+
+function isTranscribableMimeType(mime: string): boolean {
+  const normalized = mime.trim().toLowerCase();
+  return normalized.startsWith("video/") || normalized.startsWith("audio/");
+}
+
+function parseVideoEncodingRequested(req: Request): boolean | null {
+  const raw = req.headers.get("x-divine-video-processing")?.trim();
+  if (!raw) return true;
+  const lower = raw.toLowerCase();
+  if (lower === "encode") return true;
+  if (lower === "copy-only") return false;
+  return null;
+}
+
+function trustedUploadServiceTerminalError(
+  errorCode: string | undefined,
+  uploadServiceTerminal: boolean,
+): boolean {
+  return uploadServiceTerminal && errorCode === "unsupported_media_type";
+}
+
+function isValidRetryAfter(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  if (/^\d+$/.test(trimmed)) return true;
+  return !Number.isNaN(Date.parse(trimmed));
 }
 
 async function boundedBody(req: Request, max: number): Promise<Uint8Array<ArrayBuffer>> {
@@ -439,11 +472,51 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
     });
   }
 
-  async function proxyUpstream(
+  function uploadCapabilityHeaders(): Record<string, string> {
+    const out: Record<string, string> = {
+      "x-content-length": String(maxUpload),
+      "x-divine-upload-extensions": "resumable-v1",
+      "x-divine-upload-control-host": originHost,
+      "cache-control": "private, no-store",
+      "surrogate-control": "no-store",
+    };
+    if (config.upstreams?.uploadServiceUrl) {
+      out["x-divine-upload-data-host"] = new URL(config.upstreams.uploadServiceUrl).host;
+    }
+    return out;
+  }
+
+  async function triggerModerationScan(hash: string, pubkey: string): Promise<void> {
+    if (!config.upstreams?.moderationApiUrl || !config.upstreams.moderationApiToken) return;
+    try {
+      const res = await fetcher(
+        `${config.upstreams.moderationApiUrl.replace(/\/+$/, "")}/api/v1/scan`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${config.upstreams.moderationApiToken.trim()}`,
+          },
+          body: JSON.stringify({ sha256: hash, source: "blossom", pubkey }),
+          redirect: "error",
+          signal: AbortSignal.timeout(5_000),
+        },
+      );
+      await res.body?.cancel();
+    } catch {
+      // Moderation queuing is best-effort and must not fail uploads.
+    }
+  }
+
+  async function forwardUpstream(
     upstreamBase: string,
     targetPath: string,
     req: Request,
-    extraHeaders?: Record<string, string>,
+    options?: {
+      body?: BodyInit | null;
+      extraHeaders?: Record<string, string>;
+      timeoutMs?: number;
+    },
   ): Promise<Response> {
     const reqUrl = new URL(req.url);
     const targetUrl = `${upstreamBase.replace(/\/+$/, "")}${targetPath}${reqUrl.search}`;
@@ -455,30 +528,252 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         "content-length",
         "x-sha256",
         "x-request-id",
+        "x-divine-video-processing",
         "accept",
       ]
     ) {
       const val = req.headers.get(name);
       if (val !== null) headers.set(name, val);
     }
+    for (const [key, val] of req.headers.entries()) {
+      const lower = key.toLowerCase();
+      if (lower.startsWith("x-proofmode-") || lower.startsWith("x-c2pa-")) {
+        headers.set(key, val);
+      }
+    }
     headers.set("x-original-host", originHost);
-    if (extraHeaders) {
-      for (const [k, v] of Object.entries(extraHeaders)) headers.set(k, v);
+    if (options?.extraHeaders) {
+      for (const [k, v] of Object.entries(options.extraHeaders)) headers.set(k, v);
     }
     const hasBody = !["GET", "HEAD"].includes(req.method.toUpperCase());
-    const res = await fetcher(targetUrl, {
+    const body = options && "body" in options
+      ? (options.body ?? undefined)
+      : (hasBody ? req.body : undefined);
+    if (options && "body" in options) {
+      headers.delete("content-length");
+    }
+    return await fetcher(targetUrl, {
       method: req.method,
       headers,
-      body: hasBody ? req.body : undefined,
+      body,
       redirect: "error",
-      signal: AbortSignal.timeout(60_000),
+      signal: AbortSignal.timeout(options?.timeoutMs ?? 60_000),
     });
+  }
+
+  async function proxyUpstream(
+    upstreamBase: string,
+    targetPath: string,
+    req: Request,
+    extraHeaders?: Record<string, string>,
+  ): Promise<Response> {
+    const res = await forwardUpstream(upstreamBase, targetPath, req, { extraHeaders });
     const outHeaders = new Headers(res.headers);
     outHeaders.set("cache-control", "private, no-store");
     return new Response(res.body, { status: res.status, headers: outHeaders });
   }
 
-  async function handleDirectUpload(req: Request, owner: string): Promise<Response> {
+  async function mapUpstreamErrorResponse(res: Response): Promise<Response> {
+    const status = res.status >= 400 && res.status <= 599 ? res.status : 502;
+    const extra: Record<string, string> = {};
+    const retryAfter = res.headers.get("retry-after");
+    if (retryAfter && (status === 503 || status === 429) && isValidRetryAfter(retryAfter)) {
+      extra["retry-after"] = retryAfter.trim();
+    }
+    let message = status === 503
+      ? "Upload service unavailable"
+      : `Upload service error (${status})`;
+    try {
+      const rawBytes = await boundedBody(
+        new Request("https://upstream.invalid/", { method: "POST", body: res.body }),
+        16 * 1024,
+      );
+      const rawText = new TextDecoder("utf-8", { fatal: false }).decode(rawBytes).trim();
+      if (rawText) {
+        try {
+          const parsed = JSON.parse(rawText) as { error?: unknown };
+          if (typeof parsed.error === "string" && parsed.error.trim().length > 0) {
+            message = parsed.error.trim().slice(0, 512);
+          } else {
+            message = rawText.slice(0, 512);
+          }
+        } catch {
+          message = rawText.slice(0, 512);
+        }
+      }
+    } catch {
+      await res.body?.cancel().catch(() => {});
+    }
+    return jsonResp(status, { error: message }, extra);
+  }
+
+  interface DelegatedUploadPayload {
+    sha256: string;
+    size: number;
+    contentType: string;
+    thumbnailUrl?: string;
+    dim?: string;
+    derivativesEvaluated: boolean;
+    transcodeErrorCode?: string;
+    transcodeErrorMessage?: string;
+    transcodeTerminal: boolean;
+    transcriptErrorCode?: string;
+    transcriptErrorMessage?: string;
+    transcriptTerminal: boolean;
+  }
+
+  async function publishDelegatedUpload(
+    owner: string,
+    authHashes: string[],
+    encodingRequested: boolean,
+    upload: DelegatedUploadPayload,
+  ): Promise<Response> {
+    const hash = upload.sha256.toLowerCase();
+    if (!HASH.test(hash) || !Number.isInteger(upload.size) || upload.size < 0) {
+      return jsonResp(502, { error: "Invalid upload service response" });
+    }
+    if (authHashes.length > 0 && !authHashes.includes(hash)) {
+      return jsonResp(401, { error: "upload hash mismatch" });
+    }
+    const contentType = upload.contentType.trim() || "application/octet-stream";
+    const isVideo = isVideoMimeType(contentType);
+    const isTranscribable = isTranscribableMimeType(contentType);
+    const ts = now();
+    const failureRecordedAt = upload.transcodeErrorCode || upload.transcriptErrorCode
+      ? new Date(ts * 1000).toISOString().replace(/\.\d{3}Z$/, "Z")
+      : undefined;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const existing = await config.catalog.get(hash);
+      if (existing?.held) {
+        return jsonResp(403, { error: "content blocked by legal hold" });
+      }
+      if (existing?.status === "banned") {
+        return jsonResp(403, { error: "content banned" });
+      }
+      if (existing?.status === "deleted" || existing?.gate) {
+        return jsonResp(409, { error: "parent unavailable" });
+      }
+
+      if (existing) {
+        const next: BlobRecord = {
+          ...existing,
+          revision: existing.revision + 1,
+          owners: existing.owners.includes(owner) ? existing.owners : [...existing.owners, owner],
+          thumbnail: existing.thumbnail ?? upload.thumbnailUrl,
+          dim: existing.dim ?? upload.dim,
+          videoEncodingAllowed: !encodingRequested && existing.videoEncodingAllowed !== false
+            ? false
+            : existing.videoEncodingAllowed,
+        };
+        const existingIsVideo = isVideoMimeType(existing.type);
+        const existingIsTranscribable = isTranscribableMimeType(existing.type);
+        const allowsVideoEncoding = next.videoEncodingAllowed !== false;
+
+        if (
+          upload.transcodeErrorCode &&
+          existing.transcodeStatus !== "complete" &&
+          existing.transcodeStatus !== "processing"
+        ) {
+          next.transcodeStatus = "failed";
+          next.transcodeErrorCode = upload.transcodeErrorCode;
+          next.transcodeErrorMessage = upload.transcodeErrorMessage;
+          next.transcodeLastAttemptAt = failureRecordedAt;
+          next.transcodeAttemptCount = Math.max(existing.transcodeAttemptCount ?? 0, 1);
+          next.transcodeTerminal = Boolean(existing.transcodeTerminal || upload.transcodeTerminal);
+        } else if (
+          allowsVideoEncoding &&
+          upload.derivativesEvaluated &&
+          !upload.transcodeErrorCode &&
+          existingIsVideo &&
+          (existing.transcodeStatus === undefined || existing.transcodeStatus === "failed")
+        ) {
+          next.transcodeStatus = "pending";
+          next.transcodeErrorCode = undefined;
+          next.transcodeErrorMessage = undefined;
+          next.transcodeLastAttemptAt = undefined;
+          next.transcodeAttemptCount = 0;
+          next.transcodeTerminal = false;
+        }
+
+        if (
+          upload.transcriptErrorCode &&
+          existing.transcriptStatus !== "complete" &&
+          existing.transcriptStatus !== "processing"
+        ) {
+          next.transcriptStatus = "failed";
+          next.transcriptErrorCode = upload.transcriptErrorCode;
+          next.transcriptErrorMessage = upload.transcriptErrorMessage;
+          next.transcriptLastAttemptAt = failureRecordedAt;
+          next.transcriptAttemptCount = Math.max(existing.transcriptAttemptCount ?? 0, 1);
+          next.transcriptTerminal = Boolean(
+            existing.transcriptTerminal || upload.transcriptTerminal,
+          );
+        } else if (
+          upload.derivativesEvaluated &&
+          !upload.transcriptErrorCode &&
+          existingIsTranscribable &&
+          (existing.transcriptStatus === undefined || existing.transcriptStatus === "failed")
+        ) {
+          next.transcriptStatus = "pending";
+          next.transcriptErrorCode = undefined;
+          next.transcriptErrorMessage = undefined;
+          next.transcriptLastAttemptAt = undefined;
+          next.transcriptAttemptCount = 0;
+          next.transcriptTerminal = false;
+        }
+
+        if (await config.catalog.cas(hash, existing.revision, next)) {
+          return jsonResp(200, buildDescriptor(next, origin));
+        }
+        continue;
+      }
+
+      const fresh: BlobRecord = {
+        revision: 1,
+        hash,
+        size: upload.size,
+        type: contentType,
+        uploaded: ts,
+        owners: [owner],
+        status: "pending",
+        ageRestricted: false,
+        held: false,
+        gate: null,
+        cleanupPending: false,
+        thumbnail: upload.thumbnailUrl,
+        dim: upload.dim,
+        videoEncodingAllowed: encodingRequested && isVideo,
+        transcodeStatus: isVideo ? (upload.transcodeErrorCode ? "failed" : "pending") : undefined,
+        transcodeErrorCode: upload.transcodeErrorCode,
+        transcodeErrorMessage: upload.transcodeErrorMessage,
+        transcodeLastAttemptAt: upload.transcodeErrorCode ? failureRecordedAt : undefined,
+        transcodeAttemptCount: isVideo && upload.transcodeErrorCode ? 1 : 0,
+        transcodeTerminal: upload.transcodeTerminal,
+        transcriptStatus: isTranscribable
+          ? (upload.transcriptErrorCode ? "failed" : "pending")
+          : undefined,
+        transcriptErrorCode: upload.transcriptErrorCode,
+        transcriptErrorMessage: upload.transcriptErrorMessage,
+        transcriptLastAttemptAt: upload.transcriptErrorCode ? failureRecordedAt : undefined,
+        transcriptAttemptCount: isTranscribable && upload.transcriptErrorCode ? 1 : 0,
+        transcriptTerminal: upload.transcriptTerminal,
+      };
+      if (await config.catalog.cas(hash, null, fresh)) {
+        if (isVideo) {
+          await triggerModerationScan(hash, owner);
+        }
+        return jsonResp(200, buildDescriptor(fresh, origin));
+      }
+    }
+    return jsonResp(409, { error: "concurrent parent change" });
+  }
+
+  async function handleDirectUpload(
+    req: Request,
+    owner: string,
+    encodingRequested: boolean,
+  ): Promise<Response> {
     if (fixture && !fixture.owners.includes(owner)) {
       return jsonResp(403, { error: "fixture signer required" });
     }
@@ -504,12 +799,31 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       return jsonResp(409, { error: "parent unavailable" });
     }
 
+    // Deduplicate existing live blobs without rewriting storage bytes.
+    if (old) {
+      const deduped: BlobRecord = {
+        ...old,
+        revision: old.revision + 1,
+        owners: old.owners.includes(owner) ? old.owners : [...old.owners, owner],
+        videoEncodingAllowed: !encodingRequested && old.videoEncodingAllowed !== false
+          ? false
+          : old.videoEncodingAllowed,
+      };
+      if (!await config.catalog.cas(hash, old.revision, deduped)) {
+        return jsonResp(409, { error: "concurrent parent change" });
+      }
+      return jsonResp(200, buildDescriptor(deduped, origin));
+    }
+
+    const contentType = req.headers.get("content-type")?.trim() || "application/octet-stream";
+    const isVideo = isVideoMimeType(contentType);
+    const isTranscribable = isTranscribableMimeType(contentType);
     const gate = crypto.randomUUID();
-    const row: BlobRecord = old ? { ...old, revision: old.revision + 1, gate } : {
+    const row: BlobRecord = {
       revision: 1,
       hash,
       size: body.length,
-      type: req.headers.get("content-type") ?? "application/octet-stream",
+      type: contentType,
       uploaded: now(),
       owners: [],
       status: "pending",
@@ -517,9 +831,12 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       held: false,
       gate,
       cleanupPending: false,
+      videoEncodingAllowed: encodingRequested && isVideo,
+      transcodeStatus: isVideo ? "pending" : undefined,
+      transcriptStatus: isTranscribable ? "pending" : undefined,
     };
 
-    if (!await config.catalog.cas(hash, old?.revision ?? null, row)) {
+    if (!await config.catalog.cas(hash, null, row)) {
       return jsonResp(409, { error: "concurrent parent change" });
     }
 
@@ -542,6 +859,9 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
     };
     if (!await config.catalog.cas(hash, current.revision, ready)) {
       return jsonResp(409, { error: "publication changed" });
+    }
+    if (isVideo) {
+      await triggerModerationScan(hash, owner);
     }
     return jsonResp(200, buildDescriptor(ready, origin));
   }
@@ -622,67 +942,396 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       if (!config.writesEnabled && !config.upstreams?.uploadServiceUrl) {
         return new Response(null, { status: 503 });
       }
-      const headers = new Headers({
-        "x-content-length": String(maxUpload),
-        "x-divine-upload-extensions": "resumable-v1",
-        "x-divine-upload-control-host": originHost,
-        "cache-control": "private, no-store",
-      });
-      if (config.upstreams?.uploadServiceUrl) {
-        headers.set("x-divine-upload-data-host", new URL(config.upstreams.uploadServiceUrl).host);
+      const capHeaders = uploadCapabilityHeaders();
+      const preSha = req.headers.get("x-sha-256") ?? req.headers.get("x-sha256");
+      const preLenRaw = req.headers.get("x-content-length");
+      const preType = req.headers.get("x-content-type");
+
+      if (preSha !== null || preLenRaw !== null || preType !== null) {
+        if (preSha !== null) {
+          const normalizedSha = preSha.trim().toLowerCase();
+          if (!HASH.test(normalizedSha)) {
+            return new Response(null, {
+              status: 400,
+              headers: {
+                ...capHeaders,
+                "x-reason": "Invalid X-SHA-256 format (must be 64 hex characters)",
+              },
+            });
+          }
+          const existing = await config.catalog.get(normalizedSha);
+          if (existing?.held || existing?.status === "banned") {
+            return new Response(null, {
+              status: 403,
+              headers: {
+                ...capHeaders,
+                "x-reason": "This content has been removed and cannot be re-uploaded",
+              },
+            });
+          }
+          if (existing && existing.status !== "deleted" && !existing.gate) {
+            return new Response(null, {
+              status: 200,
+              headers: {
+                ...capHeaders,
+                "x-reason": "Blob already exists",
+                "x-exists": "true",
+              },
+            });
+          }
+        }
+        if (preLenRaw !== null) {
+          const trimmedLen = preLenRaw.trim();
+          const parsedLen = /^\d+$/.test(trimmedLen) ? Number(trimmedLen) : NaN;
+          if (!Number.isSafeInteger(parsedLen) || parsedLen === 0) {
+            return new Response(null, {
+              status: 400,
+              headers: {
+                ...capHeaders,
+                "x-reason": parsedLen === 0
+                  ? "File cannot be empty"
+                  : "Invalid X-Content-Length header",
+              },
+            });
+          }
+          if (parsedLen > maxUpload) {
+            return new Response(null, {
+              status: 413,
+              headers: {
+                ...capHeaders,
+                "x-reason": `File too large. Maximum size is ${maxUpload} bytes`,
+              },
+            });
+          }
+        }
+        return new Response(null, {
+          status: 200,
+          headers: {
+            ...capHeaders,
+            "x-reason": "Upload would be accepted",
+          },
+        });
       }
-      return new Response(null, { status: 200, headers });
+
+      return jsonResp(
+        200,
+        {
+          max_size: maxUpload,
+          allowed_types: null,
+          extensions: ["resumable-v1"],
+        },
+        capHeaders,
+      );
     }
 
     // BUD-02: PUT /upload
     if (path === "/upload" && method === "PUT") {
       if (url.search) return jsonResp(400, { error: "unsupported query" });
       if (!config.writesEnabled) return jsonResp(503, { error: "writes disabled" });
-      let owner: string;
+      const encodingRequested = parseVideoEncodingRequested(req);
+      if (encodingRequested === null) {
+        return jsonResp(400, { error: "invalid X-Divine-Video-Processing header" });
+      }
+      let auth;
       try {
-        owner = requireNostrAuth(req, "upload", now(), fixture?.hash, { publicOrigin: origin });
+        auth = requireNostrAuthEvent(req, "upload", now(), fixture?.hash, { publicOrigin: origin });
       } catch {
         return jsonResp(401, { error: "invalid upload authorization" });
       }
 
-      // Check legal hold / ban before delegating if X-Sha256 is supplied
+      // Check legal hold / ban before streaming to Cloud Run using either X-Sha256 or signed auth x tags.
+      const precheckHashes = new Set<string>();
       const declaredSha = req.headers.get("x-sha256")?.trim().toLowerCase();
-      if (declaredSha && HASH.test(declaredSha)) {
-        const existing = await config.catalog.get(declaredSha);
+      if (declaredSha && HASH.test(declaredSha)) precheckHashes.add(declaredSha);
+      for (const authHash of auth.hashes) {
+        if (HASH.test(authHash)) precheckHashes.add(authHash);
+      }
+      for (const candidate of precheckHashes) {
+        const existing = await config.catalog.get(candidate);
         if (existing?.held || existing?.status === "banned") {
           return jsonResp(403, { error: "content blocked" });
         }
       }
 
-      // Delegate streaming uploads to Cloud Run upload service when configured (production mode)
+      // Delegate streaming uploads to Cloud Run upload service when configured (production mode),
+      // then publish the verified upload into the Blossom catalog so reads/lists/moderation stay authoritative.
       if (config.upstreams?.uploadServiceUrl && !fixture) {
-        return await proxyUpstream(config.upstreams.uploadServiceUrl, "/upload", req);
+        const contentType = req.headers.get("content-type")?.trim() || "application/octet-stream";
+        const contentLengthRaw = req.headers.get("content-length")?.trim();
+        const fallbackSize = contentLengthRaw && /^\d+$/.test(contentLengthRaw)
+          ? Number(contentLengthRaw)
+          : 0;
+        if (fallbackSize > maxUpload) {
+          return jsonResp(413, { error: `File too large. Maximum size is ${maxUpload} bytes` });
+        }
+        const extraHeaders: Record<string, string> = {};
+        if (!encodingRequested) {
+          extraHeaders["x-divine-video-processing"] = "copy-only";
+        }
+        const upstreamRes = await forwardUpstream(
+          config.upstreams.uploadServiceUrl,
+          "/upload",
+          req,
+          { extraHeaders },
+        );
+        if (!upstreamRes.ok) {
+          return await mapUpstreamErrorResponse(upstreamRes);
+        }
+        let body: Record<string, unknown>;
+        try {
+          body = await readJson<Record<string, unknown>>(
+            new Request("https://upstream.invalid/", { method: "POST", body: upstreamRes.body }),
+            64 * 1024,
+          );
+        } catch {
+          return jsonResp(502, { error: "Invalid Cloud Run upload response" });
+        }
+        const sha256 = typeof body.sha256 === "string" ? body.sha256.toLowerCase() : "";
+        if (declaredSha && HASH.test(declaredSha) && sha256 !== declaredSha) {
+          return jsonResp(400, { error: "Declared X-Sha256 does not match uploaded content" });
+        }
+        const size = typeof body.size === "number" && Number.isInteger(body.size)
+          ? body.size
+          : fallbackSize;
+        const resolvedType = typeof body.type === "string" && body.type.trim().length > 0
+          ? body.type.trim()
+          : contentType;
+        const transcodeErrorCode = typeof body.transcode_error_code === "string"
+          ? body.transcode_error_code
+          : undefined;
+        const transcriptErrorCode = typeof body.transcript_error_code === "string"
+          ? body.transcript_error_code
+          : undefined;
+        return await publishDelegatedUpload(auth.pubkey, auth.hashes, encodingRequested, {
+          sha256,
+          size,
+          contentType: resolvedType,
+          thumbnailUrl: typeof body.thumbnail_url === "string" ? body.thumbnail_url : undefined,
+          dim: typeof body.dim === "string" ? body.dim : undefined,
+          derivativesEvaluated: isVideoMimeType(resolvedType),
+          transcodeErrorCode,
+          transcodeErrorMessage: typeof body.transcode_error_message === "string"
+            ? body.transcode_error_message
+            : undefined,
+          transcodeTerminal: trustedUploadServiceTerminalError(
+            transcodeErrorCode,
+            Boolean(body.transcode_terminal),
+          ),
+          transcriptErrorCode,
+          transcriptErrorMessage: typeof body.transcript_error_message === "string"
+            ? body.transcript_error_message
+            : undefined,
+          transcriptTerminal: trustedUploadServiceTerminalError(
+            transcriptErrorCode,
+            Boolean(body.transcript_terminal),
+          ),
+        });
       }
-      return await handleDirectUpload(req, owner);
+      return await handleDirectUpload(req, auth.pubkey, encodingRequested);
     }
 
     // Resumable upload control plane
     if (path === "/upload/init" && method === "POST") {
+      if (!config.writesEnabled) return jsonResp(503, { error: "writes disabled" });
       if (!config.upstreams?.uploadServiceUrl) {
         return jsonResp(503, { error: "upload service not configured" });
       }
+      const encodingRequested = parseVideoEncodingRequested(req);
+      if (encodingRequested === null) {
+        return jsonResp(400, { error: "invalid X-Divine-Video-Processing header" });
+      }
+      if (!encodingRequested) {
+        return jsonResp(400, { error: "Copy-only uploads must use PUT /upload or PUT /mirror" });
+      }
+      let auth;
       try {
-        requireNostrAuth(req, "upload", now(), undefined, { publicOrigin: origin });
+        auth = requireNostrAuthEvent(req, "upload", now(), undefined, { publicOrigin: origin });
       } catch {
         return jsonResp(401, { error: "invalid upload authorization" });
       }
-      return await proxyUpstream(config.upstreams.uploadServiceUrl, "/upload/init", req);
+
+      let rawBody: string;
+      let initReq: {
+        sha256?: string;
+        size?: number;
+        contentType?: string;
+        content_type?: string;
+        fileName?: string;
+        file_name?: string;
+      };
+      try {
+        const bytes = await boundedBody(req, 64 * 1024);
+        rawBody = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+        if (!rawBody.trim()) return jsonResp(400, { error: "Request body required" });
+        initReq = JSON.parse(rawBody);
+      } catch {
+        return jsonResp(400, { error: "Invalid JSON" });
+      }
+
+      const hash = typeof initReq.sha256 === "string" ? initReq.sha256.trim().toLowerCase() : "";
+      const size = initReq.size;
+      const contentType = (initReq.contentType ?? initReq.content_type ?? "").trim();
+      if (!HASH.test(hash)) {
+        return jsonResp(400, { error: "sha256 must be a 64-character hexadecimal string" });
+      }
+      if (typeof size !== "number" || !Number.isInteger(size) || size <= 0) {
+        return jsonResp(400, { error: "Upload size must be greater than zero" });
+      }
+      if (size > maxUpload) {
+        return jsonResp(400, { error: `File too large. Maximum size is ${maxUpload} bytes` });
+      }
+      if (!contentType) {
+        return jsonResp(400, { error: "Content type is required" });
+      }
+      if (auth.hashes.length > 0 && !auth.hashes.includes(hash)) {
+        return jsonResp(401, { error: "Hash in auth event doesn't match init request" });
+      }
+
+      const capHeaders = uploadCapabilityHeaders();
+      const existing = await config.catalog.get(hash);
+      if (existing?.held || existing?.status === "banned") {
+        return jsonResp(403, {
+          error: "This content has been removed and cannot be re-uploaded",
+        });
+      }
+      if (existing?.status === "deleted" || existing?.gate) {
+        return jsonResp(409, { error: "parent unavailable" }, capHeaders);
+      }
+      if (existing) {
+        return jsonResp(
+          409,
+          { error: "Blob already exists", descriptor: buildDescriptor(existing, origin) },
+          capHeaders,
+        );
+      }
+
+      const upstreamRes = await forwardUpstream(
+        config.upstreams.uploadServiceUrl,
+        "/upload/init",
+        req,
+        {
+          body: rawBody,
+          extraHeaders: { "content-type": "application/json" },
+        },
+      );
+      if (!upstreamRes.ok) {
+        return await mapUpstreamErrorResponse(upstreamRes);
+      }
+      let initResp: unknown;
+      try {
+        initResp = await readJson<unknown>(
+          new Request("https://upstream.invalid/", { method: "POST", body: upstreamRes.body }),
+          64 * 1024,
+        );
+      } catch {
+        return jsonResp(502, { error: "Invalid upload service init response" });
+      }
+      return jsonResp(200, initResp, capHeaders);
     }
+
     if (path.startsWith("/upload/") && path.endsWith("/complete") && method === "POST") {
+      if (!config.writesEnabled) return jsonResp(503, { error: "writes disabled" });
       if (!config.upstreams?.uploadServiceUrl) {
         return jsonResp(503, { error: "upload service not configured" });
       }
+      const uploadId = path.slice("/upload/".length, -"/complete".length);
+      if (!/^[a-zA-Z0-9_-]{1,128}$/.test(uploadId)) {
+        return jsonResp(400, { error: "Invalid upload complete path" });
+      }
+      const encodingRequested = parseVideoEncodingRequested(req);
+      if (encodingRequested === null) {
+        return jsonResp(400, { error: "invalid X-Divine-Video-Processing header" });
+      }
+      let auth;
       try {
-        requireNostrAuth(req, "upload", now(), undefined, { publicOrigin: origin });
+        auth = requireNostrAuthEvent(req, "upload", now(), undefined, { publicOrigin: origin });
       } catch {
         return jsonResp(401, { error: "invalid upload authorization" });
       }
-      return await proxyUpstream(config.upstreams.uploadServiceUrl, path, req);
+
+      let rawBody = "";
+      let expectedRequestHash: string | null = null;
+      try {
+        const bytes = await boundedBody(req, 64 * 1024);
+        rawBody = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+        if (rawBody.trim().length > 0) {
+          const parsed = JSON.parse(rawBody) as { sha256?: unknown };
+          if (parsed.sha256 !== undefined) {
+            if (
+              typeof parsed.sha256 !== "string" || !HASH.test(parsed.sha256.trim().toLowerCase())
+            ) {
+              return jsonResp(400, { error: "Invalid sha256 in completion request" });
+            }
+            expectedRequestHash = parsed.sha256.trim().toLowerCase();
+          }
+        }
+      } catch {
+        return jsonResp(400, { error: "Invalid JSON in completion request" });
+      }
+
+      if (
+        expectedRequestHash && auth.hashes.length > 0 && !auth.hashes.includes(expectedRequestHash)
+      ) {
+        return jsonResp(401, { error: "Hash in auth event doesn't match completion request" });
+      }
+
+      const extraHeaders: Record<string, string> = {};
+      if (!encodingRequested) {
+        extraHeaders["x-divine-video-processing"] = "copy-only";
+      }
+      if (rawBody.trim().length > 0) {
+        extraHeaders["content-type"] = "application/json";
+      }
+
+      const upstreamRes = await forwardUpstream(
+        config.upstreams.uploadServiceUrl,
+        `/upload/${uploadId}/complete`,
+        req,
+        {
+          body: rawBody.trim().length > 0 ? rawBody : null,
+          extraHeaders,
+        },
+      );
+      if (!upstreamRes.ok) {
+        return await mapUpstreamErrorResponse(upstreamRes);
+      }
+
+      let completeResp: {
+        sha256?: string;
+        size?: number;
+        contentType?: string;
+        content_type?: string;
+        thumbnailUrl?: string;
+        thumbnail_url?: string;
+        dim?: string;
+      };
+      try {
+        completeResp = await readJson(
+          new Request("https://upstream.invalid/", { method: "POST", body: upstreamRes.body }),
+          64 * 1024,
+        );
+      } catch {
+        return jsonResp(502, { error: "Invalid upload service completion response" });
+      }
+
+      const completeHash = typeof completeResp.sha256 === "string"
+        ? completeResp.sha256.trim().toLowerCase()
+        : "";
+      if (expectedRequestHash && completeHash !== expectedRequestHash) {
+        return jsonResp(409, { error: "Completion response hash did not match requested hash" });
+      }
+
+      return await publishDelegatedUpload(auth.pubkey, auth.hashes, encodingRequested, {
+        sha256: completeHash,
+        size: typeof completeResp.size === "number" ? completeResp.size : -1,
+        contentType: (completeResp.contentType ?? completeResp.content_type ?? "").trim() ||
+          "application/octet-stream",
+        thumbnailUrl: completeResp.thumbnailUrl ?? completeResp.thumbnail_url,
+        dim: typeof completeResp.dim === "string" ? completeResp.dim : undefined,
+        derivativesEvaluated: false,
+        transcodeTerminal: false,
+        transcriptTerminal: false,
+      });
     }
 
     // Synchronous transcription proxy

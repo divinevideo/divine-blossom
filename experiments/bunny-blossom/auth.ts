@@ -185,6 +185,36 @@ function validateEventForAction(
   return true;
 }
 
+export interface AuthenticatedNostrRequest {
+  pubkey: string;
+  event: ParsedNostrEvent;
+  hashes: string[];
+}
+
+/**
+ * Require a valid Nostr auth header and return both the lowercase hex pubkey and signed event metadata.
+ */
+export function requireNostrAuthEvent(
+  req: Request,
+  action: BlossomAction,
+  now: number,
+  hash?: string,
+  options?: { allowLegacyOptionalExpiry?: boolean; publicOrigin?: string },
+): AuthenticatedNostrRequest {
+  const candidates = splitAuthorizationHeaders(req);
+  for (const candidate of candidates) {
+    const event = decodeNostrHeader(candidate);
+    if (event && validateEventForAction(event, req, action, now, hash, options)) {
+      return {
+        pubkey: event.pubkey.toLowerCase(),
+        event,
+        hashes: tagValues(event, "x").map((x) => x.toLowerCase()),
+      };
+    }
+  }
+  throw new Error("unauthorized");
+}
+
 /**
  * Require a valid Nostr auth header for a management action (upload, delete, vanish, mirror, list, media).
  * Returns the authenticated lowercase hex pubkey or throws.
@@ -196,14 +226,7 @@ export function requireNostrAuth(
   hash?: string,
   options?: { allowLegacyOptionalExpiry?: boolean; publicOrigin?: string },
 ): string {
-  const candidates = splitAuthorizationHeaders(req);
-  for (const candidate of candidates) {
-    const event = decodeNostrHeader(candidate);
-    if (event && validateEventForAction(event, req, action, now, hash, options)) {
-      return event.pubkey.toLowerCase();
-    }
-  }
-  throw new Error("unauthorized");
+  return requireNostrAuthEvent(req, action, now, hash, options).pubkey;
 }
 
 /**
