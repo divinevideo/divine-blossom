@@ -46,6 +46,11 @@ function jsonResp(status: number, value: unknown, extraHeaders?: Record<string, 
   return new Response(JSON.stringify(value), { status, headers });
 }
 
+// Mobile treats 409 upload results as a successful deduplication.
+function uploadUnavailable(error: string): Response {
+  return jsonResp(503, { error }, { "retry-after": "5" });
+}
+
 function corsHeaders(existing?: Headers): Headers {
   const headers = new Headers(existing);
   headers.set("access-control-allow-origin", "*");
@@ -671,9 +676,13 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
     return new Response(res.body, { status: res.status, headers: outHeaders });
   }
 
-  async function mapUpstreamErrorResponse(res: Response): Promise<Response> {
-    const status = res.status >= 400 && res.status <= 599 ? res.status : 502;
-    const extra: Record<string, string> = {};
+  async function mapUpstreamErrorResponse(
+    res: Response,
+    options?: { uploadResult?: boolean },
+  ): Promise<Response> {
+    const uploadConflict = options?.uploadResult && res.status === 409;
+    const status = uploadConflict ? 503 : res.status >= 400 && res.status <= 599 ? res.status : 502;
+    const extra: Record<string, string> = uploadConflict ? { "retry-after": "5" } : {};
     const retryAfter = res.headers.get("retry-after");
     if (retryAfter && (status === 503 || status === 429) && isValidRetryAfter(retryAfter)) {
       extra["retry-after"] = retryAfter.trim();
@@ -761,7 +770,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         isUploadUnavailable(existing) ||
         (existing?.status === "deleted" && existing.revision !== upload.expectedDeletionRevision)
       ) {
-        return jsonResp(409, { error: "parent unavailable" });
+        return uploadUnavailable("parent unavailable");
       }
 
       if (existing && existing.status !== "deleted") {
@@ -879,7 +888,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         return jsonResp(createdStatus, buildDescriptor(fresh, origin));
       }
     }
-    return jsonResp(409, { error: "concurrent parent change" });
+    return uploadUnavailable("concurrent parent change");
   }
 
   async function handleDirectUpload(
@@ -922,7 +931,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       return jsonResp(403, { error: "content blocked" });
     }
     if (isUploadUnavailable(old)) {
-      return jsonResp(409, { error: "parent unavailable" });
+      return uploadUnavailable("parent unavailable");
     }
 
     // Deduplicate existing live blobs without rewriting storage bytes.
@@ -934,7 +943,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         videoEncodingAllowed: !encodingRequested ? false : old.videoEncodingAllowed,
       };
       if (!await config.catalog.cas(hash, old.revision, deduped, { requireUnquarantined: true })) {
-        return jsonResp(409, { error: "concurrent parent change" });
+        return uploadUnavailable("concurrent parent change");
       }
       return jsonResp(200, buildDescriptor(deduped, origin));
     }
@@ -963,7 +972,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
     if (
       !await config.catalog.cas(hash, old?.revision ?? null, row, { requireUnquarantined: true })
     ) {
-      return jsonResp(409, { error: "concurrent parent change" });
+      return uploadUnavailable("concurrent parent change");
     }
 
     // Any lost storage reply retains the gate — never silently cleared.
@@ -974,7 +983,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       !current || current.revision !== row.revision || current.gate !== gate ||
       current.status === "deleted" || current.held
     ) {
-      return jsonResp(409, { error: "publication withdrawn" });
+      return uploadUnavailable("publication withdrawn");
     }
 
     const ready: BlobRecord = {
@@ -984,7 +993,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       owners: [...new Set([...current.owners, owner])],
     };
     if (!await config.catalog.cas(hash, current.revision, ready, { requireUnquarantined: true })) {
-      return jsonResp(409, { error: "publication changed" });
+      return uploadUnavailable("publication changed");
     }
     if (isVideo) {
       await triggerModerationScan(hash, owner);
@@ -1209,7 +1218,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
           return jsonResp(403, { error: "content blocked" });
         }
         if (blocked === "unavailable") {
-          return jsonResp(409, { error: "parent unavailable" });
+          return uploadUnavailable("parent unavailable");
         }
         if (existing?.status === "deleted") deletionRevisions.set(candidate, existing.revision);
       }
@@ -1252,7 +1261,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
           throw error;
         }
         if (!upstreamRes.ok) {
-          return await mapUpstreamErrorResponse(upstreamRes);
+          return await mapUpstreamErrorResponse(upstreamRes, { uploadResult: true });
         }
         let rawBody: unknown;
         try {
@@ -1493,7 +1502,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         }
         // Cloud Run may replay a finalized session without writing again.
         if (blocked === "unavailable" || existing?.status === "deleted") {
-          return jsonResp(409, { error: "parent unavailable" });
+          return uploadUnavailable("parent unavailable");
         }
       }
 
@@ -1517,7 +1526,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         },
       );
       if (!upstreamRes.ok) {
-        return await mapUpstreamErrorResponse(upstreamRes);
+        return await mapUpstreamErrorResponse(upstreamRes, { uploadResult: true });
       }
 
       let rawComplete: unknown;
@@ -1537,7 +1546,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         ? rawComplete.sha256.trim().toLowerCase()
         : "";
       if (expectedRequestHash && completeHash !== expectedRequestHash) {
-        return jsonResp(409, { error: "Completion response hash did not match requested hash" });
+        return jsonResp(502, { error: "Completion response hash did not match requested hash" });
       }
       const rawContentType = rawComplete.contentType ?? rawComplete.content_type;
       const resolvedContentType =

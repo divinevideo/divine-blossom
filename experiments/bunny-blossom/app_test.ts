@@ -794,7 +794,9 @@ Deno.test("delegated PUT /upload publishes to SQL catalog, supports chunked bodi
       )).status,
       409,
     );
-    equal((await uploadThumbAgain()).status, 409);
+    const pendingRepost = await uploadThumbAgain();
+    equal(pendingRepost.status, 503);
+    equal(pendingRepost.headers.get("retry-after"), "5");
     equal(seenRequests.length, beforeCleanup);
     const drain = () =>
       app(
@@ -817,7 +819,7 @@ Deno.test("delegated PUT /upload publishes to SQL catalog, supports chunked bodi
         body: JSON.stringify({ sha256: thumbHash }),
       }),
     );
-    equal(staleCompletion.status, 409);
+    equal(staleCompletion.status, 503);
     equal(seenRequests.length, beforeCleanup);
     equal((await app(new Request(thumbDesc.url))).status, 404);
     equal((await uploadThumbAgain()).status, 201);
@@ -1178,7 +1180,7 @@ Deno.test("BUD-06 HEAD /upload pre-validation and Divine resumable init/complete
         body: JSON.stringify({ sha256: "4".repeat(64) }),
       }),
     );
-    equal(responseMismatchComplete.status, 409);
+    equal(responseMismatchComplete.status, 502);
 
     const completeRes = await app(
       new Request(`${origin}/upload/up_0123456789abcdef01234567/complete`, {
