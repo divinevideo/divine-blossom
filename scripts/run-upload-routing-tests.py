@@ -21,6 +21,11 @@ class UploadService(BaseHTTPRequestHandler):
     def do_POST(self):
         self.handle_upload()
 
+    def do_HEAD(self):
+        self.server.observed.append(("HEAD", self.path))
+        self.send_response(200)
+        self.end_headers()
+
     def handle_upload(self):
         self.connection.settimeout(5)
         body = self.rfile.read(int(self.headers['Content-Length']))
@@ -60,7 +65,7 @@ def main():
         'origin_error', 'hash_mismatch',
     ]
     complete_cases = ['complete_busy', 'complete_origin_error']
-    cases = direct_cases + complete_cases + ['default', 'disabled', 'invalid', 'invalid_auth', 'missing_store', 'tombstone', 'missing_policy', 'dedupe', 'bad_size']
+    cases = direct_cases + complete_cases + ['default', 'disabled', 'invalid', 'invalid_auth', 'missing_store', 'tombstone', 'missing_policy', 'dedupe', 'inline_dedupe', 'bad_size']
     parser = argparse.ArgumentParser()
     parser.add_argument('--case', choices=cases)
     selected = parser.parse_args().case
@@ -77,6 +82,14 @@ def main():
                     values = {'local_mode': 'false'}
                     if case != 'default':
                         values['upload_service_all_uploads'] = {'disabled': 'false', 'invalid': 'invalid'}.get(case, 'true')
+                    gcs_backend = ''
+                    if case == 'inline_dedupe':
+                        values.update(local_mode='true', gcs_bucket='synthetic')
+                        gcs_backend = f'''[local_server.backends.gcs_storage]
+url = "http://127.0.0.1:{server.server_port}"
+[local_server.secret_stores]
+blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_key",data="synthetic"}}]
+'''
                     settings.write_text(json.dumps(values))
                     case_file.write_text(json.dumps({'test_case': case}))
                     values_kv = {}
@@ -99,7 +112,7 @@ url = "http://127.0.0.1:{server.server_port}"
 [local_server.config_stores.routing_test]
 file = "{case_file}"
 format = "json"
-{optional}{policy}''')
+{optional}{policy}{gcs_backend}''')
                     env = os.environ.copy()
                     # Cargo's environment runner is whitespace-split, not a
                     # shell command; TOML array preserves paths containing spaces.
@@ -116,6 +129,8 @@ format = "json"
                     elif case in complete_cases:
                         body = json.dumps({'sha256': 'a' * 64}, separators=(',', ':')).encode()
                         expected = [('POST', '/upload/synthetic/complete', body, 'application/json', True)]
+                    elif case == 'inline_dedupe':
+                        expected = [('HEAD', '/synthetic/' + hashlib.sha256(b'synthetic image').hexdigest())]
                     if server.observed[before:] != expected:
                         raise AssertionError(f'{case}: unexpected loopback upload calls')
                     print(f'PASS canonical upload routing: {case}', flush=True)
