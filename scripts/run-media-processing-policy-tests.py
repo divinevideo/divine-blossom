@@ -43,6 +43,8 @@ class UploadService(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
             return
+        if self.headers.get("X-Divine-Video-Processing") == "copy-only":
+            self.server.copy_only_uploads.add(media_hash)
         payload = json.dumps({"sha256": media_hash, "size": 64, "type": "video/mp4",
                               "contentType": "video/mp4"}).encode()
         self.send_response(200)
@@ -52,6 +54,7 @@ class UploadService(BaseHTTPRequestHandler):
 
 server = ThreadingHTTPServer(("127.0.0.1", 0), UploadService)
 server.policy_reads = 0
+server.copy_only_uploads = set()
 threading.Thread(target=server.serve_forever, daemon=True).start()
 repo = Path(__file__).resolve().parent.parent
 with tempfile.TemporaryDirectory(prefix="media-policy-") as directory:
@@ -87,4 +90,5 @@ blossom_secrets = [{{key="webhook_secret",data="synthetic-webhook"}},{{key="kv_o
     if result.returncode or "test result: ok. 4 passed; 0 failed; 0 ignored;" not in result.stdout:
         raise RuntimeError(result.stdout + result.stderr)
     assert server.policy_reads == 3, server.policy_reads
+    assert server.copy_only_uploads == {"4" * 64, "5" * 64, "7" * 64}, server.copy_only_uploads
     print("PASS media processing permission, authenticated policy, retry, and stale metadata contracts")

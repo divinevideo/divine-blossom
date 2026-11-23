@@ -434,6 +434,32 @@ pub fn put_blob_metadata(metadata: &BlobMetadata) -> Result<()> {
     Ok(())
 }
 
+/// Reduce processing permission without copying stale ownership or access fields.
+pub(crate) fn restrict_video_encoding(hash: &str) -> Result<BlobMetadata> {
+    let key = format!("{BLOB_PREFIX}{}", hash.to_lowercase());
+    let result = update_json_conditionally::<Option<BlobMetadata>, _, _>(
+        &key,
+        8,
+        "video processing restriction",
+        |current| {
+            let Some(Some(mut current)) = current else {
+                return Err("Media policy is not available".into());
+            };
+            if !current.video_encoding_allowed {
+                return Ok(ConditionalJsonMutation::Complete(current));
+            }
+            current.video_encoding_allowed = false;
+            Ok(ConditionalJsonMutation::Write {
+                result: current.clone(),
+                value: Some(current),
+                time_to_live: None,
+            })
+        },
+    )?;
+    invalidate_metadata_cache(hash);
+    Ok(result)
+}
+
 /// Delete blob metadata
 pub fn delete_blob_metadata(hash: &str) -> Result<()> {
     let store = open_store()?;

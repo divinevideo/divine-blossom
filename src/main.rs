@@ -3805,6 +3805,10 @@ fn handle_upload(mut req: Request, record: &mut UploadLogRecord) -> Result<Respo
     if blob_exists(&hash)? {
         // Return existing blob descriptor but track this re-uploader
         if let Some(mut metadata) = get_blob_metadata(&hash)? {
+            if !encoding_requested && metadata.video_encoding_allowed {
+                metadata = crate::metadata::restrict_video_encoding(&hash)?;
+            }
+
             // Add re-uploader to their list and refs (best effort)
             let _ = add_to_user_list(&auth.pubkey, &hash);
             let _ = add_to_blob_refs(&hash, &auth.pubkey);
@@ -4182,6 +4186,10 @@ fn publish_upload_service_upload_with_policy(
 
     // Read authoritative metadata before updating the full record.
     if let Some(mut metadata) = get_blob_metadata_uncached(&hash)? {
+        if !encoding_requested && metadata.video_encoding_allowed {
+            metadata = crate::metadata::restrict_video_encoding(&hash)?;
+        }
+
         let _ = add_to_user_list(&auth.pubkey, &hash);
         let _ = add_to_blob_refs(&hash, &auth.pubkey);
 
@@ -4540,6 +4548,10 @@ fn handle_upload_complete(
     );
     proxy_req.set_header("Host", UPLOAD_SERVICE_HOST);
     proxy_req.set_header(header::AUTHORIZATION, &auth_header);
+    if !encoding_requested {
+        proxy_req.set_header("X-Divine-Video-Processing", "copy-only");
+    }
+
     proxy_req.set_header(upload_log::CORRELATION_HEADER, &record.req_id);
     if expected_request_hash.is_some() {
         proxy_req.set_header(header::CONTENT_TYPE, "application/json");
@@ -4702,6 +4714,10 @@ fn handle_upload_service_proxy(
     );
     proxy_req.set_header("Host", UPLOAD_SERVICE_HOST);
     proxy_req.set_header(header::AUTHORIZATION, &auth_header);
+    if !encoding_requested {
+        proxy_req.set_header("X-Divine-Video-Processing", "copy-only");
+    }
+
     proxy_req.set_header(header::CONTENT_TYPE, &content_type);
     proxy_req.set_header(header::CONTENT_LENGTH, content_length.to_string());
     proxy_req.set_header(upload_log::CORRELATION_HEADER, &record.req_id);
@@ -6291,6 +6307,10 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
 
     // Check if metadata already exists
     if let Some(mut metadata) = get_blob_metadata(&hash)? {
+        if !encoding_requested && metadata.video_encoding_allowed {
+            metadata = crate::metadata::restrict_video_encoding(&hash)?;
+        }
+
         if is_transcribable_mime_type(&metadata.mime_type) && metadata.transcript_status.is_none() {
             metadata.transcript_status = Some(TranscriptStatus::Pending);
             let _ = put_blob_metadata(&metadata);

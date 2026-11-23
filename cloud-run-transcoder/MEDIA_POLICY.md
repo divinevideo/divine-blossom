@@ -66,7 +66,11 @@ processing permission; it is not archive provenance. Existing metadata, recovere
 records, and legacy records without the flag remain copy-only. Trusted archive
 storage always overrides encoding permission. Generation-conditional metadata
 writes preserve reductions and archive storage against stale duplicate/webhook
-writes. Duplicate uploads never upgrade an existing record.
+writes. Duplicate uploads never upgrade an existing record; a copy-only opt-out
+may reduce an existing permission. This only limits processing and does not
+change media ownership or playback access. The edge forwards copy-only to the
+upload service, which suppresses eager HLS dispatch before metadata publication.
+Copy-only HLS is packaged on demand after the restriction is committed.
 
 The opt-out is supported on direct uploads, mirrors and resumable completion.
 Resumable initiation rejects the opt-out with 400 because existing upload sessions

@@ -69,7 +69,10 @@ fn media_policy_http_auth_retry_and_metadata_contract() {
         serde_json::json!({"sha256":hash,"policy":"allow_encode"})
     );
     // The fixture origin now restricts processing while POP metadata stays stale.
-    assert!(get_blob_metadata_uncached(&hash).unwrap().unwrap().allows_video_encoding());
+    assert!(get_blob_metadata_uncached(&hash)
+        .unwrap()
+        .unwrap()
+        .allows_video_encoding());
     let mut copy = lookup(&hash, Some("synthetic-webhook"));
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&copy.take_body_str()).unwrap(),
@@ -106,6 +109,23 @@ fn media_policy_stale_writes_never_upgrade_or_erase_archive_policy() {
             .unwrap()
             .video_encoding_allowed
     );
+    let protected = "d".repeat(64);
+    let mut latest = sample(&protected, true);
+    latest.status = BlobStatus::Banned;
+    latest.size = 123;
+    put_blob_metadata(&latest).unwrap();
+    let reduced = crate::metadata::restrict_video_encoding(&protected).unwrap();
+    assert!(!reduced.video_encoding_allowed);
+    assert_eq!(reduced.status, BlobStatus::Banned);
+    assert_eq!(reduced.owner, latest.owner);
+    assert_eq!(reduced.size, 123);
+    let store = crate::metadata::open_store().unwrap();
+    let key = format!("blob:{protected}");
+    let generation = store.lookup(&key).unwrap().current_generation();
+    crate::metadata::restrict_video_encoding(&protected).unwrap();
+    assert_eq!(store.lookup(&key).unwrap().current_generation(), generation);
+    store.insert(&key, "null").unwrap();
+    assert!(crate::metadata::restrict_video_encoding(&protected).is_err());
 }
 
 #[test]
@@ -160,6 +180,18 @@ fn media_policy_authenticated_upload_routes_and_duplicates() {
             !copy_only && video
         );
     }
+    // An archive opt-out can also reduce a previously authorized duplicate.
+    let hash = "4".repeat(64);
+    let mut restricted_duplicate = crate::upload_routing_tests::upload_request(true);
+    restricted_duplicate.set_header("Content-Type", "video/mp4");
+    restricted_duplicate.set_header("Content-Length", "64");
+    restricted_duplicate.set_header("X-Divine-Video-Processing", "copy-only");
+    restricted_duplicate.set_body(hash.clone());
+    assert_eq!(response(restricted_duplicate).get_status(), StatusCode::OK);
+    assert!(!get_blob_metadata_uncached(&hash)
+        .unwrap()
+        .unwrap()
+        .allows_video_encoding());
     // Init cannot silently accept an opt-out that an old resumable service would lose.
     let authorized = crate::upload_routing_tests::upload_request(true);
     let mut init = Request::post("https://media.divine.video/upload/init");
