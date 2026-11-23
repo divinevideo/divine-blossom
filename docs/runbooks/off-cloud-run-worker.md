@@ -102,10 +102,13 @@ Cloud Run accepts new jobs. To move admission separately, deploy a worker with
 `TRANSCODE_ADMISSION_SECRET` before opening admission in the reverse proxy.
 The bundled Compose and Caddy configuration checks the admission credential
 before forwarding either route in required-auth mode, including if an older
-worker image is restored. Use the literal lowercase `true` in Compose. Keep
-forced repairs on a private route when this mode is enabled. If the host has
-a custom Caddyfile, retain its existing allowlist and apply equivalent
-credential checks before opening either route.
+worker image is restored. Use the literal lowercase `true` in Compose.
+For forced repairs in that mode, use `docker compose exec transcoder` on the
+worker host to POST `force: true` to `http://127.0.0.1:8080/transcode`
+inside the container, with the configured `x-divine-repair-secret` header.
+That path bypasses the public proxy and still requires the worker's repair
+credential. On hosts with a custom Caddyfile, retain the existing allowlist
+and apply equivalent credential checks before opening either intake route.
 
 Configure queue-scoped enqueue access for the worker identity only after
 verifying that external unauthenticated admission is blocked. Ordinary requests
@@ -156,7 +159,8 @@ Keep archive publishing paused until its separate maintainer hold is lifted.
 4. Pause direct HLS writes on Cloud Run (`TRANSCODE_WRITES_PAUSED=true` still
    permits ordinary `POST /transcode` queue admission, while blocking
    `/internal/transcode`, `force: true` repairs, and `/backfill-fmp4` on Cloud
-   Run — direct forced repairs and `/backfill-fmp4` to `https://transcoder-worker.divine.video`):
+   Run). Direct those operations to the off-GCP worker. Use container loopback
+   for forced repairs when the off-GCP proxy requires admission authentication.
    ```sh
    gcloud run services update divine-transcoder \
      --region=us-central1 --project=rich-compiler-479518-d2 \
