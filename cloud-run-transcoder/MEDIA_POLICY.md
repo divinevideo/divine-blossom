@@ -82,7 +82,9 @@ copy-only media returns 422 so clients use the original instead of repeatedly
 requesting an impossible audio-remux fallback. Compatible HLS packaging remains
 available, and original bytes are never replaced.
 
-Deploy edge metadata/lookup support before configuring the policy-aware worker.
+Deploy the upload service suppression first: an older uploader ignores the header
+and can start a duplicate job before permission is reduced. Deploy edge
+metadata/lookup support second, then configure the policy-aware worker.
 Deploy the archive publisher opt-out before resuming held archive ingestion.
 Keep the archive publishing hold until the maintainer explicitly resumes it.
 Worker staging and queue cutover must retain B2-only storage settings and the
