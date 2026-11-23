@@ -452,7 +452,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
     // Try primary storage key (and alternate quality / thumbnail / legacy vtt fallbacks)
     const isVideoThumbnail = media.kind === "thumbnail" ||
       (media.kind === "original" &&
-        row.type.startsWith("video/") &&
+        isVideoMimeType(row.type) &&
         /^\/[0-9a-fA-F]{64}\.(jpg|jpeg)$/i.test(new URL(req.url).pathname));
     let targetKey = media.storageKey;
     if (isVideoThumbnail) {
@@ -467,6 +467,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       const legacyVtt = media.lang ? `${media.hash}.${media.lang}.vtt` : `${media.hash}.vtt`;
       storageResp = await config.blobs.read(legacyVtt, req);
     }
+    let thumbError: { status: number; message: string } | null = null;
     if (storageResp.status === 404 && isVideoThumbnail && config.upstreams?.uploadServiceUrl) {
       const thumbUrl = `${
         config.upstreams.uploadServiceUrl.replace(/\/+$/, "")
@@ -493,10 +494,9 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       } else {
         await thumbRes.body?.cancel().catch(() => {});
         if (thumbRes.status === 422) {
-          return jsonResp(422, { error: "Thumbnail cannot be generated for this video" });
-        }
-        if (thumbRes.status !== 404) {
-          return jsonResp(503, { error: "Thumbnail generation unavailable" });
+          thumbError = { status: 422, message: "Thumbnail cannot be generated for this video" };
+        } else if (thumbRes.status !== 404) {
+          thumbError = { status: 503, message: "Thumbnail generation unavailable" };
         }
       }
     } else if (storageResp.status === 404 && !isVideoThumbnail && targetKey !== media.storageKey) {
@@ -522,6 +522,10 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
     ) {
       await storageResp.body?.cancel().catch(() => {});
       return jsonResp(404, { error: "policy changed during origin read" });
+    }
+
+    if (thumbError) {
+      return jsonResp(thumbError.status, { error: thumbError.message });
     }
 
     if (storageResp.status === 404) {
@@ -646,7 +650,6 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         "authorization",
         "content-type",
         "content-length",
-        "x-sha256",
         "x-request-id",
         "accept",
       ]
@@ -654,10 +657,8 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       const val = req.headers.get(name);
       if (val !== null) headers.set(name, val);
     }
-    if (!headers.has("x-sha256")) {
-      const hyphenatedSha = req.headers.get("x-sha-256");
-      if (hyphenatedSha !== null) headers.set("x-sha256", hyphenatedSha);
-    }
+    const shaHeader = req.headers.get("x-sha-256") ?? req.headers.get("x-sha256");
+    if (shaHeader !== null) headers.set("x-sha256", shaHeader);
     for (const [key, val] of req.headers.entries()) {
       const lower = key.toLowerCase();
       if (lower.startsWith("x-proofmode-") || lower.startsWith("x-c2pa-")) {
@@ -1224,7 +1225,16 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         return jsonResp(401, { error: "invalid upload authorization" });
       }
 
-      const declaredShaHeader = req.headers.get("x-sha-256") ?? req.headers.get("x-sha256");
+      const hyphenatedSha = req.headers.get("x-sha-256");
+      const compactSha = req.headers.get("x-sha256");
+      if (
+        hyphenatedSha !== null &&
+        compactSha !== null &&
+        hyphenatedSha.trim().toLowerCase() !== compactSha.trim().toLowerCase()
+      ) {
+        return jsonResp(400, { error: "Conflicting X-SHA-256 and X-Sha256 headers" });
+      }
+      const declaredShaHeader = hyphenatedSha ?? compactSha;
       let declaredSha: string | null = null;
       if (declaredShaHeader !== null) {
         const normalized = declaredShaHeader.trim().toLowerCase();
@@ -1429,10 +1439,10 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         });
       }
       if (existing?.status === "deleted" || existing?.gate) {
-        const error = existing && canReplaceOwnerDeletion(existing)
-          ? "Use PUT /upload to repost a deleted blob"
-          : "parent unavailable";
-        return jsonResp(409, { error }, capHeaders);
+        if (existing && canReplaceOwnerDeletion(existing)) {
+          return jsonResp(400, { error: "Use PUT /upload to repost a deleted blob" }, capHeaders);
+        }
+        return uploadUnavailable("parent unavailable");
       }
       if (existing) {
         return jsonResp(
@@ -1560,7 +1570,8 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         },
       );
       if (!upstreamRes.ok) {
-        return await mapUpstreamErrorResponse(upstreamRes, { uploadResult: true });
+        // Preserve Cloud Run's deterministic 409 Conflict ("Upload incomplete: X of Y bytes committed").
+        return await mapUpstreamErrorResponse(upstreamRes);
       }
 
       let rawComplete: unknown;
@@ -1806,6 +1817,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       let erased = 0;
       let unlinked = 0;
       let skippedHeld = 0;
+      let casSkipped = false;
       for (const row of page.items) {
         const holds = await config.catalog.getQuarantineHolds(row.hash);
         if (row.held || holds.length > 0) {
@@ -1823,13 +1835,19 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
           deletedAt: last ? now() : row.deletedAt,
           ownerDeleted: undefined,
         };
-        if (await config.catalog.cas(row.hash, row.revision, next)) {
+        if (
+          await config.catalog.cas(row.hash, row.revision, next, {
+            requireUnquarantined: true,
+            purge: last ? { reason: "user_vanish", deleteB2: true, createdAt: now() } : undefined,
+          })
+        ) {
           if (last) {
             erased++;
-            await bestEffortPurge(row.hash, "user_vanish", true);
           } else {
             unlinked++;
           }
+        } else {
+          casSkipped = true;
         }
       }
       return jsonResp(202, {
@@ -1837,7 +1855,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         erased,
         unlinked,
         skipped_held: skippedHeld,
-        remaining: page.nextCursor !== null,
+        remaining: page.nextCursor !== null || casSkipped,
       });
     }
 
@@ -2124,8 +2142,11 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         try {
           const currentRow = await config.catalog.get(item.hash);
           const currentHolds = await config.catalog.getQuarantineHolds(item.hash);
-          const waitingForHoldRelease = item.deleteB2 && currentRow?.status === "deleted" &&
-            currentRow.cleanupPending && (currentRow.held || currentHolds.length > 0);
+          const waitingForHoldRelease = item.deleteB2 &&
+            ((!currentRow && currentHolds.length > 0) ||
+              (currentRow?.status === "deleted" &&
+                currentRow.cleanupPending &&
+                (currentRow.held || currentHolds.length > 0)));
           const allowB2Delete = item.deleteB2 &&
             currentHolds.length === 0 &&
             (!currentRow ||
@@ -2210,11 +2231,21 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         deletedAt: mapped === "delete" ? now() : row.deletedAt,
         ownerDeleted: undefined,
       };
-      if (!await config.catalog.cas(hash, row.revision, next)) {
+      if (
+        !await config.catalog.cas(hash, row.revision, next, {
+          purge: needsPurge
+            ? { reason: `moderate_${newStatus}`, deleteB2: mapped === "delete", createdAt: now() }
+            : undefined,
+        })
+      ) {
         return jsonResp(409, { error: "concurrent update" });
       }
-      if (needsPurge) {
-        await bestEffortPurge(hash, `moderate_${newStatus}`, mapped === "delete");
+      if (needsPurge && config.purger && mapped !== "delete") {
+        try {
+          await config.purger.purgeHash(hash);
+        } catch {
+          // Outbox row was enqueued atomically with the CAS update.
+        }
       }
       return jsonResp(200, {
         success: true,
@@ -2242,10 +2273,20 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         deletedAt: now(),
         ownerDeleted: undefined,
       };
-      if (!await config.catalog.cas(hash, row.revision, next)) {
+      if (
+        !await config.catalog.cas(hash, row.revision, next, {
+          purge: { reason: "admin_soft_delete", deleteB2: false, createdAt: now() },
+        })
+      ) {
         return jsonResp(409, { error: "concurrent update" });
       }
-      await bestEffortPurge(hash, "admin_soft_delete", false);
+      if (config.purger) {
+        try {
+          await config.purger.purgeHash(hash);
+        } catch {
+          // Outbox row was enqueued atomically with the CAS update.
+        }
+      }
       return jsonResp(200, { success: true, sha256: hash, legal_hold: next.held });
     }
 
@@ -2268,6 +2309,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         status: target,
         ageRestricted: target === "age_restricted",
         held: false,
+        cleanupPending: false,
         deletedAt: undefined,
         ownerDeleted: undefined,
       };
@@ -2349,6 +2391,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       const page = await config.catalog.list(pubkey, 100, null, { includeRestricted: true });
       let erased = 0;
       let skippedHeld = 0;
+      let casSkipped = false;
       for (const row of page.items) {
         const holds = await config.catalog.getQuarantineHolds(row.hash);
         if (row.held || holds.length > 0) {
@@ -2358,27 +2401,38 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         const owners = row.owners.filter((k) => k !== pubkey);
         const last = owners.length === 0;
         if (
-          await config.catalog.cas(row.hash, row.revision, {
-            ...row,
-            owners,
-            revision: row.revision + 1,
-            status: last ? "deleted" : row.status,
-            cleanupPending: last || row.cleanupPending,
-            deletedAt: last ? now() : row.deletedAt,
-            ownerDeleted: undefined,
-          })
+          await config.catalog.cas(
+            row.hash,
+            row.revision,
+            {
+              ...row,
+              owners,
+              revision: row.revision + 1,
+              status: last ? "deleted" : row.status,
+              cleanupPending: last || row.cleanupPending,
+              deletedAt: last ? now() : row.deletedAt,
+              ownerDeleted: undefined,
+            },
+            {
+              requireUnquarantined: true,
+              purge: last
+                ? { reason: "admin_vanish", deleteB2: true, createdAt: now() }
+                : undefined,
+            },
+          )
         ) {
           if (last) {
             erased++;
-            await bestEffortPurge(row.hash, "admin_vanish", true);
           }
+        } else {
+          casSkipped = true;
         }
       }
       return jsonResp(202, {
         pubkey,
         erased,
         skipped_held: skippedHeld,
-        remaining: page.nextCursor !== null,
+        remaining: page.nextCursor !== null || casSkipped,
       });
     }
 
