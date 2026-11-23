@@ -3830,7 +3830,9 @@ fn handle_upload(mut req: Request, record: &mut UploadLogRecord) -> Result<Respo
                 metadata.transcript_status,
             );
             let descriptor = metadata.to_descriptor(&base_url);
-            return Ok(json_response(StatusCode::OK, &descriptor));
+            let mut resp = json_response(StatusCode::OK, &descriptor);
+            add_cors_headers(&mut resp);
+            return Ok(resp);
         }
     }
 
@@ -4796,17 +4798,10 @@ fn handle_upload_requirements(req: Request) -> Result<Response> {
                 add_cors_headers(&mut resp);
                 return Ok(resp);
             }
-
-            // Check if blob already exists (optimization - client can skip upload)
-            if blob_exists(hash)? {
-                let mut resp = Response::from_status(StatusCode::OK);
-                resp.set_header("X-Reason", "Blob already exists");
-                resp.set_header("X-Exists", "true");
-                add_upload_capability_headers(&mut resp, &control_host);
-                add_cors_headers(&mut resp);
-                return Ok(resp);
-            }
         }
+
+        // Preflight validates the request only. Clients check whether the blob
+        // exists with HEAD /<sha256>, which enforces visibility and holds.
 
         // Validate content length
         if let Some(size) = content_length {
@@ -7717,7 +7712,7 @@ struct UploadCapabilityHeaders {
 
 fn upload_exposed_headers() -> &'static str {
     // Retry-After lets a browser client read the throttle backoff on a 429.
-    "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256, X-Content-SHA256, X-Audio-Duration, X-Audio-Size, X-Divine-Upload-Extensions, X-Divine-Upload-Control-Host, X-Divine-Upload-Data-Host, X-Reason, X-Exists, Retry-After, Content-Language, X-Divine-Machine-Translated"
+    "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256, X-Content-SHA256, X-Audio-Duration, X-Audio-Size, X-Divine-Upload-Extensions, X-Divine-Upload-Control-Host, X-Divine-Upload-Data-Host, X-Reason, Retry-After, Content-Language, X-Divine-Machine-Translated"
 }
 
 fn upload_control_host(public_host: Option<&str>) -> String {
@@ -9076,6 +9071,25 @@ mod tests {
         assert!(exposed_headers.contains("X-Divine-Upload-Data-Host"));
         // Browser clients must be able to read the 429 throttle backoff.
         assert!(exposed_headers.contains("Retry-After"));
+    }
+
+    #[test]
+    fn upload_preflight_validates_digest_without_lookup() {
+        use super::{handle_upload_requirements, Method, Request};
+
+        // This fixture has no storage backend or metadata store.
+        for method in [Method::HEAD, Method::GET] {
+            let req = Request::new(method, "https://media.divine.video/upload")
+                .with_header("X-SHA-256", "a".repeat(64))
+                .with_header("X-Content-Length", "10");
+            let resp = handle_upload_requirements(req).unwrap();
+            assert_eq!(resp.get_status(), StatusCode::OK);
+            assert_eq!(
+                resp.get_header_str("X-Reason"),
+                Some("Upload would be accepted")
+            );
+            assert!(resp.get_header("X-Exists").is_none());
+        }
     }
 
     #[test]

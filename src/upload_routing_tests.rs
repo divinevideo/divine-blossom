@@ -61,6 +61,26 @@ fn canonical_upload_routing_contract() {
         assert!(should_proxy_direct_upload(15, "image/jpeg").is_err());
         return;
     }
+    if case == "inline_dedupe" {
+        let hash = hex::encode(Sha256::digest(b"synthetic image"));
+        let metadata = serde_json::json!({
+            "sha256": hash, "size": 15, "type": "image/jpeg",
+            "uploaded": "2026-01-01T00:00:00Z", "owner": "b".repeat(64), "status": "active"
+        });
+        crate::metadata::open_store()
+            .unwrap()
+            .insert(&format!("blob:{hash}"), metadata.to_string())
+            .unwrap();
+        let request = upload_request(true).with_header("Origin", "https://client.example");
+        let mut record = UploadLogRecord::new(UploadRoute::DirectPut, "synthetic-routing".into(), 0);
+        let resp = handle_upload(request, &mut record).unwrap();
+        assert_eq!(resp.get_status(), StatusCode::OK);
+        assert_eq!(
+            resp.get_header_str("Access-Control-Allow-Origin"),
+            Some("*")
+        );
+        return;
+    }
     if case == "dedupe" {
         let hash = hex::encode(Sha256::digest(b"synthetic image"));
         let store = crate::metadata::open_store().unwrap();
