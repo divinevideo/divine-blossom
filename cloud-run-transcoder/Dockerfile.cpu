@@ -1,0 +1,34 @@
+# ABOUTME: Slim CPU-only Dockerfile for running divine-transcoder off Cloud Run
+# ABOUTME: Omits the ~3 GB CUDA runtime layer for Hetzner/Vultr/bare-metal workers
+
+FROM rust:1.83-slim-bookworm AS builder
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+
+COPY blossom-core /blossom-core
+COPY Cargo.toml Cargo.lock* ./
+
+RUN mkdir src && echo "fn main() {}" > src/main.rs
+RUN cargo build --release --locked
+RUN rm -rf src
+
+COPY src ./src
+RUN touch src/main.rs && cargo build --release --locked
+
+FROM ubuntu:22.04
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/divine-transcoder /app/divine-transcoder
+
+ENV PORT=8080
+ENV USE_GPU=false
+
+CMD ["/app/divine-transcoder"]

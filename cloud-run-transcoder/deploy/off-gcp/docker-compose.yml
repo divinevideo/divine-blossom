@@ -1,0 +1,44 @@
+# ABOUTME: Docker Compose stack for an off-GCP divine-transcoder worker (Vultr / Hetzner US)
+# ABOUTME: Runs Caddy TLS termination in front of divine-transcoder with tmpfs scratch space
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      TRANSCODER_DOMAIN: ${TRANSCODER_DOMAIN:?Set TRANSCODER_DOMAIN, e.g. transcoder-worker.divine.video}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - transcoder
+
+  transcoder:
+    image: ${TRANSCODER_IMAGE:?Set TRANSCODER_IMAGE, e.g. gcr.io/rich-compiler-479518-d2/divine-transcoder:cpu-latest}
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PORT: "8080"
+      USE_GPU: "false"
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gcp-sa.json
+      MEDIA_STORAGE_PROVIDER: b2_primary
+      MEDIA_GCS_BACKUP_ENABLED: "false"
+      TRANSCODE_WRITES_PAUSED: "false"
+    volumes:
+      - ${GCP_SA_KEY_PATH:-/etc/divine-transcoder/gcp-sa.json}:/run/secrets/gcp-sa.json:ro
+    tmpfs:
+      - /tmp:size=8G,mode=1777
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /health HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q '200 OK' <&3"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  caddy_data:
+  caddy_config:

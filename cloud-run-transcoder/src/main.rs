@@ -3657,17 +3657,92 @@ fn token_fetch_retry_delay(attempt: u32) -> Duration {
     }
 }
 
-/// Fetch a GCP access token from the metadata server (works on Cloud Run)
-/// or fall back to `gcloud auth print-access-token` locally.
+const GCP_CLOUD_PLATFORM_SCOPES: &[&str] = &["https://www.googleapis.com/auth/cloud-platform"];
+
+fn has_explicit_gcp_credentials_in_lookup<F>(mut lookup: F) -> bool
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    [
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_APPLICATION_CREDENTIALS_JSON",
+    ]
+    .into_iter()
+    .any(|key| lookup(key).is_some_and(|value| !value.trim().is_empty()))
+}
+
+fn has_explicit_gcp_credentials_env() -> bool {
+    has_explicit_gcp_credentials_in_lookup(|key| std::env::var(key).ok())
+}
+
+fn token_expires_in_secs(expiry: Option<time::OffsetDateTime>, now_unix: i64) -> Option<u64> {
+    expiry.map(|exp| exp.unix_timestamp().saturating_sub(now_unix).max(0) as u64)
+}
+
+async fn fetch_token_from_google_credentials() -> std::result::Result<MetadataAccessToken, String> {
+    let creds = google_cloud_auth::credentials::CredentialsFile::new()
+        .await
+        .map_err(|e| format!("failed to load GCP credentials: {}", e))?;
+    let source = google_cloud_auth::project::create_token_source_from_credentials(
+        &creds,
+        &google_cloud_auth::project::Config {
+            audience: None,
+            scopes: Some(GCP_CLOUD_PLATFORM_SCOPES),
+            sub: None,
+        },
+    )
+    .await
+    .map_err(|e| format!("failed to create GCP token source: {}", e))?;
+    let token = source
+        .token()
+        .await
+        .map_err(|e| format!("failed to exchange GCP credentials for token: {}", e))?;
+    if token.access_token.trim().is_empty() {
+        return Err("GCP credentials returned empty access token".to_string());
+    }
+    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+    let expires_in = token_expires_in_secs(token.expiry, now_unix);
+    Ok(MetadataAccessToken {
+        token: token.access_token,
+        expires_in,
+    })
+}
+
+/// Fetch a GCP access token from explicit `GOOGLE_APPLICATION_CREDENTIALS` /
+/// `GOOGLE_APPLICATION_CREDENTIALS_JSON` (for off-GCP workers), the GCE/Cloud
+/// Run metadata server, or `gcloud auth print-access-token` locally.
 ///
 /// Tokens are cached process-wide for no longer than `ACCESS_TOKEN_CACHE_TTL`.
-/// On a cache miss, the metadata server is retried `METADATA_FETCH_MAX_ATTEMPTS`
-/// times before giving up — a transient hiccup used to fall straight
-/// through to a `gcloud` exec that doesn't exist in the container, which
-/// in turn triggered an expensive Vertex AI Gemini fallback.
+/// On a cache miss, the active credential source is retried
+/// `METADATA_FETCH_MAX_ATTEMPTS` times before giving up — a transient hiccup
+/// used to fall straight through to a `gcloud` exec that doesn't exist in the
+/// container, which in turn triggered an expensive Vertex AI Gemini fallback.
 async fn fetch_gcp_access_token() -> std::result::Result<String, ProviderFailure> {
     if let Some(token) = access_token_cache().get(Instant::now()) {
         return Ok(token);
+    }
+
+    if has_explicit_gcp_credentials_env() {
+        let mut last_error: Option<String> = None;
+        for attempt in 0..METADATA_FETCH_MAX_ATTEMPTS {
+            match fetch_token_from_google_credentials().await {
+                Ok(cred_token) => {
+                    let cache_ttl = cred_token.cache_ttl();
+                    access_token_cache().set(cred_token.token.clone(), cache_ttl, Instant::now());
+                    return Ok(cred_token.token);
+                }
+                Err(err) => {
+                    last_error = Some(err);
+                    if attempt + 1 < METADATA_FETCH_MAX_ATTEMPTS {
+                        tokio::time::sleep(token_fetch_retry_delay(attempt)).await;
+                    }
+                }
+            }
+        }
+        return Err(provider_credential_failure(&format!(
+            "Failed to get GCP access token from configured credentials: {}",
+            last_error.unwrap_or_else(|| "unknown credential error".to_string())
+        )));
     }
 
     let mut last_metadata_error: Option<String> = None;
@@ -3929,13 +4004,108 @@ pub(crate) fn identity_token_cache_for_audience(audience: &str) -> &'static Acce
     leaked
 }
 
+fn parse_iam_id_token_response(body: &str) -> std::result::Result<String, String> {
+    #[derive(serde::Deserialize)]
+    struct IamIdTokenResponse {
+        token: String,
+    }
+    let parsed: IamIdTokenResponse = serde_json::from_str(body)
+        .map_err(|e| format!("failed to parse IAM generateIdToken json: {}", e))?;
+    let token = parsed.token.trim();
+    if token.is_empty() {
+        return Err("IAM generateIdToken returned empty token".to_string());
+    }
+    Ok(token.to_string())
+}
+
+async fn fetch_identity_token_via_iam_credentials(
+    audience: &str,
+) -> std::result::Result<String, String> {
+    let creds = google_cloud_auth::credentials::CredentialsFile::new()
+        .await
+        .map_err(|e| format!("failed to load GCP credentials: {}", e))?;
+    let service_account_email = creds
+        .client_email
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "GCP credentials missing client_email for OIDC identity token".to_string()
+        })?;
+    let access_token = fetch_gcp_access_token().await.map_err(|e| {
+        format!(
+            "failed to get access token for IAM generateIdToken: {}",
+            e.body
+        )
+    })?;
+    let url = format!(
+        "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{}:generateIdToken",
+        service_account_email
+    );
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .bearer_auth(&access_token)
+        .json(&serde_json::json!({
+            "audience": audience,
+            "includeEmail": true
+        }))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("IAM generateIdToken request failed: {}", e))?;
+
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("failed to read IAM generateIdToken body: {}", e))?;
+    if !status.is_success() {
+        invalidate_gcp_access_token_if_expired_response(
+            &access_token,
+            Some(status.as_u16()),
+            &body,
+        );
+        return Err(format!(
+            "IAM generateIdToken returned status {}",
+            status.as_u16()
+        ));
+    }
+    parse_iam_id_token_response(&body)
+}
+
 /// Fetch a Cloud Run identity token (OIDC) for `audience`. Cached per
-/// audience for 50 minutes. On metadata-server failure we apply the same
+/// audience for 50 minutes. Uses IAM `generateIdToken` when explicit
+/// `GOOGLE_APPLICATION_CREDENTIALS*` env vars are configured (off-GCP
+/// workers), otherwise queries the GCE/Cloud Run metadata server with the same
 /// 3-attempt retry as `fetch_gcp_access_token`.
 async fn fetch_gcp_identity_token(audience: &str) -> std::result::Result<String, ProviderFailure> {
     let cache = identity_token_cache_for_audience(audience);
     if let Some(token) = cache.get(Instant::now()) {
         return Ok(token);
+    }
+
+    if has_explicit_gcp_credentials_env() {
+        let mut last_error: Option<String> = None;
+        for attempt in 0..METADATA_FETCH_MAX_ATTEMPTS {
+            match fetch_identity_token_via_iam_credentials(audience).await {
+                Ok(token) => {
+                    cache.set(token.clone(), ACCESS_TOKEN_CACHE_TTL, Instant::now());
+                    return Ok(token);
+                }
+                Err(err) => {
+                    last_error = Some(err);
+                    if attempt + 1 < METADATA_FETCH_MAX_ATTEMPTS {
+                        tokio::time::sleep(token_fetch_retry_delay(attempt)).await;
+                    }
+                }
+            }
+        }
+        return Err(provider_credential_failure(&format!(
+            "Failed to get GCP identity token via IAM credentials (audience={}): {}",
+            audience,
+            last_error.unwrap_or_else(|| "unknown IAM credential error".to_string())
+        )));
     }
 
     let mut last_metadata_error: Option<String> = None;
@@ -6889,6 +7059,41 @@ mod tests {
             AudioRemux::Reencode.ffmpeg_args(),
             ["-c:a", "aac", "-b:a", "128k"]
         );
+    }
+
+    #[test]
+    fn explicit_gcp_credentials_detection_ignores_blank_values() {
+        assert!(!crate::has_explicit_gcp_credentials_in_lookup(|_| None));
+        assert!(!crate::has_explicit_gcp_credentials_in_lookup(|_| {
+            Some("   ".to_string())
+        }));
+        assert!(crate::has_explicit_gcp_credentials_in_lookup(|k| {
+            (k == "GOOGLE_APPLICATION_CREDENTIALS").then(|| "/run/secrets/gcp-sa.json".to_string())
+        }));
+        assert!(crate::has_explicit_gcp_credentials_in_lookup(|k| {
+            (k == "GOOGLE_APPLICATION_CREDENTIALS_JSON").then(|| "{}".to_string())
+        }));
+    }
+
+    #[test]
+    fn token_expires_in_secs_clamps_expired_timestamps_to_zero() {
+        let now = 1_700_000_000_i64;
+        let future = time::OffsetDateTime::from_unix_timestamp(now + 3600).unwrap();
+        let past = time::OffsetDateTime::from_unix_timestamp(now - 30).unwrap();
+        assert_eq!(crate::token_expires_in_secs(Some(future), now), Some(3600));
+        assert_eq!(crate::token_expires_in_secs(Some(past), now), Some(0));
+        assert_eq!(crate::token_expires_in_secs(None, now), None);
+    }
+
+    #[test]
+    fn parse_iam_id_token_response_accepts_token_and_rejects_empty_or_invalid() {
+        assert_eq!(
+            crate::parse_iam_id_token_response(r#"{"token":"  jwt.body.sig  "}"#).unwrap(),
+            "jwt.body.sig"
+        );
+        assert!(crate::parse_iam_id_token_response(r#"{"token":"   "}"#).is_err());
+        assert!(crate::parse_iam_id_token_response(r#"{}"#).is_err());
+        assert!(crate::parse_iam_id_token_response("not json").is_err());
     }
 }
 
