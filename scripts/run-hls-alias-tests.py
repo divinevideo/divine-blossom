@@ -92,7 +92,7 @@ blossom_secrets = [{{key="admin_token",data="synthetic-admin-token"}},{{key="gcs
                     "cargo", "test", "--locked", "--target", "wasm32-wasip1", "--bin", "fastly-blossom",
                     "hls_alias_", "--", "--ignored", "--nocapture"],
                     cwd=repo, env=env, capture_output=True, text=True, timeout=900)
-                if result.returncode or "test result: ok. 4 passed; 0 failed; 0 ignored;" not in result.stdout:
+                if result.returncode or "test result: ok. 5 passed; 0 failed; 0 ignored;" not in result.stdout:
                     raise RuntimeError(result.stdout + result.stderr)
                 prefix = f"/hls-test/{'a' * 64}/hls/"
                 provenance = [(PROVENANCE_PREFIX + "master.m3u8", None),
@@ -104,10 +104,11 @@ blossom_secrets = [{{key="admin_token",data="synthetic-admin-token"}},{{key="gcs
                     (prefix + "stream_480p.mp4", "bytes=0-3"),
                     (f"/hls-test/{'c' * 64}/hls/master.m3u8", None),
                     (f"/hls-test/{'f' * 64}/hls/master.m3u8", None),
+                    (f"/hls-test/{'9' * 64}/hls/stream_480p.mp4", None),
                     *provenance,
                 }
                 # Alias, canonical, admin and signed requests may share the cached origin master.
-                assert set(origin.reads) == required and len(origin.reads) <= 13, origin.reads
+                assert set(origin.reads) == required and len(origin.reads) <= 16, origin.reads
                 # One storage read per playlist proves the provenance repeats were cache hits,
                 # and that the refill replaced the seeded unreadable variant entry.
                 for read in provenance:

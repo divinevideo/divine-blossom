@@ -6,7 +6,8 @@ use std::{path::Path, time::Duration};
 use tokio::process::Command;
 
 const MAX_SECONDS: f64 = 10.0;
-const MAX_BITS_PER_SECOND: f64 = 500_000.0;
+const MAX_BITS_PER_SECOND: f64 = 1_500_000.0;
+const MAX_AUDIO_BITS_PER_SECOND: f64 = 128_000.0;
 
 /// Repackage a qualifying original in private staging. No original writes and
 /// no visible outputs until the complete HLS set can replace the empty output
@@ -18,7 +19,9 @@ pub async fn try_reuse(input: &Path, output: &Path) -> Result<bool> {
     if bytes == 0 || bytes as f64 > MAX_SECONDS * MAX_BITS_PER_SECOND / 8.0 {
         return Ok(false);
     }
-    let metadata = probe(input, false).await?;
+    let Some(metadata) = probe(input, false).await? else {
+        return Ok(false);
+    };
     if !eligible(&metadata, bytes) {
         return Ok(false);
     }
@@ -34,7 +37,9 @@ pub async fn try_reuse(input: &Path, output: &Path) -> Result<bool> {
     }
     // Decode and inspect all source packets in one bounded pass, rather than
     // launching separate probes for frames, video packets and audio packets.
-    let inspection = probe(input, true).await?;
+    let Some(inspection) = probe(input, true).await? else {
+        return Ok(false);
+    };
     let items = inspection["packets_and_frames"]
         .as_array()
         .context("Missing media inspection")?;
@@ -124,7 +129,9 @@ pub async fn try_reuse(input: &Path, output: &Path) -> Result<bool> {
     // MP4 colr metadata is not necessarily present in the H.264 bitstream.
     // Stream copying into TS can silently lose it while retaining identical
     // YUV samples, so a decode-only check cannot establish display fidelity.
-    let copied = probe(&candidate.path().join("stream_720p.ts"), false).await?;
+    let copied = probe(&candidate.path().join("stream_720p.ts"), false)
+        .await?
+        .context("Copied media probe rejected generated output")?;
     if !preserves_color(video, &copied)
         || !copied["streams"].as_array().is_some_and(|streams| {
             streams.iter().any(|s| {
@@ -169,9 +176,9 @@ pub async fn try_reuse(input: &Path, output: &Path) -> Result<bool> {
     Ok(true)
 }
 
-async fn probe(input: &Path, inspect: bool) -> Result<Value> {
+async fn probe(input: &Path, inspect: bool) -> Result<Option<Value>> {
     let mut command = Command::new("ffprobe");
-    command.args(["-v", "error", "-of", "json"]);
+    command.args(["-v", "error", "-of", "json", "-show_error"]);
     if inspect {
         command.args(["-show_packets", "-show_frames"]);
     } else {
@@ -180,8 +187,19 @@ async fn probe(input: &Path, inspect: bool) -> Result<Value> {
     let result =
         crate::media_command::output(command.arg(input), crate::media_command::PROBE_TIMEOUT)
             .await?;
+    parse_probe_output(result)
+}
+
+fn parse_probe_output(result: std::process::Output) -> Result<Option<Value>> {
+    // AVERROR_INVALIDDATA = FFERRTAG('I', 'N', 'D', 'A'). Do not classify
+    // missing tools, signals, deadlines, I/O, or unknown errors as bad media.
+    const INVALID_DATA: i64 = -1_094_995_529;
+    let value: Value = serde_json::from_slice(&result.stdout).context("Parse reuse media probe")?;
+    if result.status.code() == Some(1) && value["error"]["code"].as_i64() == Some(INVALID_DATA) {
+        return Ok(None);
+    }
     ensure!(result.status.success(), "Reuse media probe failed");
-    serde_json::from_slice(&result.stdout).context("Parse reuse media probe")
+    Ok(Some(value))
 }
 
 fn preserves_color(source: &Value, candidate: &Value) -> bool {
@@ -304,7 +322,7 @@ fn eligible(probe: &Value, file_bytes: u64) -> bool {
             && a["profile"] == "LC"
             && a["channels"].as_u64().is_some_and(|c| (1..=2).contains(&c))
             && matches!(a["sample_rate"].as_str(), Some("44100" | "48000"))
-            && number(&a["bit_rate"]).is_some_and(|n| n > 0.0 && n <= 96_000.0)
+            && number(&a["bit_rate"]).is_some_and(|n| n > 0.0 && n <= MAX_AUDIO_BITS_PER_SECOND)
             && number(&a["start_time"]).is_some_and(|n| n.abs() <= 0.05)
             && number(&a["duration"]).is_some_and(|n| n > 0.0 && (n - duration).abs() <= 0.1)
     })

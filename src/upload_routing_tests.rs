@@ -3,7 +3,7 @@ use super::*;
 use base64::Engine;
 use k256::schnorr::{signature::hazmat::PrehashSigner, Signature, SigningKey};
 
-fn upload_request(authenticated: bool) -> Request {
+pub(super) fn upload_request(authenticated: bool) -> Request {
     let body = b"synthetic image";
     let mut request = Request::put("https://media.divine.video/upload");
     request.set_header("Content-Type", "image/jpeg");
@@ -89,6 +89,7 @@ fn canonical_upload_routing_contract() {
                 auth.clone(),
                 "https://media.divine.video".into(),
                 upload,
+                true,
                 true,
             )
             .unwrap();

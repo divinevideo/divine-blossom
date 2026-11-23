@@ -1,0 +1,343 @@
+{
+  "source": "src/main.rs:route_request",
+  "source_sha256": "3c946b4cfe56e8744c9b6b43a863a02875ca9a36e99dcb57d8ba0f2866219eff",
+  "pre_match_dispatches": [
+    {
+      "source_line": 245,
+      "matcher": "match b2_cdn::route(&req) {",
+      "parity": "not established"
+    },
+    {
+      "source_line": 252,
+      "matcher": "match canary::route(&req) {",
+      "parity": "not established"
+    },
+    {
+      "source_line": 261,
+      "matcher": "if let Some(parent) = path.strip_prefix(\"/api/bunny-playback/\") {",
+      "parity": "not established"
+    }
+  ],
+  "routes": [
+    {
+      "source_line": 266,
+      "matcher": "(Method::GET, \"/\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 269,
+      "matcher": "(Method::GET, \"/version\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 274,
+      "matcher": "(Method::GET, p) if p.ends_with(\".hls\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 275,
+      "matcher": "(Method::HEAD, p) if p.ends_with(\".hls\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 278,
+      "matcher": "(Method::GET, p) if p.contains(\"/hls/\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 279,
+      "matcher": "(Method::HEAD, p) if p.contains(\"/hls/\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 282,
+      "matcher": "(Method::GET, p) if is_vtt_file_path(p)",
+      "parity": "not established"
+    },
+    {
+      "source_line": 283,
+      "matcher": "(Method::HEAD, p) if is_vtt_file_path(p)",
+      "parity": "not established"
+    },
+    {
+      "source_line": 286,
+      "matcher": "(Method::GET, p) if is_transcript_path(p)",
+      "parity": "not established"
+    },
+    {
+      "source_line": 287,
+      "matcher": "(Method::HEAD, p) if is_transcript_path(p)",
+      "parity": "not established"
+    },
+    {
+      "source_line": 290,
+      "matcher": "(Method::GET, p) if is_sound_analysis_path(p)",
+      "parity": "not established"
+    },
+    {
+      "source_line": 291,
+      "matcher": "(Method::HEAD, p) if is_sound_analysis_path(p)",
+      "parity": "not established"
+    },
+    {
+      "source_line": 294,
+      "matcher": "(Method::POST, \"/v1/subtitles/jobs\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 295,
+      "matcher": "(Method::GET, p) if p.starts_with(\"/v1/subtitles/jobs/\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 296,
+      "matcher": "(Method::GET, p) if p.starts_with(\"/v1/subtitles/by-hash/\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 301,
+      "matcher": "(Method::GET, p) if p.ends_with(\"/provenance\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 304,
+      "matcher": "(Method::GET, p) if is_audio_path(p)",
+      "parity": "not established"
+    },
+    {
+      "source_line": 305,
+      "matcher": "(Method::HEAD, p) if is_audio_path(p)",
+      "parity": "not established"
+    },
+    {
+      "source_line": 308,
+      "matcher": "(Method::GET, p) if is_quality_variant_path(p)",
+      "parity": "not established"
+    },
+    {
+      "source_line": 309,
+      "matcher": "(Method::HEAD, p) if is_quality_variant_path(p)",
+      "parity": "not established"
+    },
+    {
+      "source_line": 312,
+      "matcher": "(Method::GET, p) if is_hash_path(p)",
+      "parity": "not established"
+    },
+    {
+      "source_line": 313,
+      "matcher": "(Method::HEAD, p) if is_hash_path(p)",
+      "parity": "not established"
+    },
+    {
+      "source_line": 316,
+      "matcher": "(Method::PUT, \"/upload\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 318,
+      "matcher": "(Method::HEAD, \"/upload\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 321,
+      "matcher": "(Method::POST, \"/transcribe\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 323,
+      "matcher": "(Method::POST, \"/upload/init\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 326,
+      "matcher": "(Method::POST, p) if p.starts_with(\"/upload/\") && p.ends_with(\"/complete\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 333,
+      "matcher": "(Method::DELETE, p) if is_hash_path(p)",
+      "parity": "not established"
+    },
+    {
+      "source_line": 336,
+      "matcher": "(Method::DELETE, \"/vanish\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 339,
+      "matcher": "(Method::GET, p) if p.starts_with(\"/list/\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 342,
+      "matcher": "(Method::PUT, \"/report\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 345,
+      "matcher": "(Method::PUT, \"/mirror\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 348,
+      "matcher": "(Method::POST, \"/admin/moderate\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 351,
+      "matcher": "(Method::POST, \"/admin/transcode-status\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 352,
+      "matcher": "(Method::POST, \"/admin/transcript-status\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 355,
+      "matcher": "(Method::POST, \"/admin/auth/google\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 356,
+      "matcher": "(Method::GET, \"/admin/auth/github\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 357,
+      "matcher": "(Method::GET, p) if p.starts_with(\"/admin/auth/github/callback\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 360,
+      "matcher": "(Method::POST, \"/admin/logout\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 362,
+      "matcher": "(_, p) if p.starts_with(\"/internal/archive/v1/\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 368,
+      "matcher": "(Method::GET, \"/admin\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 369,
+      "matcher": "(_, p) if p.starts_with(\"/admin/api/b2-parent-gate/\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 376,
+      "matcher": "(Method::GET, \"/admin/api/stats\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 377,
+      "matcher": "(Method::GET, \"/admin/api/recent\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 378,
+      "matcher": "(Method::GET, \"/admin/api/users\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 379,
+      "matcher": "(Method::GET, p) if p.starts_with(\"/admin/api/user/\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 383,
+      "matcher": "(Method::GET, p) if p.starts_with(\"/admin/api/blob/\") && p.ends_with(\"/content\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 392,
+      "matcher": "(Method::GET, p) if p.starts_with(\"/admin/api/blob/\") && is_admin_quality_variant_path(p)",
+      "parity": "not established"
+    },
+    {
+      "source_line": 398,
+      "matcher": "(Method::GET, p) if p.starts_with(\"/admin/api/blob/\") && p.contains(\"/hls/\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 401,
+      "matcher": "(Method::GET, p) if p.starts_with(\"/admin/api/blob/\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 405,
+      "matcher": "(Method::POST, \"/admin/api/moderate\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 406,
+      "matcher": "(_, \"/admin/api/b2-cdn-purge/drain\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 409,
+      "matcher": "(_, \"/admin/api/bunny-pilot/publish\" | \"/admin/api/bunny-pilot/finalize\" | blossom_core::bunny_worker::PERMIT_PATH)",
+      "parity": "not established"
+    },
+    {
+      "source_line": 412,
+      "matcher": "(Method::POST, \"/admin/api/quarantine\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 413,
+      "matcher": "(Method::GET, p) if p.starts_with(\"/admin/api/quarantine/\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 419,
+      "matcher": "(Method::POST, \"/admin/api/bulk-approve\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 420,
+      "matcher": "(Method::POST, \"/admin/api/scan-flagged\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 421,
+      "matcher": "(Method::POST, \"/admin/api/delete\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 422,
+      "matcher": "(Method::POST, \"/admin/api/restore\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 423,
+      "matcher": "(Method::POST, \"/admin/api/vanish\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 424,
+      "matcher": "(Method::POST, \"/admin/api/backfill\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 425,
+      "matcher": "(Method::POST, \"/admin/api/backfill-vtt\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 426,
+      "matcher": "(Method::POST, \"/admin/api/reset-stuck-transcodes\")",
+      "parity": "not established"
+    },
+    {
+      "source_line": 431,
+      "matcher": "(Method::OPTIONS, _)",
+      "parity": "not established"
+    }
+  ]
+}
