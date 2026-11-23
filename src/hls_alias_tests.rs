@@ -246,6 +246,20 @@ fn hls_alias_failed_admission_keeps_playback_retryable() {
         StatusCode::ACCEPTED
     );
 
+    if crate::request_bindings::config("hetzner_transcode_admission")
+        .unwrap()
+        .as_deref()
+        == Some("true")
+    {
+        let _scope = crate::request_bindings::begin();
+        for key in ["admin_token", "gcs_access_key", "gcs_secret_key", "fixture_a", "fixture_b"] {
+            assert!(crate::request_bindings::secret(key).unwrap().is_some());
+        }
+        // The request already spent all five secret lookups; legacy intake
+        // should remain available without reading or forwarding another secret.
+        assert!(queue_transcode(&"e".repeat(64), &"b".repeat(64)).unwrap());
+    }
+
     // A terminal callback that beats admission must retain its newer state.
     let before = get_blob_metadata(&hash).unwrap().unwrap();
     crate::metadata::update_transcode_status(&hash, TranscodeStatus::Complete).unwrap();

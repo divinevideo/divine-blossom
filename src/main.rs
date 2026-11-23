@@ -3519,7 +3519,8 @@ fn transcode_admission_unavailable() -> BlossomError {
 /// `Ok(true)` requires durable admission. `Ok(false)` identifies a legacy
 /// transcoder that does not implement the queue-only route.
 fn queue_transcode(hash: &str, owner: &str) -> Result<bool> {
-    let use_hetzner = match crate::request_bindings::config("hetzner_transcode_admission")
+    const ADMISSION_SECRET: &str = "transcode_admission_secret";
+    let hetzner_enabled = match crate::request_bindings::config("hetzner_transcode_admission")
         .map_err(|_| transcode_admission_unavailable())?
         .as_deref()
     {
@@ -3527,6 +3528,9 @@ fn queue_transcode(hash: &str, owner: &str) -> Result<bool> {
         Some("false") | None => false,
         _ => return Err(transcode_admission_unavailable()),
     };
+    // Storage fallbacks and admin auth can spend all Fastly secret reads.
+    // Select Cloud Run before dispatch on those requests.
+    let use_hetzner = hetzner_enabled && crate::request_bindings::can_read_secret(ADMISSION_SECRET);
     let (host, backend) = if use_hetzner {
         (
             HETZNER_TRANSCODE_ADMISSION_HOST,
@@ -3537,7 +3541,7 @@ fn queue_transcode(hash: &str, owner: &str) -> Result<bool> {
     };
     let mut request = transcode_dispatch_request(host, "/transcode/queue", hash, owner);
     if use_hetzner {
-        let credential = crate::storage::get_secret("transcode_admission_secret")
+        let credential = crate::storage::get_secret(ADMISSION_SECRET)
             .ok()
             .filter(|secret| !secret.trim().is_empty())
             .and_then(|secret| secret.trim().parse::<fastly::http::HeaderValue>().ok())

@@ -20,7 +20,18 @@ class Origin(BaseHTTPRequestHandler):
     def do_POST(self):
         assert self.path == "/transcode/queue"
         body = self.rfile.read(int(self.headers["Content-Length"]))
-        assert json.loads(body) == {"hash": "f" * 64, "owner": "b" * 64}
+        payload = json.loads(body)
+        if payload["hash"] == "e" * 64:
+            assert self.server.use_hetzner
+            assert payload["owner"] == "b" * 64
+            assert self.headers.get("x-divine-transcode-admission") is None
+            assert self.headers["Host"] == "divine-transcoder-149672065768.us-central1.run.app"
+            self.server.fallback_admissions += 1
+            self.send_response(202)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        assert payload == {"hash": "f" * 64, "owner": "b" * 64}
         expected_credential = "synthetic-admission-token" if self.server.use_hetzner else None
         assert self.headers.get("x-divine-transcode-admission") == expected_credential
         self.server.admissions += 1
@@ -64,6 +75,7 @@ def main(use_hetzner=False):
     with ThreadingHTTPServer(("127.0.0.1", 0), Origin) as origin:
         origin.reads = []
         origin.admissions = 0
+        origin.fallback_admissions = 0
         origin.use_hetzner = use_hetzner
         thread = threading.Thread(target=origin.serve_forever, daemon=True)
         thread.start()
@@ -79,6 +91,10 @@ def main(use_hetzner=False):
                 admission_backend = (
                     "hetzner_transcode_admission" if use_hetzner else "cloud_run_transcoder"
                 )
+                legacy_backend = (
+                    f'[local_server.backends.cloud_run_transcoder]\nurl = "http://127.0.0.1:{origin.server_port}"'
+                    if use_hetzner else ""
+                )
                 config.write_text(f'''manifest_version = 3
 name = "hls-alias-test"
 language = "rust"
@@ -86,6 +102,7 @@ language = "rust"
 url = "http://127.0.0.1:{origin.server_port}"
 [local_server.backends.{admission_backend}]
 url = "http://127.0.0.1:{origin.server_port}"
+{legacy_backend}
 [local_server.kv_stores.blossom_metadata]
 file = "{kv}"
 format = "json"
@@ -93,7 +110,7 @@ format = "json"
 file = "{settings}"
 format = "json"
 [local_server.secret_stores]
-blossom_secrets = [{{key="admin_token",data="synthetic-admin-token"}},{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_key",data="synthetic"}},{{key="transcode_admission_secret",data="synthetic-admission-token"}}]
+blossom_secrets = [{{key="admin_token",data="synthetic-admin-token"}},{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_key",data="synthetic"}},{{key="transcode_admission_secret",data="synthetic-admission-token"}},{{key="fixture_a",data="a"}},{{key="fixture_b",data="b"}}]
 ''')
                 env = os.environ.copy()
                 env["CARGO_TARGET_WASM32_WASIP1_RUNNER"] = shlex.join([
@@ -124,6 +141,7 @@ blossom_secrets = [{{key="admin_token",data="synthetic-admin-token"}},{{key="gcs
                 for read in provenance:
                     assert origin.reads.count(read) == 1, origin.reads
                 assert origin.admissions == 2, origin.admissions
+                assert origin.fallback_admissions == int(use_hetzner), origin.fallback_admissions
                 print("PASS HLS alias resolves canonical playlists/segments and ranged MP4 while preserving access and cache policy")
         finally:
             origin.shutdown()
