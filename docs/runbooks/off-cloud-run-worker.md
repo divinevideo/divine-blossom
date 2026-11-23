@@ -94,6 +94,24 @@ On the worker host:
    with `TRANSCODE_WRITES_PAUSED=true` initially, and place `/etc/divine-transcoder/gcp-sa.json` (`chown 10001:10001`, `chmod 600`).
 4. Start the stack (`docker compose up -d`) and verify `curl -fsS https://transcoder-worker.divine.video/health`.
 
+### Off-GCP job intake
+
+The worker may continue receiving Cloud Tasks at `/internal/transcode` while
+Cloud Run accepts new jobs. To move admission separately, deploy a worker with
+`TRANSCODE_ADMISSION_AUTH_REQUIRED=true` and a dedicated
+`TRANSCODE_ADMISSION_SECRET` before opening admission in the reverse proxy.
+The bundled Compose and Caddy configuration uses the same required-auth flag
+to enable `/transcode/queue`. If the host has a custom Caddyfile, keep its
+existing route restrictions and opt in to the two HLS intake routes explicitly.
+
+Configure queue-scoped enqueue access for the worker identity only after
+verifying that external unauthenticated admission is blocked. Ordinary requests
+to either intake route use `x-divine-transcode-admission`. Keep that credential
+separate from task delivery and forced repair. Verify that missing and wrong
+credentials return 401 and that a synthetic authenticated request returns 202
+and becomes playable before moving any caller. Keep non-HLS routes on their
+existing origin.
+
 ## 3. Single-writer cutover & rollback (Cloud Tasks URL-safe)
 
 Follow `docs/runbooks/hls-single-writer.md` — never run concurrent unpaused

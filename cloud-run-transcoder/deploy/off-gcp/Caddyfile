@@ -1,6 +1,7 @@
 {$TRANSCODER_DOMAIN} {
 	@worker_routes {
-		path /health /internal/transcode /transcode /backfill-fmp4 /transcribe /translate
+		# Expose the queue-only route only with the worker's required-auth flag.
+		expression `path('/health', '/internal/transcode', '/transcode', '/backfill-fmp4', '/transcribe', '/translate') || (path('/transcode/queue') && {env.TRANSCODE_ADMISSION_AUTH_REQUIRED} == 'true')`
 	}
 
 	handle @worker_routes {
