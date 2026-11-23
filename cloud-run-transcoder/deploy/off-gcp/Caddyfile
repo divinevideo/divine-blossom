@@ -1,0 +1,21 @@
+{$TRANSCODER_DOMAIN} {
+	@worker_routes {
+		path /health /internal/transcode /transcode /backfill-fmp4 /transcribe /translate
+	}
+
+	handle @worker_routes {
+		reverse_proxy transcoder:8080 {
+			transport http {
+				dial_timeout 10s
+				# Match Cloud Tasks dispatchDeadline (900s) for long transcode jobs.
+				response_header_timeout 910s
+				read_timeout 910s
+				write_timeout 910s
+			}
+		}
+	}
+
+	handle {
+		respond 404
+	}
+}
