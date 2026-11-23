@@ -331,7 +331,7 @@ async fn stream_copy_accepts_unspecified_pixel_aspect() {
     tokio::fs::create_dir(&output).await.unwrap();
     make_source_with_sar(&input, false, "36", "0").await;
 
-    let inspection = super::probe(&input, true).await.unwrap();
+    let inspection = super::probe(&input, true).await.unwrap().unwrap();
     let video_frames: Vec<_> = inspection["packets_and_frames"]
         .as_array()
         .unwrap()
@@ -1140,6 +1140,30 @@ done
 exec "$DIVINE_POLICY_TEST_FFMPEG" "$@"
 "#).unwrap();
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let real_probe = std::process::Command::new("which")
+            .arg("ffprobe")
+            .output()
+            .unwrap();
+        assert!(real_probe.status.success());
+        let probe_wrapper = dir.path().join("ffprobe");
+        std::fs::write(
+            &probe_wrapper,
+            r#"#!/bin/sh
+if [ "$DIVINE_POLICY_TEST_FAIL_GENERATED_PROBE" = '1' ]; then
+    for arg in "$@"; do
+        case "$arg" in
+            */stream_720p.ts)
+                printf '{"error":{"code":-1094995529}}\n'
+                exit 1
+                ;;
+        esac
+    done
+fi
+exec "$DIVINE_POLICY_TEST_FFPROBE" "$@"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&probe_wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
         let result = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -1150,6 +1174,10 @@ exec "$DIVINE_POLICY_TEST_FFMPEG" "$@"
             .env(CHILD, "1")
             .env("DIVINE_POLICY_TEST_CALLS", dir.path().join("calls"))
             .env("DIVINE_POLICY_TEST_FFMPEG", real.trim())
+            .env(
+                "DIVINE_POLICY_TEST_FFPROBE",
+                String::from_utf8(real_probe.stdout).unwrap().trim(),
+            )
             .env(
                 "PATH",
                 format!(
@@ -1229,7 +1257,22 @@ exec "$DIVINE_POLICY_TEST_FFMPEG" "$@"
         );
     }
     assert_no_encoder();
-    // A real probe failure is retryable rather than archive incompatibility.
+    // A bad generated derivative does not prove that the original is invalid.
+    std::env::set_var("DIVINE_POLICY_TEST_FAIL_GENERATED_PROBE", "1");
+    let generated_output = dir.path().join("bad-generated");
+    tokio::fs::create_dir(&generated_output).await.unwrap();
+    let error = crate::run_ffmpeg_hls(&input, &generated_output, false, &info, false, CopyOnly)
+        .await
+        .err()
+        .unwrap();
+    assert!(!error.is::<crate::TerminalTranscode>());
+    assert!(error.to_string().contains("generated output"));
+    assert_eq!(std::fs::read_dir(&generated_output).unwrap().count(), 0);
+    assert_eq!(tokio::fs::read(&input).await.unwrap(), original);
+    assert_no_encoder();
+    std::env::remove_var("DIVINE_POLICY_TEST_FAIL_GENERATED_PROBE");
+
+    // Deterministically invalid source bytes are terminal under copy-only.
     tokio::fs::write(&incompatible, b"not media").await.unwrap();
     let error = crate::run_ffmpeg_hls(
         &incompatible,
@@ -1242,7 +1285,10 @@ exec "$DIVINE_POLICY_TEST_FFMPEG" "$@"
     .await
     .err()
     .unwrap();
-    assert!(!error.is::<crate::TerminalTranscode>());
+    assert!(error.is::<crate::TerminalTranscode>(), "{error:#}");
+    assert_eq!(error.to_string(), "archive_remux_incompatible");
+    assert_eq!(tokio::fs::read(&incompatible).await.unwrap(), b"not media");
+    assert!(!dir.path().join("broken").exists());
     assert_no_encoder();
 
     let source_hls = dir.path().join("copy-false");
@@ -1306,4 +1352,44 @@ exec "$DIVINE_POLICY_TEST_FFMPEG" "$@"
         .unwrap()
         .lines()
         .any(|arg| arg == "libx264"));
+}
+
+#[test]
+fn probe_errors_only_reject_verified_invalid_data() {
+    use std::os::unix::process::ExitStatusExt;
+    let output = |status, stdout: &[u8]| std::process::Output {
+        status: std::process::ExitStatus::from_raw(status),
+        stdout: stdout.to_vec(),
+        stderr: vec![],
+    };
+    let invalid = br#"{"error":{"code":-1094995529}}"#;
+    assert!(parse_probe_output(output(256, invalid)).unwrap().is_none());
+    for (status, body) in [
+        (256, br#"{"error":{"code":-5}}"#.as_slice()), // I/O error
+        (256, br#"{"error":{"code":-12}}"#.as_slice()), // out of memory
+        (256, br#"{"error":{"code":-2}}"#.as_slice()), // missing file
+        (256, b"{}".as_slice()),
+        (256, b"not JSON".as_slice()),
+        (9, invalid.as_slice()), // killed, even with partial structured output
+        (512, invalid.as_slice()), // unexpected process exit
+    ] {
+        assert!(parse_probe_output(output(status, body)).is_err());
+    }
+    assert!(parse_probe_output(output(0, br#"{"streams":[]}"#))
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+#[ignore = "requires ffprobe"]
+async fn missing_original_probe_remains_retryable() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(super::probe(&dir.path().join("absent.mp4"), false)
+        .await
+        .is_err());
+    assert!(
+        try_reuse(&dir.path().join("absent.mp4"), &dir.path().join("hls"))
+            .await
+            .is_err()
+    );
 }
