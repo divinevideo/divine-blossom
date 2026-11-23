@@ -26,4 +26,5 @@ jobs:
       - name: Bundle native Bunny entry points
         run: |
           deno bundle --platform=deno bunny.ts -o /tmp/blossom-runtime.js
+          deno bundle --platform=deno middleware.ts -o /tmp/blossom-runtime-middleware.js
           deno bundle --platform=deno probe_bunny.ts -o /tmp/blossom-runtime-probe.js
