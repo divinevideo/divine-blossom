@@ -455,6 +455,18 @@ Deno.test("full media lifecycle: upload, transcode webhook, HLS/MP4/VTT/Range ca
     equal(drainJson.completed >= 1, true);
     equal(ctx.blobs.deletedPrefixes.includes(hash), true);
     equal(ctx.blobs.store.size, 0);
+    const repost = await ctx.app(
+      new Request(`${ctx.origin}/upload`, {
+        method: "PUT",
+        body: payload,
+        headers: {
+          "content-type": "video/mp4",
+          authorization: blossomAuth(ownerSk, "upload", ctx.now, hash),
+        },
+      }),
+    );
+    equal(repost.status, 201);
+    equal((await ctx.app(new Request(`${ctx.origin}/${hash}.mp4`))).status, 200);
   } finally {
     ctx.db.close();
   }
@@ -751,6 +763,52 @@ Deno.test("delegated PUT /upload publishes to SQL catalog, supports chunked bodi
     // Immediately readable via Blossom GET /<sha256> and GET /list/<pubkey>
     equal((await app(new Request(thumbDesc.url))).status, 200);
     equal((await (await app(new Request(`${origin}/list/${pub1}`))).json() as unknown[]).length, 1);
+    const uploadThumbAgain = () =>
+      app(
+        new Request(`${origin}/upload`, {
+          method: "PUT",
+          body: thumbBytes,
+          headers: {
+            "content-type": "image/jpeg",
+            authorization: blossomAuth(sk1, "upload", now, thumbHash),
+          },
+        }),
+      );
+    equal(
+      (await app(
+        new Request(`${origin}/${thumbHash}`, {
+          method: "DELETE",
+          headers: { authorization: blossomAuth(sk1, "delete", now, thumbHash) },
+        }),
+      )).status,
+      202,
+    );
+    const beforeCleanup = seenRequests.length;
+    equal(
+      (await app(
+        new Request(`${origin}/upload`, {
+          method: "HEAD",
+          headers: { "x-sha-256": thumbHash },
+        }),
+      )).status,
+      409,
+    );
+    equal((await uploadThumbAgain()).status, 409);
+    equal(seenRequests.length, beforeCleanup);
+    equal(
+      (await app(
+        new Request(`${origin}/admin/api/b2-cdn-purge/drain`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${adminToken}` },
+        }),
+      )).status,
+      200,
+    );
+    equal((await app(new Request(thumbDesc.url))).status, 404);
+    equal((await uploadThumbAgain()).status, 201);
+    equal((await app(new Request(thumbDesc.url))).status, 200);
+    equal((await catalog.get(thumbHash))?.owners, [pub1]);
+
     // Image uploads do not trigger video moderation scans
     equal(modScans.length, 0);
 

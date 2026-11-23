@@ -251,6 +251,10 @@ Deno.test("B2 Native deletePrefix erases all versions and BunnyPurger purges exa
       throw new Error(`unexpected fetch ${url}`);
     },
   );
+  const withdrawn = await blobs.deletePrefix(HASH, () => Promise.resolve(false));
+  equal(withdrawn, { deleted: 0, remaining: true });
+  equal(deletedIds, []);
+
   const erased = await blobs.deletePrefix(HASH);
   equal(erased, { deleted: 2, remaining: false });
   equal(deletedIds, ["f1", "f2"]);

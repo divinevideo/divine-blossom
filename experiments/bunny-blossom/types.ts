@@ -63,6 +63,7 @@ export interface BlobRecord {
   transcriptTerminal?: boolean;
   deleteReason?: string;
   deletedAt?: number;
+  ownerDeleted?: boolean;
 }
 
 export interface BlobDescriptor {
@@ -148,7 +149,10 @@ export interface Catalog {
 export interface Blobs {
   read(key: string, request: Request): Promise<Response>;
   write(key: string, body: Uint8Array<ArrayBuffer>, type: string): Promise<void>;
-  deletePrefix?(prefix: string): Promise<{ deleted: number; remaining: boolean }>;
+  deletePrefix?(
+    prefix: string,
+    stillDeletable?: () => Promise<boolean>,
+  ): Promise<{ deleted: number; remaining: boolean }>;
 }
 
 export interface CdnPurger {

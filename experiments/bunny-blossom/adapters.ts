@@ -131,6 +131,7 @@ function decodeRecord(raw: unknown, expectedHash?: string): BlobRecord {
       : undefined,
     deleteReason: typeof parsed.deleteReason === "string" ? parsed.deleteReason : undefined,
     deletedAt: typeof parsed.deletedAt === "number" ? parsed.deletedAt : undefined,
+    ownerDeleted: parsed.ownerDeleted === true ? true : undefined,
   };
 }
 
@@ -655,7 +656,10 @@ export class B2Blobs implements Blobs {
    * Enumerate and delete every B2 version under `<prefix><hash>` using B2 Native API.
    * Returns `{ deleted, remaining }` so the purge outbox can retry bounded batches.
    */
-  async deletePrefix(hashPrefix: string): Promise<{ deleted: number; remaining: boolean }> {
+  async deletePrefix(
+    hashPrefix: string,
+    stillDeletable?: () => Promise<boolean>,
+  ): Promise<{ deleted: number; remaining: boolean }> {
     if (!HASH.test(hashPrefix)) throw new Error("invalid erasure hash");
     if (!this.eraser) throw new Error("B2 eraser credentials not configured");
 
@@ -705,6 +709,10 @@ export class B2Blobs implements Blobs {
         f.fileName === fullPrefix || f.fileName.startsWith(`${fullPrefix}/`) ||
         f.fileName.startsWith(`${fullPrefix}.`),
     );
+
+    // A concurrent drain may have finished cleanup and allowed a repost while we listed.
+    // Revalidate after listing. The version IDs in this batch then cannot include a later repost.
+    if (stillDeletable && !await stillDeletable()) return { deleted: 0, remaining: true };
 
     let deleted = 0;
     const batch = matching.slice(0, 20);

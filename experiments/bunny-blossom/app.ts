@@ -61,6 +61,14 @@ function corsHeaders(existing?: Headers): Headers {
   return headers;
 }
 
+function canReplaceOwnerDeletion(row: BlobRecord): boolean {
+  return row.status === "deleted" && row.ownerDeleted === true && !row.cleanupPending;
+}
+
+function isUploadUnavailable(row: BlobRecord | null): boolean {
+  return Boolean(row?.gate || (row?.status === "deleted" && !canReplaceOwnerDeletion(row)));
+}
+
 function isVideoMimeType(mime: string): boolean {
   return mime.trim().toLowerCase().startsWith("video/");
 }
@@ -538,10 +546,10 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
     return out;
   }
 
-  async function uploadPrecheckStatus(
-    hash: string,
-    actorPubkey?: string,
-  ): Promise<"forbidden" | "unavailable" | null> {
+  async function checkUpload(hash: string, actorPubkey: string): Promise<{
+    existing: BlobRecord | null;
+    blocked: "forbidden" | "unavailable" | null;
+  }> {
     const [existing, holds] = await Promise.all([
       config.catalog.get(hash),
       config.catalog.getQuarantineHolds(hash),
@@ -553,12 +561,9 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       (existing?.status === "restricted" &&
         (!actorPubkey || !existing.owners.includes(actorPubkey)))
     ) {
-      return "forbidden";
+      return { existing, blocked: "forbidden" };
     }
-    if (existing?.status === "deleted" || existing?.gate) {
-      return "unavailable";
-    }
-    return null;
+    return { existing, blocked: isUploadUnavailable(existing) ? "unavailable" : null };
   }
 
   async function triggerModerationScan(hash: string, pubkey: string): Promise<void> {
@@ -701,6 +706,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
   }
 
   interface DelegatedUploadPayload {
+    expectedDeletionRevision?: number;
     sha256: string;
     size: number;
     contentType: string;
@@ -751,11 +757,14 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       if (existing?.status === "restricted" && !existing.owners.includes(owner)) {
         return jsonResp(403, { error: "content blocked" });
       }
-      if (existing?.status === "deleted" || existing?.gate) {
+      if (
+        isUploadUnavailable(existing) ||
+        (existing?.status === "deleted" && existing.revision !== upload.expectedDeletionRevision)
+      ) {
         return jsonResp(409, { error: "parent unavailable" });
       }
 
-      if (existing) {
+      if (existing && existing.status !== "deleted") {
         const next: BlobRecord = {
           ...existing,
           revision: existing.revision + 1,
@@ -828,7 +837,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       }
 
       const fresh: BlobRecord = {
-        revision: 1,
+        revision: (existing?.revision ?? 0) + 1,
         hash,
         size: upload.size,
         type: contentType,
@@ -857,7 +866,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         transcriptAttemptCount: isTranscribable && upload.transcriptErrorCode ? 1 : 0,
         transcriptTerminal: upload.transcriptTerminal,
       };
-      if (await config.catalog.cas(hash, null, fresh)) {
+      if (await config.catalog.cas(hash, existing?.revision ?? null, fresh)) {
         if (isVideo) {
           await triggerModerationScan(hash, owner);
         }
@@ -906,12 +915,12 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
     if (old?.status === "restricted" && !old.owners.includes(owner)) {
       return jsonResp(403, { error: "content blocked" });
     }
-    if (old?.status === "deleted" || old?.gate) {
+    if (isUploadUnavailable(old)) {
       return jsonResp(409, { error: "parent unavailable" });
     }
 
     // Deduplicate existing live blobs without rewriting storage bytes.
-    if (old) {
+    if (old && old.status !== "deleted") {
       const deduped: BlobRecord = {
         ...old,
         revision: old.revision + 1,
@@ -929,7 +938,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
     const isTranscribable = isTranscribableMimeType(contentType);
     const gate = crypto.randomUUID();
     const row: BlobRecord = {
-      revision: 1,
+      revision: (old?.revision ?? 0) + 1,
       hash,
       size: body.length,
       type: contentType,
@@ -945,7 +954,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       transcriptStatus: isTranscribable ? "pending" : undefined,
     };
 
-    if (!await config.catalog.cas(hash, null, row)) {
+    if (!await config.catalog.cas(hash, old?.revision ?? null, row)) {
       return jsonResp(409, { error: "concurrent parent change" });
     }
 
@@ -1081,16 +1090,17 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
               },
             });
           }
-          if (existing?.status === "deleted" || existing?.gate) {
+          if (isUploadUnavailable(existing)) {
             return new Response(null, {
               status: 409,
-              headers: {
-                ...capHeaders,
-                "x-reason": "Parent unavailable",
-              },
+              headers: { ...capHeaders, "x-reason": "Parent unavailable" },
             });
           }
-          if (existing && existing.status !== "restricted") {
+          if (
+            existing &&
+            existing.status !== "deleted" &&
+            existing.status !== "restricted"
+          ) {
             return new Response(null, {
               status: 200,
               headers: {
@@ -1184,14 +1194,16 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       for (const authHash of auth.hashes) {
         if (HASH.test(authHash)) precheckHashes.add(authHash);
       }
+      const deletionRevisions = new Map<string, number>();
       for (const candidate of precheckHashes) {
-        const blocked = await uploadPrecheckStatus(candidate, auth.pubkey);
+        const { existing, blocked } = await checkUpload(candidate, auth.pubkey);
         if (blocked === "forbidden") {
           return jsonResp(403, { error: "content blocked" });
         }
         if (blocked === "unavailable") {
           return jsonResp(409, { error: "parent unavailable" });
         }
+        if (existing?.status === "deleted") deletionRevisions.set(candidate, existing.revision);
       }
 
       // Delegate streaming uploads to Cloud Run upload service when configured (production mode),
@@ -1268,6 +1280,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
           : undefined;
         return await publishDelegatedUpload(auth.pubkey, auth.hashes, encodingRequested, {
           sha256,
+          expectedDeletionRevision: deletionRevisions.get(sha256),
           size,
           contentType: resolvedType,
           thumbnailUrl: normalizeThumbnailForOrigin(body.thumbnail_url, sha256, origin),
@@ -1365,7 +1378,10 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         });
       }
       if (existing?.status === "deleted" || existing?.gate) {
-        return jsonResp(409, { error: "parent unavailable" }, capHeaders);
+        const error = existing && canReplaceOwnerDeletion(existing)
+          ? "Use PUT /upload to repost a deleted blob"
+          : "parent unavailable";
+        return jsonResp(409, { error }, capHeaders);
       }
       if (existing) {
         return jsonResp(
@@ -1463,11 +1479,12 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         if (HASH.test(authHash)) completePrecheckHashes.add(authHash);
       }
       for (const candidate of completePrecheckHashes) {
-        const blocked = await uploadPrecheckStatus(candidate, auth.pubkey);
+        const { existing, blocked } = await checkUpload(candidate, auth.pubkey);
         if (blocked === "forbidden") {
           return jsonResp(403, { error: "content blocked" });
         }
-        if (blocked === "unavailable") {
+        // Cloud Run may replay a finalized session without writing again.
+        if (blocked === "unavailable" || existing?.status === "deleted") {
           return jsonResp(409, { error: "parent unavailable" });
         }
       }
@@ -1709,6 +1726,10 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         status: last ? "deleted" : row.status,
         cleanupPending: last || row.cleanupPending,
         deletedAt: last ? now() : row.deletedAt,
+        ownerDeleted: last && !row.ageRestricted && !row.gate &&
+            (row.status === "active" || row.status === "pending")
+          ? true
+          : undefined,
       };
       if (!await config.catalog.cas(row.hash, row.revision, next)) {
         return jsonResp(409, { error: "concurrent parent change" });
@@ -1747,6 +1768,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
           status: last ? "deleted" : row.status,
           cleanupPending: last || row.cleanupPending,
           deletedAt: last ? now() : row.deletedAt,
+          ownerDeleted: undefined,
         };
         if (await config.catalog.cas(row.hash, row.revision, next)) {
           if (last) {
@@ -2047,11 +2069,19 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
           const currentHolds = await config.catalog.getQuarantineHolds(item.hash);
           const allowB2Delete = item.deleteB2 &&
             currentHolds.length === 0 &&
-            (!currentRow || (!currentRow.held && currentRow.status === "deleted"));
+            (!currentRow ||
+              (!currentRow.held && currentRow.status === "deleted" && currentRow.cleanupPending));
           if (item.deleteB2 && !allowB2Delete) {
             skippedHeld++;
           } else if (allowB2Delete && config.blobs.deletePrefix) {
-            const res = await config.blobs.deletePrefix(item.hash);
+            const res = await config.blobs.deletePrefix(item.hash, async () => {
+              const [latest, holds] = await Promise.all([
+                config.catalog.get(item.hash),
+                config.catalog.getQuarantineHolds(item.hash),
+              ]);
+              return (latest?.revision ?? null) === (currentRow?.revision ?? null) &&
+                holds.length === 0;
+            });
             if (res.remaining) {
               await config.catalog.deferPurge(item.id, item.attempts + 1, now() + 5);
               deferred++;
@@ -2061,18 +2091,20 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
           if (config.purger) {
             await config.purger.purgeHash(item.hash);
           }
-          await config.catalog.completePurge(item.id);
-          // Clear cleanupPending marker only if B2 erasure actually ran and blob is still deleted
-          if (allowB2Delete) {
-            const row = await config.catalog.get(item.hash);
-            if (row && row.cleanupPending && row.status === "deleted") {
-              await config.catalog.cas(row.hash, row.revision, {
-                ...row,
-                revision: row.revision + 1,
+          if (allowB2Delete && config.blobs.deletePrefix && currentRow) {
+            if (
+              !await config.catalog.cas(item.hash, currentRow.revision, {
+                ...currentRow,
+                revision: currentRow.revision + 1,
                 cleanupPending: false,
-              });
+              })
+            ) {
+              await config.catalog.deferPurge(item.id, item.attempts + 1, now() + 5);
+              deferred++;
+              continue;
             }
           }
+          await config.catalog.completePurge(item.id);
           completed++;
         } catch {
           const backoff = Math.min(300, 10 * Math.pow(2, Math.min(item.attempts, 5)));
@@ -2111,6 +2143,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         cleanupPending: mapped === "delete" ? true : row.cleanupPending,
         deleteReason: body.reason ?? row.deleteReason,
         deletedAt: mapped === "delete" ? now() : row.deletedAt,
+        ownerDeleted: undefined,
       };
       if (!await config.catalog.cas(hash, row.revision, next)) {
         return jsonResp(409, { error: "concurrent update" });
@@ -2142,6 +2175,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         held: Boolean(body.legal_hold) || row.held,
         deleteReason: body.reason ?? row.deleteReason,
         deletedAt: now(),
+        ownerDeleted: undefined,
       };
       if (!await config.catalog.cas(hash, row.revision, next)) {
         return jsonResp(409, { error: "concurrent update" });
@@ -2170,6 +2204,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         ageRestricted: target === "age_restricted",
         held: false,
         deletedAt: undefined,
+        ownerDeleted: undefined,
       };
       if (!await config.catalog.cas(hash, row.revision, next)) {
         return jsonResp(409, { error: "concurrent update" });
@@ -2265,6 +2300,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
             status: last ? "deleted" : row.status,
             cleanupPending: last || row.cleanupPending,
             deletedAt: last ? now() : row.deletedAt,
+            ownerDeleted: undefined,
           })
         ) {
           if (last) {
