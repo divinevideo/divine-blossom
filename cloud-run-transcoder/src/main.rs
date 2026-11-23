@@ -1031,7 +1031,7 @@ fn repair_outcome<T>(result: Result<T>, release: Result<()>) -> Result<(T, Optio
             warn!("{}", warning);
             match result {
                 Ok(value) => Ok((value, Some(warning))),
-                Err(error) => Err(anyhow!("Repair failed: {:#}; {}", error, warning)),
+                Err(error) => Err(error.context(format!("Repair failed; {warning}"))),
             }
         }
     }
@@ -1270,6 +1270,10 @@ async fn handle_backfill_fmp4(
             |ts, mp4, variant| async move { remux_variant(&ts, &mp4, variant).await },
         )
         .await;
+        let result = match result {
+            Err(error) if error.is::<hls_claim::OwnershipLost>() => return Err(error),
+            other => other,
+        };
         let release = claim.finish(result.is_ok()).await;
         if release.is_err() {
             hls_claim::count("release_failed");
@@ -1604,7 +1608,10 @@ async fn process_transcode(
     }
     let mut claim = claim_hls(&state, &hash).await?;
     let force = request.force;
-    let result = process_transcode_inner(&state, request, &hash, &mut claim).await;
+    let result = match process_transcode_inner(&state, request, &hash, &mut claim).await {
+        Err(error) if error.is::<hls_claim::OwnershipLost>() => return Err(error),
+        other => other,
+    };
     let release = claim.finish(result.is_ok()).await;
     if release.is_err() {
         hls_claim::count("release_failed");

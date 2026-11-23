@@ -608,6 +608,12 @@ impl Claim {
                 tokio::select! {
                     biased;
                     result = &mut work => return (result, None),
+                    () = tokio::time::sleep_until(self.deadline) => {
+                        lease.invalidate();
+                        heartbeat_error = Some(anyhow!(
+                            "Transcode attempt exceeded its preparation deadline"
+                        ));
+                    }
                     () = tokio::time::sleep_until(self.next_heartbeat) => {
                         if let Err(error) = self.check_deadline() {
                             lease.invalidate();

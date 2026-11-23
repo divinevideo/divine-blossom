@@ -709,10 +709,9 @@ impl MediaStorage {
             return Ok(Vec::new());
         }
         let mut seen_keys = HashSet::with_capacity(items.len());
-        let write_id = claim.write_id();
         let mut targets =
             Vec::with_capacity(items.len() * if self.required_backup.is_some() { 2 } else { 1 });
-        for item in &mut items {
+        for item in &items {
             validate_key(&item.key)?;
             if !seen_keys.insert(item.key.clone()) {
                 bail!("Duplicate media key in publication batch");
@@ -723,7 +722,6 @@ impl MediaStorage {
                     bail!("Content-addressed output key mismatch");
                 }
             }
-            item.custom.insert(WRITE_ID.to_owned(), write_id.clone());
             targets.push(WriteTarget {
                 gcs: self.is_gcs(),
                 key: item.key.clone(),
@@ -760,6 +758,10 @@ impl MediaStorage {
             HashMap::new()
         };
 
+        let write_id = claim.write_id();
+        for item in &mut items {
+            item.custom.insert(WRITE_ID.to_owned(), write_id.clone());
+        }
         claim.begin_publication(targets, &write_id).await?;
         let lease = PublishLease::new(claim.lease_renewed_at());
         let deadline = claim.deadline();

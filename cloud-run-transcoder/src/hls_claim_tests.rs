@@ -1272,6 +1272,13 @@ async fn hold_publishing_ownership_loss_invalidates_lease_and_surfaces_ownership
         saw_invalidated,
         "lease must invalidate immediately on OwnershipLost"
     );
-    assert!(hb_err.unwrap().is::<OwnershipLost>());
+    let err = hb_err.unwrap();
+    assert!(err.is::<OwnershipLost>());
+    // Even if wrapped via repair_outcome, OwnershipLost stays typed so HTTP callers
+    // receive 409 CONFLICT rather than 500.
+    let wrapped = crate::repair_outcome::<()>(Err(err), Err(anyhow!("lock retained"))).unwrap_err();
+    assert!(wrapped.is::<OwnershipLost>());
+    let response = crate::transcode_error_response(wrapped, true);
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
     replacement.finish(false).await.unwrap();
 }
