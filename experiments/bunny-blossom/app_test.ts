@@ -1826,7 +1826,7 @@ Deno.test("upload hardening: quarantine holds, restricted privacy, encoding poli
     equal(errRec?.transcriptTerminal, true);
     customUpstreamHandler = null;
 
-    // 9. PUT /mirror with copy-only sets videoEncodingAllowed: false and blocks non-owner restricted access
+    // 9. PUT /mirror with copy-only sets videoEncodingAllowed: false; restricting it blocks non-owner reads and mirrors
     const mirrorBytes = new TextEncoder().encode("synthetic-mirrored-copy-only-video");
     const mirrorHash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", mirrorBytes)));
     customUpstreamHandler = () =>
@@ -1846,6 +1846,249 @@ Deno.test("upload hardening: quarantine holds, restricted privacy, encoding poli
     const mirrorRec = await catalog.get(mirrorHash);
     equal(mirrorRec?.videoEncodingAllowed, false);
     equal(mirrorRec?.transcodeStatus, "pending");
+
+    const restrictRes = await app(
+      new Request(`${origin}/admin/api/moderate`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${adminToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ sha256: mirrorHash, action: "RESTRICT" }),
+      }),
+    );
+    equal(restrictRes.status, 200);
+    equal((await app(new Request(`${origin}/${mirrorHash}`))).status, 404);
+    const nonOwnerMirror = await app(
+      new Request(`${origin}/mirror`, {
+        method: "PUT",
+        headers: {
+          authorization: blossomAuth(sk2, "mirror", now),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ url: "https://cdn.example.com/clip.mp4" }),
+      }),
+    );
+    equal(nonOwnerMirror.status, 403);
+    customUpstreamHandler = null;
+
+    // 10. Both /admin/api/restore and /admin/api/moderate APPROVE clear cleanupPending so a subsequent
+    //     admin soft-delete + drain does NOT erase B2 bytes
+    await blobs.write(mirrorHash, mirrorBytes, "video/mp4");
+    const modDelRes = await app(
+      new Request(`${origin}/admin/api/moderate`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${adminToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ sha256: mirrorHash, action: "DELETE" }),
+      }),
+    );
+    equal(modDelRes.status, 200);
+    equal((await catalog.get(mirrorHash))?.cleanupPending, true);
+    const modApproveRes = await app(
+      new Request(`${origin}/admin/api/moderate`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${adminToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ sha256: mirrorHash, action: "APPROVE" }),
+      }),
+    );
+    equal(modApproveRes.status, 200);
+    equal((await catalog.get(mirrorHash))?.cleanupPending, false);
+    equal((await catalog.get(mirrorHash))?.deletedAt, undefined);
+    const modDelAgain = await app(
+      new Request(`${origin}/admin/api/moderate`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${adminToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ sha256: mirrorHash, action: "DELETE" }),
+      }),
+    );
+    equal(modDelAgain.status, 200);
+    equal((await catalog.get(mirrorHash))?.cleanupPending, true);
+    const restoreRes = await app(
+      new Request(`${origin}/admin/api/restore`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${adminToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ sha256: mirrorHash, status: "active" }),
+      }),
+    );
+    equal(restoreRes.status, 200);
+    equal((await catalog.get(mirrorHash))?.cleanupPending, false);
+    const softDelRes = await app(
+      new Request(`${origin}/admin/api/delete`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${adminToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ sha256: mirrorHash, reason: "soft-only" }),
+      }),
+    );
+    equal(softDelRes.status, 200);
+    const softDelRow = await catalog.get(mirrorHash);
+    equal(softDelRow?.status, "deleted");
+    equal(softDelRow?.cleanupPending, false);
+    const drainAfterRestore = await app(
+      new Request(`${origin}/admin/api/b2-cdn-purge/drain?max=10`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${adminToken}` },
+      }),
+    );
+    equal(drainAfterRestore.status, 200);
+    const drainAfterRestoreBody = await drainAfterRestore.json() as {
+      drained: number;
+      completed: number;
+      deferred: number;
+      skipped_held: number;
+    };
+    equal(drainAfterRestoreBody.drained >= 2, true);
+    equal(drainAfterRestoreBody.completed, drainAfterRestoreBody.drained);
+    equal(drainAfterRestoreBody.deferred, 0);
+    equal(drainAfterRestoreBody.skipped_held >= 1, true);
+    equal(blobs.store.has(mirrorHash), true);
+
+    // 11. /upload/:id/complete preserves Cloud Run 409 ("Upload incomplete"), /upload/init returns 400/503 on
+    //     deleted/gated blobs (never 409), conflicting SHA headers return 400, and mixed-case Video/MP4
+    //     thumbnail fallback runs policy re-check before returning 422
+    customUpstreamHandler = () =>
+      new Response(JSON.stringify({ error: "Upload incomplete: 10 of 20 bytes committed" }), {
+        status: 409,
+        headers: { "content-type": "application/json" },
+      });
+    const incompleteRes = await app(
+      new Request(`${origin}/upload/up_incomplete/complete`, {
+        method: "POST",
+        headers: {
+          authorization: blossomAuth(sk1, "upload", now),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ sha256: "7".repeat(64) }),
+      }),
+    );
+    equal(incompleteRes.status, 409);
+    equal(
+      (await incompleteRes.json() as { error: string }).error,
+      "Upload incomplete: 10 of 20 bytes committed",
+    );
+
+    // /upload/init returns 503 on gated/unavailable blobs and 400 on settled owner-deleted blobs
+    const gatedInitRes = await app(
+      new Request(`${origin}/upload/init`, {
+        method: "POST",
+        headers: {
+          authorization: blossomAuth(sk1, "upload", now, gatedHash),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ sha256: gatedHash, size: 64, contentType: "video/mp4" }),
+      }),
+    );
+    equal(gatedInitRes.status, 503);
+    equal(gatedInitRes.headers.get("retry-after"), "5");
+
+    const settledOwnerDeletedHash = "4".repeat(64);
+    await catalog.cas(settledOwnerDeletedHash, null, {
+      revision: 1,
+      hash: settledOwnerDeletedHash,
+      size: 64,
+      type: "video/mp4",
+      uploaded: now,
+      owners: [],
+      status: "deleted",
+      ageRestricted: false,
+      held: false,
+      gate: null,
+      cleanupPending: false,
+      ownerDeleted: true,
+    });
+    const settledDeletedInitRes = await app(
+      new Request(`${origin}/upload/init`, {
+        method: "POST",
+        headers: {
+          authorization: blossomAuth(sk1, "upload", now, settledOwnerDeletedHash),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          sha256: settledOwnerDeletedHash,
+          size: 64,
+          contentType: "video/mp4",
+        }),
+      }),
+    );
+    equal(settledDeletedInitRes.status, 400);
+
+    const conflictShaRes = await app(
+      new Request(`${origin}/upload`, {
+        method: "PUT",
+        body: new Uint8Array([1, 2, 3]),
+        headers: {
+          authorization: blossomAuth(sk1, "upload", now),
+          "x-sha-256": "5".repeat(64),
+          "x-sha256": "6".repeat(64),
+        },
+      }),
+    );
+    equal(conflictShaRes.status, 400);
+    const conflictHeadShaRes = await app(
+      new Request(`${origin}/upload`, {
+        method: "HEAD",
+        headers: {
+          "x-sha-256": "5".repeat(64),
+          "x-sha256": "6".repeat(64),
+        },
+      }),
+    );
+    equal(conflictHeadShaRes.status, 400);
+
+    const mixedHash = "f".repeat(64);
+    await catalog.cas(mixedHash, null, {
+      revision: 1,
+      hash: mixedHash,
+      size: 16,
+      type: "Video/MP4",
+      uploaded: now,
+      owners: [pub1],
+      status: "active",
+      ageRestricted: false,
+      held: false,
+      gate: null,
+      cleanupPending: false,
+    });
+    await blobs.write(mixedHash, new Uint8Array([9, 9, 9]), "Video/MP4");
+    let thumbUpstreamCalls = 0;
+    customUpstreamHandler = (reqUrl) => {
+      equal(reqUrl, `https://upload.divine.video/thumbnail/${mixedHash}`);
+      thumbUpstreamCalls++;
+      return new Response(null, { status: 422 });
+    };
+    const unprocThumbRes = await app(new Request(`${origin}/${mixedHash}.jpg`));
+    equal(unprocThumbRes.status, 422);
+    equal(thumbUpstreamCalls, 1);
+
+    customUpstreamHandler = async (reqUrl) => {
+      equal(reqUrl, `https://upload.divine.video/thumbnail/${mixedHash}`);
+      thumbUpstreamCalls++;
+      // Simulate concurrent quarantine while Cloud Run generates the thumbnail and returns 422.
+      await catalog.addQuarantineHold(mixedHash, "mid-flight-hold", now);
+      return new Response(null, { status: 422 });
+    };
+    const revokedThumbRes = await app(new Request(`${origin}/${mixedHash}.jpg`));
+    equal(revokedThumbRes.status, 404);
+    equal(
+      (await revokedThumbRes.json() as { error: string }).error,
+      "policy changed during origin read",
+    );
+    equal(thumbUpstreamCalls, 2);
+    equal((await catalog.getQuarantineHolds(mixedHash)).includes("mid-flight-hold"), true);
     customUpstreamHandler = null;
   } finally {
     db.close();
