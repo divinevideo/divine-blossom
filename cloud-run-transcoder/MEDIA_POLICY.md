@@ -54,7 +54,10 @@ audio-copy failure in an isolated child process.
 
 The edge endpoint is `GET /internal/media-policy/{sha256}`. It accepts the existing
 transcoder webhook bearer secret, returns only the hash and processing decision,
-and never caches responses. Missing metadata returns 503 with Retry-After so a
+and never caches responses. Reads require the existing `kv_origin_read_token`
+secret and `metadata_kv_store_id` configuration; local POP KV is not authoritative
+for granting permission. Missing origin configuration or metadata returns 503
+with Retry-After so a
 queue job dispatched before upload publication retries.
 
 New authenticated video uploads receive `video_encoding_allowed=true` unless the

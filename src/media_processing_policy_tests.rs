@@ -48,6 +48,8 @@ fn media_policy_http_auth_retry_and_metadata_contract() {
         lookup("invalid", Some("synthetic-webhook")).get_status(),
         StatusCode::BAD_REQUEST
     );
+    // Local metadata must never supply permission when origin is absent.
+    put_blob_metadata(&sample(&hash, true)).unwrap();
     let missing = lookup(&hash, Some("synthetic-webhook"));
     assert_eq!(missing.get_status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(missing.get_header_str("Retry-After"), Some("5"));
@@ -66,8 +68,8 @@ fn media_policy_http_auth_retry_and_metadata_contract() {
         serde_json::from_str::<serde_json::Value>(&allowed.take_body_str()).unwrap(),
         serde_json::json!({"sha256":hash,"policy":"allow_encode"})
     );
-    // A cached allow response must not hide a later reduction in processing.
-    put_blob_metadata(&sample(&hash, false)).unwrap();
+    // The fixture origin now restricts processing while POP metadata stays stale.
+    assert!(get_blob_metadata_uncached(&hash).unwrap().unwrap().allows_video_encoding());
     let mut copy = lookup(&hash, Some("synthetic-webhook"));
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&copy.take_body_str()).unwrap(),

@@ -6815,8 +6815,14 @@ fn handle_media_processing_policy(req: &Request, path: &str) -> Result<Response>
     if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(BlossomError::BadRequest("Invalid media hash".into()));
     }
-    // No cached metadata: old queued tasks and forced repairs obey current policy.
-    let Some(metadata) = get_blob_metadata_uncached(hash)? else {
+    // POP KV reads can be stale even without the application cache. Only the
+    // origin may grant encoding permission; missing configuration must retry.
+    let metadata = match crate::kv_origin::lookup(&format!("blob:{}", hash.to_lowercase()))? {
+        Some(Some(entry)) => serde_json::from_slice::<Option<BlobMetadata>>(&entry.body)
+            .map_err(|_| BlossomError::MetadataError("Invalid media policy metadata".into()))?,
+        _ => None,
+    };
+    let Some(metadata) = metadata else {
         let mut response = json_response(StatusCode::SERVICE_UNAVAILABLE,
             &serde_json::json!({"error":"Media policy is not available yet"}));
         response.set_header("Retry-After", "5");

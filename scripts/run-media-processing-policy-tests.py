@@ -12,6 +12,20 @@ class UploadService(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
+    def do_GET(self):
+        assert self.headers.get("Fastly-Key") == "synthetic-origin-token"
+        assert self.path == "/resources/stores/kv/synthetic-store/keys/blob:" + "1" * 64
+        self.server.policy_reads += 1
+        count = self.server.policy_reads
+        payload = json.dumps({"sha256": "1" * 64, "size":10, "type":"video/mp4",
+            "uploaded":"2026-01-01T00:00:00Z", "owner":"b"*64, "status":"active",
+            "video_encoding_allowed":count == 2}).encode()
+        self.send_response(404 if count == 1 else 200)
+        self.send_header("generation", str(count))
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def do_PUT(self):
         self.deliver()
 
@@ -37,6 +51,7 @@ class UploadService(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
 server = ThreadingHTTPServer(("127.0.0.1", 0), UploadService)
+server.policy_reads = 0
 threading.Thread(target=server.serve_forever, daemon=True).start()
 repo = Path(__file__).resolve().parent.parent
 with tempfile.TemporaryDirectory(prefix="media-policy-") as directory:
@@ -44,11 +59,13 @@ with tempfile.TemporaryDirectory(prefix="media-policy-") as directory:
     kv = root / "kv.json"
     kv.write_text("{}")
     settings = root / "settings.json"
-    settings.write_text(json.dumps({"local_mode":"false", "upload_service_all_uploads":"true"}))
+    settings.write_text(json.dumps({"local_mode":"false", "upload_service_all_uploads":"true", "metadata_kv_store_id":"synthetic-store"}))
     config = root / "fastly.toml"
     config.write_text(f'''manifest_version = 3
 name = "media-policy-test"
 language = "rust"
+[local_server.backends.kv-origin-api]
+url = "http://127.0.0.1:{server.server_port}"
 [local_server.backends.upload_service]
 url = "http://127.0.0.1:{server.server_port}"
 [local_server.config_stores.blossom_config]
@@ -58,7 +75,7 @@ format = "json"
 file = "{kv}"
 format = "json"
 [local_server.secret_stores]
-blossom_secrets = [{{key="webhook_secret",data="synthetic-webhook"}}]
+blossom_secrets = [{{key="webhook_secret",data="synthetic-webhook"}},{{key="kv_origin_read_token",data="synthetic-origin-token"}}]
 ''')
     env = os.environ.copy()
     env.pop("CARGO_TARGET_WASM32_WASIP1_RUNNER", None)
@@ -69,4 +86,5 @@ blossom_secrets = [{{key="webhook_secret",data="synthetic-webhook"}}]
         cwd=repo, env=env, capture_output=True, text=True, timeout=900)
     if result.returncode or "test result: ok. 4 passed; 0 failed; 0 ignored;" not in result.stdout:
         raise RuntimeError(result.stdout + result.stderr)
+    assert server.policy_reads == 3, server.policy_reads
     print("PASS media processing permission, authenticated policy, retry, and stale metadata contracts")
