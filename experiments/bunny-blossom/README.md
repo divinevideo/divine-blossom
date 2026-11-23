@@ -33,7 +33,7 @@ hashes are pinned in `deno.json` and `deno.lock`.
 | `DELETE /<hash>`               | Removes only the signer's reference. Last-reference removal writes a tombstone and durable cleanup-pending marker. Returns **202**, never physical-erasure completion.              |
 | SQL metadata                   | Atomic primary-key insert/update revision CAS, parameterized owner query, strict row decoding. Tested against real local SQLite.                                                    |
 | B2 transport                   | AWS SigV4, fixed provider host and isolated fixture prefix, no redirects or mutation retries, Range forwarding, response-header allowlist. Tested with captured transport requests. |
-| Runtime                        | Native Bunny SDK entry point and bundled Deno build. The separate ephemeral probe passed on the real Bunny runtime; persistent SQL/B2 integration is not yet established.           |
+| Runtime                        | Native Bunny SDK entry point and bundled Deno build. Both the ephemeral probe and separate-request hosted SQL/B2 fixture flow passed on the real Bunny runtime. See limits below.   |
 
 The upload exclusion gate survives lost storage acknowledgements. A policy change during upload or
 while waiting for origin headers prevents publication or delivery. No elapsed-time lease clears an
@@ -63,6 +63,11 @@ compatible primary, but that compatibility is not a durability, consistency or f
 Primary-only routing, concurrent updates, backup/restore and outage behavior must be proven on the
 selected hosted store. The local SQLite proof does not establish regional replication behavior.
 
+The provider currently documents a possible loss of acknowledged writes during primary failover, up
+to 10 seconds or 4096 WAL frames. That is a material durability trade-off for policy and deletion
+records, separate from temporary unavailability. The synthetic hosted proof does not test failover
+or establish an acceptable production recovery point.
+
 ## Full rewrite parity inventory
 
 `routes.json` records the canonical Rust route matchers from the source checkout. Each starts with
@@ -91,8 +96,9 @@ The following remain before a canonical cutover:
   telemetry, secret rotation and disaster recovery.
 - Metadata export/migration, reference reconciliation and a rollback path that prevents divergence
   between the old and new policy authorities.
-- Real Bunny deploy, cold/warm playback, Range/HEAD, signed publishing, concurrent policy mutations,
-  region failure and representative load/cost measurements.
+- Representative media sizes and HLS playback on Bunny, concurrent hosted policy mutations, region
+  failure and representative load/cost measurements. The small hosted original fixture establishes
+  basic integration only.
 
 Unimplemented routes return 501. Existing upload and transcoder services need not be rewritten
 merely to replace the Fastly edge, but their metadata, signing and callback contracts still need
@@ -117,6 +123,8 @@ and commitments.
 - [Before-cache execution](https://bunny.net/docs/scripting/before-cache)
 - [Bunny SQL quickstart](https://bunny.net/docs/database/quickstart)
 - [Database preview status](https://bunny.net/docs/database)
+- [Database durability](https://bunny.net/docs/database/durability-and-consistency)
+- [Database replication](https://bunny.net/docs/database/replication)
 - [Database published prices](https://bunny.net/database/)
 - [Bunny Edge Scripting pricing](https://bunny.net/edge-scripting/)
 - Production parity baseline: `src/main.rs`, `src/viewer_auth.rs`, `src/delete_policy.rs`,
@@ -134,6 +142,19 @@ Observed on Bunny on 2026-11-23: all six expected statuses passed on the first r
 subsequent probes. These samples are not a latency benchmark or a billing measurement. The provider
 also changed the requested client cache header to `no-cache`; final header and cache behavior still
 require explicit zone configuration and live verification before any real content.
+
+A separate deployment of the reviewed `bunny.ts` bundle also passed a synthetic persistent flow on
+2026-11-23: signed upload (200), original GET (200, exact bytes), HEAD (200), Range (206, exact two
+bytes), owner list (200), reference deletion (202) and subsequent denied GET (404). The tombstone
+and cleanup-pending marker were independently read back from hosted SQL. B2 credentials were limited
+to a fresh fixture prefix, and the handler admitted only one configured digest and an operator-owned
+signer. No production metadata or media was imported.
+
+The first Range probe returned a full 200 response. Direct B2 through the same adapter returned 206;
+enabling `EnableCacheSlice` on the isolated linked pull zone made the public request return 206 with
+the expected content range and bytes. This configuration is part of the hosted proof, not an
+application-code fix. The proof does not establish multi-region freshness, failover durability,
+production caching, physical erasure or load capacity.
 
 ## Fixture and delivery boundaries
 
