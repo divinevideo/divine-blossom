@@ -163,7 +163,8 @@ fn media_policy_authenticated_upload_routes_and_duplicates() {
             request.set_header("X-Divine-Video-Processing", "copy-only");
         }
         let result = response(request);
-        assert_eq!(result.get_status(), StatusCode::OK, "{route} {copy_only}");
+        let expected = if route == "direct" { StatusCode::CREATED } else { StatusCode::OK };
+        assert_eq!(result.get_status(), expected, "{route} {copy_only}");
         let stored = get_blob_metadata_uncached(&hash).unwrap().unwrap();
         assert_eq!(stored.allows_video_encoding(), !copy_only && video);
         // Repeat the same media without opt-out; it must never upgrade policy.

@@ -85,14 +85,16 @@ fn canonical_upload_routing_contract() {
                 transcript_error_message: None,
                 transcript_terminal: false,
             };
-            publish_upload_service_upload_with_policy(
+            let response = publish_upload_service_upload_with_policy(
                 auth.clone(),
                 "https://media.divine.video".into(),
                 upload,
                 true,
                 true,
+                StatusCode::CREATED,
             )
             .unwrap();
+            assert_eq!(response.get_status(), StatusCode::OK);
             let mut after = store.lookup(&key).unwrap();
             assert_eq!(
                 after.current_generation(),

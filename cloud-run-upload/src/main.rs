@@ -2744,12 +2744,15 @@ fn validate_auth(headers: &axum::http::HeaderMap, required_action: &str) -> Resu
         return Err(anyhow!("Authorization must start with 'Nostr '"));
     }
 
-    // Decode base64 event
-    let event_json = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        &auth_header[6..],
-    )
-    .map_err(|e| anyhow!("Invalid base64: {}", e))?;
+    use base64::{
+        engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+        Engine,
+    };
+    let encoded_event = &auth_header[6..];
+    let event_json = URL_SAFE_NO_PAD
+        .decode(encoded_event)
+        .or_else(|_| STANDARD.decode(encoded_event))
+        .map_err(|e| anyhow!("Invalid base64: {}", e))?;
 
     let event: NostrEvent =
         serde_json::from_slice(&event_json).map_err(|e| anyhow!("Invalid event JSON: {}", e))?;

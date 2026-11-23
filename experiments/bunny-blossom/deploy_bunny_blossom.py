@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Deploy the bundled native Bunny Blossom Edge Script (Standalone or Pull Zone Middleware)
-and configure its fronting Pull Zone with Cache Slicing and pre-cache bypass Edge Rules.
+"""Deploy the native Bunny Blossom script or create an uncached forwarding zone.
 
 Reads Bunny API key from BUNNY_API_KEY or ~/.config/divine-cdn/bunny-api-key. Never prints secrets.
 """
@@ -10,11 +9,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Any
 
@@ -79,6 +80,78 @@ def upsert_secret_or_var(
         client.req("PUT", f"/compute/script/{script_id}/secrets", {"Name": k, "Secret": v})
 
 
+def create_passthrough_zone(
+    client: BunnyClient, name: str, origin_url: str, public_host: str
+) -> dict[str, Any]:
+    hostname = re.compile(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+")
+    origin = urlsplit(origin_url)
+    if (
+        not hostname.fullmatch(public_host)
+        or origin.scheme != "https"
+        or not origin.hostname
+        or origin.netloc != origin.hostname
+        or not hostname.fullmatch(origin.hostname)
+        or origin.hostname in {public_host, f"{name}.b-cdn.net"}
+        or origin.path not in {"", "/"}
+        or origin.query
+        or origin.fragment
+    ):
+        raise ValueError("Use an HTTPS origin hostname distinct from the public and Bunny hosts")
+
+    # Bunny must forward uploads directly. The middleware hook reconstructs the
+    # streamed request, which loses its framing before it reaches Blossom.
+    config = {
+        "OriginUrl": origin_url.rstrip("/"),
+        "Type": 1,  # Volume
+        "VerifyOriginSSL": True,
+        "CacheControlMaxAgeOverride": 0,
+        "CacheErrorResponses": False,
+        "UseStaleWhileUpdating": False,
+        "UseStaleWhileOffline": False,
+        "EnableOriginShield": False,
+        "FollowRedirects": False,
+        "OriginRetry5XXResponses": False,
+        "OriginRetryConnectionTimeout": False,
+        "OriginRetryResponseTimeout": False,
+    }
+    zone = client.req("POST", "/pullzone", {"Name": name, **config})
+    path = f"/pullzone/{zone['Id']}"
+    # The Blossom origin uses this header when verifying requests and creating
+    # Blob Descriptors. Always overwrite any value supplied by the client.
+    all_requests = {
+        "Enabled": True,
+        "TriggerMatchingType": 0,
+        "Triggers": [{"Type": 0, "PatternMatches": ["*"], "PatternMatchingType": 0}],
+    }
+    rules = [
+        {**all_requests, "Description": "blossom: set canonical host",
+         "ActionType": 6, "ActionParameter1": "X-Original-Host", "ActionParameter2": public_host},
+        # Bunny's zero edge TTL can normalize an origin's no-store to max-age=0.
+        # Prohibit storage by downstream caches as well.
+        {**all_requests, "Description": "blossom: disable downstream caching",
+         "ActionType": 5, "ActionParameter1": "Cache-Control", "ActionParameter2": "private, no-store"},
+    ]
+    for rule in rules:
+        client.req("POST", f"{path}/edgerules/addOrUpdate", rule)
+    actual = client.req("GET", path)
+    if (
+        any(actual.get(key) != value for key, value in config.items())
+        or any((actual.get(field) or -1) > 0 for field in ("EdgeScriptId", "MiddlewareScriptId"))
+        or any(
+            not any(
+                all(r.get(key) == rule[key] for key in (
+                    "Enabled", "ActionType", "ActionParameter1", "ActionParameter2"
+                ))
+                and any(t.get("Type") == 0 and t.get("PatternMatches") == ["*"] for t in r["Triggers"])
+                for r in actual.get("EdgeRules", [])
+            )
+            for rule in rules
+        )
+    ):
+        raise RuntimeError(f"Bunny zone {zone['Id']} did not retain the forwarding configuration")
+    return actual
+
+
 def configure_blossom_pull_zone(
     client: BunnyClient,
     pull_zone_id: int,
@@ -99,7 +172,7 @@ def configure_blossom_pull_zone(
         "LogAnonymizationType": 1,
     }
     if middleware_script_id is not None:
-        update["EdgeScriptId"] = middleware_script_id
+        update["MiddlewareScriptId"] = middleware_script_id
     client.req("POST", f"/pullzone/{pull_zone_id}", update)
     pz = client.req("GET", f"/pullzone/{pull_zone_id}")
     for rule in pz.get("EdgeRules") or []:
@@ -207,10 +280,22 @@ def configure_blossom_pull_zone(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Bundle and deploy Bunny Blossom Edge Script.")
     parser.add_argument("--name", required=True, help="Bunny Edge Script name")
-    parser.add_argument("--mode", choices=["standalone", "middleware"], default="standalone")
+    parser.add_argument("--mode", choices=["standalone", "middleware", "passthrough"], default="standalone")
     parser.add_argument("--env-file", type=Path, help="Private JSON file with env and secrets maps")
     parser.add_argument("--pull-zone-id", type=int, help="Optional existing Pull Zone ID to link/configure")
+    parser.add_argument("--origin", help="Separate HTTPS Blossom origin for passthrough mode")
+    parser.add_argument("--public-host", help="Canonical Blossom hostname for passthrough mode")
     args = parser.parse_args()
+
+    if args.mode == "passthrough":
+        if not args.origin or not args.public_host or args.env_file or args.pull_zone_id:
+            parser.error("passthrough requires --origin and --public-host and creates a new zone")
+        zone = create_passthrough_zone(BunnyClient(load_api_key()), args.name, args.origin, args.public_host)
+        hosts = [h["Value"] for h in zone.get("Hostnames") or []]
+        print(f"Created uncached passthrough zone id={zone['Id']} hostnames={hosts}")
+        return 0
+    if args.origin or args.public_host:
+        parser.error("--origin and --public-host require --mode passthrough")
 
     here = Path(__file__).resolve().parent
     entry = here / ("middleware.ts" if args.mode == "middleware" else "bunny.ts")

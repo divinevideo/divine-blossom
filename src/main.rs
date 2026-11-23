@@ -315,7 +315,8 @@ fn route_request(req: Request) -> Result<Response> {
         // BUD-02: Upload
         (Method::PUT, "/upload") => with_upload_log(req, UploadRoute::DirectPut, handle_upload),
         // BUD-06: Upload requirements/pre-validation
-        (Method::HEAD, "/upload") => handle_upload_requirements(req),
+        // Some CDNs satisfy HEAD from a GET to the origin.
+        (Method::HEAD | Method::GET, "/upload") => handle_upload_requirements(req),
         // Synchronous audio transcription — thin forward to the upload service's
         // authenticated /transcribe proxy (which calls the transcoder).
         (Method::POST, "/transcribe") => handle_transcribe_proxy(req),
@@ -436,6 +437,9 @@ fn route_request(req: Request) -> Result<Response> {
         }
 
         // CORS preflight
+        (Method::OPTIONS, "/upload") => {
+            Ok(cors_preflight_response().with_header(header::ALLOW, "GET, HEAD, PUT, OPTIONS"))
+        }
         (Method::OPTIONS, _) => Ok(cors_preflight_response()),
 
         // Not found
@@ -3922,7 +3926,7 @@ fn handle_upload(mut req: Request, record: &mut UploadLogRecord) -> Result<Respo
 
     // Return blob descriptor
     let descriptor = metadata.to_descriptor(&base_url);
-    let mut resp = json_response(StatusCode::OK, &descriptor);
+    let mut resp = json_response(StatusCode::CREATED, &descriptor);
     add_cors_headers(&mut resp);
 
     Ok(resp)
@@ -4145,7 +4149,14 @@ fn publish_upload_service_upload(
     upload: UploadServicePublishedUpload,
     encoding_requested: bool,
 ) -> Result<Response> {
-    publish_upload_service_upload_with_policy(auth, base_url, upload, false, encoding_requested)
+    publish_upload_service_upload_with_policy(
+        auth,
+        base_url,
+        upload,
+        false,
+        encoding_requested,
+        StatusCode::OK,
+    )
 }
 
 fn publish_upload_service_upload_with_policy(
@@ -4154,6 +4165,7 @@ fn publish_upload_service_upload_with_policy(
     upload: UploadServicePublishedUpload,
     preserve_inline_dedupe: bool,
     encoding_requested: bool,
+    new_blob_status: StatusCode,
 ) -> Result<Response> {
     let hash = upload.sha256;
     let size = upload.size;
@@ -4373,7 +4385,7 @@ fn publish_upload_service_upload_with_policy(
     );
 
     let descriptor = metadata.to_descriptor(&base_url);
-    let mut resp = json_response(StatusCode::OK, &descriptor);
+    let mut resp = json_response(new_blob_status, &descriptor);
     add_cors_headers(&mut resp);
 
     Ok(resp)
@@ -4741,7 +4753,14 @@ fn handle_upload_service_proxy(
             "Upload service returned a different content hash".into(),
         ));
     }
-    publish_upload_service_upload_with_policy(auth, base_url, upload, expected_hash.is_some(), encoding_requested)
+    publish_upload_service_upload_with_policy(
+        auth,
+        base_url,
+        upload,
+        expected_hash.is_some(),
+        encoding_requested,
+        StatusCode::CREATED,
+    )
 }
 
 /// HEAD /upload - BUD-06 upload pre-validation
@@ -7684,7 +7703,7 @@ fn add_cors_headers(resp: &mut Response) {
     );
     resp.set_header(
         "Access-Control-Allow-Headers",
-        "Authorization, Content-Type, X-Sha256, X-Request-Id, X-Divine-Video-Processing",
+        "Authorization, Content-Type, X-Sha256, X-SHA-256, X-Content-Length, X-Content-Type, X-Request-Id, X-Divine-Video-Processing",
     );
     resp.set_header("Access-Control-Expose-Headers", upload_exposed_headers());
 }
@@ -7698,7 +7717,7 @@ struct UploadCapabilityHeaders {
 
 fn upload_exposed_headers() -> &'static str {
     // Retry-After lets a browser client read the throttle backoff on a 429.
-    "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256, X-Content-SHA256, X-Audio-Duration, X-Audio-Size, X-Divine-Upload-Extensions, X-Divine-Upload-Control-Host, X-Divine-Upload-Data-Host, Retry-After, Content-Language, X-Divine-Machine-Translated"
+    "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256, X-Content-SHA256, X-Audio-Duration, X-Audio-Size, X-Divine-Upload-Extensions, X-Divine-Upload-Control-Host, X-Divine-Upload-Data-Host, X-Reason, X-Exists, Retry-After, Content-Language, X-Divine-Machine-Translated"
 }
 
 fn upload_control_host(public_host: Option<&str>) -> String {
@@ -7718,6 +7737,7 @@ fn add_upload_capability_headers(resp: &mut Response, control_host: &str) {
     resp.set_header("X-Divine-Upload-Extensions", headers.extensions);
     resp.set_header("X-Divine-Upload-Control-Host", headers.control_host);
     resp.set_header("X-Divine-Upload-Data-Host", headers.data_host);
+    add_no_cache_headers(resp);
 }
 
 /// CORS preflight response

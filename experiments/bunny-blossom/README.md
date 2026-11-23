@@ -18,6 +18,30 @@ deno bundle --platform=deno middleware.ts -o /tmp/bunny-blossom-middleware.js
 deno bundle --platform=deno probe_bunny.ts -o /tmp/bunny-blossom-probe.js
 ```
 
+## Test direct uploads through Bunny Volume
+
+Create an isolated pull zone with the existing Blossom service as the origin. This mode forwards
+HTTP directly and sets the public host that Blossom uses in response URLs. Origin middleware
+returned 502 for uploads in a live transport probe. Direct forwarding preserved the original body,
+authorization, and Content-Length through 2 MiB over HTTP/1.1 and HTTP/2.
+
+```sh
+python3 deploy_bunny_blossom.py --mode passthrough --name "$staging_zone" \
+  --origin "$staging_origin" --public-host "$staging_zone.b-cdn.net"
+```
+
+Use an isolated HTTPS Blossom origin with synthetic storage. Test a signed direct PUT with
+`nak blossom upload` and test HEAD plus PUT with `blossom-client-sdk`. Verify the descriptor's URL,
+Unix timestamp, hash, and size. Repeat an upload to check 200 after the original 201, and retrieve
+the blob at the returned URL to compare the bytes. Verify OPTIONS advertises PUT and that the origin
+sees the original authorization and length. Use a synthetic clip and a separately uploaded JPEG,
+both larger than 8 KiB.
+
+This mode disables Bunny caching and downstream caching. Keep the zone off production DNS until
+canonical-host auth, posting, cache admission, and durable revocation for every served hostname pass
+in staging. Moderation and appeals continue through the authoritative Blossom origin and its
+existing storage.
+
 ## Architecture
 
 - **Entrypoints**:
