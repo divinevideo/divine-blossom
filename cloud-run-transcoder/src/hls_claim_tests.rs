@@ -654,19 +654,19 @@ async fn short_media_meets_the_same_key_quota_with_and_without_backups() {
             &gcs,
             MediaStorage::gcs(gcs.client(), "synthetic-gcs".into()),
             "testsrc2=size=640x360:rate=24:duration=6",
-            10
+            4
         ),
         measured_pipeline(
             &gcs,
             b2.with_gcs_backup(gcs.client()),
             "testsrc2=size=640x352:rate=24:duration=6",
-            17
+            4
         ),
         measured_pipeline(
             &gcs,
             b2.with_gcs_input_only(gcs.client()),
             "testsrc2=size=640x344:rate=24:duration=6",
-            10
+            4
         ),
     );
     eprintln!("6s FFmpeg fixtures with loopback storage: GCS-only {single:?}; B2 with backup {dual:?}; B2 without backup {primary_only:?}");
@@ -868,4 +868,245 @@ async fn disabling_backups_recovers_old_gcs_writes_only_with_matching_commit_mar
             assert!(locks.objects.lock().await.live.contains_key(&lock_key(A)));
         }
     }
+}
+
+#[tokio::test]
+async fn batch_publishing_recovery_requires_every_target_marker() {
+    let locks = Origin::start().await;
+    let media = crate::object_storage::tests::Origin::start().await;
+    let storage = media.with_gcs_backup(locks.client());
+    let mut owner = locks.store().claim(A, Some(&storage)).await.unwrap();
+    let k1 = format!("{A}/hls/stream_720p.ts");
+    let k2 = format!("{A}/hls/master.m3u8");
+    let id = owner.write_id();
+    owner
+        .begin_publication(
+            vec![
+                WriteTarget {
+                    gcs: false,
+                    key: k1.clone(),
+                },
+                WriteTarget {
+                    gcs: true,
+                    key: k2.clone(),
+                },
+            ],
+            &id,
+        )
+        .await
+        .unwrap();
+
+    // Only one of the two targets has committed -> must remain fenced.
+    media
+        .store()
+        .put_verified(
+            &k1,
+            Bytes::from_static(b"segment"),
+            "video/mp2t",
+            HashMap::from([(WRITE_ID.into(), id.clone())]),
+            None,
+        )
+        .await
+        .unwrap();
+    locks.age(A).await;
+    assert!(locks
+        .store()
+        .claim(A, Some(&storage))
+        .await
+        .unwrap_err()
+        .is::<Busy>());
+
+    // Once every recorded target carries the exact attempt marker, recovery succeeds.
+    locks
+        .client()
+        .upload_object(
+            &UploadObjectRequest {
+                bucket: "synthetic-gcs".into(),
+                if_generation_match: Some(0),
+                ..Default::default()
+            },
+            Bytes::from_static(b"master"),
+            &UploadType::Multipart(Box::new(Object {
+                name: k2.clone(),
+                content_type: Some("application/vnd.apple.mpegurl".into()),
+                metadata: Some(HashMap::from([(WRITE_ID.into(), id.clone())])),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+    let replacement = locks.store().claim(A, Some(&storage)).await.unwrap();
+    assert_eq!(replacement.dirty(), Dirty::Hls);
+    assert!(owner.confirm().await.is_err());
+    replacement.finish(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn batch_publish_retries_transient_b2_500_within_lease_and_succeeds() {
+    let locks = Origin::start().await;
+    let media = crate::object_storage::tests::Origin::start().await;
+    let storage = media.with_gcs_input_only(locks.client());
+    let k_seg = format!("{A}/hls/stream_720p.ts");
+    let k_master = format!("{A}/hls/master.m3u8");
+    media.objects.lock().await.fail_put_by_key.insert(
+        k_seg.clone(),
+        vec![
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        ],
+    );
+    let mut claim = locks.store().claim(A, Some(&storage)).await.unwrap();
+    let receipts = storage
+        .put_hls_batch_verified(
+            vec![
+                crate::object_storage::HlsUploadItem {
+                    tier: 0,
+                    key: k_seg.clone(),
+                    body: Bytes::from_static(b"segment"),
+                    mime: "video/mp2t".into(),
+                    custom: HashMap::new(),
+                    cache_control: None,
+                },
+                crate::object_storage::HlsUploadItem {
+                    tier: 2,
+                    key: k_master.clone(),
+                    body: Bytes::from_static(b"master"),
+                    mime: "application/vnd.apple.mpegurl".into(),
+                    custom: HashMap::new(),
+                    cache_control: None,
+                },
+            ],
+            &mut claim,
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipts.len(), 2);
+    claim.mark_verified().await.unwrap();
+    claim.finish(true).await.unwrap();
+    let state = locks.objects.lock().await;
+    assert_eq!(state.claim_writes[&lock_key(A)], 4);
+    assert!(!state.live.contains_key(&lock_key(A)));
+}
+
+#[tokio::test]
+async fn batch_publish_settles_explicit_rejection_without_publishing_master() {
+    let locks = Origin::start().await;
+    let media = crate::object_storage::tests::Origin::start().await;
+    let storage = media.with_gcs_input_only(locks.client());
+    let k_ok = format!("{A}/hls/stream_720p.ts");
+    let k_rej = format!("{A}/hls/stream_480p.ts");
+    let k_master = format!("{A}/hls/master.m3u8");
+    media
+        .objects
+        .lock()
+        .await
+        .fail_put_by_key
+        .insert(k_rej.clone(), vec![axum::http::StatusCode::FORBIDDEN]);
+    let mut claim = locks.store().claim(A, Some(&storage)).await.unwrap();
+    assert!(storage
+        .put_hls_batch_verified(
+            vec![
+                crate::object_storage::HlsUploadItem {
+                    tier: 0,
+                    key: k_ok,
+                    body: Bytes::from_static(b"seg720"),
+                    mime: "video/mp2t".into(),
+                    custom: HashMap::new(),
+                    cache_control: None,
+                },
+                crate::object_storage::HlsUploadItem {
+                    tier: 0,
+                    key: k_rej,
+                    body: Bytes::from_static(b"seg480"),
+                    mime: "video/mp2t".into(),
+                    custom: HashMap::new(),
+                    cache_control: None,
+                },
+                crate::object_storage::HlsUploadItem {
+                    tier: 2,
+                    key: k_master.clone(),
+                    body: Bytes::from_static(b"master"),
+                    mime: "application/vnd.apple.mpegurl".into(),
+                    custom: HashMap::new(),
+                    cache_control: None,
+                },
+            ],
+            &mut claim,
+        )
+        .await
+        .is_err());
+    // Master must never have been attempted after a tier-0 failure.
+    assert!(media.store().stat(&k_master).await.unwrap().is_none());
+    // Because every started PUT settled (one 200, one 403), finish(false)
+    // transitions cleanly to Retry so a replacement can immediately reclaim.
+    claim.finish(false).await.unwrap();
+    let replacement = locks.store().claim(A, Some(&storage)).await.unwrap();
+    assert_eq!(replacement.dirty(), Dirty::Hls);
+    replacement.finish(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn batch_publish_keeps_claim_fenced_when_any_sibling_put_is_unconfirmed() {
+    let locks = Origin::start().await;
+    let media = crate::object_storage::tests::Origin::start().await;
+    let storage = media.with_gcs_input_only(locks.client());
+    let k_rej = format!("{A}/hls/stream_720p.ts");
+    let k_500 = format!("{A}/hls/stream_480p.ts");
+    let k_master = format!("{A}/hls/master.m3u8");
+    {
+        let mut objs = media.objects.lock().await;
+        objs.fail_put_by_key
+            .insert(k_rej.clone(), vec![axum::http::StatusCode::FORBIDDEN]);
+        objs.fail_put_by_key.insert(
+            k_500.clone(),
+            vec![
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            ],
+        );
+    }
+    let mut claim = locks.store().claim(A, Some(&storage)).await.unwrap();
+    assert!(storage
+        .put_hls_batch_verified(
+            vec![
+                crate::object_storage::HlsUploadItem {
+                    tier: 0,
+                    key: k_rej,
+                    body: Bytes::from_static(b"seg720"),
+                    mime: "video/mp2t".into(),
+                    custom: HashMap::new(),
+                    cache_control: None,
+                },
+                crate::object_storage::HlsUploadItem {
+                    tier: 0,
+                    key: k_500,
+                    body: Bytes::from_static(b"seg480"),
+                    mime: "video/mp2t".into(),
+                    custom: HashMap::new(),
+                    cache_control: None,
+                },
+                crate::object_storage::HlsUploadItem {
+                    tier: 2,
+                    key: k_master.clone(),
+                    body: Bytes::from_static(b"master"),
+                    mime: "application/vnd.apple.mpegurl".into(),
+                    custom: HashMap::new(),
+                    cache_control: None,
+                },
+            ],
+            &mut claim,
+        )
+        .await
+        .is_err());
+    assert!(media.store().stat(&k_master).await.unwrap().is_none());
+    // The 403 sibling must not clear the unconfirmed 500 sibling!
+    assert!(claim.finish(false).await.is_err());
+    locks.age(A).await;
+    assert!(locks
+        .store()
+        .claim(A, Some(&storage))
+        .await
+        .unwrap_err()
+        .is::<Busy>());
 }

@@ -26,6 +26,7 @@ pub(crate) struct Objects {
     latest: HashMap<String, String>,
     pub(crate) requests: Vec<(String, String, Option<String>)>,
     pub(crate) fail: Option<StatusCode>,
+    pub(crate) fail_put_by_key: HashMap<String, Vec<StatusCode>>,
     missing_version: bool,
     pub(crate) corrupt: bool,
     pub(crate) get_status: Option<StatusCode>,
@@ -105,6 +106,17 @@ async fn request(State(state): State<Arc<Mutex<Objects>>>, req: Request) -> Resp
             .status(status)
             .body(Body::empty())
             .unwrap();
+    }
+    if method == "PUT" {
+        if let Some(statuses) = state.fail_put_by_key.get_mut(&key) {
+            if !statuses.is_empty() {
+                let status = statuses.remove(0);
+                return Response::builder()
+                    .status(status)
+                    .body(Body::empty())
+                    .unwrap();
+            }
+        }
     }
     assert!(req
         .headers()

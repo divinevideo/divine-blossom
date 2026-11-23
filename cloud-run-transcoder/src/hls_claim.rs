@@ -17,18 +17,25 @@ use google_cloud_storage::{
     },
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, future::Future, time::Duration};
+use std::{
+    collections::HashMap,
+    future::Future,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::time::Instant;
 
 use crate::object_storage::MediaStorage;
 
 const LEASE: Duration = Duration::from_secs(90);
+pub(crate) const B2_RETRY_LEASE_MARGIN: Duration = Duration::from_secs(45);
 const HEARTBEAT: Duration = Duration::from_secs(20);
 // Work must stop preparing new mutations after the dispatch deadline.
 const ATTEMPT_BUDGET: Duration = Duration::from_secs(900);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
-// Cloud Storage limits mutations of an object name to one per second.
-const MUTATION_INTERVAL: Duration = Duration::from_secs(1);
+// Cloud Storage limits mutations of an object name to one per second; a small
+// buffer avoids clock/RTT jitter tripping 429s on consecutive transitions.
+const MUTATION_INTERVAL: Duration = Duration::from_millis(1100);
 const STATE: &str = "hls_claim_v1";
 pub(crate) const WRITE_ID: &str = "hls_write_id";
 
@@ -55,6 +62,12 @@ struct Journal {
     phase: Phase,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WriteTarget {
+    pub(crate) gcs: bool,
+    pub(crate) key: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 enum Phase {
     #[default]
@@ -63,6 +76,10 @@ enum Phase {
         gcs: bool,
         key: String,
         id: String,
+    },
+    Publishing {
+        id: String,
+        writes: Vec<WriteTarget>,
     },
     Retry,
 }
@@ -80,11 +97,13 @@ pub(crate) struct Claim {
     journal: Journal,
     intent: Dirty,
     deadline: Instant,
+    lease_renewed_at: Instant,
     next_heartbeat: Instant,
     next_mutation: Instant,
-    // A provider success proves this PUT settled for the active worker. The
-    // durable Writing entry stays until the next CAS, so recovery can prove
-    // settlement independently by finding the same marker on the provider.
+    // A provider success proves the journaled PUT(s) settled for the active
+    // worker. The durable Writing/Publishing entry stays until the next CAS,
+    // so recovery can prove settlement independently by finding the same
+    // marker on the provider.
     write_acknowledged: bool,
 }
 
@@ -170,6 +189,32 @@ impl ClaimStore {
                         }
                     }
                 }
+                Phase::Publishing { id, writes } if stale => {
+                    if writes.is_empty() {
+                        count("invalid_lock_blocked");
+                        return Err(Busy.into());
+                    }
+                    let Some(storage) = storage else {
+                        count("recovery_failed");
+                        return Err(Busy.into());
+                    };
+                    let checks =
+                        futures::future::try_join_all(writes.iter().map(|target| {
+                            storage.hls_write_committed(target.gcs, &target.key, id)
+                        }))
+                        .await;
+                    match checks {
+                        Ok(results) if results.iter().all(|&committed| committed) => {}
+                        Ok(_) => {
+                            count("recovery_failed");
+                            return Err(Busy.into());
+                        }
+                        Err(error) => {
+                            count("recovery_failed");
+                            return Err(error).context("Transcode write recovery lookup failed");
+                        }
+                    }
+                }
                 _ => return Err(Busy.into()),
             }
             journal.phase = Phase::Preparing;
@@ -197,6 +242,7 @@ impl ClaimStore {
             journal,
             intent: Dirty::Hls,
             deadline: now + ATTEMPT_BUDGET,
+            lease_renewed_at: now,
             next_heartbeat: now + HEARTBEAT,
             next_mutation: now + MUTATION_INTERVAL,
             write_acknowledged: false,
@@ -307,6 +353,14 @@ impl Claim {
         self.generation.to_string()
     }
 
+    pub(crate) fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    pub(crate) fn lease_renewed_at(&self) -> Instant {
+        self.lease_renewed_at
+    }
+
     async fn transition(&mut self, journal: Journal, work_deadline: Option<Instant>) -> Result<()> {
         self.generation = self
             .store
@@ -322,13 +376,17 @@ impl Claim {
         self.journal = journal;
         self.write_acknowledged = false;
         let now = Instant::now();
+        self.lease_renewed_at = now;
         self.next_heartbeat = now + HEARTBEAT;
         self.next_mutation = now + MUTATION_INTERVAL;
         Ok(())
     }
 
     fn has_unconfirmed_write(&self) -> bool {
-        matches!(self.journal.phase, Phase::Writing { .. }) && !self.write_acknowledged
+        matches!(
+            self.journal.phase,
+            Phase::Writing { .. } | Phase::Publishing { .. }
+        ) && !self.write_acknowledged
     }
 
     fn check_deadline(&self) -> Result<()> {
@@ -389,6 +447,72 @@ impl Claim {
         self.transition(Journal::default(), None).await
     }
 
+    pub(crate) async fn begin_publication(
+        &mut self,
+        writes: Vec<WriteTarget>,
+        id: &str,
+    ) -> Result<()> {
+        self.check_deadline()?;
+        if self.has_unconfirmed_write() {
+            bail!("Cannot begin another write with an unconfirmed publication");
+        }
+        if writes.is_empty() {
+            bail!("Publication batch must include at least one target");
+        }
+        self.transition(
+            Journal {
+                dirty: self.journal.dirty.max(self.intent),
+                phase: Phase::Publishing {
+                    id: id.to_owned(),
+                    writes,
+                },
+            },
+            Some(self.deadline),
+        )
+        .await
+    }
+
+    /// Renew an active `Publishing` lease without ever cancelling or dropping
+    /// in-flight provider PUT futures. Any heartbeat failure is returned after
+    /// `work` completes so callers accurately observe whether every PUT settled.
+    pub(crate) async fn hold_publishing<T>(
+        &mut self,
+        lease_clock: Arc<Mutex<Instant>>,
+        work: impl Future<Output = T>,
+    ) -> (T, Option<anyhow::Error>) {
+        tokio::pin!(work);
+        let mut heartbeat_error: Option<anyhow::Error> = None;
+        loop {
+            if heartbeat_error.is_some() {
+                return (work.await, heartbeat_error);
+            }
+            tokio::select! {
+                biased;
+                result = &mut work => return (result, None),
+                () = tokio::time::sleep_until(self.next_heartbeat) => {
+                    let renewed = match self.check_deadline() {
+                        Ok(()) => {
+                            let journal = self.journal.clone();
+                            self.transition(journal, Some(self.deadline)).await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    match renewed {
+                        Ok(()) => {
+                            if let Ok(mut guard) = lease_clock.lock() {
+                                *guard = self.lease_renewed_at;
+                            }
+                        }
+                        Err(error) => {
+                            heartbeat_error = Some(error);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) async fn begin_write(&mut self, gcs: bool, key: &str, id: &str) -> Result<()> {
         self.check_deadline()?;
         if self.has_unconfirmed_write() {
