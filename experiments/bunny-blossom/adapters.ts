@@ -6,6 +6,7 @@ import { AwsClient } from "aws4fetch";
 import {
   type BlobRecord,
   type Blobs,
+  type CasOptions,
   type Catalog,
   type CdnPurger,
   type GlobalStats,
@@ -177,20 +178,30 @@ export class SqlCatalog implements Catalog {
     return result.rows.length ? decodeRecord(result.rows[0].body, hash.toLowerCase()) : null;
   }
 
-  async cas(hash: string, expected: number | null, row: BlobRecord): Promise<boolean> {
+  async cas(
+    hash: string,
+    expected: number | null,
+    row: BlobRecord,
+    options?: CasOptions,
+  ): Promise<boolean> {
     const normalizedHash = hash.toLowerCase();
     const encoded = JSON.stringify({ ...row, hash: normalizedHash });
     const decoded = decodeRecord(encoded, normalizedHash);
     if (decoded.revision !== (expected ?? 0) + 1) throw new Error("invalid revision");
 
     const primaryOwner = decoded.owners[0] ?? "";
+    const quarantineGuard = options?.requireUnquarantined
+      ? "AND NOT EXISTS (SELECT 1 FROM quarantine_holds WHERE hash = ?)"
+      : "";
+    const quarantineArgs = options?.requireUnquarantined ? [normalizedHash] : [];
     const casQuery = expected === null
       ? {
         sql: `INSERT INTO blobs(
             hash, revision, status, age_restricted, held, size, mime_type, uploaded, owner,
             transcode_status, transcode_generation, transcript_status, transcript_generation,
             gate, cleanup_pending, body
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          WHERE 1 = 1 ${quarantineGuard}
           ON CONFLICT(hash) DO NOTHING RETURNING revision`,
         args: [
           normalizedHash,
@@ -209,6 +220,7 @@ export class SqlCatalog implements Catalog {
           decoded.gate,
           decoded.cleanupPending ? 1 : 0,
           encoded,
+          ...quarantineArgs,
         ],
       }
       : {
@@ -217,7 +229,7 @@ export class SqlCatalog implements Catalog {
             uploaded = ?, owner = ?, transcode_status = ?, transcode_generation = ?,
             transcript_status = ?, transcript_generation = ?, gate = ?, cleanup_pending = ?,
             body = ?
-          WHERE hash = ? AND revision = ? RETURNING revision`,
+          WHERE hash = ? AND revision = ? ${quarantineGuard} RETURNING revision`,
         args: [
           decoded.revision,
           decoded.status,
@@ -236,6 +248,7 @@ export class SqlCatalog implements Catalog {
           encoded,
           normalizedHash,
           expected,
+          ...quarantineArgs,
         ],
       };
 

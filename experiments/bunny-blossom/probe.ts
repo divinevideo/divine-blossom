@@ -7,6 +7,7 @@ import { createApp, hex } from "./app.ts";
 import type {
   BlobRecord,
   Blobs,
+  CasOptions,
   Catalog,
   GlobalStats,
   ListPage,
@@ -26,10 +27,20 @@ class MemoryCatalog implements Catalog {
     const r = this.rows.get(hash.toLowerCase());
     return Promise.resolve(r ? structuredClone(r) : null);
   }
-  cas(hash: string, expected: number | null, value: BlobRecord): Promise<boolean> {
+  cas(
+    hash: string,
+    expected: number | null,
+    value: BlobRecord,
+    options?: CasOptions,
+  ): Promise<boolean> {
     const k = hash.toLowerCase();
     const cur = this.rows.get(k);
-    if ((cur?.revision ?? null) !== expected) return Promise.resolve(false);
+    if (
+      (cur?.revision ?? null) !== expected ||
+      (options?.requireUnquarantined && this.holds.get(k)?.size)
+    ) {
+      return Promise.resolve(false);
+    }
     this.rows.set(k, structuredClone(value));
     return Promise.resolve(true);
   }

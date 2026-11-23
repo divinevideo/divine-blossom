@@ -122,9 +122,18 @@ export interface ListOptions {
   includeRestricted?: boolean;
 }
 
+export interface CasOptions {
+  requireUnquarantined?: boolean;
+}
+
 export interface Catalog {
   get(hash: string): Promise<BlobRecord | null>;
-  cas(hash: string, expectedRevision: number | null, value: BlobRecord): Promise<boolean>;
+  cas(
+    hash: string,
+    expectedRevision: number | null,
+    value: BlobRecord,
+    options?: CasOptions,
+  ): Promise<boolean>;
   list(
     owner: string,
     limit: number,

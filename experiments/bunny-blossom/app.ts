@@ -830,7 +830,9 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
           next.transcriptTerminal = false;
         }
 
-        if (await config.catalog.cas(hash, existing.revision, next)) {
+        if (
+          await config.catalog.cas(hash, existing.revision, next, { requireUnquarantined: true })
+        ) {
           return jsonResp(200, buildDescriptor(next, origin));
         }
         continue;
@@ -866,7 +868,11 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         transcriptAttemptCount: isTranscribable && upload.transcriptErrorCode ? 1 : 0,
         transcriptTerminal: upload.transcriptTerminal,
       };
-      if (await config.catalog.cas(hash, existing?.revision ?? null, fresh)) {
+      if (
+        await config.catalog.cas(hash, existing?.revision ?? null, fresh, {
+          requireUnquarantined: true,
+        })
+      ) {
         if (isVideo) {
           await triggerModerationScan(hash, owner);
         }
@@ -927,7 +933,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         owners: old.owners.includes(owner) ? old.owners : [...old.owners, owner],
         videoEncodingAllowed: !encodingRequested ? false : old.videoEncodingAllowed,
       };
-      if (!await config.catalog.cas(hash, old.revision, deduped)) {
+      if (!await config.catalog.cas(hash, old.revision, deduped, { requireUnquarantined: true })) {
         return jsonResp(409, { error: "concurrent parent change" });
       }
       return jsonResp(200, buildDescriptor(deduped, origin));
@@ -954,7 +960,9 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       transcriptStatus: isTranscribable ? "pending" : undefined,
     };
 
-    if (!await config.catalog.cas(hash, old?.revision ?? null, row)) {
+    if (
+      !await config.catalog.cas(hash, old?.revision ?? null, row, { requireUnquarantined: true })
+    ) {
       return jsonResp(409, { error: "concurrent parent change" });
     }
 
@@ -975,7 +983,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       gate: null,
       owners: [...new Set([...current.owners, owner])],
     };
-    if (!await config.catalog.cas(hash, current.revision, ready)) {
+    if (!await config.catalog.cas(hash, current.revision, ready, { requireUnquarantined: true })) {
       return jsonResp(409, { error: "publication changed" });
     }
     if (isVideo) {
