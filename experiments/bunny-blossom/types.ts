@@ -115,10 +115,20 @@ export interface UserSummary {
   latest_uploaded: number;
 }
 
+export interface ListOptions {
+  /** Include owner-only `restricted` and quarantined rows (only for authenticated owner / admin / vanish). */
+  includeRestricted?: boolean;
+}
+
 export interface Catalog {
   get(hash: string): Promise<BlobRecord | null>;
   cas(hash: string, expectedRevision: number | null, value: BlobRecord): Promise<boolean>;
-  list(owner: string, limit: number, cursor?: string | null): Promise<ListPage>;
+  list(
+    owner: string,
+    limit: number,
+    cursor?: string | null,
+    options?: ListOptions,
+  ): Promise<ListPage>;
   recent(limit: number): Promise<BlobRecord[]>;
   stats(): Promise<GlobalStats>;
   users(limit: number): Promise<UserSummary[]>;

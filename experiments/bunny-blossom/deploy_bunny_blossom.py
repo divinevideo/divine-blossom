@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -78,24 +79,28 @@ def upsert_secret_or_var(
         client.req("PUT", f"/compute/script/{script_id}/secrets", {"Name": k, "Secret": v})
 
 
-def configure_blossom_pull_zone(client: BunnyClient, pull_zone_id: int) -> None:
+def configure_blossom_pull_zone(
+    client: BunnyClient,
+    pull_zone_id: int,
+    *,
+    middleware_script_id: int | None = None,
+) -> None:
     """Configure Pull Zone caching + pre-cache bypass Edge Rules for Blossom."""
-    client.req(
-        "POST",
-        f"/pullzone/{pull_zone_id}",
-        {
-            "EnableCacheSlice": True,
-            "EnableOriginShield": False,
-            "CacheErrorResponses": False,
-            "UseStaleWhileUpdating": False,
-            "UseStaleWhileOffline": False,
-            "DisableCookies": True,
-            "FollowRedirects": False,
-            "EnableSmartCache": False,
-            "IgnoreQueryStrings": False,
-            "LogAnonymizationType": 1,
-        },
-    )
+    update: dict[str, Any] = {
+        "EnableCacheSlice": True,
+        "EnableOriginShield": False,
+        "CacheErrorResponses": False,
+        "UseStaleWhileUpdating": False,
+        "UseStaleWhileOffline": False,
+        "DisableCookies": True,
+        "FollowRedirects": False,
+        "EnableSmartCache": False,
+        "IgnoreQueryStrings": False,
+        "LogAnonymizationType": 1,
+    }
+    if middleware_script_id is not None:
+        update["EdgeScriptId"] = middleware_script_id
+    client.req("POST", f"/pullzone/{pull_zone_id}", update)
     pz = client.req("GET", f"/pullzone/{pull_zone_id}")
     for rule in pz.get("EdgeRules") or []:
         if str(rule.get("Description", "")).startswith("blossom:"):
@@ -113,6 +118,17 @@ def configure_blossom_pull_zone(client: BunnyClient, pull_zone_id: int) -> None:
             ],
         },
         {
+            "Description": "blossom: mark Authorization responses private no-store",
+            "Enabled": True,
+            "ActionType": 5,  # SetResponseHeader
+            "ActionParameter1": "Cache-Control",
+            "ActionParameter2": "private, no-store",
+            "TriggerMatchingType": 0,
+            "Triggers": [
+                {"Type": 1, "PatternMatches": ["*"], "PatternMatchingType": 0, "Parameter1": "Authorization"}
+            ],
+        },
+        {
             "Description": "blossom: bypass cache for non-GET/HEAD methods",
             "Enabled": True,
             "ActionType": 3,
@@ -123,7 +139,7 @@ def configure_blossom_pull_zone(client: BunnyClient, pull_zone_id: int) -> None:
             ],
         },
         {
-            "Description": "blossom: bypass cache for control plane and API paths",
+            "Description": "blossom: bypass cache for control plane and API paths (1)",
             "Enabled": True,
             "ActionType": 3,
             "ActionParameter1": "0",
@@ -132,23 +148,51 @@ def configure_blossom_pull_zone(client: BunnyClient, pull_zone_id: int) -> None:
                 {
                     "Type": 0,
                     "PatternMatches": [
-                        "https://*/admin*",
-                        "https://*/upload*",
-                        "https://*/list/*",
-                        "https://*/v1/*",
-                        "https://*/api/*",
+                        "*://*/admin*",
+                        "*://*/upload*",
+                        "*://*/list/*",
+                        "*://*/v1/*",
+                        "*://*/api/*",
                     ],
                     "PatternMatchingType": 0,
                     "Parameter1": "",
                 },
+            ],
+        },
+        {
+            "Description": "blossom: bypass cache for control plane and API paths (2)",
+            "Enabled": True,
+            "ActionType": 3,
+            "ActionParameter1": "0",
+            "TriggerMatchingType": 0,
+            "Triggers": [
                 {
                     "Type": 0,
                     "PatternMatches": [
-                        "https://*/internal/*",
-                        "https://*/vanish",
-                        "https://*/report",
-                        "https://*/mirror",
-                        "https://*/health",
+                        "*://*/internal/*",
+                        "*://*/vanish",
+                        "*://*/report",
+                        "*://*/mirror",
+                        "*://*/health",
+                    ],
+                    "PatternMatchingType": 0,
+                    "Parameter1": "",
+                },
+            ],
+        },
+        {
+            "Description": "blossom: bypass cache for transcribe, version, and provenance paths",
+            "Enabled": True,
+            "ActionType": 3,
+            "ActionParameter1": "0",
+            "TriggerMatchingType": 0,
+            "Triggers": [
+                {
+                    "Type": 0,
+                    "PatternMatches": [
+                        "*://*/transcribe",
+                        "*://*/version",
+                        "*://*/*/provenance",
                     ],
                     "PatternMatchingType": 0,
                     "Parameter1": "",
@@ -170,13 +214,14 @@ def main() -> int:
 
     here = Path(__file__).resolve().parent
     entry = here / ("middleware.ts" if args.mode == "middleware" else "bunny.ts")
-    bundle_path = Path(f"/tmp/{args.name}-bundle.js")
-    subprocess.run(
-        ["deno", "bundle", "--platform=deno", str(entry), "-o", str(bundle_path)],
-        cwd=here,
-        check=True,
-    )
-    code = bundle_path.read_text()
+    with tempfile.TemporaryDirectory(prefix="bunny-blossom-") as tmp_dir:
+        bundle_path = Path(tmp_dir) / "bundle.js"
+        subprocess.run(
+            ["deno", "bundle", "--platform=deno", str(entry), "-o", str(bundle_path)],
+            cwd=here,
+            check=True,
+        )
+        code = bundle_path.read_text()
 
     client = BunnyClient(load_api_key())
     script = find_script(client, args.name)
@@ -215,7 +260,11 @@ def main() -> int:
     linked = refreshed.get("LinkedPullZones") or []
     pz_id = args.pull_zone_id or (int(linked[0]["Id"]) if linked else None)
     if pz_id:
-        configure_blossom_pull_zone(client, pz_id)
+        configure_blossom_pull_zone(
+            client,
+            pz_id,
+            middleware_script_id=script_id if args.mode == "middleware" else None,
+        )
         pz = client.req("GET", f"/pullzone/{pz_id}")
         hosts = [h["Value"] for h in pz.get("Hostnames") or []]
         print(f"Configured Pull Zone id={pz_id} hostnames={hosts}")

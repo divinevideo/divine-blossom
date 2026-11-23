@@ -70,6 +70,44 @@ class MigrateKvToSqlTests(unittest.TestCase):
             finally:
                 conn.close()
 
+    def test_higher_revision_preserves_deleted_owner_removal(self) -> None:
+        entries = [
+            (
+                f"blob:{H1}",
+                {
+                    "sha256": H1,
+                    "size": 123,
+                    "type": "video/mp4",
+                    "uploaded": 1700000000,
+                    "owner": OWNER,
+                    "status": "active",
+                },
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "blossom.db"
+            migrate_entries(entries, sqlite_path=db_path)
+
+            # Simulate newer runtime revision deleting H1 and clearing blob_owners
+            conn = sqlite3.connect(str(db_path))
+            try:
+                with conn:
+                    conn.execute("UPDATE blobs SET revision = 2, status = 'deleted' WHERE hash = ?", (H1,))
+                    conn.execute("DELETE FROM blob_owners WHERE hash = ?", (H1,))
+            finally:
+                conn.close()
+
+            # Re-running migration (revision 1) must NOT overwrite blobs or re-insert blob_owners
+            migrate_entries(entries, sqlite_path=db_path)
+            conn = sqlite3.connect(str(db_path))
+            try:
+                row = conn.execute("SELECT revision, status FROM blobs WHERE hash = ?", (H1,)).fetchone()
+                self.assertEqual(row, (2, "deleted"))
+                owners = conn.execute("SELECT owner FROM blob_owners WHERE hash = ?", (H1,)).fetchall()
+                self.assertEqual(owners, [])
+            finally:
+                conn.close()
+
     def test_transform_rejects_bad_hash(self) -> None:
         self.assertIsNone(transform_kv_blob("blob:notahash", {"status": "active"}))
 

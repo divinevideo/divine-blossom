@@ -168,11 +168,19 @@ def build_upsert_statements(record: dict[str, Any]) -> list[tuple[str, list[Any]
             ],
         )
     ]
-    if record["status"] != "deleted" and not record["held"]:
+    if record["status"] == "deleted" or record["held"]:
+        stmts.append((
+            "DELETE FROM blob_owners WHERE hash = ? AND EXISTS (SELECT 1 FROM blobs WHERE hash = ? AND revision <= ?)",
+            [record["hash"], record["hash"], record["revision"]],
+        ))
+    else:
         for owner in record["owners"]:
             stmts.append((
-                "INSERT OR REPLACE INTO blob_owners(owner, hash, uploaded) VALUES (?, ?, ?)",
-                [owner, record["hash"], record["uploaded"]],
+                """INSERT OR REPLACE INTO blob_owners(owner, hash, uploaded)
+                SELECT ?, ?, ? WHERE EXISTS (
+                    SELECT 1 FROM blobs WHERE hash = ? AND revision <= ? AND status != 'deleted' AND held = 0
+                )""",
+                [owner, record["hash"], record["uploaded"], record["hash"], record["revision"]],
             ))
     return stmts
 
@@ -205,16 +213,27 @@ def execute_libsql_batch(sql_url: str, token: str, stmts: list[tuple[str, list[A
             raise RuntimeError(f"libSQL batch error: {item.get('error')}")
 
 
-def fetch_fastly_kv_entries(
+def list_fastly_kv_keys(
     store_id: str,
     token: str,
-    prefix: str = "blob:",
-    max_pages: int = 50,
+    *,
+    prefix: str,
+    max_pages: int = 0,
     page_size: int = 100,
-) -> list[tuple[str, dict[str, Any]]]:
-    entries: list[tuple[str, dict[str, Any]]] = []
+    allow_truncated: bool = False,
+) -> list[str]:
+    """List Fastly KV keys for a prefix. `max_pages=0` paginates until exhausted."""
+    keys: list[str] = []
     cursor: str | None = None
-    for _ in range(max_pages):
+    pages = 0
+    while True:
+        if max_pages > 0 and pages >= max_pages:
+            if cursor and not allow_truncated:
+                raise RuntimeError(
+                    f"Fastly KV listing for prefix {prefix!r} truncated at {max_pages} pages "
+                    "(pass --max-pages 0 for full scan or --allow-truncated for bounded sample)"
+                )
+            break
         params = {"prefix": prefix, "limit": str(page_size)}
         if cursor:
             params["cursor"] = cursor
@@ -225,23 +244,67 @@ def fetch_fastly_kv_entries(
         )
         with urllib.request.urlopen(req, timeout=20) as resp:
             page = json.loads(resp.read().decode())
-        keys = page.get("data", [])
-        for key in keys:
-            kreq = urllib.request.Request(
-                f"https://api.fastly.com/resources/stores/kv/{store_id}/keys/{urllib.parse.quote(key, safe='')}",
-                headers={"Fastly-Key": token},
-            )
-            try:
-                with urllib.request.urlopen(kreq, timeout=15) as kr:
-                    meta = json.loads(kr.read().decode())
-                if isinstance(meta, dict):
-                    entries.append((key, meta))
-            except (urllib.error.HTTPError, json.JSONDecodeError):
-                continue
+        keys.extend(page.get("data", []))
+        pages += 1
         cursor = page.get("meta", {}).get("next_cursor")
         if not cursor:
             break
+    return keys
+
+
+def fetch_fastly_kv_entries(
+    store_id: str,
+    token: str,
+    prefix: str = "blob:",
+    max_pages: int = 0,
+    page_size: int = 100,
+    allow_truncated: bool = False,
+) -> list[tuple[str, dict[str, Any]]]:
+    entries: list[tuple[str, dict[str, Any]]] = []
+    keys = list_fastly_kv_keys(
+        store_id,
+        token,
+        prefix=prefix,
+        max_pages=max_pages,
+        page_size=page_size,
+        allow_truncated=allow_truncated,
+    )
+    for key in keys:
+        kreq = urllib.request.Request(
+            f"https://api.fastly.com/resources/stores/kv/{store_id}/keys/{urllib.parse.quote(key, safe='')}",
+            headers={"Fastly-Key": token},
+        )
+        try:
+            with urllib.request.urlopen(kreq, timeout=15) as kr:
+                meta = json.loads(kr.read().decode())
+            if isinstance(meta, dict):
+                entries.append((key, meta))
+        except (urllib.error.HTTPError, json.JSONDecodeError):
+            continue
     return entries
+
+
+def fetch_fastly_kv_tombstones(
+    store_id: str,
+    token: str,
+    *,
+    max_pages: int = 0,
+    page_size: int = 100,
+    allow_truncated: bool = False,
+) -> set[str]:
+    keys = list_fastly_kv_keys(
+        store_id,
+        token,
+        prefix="tombstone:",
+        max_pages=max_pages,
+        page_size=page_size,
+        allow_truncated=allow_truncated,
+    )
+    return {
+        k[len("tombstone:"):].strip().lower()
+        for k in keys
+        if k.startswith("tombstone:") and HASH_RE.fullmatch(k[len("tombstone:"):].strip().lower())
+    }
 
 
 def migrate_entries(
@@ -298,7 +361,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Migrate Fastly blossom_metadata KV into Bunny SQL.")
     parser.add_argument("--from-backup", type=Path, help="Local JSON map of KV key -> JSON object")
     parser.add_argument("--kv-store-id", help="Fastly KV store ID (reads FASTLY_API_TOKEN from env)")
-    parser.add_argument("--max-pages", type=int, default=10, help="Max Fastly KV list pages")
+    parser.add_argument("--max-pages", type=int, default=0, help="Max Fastly KV list pages (0 = full scan)")
+    parser.add_argument("--allow-truncated", action="store_true", help="Allow stopping early when --max-pages is reached")
     parser.add_argument("--page-size", type=int, default=100, help="Fastly KV keys per page")
     parser.add_argument("--sqlite-path", type=Path, help="Target local SQLite database path")
     parser.add_argument("--sql-url", help="Target libSQL/Bunny DB HTTPS/libsql URL")
@@ -319,8 +383,19 @@ def main(argv: list[str] | None = None) -> int:
         if not token:
             print("FASTLY_API_TOKEN environment variable required", file=sys.stderr)
             return 2
+        tombstones = fetch_fastly_kv_tombstones(
+            args.kv_store_id,
+            token,
+            max_pages=args.max_pages,
+            page_size=args.page_size,
+            allow_truncated=args.allow_truncated,
+        )
         entries = fetch_fastly_kv_entries(
-            args.kv_store_id, token, max_pages=args.max_pages, page_size=args.page_size
+            args.kv_store_id,
+            token,
+            max_pages=args.max_pages,
+            page_size=args.page_size,
+            allow_truncated=args.allow_truncated,
         )
     else:
         parser.error("Provide --from-backup or --kv-store-id")

@@ -9,6 +9,7 @@ import {
   isTranscodeWebhook,
   optionalViewerPubkey,
   requireNostrAuth,
+  verifySignedNostrEvent,
 } from "./auth.ts";
 import { LANDING_HTML } from "./landing.ts";
 import {
@@ -270,6 +271,35 @@ function mapModerationAction(action: string, isWebhook: boolean): BlobStatus | "
     default:
       return null;
   }
+}
+
+function assertSafeMirrorUrl(raw: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error("invalid url");
+  }
+  if (parsed.protocol !== "https:") throw new Error("https required");
+  if (parsed.username || parsed.password) throw new Error("credentials forbidden");
+  if (parsed.port && parsed.port !== "443") throw new Error("non-standard port forbidden");
+  const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
+  // Reject bare IPv4/IPv6 literals, localhost, single-label names, and internal suffixes.
+  if (
+    !host ||
+    !host.includes(".") ||
+    host.includes(":") ||
+    host.startsWith("[") ||
+    /^\d+(?:\.\d+){1,3}$/.test(host) ||
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".local") ||
+    host.endsWith(".internal") ||
+    host.endsWith(".arpa")
+  ) {
+    throw new Error("disallowed mirror host");
+  }
+  return parsed;
 }
 
 export function createApp(config: Config): (req: Request) => Promise<Response> {
@@ -670,6 +700,22 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
 
     // Subtitle jobs API
     if (path === "/v1/subtitles/jobs" && method === "POST") {
+      const authorized = isAdminRequest(req, config.secrets) || (() => {
+        try {
+          requireNostrAuth(req, "media", now(), undefined, { publicOrigin: origin });
+          return true;
+        } catch {
+          try {
+            requireNostrAuth(req, "upload", now(), undefined, { publicOrigin: origin });
+            return true;
+          } catch {
+            return false;
+          }
+        }
+      })();
+      if (!authorized) {
+        return jsonResp(401, { error: "subtitle job authorization required" });
+      }
       const body = await readJson<{ video_sha256?: string; lang?: string; force?: boolean }>(req);
       const hash = body.video_sha256?.toLowerCase() ?? "";
       const lang = (body.lang ?? "en").toLowerCase();
@@ -736,6 +782,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
     const listMatch = /^\/list\/([0-9a-fA-F]{64})$/.exec(path);
     if (listMatch && method === "GET") {
       const targetPubkey = listMatch[1].toLowerCase();
+      let isAuthenticatedOwner = false;
       if (req.headers.has("authorization")) {
         let authPubkey: string;
         try {
@@ -747,6 +794,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
           return jsonResp(401, { error: "invalid list authorization" });
         }
         if (authPubkey !== targetPubkey) return jsonResp(403, { error: "owner mismatch" });
+        isAuthenticatedOwner = true;
       } else if (fixture) {
         return jsonResp(401, { error: "invalid list authorization" });
       }
@@ -758,7 +806,9 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       }
       let page;
       try {
-        page = await config.catalog.list(targetPubkey, limit, cursor);
+        page = await config.catalog.list(targetPubkey, limit, cursor, {
+          includeRestricted: isAuthenticatedOwner,
+        });
       } catch {
         return jsonResp(400, { error: "invalid cursor" });
       }
@@ -784,6 +834,10 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       const row = await config.catalog.get(hash);
       if (!row) return jsonResp(404, { error: "not found" });
       if (!row.owners.includes(owner)) return jsonResp(403, { error: "owner mismatch" });
+      const holds = await config.catalog.getQuarantineHolds(hash);
+      if (row.held || holds.length > 0) {
+        return jsonResp(403, { error: "content under legal hold or quarantine" });
+      }
 
       const owners = row.owners.filter((k) => k !== owner);
       const last = owners.length === 0;
@@ -813,10 +867,16 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       } catch {
         return jsonResp(401, { error: "invalid vanish authorization" });
       }
-      const page = await config.catalog.list(owner, 100);
+      const page = await config.catalog.list(owner, 100, null, { includeRestricted: true });
       let erased = 0;
       let unlinked = 0;
+      let skippedHeld = 0;
       for (const row of page.items) {
+        const holds = await config.catalog.getQuarantineHolds(row.hash);
+        if (row.held || holds.length > 0) {
+          skippedHeld++;
+          continue;
+        }
         const owners = row.owners.filter((k) => k !== owner);
         const last = owners.length === 0;
         const next: BlobRecord = {
@@ -840,6 +900,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         pubkey: owner,
         erased,
         unlinked,
+        skipped_held: skippedHeld,
         remaining: page.nextCursor !== null,
       });
     }
@@ -847,8 +908,8 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
     // BUD-09: PUT /report
     if (path === "/report" && method === "PUT") {
       const event = await readJson<{ kind?: number; id?: string }>(req, 32 * 1024);
-      if (event.kind !== 1984) {
-        return jsonResp(400, { error: "NIP-56 kind 1984 report event required" });
+      if (event.kind !== 1984 || !verifySignedNostrEvent(event)) {
+        return jsonResp(400, { error: "signed NIP-56 kind 1984 report event required" });
       }
       if (config.upstreams?.moderationApiUrl) {
         const modHeaders: Record<string, string> = { "content-type": "application/json" };
@@ -874,11 +935,17 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       } catch {
         return jsonResp(401, { error: "invalid mirror authorization" });
       }
-      const body = await readJson<{ url?: string }>(req, 8 * 1024);
-      if (!body.url || !body.url.startsWith("https://")) {
-        return jsonResp(400, { error: "HTTPS mirror url required" });
+      if (fixture && !fixture.owners.includes(owner)) {
+        return jsonResp(403, { error: "fixture signer required" });
       }
-      const remote = await fetcher(body.url, {
+      const body = await readJson<{ url?: string }>(req, 8 * 1024);
+      let mirrorUrl: URL;
+      try {
+        mirrorUrl = assertSafeMirrorUrl(body.url ?? "");
+      } catch {
+        return jsonResp(400, { error: "public HTTPS mirror url required" });
+      }
+      const remote = await fetcher(mirrorUrl.toString(), {
         redirect: "error",
         signal: AbortSignal.timeout(20_000),
       });
@@ -887,13 +954,23 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         return jsonResp(502, { error: "mirror source unavailable" });
       }
       const bytes = await boundedBody(
-        new Request(body.url, { method: "POST", body: remote.body, headers: remote.headers }),
+        new Request(mirrorUrl.toString(), {
+          method: "POST",
+          body: remote.body,
+          headers: remote.headers,
+        }),
         maxDirectUpload,
       );
       const hash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)));
+      if (fixture && hash !== fixture.hash) {
+        return jsonResp(403, { error: "fixture digest required" });
+      }
       const existing = await config.catalog.get(hash);
       if (existing?.held || existing?.status === "banned") {
         return jsonResp(403, { error: "content blocked" });
+      }
+      if (existing?.status === "deleted" || existing?.gate) {
+        return jsonResp(409, { error: "parent unavailable" });
       }
       if (!existing) {
         const mime = remote.headers.get("content-type") ?? "application/octet-stream";
@@ -911,8 +988,21 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
           gate: null,
           cleanupPending: false,
         };
-        await config.catalog.cas(hash, null, rec);
+        if (!await config.catalog.cas(hash, null, rec)) {
+          return jsonResp(409, { error: "concurrent parent change" });
+        }
         return jsonResp(200, buildDescriptor(rec, origin));
+      }
+      if (!existing.owners.includes(owner)) {
+        const updated: BlobRecord = {
+          ...existing,
+          revision: existing.revision + 1,
+          owners: [...existing.owners, owner],
+        };
+        if (!await config.catalog.cas(hash, existing.revision, updated)) {
+          return jsonResp(409, { error: "concurrent parent change" });
+        }
+        return jsonResp(200, buildDescriptor(updated, origin));
       }
       return jsonResp(200, buildDescriptor(existing, origin));
     }
@@ -1060,6 +1150,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
 
     // Durable purge & B2 erasure outbox drain: POST /admin/api/b2-cdn-purge/drain
     if (path === "/admin/api/b2-cdn-purge/drain") {
+      if (method !== "POST") return jsonResp(405, { error: "POST required" });
       if (!isPurgeDrainAuthorized(req, config.secrets)) {
         return jsonResp(401, { error: "Purge drain authorization required" });
       }
@@ -1068,9 +1159,17 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       const due = await config.catalog.listDuePurges(now(), limit);
       let completed = 0;
       let deferred = 0;
+      let skippedHeld = 0;
       for (const item of due) {
         try {
-          if (item.deleteB2 && config.blobs.deletePrefix) {
+          const currentRow = await config.catalog.get(item.hash);
+          const currentHolds = await config.catalog.getQuarantineHolds(item.hash);
+          const allowB2Delete = item.deleteB2 &&
+            (!currentRow ||
+              (!currentRow.held && currentHolds.length === 0 && currentRow.status === "deleted"));
+          if (item.deleteB2 && !allowB2Delete) {
+            skippedHeld++;
+          } else if (allowB2Delete && config.blobs.deletePrefix) {
             const res = await config.blobs.deletePrefix(item.hash);
             if (res.remaining) {
               await config.catalog.deferPurge(item.id, item.attempts + 1, now() + 5);
@@ -1082,14 +1181,16 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
             await config.purger.purgeHash(item.hash);
           }
           await config.catalog.completePurge(item.id);
-          // Clear cleanupPending marker if blob is still deleted
-          const row = await config.catalog.get(item.hash);
-          if (row && row.cleanupPending) {
-            await config.catalog.cas(row.hash, row.revision, {
-              ...row,
-              revision: row.revision + 1,
-              cleanupPending: false,
-            });
+          // Clear cleanupPending marker only if B2 erasure actually ran and blob is still deleted
+          if (allowB2Delete) {
+            const row = await config.catalog.get(item.hash);
+            if (row && row.cleanupPending && row.status === "deleted") {
+              await config.catalog.cas(row.hash, row.revision, {
+                ...row,
+                revision: row.revision + 1,
+                cleanupPending: false,
+              });
+            }
           }
           completed++;
         } catch {
@@ -1098,7 +1199,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
           deferred++;
         }
       }
-      return jsonResp(200, { drained: due.length, completed, deferred });
+      return jsonResp(200, { drained: due.length, completed, deferred, skipped_held: skippedHeld });
     }
 
     // Admin & Moderation endpoints
@@ -1264,9 +1365,15 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       const body = await readJson<{ pubkey?: string }>(req);
       const pubkey = body.pubkey?.toLowerCase() ?? "";
       if (!HASH.test(pubkey)) return jsonResp(400, { error: "Invalid pubkey" });
-      const page = await config.catalog.list(pubkey, 100);
+      const page = await config.catalog.list(pubkey, 100, null, { includeRestricted: true });
       let erased = 0;
+      let skippedHeld = 0;
       for (const row of page.items) {
+        const holds = await config.catalog.getQuarantineHolds(row.hash);
+        if (row.held || holds.length > 0) {
+          skippedHeld++;
+          continue;
+        }
         const owners = row.owners.filter((k) => k !== pubkey);
         const last = owners.length === 0;
         if (
@@ -1285,7 +1392,12 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
           }
         }
       }
-      return jsonResp(202, { pubkey, erased, remaining: page.nextCursor !== null });
+      return jsonResp(202, {
+        pubkey,
+        erased,
+        skipped_held: skippedHeld,
+        remaining: page.nextCursor !== null,
+      });
     }
 
     if (path === "/admin/api/stats" && method === "GET") {
@@ -1319,7 +1431,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       const pubkey = path.slice("/admin/api/user/".length).toLowerCase();
       if (!HASH.test(pubkey)) return jsonResp(400, { error: "Invalid pubkey" });
       const cursor = url.searchParams.get("cursor");
-      const page = await config.catalog.list(pubkey, 100, cursor);
+      const page = await config.catalog.list(pubkey, 100, cursor, { includeRestricted: true });
       return jsonResp(200, { pubkey, blobs: page.items, next_cursor: page.nextCursor });
     }
 

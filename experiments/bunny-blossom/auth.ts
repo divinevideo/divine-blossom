@@ -80,6 +80,17 @@ export function isArchiveImportAuthorized(req: Request, secrets?: AuthSecrets): 
   return hasValidBearer(req, [secrets?.archiveImportToken]);
 }
 
+export function verifySignedNostrEvent(event: unknown): event is ParsedNostrEvent {
+  if (!event || typeof event !== "object") return false;
+  const candidate = event as Partial<ParsedNostrEvent>;
+  if (!Array.isArray(candidate.tags)) return false;
+  try {
+    return verifyEvent(candidate as ParsedNostrEvent);
+  } catch {
+    return false;
+  }
+}
+
 function decodeNostrHeader(headerValue: string): ParsedNostrEvent | null {
   const trimmed = headerValue.trim();
   if (trimmed.length > MAX_AUTH_HEADER || !/^nostr\s+/i.test(trimmed)) return null;

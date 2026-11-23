@@ -9,6 +9,7 @@ import {
   type Catalog,
   type CdnPurger,
   type GlobalStats,
+  type ListOptions,
   type ListPage,
   normalizeStatus,
   type PurgeItem,
@@ -130,11 +131,22 @@ function decodeRecord(raw: unknown, expectedHash?: string): BlobRecord {
   };
 }
 
+export interface SqlTransaction {
+  execute(query: {
+    sql: string;
+    args: (string | number | null)[];
+  }): Promise<{ rows: Record<string, unknown>[] }>;
+  commit(): Promise<void>;
+  rollback(): Promise<void>;
+  close?(): void;
+}
+
 export interface SqlExecutor {
   execute(query: {
     sql: string;
     args: (string | number | null)[];
   }): Promise<{ rows: Record<string, unknown>[] }>;
+  transaction?(mode: "write" | "read"): Promise<SqlTransaction>;
 }
 
 /**
@@ -168,84 +180,120 @@ export class SqlCatalog implements Catalog {
     if (decoded.revision !== (expected ?? 0) + 1) throw new Error("invalid revision");
 
     const primaryOwner = decoded.owners[0] ?? "";
-    const result = await this.client.execute(
-      expected === null
-        ? {
-          sql: `INSERT INTO blobs(
-              hash, revision, status, age_restricted, held, size, mime_type, uploaded, owner,
-              transcode_status, transcode_generation, transcript_status, transcript_generation,
-              gate, cleanup_pending, body
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(hash) DO NOTHING RETURNING revision`,
-          args: [
-            normalizedHash,
-            decoded.revision,
-            decoded.status,
-            decoded.ageRestricted ? 1 : 0,
-            decoded.held ? 1 : 0,
-            decoded.size,
-            decoded.type,
-            decoded.uploaded,
-            primaryOwner,
-            decoded.transcodeStatus ?? null,
-            decoded.transcodeGeneration ?? null,
-            decoded.transcriptStatus ?? null,
-            decoded.transcriptGeneration ?? null,
-            decoded.gate,
-            decoded.cleanupPending ? 1 : 0,
-            encoded,
-          ],
+    const casQuery = expected === null
+      ? {
+        sql: `INSERT INTO blobs(
+            hash, revision, status, age_restricted, held, size, mime_type, uploaded, owner,
+            transcode_status, transcode_generation, transcript_status, transcript_generation,
+            gate, cleanup_pending, body
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(hash) DO NOTHING RETURNING revision`,
+        args: [
+          normalizedHash,
+          decoded.revision,
+          decoded.status,
+          decoded.ageRestricted ? 1 : 0,
+          decoded.held ? 1 : 0,
+          decoded.size,
+          decoded.type,
+          decoded.uploaded,
+          primaryOwner,
+          decoded.transcodeStatus ?? null,
+          decoded.transcodeGeneration ?? null,
+          decoded.transcriptStatus ?? null,
+          decoded.transcriptGeneration ?? null,
+          decoded.gate,
+          decoded.cleanupPending ? 1 : 0,
+          encoded,
+        ],
+      }
+      : {
+        sql: `UPDATE blobs SET
+            revision = ?, status = ?, age_restricted = ?, held = ?, size = ?, mime_type = ?,
+            uploaded = ?, owner = ?, transcode_status = ?, transcode_generation = ?,
+            transcript_status = ?, transcript_generation = ?, gate = ?, cleanup_pending = ?,
+            body = ?
+          WHERE hash = ? AND revision = ? RETURNING revision`,
+        args: [
+          decoded.revision,
+          decoded.status,
+          decoded.ageRestricted ? 1 : 0,
+          decoded.held ? 1 : 0,
+          decoded.size,
+          decoded.type,
+          decoded.uploaded,
+          primaryOwner,
+          decoded.transcodeStatus ?? null,
+          decoded.transcodeGeneration ?? null,
+          decoded.transcriptStatus ?? null,
+          decoded.transcriptGeneration ?? null,
+          decoded.gate,
+          decoded.cleanupPending ? 1 : 0,
+          encoded,
+          normalizedHash,
+          expected,
+        ],
+      };
+
+    const runWithExecutor = async (
+      exec: Pick<SqlExecutor, "execute">,
+    ): Promise<boolean> => {
+      const result = await exec.execute(casQuery);
+      if (result.rows.length !== 1) return false;
+
+      // Synchronize indexed owner join table inside the same write transaction.
+      await exec.execute({
+        sql: "DELETE FROM blob_owners WHERE hash = ?",
+        args: [normalizedHash],
+      });
+      if (decoded.status !== "deleted" && !decoded.held && decoded.gate === null) {
+        for (const owner of decoded.owners) {
+          await exec.execute({
+            sql: `INSERT OR REPLACE INTO blob_owners(owner, hash, uploaded) VALUES (?, ?, ?)`,
+            args: [owner, normalizedHash, decoded.uploaded],
+          });
         }
-        : {
-          sql: `UPDATE blobs SET
-              revision = ?, status = ?, age_restricted = ?, held = ?, size = ?, mime_type = ?,
-              uploaded = ?, owner = ?, transcode_status = ?, transcode_generation = ?,
-              transcript_status = ?, transcript_generation = ?, gate = ?, cleanup_pending = ?,
-              body = ?
-            WHERE hash = ? AND revision = ? RETURNING revision`,
-          args: [
-            decoded.revision,
-            decoded.status,
-            decoded.ageRestricted ? 1 : 0,
-            decoded.held ? 1 : 0,
-            decoded.size,
-            decoded.type,
-            decoded.uploaded,
-            primaryOwner,
-            decoded.transcodeStatus ?? null,
-            decoded.transcodeGeneration ?? null,
-            decoded.transcriptStatus ?? null,
-            decoded.transcriptGeneration ?? null,
-            decoded.gate,
-            decoded.cleanupPending ? 1 : 0,
-            encoded,
-            normalizedHash,
-            expected,
-          ],
-        },
-    );
+      }
+      return true;
+    };
 
-    if (result.rows.length !== 1) return false;
-
-    // Synchronize indexed owner join table.
-    await this.client.execute({
-      sql: "DELETE FROM blob_owners WHERE hash = ?",
-      args: [normalizedHash],
-    });
-    if (decoded.status !== "deleted" && !decoded.held && decoded.gate === null) {
-      for (const owner of decoded.owners) {
-        await this.client.execute({
-          sql: `INSERT OR REPLACE INTO blob_owners(owner, hash, uploaded) VALUES (?, ?, ?)`,
-          args: [owner, normalizedHash, decoded.uploaded],
-        });
+    if (typeof this.client.transaction === "function") {
+      const tx = await this.client.transaction("write");
+      try {
+        const applied = await runWithExecutor(tx);
+        if (applied) {
+          await tx.commit();
+        } else {
+          await tx.rollback();
+        }
+        return applied;
+      } catch (err) {
+        await tx.rollback().catch(() => {});
+        throw err;
+      } finally {
+        tx.close?.();
       }
     }
-    return true;
+
+    return await runWithExecutor(this.client);
   }
 
-  async list(owner: string, limit: number, cursor?: string | null): Promise<ListPage> {
+  async list(
+    owner: string,
+    limit: number,
+    cursor?: string | null,
+    options?: ListOptions,
+  ): Promise<ListPage> {
     const bounded = Math.max(1, Math.min(limit, 100));
     const normalizedOwner = owner.toLowerCase();
+    const visibilityClause = options?.includeRestricted
+      ? `b.status NOT IN ('deleted', 'banned')
+          AND b.held = 0
+          AND b.gate IS NULL`
+      : `b.status NOT IN ('deleted', 'banned', 'restricted')
+          AND b.held = 0
+          AND b.gate IS NULL
+          AND NOT EXISTS (SELECT 1 FROM quarantine_holds q WHERE q.hash = b.hash)`;
     let sql: string;
     let args: (string | number | null)[];
 
@@ -258,9 +306,7 @@ export class SqlCatalog implements Catalog {
       sql = `SELECT b.body FROM blob_owners o
         INNER JOIN blobs b ON b.hash = o.hash
         WHERE o.owner = ?
-          AND b.status NOT IN ('deleted', 'banned')
-          AND b.held = 0
-          AND b.gate IS NULL
+          AND ${visibilityClause}
           AND (o.uploaded < ? OR (o.uploaded = ? AND o.hash > ?))
         ORDER BY o.uploaded DESC, o.hash ASC
         LIMIT ?`;
@@ -269,9 +315,7 @@ export class SqlCatalog implements Catalog {
       sql = `SELECT b.body FROM blob_owners o
         INNER JOIN blobs b ON b.hash = o.hash
         WHERE o.owner = ?
-          AND b.status NOT IN ('deleted', 'banned')
-          AND b.held = 0
-          AND b.gate IS NULL
+          AND ${visibilityClause}
         ORDER BY o.uploaded DESC, o.hash ASC
         LIMIT ?`;
       args = [normalizedOwner, bounded + 1];
