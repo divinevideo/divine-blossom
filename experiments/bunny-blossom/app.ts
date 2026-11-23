@@ -283,7 +283,7 @@ function assertSafeMirrorUrl(raw: string): URL {
   if (parsed.protocol !== "https:") throw new Error("https required");
   if (parsed.username || parsed.password) throw new Error("credentials forbidden");
   if (parsed.port && parsed.port !== "443") throw new Error("non-standard port forbidden");
-  const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
+  const host = parsed.hostname.toLowerCase().replace(/\.+$/, "");
   // Reject bare IPv4/IPv6 literals, localhost, single-label names, and internal suffixes.
   if (
     !host ||
@@ -700,21 +700,20 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
 
     // Subtitle jobs API
     if (path === "/v1/subtitles/jobs" && method === "POST") {
-      const authorized = isAdminRequest(req, config.secrets) || (() => {
+      const isAdmin = isAdminRequest(req, config.secrets);
+      let callerPubkey: string | null = null;
+      if (!isAdmin) {
         try {
-          requireNostrAuth(req, "media", now(), undefined, { publicOrigin: origin });
-          return true;
+          callerPubkey = requireNostrAuth(req, "media", now(), undefined, { publicOrigin: origin });
         } catch {
           try {
-            requireNostrAuth(req, "upload", now(), undefined, { publicOrigin: origin });
-            return true;
+            callerPubkey = requireNostrAuth(req, "upload", now(), undefined, {
+              publicOrigin: origin,
+            });
           } catch {
-            return false;
+            return jsonResp(401, { error: "subtitle job authorization required" });
           }
         }
-      })();
-      if (!authorized) {
-        return jsonResp(401, { error: "subtitle job authorization required" });
       }
       const body = await readJson<{ video_sha256?: string; lang?: string; force?: boolean }>(req);
       const hash = body.video_sha256?.toLowerCase() ?? "";
@@ -723,8 +722,15 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         return jsonResp(400, { error: "invalid video_sha256 or lang" });
       }
       const blob = await config.catalog.get(hash);
-      if (!blob || blob.status === "deleted" || blob.status === "banned") {
+      const holds = blob ? await config.catalog.getQuarantineHolds(hash) : [];
+      if (
+        !blob || blob.status === "deleted" || blob.status === "banned" || blob.held ||
+        holds.length > 0
+      ) {
         return jsonResp(404, { error: "video not found" });
+      }
+      if (!isAdmin && (!callerPubkey || !blob.owners.includes(callerPubkey))) {
+        return jsonResp(403, { error: "owner or admin authorization required" });
       }
       const existing = await config.catalog.getSubtitleByHash(hash, lang);
       if (existing && !body.force && existing.status !== "failed") {
@@ -966,7 +972,11 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         return jsonResp(403, { error: "fixture digest required" });
       }
       const existing = await config.catalog.get(hash);
-      if (existing?.held || existing?.status === "banned") {
+      const existingHolds = existing ? await config.catalog.getQuarantineHolds(hash) : [];
+      if (
+        existing?.held || existing?.status === "banned" || existing?.status === "restricted" ||
+        existingHolds.length > 0
+      ) {
         return jsonResp(403, { error: "content blocked" });
       }
       if (existing?.status === "deleted" || existing?.gate) {
@@ -1165,8 +1175,8 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
           const currentRow = await config.catalog.get(item.hash);
           const currentHolds = await config.catalog.getQuarantineHolds(item.hash);
           const allowB2Delete = item.deleteB2 &&
-            (!currentRow ||
-              (!currentRow.held && currentHolds.length === 0 && currentRow.status === "deleted"));
+            currentHolds.length === 0 &&
+            (!currentRow || (!currentRow.held && currentRow.status === "deleted"));
           if (item.deleteB2 && !allowB2Delete) {
             skippedHeld++;
           } else if (allowB2Delete && config.blobs.deletePrefix) {

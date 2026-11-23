@@ -190,9 +190,9 @@ def configure_blossom_pull_zone(
                 {
                     "Type": 0,
                     "PatternMatches": [
-                        "*://*/transcribe",
-                        "*://*/version",
-                        "*://*/*/provenance",
+                        "*://*/transcribe*",
+                        "*://*/version*",
+                        "*://*/*/provenance*",
                     ],
                     "PatternMatchingType": 0,
                     "Parameter1": "",

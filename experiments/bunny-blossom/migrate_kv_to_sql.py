@@ -168,12 +168,11 @@ def build_upsert_statements(record: dict[str, Any]) -> list[tuple[str, list[Any]
             ],
         )
     ]
-    if record["status"] == "deleted" or record["held"]:
-        stmts.append((
-            "DELETE FROM blob_owners WHERE hash = ? AND EXISTS (SELECT 1 FROM blobs WHERE hash = ? AND revision <= ?)",
-            [record["hash"], record["hash"], record["revision"]],
-        ))
-    else:
+    stmts.append((
+        "DELETE FROM blob_owners WHERE hash = ? AND EXISTS (SELECT 1 FROM blobs WHERE hash = ? AND revision <= ?)",
+        [record["hash"], record["hash"], record["revision"]],
+    ))
+    if record["status"] != "deleted" and not record["held"]:
         for owner in record["owners"]:
             stmts.append((
                 """INSERT OR REPLACE INTO blob_owners(owner, hash, uploaded)
