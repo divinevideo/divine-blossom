@@ -1,11 +1,13 @@
 # ABOUTME: Slim CPU-only Dockerfile for running divine-transcoder off Cloud Run
-# ABOUTME: Omits the ~3 GB CUDA runtime layer for Hetzner/Vultr/bare-metal workers
+# ABOUTME: Uses debian:bookworm-slim to match builder glibc 2.36 and omit ~3 GB CUDA layers
 
 FROM rust:1.83-slim-bookworm AS builder
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+RUN DEBIAN_FRONTEND=noninteractive apt-get update \
+    && apt-get install -y --no-install-recommends pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY blossom-core /blossom-core
 COPY Cargo.toml Cargo.lock* ./
@@ -17,18 +19,24 @@ RUN rm -rf src
 COPY src ./src
 RUN touch src/main.rs && cargo build --release --locked
 
-FROM ubuntu:22.04
+FROM debian:bookworm-slim
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+RUN DEBIAN_FRONTEND=noninteractive apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --home-dir /app --shell /usr/sbin/nologin transcoder
 
 COPY --from=builder /app/target/release/divine-transcoder /app/divine-transcoder
 
 ENV PORT=8080
 ENV USE_GPU=false
+
+EXPOSE 8080
+USER transcoder
 
 CMD ["/app/divine-transcoder"]
