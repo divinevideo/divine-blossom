@@ -84,7 +84,10 @@ fn unknown_or_incompatible_streams_keep_encoding() {
 
 #[test]
 fn high_bitrate_or_unknown_duration_does_not_bypass_compression() {
-    assert!(!eligible(&compatible(), 375_001));
+    // 900_000 bytes over 6.0s = 1.2 Mbps (typical 480x480 Vine) qualifies;
+    // 1_125_001 bytes over 6.0s > 1.5 Mbps must fall back to compression.
+    assert!(eligible(&compatible(), 900_000));
+    assert!(!eligible(&compatible(), 1_125_001));
     assert!(!eligible(&compatible(), 0));
     for value in [
         json!(null),
@@ -105,12 +108,16 @@ fn high_bitrate_or_unknown_duration_does_not_bypass_compression() {
 
 #[test]
 fn incompatible_or_unbounded_audio_keeps_encoding() {
+    let mut at_ceiling = compatible();
+    at_ceiling["streams"][1]["bit_rate"] = json!("128000");
+    assert!(eligible(&at_ceiling, 900_000));
+
     for (key, value) in [
         ("codec_name", json!("opus")),
         ("profile", json!("HE-AAC")),
         ("channels", json!(6)),
         ("sample_rate", json!("96000")),
-        ("bit_rate", json!("128000")),
+        ("bit_rate", json!("192000")),
         ("bit_rate", json!(null)),
         ("duration", json!("7")),
         ("start_time", json!("0.5")),
@@ -486,9 +493,55 @@ async fn high_bitrate_source_falls_back_to_compression() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("source.mp4");
     let output = dir.path().join("hls");
-    make_source_at_quality(&input, true, "18").await;
+    media_tool(
+        "ffmpeg",
+        &[
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=480x480:rate=25:duration=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100:duration=2",
+            "-vf",
+            "setsar=1,noise=alls=40:allf=t",
+            "-c:v",
+            "libx264",
+            "-profile:v",
+            "baseline",
+            "-level:v",
+            "3.0",
+            "-pix_fmt",
+            "yuv420p",
+            "-bf",
+            "0",
+            "-crf",
+            "16",
+            "-preset",
+            "fast",
+            "-g",
+            "25",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "64k",
+            "-movflags",
+            "+faststart",
+            input.to_str().unwrap(),
+        ],
+    )
+    .await;
     tokio::fs::create_dir(&output).await.unwrap();
     let original = tokio::fs::read(&input).await.unwrap();
+    let total_bps = original.len() as f64 * 8.0 / 2.0;
+    assert!(
+        total_bps > 1_500_000.0,
+        "fixture must exceed 1.5 Mbps reuse budget, got {total_bps} bps"
+    );
     assert!(
         !eligible(&probe(&input).await, original.len() as u64),
         "fixture must exceed reuse budget"
@@ -505,6 +558,86 @@ async fn high_bitrate_source_falls_back_to_compression() {
         assert!(std::fs::metadata(output.join(name)).unwrap().len() < original.len() as u64);
     }
     assert_eq!(tokio::fs::read(&input).await.unwrap(), original);
+}
+
+#[tokio::test]
+#[ignore = "requires ffmpeg and ffprobe"]
+async fn typical_480x480_1mbps_source_is_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("source.mp4");
+    let output = dir.path().join("hls");
+    media_tool(
+        "ffmpeg",
+        &[
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=480x480:rate=30:duration=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100:duration=2",
+            "-vf",
+            "setsar=1",
+            "-c:v",
+            "libx264",
+            "-profile:v",
+            "baseline",
+            "-level:v",
+            "3.0",
+            "-pix_fmt",
+            "yuv420p",
+            "-bf",
+            "0",
+            "-b:v",
+            "950k",
+            "-maxrate",
+            "1100k",
+            "-bufsize",
+            "1100k",
+            "-preset",
+            "fast",
+            "-g",
+            "30",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            "-movflags",
+            "+faststart",
+            input.to_str().unwrap(),
+        ],
+    )
+    .await;
+    let original = tokio::fs::read(&input).await.unwrap();
+    let total_bps = original.len() as f64 * 8.0 / 2.0;
+    assert!(
+        total_bps > 500_000.0 && total_bps <= 1_500_000.0,
+        "fixture should exercise the 500k..=1500k band, got {total_bps} bps"
+    );
+    tokio::fs::create_dir(&output).await.unwrap();
+    assert!(
+        try_reuse(&input, &output).await.unwrap(),
+        "compatible 480x480 ~1 Mbps source should be reused"
+    );
+    crate::remux_ts_to_fmp4(&output).await.unwrap();
+    crate::require_progressive_outputs(&output).await.unwrap();
+    assert_eq!(
+        frames(&output.join("stream_720p.mp4")).await,
+        frames(&input).await
+    );
+    assert_eq!(
+        tokio::fs::read(output.join("stream_720p.mp4"))
+            .await
+            .unwrap(),
+        tokio::fs::read(output.join("stream_480p.mp4"))
+            .await
+            .unwrap(),
+        "identical TS variants should mirror the remuxed MP4"
+    );
 }
 
 #[tokio::test]
@@ -893,7 +1026,7 @@ async fn single_main_and_high_profile_configurations_still_copy() {
 async fn impossible_file_sizes_skip_media_probing() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("not-media.mp4");
-    for length in [0, 625_001] {
+    for length in [0, 1_875_001] {
         tokio::fs::write(&input, vec![0; length]).await.unwrap();
         assert!(!try_reuse(&input, &dir.path().join("output"))
             .await
