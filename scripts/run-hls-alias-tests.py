@@ -21,8 +21,11 @@ class Origin(BaseHTTPRequestHandler):
         assert self.path == "/transcode/queue"
         body = self.rfile.read(int(self.headers["Content-Length"]))
         assert json.loads(body) == {"hash": "f" * 64, "owner": "b" * 64}
+        expected_credential = "synthetic-admission-token" if self.server.use_hetzner else None
+        assert self.headers.get("x-divine-transcode-admission") == expected_credential
         self.server.admissions += 1
-        self.send_response(503 if self.server.admissions == 1 else 202)
+        first_status = 404 if self.server.use_hetzner else 503
+        self.send_response(first_status if self.server.admissions == 1 else 202)
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -56,11 +59,12 @@ class Origin(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def main():
+def main(use_hetzner=False):
     repo = Path(__file__).resolve().parent.parent
     with ThreadingHTTPServer(("127.0.0.1", 0), Origin) as origin:
         origin.reads = []
         origin.admissions = 0
+        origin.use_hetzner = use_hetzner
         thread = threading.Thread(target=origin.serve_forever, daemon=True)
         thread.start()
         try:
@@ -68,13 +72,19 @@ def main():
                 root = Path(directory)
                 config, kv, settings = root / "fastly.toml", root / "kv.json", root / "settings.json"
                 kv.write_text("{}")
-                settings.write_text(json.dumps({"gcs_bucket": "hls-test"}))
+                store = {"gcs_bucket": "hls-test"}
+                if use_hetzner:
+                    store["hetzner_transcode_admission"] = "true"
+                settings.write_text(json.dumps(store))
+                admission_backend = (
+                    "hetzner_transcode_admission" if use_hetzner else "cloud_run_transcoder"
+                )
                 config.write_text(f'''manifest_version = 3
 name = "hls-alias-test"
 language = "rust"
 [local_server.backends.gcs_storage]
 url = "http://127.0.0.1:{origin.server_port}"
-[local_server.backends.cloud_run_transcoder]
+[local_server.backends.{admission_backend}]
 url = "http://127.0.0.1:{origin.server_port}"
 [local_server.kv_stores.blossom_metadata]
 file = "{kv}"
@@ -83,7 +93,7 @@ format = "json"
 file = "{settings}"
 format = "json"
 [local_server.secret_stores]
-blossom_secrets = [{{key="admin_token",data="synthetic-admin-token"}},{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_key",data="synthetic"}}]
+blossom_secrets = [{{key="admin_token",data="synthetic-admin-token"}},{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_key",data="synthetic"}},{{key="transcode_admission_secret",data="synthetic-admission-token"}}]
 ''')
                 env = os.environ.copy()
                 env["CARGO_TARGET_WASM32_WASIP1_RUNNER"] = shlex.join([
@@ -122,3 +132,4 @@ blossom_secrets = [{{key="admin_token",data="synthetic-admin-token"}},{{key="gcs
 
 if __name__ == "__main__":
     main()
+    main(use_hetzner=True)

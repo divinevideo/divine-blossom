@@ -3310,6 +3310,8 @@ const CLOUD_RUN_TRANSCODER_HOST: &str = "divine-transcoder-149672065768.us-centr
 /// /transcode, /backfill-fmp4, /transcribe silently misroute to the upload
 /// service and 404, leaving videos stuck in `Processing` forever.
 const TRANSCODER_BACKEND: &str = "cloud_run_transcoder";
+const HETZNER_TRANSCODE_ADMISSION_HOST: &str = "transcoder-worker.divine.video";
+const HETZNER_TRANSCODE_ADMISSION_BACKEND: &str = "hetzner_transcode_admission";
 
 /// Generate thumbnail on-demand by proxying to Cloud Run
 fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
@@ -3490,7 +3492,7 @@ fn trigger_on_demand_transcoding(hash: &str, owner: &str) -> Result<()> {
     }
     if !queue_transcode(hash, owner)? {
         // Support edge-first rollout and rollback when the admission route is absent.
-        transcode_dispatch_request("/transcode", hash, owner)
+        transcode_dispatch_request(CLOUD_RUN_TRANSCODER_HOST, "/transcode", hash, owner)
             .send_async(TRANSCODER_BACKEND)
             .map_err(|_| transcode_admission_unavailable())?;
     }
@@ -3499,12 +3501,9 @@ fn trigger_on_demand_transcoding(hash: &str, owner: &str) -> Result<()> {
     Ok(())
 }
 
-fn transcode_dispatch_request(path: &str, hash: &str, owner: &str) -> Request {
-    let mut request = Request::new(
-        Method::POST,
-        format!("https://{CLOUD_RUN_TRANSCODER_HOST}{path}"),
-    );
-    request.set_header("Host", CLOUD_RUN_TRANSCODER_HOST);
+fn transcode_dispatch_request(host: &str, path: &str, hash: &str, owner: &str) -> Request {
+    let mut request = Request::new(Method::POST, format!("https://{host}{path}"));
+    request.set_header("Host", host);
     request.set_header("Content-Type", "application/json");
     request.set_body(serde_json::json!({"hash":hash,"owner":owner}).to_string());
     request
@@ -3520,12 +3519,37 @@ fn transcode_admission_unavailable() -> BlossomError {
 /// `Ok(true)` requires durable admission. `Ok(false)` identifies a legacy
 /// transcoder that does not implement the queue-only route.
 fn queue_transcode(hash: &str, owner: &str) -> Result<bool> {
-    let response = transcode_dispatch_request("/transcode/queue", hash, owner)
-        .send(TRANSCODER_BACKEND)
+    let use_hetzner = match crate::request_bindings::config("hetzner_transcode_admission")
+        .map_err(|_| transcode_admission_unavailable())?
+        .as_deref()
+    {
+        Some("true") => true,
+        Some("false") | None => false,
+        _ => return Err(transcode_admission_unavailable()),
+    };
+    let (host, backend) = if use_hetzner {
+        (
+            HETZNER_TRANSCODE_ADMISSION_HOST,
+            HETZNER_TRANSCODE_ADMISSION_BACKEND,
+        )
+    } else {
+        (CLOUD_RUN_TRANSCODER_HOST, TRANSCODER_BACKEND)
+    };
+    let mut request = transcode_dispatch_request(host, "/transcode/queue", hash, owner);
+    if use_hetzner {
+        let credential = crate::storage::get_secret("transcode_admission_secret")
+            .ok()
+            .filter(|secret| !secret.trim().is_empty())
+            .and_then(|secret| secret.trim().parse::<fastly::http::HeaderValue>().ok())
+            .ok_or_else(transcode_admission_unavailable)?;
+        request.set_header("x-divine-transcode-admission", credential);
+    }
+    let response = request
+        .send(backend)
         .map_err(|_| transcode_admission_unavailable())?;
     match response.get_status() {
         StatusCode::ACCEPTED => Ok(true),
-        StatusCode::NOT_FOUND => Ok(false),
+        StatusCode::NOT_FOUND if !use_hetzner => Ok(false),
         _ => Err(transcode_admission_unavailable()),
     }
 }
