@@ -145,6 +145,8 @@ struct Config {
     transcode_queue: Option<String>,
     transcode_worker_url: Option<String>,
     transcode_dispatch_secret: Option<String>,
+    transcode_admission_auth_required: bool,
+    transcode_admission_secret: Option<String>,
     /// Admit ordinary jobs during cutover while all rendition writes are paused.
     transcode_writes_paused: bool,
 }
@@ -302,6 +304,13 @@ impl Config {
             transcode_worker_url: lookup("TRANSCODE_WORKER_URL").filter(|v| !v.trim().is_empty()),
             transcode_dispatch_secret: lookup("TRANSCODE_DISPATCH_SECRET")
                 .filter(|v| !v.is_empty()),
+            // Only explicit false or 0 disables the flag. A typo cannot open admission.
+            transcode_admission_auth_required: lookup("TRANSCODE_ADMISSION_AUTH_REQUIRED")
+                .is_some_and(|value| {
+                    !matches!(value.trim().to_ascii_lowercase().as_str(), "false" | "0")
+                }),
+            transcode_admission_secret: lookup("TRANSCODE_ADMISSION_SECRET")
+                .map(|value| value.trim().to_string()),
             transcode_writes_paused: parse_bool(&mut lookup, "TRANSCODE_WRITES_PAUSED", false),
             status_queue_enabled: parse_bool(&mut lookup, "STATUS_QUEUE_ENABLED", false),
             status_queue_location: lookup("STATUS_QUEUE_LOCATION")
@@ -914,11 +923,12 @@ async fn handle_transcode(
         }
         return transcode_response(await_repair(process_transcode(state, request)).await, false);
     }
-    admit_transcode(state, request).await
+    admit_transcode(state, headers, request).await
 }
 
 async fn handle_queue_transcode(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(mut request): Json<TranscodeRequest>,
 ) -> Response {
     request.hash.make_ascii_lowercase();
@@ -929,10 +939,17 @@ async fn handle_queue_transcode(
         )
             .into_response();
     }
-    admit_transcode(state, request).await
+    admit_transcode(state, headers, request).await
 }
 
-async fn admit_transcode(state: Arc<AppState>, request: TranscodeRequest) -> Response {
+async fn admit_transcode(
+    state: Arc<AppState>,
+    headers: axum::http::HeaderMap,
+    request: TranscodeRequest,
+) -> Response {
+    if let Err(rejection) = hls_dispatch::authorize_admission(&state.config, &headers) {
+        return rejection;
+    }
     let hash = request.hash.clone();
     match await_repair(async move { hls_dispatch::enqueue(&state.config, &request).await }).await {
         Ok(()) => (
@@ -5036,6 +5053,148 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "probe failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn transcode_admission_authenticates_both_routes_without_changing_repair() {
+        use super::*;
+        use axum::body::{to_bytes, Body};
+        use tower::ServiceExt;
+
+        async fn request(
+            config: Config,
+            path: &str,
+            force: bool,
+            headers: &[(&str, &str)],
+        ) -> (StatusCode, String) {
+            let gcs_client = GcsClient::new(ClientConfig::default().anonymous());
+            let media_storage =
+                object_storage::MediaStorage::gcs(gcs_client.clone(), config.gcs_bucket.clone());
+            let state = Arc::new(AppState {
+                gcs_client,
+                media_storage,
+                config,
+                provider_semaphore: Arc::new(Semaphore::new(1)),
+            });
+            let app = Router::new()
+                .route("/transcode", post(handle_transcode))
+                .route("/transcode/queue", post(handle_queue_transcode))
+                .with_state(state);
+            let mut request =
+                axum::http::Request::post(path).header(header::CONTENT_TYPE, "application/json");
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
+            let body = serde_json::json!({"hash": "a".repeat(64), "force": force});
+            let response = app
+                .oneshot(request.body(Body::from(body.to_string())).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+            (status, String::from_utf8(bytes.to_vec()).unwrap())
+        }
+
+        let config = |required: Option<&str>, secret: Option<&str>| {
+            Config::from_lookup(|key| match key {
+                "TRANSCODE_ADMISSION_AUTH_REQUIRED" => required.map(str::to_owned),
+                "TRANSCODE_ADMISSION_SECRET" => secret.map(str::to_owned),
+                "TRANSCODE_REPAIR_SECRET" => Some("synthetic-repair".into()),
+                "TRANSCODE_WRITES_PAUSED" => Some("true".into()),
+                _ => None,
+            })
+        };
+        let header = "x-divine-transcode-admission";
+        let valid = [(header, "synthetic-intake")];
+        for path in ["/transcode", "/transcode/queue"] {
+            assert_eq!(
+                request(config(None, None), path, false, &[]).await,
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Could not queue transcode".into()
+                )
+            );
+            for headers in [
+                &[][..],
+                &[(header, "wrong")],
+                &[(header, "synthetic-intake"), (header, "wrong")],
+            ] {
+                assert_eq!(
+                    request(
+                        config(Some("true"), Some("synthetic-intake")),
+                        path,
+                        false,
+                        headers
+                    )
+                    .await
+                    .0,
+                    StatusCode::UNAUTHORIZED
+                );
+            }
+            for (required, secret) in [
+                (Some("true"), None),
+                (Some("ture"), None),
+                (None, Some("  ")),
+            ] {
+                assert_eq!(
+                    request(config(required, secret), path, false, &valid).await,
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "transcode admission not configured".into()
+                    )
+                );
+            }
+            for required in [Some("true"), None] {
+                assert_eq!(
+                    request(
+                        config(required, Some("synthetic-intake")),
+                        path,
+                        false,
+                        &valid
+                    )
+                    .await,
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Could not queue transcode".into()
+                    )
+                );
+            }
+        }
+        assert_eq!(
+            request(
+                config(Some("true"), Some("synthetic-intake")),
+                "/transcode",
+                true,
+                &valid
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            request(
+                config(Some("true"), Some("synthetic-intake")),
+                "/transcode",
+                true,
+                &[("x-divine-repair-secret", "synthetic-repair")]
+            )
+            .await,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Transcode writes paused".into()
+            )
+        );
+        assert_eq!(
+            request(
+                config(Some("true"), Some("synthetic-intake")),
+                "/transcode/queue",
+                true,
+                &valid
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
         );
     }
 
