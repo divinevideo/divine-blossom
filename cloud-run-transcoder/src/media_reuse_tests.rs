@@ -537,6 +537,11 @@ async fn high_bitrate_source_falls_back_to_compression() {
     .await;
     tokio::fs::create_dir(&output).await.unwrap();
     let original = tokio::fs::read(&input).await.unwrap();
+    let total_bps = original.len() as f64 * 8.0 / 2.0;
+    assert!(
+        total_bps > 1_500_000.0,
+        "fixture must exceed 1.5 Mbps reuse budget, got {total_bps} bps"
+    );
     assert!(
         !eligible(&probe(&input).await, original.len() as u64),
         "fixture must exceed reuse budget"
