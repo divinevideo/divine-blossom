@@ -614,6 +614,7 @@ Deno.test("delegated PUT /upload publishes to SQL catalog, supports chunked bodi
   const blobs = new FakeBlobs();
   const purger = new FakePurger();
   const now = 1800000100;
+  let clock = now;
   const origin = "https://media-bunny.divine.video";
   const adminToken = "synthetic-admin-token-1234567890";
 
@@ -709,7 +710,7 @@ Deno.test("delegated PUT /upload publishes to SQL catalog, supports chunked bodi
     cache: { publicMediaCaching: true },
     writesEnabled: true,
     bunnyDeliveryHost: "media-bunny.divine.video",
-    now: () => now,
+    now: () => clock,
   });
 
   try {
@@ -795,15 +796,29 @@ Deno.test("delegated PUT /upload publishes to SQL catalog, supports chunked bodi
     );
     equal((await uploadThumbAgain()).status, 409);
     equal(seenRequests.length, beforeCleanup);
-    equal(
-      (await app(
+    const drain = () =>
+      app(
         new Request(`${origin}/admin/api/b2-cdn-purge/drain`, {
           method: "POST",
           headers: { authorization: `Bearer ${adminToken}` },
         }),
-      )).status,
-      200,
+      );
+    await catalog.addQuarantineHold(thumbHash, "cleanup-hold", now);
+    equal((await (await drain()).json()).deferred, 1);
+    equal(blobs.store.has(thumbHash), true);
+    await catalog.removeQuarantineHold(thumbHash, "cleanup-hold");
+    clock += 60;
+    equal((await (await drain()).json()).completed, 1);
+    clock = now;
+    const staleCompletion = await app(
+      new Request(`${origin}/upload/up_previous/complete`, {
+        method: "POST",
+        headers: { authorization: blossomAuth(sk1, "upload", now, thumbHash) },
+        body: JSON.stringify({ sha256: thumbHash }),
+      }),
     );
+    equal(staleCompletion.status, 409);
+    equal(seenRequests.length, beforeCleanup);
     equal((await app(new Request(thumbDesc.url))).status, 404);
     equal((await uploadThumbAgain()).status, 201);
     equal((await app(new Request(thumbDesc.url))).status, 200);

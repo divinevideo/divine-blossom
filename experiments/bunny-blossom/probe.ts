@@ -42,6 +42,10 @@ class MemoryCatalog implements Catalog {
       return Promise.resolve(false);
     }
     this.rows.set(k, structuredClone(value));
+    if (options?.purge) {
+      const { reason, deleteB2, createdAt } = options.purge;
+      return this.enqueuePurge(k, reason, deleteB2, createdAt).then(() => true);
+    }
     return Promise.resolve(true);
   }
   list(owner: string, limit: number, cursor?: string | null): Promise<ListPage> {

@@ -1739,11 +1739,13 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
           ? true
           : undefined,
       };
-      if (!await config.catalog.cas(row.hash, row.revision, next)) {
+      if (
+        !await config.catalog.cas(row.hash, row.revision, next, {
+          requireUnquarantined: true,
+          purge: last ? { reason: "owner_delete", deleteB2: true, createdAt: now() } : undefined,
+        })
+      ) {
         return jsonResp(409, { error: "concurrent parent change" });
-      }
-      if (last) {
-        await bestEffortPurge(row.hash, "owner_delete", true);
       }
       return jsonResp(202, { status: last ? "cleanup_pending" : "reference_removed" });
     }
@@ -1896,7 +1898,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
           transcodeStatus: isVideo ? "pending" : undefined,
           transcriptStatus: isTranscribable ? "pending" : undefined,
         };
-        if (!await config.catalog.cas(hash, null, rec)) {
+        if (!await config.catalog.cas(hash, null, rec, { requireUnquarantined: true })) {
           return jsonResp(409, { error: "concurrent parent change" });
         }
         return jsonResp(200, buildDescriptor(rec, origin));
@@ -1910,7 +1912,11 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
           owners: needsOwner ? [...existing.owners, owner] : existing.owners,
           videoEncodingAllowed: needsRestrict ? false : existing.videoEncodingAllowed,
         };
-        if (!await config.catalog.cas(hash, existing.revision, updated)) {
+        if (
+          !await config.catalog.cas(hash, existing.revision, updated, {
+            requireUnquarantined: true,
+          })
+        ) {
           return jsonResp(409, { error: "concurrent parent change" });
         }
         return jsonResp(200, buildDescriptor(updated, origin));
@@ -2075,13 +2081,16 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         try {
           const currentRow = await config.catalog.get(item.hash);
           const currentHolds = await config.catalog.getQuarantineHolds(item.hash);
+          const waitingForHoldRelease = item.deleteB2 && currentRow?.status === "deleted" &&
+            currentRow.cleanupPending && (currentRow.held || currentHolds.length > 0);
           const allowB2Delete = item.deleteB2 &&
             currentHolds.length === 0 &&
             (!currentRow ||
               (!currentRow.held && currentRow.status === "deleted" && currentRow.cleanupPending));
           if (item.deleteB2 && !allowB2Delete) {
             skippedHeld++;
-          } else if (allowB2Delete && config.blobs.deletePrefix) {
+          } else if (allowB2Delete) {
+            if (!config.blobs.deletePrefix) throw new Error("blob erasure unavailable");
             const res = await config.blobs.deletePrefix(item.hash, async () => {
               const [latest, holds] = await Promise.all([
                 config.catalog.get(item.hash),
@@ -2099,7 +2108,12 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
           if (config.purger) {
             await config.purger.purgeHash(item.hash);
           }
-          if (allowB2Delete && config.blobs.deletePrefix && currentRow) {
+          if (waitingForHoldRelease) {
+            await config.catalog.deferPurge(item.id, item.attempts + 1, now() + 60);
+            deferred++;
+            continue;
+          }
+          if (allowB2Delete && currentRow) {
             if (
               !await config.catalog.cas(item.hash, currentRow.revision, {
                 ...currentRow,

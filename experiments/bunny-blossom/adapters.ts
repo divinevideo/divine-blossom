@@ -136,6 +136,14 @@ function decodeRecord(raw: unknown, expectedHash?: string): BlobRecord {
   };
 }
 
+function purgeInsert(hash: string, reason: string, deleteB2: boolean, now: number) {
+  return {
+    sql: `INSERT INTO purge_outbox(hash, reason, delete_b2, attempts, next_retry_at, created_at)
+      VALUES (?, ?, ?, 0, ?, ?)`,
+    args: [hash.toLowerCase(), reason, deleteB2 ? 1 : 0, now, now],
+  };
+}
+
 export interface SqlTransaction {
   execute(query: {
     sql: string;
@@ -270,6 +278,10 @@ export class SqlCatalog implements Catalog {
             args: [owner, normalizedHash, decoded.uploaded],
           });
         }
+      }
+      if (options?.purge) {
+        const { reason, deleteB2, createdAt } = options.purge;
+        await exec.execute(purgeInsert(normalizedHash, reason, deleteB2, createdAt));
       }
       return true;
     };
@@ -489,11 +501,7 @@ export class SqlCatalog implements Catalog {
   }
 
   async enqueuePurge(hash: string, reason: string, deleteB2: boolean, now: number): Promise<void> {
-    await this.client.execute({
-      sql: `INSERT INTO purge_outbox(hash, reason, delete_b2, attempts, next_retry_at, created_at)
-        VALUES (?, ?, ?, 0, ?, ?)`,
-      args: [hash.toLowerCase(), reason, deleteB2 ? 1 : 0, now, now],
-    });
+    await this.client.execute(purgeInsert(hash, reason, deleteB2, now));
   }
 
   async listDuePurges(now: number, limit: number): Promise<PurgeItem[]> {

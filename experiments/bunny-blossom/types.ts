@@ -124,6 +124,7 @@ export interface ListOptions {
 
 export interface CasOptions {
   requireUnquarantined?: boolean;
+  purge?: Pick<PurgeItem, "reason" | "deleteB2" | "createdAt">;
 }
 
 export interface Catalog {
