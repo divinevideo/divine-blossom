@@ -449,15 +449,13 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       return jsonResp(401, { error: "age_restricted" });
     }
 
-    // Try primary storage key (and alternate quality / thumbnail / legacy vtt fallbacks)
+    // Try primary storage key (and alternate quality / thumbnail / legacy vtt fallbacks).
+    // Never fall back to raw MP4 video bytes when a video thumbnail (.jpg) is missing.
     const isVideoThumbnail = media.kind === "thumbnail" ||
       (media.kind === "original" &&
         row.type.startsWith("video/") &&
         /^\/[0-9a-fA-F]{64}\.(jpg|jpeg)$/i.test(new URL(req.url).pathname));
-    let targetKey = media.storageKey;
-    if (isVideoThumbnail) {
-      targetKey = `${media.hash}.jpg`;
-    }
+    const targetKey = isVideoThumbnail ? `${media.hash}.jpg` : media.storageKey;
     let storageResp = await config.blobs.read(targetKey, req);
     if (storageResp.status === 404 && media.kind === "quality") {
       const altKey = media.storageKey.replace("/hls/stream_", "/");
@@ -467,15 +465,25 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       const legacyVtt = media.lang ? `${media.hash}.${media.lang}.vtt` : `${media.hash}.vtt`;
       storageResp = await config.blobs.read(legacyVtt, req);
     }
-    if (storageResp.status === 404 && isVideoThumbnail && config.upstreams?.uploadServiceUrl) {
+    if (
+      storageResp.status === 404 &&
+      isVideoThumbnail &&
+      req.method === "GET" &&
+      config.upstreams?.uploadServiceUrl
+    ) {
       const thumbUrl = `${
         config.upstreams.uploadServiceUrl.replace(/\/+$/, "")
       }/thumbnail/${media.hash}`;
-      const thumbRes = await fetcher(thumbUrl, {
-        method: "GET",
-        redirect: "error",
-        signal: AbortSignal.timeout(15_000),
-      });
+      let thumbRes: Response;
+      try {
+        thumbRes = await fetcher(thumbUrl, {
+          method: "GET",
+          redirect: "error",
+          signal: AbortSignal.timeout(25_000),
+        });
+      } catch {
+        return jsonResp(502, { error: "Thumbnail generation unavailable" });
+      }
       if (thumbRes.status === 200) {
         const thumbHeaders = new Headers({
           "content-type": "image/jpeg",
@@ -483,21 +491,27 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         });
         const cl = thumbRes.headers.get("content-length");
         if (cl) thumbHeaders.set("content-length", cl);
-        storageResp = new Response(req.method === "HEAD" ? null : thumbRes.body, {
+        storageResp = new Response(thumbRes.body, {
           status: 200,
           headers: thumbHeaders,
         });
-        if (req.method === "HEAD") {
-          await thumbRes.body?.cancel().catch(() => {});
-        }
       } else {
         await thumbRes.body?.cancel().catch(() => {});
+        if (thumbRes.status === 404) {
+          return jsonResp(404, { error: "Thumbnail not found" });
+        }
         if (thumbRes.status === 422) {
           return jsonResp(422, { error: "Thumbnail cannot be generated for this video" });
         }
-        if (thumbRes.status !== 404) {
-          return jsonResp(503, { error: "Thumbnail generation unavailable" });
+        if (thumbRes.status === 503) {
+          const retryAfter = thumbRes.headers.get("retry-after")?.trim() || "5";
+          return jsonResp(
+            503,
+            { error: "Thumbnail generation is busy" },
+            { "retry-after": retryAfter },
+          );
         }
+        return jsonResp(502, { error: "Thumbnail generation unavailable" });
       }
     } else if (storageResp.status === 404 && !isVideoThumbnail && targetKey !== media.storageKey) {
       storageResp = await config.blobs.read(media.storageKey, req);
@@ -529,7 +543,9 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
     }
 
     const headers = new Headers(storageResp.headers);
-    if (!headers.has("content-type") && media.defaultContentType) {
+    if (isVideoThumbnail) {
+      headers.set("content-type", "image/jpeg");
+    } else if (!headers.has("content-type") && media.defaultContentType) {
       headers.set("content-type", media.defaultContentType);
     }
     if (!headers.has("accept-ranges")) {

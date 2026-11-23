@@ -1851,3 +1851,132 @@ Deno.test("upload hardening: quarantine holds, restricted privacy, encoding poli
     db.close();
   }
 });
+
+Deno.test("video thumbnail requests never leak MP4 bytes and fall back to on-demand generator", async () => {
+  const ctx = await setup();
+  try {
+    const ownerPub = getPublicKey(generateSecretKey());
+    const videoHash = "b".repeat(64);
+    const imageHash = "c".repeat(64);
+    const mp4Bytes = new TextEncoder().encode("synthetic-mp4-not-jpeg");
+    const jpegBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);
+
+    await ctx.catalog.cas(videoHash, null, {
+      revision: 1,
+      hash: videoHash,
+      size: mp4Bytes.length,
+      type: "video/mp4",
+      uploaded: ctx.now,
+      owners: [ownerPub],
+      status: "active",
+      ageRestricted: false,
+      held: false,
+      gate: null,
+      cleanupPending: false,
+    });
+    await ctx.blobs.write(videoHash, mp4Bytes, "video/mp4");
+
+    await ctx.catalog.cas(imageHash, null, {
+      revision: 1,
+      hash: imageHash,
+      size: jpegBytes.length,
+      type: "image/jpeg",
+      uploaded: ctx.now,
+      owners: [ownerPub],
+      status: "active",
+      ageRestricted: false,
+      held: false,
+      gate: null,
+      cleanupPending: false,
+    });
+    await ctx.blobs.write(imageHash, jpegBytes, "image/jpeg");
+
+    // 1. Without uploadServiceUrl, missing video .jpg returns 404 (never MP4 bytes)
+    const missingNoUpstream = await ctx.app(new Request(`${ctx.origin}/${videoHash}.jpg`));
+    equal(missingNoUpstream.status, 404);
+
+    // 2. Native JPEG blob requested with .jpg still serves its original bytes
+    const nativeJpg = await ctx.app(new Request(`${ctx.origin}/${imageHash}.jpg`));
+    equal(nativeJpg.status, 200);
+    equal(nativeJpg.headers.get("content-type"), "image/jpeg");
+    equal(new Uint8Array(await nativeJpg.arrayBuffer()), jpegBytes);
+
+    // 3. With uploadServiceUrl configured, GET falls back to /thumbnail/<hash>, HEAD does not
+    const upstreamCalls: string[] = [];
+    let upstreamMode: "ok" | "busy" | "unprocessable" | "throw" = "ok";
+    const appWithThumbUpstream = createApp({
+      origin: ctx.origin,
+      catalog: ctx.catalog,
+      blobs: ctx.blobs,
+      purger: ctx.purger,
+      upstreams: {
+        uploadServiceUrl: "https://upload-service.invalid",
+        fetcher: (input, init) => {
+          const url = typeof input === "string"
+            ? input
+            : input instanceof URL
+            ? input.href
+            : input.url;
+          upstreamCalls.push(`${init?.method ?? "GET"} ${url}`);
+          if (upstreamMode === "throw") {
+            return Promise.reject(new Error("timeout"));
+          }
+          if (upstreamMode === "busy") {
+            return Promise.resolve(new Response('{"error":"busy"}', { status: 503 }));
+          }
+          if (upstreamMode === "unprocessable") {
+            return Promise.resolve(new Response('{"error":"invalid"}', { status: 422 }));
+          }
+          return Promise.resolve(
+            new Response(jpegBytes.slice(), {
+              status: 200,
+              headers: { "content-type": "image/jpeg" },
+            }),
+          );
+        },
+      },
+      cache: { publicMediaCaching: true, browserMaxAgeSecs: 300, edgeMaxAgeSecs: 86400 },
+      now: () => ctx.now,
+    });
+
+    const headMissing = await appWithThumbUpstream(
+      new Request(`${ctx.origin}/${videoHash}.jpg`, { method: "HEAD" }),
+    );
+    equal(headMissing.status, 404);
+    equal(upstreamCalls.length, 0);
+
+    const generated = await appWithThumbUpstream(new Request(`${ctx.origin}/${videoHash}.jpg`));
+    equal(generated.status, 200);
+    equal(generated.headers.get("content-type"), "image/jpeg");
+    equal(generated.headers.get("cache-control"), "public, max-age=300, s-maxage=86400");
+    equal(new Uint8Array(await generated.arrayBuffer()), jpegBytes);
+    equal(upstreamCalls, [`GET https://upload-service.invalid/thumbnail/${videoHash}`]);
+
+    // 4. Upstream 503 busy propagates 503 + Retry-After + private no-store (never cached)
+    upstreamMode = "busy";
+    const busy = await appWithThumbUpstream(new Request(`${ctx.origin}/${videoHash}/thumbnail`));
+    equal(busy.status, 503);
+    equal(busy.headers.get("retry-after"), "5");
+    equal(busy.headers.get("cache-control"), "private, no-store");
+
+    // 5. Upstream network/timeout failure maps to 502 (never unhandled 500)
+    upstreamMode = "throw";
+    const netErr = await appWithThumbUpstream(new Request(`${ctx.origin}/${videoHash}.jpg`));
+    equal(netErr.status, 502);
+
+    // 6. Upstream 422 propagates 422 cleanly
+    upstreamMode = "unprocessable";
+    const bad = await appWithThumbUpstream(new Request(`${ctx.origin}/${videoHash}.jpg`));
+    equal(bad.status, 422);
+
+    // 7. Once {hash}.jpg exists in storage, upstream is never called
+    await ctx.blobs.write(`${videoHash}.jpg`, jpegBytes, "image/jpeg");
+    const callCountBefore = upstreamCalls.length;
+    const stored = await appWithThumbUpstream(new Request(`${ctx.origin}/${videoHash}.jpg`));
+    equal(stored.status, 200);
+    equal(stored.headers.get("content-type"), "image/jpeg");
+    equal(upstreamCalls.length, callCountBefore);
+  } finally {
+    ctx.db.close();
+  }
+});
