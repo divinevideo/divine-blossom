@@ -1,0 +1,14 @@
+{
+  "imports": {
+    "nostr-tools/pure": "npm:nostr-tools@2.26.1/pure",
+    "aws4fetch": "npm:aws4fetch@1.0.20",
+    "@libsql/client/web": "npm:@libsql/client@0.18.0/web",
+    "@bunny.net/edgescript-sdk": "npm:@bunny.net/edgescript-sdk@0.13.0"
+  },
+  "tasks": {
+    "check": "deno check app.ts adapters.ts bunny.ts app_test.ts adapters_test.ts probe.ts probe_bunny.ts probe_test.ts",
+    "test": "deno test --allow-read=schema.sql app_test.ts adapters_test.ts probe_test.ts",
+    "verify": "deno fmt --check && deno lint && deno task check && deno task test && python3 inventory_test.py"
+  },
+  "fmt": { "lineWidth": 100 }
+}

@@ -1,0 +1,29 @@
+name: Bunny runtime spike
+
+on:
+  pull_request:
+    paths:
+      - experiments/bunny-blossom/**
+      - .github/workflows/bunny-runtime-spike.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: experiments/bunny-blossom
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: v2.9.8
+      - run: deno task verify
+      - name: Bundle native Bunny entry points
+        run: |
+          deno bundle --platform=deno bunny.ts -o /tmp/blossom-runtime.js
+          deno bundle --platform=deno probe_bunny.ts -o /tmp/blossom-runtime-probe.js
