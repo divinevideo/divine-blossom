@@ -49,3 +49,37 @@ The ignored tests require local FFmpeg and FFprobe, including libx264. The polic
 process-boundary test uses synthetic sources, preserves compressed audio packet
 hashes and decoded frame hashes, counts encoder invocations, and injects an
 audio-copy failure in an isolated child process.
+
+## Upload metadata and rollout
+
+The edge endpoint is `GET /internal/media-policy/{sha256}`. It accepts the existing
+transcoder webhook bearer secret, returns only the hash and processing decision,
+and never caches responses. Missing metadata returns 503 with Retry-After so a
+queue job dispatched before upload publication retries.
+
+New authenticated video uploads receive `video_encoding_allowed=true` unless the
+request includes `X-Divine-Video-Processing: copy-only`. That header only removes
+processing permission; it is not archive provenance. Existing metadata, recovered
+records, and legacy records without the flag remain copy-only. Trusted archive
+storage always overrides encoding permission. Generation-conditional metadata
+writes preserve reductions and archive storage against stale duplicate/webhook
+writes. Duplicate uploads never upgrade an existing record.
+
+The opt-out is supported on direct uploads, mirrors and resumable completion.
+Resumable initiation rejects the opt-out with 400 because existing upload sessions
+do not persist it; use direct PUT for copy-only ingestion. A malformed opt-out
+value is rejected rather than silently treated as permission to encode.
+
+Existing derivatives still serve normally. A missing progressive MP4 alias on
+copy-only media returns 422 so clients use the original instead of repeatedly
+requesting an impossible audio-remux fallback. Compatible HLS packaging remains
+available, and original bytes are never replaced.
+
+Deploy edge metadata/lookup support before configuring the policy-aware worker.
+Deploy the archive publisher opt-out before resuming held archive ingestion.
+Keep the archive publishing hold until the maintainer explicitly resumes it.
+Worker staging and queue cutover must retain B2-only storage settings and the
+current ownership-loss handling. Verify one ordinary user encode and one archive
+stream-copy job through real storage and callbacks before changing worker traffic.
+Standalone archive recovery conversion (including WebM/3GP), extracted audio,
+subtitles, moderation, and thumbnails are outside this delivery change.

@@ -344,6 +344,14 @@ fn route_request(req: Request) -> Result<Response> {
         // BUD-04: Mirror
         (Method::PUT, "/mirror") => handle_mirror(req),
 
+        (Method::GET, p) if p.starts_with("/internal/media-policy/") => {
+            let result = handle_media_processing_policy(&req, p);
+            let mut response = result.unwrap_or_else(|error| error_response(&error));
+            add_no_cache_headers(&mut response);
+            response.set_header("Surrogate-Control", "no-store");
+            Ok(response)
+        }
+
         // Admin: Moderation webhook from divine-moderation-service
         (Method::POST, "/admin/moderate") => handle_admin_moderate(req),
 
@@ -2726,6 +2734,7 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
     // Do NOT add to user lists or recent indexes for derived blobs.
     let audio_metadata = BlobMetadata {
         archive_storage: None,
+        video_encoding_allowed: false,
         sha256: audio_sha256.clone(),
         size,
         mime_type: mime_type.clone(),
@@ -2887,6 +2896,13 @@ fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
             Ok(resp)
         }
         Err(BlossomError::NotFound(_)) => {
+            if content_type == "video/mp4" && !meta.allows_video_encoding() {
+                return Ok(derivative_failure_response(
+                    Some("copy_only_variant_unavailable"),
+                    Some("Use the original video; this media does not permit re-encoding"),
+                    "Use the original video",
+                ));
+            }
             // For .mp4 requests, check if the .ts counterpart exists for lazy remux
             if content_type == "video/mp4" {
                 let ts_name = ts_filename.replace(".mp4", ".ts");
@@ -2969,7 +2985,16 @@ fn handle_head_quality_variant(path: &str) -> Result<Response> {
     }
 
     let gcs_path = format!("{}/hls/{}", hash, ts_filename);
-    download_hls_content(&gcs_path, None)?;
+    match download_hls_content(&gcs_path, None) {
+        Err(BlossomError::NotFound(_)) if content_type == "video/mp4" && !metadata.allows_video_encoding() => {
+            return Ok(derivative_failure_response(
+                Some("copy_only_variant_unavailable"),
+                Some("Use the original video; this media does not permit re-encoding"),
+                "Use the original video",
+            ));
+        }
+        result => { result?; }
+    }
 
     let mut resp = Response::from_status(StatusCode::OK);
     resp.set_header("Content-Type", content_type);
@@ -3043,6 +3068,13 @@ fn handle_admin_quality_variant(req: Request, path: &str) -> Result<Response> {
             Ok(resp)
         }
         Err(BlossomError::NotFound(_)) => {
+            if content_type == "video/mp4" && !meta.allows_video_encoding() {
+                return Ok(derivative_failure_response(
+                    Some("copy_only_variant_unavailable"),
+                    Some("Use the original video; this media does not permit re-encoding"),
+                    "Use the original video",
+                ));
+            }
             // For .mp4 requests, check if .ts counterpart exists for lazy remux
             if content_type == "video/mp4" {
                 let ts_name = ts_filename.replace(".mp4", ".ts");
@@ -3690,6 +3722,7 @@ fn trigger_moderation_scan(sha256: &str, pubkey: &str) {
 fn handle_upload(mut req: Request, record: &mut UploadLogRecord) -> Result<Response> {
     // Validate auth
     let auth = validate_auth(&req, AuthAction::Upload)?;
+    let encoding_requested = upload_encoding_requested(&req)?;
 
     // Serialize auth event for provenance (before consuming request)
     let auth_event_json = serde_json::to_string(&auth).unwrap_or_default();
@@ -3805,6 +3838,7 @@ fn handle_upload(mut req: Request, record: &mut UploadLogRecord) -> Result<Respo
     // Store metadata
     let metadata = BlobMetadata {
         archive_storage: None,
+        video_encoding_allowed: encoding_requested && is_video_mime_type(&content_type),
         sha256: hash.clone(),
         size: actual_size,
         mime_type: content_type.clone(),
@@ -4105,8 +4139,9 @@ fn publish_upload_service_upload(
     auth: crate::blossom::BlossomAuthEvent,
     base_url: String,
     upload: UploadServicePublishedUpload,
+    encoding_requested: bool,
 ) -> Result<Response> {
-    publish_upload_service_upload_with_policy(auth, base_url, upload, false)
+    publish_upload_service_upload_with_policy(auth, base_url, upload, false, encoding_requested)
 }
 
 fn publish_upload_service_upload_with_policy(
@@ -4114,6 +4149,7 @@ fn publish_upload_service_upload_with_policy(
     base_url: String,
     upload: UploadServicePublishedUpload,
     preserve_inline_dedupe: bool,
+    encoding_requested: bool,
 ) -> Result<Response> {
     let hash = upload.sha256;
     let size = upload.size;
@@ -4184,7 +4220,7 @@ fn publish_upload_service_upload_with_policy(
             // webhook) stays terminal — a reupload of the same bytes is not
             // evidence that the media became transcodable.
             metadata.transcode_terminal = metadata.transcode_terminal || transcode_terminal;
-        } else if should_reset_transcode_failure_on_clean_upload(
+        } else if metadata.allows_video_encoding() && should_reset_transcode_failure_on_clean_upload(
             &metadata.mime_type,
             metadata.transcode_status,
             upload.transcode_observation,
@@ -4240,6 +4276,7 @@ fn publish_upload_service_upload_with_policy(
 
     let metadata = BlobMetadata {
         archive_storage: None,
+        video_encoding_allowed: encoding_requested && is_video_mime_type(&content_type),
         sha256: hash.clone(),
         size,
         mime_type: content_type.clone(),
@@ -4336,6 +4373,11 @@ fn publish_upload_service_upload_with_policy(
 
 fn handle_upload_init(mut req: Request, record: &mut UploadLogRecord) -> Result<Response> {
     let auth = validate_auth(&req, AuthAction::Upload)?;
+    if !upload_encoding_requested(&req)? {
+        return Err(BlossomError::BadRequest(
+            "Copy-only uploads must use PUT /upload or PUT /mirror".into(),
+        ));
+    }
     let auth_header = extract_authorization_header(&req)?;
     let base_url = get_base_url(&req);
     let control_host = get_public_host(&req).unwrap_or_else(|| "media.divine.video".into());
@@ -4468,6 +4510,7 @@ fn handle_upload_complete(
     record: &mut UploadLogRecord,
 ) -> Result<Response> {
     let auth = validate_auth(&req, AuthAction::Upload)?;
+    let encoding_requested = upload_encoding_requested(&req)?;
     let auth_header = extract_authorization_header(&req)?;
     let base_url = get_base_url(&req);
     let upload_id = path
@@ -4532,6 +4575,7 @@ fn handle_upload_complete(
         auth,
         base_url,
         upload_from_resumable_completion(complete_response),
+        encoding_requested,
     )
 }
 
@@ -4645,6 +4689,7 @@ fn handle_upload_service_proxy(
     record: &mut UploadLogRecord,
     expected_hash: Option<&str>,
 ) -> Result<Response> {
+    let encoding_requested = upload_encoding_requested(&req)?;
     let auth_header = extract_authorization_header(&req)?;
 
     // Get the body to forward
@@ -4680,7 +4725,7 @@ fn handle_upload_service_proxy(
             "Upload service returned a different content hash".into(),
         ));
     }
-    publish_upload_service_upload_with_policy(auth, base_url, upload, expected_hash.is_some())
+    publish_upload_service_upload_with_policy(auth, base_url, upload, expected_hash.is_some(), encoding_requested)
 }
 
 /// HEAD /upload - BUD-06 upload pre-validation
@@ -6159,6 +6204,7 @@ fn handle_report(mut req: Request) -> Result<Response> {
 fn handle_mirror(mut req: Request) -> Result<Response> {
     // Validate auth (upload permission required)
     let auth = validate_auth(&req, AuthAction::Upload)?;
+    let encoding_requested = upload_encoding_requested(&req)?;
 
     // Parse request body as JSON
     let body = req.take_body().into_string();
@@ -6264,6 +6310,7 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
     // Store metadata
     let metadata = BlobMetadata {
         archive_storage: None,
+        video_encoding_allowed: encoding_requested && is_video_mime_type(&content_type),
         sha256: hash.clone(),
         size,
         mime_type: content_type.clone(),
@@ -6749,6 +6796,37 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
             Err(e)
         }
     }
+}
+
+/// This header only removes processing permission; it does not establish provenance.
+fn upload_encoding_requested(req: &Request) -> Result<bool> {
+    match req.get_header("X-Divine-Video-Processing") {
+        None => Ok(true),
+        Some(value) if value.to_str().ok() == Some("copy-only") => Ok(false),
+        Some(_) => Err(BlossomError::BadRequest(
+            "X-Divine-Video-Processing must be copy-only when supplied".into(),
+        )),
+    }
+}
+
+fn handle_media_processing_policy(req: &Request, path: &str) -> Result<Response> {
+    validate_transcoder_webhook(req, "MEDIA_POLICY")?;
+    let hash = path.strip_prefix("/internal/media-policy/").unwrap_or("");
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(BlossomError::BadRequest("Invalid media hash".into()));
+    }
+    // No cached metadata: old queued tasks and forced repairs obey current policy.
+    let Some(metadata) = get_blob_metadata_uncached(hash)? else {
+        let mut response = json_response(StatusCode::SERVICE_UNAVAILABLE,
+            &serde_json::json!({"error":"Media policy is not available yet"}));
+        response.set_header("Retry-After", "5");
+        return Ok(response);
+    };
+    if !metadata.sha256.eq_ignore_ascii_case(hash) {
+        return Err(BlossomError::MetadataError("Media policy hash mismatch".into()));
+    }
+    let policy = if metadata.allows_video_encoding() { "allow_encode" } else { "copy_only" };
+    Ok(json_response(StatusCode::OK, &serde_json::json!({"sha256":hash,"policy":policy})))
 }
 
 fn validate_transcoder_webhook(req: &Request, label: &str) -> Result<()> {
@@ -7580,7 +7658,7 @@ fn add_cors_headers(resp: &mut Response) {
     );
     resp.set_header(
         "Access-Control-Allow-Headers",
-        "Authorization, Content-Type, X-Sha256, X-Request-Id",
+        "Authorization, Content-Type, X-Sha256, X-Request-Id, X-Divine-Video-Processing",
     );
     resp.set_header("Access-Control-Expose-Headers", upload_exposed_headers());
 }
@@ -9217,3 +9295,7 @@ mod derived_origin_provenance_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "media_processing_policy_tests.rs"]
+mod media_processing_policy_tests;

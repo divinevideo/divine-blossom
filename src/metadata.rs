@@ -401,16 +401,35 @@ pub fn invalidate_metadata_cache(hash: &str) {
 
 /// Store blob metadata
 pub fn put_blob_metadata(metadata: &BlobMetadata) -> Result<()> {
-    let store = open_store()?;
     let key = format!("{}{}", BLOB_PREFIX, metadata.sha256.to_lowercase());
-
-    let json = serde_json::to_string(metadata)
-        .map_err(|e| BlossomError::MetadataError(format!("Failed to serialize metadata: {}", e)))?;
-
-    store
-        .insert(&key, json)
-        .map_err(|e| BlossomError::MetadataError(format!("Failed to store metadata: {}", e)))?;
-
+    update_json_conditionally::<Option<BlobMetadata>, _, _>(
+        &key,
+        8,
+        "blob metadata",
+        |current| {
+            let mut next = metadata.clone();
+            match current {
+                Some(None) => return Err("Blob metadata has been erased".into()),
+                Some(Some(existing)) => {
+                    // A delayed webhook or duplicate upload cannot upgrade legacy
+                    // media or erase an archive restriction recorded after its read.
+                    next.video_encoding_allowed &= existing.video_encoding_allowed;
+                    if existing.archive_storage.is_some() {
+                        next.archive_storage = existing.archive_storage;
+                    }
+                }
+                None => {}
+            }
+            if next.archive_storage.is_some() {
+                next.video_encoding_allowed = false;
+            }
+            Ok(ConditionalJsonMutation::Write {
+                value: Some(next),
+                result: (),
+                time_to_live: None,
+            })
+        },
+    )?;
     invalidate_metadata_cache(&metadata.sha256);
     Ok(())
 }

@@ -39,6 +39,10 @@ pub struct BlobMetadata {
     /// Private canonical B2 receipt for a trusted archive original.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archive_storage: Option<ArchiveStorage>,
+    /// Only new authenticated uploads may opt into video encoding. Legacy
+    /// records default to stream-copy packaging; trusted archive overrides this.
+    #[serde(default)]
+    pub video_encoding_allowed: bool,
     /// SHA-256 hash (hex encoded)
     pub sha256: String,
     /// Size in bytes
@@ -184,6 +188,10 @@ pub enum BlobAccess {
 }
 
 impl BlobMetadata {
+    pub fn allows_video_encoding(&self) -> bool {
+        self.video_encoding_allowed && self.archive_storage.is_none()
+    }
+
     /// Decide whether a viewer is allowed to access this blob.
     ///
     /// `requester_pubkey` is the authenticated viewer's pubkey, if any.
@@ -911,10 +919,39 @@ mod tests {
         assert!(!is_transcribable_mime_type("application/json"));
     }
 
+    #[test]
+    fn video_encoding_permission_defaults_closed_and_survives_roundtrip() {
+        let mut legacy = serde_json::to_value(test_metadata("video/mp4")).unwrap();
+        legacy.as_object_mut().unwrap().remove("video_encoding_allowed");
+        let decoded: BlobMetadata = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap()["video_encoding_allowed"], false
+        );
+        legacy["video_encoding_allowed"] = serde_json::json!(true);
+        let decoded: BlobMetadata = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap()["video_encoding_allowed"], true
+        );
+    }
+
+    #[test]
+    fn trusted_archive_always_overrides_video_encoding_permission() {
+        let mut meta = test_metadata("video/mp4");
+        assert!(!meta.allows_video_encoding());
+        meta.video_encoding_allowed = true;
+        assert!(meta.allows_video_encoding());
+        meta.archive_storage = Some(ArchiveStorage {
+            bucket: "synthetic-archive".into(),
+            file_id: "synthetic-version".into(),
+        });
+        assert!(!meta.allows_video_encoding());
+    }
+
     /// Helper to build a BlobMetadata for testing
     fn test_metadata(mime_type: &str) -> BlobMetadata {
         BlobMetadata {
             archive_storage: None,
+            video_encoding_allowed: false,
             sha256: "a".repeat(64),
             size: 1024,
             mime_type: mime_type.to_string(),
@@ -1098,6 +1135,7 @@ mod tests {
     fn fixture_metadata(status: BlobStatus, owner: &str) -> BlobMetadata {
         BlobMetadata {
             archive_storage: None,
+            video_encoding_allowed: false,
             sha256: "x".into(),
             size: 1,
             mime_type: "video/mp4".into(),
