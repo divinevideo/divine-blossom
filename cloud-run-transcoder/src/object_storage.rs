@@ -41,6 +41,7 @@ pub enum StorageConfiguration {
         region: String,
         access_key: String,
         secret_key: String,
+        gcs_backup_enabled: bool,
     },
 }
 impl StorageConfiguration {
@@ -59,11 +60,17 @@ impl StorageConfiguration {
                 let access_key = required("B2_ACCESS_KEY_ID")?;
                 let secret_key = required("B2_SECRET_ACCESS_KEY")?;
                 Ok(if provider.as_deref() == Some("b2_primary") {
+                    let gcs_backup_enabled = match lookup("MEDIA_GCS_BACKUP_ENABLED").as_deref() {
+                        None | Some("true") => true,
+                        Some("false") => false,
+                        _ => bail!("MEDIA_GCS_BACKUP_ENABLED must be true or false"),
+                    };
                     Self::B2Primary {
                         bucket,
                         region,
                         access_key,
                         secret_key,
+                        gcs_backup_enabled,
                     }
                 } else {
                     Self::B2 {
@@ -82,6 +89,7 @@ impl StorageConfiguration {
 #[derive(Clone)]
 pub struct MediaStorage {
     backend: Backend,
+    legacy_gcs: Option<Box<MediaStorage>>,
     required_backup: Option<Box<MediaStorage>>,
 }
 #[derive(Clone)]
@@ -129,6 +137,7 @@ impl MediaStorage {
     pub fn gcs(client: GcsClient, bucket: String) -> Self {
         Self {
             backend: Backend::Gcs { client, bucket },
+            legacy_gcs: None,
             required_backup: None,
         }
     }
@@ -137,7 +146,14 @@ impl MediaStorage {
         gcs: Option<GcsClient>,
         gcs_bucket: String,
     ) -> Result<Self> {
-        let backup_required = matches!(&config, StorageConfiguration::B2Primary { .. });
+        let legacy_required = matches!(&config, StorageConfiguration::B2Primary { .. });
+        let backup_required = matches!(
+            &config,
+            StorageConfiguration::B2Primary {
+                gcs_backup_enabled: true,
+                ..
+            }
+        );
         match config {
             StorageConfiguration::Gcs => {
                 if gcs_bucket.is_empty() {
@@ -159,15 +175,23 @@ impl MediaStorage {
                 region,
                 access_key,
                 secret_key,
+                ..
             } => {
-                let required_backup = if backup_required {
+                let legacy_gcs = if legacy_required {
                     if gcs_bucket.is_empty() {
-                        bail!("GCS backup bucket required for B2 primary");
+                        bail!("GCS legacy input bucket required for B2 primary");
                     }
                     Some(Box::new(Self::gcs(
-                        gcs.ok_or_else(|| anyhow!("GCS backup client required for B2 primary"))?,
+                        gcs.ok_or_else(|| {
+                            anyhow!("GCS legacy input client required for B2 primary")
+                        })?,
                         gcs_bucket,
                     )))
+                } else {
+                    None
+                };
+                let required_backup = if backup_required {
+                    legacy_gcs.clone()
                 } else {
                     None
                 };
@@ -202,6 +226,7 @@ impl MediaStorage {
                         endpoint: format!("https://{host}"),
                         client,
                     },
+                    legacy_gcs,
                     required_backup,
                 })
             }
@@ -232,11 +257,12 @@ impl MediaStorage {
     }
     pub async fn can_reuse_hls(&self, hash: &str) -> Result<bool> {
         let prefix = format!("{hash}/hls");
-        let Some(backup) = &self.required_backup else {
+        if self.required_backup.is_none() && self.legacy_gcs.is_none() {
             return Ok(self.stat(&format!("{prefix}/master.m3u8")).await?.is_some());
-        };
+        }
         // The encoder emits two single-file TS variants. A master alone cannot
-        // prove their backups succeeded, and regenerating every duplicate job
+        // prove the family is complete (or required backups succeeded), and
+        // regenerating every duplicate job
         // would discard the existing at-least-once dispatch's idempotency.
         for (filename, required) in [
             ("master.m3u8", true),
@@ -253,7 +279,13 @@ impl MediaStorage {
                     return Ok(false);
                 }
                 // Progressive remux is best-effort; absent MP4s are not HLS
-                // failures, but any MP4 actually written needs its backup.
+                // failures; present MP4s need a backup only when enabled.
+                continue;
+            };
+            let Some(backup) = &self.required_backup else {
+                if required && primary.size == 0 {
+                    return Ok(false);
+                }
                 continue;
             };
             let Some(replica) = backup.stat(&key).await? else {
@@ -526,7 +558,7 @@ impl MediaStorage {
         if let Some(object) = self.stat(key).await? {
             return Ok(Some((self, object)));
         }
-        match self.required_backup.as_deref() {
+        match self.legacy_gcs.as_deref() {
             Some(legacy) => Ok(legacy.stat(key).await?.map(|object| (legacy, object))),
             None => Ok(None),
         }

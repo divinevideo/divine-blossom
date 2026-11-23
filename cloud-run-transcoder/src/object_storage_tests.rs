@@ -59,6 +59,10 @@ impl Origin {
             task,
         }
     }
+    fn with_gcs_input_only(&self, client: GcsClient) -> MediaStorage {
+        b2_primary_store_with_backups(self, client, "false")
+    }
+
     pub(crate) fn store(&self) -> MediaStorage {
         MediaStorage::b2_for_test(&self.endpoint, "synthetic-bucket").unwrap()
     }
@@ -412,8 +416,13 @@ fn b2_primary_configuration_requires_b2_credentials_and_gcs_backup() {
 }
 
 fn b2_primary_store(origin: &Origin, gcs: GcsClient) -> MediaStorage {
+    b2_primary_store_with_backups(origin, gcs, "true")
+}
+
+fn b2_primary_store_with_backups(origin: &Origin, gcs: GcsClient, enabled: &str) -> MediaStorage {
     let values = HashMap::from([
         ("MEDIA_STORAGE_PROVIDER", "b2_primary"),
+        ("MEDIA_GCS_BACKUP_ENABLED", enabled),
         ("B2_MEDIA_BUCKET", "synthetic-bucket"),
         ("B2_REGION", "us-west-004"),
         ("B2_ACCESS_KEY_ID", "synthetic-access"),
@@ -2172,7 +2181,7 @@ async fn backfill_legacy_segment_is_read_without_republishing_input() {
     let mut store = primary.store();
     // The provider-independent fallback is exercised with versioned origins;
     // GCS pinned download and required backup paths have separate wire tests.
-    store.required_backup = Some(Box::new(legacy.store()));
+    store.legacy_gcs = Some(Box::new(legacy.store()));
     legacy.objects.lock().await.requests.clear();
     assert_eq!(
         crate::backfill_fmp4(&store, &"a".repeat(64), false, copy_backfill_input)
@@ -2248,4 +2257,161 @@ async fn backfill_handler_authorizes_force_before_storage() {
         assert!(origin.objects.lock().await.requests.is_empty());
     }
     task.abort();
+}
+
+#[tokio::test]
+async fn disabled_backups_preserve_legacy_reads_and_publish_only_to_b2() {
+    let origin = Origin::start().await;
+    let (legacy, client, task) = gcs_origin().await;
+    let gcs = MediaStorage::gcs(client.clone(), "synthetic-gcs".into());
+    let bytes = Bytes::from_static(b"synthetic legacy original without replication");
+    let hash = hex::encode(Sha256::digest(&bytes));
+    gcs.put_verified(&hash, bytes.clone(), "video/mp4", HashMap::new(), None)
+        .await
+        .unwrap();
+    legacy.lock().await.requests.clear();
+    let store = b2_primary_store_with_backups(&origin, client, "false");
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("original.mp4");
+    let source = store
+        .download_processing_original(&hash, &output)
+        .await
+        .unwrap();
+    assert_eq!(source.object.reference.provider, StorageProvider::Gcs);
+    assert_eq!(tokio::fs::read(output).await.unwrap(), bytes);
+    assert!(legacy
+        .lock()
+        .await
+        .requests
+        .iter()
+        .all(|(method, _)| method == "GET"));
+
+    // A failed legacy store must not block primary-only writes or reuse.
+    legacy.lock().await.requests.clear();
+    legacy.lock().await.fail = Some(StatusCode::FORBIDDEN);
+    for filename in [
+        "master.m3u8",
+        "stream_720p.m3u8",
+        "stream_480p.m3u8",
+        "stream_720p.ts",
+        "stream_480p.ts",
+        "stream_720p.mp4",
+        "stream_480p.mp4",
+    ] {
+        let receipt = store
+            .put_verified(
+                &format!("{hash}/hls/{filename}"),
+                Bytes::from_static(b"synthetic output"),
+                "application/octet-stream",
+                HashMap::new(),
+                None,
+            )
+            .await
+            .expect("disabled backups must not contact GCS for output");
+        assert!(receipt.required_backup.is_none());
+        store.ensure_required_backup(&receipt.object).await.unwrap();
+        store
+            .ensure_existing_backup(&receipt.object, Bytes::from_static(b"synthetic output"))
+            .await
+            .unwrap();
+    }
+    assert!(store.can_reuse_hls(&hash).await.unwrap());
+    origin
+        .objects
+        .lock()
+        .await
+        .latest
+        .remove(&format!("{hash}/hls/stream_480p.ts"));
+    assert!(
+        !store.can_reuse_hls(&hash).await.unwrap(),
+        "all required B2 artifacts still matter"
+    );
+    assert!(legacy.lock().await.requests.is_empty());
+    assert_eq!(
+        origin
+            .objects
+            .lock()
+            .await
+            .requests
+            .iter()
+            .filter(|(method, _, _)| method == "PUT")
+            .count(),
+        7
+    );
+    task.abort();
+}
+
+#[test]
+fn gcs_backup_switch_rejects_invalid_values() {
+    for value in ["", "0", "1", "False", "off", "typo"] {
+        let values = HashMap::from([
+            ("MEDIA_STORAGE_PROVIDER", "b2_primary"),
+            ("MEDIA_GCS_BACKUP_ENABLED", value),
+            ("B2_MEDIA_BUCKET", "synthetic-bucket"),
+            ("B2_REGION", "us-west-004"),
+            ("B2_ACCESS_KEY_ID", "synthetic-access"),
+            ("B2_SECRET_ACCESS_KEY", "synthetic-secret"),
+        ]);
+        assert!(
+            StorageConfiguration::parse(|key| values.get(key).map(|v| (*v).into())).is_err(),
+            "accepted {value:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn disabled_backups_do_not_mask_primary_failures_or_corrupt_legacy_inputs() {
+    for failure in ["forbidden", "unavailable", "corrupt"] {
+        let origin = Origin::start().await;
+        let (legacy, client, task) = gcs_origin().await;
+        let store = origin.with_gcs_input_only(client);
+        {
+            let mut state = origin.objects.lock().await;
+            state.fail = match failure {
+                "forbidden" => Some(StatusCode::FORBIDDEN),
+                "unavailable" => Some(StatusCode::SERVICE_UNAVAILABLE),
+                _ => None,
+            };
+            state.corrupt = failure == "corrupt";
+        }
+        assert!(store
+            .put_verified(
+                "artifact.mp4",
+                Bytes::from_static(b"synthetic"),
+                "video/mp4",
+                HashMap::new(),
+                None
+            )
+            .await
+            .is_err());
+        assert!(
+            legacy.lock().await.requests.is_empty(),
+            "B2 errors cannot initiate GCS output"
+        );
+        task.abort();
+    }
+    for corrupt in [false, true] {
+        let origin = Origin::start().await;
+        let (legacy, client, task) = gcs_origin().await;
+        let gcs = MediaStorage::gcs(client.clone(), "synthetic-gcs".into());
+        let bytes = Bytes::from_static(b"synthetic legacy bytes requiring verification");
+        let hash = hex::encode(Sha256::digest(&bytes));
+        gcs.put_verified(&hash, bytes, "video/mp4", HashMap::new(), None)
+            .await
+            .unwrap();
+        {
+            let mut state = legacy.lock().await;
+            state.corrupt = corrupt;
+            state.patch_after_metadata = !corrupt;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("original.mp4");
+        assert!(origin
+            .with_gcs_input_only(client)
+            .download_processing_original(&hash, &output)
+            .await
+            .is_err());
+        assert!(!output.exists());
+        task.abort();
+    }
 }
