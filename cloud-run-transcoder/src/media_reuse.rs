@@ -6,7 +6,8 @@ use std::{path::Path, time::Duration};
 use tokio::process::Command;
 
 const MAX_SECONDS: f64 = 10.0;
-const MAX_BITS_PER_SECOND: f64 = 500_000.0;
+const MAX_BITS_PER_SECOND: f64 = 1_500_000.0;
+const MAX_AUDIO_BITS_PER_SECOND: f64 = 128_000.0;
 
 /// Repackage a qualifying original in private staging. No original writes and
 /// no visible outputs until the complete HLS set can replace the empty output
@@ -304,7 +305,7 @@ fn eligible(probe: &Value, file_bytes: u64) -> bool {
             && a["profile"] == "LC"
             && a["channels"].as_u64().is_some_and(|c| (1..=2).contains(&c))
             && matches!(a["sample_rate"].as_str(), Some("44100" | "48000"))
-            && number(&a["bit_rate"]).is_some_and(|n| n > 0.0 && n <= 96_000.0)
+            && number(&a["bit_rate"]).is_some_and(|n| n > 0.0 && n <= MAX_AUDIO_BITS_PER_SECOND)
             && number(&a["start_time"]).is_some_and(|n| n.abs() <= 0.05)
             && number(&a["duration"]).is_some_and(|n| n > 0.0 && (n - duration).abs() <= 0.1)
     })

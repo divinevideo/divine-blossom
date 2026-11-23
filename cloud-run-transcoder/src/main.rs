@@ -6900,6 +6900,320 @@ mod tests {
             ["-c:a", "aac", "-b:a", "128k"]
         );
     }
+
+    #[test]
+    fn add_720p_entry_to_master_mirrors_single_480p_variant() {
+        let input = "\
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=480x480,CODECS=\"avc1.4d401e,mp4a.40.2\"
+stream_480p.m3u8
+";
+        let output = crate::add_720p_entry_to_master(input).unwrap();
+        assert_eq!(
+            output,
+            "\
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=480x480,CODECS=\"avc1.4d401e,mp4a.40.2\"
+stream_720p.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=480x480,CODECS=\"avc1.4d401e,mp4a.40.2\"
+stream_480p.m3u8
+"
+        );
+        assert!(crate::add_720p_entry_to_master("#EXTM3U\n").is_err());
+        assert!(crate::add_720p_entry_to_master("#EXTM3U\nstream_480p.m3u8\n").is_err());
+        assert!(crate::add_720p_entry_to_master(&output).is_err());
+        let crlf = input.replace('\n', "\r\n");
+        assert_eq!(crate::add_720p_entry_to_master(&crlf).unwrap(), output);
+    }
+
+    #[tokio::test]
+    async fn files_identical_streams_chunks_and_rejects_mismatches() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.ts");
+        let b = dir.path().join("b.ts");
+        let missing = dir.path().join("missing.ts");
+
+        // Empty files must return false.
+        tokio::fs::write(&a, b"").await.unwrap();
+        tokio::fs::write(&b, b"").await.unwrap();
+        assert!(!crate::files_identical(&a, &b).await);
+        assert!(!crate::files_identical(&a, &missing).await);
+
+        // Multi-chunk identical payload (> 64 KiB) returns true.
+        let mut payload = vec![0xABu8; 150_000];
+        tokio::fs::write(&a, &payload).await.unwrap();
+        tokio::fs::write(&b, &payload).await.unwrap();
+        assert!(crate::files_identical(&a, &b).await);
+
+        // Same length, single byte flipped in the final chunk returns false.
+        payload[149_999] ^= 0xFF;
+        tokio::fs::write(&b, &payload).await.unwrap();
+        assert!(!crate::files_identical(&a, &b).await);
+
+        // Different lengths return false.
+        tokio::fs::write(&b, &payload[..100_000]).await.unwrap();
+        assert!(!crate::files_identical(&a, &b).await);
+    }
+
+    #[tokio::test]
+    async fn mirror_480p_as_720p_validates_and_mirrors_all_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("stream_480p.ts"), b"ts-bytes")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            dir.path().join("stream_480p.m3u8"),
+            "#EXTM3U\n#EXTINF:2.0,\nstream_480p.ts\n#EXT-X-ENDLIST\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            dir.path().join("master.m3u8"),
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=480x480\nstream_480p.m3u8\n",
+        )
+        .await
+        .unwrap();
+
+        crate::mirror_480p_as_720p(dir.path()).await.unwrap();
+        assert_eq!(
+            tokio::fs::read(dir.path().join("stream_720p.ts"))
+                .await
+                .unwrap(),
+            b"ts-bytes"
+        );
+        let pl720 = tokio::fs::read_to_string(dir.path().join("stream_720p.m3u8"))
+            .await
+            .unwrap();
+        assert!(pl720.contains("stream_720p.ts"));
+        assert!(!pl720.contains("stream_480p.ts"));
+
+        // Re-running must fail because master.m3u8 already has stream_720p.m3u8.
+        assert!(crate::mirror_480p_as_720p(dir.path()).await.is_err());
+
+        // Missing stream_480p.ts reference in playlist must fail.
+        let bad = tempfile::tempdir().unwrap();
+        tokio::fs::write(bad.path().join("stream_480p.ts"), b"ts-bytes")
+            .await
+            .unwrap();
+        tokio::fs::write(bad.path().join("stream_480p.m3u8"), "#EXTM3U\n")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            bad.path().join("master.m3u8"),
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1200000\nstream_480p.m3u8\n",
+        )
+        .await
+        .unwrap();
+        assert!(crate::mirror_480p_as_720p(bad.path()).await.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ffmpeg and ffprobe"]
+    async fn encode_hls_single_variant_video_only_480p_mirrors_720p_and_mp4() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("source_480_silent.mp4");
+        let output = dir.path().join("hls");
+        tokio::fs::create_dir(&output).await.unwrap();
+
+        let status = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=480x480:rate=25:duration=2",
+                "-c:v",
+                "libx264",
+                "-profile:v",
+                "main",
+                "-bf",
+                "2",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&input)
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+
+        let info = crate::probe_video(&input).await.unwrap();
+        assert!(!info.has_audio);
+        crate::encode_hls(&input, &output, false, &info)
+            .await
+            .unwrap();
+        crate::remux_ts_to_fmp4(&output).await.unwrap();
+        crate::require_progressive_outputs(&output).await.unwrap();
+        assert_eq!(
+            tokio::fs::read(output.join("stream_720p.mp4"))
+                .await
+                .unwrap(),
+            tokio::fs::read(output.join("stream_480p.mp4"))
+                .await
+                .unwrap()
+        );
+        let probed = crate::probe_video(&output.join("stream_720p.mp4"))
+            .await
+            .unwrap();
+        assert_eq!((probed.display_width, probed.display_height), (480, 480));
+        assert!(!probed.has_audio);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ffmpeg and ffprobe"]
+    async fn encode_hls_single_variant_for_480p_mirrors_720p_and_mp4() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("source_480.mp4");
+        let output = dir.path().join("hls");
+        tokio::fs::create_dir(&output).await.unwrap();
+
+        let status = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=480x480:rate=25:duration=2",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100:duration=2",
+                "-c:v",
+                "libx264",
+                "-profile:v",
+                "main",
+                "-bf",
+                "2",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "64k",
+            ])
+            .arg(&input)
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+
+        let info = crate::probe_video(&input).await.unwrap();
+        let variants = crate::encode_hls(&input, &output, false, &info)
+            .await
+            .unwrap();
+        assert_eq!(variants.len(), 2);
+
+        let master = tokio::fs::read_to_string(output.join("master.m3u8"))
+            .await
+            .unwrap();
+        assert!(master.contains("stream_720p.m3u8"));
+        assert!(master.contains("stream_480p.m3u8"));
+
+        let pl_720 = tokio::fs::read_to_string(output.join("stream_720p.m3u8"))
+            .await
+            .unwrap();
+        let pl_480 = tokio::fs::read_to_string(output.join("stream_480p.m3u8"))
+            .await
+            .unwrap();
+        assert!(pl_720.contains("stream_720p.ts"));
+        assert!(!pl_720.contains("stream_480p.ts"));
+        assert!(pl_480.contains("stream_480p.ts"));
+
+        assert_eq!(
+            tokio::fs::read(output.join("stream_720p.ts"))
+                .await
+                .unwrap(),
+            tokio::fs::read(output.join("stream_480p.ts"))
+                .await
+                .unwrap(),
+            "single-variant <=480p encode should mirror stream_480p.ts to stream_720p.ts"
+        );
+
+        crate::remux_ts_to_fmp4(&output).await.unwrap();
+        crate::require_progressive_outputs(&output).await.unwrap();
+        assert_eq!(
+            tokio::fs::read(output.join("stream_720p.mp4"))
+                .await
+                .unwrap(),
+            tokio::fs::read(output.join("stream_480p.mp4"))
+                .await
+                .unwrap(),
+            "identical TS variants should mirror stream_720p.mp4 to stream_480p.mp4"
+        );
+        let probed = crate::probe_video(&output.join("stream_720p.mp4"))
+            .await
+            .unwrap();
+        assert_eq!((probed.display_width, probed.display_height), (480, 480));
+        assert!(probed.has_audio);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ffmpeg and ffprobe"]
+    async fn encode_hls_dual_variant_for_720p_produces_distinct_renditions() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("source_720.mp4");
+        let output = dir.path().join("hls");
+        tokio::fs::create_dir(&output).await.unwrap();
+
+        let status = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=720x720:rate=25:duration=2",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100:duration=2",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "64k",
+            ])
+            .arg(&input)
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+
+        let info = crate::probe_video(&input).await.unwrap();
+        crate::encode_hls(&input, &output, false, &info)
+            .await
+            .unwrap();
+        crate::remux_ts_to_fmp4(&output).await.unwrap();
+        crate::require_progressive_outputs(&output).await.unwrap();
+
+        assert_ne!(
+            tokio::fs::read(output.join("stream_720p.ts"))
+                .await
+                .unwrap(),
+            tokio::fs::read(output.join("stream_480p.ts"))
+                .await
+                .unwrap(),
+            ">480p inputs must still produce distinct 720p and 480p renditions"
+        );
+        let p720 = crate::probe_video(&output.join("stream_720p.mp4"))
+            .await
+            .unwrap();
+        let p480 = crate::probe_video(&output.join("stream_480p.mp4"))
+            .await
+            .unwrap();
+        assert_eq!((p720.display_width, p720.display_height), (720, 720));
+        assert_eq!((p480.display_width, p480.display_height), (480, 480));
+    }
 }
 
 fn summarize_vtt(vtt: &str) -> (u32, u64) {
@@ -7281,6 +7595,11 @@ async fn encode_hls(
         );
     }
 
+    // When both renditions resolve to identical dimensions (all <=480p sources,
+    // including 480x480 Vines), encode once and mirror the single HLS output
+    // to stream_720p so we preserve client contracts at half the encoder CPU.
+    let single_variant = w_720 == w_480 && h_720 == h_480;
+
     // Build FFmpeg command
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-y"); // Overwrite output
@@ -7294,8 +7613,14 @@ async fn encode_hls(
 
     cmd.args(["-i", &input_str]);
 
-    // Output mapping: create two video streams (720p, 480p), with audio if present
-    if video_info.has_audio {
+    // Output mapping: single stream when 720p==480p, otherwise two streams (720p, 480p)
+    if single_variant {
+        if video_info.has_audio {
+            cmd.args(["-map", "0:v:0", "-map", "0:a:0"]);
+        } else {
+            cmd.args(["-map", "0:v:0"]);
+        }
+    } else if video_info.has_audio {
         cmd.args([
             "-map", "0:v:0", "-map", "0:a:0", // 720p with audio
             "-map", "0:v:0", "-map", "0:a:0", // 480p with audio
@@ -7331,7 +7656,49 @@ async fn encode_hls(
         format!("scale={}:-2", w_480)
     };
 
-    if effective_gpu {
+    if single_variant {
+        if effective_gpu {
+            cmd.args([
+                "-filter:v:0",
+                &scale_480,
+                "-c:v:0",
+                "h264_nvenc",
+                "-profile:v:0",
+                "main",
+                "-level:v:0",
+                "3.1",
+                "-cq:v:0",
+                "23",
+                "-maxrate:v:0",
+                "1200k",
+                "-bufsize:v:0",
+                "2400k",
+                "-bf:v:0",
+                "0",
+            ]);
+        } else {
+            cmd.args([
+                "-filter:v:0",
+                &scale_480,
+                "-c:v:0",
+                "libx264",
+                "-profile:v:0",
+                "main",
+                "-level:v:0",
+                "3.1",
+                "-crf:v:0",
+                "23",
+                "-maxrate:v:0",
+                "1200k",
+                "-bufsize:v:0",
+                "2400k",
+                "-preset:v:0",
+                "fast",
+                "-bf:v:0",
+                "0",
+            ]);
+        }
+    } else if effective_gpu {
         cmd.args([
             // 720p variant
             "-filter:v:0",
@@ -7418,7 +7785,11 @@ async fn encode_hls(
 
     // Audio encoding (only if audio stream exists)
     if video_info.has_audio {
-        cmd.args(["-c:a", "aac", "-b:a:0", "128k", "-b:a:1", "96k"]);
+        if single_variant {
+            cmd.args(["-c:a", "aac", "-b:a:0", "128k"]);
+        } else {
+            cmd.args(["-c:a", "aac", "-b:a:0", "128k", "-b:a:1", "96k"]);
+        }
     }
 
     // HLS output settings
@@ -7427,10 +7798,11 @@ async fn encode_hls(
     // -hls_flags single_file: Put all segments in single .ts file (efficient for short clips)
     // -master_pl_name: Name of master playlist
     // -var_stream_map: Map variants to output streams
-    let var_stream_map = if video_info.has_audio {
-        "v:0,a:0,name:720p v:1,a:1,name:480p"
-    } else {
-        "v:0,name:720p v:1,name:480p"
+    let var_stream_map = match (single_variant, video_info.has_audio) {
+        (true, true) => "v:0,a:0,name:480p",
+        (true, false) => "v:0,name:480p",
+        (false, true) => "v:0,a:0,name:720p v:1,a:1,name:480p",
+        (false, false) => "v:0,name:720p v:1,name:480p",
     };
 
     cmd.args([
@@ -7459,12 +7831,93 @@ async fn encode_hls(
         return Err(anyhow!("FFmpeg failed: {}", stderr));
     }
 
+    if single_variant {
+        mirror_480p_as_720p(output_dir).await?;
+    }
+
     // Verify outputs exist
     if !master_playlist.exists() {
         return Err(anyhow!("Master playlist not created"));
     }
 
     Ok(hls_variants())
+}
+
+/// Mirror a single-encoded 480p HLS output to the 720p variant paths so
+/// existing client and storage contracts stay intact without running a second
+/// identical libx264 encode.
+async fn mirror_480p_as_720p(output_dir: &Path) -> Result<()> {
+    let ts_480 = output_dir.join("stream_480p.ts");
+    let ts_720 = output_dir.join("stream_720p.ts");
+    let pl_480 = output_dir.join("stream_480p.m3u8");
+    let pl_720 = output_dir.join("stream_720p.m3u8");
+    let master_path = output_dir.join("master.m3u8");
+
+    tokio::fs::copy(&ts_480, &ts_720)
+        .await
+        .context("Mirror stream_480p.ts to stream_720p.ts")?;
+
+    let playlist_480 = tokio::fs::read_to_string(&pl_480)
+        .await
+        .context("Read stream_480p.m3u8")?;
+    if !playlist_480.contains("stream_480p.ts") {
+        return Err(anyhow!("stream_480p.m3u8 did not reference stream_480p.ts"));
+    }
+    let playlist_720 = playlist_480.replace("stream_480p.ts", "stream_720p.ts");
+    tokio::fs::write(&pl_720, playlist_720)
+        .await
+        .context("Write stream_720p.m3u8")?;
+
+    let master = tokio::fs::read_to_string(&master_path)
+        .await
+        .context("Read master.m3u8")?;
+    let rewritten = add_720p_entry_to_master(&master)?;
+    tokio::fs::write(&master_path, rewritten)
+        .await
+        .context("Write mirrored master.m3u8")?;
+
+    for name in [
+        "master.m3u8",
+        "stream_720p.m3u8",
+        "stream_480p.m3u8",
+        "stream_720p.ts",
+        "stream_480p.ts",
+    ] {
+        let len = tokio::fs::metadata(output_dir.join(name))
+            .await
+            .with_context(|| format!("Missing mirrored HLS output {name}"))?
+            .len();
+        if len == 0 {
+            return Err(anyhow!("Empty mirrored HLS output {name}"));
+        }
+    }
+    Ok(())
+}
+
+fn add_720p_entry_to_master(master: &str) -> Result<String> {
+    let lines: Vec<&str> = master.lines().collect();
+    if lines.iter().any(|line| line.trim() == "stream_720p.m3u8") {
+        return Err(anyhow!("master.m3u8 already references stream_720p.m3u8"));
+    }
+    let idx = lines
+        .iter()
+        .position(|line| line.trim() == "stream_480p.m3u8")
+        .ok_or_else(|| anyhow!("master.m3u8 did not reference stream_480p.m3u8"))?;
+    if idx == 0
+        || !lines[idx - 1]
+            .trim_start()
+            .starts_with("#EXT-X-STREAM-INF:")
+    {
+        return Err(anyhow!(
+            "master.m3u8 missing #EXT-X-STREAM-INF before stream_480p.m3u8"
+        ));
+    }
+    let mut out = Vec::with_capacity(lines.len() + 2);
+    out.extend_from_slice(&lines[..idx - 1]);
+    out.push(lines[idx - 1]);
+    out.push("stream_720p.m3u8");
+    out.extend_from_slice(&lines[idx - 1..]);
+    Ok(format!("{}\n", out.join("\n")))
 }
 
 fn hls_variants() -> Vec<HlsVariant> {
@@ -7527,7 +7980,85 @@ async fn require_progressive_outputs(hls_dir: &Path) -> Result<()> {
 /// bytes of AAC-LC config plus an explicit "SBR absent" marker. Copying avoids
 /// an unnecessary generation of lossy re-encoding and produces the measured
 /// 2-byte configuration without claiming an unverified playback cost (#235).
+async fn files_identical(a: &Path, b: &Path) -> bool {
+    use tokio::io::AsyncReadExt;
+
+    let Ok((ma, mb)) = tokio::try_join!(tokio::fs::metadata(a), tokio::fs::metadata(b)) else {
+        return false;
+    };
+    if !ma.is_file() || !mb.is_file() || ma.len() == 0 || ma.len() != mb.len() {
+        return false;
+    }
+    let Ok((mut fa, mut fb)) = tokio::try_join!(tokio::fs::File::open(a), tokio::fs::File::open(b))
+    else {
+        return false;
+    };
+
+    const CHUNK_SIZE: usize = 64 * 1024;
+    let mut buf_a = vec![0u8; CHUNK_SIZE];
+    let mut buf_b = vec![0u8; CHUNK_SIZE];
+    let mut remaining = ma.len();
+
+    while remaining > 0 {
+        let to_read = (remaining as usize).min(CHUNK_SIZE);
+        if fa.read_exact(&mut buf_a[..to_read]).await.is_err()
+            || fb.read_exact(&mut buf_b[..to_read]).await.is_err()
+        {
+            return false;
+        }
+        if buf_a[..to_read] != buf_b[..to_read] {
+            return false;
+        }
+        remaining -= to_read as u64;
+    }
+    // Verify neither file grew while reading.
+    matches!(
+        tokio::try_join!(fa.read(&mut buf_a[..1]), fb.read(&mut buf_b[..1])),
+        Ok((0, 0))
+    )
+}
+
 async fn remux_ts_to_fmp4(hls_dir: &Path) -> Result<()> {
+    let ts_720 = hls_dir.join("stream_720p.ts");
+    let ts_480 = hls_dir.join("stream_480p.ts");
+    if files_identical(&ts_720, &ts_480).await {
+        let mp4_720 = hls_dir.join("stream_720p.mp4");
+        let mp4_480 = hls_dir.join("stream_480p.mp4");
+        match remux_variant(&ts_720, &mp4_720, "stream_720p").await {
+            Ok(()) => {
+                info!("Remuxed stream_720p to MP4");
+                match tokio::fs::copy(&mp4_720, &mp4_480).await {
+                    Ok(_) => {
+                        info!("Mirrored stream_720p.mp4 to stream_480p.mp4");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        warn!("Failed to mirror stream_720p.mp4 to stream_480p.mp4: {}", e);
+                        let _ = tokio::fs::remove_file(&mp4_480).await;
+                        // Fall back to remuxing stream_480p directly without redoing stream_720p.
+                        if let Err(e) = remux_variant(&ts_480, &mp4_480, "stream_480p").await {
+                            warn!("MP4 remux failed for stream_480p: {}", e);
+                            let _ = tokio::fs::remove_file(&mp4_480).await;
+                        } else {
+                            info!("Remuxed stream_480p to MP4");
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("MP4 remux failed for stream_720p: {}", e);
+                match tokio::fs::remove_file(&mp4_720).await {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        warn!("Could not remove failed stream_720p MP4: {}", e);
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
+        }
+    }
+
     for variant in &["stream_720p", "stream_480p"] {
         let ts_path = hls_dir.join(format!("{}.ts", variant));
         let mp4_path = hls_dir.join(format!("{}.mp4", variant));
