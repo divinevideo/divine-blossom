@@ -167,7 +167,8 @@ Deno.test("full media lifecycle: upload, transcode webhook, HLS/MP4/VTT/Range ca
     equal((await ctx.app(new Request(`${ctx.origin}/health`))).status, 200);
     const headUpload = await ctx.app(new Request(`${ctx.origin}/upload`, { method: "HEAD" }));
     equal(headUpload.status, 200);
-    equal(headUpload.headers.get("x-divine-upload-extensions"), "resumable-sessions");
+    // Without uploadServiceUrl configured, resumable-sessions is not advertised.
+    equal(headUpload.headers.get("x-divine-upload-extensions"), null);
 
     // PUT /upload
     const up = await ctx.app(
@@ -186,10 +187,12 @@ Deno.test("full media lifecycle: upload, transcode webhook, HLS/MP4/VTT/Range ca
     equal(desc.url, `${ctx.origin}/${hash}.mp4`);
     equal(desc.uploaded, ctx.now);
 
-    // Pending blob serves privately (never publicly cached before approval)
+    // Pending blob serves privately (never publicly cached before approval),
+    // and missing video poster /{hash}.jpg returns 404 (never raw MP4 bytes).
     const pendingGet = await ctx.app(new Request(`${ctx.origin}/${hash}`));
     equal(pendingGet.status, 200);
     equal(pendingGet.headers.get("cache-control"), "private, no-store");
+    equal((await ctx.app(new Request(`${ctx.origin}/${hash}.jpg`))).status, 404);
 
     // Transcode + transcript webhooks (including stale generation rejection)
     const tc1 = await ctx.app(
@@ -652,6 +655,13 @@ Deno.test("delegated PUT /upload publishes to SQL catalog, supports chunked bodi
       return fn();
     }
 
+    if (reqUrl.startsWith("https://upload.divine.video/thumbnail/") && method === "GET") {
+      return new Response(new Uint8Array([0xff, 0xd8, 0xff, 0xd9]), {
+        status: 200,
+        headers: { "content-type": "image/jpeg", "content-length": "4" },
+      });
+    }
+
     if (reqUrl === "https://upload.divine.video/upload" && method === "PUT") {
       // Enforce real Cloud Run header invariants: exact "Nostr " prefix and strict "copy-only" value.
       const authHeader = headers.get("authorization") ?? "";
@@ -854,6 +864,14 @@ Deno.test("delegated PUT /upload publishes to SQL catalog, supports chunked bodi
     equal(videoDesc.url, `${origin}/${videoHash}.mp4`);
     equal(videoDesc.thumbnail, `${origin}/${videoHash}.jpg`);
     equal(videoDesc.dim, "720x1280");
+    // Fetching the rewritten thumbnail URL delegates to Cloud Run /thumbnail/:hash (image/jpeg, NEVER raw MP4)
+    const fetchedThumb = await app(new Request(videoDesc.thumbnail!));
+    equal(fetchedThumb.status, 200);
+    equal(fetchedThumb.headers.get("content-type"), "image/jpeg");
+    equal(
+      new Uint8Array(await fetchedThumb.arrayBuffer()),
+      new Uint8Array([0xff, 0xd8, 0xff, 0xd9]),
+    );
     equal(modScans.length, 1);
     equal(modScans[0].sha256, videoHash);
     const forwardedPut = seenRequests.find((r) =>

@@ -450,11 +450,13 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
     }
 
     // Try primary storage key (and alternate quality / thumbnail / legacy vtt fallbacks)
+    const isVideoThumbnail = media.kind === "thumbnail" ||
+      (media.kind === "original" &&
+        row.type.startsWith("video/") &&
+        /^\/[0-9a-fA-F]{64}\.(jpg|jpeg)$/i.test(new URL(req.url).pathname));
     let targetKey = media.storageKey;
-    if (media.kind === "original" && row.type.startsWith("video/")) {
-      if (/^\/[0-9a-fA-F]{64}\.(jpg|jpeg)$/i.test(new URL(req.url).pathname)) {
-        targetKey = `${media.hash}.jpg`;
-      }
+    if (isVideoThumbnail) {
+      targetKey = `${media.hash}.jpg`;
     }
     let storageResp = await config.blobs.read(targetKey, req);
     if (storageResp.status === 404 && media.kind === "quality") {
@@ -465,7 +467,39 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       const legacyVtt = media.lang ? `${media.hash}.${media.lang}.vtt` : `${media.hash}.vtt`;
       storageResp = await config.blobs.read(legacyVtt, req);
     }
-    if (storageResp.status === 404 && targetKey !== media.storageKey) {
+    if (storageResp.status === 404 && isVideoThumbnail && config.upstreams?.uploadServiceUrl) {
+      const thumbUrl = `${
+        config.upstreams.uploadServiceUrl.replace(/\/+$/, "")
+      }/thumbnail/${media.hash}`;
+      const thumbRes = await fetcher(thumbUrl, {
+        method: "GET",
+        redirect: "error",
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (thumbRes.status === 200) {
+        const thumbHeaders = new Headers({
+          "content-type": "image/jpeg",
+          "accept-ranges": "bytes",
+        });
+        const cl = thumbRes.headers.get("content-length");
+        if (cl) thumbHeaders.set("content-length", cl);
+        storageResp = new Response(req.method === "HEAD" ? null : thumbRes.body, {
+          status: 200,
+          headers: thumbHeaders,
+        });
+        if (req.method === "HEAD") {
+          await thumbRes.body?.cancel().catch(() => {});
+        }
+      } else {
+        await thumbRes.body?.cancel().catch(() => {});
+        if (thumbRes.status === 422) {
+          return jsonResp(422, { error: "Thumbnail cannot be generated for this video" });
+        }
+        if (thumbRes.status !== 404) {
+          return jsonResp(503, { error: "Thumbnail generation unavailable" });
+        }
+      }
+    } else if (storageResp.status === 404 && !isVideoThumbnail && targetKey !== media.storageKey) {
       storageResp = await config.blobs.read(media.storageKey, req);
     }
 
@@ -540,12 +574,12 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
   function uploadCapabilityHeaders(): Record<string, string> {
     const out: Record<string, string> = {
       "x-content-length": String(effectiveMaxUploadBytes()),
-      "x-divine-upload-extensions": DIVINE_UPLOAD_EXTENSION_RESUMABLE,
       "x-divine-upload-control-host": originHost,
       "cache-control": "private, no-store",
       "surrogate-control": "no-store",
     };
     if (config.upstreams?.uploadServiceUrl) {
+      out["x-divine-upload-extensions"] = DIVINE_UPLOAD_EXTENSION_RESUMABLE;
       out["x-divine-upload-data-host"] = new URL(config.upstreams.uploadServiceUrl).host;
     }
     return out;
