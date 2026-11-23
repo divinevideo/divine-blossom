@@ -56,39 +56,67 @@ where
     T: DeserializeOwned + Serialize,
     F: FnMut(Option<T>) -> std::result::Result<ConditionalJsonMutation<T, R>, String>,
 {
+    with_json_store_io(key, operation, false, |lookup, write| {
+        update_json_conditionally_with_io(max_attempts, operation, mutate, lookup, write)
+    })
+}
+
+type JsonLookup<'a> = dyn FnMut() -> std::result::Result<Option<(String, u64)>, String> + 'a;
+type JsonWrite<'a> =
+    dyn FnMut(String, Option<u64>, Option<Duration>) -> std::result::Result<bool, String> + 'a;
+
+/// Keep provider I/O separate from the read-modify-write transaction so tests can
+/// deterministically interleave a concurrent writer at the storage boundary.
+fn with_json_store_io<R>(
+    key: &str,
+    operation: &str,
+    diagnose_status_failure: bool,
+    run: impl FnOnce(&mut JsonLookup<'_>, &mut JsonWrite<'_>) -> std::result::Result<R, String>,
+) -> Result<R> {
     let store = open_store()?;
     let tracker = std::cell::RefCell::new(CasConflictTracker::default());
     let conflicted = std::cell::Cell::new(false);
-    let result = update_json_conditionally_with_io(
-        max_attempts,
-        operation,
-        mutate,
-        || {
+    let origin_reads = std::cell::Cell::new(0u32);
+    let origin_errors = std::cell::Cell::new(0u32);
+    let origin_unconfigured = std::cell::Cell::new(0u32);
+    let conflicts = std::cell::Cell::new(0u32);
+    let result = run(
+        &mut || {
             // After a lost write the edge copy may be stale, so re-read from the origin when it is
             // configured and reachable; otherwise keep reading the edge as before.
             if conflicted.get() {
-                if let Ok(Some(origin)) = crate::kv_origin::lookup(key) {
-                    let read = origin.map(|entry| {
-                        (String::from_utf8_lossy(&entry.body).into_owned(), entry.generation)
-                    });
-                    tracker.borrow_mut().read(read.as_ref().map(|(_, generation)| *generation));
-                    return Ok(read);
+                match crate::kv_origin::lookup(key) {
+                    Ok(Some(origin)) => {
+                        origin_reads.set(origin_reads.get() + 1);
+                        let read = origin.map(|entry| {
+                            (
+                                String::from_utf8_lossy(&entry.body).into_owned(),
+                                entry.generation,
+                            )
+                        });
+                        tracker
+                            .borrow_mut()
+                            .read(read.as_ref().map(|(_, generation)| *generation));
+                        return Ok(read);
+                    }
+                    Ok(None) => origin_unconfigured.set(origin_unconfigured.get() + 1),
+                    Err(_) => origin_errors.set(origin_errors.get() + 1),
                 }
             }
             match observe_kv(KvOperation::Lookup, store.lookup(key)) {
-            Ok(mut lookup) => {
-                let generation = lookup.current_generation();
-                tracker.borrow_mut().read(Some(generation));
-                Ok(Some((lookup.take_body().into_string(), generation)))
-            }
-            Err(KVStoreError::ItemNotFound) => {
-                tracker.borrow_mut().read(None);
-                Ok(None)
-            }
-            Err(error) => Err(format!("Failed to load {operation}: {error}")),
+                Ok(mut lookup) => {
+                    let generation = lookup.current_generation();
+                    tracker.borrow_mut().read(Some(generation));
+                    Ok(Some((lookup.take_body().into_string(), generation)))
+                }
+                Err(KVStoreError::ItemNotFound) => {
+                    tracker.borrow_mut().read(None);
+                    Ok(None)
+                }
+                Err(error) => Err(format!("Failed to load {operation}: {error}")),
             }
         },
-        |value, generation, time_to_live| {
+        &mut |value, generation, time_to_live| {
             let insert = match generation {
                 Some(generation) => store.build_insert().if_generation_match(generation),
                 None => store.build_insert().mode(InsertMode::Add),
@@ -97,9 +125,17 @@ where
                 Some(ttl) => insert.time_to_live(ttl),
                 None => insert,
             };
-            match observe_kv(if generation.is_some() { KvOperation::InsertCas } else { KvOperation::InsertAdd }, insert.execute(key, value)) {
+            match observe_kv(
+                if generation.is_some() {
+                    KvOperation::InsertCas
+                } else {
+                    KvOperation::InsertAdd
+                },
+                insert.execute(key, value),
+            ) {
                 Ok(()) => Ok(true),
                 Err(KVStoreError::ItemPreconditionFailed) => {
+                    conflicts.set(conflicts.get() + 1);
                     tracker.borrow_mut().conflict(generation);
                     conflicted.set(true);
                     Ok(false)
@@ -109,6 +145,15 @@ where
         },
     );
     if result.is_err() {
+        if diagnose_status_failure {
+            crate::request_log::emit_transcode_cas_failure(
+                tracker.borrow().pattern(),
+                conflicts.get(),
+                origin_reads.get(),
+                origin_errors.get(),
+                origin_unconfigured.get(),
+            );
+        }
         match tracker.borrow().pattern() {
             Some(CasRetryPattern::StaleRead) => note(Reason::CasStaleRead),
             Some(CasRetryPattern::Contended) => note(Reason::CasContended),
@@ -1230,63 +1275,94 @@ pub fn update_transcode_status_with_metadata(
     dim: Option<String>,
     update: TranscodeMetadataUpdate,
 ) -> Result<StatusUpdateOutcome> {
-    let mut metadata = get_blob_metadata_uncached(hash)?
-        .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
+    let key = format!("{BLOB_PREFIX}{}", hash.to_lowercase());
+    let result = with_json_store_io(&key, "blob metadata", true, |lookup, write| {
+        update_transcode_status_with_io(status, new_size, dim, update, lookup, write)
+    })?
+    .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
+    invalidate_metadata_cache(hash);
+    Ok(result)
+}
 
-    if let Some(outcome) = generation_rejection(
-        update.generation,
-        metadata.transcode_generation,
-        update.require_generation_after_versioned,
-        update.malformed_generation,
-    ) {
-        return Ok(outcome);
-    }
-
-    metadata.transcode_status = Some(status);
-    match status {
-        crate::blossom::TranscodeStatus::Failed => {
-            if update.increment_attempt_count {
-                metadata.transcode_attempt_count =
-                    metadata.transcode_attempt_count.saturating_add(1);
+fn update_transcode_status_with_io(
+    status: crate::blossom::TranscodeStatus,
+    new_size: Option<u64>,
+    dim: Option<String>,
+    update: TranscodeMetadataUpdate,
+    lookup: &mut JsonLookup<'_>,
+    write: &mut JsonWrite<'_>,
+) -> std::result::Result<Option<StatusUpdateOutcome>, String> {
+    update_json_conditionally_with_io(
+        8,
+        "blob metadata",
+        |current: Option<Option<BlobMetadata>>| {
+            let Some(Some(mut metadata)) = current else {
+                // Missing and erased records cannot be recreated by callbacks.
+                return Ok(ConditionalJsonMutation::Complete(None));
+            };
+            // The callback generation belongs to the record read for THIS CAS.
+            // A lost write can expose a newer callback, including this delivery
+            // already committed by another request.
+            if let Some(outcome) = generation_rejection(
+                update.generation,
+                metadata.transcode_generation,
+                update.require_generation_after_versioned,
+                update.malformed_generation,
+            ) {
+                return Ok(ConditionalJsonMutation::Complete(Some(outcome)));
             }
-            metadata.transcode_error_code = update.error_code;
-            metadata.transcode_error_message = update.error_message;
-            metadata.transcode_last_attempt_at = update.last_attempt_at;
-            metadata.transcode_retry_after = update.retry_after;
-            metadata.transcode_terminal = update.terminal.unwrap_or(false);
-        }
-        crate::blossom::TranscodeStatus::Complete => {
-            metadata.transcode_error_code = None;
-            metadata.transcode_error_message = None;
-            metadata.transcode_last_attempt_at = update.last_attempt_at;
-            metadata.transcode_retry_after = None;
-            metadata.transcode_attempt_count = 0;
-            metadata.transcode_terminal = false;
-        }
-        crate::blossom::TranscodeStatus::Processing | crate::blossom::TranscodeStatus::Pending => {
-            metadata.transcode_error_code = update.error_code;
-            metadata.transcode_error_message = update.error_message;
-            metadata.transcode_last_attempt_at = update.last_attempt_at;
-            metadata.transcode_retry_after = update.retry_after;
-            metadata.transcode_terminal = update.terminal.unwrap_or(false);
-        }
-    }
+            metadata.transcode_status = Some(status);
+            match status {
+                crate::blossom::TranscodeStatus::Failed => {
+                    if update.increment_attempt_count {
+                        metadata.transcode_attempt_count =
+                            metadata.transcode_attempt_count.saturating_add(1);
+                    }
+                    metadata.transcode_error_code = update.error_code.clone();
+                    metadata.transcode_error_message = update.error_message.clone();
+                    metadata.transcode_last_attempt_at = update.last_attempt_at.clone();
+                    metadata.transcode_retry_after = update.retry_after;
+                    metadata.transcode_terminal = update.terminal.unwrap_or(false);
+                }
+                crate::blossom::TranscodeStatus::Complete => {
+                    metadata.transcode_error_code = None;
+                    metadata.transcode_error_message = None;
+                    metadata.transcode_last_attempt_at = update.last_attempt_at.clone();
+                    metadata.transcode_retry_after = None;
+                    metadata.transcode_attempt_count = 0;
+                    metadata.transcode_terminal = false;
+                }
+                crate::blossom::TranscodeStatus::Processing
+                | crate::blossom::TranscodeStatus::Pending => {
+                    metadata.transcode_error_code = update.error_code.clone();
+                    metadata.transcode_error_message = update.error_message.clone();
+                    metadata.transcode_last_attempt_at = update.last_attempt_at.clone();
+                    metadata.transcode_retry_after = update.retry_after;
+                    metadata.transcode_terminal = update.terminal.unwrap_or(false);
+                }
+            }
 
-    if let Some(size) = new_size {
-        metadata.size = size;
-    }
+            if let Some(size) = new_size {
+                metadata.size = size;
+            }
 
-    if let Some(d) = dim {
-        metadata.dim = Some(d);
-    }
+            if let Some(d) = &dim {
+                metadata.dim = Some(d.clone());
+            }
 
-    if let Some(generation) = update.generation {
-        metadata.transcode_generation = Some(generation);
-    }
+            if let Some(generation) = update.generation {
+                metadata.transcode_generation = Some(generation);
+            }
 
-    put_blob_metadata(&metadata)?;
-
-    Ok(StatusUpdateOutcome::Applied)
+            Ok(ConditionalJsonMutation::Write {
+                value: Some(metadata),
+                result: Some(StatusUpdateOutcome::Applied),
+                time_to_live: None,
+            })
+        },
+        lookup,
+        write,
+    )
 }
 
 /// Update transcript status for an audio/video blob
@@ -2140,6 +2216,247 @@ mod tests {
         vanish_in_progress_key, StatusUpdateOutcome, VanishAuditState,
     };
     use std::collections::HashSet;
+
+    fn status_fixture() -> crate::blossom::BlobMetadata {
+        serde_json::from_value(serde_json::json!({
+            "sha256": "a1".repeat(32), "size": 100, "type": "video/mp4",
+            "uploaded": "2026-01-01T00:00:00Z", "owner": "b2".repeat(32),
+            "status": "active", "transcode_status": "processing",
+            "transcode_generation": 10, "transcode_attempt_count": 2,
+            "video_encoding_allowed": true
+        }))
+        .unwrap()
+    }
+
+    // Run the production status transaction against a real generation-fenced
+    // in-memory record; interleave another commit immediately before its first PUT.
+    fn status_race(
+        mut concurrent: crate::blossom::BlobMetadata,
+    ) -> (StatusUpdateOutcome, crate::blossom::BlobMetadata, usize) {
+        use std::cell::{Cell, RefCell};
+        let state = RefCell::new((serde_json::to_string(&status_fixture()).unwrap(), 100u64));
+        let writes = Cell::new(0);
+        concurrent.sha256 = "a1".repeat(32);
+        let result = super::update_transcode_status_with_io(
+            crate::blossom::TranscodeStatus::Failed,
+            Some(200),
+            Some("480x480".into()),
+            super::TranscodeMetadataUpdate {
+                generation: Some(20),
+                increment_attempt_count: true,
+                error_code: Some("archive_remux_incompatible".into()),
+                terminal: Some(true),
+                require_generation_after_versioned: true,
+                ..Default::default()
+            },
+            &mut || Ok(Some(state.borrow().clone())),
+            &mut |json, expected, _| {
+                writes.set(writes.get() + 1);
+                if writes.get() == 1 {
+                    *state.borrow_mut() = (serde_json::to_string(&concurrent).unwrap(), 101);
+                }
+                let mut current = state.borrow_mut();
+                if expected != Some(current.1) {
+                    return Ok(false);
+                }
+                *current = (json, current.1 + 1);
+                Ok(true)
+            },
+        )
+        .unwrap()
+        .expect("fixture exists");
+        let record = serde_json::from_str(&state.borrow().0).unwrap();
+        (result, record, writes.get())
+    }
+
+    #[test]
+    fn status_cas_preserves_concurrent_unrelated_metadata() {
+        let mut concurrent = status_fixture();
+        concurrent.owner = "c3".repeat(32);
+        concurrent.status = crate::blossom::BlobStatus::Restricted;
+        concurrent.transcript_status = Some(crate::blossom::TranscriptStatus::Complete);
+        concurrent.transcript_generation = Some(444);
+        concurrent.video_encoding_allowed = false;
+        let (outcome, stored, writes) = status_race(concurrent);
+        assert_eq!(outcome, StatusUpdateOutcome::Applied);
+        assert_eq!(writes, 2);
+        assert_eq!(stored.owner, "c3".repeat(32));
+        assert_eq!(stored.status, crate::blossom::BlobStatus::Restricted);
+        assert_eq!(stored.transcript_generation, Some(444));
+        assert_eq!(
+            stored.transcript_status,
+            Some(crate::blossom::TranscriptStatus::Complete)
+        );
+        assert!(!stored.video_encoding_allowed);
+        assert_eq!(stored.transcode_attempt_count, 3);
+        assert_eq!(stored.transcode_generation, Some(20));
+        assert_eq!(stored.size, 200);
+        assert_eq!(stored.dim.as_deref(), Some("480x480"));
+    }
+
+    #[test]
+    fn status_cas_rechecks_newer_generation_after_conflict() {
+        let mut concurrent = status_fixture();
+        concurrent.transcode_generation = Some(30);
+        concurrent.transcode_status = Some(crate::blossom::TranscodeStatus::Complete);
+        concurrent.transcode_attempt_count = 0;
+        let (outcome, stored, writes) = status_race(concurrent);
+        assert_eq!(
+            outcome,
+            StatusUpdateOutcome::StaleGeneration {
+                incoming: Some(20),
+                stored: Some(30)
+            }
+        );
+        assert_eq!(writes, 1);
+        assert_eq!(
+            stored.transcode_status,
+            Some(crate::blossom::TranscodeStatus::Complete)
+        );
+        assert_eq!(stored.transcode_attempt_count, 0);
+        assert_eq!(stored.size, 100);
+    }
+
+    #[test]
+    fn status_cas_duplicate_race_does_not_write_or_increment_twice() {
+        let mut concurrent = status_fixture();
+        concurrent.transcode_generation = Some(20);
+        concurrent.transcode_status = Some(crate::blossom::TranscodeStatus::Failed);
+        concurrent.transcode_attempt_count = 3;
+        let (outcome, stored, writes) = status_race(concurrent);
+        assert_eq!(
+            outcome,
+            StatusUpdateOutcome::DuplicateGeneration {
+                incoming: Some(20),
+                stored: Some(20)
+            }
+        );
+        assert_eq!(writes, 1);
+        assert_eq!(stored.transcode_attempt_count, 3);
+    }
+
+    #[test]
+    fn status_cas_does_not_recreate_missing_or_erased_records() {
+        use std::cell::Cell;
+        for erased in [None, Some(("null".to_string(), 100))] {
+            let writes = Cell::new(0);
+            let outcome = super::update_transcode_status_with_io(
+                crate::blossom::TranscodeStatus::Complete,
+                None,
+                None,
+                super::TranscodeMetadataUpdate::default(),
+                &mut || Ok(erased.clone()),
+                &mut |_, _, _| {
+                    writes.set(writes.get() + 1);
+                    Ok(true)
+                },
+            )
+            .unwrap();
+            assert_eq!(outcome, None);
+            assert_eq!(writes.get(), 0);
+        }
+        // The record is erased after the first read but before its fenced PUT.
+        let reads = Cell::new(0);
+        let writes = Cell::new(0);
+        let result = super::update_transcode_status_with_io(
+            crate::blossom::TranscodeStatus::Complete,
+            None,
+            None,
+            super::TranscodeMetadataUpdate {
+                generation: Some(20),
+                ..Default::default()
+            },
+            &mut || {
+                reads.set(reads.get() + 1);
+                Ok(Some((
+                    if reads.get() == 1 {
+                        serde_json::to_string(&status_fixture()).unwrap()
+                    } else {
+                        "null".into()
+                    },
+                    reads.get(),
+                )))
+            },
+            &mut |_, _, _| {
+                writes.set(writes.get() + 1);
+                Ok(false)
+            },
+        )
+        .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(writes.get(), 1);
+    }
+
+    #[test]
+    fn status_cas_keeps_storage_failure_and_exhaustion_retryable() {
+        use std::cell::Cell;
+        for explicit_error in [false, true] {
+            let writes = Cell::new(0);
+            let result = super::update_transcode_status_with_io(
+                crate::blossom::TranscodeStatus::Complete,
+                None,
+                None,
+                super::TranscodeMetadataUpdate {
+                    generation: Some(20),
+                    ..Default::default()
+                },
+                &mut || {
+                    Ok(Some((
+                        serde_json::to_string(&status_fixture()).unwrap(),
+                        100,
+                    )))
+                },
+                &mut |_, _, _| {
+                    writes.set(writes.get() + 1);
+                    if explicit_error {
+                        Err("synthetic write failure".into())
+                    } else {
+                        Ok(false)
+                    }
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(writes.get(), if explicit_error { 1 } else { 8 });
+        }
+    }
+
+    #[test]
+    fn status_cas_generation_guards_do_not_write() {
+        for (incoming, malformed, expected) in [
+            (
+                None,
+                false,
+                StatusUpdateOutcome::MissingGeneration { stored: Some(10) },
+            ),
+            (
+                Some(20),
+                true,
+                StatusUpdateOutcome::MalformedGeneration { stored: Some(10) },
+            ),
+        ] {
+            let result = super::update_transcode_status_with_io(
+                crate::blossom::TranscodeStatus::Failed,
+                None,
+                None,
+                super::TranscodeMetadataUpdate {
+                    generation: incoming,
+                    malformed_generation: malformed,
+                    require_generation_after_versioned: true,
+                    increment_attempt_count: true,
+                    ..Default::default()
+                },
+                &mut || {
+                    Ok(Some((
+                        serde_json::to_string(&status_fixture()).unwrap(),
+                        100,
+                    )))
+                },
+                &mut |_, _, _| panic!("rejected callback must not write"),
+            )
+            .unwrap();
+            assert_eq!(result, Some(expected));
+        }
+    }
 
     #[test]
     #[ignore = "requires local KV fixture; scripts/run-parent-gate-tests.py"]
