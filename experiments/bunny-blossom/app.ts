@@ -27,6 +27,7 @@ export type { BlobRecord as RecordState, Blobs, Catalog, Config } from "./types.
 
 const HASH = /^[0-9a-f]{64}$/;
 const DEFAULT_VERSION = "v128-bunny-edge-blossom";
+const DIVINE_UPLOAD_EXTENSION_RESUMABLE = "resumable-sessions";
 const DEFAULT_MAX_DIRECT_UPLOAD = 16 * 1024 * 1024;
 const DEFAULT_MAX_UPLOAD = 50 * 1024 * 1024 * 1024;
 
@@ -70,12 +71,37 @@ function isTranscribableMimeType(mime: string): boolean {
 }
 
 function parseVideoEncodingRequested(req: Request): boolean | null {
-  const raw = req.headers.get("x-divine-video-processing")?.trim();
-  if (!raw) return true;
-  const lower = raw.toLowerCase();
-  if (lower === "encode") return true;
-  if (lower === "copy-only") return false;
+  const raw = req.headers.get("x-divine-video-processing");
+  if (raw === null) return true;
+  if (raw === "copy-only") return false;
   return null;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function allowsVideoEncoding(record: BlobRecord): boolean {
+  return record.videoEncodingAllowed === true && !record.archiveStorage;
+}
+
+function limitStreamBytes(
+  stream: ReadableStream<Uint8Array>,
+  maxBytes: number,
+): ReadableStream<Uint8Array> {
+  let seen = 0;
+  return stream.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        seen += chunk.byteLength;
+        if (seen > maxBytes) {
+          controller.error(new RangeError("body limit"));
+          return;
+        }
+        controller.enqueue(chunk);
+      },
+    }),
+  );
 }
 
 function trustedUploadServiceTerminalError(
@@ -475,7 +501,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
   function uploadCapabilityHeaders(): Record<string, string> {
     const out: Record<string, string> = {
       "x-content-length": String(maxUpload),
-      "x-divine-upload-extensions": "resumable-v1",
+      "x-divine-upload-extensions": DIVINE_UPLOAD_EXTENSION_RESUMABLE,
       "x-divine-upload-control-host": originHost,
       "cache-control": "private, no-store",
       "surrogate-control": "no-store",
@@ -484,6 +510,20 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       out["x-divine-upload-data-host"] = new URL(config.upstreams.uploadServiceUrl).host;
     }
     return out;
+  }
+
+  async function uploadPrecheckStatus(hash: string): Promise<"forbidden" | "unavailable" | null> {
+    const [existing, holds] = await Promise.all([
+      config.catalog.get(hash),
+      config.catalog.getQuarantineHolds(hash),
+    ]);
+    if (existing?.held || existing?.status === "banned" || holds.length > 0) {
+      return "forbidden";
+    }
+    if (existing?.status === "deleted" || existing?.gate) {
+      return "unavailable";
+    }
+    return null;
   }
 
   async function triggerModerationScan(hash: string, pubkey: string): Promise<void> {
@@ -516,6 +556,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       body?: BodyInit | null;
       extraHeaders?: Record<string, string>;
       timeoutMs?: number;
+      maxBodyBytes?: number;
     },
   ): Promise<Response> {
     const reqUrl = new URL(req.url);
@@ -528,12 +569,15 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         "content-length",
         "x-sha256",
         "x-request-id",
-        "x-divine-video-processing",
         "accept",
       ]
     ) {
       const val = req.headers.get(name);
       if (val !== null) headers.set(name, val);
+    }
+    if (!headers.has("x-sha256")) {
+      const hyphenatedSha = req.headers.get("x-sha-256");
+      if (hyphenatedSha !== null) headers.set("x-sha256", hyphenatedSha);
     }
     for (const [key, val] of req.headers.entries()) {
       const lower = key.toLowerCase();
@@ -546,11 +590,14 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       for (const [k, v] of Object.entries(options.extraHeaders)) headers.set(k, v);
     }
     const hasBody = !["GET", "HEAD"].includes(req.method.toUpperCase());
-    const body = options && "body" in options
-      ? (options.body ?? undefined)
-      : (hasBody ? req.body : undefined);
+    let body: BodyInit | undefined;
     if (options && "body" in options) {
+      body = options.body ?? undefined;
       headers.delete("content-length");
+    } else if (hasBody && req.body) {
+      body = options?.maxBodyBytes !== undefined
+        ? limitStreamBytes(req.body, options.maxBodyBytes)
+        : req.body;
     }
     return await fetcher(targetUrl, {
       method: req.method,
@@ -644,9 +691,12 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       : undefined;
 
     for (let attempt = 0; attempt < 3; attempt++) {
-      const existing = await config.catalog.get(hash);
-      if (existing?.held) {
-        return jsonResp(403, { error: "content blocked by legal hold" });
+      const [existing, holds] = await Promise.all([
+        config.catalog.get(hash),
+        config.catalog.getQuarantineHolds(hash),
+      ]);
+      if (existing?.held || holds.length > 0) {
+        return jsonResp(403, { error: "content blocked by legal hold or quarantine" });
       }
       if (existing?.status === "banned") {
         return jsonResp(403, { error: "content banned" });
@@ -662,13 +712,11 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
           owners: existing.owners.includes(owner) ? existing.owners : [...existing.owners, owner],
           thumbnail: existing.thumbnail ?? upload.thumbnailUrl,
           dim: existing.dim ?? upload.dim,
-          videoEncodingAllowed: !encodingRequested && existing.videoEncodingAllowed !== false
-            ? false
-            : existing.videoEncodingAllowed,
+          videoEncodingAllowed: !encodingRequested ? false : existing.videoEncodingAllowed,
         };
         const existingIsVideo = isVideoMimeType(existing.type);
         const existingIsTranscribable = isTranscribableMimeType(existing.type);
-        const allowsVideoEncoding = next.videoEncodingAllowed !== false;
+        const canEncode = allowsVideoEncoding(next);
 
         if (
           upload.transcodeErrorCode &&
@@ -682,7 +730,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
           next.transcodeAttemptCount = Math.max(existing.transcodeAttemptCount ?? 0, 1);
           next.transcodeTerminal = Boolean(existing.transcodeTerminal || upload.transcodeTerminal);
         } else if (
-          allowsVideoEncoding &&
+          canEncode &&
           upload.derivativesEvaluated &&
           !upload.transcodeErrorCode &&
           existingIsVideo &&
@@ -788,9 +836,12 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       return jsonResp(401, { error: "upload hash mismatch" });
     }
 
-    const old = await config.catalog.get(hash);
-    if (old?.held) {
-      return jsonResp(403, { error: "content blocked by legal hold" });
+    const [old, holds] = await Promise.all([
+      config.catalog.get(hash),
+      config.catalog.getQuarantineHolds(hash),
+    ]);
+    if (old?.held || holds.length > 0) {
+      return jsonResp(403, { error: "content blocked by legal hold or quarantine" });
     }
     if (old?.status === "banned") {
       return jsonResp(403, { error: "content banned" });
@@ -805,9 +856,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         ...old,
         revision: old.revision + 1,
         owners: old.owners.includes(owner) ? old.owners : [...old.owners, owner],
-        videoEncodingAllowed: !encodingRequested && old.videoEncodingAllowed !== false
-          ? false
-          : old.videoEncodingAllowed,
+        videoEncodingAllowed: !encodingRequested ? false : old.videoEncodingAllowed,
       };
       if (!await config.catalog.cas(hash, old.revision, deduped)) {
         return jsonResp(409, { error: "concurrent parent change" });
@@ -939,7 +988,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
 
     // BUD-06: HEAD /upload (also handle GET when a proxy converts HEAD to GET)
     if (path === "/upload" && (method === "HEAD" || method === "GET")) {
-      if (!config.writesEnabled && !config.upstreams?.uploadServiceUrl) {
+      if (!config.writesEnabled) {
         return new Response(null, { status: 503 });
       }
       const capHeaders = uploadCapabilityHeaders();
@@ -959,8 +1008,11 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
               },
             });
           }
-          const existing = await config.catalog.get(normalizedSha);
-          if (existing?.held || existing?.status === "banned") {
+          const [existing, holds] = await Promise.all([
+            config.catalog.get(normalizedSha),
+            config.catalog.getQuarantineHolds(normalizedSha),
+          ]);
+          if (existing?.held || existing?.status === "banned" || holds.length > 0) {
             return new Response(null, {
               status: 403,
               headers: {
@@ -969,7 +1021,12 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
               },
             });
           }
-          if (existing && existing.status !== "deleted" && !existing.gate) {
+          if (
+            existing &&
+            existing.status !== "deleted" &&
+            existing.status !== "restricted" &&
+            !existing.gate
+          ) {
             return new Response(null, {
               status: 200,
               headers: {
@@ -1018,7 +1075,7 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         {
           max_size: maxUpload,
           allowed_types: null,
-          extensions: ["resumable-v1"],
+          extensions: [DIVINE_UPLOAD_EXTENSION_RESUMABLE],
         },
         capHeaders,
       );
@@ -1030,7 +1087,9 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       if (!config.writesEnabled) return jsonResp(503, { error: "writes disabled" });
       const encodingRequested = parseVideoEncodingRequested(req);
       if (encodingRequested === null) {
-        return jsonResp(400, { error: "invalid X-Divine-Video-Processing header" });
+        return jsonResp(400, {
+          error: "X-Divine-Video-Processing must be copy-only when supplied",
+        });
       }
       let auth;
       try {
@@ -1039,17 +1098,34 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         return jsonResp(401, { error: "invalid upload authorization" });
       }
 
-      // Check legal hold / ban before streaming to Cloud Run using either X-Sha256 or signed auth x tags.
+      const declaredShaHeader = req.headers.get("x-sha-256") ?? req.headers.get("x-sha256");
+      let declaredSha: string | null = null;
+      if (declaredShaHeader !== null) {
+        const normalized = declaredShaHeader.trim().toLowerCase();
+        if (!HASH.test(normalized)) {
+          return jsonResp(400, {
+            error: "Invalid X-SHA-256 format (must be 64 hex characters)",
+          });
+        }
+        if (auth.hashes.length > 0 && !auth.hashes.includes(normalized)) {
+          return jsonResp(401, { error: "upload hash mismatch" });
+        }
+        declaredSha = normalized;
+      }
+
+      // Pre-check legal hold / ban / quarantine / deleted status before streaming bytes upstream.
       const precheckHashes = new Set<string>();
-      const declaredSha = req.headers.get("x-sha256")?.trim().toLowerCase();
-      if (declaredSha && HASH.test(declaredSha)) precheckHashes.add(declaredSha);
+      if (declaredSha) precheckHashes.add(declaredSha);
       for (const authHash of auth.hashes) {
         if (HASH.test(authHash)) precheckHashes.add(authHash);
       }
       for (const candidate of precheckHashes) {
-        const existing = await config.catalog.get(candidate);
-        if (existing?.held || existing?.status === "banned") {
+        const blocked = await uploadPrecheckStatus(candidate);
+        if (blocked === "forbidden") {
           return jsonResp(403, { error: "content blocked" });
+        }
+        if (blocked === "unavailable") {
+          return jsonResp(409, { error: "parent unavailable" });
         }
       }
 
@@ -1057,42 +1133,62 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       // then publish the verified upload into the Blossom catalog so reads/lists/moderation stay authoritative.
       if (config.upstreams?.uploadServiceUrl && !fixture) {
         const contentType = req.headers.get("content-type")?.trim() || "application/octet-stream";
-        const contentLengthRaw = req.headers.get("content-length")?.trim();
-        const fallbackSize = contentLengthRaw && /^\d+$/.test(contentLengthRaw)
-          ? Number(contentLengthRaw)
-          : 0;
-        if (fallbackSize > maxUpload) {
-          return jsonResp(413, { error: `File too large. Maximum size is ${maxUpload} bytes` });
+        const contentLengthHeader = req.headers.get("content-length");
+        let declaredContentLength: number | null = null;
+        if (contentLengthHeader !== null) {
+          const trimmedLen = contentLengthHeader.trim();
+          const parsedLen = /^\d+$/.test(trimmedLen) ? Number(trimmedLen) : NaN;
+          if (!Number.isSafeInteger(parsedLen) || parsedLen === 0) {
+            return jsonResp(400, { error: "Invalid Content-Length header" });
+          }
+          if (parsedLen > maxUpload) {
+            return jsonResp(413, { error: `File too large. Maximum size is ${maxUpload} bytes` });
+          }
+          declaredContentLength = parsedLen;
         }
-        const extraHeaders: Record<string, string> = {};
+        const extraHeaders: Record<string, string> = {
+          authorization: auth.headerValue,
+        };
         if (!encodingRequested) {
           extraHeaders["x-divine-video-processing"] = "copy-only";
         }
-        const upstreamRes = await forwardUpstream(
-          config.upstreams.uploadServiceUrl,
-          "/upload",
-          req,
-          { extraHeaders },
-        );
+        let upstreamRes: Response;
+        try {
+          upstreamRes = await forwardUpstream(
+            config.upstreams.uploadServiceUrl,
+            "/upload",
+            req,
+            { extraHeaders, maxBodyBytes: maxUpload },
+          );
+        } catch (error) {
+          if (error instanceof RangeError) {
+            return jsonResp(413, { error: `File too large. Maximum size is ${maxUpload} bytes` });
+          }
+          throw error;
+        }
         if (!upstreamRes.ok) {
           return await mapUpstreamErrorResponse(upstreamRes);
         }
-        let body: Record<string, unknown>;
+        let rawBody: unknown;
         try {
-          body = await readJson<Record<string, unknown>>(
+          rawBody = await readJson<unknown>(
             new Request("https://upstream.invalid/", { method: "POST", body: upstreamRes.body }),
             64 * 1024,
           );
         } catch {
           return jsonResp(502, { error: "Invalid Cloud Run upload response" });
         }
+        if (!isPlainObject(rawBody)) {
+          return jsonResp(502, { error: "Invalid Cloud Run upload response" });
+        }
+        const body = rawBody;
         const sha256 = typeof body.sha256 === "string" ? body.sha256.toLowerCase() : "";
-        if (declaredSha && HASH.test(declaredSha) && sha256 !== declaredSha) {
+        if (declaredSha && sha256 !== declaredSha) {
           return jsonResp(400, { error: "Declared X-Sha256 does not match uploaded content" });
         }
-        const size = typeof body.size === "number" && Number.isInteger(body.size)
+        const size = typeof body.size === "number" && Number.isInteger(body.size) && body.size > 0
           ? body.size
-          : fallbackSize;
+          : declaredContentLength ?? -1;
         const resolvedType = typeof body.type === "string" && body.type.trim().length > 0
           ? body.type.trim()
           : contentType;
@@ -1138,7 +1234,9 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       }
       const encodingRequested = parseVideoEncodingRequested(req);
       if (encodingRequested === null) {
-        return jsonResp(400, { error: "invalid X-Divine-Video-Processing header" });
+        return jsonResp(400, {
+          error: "X-Divine-Video-Processing must be copy-only when supplied",
+        });
       }
       if (!encodingRequested) {
         return jsonResp(400, { error: "Copy-only uploads must use PUT /upload or PUT /mirror" });
@@ -1151,26 +1249,22 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       }
 
       let rawBody: string;
-      let initReq: {
-        sha256?: string;
-        size?: number;
-        contentType?: string;
-        content_type?: string;
-        fileName?: string;
-        file_name?: string;
-      };
+      let initReq: Record<string, unknown>;
       try {
         const bytes = await boundedBody(req, 64 * 1024);
         rawBody = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
         if (!rawBody.trim()) return jsonResp(400, { error: "Request body required" });
-        initReq = JSON.parse(rawBody);
+        const parsed = JSON.parse(rawBody);
+        if (!isPlainObject(parsed)) return jsonResp(400, { error: "Invalid JSON" });
+        initReq = parsed;
       } catch {
         return jsonResp(400, { error: "Invalid JSON" });
       }
 
       const hash = typeof initReq.sha256 === "string" ? initReq.sha256.trim().toLowerCase() : "";
       const size = initReq.size;
-      const contentType = (initReq.contentType ?? initReq.content_type ?? "").trim();
+      const contentTypeRaw = initReq.contentType ?? initReq.content_type;
+      const contentType = typeof contentTypeRaw === "string" ? contentTypeRaw.trim() : "";
       if (!HASH.test(hash)) {
         return jsonResp(400, { error: "sha256 must be a 64-character hexadecimal string" });
       }
@@ -1188,8 +1282,11 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       }
 
       const capHeaders = uploadCapabilityHeaders();
-      const existing = await config.catalog.get(hash);
-      if (existing?.held || existing?.status === "banned") {
+      const [existing, holds] = await Promise.all([
+        config.catalog.get(hash),
+        config.catalog.getQuarantineHolds(hash),
+      ]);
+      if (existing?.held || existing?.status === "banned" || holds.length > 0) {
         return jsonResp(403, {
           error: "This content has been removed and cannot be re-uploaded",
         });
@@ -1198,6 +1295,9 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         return jsonResp(409, { error: "parent unavailable" }, capHeaders);
       }
       if (existing) {
+        if (existing.status === "restricted" && !existing.owners.includes(auth.pubkey)) {
+          return jsonResp(409, { error: "Blob already exists" }, capHeaders);
+        }
         return jsonResp(
           409,
           { error: "Blob already exists", descriptor: buildDescriptor(existing, origin) },
@@ -1211,7 +1311,10 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         req,
         {
           body: rawBody,
-          extraHeaders: { "content-type": "application/json" },
+          extraHeaders: {
+            authorization: auth.headerValue,
+            "content-type": "application/json",
+          },
         },
       );
       if (!upstreamRes.ok) {
@@ -1224,6 +1327,9 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
           64 * 1024,
         );
       } catch {
+        return jsonResp(502, { error: "Invalid upload service init response" });
+      }
+      if (!isPlainObject(initResp)) {
         return jsonResp(502, { error: "Invalid upload service init response" });
       }
       return jsonResp(200, initResp, capHeaders);
@@ -1240,7 +1346,9 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       }
       const encodingRequested = parseVideoEncodingRequested(req);
       if (encodingRequested === null) {
-        return jsonResp(400, { error: "invalid X-Divine-Video-Processing header" });
+        return jsonResp(400, {
+          error: "X-Divine-Video-Processing must be copy-only when supplied",
+        });
       }
       let auth;
       try {
@@ -1255,7 +1363,10 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         const bytes = await boundedBody(req, 64 * 1024);
         rawBody = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
         if (rawBody.trim().length > 0) {
-          const parsed = JSON.parse(rawBody) as { sha256?: unknown };
+          const parsed = JSON.parse(rawBody);
+          if (!isPlainObject(parsed)) {
+            return jsonResp(400, { error: "Invalid JSON in completion request" });
+          }
           if (parsed.sha256 !== undefined) {
             if (
               typeof parsed.sha256 !== "string" || !HASH.test(parsed.sha256.trim().toLowerCase())
@@ -1275,7 +1386,25 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         return jsonResp(401, { error: "Hash in auth event doesn't match completion request" });
       }
 
-      const extraHeaders: Record<string, string> = {};
+      // Pre-check legal hold / ban / quarantine / deleted status before finalizing upload in Cloud Run.
+      const completePrecheckHashes = new Set<string>();
+      if (expectedRequestHash) completePrecheckHashes.add(expectedRequestHash);
+      for (const authHash of auth.hashes) {
+        if (HASH.test(authHash)) completePrecheckHashes.add(authHash);
+      }
+      for (const candidate of completePrecheckHashes) {
+        const blocked = await uploadPrecheckStatus(candidate);
+        if (blocked === "forbidden") {
+          return jsonResp(403, { error: "content blocked" });
+        }
+        if (blocked === "unavailable") {
+          return jsonResp(409, { error: "parent unavailable" });
+        }
+      }
+
+      const extraHeaders: Record<string, string> = {
+        authorization: auth.headerValue,
+      };
       if (!encodingRequested) {
         extraHeaders["x-divine-video-processing"] = "copy-only";
       }
@@ -1296,38 +1425,44 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         return await mapUpstreamErrorResponse(upstreamRes);
       }
 
-      let completeResp: {
-        sha256?: string;
-        size?: number;
-        contentType?: string;
-        content_type?: string;
-        thumbnailUrl?: string;
-        thumbnail_url?: string;
-        dim?: string;
-      };
+      let rawComplete: unknown;
       try {
-        completeResp = await readJson(
+        rawComplete = await readJson<unknown>(
           new Request("https://upstream.invalid/", { method: "POST", body: upstreamRes.body }),
           64 * 1024,
         );
       } catch {
         return jsonResp(502, { error: "Invalid upload service completion response" });
       }
+      if (!isPlainObject(rawComplete)) {
+        return jsonResp(502, { error: "Invalid upload service completion response" });
+      }
 
-      const completeHash = typeof completeResp.sha256 === "string"
-        ? completeResp.sha256.trim().toLowerCase()
+      const completeHash = typeof rawComplete.sha256 === "string"
+        ? rawComplete.sha256.trim().toLowerCase()
         : "";
       if (expectedRequestHash && completeHash !== expectedRequestHash) {
         return jsonResp(409, { error: "Completion response hash did not match requested hash" });
       }
+      const rawContentType = rawComplete.contentType ?? rawComplete.content_type;
+      const resolvedContentType =
+        typeof rawContentType === "string" && rawContentType.trim().length > 0
+          ? rawContentType.trim()
+          : "application/octet-stream";
+      const rawThumb = rawComplete.thumbnailUrl ?? rawComplete.thumbnail_url;
+      const resolvedThumb = typeof rawThumb === "string" && rawThumb.trim().length > 0
+        ? rawThumb.trim()
+        : undefined;
 
       return await publishDelegatedUpload(auth.pubkey, auth.hashes, encodingRequested, {
         sha256: completeHash,
-        size: typeof completeResp.size === "number" ? completeResp.size : -1,
-        contentType: (completeResp.contentType ?? completeResp.content_type ?? "").trim() ||
-          "application/octet-stream",
-        thumbnailUrl: completeResp.thumbnailUrl ?? completeResp.thumbnail_url,
-        dim: typeof completeResp.dim === "string" ? completeResp.dim : undefined,
+        size: typeof rawComplete.size === "number" && Number.isInteger(rawComplete.size) &&
+            rawComplete.size > 0
+          ? rawComplete.size
+          : -1,
+        contentType: resolvedContentType,
+        thumbnailUrl: resolvedThumb,
+        dim: typeof rawComplete.dim === "string" ? rawComplete.dim : undefined,
         derivativesEvaluated: false,
         transcodeTerminal: false,
         transcriptTerminal: false,
@@ -1339,12 +1474,15 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       if (!config.upstreams?.uploadServiceUrl) {
         return jsonResp(503, { error: "transcription upstream not configured" });
       }
+      let auth;
       try {
-        requireNostrAuth(req, "media", now(), undefined, { publicOrigin: origin });
+        auth = requireNostrAuthEvent(req, "media", now(), undefined, { publicOrigin: origin });
       } catch {
         return jsonResp(401, { error: "invalid transcribe authorization" });
       }
-      return await proxyUpstream(config.upstreams.uploadServiceUrl, "/transcribe", req);
+      return await proxyUpstream(config.upstreams.uploadServiceUrl, "/transcribe", req, {
+        authorization: auth.headerValue,
+      });
     }
 
     // Subtitle jobs API
@@ -1584,6 +1722,12 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
     // BUD-04: PUT /mirror
     if (path === "/mirror" && method === "PUT") {
       if (!config.writesEnabled) return jsonResp(503, { error: "writes disabled" });
+      const encodingRequested = parseVideoEncodingRequested(req);
+      if (encodingRequested === null) {
+        return jsonResp(400, {
+          error: "X-Divine-Video-Processing must be copy-only when supplied",
+        });
+      }
       let owner: string;
       try {
         owner = requireNostrAuth(req, "mirror", now(), undefined, { publicOrigin: origin });
@@ -1620,8 +1764,10 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
       if (fixture && hash !== fixture.hash) {
         return jsonResp(403, { error: "fixture digest required" });
       }
-      const existing = await config.catalog.get(hash);
-      const existingHolds = existing ? await config.catalog.getQuarantineHolds(hash) : [];
+      const [existing, existingHolds] = await Promise.all([
+        config.catalog.get(hash),
+        config.catalog.getQuarantineHolds(hash),
+      ]);
       if (
         existing?.held || existing?.status === "banned" || existing?.status === "restricted" ||
         existingHolds.length > 0
@@ -1632,7 +1778,9 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
         return jsonResp(409, { error: "parent unavailable" });
       }
       if (!existing) {
-        const mime = remote.headers.get("content-type") ?? "application/octet-stream";
+        const mime = remote.headers.get("content-type")?.trim() || "application/octet-stream";
+        const isVideo = isVideoMimeType(mime);
+        const isTranscribable = isTranscribableMimeType(mime);
         await config.blobs.write(hash, bytes, mime);
         const rec: BlobRecord = {
           revision: 1,
@@ -1646,17 +1794,23 @@ export function createApp(config: Config): (req: Request) => Promise<Response> {
           held: false,
           gate: null,
           cleanupPending: false,
+          videoEncodingAllowed: encodingRequested && isVideo,
+          transcodeStatus: isVideo ? "pending" : undefined,
+          transcriptStatus: isTranscribable ? "pending" : undefined,
         };
         if (!await config.catalog.cas(hash, null, rec)) {
           return jsonResp(409, { error: "concurrent parent change" });
         }
         return jsonResp(200, buildDescriptor(rec, origin));
       }
-      if (!existing.owners.includes(owner)) {
+      const needsOwner = !existing.owners.includes(owner);
+      const needsRestrict = !encodingRequested && existing.videoEncodingAllowed !== false;
+      if (needsOwner || needsRestrict) {
         const updated: BlobRecord = {
           ...existing,
           revision: existing.revision + 1,
-          owners: [...existing.owners, owner],
+          owners: needsOwner ? [...existing.owners, owner] : existing.owners,
+          videoEncodingAllowed: needsRestrict ? false : existing.videoEncodingAllowed,
         };
         if (!await config.catalog.cas(hash, existing.revision, updated)) {
           return jsonResp(409, { error: "concurrent parent change" });

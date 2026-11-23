@@ -189,6 +189,8 @@ export interface AuthenticatedNostrRequest {
   pubkey: string;
   event: ParsedNostrEvent;
   hashes: string[];
+  /** Normalized `"Nostr <base64>"` header value suitable for forwarding upstream. */
+  headerValue: string;
 }
 
 /**
@@ -205,10 +207,12 @@ export function requireNostrAuthEvent(
   for (const candidate of candidates) {
     const event = decodeNostrHeader(candidate);
     if (event && validateEventForAction(event, req, action, now, hash, options)) {
+      const b64 = candidate.replace(/^nostr\s+/i, "").trim();
       return {
         pubkey: event.pubkey.toLowerCase(),
         event,
         hashes: tagValues(event, "x").map((x) => x.toLowerCase()),
+        headerValue: `Nostr ${b64}`,
       };
     }
   }

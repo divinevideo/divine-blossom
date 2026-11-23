@@ -166,7 +166,7 @@ Deno.test("full media lifecycle: upload, transcode webhook, HLS/MP4/VTT/Range ca
     equal((await ctx.app(new Request(`${ctx.origin}/health`))).status, 200);
     const headUpload = await ctx.app(new Request(`${ctx.origin}/upload`, { method: "HEAD" }));
     equal(headUpload.status, 200);
-    equal(headUpload.headers.get("x-divine-upload-extensions"), "resumable-v1");
+    equal(headUpload.headers.get("x-divine-upload-extensions"), "resumable-sessions");
 
     // PUT /upload
     const up = await ctx.app(
@@ -638,6 +638,22 @@ Deno.test("delegated PUT /upload publishes to SQL catalog, supports chunked bodi
     }
 
     if (reqUrl === "https://upload.divine.video/upload" && method === "PUT") {
+      // Enforce real Cloud Run header invariants: exact "Nostr " prefix and strict "copy-only" value.
+      const authHeader = headers.get("authorization") ?? "";
+      if (!authHeader.startsWith("Nostr ")) {
+        return new Response(JSON.stringify({ error: "Invalid Authorization prefix" }), {
+          status: 401,
+        });
+      }
+      const procHeader = headers.get("x-divine-video-processing");
+      if (procHeader !== null && procHeader !== "copy-only") {
+        return new Response(
+          JSON.stringify({
+            error: "X-Divine-Video-Processing must contain exactly one copy-only value",
+          }),
+          { status: 400 },
+        );
+      }
       const hash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", bodyBytes)));
       const contentType = headers.get("content-type") ?? "application/octet-stream";
       await blobs.write(hash, bodyBytes, contentType);
@@ -936,9 +952,15 @@ Deno.test("BUD-06 HEAD /upload pre-validation and Divine resumable init/complete
     // 1. BUD-06 HEAD /upload capability discovery and pre-validation
     const capRes = await app(new Request(`${origin}/upload`, { method: "HEAD" }));
     equal(capRes.status, 200);
-    equal(capRes.headers.get("x-divine-upload-extensions"), "resumable-v1");
+    equal(capRes.headers.get("x-divine-upload-extensions"), "resumable-sessions");
     equal(capRes.headers.get("x-divine-upload-control-host"), "media-bunny.divine.video");
     equal(capRes.headers.get("x-divine-upload-data-host"), "upload.divine.video");
+
+    const getCapRes = await app(new Request(`${origin}/upload`, { method: "GET" }));
+    equal(getCapRes.status, 200);
+    const getCapJson = await getCapRes.json() as { extensions: string[]; max_size: number };
+    equal(getCapJson.extensions, ["resumable-sessions"]);
+    equal(getCapJson.max_size, 1024 * 1024);
 
     const badShaHead = await app(
       new Request(`${origin}/upload`, {
@@ -1031,7 +1053,7 @@ Deno.test("BUD-06 HEAD /upload pre-validation and Divine resumable init/complete
     const initJson = await initRes.json() as { uploadId: string; uploadUrl: string };
     equal(initJson.uploadId, "up_0123456789abcdef01234567");
 
-    // 3. POST /upload/<id>/complete rejects path traversal and hash mismatch, then succeeds and publishes to catalog
+    // 3. POST /upload/<id>/complete rejects path traversal and hash mismatches, then succeeds and publishes to catalog
     const badIdRes = await app(
       new Request(`${origin}/upload/bad..id/complete`, {
         method: "POST",
@@ -1043,6 +1065,30 @@ Deno.test("BUD-06 HEAD /upload pre-validation and Divine resumable init/complete
       }),
     );
     equal(badIdRes.status, 400);
+
+    const authMismatchComplete = await app(
+      new Request(`${origin}/upload/up_0123456789abcdef01234567/complete`, {
+        method: "POST",
+        headers: {
+          authorization: blossomAuth(sk, "upload", now, "3".repeat(64)),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ sha256: videoHash }),
+      }),
+    );
+    equal(authMismatchComplete.status, 401);
+
+    const responseMismatchComplete = await app(
+      new Request(`${origin}/upload/up_0123456789abcdef01234567/complete`, {
+        method: "POST",
+        headers: {
+          authorization: blossomAuth(sk, "upload", now),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ sha256: "4".repeat(64) }),
+      }),
+    );
+    equal(responseMismatchComplete.status, 409);
 
     const completeRes = await app(
       new Request(`${origin}/upload/up_0123456789abcdef01234567/complete`, {
@@ -1114,6 +1160,461 @@ Deno.test("BUD-06 HEAD /upload pre-validation and Divine resumable init/complete
     const pbBody = await pbRes.json() as { host: string; paths: string[] };
     equal(pbBody.host, "media-bunny.divine.video");
     equal(pbBody.paths, [`/${videoHash}`]);
+  } finally {
+    db.close();
+  }
+});
+
+Deno.test("upload hardening: quarantine holds, restricted privacy, encoding policy, chunked size bounds, auth normalization, and derivative failures", async () => {
+  const db = new DatabaseSync(":memory:");
+  db.exec(await Deno.readTextFile("schema.sql"));
+  const catalog = new SqlCatalog("https://primary.invalid", "synthetic", {
+    execute({ sql, args }) {
+      return Promise.resolve({
+        rows: db.prepare(sql).all(...args) as Record<string, unknown>[],
+      });
+    },
+  });
+  const blobs = new FakeBlobs();
+  const now = 1800000300;
+  const origin = "https://media-bunny.divine.video";
+  const adminToken = "synthetic-admin-token-1234567890";
+
+  let upstreamCalls = 0;
+  let customUpstreamHandler:
+    | ((
+      reqUrl: string,
+      method: string,
+      headers: Headers,
+      body: Uint8Array,
+    ) => Response | Promise<Response>)
+    | null = null;
+
+  const fakeFetcher: typeof fetch = async (input, init) => {
+    upstreamCalls++;
+    const reqUrl = typeof input === "string"
+      ? input
+      : input instanceof URL
+      ? input.toString()
+      : input.url;
+    const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+    const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : {}));
+    const bodyBytes = init?.body
+      ? new Uint8Array(await new Response(init.body as BodyInit).arrayBuffer())
+      : new Uint8Array();
+    if (customUpstreamHandler) {
+      return await customUpstreamHandler(reqUrl, method, headers, bodyBytes);
+    }
+    const authHeader = headers.get("authorization") ?? "";
+    if (!authHeader.startsWith("Nostr ")) {
+      return new Response(JSON.stringify({ error: "Invalid Authorization prefix" }), {
+        status: 401,
+      });
+    }
+    const procHeader = headers.get("x-divine-video-processing");
+    if (procHeader !== null && procHeader !== "copy-only") {
+      return new Response(
+        JSON.stringify({
+          error: "X-Divine-Video-Processing must contain exactly one copy-only value",
+        }),
+        { status: 400 },
+      );
+    }
+    const hash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", bodyBytes)));
+    return new Response(
+      JSON.stringify({
+        sha256: hash,
+        size: bodyBytes.length,
+        type: headers.get("content-type") ?? "application/octet-stream",
+        uploaded: now,
+        url: `https://media.divine.video/${hash}`,
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  };
+
+  const makeApp = (writesEnabled = true) =>
+    createApp({
+      origin,
+      catalog,
+      blobs,
+      secrets: { adminToken },
+      upstreams: {
+        uploadServiceUrl: "https://upload.divine.video",
+        fetcher: fakeFetcher,
+      },
+      writesEnabled,
+      maxUploadBytes: 32 * 1024,
+      now: () => now,
+    });
+
+  const app = makeApp(true);
+
+  try {
+    const sk1 = generateSecretKey();
+    const pub1 = getPublicKey(sk1);
+    const sk2 = generateSecretKey();
+    const pub2 = getPublicKey(sk2);
+
+    // 1. writesEnabled: false makes HEAD /upload return 503 even when uploadServiceUrl is set
+    const readOnlyApp = makeApp(false);
+    equal((await readOnlyApp(new Request(`${origin}/upload`, { method: "HEAD" }))).status, 503);
+
+    // 2. Quarantine hold blocks HEAD /upload, POST /upload/init, PUT /upload, and POST /upload/:id/complete before upstream
+    const qBytes = new TextEncoder().encode("synthetic-quarantined-payload-1");
+    const qHash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", qBytes)));
+    await catalog.cas(qHash, null, {
+      revision: 1,
+      hash: qHash,
+      size: qBytes.length,
+      type: "video/mp4",
+      uploaded: now,
+      owners: [pub1],
+      status: "active",
+      ageRestricted: false,
+      held: false,
+      gate: null,
+      cleanupPending: false,
+    });
+    await catalog.addQuarantineHold(qHash, "review-hold-42", now);
+
+    equal(
+      (await app(
+        new Request(`${origin}/upload`, {
+          method: "HEAD",
+          headers: { "x-sha-256": qHash },
+        }),
+      )).status,
+      403,
+    );
+    const callsBeforeQuarantine = upstreamCalls;
+    equal(
+      (await app(
+        new Request(`${origin}/upload/init`, {
+          method: "POST",
+          headers: {
+            authorization: blossomAuth(sk2, "upload", now, qHash),
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ sha256: qHash, size: qBytes.length, contentType: "video/mp4" }),
+        }),
+      )).status,
+      403,
+    );
+    equal(
+      (await app(
+        new Request(`${origin}/upload`, {
+          method: "PUT",
+          body: qBytes,
+          headers: {
+            "content-type": "video/mp4",
+            authorization: blossomAuth(sk2, "upload", now, qHash),
+          },
+        }),
+      )).status,
+      403,
+    );
+    equal(
+      (await app(
+        new Request(`${origin}/upload/up_q123/complete`, {
+          method: "POST",
+          headers: {
+            authorization: blossomAuth(sk2, "upload", now, qHash),
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ sha256: qHash }),
+        }),
+      )).status,
+      403,
+    );
+    // None of those hit Cloud Run, and sk2 was never added to owners
+    equal(upstreamCalls, callsBeforeQuarantine);
+    equal((await catalog.get(qHash))?.owners, [pub1]);
+
+    // 3. Restricted blob does not advertise X-Exists on HEAD /upload and hides descriptor from non-owner on /upload/init
+    const rHash = "a".repeat(64);
+    await catalog.cas(rHash, null, {
+      revision: 1,
+      hash: rHash,
+      size: 256,
+      type: "video/mp4",
+      uploaded: now,
+      owners: [pub1],
+      status: "restricted",
+      ageRestricted: false,
+      held: false,
+      gate: null,
+      cleanupPending: false,
+    });
+    const restrictedHead = await app(
+      new Request(`${origin}/upload`, {
+        method: "HEAD",
+        headers: { "x-sha-256": rHash },
+      }),
+    );
+    equal(restrictedHead.status, 200);
+    equal(restrictedHead.headers.get("x-exists"), null);
+
+    const restrictedInit = await app(
+      new Request(`${origin}/upload/init`, {
+        method: "POST",
+        headers: {
+          authorization: blossomAuth(sk2, "upload", now, rHash),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ sha256: rHash, size: 256, contentType: "video/mp4" }),
+      }),
+    );
+    equal(restrictedInit.status, 409);
+    const restrictedInitJson = await restrictedInit.json() as Record<string, unknown>;
+    equal("descriptor" in restrictedInitJson, false);
+
+    // 4. X-Divine-Video-Processing rejects "encode" with 400 on PUT /upload, POST /upload/init, POST /complete, PUT /mirror
+    for (
+      const req of [
+        new Request(`${origin}/upload`, {
+          method: "PUT",
+          body: new Uint8Array([1, 2, 3]),
+          headers: {
+            authorization: blossomAuth(sk1, "upload", now),
+            "x-divine-video-processing": "encode",
+          },
+        }),
+        new Request(`${origin}/upload/init`, {
+          method: "POST",
+          body: JSON.stringify({ sha256: qHash, size: 10, contentType: "video/mp4" }),
+          headers: {
+            authorization: blossomAuth(sk1, "upload", now),
+            "content-type": "application/json",
+            "x-divine-video-processing": "encode",
+          },
+        }),
+        new Request(`${origin}/upload/up_abc/complete`, {
+          method: "POST",
+          body: JSON.stringify({ sha256: qHash }),
+          headers: {
+            authorization: blossomAuth(sk1, "upload", now),
+            "content-type": "application/json",
+            "x-divine-video-processing": "encode",
+          },
+        }),
+        new Request(`${origin}/mirror`, {
+          method: "PUT",
+          body: JSON.stringify({ url: "https://example.com/a.mp4" }),
+          headers: {
+            authorization: blossomAuth(sk1, "mirror", now),
+            "content-type": "application/json",
+            "x-divine-video-processing": "encode",
+          },
+        }),
+      ]
+    ) {
+      equal((await app(req)).status, 400);
+    }
+
+    // 5. Lowercase "nostr " auth header is normalized to "Nostr " for Cloud Run, and X-SHA-256 is validated
+    const okBytes = new TextEncoder().encode("synthetic-lowercase-nostr-header-test");
+    const okHash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", okBytes)));
+    const lowerAuth = blossomAuth(sk1, "upload", now, okHash).replace(/^Nostr /, "nostr ");
+    equal(
+      (await app(
+        new Request(`${origin}/upload`, {
+          method: "PUT",
+          body: okBytes,
+          headers: {
+            "content-type": "image/jpeg",
+            "x-sha-256": "not-valid-hex",
+            authorization: lowerAuth,
+          },
+        }),
+      )).status,
+      400,
+    );
+    equal(
+      (await app(
+        new Request(`${origin}/upload`, {
+          method: "PUT",
+          body: okBytes,
+          headers: {
+            "content-type": "image/jpeg",
+            "x-sha-256": "b".repeat(64),
+            authorization: lowerAuth,
+          },
+        }),
+      )).status,
+      401,
+    );
+    const lowerAuthRes = await app(
+      new Request(`${origin}/upload`, {
+        method: "PUT",
+        body: okBytes,
+        headers: {
+          "content-type": "image/jpeg",
+          "x-sha-256": okHash,
+          authorization: lowerAuth,
+        },
+      }),
+    );
+    equal(lowerAuthRes.status, 200);
+
+    // 6. Chunked PUT exceeding maxUpload (32 KiB) returns 413; missing size on chunked response returns 502
+    const bigStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(20 * 1024));
+        controller.enqueue(new Uint8Array(20 * 1024));
+        controller.close();
+      },
+    });
+    const tooBigChunked = await app(
+      new Request(`${origin}/upload`, {
+        method: "PUT",
+        body: bigStream,
+        headers: {
+          "content-type": "video/mp4",
+          authorization: blossomAuth(sk1, "upload", now),
+        },
+      }),
+    );
+    equal(tooBigChunked.status, 413);
+
+    customUpstreamHandler = (_u, _m, _h, body) =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            sha256: "c".repeat(64),
+            type: "image/jpeg",
+            // Intentionally omit `size` on a chunked request (no Content-Length)
+            _len: body.length,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    const missingSizeStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array([1, 2, 3, 4]));
+        controller.close();
+      },
+    });
+    const missingSizeRes = await app(
+      new Request(`${origin}/upload`, {
+        method: "PUT",
+        body: missingSizeStream,
+        headers: {
+          "content-type": "image/jpeg",
+          authorization: blossomAuth(sk1, "upload", now),
+        },
+      }),
+    );
+    equal(missingSizeRes.status, 502);
+    customUpstreamHandler = null;
+
+    // 7. JSON null payload on /upload/init returns 400 (not 503), non-string thumbnailUrl on /complete doesn't crash
+    const nullInit = await app(
+      new Request(`${origin}/upload/init`, {
+        method: "POST",
+        headers: {
+          authorization: blossomAuth(sk1, "upload", now),
+          "content-type": "application/json",
+        },
+        body: "null",
+      }),
+    );
+    equal(nullInit.status, 400);
+
+    const weirdThumbHash = "d".repeat(64);
+    customUpstreamHandler = () =>
+      new Response(
+        JSON.stringify({
+          sha256: weirdThumbHash,
+          size: 512,
+          contentType: "video/mp4",
+          thumbnailUrl: { unexpected: true },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    const weirdThumbRes = await app(
+      new Request(`${origin}/upload/up_weirdthumb/complete`, {
+        method: "POST",
+        headers: {
+          authorization: blossomAuth(sk1, "upload", now, weirdThumbHash),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ sha256: weirdThumbHash }),
+      }),
+    );
+    equal(weirdThumbRes.status, 200);
+    const weirdThumbDesc = await weirdThumbRes.json() as Record<string, unknown>;
+    equal("thumbnail" in weirdThumbDesc, false);
+    customUpstreamHandler = null;
+
+    // 8. Legacy/archive records (videoEncodingAllowed: undefined) must NOT reset failed transcode on clean re-upload,
+    //    and derivative error clamping treats invalid_media as non-terminal while unsupported_media_type is terminal.
+    const legacyBytes = new TextEncoder().encode("synthetic-legacy-archive-video-bytes");
+    const legacyHash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", legacyBytes)));
+    await catalog.cas(legacyHash, null, {
+      revision: 1,
+      hash: legacyHash,
+      size: legacyBytes.length,
+      type: "video/mp4",
+      uploaded: now,
+      owners: [pub1],
+      status: "active",
+      ageRestricted: false,
+      held: false,
+      gate: null,
+      cleanupPending: false,
+      transcodeStatus: "failed",
+      transcodeErrorCode: "old_err",
+      // videoEncodingAllowed deliberately omitted (legacy / migrated record)
+    });
+    const legacyReup = await app(
+      new Request(`${origin}/upload`, {
+        method: "PUT",
+        body: legacyBytes,
+        headers: {
+          "content-type": "video/mp4",
+          authorization: blossomAuth(sk2, "upload", now, legacyHash),
+        },
+      }),
+    );
+    equal(legacyReup.status, 200);
+    const legacyAfter = await catalog.get(legacyHash);
+    equal(legacyAfter?.transcodeStatus, "failed");
+    equal(legacyAfter?.owners, [pub1, pub2]);
+
+    const errBytes = new TextEncoder().encode("synthetic-error-clamping-video");
+    const errHash = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", errBytes)));
+    customUpstreamHandler = () =>
+      new Response(
+        JSON.stringify({
+          sha256: errHash,
+          size: errBytes.length,
+          type: "video/mp4",
+          transcode_error_code: "invalid_media",
+          transcode_error_message: "probe failed",
+          transcode_terminal: true, // must be clamped to false for invalid_media
+          transcript_error_code: "unsupported_media_type",
+          transcript_terminal: true, // trusted as terminal
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    const errRes = await app(
+      new Request(`${origin}/upload`, {
+        method: "PUT",
+        body: errBytes,
+        headers: {
+          "content-type": "video/mp4",
+          authorization: blossomAuth(sk1, "upload", now, errHash),
+        },
+      }),
+    );
+    equal(errRes.status, 200);
+    const errRec = await catalog.get(errHash);
+    equal(errRec?.transcodeStatus, "failed");
+    equal(errRec?.transcodeTerminal, false);
+    equal(errRec?.transcriptStatus, "failed");
+    equal(errRec?.transcriptTerminal, true);
+    customUpstreamHandler = null;
   } finally {
     db.close();
   }
