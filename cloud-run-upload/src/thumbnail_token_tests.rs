@@ -166,3 +166,51 @@ async fn router_reads_the_token_header() {
     assert_eq!(served.status(), StatusCode::OK);
     assert_not_shared_cacheable(&served, "router served");
 }
+
+/// The repair and backfill tools' preflight requests `/thumbnail/auth-check`
+/// before deleting anything and read 400 as "credentials accepted" and 404 as
+/// "refused". That holds only while the token check runs before hash
+/// validation; if the order flipped, a refused token would get 400 and the
+/// tools would delete thumbnails they can't regenerate.
+#[tokio::test]
+async fn repair_preflight_sees_the_token_check_before_hash_validation() {
+    use tower::ServiceExt;
+    let storage = storage_with_cached_thumbnail().await;
+    let cases = [
+        (
+            Policy::Required("svc-token".into()),
+            None,
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Policy::Required("svc-token".into()),
+            Some("wrong"),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Policy::Required("svc-token".into()),
+            Some("svc-token"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Policy::Observe("svc-token".into()),
+            None,
+            StatusCode::BAD_REQUEST,
+        ),
+        (Policy::Open, None, StatusCode::BAD_REQUEST),
+    ];
+    for (policy, token, expected) in cases {
+        let mode = policy.mode();
+        let app = build_router(state(&storage, policy));
+        let mut request = axum::http::Request::get("/thumbnail/auth-check");
+        if let Some(token) = token {
+            request = request.header(HEADER, token);
+        }
+        let response = app
+            .oneshot(request.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{mode} {token:?}");
+    }
+    assert!(storage.received_requests().await.unwrap().is_empty());
+}
