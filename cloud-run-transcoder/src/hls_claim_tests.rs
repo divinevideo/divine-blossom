@@ -958,6 +958,7 @@ async fn sound_claim_recovers_late_primary_write_without_a_backup_marker() {
     let locks = Origin::start().await;
     let media = crate::object_storage::tests::Origin::start().await;
     let storage = media.with_gcs_backup(locks.client());
+    let backup_disabled = media.with_gcs_input_only(locks.client());
     let key = format!("{A}/audio/analysis.json");
     let verdict = Bytes::from_static(br#"{"silent":false,"tags":[]}"#);
     let mut owner = locks.store().claim_sound(A, &storage).await.unwrap();
@@ -991,7 +992,7 @@ async fn sound_claim_recovers_late_primary_write_without_a_backup_marker() {
         .unwrap()["timeCreated"] = json!("2000-01-01T00:00:00Z");
     assert!(locks
         .store()
-        .claim_sound(A, &storage)
+        .claim_sound(A, &backup_disabled)
         .await
         .unwrap_err()
         .is::<Busy>());
@@ -1008,7 +1009,7 @@ async fn sound_claim_recovers_late_primary_write_without_a_backup_marker() {
         )
         .await
         .unwrap();
-    let replacement = locks.store().claim_sound(A, &storage).await.unwrap();
+    let replacement = locks.store().claim_sound(A, &backup_disabled).await.unwrap();
     replacement.finish(false).await.unwrap();
 }
 

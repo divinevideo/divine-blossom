@@ -299,6 +299,9 @@ impl MediaStorage {
     pub fn is_gcs(&self) -> bool {
         matches!(self.backend, Backend::Gcs { .. })
     }
+    pub(crate) fn is_b2_primary(&self) -> bool {
+        self.legacy_gcs.is_some()
+    }
     pub(crate) fn requires_backup(&self) -> bool {
         self.required_backup.is_some()
     }

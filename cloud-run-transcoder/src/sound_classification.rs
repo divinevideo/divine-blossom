@@ -198,8 +198,8 @@ where
         analyze(object.content_type.clone(), audio).await
     };
     let storage = &state.media_storage;
-    if storage.requires_backup() {
-        // A local guard cannot order both provider writes across instances.
+    if storage.is_b2_primary() {
+        // Both backup configurations share one journal across instances.
         let store = ClaimStore::new(state.gcs_client.clone(), &state.config.gcs_bucket);
         let mut claim = match store.claim_sound(hash, storage).await {
             Ok(claim) => claim,
@@ -576,5 +576,54 @@ mod tests {
         assert!(reusable_analysis(&state, &path).await.unwrap());
         let primary = state.media_storage.stat(&path).await.unwrap().unwrap();
         assert_eq!(state.media_storage.read(&primary).await.unwrap(), verdict);
+    }
+
+    #[tokio::test]
+    async fn disabling_b2_primary_backups_keeps_an_unconfirmed_sound_write_fenced() {
+        use crate::{hls_claim, object_storage, Config};
+        use sha2::{Digest, Sha256};
+        use tokio::sync::Semaphore;
+
+        let b2 = object_storage::tests::Origin::start().await;
+        let gcs = hls_claim::tests::Origin::start().await;
+        let audio = Bytes::from_static(b"sound-backup-rollout-fixture");
+        let hash = hex::encode(Sha256::digest(&audio));
+        b2.store()
+            .put_verified(&hash, audio, "audio/mpeg", HashMap::new(), None)
+            .await
+            .unwrap();
+
+        let backup_enabled = b2.with_gcs_backup(gcs.client());
+        let store = ClaimStore::new(gcs.client(), "synthetic-gcs");
+        let mut writer = store.claim_sound(&hash, &backup_enabled).await.unwrap();
+        let write_id = writer.write_id();
+        let path = analysis_object_path(&hash);
+        writer
+            .begin_publication(
+                vec![hls_claim::WriteTarget {
+                    gcs: false,
+                    key: path.clone(),
+                }],
+                &write_id,
+            )
+            .await
+            .unwrap();
+        assert!(writer.finish(false).await.is_err());
+
+        let state = AppState {
+            media_storage: b2.with_gcs_input_only(gcs.client()),
+            gcs_client: gcs.client(),
+            config: Config::from_lookup(|key| {
+                (key == "GCS_BUCKET").then(|| "synthetic-gcs".into())
+            }),
+            provider_semaphore: Arc::new(Semaphore::new(2)),
+        };
+        let contender = classify_sound_with(&state, &hash, true, |_, _| async {
+            Ok((Bytes::from_static(br#"{"silent":false,"tags":[]}"#), false))
+        })
+        .await
+        .unwrap();
+        assert_eq!(contender, ClassifyOutcome::InProgress.into());
+        assert!(b2.store().stat(&path).await.unwrap().is_none());
     }
 }
