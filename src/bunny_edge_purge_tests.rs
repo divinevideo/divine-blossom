@@ -96,13 +96,14 @@ fn legacy_physical_creator_delete_preserves_origin_secret_budget() {
         serde_json::json!({"sha256": hash, "action": "DELETE", "reason": "creator delete"})
             .to_string(),
     );
-    // Pre-existing `kv_origin::settings()` on base `main` looks up absent
-    // `kv_origin_read_token` before checking `metadata_kv_store_id`, so run via
-    // `handle_main` and verify Fastly+GCS+FOS ordering and 0 Bunny reads in Python.
-    let mut resp = crate::handle_main(req).unwrap();
-    assert_eq!(resp.get_status(), StatusCode::OK);
-    let body: serde_json::Value = serde_json::from_str(&resp.take_body_str()).unwrap();
-    assert_eq!(body["physical_deleted"], serde_json::json!(true));
+    // With `bunny_delivery_zones` configured, physical creator delete uses the
+    // durable phased path: GCS erasure runs within the 5-secret budget, inline
+    // CDN purges are deferred to `Phase::Final`, and completion returns 409
+    // Conflict until the final purge drain acknowledges.
+    let resp = crate::request_bindings::metered(req);
+    assert_eq!(resp.get_status(), StatusCode::CONFLICT);
+    assert!(crate::b2_cdn_phase::physical_absent(&hash).unwrap());
+    assert!(!crate::storage::vanish_complete(&hash));
 }
 
 #[test]
@@ -118,8 +119,20 @@ fn legacy_physical_creator_delete_early_gcs_failure_purges_bunny_fallback() {
         serde_json::json!({"sha256": hash, "action": "DELETE", "reason": "creator delete"})
             .to_string(),
     );
+    // When GCS erasure fails in phased mode, metadata is denied, physical
+    // absence is NOT recorded (remains retryable), and a durable purge intent
+    // is still queued for drain without breaching the 5-secret ceiling.
     let resp = crate::request_bindings::metered(req);
-    assert!(resp.get_status().is_server_error());
+    assert_eq!(resp.get_status(), StatusCode::CONFLICT);
+    assert!(!crate::b2_cdn_phase::physical_absent(&hash).unwrap());
+    assert!(!crate::storage::vanish_complete(&hash));
+    let pending = crate::metadata::open_store()
+        .unwrap()
+        .build_list()
+        .prefix("b2-cdn-purge:v1:")
+        .execute()
+        .unwrap();
+    assert!(!pending.keys().is_empty());
 }
 
 #[test]
@@ -138,4 +151,25 @@ fn bulk_approve_batches_fastly_and_bounds_bunny_within_backend_limit() {
     assert_eq!(resp.get_status(), StatusCode::OK);
     let body: serde_json::Value = serde_json::from_str(&resp.take_body_str()).unwrap();
     assert_eq!(body["approved"], serde_json::json!(16));
+    assert_eq!(
+        body["cdn_purge_pending_hashes"].as_array().map(Vec::len),
+        Some(16),
+        "bulk approve must queue durable purge intents when bunny_delivery_zones is configured"
+    );
+
+    // Also directly verify `purge_edge_cache_batch` batches Fastly and caps
+    // inline Bunny purges within Fastly's 32-backend-request ceiling.
+    let mark = |phase: &str| {
+        let r = Request::post("http://fixture.invalid/fixture/meter")
+            .with_body(phase)
+            .send("fixture_control")
+            .unwrap();
+        assert!(r.get_status().is_success());
+    };
+    mark("batch");
+    {
+        let _scope = crate::request_bindings::begin();
+        crate::purge_edge_cache_batch(&hashes);
+    }
+    mark("outside");
 }
