@@ -5,7 +5,10 @@
 set -euo pipefail
 
 MEDIA_URL="${MEDIA_URL:-https://media.divine.video}"
-UPLOAD_URL="${UPLOAD_URL:-https://blossom-upload-rust-149672065768.us-central1.run.app}"
+DEFAULT_UPLOAD_URL="https://blossom-upload-rust-149672065768.us-central1.run.app"
+UPLOAD_URL="${UPLOAD_URL:-$DEFAULT_UPLOAD_URL}"
+# Token the upload service can require on /thumbnail (divine-upload-server#52).
+THUMBNAIL_SERVICE_TOKEN="$(printf '%s' "${THUMBNAIL_SERVICE_TOKEN:-}" | tr -d '[:space:]')"
 BUCKET="${BUCKET:-divine-blossom-media}"
 WAIT_FOR_TRANSCRIPT="${WAIT_FOR_TRANSCRIPT:-false}"
 DELETE_VTT_FIRST="${DELETE_VTT_FIRST:-false}"
@@ -35,6 +38,7 @@ Options:
 Env:
   MEDIA_URL                Public Blossom base URL
   UPLOAD_URL               Cloud Run upload service base URL
+  THUMBNAIL_SERVICE_TOKEN  Upload service thumbnail token, sent on /thumbnail when set
   BUCKET                   GCS bucket containing blobs
   WAIT_FOR_TRANSCRIPT      true/false
   DELETE_VTT_FIRST         true/false
@@ -202,10 +206,25 @@ regenerate_thumbnail() {
     local hash="$1"
 
     gsutil -q rm "gs://${BUCKET}/${hash}.jpg" 2>/dev/null || true
-    curl -fsS -o /dev/null "${UPLOAD_URL}/thumbnail/${hash}"
+    if [[ -n "$THUMBNAIL_SERVICE_TOKEN" ]]; then
+        # Headers on stdin keep the token out of the process list.
+        printf 'X-Divine-Thumbnail-Token: %s\n' "$THUMBNAIL_SERVICE_TOKEN" |
+            curl -fsS -H @- -o /dev/null "${UPLOAD_URL}/thumbnail/${hash}"
+    else
+        curl -fsS -o /dev/null "${UPLOAD_URL}/thumbnail/${hash}"
+    fi
     curl -fsS -H "Cache-Control: no-cache" -o /dev/null "${MEDIA_URL}/${hash}.jpg"
     echo "  thumbnail regenerated"
 }
+
+if [[ "$repair_thumbnail" == "true" ]]; then
+    if [[ -z "$THUMBNAIL_SERVICE_TOKEN" ]]; then
+        echo "WARNING: THUMBNAIL_SERVICE_TOKEN is not set; once the upload service requires it, thumbnail regeneration fails with 404" >&2
+    elif [[ "${UPLOAD_URL%/}" != "$DEFAULT_UPLOAD_URL" ]]; then
+        upload_host="${UPLOAD_URL#*://}"
+        echo "WARNING: sending THUMBNAIL_SERVICE_TOKEN to a non-default upload host: ${upload_host%%/*}" >&2
+    fi
+fi
 
 echo "Repair target count: ${#hashes[@]}"
 echo "Transcript repair: ${repair_transcript}"

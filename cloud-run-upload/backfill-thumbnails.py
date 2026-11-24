@@ -3,6 +3,7 @@
 
 import argparse
 import concurrent.futures
+import os
 import subprocess
 import sys
 import threading
@@ -162,6 +163,25 @@ def request(
     return 599
 
 
+def thumbnail_service_headers() -> dict[str, str]:
+    """The upload service's thumbnail token, which it can require on /thumbnail."""
+    token = os.environ.get("THUMBNAIL_SERVICE_TOKEN", "").strip()
+    return {"X-Divine-Thumbnail-Token": token} if token else {}
+
+
+def thumbnail_token_warnings(upload_url: str) -> list[str]:
+    """Operator warnings about the /thumbnail service token for this run."""
+    if not os.environ.get("THUMBNAIL_SERVICE_TOKEN", "").strip():
+        return [
+            "warning: THUMBNAIL_SERVICE_TOKEN is not set; once the upload service "
+            "requires it, every regeneration fails as regenerate:404"
+        ]
+    if upload_url.rstrip("/") != DEFAULT_UPLOAD_URL:
+        host = urllib.parse.urlparse(upload_url).netloc or upload_url
+        return [f"warning: sending THUMBNAIL_SERVICE_TOKEN to a non-default upload host: {host}"]
+    return []
+
+
 def process_hash(
     hash_: str, bucket: str, upload_url: str, media_url: str
 ) -> tuple[str, str | None]:
@@ -170,7 +190,9 @@ def process_hash(
     delete_status = request(delete_url, method="DELETE", auth=True)
     delete_error = None if delete_status in (200, 204, 404) else f"delete:{delete_status}"
 
-    regenerate_status = request(f"{upload_url}/thumbnail/{hash_}")
+    regenerate_status = request(
+        f"{upload_url}/thumbnail/{hash_}", headers=thumbnail_service_headers()
+    )
     if regenerate_status != 200:
         errors = [err for err in (delete_error, f"regenerate:{regenerate_status}") if err]
         return hash_, ",".join(errors)
@@ -188,6 +210,8 @@ def process_hash(
 
 def main() -> None:
     args = parse_args()
+    for warning in thumbnail_token_warnings(args.upload_url):
+        print(warning, file=sys.stderr)
     hashes = load_hashes(args)
     total = len(hashes)
 
