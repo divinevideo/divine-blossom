@@ -142,8 +142,8 @@ repairs a missing or mismatched required GCS backup under its existing job claim
 B2-first edge polling waits on that claim while a required backup is being
 verified, and retries a visible primary after a retryable failure's cooldown.
 Successful verification clears the claim. During a GCS job-record outage,
-the edge serves existing subtitles. Backup detection and repair dispatch
-resume when the job record is readable.
+the edge serves existing subtitles with private, no-store headers. Backup
+detection and repair dispatch resume when the job record is readable.
 In `b2_primary` mode, the GCS journal at `.internal/sound-claims/{hash}`
 serializes sound publication across worker instances with or without backups.
 Keep this namespace outside lifecycle deletion and manual cleanup while writers

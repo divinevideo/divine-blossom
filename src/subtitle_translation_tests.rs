@@ -179,6 +179,14 @@ fn subtitle_translation_b2_visible_output_retries_failed_backup() {
     let hash = seed('9', "complete", false);
     let mut control_unavailable = translated_get(&hash, false).unwrap();
     assert_eq!(control_unavailable.get_status(), StatusCode::OK);
+    assert_eq!(
+        control_unavailable.get_header_str("Cache-Control"),
+        Some("private, no-store"),
+    );
+    assert_eq!(
+        control_unavailable.get_header_str("Surrogate-Control"),
+        Some("no-store"),
+    );
     assert!(control_unavailable.take_body_str().contains("B2 translation"));
 }
 

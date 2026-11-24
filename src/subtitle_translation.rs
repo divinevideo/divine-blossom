@@ -50,7 +50,7 @@ pub(super) fn serve_translated_transcript(
 ) -> Result<Response> {
     let digest = hex::encode(Sha256::digest(source));
     let path = translated_vtt_path(hash, &digest, lang);
-    let existing = match download_transcript_content(&path) {
+    let mut existing = match download_transcript_content(&path) {
         Ok(response) => Some(response),
         Err(BlossomError::NotFound(_)) => None,
         Err(error) => return Err(error),
@@ -60,12 +60,15 @@ pub(super) fn serve_translated_transcript(
     {
         match load_translation_job(&path) {
             Ok(job) => job,
-            // A control-store outage must not make existing B2 subtitles unavailable.
-            Err(error) if existing.is_some() => {
+            Err(error) => {
+                let Some(response) = existing.as_mut() else {
+                    return Err(error);
+                };
                 eprintln!("[VTT] Translation job lookup failed for an existing output: {error}");
+                // Keep the fallback readable and let the next poll recheck the job.
+                add_private_cache_headers(response, hash);
                 None
             }
-            Err(error) => return Err(error),
         }
     } else {
         None

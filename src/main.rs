@@ -2058,7 +2058,7 @@ fn serve_transcript_by_hash(
                 if translated.get_status() == StatusCode::OK {
                     if is_admin || status_requires_private_response(metadata.status) {
                         add_private_cache_headers(&mut translated, hash);
-                    } else {
+                    } else if translated.get_header_str("Surrogate-Control") != Some("no-store") {
                         add_derivative_cache_headers(&mut translated, hash);
                     }
                 }
