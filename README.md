@@ -207,8 +207,11 @@ characters on the edge) on both `GET` and `HEAD`; `cloud-run-upload` preserves
 the full prefixed id (up to 128 characters) in its logs, and archive import
 calls carry bare `blossom-thumbnail`. Because `x-request-id` is caller-supplied,
 corroborate unauthenticated `blossom-thumbnail-*` hits against Blossom edge logs.
-When `derived_media_read_primary=b2`, Blossom reserves one Compute secret slot
-across B2 404 -> GCS fallback so `thumbnail_service_token` stays readable.
+When `derived_media_read_primary=b2` and a thumbnail misses on B2, Blossom
+checks the Compute secret budget first: if reading the GCS fallback credentials
+would leave no slot for `thumbnail_service_token`, it skips the GCS fallback
+and goes straight to on-demand generation, where the upload service serves any
+thumbnail already stored in GCS without re-running ffmpeg.
 Any corroborated `blossom-thumbnail-*` `missing` hit blocks flipping
 `THUMBNAIL_TOKEN_REQUIRED=true`. (`experiments/bunny-blossom/app.ts` does not
 send this token yet and must be updated or retired before enforcement if used
