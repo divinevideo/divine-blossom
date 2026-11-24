@@ -16,14 +16,46 @@ import time
 import unittest
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
 OFF_GCP_DIR = Path(__file__).resolve().parents[1] / "deploy" / "off-gcp"
+BASE_COMPOSE = OFF_GCP_DIR / "docker-compose.yml"
 CADDYFILE = OFF_GCP_DIR / "Caddyfile"
 UPLOAD_CADDYFILE = OFF_GCP_DIR / "Caddyfile.upload.example"
 UPLOAD_COMPOSE = OFF_GCP_DIR / "docker-compose.upload.yml"
 UPLOAD_ENV_EXAMPLE = OFF_GCP_DIR / ".env.upload.example"
+GITIGNORE = REPO_ROOT / ".gitignore"
+CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+
+
+def _stop_process(proc: subprocess.Popen[str]) -> None:
+    if proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait(timeout=5)
+    if proc.stdout is not None:
+        proc.stdout.close()
+    if proc.stderr is not None:
+        proc.stderr.close()
 
 
 class OffGcpUploadConfigTest(unittest.TestCase):
+    def _require_caddy_bin(self) -> str:
+        caddy_bin = shutil.which("caddy")
+        if caddy_bin is None:
+            if os.environ.get("REQUIRE_CADDY_TESTS") == "1" or os.environ.get("CI"):
+                self.fail("caddy binary is required in CI / when REQUIRE_CADDY_TESTS=1")
+            self.skipTest("caddy binary not installed in this environment")
+        return caddy_bin
+
     def test_upload_caddyfile_wraps_proxy_and_fallback_in_handle_blocks(self) -> None:
         text = UPLOAD_CADDYFILE.read_text(encoding="utf-8")
 
@@ -37,6 +69,8 @@ class OffGcpUploadConfigTest(unittest.TestCase):
         self.assertRegex(text, r"(?m)^\t\trespond 404$")
         self.assertNotRegex(text, r"(?m)^\trespond 404$")
         self.assertNotRegex(text, r"(?m)^\treverse_proxy @public_upload\b")
+        # Do not encourage setting UPLOAD_DOMAIN in .env (recreates transcoder/caddy).
+        self.assertNotIn("set UPLOAD_DOMAIN=", text)
 
     def test_upload_caddyfile_allowlist_covers_public_routes_and_blocks_internal(self) -> None:
         text = UPLOAD_CADDYFILE.read_text(encoding="utf-8")
@@ -59,17 +93,42 @@ class OffGcpUploadConfigTest(unittest.TestCase):
         self.assertNotIn("/metrics", cel)
 
     def test_upload_compose_decouples_caddy_and_preserves_env_file_tuning(self) -> None:
+        base_text = BASE_COMPOSE.read_text(encoding="utf-8")
         text = UPLOAD_COMPOSE.read_text(encoding="utf-8")
 
+        # Base Caddy service must drain past the 910s upstream transcode timeout
+        # and avoid unused UPLOAD_DOMAIN env plumbing.
+        base_caddy = base_text.split("  caddy:", 1)[1].split("  transcoder:", 1)[0]
+        grace_match = re.search(r"(?m)^\s+stop_grace_period:\s+(\d+)s$", base_caddy)
+        self.assertIsNotNone(grace_match, "Expected stop_grace_period on caddy service")
+        self.assertGreaterEqual(int(grace_match.group(1)), 910)
+        self.assertNotIn("UPLOAD_DOMAIN", base_caddy)
+
         # Co-located upload health must never block Caddy / transcoder ingress.
-        self.assertNotRegex(text, r"(?m)^  caddy:")
         self.assertNotIn("depends_on:", text)
+        self.assertNotRegex(text, r"(?m)^  transcoder:")
         # Match divine-upload-server's 300s graceful shutdown drain window (GKE: 330s).
         self.assertRegex(text, r"(?m)^\s+stop_grace_period:\s+330s$")
 
+        # Back /tmp with a disk volume (never tmpfs charged to mem_limit).
+        self.assertNotIn("tmpfs:", text)
+        self.assertRegex(text, r"(?m)^\s+-\s+upload_tmp:/tmp$")
+        self.assertRegex(text, r"(?m)^volumes:\n\s+upload_tmp:$")
+
+        # Isolate upload on upload_edge; attach caddy to both default and upload_edge.
+        caddy_overlay = text.split("  caddy:", 1)[1].split("  upload:", 1)[0]
+        self.assertRegex(caddy_overlay, r"(?m)^\s+-\s+default$")
+        self.assertRegex(caddy_overlay, r"(?m)^\s+-\s+upload_edge$")
+
+        upload_block = text.split("  upload:", 1)[1].split("\nvolumes:", 1)[0]
+        upload_networks = upload_block.split("networks:", 1)[1].split("healthcheck:", 1)[0]
+        self.assertRegex(upload_networks, r"(?m)^\s+-\s+upload_edge$")
+        self.assertNotRegex(upload_networks, r"(?m)^\s+-\s+default$")
+        self.assertRegex(text, r"(?m)^networks:\n\s+upload_edge:$")
+
         # Concurrency limits belong in .env.upload so they are not shadowed by
         # static compose `environment:` entries.
-        env_block = text.split("environment:", 1)[1].split("volumes:", 1)[0]
+        env_block = upload_block.split("environment:", 1)[1].split("volumes:", 1)[0]
         for key in (
             "MAX_CONCURRENT_UPLOADS",
             "MAX_CONCURRENT_THUMBNAILS",
@@ -96,6 +155,9 @@ class OffGcpUploadConfigTest(unittest.TestCase):
 
         self.assertNotIn("104857600", text)
         self.assertNotRegex(text, r"(?m)^TRANSCODE_ADMISSION_SECRET=")
+        # divine-upload-server has no Sentry integration.
+        self.assertNotIn("SENTRY_DSN", text)
+        self.assertNotIn("SENTRY_ENVIRONMENT", text)
 
         # Keep TRANSCODER_URL aligned with Cloud Run prod while admission secret is unset.
         transcoder_match = re.search(r"(?m)^TRANSCODER_URL=(\S+)$", text)
@@ -105,17 +167,37 @@ class OffGcpUploadConfigTest(unittest.TestCase):
             "https://divine-transcoder-149672065768.us-central1.run.app",
         )
 
-        # TRANSCRIBER_URL must be explicitly set (not commented out) to an origin
-        # that serves POST /transcribe/audio rather than falling back to the worker
-        # Caddy vhost (which returns 404 for /transcribe/audio).
+        # TRANSCRIBER_URL is explicitly set to the Cloud Run transcription origin
+        # so switching TRANSCODER_URL to the off-GCP worker cannot fall back to
+        # the worker's Caddy vhost (which returns 404 for /transcribe/audio).
         transcriber_match = re.search(r"(?m)^TRANSCRIBER_URL=(\S+)$", text)
         self.assertIsNotNone(transcriber_match, "Expected active TRANSCRIBER_URL in .env.upload.example")
         self.assertNotIn("transcoder-worker.divine.video", transcriber_match.group(1))
 
+    def test_gitignore_covers_populated_off_gcp_deployment_files(self) -> None:
+        text = GITIGNORE.read_text(encoding="utf-8")
+        for pattern in (
+            "cloud-run-transcoder/deploy/off-gcp/.env",
+            "cloud-run-transcoder/deploy/off-gcp/.env.upload",
+            "cloud-run-transcoder/deploy/off-gcp/conf.d/*.caddy",
+            "cloud-run-transcoder/deploy/off-gcp/conf.d/certs/",
+        ):
+            self.assertRegex(text, rf"(?m)^{re.escape(pattern)}$")
+
+    def test_ci_workflow_pins_and_requires_caddy_tests(self) -> None:
+        base_text = BASE_COMPOSE.read_text(encoding="utf-8")
+        ci_text = CI_WORKFLOW.read_text(encoding="utf-8")
+
+        compose_match = re.search(r"(?m)^\s+image:\s+caddy:([0-9]+\.[0-9]+\.[0-9]+)-alpine$", base_text)
+        self.assertIsNotNone(compose_match, "Expected pinned caddy:<ver>-alpine image in docker-compose.yml")
+        ci_match = re.search(r"(?m)^\s+CADDY_VERSION:\s+([0-9]+\.[0-9]+\.[0-9]+)$", ci_text)
+        self.assertIsNotNone(ci_match, "Expected pinned CADDY_VERSION in .github/workflows/ci.yml")
+        self.assertEqual(compose_match.group(1), ci_match.group(1))
+        self.assertIn("sha512sum -c -", ci_text)
+        self.assertRegex(ci_text, r'(?m)^\s+REQUIRE_CADDY_TESTS:\s+"1"$')
+
     def test_caddy_adapt_orders_upload_proxy_before_404_fallback(self) -> None:
-        caddy_bin = shutil.which("caddy")
-        if caddy_bin is None:
-            self.skipTest("caddy binary not installed in this environment")
+        caddy_bin = self._require_caddy_bin()
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -133,7 +215,6 @@ class OffGcpUploadConfigTest(unittest.TestCase):
             env.update(
                 {
                     "TRANSCODER_DOMAIN": "transcoder-worker.example.test",
-                    "UPLOAD_DOMAIN": "upload.example.test",
                     "TRANSCODE_ADMISSION_AUTH_REQUIRED": "true",
                     "TRANSCODE_ADMISSION_SECRET": "synthetic-secret",
                 }
@@ -149,10 +230,12 @@ class OffGcpUploadConfigTest(unittest.TestCase):
             )
             self.assertEqual(only_transcoder.returncode, 0, only_transcoder.stderr)
 
-            # 2. Co-located host with conf.d/upload.caddy must route upload:8080
-            #    ahead of the 404 fallback inside a subroute for upload.example.test.
+            # 2. Co-located host with literal hostname in conf.d/upload.caddy must
+            #    route upload:8080 ahead of the 404 fallback inside a subroute.
             (conf_d / "upload.caddy").write_text(
-                UPLOAD_CADDYFILE.read_text(encoding="utf-8"),
+                UPLOAD_CADDYFILE.read_text(encoding="utf-8").replace(
+                    "{$UPLOAD_DOMAIN}", "upload.example.test"
+                ),
                 encoding="utf-8",
             )
             colocated = subprocess.run(
@@ -198,9 +281,7 @@ class OffGcpUploadConfigTest(unittest.TestCase):
     def test_caddy_live_loopback_enforces_upload_allowlist_and_blocks_worker_transcribe_audio(
         self,
     ) -> None:
-        caddy_bin = shutil.which("caddy")
-        if caddy_bin is None:
-            self.skipTest("caddy binary not installed in this environment")
+        caddy_bin = self._require_caddy_bin()
 
         recorded: list[tuple[str, str, str]] = []
 
@@ -249,10 +330,6 @@ class OffGcpUploadConfigTest(unittest.TestCase):
         upload_thread.start()
         transcoder_thread.start()
 
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-            probe.bind(("127.0.0.1", 0))
-            caddy_port = probe.getsockname()[1]
-
         proc = None
         try:
             with tempfile.TemporaryDirectory() as tmp:
@@ -269,42 +346,73 @@ class OffGcpUploadConfigTest(unittest.TestCase):
                 test_caddyfile = tmp_path / "Caddyfile"
                 test_caddyfile.write_text(base_text, encoding="utf-8")
 
-                upload_text = UPLOAD_CADDYFILE.read_text(encoding="utf-8").replace(
+                upload_template = UPLOAD_CADDYFILE.read_text(encoding="utf-8").replace(
                     "upload:8080", f"127.0.0.1:{upload_server.server_port}"
                 )
-                (conf_d / "upload.caddy").write_text(upload_text, encoding="utf-8")
 
-                env = os.environ.copy()
-                env.update(
-                    {
-                        "TRANSCODER_DOMAIN": f"http://transcoder-worker.example.test:{caddy_port}",
-                        "UPLOAD_DOMAIN": f"http://upload.example.test:{caddy_port}",
-                        "TRANSCODE_ADMISSION_AUTH_REQUIRED": "true",
-                        "TRANSCODE_ADMISSION_SECRET": "synthetic-secret",
-                    }
-                )
+                # Retry ephemeral port binding to avoid flaking if another local
+                # process claims the probe port before Caddy binds it.
+                caddy_port = None
+                last_bind_err = ""
+                for _attempt in range(5):
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                        probe.bind(("127.0.0.1", 0))
+                        candidate_port = probe.getsockname()[1]
 
-                proc = subprocess.Popen(
-                    [caddy_bin, "run", "--config", str(test_caddyfile), "--adapter", "caddyfile"],
-                    env=env,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    start_new_session=True,
-                )
+                    (conf_d / "upload.caddy").write_text(
+                        upload_template.replace(
+                            "{$UPLOAD_DOMAIN}", f"http://upload.example.test:{candidate_port}"
+                        ),
+                        encoding="utf-8",
+                    )
 
-                deadline = time.monotonic() + 10.0
-                while time.monotonic() < deadline:
-                    if proc.poll() is not None:
-                        _, err = proc.communicate(timeout=2)
-                        self.fail(f"caddy exited early ({proc.returncode}): {err}")
-                    try:
-                        with socket.create_connection(("127.0.0.1", caddy_port), timeout=0.2):
-                            break
-                    except OSError:
-                        time.sleep(0.05)
-                else:
+                    env = os.environ.copy()
+                    env.update(
+                        {
+                            "TRANSCODER_DOMAIN": f"http://transcoder-worker.example.test:{candidate_port}",
+                            "TRANSCODE_ADMISSION_AUTH_REQUIRED": "true",
+                            "TRANSCODE_ADMISSION_SECRET": "synthetic-secret",
+                        }
+                    )
+
+                    proc = subprocess.Popen(
+                        [caddy_bin, "run", "--config", str(test_caddyfile), "--adapter", "caddyfile"],
+                        env=env,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        start_new_session=True,
+                    )
+
+                    bind_conflict = False
+                    deadline = time.monotonic() + 10.0
+                    while time.monotonic() < deadline:
+                        if proc.poll() is not None:
+                            _, err = proc.communicate(timeout=2)
+                            _stop_process(proc)
+                            proc = None
+                            if "address already in use" in err.lower() or "bind:" in err.lower():
+                                last_bind_err = err
+                                bind_conflict = True
+                                break
+                            self.fail(f"caddy exited early: {err}")
+                        try:
+                            with socket.create_connection(("127.0.0.1", candidate_port), timeout=0.2):
+                                caddy_port = candidate_port
+                                break
+                        except OSError:
+                            time.sleep(0.05)
+
+                    if caddy_port is not None:
+                        break
+                    if bind_conflict:
+                        continue
+                    _stop_process(proc)
+                    proc = None
                     self.fail("caddy did not open loopback port in time")
+
+                if caddy_port is None:
+                    self.fail(f"caddy failed to bind loopback port after retries: {last_bind_err}")
 
                 def send(host: str, method: str, path: str, body: bytes | None = None) -> int:
                     conn = http.client.HTTPConnection("127.0.0.1", caddy_port, timeout=5)
@@ -405,23 +513,7 @@ class OffGcpUploadConfigTest(unittest.TestCase):
                 self.assertEqual(recorded, [])
         finally:
             if proc is not None:
-                if proc.poll() is None:
-                    try:
-                        os.killpg(proc.pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        try:
-                            os.killpg(proc.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                        proc.wait(timeout=5)
-                if proc.stdout is not None:
-                    proc.stdout.close()
-                if proc.stderr is not None:
-                    proc.stderr.close()
+                _stop_process(proc)
             upload_server.shutdown()
             upload_server.server_close()
             transcoder_server.shutdown()

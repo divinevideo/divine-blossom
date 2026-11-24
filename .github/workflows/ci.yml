@@ -70,8 +70,21 @@ jobs:
       - name: Run transcoder service tests
         run: cargo test --manifest-path cloud-run-transcoder/Cargo.toml --locked -- --include-ignored
 
+      - name: Install Caddy for off-GCP config regression tests
+        env:
+          CADDY_VERSION: 2.11.9
+          CADDY_SHA512: 0e85544340290a16ce4bfb76fe7d65e9de1bf3a6e67f5ccfff30b30d27ea4c73e078077b7bf3e58ae60b6b12e44327705287059c775bca5782e8ee85ea7edd75
+        run: |
+          curl --retry 3 --retry-all-errors -sSfL -o /tmp/caddy.tar.gz \
+            "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_amd64.tar.gz"
+          echo "${CADDY_SHA512}  /tmp/caddy.tar.gz" | sha512sum -c -
+          tar xzf /tmp/caddy.tar.gz -C /usr/local/bin/ caddy
+          caddy version
+
       - name: Run transcoder Python tests
         working-directory: cloud-run-transcoder
+        env:
+          REQUIRE_CADDY_TESTS: "1"
         run: python3 -m unittest discover -s tests -p 'test_*.py'
 
       - name: Run script Python tests

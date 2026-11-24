@@ -3,8 +3,11 @@
 
 services:
   caddy:
-    image: caddy:2-alpine
+    image: caddy:2.11.9-alpine
     restart: unless-stopped
+    # Exceed Caddyfile's 910s upstream transcode timeout so Caddy recreates drain
+    # in-flight /internal/transcode requests instead of SIGKILLing after 10s.
+    stop_grace_period: 920s
     ports:
       - "80:80"
       - "443:443"
@@ -12,7 +15,6 @@ services:
       TRANSCODER_DOMAIN: ${TRANSCODER_DOMAIN:?Set TRANSCODER_DOMAIN, e.g. transcoder-worker.divine.video}
       TRANSCODE_ADMISSION_AUTH_REQUIRED: ${TRANSCODE_ADMISSION_AUTH_REQUIRED-false}
       TRANSCODE_ADMISSION_SECRET: ${TRANSCODE_ADMISSION_SECRET-}
-      UPLOAD_DOMAIN: ${UPLOAD_DOMAIN-}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ./conf.d:/etc/caddy/conf.d:ro

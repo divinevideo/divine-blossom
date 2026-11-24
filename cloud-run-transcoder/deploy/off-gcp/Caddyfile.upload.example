@@ -1,13 +1,13 @@
 # Template for co-located divine-upload-server site blocks under conf.d/:
 # - Staging: copy to conf.d/upload-candidate.caddy and replace {$UPLOAD_DOMAIN}
 #   with the literal candidate hostname (e.g. upload-hetzner.divine.video).
-# - Production cutover: copy to conf.d/upload.caddy with literal
-#   upload.divine.video (or set UPLOAD_DOMAIN=upload.divine.video in .env right
-#   before adding conf.d/upload.caddy), stage an externally renewed DNS-01 cert
-#   under conf.d/certs/ with a Caddy validate + reload --force hook, and keep
-#   conf.d/upload-candidate.caddy active until candidate sessions drain.
-# Never leave a conf.d/*.caddy file referencing {$UPLOAD_DOMAIN} while
-# UPLOAD_DOMAIN is unset/empty, or Caddy will fail to start.
+# - Production cutover: copy to conf.d/upload.caddy and replace {$UPLOAD_DOMAIN}
+#   with literal upload.divine.video, stage an externally renewed DNS-01 cert
+#   under conf.d/certs/ with an atomic Caddy validate + reload --force hook, and
+#   keep conf.d/upload-candidate.caddy active until candidate sessions drain.
+# Always replace {$UPLOAD_DOMAIN} with a literal hostname (do not set
+# UPLOAD_DOMAIN in .env): Caddy reads env vars only at container creation, and
+# editing .env changes transcoder's Compose config hash.
 {$UPLOAD_DOMAIN} {
 	# Public surface parity with GKE HTTPRoute for callers on UPLOAD_SERVICE_HOST:
 	# - /transcribe enforces BUD-11 Nostr auth in divine-upload-server before
@@ -29,8 +29,9 @@
 	# Wrap proxy and fallback in handle blocks so respond 404 never shadows
 	# reverse_proxy under Caddy 2's built-in directive order.
 	handle @public_upload {
-		# Match GKE HTTPRoute's 16 MiB upload-body-size filter so direct/chunked
-		# request bodies cannot exceed the bounded 4G /tmp tmpfs and 6G memory cap.
+		# Match GKE HTTPRoute's 16 MiB upload-body-size filter for direct uploads
+		# and resumable chunks (resumable completion and /migrate still spool whole
+		# objects up to MAX_UPLOAD_BYTES on disk-backed /tmp).
 		request_body {
 			max_size 16MiB
 		}

@@ -219,9 +219,9 @@ sole writer.
 2. Copy `cloud-run-transcoder/deploy/off-gcp/.env.upload.example` to
    `/opt/divine-transcoder/.env.upload` (`chmod 600`) and populate the B2,
    transcribe, and optional parity keys (`MIGRATION_NSEC`,
-   `AI_DETECTOR_BASE_URL`, `MAX_UPLOAD_BYTES`, `MIRROR_FETCH_TIMEOUT_SECS`,
-   `SENTRY_DSN`) to match live GKE production. Keep `TRANSCODER_URL` at its
-   default (`https://divine-transcoder-149672065768.us-central1.run.app`) with
+   `AI_DETECTOR_BASE_URL`, `MAX_UPLOAD_BYTES`, `MIRROR_FETCH_TIMEOUT_SECS`) to
+   match live GKE production. Keep `TRANSCODER_URL` at its default
+   (`https://divine-transcoder-149672065768.us-central1.run.app`) with
    `TRANSCODE_ADMISSION_SECRET` unset to match live GKE production; only set
    `TRANSCODE_ADMISSION_SECRET` when intentionally routing HLS admission to the
    off-GCP worker's `/transcode/queue` endpoint with matching
@@ -233,74 +233,115 @@ sole writer.
    storage and resumable sessions. Keep `TRANSCRIBER_URL` explicitly set to an
    origin serving `POST /transcribe/audio` (the Cloud Run origin
    `https://divine-transcoder-149672065768.us-central1.run.app` by default, or
-   internal `http://transcoder:8080` only if the local worker is configured with
-   transcription credentials and matching `TRANSCRIBE_SHARED_SECRET`); leaving
-   `TRANSCRIBER_URL` unset falls back to `TRANSCODER_URL`, whose Caddy site
-   intentionally returns `404` for `/transcribe/audio`. Set
+   internal `http://transcoder:8080` only if you also attach `transcoder` to the
+   `upload_edge` network and configure the local worker with transcription
+   credentials and matching `TRANSCRIBE_SHARED_SECRET`). Leaving
+   `TRANSCRIBER_URL` unset falls back to `TRANSCODER_URL`, which works against
+   the Cloud Run default but fails with `404` if `TRANSCODER_URL` is pointed at
+   the off-GCP worker's public Caddy vhost (which intentionally blocks
+   `/transcribe/audio`). Set
    `UPLOAD_BASE_URL=https://upload-hetzner.divine.video` for candidate testing
    so `/upload/init` returns candidate-host `/sessions/:id` URLs instead of
    pointing chunk uploads back to GKE.
-3. In `/opt/divine-transcoder/.env`, add:
+3. Configure read-only Artifact Registry pull access for
+   `us-central1-docker.pkg.dev` under the host account that runs Docker Compose
+   (a dedicated service account with `roles/artifactregistry.reader` on
+   `dv-platform-prod` / `containers-production` — the runtime `gcp-sa.json`
+   mounted inside the container is unavailable to the Docker daemon during
+   pulls, and section 1 only logs Docker into `gcr.io`):
+   ```sh
+   docker login -u _json_key --password-stdin https://us-central1-docker.pkg.dev < /etc/divine-upload/ar-pull-key.json
+   ```
+   Then add to `/opt/divine-transcoder/.env`:
    ```sh
    COMPOSE_FILE=docker-compose.yml:docker-compose.upload.yml
    UPLOAD_IMAGE=us-central1-docker.pkg.dev/dv-platform-prod/containers-production/divine-upload-server@sha256:<pinned-digest>
    ```
+   And pre-pull the pinned image before touching Caddy:
+   ```sh
+   docker compose pull upload
+   ```
    *(Pin a digest built from a `divine-upload-server` commit that includes PR
    `divinevideo/divine-upload-server#51` — `spawn_blocking` thumbnail isolation
-   and admission-accounting fixes. Do not set `UPLOAD_DOMAIN` to the candidate
-   hostname here; use literal hostnames in `conf.d/upload-candidate.caddy` and
-   `conf.d/upload.caddy` so staging and cutover never risk duplicate site blocks
-   or an extra Caddy restart. Because `transcoder` loads `.env` via `env_file`,
-   editing `.env` changes `transcoder`'s Compose config hash; do **not** run a
-   broad `docker compose up -d` that would recreate `transcoder` and interrupt
+   and admission-accounting fixes. Do not set `UPLOAD_DOMAIN` in `.env`; use
+   literal hostnames in `conf.d/upload-candidate.caddy` and `conf.d/upload.caddy`
+   so staging and cutover never risk duplicate site blocks or an extra Caddy
+   restart. Because `transcoder` loads `.env` via `env_file`, editing `.env`
+   changes `transcoder`'s Compose config hash; do **not** run a broad
+   `docker compose up -d` that would recreate `transcoder` and interrupt
    in-flight jobs.)*
 4. Copy `Caddyfile.upload.example` to `conf.d/upload-candidate.caddy` and
    replace `{$UPLOAD_DOMAIN}` with the literal candidate hostname
    `upload-hetzner.divine.video` (so it can remain active alongside
-   `conf.d/upload.caddy` during cutover). Confirm `transcoder` is healthy first,
+   `conf.d/upload.caddy` during cutover). Confirm `transcoder` is healthy and
    validate the updated Compose Caddy config (including the new `./conf.d`
-   mount and `.env`) in a one-off container before touching live ingress, then
-   start `upload` and update `caddy` with `--no-deps` so Compose does **not**
-   recreate `transcoder`:
+   mount and `upload_edge` network) in a one-off container before touching live
+   ingress. On first enablement of an existing worker (or any worker upgrading
+   to the updated `docker-compose.yml`, which adds `./conf.d` and
+   `stop_grace_period: 920s`), Docker stops the previously running Caddy
+   container under its **old** 10s stop timeout when recreating it — which would
+   reset any in-flight `/internal/transcode` requests (up to 910s). Pause
+   `divine-transcode` and wait for in-flight transcode jobs to drop to **0**
+   (per section 3) before recreating `caddy`, then start `upload` and update
+   `caddy` with `--no-deps` so Compose does **not** recreate `transcoder`,
+   verify `/health`, and resume `divine-transcode`:
    ```sh
    docker compose ps transcoder
    docker compose run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile
+   gcloud tasks queues pause divine-transcode \
+     --location=us-central1 --project=rich-compiler-479518-d2
+   # Wait until active /internal/transcode requests on the worker drop to 0
    docker compose up -d --no-deps upload
    docker compose up -d --no-deps caddy
    docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile
+   curl -fsS https://transcoder-worker.divine.video/health
+   gcloud tasks queues resume divine-transcode \
+     --location=us-central1 --project=rich-compiler-479518-d2
    ```
    *(Running `docker compose run --rm --no-deps caddy caddy validate` beforehand
-   validates the `./conf.d` mount and `.env` without binding host ports or
+   validates the `./conf.d` mount and site files without binding host ports or
    restarting live `caddy`, so a broken vhost cannot disrupt live
-   `transcoder-worker.divine.video` traffic on first recreate. If `caddy` was
-   recreated to pick up the new `./conf.d` mount, it already loaded the
-   validated config; the `caddy reload` covers the no-recreate case.)*
+   `transcoder-worker.divine.video` traffic on recreate. Once recreated onto the
+   updated `docker-compose.yml`, future Caddy recreates inherit
+   `stop_grace_period: 920s` to exceed the 910s upstream transcode timeout. The
+   `caddy reload` covers the no-recreate case.)*
 5. Verify against the candidate hostname (DNS-only / grey cloud). The
    container health check only confirms that the port accepts connections.
    Confirm the pinned image can read `/run/secrets/gcp-sa.json` under
-   `cap_drop: ALL`, write scratch files to `/tmp` with a read-only root, reach
-   both configured storage buckets, and reach `TRANSCODER_URL` from inside the
-   container (plus container-to-host HTTPS hairpinning if using the worker's
-   `/transcode/queue` admission path). Confirm `.env.upload` uses the intended
-   buckets, credentials, and concurrency limits for this host, then check:
+   `cap_drop: ALL`, write scratch files to the disk-backed `/tmp` volume
+   (`upload_tmp`) with a read-only root, reach both configured storage buckets,
+   and reach `TRANSCODER_URL` from inside the container (plus container-to-host
+   HTTPS hairpinning if using the worker's `/transcode/queue` admission path).
+   Confirm `.env.upload` uses the intended buckets, credentials, and concurrency
+   limits for this host, then check:
    - `GET /` and `HEAD /` return `200`, and `OPTIONS` preflights succeed across
      the public routes.
    - `GET https://upload-hetzner.divine.video/thumbnail/<known-video-hash>` returns `200 image/jpeg`.
    - Direct `PUT /upload`, resumable `POST /upload/init` → `PUT`/`HEAD /sessions/:id` → `POST /upload/:id/complete`, and `DELETE /upload/:id` abort succeed and write to B2 + GCS.
    - An uploaded video completes HLS transcoding end-to-end via `TRANSCODER_URL`.
    - Requests larger than `16 MiB` are rejected by Caddy with `413`.
-   - `POST /transcribe` (with valid BUD-11 `t=media` auth and a short sample
-     audio clip) returns `200` with `text/vtt` WebVTT output (proving
-     `TRANSCRIBER_URL` → `POST /transcribe/audio` works end-to-end).
+   - `POST /transcribe` with a short sample audio clip and a valid BUD-11
+     kind-24242 `t=media` token carrying an `expiration` tag returns `200` with
+     `text/vtt` WebVTT output (proving `TRANSCRIBER_URL` →
+     `POST /transcribe/audio` works end-to-end). Because the minimum `#51`
+     `divine-upload-server` build only accepts `server` tag values of
+     `upload.divine.video` or `media.divine.video` (rejecting
+     `upload-hetzner.divine.video` with `401` before reaching
+     `/transcribe/audio`), either omit the `server` tag or scope it to
+     `upload.divine.video` / `media.divine.video` for this staging check (if
+     staging must accept candidate-scoped clients, add explicit candidate-host
+     support upstream in `divine-upload-server` and raise the pinned digest
+     floor).
    - `POST /migrate` routes through Caddy cleanly, while `POST /audit` returns
      `404` (only `CLOUD_RUN_HOST` handles `/audit`).
-6. Before cutover, record the current DNS records, ownership TXT records, and
-   TTL. Verify both upload instances share compatible object-backed session
-   storage (`ProviderSessionStore`) and can resume each other's sessions in both
-   directions (GKE → Hetzner and Hetzner → GKE). Confirm both submit to the
-   existing single transcoder writer. Exercise `HEAD`, browser preflights, and
-   slow bodies near the configured limit. Load test uploads, thumbnail misses,
-   and transcoding together. Measure `/tmp` tmpfs and memory usage, CPU
+6. Before cutover, record the current `A` and `AAAA` DNS records, ownership TXT
+   records, and TTLs. Verify both upload instances share compatible
+   object-backed session storage (`ProviderSessionStore`) and can resume each
+   other's sessions in both directions (GKE → Hetzner and Hetzner → GKE).
+   Confirm both submit to the existing single transcoder writer. Exercise
+   `HEAD`, browser preflights, and slow bodies near the configured limit. Load
+   test uploads, thumbnail misses, and transcoding together. Measure disk-backed
+   `/tmp` (`upload_tmp` volume) disk usage, container memory usage, CPU
    saturation, and transcode queue latency. Include both upload-generated and
    on-demand thumbnails in the budget.
 7. Execute production cutover only after resolving DNS ownership and verifying
@@ -316,40 +357,62 @@ sole writer.
       from ExternalDNS reconciliation across all serving and redirect
       `HTTPRoute` resources (e.g., via `excludeDomains` in ExternalDNS config)
       while keeping `spec.hostnames: ["upload.divine.video"]` and preserving the
-      live `A` record so GKE continues serving cached-DNS and rollback traffic;
-      verify ExternalDNS stops reconciling the record (or transfer DNS ownership
-      to an OpenTofu Cloudflare DNS stack), confirm no conflicting `AAAA` record
-      remains, and dry-run the matching rollback path before cutover.
+      live `A` (and any `AAAA`) record so GKE continues serving cached-DNS and
+      rollback traffic; verify ExternalDNS stops reconciling the record (or
+      transfer DNS ownership to an OpenTofu Cloudflare DNS stack), confirm no
+      conflicting `AAAA` record remains, and dry-run the matching rollback path
+      before cutover.
    2. **Stage production vhost & publicly trusted certificate on the worker before DNS flip:**
       Keep `conf.d/upload-candidate.caddy` active so in-flight resumable
       sessions issued on `upload-hetzner.divine.video` keep draining. Because
-      stock `caddy:2-alpine` does not bundle the Cloudflare DNS-01 plugin,
+      stock `caddy:2.11.9-alpine` does not bundle the Cloudflare DNS-01 plugin,
       obtain a **publicly trusted** certificate for `upload.divine.video` on the
       host via DNS-01 (for example `certbot certonly --dns-cloudflare` or
       `acme.sh --dns dns_cf` — do **not** use a Cloudflare Origin CA cert, which
-      fails direct TLS verification on DNS-only records). Copy regular files (not
-      symlinks, which break inside `./conf.d:/etc/caddy/conf.d:ro`) for the full
-      chain and private key to `/opt/divine-transcoder/conf.d/certs/upload.pem`
-      (`fullchain.pem`, including intermediates) and
-      `/opt/divine-transcoder/conf.d/certs/upload.key` (`privkey.pem`,
-      `install -m 600` so it is readable only by root/Caddy). Configure an
-      automated renewal hook that installs the renewed files and runs from
-      `/opt/divine-transcoder` (`certbot` `--deploy-hook` script below, or
-      `acme.sh --install-cert --fullchain-file /opt/divine-transcoder/conf.d/certs/upload.pem --key-file /opt/divine-transcoder/conf.d/certs/upload.key --reloadcmd "cd /opt/divine-transcoder && docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile && docker compose exec -T caddy caddy reload --force --config /etc/caddy/Caddyfile"`):
+      fails direct TLS verification on DNS-only records). Install regular files
+      (not symlinks pointing outside `./conf.d`, which break inside
+      `./conf.d:/etc/caddy/conf.d:ro`) for the full chain and private key to
+      `/opt/divine-transcoder/conf.d/certs/upload.pem` (`fullchain.pem`,
+      including intermediates) and
+      `/opt/divine-transcoder/conf.d/certs/upload.key` (`privkey.pem`, mode
+      `0600` so it is readable only by root/Caddy). Configure an automated
+      per-certificate renewal hook script (bound via `certbot --deploy-hook` or
+      an `acme.sh --reloadcmd` wrapper rather than direct in-place overwrites)
+      that stages both files under temporary names, verifies the cert and key
+      match before replacing the live pair, rolls back to the previous pair if
+      `caddy validate` fails (so a failed renewal can never leave a mismatched
+      pair on disk that breaks the next Caddy restart and takes down
+      `transcoder`), and force-reloads Caddy:
       ```sh
-      install -m 644 "$RENEWED_LINEAGE/fullchain.pem" /opt/divine-transcoder/conf.d/certs/upload.pem && \
-      install -m 600 "$RENEWED_LINEAGE/privkey.pem" /opt/divine-transcoder/conf.d/certs/upload.key && \
-      cd /opt/divine-transcoder && \
-      docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile && \
+      #!/bin/sh
+      set -eu
+      CERT_DIR=/opt/divine-transcoder/conf.d/certs
+      trap 'rm -f "$CERT_DIR/upload.pem.new" "$CERT_DIR/upload.key.new"' EXIT
+      install -m 644 "$RENEWED_LINEAGE/fullchain.pem" "$CERT_DIR/upload.pem.new"
+      install -m 600 "$RENEWED_LINEAGE/privkey.pem" "$CERT_DIR/upload.key.new"
+      test "$(openssl x509 -in "$CERT_DIR/upload.pem.new" -noout -pubkey)" = \
+           "$(openssl pkey -in "$CERT_DIR/upload.key.new" -pubout)"
+      cp -p "$CERT_DIR/upload.pem" "$CERT_DIR/upload.pem.prev" 2>/dev/null || true
+      cp -p "$CERT_DIR/upload.key" "$CERT_DIR/upload.key.prev" 2>/dev/null || true
+      mv -f "$CERT_DIR/upload.pem.new" "$CERT_DIR/upload.pem"
+      mv -f "$CERT_DIR/upload.key.new" "$CERT_DIR/upload.key"
+      cd /opt/divine-transcoder
+      if ! docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile; then
+        mv -f "$CERT_DIR/upload.pem.prev" "$CERT_DIR/upload.pem" 2>/dev/null || true
+        mv -f "$CERT_DIR/upload.key.prev" "$CERT_DIR/upload.key" 2>/dev/null || true
+        exit 1
+      fi
+      rm -f "$CERT_DIR/upload.pem.prev" "$CERT_DIR/upload.key.prev"
       docker compose exec -T caddy caddy reload --force --config /etc/caddy/Caddyfile
       ```
-      *(All three details are required: `cd /opt/divine-transcoder` — not
-      `--project-directory` alone — because `.env` sets relative `COMPOSE_FILE`
-      paths that Docker Compose resolves against the caller's cwd, which in
-      non-interactive `certbot`/`acme.sh` hooks defaults to `/` or the client's
-      home; `exec -T` because hooks have no TTY; and `caddy reload --force`
-      because plain `caddy reload` is a no-op when the Caddyfile text is
-      unchanged and would keep serving the old in-memory cert until expiry.)*
+      *(All three Compose/Caddy details are required: `cd /opt/divine-transcoder`
+      — not `--project-directory` alone — because `.env` sets relative
+      `COMPOSE_FILE` paths that Docker Compose resolves against the caller's
+      cwd, which in non-interactive `certbot`/`acme.sh` hooks defaults to `/` or
+      the client's home; `exec -T` because hooks have no TTY; and
+      `caddy reload --force` because plain `caddy reload` is a no-op when the
+      Caddyfile text is unchanged and would keep serving the old in-memory cert
+      until expiry.)*
       Next, copy `Caddyfile.upload.example` to `conf.d/upload.caddy` with
       literal site address `upload.divine.video` and
       `tls /etc/caddy/conf.d/certs/upload.pem /etc/caddy/conf.d/certs/upload.key`
@@ -366,14 +429,19 @@ sole writer.
       curl -fsS --resolve upload.divine.video:443:<worker-ip> https://upload.divine.video/
       ```
       Do not move DNS until this check succeeds.
-   4. **Switch `UPLOAD_BASE_URL`, drain safely, and re-verify health:** Update
-      `UPLOAD_BASE_URL=https://upload.divine.video` in `.env.upload` and
-      recreate `upload` cleanly (`docker compose up -d --no-deps --force-recreate upload`
-      — Compose honors `stop_grace_period: 330s` to let `divine-upload-server`'s
-      300s shutdown drain complete) so newly initialized sessions advertise the
-      production hostname. Avoid starting new candidate-hostname test uploads
-      between this step and step 7.5. Confirm `upload` is healthy and still
-      serves the production SNI check before flipping DNS:
+   4. **Switch `UPLOAD_BASE_URL`, drain safely, and re-verify health:** Confirm
+      no active candidate-host test uploads are running first — force-recreating
+      the single `upload` container stops it while draining
+      (`stop_grace_period: 330s`), which briefly takes
+      `upload-hetzner.divine.video` offline (`502`) until the new container
+      starts. Update `UPLOAD_BASE_URL=https://upload.divine.video` in
+      `.env.upload` and recreate `upload` cleanly
+      (`docker compose up -d --no-deps --force-recreate upload` — Compose honors
+      `stop_grace_period: 330s` to let `divine-upload-server`'s 300s shutdown
+      drain complete) so newly initialized sessions advertise the production
+      hostname. Avoid starting new candidate-hostname test uploads between this
+      step and step 7.5. Confirm `upload` is healthy and still serves the
+      production SNI check before flipping DNS:
       ```sh
       docker compose ps upload
       curl -fsS --resolve upload.divine.video:443:<worker-ip> https://upload.divine.video/
@@ -381,14 +449,16 @@ sole writer.
    5. **Flip production DNS via the chosen controller/owner and verify steady-state TLS:**
       Point the DNS-only (grey-cloud) `A` record for `upload.divine.video` to
       the worker IP (with matching or removed `AAAA`), wait for public DNS
-      propagation (`dig @1.1.1.1 +short A upload.divine.video`), and repeat the
-      smoke checks from step 5 (including the `POST /transcribe` WebVTT check)
+      propagation on both address families
+      (`dig @1.1.1.1 +short A upload.divine.video` and
+      `dig @1.1.1.1 +short AAAA upload.divine.video`), and repeat the smoke
+      checks from step 5 (including the `POST /transcribe` WebVTT check)
       against `https://upload.divine.video`. Keep the DNS-01 file certificate
       (`conf.d/certs/upload.pem` / `upload.key`) and `tls` directive in
       `conf.d/upload.caddy` active under the automated `certbot` / `acme.sh`
-      renewal hook installed in step 7.2 (which copies the renewed fullchain and
-      private key into `conf.d/certs/` and runs `caddy reload --force`) — do
-      **not** remove `tls` and reload
+      renewal hook installed in step 7.2 (which stages and validates the renewed
+      fullchain and private key into `conf.d/certs/` and runs
+      `caddy reload --force`) — do **not** remove `tls` and reload
       Caddy while Caddy's managed ACME storage is empty, because Caddy unloads
       the file certificate immediately and fails TLS SNI handshakes until a
       managed issuer certificate is obtained. Only transition to Caddy-managed
@@ -400,14 +470,19 @@ sole writer.
 
 ### Rollback
 
-Restore `upload.divine.video` `A` record to the GKE Gateway IP while
-`upload.divine.video` remains excluded from ExternalDNS (or through the
-chosen DNS controller / OpenTofu stack). Verify the GKE endpoint serves the
-production certificate and can resume sessions begun on Hetzner, and only then
-re-enable ExternalDNS management (`excludeDomains` removal) if returning DNS
-ownership to ExternalDNS. Keep `conf.d/upload.caddy` serving through DNS
-propagation and active-request drain (`stop_grace_period: 330s`), then remove
-`conf.d/upload.caddy` and `conf.d/certs/` and validate/reload Caddy:
+Restore **both** the recorded `A` and `AAAA` DNS records for
+`upload.divine.video` to their pre-cutover GKE Gateway state (removing any
+Hetzner `AAAA` record if GKE originally had no `AAAA`) while
+`upload.divine.video` remains excluded from ExternalDNS (or through the chosen
+DNS controller / OpenTofu stack). Verify public propagation on both address
+families (`dig @1.1.1.1 +short A upload.divine.video` and
+`dig @1.1.1.1 +short AAAA upload.divine.video`), confirm the GKE endpoint serves
+the production certificate (over IPv4 and, if restored, IPv6) and can resume
+sessions begun on Hetzner, and only then re-enable ExternalDNS management
+(`excludeDomains` removal) if returning DNS ownership to ExternalDNS. Keep
+`conf.d/upload.caddy` serving through DNS propagation and active-request drain
+(`stop_grace_period: 330s`), then remove `conf.d/upload.caddy` and
+`conf.d/certs/` and validate/reload Caddy:
 ```sh
 docker compose exec caddy caddy validate --config /etc/caddy/Caddyfile
 docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile
@@ -417,12 +492,21 @@ Resumable sessions issued on the candidate hostname (`UPLOAD_BASE_URL` =
 idle between chunks up to `RESUMABLE_SESSION_TTL_SECS` (`86400`s). Keep
 `conf.d/upload-candidate.caddy` and `upload` running until candidate-host
 sessions finish or reach their `86400`s expiry (or after confirming no active
-candidate sessions remain). Only then remove `conf.d/upload-candidate.caddy`,
-validate and reload Caddy
-(`docker compose exec caddy caddy validate --config /etc/caddy/Caddyfile && docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile`),
-stop and remove `upload` (`docker compose stop upload && docker compose rm -f upload`),
-and finally remove `COMPOSE_FILE` (and `UPLOAD_DOMAIN`, if set) from `.env`
-(so empty `UPLOAD_DOMAIN` cannot fail Caddy config parsing and `upload` is not
-left behind as an orphan container). Remember that editing `.env` still changes
-`transcoder`'s Compose hash; avoid broad `docker compose up -d` until
-`transcoder` is intentionally drained.
+candidate sessions remain). Only then:
+1. Remove `conf.d/upload-candidate.caddy`, validate and reload Caddy
+   (`docker compose exec caddy caddy validate --config /etc/caddy/Caddyfile && docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile`).
+2. Stop and remove `upload` (`docker compose stop upload && docker compose rm -f upload`) and remove its scratch volume listed by `docker volume ls --filter name=upload_tmp` (e.g., `docker volume rm divine-transcoder_upload_tmp`).
+3. Remove the `certbot` (`certbot delete --cert-name upload.divine.video`) or
+   `acme.sh` (`acme.sh --remove -d upload.divine.video`) certificate lineage,
+   its deploy hook script, and its Cloudflare DNS-01 credential file if no other
+   certificate uses it (so scheduled renewals do not keep failing against the
+   deleted `conf.d/certs/` directory).
+4. Delete `/etc/divine-upload/gcp-sa.json` and revoke that service-account key
+   in GCP IAM (and remove/revoke `/etc/divine-upload/ar-pull-key.json` and run
+   `docker logout https://us-central1-docker.pkg.dev` if no other service on the
+   host pulls from Artifact Registry).
+5. Remove `/opt/divine-transcoder/.env.upload`, and remove `COMPOSE_FILE` and
+   `UPLOAD_IMAGE` (plus `UPLOAD_DOMAIN`, if set) from `/opt/divine-transcoder/.env`
+   so `upload` is not left behind or restarted on reboot. Remember that editing
+   `.env` still changes `transcoder`'s Compose hash; avoid broad
+   `docker compose up -d` until `transcoder` is intentionally drained.
