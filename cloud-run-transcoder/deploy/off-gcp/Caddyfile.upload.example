@@ -1,0 +1,72 @@
+# Template for co-located divine-upload-server site blocks under conf.d/:
+# - Staging: copy to conf.d/upload-candidate.caddy and replace {$UPLOAD_DOMAIN}
+#   with the literal candidate hostname (e.g. upload-hetzner.divine.video).
+# - Production cutover: copy to conf.d/upload.caddy and replace {$UPLOAD_DOMAIN}
+#   with literal upload.divine.video, stage an externally renewed DNS-01 cert
+#   under conf.d/certs/ with an atomic Caddy validate + reload --force hook, and
+#   keep conf.d/upload-candidate.caddy active until candidate sessions drain.
+# Always replace {$UPLOAD_DOMAIN} with a literal hostname (do not set
+# UPLOAD_DOMAIN in .env): Caddy reads env vars only at container creation, and
+# editing .env changes transcoder's Compose config hash.
+{$UPLOAD_DOMAIN} {
+	# Public surface parity with GKE HTTPRoute for callers on UPLOAD_SERVICE_HOST:
+	# - /transcribe enforces BUD-11 Nostr auth in divine-upload-server before
+	#   injecting TRANSCRIBE_SHARED_SECRET upstream to transcoder.
+	# - /migrate preserves Fastly PUT /mirror parity (guarded in-app by
+	#   acquire_mirror() and HTTPS host allowlist; no Nostr auth in-app).
+	# - /audit is intentionally blocked (404) because divine-blossom posts /audit
+	#   only to CLOUD_RUN_HOST, and /metrics stays on container-internal port 9090.
+	@public_upload <<CEL
+		(method('PUT', 'OPTIONS') && path('/upload', '/'))
+		|| (method('GET', 'HEAD') && path('/'))
+		|| (method('POST', 'OPTIONS') && path('/upload/init', '/transcribe', '/migrate'))
+		|| (method('POST', 'OPTIONS') && path_regexp('^/upload/[^/]+/complete$'))
+		|| (method('DELETE', 'OPTIONS') && path_regexp('^/upload/[^/]+$'))
+		|| (method('PUT', 'HEAD', 'OPTIONS') && path_regexp('^/sessions/[^/]+$'))
+		|| (method('GET', 'HEAD', 'OPTIONS') && path_regexp('^/thumbnail/[^/]+$'))
+		CEL
+
+	# Preserve browser-visible CORS on Caddy-generated 413 responses when
+	# request_body max_size rejects an upload before upload-proxy sees it.
+	handle_errors 413 {
+		header Access-Control-Allow-Origin "*"
+		header Access-Control-Allow-Methods "GET, HEAD, PUT, POST, DELETE, OPTIONS"
+		header Content-Type "text/plain"
+		respond "Payload Too Large" 413
+	}
+
+	# Wrap proxy and fallback in handle blocks so respond 404 never shadows
+	# reverse_proxy under Caddy 2's built-in directive order.
+	handle @public_upload {
+		# Match GKE HTTPRoute's 16 MiB upload-body-size filter for direct uploads
+		# and resumable chunks (resumable completion and /migrate still spool whole
+		# objects up to MAX_UPLOAD_BYTES on disk-backed /tmp).
+		request_body {
+			max_size 16MiB
+		}
+		reverse_proxy upload-proxy:8081 {
+			# Stream request bodies directly to isolated upload-proxy (nginx on
+			# upload_edge), which rejects unexpected bodies on GET/HEAD/OPTIONS/DELETE
+			# before buffering (413) and enforces an aggregate limit_conn cap of 64
+			# concurrent body-eligible requests across body buffering and upstream
+			# response wait (returning CORS-enabled 429 before body allocation, with
+			# no per-IP cap so Fastly POP egress IPs are not throttled) while buffering
+			# <=16 MiB bodies on bounded scratch disk (128 KiB RAM buffer) ahead
+			# of upload:8080. This keeps slow or flooding upload clients out of
+			# shared Caddy memory so transcoder-worker stays isolated.
+			# Flush response headers/chunks immediately for thumbnail and upload responses.
+			flush_interval -1
+			transport http {
+				dial_timeout 10s
+				response_header_timeout 310s
+				# Close idle connections to upload-proxy before nginx's 130s
+				# keepalive_timeout to avoid half-closed PUT/POST retries.
+				keepalive 60s
+			}
+		}
+	}
+
+	handle {
+		respond 404
+	}
+}

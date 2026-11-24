@@ -1,0 +1,110 @@
+# ABOUTME: Optional Docker Compose overlay for co-locating divine-upload-server on an off-GCP worker host
+# ABOUTME: Enable via COMPOSE_FILE=docker-compose.yml:docker-compose.upload.yml and conf.d/upload.caddy
+
+services:
+  caddy:
+    # Shared Caddy streams upload bodies directly to isolated upload-proxy
+    # without buffering bodies in Caddy RAM; mem_limit and GOMEMLIMIT bound
+    # connection overhead so Go GC tightens before hitting the cgroup ceiling.
+    mem_limit: ${CADDY_MEM_LIMIT:-2g}
+    environment:
+      GOMEMLIMIT: ${CADDY_GOMEMLIMIT:-1600MiB}
+    # Attach Caddy to upload_edge alongside default without adding depends_on
+    # so upload failures can never block transcoder ingress startup.
+    networks:
+      - default
+      - upload_edge
+
+  upload-proxy:
+    image: nginx:1.30.8-alpine
+    user: "101:101"
+    restart: unless-stopped
+    # Match upload's 300s graceful drain window (nginx stops gracefully on SIGQUIT).
+    stop_grace_period: 330s
+    command:
+      - /bin/sh
+      - -ec
+      - "if [ ! -f /tmp/.divine-upload-scratch ]; then echo 'ERROR: /tmp/.divine-upload-scratch missing; refusing to start upload-proxy on unverified scratch mount' >&2; exit 1; fi; rm -rf /tmp/body /tmp/proxy /tmp/fastcgi /tmp/uwsgi /tmp/scgi /tmp/nginx.pid || echo 'proxy tmp sweep incomplete' >&2; exec nginx -c /etc/nginx/nginx.conf -g 'daemon off;'"
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    cpus: "${UPLOAD_PROXY_CPUS:-1.0}"
+    mem_limit: ${UPLOAD_PROXY_MEM_LIMIT:-512m}
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    volumes:
+      - ./nginx.upload-proxy.conf:/etc/nginx/nginx.conf:ro
+      - type: bind
+        source: ${UPLOAD_PROXY_TMP_DIR:-/var/lib/divine-upload/scratch/proxy-tmp}
+        target: /tmp
+        bind:
+          create_host_path: false
+    networks:
+      - upload_edge
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  upload:
+    image: ${UPLOAD_IMAGE:?Set UPLOAD_IMAGE, e.g. us-central1-docker.pkg.dev/dv-platform-prod/containers-production/divine-upload-server@sha256:...}
+    restart: unless-stopped
+    # Match divine-upload-server's 300s graceful shutdown drain window (GKE uses 330s).
+    stop_grace_period: 330s
+    # Verify the bounded scratch sentinel marker and sweep only orphaned .tmp*
+    # spools before handing PID 1 to the pinned image's CMD binary (warn rather
+    # than crash-looping if an entry cannot be removed).
+    command:
+      - /bin/sh
+      - -ec
+      - "if [ ! -f /tmp/.divine-upload-scratch ]; then echo 'ERROR: /tmp/.divine-upload-scratch missing; refusing to start upload on unverified scratch mount' >&2; exit 1; fi; find /tmp -mindepth 1 -maxdepth 1 -name '.tmp*' -exec rm -rf -- {} + || echo 'tmp sweep incomplete' >&2; exec /app/divine-upload-server"
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    cpus: "${UPLOAD_CPUS:-6.0}"
+    mem_limit: ${UPLOAD_MEM_LIMIT:-6g}
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    env_file:
+      - ${UPLOAD_ENV_FILE:-.env.upload}
+    environment:
+      PORT: "8080"
+      METRICS_PORT: "9090"
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gcp-sa.json
+    volumes:
+      - ${UPLOAD_GCP_SA_KEY_PATH:-/etc/divine-upload/gcp-sa.json}:/run/secrets/gcp-sa.json:ro
+      # Mount a host-provisioned bounded disk filesystem (e.g. a dedicated LV or
+      # preallocated loopback ext4 image at /var/lib/divine-upload/scratch with
+      # an inner tmp/ directory) so concurrent 1 GiB resumable completions and
+      # /migrate spools never consume mem_limit RAM or fill the worker root disk.
+      # Create scratch/tmp only after verifying the scratch mount is active, and
+      # check `mountpoint -q /var/lib/divine-upload/scratch` before starting
+      # upload (`create_host_path: false` only fails if the directory is absent).
+      - type: bind
+        source: ${UPLOAD_TMP_DIR:-/var/lib/divine-upload/scratch/tmp}
+        target: /tmp
+        bind:
+          create_host_path: false
+    # Isolate upload from the default network so it cannot bypass Caddy to reach
+    # transcoder:8080 directly.
+    networks:
+      - upload_edge
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+networks:
+  upload_edge:

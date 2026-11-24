@@ -66,3 +66,9 @@ __pycache__/
 # Local storage credentials (never commit)
 .fastly-fos-objects-key.json
 .gcs-hmac-mirror.json
+
+# Off-GCP deployment secrets and local configs (never commit)
+cloud-run-transcoder/deploy/off-gcp/.env
+cloud-run-transcoder/deploy/off-gcp/.env.upload
+cloud-run-transcoder/deploy/off-gcp/conf.d/*.caddy
+cloud-run-transcoder/deploy/off-gcp/conf.d/certs/

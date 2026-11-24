@@ -3,7 +3,7 @@
 
 services:
   caddy:
-    image: caddy:2-alpine
+    image: caddy:2.11.9-alpine
     restart: unless-stopped
     ports:
       - "80:80"
@@ -14,6 +14,7 @@ services:
       TRANSCODE_ADMISSION_SECRET: ${TRANSCODE_ADMISSION_SECRET-}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./conf.d:/etc/caddy/conf.d:ro
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
