@@ -5,7 +5,12 @@
 set -euo pipefail
 
 MEDIA_URL="${MEDIA_URL:-https://media.divine.video}"
-UPLOAD_URL="${UPLOAD_URL:-https://blossom-upload-rust-149672065768.us-central1.run.app}"
+DEFAULT_UPLOAD_URL="https://blossom-upload-rust-149672065768.us-central1.run.app"
+UPLOAD_URL="${UPLOAD_URL:-$DEFAULT_UPLOAD_URL}"
+UPLOAD_URL="${UPLOAD_URL%/}"
+ALLOW_NON_DEFAULT_UPLOAD_URL="${ALLOW_NON_DEFAULT_UPLOAD_URL:-false}"
+# Token the upload service can require on /thumbnail (divine-upload-server#52).
+THUMBNAIL_SERVICE_TOKEN="$(printf '%s' "${THUMBNAIL_SERVICE_TOKEN:-}" | tr -d '[:space:]')"
 BUCKET="${BUCKET:-divine-blossom-media}"
 WAIT_FOR_TRANSCRIPT="${WAIT_FOR_TRANSCRIPT:-false}"
 DELETE_VTT_FIRST="${DELETE_VTT_FIRST:-false}"
@@ -35,6 +40,8 @@ Options:
 Env:
   MEDIA_URL                Public Blossom base URL
   UPLOAD_URL               Cloud Run upload service base URL
+  ALLOW_NON_DEFAULT_UPLOAD_URL true/false; allow non-default HTTPS upload host (or local loopback HTTP)
+  THUMBNAIL_SERVICE_TOKEN  Upload service thumbnail token, sent on /thumbnail when set
   BUCKET                   GCS bucket containing blobs
   WAIT_FOR_TRANSCRIPT      true/false
   DELETE_VTT_FIRST         true/false
@@ -198,14 +205,131 @@ force_retranscribe() {
     fi
 }
 
+validate_upload_url() {
+    local has_token="false"
+    if [[ -n "$THUMBNAIL_SERVICE_TOKEN" ]]; then
+        has_token="true"
+    fi
+    python3 - "$UPLOAD_URL" "$DEFAULT_UPLOAD_URL" "$ALLOW_NON_DEFAULT_UPLOAD_URL" "$has_token" <<'PY'
+import sys
+from urllib import parse
+
+url, default_url, allow_non_default, has_token = (
+    sys.argv[1].rstrip("/"),
+    sys.argv[2].rstrip("/"),
+    sys.argv[3] == "true",
+    sys.argv[4] == "true",
+)
+parsed = parse.urlsplit(url)
+local = parsed.hostname in {"127.0.0.1", "::1", "localhost"}
+scheme_ok = parsed.scheme == "https" or (
+    parsed.scheme == "http" and local and allow_non_default
+)
+if (
+    not scheme_ok
+    or not parsed.hostname
+    or parsed.username is not None
+    or parsed.password is not None
+    or parsed.query
+    or parsed.fragment
+    or parsed.path not in ("", "/")
+):
+    print(
+        "ERROR: UPLOAD_URL must be a bare HTTPS origin (local HTTP requires ALLOW_NON_DEFAULT_UPLOAD_URL=true)",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+if has_token and url != default_url and not allow_non_default:
+    host = parsed.netloc or url
+    print(
+        f"ERROR: refusing to send THUMBNAIL_SERVICE_TOKEN to non-default upload host {host} without ALLOW_NON_DEFAULT_UPLOAD_URL=true",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+}
+
+preflight_thumbnail_auth() {
+    local hdr_file status auth_kind
+    hdr_file="$(mktemp)"
+    if [[ -n "$THUMBNAIL_SERVICE_TOKEN" ]]; then
+        # Headers on stdin keep the token out of the process list; omit -L so redirects fail closed.
+        if ! status="$(printf 'X-Divine-Thumbnail-Token: %s\n' "$THUMBNAIL_SERVICE_TOKEN" |
+            curl -sS -D "$hdr_file" -H @- -o /dev/null -w '%{http_code}' "${UPLOAD_URL}/thumbnail/auth-check")"; then
+            rm -f "$hdr_file"
+            echo "ERROR: upload service /thumbnail preflight request failed; aborting before deleting thumbnails" >&2
+            exit 1
+        fi
+    else
+        if ! status="$(curl -sS -D "$hdr_file" -o /dev/null -w '%{http_code}' "${UPLOAD_URL}/thumbnail/auth-check")"; then
+            rm -f "$hdr_file"
+            echo "ERROR: upload service /thumbnail preflight request failed; aborting before deleting thumbnails" >&2
+            exit 1
+        fi
+    fi
+
+    auth_kind="$(python3 - "$hdr_file" <<'PY'
+import sys
+
+values = []
+with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as handle:
+    for line in handle:
+        if ":" not in line:
+            continue
+        name, val = line.split(":", 1)
+        if name.strip().lower() == "x-divine-thumbnail-auth":
+            values.append(val.strip())
+
+if not values:
+    print("missing")
+elif len(values) > 1 or values[0] not in ("verified", "open"):
+    print("unexpected")
+else:
+    print(values[0])
+PY
+)"
+    rm -f "$hdr_file"
+
+    if [[ -n "$THUMBNAIL_SERVICE_TOKEN" ]]; then
+        if [[ "$status" == "204" && "$auth_kind" == "verified" ]]; then
+            return 0
+        fi
+        echo "ERROR: upload service /thumbnail preflight failed before deleting thumbnails (HTTP ${status}, x-divine-thumbnail-auth=${auth_kind}; expected 204 verified)" >&2
+        exit 1
+    fi
+
+    if [[ "$status" == "204" && "$auth_kind" == "open" ]]; then
+        return 0
+    fi
+    echo "ERROR: upload service /thumbnail preflight failed before deleting thumbnails (HTTP ${status}, x-divine-thumbnail-auth=${auth_kind}; expected 204 open)" >&2
+    exit 1
+}
+
 regenerate_thumbnail() {
     local hash="$1"
 
     gsutil -q rm "gs://${BUCKET}/${hash}.jpg" 2>/dev/null || true
-    curl -fsS -o /dev/null "${UPLOAD_URL}/thumbnail/${hash}"
+    if [[ -n "$THUMBNAIL_SERVICE_TOKEN" ]]; then
+        # Headers on stdin keep the token out of the process list.
+        printf 'X-Divine-Thumbnail-Token: %s\n' "$THUMBNAIL_SERVICE_TOKEN" |
+            curl -fsS -H @- -o /dev/null "${UPLOAD_URL}/thumbnail/${hash}"
+    else
+        curl -fsS -o /dev/null "${UPLOAD_URL}/thumbnail/${hash}"
+    fi
     curl -fsS -H "Cache-Control: no-cache" -o /dev/null "${MEDIA_URL}/${hash}.jpg"
     echo "  thumbnail regenerated"
 }
+
+if [[ "$repair_thumbnail" == "true" ]]; then
+    validate_upload_url
+    if [[ -z "$THUMBNAIL_SERVICE_TOKEN" ]]; then
+        echo "WARNING: THUMBNAIL_SERVICE_TOKEN is not set; once the upload service requires it, thumbnail regeneration fails with 404" >&2
+    elif [[ "${UPLOAD_URL%/}" != "$DEFAULT_UPLOAD_URL" ]]; then
+        upload_host="${UPLOAD_URL#*://}"
+        echo "WARNING: sending THUMBNAIL_SERVICE_TOKEN to a non-default upload host: ${upload_host%%/*}" >&2
+    fi
+    preflight_thumbnail_auth
+fi
 
 echo "Repair target count: ${#hashes[@]}"
 echo "Transcript repair: ${repair_transcript}"

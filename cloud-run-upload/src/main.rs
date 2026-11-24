@@ -1,12 +1,13 @@
 // ABOUTME: Rust Cloud Run service for Blossom blob uploads
 // ABOUTME: Handles Nostr auth validation, streaming upload to GCS, and SHA-256 hashing
 
-mod cleanup;
 mod bunny_worker;
+mod cleanup;
 mod mp4;
 mod resumable;
 mod tasks;
 mod thumbnail;
+mod thumbnail_auth;
 
 use anyhow::{anyhow, Result};
 use axum::{
@@ -64,11 +65,13 @@ struct Config {
     /// Cloud Tasks queue for transcode jobs. `None` leaves transcoding on the
     /// direct-dispatch path, so the service runs before the queue is created.
     transcode_queue: Option<tasks::TaskQueueConfig>,
+    /// Who may call `/thumbnail/<hash>`; see `thumbnail_auth`.
+    thumbnail_auth: thumbnail_auth::Policy,
 }
 
 impl Config {
-    fn from_env() -> Self {
-        Self {
+    fn from_env() -> Result<Self> {
+        Ok(Self {
             gcs_bucket: env::var("GCS_BUCKET")
                 .unwrap_or_else(|_| "divine-blossom-media".to_string()),
             cdn_base_url: env::var("CDN_BASE_URL")
@@ -96,7 +99,8 @@ impl Config {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(resumable::DEFAULT_RESUMABLE_CHUNK_SIZE),
-        }
+            thumbnail_auth: thumbnail_auth::Policy::from_env()?,
+        })
     }
 }
 
@@ -336,27 +340,7 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let _sentry_guard = init_sentry("divine-upload");
-
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("blossom_upload=info".parse()?),
-        )
-        .init();
-
-    let config = Config::from_env();
-    let port = config.port;
-
-    // Initialize GCS client
-    let gcs_config = ClientConfig::default().with_auth().await?;
-    let gcs_client = GcsClient::new(gcs_config);
-
-    let state = Arc::new(AppState { gcs_client, config });
-
+fn build_router(state: Arc<AppState>) -> Router {
     // CORS configuration
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -382,8 +366,7 @@ async fn main() -> Result<()> {
         ])
         .max_age(std::time::Duration::from_secs(86400));
 
-    // Build router
-    let app = Router::new()
+    Router::new()
         .route("/upload", put(handle_upload))
         .route("/upload", options(handle_cors_preflight))
         .route("/upload/init", post(handle_resumable_init))
@@ -411,12 +394,45 @@ async fn main() -> Result<()> {
         .route("/internal/bunny-pilot/v1", post(bunny_worker::handle))
         .route("/probe-delivery", post(handle_probe_delivery))
         .route("/delete-blob/health", get(handle_delete_blob_health))
+        .route("/thumbnail/auth-check", get(handle_thumbnail_auth_check))
         .route("/thumbnail/:hash", get(handle_thumbnail_generate))
         .route("/thumbnail/:hash", options(handle_cors_preflight))
         .route("/", put(handle_upload))
         .route("/", options(handle_cors_preflight))
         .layer(cors)
-        .with_state(state);
+        .with_state(state)
+}
+
+pub(crate) fn build_tracing_filter(
+    rust_log: Option<&str>,
+) -> Result<tracing_subscriber::EnvFilter> {
+    let base = tracing_subscriber::EnvFilter::new(rust_log.unwrap_or(""));
+    Ok(base.add_directive("blossom_upload=info".parse()?))
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let _sentry_guard = init_sentry("divine-upload");
+
+    // Initialize tracing
+    tracing_subscriber::fmt()
+        .with_env_filter(build_tracing_filter(env::var("RUST_LOG").ok().as_deref())?)
+        .init();
+
+    let config = Config::from_env()?;
+    let port = config.port;
+    match config.thumbnail_auth {
+        thumbnail_auth::Policy::Required(_) => info!("{}", config.thumbnail_auth.startup_message()),
+        _ => warn!("{}", config.thumbnail_auth.startup_message()),
+    }
+
+    // Initialize GCS client
+    let gcs_config = ClientConfig::default().with_auth().await?;
+    let gcs_client = GcsClient::new(gcs_config);
+
+    let state = Arc::new(AppState { gcs_client, config });
+
+    let app = build_router(state);
 
     let addr = format!("0.0.0.0:{}", port);
     info!("Starting HTTP/2 server on {}", addr);
@@ -1591,13 +1607,89 @@ static THUMBNAIL_IN_FLIGHT: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
 static THUMBNAIL_NEGATIVE_CACHE: LazyLock<Mutex<HashMap<String, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+fn attach_thumbnail_cache_headers(response: &mut Response) {
+    // Once a token decides who gets a thumbnail (or on `/thumbnail/auth-check`),
+    // no shared cache may store any answer from this route (issue divine-upload-server#52).
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    headers.append(
+        header::VARY,
+        HeaderValue::from_static(thumbnail_auth::HEADER),
+    );
+}
+
+/// Non-destructive credential check for repair and backfill scripts before they
+/// delete stored JPEGs. Distinguishes open mode vs a verified token without
+/// touching storage or emitting `/thumbnail/:hash` rollout logs.
+async fn handle_thumbnail_auth_check(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    let mut response = match &state.config.thumbnail_auth {
+        thumbnail_auth::Policy::Open => (
+            StatusCode::NO_CONTENT,
+            [(thumbnail_auth::AUTH_STATUS_HEADER, "open")],
+        )
+            .into_response(),
+        thumbnail_auth::Policy::Observe(_) | thumbnail_auth::Policy::Required(_) => {
+            if state.config.thumbnail_auth.verify_presented_token(&headers) {
+                (
+                    StatusCode::NO_CONTENT,
+                    [(thumbnail_auth::AUTH_STATUS_HEADER, "verified")],
+                )
+                    .into_response()
+            } else {
+                thumbnail_not_found()
+            }
+        }
+    };
+    attach_thumbnail_cache_headers(&mut response);
+    response
+}
+
 /// On-demand thumbnail generation endpoint.
 ///
 /// Downloads video from GCS, generates thumbnail, stores it, returns the image.
 async fn handle_thumbnail_generate(
     State(state): State<Arc<AppState>>,
     Path(hash): Path<String>,
-) -> impl IntoResponse {
+    headers: HeaderMap,
+) -> Response {
+    let guarded = !matches!(state.config.thumbnail_auth, thumbnail_auth::Policy::Open);
+    let mut response = thumbnail_response(state, hash, headers).await;
+    if guarded {
+        attach_thumbnail_cache_headers(&mut response);
+    }
+    response
+}
+
+/// 404 for a thumbnail whose video can't be found. A request refused for a
+/// missing service token gets this same response, so a refusal reveals nothing.
+fn thumbnail_not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        [(header::CONTENT_TYPE, "application/json")],
+        Json(ErrorResponse {
+            error: "Video not found".to_string(),
+        })
+        .into_response(),
+    )
+        .into_response()
+}
+
+async fn thumbnail_response(state: Arc<AppState>, hash: String, headers: HeaderMap) -> Response {
+    // Blossom decides who may see a thumbnail before it calls this route, so
+    // only the caller holding its service token should reach storage. Check
+    // first: a refused caller gets the missing-video 404 before any storage I/O.
+    let decision = state.config.thumbnail_auth.decide(&headers);
+    thumbnail_auth::log_decision(&state.config.thumbnail_auth, &decision, &headers);
+    if matches!(decision, thumbnail_auth::Decision::Reject(_)) {
+        return thumbnail_not_found();
+    }
+
     // Validate hash format (64 hex characters)
     if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
         return (
@@ -1661,15 +1753,7 @@ async fn generate_thumbnail_response(state: Arc<AppState>, hash: String) -> Resp
         Err(e) => {
             error!("Failed to download video {}: {}", hash, e);
             finish_thumbnail_generation(&hash, &generation_lock).await;
-            return (
-                StatusCode::NOT_FOUND,
-                [(header::CONTENT_TYPE, "application/json")],
-                Json(ErrorResponse {
-                    error: "Video not found".to_string(),
-                })
-                .into_response(),
-            )
-                .into_response();
+            return thumbnail_not_found();
         }
     };
 
@@ -3352,6 +3436,9 @@ fn decode_nsec(nsec: &str) -> Result<[u8; 32]> {
 
 #[cfg(test)]
 mod upload_policy_tests;
+
+#[cfg(test)]
+mod thumbnail_token_tests;
 
 #[cfg(test)]
 mod thumbnail_busy_tests {

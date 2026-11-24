@@ -80,6 +80,9 @@ language = "rust"
         [local_server.secret_stores.blossom_secrets.contents.moderation_api_token]
         plaintext = "YOUR_MODERATION_API_BEARER_TOKEN"
 
+        [local_server.secret_stores.blossom_secrets.contents.thumbnail_service_token]
+        plaintext = "YOUR_THUMBNAIL_SERVICE_TOKEN"
+
         [local_server.secret_stores.blossom_secrets.contents.b2_vanish_application_key_id]
         plaintext = "YOUR_BUCKET_SCOPED_B2_KEY_ID"
 

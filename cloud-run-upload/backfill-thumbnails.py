@@ -3,6 +3,7 @@
 
 import argparse
 import concurrent.futures
+import os
 import subprocess
 import sys
 import threading
@@ -19,7 +20,11 @@ DEFAULT_MEDIA_URL = "https://media.divine.video"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Backfill thumbnails by deleting the stored JPEG, regenerating it, and revalidating the CDN URL."
+        description=(
+            "Backfill thumbnails by deleting the stored JPEG, regenerating it, "
+            "and revalidating the CDN URL. Only run against a stable deployment "
+            "(never during a token rollout flip, token rotation, or mixed-replica rollout)."
+        )
     )
     parser.add_argument(
         "hashes",
@@ -70,6 +75,11 @@ def parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="Validate input and print planned count without changing anything.",
+    )
+    parser.add_argument(
+        "--allow-non-default-upload-url",
+        action="store_true",
+        help="Allow sending THUMBNAIL_SERVICE_TOKEN to a non-default HTTPS upload host (or local loopback HTTP).",
     )
     return parser.parse_args()
 
@@ -126,23 +136,34 @@ TOKEN_MANAGER = TokenManager()
 THREAD_LOCAL = threading.local()
 
 
-def get_opener():
-    opener = getattr(THREAD_LOCAL, "opener", None)
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def get_opener(*, follow_redirects: bool = True):
+    attr = "opener" if follow_redirects else "no_redirect_opener"
+    opener = getattr(THREAD_LOCAL, attr, None)
     if opener is None:
-        opener = urllib.request.build_opener()
-        THREAD_LOCAL.opener = opener
+        opener = (
+            urllib.request.build_opener()
+            if follow_redirects
+            else urllib.request.build_opener(NoRedirect())
+        )
+        setattr(THREAD_LOCAL, attr, opener)
     return opener
 
 
-def request(
+def request_with_headers(
     url: str,
     *,
     method: str = "GET",
     headers: dict[str, str] | None = None,
     timeout: int = 60,
     auth: bool = False,
-) -> int:
-    opener = get_opener()
+    follow_redirects: bool = True,
+) -> tuple[int, dict[str, str]]:
+    opener = get_opener(follow_redirects=follow_redirects)
     final_headers = dict(headers or {})
 
     for attempt in range(2):
@@ -153,13 +174,152 @@ def request(
         req = urllib.request.Request(url, method=method, headers=final_headers)
         try:
             with opener.open(req, timeout=timeout) as resp:
-                return resp.status
+                resp_headers = {
+                    key.lower(): value.strip() for key, value in resp.headers.items()
+                }
+                return resp.status, resp_headers
         except urllib.error.HTTPError as exc:
-            if auth and exc.code in (401, 403) and attempt == 0:
-                continue
-            return exc.code
+            try:
+                if auth and exc.code in (401, 403) and attempt == 0:
+                    continue
+                resp_headers = (
+                    {key.lower(): value.strip() for key, value in exc.headers.items()}
+                    if exc.headers is not None
+                    else {}
+                )
+                return exc.code, resp_headers
+            finally:
+                exc.close()
 
-    return 599
+    return 599, {}
+
+
+def request(
+    url: str,
+    *,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    timeout: int = 60,
+    auth: bool = False,
+    follow_redirects: bool = True,
+) -> int:
+    status, _ = request_with_headers(
+        url,
+        method=method,
+        headers=headers,
+        timeout=timeout,
+        auth=auth,
+        follow_redirects=follow_redirects,
+    )
+    return status
+
+
+AUTH_STATUS_HEADER = "x-divine-thumbnail-auth"
+
+
+def _classify_auth_header(raw_value: str | None) -> str:
+    """Classify the auth marker without echoing raw unrecognized header values."""
+    if not raw_value:
+        return "missing"
+    if raw_value in ("verified", "open"):
+        return raw_value
+    return "unexpected"
+
+
+def thumbnail_service_headers() -> dict[str, str]:
+    """The upload service's thumbnail token, which it can require on /thumbnail."""
+    token = os.environ.get("THUMBNAIL_SERVICE_TOKEN", "").strip()
+    return {"X-Divine-Thumbnail-Token": token} if token else {}
+
+
+def validate_upload_url(
+    upload_url: str, *, allow_non_default: bool, has_token: bool
+) -> str:
+    """Validate upload_url before sending credentials or deleting thumbnails."""
+    normalized = upload_url.strip().rstrip("/")
+    parsed = urllib.parse.urlsplit(normalized)
+    local = parsed.hostname in {"127.0.0.1", "::1", "localhost"}
+    scheme_ok = parsed.scheme == "https" or (
+        parsed.scheme == "http" and local and allow_non_default
+    )
+    if (
+        not scheme_ok
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in ("", "/")
+    ):
+        raise ValueError(
+            "upload_url must be a bare HTTPS origin (local HTTP allowed only with --allow-non-default-upload-url)"
+        )
+    if has_token and normalized != DEFAULT_UPLOAD_URL and not allow_non_default:
+        host = parsed.netloc or normalized
+        raise ValueError(
+            f"Refusing to send THUMBNAIL_SERVICE_TOKEN to non-default upload host {host} "
+            "without --allow-non-default-upload-url"
+        )
+    return normalized
+
+
+def thumbnail_token_warnings(upload_url: str) -> list[str]:
+    """Operator warnings about the /thumbnail service token for this run."""
+    if not os.environ.get("THUMBNAIL_SERVICE_TOKEN", "").strip():
+        return [
+            "warning: THUMBNAIL_SERVICE_TOKEN is not set; once the upload service "
+            "requires it, every regeneration fails as regenerate:404"
+        ]
+    if upload_url.rstrip("/") != DEFAULT_UPLOAD_URL:
+        host = urllib.parse.urlparse(upload_url).netloc or upload_url
+        return [f"warning: sending THUMBNAIL_SERVICE_TOKEN to a non-default upload host: {host}"]
+    return []
+
+
+def preflight_thumbnail_auth(upload_url: str) -> None:
+    """Confirm /thumbnail/auth-check positively verifies access before deleting any JPEGs."""
+    headers = thumbnail_service_headers()
+    try:
+        status, resp_headers = request_with_headers(
+            f"{upload_url.rstrip('/')}/thumbnail/auth-check",
+            headers=headers,
+            follow_redirects=False,
+        )
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"Upload service /thumbnail preflight failed ({exc.reason}); aborting before deleting thumbnails"
+        ) from exc
+
+    auth_kind = _classify_auth_header(resp_headers.get(AUTH_STATUS_HEADER))
+    if headers:
+        if status == 204 and auth_kind == "verified":
+            return
+        if status == 204 and auth_kind == "open":
+            raise RuntimeError(
+                "Upload service /thumbnail preflight reported open mode while THUMBNAIL_SERVICE_TOKEN is set; "
+                "wait for a stable deployment or unset the token before deleting thumbnails"
+            )
+        if status == 404:
+            raise RuntimeError(
+                "Upload service /thumbnail preflight returned HTTP 404; "
+                "check THUMBNAIL_SERVICE_TOKEN before deleting thumbnails"
+            )
+        raise RuntimeError(
+            f"Upload service /thumbnail preflight failed before deleting thumbnails "
+            f"(HTTP {status}, {AUTH_STATUS_HEADER}={auth_kind}; expected 204 verified)"
+        )
+
+    if status == 204 and auth_kind == "open":
+        return
+    if status == 404:
+        raise RuntimeError(
+            "Upload service /thumbnail preflight returned HTTP 404; "
+            "target server has THUMBNAIL_SERVICE_TOKEN configured (set it before deleting thumbnails)"
+        )
+    raise RuntimeError(
+        f"Upload service /thumbnail preflight failed before deleting thumbnails "
+        f"(HTTP {status}, {AUTH_STATUS_HEADER}={auth_kind}; expected 204 open)"
+    )
 
 
 def process_hash(
@@ -170,7 +330,11 @@ def process_hash(
     delete_status = request(delete_url, method="DELETE", auth=True)
     delete_error = None if delete_status in (200, 204, 404) else f"delete:{delete_status}"
 
-    regenerate_status = request(f"{upload_url}/thumbnail/{hash_}")
+    regenerate_status = request(
+        f"{upload_url.rstrip('/')}/thumbnail/{hash_}",
+        headers=thumbnail_service_headers(),
+        follow_redirects=False,
+    )
     if regenerate_status != 200:
         errors = [err for err in (delete_error, f"regenerate:{regenerate_status}") if err]
         return hash_, ",".join(errors)
@@ -188,12 +352,28 @@ def process_hash(
 
 def main() -> None:
     args = parse_args()
+    has_token = bool(thumbnail_service_headers())
+    try:
+        upload_url = validate_upload_url(
+            args.upload_url,
+            allow_non_default=args.allow_non_default_upload_url,
+            has_token=has_token,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    for warning in thumbnail_token_warnings(upload_url):
+        print(warning, file=sys.stderr)
     hashes = load_hashes(args)
     total = len(hashes)
 
     if args.dry_run:
         print(f"would_process={total}")
         return
+
+    try:
+        preflight_thumbnail_auth(upload_url)
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
 
     failure_handle = (
         open(args.failure_file, "a", encoding="utf-8") if args.failure_file else None
@@ -206,7 +386,7 @@ def main() -> None:
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
             future_to_hash = {
                 executor.submit(
-                    process_hash, hash_, args.bucket, args.upload_url, args.media_url
+                    process_hash, hash_, args.bucket, upload_url, args.media_url
                 ): hash_
                 for hash_ in hashes
             }

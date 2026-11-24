@@ -1,0 +1,251 @@
+"""cloud-run-upload/backfill-thumbnails.py sends the thumbnail token (divine-upload-server#52)."""
+
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import contextlib
+import importlib.util
+import io
+from pathlib import Path
+import threading
+import unittest
+from unittest.mock import patch
+import urllib.error
+
+_spec = importlib.util.spec_from_file_location(
+    "cloud_run_upload_backfill_thumbnails",
+    Path(__file__).resolve().parents[2] / "cloud-run-upload" / "backfill-thumbnails.py",
+)
+helper = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(helper)
+
+
+class ThumbnailServiceTokenTests(unittest.TestCase):
+    def regenerate_headers(self, env):
+        calls = []
+
+        def fake_request(url, **kwargs):
+            calls.append((url, kwargs))
+            return 200
+
+        with patch.dict("os.environ", env, clear=True), patch.object(helper, "request", side_effect=fake_request):
+            helper.process_hash("a" * 64, "bucket", "https://upload.test", "https://media.test")
+        regenerate = [kwargs for url, kwargs in calls if "/thumbnail/" in url]
+        self.assertEqual(len(regenerate), 1)
+        self.assertIs(regenerate[0].get("follow_redirects"), False)
+        others = [kwargs for url, kwargs in calls if "/thumbnail/" not in url]
+        for kwargs in others:
+            self.assertNotIn("X-Divine-Thumbnail-Token", kwargs.get("headers") or {})
+        return regenerate[0].get("headers") or {}
+
+    def test_sends_the_service_token_when_configured(self):
+        headers = self.regenerate_headers({"THUMBNAIL_SERVICE_TOKEN": " svc-token "})
+        self.assertEqual(headers.get("X-Divine-Thumbnail-Token"), "svc-token")
+
+    def test_sends_no_token_header_when_unset(self):
+        self.assertNotIn("X-Divine-Thumbnail-Token", self.regenerate_headers({}))
+
+    def test_warns_when_no_token_is_set(self):
+        with patch.dict("os.environ", {}, clear=True):
+            warnings = helper.thumbnail_token_warnings(helper.DEFAULT_UPLOAD_URL)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("THUMBNAIL_SERVICE_TOKEN", warnings[0])
+
+    def test_quiet_with_a_token_for_the_default_host(self):
+        with patch.dict("os.environ", {"THUMBNAIL_SERVICE_TOKEN": "svc"}, clear=True):
+            self.assertEqual(helper.thumbnail_token_warnings(helper.DEFAULT_UPLOAD_URL), [])
+
+    def test_warns_before_sending_the_token_to_another_host(self):
+        with patch.dict("os.environ", {"THUMBNAIL_SERVICE_TOKEN": "svc"}, clear=True):
+            warnings = helper.thumbnail_token_warnings("https://elsewhere.example")
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("elsewhere.example", warnings[0])
+        self.assertNotIn("svc", warnings[0])
+
+    def test_rejects_non_https_and_unapproved_non_default_upload_urls(self):
+        with self.assertRaises(ValueError):
+            helper.validate_upload_url(
+                "http://upload.example", allow_non_default=True, has_token=True
+            )
+        with self.assertRaises(ValueError):
+            helper.validate_upload_url(
+                "http://127.0.0.1:8080", allow_non_default=False, has_token=False
+            )
+        with self.assertRaises(ValueError):
+            helper.validate_upload_url(
+                "https://elsewhere.example", allow_non_default=False, has_token=True
+            )
+        self.assertEqual(
+            helper.validate_upload_url(
+                "https://elsewhere.example/", allow_non_default=True, has_token=True
+            ),
+            "https://elsewhere.example",
+        )
+        self.assertEqual(
+            helper.validate_upload_url(
+                "http://127.0.0.1:8080", allow_non_default=True, has_token=True
+            ),
+            "http://127.0.0.1:8080",
+        )
+
+    def test_redirects_never_forward_the_service_token(self):
+        target_calls = []
+
+        class RedirectHandler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_GET(self):
+                if self.path.startswith("/redirect-source"):
+                    self.send_response(302)
+                    self.send_header("Location", f"http://127.0.0.1:{self.server.server_port}/leaked")
+                    self.end_headers()
+                    return
+                target_calls.append((self.path, dict(self.headers)))
+                self.send_response(200)
+                self.end_headers()
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                status = helper.request(
+                    f"http://127.0.0.1:{server.server_port}/redirect-source",
+                    headers={"X-Divine-Thumbnail-Token": "svc-token"},
+                    follow_redirects=False,
+                )
+            finally:
+                server.shutdown()
+                thread.join()
+        self.assertEqual(status, 302)
+        self.assertEqual(target_calls, [])
+
+    def test_preflight_blocks_unverified_or_refused_responses_without_deleting(self):
+        for bad_response in (
+            (404, {}),
+            (400, {}),
+            (302, {}),
+            (204, {}),
+            (204, {"x-divine-thumbnail-auth": "open"}),
+            (204, {"x-divine-thumbnail-auth": "raw-unrecognized"}),
+        ):
+            calls = []
+
+            def fake_request(url, resp=bad_response, **kwargs):
+                calls.append((url, kwargs))
+                return resp
+
+            with (
+                self.subTest(resp=bad_response),
+                patch.dict("os.environ", {"THUMBNAIL_SERVICE_TOKEN": "svc-token"}, clear=True),
+                patch.object(helper, "request_with_headers", side_effect=fake_request),
+                patch.object(helper, "process_hash") as process_mock,
+                patch("sys.argv", ["backfill-thumbnails.py", "a" * 64]),
+            ):
+                with self.assertRaises(SystemExit) as ctx:
+                    helper.main()
+            self.assertNotIn("svc-token", str(ctx.exception))
+            self.assertNotIn("raw-unrecognized", str(ctx.exception))
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(calls[0][0].endswith("/thumbnail/auth-check"))
+            self.assertIs(calls[0][1].get("follow_redirects"), False)
+            process_mock.assert_not_called()
+
+    def test_preflight_requires_verified_204_with_token_and_open_204_without_token(self):
+        calls = []
+
+        def fake_request(url, **kwargs):
+            calls.append((url, kwargs))
+            return 204, {"x-divine-thumbnail-auth": "verified"}
+
+        with (
+            patch.dict("os.environ", {"THUMBNAIL_SERVICE_TOKEN": "svc-token"}, clear=True),
+            patch.object(helper, "request_with_headers", side_effect=fake_request),
+            patch.object(helper, "request", return_value=200) as req_mock,
+            patch("sys.argv", ["backfill-thumbnails.py", "a" * 64]),
+        ):
+            helper.main()
+        self.assertTrue(any(url.endswith("/thumbnail/auth-check") for url, _ in calls))
+        self.assertTrue(any("storage.googleapis.com" in c.args[0] for c in req_mock.call_args_list))
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch.object(
+                helper,
+                "request_with_headers",
+                return_value=(204, {"x-divine-thumbnail-auth": "open"}),
+            ),
+            patch.object(helper, "request", return_value=200) as open_req_mock,
+            patch("sys.argv", ["backfill-thumbnails.py", "a" * 64]),
+        ):
+            helper.main()
+        self.assertTrue(any("storage.googleapis.com" in c.args[0] for c in open_req_mock.call_args_list))
+
+        for bad_open in ((404, {}), (400, {}), (204, {}), (204, {"x-divine-thumbnail-auth": "verified"})):
+            with (
+                self.subTest(bad_open=bad_open),
+                patch.dict("os.environ", {}, clear=True),
+                patch.object(helper, "request_with_headers", return_value=bad_open),
+                patch.object(helper, "process_hash") as process_mock,
+                patch("sys.argv", ["backfill-thumbnails.py", "a" * 64]),
+            ):
+                with self.assertRaises(SystemExit):
+                    helper.main()
+            process_mock.assert_not_called()
+
+    def test_http_error_response_is_closed_on_retry_and_return(self):
+        closed = []
+
+        class FakeHTTPError(urllib.error.HTTPError):
+            def __init__(self, code, hdrs=None):
+                super().__init__(
+                    "https://upload.example/thumbnail/auth-check",
+                    code,
+                    "err",
+                    hdrs or {},
+                    io.BytesIO(b""),
+                )
+
+            def close(self):
+                closed.append(self.code)
+                super().close()
+
+        err_401 = FakeHTTPError(401)
+        err_404 = FakeHTTPError(404, {"X-Divine-Thumbnail-Auth": "missing"})
+
+        class StubOpener:
+            def __init__(self):
+                self.calls = 0
+
+            def open(self, _req, timeout=60):
+                self.calls += 1
+                raise (err_401 if self.calls == 1 else err_404)
+
+        with (
+            patch.object(helper, "get_opener", return_value=StubOpener()),
+            patch.object(helper.TOKEN_MANAGER, "get", return_value="gcs-tok"),
+        ):
+            status, headers = helper.request_with_headers(
+                "https://upload.example/thumbnail/auth-check", auth=True
+            )
+        self.assertEqual(status, 404)
+        self.assertEqual(headers.get("x-divine-thumbnail-auth"), "missing")
+        self.assertEqual(closed, [401, 404])
+
+    def test_dry_run_makes_no_network_calls_without_credentials(self):
+        out = io.StringIO()
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch.object(helper, "request_with_headers") as req_headers_mock,
+            patch.object(helper, "request") as req_mock,
+            patch.object(helper, "process_hash") as process_mock,
+            patch("sys.argv", ["backfill-thumbnails.py", "--dry-run", "a" * 64]),
+            contextlib.redirect_stdout(out),
+        ):
+            helper.main()
+        self.assertIn("would_process=1", out.getvalue())
+        req_headers_mock.assert_not_called()
+        req_mock.assert_not_called()
+        process_mock.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

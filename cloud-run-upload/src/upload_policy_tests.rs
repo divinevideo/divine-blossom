@@ -54,6 +54,7 @@ fn state(storage: &MockServer, derivatives: &MockServer) -> Arc<AppState> {
             resumable_session_ttl_secs: 86400,
             resumable_chunk_size: 8 * 1024 * 1024,
             transcode_queue: None,
+            thumbnail_auth: crate::thumbnail_auth::Policy::Open,
         },
     })
 }
