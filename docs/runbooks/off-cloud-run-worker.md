@@ -333,18 +333,23 @@ sole writer.
       (`fullchain.pem`, including intermediates) and
       `/opt/divine-transcoder/conf.d/certs/upload.key` (`privkey.pem`,
       `install -m 600` so it is readable only by root/Caddy). Configure an
-      automated renewal hook that copies both renewed files into `conf.d/certs/`
-      (`certbot` `--deploy-hook` or `acme.sh --install-cert --fullchain-file /opt/divine-transcoder/conf.d/certs/upload.pem --key-file /opt/divine-transcoder/conf.d/certs/upload.key --reloadcmd "..."`)
-      and forces Caddy to reload its in-memory file certificate from outside the
-      Compose directory:
+      automated renewal hook that installs the renewed files and runs from
+      `/opt/divine-transcoder` (`certbot` `--deploy-hook` script below, or
+      `acme.sh --install-cert --fullchain-file /opt/divine-transcoder/conf.d/certs/upload.pem --key-file /opt/divine-transcoder/conf.d/certs/upload.key --reloadcmd "cd /opt/divine-transcoder && docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile && docker compose exec -T caddy caddy reload --force --config /etc/caddy/Caddyfile"`):
       ```sh
-      docker compose --project-directory /opt/divine-transcoder exec -T caddy caddy validate --config /etc/caddy/Caddyfile && \
-      docker compose --project-directory /opt/divine-transcoder exec -T caddy caddy reload --force --config /etc/caddy/Caddyfile
+      install -m 644 "$RENEWED_LINEAGE/fullchain.pem" /opt/divine-transcoder/conf.d/certs/upload.pem && \
+      install -m 600 "$RENEWED_LINEAGE/privkey.pem" /opt/divine-transcoder/conf.d/certs/upload.key && \
+      cd /opt/divine-transcoder && \
+      docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile && \
+      docker compose exec -T caddy caddy reload --force --config /etc/caddy/Caddyfile
       ```
-      *(Both `--force` and `--project-directory` are required: plain
-      `caddy reload` is a no-op when the Caddyfile text is unchanged and would
-      keep serving the old in-memory cert until expiry, and non-interactive
-      `certbot`/`acme.sh` hooks run without a Compose working directory or TTY.)*
+      *(All three details are required: `cd /opt/divine-transcoder` — not
+      `--project-directory` alone — because `.env` sets relative `COMPOSE_FILE`
+      paths that Docker Compose resolves against the caller's cwd, which in
+      non-interactive `certbot`/`acme.sh` hooks defaults to `/` or the client's
+      home; `exec -T` because hooks have no TTY; and `caddy reload --force`
+      because plain `caddy reload` is a no-op when the Caddyfile text is
+      unchanged and would keep serving the old in-memory cert until expiry.)*
       Next, copy `Caddyfile.upload.example` to `conf.d/upload.caddy` with
       literal site address `upload.divine.video` and
       `tls /etc/caddy/conf.d/certs/upload.pem /etc/caddy/conf.d/certs/upload.key`
