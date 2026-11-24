@@ -227,7 +227,7 @@ impl S3Config {
     }
 }
 
-fn media_read_policy() -> Result<MediaReadPolicy> {
+pub(crate) fn media_read_policy() -> Result<MediaReadPolicy> {
     MediaReadPolicy::parse(
         optional_config("media_read_primary")?.as_deref(),
         optional_config("gcs_fallback_enabled")?.as_deref(),
@@ -1568,8 +1568,11 @@ fn head_exists_status(status: StatusCode, require_confirmed_absence: bool) -> Re
     }
 }
 
-fn check_blob_exists(hash: &str, require_confirmed_absence: bool) -> Result<bool> {
-    let policy = media_read_policy()?;
+fn check_blob_exists(
+    hash: &str,
+    policy: MediaReadPolicy,
+    require_confirmed_absence: bool,
+) -> Result<bool> {
     let response = head_media_origin(policy.primary, hash);
     let should_fallback = match &response {
         Ok(resp) => policy.should_fallback(resp.get_status().as_u16()),
@@ -1582,27 +1585,43 @@ fn check_blob_exists(hash: &str, require_confirmed_absence: bool) -> Result<bool
             Err(_) => "transport".to_string(),
         };
         eprintln!("[MEDIA_ORIGIN] op=head primary=b2 fallback=gcs cause={cause}");
-        let fallback = head_media_origin(StorageProvider::Gcs, hash)
-            .map_err(MediaFetchError::into_storage_error)?;
-        let status = fallback.get_status();
-        // A GCS miss cannot prove the blob absent if the B2 HEAD failed.
-        if status != StatusCode::NOT_FOUND {
-            return head_exists_status(status, require_confirmed_absence);
-        }
+        return match (response, head_media_origin(StorageProvider::Gcs, hash)) {
+            (_, Ok(fallback)) if fallback.get_status() == StatusCode::OK => Ok(true),
+            // Only a confirmed hit can recover a primary transport failure.
+            (Err(error), _) | (_, Err(error)) => Err(error.into_storage_error()),
+            (Ok(primary), Ok(fallback)) if fallback.get_status() == StatusCode::NOT_FOUND => {
+                head_exists_status(primary.get_status(), require_confirmed_absence)
+            }
+            (_, Ok(fallback)) => head_exists_status(fallback.get_status(), require_confirmed_absence),
+        };
     }
     let resp = response.map_err(MediaFetchError::into_storage_error)?;
     head_exists_status(resp.get_status(), require_confirmed_absence)
 }
 
-/// Check the configured media origins before reusing or clearing an audio mapping.
-pub fn blob_exists(hash: &str) -> Result<bool> {
-    check_blob_exists(hash, true)
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AudioBlobPresence {
+    Present,
+    Missing,
+    ServingOriginMiss,
+}
+
+pub(crate) fn audio_blob_presence(hash: &str) -> Result<AudioBlobPresence> {
+    let policy = media_read_policy()?;
+    if check_blob_exists(hash, policy, true)? {
+        Ok(AudioBlobPresence::Present)
+    } else if policy.primary == StorageProvider::B2 && !policy.gcs_fallback_enabled {
+        // A GCS writer can still own the audio while only B2 serves reads.
+        Ok(AudioBlobPresence::ServingOriginMiss)
+    } else {
+        Ok(AudioBlobPresence::Missing)
+    }
 }
 
 /// Check the configured media origins for upload deduplication. Unexpected HTTP
 /// statuses leave the upload eligible, while configuration and transport errors propagate.
-pub fn blob_exists_for_upload(hash: &str) -> Result<bool> {
-    check_blob_exists(hash, false)
+pub(crate) fn blob_exists_for_upload(hash: &str, policy: MediaReadPolicy) -> Result<bool> {
+    check_blob_exists(hash, policy, false)
 }
 
 /// Check if a blob exists directly in GCS (used by legacy GCS-writing paths).
@@ -6066,52 +6085,239 @@ mod tests {
     #[test]
     #[ignore = "requires synthetic storage backends; run-media-origin-tests.py"]
     fn blob_exists_b2_without_gcs_contract() {
-        assert!(super::blob_exists("hit").unwrap());
-        assert!(!super::blob_exists("missing").unwrap());
-        assert!(super::blob_exists("forbidden").is_err());
-        assert!(super::blob_exists("transient").is_err());
+        assert_eq!(
+            super::audio_blob_presence("hit").unwrap(),
+            super::AudioBlobPresence::Present
+        );
+        assert_eq!(
+            super::audio_blob_presence("missing").unwrap(),
+            super::AudioBlobPresence::ServingOriginMiss
+        );
+        assert!(super::audio_blob_presence("forbidden").is_err());
+        assert!(super::audio_blob_presence("transient").is_err());
     }
 
     #[test]
     #[ignore = "requires synthetic storage backends; run-media-origin-tests.py"]
     fn blob_exists_b2_with_gcs_fallback_contract() {
-        assert!(super::blob_exists("hit").unwrap());
-        assert!(super::blob_exists("missing").unwrap());
-        assert!(!super::blob_exists("absent_everywhere").unwrap());
-        assert!(super::blob_exists("transient").unwrap());
-        assert!(super::blob_exists("transient_b2_only").is_err());
-        assert!(super::blob_exists("transport").unwrap());
-        assert!(super::blob_exists("transport_b2_only").is_err());
-        assert!(super::blob_exists("forbidden").is_err());
+        assert_eq!(
+            super::audio_blob_presence("hit").unwrap(),
+            super::AudioBlobPresence::Present
+        );
+        assert_eq!(
+            super::audio_blob_presence("missing").unwrap(),
+            super::AudioBlobPresence::Present
+        );
+        assert_eq!(
+            super::audio_blob_presence("absent_everywhere").unwrap(),
+            super::AudioBlobPresence::Missing
+        );
+        assert_eq!(
+            super::audio_blob_presence("transient").unwrap(),
+            super::AudioBlobPresence::Present
+        );
+        assert!(super::audio_blob_presence("transient_b2_only").is_err());
+        assert_eq!(
+            super::audio_blob_presence("transport").unwrap(),
+            super::AudioBlobPresence::Present
+        );
+        assert!(super::audio_blob_presence("transport_b2_only").is_err());
+        assert!(super::audio_blob_presence("forbidden").is_err());
     }
 
     #[test]
     #[ignore = "requires synthetic storage backends; run-media-origin-tests.py"]
     fn upload_dedup_gcs_status_contract() {
-        use fastly::http::{Method, StatusCode};
-
         for hash in ["f".repeat(64), "5".repeat(64)] {
-            let mut req = Request::new(Method::HEAD, "https://media.example.com/upload");
-            req.set_header("X-SHA-256", &hash);
-            let response = crate::handle_upload_requirements(req).unwrap();
-            assert_eq!(response.get_status(), StatusCode::OK);
-            assert_eq!(response.get_header_str("X-Exists"), None);
-            assert_eq!(
-                response.get_header_str("X-Reason"),
-                Some("Upload would be accepted")
-            );
+            assert_resumable_session(resumable_init(&hash).unwrap());
         }
         for key in ["forbidden", "unavailable"] {
             assert!(!super::blob_exists_in_gcs(key).unwrap());
-            assert!(super::blob_exists(key).is_err());
+            assert!(super::audio_blob_presence(key).is_err());
         }
         assert!(super::blob_exists_in_gcs("disconnect").is_err());
+    }
+
+    fn resumable_init(hash: &str) -> crate::error::Result<fastly::Response> {
+        let authenticated = crate::upload_routing_tests::upload_request(true);
+        let authorization = authenticated.get_header("Authorization").unwrap();
+        let mut req = Request::post("https://media.example.com/upload/init");
+        req.set_header("Authorization", authorization);
+        req.set_body(
+            serde_json::json!({"sha256": hash, "size": 15, "contentType": "video/mp4"}).to_string(),
+        );
+        crate::handle_request(req)
+    }
+
+    fn assert_resumable_session(mut response: fastly::Response) {
+        assert_eq!(response.get_status().as_u16(), 200);
+        let session: crate::ResumableUploadInitResponse =
+            serde_json::from_str(&response.take_body().into_string()).unwrap();
+        assert_eq!(session.upload_id, "synthetic-session");
+    }
+
+    fn seed_origin_metadata(hash: &str, owner: &str, status: &str) {
+        let metadata = serde_json::json!({
+            "sha256": hash, "size": 15, "type": "video/mp4", "owner": owner,
+            "uploaded": "2026-01-01T00:00:00Z", "status": status,
+        });
+        crate::metadata::open_store()
+            .unwrap()
+            .insert(&format!("blob:{hash}"), metadata.to_string())
+            .unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires synthetic storage backends; run-media-origin-tests.py"]
+    fn upload_dedup_b2_transport_contract() {
+        let owner = "a".repeat(64);
+        for hash in ["f".repeat(64), "5".repeat(64)] {
+            seed_origin_metadata(&hash, &owner, "active");
+            let error = resumable_init(&hash).unwrap_err();
+            assert_eq!(error.message(), "media origin request failed");
+        }
+        let recovered = "1".repeat(64);
+        seed_origin_metadata(&recovered, &owner, "active");
+        assert_eq!(
+            resumable_init(&recovered).unwrap().get_status().as_u16(),
+            409
+        );
+    }
+
+    #[test]
+    #[ignore = "requires synthetic storage backends; run-media-origin-tests.py"]
+    fn upload_dedup_b2_visibility_contract() {
+        let store = crate::metadata::open_store().unwrap();
+        let owner = "a".repeat(64);
+        let vanishing_owner = "d".repeat(64);
+        let allowed = "a".repeat(64);
+        seed_origin_metadata(&allowed, &owner, "active");
+        let mut duplicate = resumable_init(&allowed).unwrap();
+        assert_eq!(duplicate.get_status().as_u16(), 409);
+        let body: serde_json::Value =
+            serde_json::from_str(&duplicate.take_body().into_string()).unwrap();
+        assert_eq!(body["descriptor"]["sha256"], allowed);
+
+        let restricted = "b".repeat(64);
+        let held = "c".repeat(64);
+        let vanishing = "d".repeat(64);
+        let unknown = "e".repeat(64);
+        let alias_only = "0".repeat(64);
+        let vanishing_ref = "2".repeat(64);
+        let absent = "3".repeat(64);
+        let too_many_refs = "4".repeat(64);
+        seed_origin_metadata(&restricted, &owner, "restricted");
+        for hash in [&held, &alias_only, &vanishing_ref, &absent, &too_many_refs] {
+            seed_origin_metadata(hash, &owner, "active");
+        }
+        seed_origin_metadata(&vanishing, &vanishing_owner, "active");
+        store
+            .insert(
+                &format!("quarantine:v1:{held}"),
+                r#"{"version":1,"holds":{"review:synthetic":{"version":1,"active":true}}}"#,
+            )
+            .unwrap();
+        store
+            .insert(&format!("vanish_in_progress:v1:{vanishing_owner}"), "{}")
+            .unwrap();
+        store
+            .insert(
+                &format!("refs:{vanishing_ref}"),
+                serde_json::json!([vanishing_owner]).to_string(),
+            )
+            .unwrap();
+        let refs: Vec<_> = (0..16).map(|index| format!("{index:064x}")).collect();
+        store
+            .insert(
+                &format!("refs:{too_many_refs}"),
+                serde_json::to_string(&refs).unwrap(),
+            )
+            .unwrap();
+        crate::metadata::add_to_audio_source_refs(&alias_only, &owner).unwrap();
+        for hash in [
+            &restricted,
+            &held,
+            &vanishing,
+            &unknown,
+            &alias_only,
+            &vanishing_ref,
+            &too_many_refs,
+            &absent,
+        ] {
+            assert_resumable_session(resumable_init(hash).unwrap());
+        }
+    }
+
+    fn seed_audio_route(source: &str, audio: &str) {
+        seed_origin_metadata(source, &"b".repeat(64), "active");
+        crate::metadata::put_audio_mapping(&crate::AudioMapping {
+            source_sha256: source.into(),
+            audio_sha256: audio.into(),
+            duration_seconds: 1.0,
+            size_bytes: 15,
+            mime_type: "audio/mp4".into(),
+        })
+        .unwrap();
+        crate::metadata::add_to_audio_source_refs(audio, source).unwrap();
+    }
+
+    fn request_audio(method: fastly::http::Method, source: &str) -> fastly::Response {
+        let request = Request::new(
+            method,
+            format!("https://media.example.com/{source}.audio.m4a"),
+        );
+        crate::handle_request(request).unwrap_or_else(|error| crate::error_response(&error))
+    }
+
+    #[test]
+    #[ignore = "requires synthetic storage backends; run-media-origin-tests.py"]
+    fn audio_route_single_origin_miss_contract() {
+        use fastly::http::Method;
+
+        let source = "6".repeat(64);
+        let audio = "7".repeat(64);
+        seed_audio_route(&source, &audio);
+        for method in [Method::GET, Method::HEAD] {
+            let response = request_audio(method, &source);
+            assert_eq!(response.get_status().as_u16(), 503);
+            assert_eq!(response.get_header_str("Retry-After"), Some("30"));
+            assert_eq!(response.get_header_str("Cache-Control"), Some("no-store"));
+            let mapping = crate::metadata::get_audio_mapping(&source)
+                .unwrap()
+                .unwrap();
+            assert_eq!(mapping.audio_sha256, audio);
+            assert_eq!(
+                crate::metadata::get_audio_source_refs(&audio).unwrap(),
+                [source.clone()]
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires synthetic storage backends; run-media-origin-tests.py"]
+    fn audio_route_confirmed_absence_contract() {
+        use fastly::http::Method;
+
+        let audio = "8".repeat(64);
+        for (method, source, status) in [
+            (Method::GET, "6".repeat(64), 422),
+            (Method::HEAD, "9".repeat(64), 404),
+        ] {
+            seed_audio_route(&source, &audio);
+            assert_eq!(request_audio(method, &source).get_status().as_u16(), status);
+            assert!(crate::metadata::get_audio_mapping(&source)
+                .unwrap()
+                .is_none());
+            assert!(crate::metadata::get_audio_source_refs(&audio)
+                .unwrap()
+                .is_empty());
+        }
     }
 
     #[test]
     #[ignore = "requires unavailable synthetic bindings; run-media-origin-tests.py"]
     fn blob_exists_unavailable_config_contract() {
-        let error = super::blob_exists("hit").unwrap_err().to_string();
+        let error = super::audio_blob_presence("hit").unwrap_err().to_string();
         assert!(error.contains("Config store unavailable"), "{error}");
     }
 
