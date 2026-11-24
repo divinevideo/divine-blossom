@@ -201,9 +201,13 @@ The token must be visible ASCII with no spaces. It travels in
 Whenever it is configured, every `/thumbnail` response is
 `Cache-Control: private, no-store` with `Vary: X-Divine-Thumbnail-Token`.
 
-Blossom's calls carry `x-request-id: blossom-thumbnail`, so a Blossom call that
-arrives without a valid token (for example when earlier storage reads spent the
-Compute secret budget) can be told apart from other callers.
+Blossom's calls carry `x-request-id: blossom-thumbnail-<request id>`, with the
+triggering Blossom request's id (sanitized to `[A-Za-z0-9_-]`, at most 64
+characters), like its other proxied calls. A Blossom call that arrives without a
+valid token (for example when earlier storage reads spent the Compute secret
+budget) can be told apart from other callers and matched to the request that
+caused it. Calls with no triggering request (HEAD, archive import) carry
+`blossom-thumbnail`.
 
 `cloud-run-upload` has no metrics listener, so each guarded request logs one
 `thumbnail_token` line with `result=authenticated|missing|invalid`, `mode`,
@@ -217,16 +221,29 @@ remaining `missing` hits are traced to callers you don't intend to support.
 so it never appears in the process list), and warn when it is unset or would go
 to a non-default upload host.
 
-For `cloud-run-upload`, bind the token from GCP Secret Manager (the
-authoritative copy) with `gcloud run services update blossom-upload-rust
+For `cloud-run-upload`, bind the token from GCP Secret Manager in
+`rich-compiler-479518-d2` with `gcloud run services update blossom-upload-rust
 --update-secrets THUMBNAIL_SERVICE_TOKEN=<secret>:latest` (and, at the flip,
 `--update-env-vars THUMBNAIL_TOKEN_REQUIRED=true`). `deploy.sh` uses
 `--update-env-vars` and `--update-secrets`, so later CI deploys keep these
 bindings. Rolling back is `--update-env-vars THUMBNAIL_TOKEN_REQUIRED=false`.
-Rotation goes through observe mode, because the token is read once at startup
-and only one value is accepted: set the flag to `false`, update the secret in
-GCP and in Fastly `blossom_secrets`, redeploy so the new revision reads it,
-confirm `authenticated` with no `invalid`, then set the flag back to `true`.
+
+Rotation: there are three copies of the one token, and every copy must change
+before the token is required again: GCP Secret Manager in `dv-platform-prod`
+(divine-upload-server on GKE, through External Secrets), GCP Secret Manager in
+`rich-compiler-479518-d2` (Cloud Run `blossom-upload-rust`), and Fastly
+`blossom_secrets` (`thumbnail_service_token`, which Blossom sends). The token is
+read once at startup and a single value is accepted, so rotate through observe
+mode, changing the receivers before the sender:
+
+1. Set `THUMBNAIL_TOKEN_REQUIRED=false` on both upload services and roll them.
+   From here no copy can break a request.
+2. Update both GCP secrets, then roll divine-upload-server once External
+   Secrets has refreshed and deploy a new `blossom-upload-rust` revision.
+   Blossom still sends the old token, which shows as `invalid` but is served.
+3. Update Fastly `blossom_secrets`. Blossom sends the new token, `authenticated`
+   rises and `invalid` stops.
+4. Once `invalid` stays at zero on both services, set the flag back to `true`.
 
 ## API
 
