@@ -1124,9 +1124,6 @@ pub fn handle_admin_bulk_approve(mut req: Request) -> Result<Response> {
                             if !skip_purge {
                                 let _ =
                                     update_stats_on_status_change(meta.status, BlobStatus::Active);
-                                if !queued_cdn_invalidation {
-                                    crate::purge_edge_cache(hash);
-                                }
                             }
                             approved += 1;
                             approved_hashes.push(hash.clone());
@@ -1140,6 +1137,10 @@ pub fn handle_admin_bulk_approve(mut req: Request) -> Result<Response> {
             Ok(None) => not_found += 1,
             Err(_) => errors += 1,
         }
+    }
+
+    if !skip_purge && !queued_cdn_invalidation && !approved_hashes.is_empty() {
+        crate::purge_edge_cache_batch(&approved_hashes);
     }
 
     eprintln!(
