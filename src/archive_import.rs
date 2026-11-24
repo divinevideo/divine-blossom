@@ -386,7 +386,7 @@ fn retire_attempt(i: &Item) -> Result<()> {
     })
 }
 fn retire_copy(i: &Item) -> Result<Item> {
-    metadata::update_json_conditionally(
+    metadata::update_json_conditionally_from_origin(
         &key(&i.sha256),
         5,
         "archive copy settlement",
@@ -601,15 +601,21 @@ pub(crate) fn handle(mut req: Request, op: &str) -> Response {
                 Ok(serde_json::json!({"settled":true}))
             },
             "settle-copy"=>{
-                let expected=i.generation.as_deref().filter(|g|parent_gate::generation(g).is_some()).ok_or_else(invalid)?;
+                let expected = i.generation.as_deref()
+                    .filter(|g| parent_gate::generation(g).is_some())
+                    .ok_or_else(invalid)?;
                 policy(i)?;
-                parent_gate::archive_copy_settlement_precheck(&i.sha256,&i.attempt,expected)?;
-                let bound=retire_copy(i)?;
-                parent_gate::archive_release(&i.sha256,&i.attempt,expected)?;
+                let generation = parent_gate::archive_copy_settlement_precheck(
+                    &i.sha256, &i.attempt, expected
+                )?;
+                let bound = retire_copy(i)?;
+                if let Some(generation) = generation {
+                    parent_gate::archive_release_copy(&i.sha256, &i.attempt, generation)?;
+                }
                 policy(&bound)?;
-                let mut proof=parent_gate::archive_copy_release_proof(&i.sha256,&i.attempt,expected)?;
-                proof["owner"]=serde_json::json!(bound.owner);
-                Ok(serde_json::json!({"settled":true,"copy_settlement":proof}))
+                let mut proof = parent_gate::archive_copy_release_proof(&i.sha256, &i.attempt, expected)?;
+                proof["owner"] = serde_json::json!(bound.owner);
+                Ok(serde_json::json!({"settled": true, "copy_settlement": proof}))
             },
             operation if operation.starts_with("process-") => process(i,operation.trim_start_matches("process-")),
             "reconcile"=>{policy(i)?;let r=read(&i.sha256)?;Ok(serde_json::json!({"receipt":r.receipts.get(&i.owner),"admission":r.admission}))},
@@ -631,6 +637,22 @@ pub(crate) fn handle(mut req: Request, op: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kv_origin::test_origin::with_lookup;
+    use blossom_core::kv_origin::OriginEntry;
+
+    // The Viceroy store supplies normal entries. Individual tests can give the
+    // origin a different view of a key to model a POP lagging behind the origin.
+    fn fixture_origin(key: &str) -> Result<Option<OriginEntry>> {
+        match metadata::open_store()?.lookup(key) {
+            Ok(mut entry) => Ok(Some(OriginEntry {
+                generation: entry.current_generation(),
+                body: entry.take_body().into_bytes(),
+            })),
+            Err(KVStoreError::ItemNotFound) => Ok(None),
+            Err(_) => Err(unavailable()),
+        }
+    }
+
     fn sample(hash: &str, owner: &str, attempt: &str) -> Item {
         Item {
             sha256: hash.repeat(64),
@@ -724,7 +746,103 @@ mod tests {
     }
     #[test]
     #[ignore = "requires synthetic KV; scripts/run-archive-import-tests.py"]
+    fn archive_copy_settlement_uses_origin_during_edge_lag() {
+        let mut copy = sample("a", "b", "c");
+        copy.generation = Some(
+            admit_for(&copy, true).unwrap()["generation"]
+                .as_str()
+                .unwrap()
+                .into(),
+        );
+        let gate_key = format!("b2-sync:v1:{}", copy.sha256);
+        let archive_key = key(&copy.sha256);
+
+        // A matching edge entry is insufficient without origin confirmation.
+        assert_eq!(call(&copy, "settle-copy")["items"][0]["error"], "retry");
+        assert_eq!(read(&copy.sha256).unwrap().admission, Some(copy.clone()));
+
+        let origin_generation = u64::MAX;
+        let mut reads = 0;
+        let origin_gate_key = gate_key.clone();
+        let completed = with_lookup(
+            Box::new(move |key| {
+                let mut observed = fixture_origin(key)?;
+                if key == origin_gate_key {
+                    reads += 1;
+                    if reads == 2 {
+                        let entry = observed.as_mut().unwrap();
+                        assert!(matches!(
+                            parent_gate::parse(&entry.body),
+                            Some(parent_gate::Gate::Released { .. })
+                        ));
+                        entry.generation = origin_generation;
+                    }
+                }
+                Ok(observed)
+            }),
+            || call(&copy, "settle-copy"),
+        );
+        let proof = &completed["items"][0]["result"]["copy_settlement"];
+        assert_eq!(proof["parent_generation"], origin_generation.to_string());
+
+        let mut released = fixture_origin(&gate_key).unwrap().unwrap();
+        assert_ne!(released.generation, origin_generation);
+        released.generation = origin_generation;
+        let retained = fixture_origin(&archive_key).unwrap().unwrap();
+        let edge_binding = retained.body.clone();
+        metadata::open_store().unwrap().delete(&archive_key).unwrap();
+        let origin_gate_key = gate_key.clone();
+        let origin_archive_key = archive_key.clone();
+        let replay = with_lookup(
+            Box::new(move |key| {
+                if key == origin_gate_key {
+                    Ok(Some(released.clone()))
+                } else if key == origin_archive_key {
+                    Ok(Some(retained.clone()))
+                } else {
+                    fixture_origin(key)
+                }
+            }),
+            || call(&copy, "settle-copy"),
+        );
+        assert_eq!(replay, completed);
+        metadata::open_store().unwrap().insert(&archive_key, edge_binding).unwrap();
+
+        // The gate can advance between an exact origin precheck and proof readback.
+        // The POP still reports the old release and its retained binding.
+        let mut gate_reads = 0;
+        let moved = with_lookup(
+            Box::new(move |key| {
+                if key == gate_key {
+                    gate_reads += 1;
+                    if gate_reads == 2 {
+                        return Ok(Some(OriginEntry {
+                            generation: 3,
+                            body: serde_json::json!({"state":"copying","attempt_id":"new-attempt"})
+                                .to_string()
+                                .into_bytes(),
+                        }));
+                    }
+                }
+                fixture_origin(key)
+            }),
+            || call(&copy, "settle-copy"),
+        );
+        assert_eq!(moved["items"][0]["error"], "invalid");
+
+        let unavailable = with_lookup(Box::new(|_| Err(unavailable())), || {
+            call(&copy, "settle-copy")
+        });
+        assert_eq!(unavailable["items"][0]["error"], "retry");
+    }
+
+    #[test]
+    #[ignore = "requires synthetic KV; scripts/run-archive-import-tests.py"]
     fn archive_copy_settlement_requires_exact_release_proof() {
+        with_lookup(Box::new(fixture_origin), assert_exact_release_proof);
+    }
+
+    fn assert_exact_release_proof() {
         let mut original=sample("a","b","c");
         original.generation=Some(admit(&original).unwrap()["generation"].as_str().unwrap().into());
         original.file_id=Some("fixture-version".into());original.bucket=Some("b2".into());

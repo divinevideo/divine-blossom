@@ -66,8 +66,11 @@ A successful item returns this object in `items[n].result`:
 
 Retirement atomically retains the admitted item and clears the active admission.
 The operation conditionally releases the owning gate, rechecks current policy, and
-returns proof only after observing that exact released gate. `owner` comes from the
-retained item. Both `admission_generation` and `released_from_generation` equal the
+returns proof only after observing that exact released gate. Gate and binding
+reads for `settle-copy` use the Fastly KV origin. Missing `metadata_kv_store_id`
+or `kv_origin_read_token`, or an unavailable origin, returns `retry`.
+`owner` comes from the retained item.
+Both `admission_generation` and `released_from_generation` equal the
 supplied generation; `parent_generation` identifies the observed released gate.
 All three are canonical, nonzero decimal `u64` strings used as equality fences.
 

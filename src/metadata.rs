@@ -56,9 +56,31 @@ where
     T: DeserializeOwned + Serialize,
     F: FnMut(Option<T>) -> std::result::Result<ConditionalJsonMutation<T, R>, String>,
 {
-    with_json_store_io(key, operation, false, |lookup, write| {
+    with_json_store_io(key, operation, JsonRead::EdgeFirst, false, |lookup, write| {
         update_json_conditionally_with_io(max_attempts, operation, mutate, lookup, write)
     })
+}
+
+/// Use the origin even when the mutation can finish without a write. An edge
+/// miss would have no CAS conflict to force a fresh read in that case.
+pub(crate) fn update_json_conditionally_from_origin<T, R, F>(
+    key: &str,
+    max_attempts: usize,
+    operation: &str,
+    mutate: F,
+) -> Result<R>
+where
+    T: DeserializeOwned + Serialize,
+    F: FnMut(Option<T>) -> std::result::Result<ConditionalJsonMutation<T, R>, String>,
+{
+    with_json_store_io(key, operation, JsonRead::Origin, false, |lookup, write| {
+        update_json_conditionally_with_io(max_attempts, operation, mutate, lookup, write)
+    })
+}
+
+enum JsonRead {
+    EdgeFirst,
+    Origin,
 }
 
 type JsonLookup<'a> = dyn FnMut() -> std::result::Result<Option<(String, u64)>, String> + 'a;
@@ -70,6 +92,7 @@ type JsonWrite<'a> =
 fn with_json_store_io<R>(
     key: &str,
     operation: &str,
+    read: JsonRead,
     diagnose_status_failure: bool,
     run: impl FnOnce(&mut JsonLookup<'_>, &mut JsonWrite<'_>) -> std::result::Result<R, String>,
 ) -> Result<R> {
@@ -82,6 +105,20 @@ fn with_json_store_io<R>(
     let conflicts = std::cell::Cell::new(0u32);
     let result = run(
         &mut || {
+            if matches!(read, JsonRead::Origin) {
+                let read = crate::kv_origin::required_lookup(key)
+                    .map_err(|error| format!("Failed to load {operation}: {error}"))?
+                    .map(|entry| {
+                        String::from_utf8(entry.body)
+                            .map(|body| (body, entry.generation))
+                            .map_err(|_| format!("Invalid UTF-8 for {operation}"))
+                    })
+                    .transpose()?;
+                tracker
+                    .borrow_mut()
+                    .read(read.as_ref().map(|(_, generation)| *generation));
+                return Ok(read);
+            }
             // After a lost write the edge copy may be stale, so re-read from the origin when it is
             // configured and reachable; otherwise keep reading the edge as before.
             if conflicted.get() {
@@ -1276,9 +1313,13 @@ pub fn update_transcode_status_with_metadata(
     update: TranscodeMetadataUpdate,
 ) -> Result<StatusUpdateOutcome> {
     let key = format!("{BLOB_PREFIX}{}", hash.to_lowercase());
-    let result = with_json_store_io(&key, "blob metadata", true, |lookup, write| {
-        update_transcode_status_with_io(status, new_size, dim, update, lookup, write)
-    })?
+    let result = with_json_store_io(
+        &key,
+        "blob metadata",
+        JsonRead::EdgeFirst,
+        true,
+        |lookup, write| update_transcode_status_with_io(status, new_size, dim, update, lookup, write),
+    )?
     .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
     invalidate_metadata_cache(hash);
     Ok(result)

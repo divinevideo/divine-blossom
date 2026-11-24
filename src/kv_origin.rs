@@ -64,6 +64,10 @@ pub(crate) fn enabled() -> bool {
 /// Read `key` from the KV origin. `Ok(None)` means origin reads are not configured;
 /// `Ok(Some(None))` means the key does not exist at the origin.
 pub(crate) fn lookup(key: &str) -> Result<Option<Option<OriginEntry>>> {
+    #[cfg(test)]
+    if let Some(result) = test_origin::lookup(key) {
+        return result.map(Some);
+    }
     let Some(settings) = settings()? else {
         return Ok(None);
     };
@@ -78,4 +82,41 @@ pub(crate) fn lookup(key: &str) -> Result<Option<Option<OriginEntry>>> {
     interpret(status, generation.as_deref(), body)
         .map(Some)
         .map_err(BlossomError::MetadataError)
+}
+
+/// Distinguish a missing key from missing origin configuration.
+pub(crate) fn required_lookup(key: &str) -> Result<Option<OriginEntry>> {
+    lookup(key)?.ok_or_else(|| BlossomError::MetadataError("KV origin unavailable".into()))
+}
+
+#[cfg(test)]
+pub(crate) mod test_origin {
+    use super::{OriginEntry, Result};
+    use std::cell::RefCell;
+
+    type Lookup = Box<dyn FnMut(&str) -> Result<Option<OriginEntry>>>;
+
+    thread_local! {
+        static LOOKUP: RefCell<Option<Lookup>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn lookup(key: &str) -> Option<Result<Option<OriginEntry>>> {
+        LOOKUP.with_borrow_mut(|lookup| lookup.as_mut().map(|lookup| lookup(key)))
+    }
+
+    pub(crate) fn with_lookup<T>(lookup: Lookup, run: impl FnOnce() -> T) -> T {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                LOOKUP.with_borrow_mut(|lookup| *lookup = None);
+            }
+        }
+
+        LOOKUP.with_borrow_mut(|slot| {
+            assert!(slot.is_none());
+            *slot = Some(lookup);
+        });
+        let _reset = Reset;
+        run()
+    }
 }
