@@ -7,11 +7,11 @@
 //!
 //! This service has no metrics listener, so every guarded request logs one
 //! `thumbnail_token` line with `result=authenticated|missing|invalid`; a
-//! log-based metric on that line gives the flip signal.
+//! log-based metric on that line is the flip signal (there are no in-process
+//! counters).
 
 use axum::http::HeaderMap;
 use sha2::{Digest, Sha256};
-use std::sync::atomic::{AtomicU64, Ordering};
 use subtle::ConstantTimeEq;
 use tracing::info;
 
@@ -62,10 +62,6 @@ pub enum Decision {
     Reject(Reason),
 }
 
-static AUTHENTICATED: AtomicU64 = AtomicU64::new(0);
-static MISSING: AtomicU64 = AtomicU64::new(0);
-static INVALID: AtomicU64 = AtomicU64::new(0);
-
 impl Policy {
     pub fn from_env() -> anyhow::Result<Self> {
         Self::from_lookup(|key| std::env::var(key).ok())
@@ -115,15 +111,8 @@ impl Policy {
         };
         let reason = match headers.get(HEADER) {
             None => Reason::Missing,
-            Some(_) if presented_matches(headers, expected) => {
-                AUTHENTICATED.fetch_add(1, Ordering::Relaxed);
-                return Decision::Allow;
-            }
+            Some(_) if presented_matches(headers, expected) => return Decision::Allow,
             Some(_) => Reason::Invalid,
-        };
-        match reason {
-            Reason::Missing => MISSING.fetch_add(1, Ordering::Relaxed),
-            Reason::Invalid => INVALID.fetch_add(1, Ordering::Relaxed),
         };
         if matches!(self, Policy::Required(_)) {
             Decision::Reject(reason)
@@ -190,15 +179,6 @@ pub fn log_decision(policy: &Policy, decision: &Decision, headers: &HeaderMap) {
         request_id = %request_id(headers),
         "thumbnail_token"
     );
-}
-
-#[cfg(test)]
-pub fn counts() -> (u64, u64, u64) {
-    (
-        AUTHENTICATED.load(Ordering::Relaxed),
-        MISSING.load(Ordering::Relaxed),
-        INVALID.load(Ordering::Relaxed),
-    )
 }
 
 #[cfg(test)]
@@ -274,15 +254,83 @@ mod tests {
         }
     }
 
+    /// Collects what the `tracing` subscriber writes during a closure.
+    fn captured_logs(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Capture;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = capture.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
     #[test]
-    fn counters_separate_authenticated_missing_and_invalid() {
-        let (a, m, i) = counts();
-        let p = Policy::Observe("t".into());
-        p.decide(&headers(Some("t")));
-        p.decide(&headers(None));
-        p.decide(&headers(Some("x")));
-        let (a2, m2, i2) = counts();
-        assert!(a2 > a && m2 > m && i2 > i);
+    fn each_guarded_request_logs_one_flip_line_without_the_token() {
+        let mut with_id = headers(Some("s3cret-token"));
+        with_id.insert("x-request-id", "blossom-thumbnail-req1".parse().unwrap());
+        let wrong = {
+            let mut h = headers(Some("not-it"));
+            h.insert("x-request-id", "blossom-thumbnail-req1".parse().unwrap());
+            h
+        };
+        let observe = Policy::Observe("s3cret-token".into());
+        let required = Policy::Required("s3cret-token".into());
+        let logs = captured_logs(|| {
+            for (policy, h) in [
+                (&observe, &with_id),
+                (&observe, &headers(None)),
+                (&observe, &wrong),
+                (&required, &wrong),
+            ] {
+                let decision = policy.decide(h);
+                log_decision(policy, &decision, h);
+            }
+            let open = Policy::Open;
+            log_decision(&open, &open.decide(&with_id), &with_id);
+        });
+        let lines: Vec<&str> = logs
+            .lines()
+            .filter(|l| l.contains("thumbnail_token"))
+            .collect();
+        assert_eq!(lines.len(), 4, "{logs}");
+        let expect = [
+            (
+                "observe",
+                "authenticated",
+                "false",
+                "blossom-thumbnail-req1",
+            ),
+            ("observe", "missing", "false", "-"),
+            ("observe", "invalid", "false", "blossom-thumbnail-req1"),
+            ("required", "invalid", "true", "blossom-thumbnail-req1"),
+        ];
+        for (line, (mode, result, refused, id)) in lines.iter().zip(expect) {
+            assert!(line.contains(&format!("mode=\"{mode}\"")), "{line}");
+            assert!(line.contains(&format!("result=\"{result}\"")), "{line}");
+            assert!(line.contains(&format!("refused={refused}")), "{line}");
+            assert!(line.contains(&format!("request_id={id}")), "{line}");
+        }
+        assert!(!logs.contains("s3cret-token"), "{logs}");
+        assert!(!logs.contains("not-it"), "{logs}");
     }
 
     #[test]
