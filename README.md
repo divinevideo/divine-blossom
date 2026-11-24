@@ -178,6 +178,52 @@ C2PA validation in `cloud-functions/process-blob` is controlled by environment v
 
 In `enforce` mode, unsigned or untrusted content is rejected (status set to `restricted`). C2PA runs before SafeSearch to short-circuit untrusted content and save Vision API cost.
 
+### Thumbnail service token
+
+Blossom checks a video's moderation status, owner and age gate before it asks
+an upload service to generate a missing thumbnail. The upload services can't
+read that state, so their public `GET /thumbnail/:hash` can require a shared
+token that only Blossom holds (divine-upload-server#52). Two services serve
+that route from the same media bucket: divine-upload-server on GKE
+(`upload.divine.video`, where Blossom sends its calls) and this repo's
+`cloud-run-upload` (`blossom-upload-rust`), which the repair and backfill
+scripts call. Both take the same settings:
+
+| `THUMBNAIL_SERVICE_TOKEN` | `THUMBNAIL_TOKEN_REQUIRED` | Behavior |
+| --- | --- | --- |
+| unset | unset or `false` | Unchanged: every request is served; startup warns the route is open. |
+| set | unset or `false` | Every request is served; requests without a valid token are recorded. |
+| set | `true` | Requests without a valid token get the missing-video `404`, before any storage read. |
+| unset | `true` | The service refuses to start. |
+
+The token must be visible ASCII with no spaces. It travels in
+`X-Divine-Thumbnail-Token`, is compared in constant time and is never logged.
+Whenever it is configured, every `/thumbnail` response is
+`Cache-Control: private, no-store` with `Vary: X-Divine-Thumbnail-Token`.
+
+`cloud-run-upload` has no metrics listener, so each guarded request logs one
+`thumbnail_token` line with `result=authenticated|missing|invalid`, `mode`,
+`refused` and the caller's sanitized `request_id`; build a log-based metric on
+it. Flip a service to required only when `authenticated` arrives at the rate
+its real callers generate thumbnails, `invalid` stays at zero, and any
+remaining `missing` hits are traced to callers you don't intend to support.
+`cloud-run-transcoder/repair-media-artifacts.sh` and
+`cloud-run-upload/backfill-thumbnails.py` send the token when
+`THUMBNAIL_SERVICE_TOKEN` is set (the shell script passes it to curl on stdin,
+so it never appears in the process list), and warn when it is unset or would go
+to a non-default upload host.
+
+For `cloud-run-upload`, bind the token from GCP Secret Manager (the
+authoritative copy) with `gcloud run services update blossom-upload-rust
+--update-secrets THUMBNAIL_SERVICE_TOKEN=<secret>:latest` (and, at the flip,
+`--update-env-vars THUMBNAIL_TOKEN_REQUIRED=true`). `deploy.sh` uses
+`--update-env-vars` and `--update-secrets`, so later CI deploys keep these
+bindings. Rolling back is `--update-env-vars THUMBNAIL_TOKEN_REQUIRED=false`.
+Rotation goes through observe mode, because the token is read once at startup
+and only one value is accepted: set the flag to `false`, update the secret in
+GCP and in Fastly `blossom_secrets`, redeploy so the new revision reads it,
+confirm `authenticated` with no `invalid`, then set the flag back to `true`.
+
 ## API
 
 ### Retrieval (BUD-01)
