@@ -217,18 +217,27 @@ Any corroborated `blossom-thumbnail-*` `missing` hit blocks flipping
 send this token yet and must be updated or retired before enforcement if used
 against an upload service.)
 
-`cloud-run-upload` has no metrics listener, so each guarded request logs one
-`thumbnail_token` line with `result=authenticated|missing|invalid`, `mode`,
-`refused` and the caller's sanitized `request_id`; build a log-based metric on
-it. Flip a service to required only when `authenticated` arrives at the rate
-its real callers generate thumbnails, `invalid` stays at zero, and any
-remaining `missing` hits are traced to callers you don't intend to support.
+`cloud-run-upload` has no metrics listener, so each guarded `/thumbnail/:hash`
+request logs one `thumbnail_token` line (before hash validation) with
+`result=authenticated|missing|invalid`, `mode`, `refused` and the caller's
+sanitized `request_id`; build a log-based metric on it. Flip each receiver to
+required only when its own real callers authenticate and `invalid` stays at zero:
+on `divine-upload-server` (GKE), match Blossom edge logs against its logs; on
+`blossom-upload-rust` (Cloud Run), confirm authenticated log lines from the
+repair and backfill tools (aggregate `invalid`/`missing` counts on a public
+route are diagnostic).
 `cloud-run-transcoder/repair-media-artifacts.sh` and
 `cloud-run-upload/backfill-thumbnails.py` send the token when
 `THUMBNAIL_SERVICE_TOKEN` is set (the shell script passes it to curl on stdin,
 so it never appears in the process list), enforce bare HTTPS origins without
-following redirects, run a non-destructive `/thumbnail/auth-check` preflight
-(expecting `400`) before deleting stored thumbnails, and require explicit opt-in
+following redirects, and run a non-destructive `GET /thumbnail/auth-check`
+preflight before deleting stored thumbnails. `/thumbnail/auth-check` returns
+`204` with `X-Divine-Thumbnail-Auth: verified` (when the presented token
+matches) or `X-Divine-Thumbnail-Auth: open` (when no token is configured), or
+`404` otherwise, without touching storage or emitting `/thumbnail/:hash` rollout
+logs; both tools abort on any other status or marker (`400`, `404`, redirects, or
+mismatched mode), and must only run against a stable deployment (never during a
+flip, rotation, or mixed-replica rollout). Both require explicit opt-in
 (`ALLOW_NON_DEFAULT_UPLOAD_URL=true` / `--allow-non-default-upload-url`) to
 send the token to a non-default host.
 
@@ -252,12 +261,13 @@ would require a separate follow-up). Rotate receivers before the sender:
    From here no copy can break a request.
 2. Update both GCP secrets, then roll divine-upload-server once External
    Secrets has refreshed and deploy a new `blossom-upload-rust` revision.
-   Blossom still sends the old token, which shows as `invalid` but is served.
+   Blossom still sends the old token, which logs as `invalid` (and passes the
+   token check) until Fastly updates.
 3. Update Fastly `blossom_secrets`. Blossom sends the new token, `authenticated`
    rises and `invalid` stops.
-4. Once `authenticated` Blossom traffic is confirmed and `invalid` stays at zero
-   on both services (with no corroborated Blossom `missing` hits), set the flag
-   back to `true`.
+4. Once each receiver's real callers authenticate and `invalid` stays at zero
+   (with no corroborated Blossom `missing` hits on GKE, and any B2-miss GCS
+   fallback skips verified on Cloud Run), set the flag back to `true`.
 
 ## API
 

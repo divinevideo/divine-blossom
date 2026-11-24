@@ -17,6 +17,8 @@ use tracing::info;
 
 /// Header divine-blossom sets on its `/thumbnail/<hash>` calls.
 pub const HEADER: &str = "x-divine-thumbnail-token";
+/// Header returned by `/thumbnail/auth-check` to distinguish open mode vs a verified token.
+pub const AUTH_STATUS_HEADER: &str = "x-divine-thumbnail-auth";
 const TOKEN_ENV: &str = "THUMBNAIL_SERVICE_TOKEN";
 const REQUIRED_ENV: &str = "THUMBNAIL_TOKEN_REQUIRED";
 
@@ -127,16 +129,26 @@ impl Policy {
             Policy::Open => return Decision::Allow,
             Policy::Observe(token) | Policy::Required(token) => token,
         };
-        let mut values = headers.get_all(HEADER).iter();
-        let reason = match (values.next(), values.next()) {
-            (None, None) => Reason::Missing,
-            (Some(value), None) if presented_matches(value, expected) => return Decision::Allow,
-            _ => Reason::Invalid,
+        let reason = match matches_single_header(headers, expected) {
+            None => Reason::Missing,
+            Some(true) => return Decision::Allow,
+            Some(false) => Reason::Invalid,
         };
         if matches!(self, Policy::Required(_)) {
             Decision::Reject(reason)
         } else {
             Decision::AllowUnauthenticated(reason)
+        }
+    }
+
+    /// Check whether a single `X-Divine-Thumbnail-Token` header matches the
+    /// configured secret without emitting rollout log lines.
+    pub fn verify_presented_token(&self, headers: &HeaderMap) -> bool {
+        match self {
+            Policy::Open => false,
+            Policy::Observe(expected) | Policy::Required(expected) => {
+                matches_single_header(headers, expected) == Some(true)
+            }
         }
     }
 
@@ -150,6 +162,15 @@ impl Policy {
             }
             Policy::Required(_) => "/thumbnail requires the service token",
         }
+    }
+}
+
+fn matches_single_header(headers: &HeaderMap, expected: &str) -> Option<bool> {
+    let mut values = headers.get_all(HEADER).iter();
+    match (values.next(), values.next()) {
+        (None, None) => None,
+        (Some(value), None) => Some(presented_matches(value, expected)),
+        _ => Some(false),
     }
 }
 
@@ -197,7 +218,7 @@ pub fn log_decision(policy: &Policy, decision: &Decision, headers: &HeaderMap) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::HashMap;
 
@@ -270,7 +291,7 @@ mod tests {
     }
 
     /// Collects what the `tracing` subscriber writes during a closure.
-    fn captured_logs(f: impl FnOnce()) -> String {
+    pub(crate) fn captured_logs(f: impl FnOnce()) -> String {
         #[derive(Clone, Default)]
         struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Capture {
@@ -427,5 +448,24 @@ mod tests {
             log_decision(&observe, &decision, &map);
         });
         assert!(logs.contains(&format!("request_id={full_id}")), "{logs}");
+    }
+
+    #[test]
+    fn verify_presented_token_checks_single_matching_header_across_policies() {
+        let mut duplicate = headers(Some("s3cret"));
+        duplicate.append(HEADER, "s3cret".parse().unwrap());
+
+        assert!(!Policy::Open.verify_presented_token(&headers(None)));
+        assert!(!Policy::Open.verify_presented_token(&headers(Some("s3cret"))));
+
+        for policy in [
+            Policy::Observe("s3cret".into()),
+            Policy::Required("s3cret".into()),
+        ] {
+            assert!(policy.verify_presented_token(&headers(Some("s3cret"))));
+            assert!(!policy.verify_presented_token(&headers(None)));
+            assert!(!policy.verify_presented_token(&headers(Some("wrong"))));
+            assert!(!policy.verify_presented_token(&duplicate));
+        }
     }
 }

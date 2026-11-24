@@ -1,7 +1,7 @@
 // divine-upload-server#52: this service's public /thumbnail/<hash> reads the
 // same media bucket, so it takes the same service-token guard.
 use super::*;
-use crate::thumbnail_auth::{Policy, HEADER};
+use crate::thumbnail_auth::{Policy, AUTH_STATUS_HEADER, HEADER};
 use wiremock::matchers::{method, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -167,11 +167,9 @@ async fn router_reads_the_token_header() {
     assert_not_shared_cacheable(&served, "router served");
 }
 
-/// The repair and backfill tools' preflight requests `/thumbnail/auth-check`
-/// before deleting anything and read 400 as "credentials accepted" and 404 as
-/// "refused". That holds only while the token check runs before hash
-/// validation; if the order flipped, a refused token would get 400 and the
-/// tools would delete thumbnails they can't regenerate.
+/// Pins that `/thumbnail/:hash` checks the token before validating the hash:
+/// invalid hashes with a refused token must return 404 before hash validation's
+/// 400. Moving hash validation ahead of the token check fails this test.
 #[tokio::test]
 async fn repair_preflight_sees_the_token_check_before_hash_validation() {
     use tower::ServiceExt;
@@ -202,7 +200,7 @@ async fn repair_preflight_sees_the_token_check_before_hash_validation() {
     for (policy, token, expected) in cases {
         let mode = policy.mode();
         let app = build_router(state(&storage, policy));
-        let mut request = axum::http::Request::get("/thumbnail/auth-check");
+        let mut request = axum::http::Request::get("/thumbnail/not-a-valid-hash");
         if let Some(token) = token {
             request = request.header(HEADER, token);
         }
@@ -213,4 +211,122 @@ async fn repair_preflight_sees_the_token_check_before_hash_validation() {
         assert_eq!(response.status(), expected, "{mode} {token:?}");
     }
     assert!(storage.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn thumbnail_auth_check_positively_verifies_access_without_touching_storage_or_logs() {
+    use tower::ServiceExt;
+
+    #[derive(Clone, Default)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let capture = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(crate::build_tracing_filter(None).unwrap())
+        .with_writer(capture.clone())
+        .with_ansi(false)
+        .finish();
+    let _log_guard = tracing::subscriber::set_default(subscriber);
+
+    let storage = storage_with_cached_thumbnail().await;
+
+    let open_app = build_router(state(&storage, Policy::Open));
+    let open_resp = open_app
+        .oneshot(
+            axum::http::Request::get("/thumbnail/auth-check")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(open_resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        open_resp
+            .headers()
+            .get(AUTH_STATUS_HEADER)
+            .map(|v| v.to_str().unwrap()),
+        Some("open")
+    );
+    assert_not_shared_cacheable(&open_resp, "auth-check open");
+
+    for policy in [
+        Policy::Observe("svc-token".into()),
+        Policy::Required("svc-token".into()),
+    ] {
+        let mode = policy.mode();
+        let app = build_router(state(&storage, policy));
+
+        let ok_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/thumbnail/auth-check")
+                    .header(HEADER, "svc-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok_resp.status(), StatusCode::NO_CONTENT, "{mode} valid");
+        assert_eq!(
+            ok_resp
+                .headers()
+                .get(AUTH_STATUS_HEADER)
+                .map(|v| v.to_str().unwrap()),
+            Some("verified"),
+            "{mode} valid"
+        );
+        assert_not_shared_cacheable(&ok_resp, &format!("{mode} auth-check valid"));
+
+        for (case, req) in [
+            (
+                "missing",
+                axum::http::Request::get("/thumbnail/auth-check")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            ),
+            (
+                "wrong",
+                axum::http::Request::get("/thumbnail/auth-check")
+                    .header(HEADER, "wrong-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            ),
+            (
+                "duplicate",
+                axum::http::Request::get("/thumbnail/auth-check")
+                    .header(HEADER, "svc-token")
+                    .header(HEADER, "svc-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            ),
+        ] {
+            let bad_resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(bad_resp.status(), StatusCode::NOT_FOUND, "{mode} {case}");
+            assert!(
+                bad_resp.headers().get(AUTH_STATUS_HEADER).is_none(),
+                "{mode} {case} must not emit auth status header"
+            );
+            assert_not_shared_cacheable(&bad_resp, &format!("{mode} auth-check {case}"));
+            assert_eq!(body(bad_resp).await, br#"{"error":"Video not found"}"#);
+        }
+    }
+
+    assert!(storage.received_requests().await.unwrap().is_empty());
+    let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert!(!logs.contains("thumbnail_token"), "unexpected logs: {logs}");
 }

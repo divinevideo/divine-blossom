@@ -19,8 +19,18 @@ args = sys.argv[1:]
 stdin_headers = sys.stdin.read() if "@-" in args else ""
 with open(os.environ["CURL_LOG"], "a") as log:
     log.write(json.dumps({"args": args, "stdin": stdin_headers}) + "\n")
+has_token = "X-Divine-Thumbnail-Token:" in stdin_headers
+status = os.environ.get("FAKE_PREFLIGHT_STATUS", "204")
+default_auth = "verified" if has_token else "open"
+auth_hdr = os.environ.get("FAKE_PREFLIGHT_AUTH", default_auth)
+if "-D" in args:
+    hdr_path = args[args.index("-D") + 1]
+    with open(hdr_path, "w") as hf:
+        hf.write(f"HTTP/1.1 {status} \r\n")
+        if auth_hdr:
+            hf.write(f"X-Divine-Thumbnail-Auth: {auth_hdr}\r\n")
 if "-w" in args:
-    sys.stdout.write(os.environ.get("FAKE_PREFLIGHT_STATUS", "400"))
+    sys.stdout.write(status)
 """
 
 FAKE_GSUTIL = r"""#!/usr/bin/env python3
@@ -126,19 +136,25 @@ class RepairThumbnailTokenTests(unittest.TestCase):
         self.assertEqual(gsutil_calls, [])
         self.assertNotIn("svc-token", result.stdout + result.stderr)
 
-    def test_preflight_404_aborts_before_deleting_stored_thumbnail(self):
-        result, calls, gsutil_calls = self.run_script(
-            {
-                "THUMBNAIL_SERVICE_TOKEN": "svc-token",
-                "FAKE_PREFLIGHT_STATUS": "404",
-            },
-            check=False,
-        )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(len(calls), 1)
-        self.assertTrue(any(a.endswith("/thumbnail/auth-check") for a in calls[0]["args"]))
-        self.assertEqual(gsutil_calls, [])
-        self.assertNotIn("svc-token", result.stdout + result.stderr)
+    def test_preflight_requires_verified_204_with_token_and_open_204_without_token(self):
+        for name, extra in (
+            ("404", {"THUMBNAIL_SERVICE_TOKEN": "svc-token", "FAKE_PREFLIGHT_STATUS": "404", "FAKE_PREFLIGHT_AUTH": ""}),
+            ("400", {"THUMBNAIL_SERVICE_TOKEN": "svc-token", "FAKE_PREFLIGHT_STATUS": "400", "FAKE_PREFLIGHT_AUTH": ""}),
+            ("302", {"THUMBNAIL_SERVICE_TOKEN": "svc-token", "FAKE_PREFLIGHT_STATUS": "302", "FAKE_PREFLIGHT_AUTH": ""}),
+            ("missing_hdr", {"THUMBNAIL_SERVICE_TOKEN": "svc-token", "FAKE_PREFLIGHT_STATUS": "204", "FAKE_PREFLIGHT_AUTH": ""}),
+            ("open_with_token", {"THUMBNAIL_SERVICE_TOKEN": "svc-token", "FAKE_PREFLIGHT_STATUS": "204", "FAKE_PREFLIGHT_AUTH": "open"}),
+            ("unrecognized", {"THUMBNAIL_SERVICE_TOKEN": "svc-token", "FAKE_PREFLIGHT_STATUS": "204", "FAKE_PREFLIGHT_AUTH": "raw-unrecognized"}),
+            ("verified_without_token", {"FAKE_PREFLIGHT_STATUS": "204", "FAKE_PREFLIGHT_AUTH": "verified"}),
+            ("no_token_404", {"FAKE_PREFLIGHT_STATUS": "404", "FAKE_PREFLIGHT_AUTH": ""}),
+        ):
+            with self.subTest(case=name):
+                result, calls, gsutil_calls = self.run_script(extra, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(len(calls), 1)
+                self.assertTrue(any(a.endswith("/thumbnail/auth-check") for a in calls[0]["args"]))
+                self.assertEqual(gsutil_calls, [])
+                self.assertNotIn("svc-token", result.stdout + result.stderr)
+                self.assertNotIn("raw-unrecognized", result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

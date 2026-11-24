@@ -250,17 +250,59 @@ PY
 }
 
 preflight_thumbnail_auth() {
-    local status
+    local hdr_file status auth_kind
+    hdr_file="$(mktemp)"
     if [[ -n "$THUMBNAIL_SERVICE_TOKEN" ]]; then
-        status="$(printf 'X-Divine-Thumbnail-Token: %s\n' "$THUMBNAIL_SERVICE_TOKEN" |
-            curl -sS -H @- -o /dev/null -w '%{http_code}' "${UPLOAD_URL}/thumbnail/auth-check")"
+        # Headers on stdin keep the token out of the process list; omit -L so redirects fail closed.
+        if ! status="$(printf 'X-Divine-Thumbnail-Token: %s\n' "$THUMBNAIL_SERVICE_TOKEN" |
+            curl -sS -D "$hdr_file" -H @- -o /dev/null -w '%{http_code}' "${UPLOAD_URL}/thumbnail/auth-check")"; then
+            rm -f "$hdr_file"
+            echo "ERROR: upload service /thumbnail preflight request failed; aborting before deleting thumbnails" >&2
+            exit 1
+        fi
     else
-        status="$(curl -sS -o /dev/null -w '%{http_code}' "${UPLOAD_URL}/thumbnail/auth-check")"
+        if ! status="$(curl -sS -D "$hdr_file" -o /dev/null -w '%{http_code}' "${UPLOAD_URL}/thumbnail/auth-check")"; then
+            rm -f "$hdr_file"
+            echo "ERROR: upload service /thumbnail preflight request failed; aborting before deleting thumbnails" >&2
+            exit 1
+        fi
     fi
-    if [[ "$status" != "400" ]]; then
-        echo "ERROR: upload service /thumbnail preflight returned HTTP ${status} (expected 400); aborting before deleting thumbnails" >&2
+
+    auth_kind="$(python3 - "$hdr_file" <<'PY'
+import sys
+
+values = []
+with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as handle:
+    for line in handle:
+        if ":" not in line:
+            continue
+        name, val = line.split(":", 1)
+        if name.strip().lower() == "x-divine-thumbnail-auth":
+            values.append(val.strip())
+
+if not values:
+    print("missing")
+elif len(values) > 1 or values[0] not in ("verified", "open"):
+    print("unexpected")
+else:
+    print(values[0])
+PY
+)"
+    rm -f "$hdr_file"
+
+    if [[ -n "$THUMBNAIL_SERVICE_TOKEN" ]]; then
+        if [[ "$status" == "204" && "$auth_kind" == "verified" ]]; then
+            return 0
+        fi
+        echo "ERROR: upload service /thumbnail preflight failed before deleting thumbnails (HTTP ${status}, x-divine-thumbnail-auth=${auth_kind}; expected 204 verified)" >&2
         exit 1
     fi
+
+    if [[ "$status" == "204" && "$auth_kind" == "open" ]]; then
+        return 0
+    fi
+    echo "ERROR: upload service /thumbnail preflight failed before deleting thumbnails (HTTP ${status}, x-divine-thumbnail-auth=${auth_kind}; expected 204 open)" >&2
+    exit 1
 }
 
 regenerate_thumbnail() {

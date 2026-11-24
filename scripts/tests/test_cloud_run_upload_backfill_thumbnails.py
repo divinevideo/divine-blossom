@@ -1,11 +1,14 @@
 """cloud-run-upload/backfill-thumbnails.py sends the thumbnail token (divine-upload-server#52)."""
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import contextlib
 import importlib.util
+import io
 from pathlib import Path
 import threading
 import unittest
 from unittest.mock import patch
+import urllib.error
 
 _spec = importlib.util.spec_from_file_location(
     "cloud_run_upload_backfill_thumbnails",
@@ -115,45 +118,133 @@ class ThumbnailServiceTokenTests(unittest.TestCase):
         self.assertEqual(status, 302)
         self.assertEqual(target_calls, [])
 
-    def test_preflight_404_aborts_before_deleting_any_thumbnails(self):
-        calls = []
-
-        def fake_request(url, **kwargs):
-            calls.append((url, kwargs))
-            if url.endswith("/thumbnail/auth-check"):
-                return 404
-            return 200
-
-        with (
-            patch.dict("os.environ", {"THUMBNAIL_SERVICE_TOKEN": "svc-token"}, clear=True),
-            patch.object(helper, "request", side_effect=fake_request),
-            patch("sys.argv", ["backfill-thumbnails.py", "a" * 64]),
+    def test_preflight_blocks_unverified_or_refused_responses_without_deleting(self):
+        for bad_response in (
+            (404, {}),
+            (400, {}),
+            (302, {}),
+            (204, {}),
+            (204, {"x-divine-thumbnail-auth": "open"}),
+            (204, {"x-divine-thumbnail-auth": "raw-unrecognized"}),
         ):
-            with self.assertRaises(SystemExit) as ctx:
-                helper.main()
-        self.assertIn("404", str(ctx.exception))
-        self.assertNotIn("svc-token", str(ctx.exception))
-        self.assertEqual(len(calls), 1)
-        self.assertTrue(calls[0][0].endswith("/thumbnail/auth-check"))
-        self.assertIs(calls[0][1].get("follow_redirects"), False)
+            calls = []
 
-    def test_preflight_400_allows_batch_to_proceed(self):
+            def fake_request(url, resp=bad_response, **kwargs):
+                calls.append((url, kwargs))
+                return resp
+
+            with (
+                self.subTest(resp=bad_response),
+                patch.dict("os.environ", {"THUMBNAIL_SERVICE_TOKEN": "svc-token"}, clear=True),
+                patch.object(helper, "request_with_headers", side_effect=fake_request),
+                patch.object(helper, "process_hash") as process_mock,
+                patch("sys.argv", ["backfill-thumbnails.py", "a" * 64]),
+            ):
+                with self.assertRaises(SystemExit) as ctx:
+                    helper.main()
+            self.assertNotIn("svc-token", str(ctx.exception))
+            self.assertNotIn("raw-unrecognized", str(ctx.exception))
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(calls[0][0].endswith("/thumbnail/auth-check"))
+            self.assertIs(calls[0][1].get("follow_redirects"), False)
+            process_mock.assert_not_called()
+
+    def test_preflight_requires_verified_204_with_token_and_open_204_without_token(self):
         calls = []
 
         def fake_request(url, **kwargs):
             calls.append((url, kwargs))
-            if url.endswith("/thumbnail/auth-check"):
-                return 400
-            return 200
+            return 204, {"x-divine-thumbnail-auth": "verified"}
 
         with (
             patch.dict("os.environ", {"THUMBNAIL_SERVICE_TOKEN": "svc-token"}, clear=True),
-            patch.object(helper, "request", side_effect=fake_request),
+            patch.object(helper, "request_with_headers", side_effect=fake_request),
+            patch.object(helper, "request", return_value=200) as req_mock,
             patch("sys.argv", ["backfill-thumbnails.py", "a" * 64]),
         ):
             helper.main()
         self.assertTrue(any(url.endswith("/thumbnail/auth-check") for url, _ in calls))
-        self.assertTrue(any("storage.googleapis.com" in url for url, _ in calls))
+        self.assertTrue(any("storage.googleapis.com" in c.args[0] for c in req_mock.call_args_list))
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch.object(
+                helper,
+                "request_with_headers",
+                return_value=(204, {"x-divine-thumbnail-auth": "open"}),
+            ),
+            patch.object(helper, "request", return_value=200) as open_req_mock,
+            patch("sys.argv", ["backfill-thumbnails.py", "a" * 64]),
+        ):
+            helper.main()
+        self.assertTrue(any("storage.googleapis.com" in c.args[0] for c in open_req_mock.call_args_list))
+
+        for bad_open in ((404, {}), (400, {}), (204, {}), (204, {"x-divine-thumbnail-auth": "verified"})):
+            with (
+                self.subTest(bad_open=bad_open),
+                patch.dict("os.environ", {}, clear=True),
+                patch.object(helper, "request_with_headers", return_value=bad_open),
+                patch.object(helper, "process_hash") as process_mock,
+                patch("sys.argv", ["backfill-thumbnails.py", "a" * 64]),
+            ):
+                with self.assertRaises(SystemExit):
+                    helper.main()
+            process_mock.assert_not_called()
+
+    def test_http_error_response_is_closed_on_retry_and_return(self):
+        closed = []
+
+        class FakeHTTPError(urllib.error.HTTPError):
+            def __init__(self, code, hdrs=None):
+                super().__init__(
+                    "https://upload.example/thumbnail/auth-check",
+                    code,
+                    "err",
+                    hdrs or {},
+                    io.BytesIO(b""),
+                )
+
+            def close(self):
+                closed.append(self.code)
+                super().close()
+
+        err_401 = FakeHTTPError(401)
+        err_404 = FakeHTTPError(404, {"X-Divine-Thumbnail-Auth": "missing"})
+
+        class StubOpener:
+            def __init__(self):
+                self.calls = 0
+
+            def open(self, _req, timeout=60):
+                self.calls += 1
+                raise (err_401 if self.calls == 1 else err_404)
+
+        with (
+            patch.object(helper, "get_opener", return_value=StubOpener()),
+            patch.object(helper.TOKEN_MANAGER, "get", return_value="gcs-tok"),
+        ):
+            status, headers = helper.request_with_headers(
+                "https://upload.example/thumbnail/auth-check", auth=True
+            )
+        self.assertEqual(status, 404)
+        self.assertEqual(headers.get("x-divine-thumbnail-auth"), "missing")
+        self.assertEqual(closed, [401, 404])
+
+    def test_dry_run_makes_no_network_calls_without_credentials(self):
+        out = io.StringIO()
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch.object(helper, "request_with_headers") as req_headers_mock,
+            patch.object(helper, "request") as req_mock,
+            patch.object(helper, "process_hash") as process_mock,
+            patch("sys.argv", ["backfill-thumbnails.py", "--dry-run", "a" * 64]),
+            contextlib.redirect_stdout(out),
+        ):
+            helper.main()
+        self.assertIn("would_process=1", out.getvalue())
+        req_headers_mock.assert_not_called()
+        req_mock.assert_not_called()
+        process_mock.assert_not_called()
 
 
 if __name__ == "__main__":

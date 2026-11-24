@@ -1,8 +1,8 @@
 // ABOUTME: Rust Cloud Run service for Blossom blob uploads
 // ABOUTME: Handles Nostr auth validation, streaming upload to GCS, and SHA-256 hashing
 
-mod cleanup;
 mod bunny_worker;
+mod cleanup;
 mod mp4;
 mod resumable;
 mod tasks;
@@ -394,6 +394,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/internal/bunny-pilot/v1", post(bunny_worker::handle))
         .route("/probe-delivery", post(handle_probe_delivery))
         .route("/delete-blob/health", get(handle_delete_blob_health))
+        .route("/thumbnail/auth-check", get(handle_thumbnail_auth_check))
         .route("/thumbnail/:hash", get(handle_thumbnail_generate))
         .route("/thumbnail/:hash", options(handle_cors_preflight))
         .route("/", put(handle_upload))
@@ -1606,6 +1607,49 @@ static THUMBNAIL_IN_FLIGHT: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
 static THUMBNAIL_NEGATIVE_CACHE: LazyLock<Mutex<HashMap<String, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+fn attach_thumbnail_cache_headers(response: &mut Response) {
+    // Once a token decides who gets a thumbnail (or on `/thumbnail/auth-check`),
+    // no shared cache may store any answer from this route (issue divine-upload-server#52).
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    headers.append(
+        header::VARY,
+        HeaderValue::from_static(thumbnail_auth::HEADER),
+    );
+}
+
+/// Non-destructive credential check for repair and backfill scripts before they
+/// delete stored JPEGs. Distinguishes open mode vs a verified token without
+/// touching storage or emitting `/thumbnail/:hash` rollout logs.
+async fn handle_thumbnail_auth_check(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    let mut response = match &state.config.thumbnail_auth {
+        thumbnail_auth::Policy::Open => (
+            StatusCode::NO_CONTENT,
+            [(thumbnail_auth::AUTH_STATUS_HEADER, "open")],
+        )
+            .into_response(),
+        thumbnail_auth::Policy::Observe(_) | thumbnail_auth::Policy::Required(_) => {
+            if state.config.thumbnail_auth.verify_presented_token(&headers) {
+                (
+                    StatusCode::NO_CONTENT,
+                    [(thumbnail_auth::AUTH_STATUS_HEADER, "verified")],
+                )
+                    .into_response()
+            } else {
+                thumbnail_not_found()
+            }
+        }
+    };
+    attach_thumbnail_cache_headers(&mut response);
+    response
+}
+
 /// On-demand thumbnail generation endpoint.
 ///
 /// Downloads video from GCS, generates thumbnail, stores it, returns the image.
@@ -1617,17 +1661,7 @@ async fn handle_thumbnail_generate(
     let guarded = !matches!(state.config.thumbnail_auth, thumbnail_auth::Policy::Open);
     let mut response = thumbnail_response(state, hash, headers).await;
     if guarded {
-        // Once a token decides who gets a thumbnail, no shared cache may store
-        // any answer from this route (issue divine-upload-server#52).
-        let headers = response.headers_mut();
-        headers.insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("private, no-store"),
-        );
-        headers.append(
-            header::VARY,
-            HeaderValue::from_static(thumbnail_auth::HEADER),
-        );
+        attach_thumbnail_cache_headers(&mut response);
     }
     response
 }

@@ -20,7 +20,11 @@ DEFAULT_MEDIA_URL = "https://media.divine.video"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Backfill thumbnails by deleting the stored JPEG, regenerating it, and revalidating the CDN URL."
+        description=(
+            "Backfill thumbnails by deleting the stored JPEG, regenerating it, "
+            "and revalidating the CDN URL. Only run against a stable deployment "
+            "(never during a token rollout flip, token rotation, or mixed-replica rollout)."
+        )
     )
     parser.add_argument(
         "hashes",
@@ -150,7 +154,7 @@ def get_opener(*, follow_redirects: bool = True):
     return opener
 
 
-def request(
+def request_with_headers(
     url: str,
     *,
     method: str = "GET",
@@ -158,7 +162,7 @@ def request(
     timeout: int = 60,
     auth: bool = False,
     follow_redirects: bool = True,
-) -> int:
+) -> tuple[int, dict[str, str]]:
     opener = get_opener(follow_redirects=follow_redirects)
     final_headers = dict(headers or {})
 
@@ -170,13 +174,56 @@ def request(
         req = urllib.request.Request(url, method=method, headers=final_headers)
         try:
             with opener.open(req, timeout=timeout) as resp:
-                return resp.status
+                resp_headers = {
+                    key.lower(): value.strip() for key, value in resp.headers.items()
+                }
+                return resp.status, resp_headers
         except urllib.error.HTTPError as exc:
-            if auth and exc.code in (401, 403) and attempt == 0:
-                continue
-            return exc.code
+            try:
+                if auth and exc.code in (401, 403) and attempt == 0:
+                    continue
+                resp_headers = (
+                    {key.lower(): value.strip() for key, value in exc.headers.items()}
+                    if exc.headers is not None
+                    else {}
+                )
+                return exc.code, resp_headers
+            finally:
+                exc.close()
 
-    return 599
+    return 599, {}
+
+
+def request(
+    url: str,
+    *,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    timeout: int = 60,
+    auth: bool = False,
+    follow_redirects: bool = True,
+) -> int:
+    status, _ = request_with_headers(
+        url,
+        method=method,
+        headers=headers,
+        timeout=timeout,
+        auth=auth,
+        follow_redirects=follow_redirects,
+    )
+    return status
+
+
+AUTH_STATUS_HEADER = "x-divine-thumbnail-auth"
+
+
+def _classify_auth_header(raw_value: str | None) -> str:
+    """Classify the auth marker without echoing raw unrecognized header values."""
+    if not raw_value:
+        return "missing"
+    if raw_value in ("verified", "open"):
+        return raw_value
+    return "unexpected"
 
 
 def thumbnail_service_headers() -> dict[str, str]:
@@ -230,22 +277,49 @@ def thumbnail_token_warnings(upload_url: str) -> list[str]:
 
 
 def preflight_thumbnail_auth(upload_url: str) -> None:
-    """Verify the upload service accepts our /thumbnail request before deleting any JPEGs."""
+    """Confirm /thumbnail/auth-check positively verifies access before deleting any JPEGs."""
+    headers = thumbnail_service_headers()
     try:
-        status = request(
+        status, resp_headers = request_with_headers(
             f"{upload_url.rstrip('/')}/thumbnail/auth-check",
-            headers=thumbnail_service_headers(),
+            headers=headers,
             follow_redirects=False,
         )
     except urllib.error.URLError as exc:
         raise RuntimeError(
             f"Upload service /thumbnail preflight failed ({exc.reason}); aborting before deleting thumbnails"
         ) from exc
-    if status != 400:
+
+    auth_kind = _classify_auth_header(resp_headers.get(AUTH_STATUS_HEADER))
+    if headers:
+        if status == 204 and auth_kind == "verified":
+            return
+        if status == 204 and auth_kind == "open":
+            raise RuntimeError(
+                "Upload service /thumbnail preflight reported open mode while THUMBNAIL_SERVICE_TOKEN is set; "
+                "wait for a stable deployment or unset the token before deleting thumbnails"
+            )
+        if status == 404:
+            raise RuntimeError(
+                "Upload service /thumbnail preflight returned HTTP 404; "
+                "check THUMBNAIL_SERVICE_TOKEN before deleting thumbnails"
+            )
         raise RuntimeError(
-            f"Upload service /thumbnail preflight returned HTTP {status} (expected 400); "
-            "check THUMBNAIL_SERVICE_TOKEN before deleting thumbnails"
+            f"Upload service /thumbnail preflight failed before deleting thumbnails "
+            f"(HTTP {status}, {AUTH_STATUS_HEADER}={auth_kind}; expected 204 verified)"
         )
+
+    if status == 204 and auth_kind == "open":
+        return
+    if status == 404:
+        raise RuntimeError(
+            "Upload service /thumbnail preflight returned HTTP 404; "
+            "target server has THUMBNAIL_SERVICE_TOKEN configured (set it before deleting thumbnails)"
+        )
+    raise RuntimeError(
+        f"Upload service /thumbnail preflight failed before deleting thumbnails "
+        f"(HTTP {status}, {AUTH_STATUS_HEADER}={auth_kind}; expected 204 open)"
+    )
 
 
 def process_hash(
