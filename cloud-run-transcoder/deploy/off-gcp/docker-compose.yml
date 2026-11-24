@@ -12,8 +12,10 @@ services:
       TRANSCODER_DOMAIN: ${TRANSCODER_DOMAIN:?Set TRANSCODER_DOMAIN, e.g. transcoder-worker.divine.video}
       TRANSCODE_ADMISSION_AUTH_REQUIRED: ${TRANSCODE_ADMISSION_AUTH_REQUIRED-false}
       TRANSCODE_ADMISSION_SECRET: ${TRANSCODE_ADMISSION_SECRET-}
+      UPLOAD_DOMAIN: ${UPLOAD_DOMAIN-}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./conf.d:/etc/caddy/conf.d:ro
       - caddy_data:/data
       - caddy_config:/config
     depends_on:

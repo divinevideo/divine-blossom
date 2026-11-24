@@ -1,0 +1,14 @@
+# Copy to conf.d/upload.caddy on a co-located host and set UPLOAD_DOMAIN in .env
+# (e.g. UPLOAD_DOMAIN=upload.divine.video, or a staging hostname first).
+{$UPLOAD_DOMAIN} {
+	reverse_proxy upload:8080 {
+		# Stream direct/resumable video uploads and thumbnail bytes without buffering.
+		flush_interval -1
+		transport http {
+			dial_timeout 10s
+			response_header_timeout 310s
+			read_timeout 310s
+			write_timeout 310s
+		}
+	}
+}

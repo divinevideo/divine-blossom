@@ -197,3 +197,46 @@ Never purge `divine-transcode` or discard a write journal blindly (see
    propagation before resuming.
 5. Resume `divine-transcode` (and clear any temporary URI override once queued
    tasks have drained).
+
+## 4. Co-locating `divine-upload-server` on the worker host
+
+On a multi-core off-GCP worker host (such as the Ashburn `ccx43`), you can run
+`divine-upload-server` alongside `transcoder` behind the same Caddy instance
+with bounded CPU/memory limits (`UPLOAD_CPUS`, `UPLOAD_MEM_LIMIT`) so upload
+and on-demand thumbnail bursts stay isolated from single-writer transcoding.
+
+### Enable co-located upload
+
+1. Export a dedicated GCP service account key for `divine-upload-server` to
+   `/etc/divine-upload/gcp-sa.json` (`chmod 600`, owned/readable by container
+   UID) with `roles/storage.objectAdmin` on `gs://divine-blossom-media` (while
+   `GCS_COMPAT_ENABLED=true`).
+2. Copy `cloud-run-transcoder/deploy/off-gcp/.env.upload.example` to
+   `/opt/divine-transcoder/.env.upload` (`chmod 600`) and populate the B2,
+   transcode admission, and transcribe secrets.
+3. In `/opt/divine-transcoder/.env`, add:
+   ```sh
+   COMPOSE_FILE=docker-compose.yml:docker-compose.upload.yml
+   UPLOAD_IMAGE=us-central1-docker.pkg.dev/dv-platform-prod/containers-production/divine-upload-server@sha256:<pinned-digest>
+   UPLOAD_DOMAIN=upload-hetzner.divine.video
+   ```
+   *(Start with a candidate hostname like `upload-hetzner.divine.video` for
+   pre-cutover testing; switch to `upload.divine.video` at DNS cutover.)*
+4. Copy `Caddyfile.upload.example` to `conf.d/upload.caddy` and start the
+   upload container + reload Caddy:
+   ```sh
+   docker compose up -d upload caddy
+   docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile
+   ```
+5. Verify against the candidate hostname (DNS-only / grey cloud):
+   - `GET https://upload-hetzner.divine.video/thumbnail/<known-video-hash>` returns `200 image/jpeg`.
+   - Direct `PUT /upload` and resumable `/upload/init` → `/sessions/:id` → `/complete` succeed and write to B2 + GCS.
+6. Switch `UPLOAD_DOMAIN=upload.divine.video` in `.env`, reload Caddy, and point
+   the Cloudflare `upload.divine.video` A record (DNS-only / grey cloud) to the
+   worker host's IPv4.
+
+### Rollback
+
+Point the Cloudflare `upload.divine.video` A record back to the GKE load
+balancer IP, wait for DNS TTL to expire, then stop the co-located container
+with `docker compose stop upload` and remove `conf.d/upload.caddy`.
