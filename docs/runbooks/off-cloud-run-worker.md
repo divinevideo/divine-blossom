@@ -497,6 +497,10 @@ sole writer.
          *:*)  host="${rest%:*}"; port="${rest##*:}" ;;
          *)    host="$rest";      port="$default_port" ;;
        esac
+       case "$host" in
+         ""|'*') host="" ;;
+         '*.'*)  host="healthcheck.${host#\*.}" ;;
+       esac
        if [ -z "$host" ]; then
          curl -fsS --noproxy '*' --max-time 5 "${scheme}://${local_addr}:${port}/health" >/dev/null
        elif [ "$port" = "$default_port" ]; then
@@ -581,6 +585,10 @@ sole writer.
          :*)   host="";           port="${rest#:}" ;;
          *:*)  host="${rest%:*}"; port="${rest##*:}" ;;
          *)    host="$rest";      port="$default_port" ;;
+       esac
+       case "$host" in
+         ""|'*') host="" ;;
+         '*.'*)  host="healthcheck.${host#\*.}" ;;
        esac
        if [ -z "$host" ]; then
          curl -fsS --noproxy '*' --max-time 5 "${scheme}://${local_addr}:${port}/health" >/dev/null
