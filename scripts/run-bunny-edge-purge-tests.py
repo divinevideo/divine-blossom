@@ -47,6 +47,34 @@ class PurgeBackends(BaseHTTPRequestHandler):
         if self.server.in_meter:
             self.server.metered_calls.append(record)
         self.server.all_calls.append(record)
+        if self.command == "POST" and self.path.endswith("?delete"):
+            if self.server.fail_gcs and "/synthetic-gcs" in self.path:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/xml")
+                self.end_headers()
+                self.wfile.write(b"<Error><Code>InternalError</Code></Error>")
+                return
+            keys = re.findall(r"<Key>([^<]+)</Key>", body.decode("utf-8", errors="replace"))
+            deleted = "".join(f"<Deleted><Key>{k}</Key></Deleted>" for k in keys)
+            payload = f"<DeleteResult>{deleted}</DeleteResult>".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/xml")
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if host == "api.fastly.com" and self.path.endswith("/purge"):
+            keys = (record["surrogate_key"] or "").split()
+            if not keys:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"status":"error"}')
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({k: "synthetic-purge-id" for k in keys}).encode())
+            return
         status = 500 if (self.server.fail_gcs and self.command == "DELETE" and "/synthetic-gcs/" in self.path) else 200
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -189,7 +217,8 @@ def main():
                 assert sum(1 for c in c2 if c["host"] == "api.bunny.net") == 2, c2
                 print("PASS missing_fastly_token_still_purges_bunny", flush=True)
 
-                # 3. /admin/moderate tracks webhook_secret in request_bindings
+                # 3. /admin/moderate tracks webhook_secret in request_bindings and
+                # runs checked 2-round Fastly + Bunny invalidation when bunny_delivery_zones is set
                 q3, c3 = run_case(
                     repo, server, cfg,
                     "admin_moderate_webhook_tracks_webhook_secret_and_purges_bunny",
@@ -201,11 +230,11 @@ def main():
                     ],
                 )
                 assert q3["secrets"] <= 5 and q3["plaintext"] == 3, q3
-                assert sum(1 for c in c3 if c["host"] == "api.fastly.com") == 2, c3
-                assert sum(1 for c in c3 if c["host"] == "api.bunny.net") == 2, c3
+                assert sum(1 for c in c3 if c["host"] == "api.fastly.com") == 4, c3
+                assert sum(1 for c in c3 if c["host"] == "api.bunny.net") == 4, c3
                 print("PASS admin_moderate_webhook_tracks_webhook_secret_and_purges_bunny", flush=True)
 
-                # 4. Admin soft delete (session cookie) purges Fastly + Bunny within budget
+                # 4. Admin soft delete (session cookie) runs checked 2-round Fastly + Bunny within budget
                 q4_soft, c4_soft = run_case(
                     repo, server, cfg,
                     "admin_soft_delete_purges_fastly_and_bunny_within_budget",
@@ -216,12 +245,14 @@ def main():
                     ],
                 )
                 assert q4_soft["secrets"] <= 5 and q4_soft["plaintext"] == 2, q4_soft
-                assert sum(1 for c in c4_soft if c["host"] == "api.fastly.com") == 2, c4_soft
-                assert sum(1 for c in c4_soft if c["host"] == "api.bunny.net") == 2, c4_soft
+                assert sum(1 for c in c4_soft if c["host"] == "api.fastly.com") == 4, c4_soft
+                assert sum(1 for c in c4_soft if c["host"] == "api.bunny.net") == 4, c4_soft
                 print("PASS admin_soft_delete_purges_fastly_and_bunny_within_budget", flush=True)
 
-                # 5. Legacy physical creator delete defers Bunny during soft_delete so GCS + FOS succeed
-                _, c4 = run_case(
+                # 5. Physical creator delete with bunny_delivery_zones uses phased erasure:
+                # GCS delete and inline Fastly vanish purge fit within 5 secrets, while
+                # inline Bunny eviction and checked final confirmation defer to Phase::Final
+                q4, c4 = run_case(
                     repo, server, cfg,
                     "legacy_physical_creator_delete_preserves_origin_secret_budget",
                     {
@@ -239,15 +270,15 @@ def main():
                         ("fos_access_key", "fos-ak"),
                         ("fos_secret_key", "fos-sk"),
                     ],
-                    metered=False,
+                    metered=True,
                 )
-                assert any(c["method"] == "DELETE" and "/synthetic-gcs/" in c["path"] for c in c4), c4
-                assert any(c["method"] == "DELETE" and "/synthetic-fos/" in c["path"] for c in c4), c4
-                assert sum(1 for c in c4 if c["host"] == "api.fastly.com") == 4, c4
+                assert q4["secrets"] <= 5, q4
+                assert any(c["method"] == "POST" and "/synthetic-gcs?delete" in c["path"] for c in c4), c4
+                assert sum(1 for c in c4 if c["host"] == "api.fastly.com") == 2, c4
                 assert sum(1 for c in c4 if c["host"] == "api.bunny.net") == 0, c4
                 print("PASS legacy_physical_creator_delete_preserves_origin_secret_budget", flush=True)
 
-                # 6. Early GCS failure in legacy physical creator delete fires deferred Bunny fallback
+                # 6. Early GCS failure in phased physical creator delete stays within budget and queues drain
                 q4_fail, c4_fail = run_case(
                     repo, server, cfg,
                     "legacy_physical_creator_delete_early_gcs_failure_purges_bunny_fallback",
@@ -269,14 +300,14 @@ def main():
                     metered=True,
                     fail_gcs=True,
                 )
-                assert q4_fail["secrets"] <= 5 and q4_fail["plaintext"] == 4, q4_fail
-                assert any(c["method"] == "DELETE" and "/synthetic-gcs/" in c["path"] for c in c4_fail), c4_fail
-                assert not any(c["method"] == "DELETE" and "/synthetic-fos/" in c["path"] for c in c4_fail), c4_fail
-                assert sum(1 for c in c4_fail if c["host"] == "api.fastly.com") == 2, c4_fail
-                assert sum(1 for c in c4_fail if c["host"] == "api.bunny.net") == 2, c4_fail
+                assert q4_fail["secrets"] <= 5, q4_fail
+                assert any(c["method"] == "POST" and "/synthetic-gcs?delete" in c["path"] for c in c4_fail), c4_fail
+                assert not any("/synthetic-fos" in c["path"] for c in c4_fail), c4_fail
+                assert sum(1 for c in c4_fail if c["host"] == "api.fastly.com") == 0, c4_fail
+                assert sum(1 for c in c4_fail if c["host"] == "api.bunny.net") == 0, c4_fail
                 print("PASS legacy_physical_creator_delete_early_gcs_failure_purges_bunny_fallback", flush=True)
 
-                # 7. Bulk approve batches Fastly and caps Bunny purges within 32-request budget
+                # 7. Bulk approve queues durable intents with 0 inline purge calls when bunny_delivery_zones is set
                 q5, c5 = run_case(
                     repo, server, cfg,
                     "bulk_approve_batches_fastly_and_bounds_bunny_within_backend_limit",
@@ -286,16 +317,30 @@ def main():
                         ("bunny_api_key", "bunny-tok"),
                     ],
                 )
-                assert q5["secrets"] <= 5 and q5["plaintext"] == 2, q5
-                fastly_calls = [c for c in c5 if c["host"] == "api.fastly.com"]
-                bunny_calls = [c for c in c5 if c["host"] == "api.bunny.net"]
+                assert q5["secrets"] <= 5 and q5["plaintext"] == 0, q5
+                assert len(c5) == 0, c5
+                print("PASS bulk_approve_batches_fastly_and_bounds_bunny_within_backend_limit", flush=True)
+
+                # 8. Direct purge_edge_cache_batch batches Fastly and caps Bunny within 32-request and 5-secret budgets
+                q6, c6 = run_case(
+                    repo, server, cfg,
+                    "purge_edge_cache_batch_bounds_bunny_within_backend_limit",
+                    {"bunny_delivery_zones": zones},
+                    [
+                        ("fastly_api_token", "fastly-tok"),
+                        ("bunny_api_key", "bunny-tok"),
+                    ],
+                )
+                assert q6["secrets"] <= 5 and q6["plaintext"] == 2, q6
+                fastly_calls = [c for c in c6 if c["host"] == "api.fastly.com"]
+                bunny_calls = [c for c in c6 if c["host"] == "api.bunny.net"]
                 assert len(fastly_calls) == 2, fastly_calls
                 assert len(bunny_calls) == 28, len(bunny_calls)
-                assert len(c5) == 30, len(c5)
+                assert len(c6) == 30, len(c6)
                 for fc in fastly_calls:
                     keys = fc["surrogate_key"].split()
                     assert len(keys) == 16, fc
-                print("PASS bulk_approve_batches_fastly_and_bounds_bunny_within_backend_limit", flush=True)
+                print("PASS purge_edge_cache_batch_bounds_bunny_within_backend_limit", flush=True)
         finally:
             server.shutdown()
             thread.join()
