@@ -88,10 +88,22 @@ class OffGcpUploadConfigTest(unittest.TestCase):
             "TRANSCRIBE_SHARED_SECRET=",
             "MIGRATION_NSEC=",
             "AI_DETECTOR_BASE_URL=",
-            "MAX_UPLOAD_BYTES=",
+            "# MAX_UPLOAD_BYTES=1073741824",
+            "# TRANSCODE_ADMISSION_SECRET=",
             "MIRROR_FETCH_TIMEOUT_SECS=",
         ):
             self.assertIn(key, text)
+
+        self.assertNotIn("104857600", text)
+        self.assertNotRegex(text, r"(?m)^TRANSCODE_ADMISSION_SECRET=")
+
+        # Keep TRANSCODER_URL aligned with Cloud Run prod while admission secret is unset.
+        transcoder_match = re.search(r"(?m)^TRANSCODER_URL=(\S+)$", text)
+        self.assertIsNotNone(transcoder_match, "Expected active TRANSCODER_URL in .env.upload.example")
+        self.assertEqual(
+            transcoder_match.group(1),
+            "https://divine-transcoder-149672065768.us-central1.run.app",
+        )
 
         # TRANSCRIBER_URL must be explicitly set (not commented out) to an origin
         # that serves POST /transcribe/audio rather than falling back to the worker

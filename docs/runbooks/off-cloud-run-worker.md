@@ -218,17 +218,23 @@ sole writer.
    the Dockerfile later switches to a non-root user).
 2. Copy `cloud-run-transcoder/deploy/off-gcp/.env.upload.example` to
    `/opt/divine-transcoder/.env.upload` (`chmod 600`) and populate the B2,
-   transcode admission, transcribe, and optional parity keys (`MIGRATION_NSEC`,
+   transcribe, and optional parity keys (`MIGRATION_NSEC`,
    `AI_DETECTOR_BASE_URL`, `MAX_UPLOAD_BYTES`, `MIRROR_FETCH_TIMEOUT_SECS`,
-   `SENTRY_DSN`) to match live GKE production. Confirm `MEDIA_WRITE_PROVIDER`,
-   `B2_MEDIA_BUCKET`, `GCS_BUCKET`, and `GCS_COMPAT_ENABLED` match live GKE
-   production so both hosts share object storage and resumable sessions. Keep
-   `TRANSCRIBER_URL` explicitly set to an origin serving `POST /transcribe/audio`
-   (the Cloud Run origin `https://divine-transcoder-149672065768.us-central1.run.app`
-   by default, or internal `http://transcoder:8080` only if the local worker is
-   configured with transcription credentials and matching `TRANSCRIBE_SHARED_SECRET`);
-   leaving `TRANSCRIBER_URL` unset falls back to `TRANSCODER_URL`, whose Caddy
-   site intentionally returns `404` for `/transcribe/audio`. Set
+   `SENTRY_DSN`) to match live GKE production. Keep `TRANSCODER_URL` at its
+   default (`https://divine-transcoder-149672065768.us-central1.run.app`) with
+   `TRANSCODE_ADMISSION_SECRET` unset to match live GKE production; only set
+   `TRANSCODE_ADMISSION_SECRET` when intentionally routing HLS admission to the
+   off-GCP worker's `/transcode/queue` endpoint with matching
+   `TRANSCODE_ADMISSION_AUTH_REQUIRED=true` and `TRANSCODE_ADMISSION_SECRET` on
+   the worker. Confirm `MEDIA_WRITE_PROVIDER`, `B2_MEDIA_BUCKET`, `GCS_BUCKET`,
+   and `GCS_COMPAT_ENABLED` match live GKE production so both hosts share object
+   storage and resumable sessions. Keep `TRANSCRIBER_URL` explicitly set to an
+   origin serving `POST /transcribe/audio` (the Cloud Run origin
+   `https://divine-transcoder-149672065768.us-central1.run.app` by default, or
+   internal `http://transcoder:8080` only if the local worker is configured with
+   transcription credentials and matching `TRANSCRIBE_SHARED_SECRET`); leaving
+   `TRANSCRIBER_URL` unset falls back to `TRANSCODER_URL`, whose Caddy site
+   intentionally returns `404` for `/transcribe/audio`. Set
    `UPLOAD_BASE_URL=https://upload-hetzner.divine.video` for candidate testing
    so `/upload/init` returns candidate-host `/sessions/:id` URLs instead of
    pointing chunk uploads back to GKE.
@@ -267,14 +273,16 @@ sole writer.
    container health check only confirms that the port accepts connections.
    Confirm the pinned image can read `/run/secrets/gcp-sa.json` under
    `cap_drop: ALL`, write scratch files to `/tmp` with a read-only root, reach
-   both configured storage buckets, and hairpin HTTPS requests to
-   `TRANSCODER_URL` (`https://transcoder-worker.divine.video`) from inside the
-   container. Confirm `.env.upload` uses the intended buckets, credentials, and
-   concurrency limits for this host, then check:
+   both configured storage buckets, and reach `TRANSCODER_URL` from inside the
+   container (plus container-to-host HTTPS hairpinning if using the worker's
+   `/transcode/queue` admission path). Confirm `.env.upload` uses the intended
+   buckets, credentials, and concurrency limits for this host, then check:
    - `GET /` and `HEAD /` return `200`, and `OPTIONS` preflights succeed across
      the public routes.
    - `GET https://upload-hetzner.divine.video/thumbnail/<known-video-hash>` returns `200 image/jpeg`.
    - Direct `PUT /upload`, resumable `POST /upload/init` → `PUT`/`HEAD /sessions/:id` → `POST /upload/:id/complete`, and `DELETE /upload/:id` abort succeed and write to B2 + GCS.
+   - An uploaded video completes HLS transcoding end-to-end via `TRANSCODER_URL`.
+   - Requests larger than `16 MiB` are rejected by Caddy with `413`.
    - `POST /transcribe` (with valid BUD-11 `t=media` auth and a short sample
      audio clip) returns `200` with `text/vtt` WebVTT output (proving
      `TRANSCRIBER_URL` → `POST /transcribe/audio` works end-to-end).
@@ -291,16 +299,19 @@ sole writer.
    on-demand thumbnails in the budget.
 7. Execute production cutover only after resolving DNS ownership and verifying
    production TLS on the worker **before** sending production traffic to it:
-   1. **DNS ownership plan (`divine-iac-coreconfig`):** GKE's production
-      `HTTPRoute/divine-upload-server` currently declares
-      `external-dns.alpha.kubernetes.io/hostname: upload.divine.video`, so
-      ExternalDNS will reconcile manual Cloudflare edits back to GKE. Before
-      cutting over, Platform must choose and merge a controller-managed handoff:
-      remove the `external-dns.alpha.kubernetes.io/hostname` annotation from
-      GKE's `HTTPRoute` (while keeping `spec.hostnames: ["upload.divine.video"]`
-      so GKE continues serving rollback traffic), verify ExternalDNS releases
-      the record or transfer ownership to an OpenTofu Cloudflare DNS stack, and
-      confirm no conflicting `AAAA` record remains.
+   1. **DNS ownership plan (`divine-iac-coreconfig`):** ExternalDNS currently
+      manages `upload.divine.video` from GKE `HTTPRoute/divine-upload-server`
+      under `policy: sync`, so manual Cloudflare edits will be reconciled back
+      to GKE. Because ExternalDNS reads `spec.hostnames`, removing only the
+      `external-dns.alpha.kubernetes.io/hostname` annotation will **not** release
+      the record, and removing `spec.hostnames` deletes the live `A` record.
+      Before cutting over, Platform must exclude `upload.divine.video` from
+      ExternalDNS (e.g., via `excludeDomains` in the cluster's ExternalDNS
+      configuration) while keeping `spec.hostnames: ["upload.divine.video"]` on
+      GKE's `HTTPRoute` so GKE continues serving cached-DNS and rollback
+      traffic, verify ExternalDNS stops reconciling the record (or transfer DNS
+      ownership to an OpenTofu Cloudflare DNS stack), and confirm no conflicting
+      `AAAA` record remains.
    2. **Stage production vhost & publicly trusted certificate on the worker before DNS flip:**
       Keep `conf.d/upload-candidate.caddy` active so in-flight resumable
       sessions issued on `upload-hetzner.divine.video` keep draining. Because
@@ -357,11 +368,12 @@ sole writer.
 
 ### Rollback
 
-Restore `upload.divine.video` DNS through the same ownership path chosen in step
-7.1 (either restoring the GKE `HTTPRoute` ExternalDNS annotation in
-`divine-iac-coreconfig` or reverting the OpenTofu Cloudflare DNS record back to
-the GKE Gateway IP). Verify the GKE endpoint serves the production certificate
-and can resume sessions begun on Hetzner. Keep the Hetzner upload endpoint
+Restore `upload.divine.video` `A` record to the GKE Gateway IP while
+`upload.divine.video` remains excluded from ExternalDNS (or through the
+chosen DNS controller / OpenTofu stack). Verify the GKE endpoint serves the
+production certificate and can resume sessions begun on Hetzner, and only then
+re-enable ExternalDNS management (`excludeDomains` removal) if returning DNS
+ownership to ExternalDNS. Keep the Hetzner upload endpoint
 running through DNS propagation and until outstanding requests have drained
 (`stop_grace_period: 330s`). Then remove `conf.d/upload.caddy`,
 `conf.d/upload-candidate.caddy`, and any temporary `conf.d/certs/`, validate
