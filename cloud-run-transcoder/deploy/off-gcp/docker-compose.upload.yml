@@ -36,10 +36,12 @@ services:
     volumes:
       - ${UPLOAD_GCP_SA_KEY_PATH:-/etc/divine-upload/gcp-sa.json}:/run/secrets/gcp-sa.json:ro
       # Mount a host-provisioned bounded disk filesystem (e.g. a dedicated LV or
-      # fixed-size loopback ext4 image at /var/lib/divine-upload/scratch with an
-      # inner tmp/ directory) so concurrent 1 GiB resumable completions and
+      # preallocated loopback ext4 image at /var/lib/divine-upload/scratch with
+      # an inner tmp/ directory) so concurrent 1 GiB resumable completions and
       # /migrate spools never consume mem_limit RAM or fill the worker root disk.
-      # create_host_path: false prevents silent fallback to / if unmounted.
+      # Create scratch/tmp only after verifying the scratch mount is active, and
+      # check `mountpoint -q /var/lib/divine-upload/scratch` before starting
+      # upload (`create_host_path: false` only fails if the directory is absent).
       - type: bind
         source: ${UPLOAD_TMP_DIR:-/var/lib/divine-upload/scratch/tmp}
         target: /tmp

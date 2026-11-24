@@ -229,35 +229,57 @@ sole writer.
    (`16` uploads + `2` mirrors at `1 GiB`, plus `12` thumbnails × `100 MiB` ≈
    `19.2 GiB` peak), provision at least **`24 GiB`** (`24G`–`32G`, scaling up
    if you raise those concurrency or size caps). Prefer a dedicated logical
-   volume/partition; otherwise verify root disk headroom (`df -h /`) and create a
-   **fully preallocated** loopback `ext4` image on `/` (never sparse `truncate`
-   or discard-on-mkfs, which would let the mounted ext4 volume report headroom
-   while exhausting `/`, and never reformat an existing or mounted image):
+   volume/partition; otherwise verify root disk headroom (`df -h /`) and run the
+   fail-closed loopback provisioning subshell below (create
+   `/var/lib/divine-upload/scratch/tmp` **only after** verifying the bounded
+   `ext4` filesystem is mounted, never on `/`, and never reformat an existing or
+   mounted image):
    ```sh
-   df -h /
-   install -d -m 0755 /var/lib/divine-upload/scratch
-   if ! mountpoint -q /var/lib/divine-upload/scratch && [ ! -e /var/lib/divine-upload/scratch.img ]; then
-     # Use fallocate (or dd if=/dev/zero bs=1M count=24576 if the root FS lacks fallocate)
-     fallocate -l 24G /var/lib/divine-upload/scratch.img.tmp
-     mkfs.ext4 -F -E nodiscard -m 0 /var/lib/divine-upload/scratch.img.tmp
-     mv -n /var/lib/divine-upload/scratch.img.tmp /var/lib/divine-upload/scratch.img
-   fi
-   grep -q '/var/lib/divine-upload/scratch.img' /etc/fstab || \
-     echo '/var/lib/divine-upload/scratch.img /var/lib/divine-upload/scratch ext4 loop,nosuid,nodev,noexec,nofail,x-systemd.before=docker.service 0 2' >> /etc/fstab
-   systemctl daemon-reload
-   mountpoint -q /var/lib/divine-upload/scratch || mount /var/lib/divine-upload/scratch
-   install -d -m 1777 -o 0 -g 0 /var/lib/divine-upload/scratch/tmp
-   du -h --apparent-size /var/lib/divine-upload/scratch.img
-   du -h /var/lib/divine-upload/scratch.img
+   (
+     set -eu
+     SCRATCH_DIR=/var/lib/divine-upload/scratch
+     SCRATCH_IMG=/var/lib/divine-upload/scratch.img
+     TMP_IMG=/var/lib/divine-upload/scratch.img.tmp
+     trap 'rm -f "$TMP_IMG"' EXIT
+
+     df -h /
+     install -d -m 0755 "$SCRATCH_DIR"
+     if ! mountpoint -q "$SCRATCH_DIR" && [ ! -e "$SCRATCH_IMG" ]; then
+       # Use fallocate (or dd if=/dev/zero bs=1M count=24576 if the root FS lacks fallocate)
+       fallocate -l 24G "$TMP_IMG"
+       mkfs.ext4 -F -E nodiscard -m 0 "$TMP_IMG"
+       mv -n "$TMP_IMG" "$SCRATCH_IMG"
+     fi
+     if [ -e "$SCRATCH_IMG" ]; then
+       set -- $(stat -c '%b %s' "$SCRATCH_IMG")
+       test $(( $1 * 512 )) -ge "$2"
+     fi
+     grep -q "$SCRATCH_IMG" /etc/fstab || \
+       echo "$SCRATCH_IMG $SCRATCH_DIR ext4 loop,nosuid,nodev,noexec,nofail,x-systemd.before=docker.service 0 2" >> /etc/fstab
+     systemctl daemon-reload
+     mountpoint -q "$SCRATCH_DIR" || mount "$SCRATCH_DIR"
+     mountpoint -q "$SCRATCH_DIR"
+     test "$(findmnt -rn -o FSTYPE --target "$SCRATCH_DIR")" = "ext4"
+     install -d -m 1777 -o 0 -g 0 "$SCRATCH_DIR/tmp"
+     if [ -e "$SCRATCH_IMG" ]; then
+       du -h --apparent-size "$SCRATCH_IMG"
+       du -h "$SCRATCH_IMG"
+     fi
+   )
    ```
    Using the inner `tmp/` directory paired with `create_host_path: false` in
    `docker-compose.upload.yml` guarantees Docker refuses to start `upload` if
-   the scratch filesystem is unmounted (preventing silent spillover onto `/`).
+   `scratch/tmp` does not exist on `/`, so it is safe only because `scratch/tmp`
+   is created **inside** the verified mount (always check
+   `mountpoint -q /var/lib/divine-upload/scratch && test -d /var/lib/divine-upload/scratch/tmp`
+   before starting `upload`).
    Because OOM kills or forced stops can leave orphaned `NamedTempFile` `.tmp*`
    dotfiles behind, `docker-compose.upload.yml` sweeps `/tmp` (excluding
    `lost+found`) on every container start before `exec /app/divine-upload-server`;
    if reclaiming manually while running, stop `upload` first (`docker compose stop upload`),
-   clear `/var/lib/divine-upload/scratch/tmp`, and start only `upload` (`docker compose up -d --no-deps upload`).
+   clear `/var/lib/divine-upload/scratch/tmp`, verify
+   `mountpoint -q /var/lib/divine-upload/scratch && test -d /var/lib/divine-upload/scratch/tmp`,
+   and start only `upload` (`docker compose up -d --no-deps upload`).
 2. Copy `cloud-run-transcoder/deploy/off-gcp/.env.upload.example` to
    `/opt/divine-transcoder/.env.upload` (`chmod 600`) and populate the B2,
    transcribe, and optional parity keys (`MIGRATION_NSEC`,
@@ -323,22 +345,74 @@ sole writer.
    `stop_grace_period: 920s`), Docker stops the previously running Caddy
    container under its **old** 10s stop timeout when recreating it — which would
    reset any in-flight `/internal/transcode` requests (up to 910s). Pause
-   `divine-transcode` and wait for in-flight transcode jobs to drop to **0**
-   (per section 3) before recreating `caddy`, then start `upload` and update
-   `caddy` with `--no-deps` so Compose does **not** recreate `transcoder`,
-   verify `/health`, and resume `divine-transcode`:
+   `divine-transcode` and confirm in-flight transcode requests and worker jobs
+   have drained to **0** before recreating `caddy`. Only after validation, queue
+   pause, and drain succeed, start `upload`, replace `caddy` with `--no-deps`
+   (so Compose does **not** recreate `transcoder`), verify `/health`, and resume
+   `divine-transcode`. Run these three fail-closed phases in order:
+
+   Phase A — Preflight checks and pause `divine-transcode`:
    ```sh
-   docker compose ps transcoder
-   docker compose run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile
-   gcloud tasks queues pause divine-transcode \
-     --location=us-central1 --project=rich-compiler-479518-d2
-   # Wait until active /internal/transcode requests on the worker drop to 0
-   docker compose up -d --no-deps upload
-   docker compose up -d --no-deps caddy
-   docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile
-   curl -fsS https://transcoder-worker.divine.video/health
-   gcloud tasks queues resume divine-transcode \
-     --location=us-central1 --project=rich-compiler-479518-d2
+   (
+     set -eu
+     mountpoint -q /var/lib/divine-upload/scratch
+     test -d /var/lib/divine-upload/scratch/tmp
+     docker compose ps --status running --services | grep -qx transcoder
+     docker compose run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile
+     gcloud tasks queues pause divine-transcode \
+       --location=us-central1 --project=rich-compiler-479518-d2
+     test "$(gcloud tasks queues describe divine-transcode \
+       --location=us-central1 --project=rich-compiler-479518-d2 \
+       --format='value(state)')" = "PAUSED"
+   )
+   ```
+
+   Phase B — Wait up to `910s` until Caddy reports `0` active upstream
+   requests and `transcoder` has no active `ffmpeg` worker processes (re-run
+   until it exits `0`):
+   ```sh
+   (
+     set -eu
+     upstreams="$(docker compose exec -T caddy wget -qO- http://127.0.0.1:2019/reverse_proxy/upstreams)"
+     printf '%s\n' "$upstreams" | \
+       python3 -c 'import json, sys; up = json.load(sys.stdin); assert up and all(u.get("num_requests", 1) == 0 for u in up), up'
+     top_out="$(docker compose top transcoder)"
+     test -n "$top_out"
+     if printf '%s\n' "$top_out" | grep -q '[f]fmpeg'; then
+       echo 'transcoder still running ffmpeg' >&2
+       exit 1
+     fi
+   )
+   ```
+
+   Phase C — Gated activation and queue resume (re-checks preflight, pause, and
+   drain inside one `set -eu` block so `caddy` is never replaced after a failed
+   validation or un-drained worker):
+   ```sh
+   (
+     set -eu
+     mountpoint -q /var/lib/divine-upload/scratch
+     test -d /var/lib/divine-upload/scratch/tmp
+     docker compose run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile
+     test "$(gcloud tasks queues describe divine-transcode \
+       --location=us-central1 --project=rich-compiler-479518-d2 \
+       --format='value(state)')" = "PAUSED"
+     upstreams="$(docker compose exec -T caddy wget -qO- http://127.0.0.1:2019/reverse_proxy/upstreams)"
+     printf '%s\n' "$upstreams" | \
+       python3 -c 'import json, sys; up = json.load(sys.stdin); assert up and all(u.get("num_requests", 1) == 0 for u in up), up'
+     top_out="$(docker compose top transcoder)"
+     test -n "$top_out"
+     if printf '%s\n' "$top_out" | grep -q '[f]fmpeg'; then
+       echo 'transcoder still running ffmpeg' >&2
+       exit 1
+     fi
+     docker compose up -d --no-deps upload
+     docker compose up -d --no-deps caddy
+     docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile
+     curl -fsS https://transcoder-worker.divine.video/health
+     gcloud tasks queues resume divine-transcode \
+       --location=us-central1 --project=rich-compiler-479518-d2
+   )
    ```
    *(Running `docker compose run --rm --no-deps caddy caddy validate` beforehand
    validates the `./conf.d` mount and site files without binding host ports or
@@ -601,38 +675,54 @@ sole writer.
         WantedBy=timers.target
         ```
         Enable the timer and run a baseline verification (`systemctl daemon-reload && systemctl enable --now deploy-upload-cert.timer && systemctl start deploy-upload-cert.service`): any failed reload or SNI mismatch leaves `deploy-upload-cert.service` in `failed` state (`systemctl --failed`) and retries hourly until confirmed live.
-   3. **Verify production SNI & TLS directly on the worker before DNS cutover:**
+   3. **Verify production SNI & TLS directly on every worker address family before DNS cutover:**
       Confirm the worker presents a valid trusted certificate for
-      `upload.divine.video` and answers healthy directly at the worker IP:
+      `upload.divine.video` and answers healthy directly on `<worker-ipv4>`, and
+      also on `<worker-ipv6>` whenever publishing or retaining an `AAAA` record:
       ```sh
-      curl -fsS --resolve upload.divine.video:443:<worker-ip> https://upload.divine.video/
+      curl -fsS -4 --resolve "upload.divine.video:443:<worker-ipv4>" https://upload.divine.video/
+      # Required if publishing an AAAA record for upload.divine.video:
+      curl -fsS -6 --resolve "upload.divine.video:443:[<worker-ipv6>]" https://upload.divine.video/
       ```
-      Do not move DNS until this check succeeds.
+      Do not move DNS until every target address family check succeeds.
    4. **Switch `UPLOAD_BASE_URL`, drain safely, and re-verify health:** Confirm
       no active candidate-host test uploads are running first — force-recreating
       the single `upload` container stops it while draining
       (`stop_grace_period: 330s`), which briefly takes
       `upload-hetzner.divine.video` offline (`502`) until the new container
-      starts. Update `UPLOAD_BASE_URL=https://upload.divine.video` in
-      `.env.upload` and recreate `upload` cleanly
+      starts. Confirm the bounded scratch mount is active
+      (`mountpoint -q /var/lib/divine-upload/scratch && test -d /var/lib/divine-upload/scratch/tmp`),
+      update `UPLOAD_BASE_URL=https://upload.divine.video` in `.env.upload`, and
+      recreate `upload` cleanly
       (`docker compose up -d --no-deps --force-recreate upload` — Compose honors
       `stop_grace_period: 330s` to let `divine-upload-server`'s 300s shutdown
       drain complete) so newly initialized sessions advertise the production
       hostname. Avoid starting new candidate-hostname test uploads between this
       step and step 7.5. Confirm `upload` is healthy and still serves the
-      production SNI check before flipping DNS:
+      production SNI check on every target address family before flipping DNS:
       ```sh
+      mountpoint -q /var/lib/divine-upload/scratch && test -d /var/lib/divine-upload/scratch/tmp
       docker compose ps upload
-      curl -fsS --resolve upload.divine.video:443:<worker-ip> https://upload.divine.video/
+      curl -fsS -4 --resolve "upload.divine.video:443:<worker-ipv4>" https://upload.divine.video/
+      # Required if publishing an AAAA record:
+      curl -fsS -6 --resolve "upload.divine.video:443:[<worker-ipv6>]" https://upload.divine.video/
       ```
    5. **Flip production DNS via the chosen controller/owner and verify steady-state TLS:**
-      Point the DNS-only (grey-cloud) `A` record for `upload.divine.video` to
-      the worker IP (with matching or removed `AAAA`), wait for public DNS
-      propagation on both address families
-      (`dig @1.1.1.1 +short A upload.divine.video` and
-      `dig @1.1.1.1 +short AAAA upload.divine.video`), and repeat the smoke
-      checks from step 5 (including the `POST /transcribe` WebVTT check)
-      against `https://upload.divine.video`. Keep the DNS-01 file certificate
+      - **Dual-stack cutover:** Only after both IPv4 and IPv6 probes above pass,
+        point both DNS-only (grey-cloud) `A` and `AAAA` records for
+        `upload.divine.video` to the worker, wait for propagation on both
+        address families (`dig @1.1.1.1 +short A upload.divine.video` and
+        `dig @1.1.1.1 +short AAAA upload.divine.video`), and repeat the Step 5
+        smoke checks (including `POST /transcribe`) over both IPv4 (`curl -4`)
+        and IPv6 (`curl -6`).
+      - **IPv4-only cutover:** If GKE previously published an `AAAA` record,
+        delete that `AAAA` record first while GKE remains available over IPv4,
+        wait for the pre-cutover `AAAA` TTL recorded in Step 6 to expire and
+        confirm `dig @1.1.1.1 +short AAAA upload.divine.video` returns empty,
+        and only then point DNS-only `A` to `<worker-ipv4>` and repeat the Step
+        5 smoke checks (including `POST /transcribe`) against
+        `https://upload.divine.video`.
+      Keep the DNS-01 file certificate
       (`conf.d/certs/current/upload.pem` / `upload.key`) and `tls` directive in
       `conf.d/upload.caddy` active under `/usr/local/sbin/deploy-upload-cert.sh`
       and `deploy-upload-cert.timer` installed in step 7.2 (which atomically
