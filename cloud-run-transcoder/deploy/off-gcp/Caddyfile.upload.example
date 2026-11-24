@@ -37,10 +37,11 @@
 		}
 		reverse_proxy upload-proxy:8081 {
 			# Stream request bodies directly to isolated upload-proxy (nginx on
-			# upload_edge), which enforces an aggregate limit_conn cap of 64
-			# concurrent PUT/POST requests across body buffering and upstream
-			# response wait (returning 429 before body allocation, with no per-IP
-			# cap so Fastly POP egress IPs are not throttled) while buffering
+			# upload_edge), which rejects unexpected bodies on GET/HEAD/OPTIONS/DELETE
+			# before buffering (413) and enforces an aggregate limit_conn cap of 64
+			# concurrent body-eligible requests across body buffering and upstream
+			# response wait (returning CORS-enabled 429 before body allocation, with
+			# no per-IP cap so Fastly POP egress IPs are not throttled) while buffering
 			# <=16 MiB bodies on bounded scratch disk (128 KiB RAM buffer) ahead
 			# of upload:8080. This keeps slow or flooding upload clients out of
 			# shared Caddy memory so transcoder-worker stays isolated.
@@ -49,6 +50,9 @@
 			transport http {
 				dial_timeout 10s
 				response_header_timeout 310s
+				# Close idle connections to upload-proxy before nginx's 130s
+				# keepalive_timeout to avoid half-closed PUT/POST retries.
+				keepalive 60s
 			}
 		}
 	}

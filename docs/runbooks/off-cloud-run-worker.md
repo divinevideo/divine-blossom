@@ -223,9 +223,10 @@ sole writer.
    `chmod 0700`, mounted into `upload-proxy:/tmp`) — and verify the bounded
    filesystem from your configured limits: worst-case concurrent `/tmp` spooling
    (`divine-upload-server` resumable completion/verification, `/migrate`, and
-   sync `ffmpeg` thumbnail extraction up to `MAX_SYNC_VIDEO_BYTES=100 MiB`, plus
-   up to `64` concurrent `16 MiB` request bodies buffered on scratch disk by
-   `upload-proxy` before upstream admission) is
+   (`MAX_SYNC_VIDEO_BYTES=100 MiB`), plus up to `64` concurrent `16 MiB`
+   request bodies buffered on scratch disk by `upload-proxy` across all
+   body-eligible methods (`GET`, `HEAD`, `OPTIONS`, and `DELETE` reject
+   non-empty bodies with `413` before buffering)) is
    `(MAX_CONCURRENT_UPLOADS + MAX_CONCURRENT_MIRRORS) * MAX_UPLOAD_BYTES + MAX_CONCURRENT_THUMBNAILS * 100 MiB + 64 * 16 MiB`
    plus MP4 remux and filesystem overhead. With `.env.upload.example` defaults
    (`16` uploads + `2` mirrors at `1 GiB`, `12` thumbnails × `100 MiB`, and `64`
@@ -544,13 +545,15 @@ sole writer.
    least `~450 kbit/s` for a full `16 MiB` direct `PUT`, whereas `1 MiB`
    resumable chunks succeed down to `~28 kbit/s`). Load test concurrent slow
    uploads, thumbnail misses, and transcoding together: verify `upload-proxy`
-   caps aggregate concurrent `PUT`/`POST` requests at `64` across their full
-   lifetime (body buffering on scratch disk plus upstream wait up to `310s` for
-   `/upload`, `/upload/init`, `/upload/:id/complete`, `/transcribe`, and
-   `/migrate`, with no per-IP cap so Fastly POP egress IPs are not throttled
-   after cutover) and rejects excess `PUT`/`POST` load with `429` before body
-   allocation without starving `GET /` / `/thumbnail/:hash` or holding Caddy RAM,
-   measure shared `caddy` memory (`CADDY_MEM_LIMIT=2g`, `CADDY_GOMEMLIMIT=1600MiB`) and
+   rejects non-empty bodies on strictly bodyless methods (`GET`/`HEAD`/`OPTIONS`/`DELETE`)
+   before buffering (`413`), caps aggregate concurrent body-eligible requests at
+   `64` across their full lifetime (body buffering on scratch disk plus upstream
+   wait up to `310s` for `/upload`, `/upload/init`, `/upload/:id/complete`,
+   `/transcribe`, and `/migrate`, with no per-IP cap so Fastly POP egress IPs
+   are not throttled after cutover), and rejects excess load with a CORS-enabled
+   `429` before body allocation without starving `GET /` / `/thumbnail/:hash` or
+   holding Caddy RAM; measure shared `caddy` memory (`CADDY_MEM_LIMIT=2g`,
+   `CADDY_GOMEMLIMIT=1600MiB`) and
    `upload-proxy` memory (`UPLOAD_PROXY_MEM_LIMIT=512m`), confirm
    `https://transcoder-worker.divine.video/health` and `/internal/transcode` keep
    succeeding under upload flood/saturation, and check bounded
@@ -621,17 +624,21 @@ sole writer.
       (`chmod 755`) to handle automated renewals safely: it acquires
       `/run/deploy-upload-cert.lock`, confirms `conf.d/upload.caddy` is still
       present (exiting `0` cleanly without creating `conf.d/certs/` if teardown
-      has already removed the production vhost), checks idempotency against
-      **both** the staged files and the certificate serial Caddy actually serves
-      over TLS SNI, atomically swaps `conf.d/certs/current`, validates and runs
-      `caddy reload --force`, and polls localhost SNI on `127.0.0.1:443` until
-      the new serial is served. If validation, reload, SNI activation, or a
-      caught `INT`/`TERM` signal interrupts activation, it restores
-      `conf.d/certs/current -> $PREV`, runs a recovery `caddy reload --force`,
-      verifies Caddy serves `$PREV`'s serial over SNI again (retaining both
-      `$PREV` and the staged directory and logging to stderr if recovery reload
-      or SNI verification also fails), and exits non-zero. Only after the new
-      serial is confirmed live over SNI does it prune stale release directories:
+      has already removed the production vhost), validates the staged leaf
+      key-pair match and full certificate chain against the system trust store
+      and `upload.divine.video` hostname (`openssl verify -untrusted "$SRC_CERT" -verify_hostname "$SNI_HOST" "$SRC_CERT"`)
+      before modifying `conf.d/certs/`, checks idempotency against **both** the
+      staged files and a **trusted, hostname-verified** TLS handshake over
+      `127.0.0.1:443` matching the leaf SHA-256 fingerprint, atomically swaps
+      `conf.d/certs/current`, validates and runs `caddy reload --force`, and
+      polls `127.0.0.1:443` until Caddy completes a verified TLS handshake
+      (`-verify_hostname "$SNI_HOST" -verify_return_error`) serving the new
+      leaf SHA-256 fingerprint. If pre-swap verification, validation, reload,
+      trusted TLS handshake verification, or a caught `INT`/`TERM` signal fails
+      or interrupts activation, it retains `$PREV` (restoring
+      `conf.d/certs/current -> $PREV` and running a recovery `caddy reload --force`
+      plus verified TLS check if swapped). Only after the new leaf is confirmed
+      trusted and live over TLS does it prune stale release directories:
       ```sh
       #!/bin/sh
       set -eu
@@ -650,21 +657,23 @@ sole writer.
       fi
       mkdir -p "$CERT_DIR/releases"
 
-      WANT_SERIAL="$(openssl x509 -in "$SRC_CERT" -noout -serial)"
-      test -n "$WANT_SERIAL"
+      WANT_FP="$(openssl x509 -in "$SRC_CERT" -noout -fingerprint -sha256)"
+      test -n "$WANT_FP"
       test "$(openssl x509 -in "$SRC_CERT" -noout -pubkey)" = \
            "$(openssl pkey -in "$SRC_KEY" -pubout)"
+      openssl verify -untrusted "$SRC_CERT" -verify_hostname "$SNI_HOST" "$SRC_CERT" >/dev/null
 
-      served_serial() {
-        timeout 5 openssl s_client -connect 127.0.0.1:443 -servername "$SNI_HOST" </dev/null 2>/dev/null \
-          | openssl x509 -noout -serial 2>/dev/null || true
+      served_verified_fp() {
+        out="$(timeout 5 openssl s_client -connect 127.0.0.1:443 -servername "$SNI_HOST" \
+          -verify_hostname "$SNI_HOST" -verify_return_error </dev/null 2>/dev/null)" || return 1
+        printf '%s\n' "$out" | openssl x509 -noout -fingerprint -sha256 2>/dev/null || return 1
       }
 
-      wait_for_serial() {
+      wait_for_verified_fp() {
         want="$1"
         i=0
         while [ "$i" -lt 5 ]; do
-          if [ "$(served_serial)" = "$want" ]; then
+          if [ "$(served_verified_fp || true)" = "$want" ]; then
             return 0
           fi
           i=$((i + 1))
@@ -676,16 +685,16 @@ sole writer.
       if [ -f "$CERT_DIR/current/upload.pem" ] && [ -f "$CERT_DIR/current/upload.key" ] \
          && cmp -s "$SRC_CERT" "$CERT_DIR/current/upload.pem" \
          && cmp -s "$SRC_KEY" "$CERT_DIR/current/upload.key" \
-         && [ "$(served_serial)" = "$WANT_SERIAL" ]; then
+         && [ "$(served_verified_fp || true)" = "$WANT_FP" ]; then
         exit 0
       fi
 
       REL="releases/$(date -u +%Y%m%dT%H%M%SZ)-$$"
       STAGE="$CERT_DIR/$REL"
       PREV="$(readlink "$CERT_DIR/current" 2>/dev/null || true)"
-      PREV_SERIAL=""
+      PREV_FP=""
       if [ -n "$PREV" ] && [ -f "$CERT_DIR/$PREV/upload.pem" ]; then
-        PREV_SERIAL="$(openssl x509 -in "$CERT_DIR/$PREV/upload.pem" -noout -serial 2>/dev/null || true)"
+        PREV_FP="$(openssl x509 -in "$CERT_DIR/$PREV/upload.pem" -noout -fingerprint -sha256 2>/dev/null || true)"
       fi
       RELOADED=0
 
@@ -708,12 +717,12 @@ sole writer.
           rm -rf "$STAGE"
           exit "$rc"
         fi
-        if [ -n "$PREV" ] && [ -n "$PREV_SERIAL" ]; then
+        if [ -n "$PREV" ] && [ -n "$PREV_FP" ]; then
           ln -sfn "$PREV" "$CERT_DIR/current.prev"
           mv -Tf "$CERT_DIR/current.prev" "$CERT_DIR/current"
           cd /opt/divine-transcoder
           if docker compose exec -T caddy caddy reload --force --config /etc/caddy/Caddyfile \
-             && wait_for_serial "$PREV_SERIAL"; then
+             && wait_for_verified_fp "$PREV_FP"; then
             rm -rf "$STAGE"
           else
             printf 'ERROR: certificate rollback to %s is unverified; keeping both %s and %s on disk\n' \
@@ -733,6 +742,7 @@ sole writer.
       install -m 600 "$SRC_KEY" "$STAGE/upload.key"
       test "$(openssl x509 -in "$STAGE/upload.pem" -noout -pubkey)" = \
            "$(openssl pkey -in "$STAGE/upload.key" -pubout)"
+      openssl verify -untrusted "$STAGE/upload.pem" -verify_hostname "$SNI_HOST" "$STAGE/upload.pem" >/dev/null
 
       ln -sfn "$REL" "$CERT_DIR/current.next"
       mv -Tf "$CERT_DIR/current.next" "$CERT_DIR/current"
@@ -741,7 +751,7 @@ sole writer.
       docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile
       RELOADED=1
       docker compose exec -T caddy caddy reload --force --config /etc/caddy/Caddyfile
-      wait_for_serial "$WANT_SERIAL"
+      wait_for_verified_fp "$WANT_FP"
 
       trap - EXIT INT TERM
       for d in "$CERT_DIR"/releases/*; do
@@ -850,8 +860,8 @@ sole writer.
       `conf.d/upload.caddy` active under `/usr/local/sbin/deploy-upload-cert.sh`
       and `deploy-upload-cert.timer` installed in step 7.2 (which atomically
       swaps `conf.d/certs/current`, runs `caddy reload --force`, and verifies
-      SNI serial activation — rolling back Caddy + `current` on failure —
-      before cleaning old releases) — do **not** remove `tls` and reload
+      a trusted, hostname-verified TLS handshake and leaf SHA-256 fingerprint —
+      rolling back Caddy + `current` on failure — before cleaning old releases) — do **not** remove `tls` and reload
       Caddy while Caddy's managed ACME storage is empty, because Caddy unloads
       the file certificate immediately and fails TLS SNI handshakes until a
       managed issuer certificate is obtained. Only transition to Caddy-managed
@@ -863,19 +873,34 @@ sole writer.
 
 ### Post-cutover upload upgrades & maintenance
 
-Because only one `upload` container runs behind Caddy on this host, every
-post-cutover `docker compose up -d --no-deps --force-recreate upload` (image
-update or `.env.upload` change) stops the running container first and drains
-in-flight requests for up to `stop_grace_period: 330s` (~5.5 minutes) before
-starting the replacement. During that drain window, `upload.divine.video`
-returns `502` on new uploads, `/upload/init`, `/complete`, and `/thumbnail`
-requests (unlike GKE's 2–8 pod rolling updates). Plan routine upgrades for a
-maintenance window (or temporarily route `upload.divine.video` back to GKE),
-and verify `mountpoint -q /var/lib/divine-upload/scratch && test -f /var/lib/divine-upload/scratch/tmp/.divine-upload-scratch`
-before recreating `upload`. Zero-downtime single-host upgrades would require
-running two `upload` services behind Caddy with health checks,
-`lb_try_duration`, and **separate** `UPLOAD_TMP_DIR` directories so each
-container's startup sweep cannot delete the other's scratch marker or spools.
+Because only one `upload` container and one `upload-proxy` container run behind
+Caddy on this host, every post-cutover `docker compose up -d --no-deps --force-recreate`
+on `upload` (image update or `.env.upload` change) or `upload-proxy` (nginx
+image bump; nginx stops accepting new connections on `SIGQUIT` while draining)
+stops the running container first and drains in-flight requests for up to
+`stop_grace_period: 330s` (~5.5 minutes) before starting the replacement. During
+that drain window, `upload.divine.video` returns `502` on new uploads,
+`/upload/init`, `/complete`, and `/thumbnail` requests (unlike GKE's 2–8 pod
+rolling updates). Plan container recreations for a maintenance window (or
+temporarily route `upload.divine.video` back to GKE), and verify
+`mountpoint -q /var/lib/divine-upload/scratch && test -f /var/lib/divine-upload/scratch/tmp/.divine-upload-scratch && test -f /var/lib/divine-upload/scratch/proxy-tmp/.divine-upload-scratch`
+before recreating `upload` or `upload-proxy`.
+
+For config-only changes to `/opt/divine-transcoder/nginx.upload-proxy.conf`,
+update the file **in place** using `cp` (do **not** replace it via `mv` or a
+write-temp-then-rename tool, because `nginx.upload-proxy.conf` is a single-file
+bind mount and changing its host inode leaves the running container reading the
+old configuration), then validate and reload cleanly without dropping active
+connections:
+```sh
+docker compose exec upload-proxy nginx -t -c /etc/nginx/nginx.conf
+docker compose exec upload-proxy nginx -s reload
+```
+
+Zero-downtime single-host `upload` upgrades would require running two `upload`
+services behind Caddy/`upload-proxy` with health checks, `lb_try_duration`, and
+**separate** `UPLOAD_TMP_DIR` directories so each container's startup sweep
+cannot delete the other's scratch marker or spools.
 
 ### Rollback
 

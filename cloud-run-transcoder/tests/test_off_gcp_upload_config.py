@@ -70,6 +70,7 @@ class OffGcpUploadConfigTest(unittest.TestCase):
         self.assertRegex(text, r"(?m)^\t\treverse_proxy upload-proxy:8081 \{$")
         self.assertNotIn("request_buffers", text)
         self.assertRegex(text, r"(?m)^\t\t\t\tresponse_header_timeout 310s$")
+        self.assertRegex(text, r"(?m)^\t\t\t\tkeepalive 60s$")
         self.assertNotIn("read_timeout", text)
         self.assertNotIn("write_timeout", text)
         self.assertRegex(text, r"(?m)^\thandle \{$")
@@ -130,7 +131,7 @@ class OffGcpUploadConfigTest(unittest.TestCase):
         self.assertRegex(caddy_overlay, r"(?m)^\s+-\s+upload_edge$")
 
         upload_proxy_block = text.split("  upload-proxy:", 1)[1].split("  upload:", 1)[0]
-        self.assertIn("image: nginx:1.27.5-alpine", upload_proxy_block)
+        self.assertIn("image: nginx:1.28.3-alpine", upload_proxy_block)
         self.assertIn('user: "101:101"', upload_proxy_block)
         self.assertRegex(upload_proxy_block, r"(?m)^\s+stop_grace_period:\s+330s$")
         self.assertRegex(upload_proxy_block, r"(?m)^\s+mem_limit:\s+\$\{UPLOAD_PROXY_MEM_LIMIT:-512m\}$")
@@ -186,10 +187,22 @@ class OffGcpUploadConfigTest(unittest.TestCase):
         text = UPLOAD_PROXY_NGINX.read_text(encoding="utf-8")
         for required in (
             "server_tokens off;",
+            "keepalive_timeout 130s;",
             "pid /tmp/nginx.pid;",
             "client_body_temp_path /tmp/body 1 2;",
             "real_ip_header X-Forwarded-For;",
             "real_ip_recursive off;",
+            "$reject_unexpected_body",
+            "~^(GET|HEAD|OPTIONS|DELETE):0*:$",
+            "if ($reject_unexpected_body)",
+            'default "body";',
+            "error_page 429 = @too_many_requests;",
+            "error_page 413 = @payload_too_large;",
+            "location @too_many_requests",
+            'add_header Access-Control-Allow-Origin "*" always;',
+            'add_header Access-Control-Allow-Methods "GET, HEAD, PUT, POST, DELETE, OPTIONS" always;',
+            'add_header Access-Control-Expose-Headers "Retry-After" always;',
+            'add_header Retry-After "5" always;',
             "limit_conn_status 429;",
             "limit_conn upload_body_total 64;",
             "limit_conn upload_all_total 256;",
@@ -350,6 +363,7 @@ class OffGcpUploadConfigTest(unittest.TestCase):
             self.assertNotIn("request_buffers", proxy_handler)
             self.assertEqual(proxy_handler["flush_interval"], -1)
             self.assertEqual(proxy_handler["transport"]["response_header_timeout"], 310_000_000_000)
+            self.assertEqual(proxy_handler["transport"]["keep_alive"]["idle_timeout"], 60_000_000_000)
             self.assertNotIn("read_timeout", proxy_handler["transport"])
             self.assertNotIn("write_timeout", proxy_handler["transport"])
 
