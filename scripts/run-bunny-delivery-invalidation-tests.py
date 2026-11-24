@@ -244,6 +244,17 @@ def run_case(mode):
                         "bunny_delivery_zones": f"{PRIMARY_HOST},{ALIAS_HOST}",
                         "b2_replica_enabled": "false",
                     }
+                elif mode == "vanish-b2-replica-budget":
+                    configuration = {
+                        "fixture_delivery_mode": mode,
+                        "bunny_delivery_zones": f"{PRIMARY_HOST},{ALIAS_HOST}",
+                        "b2_replica_enabled": "true",
+                    }
+                elif mode == "bunny-retry-clears-on-target-error":
+                    configuration = {
+                        "fixture_delivery_mode": mode,
+                        "bunny_delivery_zones": "   ",
+                    }
                 elif mode == "webhook-admin-moderate":
                     configuration = {
                         "fixture_delivery_mode": mode,
@@ -306,7 +317,7 @@ def run_case(mode):
                 if result.returncode or "1 passed; 0 failed" not in result.stdout or server.errors:
                     raise RuntimeError(result.stdout + result.stderr + repr(server.errors))
 
-                if mode in ("invalid-config", "rotation-overflow"):
+                if mode in ("invalid-config", "rotation-overflow", "bunny-retry-clears-on-target-error"):
                     assert not server.bunny_counts
                     print(f"PASS {mode}: fails closed")
                     return
@@ -336,6 +347,7 @@ def run_case(mode):
                 elif mode in (
                     "webhook-packed-budget",
                     "bunny-only-vanish-no-replica",
+                    "vanish-b2-replica-budget",
                     "webhook-admin-moderate",
                 ):
                     assert server.bunny_counts == {PRIMARY_HOST: 2, ALIAS_HOST: 2}, server.bunny_counts
@@ -356,6 +368,8 @@ if __name__ == "__main__":
         "webhook-packed-budget",
         "webhook-no-bundle-safe-failclosed",
         "bunny-only-vanish-no-replica",
+        "vanish-b2-replica-budget",
+        "bunny-retry-clears-on-target-error",
         "webhook-admin-moderate",
         "invalid-config",
     )

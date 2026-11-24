@@ -13,7 +13,7 @@ type Value = Binding<Option<String>>;
 struct Bindings {
     configs: BTreeMap<String, Value>,
     secrets: BTreeMap<String, Value>,
-    origin_kv: BTreeMap<String, Option<String>>,
+    origin_kv: BTreeMap<String, (Option<String>, Option<u64>)>,
     delivery_zones_retained: Option<String>,
     config_store: Option<Binding<ConfigStoreHandle>>,
     secret_store: Option<Binding<u32>>,
@@ -187,34 +187,41 @@ pub(crate) fn secret(key: &str) -> Result<Option<String>> {
     lookup(|bindings| bindings.secret(key))
 }
 
-/// Cache successful KV-origin lookups for static target-retention keys within
-/// one Compute request so repeated policy/drain checks do not re-spend backend
-/// subrequests. Errors are never cached.
+/// Cache successful KV-origin lookups (value and optional generation) for static
+/// target-retention keys within one Compute request so repeated policy/drain
+/// checks do not re-spend backend subrequests. Errors are never cached.
 pub(crate) fn cached_origin_kv(
     key: &str,
     fetch: impl FnOnce() -> Result<Option<String>>,
 ) -> Result<Option<String>> {
+    cached_origin_kv_with_gen(key, || fetch().map(|value| (value, None))).map(|(value, _)| value)
+}
+
+pub(crate) fn cached_origin_kv_with_gen(
+    key: &str,
+    fetch: impl FnOnce() -> Result<(Option<String>, Option<u64>)>,
+) -> Result<(Option<String>, Option<u64>)> {
     let cached = CURRENT.with(|slot| {
         slot.borrow()
             .as_ref()
             .and_then(|bindings| bindings.origin_kv.get(key).cloned())
     });
-    if let Some(value) = cached {
-        return Ok(value);
+    if let Some(entry) = cached {
+        return Ok(entry);
     }
-    let value = fetch()?;
+    let entry = fetch()?;
     CURRENT.with(|slot| {
         if let Some(bindings) = slot.borrow_mut().as_mut() {
-            bindings.origin_kv.insert(key.to_owned(), value.clone());
+            bindings.origin_kv.insert(key.to_owned(), entry.clone());
         }
     });
-    Ok(value)
+    Ok(entry)
 }
 
 pub(crate) fn set_cached_origin_kv(key: &str, value: Option<String>) {
     CURRENT.with(|slot| {
         if let Some(bindings) = slot.borrow_mut().as_mut() {
-            bindings.origin_kv.insert(key.to_owned(), value);
+            bindings.origin_kv.insert(key.to_owned(), (value, None));
         }
     });
 }

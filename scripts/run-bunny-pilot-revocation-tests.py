@@ -326,9 +326,11 @@ def run(versions, resume, fallback=None, with_delivery=False, rotated_delivery=F
 
 
 if __name__ == '__main__':
-    for case in sys.argv[1:] or ("standalone-5xx","standalone-missing","standalone-rejected","missing-cold","rejected-cold","rejected-immediate","malformed-immediate","missing-unrelated-immediate","missing-unrelated-webhook","paged","single","single-with-delivery","single-with-rotated-delivery"):
+    for case in sys.argv[1:] or ("standalone-5xx","standalone-missing","standalone-rejected","missing-cold","rejected-cold","rejected-immediate","malformed-immediate","missing-unrelated-immediate","missing-unrelated-webhook","paged","paged-with-rotated-delivery","single","single-with-delivery","single-with-rotated-delivery"):
         if case in ("paged","single"):
             run(VERSIONS if case == "paged" else {(PREFIX,"original-v1")}, case == "paged")
+        elif case == "paged-with-rotated-delivery":
+            run(VERSIONS, True, rotated_delivery=True)
         elif case == "single-with-delivery":
             run({(PREFIX,"original-v1")}, False, with_delivery=True)
         elif case == "single-with-rotated-delivery":

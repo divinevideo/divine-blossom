@@ -767,9 +767,11 @@ fn bunny_pilot_age_gate_eviction_retries() {
         record["state"].clone()
     };
     assert_eq!(intent_state(), "committed");
-    // Four version deletes per execution. The first verified empty listing
-    // reaches the configured transient purge failure and stays pending.
-    for _ in 0..6 {
+    // Up to four version deletes per execution (or one per pass during 4-host
+    // delivery rotation to stay within the 32-backend-request budget). The
+    // first verified empty listing reaches the configured transient purge
+    // failure and stays pending.
+    for _ in 0..20 {
         let req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=1", false)
             .with_header("Authorization", "Bearer synthetic-webhook-token");
         let mut retry = crate::request_bindings::metered(req);
@@ -964,8 +966,29 @@ fn bunny_delivery_policy_purge_and_durable_retry() {
         return;
     }
 
-    if mode == "bunny-only-vanish-no-replica" {
+    if mode == "bunny-only-vanish-no-replica" || mode == "vanish-b2-replica-budget" {
         let hash = hash();
+        if mode == "vanish-b2-replica-budget" {
+            // Simulate a real vanish wave that has already spent 5 secrets before
+            // reaching inline `purge_bunny_hashes`: phased CDN invalidation must
+            // defer Bunny purging to `Phase::Final` drain without failing the wave.
+            let _scope = crate::request_bindings::begin();
+            for secret_name in [
+                "b2_cdn_purge_drain_token",
+                "admin_token",
+                "webhook_secret",
+                "fastly_api_token",
+                "kv_origin_read_token",
+            ] {
+                let _ = crate::request_bindings::secret(secret_name);
+            }
+            let mut vanish_result = storage::VanishStorageResult::default();
+            storage::purge_bunny_hashes(std::slice::from_ref(&hash), &mut vanish_result);
+            assert!(
+                vanish_result.failed_hashes.is_empty(),
+                "phased vanish must not fail inline Bunny purge when 5 secrets are spent"
+            );
+        }
         let epoch = storage::begin_vanish_phase(&hash).unwrap().unwrap();
         let empty = std::collections::HashSet::new();
         assert!(storage::finish_vanish_phase(&hash, &epoch, &empty, &empty).unwrap());
@@ -978,6 +1001,22 @@ fn bunny_delivery_policy_purge_and_durable_retry() {
         let reply: serde_json::Value = serde_json::from_str(&response.take_body_str()).unwrap();
         assert_eq!(reply["result"], 1);
         assert!(storage::vanish_complete(&hash));
+        return;
+    }
+
+    if mode == "bunny-retry-clears-on-target-error" {
+        let hash = hash();
+        let store = open_store().unwrap();
+        let hint_key = format!("canonical-purge-priority:v1:{hash}");
+        store.insert(&hint_key, "bunny-retry").unwrap();
+        assert!(storage::invalidate_b2_cdn(std::slice::from_ref(&hash)).is_err());
+        assert!(
+            matches!(
+                store.lookup(&hint_key),
+                Err(fastly::kv_store::KVStoreError::ItemNotFound)
+            ),
+            "bunny-retry hint must clear even when bunny_delivery_purge_targets fails"
+        );
         return;
     }
 
