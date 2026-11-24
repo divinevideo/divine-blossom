@@ -203,11 +203,16 @@ Whenever it is configured, every `/thumbnail` response is
 
 Blossom's calls carry `x-request-id: blossom-thumbnail-<request id>`, with the
 triggering Blossom request's id (sanitized to `[A-Za-z0-9_-]`, at most 64
-characters), like its other proxied calls. A Blossom call that arrives without a
-valid token (for example when earlier storage reads spent the Compute secret
-budget) can be told apart from other callers and matched to the request that
-caused it. Calls with no triggering request (HEAD, archive import) carry
-`blossom-thumbnail`.
+characters on the edge) on both `GET` and `HEAD`; `cloud-run-upload` preserves
+the full prefixed id (up to 128 characters) in its logs, and archive import
+calls carry bare `blossom-thumbnail`. Because `x-request-id` is caller-supplied,
+corroborate unauthenticated `blossom-thumbnail-*` hits against Blossom edge logs.
+When `derived_media_read_primary=b2`, Blossom reserves one Compute secret slot
+across B2 404 -> GCS fallback so `thumbnail_service_token` stays readable.
+Any corroborated `blossom-thumbnail-*` `missing` hit blocks flipping
+`THUMBNAIL_TOKEN_REQUIRED=true`. (`experiments/bunny-blossom/app.ts` does not
+send this token yet and must be updated or retired before enforcement if used
+against an upload service.)
 
 `cloud-run-upload` has no metrics listener, so each guarded request logs one
 `thumbnail_token` line with `result=authenticated|missing|invalid`, `mode`,
@@ -218,8 +223,11 @@ remaining `missing` hits are traced to callers you don't intend to support.
 `cloud-run-transcoder/repair-media-artifacts.sh` and
 `cloud-run-upload/backfill-thumbnails.py` send the token when
 `THUMBNAIL_SERVICE_TOKEN` is set (the shell script passes it to curl on stdin,
-so it never appears in the process list), and warn when it is unset or would go
-to a non-default upload host.
+so it never appears in the process list), enforce bare HTTPS origins without
+following redirects, run a non-destructive `/thumbnail/auth-check` preflight
+(expecting `400`) before deleting stored thumbnails, and require explicit opt-in
+(`ALLOW_NON_DEFAULT_UPLOAD_URL=true` / `--allow-non-default-upload-url`) to
+send the token to a non-default host.
 
 For `cloud-run-upload`, bind the token from GCP Secret Manager in
 `rich-compiler-479518-d2` with `gcloud run services update blossom-upload-rust
@@ -233,8 +241,9 @@ before the token is required again: GCP Secret Manager in `dv-platform-prod`
 (divine-upload-server on GKE, through External Secrets), GCP Secret Manager in
 `rich-compiler-479518-d2` (Cloud Run `blossom-upload-rust`), and Fastly
 `blossom_secrets` (`thumbnail_service_token`, which Blossom sends). The token is
-read once at startup and a single value is accepted, so rotate through observe
-mode, changing the receivers before the sender:
+read once at startup and a single value is accepted, so rotating via observe
+mode temporarily reopens `/thumbnail/:hash` (supporting overlapping credentials
+would require a separate follow-up). Rotate receivers before the sender:
 
 1. Set `THUMBNAIL_TOKEN_REQUIRED=false` on both upload services and roll them.
    From here no copy can break a request.
@@ -243,7 +252,9 @@ mode, changing the receivers before the sender:
    Blossom still sends the old token, which shows as `invalid` but is served.
 3. Update Fastly `blossom_secrets`. Blossom sends the new token, `authenticated`
    rises and `invalid` stops.
-4. Once `invalid` stays at zero on both services, set the flag back to `true`.
+4. Once `authenticated` Blossom traffic is confirmed and `invalid` stays at zero
+   on both services (with no corroborated Blossom `missing` hits), set the flag
+   back to `true`.
 
 ## API
 
