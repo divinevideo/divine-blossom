@@ -64,11 +64,29 @@ pub enum Decision {
 
 impl Policy {
     pub fn from_env() -> anyhow::Result<Self> {
-        Self::from_lookup(|key| std::env::var(key).ok())
+        Self::from_var_lookup(|key| std::env::var(key))
     }
 
+    #[cfg(test)]
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
-        let token = match lookup(TOKEN_ENV) {
+        Self::from_values(lookup(TOKEN_ENV), lookup(REQUIRED_ENV))
+    }
+
+    fn from_var_lookup(
+        lookup: impl Fn(&str) -> Result<String, std::env::VarError>,
+    ) -> anyhow::Result<Self> {
+        let read = |key: &str| match lookup(key) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                anyhow::bail!("{key} must be valid UTF-8")
+            }
+        };
+        Self::from_values(read(TOKEN_ENV)?, read(REQUIRED_ENV)?)
+    }
+
+    fn from_values(token: Option<String>, required: Option<String>) -> anyhow::Result<Self> {
+        let token = match token {
             None => None,
             Some(raw) => {
                 let token = raw.trim().to_string();
@@ -83,7 +101,7 @@ impl Policy {
                 Some(token)
             }
         };
-        let required = match lookup(REQUIRED_ENV).as_deref().map(str::trim) {
+        let required = match required.as_deref().map(str::trim) {
             None | Some("") | Some("false") => false,
             Some("true") => true,
             Some(_) => anyhow::bail!("{REQUIRED_ENV} must be true or false"),
@@ -109,10 +127,11 @@ impl Policy {
             Policy::Open => return Decision::Allow,
             Policy::Observe(token) | Policy::Required(token) => token,
         };
-        let reason = match headers.get(HEADER) {
-            None => Reason::Missing,
-            Some(_) if presented_matches(headers, expected) => return Decision::Allow,
-            Some(_) => Reason::Invalid,
+        let mut values = headers.get_all(HEADER).iter();
+        let reason = match (values.next(), values.next()) {
+            (None, None) => Reason::Missing,
+            (Some(value), None) if presented_matches(value, expected) => return Decision::Allow,
+            _ => Reason::Invalid,
         };
         if matches!(self, Policy::Required(_)) {
             Decision::Reject(reason)
@@ -134,14 +153,11 @@ impl Policy {
     }
 }
 
-fn presented_matches(headers: &HeaderMap, expected: &str) -> bool {
-    let Some(candidate) = headers.get(HEADER).map(|v| v.as_bytes()) else {
-        return false;
-    };
+fn presented_matches(value: &axum::http::HeaderValue, expected: &str) -> bool {
     // Compare fixed-size digests in constant time, so neither the content nor
     // the length of the configured token shapes the comparison time.
     let expected = Sha256::digest(expected.as_bytes());
-    let candidate = Sha256::digest(candidate);
+    let candidate = Sha256::digest(value.as_bytes());
     expected.ct_eq(&candidate).into()
 }
 
@@ -153,7 +169,7 @@ fn request_id(headers: &HeaderMap) -> String {
         .unwrap_or("")
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .take(64)
+        .take(128)
         .collect();
     if id.is_empty() {
         "-".into()
@@ -348,5 +364,68 @@ mod tests {
         map.insert("x-request-id", "a b=c\"d".parse().unwrap());
         assert_eq!(request_id(&map), "abcd");
         assert_eq!(request_id(&HeaderMap::new()), "-");
+    }
+
+    #[test]
+    fn non_unicode_env_vars_fail_startup_without_exposing_values() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let bad_utf8 = OsString::from_vec(vec![0xff, 0xfe]);
+        for bad_key in [TOKEN_ENV, REQUIRED_ENV] {
+            let err = Policy::from_var_lookup(|key| {
+                if key == bad_key {
+                    Err(std::env::VarError::NotUnicode(bad_utf8.clone()))
+                } else {
+                    Err(std::env::VarError::NotPresent)
+                }
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(bad_key), "{err}");
+            assert!(err.contains("UTF-8"), "{err}");
+        }
+    }
+
+    #[test]
+    fn duplicate_token_headers_are_classified_as_invalid() {
+        let observe = Policy::Observe("s3cret".into());
+        let required = Policy::Required("s3cret".into());
+        let mut dup_matching = headers(Some("s3cret"));
+        dup_matching.append(HEADER, "s3cret".parse().unwrap());
+        assert_eq!(
+            observe.decide(&dup_matching),
+            Decision::AllowUnauthenticated(Reason::Invalid)
+        );
+        assert_eq!(
+            required.decide(&dup_matching),
+            Decision::Reject(Reason::Invalid)
+        );
+
+        let mut dup_mismatched = headers(Some("s3cret"));
+        dup_mismatched.append(HEADER, "other".parse().unwrap());
+        assert_eq!(
+            observe.decide(&dup_mismatched),
+            Decision::AllowUnauthenticated(Reason::Invalid)
+        );
+        assert_eq!(
+            required.decide(&dup_mismatched),
+            Decision::Reject(Reason::Invalid)
+        );
+    }
+
+    #[test]
+    fn full_prefixed_request_id_is_preserved_in_logs() {
+        let full_id = format!("blossom-thumbnail-{}", "a".repeat(64));
+        assert_eq!(full_id.len(), 82);
+        let mut map = headers(Some("s3cret-token"));
+        map.insert("x-request-id", full_id.parse().unwrap());
+        assert_eq!(request_id(&map), full_id);
+
+        let observe = Policy::Observe("s3cret-token".into());
+        let logs = captured_logs(|| {
+            let decision = observe.decide(&map);
+            log_decision(&observe, &decision, &map);
+        });
+        assert!(logs.contains(&format!("request_id={full_id}")), "{logs}");
     }
 }

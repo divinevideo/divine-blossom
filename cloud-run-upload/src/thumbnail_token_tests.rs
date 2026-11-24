@@ -153,6 +153,7 @@ async fn router_reads_the_token_header() {
         .await
         .unwrap();
     assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+    assert_not_shared_cacheable(&refused, "router refused");
     let served = app
         .oneshot(
             axum::http::Request::get(&uri)
@@ -163,4 +164,5 @@ async fn router_reads_the_token_header() {
         .await
         .unwrap();
     assert_eq!(served.status(), StatusCode::OK);
+    assert_not_shared_cacheable(&served, "router served");
 }

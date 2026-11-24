@@ -405,11 +405,7 @@ fn build_router(state: Arc<AppState>) -> Router {
 pub(crate) fn build_tracing_filter(
     rust_log: Option<&str>,
 ) -> Result<tracing_subscriber::EnvFilter> {
-    let base = match rust_log {
-        Some(value) if !value.is_empty() => tracing_subscriber::EnvFilter::try_new(value)
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("")),
-        _ => tracing_subscriber::EnvFilter::new(""),
-    };
+    let base = tracing_subscriber::EnvFilter::new(rust_log.unwrap_or(""));
     Ok(base.add_directive("blossom_upload=info".parse()?))
 }
 
