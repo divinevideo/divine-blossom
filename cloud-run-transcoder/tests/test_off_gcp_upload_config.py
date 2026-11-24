@@ -131,7 +131,7 @@ class OffGcpUploadConfigTest(unittest.TestCase):
         self.assertRegex(caddy_overlay, r"(?m)^\s+-\s+upload_edge$")
 
         upload_proxy_block = text.split("  upload-proxy:", 1)[1].split("  upload:", 1)[0]
-        self.assertIn("image: nginx:1.28.3-alpine", upload_proxy_block)
+        self.assertIn("image: nginx:1.30.8-alpine", upload_proxy_block)
         self.assertIn('user: "101:101"', upload_proxy_block)
         self.assertRegex(upload_proxy_block, r"(?m)^\s+stop_grace_period:\s+330s$")
         self.assertRegex(upload_proxy_block, r"(?m)^\s+mem_limit:\s+\$\{UPLOAD_PROXY_MEM_LIMIT:-512m\}$")

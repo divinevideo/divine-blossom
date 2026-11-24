@@ -223,7 +223,8 @@ sole writer.
    `chmod 0700`, mounted into `upload-proxy:/tmp`) — and verify the bounded
    filesystem from your configured limits: worst-case concurrent `/tmp` spooling
    (`divine-upload-server` resumable completion/verification, `/migrate`, and
-   (`MAX_SYNC_VIDEO_BYTES=100 MiB`), plus up to `64` concurrent `16 MiB`
+   sync `ffmpeg` thumbnail extraction up to `MAX_SYNC_VIDEO_BYTES=100 MiB`,
+   plus up to `64` concurrent `16 MiB`
    request bodies buffered on scratch disk by `upload-proxy` across all
    body-eligible methods (`GET`, `HEAD`, `OPTIONS`, and `DELETE` reject
    non-empty bodies with `413` before buffering)) is

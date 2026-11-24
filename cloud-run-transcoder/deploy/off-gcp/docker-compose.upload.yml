@@ -16,7 +16,7 @@ services:
       - upload_edge
 
   upload-proxy:
-    image: nginx:1.28.3-alpine
+    image: nginx:1.30.8-alpine
     user: "101:101"
     restart: unless-stopped
     # Match upload's 300s graceful drain window (nginx stops gracefully on SIGQUIT).
