@@ -23,6 +23,10 @@ BUCKET_ID = 'synthetic-bucket-id'
 PREFIX = f'bunny-delivery/{HASH}'
 CUSTOM_HOST = 'media-bunny.divine.video'
 ALIAS = 'divine-media-pilot.b-cdn.net'
+DELIVERY_HOST = 'media.divine.video'
+DELIVERY_ALIAS = 'divine-media-cdn.b-cdn.net'
+OLD_DELIVERY_HOST = 'old.divine.video'
+OLD_DELIVERY_ALIAS = 'old-cdn.b-cdn.net'
 FASTLY_SERVICES = {'ML7R82HKfmTaqTpHExIDVN', 'pOvEEWykEbpnylqst1KTrR'}
 TEST = 'quarantine_tests::bunny_pilot_age_gate_eviction_retries'
 VERSIONS = {(PREFIX, 'original-v1'), (f'{PREFIX}/720p.mp4', '720p-v1'),
@@ -129,7 +133,12 @@ class Provider(BaseHTTPRequestHandler):
         assert params['async'] == ['false']
         assert len(params['url']) == 1
         target = urlsplit(params['url'][0])
-        assert target.scheme == 'https' and target.netloc in (CUSTOM_HOST, ALIAS)
+        assert target.scheme == 'https'
+        if self.server.with_delivery and target.netloc in self.server.delivery_hosts:
+            assert target.path in (f'/{HASH}*', f'/{"c" * 64}*') and not target.query
+            self.server.delivery_counts[target.netloc] += 1
+            return 200, {}
+        assert target.netloc in (CUSTOM_HOST, ALIAS)
         assert target.path == f'/{HASH}*' and not target.query
         assert not (self.server.versions & VERSIONS)
         assert ('versions', 0) in self.server.events
@@ -205,11 +214,18 @@ blossom_secrets = [
 '''
 
 
-def run(versions, resume, fallback=None):
+def run(versions, resume, fallback=None, with_delivery=False, rotated_delivery=False):
     unrelated = {(HASH, 'canonical-original'), (f'bunny-delivery/{"b" * 64}', 'other-pilot-asset')}
     with ThreadingHTTPServer(('127.0.0.1', 0), Provider) as server:
         server.lock = threading.Lock()
         server.fallback = fallback
+        server.with_delivery = with_delivery or rotated_delivery
+        server.delivery_hosts = (
+            (DELIVERY_HOST, DELIVERY_ALIAS, OLD_DELIVERY_HOST, OLD_DELIVERY_ALIAS)
+            if rotated_delivery
+            else (DELIVERY_HOST, DELIVERY_ALIAS)
+        )
+        server.delivery_counts = Counter()
         server.legacy_targets = []
         server.packed_rounds = {}
         server.expired_requests = 0
@@ -221,13 +237,18 @@ def run(versions, resume, fallback=None):
         try:
             with tempfile.TemporaryDirectory(prefix='bunny-pilot-revocation-') as directory:
                 config, kv, settings = (Path(directory) / name for name in ('fastly.toml', 'kv.json', 'settings.json'))
-                kv.write_text('{}')
+                kv_seed = {}
+                if rotated_delivery:
+                    kv_seed['bunny-delivery-retained-zones:v1'] = f'{OLD_DELIVERY_HOST},{OLD_DELIVERY_ALIAS}'
+                kv.write_text(json.dumps(kv_seed))
                 configuration = {'b2_bucket_id': BUCKET_ID, 'b2_media_bucket': BUCKET,
                                                 'bunny_fixture_resume_revoke': 'true' if resume else 'false',
                                                 'bunny_fixture_local_gate': 'true', 'bunny_fixture_meter_gate': 'true',
                                                 'b2_cdn_host': 'media-b2-cdn.divine.video',
                                                 'b2_cdn_purge_hosts': 'media-b2-cdn.divine.video,media-b2.divine.video', 'metadata_kv_store_id': 'fixture-store',
                                                 'bunny_pilot_zone_hosts': f'{CUSTOM_HOST},reconfigured-zone.b-cdn.net'}
+                if with_delivery or rotated_delivery:
+                    configuration['bunny_delivery_zones'] = f'{DELIVERY_HOST},{DELIVERY_ALIAS}'
                 if not resume:
                     configuration.pop('bunny_pilot_zone_hosts')
                 if fallback:
@@ -281,7 +302,11 @@ def run(versions, resume, fallback=None):
                 assert server.versions == unrelated, server.versions
                 assert Counter(entry for event, entry in server.events if event == 'delete') == Counter(versions)
                 assert server.bunny_counts == {CUSTOM_HOST: 4, ALIAS: 4}, server.events
-                assert Counter(entry for event, entry in server.events if event == 'fastly') == dict.fromkeys(FASTLY_SERVICES, 14 if resume else 8), server.events
+                if with_delivery or rotated_delivery:
+                    for host in server.delivery_hosts:
+                        assert server.delivery_counts[host] >= 6, (host, server.delivery_counts)
+                else:
+                    assert Counter(entry for event, entry in server.events if event == 'fastly') == dict.fromkeys(FASTLY_SERVICES, 14 if resume else 8), server.events
                 for report in result.stderr.splitlines():
                     if report.startswith("BUNNY_QUOTA "):
                         print(report)
@@ -294,8 +319,12 @@ def run(versions, resume, fallback=None):
 
 
 if __name__ == '__main__':
-    for case in sys.argv[1:] or ("standalone-5xx","standalone-missing","standalone-rejected","missing-cold","rejected-cold","rejected-immediate","malformed-immediate","missing-unrelated-immediate","missing-unrelated-webhook","paged","single"):
+    for case in sys.argv[1:] or ("standalone-5xx","standalone-missing","standalone-rejected","missing-cold","rejected-cold","rejected-immediate","malformed-immediate","missing-unrelated-immediate","missing-unrelated-webhook","paged","single","single-with-delivery","single-with-rotated-delivery"):
         if case in ("paged","single"):
             run(VERSIONS if case == "paged" else {(PREFIX,"original-v1")}, case == "paged")
+        elif case == "single-with-delivery":
+            run({(PREFIX,"original-v1")}, False, with_delivery=True)
+        elif case == "single-with-rotated-delivery":
+            run({(PREFIX,"original-v1")}, False, rotated_delivery=True)
         else:
             run({(PREFIX,"original-v1")} if case == "standalone-rejected" else VERSIONS, False, case)

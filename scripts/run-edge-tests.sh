@@ -86,6 +86,7 @@ VICEROY="$VICEROY" python3 scripts/run-b2-cdn-purge-outbox-tests.py
 VICEROY="$VICEROY" python3 scripts/run-parent-gate-tests.py
 VICEROY="$VICEROY" python3 scripts/run-b2-cdn-phase-tests.py
 VICEROY="$VICEROY" python3 scripts/run-bunny-pilot-revocation-tests.py
+VICEROY="$VICEROY" python3 scripts/run-bunny-delivery-invalidation-tests.py
 VICEROY="$VICEROY" python3 scripts/run-bunny-pilot-publication-tests.py
 for contract in \
   quarantine_cdn_purge_failure_remains_denied_and_idempotently_retries \

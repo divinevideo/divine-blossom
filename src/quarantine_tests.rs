@@ -898,3 +898,127 @@ fn bunny_legacy_canonical_fallback() {
         assert_eq!(result, u8::from(storage::config_flag("fixture_unenrolled")));
     }
 }
+
+#[test]
+#[ignore = "requires synthetic Fastly and Bunny providers; scripts/run-bunny-delivery-invalidation-tests.py"]
+fn bunny_delivery_policy_purge_and_durable_retry() {
+    let mode = storage::optional_config("fixture_delivery_mode")
+        .unwrap()
+        .unwrap_or_else(|| "bunny-only".to_string());
+
+    if mode == "invalid-config" {
+        assert!(b2_cdn_purge::configured());
+        assert!(storage::invalidate_b2_cdn(&[hash()]).is_err());
+        return;
+    }
+
+    if mode == "webhook-packed-budget" {
+        let hash = "c".repeat(64);
+        b2_cdn_purge::enqueue(&hash, b2_cdn_purge::Phase::Single).unwrap();
+        let req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false)
+            .with_header("Authorization", "Bearer synthetic-webhook-token");
+        let mut response = crate::request_bindings::metered(req);
+        assert_eq!(response.get_status(), StatusCode::OK);
+        let reply: serde_json::Value = serde_json::from_str(&response.take_body_str()).unwrap();
+        assert_eq!(reply["result"], 1);
+        assert_eq!(reply["errors"], 0);
+        assert_eq!(reply["pending"], 0);
+        return;
+    }
+
+    if mode == "retained-after-removal" || mode == "zone-rotation" {
+        assert!(b2_cdn_purge::configured());
+        b2_cdn_purge::enqueue(&hash(), b2_cdn_purge::Phase::Single).unwrap();
+        if mode == "zone-rotation" {
+            let retained = open_store()
+                .unwrap()
+                .lookup("bunny-delivery-retained-zones:v1")
+                .unwrap()
+                .take_body()
+                .into_string();
+            assert_eq!(retained, "old.divine.video,old-cdn.b-cdn.net");
+        }
+        let req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false)
+            .with_header("Authorization", "Bearer synthetic-drain-token");
+        let mut response = crate::request_bindings::metered(req);
+        assert_eq!(response.get_status(), StatusCode::OK);
+        let reply: serde_json::Value = serde_json::from_str(&response.take_body_str()).unwrap();
+        assert_eq!(reply["result"], 1);
+        assert_eq!(reply["errors"], 0);
+        assert_eq!(reply["pending"], 0);
+        return;
+    }
+
+    let hash = hash();
+    let metadata = serde_json::from_value(serde_json::json!({
+        "sha256": hash,
+        "size": 9,
+        "type": "video/mp4",
+        "uploaded": "2026-01-01T00:00:00Z",
+        "owner": "b".repeat(64),
+        "status": "active"
+    }))
+    .unwrap();
+    put_blob_metadata(&metadata).unwrap();
+
+    let mut moderate = request(Method::POST, "/admin/api/moderate", true);
+    moderate.set_body(serde_json::json!({"sha256": hash, "action": "BAN"}).to_string());
+    assert_eq!(
+        crate::request_bindings::metered(moderate).get_status(),
+        StatusCode::BAD_GATEWAY
+    );
+    assert_eq!(
+        get_blob_metadata_uncached(&hash).unwrap().unwrap().status,
+        BlobStatus::Banned
+    );
+    assert_eq!(
+        call(request(Method::GET, &format!("/{hash}"), false)).get_status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let store = open_store().unwrap();
+    let retained = store
+        .lookup("bunny-delivery-retained-zones:v1")
+        .unwrap()
+        .take_body()
+        .into_string();
+    assert_eq!(retained, "media.divine.video,divine-media-cdn.b-cdn.net");
+
+    let queue = store
+        .build_list()
+        .prefix("b2-cdn-purge:v1:")
+        .execute()
+        .unwrap();
+    assert_eq!(queue.keys().len(), 1);
+    let key = &queue.keys()[0];
+    let intent_state = || {
+        let record: serde_json::Value =
+            serde_json::from_str(&store.lookup(key).unwrap().take_body().into_string()).unwrap();
+        record["state"].clone()
+    };
+    assert_eq!(intent_state(), "committed");
+
+    // First drain still fails on one Bunny alias: intent must remain committed.
+    let first_drain = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false)
+        .with_header("Authorization", "Bearer synthetic-drain-token");
+    let mut first_resp = crate::request_bindings::metered(first_drain);
+    assert_eq!(first_resp.get_status(), StatusCode::OK);
+    let first_body: serde_json::Value =
+        serde_json::from_str(&first_resp.take_body_str()).unwrap();
+    assert_eq!(first_body["result"], 0);
+    assert_eq!(first_body["errors"], 1);
+    assert_eq!(first_body["pending"], 1);
+    assert_eq!(intent_state(), "committed");
+
+    // Second drain succeeds across both aliases and both rounds: intent clears.
+    let second_drain = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false)
+        .with_header("Authorization", "Bearer synthetic-drain-token");
+    let mut second_resp = crate::request_bindings::metered(second_drain);
+    assert_eq!(second_resp.get_status(), StatusCode::OK);
+    let second_body: serde_json::Value =
+        serde_json::from_str(&second_resp.take_body_str()).unwrap();
+    assert_eq!(second_body["result"], 1);
+    assert_eq!(second_body["errors"], 0);
+    assert_eq!(second_body["pending"], 0);
+    assert_eq!(intent_state(), "cleared");
+}

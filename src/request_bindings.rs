@@ -154,10 +154,30 @@ pub(crate) fn config(key: &str) -> Result<Option<String>> {
 /// The exceptional purge fallback must leave a native read slot for any
 /// credential still needed by this execution.
 pub(crate) fn can_read_secret(key: &str) -> bool {
+    has_secret_budget(&[key])
+}
+
+/// Whether `key` has already been loaded in the current request's secret cache.
+pub(crate) fn secret_cached(key: &str) -> bool {
     CURRENT.with(|slot| {
         slot.borrow()
             .as_ref()
-            .is_none_or(|bindings| bindings.secrets.contains_key(key) || bindings.secrets.len() < 5)
+            .is_some_and(|bindings| bindings.secrets.contains_key(key))
+    })
+}
+
+/// Whether all distinct `keys` fit inside the 5-secret per-request Compute limit.
+pub(crate) fn has_secret_budget(keys: &[&str]) -> bool {
+    CURRENT.with(|slot| {
+        slot.borrow().as_ref().is_none_or(|bindings| {
+            let mut needed = 0usize;
+            for (index, key) in keys.iter().enumerate() {
+                if !bindings.secrets.contains_key(*key) && !keys[..index].contains(key) {
+                    needed += 1;
+                }
+            }
+            bindings.secrets.len() + needed <= 5
+        })
     })
 }
 
