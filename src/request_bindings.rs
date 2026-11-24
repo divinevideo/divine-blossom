@@ -298,3 +298,26 @@ pub(crate) fn metered(req: fastly::Request) -> fastly::Response {
         "Fastly request limits exceeded: {path} config={config} secrets={secrets} plaintext={plaintext}");
     response
 }
+
+#[cfg(test)]
+pub(crate) fn metered_scoped(label: &str, op: impl FnOnce()) {
+    let mark = |name: &str| {
+        let response = fastly::Request::post("http://fixture.invalid/fixture/meter")
+            .with_body(name)
+            .send("fixture_control")
+            .unwrap();
+        assert!(response.get_status().is_success());
+    };
+    mark(label);
+    {
+        let _scope = begin();
+        op();
+    }
+    mark("outside");
+    let [config, secrets, plaintext] = LAST_READS.get();
+    eprintln!("BUNNY_QUOTA {label} {config} {secrets} {plaintext}");
+    assert!(
+        (1..=32).contains(&config) && secrets <= 5 && plaintext <= 5,
+        "Fastly request limits exceeded: {label} config={config} secrets={secrets} plaintext={plaintext}"
+    );
+}
