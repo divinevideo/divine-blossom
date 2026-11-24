@@ -498,8 +498,8 @@ sole writer.
          *)    host="$rest";      port="$default_port" ;;
        esac
        case "$host" in
-         ""|'*') host="" ;;
-         '*.'*)  host="healthcheck.${host#\*.}" ;;
+         '*')   host="healthcheck" ;;
+         '*.'*) host="healthcheck.${host#\*.}" ;;
        esac
        if [ -z "$host" ]; then
          curl -fsS --noproxy '*' --max-time 5 "${scheme}://${local_addr}:${port}/health" >/dev/null
@@ -587,8 +587,8 @@ sole writer.
          *)    host="$rest";      port="$default_port" ;;
        esac
        case "$host" in
-         ""|'*') host="" ;;
-         '*.'*)  host="healthcheck.${host#\*.}" ;;
+         '*')   host="healthcheck" ;;
+         '*.'*) host="healthcheck.${host#\*.}" ;;
        esac
        if [ -z "$host" ]; then
          curl -fsS --noproxy '*' --max-time 5 "${scheme}://${local_addr}:${port}/health" >/dev/null
