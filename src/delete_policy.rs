@@ -77,6 +77,46 @@ impl CreatorDeleteOps for DefaultCreatorDeleteOps {
     }
 }
 
+/// Legacy single-execution physical creator-delete defers Bunny edge purges
+/// during `soft_delete` so `bunny_api_key` never consumes a secret slot needed
+/// by downstream origin erasure (`gcs_*` / `fos_*`). Because `fastly_api_token`
+/// plus GCS and FOS credentials already fill Fastly Compute's 5-secret ceiling,
+/// Bunny purging is skipped at the end on a full 5-secret run and only runs
+/// inline when a secret slot remains (e.g. `fastly_api_token` absent or early
+/// GCS failure before FOS loads). Durable Bunny eviction for physical creator
+/// delete requires phased outbox mode (`cdn_invalidation_configured()`).
+#[derive(Default)]
+struct PhysicalCreatorDeleteOps {
+    soft_delete_succeeded: std::cell::Cell<bool>,
+}
+
+impl BlobErasureOps for PhysicalCreatorDeleteOps {
+    fn cleanup_derived_audio(&self, hash: &str) -> Result<()> {
+        DefaultCreatorDeleteOps.cleanup_derived_audio(hash)
+    }
+    fn delete_blob_from_gcs(&self, hash: &str) -> Result<()> {
+        DefaultCreatorDeleteOps.delete_blob_from_gcs(hash)
+    }
+    fn delete_blob_from_replica(&self, hash: &str) -> Result<()> {
+        DefaultCreatorDeleteOps.delete_blob_from_replica(hash)
+    }
+    fn delete_blob_gcs_artifacts(&self, hash: &str) -> Result<()> {
+        DefaultCreatorDeleteOps.delete_blob_gcs_artifacts(hash)
+    }
+    fn purge_vcl_cache(&self, hash: &str) {
+        DefaultCreatorDeleteOps.purge_vcl_cache(hash);
+    }
+}
+
+impl CreatorDeleteOps for PhysicalCreatorDeleteOps {
+    fn soft_delete(&self, hash: &str, metadata: &BlobMetadata, reason: &str) -> Result<()> {
+        let _defer = crate::defer_bunny_edge_purge();
+        soft_delete_blob(hash, metadata, reason, false)?;
+        self.soft_delete_succeeded.set(true);
+        Ok(())
+    }
+}
+
 impl VanishBlobOps for DefaultCreatorDeleteOps {
     fn get_blob_metadata(&self, hash: &str) -> Result<Option<BlobMetadata>> {
         crate::metadata::get_blob_metadata(hash)
@@ -257,6 +297,21 @@ pub fn handle_creator_delete(
 ) -> Result<CreatorDeleteOutcome> {
     if physical_delete_enabled && crate::storage::phase_or_cdn_invalidation_active(hash) {
         return handle_phased_creator_delete(hash, metadata, reason);
+    }
+    if physical_delete_enabled {
+        let ops = PhysicalCreatorDeleteOps::default();
+        let outcome = handle_creator_delete_with_ops(
+            hash,
+            metadata,
+            reason,
+            true,
+            req_id,
+            &ops,
+        );
+        if outcome.is_err() && ops.soft_delete_succeeded.get() {
+            crate::purge_bunny_edge_cache(hash);
+        }
+        return outcome;
     }
     handle_creator_delete_with_ops(
         hash,

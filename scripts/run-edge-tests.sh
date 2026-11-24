@@ -140,3 +140,6 @@ VICEROY="$VICEROY" python3 scripts/run-b2-canonical-demand-tests.py
 
 # Trusted archive imports register without media readback and share erasure exclusion.
 VICEROY="$VICEROY" python3 scripts/run-archive-import-tests.py
+
+# Metered Bunny edge purge contracts against loopback backends.
+VICEROY="$VICEROY" python3 scripts/run-bunny-edge-purge-tests.py
