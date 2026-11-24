@@ -457,11 +457,12 @@ sole writer.
    ```
 
    Phase C — Gated activation and conditional queue resume (re-checks preflight,
-   pause, and captured drain gates inside one `set -eu` block, pins the
-   post-reload `/health` readiness probe to the local Caddy listener via
-   `${LOCAL_CADDY_ADDR:-127.0.0.1}` and `TRANSCODER_DOMAIN` from
-   `/opt/divine-transcoder/.env` so shared DNS/LB peers cannot mask a failed
-   local Caddy, and resumes `divine-transcode` only if Phase A paused it):
+   pause, and captured drain gates inside one `set -eu` block, reads the
+   effective `TRANSCODER_DOMAIN` resolved by Compose from the running `caddy`
+   container and pins the post-reload `/health` probe to
+   `${LOCAL_CADDY_ADDR:-127.0.0.1}` with `--noproxy '*'` so shell proxies and
+   shared DNS/LB peers cannot mask a failed local Caddy, and resumes
+   `divine-transcode` only if Phase A paused it):
    ```sh
    (
      set -eu
@@ -479,14 +480,16 @@ sole writer.
        return 1
      }
      probe_local_transcoder_health() {
-       raw_domain="$(awk -F= '/^[[:space:]]*(export[[:space:]]+)?TRANSCODER_DOMAIN=/{val=substr($0, index($0,"=")+1)} END{print val}' /opt/divine-transcoder/.env | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^"//; s/"$//; s/^'\''//; s/'\''$//')"
-       [ -n "$raw_domain" ] || { echo 'TRANSCODER_DOMAIN not set in /opt/divine-transcoder/.env' >&2; return 1; }
+       raw_domain="$(docker compose exec -T caddy printenv TRANSCODER_DOMAIN 2>/dev/null || true)"
+       raw_domain="$(printf '%s' "${raw_domain%%,*}" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+       [ -n "$raw_domain" ] || { echo 'TRANSCODER_DOMAIN not set in running caddy container' >&2; return 1; }
        local_addr="${LOCAL_CADDY_ADDR:-127.0.0.1}"
        case "$raw_domain" in
-         http://*)  scheme=http;  rest="${raw_domain#http://}";  default_port=80 ;;
-         https://*) scheme=https; rest="${raw_domain#https://}"; default_port=443 ;;
-         :*)        scheme=http;  rest="$raw_domain";            default_port=80 ;;
-         *)         scheme=https; rest="$raw_domain";            default_port=443 ;;
+         http://*)    scheme=http;  rest="${raw_domain#http://}";  default_port=80 ;;
+         https://*)   scheme=https; rest="${raw_domain#https://}"; default_port=443 ;;
+         :*)          scheme=http;  rest="$raw_domain";            default_port=80 ;;
+         *:80|*:80/*) scheme=http;  rest="$raw_domain";            default_port=80 ;;
+         *)           scheme=https; rest="$raw_domain";            default_port=443 ;;
        esac
        rest="${rest%%/*}"
        case "$rest" in
@@ -495,11 +498,11 @@ sole writer.
          *)    host="$rest";      port="$default_port" ;;
        esac
        if [ -z "$host" ]; then
-         curl -fsS --max-time 5 "${scheme}://${local_addr}:${port}/health" >/dev/null
+         curl -fsS --noproxy '*' --max-time 5 "${scheme}://${local_addr}:${port}/health" >/dev/null
        elif [ "$port" = "$default_port" ]; then
-         curl -fsS --max-time 5 --resolve "${host}:${port}:${local_addr}" "${scheme}://${host}/health" >/dev/null
+         curl -fsS --noproxy '*' --max-time 5 --resolve "${host}:${port}:${local_addr}" "${scheme}://${host}/health" >/dev/null
        else
-         curl -fsS --max-time 5 --resolve "${host}:${port}:${local_addr}" "${scheme}://${host}:${port}/health" >/dev/null
+         curl -fsS --noproxy '*' --max-time 5 --resolve "${host}:${port}:${local_addr}" "${scheme}://${host}:${port}/health" >/dev/null
        fi
      }
      wait_transcoder_health() {
@@ -549,26 +552,29 @@ sole writer.
 
    Phase C recovery — Restore last known-good transcoder-only `caddy` ingress if
    Phase C failed after stopping or replacing `caddy` (keeps `transcoder` untouched;
-   pins each `/health` readiness probe to the local Caddy listener via
-   `${LOCAL_CADDY_ADDR:-127.0.0.1}` and `TRANSCODER_DOMAIN` from
-   `/opt/divine-transcoder/.env` so healthy peer nodes behind shared DNS/LB cannot
-   mask a failed replacement; if the updated base `docker-compose.yml` or
-   `Caddyfile` fails `/health`, falls back automatically to
-   `/var/lib/divine-upload/pre-sync-backup`, resumes `divine-transcode` only after
-   `/health` passes and only if Phase A created the pause marker, and then clears
-   the pre-sync backup so subsequent rollouts take a fresh baseline):
+   reads the Compose-resolved `TRANSCODER_DOMAIN` from the running base `caddy`
+   container and pins each `/health` readiness probe to
+   `${LOCAL_CADDY_ADDR:-127.0.0.1}` with `--noproxy '*'` so shell proxies and
+   healthy peer nodes behind shared DNS/LB cannot mask a failed replacement; if
+   the updated base `docker-compose.yml` or `Caddyfile` fails `/health`, falls
+   back automatically to `/var/lib/divine-upload/pre-sync-backup`, resumes
+   `divine-transcode` only after `/health` passes and only if Phase A created
+   the pause marker, and then clears the pre-sync backup so subsequent rollouts
+   take a fresh baseline):
    ```sh
    (
      set -eu
      probe_local_transcoder_health() {
-       raw_domain="$(awk -F= '/^[[:space:]]*(export[[:space:]]+)?TRANSCODER_DOMAIN=/{val=substr($0, index($0,"=")+1)} END{print val}' /opt/divine-transcoder/.env | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^"//; s/"$//; s/^'\''//; s/'\''$//')"
-       [ -n "$raw_domain" ] || { echo 'TRANSCODER_DOMAIN not set in /opt/divine-transcoder/.env' >&2; return 1; }
+       raw_domain="$(docker compose -f docker-compose.yml exec -T caddy printenv TRANSCODER_DOMAIN 2>/dev/null || true)"
+       raw_domain="$(printf '%s' "${raw_domain%%,*}" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+       [ -n "$raw_domain" ] || { echo 'TRANSCODER_DOMAIN not set in running caddy container' >&2; return 1; }
        local_addr="${LOCAL_CADDY_ADDR:-127.0.0.1}"
        case "$raw_domain" in
-         http://*)  scheme=http;  rest="${raw_domain#http://}";  default_port=80 ;;
-         https://*) scheme=https; rest="${raw_domain#https://}"; default_port=443 ;;
-         :*)        scheme=http;  rest="$raw_domain";            default_port=80 ;;
-         *)         scheme=https; rest="$raw_domain";            default_port=443 ;;
+         http://*)    scheme=http;  rest="${raw_domain#http://}";  default_port=80 ;;
+         https://*)   scheme=https; rest="${raw_domain#https://}"; default_port=443 ;;
+         :*)          scheme=http;  rest="$raw_domain";            default_port=80 ;;
+         *:80|*:80/*) scheme=http;  rest="$raw_domain";            default_port=80 ;;
+         *)           scheme=https; rest="$raw_domain";            default_port=443 ;;
        esac
        rest="${rest%%/*}"
        case "$rest" in
@@ -577,11 +583,11 @@ sole writer.
          *)    host="$rest";      port="$default_port" ;;
        esac
        if [ -z "$host" ]; then
-         curl -fsS --max-time 5 "${scheme}://${local_addr}:${port}/health" >/dev/null
+         curl -fsS --noproxy '*' --max-time 5 "${scheme}://${local_addr}:${port}/health" >/dev/null
        elif [ "$port" = "$default_port" ]; then
-         curl -fsS --max-time 5 --resolve "${host}:${port}:${local_addr}" "${scheme}://${host}/health" >/dev/null
+         curl -fsS --noproxy '*' --max-time 5 --resolve "${host}:${port}:${local_addr}" "${scheme}://${host}/health" >/dev/null
        else
-         curl -fsS --max-time 5 --resolve "${host}:${port}:${local_addr}" "${scheme}://${host}:${port}/health" >/dev/null
+         curl -fsS --noproxy '*' --max-time 5 --resolve "${host}:${port}:${local_addr}" "${scheme}://${host}:${port}/health" >/dev/null
        fi
      }
      wait_transcoder_health() {
