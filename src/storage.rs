@@ -1682,6 +1682,9 @@ pub(crate) struct VanishStorageResult {
     /// Hashes whose provider version set exceeded one bounded slice. Their deletion is
     /// progressing, so they are pending work rather than failures.
     pub remaining_hashes: HashSet<String>,
+    /// True when inline Fastly vanish purge was deferred to `Phase::Final`
+    /// drain to stay within Fastly Compute's 5-secret per-request limit.
+    pub purge_deferred: bool,
     pub timings: VanishStorageTimings,
 }
 
@@ -1690,6 +1693,7 @@ impl VanishStorageResult {
         self.failed_hashes = retry.failed_hashes;
         self.purged_hashes.extend(retry.purged_hashes);
         self.remaining_hashes = retry.remaining_hashes;
+        self.purge_deferred |= retry.purge_deferred;
         self.timings.cloud_run_cleanup_ms = self
             .timings
             .cloud_run_cleanup_ms
@@ -3509,6 +3513,22 @@ pub(crate) fn purge_policy_cache(hash: &str) -> Result<()> {
     else { crate::purge_edge_cache(hash); Ok(()) }
 }
 
+fn vanish_inline_fastly_purge_has_budget() -> bool {
+    let reserve_kv_origin = !b2_replica_enabled()
+        && optional_config("metadata_kv_store_id").map_or(true, |value| {
+            value.as_deref().is_some_and(|id| !id.trim().is_empty())
+        });
+    if reserve_kv_origin {
+        crate::request_bindings::has_secret_budget(&[
+            "fastly_api_token",
+            "kv_origin_read_token",
+            "webhook_secret",
+        ])
+    } else {
+        crate::request_bindings::has_secret_budget(&["fastly_api_token", "webhook_secret"])
+    }
+}
+
 /// Purge the given hashes by surrogate key from both CDN services and return
 /// the hashes whose purge request both services accepted.
 fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) -> HashSet<String> {
@@ -3516,14 +3536,14 @@ fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) -> H
     if hashes.is_empty() {
         return purged;
     }
-    // When durable CDN invalidation is active, phased vanish and creator
-    // physical delete block completion until the dedicated `Phase::Final` drain
-    // executes two checked Fastly + Bunny purge rounds in a fresh 5-secret
-    // Compute budget. Deferring the inline Fastly purge here (matching
-    // `purge_bunny_hashes`) keeps physical waves within Fastly's 5-secret and
-    // 32-backend-request limits even when `kv_origin_read_token` is needed for
-    // cold-POP rollback/rotation checks or `b2_replica_required_for_cdn`.
-    if cdn_invalidation_configured() {
+    // When durable CDN invalidation is active and this request cannot spare a
+    // secret slot for `fastly_api_token` (while keeping room for downstream
+    // `kv_origin_read_token` and `webhook_secret` calls), defer inline Fastly
+    // eviction to the dedicated `Phase::Final` drain so physical waves stay
+    // within Fastly's 5-secret limit. When budget remains, run the immediate
+    // Fastly purge so #279 delivery probes and immediate eviction continue.
+    if cdn_invalidation_configured() && !vanish_inline_fastly_purge_has_budget() {
+        result.purge_deferred = true;
         return purged;
     }
 
@@ -7213,6 +7233,30 @@ mod tests {
                 .into_iter()
                 .collect::<HashSet<_>>()
         );
+    }
+
+    #[test]
+    fn vanish_inline_fastly_purge_respects_5_secret_budget_and_records_deferral() {
+        let _scope = crate::request_bindings::begin();
+        for key in ["fos_access_key", "fos_secret_key", "webhook_secret"] {
+            let _ = crate::request_bindings::secret(key);
+        }
+        assert!(
+            super::vanish_inline_fastly_purge_has_budget(),
+            "3-secret wave with webhook_secret cached must still afford fastly_api_token + kv_origin_read_token"
+        );
+
+        let _ = crate::request_bindings::secret("admin_token");
+        assert!(
+            !super::vanish_inline_fastly_purge_has_budget(),
+            "4-secret wave reserving kv_origin_read_token must defer inline Fastly purge"
+        );
+
+        let hash = "a".repeat(64);
+        let mut result = VanishStorageResult::default();
+        let purged = super::purge_vanish_hashes(std::slice::from_ref(&hash), &mut result);
+        assert!(purged.is_empty());
+        assert!(result.purge_deferred);
     }
 }
 

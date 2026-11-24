@@ -5487,6 +5487,7 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     let mut storage_timings = VanishStorageTimings::default();
     let mut erase_main_candidates: HashSet<String> = HashSet::new();
     let mut purged_main_hashes: HashSet<String> = HashSet::new();
+    let mut purge_deferred_to_final = false;
     let mut prepare_ms = 0u128;
     let mut kv_finalize_ms = 0u128;
     let mut last_wave = Duration::ZERO;
@@ -5627,6 +5628,7 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         };
         storage_attempts = storage_attempts.saturating_add(u32::from(!erase_hashes.is_empty()));
         add_vanish_storage_timings(&mut storage_timings, &storage_result.timings);
+        purge_deferred_to_final |= storage_result.purge_deferred;
         purged_main_hashes.extend(
             storage_result
                 .purged_hashes
@@ -5824,7 +5826,12 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     // through the public media host. Aggregate counters only; a 2xx records a
     // `present` failure signal without gating erasure completion, because a
     // residual edge copy cannot be repaired by retrying the vanish.
-    let (delivery_probe, delivery_probe_skipped) = if should_probe_delivery(
+    let (delivery_probe, delivery_probe_skipped) = if purge_deferred_to_final
+        && purged_main_hashes.is_empty()
+    {
+        eprintln!("[VANISH] delivery_probe stage=deferred_to_final_purge skipped");
+        (DeliveryProbeCounts::default(), 1u32)
+    } else if should_probe_delivery(
         started.elapsed(),
         DELIVERY_PROBE_BUDGET_RESERVE,
         VANISH_TIME_BUDGET,
