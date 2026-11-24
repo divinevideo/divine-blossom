@@ -9525,3 +9525,7 @@ mod derived_origin_provenance_tests {
 #[cfg(test)]
 #[path = "media_processing_policy_tests.rs"]
 mod media_processing_policy_tests;
+
+#[cfg(test)]
+#[path = "bunny_edge_purge_tests.rs"]
+mod bunny_edge_purge_tests;
