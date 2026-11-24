@@ -7,9 +7,7 @@ use blossom_core::read_through::{
     check_mirror_response, object_path, parse_bool_flag, replica_delete_outcome,
     write_back_decision, ReplicaDeleteOutcome, MAX_WRITE_BACK_BYTES, SOURCE_FOS, SOURCE_GCS,
 };
-use blossom_core::storage_origin::{
-    ErasurePolicy, ErasurePolicyInputs, MediaReadPolicy, StorageProvider,
-};
+use blossom_core::storage_origin::{MediaReadPolicy, StorageProvider};
 use fastly::http::{Method, StatusCode};
 use fastly::{Backend, Body, Request, Response};
 use md5::Md5;
@@ -231,8 +229,8 @@ impl S3Config {
 
 fn media_read_policy() -> Result<MediaReadPolicy> {
     MediaReadPolicy::parse(
-        get_config("media_read_primary").ok().as_deref(),
-        get_config("gcs_fallback_enabled").ok().as_deref(),
+        optional_config("media_read_primary")?.as_deref(),
+        optional_config("gcs_fallback_enabled")?.as_deref(),
     )
     .map_err(|e| BlossomError::StorageError(e.into()))
 }
@@ -1559,27 +1557,20 @@ fn head_media_origin(
     req.send(backend).map_err(|_| MediaFetchError::Transport)
 }
 
-fn head_exists_status(status: StatusCode) -> Result<bool> {
+fn head_exists_status(status: StatusCode, require_confirmed_absence: bool) -> Result<bool> {
     match status {
         StatusCode::OK => Ok(true),
         StatusCode::NOT_FOUND => Ok(false),
+        _ if !require_confirmed_absence => Ok(false),
         other => Err(BlossomError::StorageError(format!(
             "Blob existence check failed with status: {other}"
         ))),
     }
 }
 
-/// Check if a blob exists in the configured primary media origin (with optional
-/// GCS fallback per `media_read_primary` and `gcs_fallback_enabled`).
-pub fn blob_exists(hash: &str) -> Result<bool> {
+fn check_blob_exists(hash: &str, require_confirmed_absence: bool) -> Result<bool> {
     let policy = media_read_policy()?;
     let response = head_media_origin(policy.primary, hash);
-    if let Ok(ref resp) = response {
-        if resp.get_status() == StatusCode::OK {
-            return Ok(true);
-        }
-    }
-    let primary_absent = matches!(&response, Ok(resp) if resp.get_status() == StatusCode::NOT_FOUND);
     let should_fallback = match &response {
         Ok(resp) => policy.should_fallback(resp.get_status().as_u16()),
         Err(MediaFetchError::Transport) => policy.should_fallback(503),
@@ -1593,93 +1584,36 @@ pub fn blob_exists(hash: &str) -> Result<bool> {
         eprintln!("[MEDIA_ORIGIN] op=head primary=b2 fallback=gcs cause={cause}");
         let fallback = head_media_origin(StorageProvider::Gcs, hash)
             .map_err(MediaFetchError::into_storage_error)?;
-        return match fallback.get_status() {
-            StatusCode::OK => Ok(true),
-            StatusCode::NOT_FOUND if primary_absent => Ok(false),
-            // Primary errored (5xx or transport) and GCS returned 404: absence is
-            // not proven, so fail closed with the primary error.
-            StatusCode::NOT_FOUND => {
-                let resp = response.map_err(MediaFetchError::into_storage_error)?;
-                head_exists_status(resp.get_status())
-            }
-            other => head_exists_status(other),
-        };
+        let status = fallback.get_status();
+        // A GCS miss cannot prove the blob absent if the B2 HEAD failed.
+        if status != StatusCode::NOT_FOUND {
+            return head_exists_status(status, require_confirmed_absence);
+        }
     }
     let resp = response.map_err(MediaFetchError::into_storage_error)?;
-    head_exists_status(resp.get_status())
+    head_exists_status(resp.get_status(), require_confirmed_absence)
+}
+
+/// Check the configured media origins before reusing or clearing an audio mapping.
+pub fn blob_exists(hash: &str) -> Result<bool> {
+    check_blob_exists(hash, true)
+}
+
+/// Check the configured media origins for upload deduplication. Unexpected HTTP
+/// statuses leave the upload eligible, while configuration and transport errors propagate.
+pub fn blob_exists_for_upload(hash: &str) -> Result<bool> {
+    check_blob_exists(hash, false)
 }
 
 /// Check if a blob exists directly in GCS (used by legacy GCS-writing paths).
 pub fn blob_exists_in_gcs(hash: &str) -> Result<bool> {
     let resp = head_media_origin(StorageProvider::Gcs, hash)
         .map_err(MediaFetchError::into_storage_error)?;
-    head_exists_status(resp.get_status())
+    Ok(resp.get_status() == StatusCode::OK)
 }
 
-pub fn erasure_policy() -> Result<ErasurePolicy> {
-    let gcs_erasure = optional_config("gcs_erasure_enabled")?;
-    let fos_erasure = optional_config("fos_erasure_enabled")?;
-    let (
-        b2_replica,
-        media_read_primary,
-        gcs_fallback_enabled,
-        derived_media_read_primary,
-        derived_media_gcs_fallback_enabled,
-        upload_service_all_uploads,
-        b2_demand_mirror_enabled,
-        b2_cdn_enabled,
-    ) = if gcs_erasure.as_deref() == Some("false") {
-        (
-            optional_config(B2_REPLICA_FLAG)?,
-            optional_config("media_read_primary")?,
-            optional_config("gcs_fallback_enabled")?,
-            optional_config("derived_media_read_primary")?,
-            optional_config("derived_media_gcs_fallback_enabled")?,
-            optional_config("upload_service_all_uploads")?,
-            optional_config("b2_demand_mirror_enabled")?,
-            optional_config("b2_cdn_enabled")?,
-        )
-    } else {
-        (None, None, None, None, None, None, None, None)
-    };
-    let (fos_read, fos_write_back) = if fos_erasure.as_deref() == Some("false") {
-        (
-            optional_config(FOS_READ_FLAG)?,
-            optional_config(FOS_WRITE_BACK_FLAG)?,
-        )
-    } else {
-        (None, None)
-    };
-    ErasurePolicy::parse(ErasurePolicyInputs {
-        gcs_erasure: gcs_erasure.as_deref(),
-        fos_erasure: fos_erasure.as_deref(),
-        b2_replica_enabled: b2_replica.as_deref(),
-        media_read_primary: media_read_primary.as_deref(),
-        gcs_fallback_enabled: gcs_fallback_enabled.as_deref(),
-        derived_media_read_primary: derived_media_read_primary.as_deref(),
-        derived_media_gcs_fallback_enabled: derived_media_gcs_fallback_enabled.as_deref(),
-        upload_service_all_uploads: upload_service_all_uploads.as_deref(),
-        b2_demand_mirror_enabled: b2_demand_mirror_enabled.as_deref(),
-        b2_cdn_enabled: b2_cdn_enabled.as_deref(),
-        fos_read_enabled: fos_read.as_deref(),
-        fos_write_back_enabled: fos_write_back.as_deref(),
-    })
-    .map_err(|error| BlossomError::StorageError(error.into()))
-}
-
-pub fn gcs_erasure_enabled() -> Result<bool> {
-    Ok(erasure_policy()?.gcs_enabled)
-}
-
-pub fn fos_erasure_enabled() -> Result<bool> {
-    Ok(erasure_policy()?.fos_enabled)
-}
-
-/// Delete a blob from GCS (skipped when `gcs_erasure_enabled=false` and B2 erasure is active).
+/// Delete a blob from GCS
 pub fn delete_blob(hash: &str) -> Result<()> {
-    if !gcs_erasure_enabled()? {
-        return Ok(());
-    }
     let config = S3Config::load_gcs()?;
     let path = format!("/{}/{}", config.bucket, hash);
 
@@ -1714,11 +1648,7 @@ fn build_fos_delete_request(key: &str, config: &S3Config) -> Result<Request> {
 ///
 /// This operation is intentionally not gated by the mirror feature flags: the
 /// historical bulk mirror may contain the object even when both flags are off.
-/// Only explicit `fos_erasure_enabled=false` (with FOS reads/writes disabled) skips it.
 pub fn delete_blob_from_fos(key: &str) -> Result<()> {
-    if !fos_erasure_enabled()? {
-        return Ok(());
-    }
     let config = S3Config::load_fos()?;
     let req = build_fos_delete_request(key, &config)?;
     let resp = req
@@ -2262,18 +2192,8 @@ fn erase_b2_hash_versions(authorization: &B2Authorization, hash: &str) -> Result
 
 /// Returns `(failed, remaining)` hashes. `remaining` hashes made bounded
 /// progress and are counted as pending, not failed.
-fn erase_b2_replica_hashes(
-    hashes: &[String],
-    require_media_bucket_match: bool,
-) -> (HashSet<String>, HashSet<String>) {
-    if hashes.is_empty() {
-        return (HashSet::new(), HashSet::new());
-    }
-    if !b2_replica_enabled() {
-        if require_media_bucket_match {
-            eprintln!("[VANISH] B2 erasure required while gcs_erasure_enabled=false");
-            return (hashes.iter().cloned().collect(), HashSet::new());
-        }
+fn erase_b2_replica_hashes(hashes: &[String]) -> (HashSet<String>, HashSet<String>) {
+    if !b2_replica_enabled() || hashes.is_empty() {
         return (HashSet::new(), HashSet::new());
     }
     let authorization = match authorize_b2_vanish() {
@@ -2283,19 +2203,6 @@ fn erase_b2_replica_hashes(
             return (hashes.iter().cloned().collect(), HashSet::new());
         }
     };
-    if require_media_bucket_match {
-        let media_bucket = match get_config("b2_media_bucket") {
-            Ok(bucket) => bucket,
-            Err(error) => {
-                eprintln!("[VANISH] B2 media bucket lookup failed error={error}");
-                return (hashes.iter().cloned().collect(), HashSet::new());
-            }
-        };
-        if authorization.bucket_name.as_deref() != Some(media_bucket.as_str()) {
-            eprintln!("[VANISH] B2 read and erasure buckets do not match");
-            return (hashes.iter().cloned().collect(), HashSet::new());
-        }
-    }
     let mut failed = HashSet::new();
     let mut remaining = HashSet::new();
     for hash in hashes {
@@ -2315,9 +2222,7 @@ fn erase_b2_replica_hashes(
 
 /// Creator deletion must erase the same B2 version set as account vanish.
 pub(crate) fn erase_b2_creator_replica(hash: &str) -> Result<()> {
-    let require_media_bucket_match = !gcs_erasure_enabled()?;
-    let (failed, remaining) =
-        erase_b2_replica_hashes(&[hash.to_string()], require_media_bucket_match);
+    let (failed, remaining) = erase_b2_replica_hashes(&[hash.to_string()]);
     if failed.is_empty() && remaining.is_empty() {
         Ok(())
     } else {
@@ -4245,137 +4150,120 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
     }
 
     let local_mode = is_local_mode();
-    let erasure = match erasure_policy() {
-        Ok(policy) => policy,
-        Err(error) => {
-            eprintln!("[VANISH] invalid erasure policy: {error}");
+    let (storage_config, storage_backend) = if local_mode {
+        (S3Config::load_gcs(), GCS_BACKEND)
+    } else {
+        (S3Config::load_fos(), FOS_BACKEND)
+    };
+    let storage_config = match storage_config {
+        Ok(config) => config,
+        Err(_) => {
             result.failed_hashes.extend(hashes.iter().cloned());
             return result;
         }
     };
-    let run_primary_multi_delete = if local_mode {
-        erasure.gcs_enabled
-    } else {
-        erasure.fos_enabled
-    };
-    if run_primary_multi_delete {
-        let (storage_config, storage_backend) = if local_mode {
-            (S3Config::load_gcs(), GCS_BACKEND)
-        } else {
-            (S3Config::load_fos(), FOS_BACKEND)
-        };
-        let storage_config = match storage_config {
-            Ok(config) => config,
-            Err(_) => {
-                result.failed_hashes.extend(hashes.iter().cloned());
-                return result;
-            }
-        };
-        let mut pending = Vec::new();
-        let mut stage_started = HashMap::<String, Instant>::new();
-        let mut requested_by_stage = HashMap::<String, Vec<String>>::new();
+    let mut pending = Vec::new();
+    let mut stage_started = HashMap::<String, Instant>::new();
+    let mut requested_by_stage = HashMap::<String, Vec<String>>::new();
 
-        for batch in plan_vanish_delete_batches(hashes, local_mode) {
-            let stage = batch.stage;
-            let keys = batch.keys;
-            stage_started.insert(stage.clone(), Instant::now());
-            requested_by_stage.insert(stage.clone(), keys.clone());
-            match build_multi_delete_request(&keys, &storage_config, &stage).and_then(|request| {
-                request.send_async(storage_backend).map_err(|error| {
-                    BlossomError::StorageError(format!("{} batch delete failed: {}", stage, error))
-                })
-            }) {
-                Ok(request) => pending.push(request),
-                Err(_) => {
-                    let failed_keys: HashSet<String> = keys.into_iter().collect();
-                    mark_failed_keys(&mut result, &failed_keys);
-                    if stage.starts_with("gcs_main:") || stage.starts_with("fos_main:") {
-                        main_origin_failures.extend(
-                            failed_keys
-                                .iter()
-                                .filter_map(|key| hash_for_vanish_key(key)),
-                        );
-                    }
+    for batch in plan_vanish_delete_batches(hashes, local_mode) {
+        let stage = batch.stage;
+        let keys = batch.keys;
+        stage_started.insert(stage.clone(), Instant::now());
+        requested_by_stage.insert(stage.clone(), keys.clone());
+        match build_multi_delete_request(&keys, &storage_config, &stage).and_then(|request| {
+            request.send_async(storage_backend).map_err(|error| {
+                BlossomError::StorageError(format!("{} batch delete failed: {}", stage, error))
+            })
+        }) {
+            Ok(request) => pending.push(request),
+            Err(_) => {
+                let failed_keys: HashSet<String> = keys.into_iter().collect();
+                mark_failed_keys(&mut result, &failed_keys);
+                if stage.starts_with("gcs_main:") || stage.starts_with("fos_main:") {
+                    main_origin_failures.extend(
+                        failed_keys
+                            .iter()
+                            .filter_map(|key| hash_for_vanish_key(key)),
+                    );
                 }
             }
         }
+    }
 
-        while !pending.is_empty() {
-            let (response, remaining) = fastly::http::request::select(pending);
-            pending = remaining;
-            match response {
-                Ok(response) => {
-                    let stage = response
-                        .get_backend_request()
-                        .and_then(|request| request.get_header_str("X-Divine-Vanish-Stage"))
-                        .unwrap_or_default()
-                        .to_string();
-                    let status = response.get_status();
-                    if !status.is_success() {
-                        let key_count = requested_by_stage
-                            .get(&stage)
-                            .map_or(hashes.len(), Vec::len);
-                        eprintln!(
-                            "[VANISH] multi-delete stage={} status={} key_count={}",
-                            stage,
-                            status.as_u16(),
-                            key_count
-                        );
-                    }
-                    if let Some(started) = stage_started.get(stage.as_str()) {
-                        let duration = elapsed_ms(*started);
-                        if stage.starts_with("fos_main:") {
-                            result.timings.fos_main_ms = result.timings.fos_main_ms.max(duration);
-                        }
-                    }
-                    if let Some(requested) = requested_by_stage.get(&stage) {
-                        let failed = failed_multi_delete_keys(response, requested, &stage);
-                        mark_failed_keys(&mut result, &failed);
-                        if stage.starts_with("gcs_main:") || stage.starts_with("fos_main:") {
-                            main_origin_failures
-                                .extend(failed.iter().filter_map(|key| hash_for_vanish_key(key)));
-                        }
-                    } else {
-                        eprintln!(
-                            "[VANISH] multi-delete unmatched_stage={} expected_stages={:?}",
-                            stage,
-                            requested_by_stage.keys().collect::<Vec<_>>()
-                        );
-                        result.failed_hashes.extend(hashes.iter().cloned());
-                        main_origin_failures.extend(hashes.iter().cloned());
-                    }
-                }
-                Err(error) => {
-                    let transport_error = error.to_string();
-                    let request = error.into_sent_req();
-                    let stage = request
-                        .get_header_str("X-Divine-Vanish-Stage")
-                        .unwrap_or_default();
+    while !pending.is_empty() {
+        let (response, remaining) = fastly::http::request::select(pending);
+        pending = remaining;
+        match response {
+            Ok(response) => {
+                let stage = response
+                    .get_backend_request()
+                    .and_then(|request| request.get_header_str("X-Divine-Vanish-Stage"))
+                    .unwrap_or_default()
+                    .to_string();
+                let status = response.get_status();
+                if !status.is_success() {
                     let key_count = requested_by_stage
-                        .get(stage)
+                        .get(&stage)
                         .map_or(hashes.len(), Vec::len);
                     eprintln!(
-                        "[VANISH] multi-delete stage={} error={} key_count={}",
-                        stage, transport_error, key_count
+                        "[VANISH] multi-delete stage={} status={} key_count={}",
+                        stage,
+                        status.as_u16(),
+                        key_count
                     );
-                    if let Some(requested) = requested_by_stage.get(stage) {
-                        let failed: HashSet<String> = requested.iter().cloned().collect();
-                        mark_failed_keys(&mut result, &failed);
-                        if stage.starts_with("gcs_main:") || stage.starts_with("fos_main:") {
-                            main_origin_failures
-                                .extend(failed.iter().filter_map(|key| hash_for_vanish_key(key)));
-                        }
-                    } else {
-                        result.failed_hashes.extend(hashes.iter().cloned());
-                        main_origin_failures.extend(hashes.iter().cloned());
+                }
+                if let Some(started) = stage_started.get(stage.as_str()) {
+                    let duration = elapsed_ms(*started);
+                    if stage.starts_with("fos_main:") {
+                        result.timings.fos_main_ms = result.timings.fos_main_ms.max(duration);
                     }
+                }
+                if let Some(requested) = requested_by_stage.get(&stage) {
+                    let failed = failed_multi_delete_keys(response, requested, &stage);
+                    mark_failed_keys(&mut result, &failed);
+                    if stage.starts_with("gcs_main:") || stage.starts_with("fos_main:") {
+                        main_origin_failures
+                            .extend(failed.iter().filter_map(|key| hash_for_vanish_key(key)));
+                    }
+                } else {
+                    eprintln!(
+                        "[VANISH] multi-delete unmatched_stage={} expected_stages={:?}",
+                        stage,
+                        requested_by_stage.keys().collect::<Vec<_>>()
+                    );
+                    result.failed_hashes.extend(hashes.iter().cloned());
+                    main_origin_failures.extend(hashes.iter().cloned());
+                }
+            }
+            Err(error) => {
+                let transport_error = error.to_string();
+                let request = error.into_sent_req();
+                let stage = request
+                    .get_header_str("X-Divine-Vanish-Stage")
+                    .unwrap_or_default();
+                let key_count = requested_by_stage.get(stage).map_or(hashes.len(), Vec::len);
+                eprintln!(
+                    "[VANISH] multi-delete stage={} error={} key_count={}",
+                    stage, transport_error, key_count
+                );
+                if let Some(requested) = requested_by_stage.get(stage) {
+                    let failed: HashSet<String> = requested.iter().cloned().collect();
+                    mark_failed_keys(&mut result, &failed);
+                    if stage.starts_with("gcs_main:") || stage.starts_with("fos_main:") {
+                        main_origin_failures
+                            .extend(failed.iter().filter_map(|key| hash_for_vanish_key(key)));
+                    }
+                } else {
+                    result.failed_hashes.extend(hashes.iter().cloned());
+                    main_origin_failures.extend(hashes.iter().cloned());
                 }
             }
         }
     }
 
     let b2_started = Instant::now();
-    let (b2_failures, b2_remaining) = erase_b2_replica_hashes(hashes, !erasure.gcs_enabled);
+    let (b2_failures, b2_remaining) = erase_b2_replica_hashes(hashes);
     result.timings.b2_replica_ms = elapsed_ms(b2_started);
     result.failed_hashes.extend(b2_failures.iter().cloned());
     main_origin_failures.extend(b2_failures);
@@ -4385,22 +4273,20 @@ pub(crate) fn erase_vanish_batch(hashes: &[String]) -> VanishStorageResult {
     // Run after the provider responses are drained so `fos_main_ms` measures
     // provider completion instead of the Cloud Run wait.
     let cloud_cleanup_started = Instant::now();
-    if erasure.gcs_enabled {
-        if local_mode {
-            for hash in hashes {
-                if crate::delete_blob_gcs_artifacts(hash).is_err() {
-                    result.failed_hashes.insert(hash.clone());
-                }
+    if local_mode {
+        for hash in hashes {
+            if crate::delete_blob_gcs_artifacts(hash).is_err() {
+                result.failed_hashes.insert(hash.clone());
             }
-        } else {
-            match trigger_cloud_run_delete_blobs(hashes) {
-                Ok(outcome) => {
-                    apply_cloud_cleanup_outcome(&mut result, &mut main_origin_failures, outcome);
-                }
-                Err(_) => {
-                    result.failed_hashes.extend(hashes.iter().cloned());
-                    main_origin_failures.extend(hashes.iter().cloned());
-                }
+        }
+    } else {
+        match trigger_cloud_run_delete_blobs(hashes) {
+            Ok(outcome) => {
+                apply_cloud_cleanup_outcome(&mut result, &mut main_origin_failures, outcome);
+            }
+            Err(_) => {
+                result.failed_hashes.extend(hashes.iter().cloned());
+                main_origin_failures.extend(hashes.iter().cloned());
             }
         }
     }
@@ -6184,9 +6070,6 @@ mod tests {
         assert!(!super::blob_exists("missing").unwrap());
         assert!(super::blob_exists("forbidden").is_err());
         assert!(super::blob_exists("transient").is_err());
-        super::delete_blob("hit").unwrap();
-        super::delete_blob_from_fos("hit").unwrap();
-        crate::delete_blob_gcs_artifacts("hit").unwrap();
     }
 
     #[test]
@@ -6200,6 +6083,45 @@ mod tests {
         assert!(super::blob_exists("transport").unwrap());
         assert!(super::blob_exists("transport_b2_only").is_err());
         assert!(super::blob_exists("forbidden").is_err());
+    }
+
+    #[test]
+    #[ignore = "requires synthetic storage backends; run-media-origin-tests.py"]
+    fn upload_dedup_gcs_status_contract() {
+        use fastly::http::{Method, StatusCode};
+
+        for hash in ["f".repeat(64), "5".repeat(64)] {
+            let mut req = Request::new(Method::HEAD, "https://media.example.com/upload");
+            req.set_header("X-SHA-256", &hash);
+            let response = crate::handle_upload_requirements(req).unwrap();
+            assert_eq!(response.get_status(), StatusCode::OK);
+            assert_eq!(response.get_header_str("X-Exists"), None);
+            assert_eq!(
+                response.get_header_str("X-Reason"),
+                Some("Upload would be accepted")
+            );
+        }
+        for key in ["forbidden", "unavailable"] {
+            assert!(!super::blob_exists_in_gcs(key).unwrap());
+            assert!(super::blob_exists(key).is_err());
+        }
+        assert!(super::blob_exists_in_gcs("disconnect").is_err());
+    }
+
+    #[test]
+    #[ignore = "requires unavailable synthetic bindings; run-media-origin-tests.py"]
+    fn blob_exists_unavailable_config_contract() {
+        let error = super::blob_exists("hit").unwrap_err().to_string();
+        assert!(error.contains("Config store unavailable"), "{error}");
+    }
+
+    #[test]
+    #[ignore = "requires synthetic storage backends; run-media-origin-tests.py"]
+    fn creator_storage_cleanup_remains_mandatory_contract() {
+        let hash = "a".repeat(64);
+        super::delete_blob(&hash).unwrap();
+        crate::delete_blob_gcs_artifacts(&hash).unwrap();
+        super::delete_blob_from_fos(&hash).unwrap();
     }
 
     #[test]

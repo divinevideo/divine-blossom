@@ -662,11 +662,9 @@ pub(crate) fn cleanup_derived_audio_for_source(source_hash: &str) -> Result<()> 
         let _ = storage_delete(&mapping.audio_sha256);
         let derivative_result = delete_blob_gcs_artifacts(&mapping.audio_sha256);
         let replica_result = storage::delete_blob_from_fos(&mapping.audio_sha256);
-        let b2_result = storage::erase_b2_creator_replica(&mapping.audio_sha256);
         purge_edge_cache(&mapping.audio_sha256);
         derivative_result?;
         replica_result?;
-        b2_result?;
         delete_blob_kv_artifacts(&mapping.audio_sha256);
         delete_blob_metadata(&mapping.audio_sha256)?;
     }
@@ -2692,7 +2690,7 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
 
     // 5. Check cache: source->audio mapping
     if let Some(mapping) = get_audio_mapping(&hash)? {
-        // Verify the audio blob still exists in GCS
+        // Confirm the audio blob's presence using the configured media origins.
         if blob_exists(&mapping.audio_sha256)? {
             add_to_audio_source_refs(&mapping.audio_sha256, &hash).map_err(|e| {
                 BlossomError::Internal(format!("Failed to persist audio source refs: {}", e))
@@ -4588,7 +4586,7 @@ fn handle_upload_init(mut req: Request, record: &mut UploadLogRecord) -> Result<
         ));
     }
 
-    if blob_exists(&init_request.sha256)? {
+    if storage::blob_exists_for_upload(&init_request.sha256)? {
         let payload = if let Some(metadata) = get_blob_metadata(&init_request.sha256)? {
             serde_json::json!({
                 "error": "Blob already exists",
@@ -5001,9 +4999,6 @@ fn local_derivative_cleanup_result(
 }
 
 pub(crate) fn delete_blob_gcs_artifacts(hash: &str) -> Result<()> {
-    if !crate::storage::gcs_erasure_enabled()? {
-        return Ok(());
-    }
     let paths = [
         format!("{}.jpg", hash),
         format!("{}/hls/master.m3u8", hash),

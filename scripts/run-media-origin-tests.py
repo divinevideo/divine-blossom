@@ -39,9 +39,17 @@ class Storage(BaseHTTPRequestHandler):
                 "transport_b2_only": 404,
                 "forbidden": 403,
                 "unavailable": 503,
+                "f" * 64: 403,
+                "5" * 64: 503,
             }.get(key, 200)
         self.send_response(status)
         self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_DELETE(self):
+        bucket, key = self.path.strip("/").split("/", 1)
+        self.server.reads.append(("DELETE", bucket, key))
+        self.send_response(204)
         self.end_headers()
 
     def do_GET(self):
@@ -87,19 +95,23 @@ def main():
                 root = Path(directory)
                 config = root / "fastly.toml"
                 settings = root / "settings.json"
-                config.write_text(f'''manifest_version = 3
+                backends = f'''manifest_version = 3
 name = "media-origins-test"
 language = "rust"
 [local_server.backends.gcs_storage]
 url = "http://127.0.0.1:{server.server_port}"
 [local_server.backends.b2_storage]
 url = "http://127.0.0.1:{server.server_port}"
+[local_server.backends.fos_storage]
+url = "http://127.0.0.1:{server.server_port}"
+'''
+                bindings = f'''
 [local_server.config_stores.blossom_config]
 file = "{settings}"
 format = "json"
 [local_server.secret_stores]
-blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_key",data="synthetic"}},{{key="b2_media_access_key",data="synthetic"}},{{key="b2_media_secret_key",data="synthetic"}}]
-''')
+blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_key",data="synthetic"}},{{key="b2_media_access_key",data="synthetic"}},{{key="b2_media_secret_key",data="synthetic"}},{{key="fos_access_key",data="synthetic"}},{{key="fos_secret_key",data="synthetic"}}]
+'''
                 env = os.environ.copy()
                 env["CARGO_TARGET_WASM32_WASIP1_RUNNER"] = shlex.join([
                     env.get("VICEROY", "viceroy"), "run", "-C", str(config), "--"
@@ -118,6 +130,9 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                     ("media_origin_invalid_config_contract", "invalid", "true"),
                     ("media_origin_gcs_errors_contract", None, "true"),
                     ("media_origin_gcs_missing_config_contract", None, "true"),
+                    ("upload_dedup_gcs_status_contract", None, "false"),
+                    ("blob_exists_unavailable_config_contract", None, "false"),
+                    ("creator_storage_cleanup_remains_mandatory_contract", "b2", "false"),
                 ]
                 for test, primary, fallback in cases:
                     values = {
@@ -133,6 +148,8 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                         values.update(derived_media_read_primary="b2", derived_media_gcs_fallback_enabled="false")
                         del values["gcs_bucket"]
                     elif test == "blob_exists_b2_without_gcs_contract":
+                        del values["gcs_bucket"]
+                    elif test == "creator_storage_cleanup_remains_mandatory_contract":
                         values.update(
                             derived_media_read_primary="b2",
                             derived_media_gcs_fallback_enabled="false",
@@ -140,13 +157,15 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                             b2_replica_enabled="true",
                             gcs_erasure_enabled="false",
                             fos_erasure_enabled="false",
+                            local_mode="true",
+                            fos_bucket="fos",
                         )
-                        del values["gcs_bucket"]
                     elif test in ("derived_origin_fallback_contract", "derived_body_fallback_source_contract"):
                         values.update(derived_media_read_primary="b2", derived_media_gcs_fallback_enabled="true")
                     elif test == "derived_origin_invalid_config_contract":
                         values["derived_media_read_primary"] = "invalid"
                     settings.write_text(json.dumps(values))
+                    config.write_text(backends + ("" if test == "blob_exists_unavailable_config_contract" else bindings))
                     before = len(server.reads)
                     result = subprocess.run([
                         "cargo", "test", "--locked", "--target", "wasm32-wasip1",
@@ -212,6 +231,22 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                     elif test == "media_origin_gcs_errors_contract":
                         assert reads == [("gcs", key, None) for key in
                                          ("forbidden", "unavailable", "invalid-range", "disconnect")], reads
+                    elif test == "upload_dedup_gcs_status_contract":
+                        assert reads == [("HEAD", "gcs", key) for key in
+                                        ("f" * 64, "5" * 64, "forbidden", "forbidden",
+                                         "unavailable", "unavailable", "disconnect")], reads
+                    elif test == "creator_storage_cleanup_remains_mandatory_contract":
+                        hash_value = "a" * 64
+                        assert reads == [
+                            ("DELETE", "gcs", hash_value),
+                            ("DELETE", "gcs", hash_value + ".jpg"),
+                            *(("DELETE", "gcs", f"{hash_value}/{path}") for path in (
+                                "hls/master.m3u8", "hls/stream_720p.m3u8", "hls/stream_720p.ts",
+                                "hls/stream_480p.m3u8", "hls/stream_480p.ts", "hls/stream_720p.mp4",
+                                "hls/stream_480p.mp4", "vtt/main.vtt",
+                            )),
+                            ("DELETE", "fos", hash_value),
+                        ], reads
                     else:
                         assert reads == [], reads
                     print(f"PASS {test}")
