@@ -371,39 +371,53 @@ sole writer.
       `acme.sh --dns dns_cf` — do **not** use a Cloudflare Origin CA cert, which
       fails direct TLS verification on DNS-only records). Install regular files
       (not symlinks pointing outside `./conf.d`, which break inside
-      `./conf.d:/etc/caddy/conf.d:ro`) for the full chain and private key to
-      `/opt/divine-transcoder/conf.d/certs/upload.pem` (`fullchain.pem`,
-      including intermediates) and
-      `/opt/divine-transcoder/conf.d/certs/upload.key` (`privkey.pem`, mode
-      `0600` so it is readable only by root/Caddy). Configure an automated
-      per-certificate renewal hook script (bound via `certbot --deploy-hook` or
-      an `acme.sh --reloadcmd` wrapper rather than direct in-place overwrites)
-      that stages both files under temporary names, verifies the cert and key
-      match before replacing the live pair, rolls back to the previous pair if
-      `caddy validate` fails (so a failed renewal can never leave a mismatched
-      pair on disk that breaks the next Caddy restart and takes down
-      `transcoder`), and force-reloads Caddy:
+      `./conf.d:/etc/caddy/conf.d:ro`) inside a versioned release directory
+      under `/opt/divine-transcoder/conf.d/certs/releases/<id>/` with a
+      **relative** symlink `/opt/divine-transcoder/conf.d/certs/current ->
+      releases/<id>` (both symlink and target stay inside the `./conf.d` bind
+      mount). For initial staging, install `fullchain.pem` (mode `0644`,
+      including intermediates) and `privkey.pem` (mode `0600`, readable only by
+      root/Caddy) into `/opt/divine-transcoder/conf.d/certs/releases/initial/`
+      as `upload.pem` and `upload.key`, then run
+      `ln -sfn releases/initial /opt/divine-transcoder/conf.d/certs/current`.
+      Configure an automated per-certificate renewal hook script (bound via
+      `certbot --deploy-hook` or an `acme.sh --reloadcmd` wrapper rather than
+      direct in-place overwrites) that stages both files in a new release
+      directory, verifies the cert and key match before atomically swapping
+      `conf.d/certs/current` in a single `mv -Tf` rename, rolls `current` back
+      to the previous release if `caddy validate` fails (so a failed renewal
+      can never leave a mismatched pair on disk that breaks the next Caddy
+      restart and takes down `transcoder`), force-reloads Caddy, and only then
+      removes the previous release directory:
       ```sh
       #!/bin/sh
       set -eu
       CERT_DIR=/opt/divine-transcoder/conf.d/certs
-      trap 'rm -f "$CERT_DIR/upload.pem.new" "$CERT_DIR/upload.key.new"' EXIT
-      install -m 644 "$RENEWED_LINEAGE/fullchain.pem" "$CERT_DIR/upload.pem.new"
-      install -m 600 "$RENEWED_LINEAGE/privkey.pem" "$CERT_DIR/upload.key.new"
-      test "$(openssl x509 -in "$CERT_DIR/upload.pem.new" -noout -pubkey)" = \
-           "$(openssl pkey -in "$CERT_DIR/upload.key.new" -pubout)"
-      cp -p "$CERT_DIR/upload.pem" "$CERT_DIR/upload.pem.prev" 2>/dev/null || true
-      cp -p "$CERT_DIR/upload.key" "$CERT_DIR/upload.key.prev" 2>/dev/null || true
-      mv -f "$CERT_DIR/upload.pem.new" "$CERT_DIR/upload.pem"
-      mv -f "$CERT_DIR/upload.key.new" "$CERT_DIR/upload.key"
+      REL="releases/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+      STAGE="$CERT_DIR/$REL"
+      trap 'rm -rf "$STAGE" "$CERT_DIR/current.next" "$CERT_DIR/current.prev"' EXIT
+      mkdir -p "$STAGE"
+      install -m 644 "$RENEWED_LINEAGE/fullchain.pem" "$STAGE/upload.pem"
+      install -m 600 "$RENEWED_LINEAGE/privkey.pem" "$STAGE/upload.key"
+      test "$(openssl x509 -in "$STAGE/upload.pem" -noout -pubkey)" = \
+           "$(openssl pkey -in "$STAGE/upload.key" -pubout)"
+      PREV="$(readlink "$CERT_DIR/current" 2>/dev/null || true)"
+      ln -sfn "$REL" "$CERT_DIR/current.next"
+      mv -Tf "$CERT_DIR/current.next" "$CERT_DIR/current"
+      trap - EXIT
       cd /opt/divine-transcoder
       if ! docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile; then
-        mv -f "$CERT_DIR/upload.pem.prev" "$CERT_DIR/upload.pem" 2>/dev/null || true
-        mv -f "$CERT_DIR/upload.key.prev" "$CERT_DIR/upload.key" 2>/dev/null || true
+        if [ -n "$PREV" ]; then
+          ln -sfn "$PREV" "$CERT_DIR/current.prev"
+          mv -Tf "$CERT_DIR/current.prev" "$CERT_DIR/current"
+        fi
+        rm -rf "$STAGE"
         exit 1
       fi
-      rm -f "$CERT_DIR/upload.pem.prev" "$CERT_DIR/upload.key.prev"
       docker compose exec -T caddy caddy reload --force --config /etc/caddy/Caddyfile
+      if [ -n "$PREV" ] && [ "$PREV" != "$REL" ]; then
+        rm -rf "${CERT_DIR:?}/${PREV:?}"
+      fi
       ```
       *(All three Compose/Caddy details are required: `cd /opt/divine-transcoder`
       — not `--project-directory` alone — because `.env` sets relative
@@ -415,7 +429,7 @@ sole writer.
       until expiry.)*
       Next, copy `Caddyfile.upload.example` to `conf.d/upload.caddy` with
       literal site address `upload.divine.video` and
-      `tls /etc/caddy/conf.d/certs/upload.pem /etc/caddy/conf.d/certs/upload.key`
+      `tls /etc/caddy/conf.d/certs/current/upload.pem /etc/caddy/conf.d/certs/current/upload.key`
       inside the site block, then validate and reload Caddy without recreating
       `caddy` or `transcoder`:
       ```sh
@@ -454,11 +468,11 @@ sole writer.
       `dig @1.1.1.1 +short AAAA upload.divine.video`), and repeat the smoke
       checks from step 5 (including the `POST /transcribe` WebVTT check)
       against `https://upload.divine.video`. Keep the DNS-01 file certificate
-      (`conf.d/certs/upload.pem` / `upload.key`) and `tls` directive in
+      (`conf.d/certs/current/upload.pem` / `upload.key`) and `tls` directive in
       `conf.d/upload.caddy` active under the automated `certbot` / `acme.sh`
-      renewal hook installed in step 7.2 (which stages and validates the renewed
-      fullchain and private key into `conf.d/certs/` and runs
-      `caddy reload --force`) — do **not** remove `tls` and reload
+      renewal hook installed in step 7.2 (which atomically swaps
+      `conf.d/certs/current` to the validated fullchain/key release directory
+      and runs `caddy reload --force`) — do **not** remove `tls` and reload
       Caddy while Caddy's managed ACME storage is empty, because Caddy unloads
       the file certificate immediately and fails TLS SNI handshakes until a
       managed issuer certificate is obtained. Only transition to Caddy-managed
