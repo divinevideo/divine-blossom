@@ -202,8 +202,9 @@ Never purge `divine-transcode` or discard a write journal blindly (see
 
 On a multi-core off-GCP worker host (such as the Ashburn `ccx43`), you can run
 `divine-upload-server` alongside `transcoder` behind the same Caddy instance
-with bounded CPU/memory limits (`UPLOAD_CPUS`, `UPLOAD_MEM_LIMIT`) so upload
-and on-demand thumbnail bursts stay isolated from single-writer transcoding.
+with bounded CPU/memory limits (`UPLOAD_CPUS`, `UPLOAD_MEM_LIMIT`) to limit upload and on-demand thumbnail resource use. The services still share
+host CPU, memory, and network capacity. Keep the existing transcoder as the
+sole writer.
 
 ### Enable co-located upload
 
@@ -228,15 +229,35 @@ and on-demand thumbnail bursts stay isolated from single-writer transcoding.
    docker compose up -d upload caddy
    docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile
    ```
-5. Verify against the candidate hostname (DNS-only / grey cloud):
+5. Verify against the candidate hostname (DNS-only / grey cloud). The
+   container health check only confirms that the port accepts connections.
+   Confirm the pinned image can read the mounted credential, write scratch
+   files to `/tmp` with a read-only root, and reach both configured buckets.
+   Confirm `.env.upload` uses the intended buckets, credentials, and
+   concurrency limits for this host, then check:
    - `GET https://upload-hetzner.divine.video/thumbnail/<known-video-hash>` returns `200 image/jpeg`.
    - Direct `PUT /upload` and resumable `/upload/init` → `/sessions/:id` → `/complete` succeed and write to B2 + GCS.
-6. Switch `UPLOAD_DOMAIN=upload.divine.video` in `.env`, reload Caddy, and point
-   the Cloudflare `upload.divine.video` A record (DNS-only / grey cloud) to the
-   worker host's IPv4.
+6. Before cutover, record the current DNS records and TTL. Verify both upload
+   instances use compatible session storage and can resume each other's
+   sessions. Confirm both submit to the existing single transcoder writer.
+   Exercise HEAD, browser preflights, and slow bodies near the configured
+   limit. Load test uploads, thumbnail misses and transcoding together.
+   Measure tmpfs and memory usage, CPU saturation, and transcode queue latency.
+   Include both upload-generated and on-demand thumbnails in the budget.
+7. Set `UPLOAD_DOMAIN=upload.divine.video` in `.env`. Recreate Caddy so the
+   container receives the new environment:
+   `docker compose up -d --no-deps --force-recreate caddy`.
+   Verify hostname routing before changing DNS. Coordinate the brief shared
+   ingress restart. For Caddy-managed certificates, ensure public ports 80
+   and 443 can reach Caddy and remove or update any conflicting AAAA record.
+   Point the DNS-only A record at the worker, then immediately confirm a
+   trusted certificate for the production hostname and repeat the upload
+   smoke checks. Keep the previous endpoint available during propagation.
 
 ### Rollback
 
-Point the Cloudflare `upload.divine.video` A record back to the GKE load
-balancer IP, wait for DNS TTL to expire, then stop the co-located container
-with `docker compose stop upload` and remove `conf.d/upload.caddy`.
+Restore the recorded DNS records. Verify the previous endpoint serves the
+production certificate and can resume sessions begun on Hetzner. Keep the
+Hetzner upload endpoint running through DNS propagation and until outstanding
+requests have drained. Then remove `conf.d/upload.caddy`, reload Caddy, and
+stop the upload container with `docker compose stop upload`.

@@ -2,11 +2,6 @@
 # ABOUTME: Enable via COMPOSE_FILE=docker-compose.yml:docker-compose.upload.yml and conf.d/upload.caddy
 
 services:
-  caddy:
-    depends_on:
-      upload:
-        condition: service_healthy
-
   upload:
     image: ${UPLOAD_IMAGE:?Set UPLOAD_IMAGE, e.g. us-central1-docker.pkg.dev/dv-platform-prod/containers-production/divine-upload-server@sha256:...}
     restart: unless-stopped
@@ -24,9 +19,6 @@ services:
       PORT: "8080"
       METRICS_PORT: "9090"
       GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gcp-sa.json
-      MAX_CONCURRENT_THUMBNAILS: ${MAX_CONCURRENT_THUMBNAILS:-12}
-      MAX_CONCURRENT_UPLOADS: ${MAX_CONCURRENT_UPLOADS:-16}
-      THUMBNAIL_WAIT_SECS: ${THUMBNAIL_WAIT_SECS:-6}
     volumes:
       - ${UPLOAD_GCP_SA_KEY_PATH:-/etc/divine-upload/gcp-sa.json}:/run/secrets/gcp-sa.json:ro
     tmpfs:

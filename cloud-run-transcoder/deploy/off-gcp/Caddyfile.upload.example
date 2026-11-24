@@ -1,7 +1,17 @@
 # Copy to conf.d/upload.caddy on a co-located host and set UPLOAD_DOMAIN in .env
 # (e.g. UPLOAD_DOMAIN=upload.divine.video, or a staging hostname first).
 {$UPLOAD_DOMAIN} {
-	reverse_proxy upload:8080 {
+	@public_upload <<CEL
+		(method('PUT', 'OPTIONS') && path('/upload', '/'))
+		|| (method('GET') && path('/'))
+		|| (method('POST', 'OPTIONS') && path('/upload/init'))
+		|| (method('POST', 'OPTIONS') && path_regexp('^/upload/[^/]+/complete$'))
+		|| (method('DELETE', 'OPTIONS') && path_regexp('^/upload/[^/]+$'))
+		|| (method('PUT', 'HEAD', 'OPTIONS') && path_regexp('^/sessions/[^/]+$'))
+		|| (method('GET', 'HEAD', 'OPTIONS') && path_regexp('^/thumbnail/[^/]+$'))
+		CEL
+
+	reverse_proxy @public_upload upload:8080 {
 		# Stream direct/resumable video uploads and thumbnail bytes without buffering.
 		flush_interval -1
 		transport http {
@@ -11,4 +21,5 @@
 			write_timeout 310s
 		}
 	}
+	respond 404
 }
