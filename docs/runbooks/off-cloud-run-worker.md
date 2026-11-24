@@ -296,8 +296,9 @@ sole writer.
 2. On an existing worker, first snapshot the running known-good base Caddy
    configuration and local image ID so Phase C recovery can still restore a
    working ingress even if the updated base `docker-compose.yml` or `Caddyfile`
-   fails at runtime (`if [ ! -e "$BACKUP_DIR" ]` prevents re-runs from
-   overwriting the pre-sync snapshot):
+   fails at runtime (`if [ ! -e "$BACKUP_DIR" ]` preserves the baseline across
+   mid-activation retries, and Phase C success, Phase C recovery success, and
+   Rollback teardown remove the snapshot so later rollouts capture a fresh one):
    ```sh
    (
      set -eu
@@ -488,15 +489,17 @@ sole writer.
      else
        echo 'Preserving pre-existing divine-transcode pause for its owner'
      fi
+     rm -rf /var/lib/divine-upload/pre-sync-backup /var/lib/divine-upload/pre-sync-backup.tmp
    )
    ```
 
    Phase C recovery — Restore last known-good transcoder-only `caddy` ingress if
    Phase C failed after stopping or replacing `caddy` (keeps `transcoder` untouched;
    if the updated base `docker-compose.yml` or `Caddyfile` fails `/health`,
-   falls back automatically to `/var/lib/divine-upload/pre-sync-backup`, and
+   falls back automatically to `/var/lib/divine-upload/pre-sync-backup`,
    resumes `divine-transcode` only after `/health` passes and only if Phase A
-   created the pause marker):
+   created the pause marker, and then clears the pre-sync backup so subsequent
+   rollouts take a fresh baseline):
    ```sh
    (
      set -eu
@@ -546,6 +549,7 @@ sole writer.
      else
        echo 'Preserving pre-existing divine-transcode pause for its owner'
      fi
+     rm -rf /var/lib/divine-upload/pre-sync-backup /var/lib/divine-upload/pre-sync-backup.tmp
    )
    ```
    *(Running `docker compose run --rm --no-deps caddy caddy validate` beforehand
@@ -1025,7 +1029,8 @@ candidate sessions remain). Only then:
    in GCP IAM (and remove/revoke `/etc/divine-upload/ar-pull-key.json` and run
    `docker logout https://us-central1-docker.pkg.dev` if no other service on the
    host pulls from Artifact Registry).
-4. Remove `/opt/divine-transcoder/.env.upload`, remove `COMPOSE_FILE` and
+4. Remove `/opt/divine-transcoder/.env.upload`, `/var/lib/divine-upload/pre-sync-backup`,
+   and `/var/lib/divine-upload/pre-sync-backup.tmp`, remove `COMPOSE_FILE` and
    `UPLOAD_IMAGE` (plus `UPLOAD_DOMAIN`, if set) from `/opt/divine-transcoder/.env`,
    and optionally remove `/opt/divine-transcoder/nginx.upload-proxy.conf` so
    `upload` and `upload-proxy` are not left behind or restarted on reboot. Remember that editing
