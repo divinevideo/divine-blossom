@@ -462,6 +462,32 @@ sole writer.
    ```sh
    (
      set -eu
+     wait_caddy_admin() {
+       i=0
+       while [ "$i" -lt 15 ]; do
+         if docker compose exec -T caddy wget -qO- http://127.0.0.1:2019/config/ >/dev/null 2>&1; then
+           return 0
+         fi
+         i=$((i + 1))
+         if [ "$i" -lt 15 ]; then
+           sleep 1
+         fi
+       done
+       return 1
+     }
+     wait_transcoder_health() {
+       i=0
+       while [ "$i" -lt 15 ]; do
+         if curl -fsS --max-time 5 https://transcoder-worker.divine.video/health >/dev/null; then
+           return 0
+         fi
+         i=$((i + 1))
+         if [ "$i" -lt 15 ]; then
+           sleep 2
+         fi
+       done
+       return 1
+     }
      mountpoint -q /var/lib/divine-upload/scratch
      test -f /var/lib/divine-upload/scratch/tmp/.divine-upload-scratch
      test -f /var/lib/divine-upload/scratch/proxy-tmp/.divine-upload-scratch
@@ -480,8 +506,9 @@ sole writer.
      fi
      docker compose up -d --no-deps upload-proxy upload
      docker compose up -d --no-deps caddy
+     wait_caddy_admin
      docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile
-     curl -fsS https://transcoder-worker.divine.video/health
+     wait_transcoder_health
      if [ -f /var/lib/divine-upload/activation-paused-queue ]; then
        gcloud tasks queues resume divine-transcode \
          --location=us-central1 --project=rich-compiler-479518-d2
@@ -503,6 +530,19 @@ sole writer.
    ```sh
    (
      set -eu
+     wait_transcoder_health() {
+       i=0
+       while [ "$i" -lt 15 ]; do
+         if curl -fsS --max-time 5 https://transcoder-worker.divine.video/health >/dev/null; then
+           return 0
+         fi
+         i=$((i + 1))
+         if [ "$i" -lt 15 ]; then
+           sleep 2
+         fi
+       done
+       return 1
+     }
      cd /opt/divine-transcoder
      test "$(gcloud tasks queues describe divine-transcode \
        --location=us-central1 --project=rich-compiler-479518-d2 \
@@ -520,7 +560,7 @@ sole writer.
      if ! (
        docker compose -f docker-compose.yml run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile &&
        docker compose -f docker-compose.yml up -d --no-deps caddy &&
-       curl -fsS https://transcoder-worker.divine.video/health
+       wait_transcoder_health
      ); then
        BACKUP_DIR=/var/lib/divine-upload/pre-sync-backup
        if [ ! -d "$BACKUP_DIR" ]; then
@@ -540,7 +580,7 @@ sole writer.
        fi
        docker compose -f docker-compose.yml run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile
        docker compose -f docker-compose.yml up -d --no-deps caddy
-       curl -fsS https://transcoder-worker.divine.video/health
+       wait_transcoder_health
      fi
      if [ -f /var/lib/divine-upload/activation-paused-queue ]; then
        gcloud tasks queues resume divine-transcode \

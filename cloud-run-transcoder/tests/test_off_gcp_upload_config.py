@@ -883,6 +883,27 @@ Server(("0.0.0.0", 8080), Handler).serve_forever()
                 else:
                     self.fail("nginx upload-proxy container /healthz did not become ready")
 
+                # nginx answers /healthz itself, so also wait for the stub upstream to accept
+                # connections; otherwise the first proxied request races its startup and gets 502.
+                upstream_deadline = time.monotonic() + 15.0
+                while time.monotonic() < upstream_deadline:
+                    conn = None
+                    try:
+                        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
+                        conn.request("GET", "/ready")
+                        resp = conn.getresponse()
+                        resp.read()
+                        if resp.status == 200:
+                            break
+                    except (OSError, http.client.HTTPException):
+                        pass
+                    finally:
+                        if conn is not None:
+                            conn.close()
+                    time.sleep(0.1)
+                else:
+                    self.fail("stub upstream behind nginx did not become ready")
+
                 # Upstream 200 must keep single Access-Control-Allow-Origin header.
                 conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
                 conn.request("GET", "/probe")
