@@ -309,6 +309,15 @@ fn download_derived_media_object(
     range: Option<&str>,
     uncached: bool,
 ) -> Result<Response> {
+    download_derived_media_object_reserving_fallback_secrets(key, range, uncached, &[])
+}
+
+fn download_derived_media_object_reserving_fallback_secrets(
+    key: &str,
+    range: Option<&str>,
+    uncached: bool,
+    reserve_on_b2_miss: &[&str],
+) -> Result<Response> {
     // Originals and derived artifacts are migrated independently. Never inherit
     // an original-only rollout flag before the artifact family is available.
     let policy = MediaReadPolicy::parse(
@@ -316,7 +325,14 @@ fn download_derived_media_object(
         get_config("derived_media_gcs_fallback_enabled").ok().as_deref(),
     )
     .map_err(|_| BlossomError::StorageError("Invalid derived media origin policy".into()))?;
-    let (mut response, source) = download_object_with_policy(policy, key, range, false, uncached)?;
+    let (mut response, source) = download_object_with_policy_reserving_fallback_secrets(
+        policy,
+        key,
+        range,
+        false,
+        uncached,
+        reserve_on_b2_miss,
+    )?;
     // Attribute the selected transport, never an origin-supplied claim. Cached
     // downstream responses retain fill provenance, not a new provider read.
     response.set_header("X-Divine-Source", source);
@@ -339,8 +355,33 @@ fn download_object_with_policy(
     immutable: bool,
     uncached: bool,
 ) -> Result<(Response, &'static str)> {
-    download_object_with_policy_details(policy, key, range, immutable, uncached)
-        .map(|result| (result.response, result.source))
+    download_object_with_policy_reserving_fallback_secrets(
+        policy,
+        key,
+        range,
+        immutable,
+        uncached,
+        &[],
+    )
+}
+
+fn download_object_with_policy_reserving_fallback_secrets(
+    policy: MediaReadPolicy,
+    key: &str,
+    range: Option<&str>,
+    immutable: bool,
+    uncached: bool,
+    reserve_on_b2_miss: &[&str],
+) -> Result<(Response, &'static str)> {
+    download_object_with_policy_details_reserving(
+        policy,
+        key,
+        range,
+        immutable,
+        uncached,
+        reserve_on_b2_miss,
+    )
+    .map(|result| (result.response, result.source))
 }
 
 struct MediaDownload {
@@ -356,6 +397,17 @@ fn download_object_with_policy_details(
     immutable: bool,
     uncached: bool,
 ) -> Result<MediaDownload> {
+    download_object_with_policy_details_reserving(policy, key, range, immutable, uncached, &[])
+}
+
+fn download_object_with_policy_details_reserving(
+    policy: MediaReadPolicy,
+    key: &str,
+    range: Option<&str>,
+    immutable: bool,
+    uncached: bool,
+    reserve_on_b2_miss: &[&str],
+) -> Result<MediaDownload> {
     let response = fetch_media_origin(policy.primary, key, range, immutable, uncached);
     let b2_missing = policy.primary == StorageProvider::B2
         && response
@@ -367,6 +419,23 @@ fn download_object_with_policy_details(
         Err(MediaFetchError::Configuration(_)) => false,
     };
     if should_fallback {
+        if b2_missing && !reserve_on_b2_miss.is_empty() {
+            let mut required = Vec::with_capacity(2 + reserve_on_b2_miss.len());
+            required.extend_from_slice(&["gcs_access_key", "gcs_secret_key"]);
+            required.extend_from_slice(reserve_on_b2_miss);
+            if !crate::request_bindings::has_secret_budget(&required) {
+                eprintln!(
+                    "[MEDIA_ORIGIN] primary=b2 fallback=gcs skipped=secret_budget_reserved"
+                );
+                return response
+                    .map(|response| MediaDownload {
+                        response,
+                        source: policy.primary.name(),
+                        b2_missing,
+                    })
+                    .map_err(MediaFetchError::into_storage_error);
+            }
+        }
         let cause = match &response {
             Ok(response) => format!("http_{}", response.get_status().as_u16()),
             Err(_) => "transport".to_string(),
@@ -860,9 +929,16 @@ pub fn upload_blob(
     Ok(())
 }
 
-/// Download a thumbnail from the independently selected derived-media origin.
+/// Download a thumbnail from the independently selected derived-media origin,
+/// keeping one Compute secret slot available for `thumbnail_service_token` if
+/// a B2 miss falls through to on-demand generation.
 pub fn download_thumbnail(gcs_key: &str) -> Result<Response> {
-    let resp = download_derived_media_object(gcs_key, None, false)?;
+    let resp = download_derived_media_object_reserving_fallback_secrets(
+        gcs_key,
+        None,
+        false,
+        &[crate::THUMBNAIL_SERVICE_TOKEN_SECRET],
+    )?;
 
     match resp.get_status() {
         StatusCode::OK => Ok(resp),

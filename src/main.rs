@@ -310,7 +310,9 @@ fn route_request(req: Request) -> Result<Response> {
 
         // BUD-01: Blob retrieval
         (Method::GET, p) if is_hash_path(p) => handle_get_blob(req, p),
-        (Method::HEAD, p) if is_hash_path(p) => handle_head_blob(p),
+        (Method::HEAD, p) if is_hash_path(p) => {
+            handle_head_blob(p, req.get_header_str(req_id::REQUEST_ID_HEADER))
+        }
 
         // BUD-02: Upload
         (Method::PUT, "/upload") => with_upload_log(req, UploadRoute::DirectPut, handle_upload),
@@ -959,7 +961,7 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
 }
 
 /// HEAD /<sha256>[.ext] - Check blob existence
-fn handle_head_blob(path: &str) -> Result<Response> {
+fn handle_head_blob(path: &str, request_id: Option<&str>) -> Result<Response> {
     // Check if this is a thumbnail request ({hash}.jpg)
     if let Some(thumbnail_key) = parse_thumbnail_path(path) {
         let thumb_hash = thumbnail_key.trim_end_matches(".jpg");
@@ -981,8 +983,7 @@ fn handle_head_blob(path: &str) -> Result<Response> {
 
         let resp = match download_thumbnail(&thumbnail_key) {
             Ok(resp) => resp,
-            // HEAD has no request in scope here; the call is still tagged.
-            Err(BlossomError::NotFound(_)) => generate_thumbnail_on_demand(thumb_hash, None)?,
+            Err(BlossomError::NotFound(_)) => generate_thumbnail_on_demand(thumb_hash, request_id)?,
             Err(e) => return Err(e),
         };
         let content_length = resp
@@ -3322,7 +3323,7 @@ const HETZNER_TRANSCODE_ADMISSION_BACKEND: &str = "hetzner_transcode_admission";
 /// who may see the thumbnail when it makes this call; the token tells the
 /// upload server the call came from Blossom rather than from someone who only
 /// knows a video's hash.
-const THUMBNAIL_SERVICE_TOKEN_SECRET: &str = "thumbnail_service_token";
+pub(crate) const THUMBNAIL_SERVICE_TOKEN_SECRET: &str = "thumbnail_service_token";
 /// Header the upload server reads the token from.
 const THUMBNAIL_SERVICE_TOKEN_HEADER: &str = "X-Divine-Thumbnail-Token";
 /// Prefix of the request id on Blossom's thumbnail calls, logged by the
@@ -8156,6 +8157,32 @@ mod tests {
     fn thumbnail_token_loopback_never_forwards_a_viewer_token_without_a_key() {
         let resp = viewer_thumbnail_through_blossom();
         assert_eq!(resp.get_header_str("x-seen-token"), Some("-"));
+    }
+
+    #[test]
+    #[ignore = "requires a loopback upload service; run-thumbnail-token-tests.py"]
+    fn thumbnail_token_loopback_b2_miss_reserves_budget_for_token() {
+        let _scope = crate::request_bindings::begin();
+        let hash = "b".repeat(64);
+        let mut req = fastly::Request::get(format!("https://media.divine.video/{hash}.jpg"));
+        req.set_header("Authorization", "Bearer loopback-admin");
+        req.set_header("x-request-id", "b2-miss-req-1");
+        let resp = super::handle_get_blob(req, &format!("/{hash}.jpg")).unwrap();
+        assert_eq!(resp.get_status(), StatusCode::OK);
+        assert_eq!(resp.get_header_str("x-seen-token"), Some("loopback-token"));
+        assert_eq!(
+            resp.get_header_str("x-seen-request-id"),
+            Some("blossom-thumbnail-b2-miss-req-1")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a loopback upload service; run-thumbnail-token-tests.py"]
+    fn thumbnail_token_loopback_head_sends_token_and_request_id() {
+        let _scope = crate::request_bindings::begin();
+        let hash = "b".repeat(64);
+        let resp = super::handle_head_blob(&format!("/{hash}.jpg"), Some("head-req-1")).unwrap();
+        assert_eq!(resp.get_status(), StatusCode::OK);
     }
 
     /// A viewer's thumbnail request carrying its own token and request id, as
