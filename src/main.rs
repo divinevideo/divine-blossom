@@ -7374,16 +7374,18 @@ fn normalize_bunny_purge_hash(surrogate_key: &str) -> Option<String> {
 }
 
 fn is_valid_bunny_purge_zone(zone: &str) -> bool {
-    !zone.is_empty()
-        && zone.contains('.')
-        && !zone.starts_with('.')
-        && !zone.ends_with('.')
-        && !zone.starts_with('-')
-        && !zone.ends_with('-')
-        && !zone.contains("..")
-        && zone
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+    if zone.is_empty() || zone.len() > 253 || !zone.contains('.') {
+        return false;
+    }
+    zone.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    })
 }
 
 fn parse_bunny_edge_purge_zones(raw: &str) -> Option<Vec<String>> {
@@ -7418,6 +7420,14 @@ fn build_bunny_edge_purge_url(zone: &str, surrogate_key: &str) -> Option<String>
     ))
 }
 
+fn parse_purge_header_secret(raw: &str) -> Option<fastly::http::HeaderValue> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    fastly::http::HeaderValue::from_str(trimmed).ok()
+}
+
 /// Purge content from the Fastly VCL/Compute caches by Surrogate-Key and from
 /// configured outer Bunny CDN delivery zones (`bunny_delivery_zones`) by hash
 /// prefix wildcard. Best-effort: logs errors but never fails the calling request.
@@ -7434,10 +7444,13 @@ fn purge_fastly_edge_cache(surrogate_key: &str) {
         );
         return;
     }
-    let api_token = match storage::get_secret("fastly_api_token").ok() {
-        Some(token) if !token.is_empty() => token,
-        _ => {
-            eprintln!("[PURGE] fastly_api_token not configured, skipping Fastly cache purge");
+    let api_token = match storage::get_secret("fastly_api_token")
+        .ok()
+        .and_then(|token| parse_purge_header_secret(&token))
+    {
+        Some(token) => token,
+        None => {
+            eprintln!("[PURGE] fastly_api_token not configured or invalid, skipping Fastly cache purge");
             return;
         }
     };
@@ -7455,7 +7468,7 @@ fn purge_fastly_edge_cache(surrogate_key: &str) {
 
         let mut purge_req = Request::new(Method::POST, &url);
         purge_req.set_header("Host", "api.fastly.com");
-        purge_req.set_header("Fastly-Key", &api_token);
+        purge_req.set_header("Fastly-Key", api_token.clone());
         purge_req.set_header("Accept", "application/json");
 
         match purge_req.send("fastly_api") {
@@ -7487,8 +7500,8 @@ fn purge_bunny_edge_cache(surrogate_key: &str) {
         return;
     };
     let raw_zones = match storage::optional_config("bunny_delivery_zones") {
-        Ok(Some(raw)) => raw,
-        Ok(None) => return,
+        Ok(Some(raw)) if !raw.trim().is_empty() => raw,
+        Ok(Some(_)) | Ok(None) => return,
         Err(e) => {
             eprintln!(
                 "[PURGE] Bunny purge config lookup failed for key={}: {}",
@@ -7511,10 +7524,13 @@ fn purge_bunny_edge_cache(surrogate_key: &str) {
         );
         return;
     }
-    let api_key = match storage::get_secret("bunny_api_key").ok() {
-        Some(key) if !key.trim().is_empty() => key,
-        _ => {
-            eprintln!("[PURGE] bunny_api_key not configured, skipping Bunny cache purge");
+    let api_key = match storage::get_secret("bunny_api_key")
+        .ok()
+        .and_then(|key| parse_purge_header_secret(&key))
+    {
+        Some(key) => key,
+        None => {
+            eprintln!("[PURGE] bunny_api_key not configured or invalid, skipping Bunny cache purge");
             return;
         }
     };
@@ -7526,7 +7542,7 @@ fn purge_bunny_edge_cache(surrogate_key: &str) {
         };
         let mut purge_req = Request::new(Method::POST, &url);
         purge_req.set_header("Host", "api.bunny.net");
-        purge_req.set_header("AccessKey", &api_key);
+        purge_req.set_header("AccessKey", api_key.clone());
         match purge_req.send_async("bunny_api") {
             Ok(handle) => pending.push(handle),
             Err(e) => {
@@ -7560,7 +7576,14 @@ fn purge_bunny_edge_cache(surrogate_key: &str) {
                 }
             }
             Err(e) => {
-                eprintln!("[PURGE] Bunny purge request failed for key={}: {}", hash, e);
+                let err_msg = e.to_string();
+                let sent = e.into_sent_req();
+                eprintln!(
+                    "[PURGE] Bunny purge request failed for key={} ({}): {}",
+                    hash,
+                    sent.get_url_str(),
+                    err_msg
+                );
             }
         }
     }
@@ -9201,6 +9224,12 @@ mod tests {
         );
         assert_eq!(parse_bunny_edge_purge_zones(".media.divine.video"), None);
         assert_eq!(parse_bunny_edge_purge_zones("media..divine.video"), None);
+        assert_eq!(parse_bunny_edge_purge_zones("media.-divine.video"), None);
+        assert_eq!(parse_bunny_edge_purge_zones("media-.divine.video"), None);
+        assert_eq!(
+            parse_bunny_edge_purge_zones(&format!("{}.divine.video", "a".repeat(64))),
+            None
+        );
         assert_eq!(
             parse_bunny_edge_purge_zones("a.example.com,b.example.com,c.example.com"),
             None
@@ -9226,6 +9255,15 @@ mod tests {
             build_bunny_edge_purge_url("media.divine.video/bad", &lower),
             None
         );
+    }
+
+    #[test]
+    fn parse_purge_header_secret_trims_and_rejects_invalid_header_bytes() {
+        use super::parse_purge_header_secret;
+        let valid = parse_purge_header_secret("  secret-token\r\n").expect("trimmed token valid");
+        assert_eq!(valid.to_str().unwrap(), "secret-token");
+        assert!(parse_purge_header_secret("   \n").is_none());
+        assert!(parse_purge_header_secret("line1\nline2").is_none());
     }
 }
 
