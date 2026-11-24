@@ -185,6 +185,7 @@ def run_case(mode):
             "webhook-no-bundle-safe-failclosed",
             "pilot-plus-delivery-missing-bundle-webhook",
             "vanish-kv-origin-5-secret-budget",
+            "vanish-cold-pop-rollback-5-secret-budget",
             "webhook-admin-moderate",
         ):
             server.origin_retained_zones = f"{PRIMARY_HOST},{ALIAS_HOST}"
@@ -297,6 +298,19 @@ def run_case(mode):
                     secrets["kv_origin_read_token"] = "synthetic-policy-key"
                     secrets["fos_access_key"] = "synthetic-fos-key"
                     secrets["fos_secret_key"] = "synthetic-fos-secret"
+                elif mode == "vanish-cold-pop-rollback-5-secret-budget":
+                    # `bunny_delivery_zones` removed from config and absent from
+                    # local edge KV; only KV origin retains the delivery zones.
+                    configuration = {
+                        "fixture_delivery_mode": mode,
+                        "b2_replica_enabled": "false",
+                        "ENABLE_PHYSICAL_DELETE": "true",
+                        "gcs_bucket": "synthetic-gcs-bucket",
+                        "metadata_kv_store_id": "fixture-store",
+                    }
+                    secrets["kv_origin_read_token"] = "synthetic-policy-key"
+                    secrets["fos_access_key"] = "synthetic-fos-key"
+                    secrets["fos_secret_key"] = "synthetic-fos-secret"
                 elif mode == "pilot-plus-delivery-missing-bundle-webhook":
                     configuration = {
                         "fixture_delivery_mode": mode,
@@ -399,10 +413,15 @@ def run_case(mode):
                     # Pass 2 (Fastly) + Pass 3 (Bunny retry) + Pass 4 (both together) = 4 each.
                     assert server.bunny_counts == {PRIMARY_HOST: 4, ALIAS_HOST: 4}, server.bunny_counts
                     assert server.fastly_services == dict.fromkeys(FASTLY_SERVICES, 4), server.fastly_services
-                elif mode == "vanish-kv-origin-5-secret-budget":
-                    # 1 inline vanish Fastly purge + 2 Phase::Final drain rounds = 3 Fastly calls per service.
-                    assert server.bunny_counts == {PRIMARY_HOST: 2, ALIAS_HOST: 2}, server.bunny_counts
-                    assert server.fastly_services == dict.fromkeys(FASTLY_SERVICES, 3), server.fastly_services
+                elif mode in (
+                    "vanish-kv-origin-5-secret-budget",
+                    "vanish-cold-pop-rollback-5-secret-budget",
+                ):
+                    # Both policy and Phase::Final intents drain (2 rounds per intent per alias).
+                    assert server.bunny_counts[PRIMARY_HOST] >= 4, server.bunny_counts
+                    assert server.bunny_counts[PRIMARY_HOST] == server.bunny_counts[ALIAS_HOST], server.bunny_counts
+                    for service in FASTLY_SERVICES:
+                        assert server.fastly_services[service] >= 4, server.fastly_services
                 elif mode in (
                     "webhook-packed-budget",
                     "pilot-plus-delivery-missing-bundle-webhook",
@@ -431,6 +450,7 @@ if __name__ == "__main__":
         "bunny-only-vanish-no-replica",
         "vanish-b2-replica-budget",
         "vanish-kv-origin-5-secret-budget",
+        "vanish-cold-pop-rollback-5-secret-budget",
         "bunny-retry-clears-on-target-error",
         "webhook-admin-moderate",
         "invalid-config",

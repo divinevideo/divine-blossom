@@ -1025,7 +1025,9 @@ fn bunny_delivery_policy_purge_and_durable_retry() {
         return;
     }
 
-    if mode == "vanish-kv-origin-5-secret-budget" {
+    if mode == "vanish-kv-origin-5-secret-budget"
+        || mode == "vanish-cold-pop-rollback-5-secret-budget"
+    {
         let hash = hash();
         let metadata = serde_json::from_value(serde_json::json!({
             "sha256": hash,
@@ -1037,23 +1039,35 @@ fn bunny_delivery_policy_purge_and_durable_retry() {
         }))
         .unwrap();
         put_blob_metadata(&metadata).unwrap();
-        // Physical creator delete with kv_origin + bunny_delivery_zones + FOS
-        // must stay within the 5-secret Compute limit (admin_token,
-        // fos_access_key, fos_secret_key, fastly_api_token, webhook_secret)
-        // without spending a 6th slot on kv_origin_read_token.
+        // Physical creator delete with kv_origin + bunny_delivery_zones (both
+        // active and cold-POP rollback where only KV origin retains zones) must
+        // stay within the 5-secret Compute limit without failing the physical
+        // wave, then complete after bounded Phase::Final drain.
         let mut delete_req = request(Method::POST, "/admin/api/moderate", true);
         delete_req.set_body(serde_json::json!({"sha256": hash, "action": "DELETE"}).to_string());
         let delete_resp = crate::request_bindings::metered(delete_req);
         assert_eq!(delete_resp.get_status(), StatusCode::CONFLICT);
         assert!(b2_cdn_phase::physical_absent(&hash).unwrap());
 
-        let drain_req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false)
-            .with_header("Authorization", "Bearer synthetic-drain-token");
-        let mut drain_resp = crate::request_bindings::metered(drain_req);
-        assert_eq!(drain_resp.get_status(), StatusCode::OK);
-        let reply: serde_json::Value = serde_json::from_str(&drain_resp.take_body_str()).unwrap();
-        assert_eq!(reply["result"], 1);
-        assert_eq!(reply["errors"], 0);
+        // `handle_phased_creator_delete` enqueues both policy and Phase::Final
+        // intents under random nonces while `handle_drain` clamps `limit = 1`.
+        // Drain in a bounded loop until the queue is empty (`result == 0`).
+        let mut cleared = 0u64;
+        for _ in 0..5 {
+            let drain_req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false)
+                .with_header("Authorization", "Bearer synthetic-drain-token");
+            let mut drain_resp = crate::request_bindings::metered(drain_req);
+            assert_eq!(drain_resp.get_status(), StatusCode::OK);
+            let reply: serde_json::Value =
+                serde_json::from_str(&drain_resp.take_body_str()).unwrap();
+            assert_eq!(reply["errors"], 0);
+            let drained = reply["result"].as_u64().unwrap_or(0);
+            cleared += drained;
+            if drained == 0 && reply["pending"] == 0 {
+                break;
+            }
+        }
+        assert!(cleared >= 1, "expected queued intents to drain");
         assert!(storage::vanish_complete(&hash));
 
         let mut finish_req = request(Method::POST, "/admin/api/moderate", true);

@@ -2630,23 +2630,22 @@ pub(crate) fn retain_bunny_delivery_zones() -> Result<()> {
         return Ok(());
     }
     let store = crate::metadata::open_store()?;
-    let allow_origin = !crate::request_bindings::delivery_origin_retention_deferred();
     for attempt in 0..3 {
         // Attempt 0 uses local KV + atomic origin-enforced Add/CAS so steady-state
-        // requests and 5-secret physical-erasure waves spend zero
-        // `kv_origin_read_token` secrets and zero origin HTTP subrequests. Only
-        // a genuine `ItemPreconditionFailed` escalates to a KV-origin read.
+        // requests spend zero `kv_origin_read_token` secrets and zero origin HTTP
+        // subrequests. Any `ItemPreconditionFailed` escalates to a KV-origin CAS
+        // read (failing closed if origin cannot be read) so rotated zones are
+        // always durably retained before a policy mutation commits.
         let (current, from_origin) = if attempt == 0 {
             (
                 lookup_local_retained_bunny_delivery_with_generation(&store)?,
                 false,
             )
         } else {
-            if !allow_origin || !crate::request_bindings::can_read_secret("kv_origin_read_token") {
-                // `ItemPreconditionFailed` already proved a retained record
-                // exists at KV origin; defer any cold-POP rotation merge to
-                // the fresh-budget drain execution (`bunny_delivery_purge_targets`).
-                return Ok(());
+            if !crate::request_bindings::can_read_secret("kv_origin_read_token") {
+                return Err(BlossomError::MetadataError(
+                    "Bunny delivery target record unavailable".into(),
+                ));
             }
             lookup_origin_retained_bunny_delivery_with_generation(&store, attempt == 1)?
         };
@@ -3520,6 +3519,18 @@ pub(crate) fn purge_policy_cache(hash: &str) -> Result<()> {
 fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) -> HashSet<String> {
     let mut purged = HashSet::new();
     if hashes.is_empty() {
+        return purged;
+    }
+    // When durable CDN invalidation is active, phased vanish and creator
+    // physical delete block completion until the dedicated `Phase::Final` drain
+    // executes two checked Fastly + Bunny purge rounds in a fresh 5-secret
+    // Compute budget. If the wave already spent all 5 secrets (for example,
+    // reading `kv_origin_read_token` on a cold-POP rollback or zone rotation
+    // alongside admin, webhook, and FOS keys), defer Fastly eviction to
+    // `Phase::Final` instead of failing the physical wave.
+    if cdn_invalidation_configured()
+        && !crate::request_bindings::can_read_secret("fastly_api_token")
+    {
         return purged;
     }
 
