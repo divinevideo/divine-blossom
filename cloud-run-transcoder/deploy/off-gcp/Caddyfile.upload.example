@@ -1,25 +1,40 @@
 # Copy to conf.d/upload.caddy on a co-located host and set UPLOAD_DOMAIN in .env
-# (e.g. UPLOAD_DOMAIN=upload.divine.video, or a staging hostname first).
+# (e.g. UPLOAD_DOMAIN=upload-hetzner.divine.video during staging, then
+# UPLOAD_DOMAIN=upload.divine.video at DNS cutover).
 {$UPLOAD_DOMAIN} {
+	# Public surface parity with GKE HTTPRoute for callers on UPLOAD_SERVICE_HOST:
+	# - /transcribe enforces BUD-11 Nostr auth in divine-upload-server before
+	#   injecting TRANSCRIBE_SHARED_SECRET upstream to transcoder.
+	# - /migrate preserves Fastly PUT /mirror parity (guarded in-app by
+	#   acquire_mirror() and HTTPS host allowlist; no Nostr auth in-app).
+	# - /audit is intentionally blocked (404) because divine-blossom posts /audit
+	#   only to CLOUD_RUN_HOST, and /metrics stays on container-internal port 9090.
 	@public_upload <<CEL
 		(method('PUT', 'OPTIONS') && path('/upload', '/'))
-		|| (method('GET') && path('/'))
-		|| (method('POST', 'OPTIONS') && path('/upload/init'))
+		|| (method('GET', 'HEAD') && path('/'))
+		|| (method('POST', 'OPTIONS') && path('/upload/init', '/transcribe', '/migrate'))
 		|| (method('POST', 'OPTIONS') && path_regexp('^/upload/[^/]+/complete$'))
 		|| (method('DELETE', 'OPTIONS') && path_regexp('^/upload/[^/]+$'))
 		|| (method('PUT', 'HEAD', 'OPTIONS') && path_regexp('^/sessions/[^/]+$'))
 		|| (method('GET', 'HEAD', 'OPTIONS') && path_regexp('^/thumbnail/[^/]+$'))
 		CEL
 
-	reverse_proxy @public_upload upload:8080 {
-		# Stream direct/resumable video uploads and thumbnail bytes without buffering.
-		flush_interval -1
-		transport http {
-			dial_timeout 10s
-			response_header_timeout 310s
-			read_timeout 310s
-			write_timeout 310s
+	# Wrap proxy and fallback in handle blocks so respond 404 never shadows
+	# reverse_proxy under Caddy 2's built-in directive order.
+	handle @public_upload {
+		reverse_proxy upload:8080 {
+			# Stream direct/resumable video uploads and thumbnail bytes without buffering.
+			flush_interval -1
+			transport http {
+				dial_timeout 10s
+				response_header_timeout 310s
+				read_timeout 310s
+				write_timeout 310s
+			}
 		}
 	}
-	respond 404
+
+	handle {
+		respond 404
+	}
 }
