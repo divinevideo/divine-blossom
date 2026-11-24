@@ -13,7 +13,11 @@ registration, reconciliation and settlement remain available when admissions pau
 {"version":1,"items":[{"sha256":"<64 lowercase hex>","owner":"<64 lowercase hex>","attempt":"<32 lowercase hex>","source":"<immutable source identity>","provenance":"<approved archive manifest identity>","size":99,"content_type":"video/mp4"}]}
 ```
 
-Maximum 16 items and 64 KiB per request. Results preserve input order and identify the
+Maximum 16 items and 64 KiB per request. Submit exactly one item per `settle-copy`
+request. A larger typed batch returns HTTP 400 before making any changes. One
+item uses at most 30 Fastly KV origin requests, including up to four attempts to
+retire the admission, within the 32-backend-request limit.
+Results preserve input order and identify the
 hash and owner; each contains `ok` and `result`, or `error` (`policy_denied`, `invalid`,
 `retry`). Retrying one item does not replay successful items. The importer is trusted
 to bind approved archive identity to its existing creator account; this is not a public
@@ -38,13 +42,19 @@ returning a copy proof. `settle-copy` obtains proof before processing; it MUST N
 replace this generic cleanup drain. A policy-denied proof request leaves its gate
 for legacy settlement to drain if policy denies before release. Policy can also
 deny after release, leaving no copying gate to drain; legacy settlement is then
-an idempotent no-op. Neither denial authorizes processing.
+an idempotent no-op. Neither denial authorizes processing. A generic response
+does not confirm current gate state.
 
 For `settle-copy`, add the `generation` returned by `admit-copy` to the original
 admitted item. Every item field must match the admission, or the exact item retained
-by an earlier copy settlement. The generation must be a canonical, nonzero decimal
-`u64` string. Before retiring the attempt, the operation requires either its exact
-copying gate or the released gate for that same attempt and admission generation.
+by an earlier copy settlement. Blossom records the copy marker when it creates the
+admission through `admit-copy`. A replay cannot add or remove a marker. Use
+generic cleanup or reconciliation for in-flight admissions created before the
+upgrade. A new attempt can produce typed proof after the earlier attempt has been
+safely closed. Admissions without a marker cannot produce a typed proof. The generation must be
+a canonical, nonzero decimal `u64` string. Before retiring the attempt, the
+operation requires either its exact copying gate or the released gate for that
+same attempt and admission generation.
 
 A successful item returns this object in `items[n].result`:
 
@@ -65,17 +75,21 @@ A successful item returns this object in `items[n].result`:
 ```
 
 Retirement atomically retains the admitted item and clears the active admission.
-The operation conditionally releases the owning gate, rechecks current policy, and
-returns proof only after observing that exact released gate. Gate and binding
-reads for `settle-copy` use the Fastly KV origin. Missing `metadata_kv_store_id`
-or `kv_origin_read_token`, or an unavailable origin, returns `retry`.
+The operation conditionally releases the owning gate, observes that exact
+released gate at the origin, and then rechecks policy before returning proof.
+The initial policy check, ownership checks during retirement, and gate and
+binding reads also use the Fastly KV origin. A blob record cleared by erasure
+denies proof. A new admission may have no blob record. Missing
+`metadata_kv_store_id` or `kv_origin_read_token`, or an unavailable origin,
+returns `retry`.
 `owner` comes from the retained item.
 Both `admission_generation` and `released_from_generation` equal the
 supplied generation; `parent_generation` identifies the observed released gate.
 All three are canonical, nonzero decimal `u64` strings used as equality fences.
 
-This is a statement of current gate state, not durable release history. A later
-attempt can claim the released gate, making this attempt's proof unobtainable.
+The proof describes the gate when read, followed by a fresh policy check.
+These reads use separate KV keys and do not form a transaction. A later attempt
+can claim the released gate, making this attempt's proof unobtainable.
 A delayed admission for the same attempt can also pass its initial retirement
 check before settlement, then reclaim and release the gate at a new generation
 after settlement. That changes the release fence even without another attempt,
@@ -93,10 +107,10 @@ Legacy `settle` returns only `{"settled":true}`; that acknowledgment
 is not a copy-release proof, and a historical settlement without a retained copy
 item cannot be upgraded to one by replaying `settle-copy`.
 
-Rollback compatibility: edge versions predating retained `settled_copies` bindings
-ignore that field and drop it when rewriting an archive record. Rolling forward
-does not restore those bindings: an affected historical settlement cannot obtain
-a typed proof and returns `invalid`. Legacy `settle` remains the cleanup drain.
+Rollback compatibility: edge versions predating typed settlement drop the copy
+marker and retained `settled_copies` bindings when they rewrite an archive record.
+Rolling forward cannot restore them. An affected attempt returns `invalid` on the
+typed proof path. Legacy `settle` keeps its existing cleanup behavior.
 
 See the [archive handler and synthetic contract](../../src/archive_import.rs) and
 [parent-gate helpers](../../src/parent_gate.rs) for the implementation.

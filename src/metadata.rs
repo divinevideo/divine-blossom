@@ -323,6 +323,32 @@ pub fn get_blob_metadata_uncached(hash: &str) -> Result<Option<BlobMetadata>> {
     overlay_quarantine_holds(hash, metadata)
 }
 
+/// Read the archive copy's media policy directly from the origin. An absent
+/// entry allows a new admission, while JSON null is an erasure fence.
+pub(crate) fn archive_copy_policy_metadata(hash: &str) -> Result<Option<BlobMetadata>> {
+    use crate::kv_origin::required_lookup;
+
+    let denied = || BlossomError::Forbidden("Archive policy denied".into());
+    if required_lookup(&format!("{TOMBSTONE_PREFIX}{hash}"))?.is_some() {
+        return Err(denied());
+    }
+    if let Some(entry) = required_lookup(&format!("{QUARANTINE_PREFIX}{hash}"))? {
+        let holds: QuarantineHolds = serde_json::from_slice(&entry.body)
+            .map_err(|_| BlossomError::MetadataError("Invalid archive quarantine holds".into()))?;
+        holds.validate().map_err(BlossomError::MetadataError)?;
+        if !holds.active_ids().is_empty() {
+            return Err(denied());
+        }
+    }
+    match required_lookup(&format!("{BLOB_PREFIX}{hash}"))? {
+        Some(entry) => serde_json::from_slice::<Option<BlobMetadata>>(&entry.body)
+            .map_err(|_| BlossomError::MetadataError("Invalid archive blob metadata".into()))?
+            .map(Some)
+            .ok_or_else(denied),
+        None => Ok(None),
+    }
+}
+
 /// Replica publication cannot use a POP's stale view of a new age gate or
 /// takedown. Read the current policy at the KV origin before and after the PUT.
 pub(crate) fn bunny_public_metadata(hash: &str) -> Result<BlobMetadata> {
