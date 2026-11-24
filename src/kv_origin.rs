@@ -19,10 +19,10 @@ struct Settings {
 }
 
 fn settings() -> Option<Settings> {
-    let token = crate::storage::get_secret(TOKEN_SECRET).ok()
+    let store_id = crate::admin::get_config(STORE_ID_CONFIG)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())?;
-    let store_id = crate::admin::get_config(STORE_ID_CONFIG)
+    let token = crate::storage::get_secret(TOKEN_SECRET).ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())?;
     Some(Settings { token, store_id })

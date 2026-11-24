@@ -6714,12 +6714,11 @@ fn handle_admin_backfill_vtt(req: Request) -> Result<Response> {
 fn handle_admin_moderate(mut req: Request) -> Result<Response> {
     let req_id = crate::req_id::for_request(&req);
 
-    // Try to get webhook secret from secret store (optional)
-    let expected_secret: Option<String> =
-        fastly::secret_store::SecretStore::open("blossom_secrets")
-            .ok()
-            .and_then(|store| store.get("webhook_secret"))
-            .map(|secret| String::from_utf8(secret.plaintext().to_vec()).unwrap_or_default());
+    // Try to get webhook secret from secret store (optional) via request_bindings
+    // so downstream purge paths accurately account for Fastly's 5-secret limit.
+    let expected_secret: Option<String> = crate::request_bindings::secret("webhook_secret")
+        .ok()
+        .flatten();
 
     // Get Authorization header
     let auth_header = req

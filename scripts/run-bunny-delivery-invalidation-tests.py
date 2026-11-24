@@ -43,6 +43,16 @@ class Provider(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/resources/stores/kv/fixture-store/keys/"):
             assert self.headers.get("Fastly-Key") == "synthetic-policy-key"
+            if (
+                self.server.origin_retained_zones is not None
+                and self.path.endswith("/bunny-delivery-retained-zones:v1")
+            ):
+                body = self.server.origin_retained_zones.encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("generation", "1")
+                self.end_headers()
+                return self.wfile.write(body)
             return self.reply(404, {})
         return self.reply(404, {})
 
@@ -136,6 +146,9 @@ def run_case(mode):
         server.fastly_services = Counter()
         server.fastly_url_purges = []
         server.fail_primary_first_n = 4 if mode == "bunny-only" else 0
+        server.origin_retained_zones = (
+            f"{PRIMARY_HOST},{ALIAS_HOST}" if mode == "cold-pop-origin-retention" else None
+        )
         server.allowed_bunny_hosts = (
             {PRIMARY_HOST, ALIAS_HOST, OLD_PRIMARY_HOST, OLD_ALIAS_HOST}
             if mode == "zone-rotation"
@@ -179,6 +192,42 @@ def run_case(mode):
                         "bunny_delivery_zones": f"{PRIMARY_HOST},{ALIAS_HOST}",
                     }
                     kv_initial["bunny-delivery-retained-zones:v1"] = f"{OLD_PRIMARY_HOST},{OLD_ALIAS_HOST}"
+                elif mode == "rotation-overflow":
+                    configuration = {
+                        "fixture_delivery_mode": mode,
+                        "bunny_delivery_zones": "third.divine.video,third-cdn.b-cdn.net",
+                    }
+                    kv_initial["bunny-delivery-retained-zones:v1"] = (
+                        f"{OLD_PRIMARY_HOST},{OLD_ALIAS_HOST},{PRIMARY_HOST},{ALIAS_HOST}"
+                    )
+                elif mode == "webhook-no-bundle-livelock":
+                    configuration = {
+                        "fixture_delivery_mode": mode,
+                        "bunny_delivery_zones": f"{PRIMARY_HOST},{ALIAS_HOST}",
+                        "metadata_kv_store_id": "fixture-store",
+                    }
+                    secrets["kv_origin_read_token"] = "synthetic-policy-key"
+                elif mode == "cold-pop-origin-retention":
+                    configuration = {
+                        "fixture_delivery_mode": mode,
+                        "b2_cdn_host": "media-b2-cdn.divine.video",
+                        "b2_cdn_purge_hosts": "media-b2-cdn.divine.video,media-b2.divine.video",
+                        "metadata_kv_store_id": "fixture-store",
+                    }
+                    secrets["kv_origin_read_token"] = "synthetic-policy-key"
+                elif mode == "bunny-only-vanish-no-replica":
+                    configuration = {
+                        "fixture_delivery_mode": mode,
+                        "bunny_delivery_zones": f"{PRIMARY_HOST},{ALIAS_HOST}",
+                        "b2_replica_enabled": "false",
+                    }
+                elif mode == "webhook-admin-moderate":
+                    configuration = {
+                        "fixture_delivery_mode": mode,
+                        "bunny_delivery_zones": f"{PRIMARY_HOST},{ALIAS_HOST}",
+                        "metadata_kv_store_id": "fixture-store",
+                    }
+                    secrets["kv_origin_read_token"] = "synthetic-policy-key"
                 elif mode == "webhook-packed-budget":
                     configuration = {
                         "fixture_delivery_mode": mode,
@@ -234,9 +283,9 @@ def run_case(mode):
                 if result.returncode or "1 passed; 0 failed" not in result.stdout or server.errors:
                     raise RuntimeError(result.stdout + result.stderr + repr(server.errors))
 
-                if mode == "invalid-config":
+                if mode in ("invalid-config", "rotation-overflow"):
                     assert not server.bunny_counts
-                    print("PASS invalid-config: malformed bunny_delivery_zones fails closed")
+                    print(f"PASS {mode}: fails closed")
                     return
 
                 assert max(n for _, n in server.meter) <= 32, server.meter
@@ -245,7 +294,7 @@ def run_case(mode):
                     assert server.bunny_counts == {PRIMARY_HOST: 6, ALIAS_HOST: 6}, server.bunny_counts
                     assert server.fastly_services == dict.fromkeys(FASTLY_SERVICES, 6), server.fastly_services
                     assert not server.fastly_url_purges
-                elif mode == "retained-after-removal":
+                elif mode in ("retained-after-removal", "cold-pop-origin-retention"):
                     assert server.bunny_counts == {PRIMARY_HOST: 2, ALIAS_HOST: 2}, server.bunny_counts
                     assert server.fastly_services == dict.fromkeys(FASTLY_SERVICES, 2), server.fastly_services
                     assert len(server.fastly_url_purges) == 4, server.fastly_url_purges
@@ -257,7 +306,12 @@ def run_case(mode):
                         OLD_ALIAS_HOST: 2,
                     }, server.bunny_counts
                     assert server.fastly_services == dict.fromkeys(FASTLY_SERVICES, 2), server.fastly_services
-                elif mode == "webhook-packed-budget":
+                elif mode in (
+                    "webhook-packed-budget",
+                    "webhook-no-bundle-livelock",
+                    "bunny-only-vanish-no-replica",
+                    "webhook-admin-moderate",
+                ):
                     assert server.bunny_counts == {PRIMARY_HOST: 2, ALIAS_HOST: 2}, server.bunny_counts
                     assert server.fastly_services == dict.fromkeys(FASTLY_SERVICES, 2), server.fastly_services
                 print(f"PASS {mode}: bunny={dict(server.bunny_counts)} fastly={dict(server.fastly_services)}")
@@ -269,8 +323,13 @@ if __name__ == "__main__":
     cases = sys.argv[1:] or (
         "bunny-only",
         "retained-after-removal",
+        "cold-pop-origin-retention",
         "zone-rotation",
+        "rotation-overflow",
         "webhook-packed-budget",
+        "webhook-no-bundle-livelock",
+        "bunny-only-vanish-no-replica",
+        "webhook-admin-moderate",
         "invalid-config",
     )
     for case in cases:

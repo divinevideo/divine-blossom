@@ -926,6 +926,88 @@ fn bunny_delivery_policy_purge_and_durable_retry() {
         return;
     }
 
+    if mode == "webhook-no-bundle-livelock" {
+        b2_cdn_purge::enqueue(&hash(), b2_cdn_purge::Phase::Single).unwrap();
+        let drain = || {
+            let req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false)
+                .with_header("Authorization", "Bearer synthetic-webhook-token");
+            let mut response = crate::request_bindings::metered(req);
+            assert_eq!(response.get_status(), StatusCode::OK);
+            serde_json::from_str::<serde_json::Value>(&response.take_body_str()).unwrap()
+        };
+        // Pass 1: missing bundle stages standalone Fastly priority.
+        assert_eq!(drain()["result"], 0);
+        // Pass 2: Fastly completes and hands off to Bunny delivery priority.
+        assert_eq!(drain()["result"], 0);
+        // Pass 3: Bunny delivery completes and clears the outbox intent.
+        let final_reply = drain();
+        assert_eq!(final_reply["result"], 1);
+        assert_eq!(final_reply["errors"], 0);
+        assert_eq!(final_reply["pending"], 0);
+        return;
+    }
+
+    if mode == "cold-pop-origin-retention" {
+        assert!(b2_cdn_purge::configured());
+        b2_cdn_purge::enqueue(&hash(), b2_cdn_purge::Phase::Single).unwrap();
+        let req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false)
+            .with_header("Authorization", "Bearer synthetic-drain-token");
+        let mut response = crate::request_bindings::metered(req);
+        assert_eq!(response.get_status(), StatusCode::OK);
+        let reply: serde_json::Value = serde_json::from_str(&response.take_body_str()).unwrap();
+        assert_eq!(reply["result"], 1);
+        assert_eq!(reply["errors"], 0);
+        assert_eq!(reply["pending"], 0);
+        return;
+    }
+
+    if mode == "bunny-only-vanish-no-replica" {
+        let hash = hash();
+        let epoch = storage::begin_vanish_phase(&hash).unwrap().unwrap();
+        let empty = std::collections::HashSet::new();
+        assert!(storage::finish_vanish_phase(&hash, &epoch, &empty, &empty).unwrap());
+        assert!(b2_cdn_phase::ensure_final_intent(&hash).unwrap());
+        assert!(b2_cdn_phase::physical_absent(&hash).unwrap());
+        let req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false)
+            .with_header("Authorization", "Bearer synthetic-drain-token");
+        let mut response = crate::request_bindings::metered(req);
+        assert_eq!(response.get_status(), StatusCode::OK);
+        let reply: serde_json::Value = serde_json::from_str(&response.take_body_str()).unwrap();
+        assert_eq!(reply["result"], 1);
+        assert!(storage::vanish_complete(&hash));
+        return;
+    }
+
+    if mode == "rotation-overflow" {
+        let err = b2_cdn_purge::enqueue(&hash(), b2_cdn_purge::Phase::Single);
+        assert!(err.is_err(), "third rotation exceeding 4 retained zones must fail closed");
+        return;
+    }
+
+    if mode == "webhook-admin-moderate" {
+        let hash = hash();
+        let metadata = serde_json::from_value(serde_json::json!({
+            "sha256": hash,
+            "size": 9,
+            "type": "video/mp4",
+            "uploaded": "2026-01-01T00:00:00Z",
+            "owner": "b".repeat(64),
+            "status": "active"
+        }))
+        .unwrap();
+        put_blob_metadata(&metadata).unwrap();
+        let mut moderate = request(Method::POST, "/admin/moderate", false)
+            .with_header("Authorization", "Bearer synthetic-webhook-token");
+        moderate.set_body(serde_json::json!({"sha256": hash, "action": "BAN"}).to_string());
+        let response = crate::request_bindings::metered(moderate);
+        assert_eq!(response.get_status(), StatusCode::OK);
+        assert_eq!(
+            get_blob_metadata_uncached(&hash).unwrap().unwrap().status,
+            BlobStatus::Banned
+        );
+        return;
+    }
+
     if mode == "retained-after-removal" || mode == "zone-rotation" {
         assert!(b2_cdn_purge::configured());
         b2_cdn_purge::enqueue(&hash(), b2_cdn_purge::Phase::Single).unwrap();
@@ -936,7 +1018,10 @@ fn bunny_delivery_policy_purge_and_durable_retry() {
                 .unwrap()
                 .take_body()
                 .into_string();
-            assert_eq!(retained, "old.divine.video,old-cdn.b-cdn.net");
+            assert_eq!(
+                retained,
+                "old.divine.video,old-cdn.b-cdn.net,media.divine.video,divine-media-cdn.b-cdn.net"
+            );
         }
         let req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false)
             .with_header("Authorization", "Bearer synthetic-drain-token");

@@ -2141,12 +2141,14 @@ fn bunny_pilot_hosts() -> Result<String> {
 }
 
 pub(crate) fn origin_bunny_pilot_hosts() -> Result<Option<String>> {
-    let Some(Some(entry)) = crate::kv_origin::lookup(BUNNY_RETAINED_HOSTS)? else {
-        return Ok(None);
-    };
-    let hosts = String::from_utf8(entry.body)
-        .map_err(|_| BlossomError::MetadataError("Invalid Bunny target record".into()))?;
-    checked_bunny_hosts(hosts).map(Some)
+    crate::request_bindings::cached_origin_kv(BUNNY_RETAINED_HOSTS, || {
+        let Some(Some(entry)) = crate::kv_origin::lookup(BUNNY_RETAINED_HOSTS)? else {
+            return Ok(None);
+        };
+        let hosts = String::from_utf8(entry.body)
+            .map_err(|_| BlossomError::MetadataError("Invalid Bunny target record".into()))?;
+        checked_bunny_hosts(hosts).map(Some)
+    })
 }
 
 fn retain_bunny_pilot_hosts() -> Result<()> {
@@ -2428,43 +2430,134 @@ fn purge_bunny_pilot_hosts(hashes: &[String], raw_hosts: &str) -> Result<()> {
 }
 
 const BUNNY_DELIVERY_RETAINED_ZONES: &str = "bunny-delivery-retained-zones:v1";
+const MAX_RETAINED_BUNNY_DELIVERY_ZONES: usize = 4;
 
-fn parse_bunny_delivery_zones(raw: &str) -> Result<Vec<String>> {
-    let zones = raw
-        .split(',')
-        .map(str::trim)
-        .filter(|zone| !zone.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect::<Vec<_>>();
-    if zones.is_empty()
-        || zones.len() > MAX_BUNNY_DELIVERY_ZONES
-        || zones.iter().any(|zone| {
-            zone.starts_with('.')
-                || zone.ends_with('.')
-                || !zone
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
-        })
-    {
-        return Err(BlossomError::StorageError(
-            format!(
-                "bunny_delivery_zones must contain one or two comma-separated hostnames (got {})",
-                zones.len()
-            ),
-        ));
+fn is_valid_bunny_hostname(zone: &str) -> bool {
+    if zone.is_empty() || zone.len() > 253 || !zone.contains('.') {
+        return false;
+    }
+    zone.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && label
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_alphanumeric())
+            && label
+                .bytes()
+                .last()
+                .is_some_and(|b| b.is_ascii_alphanumeric())
+    })
+}
+
+fn parse_bunny_delivery_zone_list(raw: &str, max_zones: usize) -> Result<Vec<String>> {
+    let mut zones = Vec::new();
+    for segment in raw.split(',') {
+        let zone = segment.trim().to_ascii_lowercase();
+        if zone.is_empty() || !is_valid_bunny_hostname(&zone) || zones.contains(&zone) {
+            return Err(BlossomError::StorageError(format!(
+                "bunny_delivery_zones must contain 1..={max_zones} distinct comma-separated hostnames"
+            )));
+        }
+        zones.push(zone);
+    }
+    if zones.is_empty() || zones.len() > max_zones {
+        return Err(BlossomError::StorageError(format!(
+            "bunny_delivery_zones must contain 1..={max_zones} distinct comma-separated hostnames (got {})",
+            zones.len()
+        )));
     }
     Ok(zones)
+}
+
+fn parse_bunny_delivery_zones(raw: &str) -> Result<Vec<String>> {
+    parse_bunny_delivery_zone_list(raw, MAX_BUNNY_DELIVERY_ZONES)
+}
+
+fn parse_retained_bunny_delivery_zones(raw: &str) -> Result<Vec<String>> {
+    parse_bunny_delivery_zone_list(raw, MAX_RETAINED_BUNNY_DELIVERY_ZONES)
+}
+
+fn origin_bunny_delivery_zones() -> Result<Option<Vec<String>>> {
+    let raw = crate::request_bindings::cached_origin_kv(BUNNY_DELIVERY_RETAINED_ZONES, || {
+        let Some(Some(entry)) = crate::kv_origin::lookup(BUNNY_DELIVERY_RETAINED_ZONES)? else {
+            return Ok(None);
+        };
+        let value = String::from_utf8(entry.body).map_err(|_| {
+            BlossomError::MetadataError("Invalid Bunny delivery target record".into())
+        })?;
+        parse_retained_bunny_delivery_zones(&value)?;
+        Ok(Some(value))
+    })?;
+    raw.as_deref()
+        .map(parse_retained_bunny_delivery_zones)
+        .transpose()
 }
 
 fn retained_bunny_delivery_zones() -> Result<Option<Vec<String>>> {
     use fastly::kv_store::KVStoreError;
     match crate::metadata::open_store()?.lookup(BUNNY_DELIVERY_RETAINED_ZONES) {
-        Ok(mut entry) => parse_bunny_delivery_zones(&entry.take_body().into_string()).map(Some),
-        Err(KVStoreError::ItemNotFound) => Ok(None),
+        Ok(mut entry) => {
+            parse_retained_bunny_delivery_zones(&entry.take_body().into_string()).map(Some)
+        }
+        Err(KVStoreError::ItemNotFound) => origin_bunny_delivery_zones(),
         Err(_) => Err(BlossomError::MetadataError(
             "Bunny delivery target record unavailable".into(),
         )),
     }
+}
+
+fn merge_retained_bunny_delivery_zones(
+    existing: &[String],
+    configured: &[String],
+) -> Result<Option<Vec<String>>> {
+    let mut merged = existing.to_vec();
+    let mut changed = false;
+    for zone in configured {
+        if !merged.contains(zone) {
+            merged.push(zone.clone());
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(None);
+    }
+    if merged.len() > MAX_RETAINED_BUNNY_DELIVERY_ZONES {
+        return Err(BlossomError::Conflict(
+            "Too many retained Bunny delivery zones; retire old zones after cache drain".into(),
+        ));
+    }
+    Ok(Some(merged))
+}
+
+fn lookup_retained_bunny_delivery_with_generation(
+    store: &fastly::kv_store::KVStore,
+    prefer_origin: bool,
+) -> Result<Option<(Vec<String>, u64)>> {
+    use fastly::kv_store::KVStoreError;
+    if !prefer_origin {
+        match store.build_lookup().execute(BUNNY_DELIVERY_RETAINED_ZONES) {
+            Ok(mut entry) => {
+                let generation = entry.current_generation();
+                let zones = parse_retained_bunny_delivery_zones(&entry.take_body().into_string())?;
+                return Ok(Some((zones, generation)));
+            }
+            Err(KVStoreError::ItemNotFound) => {}
+            Err(_) => {
+                return Err(BlossomError::MetadataError(
+                    "Bunny delivery target record unavailable".into(),
+                ));
+            }
+        }
+    }
+    let Some(Some(entry)) = crate::kv_origin::lookup(BUNNY_DELIVERY_RETAINED_ZONES)? else {
+        return Ok(None);
+    };
+    let raw = String::from_utf8(entry.body)
+        .map_err(|_| BlossomError::MetadataError("Invalid Bunny delivery target record".into()))?;
+    let zones = parse_retained_bunny_delivery_zones(&raw)?;
+    Ok(Some((zones, entry.generation)))
 }
 
 pub(crate) fn retain_bunny_delivery_zones() -> Result<()> {
@@ -2479,35 +2572,69 @@ pub(crate) fn retain_bunny_delivery_zones() -> Result<()> {
         return Ok(());
     };
     let configured = parse_bunny_delivery_zones(&raw)?;
-    if retained_bunny_delivery_zones()?.is_some() {
-        // Keep the retained set immutable once written so rotating
-        // `bunny_delivery_zones` in config never drops older aliases before
-        // their caches and pending intents finish draining. Operators retire
-        // `bunny-delivery-retained-zones:v1` explicitly after cache drain.
-        return Ok(());
-    }
     let store = crate::metadata::open_store()?;
-    let value = configured.join(",");
-    match crate::metadata::retry_throttled_write(|| {
-        store
-            .build_insert()
-            .mode(InsertMode::Add)
-            .execute(BUNNY_DELIVERY_RETAINED_ZONES, value.as_str())
-    }) {
-        Ok(()) => Ok(()),
-        Err(KVStoreError::ItemPreconditionFailed) => {
-            retained_bunny_delivery_zones()?
-                .ok_or_else(|| {
-                    BlossomError::MetadataError(
+    let mut prefer_origin = false;
+    for _ in 0..3 {
+        if let Some((existing, generation)) =
+            lookup_retained_bunny_delivery_with_generation(&store, prefer_origin)?
+        {
+            let Some(merged) = merge_retained_bunny_delivery_zones(&existing, &configured)? else {
+                return Ok(());
+            };
+            let value = merged.join(",");
+            match crate::metadata::retry_throttled_write(|| {
+                store
+                    .build_insert()
+                    .mode(InsertMode::Overwrite)
+                    .if_generation_match(generation)
+                    .execute(BUNNY_DELIVERY_RETAINED_ZONES, value.as_str())
+            }) {
+                Ok(()) => {
+                    crate::request_bindings::invalidate_cached_origin_kv(
+                        BUNNY_DELIVERY_RETAINED_ZONES,
+                    );
+                    return Ok(());
+                }
+                Err(KVStoreError::ItemPreconditionFailed) => {
+                    prefer_origin = true;
+                    continue;
+                }
+                Err(_) => {
+                    return Err(BlossomError::MetadataError(
                         "Bunny delivery target record unavailable".into(),
-                    )
-                })
-                .map(|_| ())
+                    ));
+                }
+            }
         }
-        Err(_) => Err(BlossomError::MetadataError(
-            "Bunny delivery target record unavailable".into(),
-        )),
+        let value = configured.join(",");
+        match crate::metadata::retry_throttled_write(|| {
+            store
+                .build_insert()
+                .mode(InsertMode::Add)
+                .execute(BUNNY_DELIVERY_RETAINED_ZONES, value.as_str())
+        }) {
+            Ok(()) => {
+                crate::request_bindings::invalidate_cached_origin_kv(
+                    BUNNY_DELIVERY_RETAINED_ZONES,
+                );
+                return Ok(());
+            }
+            Err(KVStoreError::ItemPreconditionFailed) => {
+                // Another POP already created the key; re-read from KV origin
+                // so a cold POP sees the authoritative set and generation.
+                prefer_origin = true;
+                continue;
+            }
+            Err(_) => {
+                return Err(BlossomError::MetadataError(
+                    "Bunny delivery target record unavailable".into(),
+                ));
+            }
+        }
     }
+    Err(BlossomError::MetadataError(
+        "Bunny delivery target record unavailable".into(),
+    ))
 }
 
 pub(crate) fn bunny_delivery_configured() -> Result<bool> {
@@ -2544,12 +2671,16 @@ fn bunny_delivery_purge_key() -> Result<String> {
     ))
 }
 
-fn invalidate_bunny_delivery(hashes: &[String]) -> Result<()> {
+fn invalidate_bunny_delivery(hashes: &[String], zones: &[String]) -> Result<()> {
     if hashes.is_empty() {
         return Ok(());
     }
     validate_b2_cdn_purge_batch(hashes)?;
-    let zones = bunny_delivery_purge_targets()?;
+    if zones.is_empty() {
+        return Err(BlossomError::StorageError(
+            "bunny_delivery_zones not configured".into(),
+        ));
+    }
     let key = bunny_delivery_purge_key()?;
     let requests = hashes
         .iter()
@@ -2591,11 +2722,12 @@ fn bunny_delivery_purge_targets() -> Result<Vec<String>> {
             "bunny_delivery_zones not configured".into(),
         ));
     }
+    if zones.len() > MAX_RETAINED_BUNNY_DELIVERY_ZONES {
+        return Err(BlossomError::StorageError(
+            "Too many retained Bunny delivery zones; retire old zones after cache drain".into(),
+        ));
+    }
     Ok(zones)
-}
-
-fn bunny_delivery_zones() -> Result<Vec<String>> {
-    parse_bunny_delivery_zones(&get_config("bunny_delivery_zones")?)
 }
 
 fn build_bunny_purge_request(zone: &str, hash: &str, api_key: &str, stage: &str) -> Request {
@@ -2613,7 +2745,7 @@ fn purge_bunny_hashes(hashes: &[String], result: &mut VanishStorageResult) {
     if !b2_replica_enabled() || hashes.is_empty() {
         return;
     }
-    let zones = match bunny_delivery_zones() {
+    let zones = match bunny_delivery_purge_targets() {
         Ok(zones) => zones,
         Err(error) => {
             eprintln!("[VANISH] bunny purge setup failed error={error}");
@@ -2891,15 +3023,27 @@ pub(crate) fn invalidate_b2_cdn(hashes: &[String]) -> Result<()> {
     let mut packed_priority = Vec::new();
     if let Ok(store) = crate::metadata::open_store() {
         let mut standalone_priority = Vec::new();
+        let mut delivery_priority = Vec::new();
         for hash in hashes {
             let key = canonical_priority_key(hash);
             if let Ok(mut record) = store.lookup(&key) {
                 match record.take_body().into_bytes().as_slice() {
                     b"packed" => packed_priority.push(key),
                     b"1" => standalone_priority.push(key),
+                    b"delivery" => delivery_priority.push(key),
                     _ => {}
                 }
             }
+        }
+        if !delivery_priority.is_empty()
+            && delivery_priority.len() == hashes.len()
+            && delivery_configured
+            && matches!(&bunny, Ok(false))
+        {
+            let zones = bunny_delivery_purge_targets()?;
+            invalidate_bunny_delivery(hashes, &zones)?;
+            clear_canonical_priority(&store, &delivery_priority)?;
+            return Ok(());
         }
         if !standalone_priority.is_empty() {
             let canonical = get_secret("fastly_api_token").and_then(|token| {
@@ -2914,7 +3058,14 @@ pub(crate) fn invalidate_b2_cdn(hashes: &[String]) -> Result<()> {
                 }
                 return Err(error);
             }
-            clear_canonical_priority(&store, &standalone_priority)?;
+            if delivery_configured && matches!(&bunny, Ok(false)) {
+                // When Fastly succeeded under a 1-slot budget without a packed
+                // bundle, reserve the next drain pass for standalone Bunny delivery
+                // purging instead of looping back to the missing bundle lookup.
+                stage_canonical_priority(hashes, CanonicalCredential::Delivery)?;
+            } else {
+                clear_canonical_priority(&store, &standalone_priority)?;
+            }
             return Err(BlossomError::StorageError(
                 "Canonical eviction completed; CDN intent pending".into(),
             ));
@@ -2946,20 +3097,24 @@ pub(crate) fn invalidate_b2_cdn(hashes: &[String]) -> Result<()> {
             canonical_purge_token(hashes, needs_bundle, !packed_priority.is_empty())?;
         invalidate_fastly_cdn(hashes, include_b2, &token, retry)
     });
-    let delivery_target_count = delivery.as_ref().ok().copied().unwrap_or(false).then(|| {
-        bunny_delivery_purge_targets()
-            .map(|zones| zones.len())
-            .unwrap_or(0)
-    });
-    let delivery_result = delivery.and_then(|configured| {
+    let delivery_zones = delivery.and_then(|configured| {
         if configured {
-            invalidate_bunny_delivery(hashes)
+            bunny_delivery_purge_targets().map(Some)
         } else {
-            Ok(())
+            Ok(None)
         }
     });
+    let delivery_target_count = delivery_zones
+        .as_ref()
+        .ok()
+        .and_then(|zones| zones.as_ref().map(Vec::len))
+        .unwrap_or(0);
+    let delivery_result = delivery_zones.and_then(|zones| match zones {
+        Some(zones) => invalidate_bunny_delivery(hashes, &zones),
+        None => Ok(()),
+    });
     let pilot_result = enrolled.and_then(|parents| {
-        invalidate_bunny_pilot(&parents, delivery_target_count.unwrap_or(0))
+        invalidate_bunny_pilot(&parents, delivery_target_count)
     });
     pilot_result.and(delivery_result).and(fastly_result)?;
     // The packed Fastly key and Bunny cleanup capabilities share one native
@@ -2974,6 +3129,7 @@ pub(crate) fn invalidate_b2_cdn(hashes: &[String]) -> Result<()> {
 enum CanonicalCredential {
     Standalone,
     Packed,
+    Delivery,
 }
 
 fn clear_canonical_priority(store: &fastly::kv_store::KVStore, keys: &[String]) -> Result<()> {
@@ -3035,6 +3191,7 @@ fn stage_canonical_priority(hashes: &[String], credential: CanonicalCredential) 
     let preference = match credential {
         CanonicalCredential::Standalone => "1", // existing v1 checkpoints
         CanonicalCredential::Packed => "packed",
+        CanonicalCredential::Delivery => "delivery",
     };
     let store = crate::metadata::open_store()?;
     for hash in hashes {
@@ -3442,6 +3599,11 @@ pub(crate) fn vanish_needs_physical(hash: &str) -> Result<bool> {
     crate::b2_cdn_phase::needs_physical(hash)
 }
 
+fn b2_replica_required_for_cdn() -> bool {
+    crate::b2_cdn_purge::fastly_configured().unwrap_or(true)
+        || bunny_pilot_configured().unwrap_or(true)
+}
+
 /// Record the wave's outcome for the exact attempt and queue the blocking final
 /// purge when the outcome is definite. A failed or replica-skipped wave is
 /// purged too, so cached bytes leave the CDN; it simply can never complete. An
@@ -3457,7 +3619,8 @@ pub(crate) fn finish_vanish_phase(
     if !cdn_invalidation_configured() {
         return Ok(false);
     }
-    let outcome = vanish_physical_outcome(hash, failed, remaining, b2_replica_enabled());
+    let replica_satisfied = b2_replica_enabled() || !b2_replica_required_for_cdn();
+    let outcome = vanish_physical_outcome(hash, failed, remaining, replica_satisfied);
     crate::b2_cdn_phase::record_physical(hash, epoch, outcome)?;
     if !crate::b2_cdn_phase::final_purge_pending(hash)? {
         return Ok(false);
@@ -6350,6 +6513,36 @@ mod tests {
             serde_json::from_str(&delete.take_body().into_string()).expect("delete JSON");
         assert_eq!(delete_body["fileName"], version.file_name);
         assert_eq!(delete_body["fileId"], "version-id");
+    }
+
+    #[test]
+    fn bunny_delivery_zone_parser_rejects_malformed_duplicates_and_empty_segments() {
+        assert_eq!(
+            super::parse_bunny_delivery_zones(" Media.Divine.Video , divine-media-cdn.b-cdn.net ")
+                .unwrap(),
+            vec![
+                "media.divine.video".to_string(),
+                "divine-media-cdn.b-cdn.net".to_string()
+            ]
+        );
+        for bad in [
+            "",
+            "   ",
+            "media.divine.video,",
+            ",media.divine.video",
+            "media.divine.video,,divine-media-cdn.b-cdn.net",
+            "media.divine.video,MEDIA.DIVINE.VIDEO",
+            "localhost",
+            "-bad.divine.video",
+            "bad-.divine.video",
+            "a..b.divine.video",
+            "a.divine.video,b.divine.video,c.divine.video",
+        ] {
+            assert!(
+                super::parse_bunny_delivery_zones(bad).is_err(),
+                "expected invalid bunny_delivery_zones to fail: {bad:?}"
+            );
+        }
     }
 
     #[test]

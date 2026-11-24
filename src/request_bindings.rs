@@ -13,6 +13,7 @@ type Value = Binding<Option<String>>;
 struct Bindings {
     configs: BTreeMap<String, Value>,
     secrets: BTreeMap<String, Value>,
+    origin_kv: BTreeMap<String, Option<String>>,
     config_store: Option<Binding<ConfigStoreHandle>>,
     secret_store: Option<Binding<u32>>,
     #[cfg(test)]
@@ -183,6 +184,38 @@ pub(crate) fn has_secret_budget(keys: &[&str]) -> bool {
 
 pub(crate) fn secret(key: &str) -> Result<Option<String>> {
     lookup(|bindings| bindings.secret(key))
+}
+
+/// Cache successful KV-origin lookups for static target-retention keys within
+/// one Compute request so repeated policy/drain checks do not re-spend backend
+/// subrequests. Errors are never cached.
+pub(crate) fn cached_origin_kv(
+    key: &str,
+    fetch: impl FnOnce() -> Result<Option<String>>,
+) -> Result<Option<String>> {
+    let cached = CURRENT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|bindings| bindings.origin_kv.get(key).cloned())
+    });
+    if let Some(value) = cached {
+        return Ok(value);
+    }
+    let value = fetch()?;
+    CURRENT.with(|slot| {
+        if let Some(bindings) = slot.borrow_mut().as_mut() {
+            bindings.origin_kv.insert(key.to_owned(), value.clone());
+        }
+    });
+    Ok(value)
+}
+
+pub(crate) fn invalidate_cached_origin_kv(key: &str) {
+    CURRENT.with(|slot| {
+        if let Some(bindings) = slot.borrow_mut().as_mut() {
+            bindings.origin_kv.remove(key);
+        }
+    });
 }
 
 #[cfg(test)]
