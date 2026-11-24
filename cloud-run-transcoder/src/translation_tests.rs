@@ -296,14 +296,16 @@ async fn selected_and_legacy_transcripts_reach_translation_and_transcription_ded
 }
 
 #[tokio::test]
-async fn b2_primary_translation_reconciles_failed_backup_on_poll_retry() {
-    for backups_enabled in [true, false] {
+async fn b2_translation_reconciles_failed_publication_on_poll_retry() {
+    for (legacy_input, backups_enabled) in [(true, true), (true, false), (false, false)] {
         let storage = StorageDouble::new().await;
         let origin = object_storage::tests::Origin::start().await;
         let media = if backups_enabled {
             origin.with_gcs_backup(storage.state.gcs_client.clone())
-        } else {
+        } else if legacy_input {
             origin.with_gcs_input_only(storage.state.gcs_client.clone())
+        } else {
+            origin.store()
         };
         upload_transcript_to_storage(&media, &"a".repeat(64), std::str::from_utf8(SOURCE).unwrap())
             .await

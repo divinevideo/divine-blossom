@@ -147,8 +147,11 @@ detection and repair dispatch resume when the job record is readable.
 In `b2_primary` mode, the GCS journal at `.internal/sound-claims/{hash}`
 serializes sound publication across worker instances with or without backups.
 Keep this namespace outside lifecycle deletion and manual cleanup while writers
-are active. As with the [HLS write journal](hls-single-writer.md), a timed-out PUT
-remains fenced until the recorded provider and key show its attempt marker.
+are active. The journal fences an unconfirmed PUT, including a timeout or an
+ambiguous provider error, until the recorded provider and key show its attempt
+marker. Sound sends one PUT per provider: retrying an ambiguous write can leave
+an older PUT outstanding after a newer verdict takes ownership. See the
+[HLS write journal](hls-single-writer.md) for the shared fencing protocol.
 Sound retries report `in_progress` while fenced, even with `force`. The two
 journals currently emit the same `hls_counter` events, so a recovery event alone
 does not identify which journal to inspect. The legacy fMP4 backfill explicitly reads

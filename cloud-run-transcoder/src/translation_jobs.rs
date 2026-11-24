@@ -230,7 +230,7 @@ where
         if state.media_storage.can_reuse_output(&existing).await? {
             // A poll can reach here after backups were disabled or another
             // process repaired the replica. Release only an eligible job.
-            if state.media_storage.is_b2_primary() {
+            if !state.media_storage.is_gcs() {
                 if let Some((generation, job)) = load_translation_job(&state, &job_path).await? {
                     if job.defers_existing_output() && job.can_start(current_epoch_secs()) {
                         release_translation_job(&state, &job_path, generation).await?;
