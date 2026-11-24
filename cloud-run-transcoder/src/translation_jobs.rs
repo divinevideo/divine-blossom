@@ -87,29 +87,6 @@ fn gcs_error_status(error: &google_cloud_storage::http::Error) -> Option<u16> {
     }
 }
 
-/// Return only genuine 404s as absent. Preserve all other storage failures.
-async fn read_translation_object(
-    client: &GcsClient,
-    bucket: &str,
-    path: &str,
-) -> Result<Option<Vec<u8>>> {
-    match client
-        .download_object(
-            &GetObjectRequest {
-                bucket: bucket.into(),
-                object: path.into(),
-                ..Default::default()
-            },
-            &DownloadRange::default(),
-        )
-        .await
-    {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(error) if gcs_error_status(&error) == Some(404) => Ok(None),
-        Err(error) => Err(anyhow!("Translation storage read failed: {}", error)),
-    }
-}
-
 async fn write_translation_job(
     state: &AppState,
     path: &str,
@@ -137,8 +114,7 @@ async fn write_translation_job(
     }
 }
 
-/// The generation precondition serializes workers across Cloud Run instances.
-async fn claim_translation(state: &AppState, path: &str) -> Result<Option<i64>> {
+async fn load_translation_job(state: &AppState, path: &str) -> Result<Option<(i64, TranslationJob)>> {
     let object = match state
         .gcs_client
         .get_object(&GetObjectRequest {
@@ -152,37 +128,63 @@ async fn claim_translation(state: &AppState, path: &str) -> Result<Option<i64>> 
         Err(error) if gcs_error_status(&error) == Some(404) => None,
         Err(error) => return Err(anyhow!("Translation claim read failed: {}", error)),
     };
-    let generation = if let Some(object) = object {
-        // Pin the read to this generation; do not reclaim based on another worker's state.
-        let raw = state
-            .gcs_client
-            .download_object(
-                &GetObjectRequest {
-                    bucket: state.config.gcs_bucket.clone(),
-                    object: path.into(),
-                    generation: Some(object.generation),
-                    ..Default::default()
-                },
-                &DownloadRange::default(),
-            )
-            .await?;
-        let job: TranslationJob = serde_json::from_slice(&raw)?;
-        if !job.can_start(current_epoch_secs()) {
-            return Ok(None);
-        }
-        object.generation
-    } else {
-        0
+    let Some(object) = object else {
+        return Ok(None);
+    };
+    // Pin the read to this generation; do not reclaim based on another worker's state.
+    let raw = state
+        .gcs_client
+        .download_object(
+            &GetObjectRequest {
+                bucket: state.config.gcs_bucket.clone(),
+                object: path.into(),
+                generation: Some(object.generation),
+                ..Default::default()
+            },
+            &DownloadRange::default(),
+        )
+        .await?;
+    Ok(Some((object.generation, serde_json::from_slice(&raw)?)))
+}
+
+/// The generation precondition serializes workers across Cloud Run instances.
+async fn claim_translation(
+    state: &AppState,
+    path: &str,
+    publication_pending: bool,
+) -> Result<Option<i64>> {
+    let generation = match load_translation_job(state, path).await? {
+        Some((generation, job)) if job.can_start(current_epoch_secs()) => generation,
+        Some(_) => return Ok(None),
+        None => 0,
     };
     write_translation_job(
         state,
         path,
         &TranslationJob::Processing {
             retry_at: current_epoch_secs() + TRANSLATION_LEASE_SECS,
+            publication_pending,
         },
         generation,
     )
     .await
+}
+
+async fn release_translation_job(state: &AppState, path: &str, generation: i64) -> Result<()> {
+    match state
+        .gcs_client
+        .delete_object(&DeleteObjectRequest {
+            bucket: state.config.gcs_bucket.clone(),
+            object: path.into(),
+            if_generation_match: Some(generation),
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(error) if matches!(gcs_error_status(&error), Some(404 | 412)) => Ok(()),
+        Err(_) => Err(anyhow!("Translation claim release failed")),
+    }
 }
 
 async fn process_translate(
@@ -216,6 +218,7 @@ where
         .ok_or_else(|| anyhow!("Invalid target language"))?;
     let source_digest = request.source_digest.to_lowercase();
     let target_path = translated_vtt_path(&hash, &source_digest, &lang);
+    let job_path = format!("{target_path}.json");
     let response = |status: &str, cue_count: u32| TranslateResponse {
         hash: hash.clone(),
         lang: lang.clone(),
@@ -223,11 +226,19 @@ where
         vtt_path: target_path.clone(),
         cue_count,
     };
-    if read_translation_object(&state.gcs_client, &state.config.gcs_bucket, &target_path)
-        .await?
-        .is_some()
-    {
-        return Ok(response("already_exists", 0));
+    if let Some(existing) = state.media_storage.stat(&target_path).await? {
+        if state.media_storage.can_reuse_output(&existing).await? {
+            // A poll can reach here after backups were disabled or another
+            // process repaired the replica. Release only an eligible job.
+            if !state.media_storage.is_gcs() {
+                if let Some((generation, job)) = load_translation_job(&state, &job_path).await? {
+                    if job.defers_existing_output() && job.can_start(current_epoch_secs()) {
+                        release_translation_job(&state, &job_path, generation).await?;
+                    }
+                }
+            }
+            return Ok(response("already_exists", 0));
+        }
     }
     let source_path = format!("{hash}/vtt/main.vtt");
     let Some((storage, object)) = find_transcript(&state, &source_path).await? else {
@@ -237,17 +248,21 @@ where
     if hex::encode(Sha256::digest(&source)) != source_digest {
         return Ok(response("source_changed", 0));
     }
-    let job_path = format!("{target_path}.json");
-    let Some(generation) = claim_translation(&state, &job_path).await? else {
+    let publication_pending = state.media_storage.requires_backup();
+    let Some(generation) = claim_translation(&state, &job_path, publication_pending).await? else {
         return Ok(response("pending_or_failed", 0));
     };
-    // Recheck after the claim: a preceding worker may have completed between reads.
+    // Recheck after the claim: a preceding worker may have completed between reads
+    // or left a primary copy whose required GCS backup needs repair.
     let result = tokio::time::timeout(Duration::from_secs(100), async {
-        if read_translation_object(&state.gcs_client, &state.config.gcs_bucket, &target_path)
-            .await?
-            .is_some()
-        {
-            return Ok(response("already_exists", 0));
+        if let Some(existing) = state.media_storage.stat(&target_path).await? {
+            if existing.size > 0 {
+                state
+                    .media_storage
+                    .ensure_required_backup(&existing)
+                    .await?;
+                return Ok(response("already_exists", 0));
+            }
         }
         let source = String::from_utf8(source)?;
         let cues = translation_google_v3::parse_vtt_cues(&source);
@@ -296,13 +311,18 @@ where
             }
         };
         let rendered = translation_google_v3::render_vtt(&cues, &translated, &lang)?;
-        upload_transcript_variant_to_gcs(
-            &state.gcs_client,
-            &state.config.gcs_bucket,
-            &target_path,
-            &rendered,
-        )
-        .await?;
+        state
+            .media_storage
+            .put_verified(
+                &target_path,
+                Bytes::from(rendered.into_bytes()),
+                "text/vtt",
+                HashMap::new(),
+                None,
+            )
+            .await
+            .map_err(|e| anyhow!("Failed to upload transcript {}: {}", target_path, e))?;
+        info!("Uploaded transcript {}", target_path);
         Ok(response("complete", cues.len() as u32))
     })
     .await
@@ -329,37 +349,14 @@ where
             generation,
         )
         .await?;
+    } else if publication_pending
+        && result
+            .as_ref()
+            .is_ok_and(|response| matches!(response.status.as_str(), "complete" | "already_exists"))
+    {
+        release_translation_job(&state, &job_path, generation).await?;
     }
     result
-}
-
-/// Upload a translated VTT to its source-versioned object path.
-async fn upload_transcript_variant_to_gcs(
-    client: &GcsClient,
-    bucket: &str,
-    gcs_path: &str,
-    vtt_content: &str,
-) -> Result<()> {
-    let mut media = Media::new(gcs_path.to_string());
-    media.content_type = "text/vtt".into();
-    let upload_type = UploadType::Simple(media);
-
-    let req = UploadObjectRequest {
-        bucket: bucket.to_string(),
-        ..Default::default()
-    };
-
-    client
-        .upload_object(
-            &req,
-            Bytes::from(vtt_content.as_bytes().to_vec()),
-            &upload_type,
-        )
-        .await
-        .map_err(|e| anyhow!("Failed to upload transcript {}: {}", gcs_path, e))?;
-
-    info!("Uploaded transcript {}", gcs_path);
-    Ok(())
 }
 
 #[cfg(test)]

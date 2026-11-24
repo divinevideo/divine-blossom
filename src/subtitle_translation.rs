@@ -2,6 +2,7 @@
 // ABOUTME: Preserves the source lifecycle and labels every translated response.
 
 use super::*;
+use blossom_core::storage_origin::StorageProvider;
 use blossom_core::subtitle_lang::{translated_vtt_path, TranslationJob};
 
 thread_local! {
@@ -49,50 +50,59 @@ pub(super) fn serve_translated_transcript(
 ) -> Result<Response> {
     let digest = hex::encode(Sha256::digest(source));
     let path = translated_vtt_path(hash, &digest, lang);
-    match download_transcript_content(&path) {
-        Ok(mut response) => {
-            response.set_header("Content-Type", "text/vtt; charset=utf-8");
-            response.set_header("Content-Language", lang);
-            response.set_header("X-Divine-Machine-Translated", "true");
+    let mut existing = match download_transcript_content(&path) {
+        Ok(response) => Some(response),
+        Err(BlossomError::NotFound(_)) => None,
+        Err(error) => return Err(error),
+    };
+    let job = if existing.is_none()
+        || crate::storage::derived_media_read_policy()?.primary == StorageProvider::B2
+    {
+        match load_translation_job(&path) {
+            Ok(job) => job,
+            Err(error) => {
+                let Some(response) = existing.as_mut() else {
+                    return Err(error);
+                };
+                eprintln!("[VTT] Translation job lookup failed for an existing output: {error}");
+                // Keep the fallback readable and let the next poll recheck the job.
+                add_private_cache_headers(response, hash);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let defer_existing = job.as_ref().is_some_and(TranslationJob::defers_existing_output);
+    if let Some(mut response) = existing.filter(|_| !defer_existing) {
+        response.set_header("Content-Type", "text/vtt; charset=utf-8");
+        response.set_header("Content-Language", lang);
+        response.set_header("X-Divine-Machine-Translated", "true");
+        add_cors_headers(&mut response);
+        return Ok(response);
+    }
+
+    let now = unix_timestamp_secs();
+    match job {
+        Some(TranslationJob::Failed { code, retry_at }) if retry_at.map_or(true, |at| at > now) => {
+            let mut response = json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &serde_json::json!({
+                    "status": "translation_unavailable", "error_code": code, "terminal": retry_at.is_none(),
+                    "message": "Translation unavailable; use the original transcript"
+                }),
+            );
+            if let Some(at) = retry_at {
+                response.set_header("Retry-After", at.saturating_sub(now).max(1).to_string());
+            }
+            add_no_cache_headers(&mut response);
             add_cors_headers(&mut response);
             return Ok(response);
         }
-        Err(BlossomError::NotFound(_)) => {}
-        Err(error) => return Err(error),
-    }
-    let job_path = format!("{path}.json");
-    let now = unix_timestamp_secs();
-    match crate::storage::download_transcript_uncached_from_gcs(&job_path) {
-        Ok(mut response) => {
-            let job: TranslationJob = serde_json::from_slice(&response.take_body().into_bytes())
-                .map_err(|_| BlossomError::StorageError("Invalid translation job state".into()))?;
-            match job {
-                TranslationJob::Failed { code, retry_at }
-                    if retry_at.map_or(true, |at| at > now) =>
-                {
-                    let mut response = json_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        &serde_json::json!({
-                            "status": "translation_unavailable", "error_code": code, "terminal": retry_at.is_none(),
-                            "message": "Translation unavailable; use the original transcript"
-                        }),
-                    );
-                    if let Some(at) = retry_at {
-                        response
-                            .set_header("Retry-After", at.saturating_sub(now).max(1).to_string());
-                    }
-                    add_no_cache_headers(&mut response);
-                    add_cors_headers(&mut response);
-                    return Ok(response);
-                }
-                TranslationJob::Processing { retry_at } if retry_at > now => {
-                    return Ok(translation_pending_response())
-                }
-                _ => {}
-            }
+        Some(TranslationJob::Processing { retry_at, .. }) if retry_at > now => {
+            return Ok(translation_pending_response());
         }
-        Err(BlossomError::NotFound(_)) => {}
-        Err(error) => return Err(error),
+        _ => {}
     }
     if matches!(
         simple_cache::get(format!("translation-dispatch:{path}")),
@@ -119,6 +129,17 @@ pub(super) fn serve_translated_transcript(
         return Ok(translation_unavailable_response("dispatch_unavailable"));
     }
     Ok(translation_pending_response())
+}
+
+fn load_translation_job(path: &str) -> Result<Option<TranslationJob>> {
+    let job_path = format!("{path}.json");
+    match crate::storage::download_transcript_uncached_from_gcs(&job_path) {
+        Ok(mut response) => serde_json::from_slice(&response.take_body().into_bytes())
+            .map(Some)
+            .map_err(|_| BlossomError::StorageError("Invalid translation job state".into())),
+        Err(BlossomError::NotFound(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn translation_pending_response() -> Response {

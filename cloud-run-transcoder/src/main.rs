@@ -2857,20 +2857,6 @@ async fn process_transcribe(
     result
 }
 
-async fn check_gcs_exists(client: &GcsClient, bucket: &str, object: &str) -> Result<bool> {
-    match client
-        .get_object(&GetObjectRequest {
-            bucket: bucket.to_string(),
-            object: object.to_string(),
-            ..Default::default()
-        })
-        .await
-    {
-        Ok(_) => Ok(true),
-        Err(_) => Ok(false),
-    }
-}
-
 /// Read compatibility for historical translation sources. This lookup never
 /// grants transcript completion; that path requires selected-primary output.
 async fn find_transcript(

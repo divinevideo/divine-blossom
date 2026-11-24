@@ -25,14 +25,14 @@ struct Objects {
     delay_next_claim_ack: Option<Duration>,
 }
 
-struct Origin {
+pub(crate) struct Origin {
     endpoint: String,
     objects: Arc<Mutex<Objects>>,
     task: JoinHandle<()>,
 }
 
 impl Origin {
-    async fn start() -> Self {
+    pub(crate) async fn start() -> Self {
         let objects = Arc::new(Mutex::new(Objects::default()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -45,7 +45,7 @@ impl Origin {
         }
     }
 
-    fn client(&self) -> GcsClient {
+    pub(crate) fn client(&self) -> GcsClient {
         GcsClient::new(
             google_cloud_storage::client::ClientConfig {
                 storage_endpoint: self.endpoint.clone(),
@@ -140,7 +140,8 @@ async fn gcs(State(objects): State<Arc<Mutex<Objects>>>, req: Request) -> Respon
     let current = live
         .and_then(|value| value["generation"].as_str())
         .unwrap_or("0");
-    let is_claim = key.starts_with(".internal/hls-claims/");
+    let is_claim = key.starts_with(".internal/hls-claims/")
+        || key.starts_with(".internal/sound-claims/");
     let precondition = query.get("ifGenerationMatch");
     if is_claim
         || new_object
@@ -949,6 +950,66 @@ async fn batch_publishing_recovery_requires_every_target_marker() {
     let replacement = locks.store().claim(A, Some(&storage)).await.unwrap();
     assert_eq!(replacement.dirty(), Dirty::Hls);
     assert!(owner.confirm().await.is_err());
+    replacement.finish(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn sound_claim_recovers_late_primary_write_without_a_backup_marker() {
+    let locks = Origin::start().await;
+    let media = crate::object_storage::tests::Origin::start().await;
+    let storage = media.with_gcs_backup(locks.client());
+    let backup_disabled = media.with_gcs_input_only(locks.client());
+    let key = format!("{A}/audio/analysis.json");
+    let verdict = Bytes::from_static(br#"{"silent":false,"tags":[]}"#);
+    let mut owner = locks.store().claim_sound(A, &storage).await.unwrap();
+    let write_id = owner.write_id();
+    media.objects.lock().await.fail_put_by_key.insert(
+        key.clone(),
+        vec![axum::http::StatusCode::INTERNAL_SERVER_ERROR],
+    );
+
+    assert!(storage
+        .put_claimed_verified(
+            &key,
+            verdict.clone(),
+            "application/json",
+            HashMap::new(),
+            None,
+            &mut owner,
+        )
+        .await
+        .is_err());
+    assert!(owner.finish(false).await.is_err());
+    assert!(!locks.objects.lock().await.live.contains_key(&key));
+
+    let journal_key = format!(".internal/sound-claims/{A}");
+    locks
+        .objects
+        .lock()
+        .await
+        .live
+        .get_mut(&journal_key)
+        .unwrap()["timeCreated"] = json!("2000-01-01T00:00:00Z");
+    assert!(locks
+        .store()
+        .claim_sound(A, &backup_disabled)
+        .await
+        .unwrap_err()
+        .is::<Busy>());
+
+    // A delayed primary PUT can settle without any attempt at writing a backup.
+    media
+        .store()
+        .put_verified(
+            &key,
+            verdict,
+            "application/json",
+            HashMap::from([(WRITE_ID.into(), write_id)]),
+            None,
+        )
+        .await
+        .unwrap();
+    let replacement = locks.store().claim_sound(A, &backup_disabled).await.unwrap();
     replacement.finish(false).await.unwrap();
 }
 

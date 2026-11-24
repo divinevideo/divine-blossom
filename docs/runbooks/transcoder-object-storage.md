@@ -48,11 +48,11 @@ never clears an uncertain write: the recorded provider/key must still expose
 the matching attempt marker before recovery. Keep the GCS bucket/client and
 permissions needed for these reads and coordination.
 
-This is not whole-service GCS retirement: mutable job state, translation output
-and sound analysis keep their existing paths. Re-enabling backups restores
-required-copy checks for subsequent work and can cause regeneration or backup
-repair for artifacts produced while backups were off. It does not bulk-copy
-historical output at startup.
+Mutable job state and write journals remain in GCS. Translated VTTs and sound
+analysis follow the configured media destination at their existing object keys.
+Re-enabling backups restores required-copy checks for subsequent work and can
+cause regeneration or backup repair for artifacts produced while backups were off.
+It does not bulk-copy historical output at startup.
 
 This is synchronous replication through the existing processing paths. It adds
 no database, queue, credentials, or processing service. It does not activate a
@@ -119,8 +119,7 @@ layout requires updating the reuse check alongside the encoder.
 Status webhooks retain their legacy meaning. These object receipts do not
 establish durable processing dispatch.
 
-Mutable jobs, locks, translation output/state and sound analysis remain on their
-existing GCS APIs. Newly generated VTT uses the media
+Mutable job state and write locks remain on GCS. Newly generated VTT uses the media
 adapter at its unchanged `{hash}/vtt/main.vtt` key with `text/vtt`; status completion
 follows successful pinned verification. Transcription deduplication requires the
 selected-provider transcript: a GCS-only copy cannot acknowledge missing B2
@@ -137,8 +136,25 @@ without acknowledging completion or rewriting the primary. Plain B2 and GCS
 require no backup check. See [transcript regeneration and rollout](transcript-storage.md).
 Translation reads the selected version through
 the adapter and verifies the requested source digest before claiming work. Default
-GCS selection does not repeat the lookup in a fallback store. This reader adjustment
-preserves cached GCS sources; it does not migrate mutable state. The legacy fMP4 backfill explicitly reads
+GCS selection does not repeat the lookup in a fallback store. Translated VTTs and
+sound-analysis JSON are written through the selected media adapter. Translation
+repairs a missing or mismatched required GCS backup under its existing job claim.
+B2-first edge polling waits on that claim while a required backup is being
+verified, and retries a visible primary after a retryable failure's cooldown.
+Successful verification clears the claim. During a GCS job-record outage,
+the edge serves existing subtitles with private, no-store headers. Backup
+detection and repair dispatch resume when the job record is readable.
+In `b2_primary` mode, the GCS journal at `.internal/sound-claims/{hash}`
+serializes sound publication across worker instances with or without backups.
+Keep this namespace outside lifecycle deletion and manual cleanup while writers
+are active. The journal fences an unconfirmed PUT, including a timeout or an
+ambiguous provider error, until the recorded provider and key show its attempt
+marker. Sound sends one PUT per provider: retrying an ambiguous write can leave
+an older PUT outstanding after a newer verdict takes ownership. See the
+[HLS write journal](hls-single-writer.md) for the shared fencing protocol.
+Sound retries report `in_progress` while fenced, even with `force`. The two
+journals currently emit the same `hls_counter` events, so a recovery event alone
+does not identify which journal to inspect. The legacy fMP4 backfill explicitly reads
 and writes GCS. B2 adapter tests can run without GCS; this does not make the
 whole transcoder pipeline GCS independent or complete GCS retirement.
 

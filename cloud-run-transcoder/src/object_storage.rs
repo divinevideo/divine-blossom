@@ -76,6 +76,10 @@ enum B2SendError {
     Timeout(anyhow::Error),
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("GCS object MIME missing")]
+pub(crate) struct MissingGcsMime;
+
 // No Debug: credentials must never enter diagnostics.
 #[derive(Clone)]
 pub enum StorageConfiguration {
@@ -294,6 +298,12 @@ impl MediaStorage {
     }
     pub fn is_gcs(&self) -> bool {
         matches!(self.backend, Backend::Gcs { .. })
+    }
+    pub(crate) fn is_b2_primary(&self) -> bool {
+        self.legacy_gcs.is_some()
+    }
+    pub(crate) fn requires_backup(&self) -> bool {
+        self.required_backup.is_some()
     }
     fn validate_reference(&self, reference: &ObjectRef) -> Result<()> {
         validate_key(&reference.key)?;
@@ -609,7 +619,10 @@ impl MediaStorage {
     }
     /// An absent input may use the legacy store in B2-primary mode. Provider
     /// failures and failed verification must never select another source.
-    async fn find_processing_input(&self, key: &str) -> Result<Option<(&Self, ObjectMetadata)>> {
+    pub(crate) async fn find_processing_input(
+        &self,
+        key: &str,
+    ) -> Result<Option<(&Self, ObjectMetadata)>> {
         if let Some(object) = self.stat(key).await? {
             return Ok(Some((self, object)));
         }
@@ -836,7 +849,15 @@ impl MediaStorage {
             })
             .await;
 
-        match batch_result {
+        Self::settle_publication(claim, batch_result, heartbeat_error).await
+    }
+
+    async fn settle_publication<T>(
+        claim: &mut Claim,
+        result: std::result::Result<T, BatchWriteError>,
+        heartbeat_error: Option<anyhow::Error>,
+    ) -> Result<T> {
+        match result {
             Ok(verified) => {
                 if let Some(hb_err) = heartbeat_error {
                     return Err(hb_err);
@@ -866,14 +887,14 @@ impl MediaStorage {
         lease: &PublishLease,
     ) -> std::result::Result<(VerifiedObject, bool), BatchWriteError> {
         let (mut primary, mut had_ambiguous) = self
-            .put_single_batch_item(
+            .put_publication_target(
                 &item.key,
                 item.body.clone(),
                 &item.mime,
                 item.custom.clone(),
                 item.cache_control.clone(),
                 if self.is_gcs() { gcs_generation } else { None },
-                lease,
+                Some(lease),
             )
             .await?;
         if let Some(backup) = &self.required_backup {
@@ -886,14 +907,14 @@ impl MediaStorage {
                 });
             }
             let (replica, backup_ambiguous) = backup
-                .put_single_batch_item(
+                .put_publication_target(
                     &item.key,
                     item.body,
                     &item.mime,
                     item.custom,
                     item.cache_control,
                     gcs_generation,
-                    lease,
+                    Some(lease),
                 )
                 .await
                 .map_err(|mut err| {
@@ -917,7 +938,107 @@ impl MediaStorage {
         Ok((primary, had_ambiguous))
     }
 
-    async fn put_single_batch_item(
+    pub(crate) async fn put_claimed_verified(
+        &self,
+        key: &str,
+        body: Bytes,
+        mime: &str,
+        mut custom: HashMap<String, String>,
+        cache_control: Option<String>,
+        claim: &mut Claim,
+    ) -> Result<VerifiedObject> {
+        validate_key(key)?;
+        if is_sha256(key) && key != hex::encode(Sha256::digest(&body)) {
+            bail!("Content-addressed output key mismatch");
+        }
+        custom.insert(WRITE_ID.to_owned(), claim.write_id());
+
+        // Journal one provider at a time. If a primary PUT is unconfirmed,
+        // the backup has not started and cannot provide a recovery marker.
+        let mut primary = self
+            .put_claimed_target(
+                key,
+                body.clone(),
+                mime,
+                custom.clone(),
+                cache_control.clone(),
+                claim,
+            )
+            .await?;
+        if let Some(backup) = &self.required_backup {
+            let replica = backup
+                .put_claimed_target(key, body, mime, custom, cache_control, claim)
+                .await
+                .context(
+                    "Required GCS backup was not verified; primary must not be acknowledged",
+                )?;
+            if replica.sha256 != primary.sha256 {
+                bail!("Required GCS backup identity mismatch");
+            }
+            primary.required_backup = Some(replica.object);
+        }
+        Ok(primary)
+    }
+
+    async fn put_claimed_target(
+        &self,
+        key: &str,
+        body: Bytes,
+        mime: &str,
+        custom: HashMap<String, String>,
+        cache_control: Option<String>,
+        claim: &mut Claim,
+    ) -> Result<VerifiedObject> {
+        let gcs_generation = if self.is_gcs() {
+            Some(match claim.hold(self.stat(key)).await? {
+                Some(object) => gcs_generation_from_metadata(&object)?,
+                None => 0,
+            })
+        } else {
+            None
+        };
+        claim
+            .begin_publication(
+                vec![WriteTarget {
+                    gcs: self.is_gcs(),
+                    key: key.to_owned(),
+                }],
+                &custom[WRITE_ID],
+            )
+            .await?;
+        let lease = PublishLease::new(claim.lease_renewed_at());
+        let deadline = claim.deadline();
+        let (result, heartbeat_error) = claim
+            .hold_publishing(lease.clone(), async {
+                if Instant::now() >= deadline {
+                    return Err(BatchWriteError::settled(anyhow!(
+                        "Transcode attempt exceeded its preparation deadline"
+                    )));
+                }
+                if lease.remaining_after(Duration::ZERO).is_none() {
+                    return Err(BatchWriteError::settled(anyhow!(
+                        "Transcode lease lost or expired before publication"
+                    )));
+                }
+                // Sound uses a single PUT per provider so its journal covers
+                // exactly one mutable write, including when the verdict is forced.
+                self.put_publication_target(
+                    key,
+                    body,
+                    mime,
+                    custom,
+                    cache_control,
+                    gcs_generation,
+                    None,
+                )
+                .await
+                .map(|(verified, _)| verified)
+            })
+            .await;
+        Self::settle_publication(claim, result, heartbeat_error).await
+    }
+
+    async fn put_publication_target(
         &self,
         key: &str,
         body: Bytes,
@@ -925,8 +1046,10 @@ impl MediaStorage {
         custom: HashMap<String, String>,
         cache_control: Option<String>,
         gcs_generation: Option<i64>,
-        lease: &PublishLease,
+        retry_lease: Option<&PublishLease>,
     ) -> std::result::Result<(VerifiedObject, bool), BatchWriteError> {
+        let remaining_retry_time =
+            |delay| retry_lease.and_then(|lease| lease.remaining_after(delay));
         let sha256 = hex::encode(Sha256::digest(&body));
         let mut had_ambiguous_attempt = false;
         let classify_settled = |had_ambiguous: bool, err: anyhow::Error| {
@@ -1017,8 +1140,7 @@ impl MediaStorage {
                             }
                             if (transient_5xx || code == 429) && attempt < B2_RETRY_BACKOFFS.len() {
                                 let delay = B2_RETRY_BACKOFFS[attempt];
-                                if lease
-                                    .remaining_after(delay)
+                                if remaining_retry_time(delay)
                                     .is_some_and(|rem| rem >= MIN_B2_RETRY_TIMEOUT)
                                 {
                                     attempt += 1;
@@ -1036,8 +1158,7 @@ impl MediaStorage {
                                             }
                                         }
                                     }
-                                    if let Some(rem) = lease
-                                        .remaining_after(Duration::ZERO)
+                                    if let Some(rem) = remaining_retry_time(Duration::ZERO)
                                         .filter(|rem| *rem >= MIN_B2_RETRY_TIMEOUT)
                                     {
                                         timeout = rem.min(CONTROL_TIMEOUT);
@@ -1058,14 +1179,12 @@ impl MediaStorage {
                             // client, so this attempt could not have committed.
                             if attempt < B2_RETRY_BACKOFFS.len() {
                                 let delay = B2_RETRY_BACKOFFS[attempt];
-                                if lease
-                                    .remaining_after(delay)
+                                if remaining_retry_time(delay)
                                     .is_some_and(|rem| rem >= MIN_B2_RETRY_TIMEOUT)
                                 {
                                     attempt += 1;
                                     tokio::time::sleep(delay).await;
-                                    if let Some(rem) = lease
-                                        .remaining_after(Duration::ZERO)
+                                    if let Some(rem) = remaining_retry_time(Duration::ZERO)
                                         .filter(|rem| *rem >= MIN_B2_RETRY_TIMEOUT)
                                     {
                                         timeout = rem.min(CONTROL_TIMEOUT);
@@ -1080,8 +1199,7 @@ impl MediaStorage {
                             had_ambiguous_attempt = true;
                             if attempt < B2_RETRY_BACKOFFS.len() {
                                 let delay = B2_RETRY_BACKOFFS[attempt];
-                                if lease
-                                    .remaining_after(delay)
+                                if remaining_retry_time(delay)
                                     .is_some_and(|rem| rem >= MIN_B2_RETRY_TIMEOUT)
                                 {
                                     attempt += 1;
@@ -1094,8 +1212,7 @@ impl MediaStorage {
                                             break existing.reference;
                                         }
                                     }
-                                    if let Some(rem) = lease
-                                        .remaining_after(Duration::ZERO)
+                                    if let Some(rem) = remaining_retry_time(Duration::ZERO)
                                         .filter(|rem| *rem >= MIN_B2_RETRY_TIMEOUT)
                                     {
                                         timeout = rem.min(CONTROL_TIMEOUT);
@@ -1519,9 +1636,7 @@ fn from_gcs(bucket: &str, key: &str, object: Object) -> Result<ObjectMetadata> {
             version: Some(object.generation.to_string()),
         },
         size: object.size as u64,
-        content_type: object
-            .content_type
-            .ok_or_else(|| anyhow!("GCS object MIME missing"))?,
+        content_type: object.content_type.ok_or(MissingGcsMime)?,
         custom: object.metadata.unwrap_or_default(),
         cache_control: object.cache_control,
     })
