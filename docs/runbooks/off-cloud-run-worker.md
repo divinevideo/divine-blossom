@@ -293,7 +293,31 @@ sole writer.
    `/var/lib/divine-upload/scratch/tmp` (keeping `.divine-upload-scratch`),
    verify `mountpoint -q /var/lib/divine-upload/scratch && test -f /var/lib/divine-upload/scratch/tmp/.divine-upload-scratch`,
    and start only `upload` (`docker compose up -d --no-deps upload`).
-2. Sync the updated deployment files (`docker-compose.yml`,
+2. On an existing worker, first snapshot the running known-good base Caddy
+   configuration and local image ID so Phase C recovery can still restore a
+   working ingress even if the updated base `docker-compose.yml` or `Caddyfile`
+   fails at runtime (`if [ ! -e "$BACKUP_DIR" ]` prevents re-runs from
+   overwriting the pre-sync snapshot):
+   ```sh
+   (
+     set -eu
+     BACKUP_DIR=/var/lib/divine-upload/pre-sync-backup
+     BACKUP_TMP=/var/lib/divine-upload/pre-sync-backup.tmp
+     if [ ! -e "$BACKUP_DIR" ]; then
+       rm -rf "$BACKUP_TMP"
+       mkdir -p "$BACKUP_TMP"
+       cp -a /opt/divine-transcoder/docker-compose.yml "$BACKUP_TMP/docker-compose.yml"
+       cp -a /opt/divine-transcoder/Caddyfile "$BACKUP_TMP/Caddyfile"
+       caddy_cid="$(docker compose -f /opt/divine-transcoder/docker-compose.yml ps -q caddy || true)"
+       if [ -n "$caddy_cid" ]; then
+         docker inspect -f '{{.Config.Image}}' "$caddy_cid" >"$BACKUP_TMP/caddy-image.txt"
+         docker inspect -f '{{.Image}}' "$caddy_cid" >"$BACKUP_TMP/caddy-image-id.txt"
+       fi
+       mv "$BACKUP_TMP" "$BACKUP_DIR"
+     fi
+   )
+   ```
+   Then sync the updated deployment files (`docker-compose.yml`,
    `docker-compose.upload.yml`, `Caddyfile`, `Caddyfile.upload.example`,
    `nginx.upload-proxy.conf`, `.env.upload.example`, and `conf.d/.gitkeep`) from
    `cloud-run-transcoder/deploy/off-gcp/` into `/opt/divine-transcoder/` without
@@ -468,8 +492,10 @@ sole writer.
    ```
 
    Phase C recovery — Restore last known-good transcoder-only `caddy` ingress if
-   Phase C failed after stopping or replacing `caddy` (keeps `transcoder` untouched
-   and resumes `divine-transcode` only after `/health` passes and only if Phase A
+   Phase C failed after stopping or replacing `caddy` (keeps `transcoder` untouched;
+   if the updated base `docker-compose.yml` or `Caddyfile` fails `/health`,
+   falls back automatically to `/var/lib/divine-upload/pre-sync-backup`, and
+   resumes `divine-transcode` only after `/health` passes and only if Phase A
    created the pause marker):
    ```sh
    (
@@ -488,9 +514,31 @@ sole writer.
        mv -f conf.d/upload-candidate.caddy conf.d/upload-candidate.caddy.disabled
      fi
      docker compose stop upload-proxy upload 2>/dev/null || true
-     docker compose -f docker-compose.yml run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile
-     docker compose -f docker-compose.yml up -d --no-deps caddy
-     curl -fsS https://transcoder-worker.divine.video/health
+     if ! (
+       docker compose -f docker-compose.yml run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile &&
+       docker compose -f docker-compose.yml up -d --no-deps caddy &&
+       curl -fsS https://transcoder-worker.divine.video/health
+     ); then
+       BACKUP_DIR=/var/lib/divine-upload/pre-sync-backup
+       if [ ! -d "$BACKUP_DIR" ]; then
+         echo 'Updated base Caddy failed and no pre-sync backup exists; keeping queue paused' >&2
+         exit 1
+       fi
+       echo 'Updated base Caddy failed; restoring pre-sync snapshot' >&2
+       cp -a "$BACKUP_DIR/docker-compose.yml" /opt/divine-transcoder/docker-compose.yml
+       cp -a "$BACKUP_DIR/Caddyfile" /opt/divine-transcoder/Caddyfile
+       if [ -s "$BACKUP_DIR/caddy-image.txt" ] && [ -s "$BACKUP_DIR/caddy-image-id.txt" ]; then
+         saved_ref="$(cat "$BACKUP_DIR/caddy-image.txt")"
+         saved_id="$(cat "$BACKUP_DIR/caddy-image-id.txt")"
+         cur_id="$(docker image inspect -f '{{.Id}}' "$saved_ref" 2>/dev/null || true)"
+         if [ "$cur_id" != "$saved_id" ]; then
+           docker tag "$saved_id" "$saved_ref"
+         fi
+       fi
+       docker compose -f docker-compose.yml run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile
+       docker compose -f docker-compose.yml up -d --no-deps caddy
+       curl -fsS https://transcoder-worker.divine.video/health
+     fi
      if [ -f /var/lib/divine-upload/activation-paused-queue ]; then
        gcloud tasks queues resume divine-transcode \
          --location=us-central1 --project=rich-compiler-479518-d2

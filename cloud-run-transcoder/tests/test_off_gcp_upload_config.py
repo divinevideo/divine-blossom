@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -58,6 +59,26 @@ class OffGcpUploadConfigTest(unittest.TestCase):
                 self.fail("caddy binary is required in CI / when REQUIRE_CADDY_TESTS=1")
             self.skipTest("caddy binary not installed in this environment")
         return caddy_bin
+
+    def _require_docker_bin(self) -> str:
+        docker_bin = shutil.which("docker")
+        require = os.environ.get("REQUIRE_NGINX_TESTS") == "1"
+        if docker_bin is None:
+            if require:
+                self.fail("docker CLI is required when REQUIRE_NGINX_TESTS=1")
+            self.skipTest("docker CLI not installed in this environment")
+        probe = subprocess.run(
+            [docker_bin, "info"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if probe.returncode != 0:
+            if require:
+                self.fail(f"docker daemon unavailable when REQUIRE_NGINX_TESTS=1: {probe.stderr}")
+            self.skipTest(f"docker daemon unavailable: {probe.stderr.strip()}")
+        return docker_bin
 
     def test_upload_caddyfile_wraps_proxy_and_fallback_in_handle_blocks(self) -> None:
         text = UPLOAD_CADDYFILE.read_text(encoding="utf-8")
@@ -220,6 +241,18 @@ class OffGcpUploadConfigTest(unittest.TestCase):
             "proxy_read_timeout 310s;",
         ):
             self.assertIn(required, text)
+        self.assertRegex(
+            text,
+            r"if \(\$reject_unexpected_body\)\s*\{\s*return 413;\s*\}",
+        )
+        self.assertRegex(
+            text,
+            r"location @too_many_requests\s*\{[^}]*Retry-After \"5\" always;[^}]*return 429\b",
+        )
+        self.assertRegex(
+            text,
+            r"location @payload_too_large\s*\{[^}]*Access-Control-Allow-Origin \"\*\"[^}]*return 413\b",
+        )
         self.assertNotIn("upload_body_per_ip", text)
 
     def test_upload_env_example_documents_parity_keys(self) -> None:
@@ -280,6 +313,7 @@ class OffGcpUploadConfigTest(unittest.TestCase):
         self.assertEqual(compose_match.group(1), ci_match.group(1))
         self.assertIn("sha512sum -c -", ci_text)
         self.assertRegex(ci_text, r'(?m)^\s+REQUIRE_CADDY_TESTS:\s+"1"$')
+        self.assertRegex(ci_text, r'(?m)^\s+REQUIRE_NGINX_TESTS:\s+"1"$')
 
     def test_caddy_adapt_orders_upload_proxy_before_404_fallback(self) -> None:
         caddy_bin = self._require_caddy_bin()
@@ -371,6 +405,15 @@ class OffGcpUploadConfigTest(unittest.TestCase):
             fallback_handler = second_handler["routes"][0]["handle"][0]
             self.assertEqual(fallback_handler["handler"], "static_response")
             self.assertEqual(fallback_handler["status_code"], 404)
+
+            error_routes = upload_server_cfg.get("errors", {}).get("routes", [])
+            error_json = json.dumps(error_routes)
+            self.assertIn("413", error_json)
+            self.assertIn('"Access-Control-Allow-Origin": ["*"]', error_json)
+            self.assertIn(
+                '"Access-Control-Allow-Methods": ["GET, HEAD, PUT, POST, DELETE, OPTIONS"]',
+                error_json,
+            )
 
     def test_caddy_live_loopback_enforces_upload_allowlist_and_blocks_worker_transcribe_audio(
         self,
@@ -534,7 +577,9 @@ class OffGcpUploadConfigTest(unittest.TestCase):
                 if caddy_port is None:
                     self.fail(f"caddy failed to bind loopback port after retries: {last_bind_err}")
 
-                def send(host: str, method: str, path: str, body: bytes | None = None) -> int:
+                def send_with_headers(
+                    host: str, method: str, path: str, body: bytes | None = None
+                ) -> tuple[int, http.client.HTTPMessage]:
                     conn = http.client.HTTPConnection("127.0.0.1", caddy_port, timeout=5)
                     headers = {"Host": f"{host}:{caddy_port}"}
                     if body is not None:
@@ -546,9 +591,13 @@ class OffGcpUploadConfigTest(unittest.TestCase):
                             pass
                         resp = conn.getresponse()
                         resp.read()
-                        return resp.status
+                        return resp.status, resp.headers
                     finally:
                         conn.close()
+
+                def send(host: str, method: str, path: str, body: bytes | None = None) -> int:
+                    status, _ = send_with_headers(host, method, path, body=body)
+                    return status
 
                 allowed_upload = [
                     ("GET", "/"),
@@ -617,20 +666,23 @@ class OffGcpUploadConfigTest(unittest.TestCase):
                 )
                 self.assertEqual(recorded, [])
 
-                # Enforce 16 MiB request body cap on allowed upload routes.
+                # Enforce 16 MiB request body cap on allowed upload routes with browser CORS on 413.
                 limit = 16 * 1024 * 1024
                 recorded.clear()
-                self.assertEqual(
-                    send("upload.example.test", "PUT", "/upload", body=b"x" * limit),
-                    200,
+                status_ok, headers_ok = send_with_headers(
+                    "upload.example.test", "PUT", "/upload", body=b"x" * limit
                 )
+                self.assertEqual(status_ok, 200)
                 self.assertEqual(recorded, [("upload", "PUT", "/upload")])
+                self.assertIsNone(headers_ok.get("Access-Control-Allow-Origin"))
 
                 recorded.clear()
-                self.assertEqual(
-                    send("upload.example.test", "PUT", "/upload", body=b"x" * (limit + 1)),
-                    413,
+                status_413, headers_413 = send_with_headers(
+                    "upload.example.test", "PUT", "/upload", body=b"x" * (limit + 1)
                 )
+                self.assertEqual(status_413, 413)
+                self.assertEqual(headers_413.get_all("Access-Control-Allow-Origin"), ["*"])
+                self.assertIn("PUT", headers_413.get("Access-Control-Allow-Methods") or "")
                 self.assertEqual(recorded, [])
         finally:
             if proc is not None:
@@ -639,6 +691,311 @@ class OffGcpUploadConfigTest(unittest.TestCase):
             upload_server.server_close()
             transcoder_server.shutdown()
             transcoder_server.server_close()
+
+    def test_upload_proxy_live_nginx_container_enforces_admission_and_cors(self) -> None:
+        docker_bin = self._require_docker_bin()
+        compose_text = UPLOAD_COMPOSE.read_text(encoding="utf-8")
+        image_match = re.search(
+            r"(?ms)^  upload-proxy:\n.*?^\s+image:\s*(nginx:[^\s]+)$", compose_text
+        )
+        self.assertIsNotNone(image_match, "Expected pinned nginx image on upload-proxy")
+        nginx_image = image_match.group(1)
+
+        pid = os.getpid()
+        net_name = f"divine-upload-nginx-test-{pid}"
+        up_name = f"divine-upload-stub-{pid}"
+        proxy_name = f"divine-upload-proxy-{pid}"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            os.chmod(tmp, 0o755)
+            proxy_tmp = Path(tmp) / "proxy-tmp"
+            proxy_tmp.mkdir()
+            os.chmod(proxy_tmp, 0o777)
+            (proxy_tmp / ".divine-upload-scratch").write_text("ok\n", encoding="utf-8")
+
+            events_log = Path(tmp) / "events.log"
+            events_log.write_text("", encoding="utf-8")
+            os.chmod(events_log, 0o666)
+
+            upstream_py = Path(tmp) / "upstream.py"
+            upstream_py.write_text(
+                """import http.server, json, socketserver, threading
+
+gate = threading.Event()
+gate.set()
+
+def log_event(kind, path):
+    with open("/events.log", "a", encoding="utf-8") as fp:
+        fp.write(json.dumps({"kind": kind, "path": path}) + "\\n")
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def log_message(self, *_args):
+        pass
+    def _send(self, code, body):
+        data = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, PUT, POST, DELETE, OPTIONS")
+        self.end_headers()
+        self.wfile.write(data)
+    def do_GET(self):
+        log_event("GET", self.path)
+        if self.path == "/gate-close":
+            gate.clear()
+            self._send(200, '{"gate":"closed"}')
+            return
+        if self.path == "/gate-open":
+            gate.set()
+            self._send(200, '{"gate":"open"}')
+            return
+        self._send(200, json.dumps({"path": self.path}))
+    def do_DELETE(self):
+        log_event("DELETE", self.path)
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+        self._send(200, '{"deleted":true}')
+    def do_PUT(self):
+        log_event("PUT_START", self.path)
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+        if self.path == "/hold":
+            gate.wait(timeout=20)
+        self._send(200, '{"ok":true}')
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+
+Server(("0.0.0.0", 8080), Handler).serve_forever()
+""",
+                encoding="utf-8",
+            )
+            os.chmod(upstream_py, 0o644)
+
+            net_created = False
+            try:
+                net_res = subprocess.run(
+                    [docker_bin, "network", "create", net_name],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if net_res.returncode != 0:
+                    for third in range(200, 255):
+                        alt = subprocess.run(
+                            [
+                                docker_bin,
+                                "network",
+                                "create",
+                                "--subnet",
+                                f"10.249.{third}.0/24",
+                                net_name,
+                            ],
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                        )
+                        if alt.returncode == 0:
+                            net_res = alt
+                            break
+                self.assertEqual(net_res.returncode, 0, f"docker network create failed: {net_res.stderr}")
+                net_created = True
+
+                subprocess.check_call(
+                    [
+                        docker_bin,
+                        "run",
+                        "-d",
+                        "--name",
+                        up_name,
+                        "--network",
+                        net_name,
+                        "--network-alias",
+                        "upload",
+                        "-v",
+                        f"{upstream_py}:/upstream.py:ro",
+                        "-v",
+                        f"{events_log}:/events.log",
+                        "python:3.12-alpine",
+                        "python3",
+                        "/upstream.py",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                )
+
+                subprocess.check_call(
+                    [
+                        docker_bin,
+                        "run",
+                        "-d",
+                        "--name",
+                        proxy_name,
+                        "--network",
+                        net_name,
+                        "-p",
+                        "127.0.0.1:0:8081",
+                        "--read-only",
+                        "--cap-drop",
+                        "ALL",
+                        "--security-opt",
+                        "no-new-privileges:true",
+                        "--user",
+                        "101:101",
+                        "-v",
+                        f"{UPLOAD_PROXY_NGINX}:/etc/nginx/nginx.conf:ro",
+                        "-v",
+                        f"{proxy_tmp}:/tmp",
+                        nginx_image,
+                        "nginx",
+                        "-c",
+                        "/etc/nginx/nginx.conf",
+                        "-g",
+                        "daemon off;",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                )
+
+                port_out = subprocess.check_output(
+                    [docker_bin, "port", proxy_name, "8081/tcp"], text=True
+                ).strip()
+                port = int(port_out.rsplit(":", 1)[1])
+
+                deadline = time.monotonic() + 10.0
+                while time.monotonic() < deadline:
+                    conn = None
+                    try:
+                        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
+                        conn.request("GET", "/healthz")
+                        resp = conn.getresponse()
+                        body = resp.read()
+                        if resp.status == 200 and body == b"ok\n":
+                            break
+                    except (OSError, http.client.HTTPException):
+                        pass
+                    finally:
+                        if conn is not None:
+                            conn.close()
+                    time.sleep(0.05)
+                else:
+                    self.fail("nginx upload-proxy container /healthz did not become ready")
+
+                # Upstream 200 must keep single Access-Control-Allow-Origin header.
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                conn.request("GET", "/probe")
+                resp = conn.getresponse()
+                resp.read()
+                conn.close()
+                self.assertEqual(resp.status, 200)
+                self.assertEqual(resp.headers.get_all("Access-Control-Allow-Origin"), ["*"])
+
+                # Bodyless methods carrying a non-empty body return 413 with CORS before touching upstream.
+                before_events = len(events_log.read_text(encoding="utf-8").splitlines())
+                for method in ("GET", "HEAD", "OPTIONS", "DELETE"):
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                    conn.request(method, "/bodyless", body=b"x" * 1024, headers={"Content-Length": "1024"})
+                    resp = conn.getresponse()
+                    resp.read()
+                    conn.close()
+                    self.assertEqual(resp.status, 413, f"Expected 413 for {method} with body")
+                    self.assertEqual(resp.headers.get_all("Access-Control-Allow-Origin"), ["*"])
+                with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+                    sock.sendall(
+                        b"GET /chunked HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\na\r\n0\r\n\r\n"
+                    )
+                    raw_resp = sock.recv(4096).decode("utf-8", errors="replace")
+                self.assertTrue(raw_resp.startswith("HTTP/1.1 413 "), raw_resp)
+                after_events = len(events_log.read_text(encoding="utf-8").splitlines())
+                self.assertEqual(before_events, after_events)
+
+                # DELETE with explicit zero Content-Length reaches upstream normally.
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                conn.request("DELETE", "/upload/sess-1", headers={"Content-Length": "0"})
+                resp = conn.getresponse()
+                resp.read()
+                conn.close()
+                self.assertEqual(resp.status, 200)
+
+                # 64 concurrent PUTs occupy body_total slots; 65th gets 429 with CORS + Retry-After:5,
+                # while bodyless GET /thumbnail/:hash still succeeds.
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                conn.request("GET", "/gate-close")
+                conn.getresponse().read()
+                conn.close()
+
+                def send_held_put() -> int:
+                    c = http.client.HTTPConnection("127.0.0.1", port, timeout=25)
+                    c.request("PUT", "/hold", body=b"x" * 16)
+                    r = c.getresponse()
+                    r.read()
+                    c.close()
+                    return r.status
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=66) as ex:
+                    futs = [ex.submit(send_held_put) for _ in range(64)]
+                    hold_deadline = time.monotonic() + 10.0
+                    holds = 0
+                    while time.monotonic() < hold_deadline:
+                        holds = sum(
+                            1
+                            for line in events_log.read_text(encoding="utf-8").splitlines()
+                            if '"PUT_START"' in line and '"/hold"' in line
+                        )
+                        if holds >= 64:
+                            break
+                        time.sleep(0.05)
+                    self.assertEqual(holds, 64, f"Expected 64 held PUTs, saw {holds}")
+
+                    c65 = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                    c65.request("PUT", "/hold", body=b"y" * 16)
+                    r65 = c65.getresponse()
+                    r65.read()
+                    c65.close()
+                    self.assertEqual(r65.status, 429)
+                    self.assertEqual(r65.headers.get_all("Access-Control-Allow-Origin"), ["*"])
+                    self.assertIn("PUT", r65.headers.get("Access-Control-Allow-Methods") or "")
+                    self.assertEqual(r65.headers.get("Access-Control-Expose-Headers"), "Retry-After")
+                    self.assertEqual(r65.headers.get("Retry-After"), "5")
+
+                    cg = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                    cg.request("GET", "/thumbnail/abc123")
+                    rg = cg.getresponse()
+                    rg.read()
+                    cg.close()
+                    self.assertEqual(rg.status, 200)
+
+                    co = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                    co.request("GET", "/gate-open")
+                    co.getresponse().read()
+                    co.close()
+
+                    statuses = [f.result(timeout=20) for f in futs]
+                    self.assertTrue(all(st == 200 for st in statuses), statuses)
+            finally:
+                subprocess.run([docker_bin, "rm", "-f", proxy_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run([docker_bin, "rm", "-f", up_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(
+                    [
+                        docker_bin,
+                        "run",
+                        "--rm",
+                        "--user",
+                        "0:0",
+                        "-v",
+                        f"{proxy_tmp}:/cleanup",
+                        nginx_image,
+                        "sh",
+                        "-c",
+                        "rm -rf /cleanup/* /cleanup/.[!.]* /cleanup/..?* 2>/dev/null || true",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                if net_created:
+                    subprocess.run([docker_bin, "network", "rm", net_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 if __name__ == "__main__":

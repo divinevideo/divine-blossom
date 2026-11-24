@@ -85,6 +85,7 @@ jobs:
         working-directory: cloud-run-transcoder
         env:
           REQUIRE_CADDY_TESTS: "1"
+          REQUIRE_NGINX_TESTS: "1"
         run: python3 -m unittest discover -s tests -p 'test_*.py'
 
       - name: Run script Python tests

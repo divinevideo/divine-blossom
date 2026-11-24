@@ -26,6 +26,15 @@
 		|| (method('GET', 'HEAD', 'OPTIONS') && path_regexp('^/thumbnail/[^/]+$'))
 		CEL
 
+	# Preserve browser-visible CORS on Caddy-generated 413 responses when
+	# request_body max_size rejects an upload before upload-proxy sees it.
+	handle_errors 413 {
+		header Access-Control-Allow-Origin "*"
+		header Access-Control-Allow-Methods "GET, HEAD, PUT, POST, DELETE, OPTIONS"
+		header Content-Type "text/plain"
+		respond "Payload Too Large" 413
+	}
+
 	# Wrap proxy and fallback in handle blocks so respond 404 never shadows
 	# reverse_proxy under Caddy 2's built-in directive order.
 	handle @public_upload {
