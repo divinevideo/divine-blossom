@@ -767,9 +767,11 @@ fn bunny_pilot_age_gate_eviction_retries() {
         record["state"].clone()
     };
     assert_eq!(intent_state(), "committed");
-    // Four version deletes per execution. The first verified empty listing
-    // reaches the configured transient purge failure and stays pending.
-    for _ in 0..6 {
+    // Up to four version deletes per execution (or one per pass during 4-host
+    // delivery rotation to stay within the 32-backend-request budget). The
+    // first verified empty listing reaches the configured transient purge
+    // failure and stays pending.
+    for _ in 0..20 {
         let req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=1", false)
             .with_header("Authorization", "Bearer synthetic-webhook-token");
         let mut retry = crate::request_bindings::metered(req);
@@ -897,4 +899,565 @@ fn bunny_legacy_canonical_fallback() {
         });
         assert_eq!(result, u8::from(storage::config_flag("fixture_unenrolled")));
     }
+}
+
+#[test]
+#[ignore = "requires synthetic Fastly and Bunny providers; scripts/run-bunny-delivery-invalidation-tests.py"]
+fn bunny_delivery_policy_purge_and_durable_retry() {
+    let mode = storage::optional_config("fixture_delivery_mode")
+        .unwrap()
+        .unwrap_or_else(|| "bunny-only".to_string());
+
+    if mode == "invalid-config" {
+        assert!(b2_cdn_purge::configured());
+        assert!(storage::invalidate_b2_cdn(&[hash()]).is_err());
+        return;
+    }
+
+    if mode == "webhook-packed-budget" {
+        let hash = "c".repeat(64);
+        b2_cdn_purge::enqueue(&hash, b2_cdn_purge::Phase::Single).unwrap();
+        let req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false)
+            .with_header("Authorization", "Bearer synthetic-webhook-token");
+        let mut response = crate::request_bindings::metered(req);
+        assert_eq!(response.get_status(), StatusCode::OK);
+        let reply: serde_json::Value = serde_json::from_str(&response.take_body_str()).unwrap();
+        assert_eq!(reply["result"], 1);
+        assert_eq!(reply["errors"], 0);
+        assert_eq!(reply["pending"], 0);
+        return;
+    }
+
+    if mode == "webhook-no-bundle-safe-failclosed" {
+        b2_cdn_purge::enqueue(&hash(), b2_cdn_purge::Phase::Single).unwrap();
+        let drain_with = |token: &str| {
+            let req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false)
+                .with_header("Authorization", format!("Bearer {token}"));
+            let mut response = crate::request_bindings::metered(req);
+            assert_eq!(response.get_status(), StatusCode::OK);
+            serde_json::from_str::<serde_json::Value>(&response.take_body_str()).unwrap()
+        };
+        // Pass 1 (webhook, 4 secrets used): missing bundle stages standalone Fastly priority.
+        assert_eq!(drain_with("synthetic-webhook-token")["result"], 0);
+        // Pass 2 (webhook): Fastly purges and stages Bunny retry hint without clearing.
+        assert_eq!(drain_with("synthetic-webhook-token")["result"], 0);
+        // Pass 3 (webhook): Bunny delivery purges and clears hint, STILL does not clear intent
+        // so Fastly is never bypassed on a stale priority hint.
+        assert_eq!(drain_with("synthetic-webhook-token")["result"], 0);
+        // Pass 4 (dedicated drain token): both Fastly and Bunny succeed together and clear intent.
+        let final_reply = drain_with("synthetic-drain-token");
+        assert_eq!(final_reply["result"], 1);
+        assert_eq!(final_reply["errors"], 0);
+        assert_eq!(final_reply["pending"], 0);
+        return;
+    }
+
+    if mode == "cold-pop-origin-retention" || mode == "stale-pop-origin-rotation" {
+        assert!(b2_cdn_purge::configured());
+        b2_cdn_purge::enqueue(&hash(), b2_cdn_purge::Phase::Single).unwrap();
+        let req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false)
+            .with_header("Authorization", "Bearer synthetic-drain-token");
+        let mut response = crate::request_bindings::metered(req);
+        assert_eq!(response.get_status(), StatusCode::OK);
+        let reply: serde_json::Value = serde_json::from_str(&response.take_body_str()).unwrap();
+        assert_eq!(reply["result"], 1);
+        assert_eq!(reply["errors"], 0);
+        assert_eq!(reply["pending"], 0);
+        return;
+    }
+
+    if mode == "bunny-only-vanish-no-replica" || mode == "vanish-b2-replica-budget" {
+        let hash = hash();
+        if mode == "vanish-b2-replica-budget" {
+            // Simulate a real vanish wave that has already spent 5 secrets before
+            // reaching inline `purge_bunny_hashes`: phased CDN invalidation must
+            // defer Bunny purging to `Phase::Final` drain without failing the wave.
+            let _scope = crate::request_bindings::begin();
+            for secret_name in [
+                "b2_cdn_purge_drain_token",
+                "admin_token",
+                "webhook_secret",
+                "fastly_api_token",
+                "kv_origin_read_token",
+            ] {
+                let _ = crate::request_bindings::secret(secret_name);
+            }
+            let mut vanish_result = storage::VanishStorageResult::default();
+            storage::purge_bunny_hashes(std::slice::from_ref(&hash), &mut vanish_result);
+            assert!(
+                vanish_result.failed_hashes.is_empty(),
+                "phased vanish must not fail inline Bunny purge when 5 secrets are spent"
+            );
+        }
+        let epoch = storage::begin_vanish_phase(&hash).unwrap().unwrap();
+        let empty = std::collections::HashSet::new();
+        assert!(storage::finish_vanish_phase(&hash, &epoch, &empty, &empty).unwrap());
+        assert!(b2_cdn_phase::ensure_final_intent(&hash).unwrap());
+        assert!(b2_cdn_phase::physical_absent(&hash).unwrap());
+        let req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false)
+            .with_header("Authorization", "Bearer synthetic-drain-token");
+        let mut response = crate::request_bindings::metered(req);
+        assert_eq!(response.get_status(), StatusCode::OK);
+        let reply: serde_json::Value = serde_json::from_str(&response.take_body_str()).unwrap();
+        assert_eq!(reply["result"], 1);
+        assert!(storage::vanish_complete(&hash));
+        return;
+    }
+
+    if mode == "pilot-plus-delivery-missing-bundle-webhook" {
+        let hash = hash();
+        b2_cdn_purge::enqueue(&hash, b2_cdn_purge::Phase::Single).unwrap();
+        // Pass 1: webhook drain with 4 secrets spent tries missing bundle,
+        // stages Standalone ("1").
+        // Pass 2: Standalone purges Fastly and stages BunnyRetry ("bunny-retry")
+        // even though bunny_pilot_configured() is also true.
+        // Pass 3: BunnyRetry purges outer Bunny delivery zones and stages Packed
+        // ("packed") so neither Fastly nor outer Bunny delivery is starved.
+        for _ in 0..3 {
+            let req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false)
+                .with_header("Authorization", "Bearer synthetic-webhook-token");
+            let mut resp = crate::request_bindings::metered(req);
+            assert_eq!(resp.get_status(), StatusCode::OK);
+            let reply: serde_json::Value = serde_json::from_str(&resp.take_body_str()).unwrap();
+            assert_eq!(reply["result"], 0);
+            assert_eq!(reply["pending"], 1);
+        }
+        return;
+    }
+
+    if mode == "vanish-b2-replica-admin-auth-budget" {
+        // 1. POST /admin/api/vanish with webhook_secret skips loading admin_token:
+        // Attempt 1 spends webhook_secret + kv_origin_read_token -> DeferForKvOriginRetry (202),
+        // Attempt 2 hits the local phase (0 kv_origin reads) -> Ready within 5 secrets,
+        // drain completes Phase::Final, Attempt 3 finishes (200, vanished=true).
+        let owner_webhook = "e".repeat(64);
+        let webhook_hash = hash();
+        let webhook_meta = serde_json::from_value(serde_json::json!({
+            "sha256": webhook_hash,
+            "size": 9,
+            "type": "video/mp4",
+            "uploaded": "2026-01-01T00:00:00Z",
+            "owner": owner_webhook,
+            "status": "active"
+        }))
+        .unwrap();
+        put_blob_metadata(&webhook_meta).unwrap();
+        crate::metadata::add_to_user_list(&owner_webhook, &webhook_hash).unwrap();
+
+        let mut wh1 = request(Method::POST, "/admin/api/vanish", false)
+            .with_header("Authorization", "Bearer synthetic-webhook-token");
+        wh1.set_body(serde_json::json!({"pubkey": owner_webhook}).to_string());
+        let mut wh1_resp = crate::request_bindings::metered(wh1);
+        assert_eq!(wh1_resp.get_status(), StatusCode::ACCEPTED);
+        let wh1_body: serde_json::Value =
+            serde_json::from_str(&wh1_resp.take_body_str()).unwrap();
+        assert_eq!(wh1_body["errors"], 0);
+        assert_eq!(wh1_body["pending"], 1);
+        assert!(!b2_cdn_phase::physical_absent(&webhook_hash).unwrap());
+
+        let mut wh2 = request(Method::POST, "/admin/api/vanish", false)
+            .with_header("Authorization", "Bearer synthetic-webhook-token");
+        wh2.set_body(serde_json::json!({"pubkey": owner_webhook}).to_string());
+        let mut wh2_resp = crate::request_bindings::metered(wh2);
+        assert_eq!(wh2_resp.get_status(), StatusCode::ACCEPTED);
+        let wh2_body: serde_json::Value =
+            serde_json::from_str(&wh2_resp.take_body_str()).unwrap();
+        assert_eq!(wh2_body["errors"], 0);
+        assert_eq!(wh2_body["pending"], 1);
+        assert!(b2_cdn_phase::physical_absent(&webhook_hash).unwrap());
+
+        let mut cleared = 0u64;
+        for _ in 0..5 {
+            let drain_req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false)
+                .with_header("Authorization", "Bearer synthetic-drain-token");
+            let mut drain_resp = crate::request_bindings::metered(drain_req);
+            assert_eq!(drain_resp.get_status(), StatusCode::OK);
+            let reply: serde_json::Value =
+                serde_json::from_str(&drain_resp.take_body_str()).unwrap();
+            assert_eq!(reply["errors"], 0);
+            let drained = reply["result"].as_u64().unwrap_or(0);
+            cleared += drained;
+            if drained == 0 && reply["pending"] == 0 {
+                break;
+            }
+        }
+        assert!(cleared >= 1, "expected queued intents to drain");
+        assert!(storage::vanish_complete(&webhook_hash));
+
+        let mut wh3 = request(Method::POST, "/admin/api/vanish", false)
+            .with_header("Authorization", "Bearer synthetic-webhook-token");
+        wh3.set_body(serde_json::json!({"pubkey": owner_webhook}).to_string());
+        let mut wh3_resp = crate::request_bindings::metered(wh3);
+        assert_eq!(wh3_resp.get_status(), StatusCode::OK);
+        let wh3_body: serde_json::Value =
+            serde_json::from_str(&wh3_resp.take_body_str()).unwrap();
+        assert_eq!(wh3_body["errors"], 0);
+        assert_eq!(wh3_body["pending"], 0);
+        assert_eq!(wh3_body["vanished"], true);
+
+        // 2. Creator delete via /admin/api/moderate with admin_token under
+        // b2_replica_enabled=true cannot fit 5 FOS/B2/webhook secrets alongside
+        // admin_token even on retries; fail visibly (502) rather than looping 409.
+        let admin_delete_hash = "c".repeat(64);
+        let admin_delete_meta = serde_json::from_value(serde_json::json!({
+            "sha256": admin_delete_hash,
+            "size": 9,
+            "type": "video/mp4",
+            "uploaded": "2026-01-01T00:00:00Z",
+            "owner": "c".repeat(64),
+            "status": "active"
+        }))
+        .unwrap();
+        put_blob_metadata(&admin_delete_meta).unwrap();
+        let mut del_req = request(Method::POST, "/admin/api/moderate", true);
+        del_req.set_body(
+            serde_json::json!({"sha256": admin_delete_hash, "action": "DELETE"}).to_string(),
+        );
+        assert_eq!(
+            crate::request_bindings::metered(del_req).get_status(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            get_blob_metadata_uncached(&admin_delete_hash)
+                .unwrap()
+                .unwrap()
+                .status,
+            BlobStatus::Deleted
+        );
+        assert!(!b2_cdn_phase::physical_absent(&admin_delete_hash).unwrap());
+
+        // 3. POST /admin/api/vanish with admin_token cannot fit 5 physical wave
+        // secrets alongside admin_token; report error (500, errors=1, pending=0)
+        // instead of silent indefinite pending.
+        let owner_admin = "d".repeat(64);
+        let admin_vanish_hash = "d".repeat(64);
+        let admin_vanish_meta = serde_json::from_value(serde_json::json!({
+            "sha256": admin_vanish_hash,
+            "size": 9,
+            "type": "video/mp4",
+            "uploaded": "2026-01-01T00:00:00Z",
+            "owner": owner_admin,
+            "status": "active"
+        }))
+        .unwrap();
+        put_blob_metadata(&admin_vanish_meta).unwrap();
+        crate::metadata::add_to_user_list(&owner_admin, &admin_vanish_hash).unwrap();
+        let mut admin_vanish_req = request(Method::POST, "/admin/api/vanish", true);
+        admin_vanish_req.set_body(serde_json::json!({"pubkey": owner_admin}).to_string());
+        let mut admin_vanish_resp = crate::request_bindings::metered(admin_vanish_req);
+        assert_eq!(
+            admin_vanish_resp.get_status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let admin_vanish_body: serde_json::Value =
+            serde_json::from_str(&admin_vanish_resp.take_body_str()).unwrap();
+        assert_eq!(admin_vanish_body["errors"], 1);
+        assert_eq!(admin_vanish_body["pending"], 0);
+        assert_eq!(admin_vanish_body["vanished"], false);
+        assert!(!b2_cdn_phase::physical_absent(&admin_vanish_hash).unwrap());
+        return;
+    }
+
+    if mode == "vanish-b2-replica-cold-pop-rollback" {
+        let hash = hash();
+        let metadata = serde_json::from_value(serde_json::json!({
+            "sha256": hash,
+            "size": 9,
+            "type": "video/mp4",
+            "uploaded": "2026-01-01T00:00:00Z",
+            "owner": "b".repeat(64),
+            "status": "active"
+        }))
+        .unwrap();
+        put_blob_metadata(&metadata).unwrap();
+        // Cold-POP rollback with b2_replica_enabled=true on POST /admin/moderate:
+        // Attempt 1 spends webhook_secret + kv_origin_read_token to discover
+        // origin-retained Bunny delivery zones, opens the phase, and soft-deletes
+        // without exceeding 5 secrets (deferring the 5-secret physical wave).
+        let mut attempt1 = request(Method::POST, "/admin/moderate", false)
+            .with_header("Authorization", "Bearer synthetic-webhook-token");
+        attempt1.set_body(serde_json::json!({"sha256": hash, "action": "DELETE"}).to_string());
+        assert_eq!(
+            crate::request_bindings::metered(attempt1).get_status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            get_blob_metadata_uncached(&hash).unwrap().unwrap().status,
+            BlobStatus::Deleted
+        );
+        assert!(!b2_cdn_phase::physical_absent(&hash).unwrap());
+
+        // Attempt 2 sees the already-open local phase (0 kv_origin reads), runs
+        // the 5-secret FOS + B2 + Cloud Run wave within budget, and queues Phase::Final.
+        let mut attempt2 = request(Method::POST, "/admin/moderate", false)
+            .with_header("Authorization", "Bearer synthetic-webhook-token");
+        attempt2.set_body(serde_json::json!({"sha256": hash, "action": "DELETE"}).to_string());
+        assert_eq!(
+            crate::request_bindings::metered(attempt2).get_status(),
+            StatusCode::CONFLICT
+        );
+        assert!(b2_cdn_phase::physical_absent(&hash).unwrap());
+
+        let mut cleared = 0u64;
+        for _ in 0..5 {
+            let drain_req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false)
+                .with_header("Authorization", "Bearer synthetic-drain-token");
+            let mut drain_resp = crate::request_bindings::metered(drain_req);
+            assert_eq!(drain_resp.get_status(), StatusCode::OK);
+            let reply: serde_json::Value =
+                serde_json::from_str(&drain_resp.take_body_str()).unwrap();
+            assert_eq!(reply["errors"], 0);
+            let drained = reply["result"].as_u64().unwrap_or(0);
+            cleared += drained;
+            if drained == 0 && reply["pending"] == 0 {
+                break;
+            }
+        }
+        assert!(cleared >= 1, "expected queued intents to drain");
+        assert!(storage::vanish_complete(&hash));
+
+        let mut attempt3 = request(Method::POST, "/admin/moderate", false)
+            .with_header("Authorization", "Bearer synthetic-webhook-token");
+        attempt3.set_body(serde_json::json!({"sha256": hash, "action": "DELETE"}).to_string());
+        let mut finish_resp = crate::request_bindings::metered(attempt3);
+        assert_eq!(finish_resp.get_status(), StatusCode::OK);
+        let finish_body: serde_json::Value =
+            serde_json::from_str(&finish_resp.take_body_str()).unwrap();
+        assert_eq!(finish_body["physical_deleted"], true);
+        return;
+    }
+
+    if mode == "vanish-cold-pop-pilot-rollback-blocks-completion" {
+        let hash = hash();
+        let metadata = serde_json::from_value(serde_json::json!({
+            "sha256": hash,
+            "size": 9,
+            "type": "video/mp4",
+            "uploaded": "2026-01-01T00:00:00Z",
+            "owner": "b".repeat(64),
+            "status": "active"
+        }))
+        .unwrap();
+        put_blob_metadata(&metadata).unwrap();
+        // Cold-POP Bunny pilot rollback (`bunny-pilot-retained-hosts:v1` only
+        // at KV origin, `b2_replica_enabled=false`): physical creator delete
+        // must stay <= 5 secrets and record `Physical::Failed` (never
+        // `Physical::Absent`) so canonical B2 copies cannot be left behind.
+        let mut delete_req = request(Method::POST, "/admin/api/moderate", true);
+        delete_req.set_body(serde_json::json!({"sha256": hash, "action": "DELETE"}).to_string());
+        let delete_resp = crate::request_bindings::metered(delete_req);
+        assert_eq!(delete_resp.get_status(), StatusCode::CONFLICT);
+        assert!(
+            !b2_cdn_phase::physical_absent(&hash).unwrap(),
+            "cold-POP pilot rollback with b2_replica_enabled=false must not record Physical::Absent"
+        );
+        assert!(!storage::vanish_complete(&hash));
+        return;
+    }
+
+    if mode == "vanish-kv-origin-5-secret-budget"
+        || mode == "vanish-cold-pop-rollback-5-secret-budget"
+        || mode == "vanish-already-deleted-5-secret-budget"
+    {
+        let hash = hash();
+        let initial_status = if mode == "vanish-already-deleted-5-secret-budget" {
+            "deleted"
+        } else {
+            "active"
+        };
+        let metadata = serde_json::from_value(serde_json::json!({
+            "sha256": hash,
+            "size": 9,
+            "type": "video/mp4",
+            "uploaded": "2026-01-01T00:00:00Z",
+            "owner": "b".repeat(64),
+            "status": initial_status
+        }))
+        .unwrap();
+        put_blob_metadata(&metadata).unwrap();
+        // Physical creator delete with kv_origin + bunny_delivery_zones (active,
+        // already-deleted retry, and cold-POP rollback where only KV origin
+        // retains zones) must stay within the 5-secret Compute limit without
+        // failing the physical wave, then complete after bounded Phase::Final drain.
+        let mut delete_req = request(Method::POST, "/admin/api/moderate", true);
+        delete_req.set_body(serde_json::json!({"sha256": hash, "action": "DELETE"}).to_string());
+        let delete_resp = crate::request_bindings::metered(delete_req);
+        assert_eq!(delete_resp.get_status(), StatusCode::CONFLICT);
+        assert!(b2_cdn_phase::physical_absent(&hash).unwrap());
+
+        // `handle_phased_creator_delete` enqueues both policy and Phase::Final
+        // intents under random nonces while `handle_drain` clamps `limit = 1`.
+        // Drain in a bounded loop until the queue is empty (`result == 0`).
+        let mut cleared = 0u64;
+        for _ in 0..5 {
+            let drain_req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false)
+                .with_header("Authorization", "Bearer synthetic-drain-token");
+            let mut drain_resp = crate::request_bindings::metered(drain_req);
+            assert_eq!(drain_resp.get_status(), StatusCode::OK);
+            let reply: serde_json::Value =
+                serde_json::from_str(&drain_resp.take_body_str()).unwrap();
+            assert_eq!(reply["errors"], 0);
+            let drained = reply["result"].as_u64().unwrap_or(0);
+            cleared += drained;
+            if drained == 0 && reply["pending"] == 0 {
+                break;
+            }
+        }
+        assert!(cleared >= 1, "expected queued intents to drain");
+        assert!(storage::vanish_complete(&hash));
+
+        let mut finish_req = request(Method::POST, "/admin/api/moderate", true);
+        finish_req.set_body(serde_json::json!({"sha256": hash, "action": "DELETE"}).to_string());
+        let mut finish_resp = crate::request_bindings::metered(finish_req);
+        assert_eq!(finish_resp.get_status(), StatusCode::OK);
+        let finish_body: serde_json::Value =
+            serde_json::from_str(&finish_resp.take_body_str()).unwrap();
+        assert_eq!(finish_body["physical_deleted"], true);
+        return;
+    }
+
+    if mode == "bunny-retry-clears-on-target-error" {
+        let hash = hash();
+        let store = open_store().unwrap();
+        let hint_key = format!("canonical-purge-priority:v1:{hash}");
+        store.insert(&hint_key, "bunny-retry").unwrap();
+        assert!(storage::invalidate_b2_cdn(std::slice::from_ref(&hash)).is_err());
+        assert!(
+            matches!(
+                store.lookup(&hint_key),
+                Err(fastly::kv_store::KVStoreError::ItemNotFound)
+            ),
+            "bunny-retry hint must clear even when bunny_delivery_purge_targets fails"
+        );
+        return;
+    }
+
+    if mode == "rotation-overflow" {
+        let err = b2_cdn_purge::enqueue(&hash(), b2_cdn_purge::Phase::Single);
+        assert!(err.is_err(), "third rotation exceeding 4 retained zones must fail closed");
+        return;
+    }
+
+    if mode == "webhook-admin-moderate" {
+        let hash = hash();
+        let metadata = serde_json::from_value(serde_json::json!({
+            "sha256": hash,
+            "size": 9,
+            "type": "video/mp4",
+            "uploaded": "2026-01-01T00:00:00Z",
+            "owner": "b".repeat(64),
+            "status": "active"
+        }))
+        .unwrap();
+        put_blob_metadata(&metadata).unwrap();
+        let mut moderate = request(Method::POST, "/admin/moderate", false)
+            .with_header("Authorization", "Bearer synthetic-webhook-token");
+        moderate.set_body(serde_json::json!({"sha256": hash, "action": "BAN"}).to_string());
+        let response = crate::request_bindings::metered(moderate);
+        assert_eq!(response.get_status(), StatusCode::OK);
+        assert_eq!(
+            get_blob_metadata_uncached(&hash).unwrap().unwrap().status,
+            BlobStatus::Banned
+        );
+        return;
+    }
+
+    if mode == "retained-after-removal" || mode == "zone-rotation" {
+        assert!(b2_cdn_purge::configured());
+        b2_cdn_purge::enqueue(&hash(), b2_cdn_purge::Phase::Single).unwrap();
+        if mode == "zone-rotation" {
+            let retained = open_store()
+                .unwrap()
+                .lookup("bunny-delivery-retained-zones:v1")
+                .unwrap()
+                .take_body()
+                .into_string();
+            assert_eq!(
+                retained,
+                "old.divine.video,old-cdn.b-cdn.net,media.divine.video,divine-media-cdn.b-cdn.net"
+            );
+        }
+        let req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false)
+            .with_header("Authorization", "Bearer synthetic-drain-token");
+        let mut response = crate::request_bindings::metered(req);
+        assert_eq!(response.get_status(), StatusCode::OK);
+        let reply: serde_json::Value = serde_json::from_str(&response.take_body_str()).unwrap();
+        assert_eq!(reply["result"], 1);
+        assert_eq!(reply["errors"], 0);
+        assert_eq!(reply["pending"], 0);
+        return;
+    }
+
+    let hash = hash();
+    let metadata = serde_json::from_value(serde_json::json!({
+        "sha256": hash,
+        "size": 9,
+        "type": "video/mp4",
+        "uploaded": "2026-01-01T00:00:00Z",
+        "owner": "b".repeat(64),
+        "status": "active"
+    }))
+    .unwrap();
+    put_blob_metadata(&metadata).unwrap();
+
+    let mut moderate = request(Method::POST, "/admin/api/moderate", true);
+    moderate.set_body(serde_json::json!({"sha256": hash, "action": "BAN"}).to_string());
+    assert_eq!(
+        crate::request_bindings::metered(moderate).get_status(),
+        StatusCode::BAD_GATEWAY
+    );
+    assert_eq!(
+        get_blob_metadata_uncached(&hash).unwrap().unwrap().status,
+        BlobStatus::Banned
+    );
+    assert_eq!(
+        call(request(Method::GET, &format!("/{hash}"), false)).get_status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let store = open_store().unwrap();
+    let retained = store
+        .lookup("bunny-delivery-retained-zones:v1")
+        .unwrap()
+        .take_body()
+        .into_string();
+    assert_eq!(retained, "media.divine.video,divine-media-cdn.b-cdn.net");
+
+    let queue = store
+        .build_list()
+        .prefix("b2-cdn-purge:v1:")
+        .execute()
+        .unwrap();
+    assert_eq!(queue.keys().len(), 1);
+    let key = &queue.keys()[0];
+    let intent_state = || {
+        let record: serde_json::Value =
+            serde_json::from_str(&store.lookup(key).unwrap().take_body().into_string()).unwrap();
+        record["state"].clone()
+    };
+    assert_eq!(intent_state(), "committed");
+
+    // First drain still fails on one Bunny alias: intent must remain committed.
+    let first_drain = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false)
+        .with_header("Authorization", "Bearer synthetic-drain-token");
+    let mut first_resp = crate::request_bindings::metered(first_drain);
+    assert_eq!(first_resp.get_status(), StatusCode::OK);
+    let first_body: serde_json::Value =
+        serde_json::from_str(&first_resp.take_body_str()).unwrap();
+    assert_eq!(first_body["result"], 0);
+    assert_eq!(first_body["errors"], 1);
+    assert_eq!(first_body["pending"], 1);
+    assert_eq!(intent_state(), "committed");
+
+    // Second drain succeeds across both aliases and both rounds: intent clears.
+    let second_drain = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false)
+        .with_header("Authorization", "Bearer synthetic-drain-token");
+    let mut second_resp = crate::request_bindings::metered(second_drain);
+    assert_eq!(second_resp.get_status(), StatusCode::OK);
+    let second_body: serde_json::Value =
+        serde_json::from_str(&second_resp.take_body_str()).unwrap();
+    assert_eq!(second_body["result"], 1);
+    assert_eq!(second_body["errors"], 0);
+    assert_eq!(second_body["pending"], 0);
+    assert_eq!(intent_state(), "cleared");
 }

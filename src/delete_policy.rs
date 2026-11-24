@@ -255,7 +255,7 @@ pub fn handle_creator_delete(
     physical_delete_enabled: bool,
     req_id: &str,
 ) -> Result<CreatorDeleteOutcome> {
-    if physical_delete_enabled && crate::storage::cdn_invalidation_configured() {
+    if physical_delete_enabled && crate::storage::phase_or_cdn_invalidation_active(hash) {
         return handle_phased_creator_delete(hash, metadata, reason);
     }
     handle_creator_delete_with_ops(
@@ -304,11 +304,29 @@ fn handle_phased_creator_delete(
         }
     }
     if !physical.is_empty() {
-        let result = crate::storage::erase_vanish_batch(&physical);
-        for candidate in &physical {
-            crate::storage::finish_vanish_phase(
-                candidate, &epochs[candidate], &result.failed_hashes, &result.remaining_hashes,
-            )?;
+        match crate::storage::vanish_physical_secret_budget() {
+            crate::storage::VanishPhysicalSecretBudget::Ready => {
+                let result = crate::storage::erase_vanish_batch(&physical);
+                for candidate in &physical {
+                    crate::storage::finish_vanish_phase(
+                        candidate,
+                        &epochs[candidate],
+                        &result.failed_hashes,
+                        &result.remaining_hashes,
+                    )?;
+                }
+            }
+            crate::storage::VanishPhysicalSecretBudget::DeferForKvOriginRetry => {
+                // Attempt 1 spent a slot on `kv_origin_read_token` (e.g. cold-POP
+                // rollback or zone-rotation CAS); return retryable 409 Conflict
+                // below with the phase opened and metadata denied so Attempt 2
+                // runs `erase_vanish_batch` within 5 secrets.
+            }
+            crate::storage::VanishPhysicalSecretBudget::Exhausted => {
+                return Err(BlossomError::StorageError(
+                    "Creator physical erasure cannot fit in Compute 5-secret budget under current authentication; retry via /admin/moderate webhook_secret or admin session".into(),
+                ));
+            }
         }
     }
     // A crash after recording absence but before enqueue must remain retryable.

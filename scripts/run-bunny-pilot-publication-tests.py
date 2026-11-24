@@ -143,7 +143,8 @@ class Origin(BaseHTTPRequestHandler):
                     return self.reply(404)
             if key != f"blob:{HASH}":
                 assert key in {f"tombstone:{HASH}", f"quarantine:v1:{HASH}", f"refs:{HASH}",
-                               f"vanish_in_progress:v1:{OWNER}"}, key
+                               f"vanish_in_progress:v1:{OWNER}",
+                               "bunny-delivery-retained-zones:v1"}, key
                 return self.reply(404)
             status = self.server.policy_status
             if self.server.case in ("age_gate_after_put", "ready_delete_failure") and self.server.delivered is not None:
