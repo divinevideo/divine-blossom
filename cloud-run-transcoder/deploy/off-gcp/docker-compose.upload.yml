@@ -3,6 +3,9 @@
 
 services:
   caddy:
+    # Bound Caddy memory when request_buffers 16MiB is active so concurrent slow
+    # upload bodies cannot OOM the host or co-located transcoder.
+    mem_limit: ${CADDY_MEM_LIMIT:-2g}
     # Attach Caddy to upload_edge alongside default without adding depends_on
     # so upload failures can never block transcoder ingress startup.
     networks:
@@ -14,12 +17,18 @@ services:
     restart: unless-stopped
     # Match divine-upload-server's 300s graceful shutdown drain window (GKE uses 330s).
     stop_grace_period: 330s
-    # Reclaim any orphaned /tmp spools (including .tmp* dotfiles left after OOM
-    # or SIGKILL) before handing PID 1 to the pinned image's CMD binary.
+    # Verify the bounded scratch sentinel marker and sweep only orphaned .tmp*
+    # spools before handing PID 1 to the pinned image's CMD binary (warn rather
+    # than crash-looping if an entry cannot be removed).
     command:
       - /bin/sh
       - -ec
-      - find /tmp -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf -- {} + && exec /app/divine-upload-server
+      - "if [ ! -f /tmp/.divine-upload-scratch ]; then echo 'ERROR: /tmp/.divine-upload-scratch missing; refusing to start upload on unverified scratch mount' >&2; exit 1; fi; find /tmp -mindepth 1 -maxdepth 1 -name '.tmp*' -exec rm -rf -- {} + || echo 'tmp sweep incomplete' >&2; exec /app/divine-upload-server"
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     cpus: "${UPLOAD_CPUS:-6.0}"
     mem_limit: ${UPLOAD_MEM_LIMIT:-6g}
     cap_drop:

@@ -67,6 +67,10 @@ class OffGcpUploadConfigTest(unittest.TestCase):
         self.assertRegex(text, r"(?m)^\t\trequest_body \{$")
         self.assertRegex(text, r"(?m)^\t\t\tmax_size 16MiB$")
         self.assertRegex(text, r"(?m)^\t\treverse_proxy upload:8080 \{$")
+        self.assertRegex(text, r"(?m)^\t\t\trequest_buffers 16MiB$")
+        self.assertRegex(text, r"(?m)^\t\t\t\tresponse_header_timeout 310s$")
+        self.assertNotIn("read_timeout", text)
+        self.assertNotIn("write_timeout", text)
         self.assertRegex(text, r"(?m)^\thandle \{$")
         self.assertRegex(text, r"(?m)^\t\trespond 404$")
         self.assertNotRegex(text, r"(?m)^\trespond 404$")
@@ -95,15 +99,19 @@ class OffGcpUploadConfigTest(unittest.TestCase):
         self.assertNotIn("/metrics", cel)
 
     def test_upload_compose_decouples_caddy_and_preserves_env_file_tuning(self) -> None:
-        base_text = BASE_COMPOSE.read_text(encoding="utf-8")
-        text = UPLOAD_COMPOSE.read_text(encoding="utf-8")
+        def strip_yaml_comments(raw: str) -> str:
+            return "\n".join(
+                line for line in raw.splitlines() if not line.lstrip().startswith("#")
+            )
 
-        # Base Caddy service must drain past the 910s upstream transcode timeout
-        # and avoid unused UPLOAD_DOMAIN env plumbing.
+        base_text = strip_yaml_comments(BASE_COMPOSE.read_text(encoding="utf-8"))
+        text = strip_yaml_comments(UPLOAD_COMPOSE.read_text(encoding="utf-8"))
+
+        # Base Caddy service should keep Docker's default stop timeout so routine stops
+        # never hold ports 80/443 closed for 15 minutes across all vhosts, and avoid
+        # unused UPLOAD_DOMAIN env plumbing.
         base_caddy = base_text.split("  caddy:", 1)[1].split("  transcoder:", 1)[0]
-        grace_match = re.search(r"(?m)^\s+stop_grace_period:\s+(\d+)s$", base_caddy)
-        self.assertIsNotNone(grace_match, "Expected stop_grace_period on caddy service")
-        self.assertGreaterEqual(int(grace_match.group(1)), 910)
+        self.assertNotIn("stop_grace_period", base_caddy)
         self.assertNotIn("UPLOAD_DOMAIN", base_caddy)
 
         # Co-located upload health must never block Caddy / transcoder ingress.
@@ -112,27 +120,31 @@ class OffGcpUploadConfigTest(unittest.TestCase):
         # Match divine-upload-server's 300s graceful shutdown drain window (GKE: 330s).
         self.assertRegex(text, r"(?m)^\s+stop_grace_period:\s+330s$")
 
-        # Back /tmp with a required bounded host scratch mount and sweep orphaned
-        # dotfiles/spools on container start (never tmpfs or unbounded upload_tmp).
-        self.assertNotIn("tmpfs:", text)
-        self.assertNotIn("upload_tmp", text)
-        self.assertIn("type: bind", text)
-        self.assertIn(
-            "source: ${UPLOAD_TMP_DIR:-/var/lib/divine-upload/scratch/tmp}", text
-        )
-        self.assertIn("target: /tmp", text)
-        self.assertIn("create_host_path: false", text)
-        self.assertIn(
-            "find /tmp -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf -- {} + && exec /app/divine-upload-server",
-            text,
-        )
-
-        # Isolate upload on upload_edge; attach caddy to both default and upload_edge.
+        # Back /tmp with a required bounded host scratch mount, check sentinel
+        # marker, sweep only .tmp* spools without crash-looping, and cap logs.
         caddy_overlay = text.split("  caddy:", 1)[1].split("  upload:", 1)[0]
+        self.assertRegex(caddy_overlay, r"(?m)^\s+mem_limit:\s+\$\{CADDY_MEM_LIMIT:-2g\}$")
         self.assertRegex(caddy_overlay, r"(?m)^\s+-\s+default$")
         self.assertRegex(caddy_overlay, r"(?m)^\s+-\s+upload_edge$")
 
         upload_block = text.split("  upload:", 1)[1].split("\nnetworks:", 1)[0]
+        upload_volumes = upload_block.split("volumes:", 1)[1].split("networks:", 1)[0]
+        self.assertNotIn("tmpfs:", text)
+        self.assertNotIn("upload_tmp", text)
+        self.assertIn("type: bind", upload_volumes)
+        self.assertIn(
+            "source: ${UPLOAD_TMP_DIR:-/var/lib/divine-upload/scratch/tmp}",
+            upload_volumes,
+        )
+        self.assertIn("target: /tmp", upload_volumes)
+        self.assertIn("create_host_path: false", upload_volumes)
+        self.assertIn("/tmp/.divine-upload-scratch", upload_block)
+        self.assertIn("-name '.tmp*'", upload_block)
+        self.assertIn("|| echo 'tmp sweep incomplete' >&2; exec /app/divine-upload-server", upload_block)
+        self.assertIn("driver: json-file", upload_block)
+        self.assertIn('max-size: "50m"', upload_block)
+        self.assertIn('max-file: "5"', upload_block)
+
         upload_networks = upload_block.split("networks:", 1)[1].split("healthcheck:", 1)[0]
         self.assertRegex(upload_networks, r"(?m)^\s+-\s+upload_edge$")
         self.assertNotRegex(upload_networks, r"(?m)^\s+-\s+default$")
@@ -262,13 +274,17 @@ class OffGcpUploadConfigTest(unittest.TestCase):
             adapted = json.loads(colocated.stdout)
             servers = adapted["apps"]["http"]["servers"]
             upload_route = None
+            upload_server_cfg = None
             for server in servers.values():
                 for route in server.get("routes", []):
                     for matcher in route.get("match", []):
                         if "upload.example.test" in matcher.get("host", []):
                             upload_route = route
+                            upload_server_cfg = server
                             break
             self.assertIsNotNone(upload_route, "upload.example.test host route missing")
+            self.assertEqual(upload_server_cfg.get("protocols"), ["h1", "h2"])
+            self.assertEqual(upload_server_cfg.get("read_timeout"), 300_000_000_000)
 
             subroutes = upload_route["handle"][0]["routes"]
             self.assertEqual(len(subroutes), 2, f"Expected proxy + 404 subroutes, got: {subroutes}")
@@ -283,7 +299,11 @@ class OffGcpUploadConfigTest(unittest.TestCase):
             proxy_handler = first_handlers[1]
             self.assertEqual(proxy_handler["handler"], "reverse_proxy")
             self.assertEqual(proxy_handler["upstreams"][0]["dial"], "upload:8080")
+            self.assertEqual(proxy_handler["request_buffers"], 16 * 1024 * 1024)
             self.assertEqual(proxy_handler["flush_interval"], -1)
+            self.assertEqual(proxy_handler["transport"]["response_header_timeout"], 310_000_000_000)
+            self.assertNotIn("read_timeout", proxy_handler["transport"])
+            self.assertNotIn("write_timeout", proxy_handler["transport"])
 
             self.assertEqual(second_handler["handler"], "subroute")
             fallback_handler = second_handler["routes"][0]["handle"][0]
@@ -349,14 +369,19 @@ class OffGcpUploadConfigTest(unittest.TestCase):
                 conf_d = tmp_path / "conf.d"
                 conf_d.mkdir()
 
+                raw_caddyfile = CADDYFILE.read_text(encoding="utf-8")
+                assert raw_caddyfile.startswith("{\n"), "Expected global options block at top of Caddyfile"
                 base_text = (
-                    "{\n\tadmin off\n\tauto_https off\n}\n\n"
-                    + CADDYFILE.read_text(encoding="utf-8")
+                    raw_caddyfile.replace("{\n", "{\n\tadmin off\n\tauto_https off\n\tpersist_config off\n", 1)
                     .replace("/etc/caddy/conf.d/*.caddy", f"{conf_d}/*.caddy")
                     .replace("transcoder:8080", f"127.0.0.1:{transcoder_server.server_port}")
                 )
                 test_caddyfile = tmp_path / "Caddyfile"
                 test_caddyfile.write_text(base_text, encoding="utf-8")
+                xdg_config = tmp_path / "xdg-config"
+                xdg_data = tmp_path / "xdg-data"
+                xdg_config.mkdir()
+                xdg_data.mkdir()
 
                 upload_template = UPLOAD_CADDYFILE.read_text(encoding="utf-8").replace(
                     "upload:8080", f"127.0.0.1:{upload_server.server_port}"
@@ -384,6 +409,8 @@ class OffGcpUploadConfigTest(unittest.TestCase):
                             "TRANSCODER_DOMAIN": f"http://transcoder-worker.example.test:{candidate_port}",
                             "TRANSCODE_ADMISSION_AUTH_REQUIRED": "true",
                             "TRANSCODE_ADMISSION_SECRET": "synthetic-secret",
+                            "XDG_CONFIG_HOME": str(xdg_config),
+                            "XDG_DATA_HOME": str(xdg_data),
                         }
                     )
 

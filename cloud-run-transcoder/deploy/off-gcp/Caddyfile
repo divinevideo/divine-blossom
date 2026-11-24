@@ -1,3 +1,17 @@
+{
+	# Publish only HTTP/1.1 and HTTP/2 because docker-compose.yml maps TCP 443
+	# only; avoids advertising Alt-Svc h3 over an unpublished UDP 443 port.
+	# Cap total request-body read duration so slow-trickling clients cannot pin
+	# request_buffers memory indefinitely across HTTP/1.1 or HTTP/2 streams
+	# (transcoder responses still stream up to 910s via reverse_proxy timeouts).
+	servers {
+		protocols h1 h2
+		timeouts {
+			read_body 300s
+		}
+	}
+}
+
 {$TRANSCODER_DOMAIN} {
 	@worker_routes <<CEL
 		path('/health', '/internal/transcode', '/backfill-fmp4', '/transcribe', '/translate')
