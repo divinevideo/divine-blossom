@@ -172,7 +172,6 @@ pub fn log_decision(policy: &Policy, decision: &Decision, headers: &HeaderMap) {
         Decision::AllowUnauthenticated(reason) | Decision::Reject(reason) => reason.label(),
     };
     info!(
-        target: "thumbnail_token",
         mode = policy.mode(),
         result,
         refused = matches!(decision, Decision::Reject(_)),
@@ -275,6 +274,7 @@ mod tests {
         }
         let capture = Capture::default();
         let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(crate::build_tracing_filter(None).unwrap())
             .with_writer(capture.clone())
             .with_ansi(false)
             .finish();

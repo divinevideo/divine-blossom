@@ -402,16 +402,24 @@ fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+pub(crate) fn build_tracing_filter(
+    rust_log: Option<&str>,
+) -> Result<tracing_subscriber::EnvFilter> {
+    let base = match rust_log {
+        Some(value) if !value.is_empty() => tracing_subscriber::EnvFilter::try_new(value)
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("")),
+        _ => tracing_subscriber::EnvFilter::new(""),
+    };
+    Ok(base.add_directive("blossom_upload=info".parse()?))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _sentry_guard = init_sentry("divine-upload");
 
     // Initialize tracing
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("blossom_upload=info".parse()?),
-        )
+        .with_env_filter(build_tracing_filter(env::var("RUST_LOG").ok().as_deref())?)
         .init();
 
     let config = Config::from_env()?;
