@@ -366,9 +366,9 @@ sole writer.
    COMPOSE_FILE=docker-compose.yml:docker-compose.upload.yml
    UPLOAD_IMAGE=us-central1-docker.pkg.dev/dv-platform-prod/containers-production/divine-upload-server@sha256:<pinned-digest>
    ```
-   And pre-pull the pinned image before touching Caddy:
+   And pre-pull the pinned upload and proxy images before touching Caddy:
    ```sh
-   docker compose pull upload
+   docker compose pull upload-proxy upload
    ```
    *(Pin a digest built from a `divine-upload-server` commit that includes PR
    `divinevideo/divine-upload-server#51` — `spawn_blocking` thumbnail isolation
@@ -393,24 +393,23 @@ sole writer.
    ingress. Caddy keeps Docker's default 10s stop timeout so routine post-cutover
    restarts can never hold ports 80/443 closed across all vhosts for 15 minutes
    (retrying Cloud Tasks redelivers any aborted `/internal/transcode` HTTP call);
-   nevertheless, before recreating `caddy` on a transcoder-only host, check and
-   record whether `divine-transcode` already holds an intentional pause, pause
-   it if `RUNNING`, and confirm in-flight transcode requests and `ffmpeg` jobs
-   have drained to **0**. Only after validation, queue pause, and drain succeed,
-   start `upload`, replace `caddy` with `--no-deps` (so Compose does **not**
-   recreate `transcoder`), verify `/health`, and resume `divine-transcode` only if
-   Phase A created the pause marker (leaving any pre-existing publication hold
-   intact). Run these three fail-closed phases in order. If Phase A or Phase B
-   fails, resume from the failed phase rather than re-running from Phase A
-   (re-running Phase A preserves an existing
-   `/var/lib/divine-upload/activation-paused-queue` marker and only Phase C removes
-   it upon resuming). If Phase C fails **before** `docker compose up -d --no-deps caddy`
-   stops live `caddy`, re-run Phase C; if Phase C fails **during or after**
-   replacing `caddy` (leaving `caddy` stopped or unhealthy), do **not** re-run
-   Phase C's live-Caddy admin API query — run **Phase C recovery** below to
-   restore last known-good transcoder ingress while keeping the queue paused:
+   nevertheless, before recreating `caddy` on a transcoder-only host, inspect
+   the current state of `divine-transcode` and let the **operator explicitly
+   own pausing and resuming it** (so failed or retried `gcloud` CLI calls never
+   lose queue ownership or resume an operator hold). From before Phase B drain
+   until Phase C (or Phase C recovery) finishes replacing `caddy`, also hold
+   any direct worker maintenance or admission requests hitting
+   `/backfill-fmp4`, `/transcribe`, `/translate`, `/transcode`, or
+   `/transcode/queue` in `Caddyfile`. Run these three fail-closed phases in
+   order. If Phase A or Phase B fails, resume from the failed phase rather than
+   re-running from Phase A. If Phase C fails **before**
+   `docker compose up -d --no-deps caddy` stops live `caddy`, re-run Phase C; if
+   Phase C fails **during or after** replacing `caddy` (leaving `caddy` stopped
+   or unhealthy), do **not** re-run Phase C's live-Caddy admin API query — run
+   **Phase C recovery** below to restore last known-good transcoder ingress
+   while keeping the queue paused:
 
-   Phase A — Preflight checks and pause `divine-transcode` only if not already paused:
+   Phase A — Preflight checks and inspect current `divine-transcode` queue state:
    ```sh
    (
      set -eu
@@ -419,28 +418,31 @@ sole writer.
      test -f /var/lib/divine-upload/scratch/proxy-tmp/.divine-upload-scratch
      docker compose ps --status running --services | grep -qx transcoder
      docker compose run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile
-     init_state="$(gcloud tasks queues describe divine-transcode \
+     gcloud tasks queues describe divine-transcode \
        --location=us-central1 --project=rich-compiler-479518-d2 \
-       --format='value(state)')"
-     if [ "$init_state" != "PAUSED" ]; then
-       gcloud tasks queues pause divine-transcode \
-         --location=us-central1 --project=rich-compiler-479518-d2
-       mkdir -p /var/lib/divine-upload
-       : > /var/lib/divine-upload/activation-paused-queue
-     elif [ -f /var/lib/divine-upload/activation-paused-queue ]; then
-       echo 'divine-transcode is already PAUSED by this activation; retaining pause marker'
-     else
-       echo 'divine-transcode was already PAUSED; preserving existing hold for its owner'
-     fi
+       --format='value(state)'
+   )
+   ```
+   - If Phase A prints `RUNNING`, pause `divine-transcode` explicitly and
+     confirm `PAUSED` (record in your rollout log that **you** own resuming it
+     after Phase C or Phase C recovery):
+     ```sh
+     gcloud tasks queues pause divine-transcode \
+       --location=us-central1 --project=rich-compiler-479518-d2
      test "$(gcloud tasks queues describe divine-transcode \
        --location=us-central1 --project=rich-compiler-479518-d2 \
        --format='value(state)')" = "PAUSED"
-   )
-   ```
+     ```
+   - If Phase A prints `PAUSED`, confirm with the queue owner before continuing
+     and do **not** resume `divine-transcode` after Phase C or Phase C recovery.
+   - Hold any direct worker maintenance or admission requests (`/backfill-fmp4`,
+     `/transcribe`, `/translate`, `/transcode`, `/transcode/queue`) from now
+     until Phase C (or Phase C recovery) finishes replacing `caddy`.
 
-   Phase B — Wait up to `910s` until Caddy reports `0` active upstream
-   requests and `transcoder` has no active `ffmpeg` worker processes (re-run
-   until it exits `0`):
+   Phase B — With `divine-transcode` `PAUSED` and direct worker
+   maintenance/admission traffic held, wait up to `910s` until Caddy reports
+   `0` active upstream requests and `transcoder` has no active `ffmpeg` worker
+   processes (re-run until it exits `0`):
    ```sh
    (
      set -eu
@@ -456,13 +458,14 @@ sole writer.
    )
    ```
 
-   Phase C — Gated activation and conditional queue resume (re-checks preflight,
-   pause, and captured drain gates inside one `set -eu` block, reads the
-   effective `TRANSCODER_DOMAIN` resolved by Compose from the running `caddy`
-   container and pins the post-reload `/health` probe to
-   `${LOCAL_CADDY_ADDR:-127.0.0.1}` with `--noproxy '*'` so shell proxies and
-   shared DNS/LB peers cannot mask a failed local Caddy, and resumes
-   `divine-transcode` only if Phase A paused it):
+   Phase C — Start upload services, re-verify drain, and replace `caddy`
+   (re-checks preflight and `PAUSED` queue state, starts `upload-proxy` and
+   `upload` on isolated `upload_edge` **before** the final drain check so image
+   startup/pulls cannot open a post-drain race window, verifies `num_requests == 0`
+   and no `ffmpeg` immediately before replacing `caddy`, reloads and verifies
+   the local `/health` listener using the Compose-resolved `TRANSCODER_DOMAIN`
+   with `--resolve` and `--noproxy '*'`, and clears `/var/lib/divine-upload/pre-sync-backup`;
+   leaves `divine-transcode` paused for explicit operator resume):
    ```sh
    (
      set -eu
@@ -532,6 +535,7 @@ sole writer.
      test "$(gcloud tasks queues describe divine-transcode \
        --location=us-central1 --project=rich-compiler-479518-d2 \
        --format='value(state)')" = "PAUSED"
+     docker compose up -d --no-deps upload-proxy upload
      upstreams="$(docker compose exec -T caddy wget -qO- http://127.0.0.1:2019/reverse_proxy/upstreams)"
      printf '%s\n' "$upstreams" | \
        python3 -c 'import json, sys; up = json.load(sys.stdin); assert up and all(u.get("num_requests", 1) == 0 for u in up), up'
@@ -541,33 +545,38 @@ sole writer.
        echo 'transcoder still running ffmpeg' >&2
        exit 1
      fi
-     docker compose up -d --no-deps upload-proxy upload
      docker compose up -d --no-deps caddy
      wait_caddy_admin
      docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile
      wait_transcoder_health
-     if [ -f /var/lib/divine-upload/activation-paused-queue ]; then
-       gcloud tasks queues resume divine-transcode \
-         --location=us-central1 --project=rich-compiler-479518-d2
-       rm -f /var/lib/divine-upload/activation-paused-queue
-     else
-       echo 'Preserving pre-existing divine-transcode pause for its owner'
-     fi
      rm -rf /var/lib/divine-upload/pre-sync-backup /var/lib/divine-upload/pre-sync-backup.tmp
    )
    ```
+   After Phase C (or Phase C recovery below) succeeds, lift any direct worker
+   maintenance hold, and **only if you paused `divine-transcode` in Phase A**,
+   resume it explicitly (if `divine-transcode` was already `PAUSED` before
+   Phase A, leave it paused for its owner):
+   ```sh
+   gcloud tasks queues resume divine-transcode \
+     --location=us-central1 --project=rich-compiler-479518-d2
+   test "$(gcloud tasks queues describe divine-transcode \
+     --location=us-central1 --project=rich-compiler-479518-d2 \
+     --format='value(state)')" = "RUNNING"
+   ```
 
    Phase C recovery — Restore last known-good transcoder-only `caddy` ingress if
-   Phase C failed after stopping or replacing `caddy` (keeps `transcoder` untouched;
-   reads the Compose-resolved `TRANSCODER_DOMAIN` from the running base `caddy`
-   container and pins each `/health` readiness probe to
-   `${LOCAL_CADDY_ADDR:-127.0.0.1}` with `--noproxy '*'` so shell proxies and
-   healthy peer nodes behind shared DNS/LB cannot mask a failed replacement; if
-   the updated base `docker-compose.yml` or `Caddyfile` fails `/health`, falls
-   back automatically to `/var/lib/divine-upload/pre-sync-backup`, resumes
-   `divine-transcode` only after `/health` passes and only if Phase A created
-   the pause marker, and then clears the pre-sync backup so subsequent rollouts
-   take a fresh baseline):
+   Phase C failed after stopping or replacing `caddy` (keeps `transcoder` untouched
+   and leaves `divine-transcode` paused with direct worker maintenance traffic
+   held until the operator lifts them; reads the Compose-resolved
+   `TRANSCODER_DOMAIN` from the running base `caddy` container and pins each
+   `/health` readiness probe to `${LOCAL_CADDY_ADDR:-127.0.0.1}` with
+   `--noproxy '*'` so shell proxies and healthy peer nodes behind shared DNS/LB
+   cannot mask a failed replacement; if the updated base `docker-compose.yml` or
+   `Caddyfile` fails `/health`, falls back automatically to
+   `/var/lib/divine-upload/pre-sync-backup`, clears the pre-sync backup once
+   local `/health` passes so subsequent rollouts take a fresh baseline, and
+   leaves queue resume to the explicit operator step above if the operator paused
+   it in Phase A):
    ```sh
    (
      set -eu
@@ -655,13 +664,6 @@ sole writer.
        docker compose -f docker-compose.yml run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile
        docker compose -f docker-compose.yml up -d --no-deps caddy
        wait_transcoder_health
-     fi
-     if [ -f /var/lib/divine-upload/activation-paused-queue ]; then
-       gcloud tasks queues resume divine-transcode \
-         --location=us-central1 --project=rich-compiler-479518-d2
-       rm -f /var/lib/divine-upload/activation-paused-queue
-     else
-       echo 'Preserving pre-existing divine-transcode pause for its owner'
      fi
      rm -rf /var/lib/divine-upload/pre-sync-backup /var/lib/divine-upload/pre-sync-backup.tmp
    )
@@ -1013,8 +1015,8 @@ sole writer.
         `upload.divine.video` to the worker, wait for propagation on both
         address families (`dig @1.1.1.1 +short A upload.divine.video` and
         `dig @1.1.1.1 +short AAAA upload.divine.video`), and repeat the Step 5
-        smoke checks (including `POST /transcribe`) over both IPv4 (`curl -4`)
-        and IPv6 (`curl -6`).
+        smoke checks (including `POST /transcribe`) over both IPv4 (`curl --noproxy '*' -4`)
+        and IPv6 (`curl --noproxy '*' -6`).
       - **IPv4-only cutover:** If GKE previously published an `AAAA` record,
         delete that `AAAA` record first while GKE remains available over IPv4,
         wait for the pre-cutover `AAAA` TTL recorded in Step 6 to expire and

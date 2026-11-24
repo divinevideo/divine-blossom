@@ -761,8 +761,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_PUT(self):
         log_event("PUT_START", self.path)
         length = int(self.headers.get("Content-Length") or 0)
-        if length:
-            self.rfile.read(length)
+        body = self.rfile.read(length) if length else b""
+        log_event("PUT_BODY_LEN", f"{self.path}:{len(body)}")
         if self.path == "/hold":
             gate.wait(timeout=20)
         self._send(200, '{"ok":true}')
@@ -940,61 +940,121 @@ Server(("0.0.0.0", 8080), Handler).serve_forever()
                 conn.close()
                 self.assertEqual(resp.status, 200)
 
-                # 64 concurrent PUTs occupy body_total slots; 65th gets 429 with CORS + Retry-After:5,
-                # while bodyless GET /thumbnail/:hash still succeeds.
-                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-                conn.request("GET", "/gate-close")
-                conn.getresponse().read()
-                conn.close()
-
-                def send_held_put() -> int:
-                    c = http.client.HTTPConnection("127.0.0.1", port, timeout=25)
-                    c.request("PUT", "/hold", body=b"x" * 16)
-                    r = c.getresponse()
-                    r.read()
-                    c.close()
-                    return r.status
-
-                with concurrent.futures.ThreadPoolExecutor(max_workers=66) as ex:
-                    futs = [ex.submit(send_held_put) for _ in range(64)]
-                    hold_deadline = time.monotonic() + 10.0
-                    holds = 0
-                    while time.monotonic() < hold_deadline:
-                        holds = sum(
-                            1
-                            for line in events_log.read_text(encoding="utf-8").splitlines()
-                            if '"PUT_START"' in line and '"/hold"' in line
-                        )
-                        if holds >= 64:
+                # 1 slow PUT spilling to /tmp/body while arriving (before upstream sees it)
+                # + 63 concurrent upstream-held PUTs occupy all 64 body_total slots; 65th gets
+                # 429 with CORS + Retry-After:5, while bodyless GET /thumbnail/:hash still succeeds.
+                spill_total = 262144
+                spill_first = 196608
+                spill_rest = spill_total - spill_first
+                spill_sock = socket.create_connection(("127.0.0.1", port), timeout=15)
+                try:
+                    spill_sock.sendall(
+                        f"PUT /spill-test HTTP/1.1\r\nHost: localhost\r\nContent-Length: {spill_total}\r\nConnection: close\r\n\r\n".encode("ascii")
+                        + (b"s" * spill_first)
+                    )
+                    spill_probe_cmd = (
+                        'for f in /proc/[0-9]*/fd/*; do '
+                        't=$(readlink "$f" 2>/dev/null || true); '
+                        'case "$t" in /tmp/body/*) '
+                        'sz=$(stat -Lc %s "$f" 2>/dev/null || echo 0); '
+                        '[ "$sz" -gt 0 ] && echo "$f -> $t size=$sz"; '
+                        ';; esac; done'
+                    )
+                    spill_deadline = time.monotonic() + 5.0
+                    spilled_files = ""
+                    while time.monotonic() < spill_deadline:
+                        spilled_files = subprocess.check_output(
+                            [docker_bin, "exec", proxy_name, "sh", "-c", spill_probe_cmd],
+                            text=True,
+                        ).strip()
+                        if spilled_files:
                             break
                         time.sleep(0.05)
-                    self.assertEqual(holds, 64, f"Expected 64 held PUTs, saw {holds}")
+                    self.assertTrue(
+                        spilled_files,
+                        "Expected slow 256 KiB upload to spill to an open /tmp/body scratch file while arriving",
+                    )
+                    spill_events = [
+                        line for line in events_log.read_text(encoding="utf-8").splitlines()
+                        if '"/spill-test"' in line
+                    ]
+                    self.assertEqual(spill_events, [], f"Upstream saw spilled upload before full body arrived: {spill_events}")
 
-                    c65 = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-                    c65.request("PUT", "/hold", body=b"y" * 16)
-                    r65 = c65.getresponse()
-                    r65.read()
-                    c65.close()
-                    self.assertEqual(r65.status, 429)
-                    self.assertEqual(r65.headers.get_all("Access-Control-Allow-Origin"), ["*"])
-                    self.assertIn("PUT", r65.headers.get("Access-Control-Allow-Methods") or "")
-                    self.assertEqual(r65.headers.get("Access-Control-Expose-Headers"), "Retry-After")
-                    self.assertEqual(r65.headers.get("Retry-After"), "5")
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                    conn.request("GET", "/gate-close")
+                    conn.getresponse().read()
+                    conn.close()
 
-                    cg = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-                    cg.request("GET", "/thumbnail/abc123")
-                    rg = cg.getresponse()
-                    rg.read()
-                    cg.close()
-                    self.assertEqual(rg.status, 200)
+                    def send_held_put() -> int:
+                        c = http.client.HTTPConnection("127.0.0.1", port, timeout=25)
+                        c.request("PUT", "/hold", body=b"x" * 16)
+                        r = c.getresponse()
+                        r.read()
+                        c.close()
+                        return r.status
 
-                    co = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-                    co.request("GET", "/gate-open")
-                    co.getresponse().read()
-                    co.close()
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=65) as ex:
+                        futs = [ex.submit(send_held_put) for _ in range(63)]
+                        hold_deadline = time.monotonic() + 10.0
+                        holds = 0
+                        while time.monotonic() < hold_deadline:
+                            holds = sum(
+                                1
+                                for line in events_log.read_text(encoding="utf-8").splitlines()
+                                if '"PUT_START"' in line and '"/hold"' in line
+                            )
+                            if holds >= 63:
+                                break
+                            time.sleep(0.05)
+                        self.assertEqual(holds, 63, f"Expected 63 held PUTs, saw {holds}")
+                        spill_events = [
+                            line for line in events_log.read_text(encoding="utf-8").splitlines()
+                            if '"/spill-test"' in line
+                        ]
+                        self.assertEqual(spill_events, [], f"Upstream saw incomplete spilled upload under saturation: {spill_events}")
 
-                    statuses = [f.result(timeout=20) for f in futs]
-                    self.assertTrue(all(st == 200 for st in statuses), statuses)
+                        c65 = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                        c65.request("PUT", "/hold", body=b"y" * 16)
+                        r65 = c65.getresponse()
+                        r65.read()
+                        c65.close()
+                        self.assertEqual(r65.status, 429)
+                        self.assertEqual(r65.headers.get_all("Access-Control-Allow-Origin"), ["*"])
+                        self.assertIn("PUT", r65.headers.get("Access-Control-Allow-Methods") or "")
+                        self.assertEqual(r65.headers.get("Access-Control-Expose-Headers"), "Retry-After")
+                        self.assertEqual(r65.headers.get("Retry-After"), "5")
+
+                        cg = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                        cg.request("GET", "/thumbnail/abc123")
+                        rg = cg.getresponse()
+                        rg.read()
+                        cg.close()
+                        self.assertEqual(rg.status, 200)
+
+                        spill_sock.sendall(b"s" * spill_rest)
+                        spill_chunks = []
+                        while True:
+                            chunk = spill_sock.recv(4096)
+                            if not chunk:
+                                break
+                            spill_chunks.append(chunk)
+                        spill_resp = b"".join(spill_chunks).decode("utf-8", errors="replace")
+                        self.assertTrue(spill_resp.startswith("HTTP/1.1 200 "), spill_resp)
+                        body_len_lines = [
+                            line for line in events_log.read_text(encoding="utf-8").splitlines()
+                            if '"PUT_BODY_LEN"' in line and f'"/spill-test:{spill_total}"' in line
+                        ]
+                        self.assertTrue(body_len_lines, "Expected upstream to receive complete 262144-byte spilled PUT")
+
+                        co = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                        co.request("GET", "/gate-open")
+                        co.getresponse().read()
+                        co.close()
+
+                        statuses = [f.result(timeout=20) for f in futs]
+                        self.assertTrue(all(st == 200 for st in statuses), statuses)
+                finally:
+                    spill_sock.close()
             finally:
                 subprocess.run([docker_bin, "rm", "-f", proxy_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 subprocess.run([docker_bin, "rm", "-f", up_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
