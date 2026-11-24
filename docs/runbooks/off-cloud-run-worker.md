@@ -480,9 +480,12 @@ sole writer.
        return 1
      }
      probe_local_transcoder_health() {
-       raw_domain="$(docker compose exec -T caddy printenv TRANSCODER_DOMAIN 2>/dev/null || true)"
-       raw_domain="$(printf '%s' "${raw_domain%%,*}" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-       [ -n "$raw_domain" ] || { echo 'TRANSCODER_DOMAIN not set in running caddy container' >&2; return 1; }
+       if ! raw_domain="$(docker compose exec -T caddy printenv TRANSCODER_DOMAIN 2>/dev/null)"; then
+         echo 'Cannot read TRANSCODER_DOMAIN from caddy container (not running or unset)' >&2
+         return 1
+       fi
+       raw_domain="$(printf '%s' "$raw_domain" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:],].*$//')"
+       [ -n "$raw_domain" ] || { echo 'TRANSCODER_DOMAIN is empty in running caddy container' >&2; return 1; }
        local_addr="${LOCAL_CADDY_ADDR:-127.0.0.1}"
        case "$raw_domain" in
          http://*)    scheme=http;  rest="${raw_domain#http://}";  default_port=80 ;;
@@ -569,9 +572,12 @@ sole writer.
    (
      set -eu
      probe_local_transcoder_health() {
-       raw_domain="$(docker compose -f docker-compose.yml exec -T caddy printenv TRANSCODER_DOMAIN 2>/dev/null || true)"
-       raw_domain="$(printf '%s' "${raw_domain%%,*}" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-       [ -n "$raw_domain" ] || { echo 'TRANSCODER_DOMAIN not set in running caddy container' >&2; return 1; }
+       if ! raw_domain="$(docker compose -f docker-compose.yml exec -T caddy printenv TRANSCODER_DOMAIN 2>/dev/null)"; then
+         echo 'Cannot read TRANSCODER_DOMAIN from caddy container (not running or unset)' >&2
+         return 1
+       fi
+       raw_domain="$(printf '%s' "$raw_domain" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:],].*$//')"
+       [ -n "$raw_domain" ] || { echo 'TRANSCODER_DOMAIN is empty in running caddy container' >&2; return 1; }
        local_addr="${LOCAL_CADDY_ADDR:-127.0.0.1}"
        case "$raw_domain" in
          http://*)    scheme=http;  rest="${raw_domain#http://}";  default_port=80 ;;
@@ -974,9 +980,9 @@ sole writer.
       `upload.divine.video` and answers healthy directly on `<worker-ipv4>`, and
       also on `<worker-ipv6>` whenever publishing or retaining an `AAAA` record:
       ```sh
-      curl -fsS -4 --resolve "upload.divine.video:443:<worker-ipv4>" https://upload.divine.video/
+      curl -fsS --noproxy '*' -4 --resolve "upload.divine.video:443:<worker-ipv4>" https://upload.divine.video/
       # Required if publishing an AAAA record for upload.divine.video:
-      curl -fsS -6 --resolve "upload.divine.video:443:[<worker-ipv6>]" https://upload.divine.video/
+      curl -fsS --noproxy '*' -6 --resolve "upload.divine.video:443:[<worker-ipv6>]" https://upload.divine.video/
       ```
       Do not move DNS until every target address family check succeeds.
    4. **Switch `UPLOAD_BASE_URL`, drain safely, and re-verify health:** Confirm
@@ -997,9 +1003,9 @@ sole writer.
       ```sh
       mountpoint -q /var/lib/divine-upload/scratch && test -f /var/lib/divine-upload/scratch/tmp/.divine-upload-scratch
       docker compose ps upload
-      curl -fsS -4 --resolve "upload.divine.video:443:<worker-ipv4>" https://upload.divine.video/
+      curl -fsS --noproxy '*' -4 --resolve "upload.divine.video:443:<worker-ipv4>" https://upload.divine.video/
       # Required if publishing an AAAA record:
-      curl -fsS -6 --resolve "upload.divine.video:443:[<worker-ipv6>]" https://upload.divine.video/
+      curl -fsS --noproxy '*' -6 --resolve "upload.divine.video:443:[<worker-ipv6>]" https://upload.divine.video/
       ```
    5. **Flip production DNS via the chosen controller/owner and verify steady-state TLS:**
       - **Dual-stack cutover:** Only after both IPv4 and IPv6 probes above pass,
