@@ -216,6 +216,37 @@ sole writer.
    all Linux capabilities (`cap_drop: ALL`, removing `CAP_DAC_OVERRIDE`), so a
    `0600` key file must be owned by UID `0` (or match the image's runtime UID if
    the Dockerfile later switches to a non-root user).
+   Also provision a **bounded** disk scratch filesystem at
+   `/var/lib/divine-upload/scratch` with an inner directory
+   `/var/lib/divine-upload/scratch/tmp` (`chown 0:0`, `chmod 1777`) mounted
+   into the container's `/tmp` (`UPLOAD_TMP_DIR` defaults to
+   `/var/lib/divine-upload/scratch/tmp`). Size the filesystem from your
+   configured limits: worst-case concurrent `/tmp` spooling (`divine-upload-server`
+   resumable completion/verification, `/migrate`, and sync `ffmpeg` thumbnail
+   extraction up to `MAX_SYNC_VIDEO_BYTES=100 MiB`) is
+   `(MAX_CONCURRENT_UPLOADS + MAX_CONCURRENT_MIRRORS) * MAX_UPLOAD_BYTES + MAX_CONCURRENT_THUMBNAILS * 100 MiB`
+   plus MP4 remux and filesystem overhead. With `.env.upload.example` defaults
+   (`16` uploads + `2` mirrors at `1 GiB`, plus `12` thumbnails × `100 MiB` ≈
+   `19.2 GiB` peak), provision at least **`24 GiB`** (`24G`–`32G`, scaling up
+   if you raise those concurrency or size caps). Prefer a dedicated logical
+   volume/partition; otherwise create a fixed-size loopback `ext4` image on `/`:
+   ```sh
+   install -d -m 0755 /var/lib/divine-upload/scratch
+   truncate -s 24G /var/lib/divine-upload/scratch.img
+   mkfs.ext4 -F -m 0 /var/lib/divine-upload/scratch.img
+   grep -q '/var/lib/divine-upload/scratch.img' /etc/fstab || \
+     echo '/var/lib/divine-upload/scratch.img /var/lib/divine-upload/scratch ext4 loop,nosuid,nodev,noexec,nofail 0 2' >> /etc/fstab
+   mount /var/lib/divine-upload/scratch
+   install -d -m 1777 -o 0 -g 0 /var/lib/divine-upload/scratch/tmp
+   ```
+   Using the inner `tmp/` directory paired with `create_host_path: false` in
+   `docker-compose.upload.yml` guarantees Docker refuses to start `upload` if
+   the scratch filesystem is unmounted (preventing silent spillover onto `/`).
+   Because OOM kills or forced stops can leave orphaned `NamedTempFile` `.tmp*`
+   dotfiles behind, `docker-compose.upload.yml` sweeps `/tmp` (excluding
+   `lost+found`) on every container start before `exec /app/divine-upload-server`;
+   if reclaiming manually while running, stop `upload` first (`docker compose stop upload`),
+   clear `/var/lib/divine-upload/scratch/tmp`, and start only `upload` (`docker compose up -d --no-deps upload`).
 2. Copy `cloud-run-transcoder/deploy/off-gcp/.env.upload.example` to
    `/opt/divine-transcoder/.env.upload` (`chmod 600`) and populate the B2,
    transcribe, and optional parity keys (`MIGRATION_NSEC`,
@@ -308,10 +339,12 @@ sole writer.
 5. Verify against the candidate hostname (DNS-only / grey cloud). The
    container health check only confirms that the port accepts connections.
    Confirm the pinned image can read `/run/secrets/gcp-sa.json` under
-   `cap_drop: ALL`, write scratch files to the disk-backed `/tmp` volume
-   (`upload_tmp`) with a read-only root, reach both configured storage buckets,
-   and reach `TRANSCODER_URL` from inside the container (plus container-to-host
-   HTTPS hairpinning if using the worker's `/transcode/queue` admission path).
+   `cap_drop: ALL`, write scratch files to the bounded disk-backed `/tmp`
+   mount (`/var/lib/divine-upload/scratch/tmp`, failing closed with
+   `create_host_path: false` if unmounted) with a read-only root, reach both
+   configured storage buckets, and reach `TRANSCODER_URL` from inside the
+   container (plus container-to-host HTTPS hairpinning if using the worker's
+   `/transcode/queue` admission path).
    Confirm `.env.upload` uses the intended buckets, credentials, and concurrency
    limits for this host, then check:
    - `GET /` and `HEAD /` return `200`, and `OPTIONS` preflights succeed across
@@ -340,10 +373,11 @@ sole writer.
    other's sessions in both directions (GKE → Hetzner and Hetzner → GKE).
    Confirm both submit to the existing single transcoder writer. Exercise
    `HEAD`, browser preflights, and slow bodies near the configured limit. Load
-   test uploads, thumbnail misses, and transcoding together. Measure disk-backed
-   `/tmp` (`upload_tmp` volume) disk usage, container memory usage, CPU
-   saturation, and transcode queue latency. Include both upload-generated and
-   on-demand thumbnails in the budget.
+   test uploads, thumbnail misses, and transcoding together. Measure bounded
+   `/var/lib/divine-upload/scratch` (`df -h /var/lib/divine-upload/scratch`)
+   disk usage (confirming peak stays well within the `>= 24 GiB` budget),
+   container memory usage, CPU saturation, and transcode queue latency.
+   Include both upload-generated and on-demand thumbnails in the budget.
 7. Execute production cutover only after resolving DNS ownership and verifying
    production TLS on the worker **before** sending production traffic to it:
    1. **DNS ownership plan (`divine-iac-coreconfig`):** ExternalDNS currently
@@ -380,53 +414,6 @@ sole writer.
       root/Caddy) into `/opt/divine-transcoder/conf.d/certs/releases/initial/`
       as `upload.pem` and `upload.key`, then run
       `ln -sfn releases/initial /opt/divine-transcoder/conf.d/certs/current`.
-      Configure an automated per-certificate renewal hook script (bound via
-      `certbot --deploy-hook` or an `acme.sh --reloadcmd` wrapper rather than
-      direct in-place overwrites) that stages both files in a new release
-      directory, verifies the cert and key match before atomically swapping
-      `conf.d/certs/current` in a single `mv -Tf` rename, rolls `current` back
-      to the previous release if `caddy validate` fails (so a failed renewal
-      can never leave a mismatched pair on disk that breaks the next Caddy
-      restart and takes down `transcoder`), force-reloads Caddy, and only then
-      removes the previous release directory:
-      ```sh
-      #!/bin/sh
-      set -eu
-      CERT_DIR=/opt/divine-transcoder/conf.d/certs
-      REL="releases/$(date -u +%Y%m%dT%H%M%SZ)-$$"
-      STAGE="$CERT_DIR/$REL"
-      trap 'rm -rf "$STAGE" "$CERT_DIR/current.next" "$CERT_DIR/current.prev"' EXIT
-      mkdir -p "$STAGE"
-      install -m 644 "$RENEWED_LINEAGE/fullchain.pem" "$STAGE/upload.pem"
-      install -m 600 "$RENEWED_LINEAGE/privkey.pem" "$STAGE/upload.key"
-      test "$(openssl x509 -in "$STAGE/upload.pem" -noout -pubkey)" = \
-           "$(openssl pkey -in "$STAGE/upload.key" -pubout)"
-      PREV="$(readlink "$CERT_DIR/current" 2>/dev/null || true)"
-      ln -sfn "$REL" "$CERT_DIR/current.next"
-      mv -Tf "$CERT_DIR/current.next" "$CERT_DIR/current"
-      trap - EXIT
-      cd /opt/divine-transcoder
-      if ! docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile; then
-        if [ -n "$PREV" ]; then
-          ln -sfn "$PREV" "$CERT_DIR/current.prev"
-          mv -Tf "$CERT_DIR/current.prev" "$CERT_DIR/current"
-        fi
-        rm -rf "$STAGE"
-        exit 1
-      fi
-      docker compose exec -T caddy caddy reload --force --config /etc/caddy/Caddyfile
-      if [ -n "$PREV" ] && [ "$PREV" != "$REL" ]; then
-        rm -rf "${CERT_DIR:?}/${PREV:?}"
-      fi
-      ```
-      *(All three Compose/Caddy details are required: `cd /opt/divine-transcoder`
-      — not `--project-directory` alone — because `.env` sets relative
-      `COMPOSE_FILE` paths that Docker Compose resolves against the caller's
-      cwd, which in non-interactive `certbot`/`acme.sh` hooks defaults to `/` or
-      the client's home; `exec -T` because hooks have no TTY; and
-      `caddy reload --force` because plain `caddy reload` is a no-op when the
-      Caddyfile text is unchanged and would keep serving the old in-memory cert
-      until expiry.)*
       Next, copy `Caddyfile.upload.example` to `conf.d/upload.caddy` with
       literal site address `upload.divine.video` and
       `tls /etc/caddy/conf.d/certs/current/upload.pem /etc/caddy/conf.d/certs/current/upload.key`
@@ -436,6 +423,142 @@ sole writer.
       docker compose exec caddy caddy validate --config /etc/caddy/Caddyfile
       docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile
       ```
+      Once `conf.d/upload.caddy` is loaded and answering SNI for
+      `upload.divine.video`, install `/usr/local/sbin/deploy-upload-cert.sh`
+      (`chmod 755`) to handle automated renewals safely: it acquires a lock,
+      checks idempotency against **both** the staged files and the certificate
+      serial Caddy actually serves over TLS SNI, atomically swaps
+      `conf.d/certs/current`, validates and runs `caddy reload --force`, polls
+      localhost SNI on `127.0.0.1:443` until the new serial is served (rolling
+      `current` back to `$PREV` and exiting non-zero if reload or SNI
+      activation fails), and only deletes `$PREV` once SNI confirms the new
+      leaf is live:
+      ```sh
+      #!/bin/sh
+      set -eu
+      CERT_DIR=/opt/divine-transcoder/conf.d/certs
+      SNI_HOST=upload.divine.video
+      SRC_CERT="${1:-${RENEWED_LINEAGE:-/etc/letsencrypt/live/upload.divine.video}/fullchain.pem}"
+      SRC_KEY="${2:-${RENEWED_LINEAGE:-/etc/letsencrypt/live/upload.divine.video}/privkey.pem}"
+
+      mkdir -p "$CERT_DIR/releases" /run
+      exec 9>/run/deploy-upload-cert.lock
+      flock -w 30 9
+
+      WANT_SERIAL="$(openssl x509 -in "$SRC_CERT" -noout -serial)"
+      test -n "$WANT_SERIAL"
+      test "$(openssl x509 -in "$SRC_CERT" -noout -pubkey)" = \
+           "$(openssl pkey -in "$SRC_KEY" -pubout)"
+
+      served_serial() {
+        timeout 5 openssl s_client -connect 127.0.0.1:443 -servername "$SNI_HOST" </dev/null 2>/dev/null \
+          | openssl x509 -noout -serial 2>/dev/null || true
+      }
+
+      if [ -f "$CERT_DIR/current/upload.pem" ] && [ -f "$CERT_DIR/current/upload.key" ] \
+         && cmp -s "$SRC_CERT" "$CERT_DIR/current/upload.pem" \
+         && cmp -s "$SRC_KEY" "$CERT_DIR/current/upload.key" \
+         && [ "$(served_serial)" = "$WANT_SERIAL" ]; then
+        exit 0
+      fi
+
+      REL="releases/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+      STAGE="$CERT_DIR/$REL"
+      PREV="$(readlink "$CERT_DIR/current" 2>/dev/null || true)"
+      SWAPPED=0
+
+      rollback() {
+        rc=$?
+        trap - EXIT
+        if [ "$SWAPPED" -eq 1 ]; then
+          if [ -n "$PREV" ]; then
+            ln -sfn "$PREV" "$CERT_DIR/current.prev"
+            mv -Tf "$CERT_DIR/current.prev" "$CERT_DIR/current"
+          else
+            rm -f "$CERT_DIR/current"
+          fi
+        fi
+        rm -rf "$STAGE" "$CERT_DIR/current.next" "$CERT_DIR/current.prev"
+        exit "$rc"
+      }
+      trap rollback EXIT
+
+      mkdir -p "$STAGE"
+      install -m 644 "$SRC_CERT" "$STAGE/upload.pem"
+      install -m 600 "$SRC_KEY" "$STAGE/upload.key"
+      test "$(openssl x509 -in "$STAGE/upload.pem" -noout -pubkey)" = \
+           "$(openssl pkey -in "$STAGE/upload.key" -pubout)"
+
+      ln -sfn "$REL" "$CERT_DIR/current.next"
+      mv -Tf "$CERT_DIR/current.next" "$CERT_DIR/current"
+      SWAPPED=1
+
+      cd /opt/divine-transcoder
+      docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile
+      docker compose exec -T caddy caddy reload --force --config /etc/caddy/Caddyfile
+
+      ACTIVATED=0
+      i=0
+      while [ "$i" -lt 5 ]; do
+        if [ "$(served_serial)" = "$WANT_SERIAL" ]; then
+          ACTIVATED=1
+          break
+        fi
+        i=$((i + 1))
+        sleep 1
+      done
+      test "$ACTIVATED" -eq 1
+
+      trap - EXIT
+      case "$PREV" in
+        releases/*)
+          if [ "$PREV" != "$REL" ]; then
+            rm -rf "${CERT_DIR:?}/${PREV:?}"
+          fi
+          ;;
+      esac
+      ```
+      *(All three Compose/Caddy details are required: `cd /opt/divine-transcoder`
+      — not `--project-directory` alone — because `.env` sets relative
+      `COMPOSE_FILE` paths that Docker Compose resolves against the caller's
+      cwd, which in non-interactive `certbot`/systemd hooks defaults to `/`;
+      `exec -T` because hooks and systemd units have no TTY; and
+      `caddy reload --force` because plain `caddy reload` is a no-op when the
+      Caddyfile text is unchanged and would keep serving the old in-memory cert
+      until expiry.)*
+      Because Certbot runs `--deploy-hook` only on new issuance (so subsequent
+      `certbot renew` runs skip an already-renewed cert whose reload failed),
+      configure **both** the renewal hook **and** an independent hourly
+      `systemd` activation timer:
+      - **Certbot:** `certbot reconfigure --cert-name upload.divine.video --deploy-hook /usr/local/sbin/deploy-upload-cert.sh`
+        *(or with `acme.sh`, which uses `CERT_FULLCHAIN_PATH`/`CERT_KEY_PATH`
+        rather than `RENEWED_LINEAGE`: pass explicit file arguments via
+        `acme.sh --install-cert -d upload.divine.video --fullchain-file /etc/divine-upload/acme/fullchain.pem --key-file /etc/divine-upload/acme/privkey.pem --reloadcmd "/usr/local/sbin/deploy-upload-cert.sh /etc/divine-upload/acme/fullchain.pem /etc/divine-upload/acme/privkey.pem"`,
+        and pass those same two paths in `ExecStart=` below).*
+      - **Independent retry timer (`/etc/systemd/system/deploy-upload-cert.service` and `.timer`):**
+        ```ini
+        # /etc/systemd/system/deploy-upload-cert.service
+        [Unit]
+        Description=Activate issued upload.divine.video TLS certificate in Caddy
+        After=docker.service
+
+        [Service]
+        Type=oneshot
+        ExecStart=/usr/local/sbin/deploy-upload-cert.sh
+        ```
+        ```ini
+        # /etc/systemd/system/deploy-upload-cert.timer
+        [Unit]
+        Description=Retry upload.divine.video TLS certificate activation independently of issuance
+
+        [Timer]
+        OnCalendar=hourly
+        Persistent=true
+
+        [Install]
+        WantedBy=timers.target
+        ```
+        Enable the timer and run a baseline verification (`systemctl daemon-reload && systemctl enable --now deploy-upload-cert.timer && systemctl start deploy-upload-cert.service`): any failed reload or SNI mismatch leaves `deploy-upload-cert.service` in `failed` state (`systemctl --failed`) and retries hourly until confirmed live.
    3. **Verify production SNI & TLS directly on the worker before DNS cutover:**
       Confirm the worker presents a valid trusted certificate for
       `upload.divine.video` and answers healthy directly at the worker IP:
@@ -469,10 +592,11 @@ sole writer.
       checks from step 5 (including the `POST /transcribe` WebVTT check)
       against `https://upload.divine.video`. Keep the DNS-01 file certificate
       (`conf.d/certs/current/upload.pem` / `upload.key`) and `tls` directive in
-      `conf.d/upload.caddy` active under the automated `certbot` / `acme.sh`
-      renewal hook installed in step 7.2 (which atomically swaps
-      `conf.d/certs/current` to the validated fullchain/key release directory
-      and runs `caddy reload --force`) — do **not** remove `tls` and reload
+      `conf.d/upload.caddy` active under `/usr/local/sbin/deploy-upload-cert.sh`
+      and `deploy-upload-cert.timer` installed in step 7.2 (which atomically
+      swaps `conf.d/certs/current`, runs `caddy reload --force`, and verifies
+      SNI serial activation before cleaning old releases) — do **not** remove
+      `tls` and reload
       Caddy while Caddy's managed ACME storage is empty, because Caddy unloads
       the file certificate immediately and fails TLS SNI handshakes until a
       managed issuer certificate is obtained. Only transition to Caddy-managed
@@ -509,10 +633,10 @@ sessions finish or reach their `86400`s expiry (or after confirming no active
 candidate sessions remain). Only then:
 1. Remove `conf.d/upload-candidate.caddy`, validate and reload Caddy
    (`docker compose exec caddy caddy validate --config /etc/caddy/Caddyfile && docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile`).
-2. Stop and remove `upload` (`docker compose stop upload && docker compose rm -f upload`) and remove its scratch volume listed by `docker volume ls --filter name=upload_tmp` (e.g., `docker volume rm divine-transcoder_upload_tmp`).
-3. Remove the `certbot` (`certbot delete --cert-name upload.divine.video`) or
+2. Stop and remove `upload` (`docker compose stop upload && docker compose rm -f upload`), then unmount `/var/lib/divine-upload/scratch`, remove its `/etc/fstab` entry, and delete `/var/lib/divine-upload/scratch.img` and `/var/lib/divine-upload/scratch` (or remove the dedicated LV/partition).
+3. Disable and remove the retry timer/unit (`systemctl disable --now deploy-upload-cert.timer && rm -f /etc/systemd/system/deploy-upload-cert.timer /etc/systemd/system/deploy-upload-cert.service && systemctl daemon-reload`), remove `/usr/local/sbin/deploy-upload-cert.sh` and `/run/deploy-upload-cert.lock`, and remove the `certbot` (`certbot delete --cert-name upload.divine.video`) or
    `acme.sh` (`acme.sh --remove -d upload.divine.video`) certificate lineage,
-   its deploy hook script, and its Cloudflare DNS-01 credential file if no other
+   its deploy hook configuration, and its Cloudflare DNS-01 credential file if no other
    certificate uses it (so scheduled renewals do not keep failing against the
    deleted `conf.d/certs/` directory).
 4. Delete `/etc/divine-upload/gcp-sa.json` and revoke that service-account key

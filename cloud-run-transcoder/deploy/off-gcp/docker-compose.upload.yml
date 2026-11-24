@@ -14,6 +14,12 @@ services:
     restart: unless-stopped
     # Match divine-upload-server's 300s graceful shutdown drain window (GKE uses 330s).
     stop_grace_period: 330s
+    # Reclaim any orphaned /tmp spools (including .tmp* dotfiles left after OOM
+    # or SIGKILL) before handing PID 1 to the pinned image's CMD binary.
+    command:
+      - /bin/sh
+      - -ec
+      - find /tmp -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf -- {} + && exec /app/divine-upload-server
     cpus: "${UPLOAD_CPUS:-6.0}"
     mem_limit: ${UPLOAD_MEM_LIMIT:-6g}
     cap_drop:
@@ -29,9 +35,16 @@ services:
       GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gcp-sa.json
     volumes:
       - ${UPLOAD_GCP_SA_KEY_PATH:-/etc/divine-upload/gcp-sa.json}:/run/secrets/gcp-sa.json:ro
-      # Disk-backed /tmp mirrors GKE emptyDir so concurrent 1 GiB resumable
-      # completions and /migrate spools do not consume mem_limit RAM or hit ENOSPC.
-      - upload_tmp:/tmp
+      # Mount a host-provisioned bounded disk filesystem (e.g. a dedicated LV or
+      # fixed-size loopback ext4 image at /var/lib/divine-upload/scratch with an
+      # inner tmp/ directory) so concurrent 1 GiB resumable completions and
+      # /migrate spools never consume mem_limit RAM or fill the worker root disk.
+      # create_host_path: false prevents silent fallback to / if unmounted.
+      - type: bind
+        source: ${UPLOAD_TMP_DIR:-/var/lib/divine-upload/scratch/tmp}
+        target: /tmp
+        bind:
+          create_host_path: false
     # Isolate upload from the default network so it cannot bypass Caddy to reach
     # transcoder:8080 directly.
     networks:
@@ -41,9 +54,6 @@ services:
       interval: 15s
       timeout: 5s
       retries: 3
-
-volumes:
-  upload_tmp:
 
 networks:
   upload_edge:

@@ -110,17 +110,27 @@ class OffGcpUploadConfigTest(unittest.TestCase):
         # Match divine-upload-server's 300s graceful shutdown drain window (GKE: 330s).
         self.assertRegex(text, r"(?m)^\s+stop_grace_period:\s+330s$")
 
-        # Back /tmp with a disk volume (never tmpfs charged to mem_limit).
+        # Back /tmp with a required bounded host scratch mount and sweep orphaned
+        # dotfiles/spools on container start (never tmpfs or unbounded upload_tmp).
         self.assertNotIn("tmpfs:", text)
-        self.assertRegex(text, r"(?m)^\s+-\s+upload_tmp:/tmp$")
-        self.assertRegex(text, r"(?m)^volumes:\n\s+upload_tmp:$")
+        self.assertNotIn("upload_tmp", text)
+        self.assertIn("type: bind", text)
+        self.assertIn(
+            "source: ${UPLOAD_TMP_DIR:-/var/lib/divine-upload/scratch/tmp}", text
+        )
+        self.assertIn("target: /tmp", text)
+        self.assertIn("create_host_path: false", text)
+        self.assertIn(
+            "find /tmp -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf -- {} + && exec /app/divine-upload-server",
+            text,
+        )
 
         # Isolate upload on upload_edge; attach caddy to both default and upload_edge.
         caddy_overlay = text.split("  caddy:", 1)[1].split("  upload:", 1)[0]
         self.assertRegex(caddy_overlay, r"(?m)^\s+-\s+default$")
         self.assertRegex(caddy_overlay, r"(?m)^\s+-\s+upload_edge$")
 
-        upload_block = text.split("  upload:", 1)[1].split("\nvolumes:", 1)[0]
+        upload_block = text.split("  upload:", 1)[1].split("\nnetworks:", 1)[0]
         upload_networks = upload_block.split("networks:", 1)[1].split("healthcheck:", 1)[0]
         self.assertRegex(upload_networks, r"(?m)^\s+-\s+upload_edge$")
         self.assertNotRegex(upload_networks, r"(?m)^\s+-\s+default$")
@@ -396,12 +406,31 @@ class OffGcpUploadConfigTest(unittest.TestCase):
                                 bind_conflict = True
                                 break
                             self.fail(f"caddy exited early: {err}")
+                        conn = None
                         try:
-                            with socket.create_connection(("127.0.0.1", candidate_port), timeout=0.2):
+                            recorded.clear()
+                            conn = http.client.HTTPConnection("127.0.0.1", candidate_port, timeout=0.2)
+                            conn.request(
+                                "GET",
+                                "/health",
+                                headers={"Host": f"transcoder-worker.example.test:{candidate_port}"},
+                            )
+                            resp = conn.getresponse()
+                            body = resp.read()
+                            if (
+                                resp.status == 200
+                                and body == b"upstream:transcoder"
+                                and ("transcoder", "GET", "/health") in recorded
+                                and proc.poll() is None
+                            ):
                                 caddy_port = candidate_port
                                 break
-                        except OSError:
-                            time.sleep(0.05)
+                        except (OSError, http.client.HTTPException):
+                            pass
+                        finally:
+                            if conn is not None:
+                                conn.close()
+                        time.sleep(0.05)
 
                     if caddy_port is not None:
                         break
