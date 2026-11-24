@@ -21,9 +21,13 @@ env:
   IMAGE_NAME: ${{ github.repository }}
   FASTLY_SERVICE_ID: pOvEEWykEbpnylqst1KTrR
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
-    runs-on: ubuntu-24.04-16core
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -86,7 +90,7 @@ jobs:
   docker:
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04-16core
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
@@ -127,7 +131,7 @@ jobs:
   deploy-upload:
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04-16core
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       id-token: write
@@ -184,7 +188,7 @@ jobs:
     concurrency:
       group: fastly-deploy
       cancel-in-progress: false
-    runs-on: ubuntu-24.04-16core
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -230,7 +234,7 @@ jobs:
     concurrency:
       group: fastly-deploy
       cancel-in-progress: false
-    runs-on: ubuntu-24.04-16core
+    runs-on: ubuntu-24.04
     steps:
       - name: Install Fastly CLI
         run: |
@@ -245,7 +249,7 @@ jobs:
   deploy-process-blob:
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04-16core
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       id-token: write
