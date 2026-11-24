@@ -954,6 +954,65 @@ async fn batch_publishing_recovery_requires_every_target_marker() {
 }
 
 #[tokio::test]
+async fn sound_claim_recovers_late_primary_write_without_a_backup_marker() {
+    let locks = Origin::start().await;
+    let media = crate::object_storage::tests::Origin::start().await;
+    let storage = media.with_gcs_backup(locks.client());
+    let key = format!("{A}/audio/analysis.json");
+    let verdict = Bytes::from_static(br#"{"silent":false,"tags":[]}"#);
+    let mut owner = locks.store().claim_sound(A, &storage).await.unwrap();
+    let write_id = owner.write_id();
+    media.objects.lock().await.fail_put_by_key.insert(
+        key.clone(),
+        vec![axum::http::StatusCode::INTERNAL_SERVER_ERROR],
+    );
+
+    assert!(storage
+        .put_claimed_verified(
+            &key,
+            verdict.clone(),
+            "application/json",
+            HashMap::new(),
+            None,
+            &mut owner,
+        )
+        .await
+        .is_err());
+    assert!(owner.finish(false).await.is_err());
+    assert!(!locks.objects.lock().await.live.contains_key(&key));
+
+    let journal_key = format!(".internal/sound-claims/{A}");
+    locks
+        .objects
+        .lock()
+        .await
+        .live
+        .get_mut(&journal_key)
+        .unwrap()["timeCreated"] = json!("2000-01-01T00:00:00Z");
+    assert!(locks
+        .store()
+        .claim_sound(A, &storage)
+        .await
+        .unwrap_err()
+        .is::<Busy>());
+
+    // A delayed primary PUT can settle without any attempt at writing a backup.
+    media
+        .store()
+        .put_verified(
+            &key,
+            verdict,
+            "application/json",
+            HashMap::from([(WRITE_ID.into(), write_id)]),
+            None,
+        )
+        .await
+        .unwrap();
+    let replacement = locks.store().claim_sound(A, &storage).await.unwrap();
+    replacement.finish(false).await.unwrap();
+}
+
+#[tokio::test]
 async fn batch_publish_retries_transient_b2_500_within_lease_and_succeeds() {
     let locks = Origin::start().await;
     let media = crate::object_storage::tests::Origin::start().await;
