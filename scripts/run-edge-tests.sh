@@ -64,6 +64,9 @@ fi
 # These exercise actual asynchronous host I/O against a delayed loopback backend.
 VICEROY="$VICEROY" python3 scripts/run-probe-deadline-tests.py
 
+# The upload service's thumbnail token is sent only when configured, and never relayed from a viewer.
+VICEROY="$VICEROY" python3 scripts/run-thumbnail-token-tests.py
+
 # Exercise translated VTT routing against synthetic storage and worker backends.
 VICEROY="$VICEROY" python3 scripts/run-subtitle-translation-tests.py
 

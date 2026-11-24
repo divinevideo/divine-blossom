@@ -3321,6 +3321,8 @@ const HETZNER_TRANSCODE_ADMISSION_BACKEND: &str = "hetzner_transcode_admission";
 const THUMBNAIL_SERVICE_TOKEN_SECRET: &str = "thumbnail_service_token";
 /// Header the upload server reads the token from.
 const THUMBNAIL_SERVICE_TOKEN_HEADER: &str = "X-Divine-Thumbnail-Token";
+/// Request id on Blossom's thumbnail calls, logged by the upload service.
+const THUMBNAIL_REQUEST_ID: &str = "blossom-thumbnail";
 
 /// The thumbnail service token, or `None` when it isn't configured yet (the
 /// upload server then serves the call as it always has, until Platform turns
@@ -3353,10 +3355,14 @@ fn upload_thumbnail_request(hash: &str, service_token: Option<&str>) -> Request 
     );
     let mut req = Request::new(Method::GET, &url);
     req.set_header("Host", UPLOAD_SERVICE_THUMBNAIL_HOST);
+    // Lets the upload service attribute calls that arrive without a valid
+    // token (for example when the secret budget was spent) to Blossom.
+    req.set_header("x-request-id", THUMBNAIL_REQUEST_ID);
+    // The upload service accepts only visible ASCII tokens; anything else could
+    // never match, so it is not sent.
     if let Some(token) = service_token
         .map(str::trim)
-        .filter(|token| !token.is_empty())
-        .and_then(|token| token.parse::<fastly::http::HeaderValue>().ok())
+        .filter(|token| !token.is_empty() && token.bytes().all(|b| b.is_ascii_graphic()))
     {
         req.set_header(THUMBNAIL_SERVICE_TOKEN_HEADER, token);
     }
@@ -8034,8 +8040,17 @@ mod tests {
     }
 
     #[test]
+    fn upload_thumbnail_request_identifies_blossom() {
+        let req = super::upload_thumbnail_request(&"a".repeat(64), Some("svc-token"));
+        assert_eq!(
+            req.get_header_str("x-request-id"),
+            Some("blossom-thumbnail")
+        );
+    }
+
+    #[test]
     fn upload_thumbnail_request_ignores_a_blank_or_invalid_token() {
-        for token in ["", "   ", "bad\u{7f}token"] {
+        for token in ["", "   ", "bad\u{7f}token", "t\u{f6}ken", "two words"] {
             let req = super::upload_thumbnail_request(&"a".repeat(64), Some(token));
             assert!(
                 req.get_header(super::THUMBNAIL_SERVICE_TOKEN_HEADER)
@@ -8046,11 +8061,49 @@ mod tests {
     }
 
     #[test]
-    fn thumbnail_service_token_is_absent_until_the_secret_exists() {
-        // The test manifest has no blossom_secrets store, like a deploy that
-        // ships before Platform adds thumbnail_service_token.
+    fn thumbnail_service_token_is_absent_when_the_secret_store_is_unavailable() {
+        // The unit-test manifest defines no blossom_secrets store at all. The
+        // production pre-secret state (store present, key absent) is covered by
+        // run-thumbnail-token-tests.py.
         let _scope = crate::request_bindings::begin();
         assert_eq!(super::thumbnail_service_token(), None);
+    }
+
+    // Run by scripts/run-thumbnail-token-tests.py against a loopback
+    // upload_service that echoes the token it received in x-seen-token.
+    #[test]
+    #[ignore = "requires a loopback upload service; run-thumbnail-token-tests.py"]
+    fn thumbnail_token_loopback_sends_the_configured_secret() {
+        let _scope = crate::request_bindings::begin();
+        let resp = super::generate_thumbnail_on_demand(&"a".repeat(64)).unwrap();
+        assert_eq!(resp.get_header_str("x-seen-token"), Some("loopback-token"));
+        assert_eq!(
+            resp.get_header_str("x-seen-request-id"),
+            Some("blossom-thumbnail")
+        );
+        // The upload hop's private/no-store and Vary don't reach Blossom's response.
+        assert!(resp.get_header("Cache-Control").is_none());
+        assert!(resp.get_header("Vary").is_none());
+    }
+
+    #[test]
+    #[ignore = "requires a loopback upload service; run-thumbnail-token-tests.py"]
+    fn thumbnail_token_loopback_sends_nothing_when_the_key_is_missing() {
+        let _scope = crate::request_bindings::begin();
+        let resp = super::generate_thumbnail_on_demand(&"a".repeat(64)).unwrap();
+        assert_eq!(resp.get_header_str("x-seen-token"), Some("-"));
+    }
+
+    #[test]
+    #[ignore = "requires a loopback upload service; run-thumbnail-token-tests.py"]
+    fn thumbnail_token_loopback_never_forwards_a_viewer_token() {
+        let _scope = crate::request_bindings::begin();
+        let hash = "b".repeat(64);
+        let mut req = fastly::Request::get(format!("https://media.divine.video/{hash}.jpg"));
+        req.set_header("X-Divine-Thumbnail-Token", "viewer-supplied");
+        let resp = super::handle_get_blob(req, &format!("/{hash}.jpg")).unwrap();
+        assert_eq!(resp.get_status(), StatusCode::OK);
+        assert_eq!(resp.get_header_str("x-seen-token"), Some("loopback-token"));
     }
 
     #[test]

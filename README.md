@@ -137,7 +137,7 @@ Configuration is split across the Fastly config store (non-secret) and secret st
 | `b2_media_access_key` | Bucket-scoped, read-only S3 application key ID for the authoritative media bucket. |
 | `b2_media_secret_key` | Secret for the read-only B2 media key. Never use the broad development key. |
 | `moderation_api_token` | Bearer token for the Divine moderation API |
-| `thumbnail_service_token` | Optional. Sent as `X-Divine-Thumbnail-Token` when Blossom asks divine-upload-server to generate a thumbnail, so the upload server can refuse direct callers (divine-upload-server#52). Must match the upload server's `THUMBNAIL_SERVICE_TOKEN`. When absent, nothing is sent. |
+| `thumbnail_service_token` | Optional. Sent as `X-Divine-Thumbnail-Token` when Blossom asks divine-upload-server to generate a thumbnail, so the upload server can refuse direct callers (divine-upload-server#52). Must match the upload services' `THUMBNAIL_SERVICE_TOKEN` and be visible ASCII. When absent, nothing is sent. See [Thumbnail service token](#thumbnail-service-token). |
 | `b2_vanish_application_key_id` | Dedicated B2 application key ID restricted to `b2_bucket_id` with exactly `listFiles` and `deleteFiles`. |
 | `b2_vanish_application_key` | Secret for the dedicated B2 vanish application key. |
 | `bunny_api_key` | bunny control-plane key used to purge B2-backed delivery zones. |
@@ -200,6 +200,10 @@ The token must be visible ASCII with no spaces. It travels in
 `X-Divine-Thumbnail-Token`, is compared in constant time and is never logged.
 Whenever it is configured, every `/thumbnail` response is
 `Cache-Control: private, no-store` with `Vary: X-Divine-Thumbnail-Token`.
+
+Blossom's calls carry `x-request-id: blossom-thumbnail`, so a Blossom call that
+arrives without a valid token (for example when earlier storage reads spent the
+Compute secret budget) can be told apart from other callers.
 
 `cloud-run-upload` has no metrics listener, so each guarded request logs one
 `thumbnail_token` line with `result=authenticated|missing|invalid`, `mode`,
