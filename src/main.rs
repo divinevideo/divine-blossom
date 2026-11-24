@@ -7363,14 +7363,81 @@ fn add_no_cache_headers(resp: &mut Response) {
     resp.set_header("Surrogate-Control", "no-store");
 }
 
-/// Purge content from both the VCL website cache and the Compute media cache
-/// by Surrogate-Key. Calls POST /service/{id}/purge/{key} on api.fastly.com
-/// for each service. Best-effort: logs errors but never fails the calling request.
+const MAX_BUNNY_EDGE_PURGE_ZONES: usize = 2;
+
+fn normalize_bunny_purge_hash(surrogate_key: &str) -> Option<String> {
+    if surrogate_key.len() == 64 && surrogate_key.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(surrogate_key.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+fn is_valid_bunny_purge_zone(zone: &str) -> bool {
+    !zone.is_empty()
+        && zone.contains('.')
+        && !zone.starts_with('.')
+        && !zone.ends_with('.')
+        && !zone.starts_with('-')
+        && !zone.ends_with('-')
+        && !zone.contains("..")
+        && zone
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+}
+
+fn parse_bunny_edge_purge_zones(raw: &str) -> Option<Vec<String>> {
+    let mut zones = Vec::new();
+    for part in raw.split(',') {
+        let zone = part.trim().to_ascii_lowercase();
+        if zone.is_empty() {
+            continue;
+        }
+        if !is_valid_bunny_purge_zone(&zone) {
+            return None;
+        }
+        if !zones.contains(&zone) {
+            zones.push(zone);
+        }
+    }
+    if zones.is_empty() || zones.len() > MAX_BUNNY_EDGE_PURGE_ZONES {
+        return None;
+    }
+    Some(zones)
+}
+
+fn build_bunny_edge_purge_url(zone: &str, surrogate_key: &str) -> Option<String> {
+    let hash = normalize_bunny_purge_hash(surrogate_key)?;
+    if !is_valid_bunny_purge_zone(zone) {
+        return None;
+    }
+    let zone = zone.to_ascii_lowercase();
+    let purge_url = format!("https%3A%2F%2F{zone}%2F{hash}%2A");
+    Some(format!(
+        "https://api.bunny.net/purge?url={purge_url}&async=false"
+    ))
+}
+
+/// Purge content from the Fastly VCL/Compute caches by Surrogate-Key and from
+/// configured outer Bunny CDN delivery zones (`bunny_delivery_zones`) by hash
+/// prefix wildcard. Best-effort: logs errors but never fails the calling request.
 pub(crate) fn purge_edge_cache(surrogate_key: &str) {
+    purge_fastly_edge_cache(surrogate_key);
+    purge_bunny_edge_cache(surrogate_key);
+}
+
+fn purge_fastly_edge_cache(surrogate_key: &str) {
+    if !crate::request_bindings::can_read_secret("fastly_api_token") {
+        eprintln!(
+            "[PURGE] Fastly purge skipped for key={}: secret read budget exhausted",
+            surrogate_key
+        );
+        return;
+    }
     let api_token = match storage::get_secret("fastly_api_token").ok() {
         Some(token) if !token.is_empty() => token,
         _ => {
-            eprintln!("[PURGE] fastly_api_token not configured, skipping cache purge");
+            eprintln!("[PURGE] fastly_api_token not configured, skipping Fastly cache purge");
             return;
         }
     };
@@ -7410,6 +7477,90 @@ pub(crate) fn purge_edge_cache(surrogate_key: &str) {
                     "[PURGE] {} purge request failed for key={}: {}",
                     label, surrogate_key, e
                 );
+            }
+        }
+    }
+}
+
+fn purge_bunny_edge_cache(surrogate_key: &str) {
+    let Some(hash) = normalize_bunny_purge_hash(surrogate_key) else {
+        return;
+    };
+    let raw_zones = match storage::optional_config("bunny_delivery_zones") {
+        Ok(Some(raw)) => raw,
+        Ok(None) => return,
+        Err(e) => {
+            eprintln!(
+                "[PURGE] Bunny purge config lookup failed for key={}: {}",
+                hash, e
+            );
+            return;
+        }
+    };
+    let Some(zones) = parse_bunny_edge_purge_zones(&raw_zones) else {
+        eprintln!(
+            "[PURGE] Invalid bunny_delivery_zones config, skipping Bunny cache purge for key={}",
+            hash
+        );
+        return;
+    };
+    if !crate::request_bindings::can_read_secret("bunny_api_key") {
+        eprintln!(
+            "[PURGE] Bunny purge skipped for key={}: secret read budget exhausted",
+            hash
+        );
+        return;
+    }
+    let api_key = match storage::get_secret("bunny_api_key").ok() {
+        Some(key) if !key.trim().is_empty() => key,
+        _ => {
+            eprintln!("[PURGE] bunny_api_key not configured, skipping Bunny cache purge");
+            return;
+        }
+    };
+
+    let mut pending = Vec::new();
+    for zone in &zones {
+        let Some(url) = build_bunny_edge_purge_url(zone, &hash) else {
+            continue;
+        };
+        let mut purge_req = Request::new(Method::POST, &url);
+        purge_req.set_header("Host", "api.bunny.net");
+        purge_req.set_header("AccessKey", &api_key);
+        match purge_req.send_async("bunny_api") {
+            Ok(handle) => pending.push(handle),
+            Err(e) => {
+                eprintln!(
+                    "[PURGE] Bunny ({}) purge request failed for key={}: {}",
+                    zone, hash, e
+                );
+            }
+        }
+    }
+
+    while !pending.is_empty() {
+        let (result, remaining) = fastly::http::request::select(pending);
+        pending = remaining;
+        match result {
+            Ok(resp) => {
+                let status = resp.get_status();
+                let target = resp
+                    .get_backend_request()
+                    .map(|r| r.get_url_str())
+                    .unwrap_or("unknown");
+                if status.is_success() {
+                    eprintln!("[PURGE] Bunny cache purged for key={} ({})", hash, target);
+                } else {
+                    eprintln!(
+                        "[PURGE] Bunny purge failed for key={} ({}): HTTP {}",
+                        hash,
+                        target,
+                        status.as_u16()
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("[PURGE] Bunny purge request failed for key={}: {}", hash, e);
             }
         }
     }
@@ -9025,6 +9176,56 @@ mod tests {
         assert_eq!(record["delivery_probe_checked"], 0);
         assert_eq!(record["delivery_probe_errors"], 0);
         assert_eq!(record["total_ms"], 0);
+    }
+
+    #[test]
+    fn parse_bunny_edge_purge_zones_normalizes_deduplicates_and_validates() {
+        use super::parse_bunny_edge_purge_zones;
+        assert_eq!(
+            parse_bunny_edge_purge_zones(" Media.Divine.Video , divine-media-cdn.b-cdn.net "),
+            Some(vec![
+                "media.divine.video".to_string(),
+                "divine-media-cdn.b-cdn.net".to_string(),
+            ])
+        );
+        assert_eq!(
+            parse_bunny_edge_purge_zones("media.divine.video,MEDIA.DIVINE.VIDEO"),
+            Some(vec!["media.divine.video".to_string()])
+        );
+        assert_eq!(parse_bunny_edge_purge_zones(""), None);
+        assert_eq!(parse_bunny_edge_purge_zones("   ,  "), None);
+        assert_eq!(parse_bunny_edge_purge_zones("localhost"), None);
+        assert_eq!(
+            parse_bunny_edge_purge_zones("https://media.divine.video"),
+            None
+        );
+        assert_eq!(parse_bunny_edge_purge_zones(".media.divine.video"), None);
+        assert_eq!(parse_bunny_edge_purge_zones("media..divine.video"), None);
+        assert_eq!(
+            parse_bunny_edge_purge_zones("a.example.com,b.example.com,c.example.com"),
+            None
+        );
+    }
+
+    #[test]
+    fn build_bunny_edge_purge_url_uses_lowercase_hash_wildcard() {
+        use super::build_bunny_edge_purge_url;
+        let upper = "A".repeat(64);
+        let lower = "a".repeat(64);
+        assert_eq!(
+            build_bunny_edge_purge_url("Media.Divine.Video", &upper),
+            Some(format!(
+                "https://api.bunny.net/purge?url=https%3A%2F%2Fmedia.divine.video%2F{lower}%2A&async=false"
+            ))
+        );
+        assert_eq!(
+            build_bunny_edge_purge_url("media.divine.video", "not-a-sha256"),
+            None
+        );
+        assert_eq!(
+            build_bunny_edge_purge_url("media.divine.video/bad", &lower),
+            None
+        );
     }
 }
 
