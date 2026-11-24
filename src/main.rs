@@ -789,7 +789,10 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
             }
             Err(BlossomError::NotFound(_)) => {
                 // Thumbnail doesn't exist, generate on-demand via Cloud Run
-                match generate_thumbnail_on_demand(video_hash) {
+                match generate_thumbnail_on_demand(
+                    video_hash,
+                    req.get_header_str(req_id::REQUEST_ID_HEADER),
+                ) {
                     Ok(mut resp) => {
                         resp.set_header("Content-Type", "image/jpeg");
                         set_thumb_cache(&mut resp);
@@ -978,7 +981,8 @@ fn handle_head_blob(path: &str) -> Result<Response> {
 
         let resp = match download_thumbnail(&thumbnail_key) {
             Ok(resp) => resp,
-            Err(BlossomError::NotFound(_)) => generate_thumbnail_on_demand(thumb_hash)?,
+            // HEAD has no request in scope here; the call is still tagged.
+            Err(BlossomError::NotFound(_)) => generate_thumbnail_on_demand(thumb_hash, None)?,
             Err(e) => return Err(e),
         };
         let content_length = resp
@@ -3321,7 +3325,8 @@ const HETZNER_TRANSCODE_ADMISSION_BACKEND: &str = "hetzner_transcode_admission";
 const THUMBNAIL_SERVICE_TOKEN_SECRET: &str = "thumbnail_service_token";
 /// Header the upload server reads the token from.
 const THUMBNAIL_SERVICE_TOKEN_HEADER: &str = "X-Divine-Thumbnail-Token";
-/// Request id on Blossom's thumbnail calls, logged by the upload service.
+/// Prefix of the request id on Blossom's thumbnail calls, logged by the
+/// upload services.
 const THUMBNAIL_REQUEST_ID: &str = "blossom-thumbnail";
 
 /// The thumbnail service token, or `None` when it isn't configured yet (the
@@ -3348,16 +3353,23 @@ fn thumbnail_service_token() -> Option<String> {
 
 /// Request to the upload service for one video's thumbnail. Built fresh
 /// rather than forwarded, so no viewer header reaches the upload service.
-fn upload_thumbnail_request(hash: &str, service_token: Option<&str>) -> Request {
+/// `request_id` is the triggering Blossom request's id, when there is one.
+fn upload_thumbnail_request(
+    hash: &str,
+    service_token: Option<&str>,
+    request_id: Option<&str>,
+) -> Request {
     let url = format!(
         "https://{}/thumbnail/{}",
         UPLOAD_SERVICE_THUMBNAIL_HOST, hash
     );
     let mut req = Request::new(Method::GET, &url);
     req.set_header("Host", UPLOAD_SERVICE_THUMBNAIL_HOST);
-    // Lets the upload service attribute calls that arrive without a valid
-    // token (for example when the secret budget was spent) to Blossom.
-    req.set_header("x-request-id", THUMBNAIL_REQUEST_ID);
+    // Ties the call to the Blossom request that triggered it, like Blossom's
+    // other proxied calls, and lets the upload service attribute calls that
+    // arrive without a valid token (for example when the secret budget was
+    // spent) to Blossom.
+    req.set_header("x-request-id", thumbnail_request_id(request_id));
     // The upload service accepts only visible ASCII tokens; anything else could
     // never match, so it is not sent.
     if let Some(token) = service_token
@@ -3367,6 +3379,22 @@ fn upload_thumbnail_request(hash: &str, service_token: Option<&str>) -> Request 
         req.set_header(THUMBNAIL_SERVICE_TOKEN_HEADER, token);
     }
     req
+}
+
+/// `blossom-thumbnail-<id>`, keeping only `[A-Za-z0-9_-]` of the id and at
+/// most 64 of those, so the value is safe for the upload services' log fields.
+fn thumbnail_request_id(request_id: Option<&str>) -> String {
+    let id: String = request_id
+        .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(64)
+        .collect();
+    if id.is_empty() {
+        THUMBNAIL_REQUEST_ID.to_string()
+    } else {
+        format!("{THUMBNAIL_REQUEST_ID}-{id}")
+    }
 }
 
 /// The upload service marks token-guarded thumbnails `private, no-store` and
@@ -3379,7 +3407,7 @@ fn strip_upload_cache_headers(resp: &mut Response) {
 }
 
 /// Generate thumbnail on-demand by proxying to Cloud Run
-fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
+fn generate_thumbnail_on_demand(hash: &str, request_id: Option<&str>) -> Result<Response> {
     if crate::storage::is_local_mode() {
         eprintln!(
             "[THUMB][LOCAL] Returning placeholder thumbnail for {}",
@@ -3415,7 +3443,8 @@ fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
         return Ok(resp);
     }
 
-    let proxy_req = upload_thumbnail_request(hash, thumbnail_service_token().as_deref());
+    let proxy_req =
+        upload_thumbnail_request(hash, thumbnail_service_token().as_deref(), request_id);
 
     let mut resp = proxy_req.send(UPLOAD_SERVICE_BACKEND).map_err(|e| {
         BlossomError::StorageError(format!("Cloud Run thumbnail request failed: {}", e))
@@ -8019,7 +8048,7 @@ mod tests {
     // service token on /thumbnail/<hash>.
     #[test]
     fn upload_thumbnail_request_sends_no_service_token_without_one() {
-        let req = super::upload_thumbnail_request(&"a".repeat(64), None);
+        let req = super::upload_thumbnail_request(&"a".repeat(64), None, None);
         assert_eq!(
             req.get_url_str(),
             format!("https://upload.divine.video/thumbnail/{}", "a".repeat(64))
@@ -8032,7 +8061,7 @@ mod tests {
 
     #[test]
     fn upload_thumbnail_request_sends_the_trimmed_service_token() {
-        let req = super::upload_thumbnail_request(&"a".repeat(64), Some("  svc-token \n"));
+        let req = super::upload_thumbnail_request(&"a".repeat(64), Some("  svc-token \n"), None);
         assert_eq!(
             req.get_header_str(super::THUMBNAIL_SERVICE_TOKEN_HEADER),
             Some("svc-token")
@@ -8040,18 +8069,33 @@ mod tests {
     }
 
     #[test]
-    fn upload_thumbnail_request_identifies_blossom() {
-        let req = super::upload_thumbnail_request(&"a".repeat(64), Some("svc-token"));
+    fn upload_thumbnail_request_carries_the_triggering_request_id() {
+        let id = |request_id| {
+            super::upload_thumbnail_request(&"a".repeat(64), Some("svc-token"), request_id)
+                .get_header_str("x-request-id")
+                .map(str::to_owned)
+        };
         assert_eq!(
-            req.get_header_str("x-request-id"),
-            Some("blossom-thumbnail")
+            id(Some("abc-123_x")).as_deref(),
+            Some("blossom-thumbnail-abc-123_x")
+        );
+        assert_eq!(id(None).as_deref(), Some("blossom-thumbnail"));
+        assert_eq!(
+            id(Some("a b\"c=d")).as_deref(),
+            Some("blossom-thumbnail-abcd")
+        );
+        assert_eq!(id(Some(" ;")).as_deref(), Some("blossom-thumbnail"));
+        let long = "f".repeat(200);
+        assert_eq!(
+            id(Some(&long)),
+            Some(format!("blossom-thumbnail-{}", "f".repeat(64)))
         );
     }
 
     #[test]
     fn upload_thumbnail_request_ignores_a_blank_or_invalid_token() {
         for token in ["", "   ", "bad\u{7f}token", "t\u{f6}ken", "two words"] {
-            let req = super::upload_thumbnail_request(&"a".repeat(64), Some(token));
+            let req = super::upload_thumbnail_request(&"a".repeat(64), Some(token), None);
             assert!(
                 req.get_header(super::THUMBNAIL_SERVICE_TOKEN_HEADER)
                     .is_none(),
@@ -8075,11 +8119,11 @@ mod tests {
     #[ignore = "requires a loopback upload service; run-thumbnail-token-tests.py"]
     fn thumbnail_token_loopback_sends_the_configured_secret() {
         let _scope = crate::request_bindings::begin();
-        let resp = super::generate_thumbnail_on_demand(&"a".repeat(64)).unwrap();
+        let resp = super::generate_thumbnail_on_demand(&"a".repeat(64), Some("loopreq1")).unwrap();
         assert_eq!(resp.get_header_str("x-seen-token"), Some("loopback-token"));
         assert_eq!(
             resp.get_header_str("x-seen-request-id"),
-            Some("blossom-thumbnail")
+            Some("blossom-thumbnail-loopreq1")
         );
         // The upload hop's private/no-store and Vary don't reach Blossom's response.
         assert!(resp.get_header("Cache-Control").is_none());
@@ -8090,20 +8134,41 @@ mod tests {
     #[ignore = "requires a loopback upload service; run-thumbnail-token-tests.py"]
     fn thumbnail_token_loopback_sends_nothing_when_the_key_is_missing() {
         let _scope = crate::request_bindings::begin();
-        let resp = super::generate_thumbnail_on_demand(&"a".repeat(64)).unwrap();
+        let resp = super::generate_thumbnail_on_demand(&"a".repeat(64), None).unwrap();
         assert_eq!(resp.get_header_str("x-seen-token"), Some("-"));
     }
 
     #[test]
     #[ignore = "requires a loopback upload service; run-thumbnail-token-tests.py"]
     fn thumbnail_token_loopback_never_forwards_a_viewer_token() {
+        let resp = viewer_thumbnail_through_blossom();
+        assert_eq!(resp.get_header_str("x-seen-token"), Some("loopback-token"));
+        assert_eq!(
+            resp.get_header_str("x-seen-request-id"),
+            Some("blossom-thumbnail-viewer-req-1")
+        );
+    }
+
+    // With no key configured nothing overwrites the header, so a viewer's
+    // token that leaked into the upload call would show up here.
+    #[test]
+    #[ignore = "requires a loopback upload service; run-thumbnail-token-tests.py"]
+    fn thumbnail_token_loopback_never_forwards_a_viewer_token_without_a_key() {
+        let resp = viewer_thumbnail_through_blossom();
+        assert_eq!(resp.get_header_str("x-seen-token"), Some("-"));
+    }
+
+    /// A viewer's thumbnail request carrying its own token and request id, as
+    /// handle_main leaves it (handle_main pins x-request-id on every request).
+    fn viewer_thumbnail_through_blossom() -> Response {
         let _scope = crate::request_bindings::begin();
         let hash = "b".repeat(64);
         let mut req = fastly::Request::get(format!("https://media.divine.video/{hash}.jpg"));
         req.set_header("X-Divine-Thumbnail-Token", "viewer-supplied");
+        req.set_header("x-request-id", "viewer-req-1");
         let resp = super::handle_get_blob(req, &format!("/{hash}.jpg")).unwrap();
         assert_eq!(resp.get_status(), StatusCode::OK);
-        assert_eq!(resp.get_header_str("x-seen-token"), Some("loopback-token"));
+        resp
     }
 
     #[test]

@@ -77,7 +77,7 @@ blossom_secrets = [{secret_rows}]
 '''
 
 
-def run(repo, port, secrets, test_filter, expected):
+def run(repo, port, secrets, test_filter, expected, exact=False):
     with tempfile.TemporaryDirectory(prefix="thumbnail-token-") as directory:
         config = Path(directory) / "fastly.toml"
         config.write_text(manifest(directory, port, secrets))
@@ -86,7 +86,7 @@ def run(repo, port, secrets, test_filter, expected):
         env["CARGO_TARGET_WASM32_WASIP1_RUNNER"] = shlex.join(runner)
         result = subprocess.run(
             ["cargo", "test", "--locked", "--target", "wasm32-wasip1", "--bin", "fastly-blossom",
-             test_filter, "--", "--ignored", "--nocapture"],
+             test_filter, "--", "--ignored", "--nocapture", *(["--exact"] if exact else [])],
             cwd=repo, env=env, check=True, timeout=300, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
@@ -105,10 +105,12 @@ def main():
             port = server.server_port
             with_key = {**base, "thumbnail_service_token": "loopback-token"}
             run(repo, port, with_key, "thumbnail_token_loopback_sends_the_configured_secret", 1)
-            run(repo, port, with_key, "thumbnail_token_loopback_never_forwards_a_viewer_token", 1)
+            run(repo, port, with_key, "tests::thumbnail_token_loopback_never_forwards_a_viewer_token", 1, exact=True)
             # The production pre-secret state: the store exists, the key doesn't.
             run(repo, port, base, "thumbnail_token_loopback_sends_nothing_when_the_key_is_missing", 1)
-            print("PASS all 3 thumbnail token loopback tests")
+            # Nothing overwrites the header here, so a forwarded viewer token would show.
+            run(repo, port, base, "thumbnail_token_loopback_never_forwards_a_viewer_token_without_a_key", 1)
+            print("PASS all 4 thumbnail token loopback tests")
         finally:
             server.shutdown()
             thread.join()

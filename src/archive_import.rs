@@ -380,7 +380,7 @@ fn process(i: &Item, phase: &str) -> Result<serde_json::Value> {
     }
     match phase {
         "thumbnail" => {
-            let response = crate::generate_thumbnail_on_demand(&i.sha256)?;
+            let response = crate::generate_thumbnail_on_demand(&i.sha256, None)?;
             if response.get_status() != StatusCode::OK {
                 return Err(unavailable());
             }
