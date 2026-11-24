@@ -675,9 +675,15 @@ class GkeTrap(BaseHTTPRequestHandler):
         pass
 
 
+class FixtureOriginServer(ThreadingHTTPServer):
+    # Selection opens up to seven origin HEAD connections concurrently.
+    # The fixture must admit the burst while the handler threads start.
+    request_queue_size = 32
+
+
 def main():
     repo = Path(__file__).resolve().parent.parent
-    with ThreadingHTTPServer(("127.0.0.1", 0), Origin) as server, ThreadingHTTPServer(("127.0.0.1", 0), GkeTrap) as trap:
+    with FixtureOriginServer(("127.0.0.1", 0), Origin) as server, ThreadingHTTPServer(("127.0.0.1", 0), GkeTrap) as trap:
         trap.hits = 0
         server.trap = trap
         threading.Thread(target=trap.serve_forever,daemon=True).start()

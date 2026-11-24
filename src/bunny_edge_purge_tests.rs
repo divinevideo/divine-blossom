@@ -96,9 +96,6 @@ fn legacy_physical_creator_delete_preserves_origin_secret_budget() {
         serde_json::json!({"sha256": hash, "action": "DELETE", "reason": "creator delete"})
             .to_string(),
     );
-    // Pre-existing `kv_origin::settings()` on base `main` looks up absent
-    // `kv_origin_read_token` before checking `metadata_kv_store_id`, so run via
-    // `handle_main` and verify Fastly+GCS+FOS ordering and 0 Bunny reads in Python.
     let mut resp = crate::handle_main(req).unwrap();
     assert_eq!(resp.get_status(), StatusCode::OK);
     let body: serde_json::Value = serde_json::from_str(&resp.take_body_str()).unwrap();
@@ -107,7 +104,7 @@ fn legacy_physical_creator_delete_preserves_origin_secret_budget() {
 
 #[test]
 #[ignore = "requires loopback purge backends; scripts/run-bunny-edge-purge-tests.py"]
-fn legacy_physical_creator_delete_early_gcs_failure_purges_bunny_fallback() {
+fn legacy_physical_creator_delete_stops_after_gcs_failure() {
     let hash = test_hash(6);
     seed_blob(&hash, "active");
     let session = "f".repeat(64);
@@ -122,9 +119,7 @@ fn legacy_physical_creator_delete_early_gcs_failure_purges_bunny_fallback() {
     assert!(resp.get_status().is_server_error());
 }
 
-#[test]
-#[ignore = "requires loopback purge backends; scripts/run-bunny-edge-purge-tests.py"]
-fn bulk_approve_batches_fastly_and_bounds_bunny_within_backend_limit() {
+fn bulk_approve() -> serde_json::Value {
     let hashes: Vec<String> = (10u8..26u8).map(test_hash).collect();
     for hash in &hashes {
         seed_blob(hash, "banned");
@@ -138,4 +133,19 @@ fn bulk_approve_batches_fastly_and_bounds_bunny_within_backend_limit() {
     assert_eq!(resp.get_status(), StatusCode::OK);
     let body: serde_json::Value = serde_json::from_str(&resp.take_body_str()).unwrap();
     assert_eq!(body["approved"], serde_json::json!(16));
+    body
+}
+
+#[test]
+#[ignore = "requires loopback purge backends; scripts/run-bunny-edge-purge-tests.py"]
+fn legacy_bulk_approve_batches_fastly() {
+    assert_eq!(bulk_approve()["cdn_purge_pending_hashes"], serde_json::json!([]));
+}
+
+#[test]
+#[ignore = "requires a Bunny delivery zone and loopback purge backends"]
+fn bunny_bulk_approve_queues_durable_purges() {
+    let body = bulk_approve();
+    let expected: Vec<String> = (10u8..26u8).map(test_hash).collect();
+    assert_eq!(body["cdn_purge_pending_hashes"], serde_json::json!(expected));
 }
