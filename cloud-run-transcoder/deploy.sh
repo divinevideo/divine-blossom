@@ -1,6 +1,7 @@
 #!/bin/bash
 # ABOUTME: Deploy divine-transcoder to Cloud Run with the current production runtime settings
-# ABOUTME: Builds in Cloud Build, then deploys with webhook, transcription, and Sentry secrets wired
+# ABOUTME: Builds in Cloud Build and creates a no-traffic revision for explicit promotion
+# Follow docs/runbooks/hls-single-writer.md before routing any writer traffic.
 #
 # To use Google Cloud Speech-to-Text V2 (Chirp 3):
 #   TRANSCRIPTION_PROVIDER=google_stt_v2 \
@@ -105,6 +106,19 @@ STATUS_QUEUE_ENABLED="${STATUS_QUEUE_ENABLED:-false}"
 STATUS_QUEUE_LOCATION="${STATUS_QUEUE_LOCATION:-${REGION}}"
 STATUS_QUEUE_NAME="${STATUS_QUEUE_NAME:-derivative-status}"
 SENTRY_SECRET="${SENTRY_SECRET:-sentry_dsn}"
+: "${TRANSCODE_QUEUE:?Set the existing fully qualified transcode queue path}"
+: "${TRANSCODE_WORKER_URL:?Set the stable HTTPS transcoder origin}"
+: "${TRANSCODE_DISPATCH_SECRET_VERSION:?Set the pinned dispatch secret version}"
+: "${TRANSCODE_DISPATCH_SECRET_NAME:?Set a dedicated dispatch secret resource}"
+if [[ "${TRANSCODE_DISPATCH_SECRET_NAME}" == "webhook_secret" ]]; then
+  echo "TRANSCODE_DISPATCH_SECRET_NAME must be independent of the webhook secret." >&2
+  exit 1
+fi
+TRANSCODE_WRITES_PAUSED="${TRANSCODE_WRITES_PAUSED:-true}"
+if [[ ! "${TRANSCODE_DISPATCH_SECRET_VERSION}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "TRANSCODE_DISPATCH_SECRET_VERSION must be a pinned numeric version." >&2
+  exit 1
+fi
 
 # Stage an explicit source allowlist, including the shared language/job contract.
 BUILD_CONTEXT="$(mktemp -d)"
@@ -122,6 +136,7 @@ gcloud run deploy "${SERVICE_NAME}" \
   --region "${REGION}" \
   --image "${IMAGE}" \
   --allow-unauthenticated \
+  --no-traffic \
   --service-account "${SERVICE_ACCOUNT}" \
   --cpu 4 \
   --memory 8Gi \
@@ -130,10 +145,11 @@ gcloud run deploy "${SERVICE_NAME}" \
   --max-instances "${MAX_INSTANCES}" \
   --min-instances "${MIN_INSTANCES}" \
   --no-cpu-throttling \
-  --update-env-vars "^@@^GCP_PROJECT_ID=${GCP_PROJECT_ID}@@GCS_BUCKET=${GCS_BUCKET}@@WEBHOOK_URL=${WEBHOOK_URL}@@TRANSCRIPT_WEBHOOK_URL=${TRANSCRIPT_WEBHOOK_URL}@@TRANSCRIPTION_PROVIDER=${TRANSCRIPTION_PROVIDER}@@TRANSCRIPTION_MODEL=${TRANSCRIPTION_MODEL}@@TRANSCRIPTION_API_URL=${TRANSCRIPTION_API_URL}@@USE_GPU=${USE_GPU}@@SENTRY_ENVIRONMENT=${SENTRY_ENVIRONMENT}@@GOOGLE_CLOUD_LOCATION=${GOOGLE_CLOUD_LOCATION}@@GOOGLE_STT_RECOGNIZER=${GOOGLE_STT_RECOGNIZER}@@GOOGLE_STT_MODEL=${GOOGLE_STT_MODEL}@@GOOGLE_STT_LANGUAGE_CODES=${GOOGLE_STT_LANGUAGE_CODES}@@TRANSCRIPTION_FALLBACK_PROVIDER=${TRANSCRIPTION_FALLBACK_PROVIDER}@@TRANSCRIPTION_FALLBACK_ON_PROVIDER_ERROR=${TRANSCRIPTION_FALLBACK_ON_PROVIDER_ERROR}@@STATUS_QUEUE_ENABLED=${STATUS_QUEUE_ENABLED}@@STATUS_QUEUE_LOCATION=${STATUS_QUEUE_LOCATION}@@STATUS_QUEUE_NAME=${STATUS_QUEUE_NAME}" \
-  --update-secrets "WEBHOOK_SECRET=webhook_secret:latest,TRANSCRIPTION_API_KEY=openai_api_key:latest,SENTRY_DSN=${SENTRY_SECRET}:latest,TRANSCRIBE_SHARED_SECRET=transcribe_shared_secret:latest"
+  --update-env-vars "^@@^GCP_PROJECT_ID=${GCP_PROJECT_ID}@@GCS_BUCKET=${GCS_BUCKET}@@WEBHOOK_URL=${WEBHOOK_URL}@@TRANSCRIPT_WEBHOOK_URL=${TRANSCRIPT_WEBHOOK_URL}@@TRANSCRIPTION_PROVIDER=${TRANSCRIPTION_PROVIDER}@@TRANSCRIPTION_MODEL=${TRANSCRIPTION_MODEL}@@TRANSCRIPTION_API_URL=${TRANSCRIPTION_API_URL}@@USE_GPU=${USE_GPU}@@SENTRY_ENVIRONMENT=${SENTRY_ENVIRONMENT}@@GOOGLE_CLOUD_LOCATION=${GOOGLE_CLOUD_LOCATION}@@GOOGLE_STT_RECOGNIZER=${GOOGLE_STT_RECOGNIZER}@@GOOGLE_STT_MODEL=${GOOGLE_STT_MODEL}@@GOOGLE_STT_LANGUAGE_CODES=${GOOGLE_STT_LANGUAGE_CODES}@@TRANSCRIPTION_FALLBACK_PROVIDER=${TRANSCRIPTION_FALLBACK_PROVIDER}@@TRANSCRIPTION_FALLBACK_ON_PROVIDER_ERROR=${TRANSCRIPTION_FALLBACK_ON_PROVIDER_ERROR}@@STATUS_QUEUE_ENABLED=${STATUS_QUEUE_ENABLED}@@STATUS_QUEUE_LOCATION=${STATUS_QUEUE_LOCATION}@@STATUS_QUEUE_NAME=${STATUS_QUEUE_NAME}@@TRANSCODE_QUEUE=${TRANSCODE_QUEUE}@@TRANSCODE_WORKER_URL=${TRANSCODE_WORKER_URL}@@TRANSCODE_WRITES_PAUSED=${TRANSCODE_WRITES_PAUSED}" \
+  --update-secrets "WEBHOOK_SECRET=webhook_secret:latest,TRANSCRIPTION_API_KEY=openai_api_key:latest,SENTRY_DSN=${SENTRY_SECRET}:latest,TRANSCRIBE_SHARED_SECRET=transcribe_shared_secret:latest,TRANSCODE_DISPATCH_SECRET=${TRANSCODE_DISPATCH_SECRET_NAME}:${TRANSCODE_DISPATCH_SECRET_VERSION}"
 
-echo "Done! Service URL:"
+echo "Revision created with no traffic. Follow the single-writer rollout before promoting it."
+echo "Service URL:"
 gcloud run services describe "${SERVICE_NAME}" \
   --project "${PROJECT_ID}" \
   --region "${REGION}" \

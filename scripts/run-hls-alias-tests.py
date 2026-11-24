@@ -9,21 +9,51 @@ import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# Playlists under this video carry storage C2PA metadata.
+PROVENANCE_PREFIX = f"/hls-test/{'d' * 64}/hls/"
+
 
 class Origin(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
+
+    def do_POST(self):
+        assert self.path == "/transcode/queue"
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        payload = json.loads(body)
+        if payload["hash"] == "e" * 64:
+            assert self.server.use_hetzner
+            assert payload["owner"] == "b" * 64
+            assert self.headers.get("x-divine-transcode-admission") is None
+            assert self.headers["Host"] == "divine-transcoder-149672065768.us-central1.run.app"
+            self.server.fallback_admissions += 1
+            self.send_response(202)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        assert payload == {"hash": "f" * 64, "owner": "b" * 64}
+        expected_credential = "synthetic-admission-token" if self.server.use_hetzner else None
+        assert self.headers.get("x-divine-transcode-admission") == expected_credential
+        self.server.admissions += 1
+        first_status = 404 if self.server.use_hetzner else 503
+        self.send_response(first_status if self.server.admissions == 1 else 202)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_GET(self):
         assert self.headers.get("Authorization", "").startswith("AWS4-HMAC-SHA256 ")
         self.server.reads.append((self.path, self.headers.get("Range")))
         hash_value = "a" * 64
         prefix = f"/hls-test/{hash_value}/hls/"
+        master = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100\nstream_480p.m3u8\n"
+        variant = b"#EXTM3U\n#EXTINF:4,\nsegment_0.ts\n#EXT-X-ENDLIST\n"
         bodies = {
-            prefix + "master.m3u8": b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100\nstream_480p.m3u8\n",
-            prefix + "stream_480p.m3u8": b"#EXTM3U\n#EXTINF:4,\nsegment_0.ts\n#EXT-X-ENDLIST\n",
+            prefix + "master.m3u8": master,
+            prefix + "stream_480p.m3u8": variant,
             prefix + "segment_0.ts": b"segment-bytes",
             prefix + "stream_480p.mp4": b"segment-bytes",
+            PROVENANCE_PREFIX + "master.m3u8": master,
+            PROVENANCE_PREFIX + "stream_480p.m3u8": variant,
         }
         status, body = (200, bodies[self.path]) if self.path in bodies else (404, b"missing")
         if status == 200 and self.headers.get("Range") == "bytes=0-3":
@@ -31,16 +61,22 @@ class Origin(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("ETag", '"synthetic-origin-body"')
+        if self.path.startswith(PROVENANCE_PREFIX):
+            self.send_header("x-goog-meta-c2pa-manifest-id", "synthetic-manifest")
+            self.send_header("x-goog-meta-source-sha256", "e" * 64)
         if status == 206:
             self.send_header("Content-Range", "bytes 0-3/13")
         self.end_headers()
         self.wfile.write(body)
 
 
-def main():
+def main(use_hetzner=False):
     repo = Path(__file__).resolve().parent.parent
     with ThreadingHTTPServer(("127.0.0.1", 0), Origin) as origin:
         origin.reads = []
+        origin.admissions = 0
+        origin.fallback_admissions = 0
+        origin.use_hetzner = use_hetzner
         thread = threading.Thread(target=origin.serve_forever, daemon=True)
         thread.start()
         try:
@@ -48,12 +84,25 @@ def main():
                 root = Path(directory)
                 config, kv, settings = root / "fastly.toml", root / "kv.json", root / "settings.json"
                 kv.write_text("{}")
-                settings.write_text(json.dumps({"gcs_bucket": "hls-test"}))
+                store = {"gcs_bucket": "hls-test"}
+                if use_hetzner:
+                    store["hetzner_transcode_admission"] = "true"
+                settings.write_text(json.dumps(store))
+                admission_backend = (
+                    "hetzner_transcode_admission" if use_hetzner else "cloud_run_transcoder"
+                )
+                legacy_backend = (
+                    f'[local_server.backends.cloud_run_transcoder]\nurl = "http://127.0.0.1:{origin.server_port}"'
+                    if use_hetzner else ""
+                )
                 config.write_text(f'''manifest_version = 3
 name = "hls-alias-test"
 language = "rust"
 [local_server.backends.gcs_storage]
 url = "http://127.0.0.1:{origin.server_port}"
+[local_server.backends.{admission_backend}]
+url = "http://127.0.0.1:{origin.server_port}"
+{legacy_backend}
 [local_server.kv_stores.blossom_metadata]
 file = "{kv}"
 format = "json"
@@ -61,7 +110,7 @@ format = "json"
 file = "{settings}"
 format = "json"
 [local_server.secret_stores]
-blossom_secrets = [{{key="admin_token",data="synthetic-admin-token"}},{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_key",data="synthetic"}}]
+blossom_secrets = [{{key="admin_token",data="synthetic-admin-token"}},{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_key",data="synthetic"}},{{key="transcode_admission_secret",data="synthetic-admission-token"}},{{key="fixture_a",data="a"}},{{key="fixture_b",data="b"}}]
 ''')
                 env = os.environ.copy()
                 env["CARGO_TARGET_WASM32_WASIP1_RUNNER"] = shlex.join([
@@ -70,18 +119,29 @@ blossom_secrets = [{{key="admin_token",data="synthetic-admin-token"}},{{key="gcs
                     "cargo", "test", "--locked", "--target", "wasm32-wasip1", "--bin", "fastly-blossom",
                     "hls_alias_", "--", "--ignored", "--nocapture"],
                     cwd=repo, env=env, capture_output=True, text=True, timeout=900)
-                if result.returncode or "test result: ok. 2 passed; 0 failed; 0 ignored;" not in result.stdout:
+                if result.returncode or "test result: ok. 5 passed; 0 failed; 0 ignored;" not in result.stdout:
                     raise RuntimeError(result.stdout + result.stderr)
                 prefix = f"/hls-test/{'a' * 64}/hls/"
+                provenance = [(PROVENANCE_PREFIX + "master.m3u8", None),
+                              (PROVENANCE_PREFIX + "stream_480p.m3u8", None)]
                 required = {
                     (prefix + "master.m3u8", None),
                     (prefix + "stream_480p.m3u8", None),
                     (prefix + "segment_0.ts", None),
                     (prefix + "stream_480p.mp4", "bytes=0-3"),
                     (f"/hls-test/{'c' * 64}/hls/master.m3u8", None),
+                    (f"/hls-test/{'f' * 64}/hls/master.m3u8", None),
+                    (f"/hls-test/{'9' * 64}/hls/stream_480p.mp4", None),
+                    *provenance,
                 }
                 # Alias, canonical, admin and signed requests may share the cached origin master.
-                assert set(origin.reads) == required and len(origin.reads) <= 11, origin.reads
+                assert set(origin.reads) == required and len(origin.reads) <= 16, origin.reads
+                # One storage read per playlist proves the provenance repeats were cache hits,
+                # and that the refill replaced the seeded unreadable variant entry.
+                for read in provenance:
+                    assert origin.reads.count(read) == 1, origin.reads
+                assert origin.admissions == 2, origin.admissions
+                assert origin.fallback_admissions == int(use_hetzner), origin.fallback_admissions
                 print("PASS HLS alias resolves canonical playlists/segments and ranged MP4 while preserving access and cache policy")
         finally:
             origin.shutdown()
@@ -90,3 +150,4 @@ blossom_secrets = [{{key="admin_token",data="synthetic-admin-token"}},{{key="gcs
 
 if __name__ == "__main__":
     main()
+    main(use_hetzner=True)

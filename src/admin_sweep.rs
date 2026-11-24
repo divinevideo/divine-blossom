@@ -9,8 +9,8 @@ pub enum StuckAction {
     SkipNotStuck,
     /// Blob was uploaded too recently; leave it alone (might still be transcoding).
     SkipTooRecent,
-    /// HLS master manifest exists in GCS — webhook was lost, mark `Complete`.
-    MarkComplete,
+    /// A readable master needs worker verification before completion.
+    VerifyOutputs,
     /// HLS absent — reset to `Pending` so the next client request re-triggers.
     ResetPending,
 }
@@ -44,7 +44,7 @@ pub fn classify_stuck_record(
     }
 
     if hls_present {
-        StuckAction::MarkComplete
+        StuckAction::VerifyOutputs
     } else {
         StuckAction::ResetPending
     }
@@ -152,10 +152,10 @@ mod tests {
     }
 
     #[test]
-    fn mark_complete_when_hls_present_and_stale() {
+    fn a_master_without_completion_requires_worker_verification() {
         assert_eq!(
             classify_stuck_record(true, "2026-03-29T10:00:00Z", "2026-04-04T22:00:00Z", true),
-            StuckAction::MarkComplete
+            StuckAction::VerifyOutputs
         );
     }
 

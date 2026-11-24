@@ -3,7 +3,7 @@ use super::*;
 use base64::Engine;
 use k256::schnorr::{signature::hazmat::PrehashSigner, Signature, SigningKey};
 
-fn upload_request(authenticated: bool) -> Request {
+pub(super) fn upload_request(authenticated: bool) -> Request {
     let body = b"synthetic image";
     let mut request = Request::put("https://media.divine.video/upload");
     request.set_header("Content-Type", "image/jpeg");
@@ -61,6 +61,26 @@ fn canonical_upload_routing_contract() {
         assert!(should_proxy_direct_upload(15, "image/jpeg").is_err());
         return;
     }
+    if case == "inline_dedupe" {
+        let hash = hex::encode(Sha256::digest(b"synthetic image"));
+        let metadata = serde_json::json!({
+            "sha256": hash, "size": 15, "type": "image/jpeg",
+            "uploaded": "2026-01-01T00:00:00Z", "owner": "b".repeat(64), "status": "active"
+        });
+        crate::metadata::open_store()
+            .unwrap()
+            .insert(&format!("blob:{hash}"), metadata.to_string())
+            .unwrap();
+        let request = upload_request(true).with_header("Origin", "https://client.example");
+        let mut record = UploadLogRecord::new(UploadRoute::DirectPut, "synthetic-routing".into(), 0);
+        let resp = handle_upload(request, &mut record).unwrap();
+        assert_eq!(resp.get_status(), StatusCode::OK);
+        assert_eq!(
+            resp.get_header_str("Access-Control-Allow-Origin"),
+            Some("*")
+        );
+        return;
+    }
     if case == "dedupe" {
         let hash = hex::encode(Sha256::digest(b"synthetic image"));
         let store = crate::metadata::open_store().unwrap();
@@ -85,13 +105,16 @@ fn canonical_upload_routing_contract() {
                 transcript_error_message: None,
                 transcript_terminal: false,
             };
-            publish_upload_service_upload_with_policy(
+            let response = publish_upload_service_upload_with_policy(
                 auth.clone(),
                 "https://media.divine.video".into(),
                 upload,
                 true,
+                true,
+                StatusCode::CREATED,
             )
             .unwrap();
+            assert_eq!(response.get_status(), StatusCode::OK);
             let mut after = store.lookup(&key).unwrap();
             assert_eq!(
                 after.current_generation(),

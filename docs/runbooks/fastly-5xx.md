@@ -249,3 +249,28 @@ cross-service production correlation remain operator validation.
 
 Never add stale serving, blind retries, health checks, failover, shielding, or
 routing changes as an unreviewed diagnostic response.
+
+### Transcode status conditional-write failures
+
+`divine.blossom.transcode_cas_failure.v1` is a failure-only record on
+`compute-diagnostics` for the transcode-status metadata transaction. It carries
+no key, media identifier, body, raw provider error, or generation value:
+
+- `conflicts`: rejected conditional writes in this transaction.
+- `read_pattern`: `unchanged_generation`, `changed_generation`, or `unobserved`,
+  comparing each read after a conflict with that conflict's generation.
+- `origin_reads`, `origin_errors`, `origin_unconfigured`: successful origin reads
+  (including absence), failed reads, and unavailable configuration on retries.
+
+A changed generation can mean a fresh read after a stale edge read; it does not
+by itself prove an actively competing writer. Unchanged generations with
+successful origin reads differ from unchanged generations after origin errors
+and edge fallback. Correlate by UTC window with the existing request error logs;
+this aggregate diagnostic deliberately contains no per-media correlation key.
+
+Callbacks recheck their status generation and patch only transcode fields on
+each conditional-write attempt. A duplicate or superseded callback performs no
+write; an erased/missing record is never recreated. The attempt bound and
+provider generation preconditions remain enforced. Concurrency regression tests
+do not establish recovery from a persistent provider precondition mismatch;
+verify actual post-deployment error/retry counts before declaring that resolved.

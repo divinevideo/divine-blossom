@@ -1,5 +1,6 @@
 //! Private, version-pinned media I/O. Locks, jobs and readiness use other APIs.
 
+use crate::hls_claim::{gcs_status, Claim, OwnershipLost, PublishLease, WriteTarget, WRITE_ID};
 use anyhow::{anyhow, bail, Context, Result};
 use blossom_core::storage_origin::{ObjectRef, StorageProvider};
 use bytes::Bytes;
@@ -16,15 +17,64 @@ use google_cloud_storage::{
 use reqwest::{header::HeaderMap, Method, StatusCode};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
     time::Duration,
 };
 use time::OffsetDateTime;
-use tokio::io::AsyncWriteExt;
+use tokio::{io::AsyncWriteExt, time::Instant};
+
+pub(crate) const REQUIRED_HLS_FILES: [&str; 5] = [
+    "master.m3u8",
+    "stream_720p.m3u8",
+    "stream_480p.m3u8",
+    "stream_720p.ts",
+    "stream_480p.ts",
+];
+pub(crate) const OPTIONAL_HLS_FILES: [&str; 2] = ["stream_720p.mp4", "stream_480p.mp4"];
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(120);
 const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+const B2_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+const B2_RETRY_BACKOFFS: [Duration; 2] = [Duration::from_millis(200), Duration::from_millis(500)];
+const MIN_B2_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Debug)]
+pub struct HlsUploadItem {
+    pub tier: u8,
+    pub key: String,
+    pub body: Bytes,
+    pub mime: String,
+    pub custom: HashMap<String, String>,
+    pub cache_control: Option<String>,
+}
+
+struct BatchWriteError {
+    error: anyhow::Error,
+    unconfirmed: bool,
+}
+
+impl BatchWriteError {
+    fn settled(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            unconfirmed: false,
+        }
+    }
+
+    fn unconfirmed(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            unconfirmed: true,
+        }
+    }
+}
+
+enum B2SendError {
+    Connect(anyhow::Error),
+    Transport(anyhow::Error),
+    Timeout(anyhow::Error),
+}
 
 // No Debug: credentials must never enter diagnostics.
 #[derive(Clone)]
@@ -37,6 +87,7 @@ pub enum StorageConfiguration {
         secret_key: String,
     },
     B2Primary {
+        gcs_backup_enabled: bool,
         bucket: String,
         region: String,
         access_key: String,
@@ -59,7 +110,13 @@ impl StorageConfiguration {
                 let access_key = required("B2_ACCESS_KEY_ID")?;
                 let secret_key = required("B2_SECRET_ACCESS_KEY")?;
                 Ok(if provider.as_deref() == Some("b2_primary") {
+                    let gcs_backup_enabled = match lookup("MEDIA_GCS_BACKUP_ENABLED").as_deref() {
+                        None | Some("true") => true,
+                        Some("false") => false,
+                        _ => bail!("MEDIA_GCS_BACKUP_ENABLED must be true or false"),
+                    };
                     Self::B2Primary {
+                        gcs_backup_enabled,
                         bucket,
                         region,
                         access_key,
@@ -83,6 +140,8 @@ impl StorageConfiguration {
 pub struct MediaStorage {
     backend: Backend,
     required_backup: Option<Box<MediaStorage>>,
+    // Legacy inputs and already-journaled writes remain readable when replication is off.
+    legacy_gcs: Option<Box<MediaStorage>>,
 }
 #[derive(Clone)]
 enum Backend {
@@ -115,6 +174,11 @@ pub struct VerifiedObject {
     pub required_backup: Option<ObjectMetadata>,
 }
 
+enum WriteCondition {
+    Unconditional,
+    BackupGeneration(i64),
+}
+
 struct B2Request<'a> {
     method: Method,
     key: &'a str,
@@ -130,6 +194,7 @@ impl MediaStorage {
         Self {
             backend: Backend::Gcs { client, bucket },
             required_backup: None,
+            legacy_gcs: None,
         }
     }
     pub fn configured(
@@ -137,7 +202,14 @@ impl MediaStorage {
         gcs: Option<GcsClient>,
         gcs_bucket: String,
     ) -> Result<Self> {
-        let backup_required = matches!(&config, StorageConfiguration::B2Primary { .. });
+        let legacy_required = matches!(&config, StorageConfiguration::B2Primary { .. });
+        let backup_required = matches!(
+            &config,
+            StorageConfiguration::B2Primary {
+                gcs_backup_enabled: true,
+                ..
+            }
+        );
         match config {
             StorageConfiguration::Gcs => {
                 if gcs_bucket.is_empty() {
@@ -159,13 +231,14 @@ impl MediaStorage {
                 region,
                 access_key,
                 secret_key,
+                ..
             } => {
-                let required_backup = if backup_required {
+                let legacy_gcs = if legacy_required {
                     if gcs_bucket.is_empty() {
-                        bail!("GCS backup bucket required for B2 primary");
+                        bail!("GCS legacy bucket required for B2 primary");
                     }
                     Some(Box::new(Self::gcs(
-                        gcs.ok_or_else(|| anyhow!("GCS backup client required for B2 primary"))?,
+                        gcs.ok_or_else(|| anyhow!("GCS legacy client required for B2 primary"))?,
                         gcs_bucket,
                     )))
                 } else {
@@ -192,6 +265,7 @@ impl MediaStorage {
                 let client = reqwest::Client::builder()
                     .redirect(reqwest::redirect::Policy::none())
                     .connect_timeout(Duration::from_secs(10))
+                    .pool_idle_timeout(B2_POOL_IDLE_TIMEOUT)
                     .build()?;
                 Ok(Self {
                     backend: Backend::B2 {
@@ -202,7 +276,12 @@ impl MediaStorage {
                         endpoint: format!("https://{host}"),
                         client,
                     },
-                    required_backup,
+                    required_backup: if backup_required {
+                        legacy_gcs.clone()
+                    } else {
+                        None
+                    },
+                    legacy_gcs,
                 })
             }
         }
@@ -232,21 +311,11 @@ impl MediaStorage {
     }
     pub async fn can_reuse_hls(&self, hash: &str) -> Result<bool> {
         let prefix = format!("{hash}/hls");
-        let Some(backup) = &self.required_backup else {
-            return Ok(self.stat(&format!("{prefix}/master.m3u8")).await?.is_some());
-        };
         // The encoder emits two single-file TS variants. A master alone cannot
-        // prove their backups succeeded, and regenerating every duplicate job
-        // would discard the existing at-least-once dispatch's idempotency.
-        for (filename, required) in [
-            ("master.m3u8", true),
-            ("stream_720p.m3u8", true),
-            ("stream_480p.m3u8", true),
-            ("stream_720p.ts", true),
-            ("stream_480p.ts", true),
-            ("stream_720p.mp4", false),
-            ("stream_480p.mp4", false),
-        ] {
+        // prove the set exists. An MP4 is optional, but a present MP4 needs its backup.
+        let required = REQUIRED_HLS_FILES.into_iter().map(|name| (name, true));
+        let optional = OPTIONAL_HLS_FILES.into_iter().map(|name| (name, false));
+        for (filename, required) in required.chain(optional) {
             let key = format!("{prefix}/{filename}");
             let Some(primary) = self.stat(&key).await? else {
                 if required {
@@ -256,16 +325,48 @@ impl MediaStorage {
                 // failures, but any MP4 actually written needs its backup.
                 continue;
             };
-            let Some(replica) = backup.stat(&key).await? else {
-                return Ok(false);
-            };
-            if !backup_metadata_matches(&primary, &replica)
-                || self.hash_body(&primary, None).await? != backup.hash_body(&replica, None).await?
-            {
+            if !required && primary.size == 0 {
+                // Empty historical remux placeholders are absent for HLS;
+                // the MP4 endpoint can regenerate them from the TS variant.
+                continue;
+            }
+            if !self.can_reuse_output(&primary).await? {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+    pub async fn can_reuse_output(&self, primary: &ObjectMetadata) -> Result<bool> {
+        if primary.size == 0 {
+            return Ok(false);
+        }
+        let Some(backup) = &self.required_backup else {
+            return Ok(true);
+        };
+        let Some(replica) = backup.stat(&primary.reference.key).await? else {
+            return Ok(false);
+        };
+        Ok(backup_metadata_matches(primary, &replica)
+            && self.hash_body(primary, None).await? == backup.hash_body(&replica, None).await?)
+    }
+
+    /// A committed PUT must expose the unique attempt marker at the exact
+    /// backend and key recorded before issuing the request.
+    pub async fn hls_write_committed(&self, gcs: bool, key: &str, id: &str) -> Result<bool> {
+        let backend = if gcs && !self.is_gcs() {
+            self.legacy_gcs
+                .as_deref()
+                .context("GCS HLS recovery store unavailable")?
+        } else {
+            self
+        };
+        if backend.is_gcs() != gcs {
+            bail!("HLS storage mode changed during publication");
+        }
+        Ok(backend
+            .stat(key)
+            .await?
+            .is_some_and(|object| object.custom.get(WRITE_ID).is_some_and(|value| value == id)))
     }
     /// Verify or repair a required backup without rewriting the pinned primary.
     /// Callers that may write the same artifact must hold its existing job lock.
@@ -337,7 +438,7 @@ impl MediaStorage {
                 &primary.content_type,
                 primary.custom.clone(),
                 primary.cache_control.clone(),
-                Some(expected),
+                WriteCondition::BackupGeneration(expected),
             )
             .await
             .context("Required GCS backup of existing output was not verified")?;
@@ -377,17 +478,7 @@ impl MediaStorage {
                 }
             }
             Backend::B2 { bucket, .. } => {
-                let response = self
-                    .b2_request(B2Request {
-                        method: Method::HEAD,
-                        key,
-                        version,
-                        body: Bytes::new(),
-                        mime: None,
-                        cache: None,
-                        custom: &HashMap::new(),
-                    })
-                    .await?;
+                let response = self.b2_read_with_retry(Method::HEAD, key, version).await?;
                 if response.status() == StatusCode::NOT_FOUND {
                     return Ok(None);
                 }
@@ -440,15 +531,11 @@ impl MediaStorage {
             }
             Backend::B2 { bucket, .. } => {
                 let response = self
-                    .b2_request(B2Request {
-                        method: Method::GET,
-                        key: &object.reference.key,
-                        version: object.reference.version.as_deref(),
-                        body: Bytes::new(),
-                        mime: None,
-                        cache: None,
-                        custom: &HashMap::new(),
-                    })
+                    .b2_read_with_retry(
+                        Method::GET,
+                        &object.reference.key,
+                        object.reference.version.as_deref(),
+                    )
                     .await?;
                 if response.status() != StatusCode::OK
                     || response.headers().contains_key("content-range")
@@ -526,7 +613,7 @@ impl MediaStorage {
         if let Some(object) = self.stat(key).await? {
             return Ok(Some((self, object)));
         }
-        match self.required_backup.as_deref() {
+        match self.legacy_gcs.as_deref() {
             Some(legacy) => Ok(legacy.stat(key).await?.map(|object| (legacy, object))),
             None => Ok(None),
         }
@@ -606,18 +693,492 @@ impl MediaStorage {
         custom: HashMap<String, String>,
         cache_control: Option<String>,
     ) -> Result<VerifiedObject> {
+        self.put_with_backup(key, body, mime, custom, cache_control)
+            .await
+    }
+
+    /// Journal the entire output set in one claim mutation, then publish each
+    /// tier in order (parallel within a tier, master last) while holding the
+    /// active `Publishing` lease.
+    pub async fn put_hls_batch_verified(
+        &self,
+        mut items: Vec<HlsUploadItem>,
+        claim: &mut Claim,
+    ) -> Result<Vec<VerifiedObject>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut seen_keys = HashSet::with_capacity(items.len());
+        let mut targets =
+            Vec::with_capacity(items.len() * if self.required_backup.is_some() { 2 } else { 1 });
+        for item in &items {
+            validate_key(&item.key)?;
+            if !seen_keys.insert(item.key.clone()) {
+                bail!("Duplicate media key in publication batch");
+            }
+            if is_sha256(&item.key) {
+                let sha256 = hex::encode(Sha256::digest(&item.body));
+                if item.key != sha256 {
+                    bail!("Content-addressed output key mismatch");
+                }
+            }
+            targets.push(WriteTarget {
+                gcs: self.is_gcs(),
+                key: item.key.clone(),
+            });
+            if self.required_backup.is_some() {
+                targets.push(WriteTarget {
+                    gcs: true,
+                    key: item.key.clone(),
+                });
+            }
+        }
+
+        // Pre-fetch live GCS generations in parallel before the single
+        // begin_publication CAS so every GCS write still carries ifGenerationMatch.
+        let gcs_generations = if let Some(gcs_store) = if self.is_gcs() {
+            Some(self)
+        } else {
+            self.required_backup.as_deref()
+        } {
+            let keys: Vec<String> = items.iter().map(|item| item.key.clone()).collect();
+            let fetched = claim
+                .hold(futures::future::try_join_all(keys.iter().map(
+                    |key| async {
+                        let generation = match gcs_store.stat(key).await? {
+                            Some(object) => gcs_generation_from_metadata(&object)?,
+                            None => 0,
+                        };
+                        Ok::<(String, i64), anyhow::Error>((key.clone(), generation))
+                    },
+                )))
+                .await?;
+            fetched.into_iter().collect::<HashMap<_, _>>()
+        } else {
+            HashMap::new()
+        };
+
+        let write_id = claim.write_id();
+        for item in &mut items {
+            item.custom.insert(WRITE_ID.to_owned(), write_id.clone());
+        }
+        claim.begin_publication(targets, &write_id).await?;
+        let lease = PublishLease::new(claim.lease_renewed_at());
+        let deadline = claim.deadline();
+        let mut tiers: BTreeMap<u8, Vec<HlsUploadItem>> = BTreeMap::new();
+        for item in items {
+            tiers.entry(item.tier).or_default().push(item);
+        }
+
+        let (batch_result, heartbeat_error) = claim
+            .hold_publishing(lease.clone(), async {
+                let mut verified = Vec::new();
+                let mut batch_had_ambiguous = false;
+                for (_tier, tier_items) in tiers {
+                    if Instant::now() >= deadline {
+                        let err = anyhow!("Transcode attempt exceeded its preparation deadline");
+                        return Err(if batch_had_ambiguous {
+                            BatchWriteError::unconfirmed(err)
+                        } else {
+                            BatchWriteError::settled(err)
+                        });
+                    }
+                    if lease.remaining_after(Duration::ZERO).is_none() {
+                        let err =
+                            anyhow!("Transcode lease lost or expired before tier publication");
+                        return Err(if batch_had_ambiguous {
+                            BatchWriteError::unconfirmed(err)
+                        } else {
+                            BatchWriteError::settled(err)
+                        });
+                    }
+                    // Always await every started PUT in the tier (join_all,
+                    // never try_join_all) so we never drop an in-flight PUT
+                    // and misclassify an unconfirmed write as settled.
+                    let results =
+                        futures::future::join_all(
+                            tier_items.into_iter().map(|item| {
+                                let gcs_gen = gcs_generations.get(&item.key).copied();
+                                let lease = lease.clone();
+                                async move {
+                                    self.put_batch_item_with_backup(item, gcs_gen, &lease).await
+                                }
+                            }),
+                        )
+                        .await;
+                    let mut first_error: Option<anyhow::Error> = None;
+                    let mut any_unconfirmed = batch_had_ambiguous;
+                    let mut tier_verified = Vec::with_capacity(results.len());
+                    for result in results {
+                        match result {
+                            Ok((receipt, item_ambiguous)) => {
+                                batch_had_ambiguous |= item_ambiguous;
+                                any_unconfirmed |= item_ambiguous;
+                                tier_verified.push(receipt);
+                            }
+                            Err(err) => {
+                                if first_error.is_none() {
+                                    first_error = Some(err.error);
+                                }
+                                any_unconfirmed |= err.unconfirmed;
+                            }
+                        }
+                    }
+                    if let Some(error) = first_error {
+                        return Err(BatchWriteError {
+                            error,
+                            unconfirmed: any_unconfirmed,
+                        });
+                    }
+                    verified.extend(tier_verified);
+                }
+                Ok(verified)
+            })
+            .await;
+
+        match batch_result {
+            Ok(verified) => {
+                if let Some(hb_err) = heartbeat_error {
+                    return Err(hb_err);
+                }
+                claim.acknowledge_write();
+                Ok(verified)
+            }
+            Err(err) => {
+                if let Some(hb_err) = heartbeat_error {
+                    if hb_err.is::<OwnershipLost>() {
+                        return Err(hb_err);
+                    }
+                    return Err(err.error);
+                }
+                if !err.unconfirmed {
+                    claim.reject_write().await?;
+                }
+                Err(err.error)
+            }
+        }
+    }
+
+    async fn put_batch_item_with_backup(
+        &self,
+        item: HlsUploadItem,
+        gcs_generation: Option<i64>,
+        lease: &PublishLease,
+    ) -> std::result::Result<(VerifiedObject, bool), BatchWriteError> {
+        let (mut primary, mut had_ambiguous) = self
+            .put_single_batch_item(
+                &item.key,
+                item.body.clone(),
+                &item.mime,
+                item.custom.clone(),
+                item.cache_control.clone(),
+                if self.is_gcs() { gcs_generation } else { None },
+                lease,
+            )
+            .await?;
+        if let Some(backup) = &self.required_backup {
+            if lease.remaining_after(Duration::ZERO).is_none() {
+                let err = anyhow!("Transcode lease lost or expired before backup publication");
+                return Err(if had_ambiguous {
+                    BatchWriteError::unconfirmed(err)
+                } else {
+                    BatchWriteError::settled(err)
+                });
+            }
+            let (replica, backup_ambiguous) = backup
+                .put_single_batch_item(
+                    &item.key,
+                    item.body,
+                    &item.mime,
+                    item.custom,
+                    item.cache_control,
+                    gcs_generation,
+                    lease,
+                )
+                .await
+                .map_err(|mut err| {
+                    err.error = err.error.context(
+                        "Required GCS backup was not verified; primary must not be acknowledged",
+                    );
+                    err.unconfirmed |= had_ambiguous;
+                    err
+                })?;
+            had_ambiguous |= backup_ambiguous;
+            if replica.sha256 != primary.sha256 {
+                let err = anyhow!("Required GCS backup identity mismatch");
+                return Err(if had_ambiguous {
+                    BatchWriteError::unconfirmed(err)
+                } else {
+                    BatchWriteError::settled(err)
+                });
+            }
+            primary.required_backup = Some(replica.object);
+        }
+        Ok((primary, had_ambiguous))
+    }
+
+    async fn put_single_batch_item(
+        &self,
+        key: &str,
+        body: Bytes,
+        mime: &str,
+        custom: HashMap<String, String>,
+        cache_control: Option<String>,
+        gcs_generation: Option<i64>,
+        lease: &PublishLease,
+    ) -> std::result::Result<(VerifiedObject, bool), BatchWriteError> {
+        let sha256 = hex::encode(Sha256::digest(&body));
+        let mut had_ambiguous_attempt = false;
+        let classify_settled = |had_ambiguous: bool, err: anyhow::Error| {
+            if had_ambiguous {
+                BatchWriteError::unconfirmed(err)
+            } else {
+                BatchWriteError::settled(err)
+            }
+        };
+        let reference = match &self.backend {
+            Backend::Gcs { client, bucket } => {
+                let metadata = Object {
+                    name: key.into(),
+                    content_type: Some(mime.into()),
+                    metadata: Some(custom.clone()),
+                    cache_control: cache_control.clone(),
+                    ..Default::default()
+                };
+                let result = tokio::time::timeout(
+                    CONTROL_TIMEOUT,
+                    client.upload_object(
+                        &UploadObjectRequest {
+                            bucket: bucket.clone(),
+                            if_generation_match: gcs_generation,
+                            ..Default::default()
+                        },
+                        body.clone(),
+                        &UploadType::Multipart(Box::new(metadata)),
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    BatchWriteError::unconfirmed(anyhow!(
+                        "GCS media write deadline; outcome unconfirmed"
+                    ))
+                })?;
+                match result {
+                    Ok(object) => {
+                        from_gcs(bucket, key, object)
+                            .map_err(BatchWriteError::settled)?
+                            .reference
+                    }
+                    Err(error) => {
+                        let rejected = gcs_status(&error).is_some_and(write_rejected);
+                        let err = anyhow!("GCS media write failed");
+                        return Err(if rejected {
+                            BatchWriteError::settled(err)
+                        } else {
+                            BatchWriteError::unconfirmed(err)
+                        });
+                    }
+                }
+            }
+            Backend::B2 { .. } => {
+                let mut attempt = 0usize;
+                let mut timeout = CONTROL_TIMEOUT;
+                let write_id = custom.get(WRITE_ID).map(String::as_str);
+                loop {
+                    let request = self
+                        .build_b2_request(B2Request {
+                            method: Method::PUT,
+                            key,
+                            version: None,
+                            body: body.clone(),
+                            mime: Some(mime),
+                            cache: cache_control.as_deref(),
+                            custom: &custom,
+                        })
+                        .map_err(|err| classify_settled(had_ambiguous_attempt, err))?;
+                    match send_b2_request_classified(request, timeout).await {
+                        Ok(response) => {
+                            let status = response.status();
+                            if status.is_success() {
+                                let (_, bucket) = self.provider_bucket();
+                                let version = required(response.headers(), "x-amz-version-id")
+                                    .map_err(|err| classify_settled(had_ambiguous_attempt, err))?;
+                                break ObjectRef {
+                                    provider: StorageProvider::B2,
+                                    bucket: bucket.into(),
+                                    key: key.into(),
+                                    version: Some(version),
+                                };
+                            }
+                            let code = status.as_u16();
+                            let transient_5xx = b2_transient_status(status);
+                            if transient_5xx {
+                                had_ambiguous_attempt = true;
+                            }
+                            if (transient_5xx || code == 429) && attempt < B2_RETRY_BACKOFFS.len() {
+                                let delay = B2_RETRY_BACKOFFS[attempt];
+                                if lease
+                                    .remaining_after(delay)
+                                    .is_some_and(|rem| rem >= MIN_B2_RETRY_TIMEOUT)
+                                {
+                                    attempt += 1;
+                                    tokio::time::sleep(delay).await;
+                                    // If a 5xx arrived after B2 actually committed
+                                    // this attempt, verify the committed object
+                                    // directly instead of issuing a duplicate PUT.
+                                    if transient_5xx {
+                                        if let Ok(Some(existing)) = self.stat(key).await {
+                                            if write_id.is_some()
+                                                && existing.custom.get(WRITE_ID).map(String::as_str)
+                                                    == write_id
+                                            {
+                                                break existing.reference;
+                                            }
+                                        }
+                                    }
+                                    if let Some(rem) = lease
+                                        .remaining_after(Duration::ZERO)
+                                        .filter(|rem| *rem >= MIN_B2_RETRY_TIMEOUT)
+                                    {
+                                        timeout = rem.min(CONTROL_TIMEOUT);
+                                        crate::hls_claim::count("b2_write_retried");
+                                        continue;
+                                    }
+                                }
+                            }
+                            let err = successful(status).unwrap_err();
+                            return Err(if !had_ambiguous_attempt && write_rejected(code) {
+                                BatchWriteError::settled(err)
+                            } else {
+                                BatchWriteError::unconfirmed(err)
+                            });
+                        }
+                        Err(B2SendError::Connect(err)) => {
+                            // TCP connect failed before any HTTP bytes left the
+                            // client, so this attempt could not have committed.
+                            if attempt < B2_RETRY_BACKOFFS.len() {
+                                let delay = B2_RETRY_BACKOFFS[attempt];
+                                if lease
+                                    .remaining_after(delay)
+                                    .is_some_and(|rem| rem >= MIN_B2_RETRY_TIMEOUT)
+                                {
+                                    attempt += 1;
+                                    tokio::time::sleep(delay).await;
+                                    if let Some(rem) = lease
+                                        .remaining_after(Duration::ZERO)
+                                        .filter(|rem| *rem >= MIN_B2_RETRY_TIMEOUT)
+                                    {
+                                        timeout = rem.min(CONTROL_TIMEOUT);
+                                        crate::hls_claim::count("b2_write_retried");
+                                        continue;
+                                    }
+                                }
+                            }
+                            return Err(classify_settled(had_ambiguous_attempt, err));
+                        }
+                        Err(B2SendError::Transport(err)) => {
+                            had_ambiguous_attempt = true;
+                            if attempt < B2_RETRY_BACKOFFS.len() {
+                                let delay = B2_RETRY_BACKOFFS[attempt];
+                                if lease
+                                    .remaining_after(delay)
+                                    .is_some_and(|rem| rem >= MIN_B2_RETRY_TIMEOUT)
+                                {
+                                    attempt += 1;
+                                    tokio::time::sleep(delay).await;
+                                    if let Ok(Some(existing)) = self.stat(key).await {
+                                        if write_id.is_some()
+                                            && existing.custom.get(WRITE_ID).map(String::as_str)
+                                                == write_id
+                                        {
+                                            break existing.reference;
+                                        }
+                                    }
+                                    if let Some(rem) = lease
+                                        .remaining_after(Duration::ZERO)
+                                        .filter(|rem| *rem >= MIN_B2_RETRY_TIMEOUT)
+                                    {
+                                        timeout = rem.min(CONTROL_TIMEOUT);
+                                        crate::hls_claim::count("b2_write_retried");
+                                        continue;
+                                    }
+                                }
+                            }
+                            return Err(BatchWriteError::unconfirmed(err));
+                        }
+                        Err(B2SendError::Timeout(err)) => {
+                            return Err(BatchWriteError::unconfirmed(err));
+                        }
+                    }
+                }
+            }
+        };
+        // Read-back verification is settled only if no earlier PUT attempt on
+        // this item had an ambiguous outcome.
+        self.validate_reference(&reference)
+            .map_err(|err| classify_settled(had_ambiguous_attempt, err))?;
+        let object = self
+            .stat_reference(&reference)
+            .await
+            .map_err(|err| classify_settled(had_ambiguous_attempt, err))?
+            .ok_or_else(|| {
+                classify_settled(
+                    had_ambiguous_attempt,
+                    anyhow!("Written media version missing"),
+                )
+            })?;
+        if object.reference != reference
+            || object.size != body.len() as u64
+            || object.content_type != mime
+            || object.custom != custom
+            || object.cache_control != cache_control
+        {
+            return Err(classify_settled(
+                had_ambiguous_attempt,
+                anyhow!("Written media metadata verification failed"),
+            ));
+        }
+        self.verify_sha256(&object, &sha256)
+            .await
+            .map_err(|err| classify_settled(had_ambiguous_attempt, err))?;
+        Ok((
+            VerifiedObject {
+                object,
+                sha256,
+                required_backup: None,
+            },
+            had_ambiguous_attempt,
+        ))
+    }
+
+    async fn put_with_backup(
+        &self,
+        key: &str,
+        body: Bytes,
+        mime: &str,
+        custom: HashMap<String, String>,
+        cache_control: Option<String>,
+    ) -> Result<VerifiedObject> {
         let mut primary = self
-            .put_single_verified(
+            .put_single_verified_if_generation(
                 key,
                 body.clone(),
                 mime,
                 custom.clone(),
                 cache_control.clone(),
+                WriteCondition::Unconditional,
             )
             .await?;
         if let Some(backup) = &self.required_backup {
             let replica = backup
-                .put_single_verified(key, body, mime, custom, cache_control)
+                .put_single_verified_if_generation(
+                    key,
+                    body,
+                    mime,
+                    custom,
+                    cache_control,
+                    WriteCondition::Unconditional,
+                )
                 .await
                 .context(
                     "Required GCS backup was not verified; primary must not be acknowledged",
@@ -629,17 +1190,7 @@ impl MediaStorage {
         }
         Ok(primary)
     }
-    async fn put_single_verified(
-        &self,
-        key: &str,
-        body: Bytes,
-        mime: &str,
-        custom: HashMap<String, String>,
-        cache_control: Option<String>,
-    ) -> Result<VerifiedObject> {
-        self.put_single_verified_if_generation(key, body, mime, custom, cache_control, None)
-            .await
-    }
+
     async fn put_single_verified_if_generation(
         &self,
         key: &str,
@@ -647,8 +1198,12 @@ impl MediaStorage {
         mime: &str,
         custom: HashMap<String, String>,
         cache_control: Option<String>,
-        gcs_generation: Option<i64>,
+        condition: WriteCondition,
     ) -> Result<VerifiedObject> {
+        let gcs_generation = match condition {
+            WriteCondition::Unconditional => None,
+            WriteCondition::BackupGeneration(generation) => Some(generation),
+        };
         validate_key(key)?;
         let sha256 = hex::encode(Sha256::digest(&body));
         if is_sha256(key) && key != sha256 {
@@ -663,7 +1218,7 @@ impl MediaStorage {
                     cache_control: cache_control.clone(),
                     ..Default::default()
                 };
-                let object = tokio::time::timeout(
+                let result = tokio::time::timeout(
                     CONTROL_TIMEOUT,
                     client.upload_object(
                         &UploadObjectRequest {
@@ -676,25 +1231,24 @@ impl MediaStorage {
                     ),
                 )
                 .await
-                .context("GCS media write deadline; outcome unconfirmed")?
-                .map_err(|_| anyhow!("GCS media write failed; outcome unconfirmed"))?;
+                .context("GCS media write deadline; outcome unconfirmed")?;
+                let object = result.map_err(|_| anyhow!("GCS media write failed"))?;
                 from_gcs(bucket, key, object)?.reference
             }
             Backend::B2 { .. } => {
                 if gcs_generation.is_some() {
                     bail!("GCS generation precondition requires a GCS backup");
                 }
-                let response = self
-                    .b2_request(B2Request {
-                        method: Method::PUT,
-                        key,
-                        version: None,
-                        body: body.clone(),
-                        mime: Some(mime),
-                        cache: cache_control.as_deref(),
-                        custom: &custom,
-                    })
-                    .await?;
+                let request = self.build_b2_request(B2Request {
+                    method: Method::PUT,
+                    key,
+                    version: None,
+                    body: body.clone(),
+                    mime: Some(mime),
+                    cache: cache_control.as_deref(),
+                    custom: &custom,
+                })?;
+                let response = send_b2_request(request).await?;
                 successful(response.status())?;
                 let (_, bucket) = self.provider_bucket();
                 ObjectRef {
@@ -725,7 +1279,51 @@ impl MediaStorage {
             required_backup: None,
         })
     }
-    async fn b2_request(&self, request: B2Request<'_>) -> Result<reqwest::Response> {
+    async fn b2_read_with_retry(
+        &self,
+        method: Method,
+        key: &str,
+        version: Option<&str>,
+    ) -> Result<reqwest::Response> {
+        let mut attempt = 0usize;
+        loop {
+            let request = self.build_b2_request(B2Request {
+                method: method.clone(),
+                key,
+                version,
+                body: Bytes::new(),
+                mime: None,
+                cache: None,
+                custom: &HashMap::new(),
+            })?;
+            match send_b2_request_classified(request, CONTROL_TIMEOUT).await {
+                Ok(response) => {
+                    if (b2_transient_status(response.status())
+                        || response.status() == StatusCode::TOO_MANY_REQUESTS)
+                        && attempt < B2_RETRY_BACKOFFS.len()
+                    {
+                        let delay = B2_RETRY_BACKOFFS[attempt];
+                        attempt += 1;
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Ok(response);
+                }
+                Err(B2SendError::Connect(err) | B2SendError::Transport(err)) => {
+                    if attempt < B2_RETRY_BACKOFFS.len() {
+                        let delay = B2_RETRY_BACKOFFS[attempt];
+                        attempt += 1;
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(err);
+                }
+                Err(B2SendError::Timeout(err)) => return Err(err),
+            }
+        }
+    }
+
+    fn build_b2_request(&self, request: B2Request<'_>) -> Result<reqwest::RequestBuilder> {
         let B2Request {
             method,
             key,
@@ -836,10 +1434,7 @@ impl MediaStorage {
         for (name, value) in headers {
             request = request.header(name, value);
         }
-        tokio::time::timeout(CONTROL_TIMEOUT, request.body(body).send())
-            .await
-            .context("B2 media headers timed out; write outcome may be unconfirmed")?
-            .map_err(|_| anyhow!("B2 media transport failed; write outcome may be unconfirmed"))
+        Ok(request.body(body))
     }
     #[cfg(test)]
     fn b2_for_test(endpoint: &str, bucket: &str) -> Result<Self> {
@@ -865,6 +1460,47 @@ impl MediaStorage {
         }
         Ok(store)
     }
+}
+
+async fn send_b2_request(request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+    match send_b2_request_classified(request, CONTROL_TIMEOUT).await {
+        Ok(response) => Ok(response),
+        Err(
+            B2SendError::Connect(err) | B2SendError::Transport(err) | B2SendError::Timeout(err),
+        ) => Err(err),
+    }
+}
+
+async fn send_b2_request_classified(
+    request: reqwest::RequestBuilder,
+    timeout: Duration,
+) -> std::result::Result<reqwest::Response, B2SendError> {
+    match tokio::time::timeout(timeout, request.send()).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) if error.is_connect() => Err(B2SendError::Connect(anyhow!(
+            "B2 media connection failed before request dispatch"
+        ))),
+        Ok(Err(_)) => Err(B2SendError::Transport(anyhow!(
+            "B2 media transport failed; write outcome may be unconfirmed"
+        ))),
+        Err(_) => Err(B2SendError::Timeout(anyhow!(
+            "B2 media headers timed out; write outcome may be unconfirmed"
+        ))),
+    }
+}
+
+fn b2_transient_status(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 500 | 502 | 503 | 504)
+}
+
+fn write_rejected(status: u16) -> bool {
+    // Explicit refusal. A transport error, 408, or server error may follow
+    // a committed mutation and must keep the journal in Writing.
+    matches!(status, 400 | 401 | 403 | 404 | 409 | 411 | 412 | 413 | 429)
+}
+
+fn gcs_generation_from_metadata(object: &ObjectMetadata) -> Result<i64> {
+    gcs_generation(object.reference.version.as_deref())?.context("Missing GCS generation")
 }
 
 fn from_gcs(bucket: &str, key: &str, object: Object) -> Result<ObjectMetadata> {

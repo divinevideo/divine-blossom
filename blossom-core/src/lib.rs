@@ -1,10 +1,14 @@
 pub mod b2_cdn;
+pub mod bunny_pilot;
+pub mod bunny_hls;
+pub mod bunny_worker;
 pub mod cache_policy;
 pub mod canary;
 pub mod conditional_update;
 pub mod delete_policy;
 pub mod error;
 pub mod quarantine;
+pub mod kv_origin;
 pub mod rate_limit;
 pub mod read_through;
 pub mod request_diagnostics;

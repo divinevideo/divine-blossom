@@ -1,6 +1,6 @@
 //! Shared no-TTL writer/erasure exclusion. Generations are equality fences.
 use crate::error::{BlossomError, Result};
-use crate::archive_diagnostics::{observe_kv, KvOperation};
+use crate::archive_diagnostics::{note, observe_kv, KvOperation, Reason};
 use fastly::http::{Method, StatusCode};
 use fastly::kv_store::{InsertMode, KVStore, KVStoreError};
 use fastly::{Request, Response};
@@ -86,6 +86,7 @@ fn lookup(store: &KVStore, hash: &str) -> Result<Option<Observed>> {
     };
     let generation = entry.current_generation();
     if generation == 0 {
+        note(Reason::GateGenerationMissing);
         return Err(unavailable());
     }
     let mut body = Vec::new();
@@ -93,8 +94,14 @@ fn lookup(store: &KVStore, hash: &str) -> Result<Option<Observed>> {
         .take_body()
         .take(MAX_BODY + 1)
         .read_to_end(&mut body)
-        .map_err(|_| unavailable())?;
-    let gate = parse(&body).ok_or_else(unavailable)?;
+        .map_err(|_| {
+            note(Reason::GateRecordInvalid);
+            unavailable()
+        })?;
+    let gate = parse(&body).ok_or_else(|| {
+        note(Reason::GateRecordInvalid);
+        unavailable()
+    })?;
     Ok(Some(Observed {
         gate,
         generation: generation.to_string(),
@@ -103,12 +110,15 @@ fn lookup(store: &KVStore, hash: &str) -> Result<Option<Observed>> {
 
 fn insert(store: &KVStore, hash: &str, gate: &Gate, expected: Option<u64>) -> Result<()> {
     let body = serde_json::to_string(gate).map_err(|_| unavailable())?;
-    let builder = store.build_insert();
-    let builder = match expected {
-        Some(generation) => builder.if_generation_match(generation),
-        None => builder.mode(InsertMode::Add),
-    };
-    observe_kv(if expected.is_some() { KvOperation::InsertCas } else { KvOperation::InsertAdd }, builder.execute(&key(hash), body)).map_err(|e| match e {
+    let op = if expected.is_some() { KvOperation::InsertCas } else { KvOperation::InsertAdd };
+    crate::metadata::retry_throttled_write(|| {
+        let builder = store.build_insert();
+        let builder = match expected {
+            Some(generation) => builder.if_generation_match(generation),
+            None => builder.mode(InsertMode::Add),
+        };
+        observe_kv(op, builder.execute(&key(hash), body.clone()))
+    }).map_err(|e| match e {
         KVStoreError::ItemPreconditionFailed => stale(),
         _ => unavailable(),
     })
@@ -389,21 +399,73 @@ pub(crate) fn handle(mut req: Request, op: &str) -> Response {
 /// Policy and provenance are checked by archive_import, never by caller-selected flags.
 pub(crate) fn archive_claim(hash: &str, attempt: &str) -> Result<String> {
     let store = crate::metadata::open_store()?;
-    let expected = match lookup(&store, hash)? {
+    let observed = lookup(&store, hash)?;
+    let expected = match observed {
         Some(Observed {gate: Gate::Copying {attempt_id}, generation}) if attempt_id == attempt => return Ok(generation),
-        Some(Observed {gate: Gate::Released {..}, generation: g}) => Some(generation(&g).ok_or_else(unavailable)?),
+        Some(Observed {gate: Gate::Released {..}, generation: ref g}) => Some(generation(g).ok_or_else(|| {
+            note(Reason::ReleasedGenerationInvalid);
+            unavailable()
+        })?),
         None => None,
-        _ => return Err(stale()),
+        ref other => {
+            if let Some(reason) = hold_reason(other.as_ref(), attempt, None) {
+                note(reason);
+            }
+            return Err(stale());
+        }
     };
     insert(&store, hash, &Gate::Copying {attempt_id: attempt.to_owned()}, expected)?;
-    let current = lookup(&store, hash)?.ok_or_else(unavailable)?;
+    // Our insert succeeded, but edge reads can miss it for a long time; the origin cannot.
+    let current = match lookup(&store, hash)? {
+        Some(observed) => observed,
+        None => lookup_origin(hash)?.ok_or_else(|| {
+            note(Reason::MissingAfterWrite);
+            unavailable()
+        })?,
+    };
     archive_check(hash, attempt, &current.generation)?;
     Ok(current.generation)
 }
 pub(crate) fn archive_check(hash: &str, attempt: &str, expected: &str) -> Result<()> {
-    match lookup(&crate::metadata::open_store()?, hash)? {
-        Some(Observed {gate: Gate::Copying {attempt_id}, generation}) if attempt_id == attempt && generation == expected => Ok(()),
-        _ => Err(stale()),
+    let observed = lookup(&crate::metadata::open_store()?, hash)?;
+    let Some(edge_reason) = hold_reason(observed.as_ref(), attempt, Some(expected)) else {
+        return Ok(());
+    };
+    // A stale edge copy can disagree with a gate this attempt holds; the origin decides.
+    let reason = if crate::kv_origin::enabled() {
+        let origin = lookup_origin(hash)?;
+        match hold_reason(origin.as_ref(), attempt, Some(expected)) {
+            None => return Ok(()),
+            Some(reason) => reason,
+        }
+    } else {
+        edge_reason
+    };
+    note(reason);
+    Err(stale())
+}
+/// The gate as stored at the KV origin; `None` when origin reads are not configured or the gate is absent.
+fn lookup_origin(hash: &str) -> Result<Option<Observed>> {
+    let Some(Some(entry)) = crate::kv_origin::lookup(&key(hash))? else {
+        return Ok(None);
+    };
+    let gate = parse(&entry.body).ok_or_else(|| {
+        note(Reason::GateRecordInvalid);
+        unavailable()
+    })?;
+    Ok(Some(Observed {gate, generation: entry.generation.to_string()}))
+}
+/// Why `attempt` does not hold the gate at `expected` (any generation when `None`).
+/// Returns `None` when it does.
+fn hold_reason(observed: Option<&Observed>, attempt: &str, expected: Option<&str>) -> Option<Reason> {
+    match observed {
+        None => Some(Reason::GateMissing),
+        Some(Observed {gate: Gate::Copying {attempt_id}, generation}) if attempt_id == attempt => {
+            expected.is_some_and(|e| e != generation).then_some(Reason::GenerationChanged)
+        }
+        Some(Observed {gate: Gate::Copying {..}, ..}) => Some(Reason::HeldByOtherAttempt),
+        Some(Observed {gate: Gate::Erasing {}, ..}) => Some(Reason::Erasing),
+        Some(Observed {gate: Gate::Released {..}, ..}) => Some(Reason::Released),
     }
 }
 pub(crate) fn archive_release(hash: &str, attempt: &str, expected: &str) -> Result<()> {
@@ -417,6 +479,165 @@ pub(crate) fn archive_release(hash: &str, attempt: &str, expected: &str) -> Resu
 
 pub(crate) fn archive_owned(hash:&str,attempt:&str)->Result<bool> {
     Ok(matches!(lookup(&crate::metadata::open_store()?,hash)?,Some(Observed{gate:Gate::Copying{attempt_id},..}) if attempt_id==attempt))
+}
+
+/// Use authoritative reads on both sides of the CAS so a cold POP costs
+/// exactly the same backend requests as a warm one.
+pub(crate) fn bunny_claim(hash: &str, attempt: &str) -> Result<String> {
+    claim_observed_bunny_gate(hash, attempt, lookup_bunny_gate(hash)?)
+}
+
+fn claim_observed_bunny_gate(
+    hash: &str,
+    attempt: &str,
+    observed: Option<Observed>,
+) -> Result<String> {
+    let previous = match observed {
+        Some(Observed {
+            gate: Gate::Copying { attempt_id },
+            generation,
+        }) if attempt_id == attempt => return Ok(generation),
+        Some(Observed {
+            gate: Gate::Released { .. },
+            generation: previous,
+        }) => Some(generation(&previous).ok_or_else(unavailable)?),
+        None => None,
+        _ => return Err(stale()),
+    };
+    insert(
+        &crate::metadata::open_store()?,
+        hash,
+        &Gate::Copying {
+            attempt_id: attempt.to_owned(),
+        },
+        previous,
+    )?;
+    let current = lookup_bunny_gate(hash)?.ok_or_else(unavailable)?;
+    if hold_reason(Some(&current), attempt, None).is_some() {
+        return Err(stale());
+    }
+    Ok(current.generation)
+}
+
+/// The generation was read at origin for this exact attempt. A takeover or
+/// erasure changes it, so the conditional write itself fences settlement.
+pub(crate) fn bunny_release(hash: &str, attempt: &str, expected: &str) -> Result<()> {
+    insert(
+        &crate::metadata::open_store()?,
+        hash,
+        &Gate::Released {
+            version: 1,
+            settled_attempt_id: attempt.to_owned(),
+            released_from_generation: expected.to_owned(),
+        },
+        Some(generation(expected).ok_or_else(unavailable)?),
+    )
+}
+
+/// Run a delivery-replica removal with copy exclusion. The permanent erasure
+/// state already excludes every publisher and is never released here.
+pub(crate) fn with_delivery_removal<T>(
+    hash: &str,
+    should_revoke: impl FnOnce() -> Result<bool>,
+    remove: impl FnOnce(bool, &dyn Fn() -> Result<()>) -> Result<T>,
+) -> Result<Option<T>> {
+    let observed = lookup_bunny_gate(hash)?;
+    let attempt = format!("bunny-cleanup-{hash}");
+    let (generation, newly_denied) = match observed {
+        Some(Observed {
+            gate: Gate::Erasing {},
+            ..
+        }) => return remove(false, &|| Ok(())).map(Some),
+        Some(Observed {
+            gate: Gate::Copying { attempt_id },
+            generation,
+        }) if attempt_id == attempt => (generation, false),
+        observed => {
+            let revoke = format!("bunny-revoke-{hash}");
+            let previous = claim_observed_bunny_gate(hash, &revoke, observed)?;
+            match should_revoke() {
+                Ok(true) => {}
+                decision => {
+                    bunny_release(hash, &revoke, &previous)?;
+                    return decision.map(|_| None);
+                }
+            }
+            // Pin the obligation before the first delete. Even an appeal
+            // between paged deletion attempts must finish erasure and eviction.
+            insert(
+                &crate::metadata::open_store()?,
+                hash,
+                &Gate::Copying {
+                    attempt_id: attempt.clone(),
+                },
+                Some(generation(&previous).ok_or_else(unavailable)?),
+            )?;
+            let current = lookup_bunny_gate(hash)?.ok_or_else(unavailable)?;
+            if hold_reason(Some(&current), &attempt, None).is_some() {
+                return Err(stale());
+            }
+            (current.generation, true)
+        }
+    };
+    let result = remove(newly_denied, &|| {
+        check_bunny_gate(hash, &attempt, &generation)
+    })?;
+    bunny_release(hash, &attempt, &generation)?;
+    Ok(Some(result))
+}
+
+fn lookup_bunny_gate(hash: &str) -> Result<Option<Observed>> {
+    // Loopback provider fixtures cannot share the Viceroy runtime's KV state.
+    #[cfg(test)]
+    if crate::storage::config_flag("bunny_fixture_local_gate") {
+        if crate::storage::config_flag("bunny_fixture_meter_gate") {
+            // Meter the production origin GET. The fixture API and Viceroy's
+            // native KV write store are distinct, so read the actual fence locally.
+            crate::kv_origin::lookup(&key(hash))?;
+        }
+        return lookup(&crate::metadata::open_store()?, hash);
+    }
+    if crate::kv_origin::enabled() {
+        lookup_origin(hash)
+    } else {
+        lookup(&crate::metadata::open_store()?, hash)
+    }
+}
+
+pub(crate) fn bunny_settled_generation(hash: &str) -> Result<Option<String>> {
+    Ok(lookup_origin(hash)?.and_then(|observed| match observed.gate {
+        Gate::Released { .. } => Some(observed.generation),
+        _ => None,
+    }))
+}
+
+pub(crate) fn check_bunny_origin_gate(hash: &str, attempt: &str, expected: &str) -> Result<()> {
+    let observed = lookup_origin(hash)?;
+    if hold_reason(observed.as_ref(), attempt, Some(expected)).is_some() {
+        return Err(stale());
+    }
+    Ok(())
+}
+
+pub(crate) fn check_bunny_gate(hash: &str, attempt: &str, expected: &str) -> Result<()> {
+    let observed = lookup_bunny_gate(hash)?;
+    if hold_reason(observed.as_ref(), attempt, Some(expected)).is_some() {
+        return Err(stale());
+    }
+    Ok(())
+}
+
+/// A received PUT acknowledgement settles the writer. If verification or
+/// cleanup then fails, a durable outbox retry can take over the exact gate.
+pub(crate) fn handoff_bunny_cleanup(hash: &str, expected: &str) -> Result<()> {
+    // The KV generation condition itself fences the writer. Recovery must
+    // also work after the failed cleanup spent the backend request budget.
+    let expected = generation(expected).ok_or_else(unavailable)?;
+    crate::b2_cdn_purge::enqueue(hash, crate::b2_cdn_purge::Phase::Single)?;
+    insert(
+        &crate::metadata::open_store()?, hash,
+        &Gate::Copying { attempt_id: format!("bunny-cleanup-{hash}") }, Some(expected),
+    )
 }
 
 /// The PG authority first retires the attempt so a late admission cannot authorize bytes.
@@ -491,6 +712,20 @@ mod tests {
         ] {
             assert!(serde_json::from_value::<Wire>(serde_json::json!({"version":1,"parent":"a".repeat(64),"attempt_id":A,"purpose":"existing_family","expected":expected})).is_err());
         }
+    }
+    #[test]
+    fn archive_hold_reasons_name_the_observed_gate_without_its_values() {
+        use crate::archive_diagnostics::Reason;
+        let observed = |gate: Gate, generation: &str| Observed {gate, generation: generation.into()};
+        let copying = |attempt: &str| Gate::Copying {attempt_id: attempt.into()};
+        assert_eq!(hold_reason(None, A, None), Some(Reason::GateMissing));
+        assert_eq!(hold_reason(Some(&observed(copying(A), "7")), A, None), None);
+        assert_eq!(hold_reason(Some(&observed(copying(A), "7")), A, Some("7")), None);
+        assert_eq!(hold_reason(Some(&observed(copying(A), "8")), A, Some("7")), Some(Reason::GenerationChanged));
+        assert_eq!(hold_reason(Some(&observed(copying(B), "7")), A, Some("7")), Some(Reason::HeldByOtherAttempt));
+        assert_eq!(hold_reason(Some(&observed(Gate::Erasing {}, "7")), A, None), Some(Reason::Erasing));
+        let released = Gate::Released {version: 1, settled_attempt_id: A.into(), released_from_generation: "6".into()};
+        assert_eq!(hold_reason(Some(&observed(released, "7")), A, None), Some(Reason::Released));
     }
     #[test]
     #[ignore = "requires local KV fixture; scripts/run-parent-gate-tests.py"]

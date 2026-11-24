@@ -18,9 +18,14 @@ fn metadata(hash: &str, status: &str, transcode: &str) {
 #[ignore = "requires local synthetic metadata and HLS origin"]
 fn hls_alias_relative_playlist_http_contract() {
     let hash = "a".repeat(64);
-    metadata(&hash, "active", "complete");
+    metadata(&hash, "active", "processing");
     let alias = format!("https://media.example.test/{hash}.hls");
     let initial = response(Request::get(&alias));
+    assert_eq!(response(Request::head(&alias)).get_status(), StatusCode::OK);
+    assert_eq!(
+        get_blob_metadata(&hash).unwrap().unwrap().transcode_status,
+        Some(TranscodeStatus::Processing)
+    );
     let status = initial.get_status();
     assert_eq!(
         initial.get_header_str("Access-Control-Allow-Origin"),
@@ -103,6 +108,59 @@ fn hls_alias_relative_playlist_http_contract() {
 
 #[test]
 #[ignore = "requires local synthetic metadata and HLS origin"]
+fn hls_alias_cached_playlist_provenance_http_contract() {
+    // The harness asserts storage served each playlist once, so every repeat
+    // below is a POP Simple Cache hit and must keep the storage provenance.
+    let hash = "d".repeat(64);
+    let source = "e".repeat(64);
+    metadata(&hash, "active", "complete");
+    // A body-only entry in the current namespace is unreadable: it must be
+    // served from storage and replaced, never served without provenance.
+    simple_cache::get_or_set(
+        hls_cache::key(&format!("{hash}/hls/stream_480p.m3u8")),
+        &b"#EXTM3U\nstale-body-only-entry\n"[..],
+        HLS_CACHE_TTL,
+    )
+    .unwrap();
+    let alias = format!("https://media.example.test/{hash}.hls");
+    let canonical = format!("https://media.example.test/{hash}/hls/master.m3u8");
+    let variant = format!("https://media.example.test/{hash}/hls/stream_480p.m3u8");
+    let master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100\nstream_480p.m3u8\n";
+    let alias_master =
+        format!("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100\n/{hash}/hls/stream_480p.m3u8\n");
+    let variant_body = "#EXTM3U\n#EXTINF:4,\nsegment_0.ts\n#EXT-X-ENDLIST\n";
+    let mut admin = Request::get(&alias);
+    admin.set_header("Authorization", "Bearer synthetic-admin-token");
+    for (label, request, body) in [
+        ("master miss", Request::get(&alias), alias_master.as_str()),
+        ("master hit", Request::get(&alias), &alias_master),
+        ("canonical master hit", Request::get(&canonical), master),
+        ("admin master hit", admin, &alias_master),
+        (
+            "variant unreadable entry",
+            Request::get(&variant),
+            variant_body,
+        ),
+        ("variant hit", Request::get(&variant), variant_body),
+    ] {
+        let mut response = response(request);
+        assert_eq!(response.get_status(), StatusCode::OK, "{label}");
+        assert_eq!(response.take_body_str(), body, "{label}");
+        assert_eq!(
+            response.get_header_str("X-C2PA-Manifest-Id"),
+            Some("synthetic-manifest"),
+            "{label}"
+        );
+        assert_eq!(
+            response.get_header_str("X-Source-Sha256"),
+            Some(source.as_str()),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires local synthetic metadata and HLS origin"]
 fn hls_alias_url_bound_viewer_http_contract() {
     use base64::Engine;
     use k256::schnorr::{signature::hazmat::PrehashSigner, SigningKey};
@@ -159,5 +217,71 @@ fn hls_alias_url_bound_viewer_http_contract() {
         assert!(response
             .take_body_str()
             .contains(&format!("/{hash}/hls/stream_480p.m3u8")));
+    }
+}
+
+#[test]
+#[ignore = "requires local synthetic metadata, HLS origin and queue admission"]
+fn hls_alias_failed_admission_keeps_playback_retryable() {
+    let hash = "f".repeat(64);
+    metadata(&hash, "active", "pending");
+    let alias = format!("https://media.example.test/{hash}.hls");
+    let failed = response(Request::get(&alias));
+    assert_eq!(failed.get_status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(failed.get_header_str("Retry-After"), Some("5"));
+    assert_eq!(
+        get_blob_metadata(&hash).unwrap().unwrap().transcode_status,
+        Some(TranscodeStatus::Pending)
+    );
+    let admitted = response(Request::get(&alias));
+    assert_eq!(admitted.get_status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        get_blob_metadata(&hash).unwrap().unwrap().transcode_status,
+        Some(TranscodeStatus::Processing)
+    );
+    // Expiring the POP-local guard must not create another queued delivery.
+    simple_cache::purge(format!("hls-admitted:v1:{hash}")).unwrap();
+    assert_eq!(
+        response(Request::get(&alias)).get_status(),
+        StatusCode::ACCEPTED
+    );
+
+    if crate::request_bindings::config("hetzner_transcode_admission")
+        .unwrap()
+        .as_deref()
+        == Some("true")
+    {
+        let _scope = crate::request_bindings::begin();
+        for key in ["admin_token", "gcs_access_key", "gcs_secret_key", "fixture_a", "fixture_b"] {
+            assert!(crate::request_bindings::secret(key).unwrap().is_some());
+        }
+        // The request already spent all five secret lookups; legacy intake
+        // should remain available without reading or forwarding another secret.
+        assert!(queue_transcode(&"e".repeat(64), &"b".repeat(64)).unwrap());
+    }
+
+    // A terminal callback that beats admission must retain its newer state.
+    let before = get_blob_metadata(&hash).unwrap().unwrap();
+    crate::metadata::update_transcode_status(&hash, TranscodeStatus::Complete).unwrap();
+    crate::metadata::mark_transcode_admitted(&before).unwrap();
+    assert_eq!(
+        get_blob_metadata(&hash).unwrap().unwrap().transcode_status,
+        Some(TranscodeStatus::Complete)
+    );
+}
+
+#[test]
+#[ignore = "requires local synthetic metadata and HLS origin"]
+fn hls_alias_copy_only_missing_mp4_uses_original_fallback() {
+    let hash = "9".repeat(64);
+    metadata(&hash, "active", "complete");
+    let url = format!("https://media.example.test/{hash}/480p.mp4");
+    for req in [Request::get(&url), Request::head(&url),
+        Request::get(format!("https://media.example.test/admin/api/blob/{hash}/480p.mp4"))
+            .with_header("Authorization", "Bearer synthetic-admin-token")] {
+        let resp = response(req);
+        assert_eq!(resp.get_status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(resp.get_header_str("Cache-Control").unwrap().contains("no-store"));
+        assert!(resp.get_header_str("Retry-After").is_none());
     }
 }

@@ -1,0 +1,53 @@
+# ABOUTME: Docker Compose stack for an off-GCP divine-transcoder worker (Vultr / Hetzner US)
+# ABOUTME: Runs Caddy TLS termination in front of divine-transcoder with tmpfs scratch space
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      TRANSCODER_DOMAIN: ${TRANSCODER_DOMAIN:?Set TRANSCODER_DOMAIN, e.g. transcoder-worker.divine.video}
+      TRANSCODE_ADMISSION_AUTH_REQUIRED: ${TRANSCODE_ADMISSION_AUTH_REQUIRED-false}
+      TRANSCODE_ADMISSION_SECRET: ${TRANSCODE_ADMISSION_SECRET-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      transcoder:
+        condition: service_healthy
+
+  transcoder:
+    image: ${TRANSCODER_IMAGE:?Set TRANSCODER_IMAGE, e.g. gcr.io/rich-compiler-479518-d2/divine-transcoder:cpu-<sha>}
+    restart: unless-stopped
+    stop_grace_period: 120s
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - .env
+    environment:
+      PORT: "8080"
+      USE_GPU: "false"
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gcp-sa.json
+      MEDIA_STORAGE_PROVIDER: ${MEDIA_STORAGE_PROVIDER:-b2_primary}
+      MEDIA_GCS_BACKUP_ENABLED: ${MEDIA_GCS_BACKUP_ENABLED:-false}
+      TRANSCODE_WRITES_PAUSED: ${TRANSCODE_WRITES_PAUSED:-false}
+      TRANSCODE_ADMISSION_AUTH_REQUIRED: ${TRANSCODE_ADMISSION_AUTH_REQUIRED-false}
+    volumes:
+      - ${GCP_SA_KEY_PATH:-/etc/divine-transcoder/gcp-sa.json}:/run/secrets/gcp-sa.json:ro
+    tmpfs:
+      - /tmp:size=8G,mode=1777
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  caddy_data:
+  caddy_config:

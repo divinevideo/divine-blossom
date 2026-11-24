@@ -70,6 +70,7 @@ VICEROY="$VICEROY" python3 scripts/run-subtitle-translation-tests.py
 # Verify private origin selection, signed requests, and bounded migration fallback.
 VICEROY="$VICEROY" python3 scripts/run-media-origin-tests.py
 VICEROY="$VICEROY" python3 scripts/run-hls-alias-tests.py
+VICEROY="$VICEROY" python3 scripts/run-media-processing-policy-tests.py
 
 # Canary policy/readiness runs before every uncached pinned-version read.
 VICEROY="$VICEROY" python3 scripts/run-b2-canary-tests.py
@@ -84,6 +85,9 @@ VICEROY="$VICEROY" python3 scripts/run-private-family-erasure-tests.py
 VICEROY="$VICEROY" python3 scripts/run-b2-cdn-purge-outbox-tests.py
 VICEROY="$VICEROY" python3 scripts/run-parent-gate-tests.py
 VICEROY="$VICEROY" python3 scripts/run-b2-cdn-phase-tests.py
+VICEROY="$VICEROY" python3 scripts/run-bunny-pilot-revocation-tests.py
+VICEROY="$VICEROY" python3 scripts/run-bunny-delivery-invalidation-tests.py
+VICEROY="$VICEROY" python3 scripts/run-bunny-pilot-publication-tests.py
 for contract in \
   quarantine_cdn_purge_failure_remains_denied_and_idempotently_retries \
   moderation_cdn_purge_failure_is_durable_and_same_status_retry_purges \
@@ -136,3 +140,6 @@ VICEROY="$VICEROY" python3 scripts/run-b2-canonical-demand-tests.py
 
 # Trusted archive imports register without media readback and share erasure exclusion.
 VICEROY="$VICEROY" python3 scripts/run-archive-import-tests.py
+
+# Metered Bunny edge purge contracts against loopback backends.
+VICEROY="$VICEROY" python3 scripts/run-bunny-edge-purge-tests.py

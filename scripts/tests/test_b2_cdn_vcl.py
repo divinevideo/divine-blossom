@@ -121,6 +121,37 @@ class B2CdnVclContractTests(unittest.TestCase):
         deliver = (ROOT / "vcl/deliver.vcl").read_text()
         self.assertIn('unset resp.http.X-Playback-Load-Id;', deliver)
 
+    def test_source_provider_label_is_internal_on_every_client_host(self):
+        deliver = (ROOT / "vcl/deliver.vcl").read_text()
+        # Execute the actual simple guard predicates enclosing this unset. This
+        # checks host/hop behavior, not a retyped policy or the Fastly runtime.
+        guards = [condition for condition, body in re.findall(
+            r'if\s*\(([^{}]+?)\)\s*\{([^{}]*)\}', deliver
+        ) if 'unset resp.http.X-Divine-Source;' in body]
+        self.assertTrue(guards)
+
+        def matches(condition, host, visits):
+            values = []
+            for term in condition.split("&&"):
+                term = term.strip()
+                if term == "fastly.ff.visits_this_service == 0":
+                    values.append(visits == 0)
+                else:
+                    host_match = re.fullmatch(r'req[.]http[.]Host ~ "([^"]+)"', term)
+                    self.assertIsNotNone(host_match, f"unsupported source guard: {term}")
+                    values.append(re.search(host_match[1], host) is not None)
+            return all(values)
+
+        for host in ["media.divine.video", "media-b2.divine.video",
+                     "media-b2-cdn.divine.video", "MEDIA.DIVINE.VIDEO:443",
+                     "synthetic.invalid"]:
+            for visits in [0, 1, 2]:
+                for fill_label in ["gcs", "b2", "unknown"]:
+                    with self.subTest(host=host, visits=visits, fill_label=fill_label):
+                        stripped = any(matches(guard, host, visits) for guard in guards)
+                        delivered = None if stripped else fill_label
+                        self.assertEqual(delivered, None if visits == 0 else fill_label)
+
     def test_admission_marker_crosses_shield_but_cached_request_ids_do_not_escape(self):
         deliver = (ROOT / "vcl/deliver.vcl").read_text()
         self.assertIn("# B2 client delivery", deliver)
@@ -129,7 +160,6 @@ class B2CdnVclContractTests(unittest.TestCase):
         self.assertIn('unset resp.http.X-Divine-B2-CDN-Admission;', block)
         self.assertIn('unset resp.http.X-Playback-Request-Id;', block)
         self.assertIn('set resp.http.X-Request-Id = req.http.X-Divine-Edge-Request-Id;', block)
-        self.assertIn('unset resp.http.X-Divine-Source;', block)
         self.assertIn('unset resp.http.X-Divine-Storage-Cache;', block)
 
 
