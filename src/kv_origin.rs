@@ -25,6 +25,11 @@ fn settings() -> Result<Option<Settings>> {
     else {
         return Ok(None);
     };
+    if !crate::request_bindings::can_read_secret(TOKEN_SECRET) {
+        return Err(BlossomError::MetadataError(
+            "KV origin read token budget unavailable".into(),
+        ));
+    }
     let Some(token) = crate::request_bindings::secret(TOKEN_SECRET)?
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())

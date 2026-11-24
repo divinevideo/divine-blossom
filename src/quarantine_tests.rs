@@ -1025,9 +1025,7 @@ fn bunny_delivery_policy_purge_and_durable_retry() {
         return;
     }
 
-    if mode == "vanish-kv-origin-5-secret-budget"
-        || mode == "vanish-cold-pop-rollback-5-secret-budget"
-    {
+    if mode == "vanish-cold-pop-pilot-rollback-blocks-completion" {
         let hash = hash();
         let metadata = serde_json::from_value(serde_json::json!({
             "sha256": hash,
@@ -1039,10 +1037,46 @@ fn bunny_delivery_policy_purge_and_durable_retry() {
         }))
         .unwrap();
         put_blob_metadata(&metadata).unwrap();
-        // Physical creator delete with kv_origin + bunny_delivery_zones (both
-        // active and cold-POP rollback where only KV origin retains zones) must
-        // stay within the 5-secret Compute limit without failing the physical
-        // wave, then complete after bounded Phase::Final drain.
+        // Cold-POP Bunny pilot rollback (`bunny-pilot-retained-hosts:v1` only
+        // at KV origin, `b2_replica_enabled=false`): physical creator delete
+        // must stay <= 5 secrets and record `Physical::Failed` (never
+        // `Physical::Absent`) so canonical B2 copies cannot be left behind.
+        let mut delete_req = request(Method::POST, "/admin/api/moderate", true);
+        delete_req.set_body(serde_json::json!({"sha256": hash, "action": "DELETE"}).to_string());
+        let delete_resp = crate::request_bindings::metered(delete_req);
+        assert_eq!(delete_resp.get_status(), StatusCode::CONFLICT);
+        assert!(
+            !b2_cdn_phase::physical_absent(&hash).unwrap(),
+            "cold-POP pilot rollback with b2_replica_enabled=false must not record Physical::Absent"
+        );
+        assert!(!storage::vanish_complete(&hash));
+        return;
+    }
+
+    if mode == "vanish-kv-origin-5-secret-budget"
+        || mode == "vanish-cold-pop-rollback-5-secret-budget"
+        || mode == "vanish-already-deleted-5-secret-budget"
+    {
+        let hash = hash();
+        let initial_status = if mode == "vanish-already-deleted-5-secret-budget" {
+            "deleted"
+        } else {
+            "active"
+        };
+        let metadata = serde_json::from_value(serde_json::json!({
+            "sha256": hash,
+            "size": 9,
+            "type": "video/mp4",
+            "uploaded": "2026-01-01T00:00:00Z",
+            "owner": "b".repeat(64),
+            "status": initial_status
+        }))
+        .unwrap();
+        put_blob_metadata(&metadata).unwrap();
+        // Physical creator delete with kv_origin + bunny_delivery_zones (active,
+        // already-deleted retry, and cold-POP rollback where only KV origin
+        // retains zones) must stay within the 5-secret Compute limit without
+        // failing the physical wave, then complete after bounded Phase::Final drain.
         let mut delete_req = request(Method::POST, "/admin/api/moderate", true);
         delete_req.set_body(serde_json::json!({"sha256": hash, "action": "DELETE"}).to_string());
         let delete_resp = crate::request_bindings::metered(delete_req);

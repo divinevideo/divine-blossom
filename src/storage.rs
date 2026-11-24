@@ -2642,11 +2642,6 @@ pub(crate) fn retain_bunny_delivery_zones() -> Result<()> {
                 false,
             )
         } else {
-            if !crate::request_bindings::can_read_secret("kv_origin_read_token") {
-                return Err(BlossomError::MetadataError(
-                    "Bunny delivery target record unavailable".into(),
-                ));
-            }
             lookup_origin_retained_bunny_delivery_with_generation(&store, attempt == 1)?
         };
         if let Some((existing, generation)) = current {
@@ -3524,13 +3519,11 @@ fn purge_vanish_hashes(hashes: &[String], result: &mut VanishStorageResult) -> H
     // When durable CDN invalidation is active, phased vanish and creator
     // physical delete block completion until the dedicated `Phase::Final` drain
     // executes two checked Fastly + Bunny purge rounds in a fresh 5-secret
-    // Compute budget. If the wave already spent all 5 secrets (for example,
-    // reading `kv_origin_read_token` on a cold-POP rollback or zone rotation
-    // alongside admin, webhook, and FOS keys), defer Fastly eviction to
-    // `Phase::Final` instead of failing the physical wave.
-    if cdn_invalidation_configured()
-        && !crate::request_bindings::can_read_secret("fastly_api_token")
-    {
+    // Compute budget. Deferring the inline Fastly purge here (matching
+    // `purge_bunny_hashes`) keeps physical waves within Fastly's 5-secret and
+    // 32-backend-request limits even when `kv_origin_read_token` is needed for
+    // cold-POP rollback/rotation checks or `b2_replica_required_for_cdn`.
+    if cdn_invalidation_configured() {
         return purged;
     }
 
@@ -3753,14 +3746,8 @@ pub(crate) fn vanish_needs_physical(hash: &str) -> Result<bool> {
 }
 
 fn b2_replica_required_for_cdn() -> bool {
-    // Check config and local KV only (zero secret reads) so 5-secret physical
-    // erasure waves never spend a 6th secret on `kv_origin_read_token`. Even if
-    // a cold POP misses a retired pilot record here, `Phase::Final` drain runs
-    // in a fresh budget, reads KV origin, and deletes any enrolled pilot B2
-    // copies + purges pilot hosts before acknowledging completion.
     crate::b2_cdn_purge::fastly_configured().unwrap_or(true)
-        || bunny_pilot_config_present().unwrap_or(true)
-        || retained_bunny_pilot_hosts().map_or(true, |hosts| hosts.is_some())
+        || bunny_pilot_configured().unwrap_or(true)
 }
 
 /// Record the wave's outcome for the exact attempt and queue the blocking final

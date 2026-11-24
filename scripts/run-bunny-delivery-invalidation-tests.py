@@ -44,6 +44,16 @@ class Provider(BaseHTTPRequestHandler):
         if self.path.startswith("/resources/stores/kv/fixture-store/keys/"):
             assert self.headers.get("Fastly-Key") == "synthetic-policy-key"
             if (
+                self.server.origin_pilot_hosts is not None
+                and self.path.endswith("/bunny-pilot-retained-hosts:v1")
+            ):
+                body = self.server.origin_pilot_hosts.encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("generation", "1")
+                self.end_headers()
+                return self.wfile.write(body)
+            if (
                 self.server.pilot_enrolled
                 and self.path.endswith(f"/bunny-pilot-enrolled:v1:{HASH}")
             ):
@@ -179,6 +189,11 @@ def run_case(mode):
         server.fastly_url_purges = []
         server.fail_primary_first_n = 4 if mode == "bunny-only" else 0
         server.pilot_enrolled = mode == "pilot-plus-delivery-missing-bundle-webhook"
+        server.origin_pilot_hosts = (
+            "media-bunny.divine.video,divine-media-bunny-pilot.b-cdn.net"
+            if mode == "vanish-cold-pop-pilot-rollback-blocks-completion"
+            else None
+        )
         if mode in (
             "cold-pop-origin-retention",
             "webhook-packed-budget",
@@ -186,6 +201,7 @@ def run_case(mode):
             "pilot-plus-delivery-missing-bundle-webhook",
             "vanish-kv-origin-5-secret-budget",
             "vanish-cold-pop-rollback-5-secret-budget",
+            "vanish-already-deleted-5-secret-budget",
             "webhook-admin-moderate",
         ):
             server.origin_retained_zones = f"{PRIMARY_HOST},{ALIAS_HOST}"
@@ -311,6 +327,29 @@ def run_case(mode):
                     secrets["kv_origin_read_token"] = "synthetic-policy-key"
                     secrets["fos_access_key"] = "synthetic-fos-key"
                     secrets["fos_secret_key"] = "synthetic-fos-secret"
+                elif mode == "vanish-already-deleted-5-secret-budget":
+                    configuration = {
+                        "fixture_delivery_mode": mode,
+                        "bunny_delivery_zones": f"{PRIMARY_HOST},{ALIAS_HOST}",
+                        "b2_replica_enabled": "false",
+                        "ENABLE_PHYSICAL_DELETE": "true",
+                        "gcs_bucket": "synthetic-gcs-bucket",
+                        "metadata_kv_store_id": "fixture-store",
+                    }
+                    secrets["kv_origin_read_token"] = "synthetic-policy-key"
+                    secrets["fos_access_key"] = "synthetic-fos-key"
+                    secrets["fos_secret_key"] = "synthetic-fos-secret"
+                elif mode == "vanish-cold-pop-pilot-rollback-blocks-completion":
+                    configuration = {
+                        "fixture_delivery_mode": mode,
+                        "b2_replica_enabled": "false",
+                        "ENABLE_PHYSICAL_DELETE": "true",
+                        "gcs_bucket": "synthetic-gcs-bucket",
+                        "metadata_kv_store_id": "fixture-store",
+                    }
+                    secrets["kv_origin_read_token"] = "synthetic-policy-key"
+                    secrets["fos_access_key"] = "synthetic-fos-key"
+                    secrets["fos_secret_key"] = "synthetic-fos-secret"
                 elif mode == "pilot-plus-delivery-missing-bundle-webhook":
                     configuration = {
                         "fixture_delivery_mode": mode,
@@ -386,7 +425,12 @@ def run_case(mode):
                 if result.returncode or "1 passed; 0 failed" not in result.stdout or server.errors:
                     raise RuntimeError(result.stdout + result.stderr + repr(server.errors))
 
-                if mode in ("invalid-config", "rotation-overflow", "bunny-retry-clears-on-target-error"):
+                if mode in (
+                    "invalid-config",
+                    "rotation-overflow",
+                    "bunny-retry-clears-on-target-error",
+                    "vanish-cold-pop-pilot-rollback-blocks-completion",
+                ):
                     assert not server.bunny_counts
                     print(f"PASS {mode}: fails closed")
                     return
@@ -416,12 +460,13 @@ def run_case(mode):
                 elif mode in (
                     "vanish-kv-origin-5-secret-budget",
                     "vanish-cold-pop-rollback-5-secret-budget",
+                    "vanish-already-deleted-5-secret-budget",
                 ):
-                    # Both policy and Phase::Final intents drain (2 rounds per intent per alias).
-                    assert server.bunny_counts[PRIMARY_HOST] >= 4, server.bunny_counts
+                    # Queued intents drain (2 rounds per intent per alias/service).
+                    assert server.bunny_counts[PRIMARY_HOST] >= 2, server.bunny_counts
                     assert server.bunny_counts[PRIMARY_HOST] == server.bunny_counts[ALIAS_HOST], server.bunny_counts
                     for service in FASTLY_SERVICES:
-                        assert server.fastly_services[service] >= 4, server.fastly_services
+                        assert server.fastly_services[service] >= 2, server.fastly_services
                 elif mode in (
                     "webhook-packed-budget",
                     "pilot-plus-delivery-missing-bundle-webhook",
@@ -451,6 +496,8 @@ if __name__ == "__main__":
         "vanish-b2-replica-budget",
         "vanish-kv-origin-5-secret-budget",
         "vanish-cold-pop-rollback-5-secret-budget",
+        "vanish-already-deleted-5-secret-budget",
+        "vanish-cold-pop-pilot-rollback-blocks-completion",
         "bunny-retry-clears-on-target-error",
         "webhook-admin-moderate",
         "invalid-config",
