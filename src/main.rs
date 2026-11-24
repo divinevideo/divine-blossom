@@ -3313,6 +3313,65 @@ const TRANSCODER_BACKEND: &str = "cloud_run_transcoder";
 const HETZNER_TRANSCODE_ADMISSION_HOST: &str = "transcoder-worker.divine.video";
 const HETZNER_TRANSCODE_ADMISSION_BACKEND: &str = "hetzner_transcode_admission";
 
+/// Secret-store key for the token divine-upload-server can require on
+/// `/thumbnail/<hash>` (divine-upload-server#52). Blossom has already decided
+/// who may see the thumbnail when it makes this call; the token tells the
+/// upload server the call came from Blossom rather than from someone who only
+/// knows a video's hash.
+const THUMBNAIL_SERVICE_TOKEN_SECRET: &str = "thumbnail_service_token";
+/// Header the upload server reads the token from.
+const THUMBNAIL_SERVICE_TOKEN_HEADER: &str = "X-Divine-Thumbnail-Token";
+
+/// The thumbnail service token, or `None` when it isn't configured yet (the
+/// upload server then serves the call as it always has, until Platform turns
+/// on `THUMBNAIL_TOKEN_REQUIRED`) or when storage reads on this request have
+/// already spent the Compute secret budget.
+fn thumbnail_service_token() -> Option<String> {
+    if !crate::request_bindings::can_read_secret(THUMBNAIL_SERVICE_TOKEN_SECRET) {
+        eprintln!("[THUMB] Secret budget exhausted; calling the upload service without its token");
+        return None;
+    }
+    match crate::request_bindings::secret(THUMBNAIL_SERVICE_TOKEN_SECRET) {
+        Ok(token) => token
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty()),
+        Err(_) => {
+            eprintln!(
+                "[THUMB] Secret store unavailable; calling the upload service without its token"
+            );
+            None
+        }
+    }
+}
+
+/// Request to the upload service for one video's thumbnail. Built fresh
+/// rather than forwarded, so no viewer header reaches the upload service.
+fn upload_thumbnail_request(hash: &str, service_token: Option<&str>) -> Request {
+    let url = format!(
+        "https://{}/thumbnail/{}",
+        UPLOAD_SERVICE_THUMBNAIL_HOST, hash
+    );
+    let mut req = Request::new(Method::GET, &url);
+    req.set_header("Host", UPLOAD_SERVICE_THUMBNAIL_HOST);
+    if let Some(token) = service_token
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .and_then(|token| token.parse::<fastly::http::HeaderValue>().ok())
+    {
+        req.set_header(THUMBNAIL_SERVICE_TOKEN_HEADER, token);
+    }
+    req
+}
+
+/// The upload service marks token-guarded thumbnails `private, no-store` and
+/// varies them on the token header for caches in front of its own host. Those
+/// describe that hop only: Blossom applies its own cache policy after its
+/// access check, and must not pass a Vary on a header viewers never send.
+fn strip_upload_cache_headers(resp: &mut Response) {
+    resp.remove_header("Cache-Control");
+    resp.remove_header("Vary");
+}
+
 /// Generate thumbnail on-demand by proxying to Cloud Run
 fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
     if crate::storage::is_local_mode() {
@@ -3350,20 +3409,17 @@ fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
         return Ok(resp);
     }
 
-    let url = format!(
-        "https://{}/thumbnail/{}",
-        UPLOAD_SERVICE_THUMBNAIL_HOST, hash
-    );
+    let proxy_req = upload_thumbnail_request(hash, thumbnail_service_token().as_deref());
 
-    let mut proxy_req = Request::new(Method::GET, &url);
-    proxy_req.set_header("Host", UPLOAD_SERVICE_THUMBNAIL_HOST);
-
-    let resp = proxy_req.send(UPLOAD_SERVICE_BACKEND).map_err(|e| {
+    let mut resp = proxy_req.send(UPLOAD_SERVICE_BACKEND).map_err(|e| {
         BlossomError::StorageError(format!("Cloud Run thumbnail request failed: {}", e))
     })?;
 
     match resp.get_status() {
-        StatusCode::OK => Ok(resp),
+        StatusCode::OK => {
+            strip_upload_cache_headers(&mut resp);
+            Ok(resp)
+        }
         StatusCode::NOT_FOUND => Err(BlossomError::NotFound(
             "Video not found for thumbnail generation".into(),
         )),
@@ -7952,6 +8008,62 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::{HashSet, VecDeque};
     use std::time::Duration;
+
+    // divine-upload-server#52: the upload server can require Blossom's
+    // service token on /thumbnail/<hash>.
+    #[test]
+    fn upload_thumbnail_request_sends_no_service_token_without_one() {
+        let req = super::upload_thumbnail_request(&"a".repeat(64), None);
+        assert_eq!(
+            req.get_url_str(),
+            format!("https://upload.divine.video/thumbnail/{}", "a".repeat(64))
+        );
+        assert_eq!(req.get_header_str("Host"), Some("upload.divine.video"));
+        assert!(req
+            .get_header(super::THUMBNAIL_SERVICE_TOKEN_HEADER)
+            .is_none());
+    }
+
+    #[test]
+    fn upload_thumbnail_request_sends_the_trimmed_service_token() {
+        let req = super::upload_thumbnail_request(&"a".repeat(64), Some("  svc-token \n"));
+        assert_eq!(
+            req.get_header_str(super::THUMBNAIL_SERVICE_TOKEN_HEADER),
+            Some("svc-token")
+        );
+    }
+
+    #[test]
+    fn upload_thumbnail_request_ignores_a_blank_or_invalid_token() {
+        for token in ["", "   ", "bad\u{7f}token"] {
+            let req = super::upload_thumbnail_request(&"a".repeat(64), Some(token));
+            assert!(
+                req.get_header(super::THUMBNAIL_SERVICE_TOKEN_HEADER)
+                    .is_none(),
+                "{token:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn thumbnail_service_token_is_absent_until_the_secret_exists() {
+        // The test manifest has no blossom_secrets store, like a deploy that
+        // ships before Platform adds thumbnail_service_token.
+        let _scope = crate::request_bindings::begin();
+        assert_eq!(super::thumbnail_service_token(), None);
+    }
+
+    #[test]
+    fn upload_thumbnail_cache_headers_do_not_reach_blossom_responses() {
+        let mut resp = Response::from_status(StatusCode::OK);
+        resp.set_header("Content-Type", "image/jpeg");
+        resp.set_header("Cache-Control", "private, no-store");
+        resp.set_header("Vary", "x-divine-thumbnail-token");
+        super::strip_upload_cache_headers(&mut resp);
+        assert!(resp.get_header("Cache-Control").is_none());
+        assert!(resp.get_header("Vary").is_none());
+        assert_eq!(resp.get_header_str("Content-Type"), Some("image/jpeg"));
+    }
 
     struct TestVanishRequestOps {
         calls: RefCell<Vec<&'static str>>,
