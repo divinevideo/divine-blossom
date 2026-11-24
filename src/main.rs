@@ -5589,7 +5589,7 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         let physical_plan = plan_vanish_physical(
             &erase_hashes,
             &wave_epochs,
-            crate::storage::cdn_invalidation_configured(),
+            !wave_epochs.is_empty() || crate::storage::cdn_invalidation_configured(),
             |hash| vanish_needs_physical(hash),
         );
         // Held: no durable epoch or unreadable phase. Never erase without a
@@ -5609,7 +5609,17 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         for hash in &physical_plan.skipped {
             phase_blocked.insert(hash.to_lowercase());
         }
-        let physical_hashes = physical_plan.run;
+        let (physical_hashes, budget_deferred) =
+            if crate::storage::has_vanish_physical_secret_budget() {
+                (physical_plan.run, Vec::new())
+            } else {
+                (Vec::new(), physical_plan.run)
+            };
+        for hash in &budget_deferred {
+            retry_hashes.push(hash.clone());
+            deferred_pending = deferred_pending.saturating_add(1);
+            phase_blocked.insert(hash.to_lowercase());
+        }
         let storage_result = if physical_hashes.is_empty() {
             crate::storage::VanishStorageResult::default()
         } else {

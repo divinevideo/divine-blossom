@@ -3722,14 +3722,46 @@ pub(crate) fn plan_vanish_physical_with(
     (plan.run, plan.held)
 }
 
+/// Whether a local phased-erasure record is already open for `hash` OR CDN
+/// invalidation is configured. Checking the local phase key first avoids
+/// re-spending a `kv_origin_read_token` secret slot on physical-erasure retries
+/// after Attempt 1 has opened the phase.
+pub(crate) fn phase_or_cdn_invalidation_active(hash: &str) -> bool {
+    crate::b2_cdn_phase::epoch(hash).map_or(true, |epoch| epoch.is_some())
+        || cdn_invalidation_configured()
+}
+
+/// Whether the current Compute request still has enough of its 5-secret budget
+/// to run `erase_vanish_batch` without breaching Fastly's secret limit.
+pub(crate) fn has_vanish_physical_secret_budget() -> bool {
+    if is_local_mode() {
+        return true;
+    }
+    if b2_replica_enabled() {
+        crate::request_bindings::has_secret_budget(&[
+            "fos_access_key",
+            "fos_secret_key",
+            "b2_vanish_application_key_id",
+            "b2_vanish_application_key",
+            "webhook_secret",
+        ])
+    } else {
+        crate::request_bindings::has_secret_budget(&[
+            "fos_access_key",
+            "fos_secret_key",
+            "webhook_secret",
+        ])
+    }
+}
+
 /// Persist the deny/erasing gate and open a phased physical attempt for a hash
 /// the caller is about to erase. Must run before the physical wave so a warm
 /// outer entry is invalidated even if the wave is interrupted.
 ///
-/// Gated only on CDN invalidation configuration. Returns the attempt's epoch,
-/// or `None` when CDN invalidation is not configured.
+/// Gated only on CDN invalidation configuration (or an already-open phase).
+/// Returns the attempt's epoch, or `None` when CDN invalidation is not configured.
 pub(crate) fn begin_vanish_phase(hash: &str) -> Result<Option<String>> {
-    if !cdn_invalidation_configured() {
+    if !phase_or_cdn_invalidation_active(hash) {
         return Ok(None);
     }
     crate::metadata::claim_b2_erasure(hash)?;
@@ -3762,7 +3794,7 @@ pub(crate) fn finish_vanish_phase(
     failed: &HashSet<String>,
     remaining: &HashSet<String>,
 ) -> Result<bool> {
-    if !cdn_invalidation_configured() {
+    if !phase_or_cdn_invalidation_active(hash) {
         return Ok(false);
     }
     let replica_satisfied = b2_replica_enabled() || !b2_replica_required_for_cdn();

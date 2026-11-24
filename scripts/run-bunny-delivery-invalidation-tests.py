@@ -2,6 +2,7 @@
 """Exercise Bunny delivery zone policy purging, partial-alias failure, retention, and secret budgets."""
 
 from collections import Counter
+import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -21,6 +22,9 @@ ALIAS_HOST = "divine-media-cdn.b-cdn.net"
 OLD_PRIMARY_HOST = "old.divine.video"
 OLD_ALIAS_HOST = "old-cdn.b-cdn.net"
 FASTLY_SERVICES = {"ML7R82HKfmTaqTpHExIDVN", "pOvEEWykEbpnylqst1KTrR"}
+B2_HOST = "api.backblazeb2.com"
+B2_BUCKET = "private-media-fixture"
+B2_BUCKET_ID = "synthetic-bucket-id"
 TEST = "quarantine_tests::bunny_delivery_policy_purge_and_durable_retry"
 
 
@@ -69,6 +73,25 @@ class Provider(BaseHTTPRequestHandler):
                 self.end_headers()
                 return self.wfile.write(body)
             return self.reply(404, {})
+        if self.path == "/b2api/v4/b2_authorize_account":
+            assert self.headers.get("Host") == B2_HOST
+            assert self.headers.get("Authorization", "").startswith("Basic ")
+            return self.reply(
+                200,
+                {
+                    "authorizationToken": "synthetic-b2-token",
+                    "apiInfo": {
+                        "storageApi": {
+                            "apiUrl": f"https://{B2_HOST}",
+                            "allowed": {
+                                "buckets": [{"id": B2_BUCKET_ID, "name": B2_BUCKET}],
+                                "capabilities": ["listFiles", "deleteFiles"],
+                                "namePrefix": None,
+                            },
+                        }
+                    },
+                },
+            )
         return self.reply(404, {})
 
     def do_POST(self):
@@ -79,6 +102,10 @@ class Provider(BaseHTTPRequestHandler):
                 self.server.meter.append([raw.decode(), 0])
             return self.reply(200, {})
         parsed = urlsplit(self.path)
+        if parsed.path == "/b2api/v4/b2_list_file_versions":
+            assert self.headers.get("Host") == B2_HOST
+            assert self.headers.get("Authorization") == "synthetic-b2-token"
+            return self.reply(200, {"files": [], "nextFileName": None, "nextFileId": None})
         if parsed.query == "delete":
             xml = f"<DeleteResult><Deleted><Key>{HASH}</Key></Deleted></DeleteResult>".encode()
             self.send_response(200)
@@ -154,7 +181,17 @@ class Provider(BaseHTTPRequestHandler):
 
 
 def manifest(port, kv, settings, secrets):
-    backends = ("bunny_api", "fastly_api", "kv-origin-api", "fos_storage", "cloud_run_upload", "fixture_control")
+    native_b2 = "b2-api-" + hashlib.sha256(B2_HOST.encode()).hexdigest()[:16]
+    backends = (
+        "bunny_api",
+        "fastly_api",
+        "kv-origin-api",
+        "fos_storage",
+        "cloud_run_upload",
+        "b2_api",
+        native_b2,
+        "fixture_control",
+    )
     backend_sections = "\n".join(
         f'[local_server.backends."{name}"]\nurl = "http://127.0.0.1:{port}"'
         for name in backends
@@ -202,6 +239,7 @@ def run_case(mode):
             "vanish-kv-origin-5-secret-budget",
             "vanish-cold-pop-rollback-5-secret-budget",
             "vanish-already-deleted-5-secret-budget",
+            "vanish-b2-replica-cold-pop-rollback",
             "webhook-admin-moderate",
         ):
             server.origin_retained_zones = f"{PRIMARY_HOST},{ALIAS_HOST}"
@@ -339,6 +377,21 @@ def run_case(mode):
                     secrets["kv_origin_read_token"] = "synthetic-policy-key"
                     secrets["fos_access_key"] = "synthetic-fos-key"
                     secrets["fos_secret_key"] = "synthetic-fos-secret"
+                elif mode == "vanish-b2-replica-cold-pop-rollback":
+                    configuration = {
+                        "fixture_delivery_mode": mode,
+                        "b2_replica_enabled": "true",
+                        "b2_bucket_id": B2_BUCKET_ID,
+                        "b2_media_bucket": B2_BUCKET,
+                        "ENABLE_PHYSICAL_DELETE": "true",
+                        "gcs_bucket": "synthetic-gcs-bucket",
+                        "metadata_kv_store_id": "fixture-store",
+                    }
+                    secrets["kv_origin_read_token"] = "synthetic-policy-key"
+                    secrets["fos_access_key"] = "synthetic-fos-key"
+                    secrets["fos_secret_key"] = "synthetic-fos-secret"
+                    secrets["b2_vanish_application_key_id"] = "synthetic-b2-id"
+                    secrets["b2_vanish_application_key"] = "synthetic-b2-key"
                 elif mode == "vanish-cold-pop-pilot-rollback-blocks-completion":
                     configuration = {
                         "fixture_delivery_mode": mode,
@@ -425,6 +478,7 @@ def run_case(mode):
                 if result.returncode or "1 passed; 0 failed" not in result.stdout or server.errors:
                     raise RuntimeError(result.stdout + result.stderr + repr(server.errors))
 
+                assert max(n for _, n in server.meter) <= 32, server.meter
                 if mode in (
                     "invalid-config",
                     "rotation-overflow",
@@ -434,8 +488,6 @@ def run_case(mode):
                     assert not server.bunny_counts
                     print(f"PASS {mode}: fails closed")
                     return
-
-                assert max(n for _, n in server.meter) <= 32, server.meter
                 if mode == "bunny-only":
                     # 3 executions (moderate + 2 drains) * 2 rounds = 6 purges per alias.
                     assert server.bunny_counts == {PRIMARY_HOST: 6, ALIAS_HOST: 6}, server.bunny_counts
@@ -461,6 +513,7 @@ def run_case(mode):
                     "vanish-kv-origin-5-secret-budget",
                     "vanish-cold-pop-rollback-5-secret-budget",
                     "vanish-already-deleted-5-secret-budget",
+                    "vanish-b2-replica-cold-pop-rollback",
                 ):
                     # Queued intents drain (2 rounds per intent per alias/service).
                     assert server.bunny_counts[PRIMARY_HOST] >= 2, server.bunny_counts
@@ -497,6 +550,7 @@ if __name__ == "__main__":
         "vanish-kv-origin-5-secret-budget",
         "vanish-cold-pop-rollback-5-secret-budget",
         "vanish-already-deleted-5-secret-budget",
+        "vanish-b2-replica-cold-pop-rollback",
         "vanish-cold-pop-pilot-rollback-blocks-completion",
         "bunny-retry-clears-on-target-error",
         "webhook-admin-moderate",

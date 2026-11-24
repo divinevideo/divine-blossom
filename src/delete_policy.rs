@@ -255,7 +255,7 @@ pub fn handle_creator_delete(
     physical_delete_enabled: bool,
     req_id: &str,
 ) -> Result<CreatorDeleteOutcome> {
-    if physical_delete_enabled && crate::storage::cdn_invalidation_configured() {
+    if physical_delete_enabled && crate::storage::phase_or_cdn_invalidation_active(hash) {
         return handle_phased_creator_delete(hash, metadata, reason);
     }
     handle_creator_delete_with_ops(
@@ -303,7 +303,12 @@ fn handle_phased_creator_delete(
             physical.push(candidate.clone());
         }
     }
-    if !physical.is_empty() {
+    // Only execute the physical storage wave when this request still has room
+    // in Fastly's 5-secret Compute budget. If Attempt 1 spent a slot on
+    // `kv_origin_read_token` (e.g. cold-POP rollback or zone-rotation CAS),
+    // return retryable 409 Conflict with the phase opened and metadata denied
+    // so Attempt 2 executes `erase_vanish_batch` with the full 5-secret budget.
+    if !physical.is_empty() && crate::storage::has_vanish_physical_secret_budget() {
         let result = crate::storage::erase_vanish_batch(&physical);
         for candidate in &physical {
             crate::storage::finish_vanish_phase(
