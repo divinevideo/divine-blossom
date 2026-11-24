@@ -341,6 +341,15 @@ class OffGcpUploadConfigTest(unittest.TestCase):
                     self.assertEqual(status, 404, f"Expected 404 for {method} {path}")
                     self.assertEqual(recorded, [], f"Blocked route {method} {path} hit upstream")
 
+                # Positive control: worker vhost matches transcoder-worker.example.test
+                # and forwards /health to the transcoder upstream.
+                recorded.clear()
+                self.assertEqual(
+                    send("transcoder-worker.example.test", "GET", "/health"),
+                    200,
+                )
+                self.assertEqual(recorded, [("transcoder", "GET", "/health")])
+
                 # Worker vhost intentionally returns 404 for /transcribe/audio, proving
                 # why upload's TRANSCRIBER_URL must not fall back to transcoder-worker.
                 recorded.clear()

@@ -1,10 +1,12 @@
-# Copy to conf.d/upload-candidate.caddy (replacing {$UPLOAD_DOMAIN} with your
-# candidate hostname, e.g. upload-hetzner.divine.video) during staging. Before
-# DNS cutover, add conf.d/upload.caddy for {$UPLOAD_DOMAIN} (upload.divine.video)
-# with pre-provisioned TLS and keep conf.d/upload-candidate.caddy active until
-# in-flight sessions issued on the candidate hostname have drained.
-# Never leave conf.d/upload.caddy referencing {$UPLOAD_DOMAIN} while UPLOAD_DOMAIN
-# is unset/empty, or Caddy will fail to start.
+# Template for co-located divine-upload-server site blocks under conf.d/:
+# - Staging: copy to conf.d/upload-candidate.caddy and replace {$UPLOAD_DOMAIN}
+#   with the literal candidate hostname (e.g. upload-hetzner.divine.video).
+# - Production cutover: copy to conf.d/upload.caddy with literal
+#   upload.divine.video (or set UPLOAD_DOMAIN=upload.divine.video in .env right
+#   before adding conf.d/upload.caddy), pre-stage a publicly trusted cert, and
+#   keep conf.d/upload-candidate.caddy active until candidate sessions drain.
+# Never leave a conf.d/*.caddy file referencing {$UPLOAD_DOMAIN} while
+# UPLOAD_DOMAIN is unset/empty, or Caddy will fail to start.
 {$UPLOAD_DOMAIN} {
 	# Public surface parity with GKE HTTPRoute for callers on UPLOAD_SERVICE_HOST:
 	# - /transcribe enforces BUD-11 Nostr auth in divine-upload-server before
