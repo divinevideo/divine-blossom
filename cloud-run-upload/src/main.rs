@@ -1580,8 +1580,8 @@ async fn download_best_available_media_bytes(
 /// `spawn_blocking` alone would let a cold-feed burst launch one per request
 /// up to the blocking pool's size; this bound keeps such a burst from
 /// exhausting the instance's CPU and memory while queued requests wait.
-const MAX_CONCURRENT_THUMBNAIL_EXTRACTIONS: usize = 4;
-const THUMBNAIL_EXTRACTION_WAIT: Duration = Duration::from_secs(10);
+const MAX_CONCURRENT_THUMBNAIL_EXTRACTIONS: usize = 8;
+const THUMBNAIL_EXTRACTION_WAIT: Duration = Duration::from_secs(12);
 const THUMBNAIL_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 static THUMBNAIL_EXTRACTION_SLOTS: LazyLock<Semaphore> =
@@ -1834,7 +1834,11 @@ async fn clear_thumbnail_generation_failure(hash: &str) {
 fn thumbnail_generation_busy_response() -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        [(header::CONTENT_TYPE, "application/json")],
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::RETRY_AFTER, "5"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
         Json(ErrorResponse {
             error: "Thumbnail generation is busy".to_string(),
         })
@@ -2744,12 +2748,15 @@ fn validate_auth(headers: &axum::http::HeaderMap, required_action: &str) -> Resu
         return Err(anyhow!("Authorization must start with 'Nostr '"));
     }
 
-    // Decode base64 event
-    let event_json = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        &auth_header[6..],
-    )
-    .map_err(|e| anyhow!("Invalid base64: {}", e))?;
+    use base64::{
+        engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+        Engine,
+    };
+    let encoded_event = &auth_header[6..];
+    let event_json = URL_SAFE_NO_PAD
+        .decode(encoded_event)
+        .or_else(|_| STANDARD.decode(encoded_event))
+        .map_err(|e| anyhow!("Invalid base64: {}", e))?;
 
     let event: NostrEvent =
         serde_json::from_slice(&event_json).map_err(|e| anyhow!("Invalid event JSON: {}", e))?;
@@ -3345,3 +3352,27 @@ fn decode_nsec(nsec: &str) -> Result<[u8; 32]> {
 
 #[cfg(test)]
 mod upload_policy_tests;
+
+#[cfg(test)]
+mod thumbnail_busy_tests {
+    use super::*;
+
+    #[test]
+    fn busy_response_is_503_with_retry_after_and_no_store() {
+        let resp = thumbnail_generation_busy_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("5")
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        assert_eq!(MAX_CONCURRENT_THUMBNAIL_EXTRACTIONS, 8);
+    }
+}

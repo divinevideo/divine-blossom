@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 /// Blob descriptor returned by the server (BUD-02)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,9 +17,9 @@ pub struct BlobDescriptor {
     /// MIME type (optional)
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
-    /// Upload timestamp (ISO 8601)
+    /// Upload timestamp in Unix seconds (BUD-02)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub uploaded: Option<String>,
+    pub uploaded: Option<u64>,
     /// Thumbnail URL for videos (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumbnail: Option<String>,
@@ -426,12 +427,31 @@ impl BlobMetadata {
             None
         };
 
+        let extension = match self.mime_type.split(';').next().unwrap_or_default().trim() {
+            "video/mp4" => "mp4",
+            "video/quicktime" => "mov",
+            "video/webm" => "webm",
+            "audio/mpeg" => "mp3",
+            "audio/mp4" => "m4a",
+            "audio/wav" => "wav",
+            "audio/ogg" => "ogg",
+            // The .jpg route resolves a generated video thumbnail.
+            "image/jpeg" => "jpeg",
+            "image/png" => "png",
+            "image/webp" => "webp",
+            "image/gif" => "gif",
+            "application/pdf" => "pdf",
+            _ => "bin",
+        };
+        let uploaded = OffsetDateTime::parse(&self.uploaded, &Rfc3339)
+            .ok()
+            .and_then(|timestamp| timestamp.unix_timestamp().try_into().ok());
         BlobDescriptor {
-            url: format!("{}/{}", base_url, self.sha256),
+            url: format!("{}/{}.{}", base_url, self.sha256, extension),
             sha256: self.sha256.clone(),
             size: self.size,
             mime_type: Some(self.mime_type.clone()),
-            uploaded: Some(self.uploaded.clone()),
+            uploaded,
             thumbnail: self.thumbnail.clone(),
             hls,
             dim: self.dim.clone(),
@@ -999,6 +1019,23 @@ mod tests {
         meta.transcode_status = Some(TranscodeStatus::Complete);
         let desc = meta.to_descriptor(base);
         assert_eq!(desc.hls, Some(format!("{}/{}.hls", base, meta.sha256)));
+    }
+
+    #[test]
+    fn descriptor_has_a_unix_timestamp_and_original_blob_url() {
+        let base = "https://media.test";
+        for (mime, suffix) in [
+            ("video/mp4", ".mp4"),
+            ("image/jpeg", ".jpeg"),
+            ("custom/type", ".bin"),
+        ] {
+            let meta = test_metadata(mime);
+            let wire = serde_json::to_value(meta.to_descriptor(base)).unwrap();
+            assert_eq!(wire["uploaded"], 1_767_225_600_u64);
+            let url = wire["url"].as_str().unwrap();
+            assert_eq!(url, format!("{base}/{}{suffix}", meta.sha256));
+            assert_eq!(parse_hash_from_path(url.strip_prefix(base).unwrap()), Some(meta.sha256));
+        }
     }
 
     #[test]

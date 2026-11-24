@@ -315,7 +315,8 @@ fn route_request(req: Request) -> Result<Response> {
         // BUD-02: Upload
         (Method::PUT, "/upload") => with_upload_log(req, UploadRoute::DirectPut, handle_upload),
         // BUD-06: Upload requirements/pre-validation
-        (Method::HEAD, "/upload") => handle_upload_requirements(req),
+        // Some CDNs satisfy HEAD from a GET to the origin.
+        (Method::HEAD | Method::GET, "/upload") => handle_upload_requirements(req),
         // Synchronous audio transcription — thin forward to the upload service's
         // authenticated /transcribe proxy (which calls the transcoder).
         (Method::POST, "/transcribe") => handle_transcribe_proxy(req),
@@ -436,6 +437,9 @@ fn route_request(req: Request) -> Result<Response> {
         }
 
         // CORS preflight
+        (Method::OPTIONS, "/upload") => {
+            Ok(cors_preflight_response().with_header(header::ALLOW, "GET, HEAD, PUT, OPTIONS"))
+        }
         (Method::OPTIONS, _) => Ok(cors_preflight_response()),
 
         // Not found
@@ -3306,6 +3310,8 @@ const CLOUD_RUN_TRANSCODER_HOST: &str = "divine-transcoder-149672065768.us-centr
 /// /transcode, /backfill-fmp4, /transcribe silently misroute to the upload
 /// service and 404, leaving videos stuck in `Processing` forever.
 const TRANSCODER_BACKEND: &str = "cloud_run_transcoder";
+const HETZNER_TRANSCODE_ADMISSION_HOST: &str = "transcoder-worker.divine.video";
+const HETZNER_TRANSCODE_ADMISSION_BACKEND: &str = "hetzner_transcode_admission";
 
 /// Generate thumbnail on-demand by proxying to Cloud Run
 fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
@@ -3366,9 +3372,19 @@ fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
                 "Thumbnail cannot be generated for this video".into(),
             ))
         }
-        StatusCode::SERVICE_UNAVAILABLE => Err(BlossomError::StorageError(
-            "Thumbnail generation is busy".into(),
-        )),
+        StatusCode::SERVICE_UNAVAILABLE => {
+            let retry_after = resp
+                .get_header(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| valid_upload_retry_after(value))
+                .map(str::to_owned)
+                .or_else(|| Some("5".into()));
+            Err(BlossomError::ServiceUnavailable {
+                message: "Thumbnail generation is busy".into(),
+                retry_after,
+            })
+        }
         status => Err(BlossomError::StorageError(format!(
             "Thumbnail generation failed with status: {}",
             status
@@ -3476,7 +3492,7 @@ fn trigger_on_demand_transcoding(hash: &str, owner: &str) -> Result<()> {
     }
     if !queue_transcode(hash, owner)? {
         // Support edge-first rollout and rollback when the admission route is absent.
-        transcode_dispatch_request("/transcode", hash, owner)
+        transcode_dispatch_request(CLOUD_RUN_TRANSCODER_HOST, "/transcode", hash, owner)
             .send_async(TRANSCODER_BACKEND)
             .map_err(|_| transcode_admission_unavailable())?;
     }
@@ -3485,12 +3501,9 @@ fn trigger_on_demand_transcoding(hash: &str, owner: &str) -> Result<()> {
     Ok(())
 }
 
-fn transcode_dispatch_request(path: &str, hash: &str, owner: &str) -> Request {
-    let mut request = Request::new(
-        Method::POST,
-        format!("https://{CLOUD_RUN_TRANSCODER_HOST}{path}"),
-    );
-    request.set_header("Host", CLOUD_RUN_TRANSCODER_HOST);
+fn transcode_dispatch_request(host: &str, path: &str, hash: &str, owner: &str) -> Request {
+    let mut request = Request::new(Method::POST, format!("https://{host}{path}"));
+    request.set_header("Host", host);
     request.set_header("Content-Type", "application/json");
     request.set_body(serde_json::json!({"hash":hash,"owner":owner}).to_string());
     request
@@ -3506,12 +3519,41 @@ fn transcode_admission_unavailable() -> BlossomError {
 /// `Ok(true)` requires durable admission. `Ok(false)` identifies a legacy
 /// transcoder that does not implement the queue-only route.
 fn queue_transcode(hash: &str, owner: &str) -> Result<bool> {
-    let response = transcode_dispatch_request("/transcode/queue", hash, owner)
-        .send(TRANSCODER_BACKEND)
+    const ADMISSION_SECRET: &str = "transcode_admission_secret";
+    let hetzner_enabled = match crate::request_bindings::config("hetzner_transcode_admission")
+        .map_err(|_| transcode_admission_unavailable())?
+        .as_deref()
+    {
+        Some("true") => true,
+        Some("false") | None => false,
+        _ => return Err(transcode_admission_unavailable()),
+    };
+    // Storage fallbacks and admin auth can spend all Fastly secret reads.
+    // Select Cloud Run before dispatch on those requests.
+    let use_hetzner = hetzner_enabled && crate::request_bindings::can_read_secret(ADMISSION_SECRET);
+    let (host, backend) = if use_hetzner {
+        (
+            HETZNER_TRANSCODE_ADMISSION_HOST,
+            HETZNER_TRANSCODE_ADMISSION_BACKEND,
+        )
+    } else {
+        (CLOUD_RUN_TRANSCODER_HOST, TRANSCODER_BACKEND)
+    };
+    let mut request = transcode_dispatch_request(host, "/transcode/queue", hash, owner);
+    if use_hetzner {
+        let credential = crate::storage::get_secret(ADMISSION_SECRET)
+            .ok()
+            .filter(|secret| !secret.trim().is_empty())
+            .and_then(|secret| secret.trim().parse::<fastly::http::HeaderValue>().ok())
+            .ok_or_else(transcode_admission_unavailable)?;
+        request.set_header("x-divine-transcode-admission", credential);
+    }
+    let response = request
+        .send(backend)
         .map_err(|_| transcode_admission_unavailable())?;
     match response.get_status() {
         StatusCode::ACCEPTED => Ok(true),
-        StatusCode::NOT_FOUND => Ok(false),
+        StatusCode::NOT_FOUND if !use_hetzner => Ok(false),
         _ => Err(transcode_admission_unavailable()),
     }
 }
@@ -3826,7 +3868,9 @@ fn handle_upload(mut req: Request, record: &mut UploadLogRecord) -> Result<Respo
                 metadata.transcript_status,
             );
             let descriptor = metadata.to_descriptor(&base_url);
-            return Ok(json_response(StatusCode::OK, &descriptor));
+            let mut resp = json_response(StatusCode::OK, &descriptor);
+            add_cors_headers(&mut resp);
+            return Ok(resp);
         }
     }
 
@@ -3922,7 +3966,7 @@ fn handle_upload(mut req: Request, record: &mut UploadLogRecord) -> Result<Respo
 
     // Return blob descriptor
     let descriptor = metadata.to_descriptor(&base_url);
-    let mut resp = json_response(StatusCode::OK, &descriptor);
+    let mut resp = json_response(StatusCode::CREATED, &descriptor);
     add_cors_headers(&mut resp);
 
     Ok(resp)
@@ -4145,7 +4189,14 @@ fn publish_upload_service_upload(
     upload: UploadServicePublishedUpload,
     encoding_requested: bool,
 ) -> Result<Response> {
-    publish_upload_service_upload_with_policy(auth, base_url, upload, false, encoding_requested)
+    publish_upload_service_upload_with_policy(
+        auth,
+        base_url,
+        upload,
+        false,
+        encoding_requested,
+        StatusCode::OK,
+    )
 }
 
 fn publish_upload_service_upload_with_policy(
@@ -4154,6 +4205,7 @@ fn publish_upload_service_upload_with_policy(
     upload: UploadServicePublishedUpload,
     preserve_inline_dedupe: bool,
     encoding_requested: bool,
+    new_blob_status: StatusCode,
 ) -> Result<Response> {
     let hash = upload.sha256;
     let size = upload.size;
@@ -4373,7 +4425,7 @@ fn publish_upload_service_upload_with_policy(
     );
 
     let descriptor = metadata.to_descriptor(&base_url);
-    let mut resp = json_response(StatusCode::OK, &descriptor);
+    let mut resp = json_response(new_blob_status, &descriptor);
     add_cors_headers(&mut resp);
 
     Ok(resp)
@@ -4741,7 +4793,14 @@ fn handle_upload_service_proxy(
             "Upload service returned a different content hash".into(),
         ));
     }
-    publish_upload_service_upload_with_policy(auth, base_url, upload, expected_hash.is_some(), encoding_requested)
+    publish_upload_service_upload_with_policy(
+        auth,
+        base_url,
+        upload,
+        expected_hash.is_some(),
+        encoding_requested,
+        StatusCode::CREATED,
+    )
 }
 
 /// HEAD /upload - BUD-06 upload pre-validation
@@ -4777,17 +4836,10 @@ fn handle_upload_requirements(req: Request) -> Result<Response> {
                 add_cors_headers(&mut resp);
                 return Ok(resp);
             }
-
-            // Check if blob already exists (optimization - client can skip upload)
-            if blob_exists(hash)? {
-                let mut resp = Response::from_status(StatusCode::OK);
-                resp.set_header("X-Reason", "Blob already exists");
-                resp.set_header("X-Exists", "true");
-                add_upload_capability_headers(&mut resp, &control_host);
-                add_cors_headers(&mut resp);
-                return Ok(resp);
-            }
         }
+
+        // Preflight validates the request only. Clients check whether the blob
+        // exists with HEAD /<sha256>, which enforces visibility and holds.
 
         // Validate content length
         if let Some(size) = content_length {
@@ -7203,320 +7255,7 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
 
 /// GET / - Landing page
 fn handle_landing_page() -> Response {
-    let html = r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Divine Blossom Server</title>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-            line-height: 1.6;
-            color: #333;
-            background: #f8fafc;
-        }
-        .container {
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 2rem;
-        }
-        header {
-            text-align: center;
-            margin-bottom: 3rem;
-            padding: 2rem 0;
-        }
-        h1 {
-            font-size: 2.5rem;
-            color: #1a202c;
-            margin-bottom: 0.5rem;
-        }
-        .badge {
-            display: inline-block;
-            padding: 0.25rem 0.75rem;
-            border-radius: 9999px;
-            font-size: 0.75rem;
-            font-weight: 600;
-            text-transform: uppercase;
-            margin-left: 0.5rem;
-        }
-        .badge-beta { background: #c6f6d5; color: #276749; }
-        .badge-fastly { background: #fed7d7; color: #c53030; }
-        .tagline {
-            color: #718096;
-            font-size: 1.1rem;
-            margin-top: 1rem;
-        }
-        section {
-            background: white;
-            border-radius: 12px;
-            padding: 1.5rem;
-            margin-bottom: 1.5rem;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        }
-        h2 {
-            font-size: 1.25rem;
-            color: #2d3748;
-            margin-bottom: 1rem;
-            padding-bottom: 0.5rem;
-            border-bottom: 2px solid #e2e8f0;
-        }
-        .endpoint {
-            display: flex;
-            align-items: flex-start;
-            padding: 0.75rem 0;
-            border-bottom: 1px solid #edf2f7;
-        }
-        .endpoint:last-child { border-bottom: none; }
-        .method {
-            display: inline-block;
-            padding: 0.25rem 0.5rem;
-            border-radius: 4px;
-            font-size: 0.75rem;
-            font-weight: 700;
-            font-family: monospace;
-            min-width: 60px;
-            text-align: center;
-            margin-right: 1rem;
-        }
-        .method-get { background: #c6f6d5; color: #276749; }
-        .method-head { background: #bee3f8; color: #2b6cb0; }
-        .method-put { background: #feebc8; color: #c05621; }
-        .method-delete { background: #fed7d7; color: #c53030; }
-        .endpoint-info { flex: 1; }
-        .endpoint-path {
-            font-family: monospace;
-            font-weight: 600;
-            color: #5a67d8;
-        }
-        .endpoint-desc {
-            color: #718096;
-            font-size: 0.9rem;
-            margin-top: 0.25rem;
-        }
-        .features {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 1rem;
-        }
-        .feature {
-            padding: 1rem;
-            background: #f7fafc;
-            border-radius: 8px;
-        }
-        .feature h3 {
-            font-size: 0.9rem;
-            color: #4a5568;
-            margin-bottom: 0.5rem;
-        }
-        .feature p {
-            font-size: 0.85rem;
-            color: #718096;
-        }
-        footer {
-            text-align: center;
-            padding: 2rem 0;
-            color: #a0aec0;
-            font-size: 0.875rem;
-        }
-        footer a {
-            color: #5a67d8;
-            text-decoration: none;
-        }
-        footer a:hover { text-decoration: underline; }
-        code {
-            background: #edf2f7;
-            padding: 0.125rem 0.375rem;
-            border-radius: 4px;
-            font-size: 0.875rem;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <header>
-            <h1>Divine Blossom Server <span class="badge badge-beta">BETA</span><span class="badge badge-fastly">FASTLY</span></h1>
-            <p class="tagline">Content-addressable blob storage implementing the Blossom protocol with AI-powered moderation, HLS, and transcript generation</p>
-        </header>
-
-        <section>
-            <h2>API Endpoints</h2>
-            <div class="endpoint">
-                <span class="method method-get">GET</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/&lt;sha256&gt;[.ext]</span>
-                    <p class="endpoint-desc">Retrieve a blob by its SHA-256 hash. Supports optional file extension and range requests. Use <code>.jpg</code> extension to get video thumbnails. <em>(BUD-01)</em></p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-get">GET</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/&lt;sha256&gt;.hls</span>
-                    <p class="endpoint-desc">Get HLS master manifest for adaptive streaming. Automatically triggers on-demand transcoding for videos that haven't been transcoded yet. Returns <code>202 Accepted</code> with <code>Retry-After</code> header while transcoding is in progress.</p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-get">GET</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/&lt;sha256&gt;/hls/master.m3u8</span>
-                    <p class="endpoint-desc">Alternative HLS manifest URL for player compatibility. Same behavior as the <code>.hls</code> endpoint above.</p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-get">GET</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/&lt;sha256&gt;/720p</span>
-                    <p class="endpoint-desc">Direct download of the 720p H.264 transcoded variant (2.5 Mbps). Triggers transcoding on-demand if not yet available.</p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-get">GET</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/&lt;sha256&gt;/480p</span>
-                    <p class="endpoint-desc">Direct download of the 480p H.264 transcoded variant (1 Mbps). Triggers transcoding on-demand if not yet available.</p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-get">GET</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/&lt;sha256&gt;.vtt</span>
-                    <p class="endpoint-desc">Stable WebVTT URL for audio/video transcripts. Automatically triggers on-demand transcription if it has not been generated yet.</p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-get">GET</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/&lt;sha256&gt;/VTT</span>
-                    <p class="endpoint-desc">Alias for transcript retrieval, compatible with legacy clients.</p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-put">POST</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/v1/subtitles/jobs</span>
-                    <p class="endpoint-desc">Create or reuse a subtitle job by hash. Request body: <code>video_sha256</code>, optional <code>lang</code>, optional <code>force</code>.</p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-get">GET</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/v1/subtitles/jobs/&lt;job_id&gt;</span>
-                    <p class="endpoint-desc">Get subtitle job status: <code>queued</code>, <code>processing</code>, <code>ready</code>, or <code>failed</code>.</p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-get">GET</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/v1/subtitles/by-hash/&lt;sha256&gt;</span>
-                    <p class="endpoint-desc">Idempotent lookup for the current subtitle job by media hash.</p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-head">HEAD</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/&lt;sha256&gt;[.ext]</span>
-                    <p class="endpoint-desc">Check if a blob exists and get its metadata. <em>(BUD-01)</em></p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-put">PUT</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/upload</span>
-                    <p class="endpoint-desc">Upload a new blob. Requires Nostr authentication (kind 24242 event). Video uploads automatically generate a thumbnail. <em>(BUD-02)</em></p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-head">HEAD</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/upload</span>
-                    <p class="endpoint-desc">Pre-validate upload with X-SHA-256, X-Content-Length, X-Content-Type headers. <em>(BUD-06)</em></p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-get">GET</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/list/&lt;pubkey&gt;</span>
-                    <p class="endpoint-desc">List all blobs uploaded by a public key. <em>(BUD-02)</em></p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-delete">DELETE</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/&lt;sha256&gt;</span>
-                    <p class="endpoint-desc">Soft-delete a blob you own so it stops serving publicly while remaining recoverable. Non-owner refs only unlink themselves. Requires Nostr authentication. <em>(BUD-02)</em></p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-delete">DELETE</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/vanish</span>
-                    <p class="endpoint-desc">GDPR Right to Erasure. Deletes all blobs and data for the authenticated user. Requires Nostr authentication.</p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-put">PUT</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/report</span>
-                    <p class="endpoint-desc">Report problematic content using NIP-56 events (kind 1984). <em>(BUD-09)</em></p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-put">PUT</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/mirror</span>
-                    <p class="endpoint-desc">Mirror a blob from a remote URL. Requires Nostr authentication. <em>(BUD-04)</em></p>
-                </div>
-            </div>
-        </section>
-
-        <section>
-            <h2>Features</h2>
-            <div class="features">
-                <div class="feature">
-                    <h3>Nostr Authentication</h3>
-                    <p>Viewer requests accept Blossom list auth or NIP-98 HTTP auth. Upload and delete operations require signed Blossom events (kind <code>24242</code>).</p>
-                </div>
-                <div class="feature">
-                    <h3>Content Moderation</h3>
-                    <p>AI-powered moderation with SAFE, REVIEW, AGE_RESTRICTED, and PERMANENT_BAN levels.</p>
-                </div>
-                <div class="feature">
-                    <h3>Edge Computing</h3>
-                    <p>Powered by Fastly Compute for low-latency global delivery.</p>
-                </div>
-                <div class="feature">
-                    <h3>Video Thumbnails</h3>
-                    <p>Automatic JPEG thumbnail generation for uploaded videos, accessible at <code>/&lt;sha256&gt;.jpg</code>.</p>
-                </div>
-                <div class="feature">
-                    <h3>HLS Video Streaming</h3>
-                    <p>On-demand H.264 transcoding to 720p and 480p with HLS adaptive streaming. Direct quality access via <code>/&lt;sha256&gt;/720p</code> and <code>/&lt;sha256&gt;/480p</code>.</p>
-                </div>
-                <div class="feature">
-                    <h3>WebVTT Transcripts</h3>
-                    <p>On-demand transcript generation for audio/video blobs, served from immutable URLs at <code>/&lt;sha256&gt;.vtt</code>.</p>
-                </div>
-                <div class="feature">
-                    <h3>GCS Storage</h3>
-                    <p>Reliable blob storage backed by Google Cloud Storage.</p>
-                </div>
-            </div>
-        </section>
-
-        <section>
-            <h2>Protocol</h2>
-            <p>This server implements the <a href="https://github.com/hzrd149/blossom">Blossom protocol</a> for decentralized media hosting on Nostr.</p>
-            <p style="margin-top: 0.5rem;"><strong>Implemented BUDs:</strong> BUD-01 (Blob Retrieval), BUD-02 (Upload/List/Delete), BUD-04 (Mirroring), BUD-06 (Upload Pre-validation), BUD-09 (Reporting)</p>
-            <p style="margin-top: 0.5rem;">Maximum upload size: <code>50 GB</code></p>
-        </section>
-
-        <footer>
-            <p>Powered by <a href="https://www.fastly.com/products/edge-compute">Fastly Compute</a> | <a href="https://divine.video">Divine</a></p>
-        </footer>
-    </div>
-</body>
-</html>"#;
+    let html = include_str!("landing.html");
 
     let mut resp = Response::from_status(StatusCode::OK);
     resp.set_header(header::CONTENT_TYPE, "text/html; charset=utf-8");
@@ -7684,7 +7423,7 @@ fn add_cors_headers(resp: &mut Response) {
     );
     resp.set_header(
         "Access-Control-Allow-Headers",
-        "Authorization, Content-Type, X-Sha256, X-Request-Id, X-Divine-Video-Processing",
+        "Authorization, Content-Type, X-Sha256, X-SHA-256, X-Content-Length, X-Content-Type, X-Request-Id, X-Divine-Video-Processing",
     );
     resp.set_header("Access-Control-Expose-Headers", upload_exposed_headers());
 }
@@ -7698,7 +7437,7 @@ struct UploadCapabilityHeaders {
 
 fn upload_exposed_headers() -> &'static str {
     // Retry-After lets a browser client read the throttle backoff on a 429.
-    "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256, X-Content-SHA256, X-Audio-Duration, X-Audio-Size, X-Divine-Upload-Extensions, X-Divine-Upload-Control-Host, X-Divine-Upload-Data-Host, Retry-After, Content-Language, X-Divine-Machine-Translated"
+    "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256, X-Content-SHA256, X-Audio-Duration, X-Audio-Size, X-Divine-Upload-Extensions, X-Divine-Upload-Control-Host, X-Divine-Upload-Data-Host, X-Reason, Retry-After, Content-Language, X-Divine-Machine-Translated"
 }
 
 fn upload_control_host(public_host: Option<&str>) -> String {
@@ -7718,6 +7457,7 @@ fn add_upload_capability_headers(resp: &mut Response, control_host: &str) {
     resp.set_header("X-Divine-Upload-Extensions", headers.extensions);
     resp.set_header("X-Divine-Upload-Control-Host", headers.control_host);
     resp.set_header("X-Divine-Upload-Data-Host", headers.data_host);
+    add_no_cache_headers(resp);
 }
 
 /// CORS preflight response
@@ -9056,6 +8796,25 @@ mod tests {
         assert!(exposed_headers.contains("X-Divine-Upload-Data-Host"));
         // Browser clients must be able to read the 429 throttle backoff.
         assert!(exposed_headers.contains("Retry-After"));
+    }
+
+    #[test]
+    fn upload_preflight_validates_digest_without_lookup() {
+        use super::{handle_upload_requirements, Method, Request};
+
+        // This fixture has no storage backend or metadata store.
+        for method in [Method::HEAD, Method::GET] {
+            let req = Request::new(method, "https://media.divine.video/upload")
+                .with_header("X-SHA-256", "a".repeat(64))
+                .with_header("X-Content-Length", "10");
+            let resp = handle_upload_requirements(req).unwrap();
+            assert_eq!(resp.get_status(), StatusCode::OK);
+            assert_eq!(
+                resp.get_header_str("X-Reason"),
+                Some("Upload would be accepted")
+            );
+            assert!(resp.get_header("X-Exists").is_none());
+        }
     }
 
     #[test]

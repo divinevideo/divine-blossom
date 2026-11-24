@@ -7,6 +7,7 @@ import { createApp, hex } from "./app.ts";
 import type {
   BlobRecord,
   Blobs,
+  CasOptions,
   Catalog,
   GlobalStats,
   ListPage,
@@ -26,11 +27,25 @@ class MemoryCatalog implements Catalog {
     const r = this.rows.get(hash.toLowerCase());
     return Promise.resolve(r ? structuredClone(r) : null);
   }
-  cas(hash: string, expected: number | null, value: BlobRecord): Promise<boolean> {
+  cas(
+    hash: string,
+    expected: number | null,
+    value: BlobRecord,
+    options?: CasOptions,
+  ): Promise<boolean> {
     const k = hash.toLowerCase();
     const cur = this.rows.get(k);
-    if ((cur?.revision ?? null) !== expected) return Promise.resolve(false);
+    if (
+      (cur?.revision ?? null) !== expected ||
+      (options?.requireUnquarantined && this.holds.get(k)?.size)
+    ) {
+      return Promise.resolve(false);
+    }
     this.rows.set(k, structuredClone(value));
+    if (options?.purge) {
+      const { reason, deleteB2, createdAt } = options.purge;
+      return this.enqueuePurge(k, reason, deleteB2, createdAt).then(() => true);
+    }
     return Promise.resolve(true);
   }
   list(owner: string, limit: number, cursor?: string | null): Promise<ListPage> {
@@ -239,7 +254,7 @@ export async function runtimeProbe(req: Request): Promise<Response> {
   const bodyChecksPassed = upJson.sha256 === hash && upJson.size === body.length &&
     hex(getBytes) === hex(body) && listJson.length === 1 && listJson[0].sha256 === hash &&
     delJson.status === "cleanup_pending" && typeof deniedJson.error === "string";
-  const passed = up.status === 200 && get.status === 200 && head.status === 200 &&
+  const passed = up.status === 201 && get.status === 200 && head.status === 200 &&
     list.status === 200 && del.status === 202 && denied.status === 404 && bodyChecksPassed;
 
   return new Response(

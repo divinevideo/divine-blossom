@@ -94,6 +94,38 @@ On the worker host:
    with `TRANSCODE_WRITES_PAUSED=true` initially, and place `/etc/divine-transcoder/gcp-sa.json` (`chown 10001:10001`, `chmod 600`).
 4. Start the stack (`docker compose up -d`) and verify `curl -fsS https://transcoder-worker.divine.video/health`.
 
+### Off-GCP job intake
+
+The worker may continue receiving Cloud Tasks at `/internal/transcode` while
+Cloud Run accepts new jobs. To move admission separately, deploy a worker with
+`TRANSCODE_ADMISSION_AUTH_REQUIRED=true` and a dedicated
+`TRANSCODE_ADMISSION_SECRET` before opening admission in the reverse proxy.
+The bundled Compose and Caddy configuration checks the admission credential
+before forwarding either route in required-auth mode, including if an older
+worker image is restored. Use the literal lowercase `true` in Compose.
+For forced repairs in that mode, use `docker compose exec transcoder` on the
+worker host to POST `force: true` to `http://127.0.0.1:8080/transcode`
+inside the container, with the configured `x-divine-repair-secret` header.
+That path bypasses the public proxy and still requires the worker's repair
+credential. On hosts with a custom Caddyfile, retain the existing allowlist
+and apply equivalent credential checks before opening either intake route.
+
+Configure queue-scoped enqueue access for the worker identity only after
+verifying that external unauthenticated admission is blocked. Ordinary requests
+to either intake route use `x-divine-transcode-admission`. Keep that credential
+separate from task delivery and forced repair. Verify that missing and wrong
+credentials return 401 and that a synthetic authenticated request returns 202
+and becomes playable before moving any caller. Keep non-HLS routes on their
+existing origin.
+
+To roll back admission, return every moved producer to Cloud Run intake and
+confirm new jobs are being accepted there before shutting down, downgrading or
+closing off-GCP intake. Keep the worker serving the jobs it already accepted
+until those jobs drain. If also rolling back the writer, follow the queue
+pause and target-override procedure below after the producer cutback. Revoke
+the off-GCP queue grant before removing the admission credential or returning
+to a legacy proxy configuration.
+
 ## 3. Single-writer cutover & rollback (Cloud Tasks URL-safe)
 
 Follow `docs/runbooks/hls-single-writer.md` — never run concurrent unpaused
@@ -127,7 +159,8 @@ Keep archive publishing paused until its separate maintainer hold is lifted.
 4. Pause direct HLS writes on Cloud Run (`TRANSCODE_WRITES_PAUSED=true` still
    permits ordinary `POST /transcode` queue admission, while blocking
    `/internal/transcode`, `force: true` repairs, and `/backfill-fmp4` on Cloud
-   Run — direct forced repairs and `/backfill-fmp4` to `https://transcoder-worker.divine.video`):
+   Run). Direct those operations to the off-GCP worker. Use container loopback
+   for forced repairs when the off-GCP proxy requires admission authentication.
    ```sh
    gcloud run services update divine-transcoder \
      --region=us-central1 --project=rich-compiler-479518-d2 \

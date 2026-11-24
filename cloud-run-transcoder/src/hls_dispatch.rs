@@ -30,6 +30,38 @@ fn valid_worker_token(config: &Config, headers: &axum::http::HeaderMap) -> bool 
         })
 }
 
+/// Intake callers and authenticated Cloud Tasks delivery use separate credentials.
+pub(super) fn authorize_admission(
+    config: &Config,
+    headers: &axum::http::HeaderMap,
+) -> std::result::Result<(), Response> {
+    let expected = match config.transcode_admission_secret.as_deref() {
+        None if !config.transcode_admission_auth_required => return Ok(()),
+        Some(secret) if !secret.is_empty() => secret,
+        _ => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "transcode admission not configured",
+            )
+                .into_response())
+        }
+    };
+    let values = headers.get_all("x-divine-transcode-admission");
+    let mut values = values.iter();
+    if values
+        .next()
+        .is_some_and(|value| constant_time_eq(value.as_bytes(), expected.as_bytes()))
+        && values.next().is_none()
+    {
+        return Ok(());
+    }
+    Err((
+        StatusCode::UNAUTHORIZED,
+        "invalid transcode admission credential",
+    )
+        .into_response())
+}
+
 pub(super) async fn worker(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,

@@ -10,6 +10,8 @@ services:
       - "443:443"
     environment:
       TRANSCODER_DOMAIN: ${TRANSCODER_DOMAIN:?Set TRANSCODER_DOMAIN, e.g. transcoder-worker.divine.video}
+      TRANSCODE_ADMISSION_AUTH_REQUIRED: ${TRANSCODE_ADMISSION_AUTH_REQUIRED-false}
+      TRANSCODE_ADMISSION_SECRET: ${TRANSCODE_ADMISSION_SECRET-}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
@@ -35,6 +37,7 @@ services:
       MEDIA_STORAGE_PROVIDER: ${MEDIA_STORAGE_PROVIDER:-b2_primary}
       MEDIA_GCS_BACKUP_ENABLED: ${MEDIA_GCS_BACKUP_ENABLED:-false}
       TRANSCODE_WRITES_PAUSED: ${TRANSCODE_WRITES_PAUSED:-false}
+      TRANSCODE_ADMISSION_AUTH_REQUIRED: ${TRANSCODE_ADMISSION_AUTH_REQUIRED-false}
     volumes:
       - ${GCP_SA_KEY_PATH:-/etc/divine-transcoder/gcp-sa.json}:/run/secrets/gcp-sa.json:ro
     tmpfs:

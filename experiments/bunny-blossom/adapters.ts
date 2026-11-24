@@ -6,6 +6,7 @@ import { AwsClient } from "aws4fetch";
 import {
   type BlobRecord,
   type Blobs,
+  type CasOptions,
   type Catalog,
   type CdnPurger,
   type GlobalStats,
@@ -88,6 +89,9 @@ function decodeRecord(raw: unknown, expectedHash?: string): BlobRecord {
     c2paManifestId: typeof parsed.c2paManifestId === "string" ? parsed.c2paManifestId : undefined,
     moderation: parsed.moderation as BlobRecord["moderation"],
     archiveStorage: parsed.archiveStorage as BlobRecord["archiveStorage"],
+    videoEncodingAllowed: typeof parsed.videoEncodingAllowed === "boolean"
+      ? parsed.videoEncodingAllowed
+      : undefined,
     transcodeStatus: parsed.transcodeStatus as BlobRecord["transcodeStatus"],
     transcodeGeneration: typeof parsed.transcodeGeneration === "number"
       ? parsed.transcodeGeneration
@@ -128,6 +132,15 @@ function decodeRecord(raw: unknown, expectedHash?: string): BlobRecord {
       : undefined,
     deleteReason: typeof parsed.deleteReason === "string" ? parsed.deleteReason : undefined,
     deletedAt: typeof parsed.deletedAt === "number" ? parsed.deletedAt : undefined,
+    ownerDeleted: parsed.ownerDeleted === true ? true : undefined,
+  };
+}
+
+function purgeInsert(hash: string, reason: string, deleteB2: boolean, now: number) {
+  return {
+    sql: `INSERT INTO purge_outbox(hash, reason, delete_b2, attempts, next_retry_at, created_at)
+      VALUES (?, ?, ?, 0, ?, ?)`,
+    args: [hash.toLowerCase(), reason, deleteB2 ? 1 : 0, now, now],
   };
 }
 
@@ -173,20 +186,30 @@ export class SqlCatalog implements Catalog {
     return result.rows.length ? decodeRecord(result.rows[0].body, hash.toLowerCase()) : null;
   }
 
-  async cas(hash: string, expected: number | null, row: BlobRecord): Promise<boolean> {
+  async cas(
+    hash: string,
+    expected: number | null,
+    row: BlobRecord,
+    options?: CasOptions,
+  ): Promise<boolean> {
     const normalizedHash = hash.toLowerCase();
     const encoded = JSON.stringify({ ...row, hash: normalizedHash });
     const decoded = decodeRecord(encoded, normalizedHash);
     if (decoded.revision !== (expected ?? 0) + 1) throw new Error("invalid revision");
 
     const primaryOwner = decoded.owners[0] ?? "";
+    const quarantineGuard = options?.requireUnquarantined
+      ? "AND NOT EXISTS (SELECT 1 FROM quarantine_holds WHERE hash = ?)"
+      : "";
+    const quarantineArgs = options?.requireUnquarantined ? [normalizedHash] : [];
     const casQuery = expected === null
       ? {
         sql: `INSERT INTO blobs(
             hash, revision, status, age_restricted, held, size, mime_type, uploaded, owner,
             transcode_status, transcode_generation, transcript_status, transcript_generation,
             gate, cleanup_pending, body
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          WHERE 1 = 1 ${quarantineGuard}
           ON CONFLICT(hash) DO NOTHING RETURNING revision`,
         args: [
           normalizedHash,
@@ -205,6 +228,7 @@ export class SqlCatalog implements Catalog {
           decoded.gate,
           decoded.cleanupPending ? 1 : 0,
           encoded,
+          ...quarantineArgs,
         ],
       }
       : {
@@ -213,7 +237,7 @@ export class SqlCatalog implements Catalog {
             uploaded = ?, owner = ?, transcode_status = ?, transcode_generation = ?,
             transcript_status = ?, transcript_generation = ?, gate = ?, cleanup_pending = ?,
             body = ?
-          WHERE hash = ? AND revision = ? RETURNING revision`,
+          WHERE hash = ? AND revision = ? ${quarantineGuard} RETURNING revision`,
         args: [
           decoded.revision,
           decoded.status,
@@ -232,6 +256,7 @@ export class SqlCatalog implements Catalog {
           encoded,
           normalizedHash,
           expected,
+          ...quarantineArgs,
         ],
       };
 
@@ -253,6 +278,10 @@ export class SqlCatalog implements Catalog {
             args: [owner, normalizedHash, decoded.uploaded],
           });
         }
+      }
+      if (options?.purge) {
+        const { reason, deleteB2, createdAt } = options.purge;
+        await exec.execute(purgeInsert(normalizedHash, reason, deleteB2, createdAt));
       }
       return true;
     };
@@ -472,11 +501,7 @@ export class SqlCatalog implements Catalog {
   }
 
   async enqueuePurge(hash: string, reason: string, deleteB2: boolean, now: number): Promise<void> {
-    await this.client.execute({
-      sql: `INSERT INTO purge_outbox(hash, reason, delete_b2, attempts, next_retry_at, created_at)
-        VALUES (?, ?, ?, 0, ?, ?)`,
-      args: [hash.toLowerCase(), reason, deleteB2 ? 1 : 0, now, now],
-    });
+    await this.client.execute(purgeInsert(hash, reason, deleteB2, now));
   }
 
   async listDuePurges(now: number, limit: number): Promise<PurgeItem[]> {
@@ -652,7 +677,10 @@ export class B2Blobs implements Blobs {
    * Enumerate and delete every B2 version under `<prefix><hash>` using B2 Native API.
    * Returns `{ deleted, remaining }` so the purge outbox can retry bounded batches.
    */
-  async deletePrefix(hashPrefix: string): Promise<{ deleted: number; remaining: boolean }> {
+  async deletePrefix(
+    hashPrefix: string,
+    stillDeletable?: () => Promise<boolean>,
+  ): Promise<{ deleted: number; remaining: boolean }> {
     if (!HASH.test(hashPrefix)) throw new Error("invalid erasure hash");
     if (!this.eraser) throw new Error("B2 eraser credentials not configured");
 
@@ -702,6 +730,10 @@ export class B2Blobs implements Blobs {
         f.fileName === fullPrefix || f.fileName.startsWith(`${fullPrefix}/`) ||
         f.fileName.startsWith(`${fullPrefix}.`),
     );
+
+    // A concurrent drain may have finished cleanup and allowed a repost while we listed.
+    // Revalidate after listing. The version IDs in this batch then cannot include a later repost.
+    if (stillDeletable && !await stillDeletable()) return { deleted: 0, remaining: true };
 
     let deleted = 0;
     const batch = matching.slice(0, 20);

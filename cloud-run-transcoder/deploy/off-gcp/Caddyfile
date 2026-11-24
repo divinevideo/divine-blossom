@@ -1,7 +1,12 @@
 {$TRANSCODER_DOMAIN} {
-	@worker_routes {
-		path /health /internal/transcode /transcode /backfill-fmp4 /transcribe /translate
-	}
+	@worker_routes <<CEL
+		path('/health', '/internal/transcode', '/backfill-fmp4', '/transcribe', '/translate')
+		|| (path('/transcode') && {env.TRANSCODE_ADMISSION_AUTH_REQUIRED} in ['false', '0'])
+		|| (path('/transcode', '/transcode/queue') && {env.TRANSCODE_ADMISSION_AUTH_REQUIRED} == 'true'
+			&& {env.TRANSCODE_ADMISSION_SECRET} != ''
+			&& {http.request.header.X-Divine-Transcode-Admission} == {env.TRANSCODE_ADMISSION_SECRET})
+		CEL
+	@rejected_admission `path('/transcode', '/transcode/queue') && {env.TRANSCODE_ADMISSION_AUTH_REQUIRED} == 'true'`
 
 	handle @worker_routes {
 		reverse_proxy transcoder:8080 {
@@ -13,6 +18,10 @@
 				write_timeout 910s
 			}
 		}
+	}
+
+	handle @rejected_admission {
+		respond 401
 	}
 
 	handle {
