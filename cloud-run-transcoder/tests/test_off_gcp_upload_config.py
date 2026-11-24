@@ -1197,6 +1197,217 @@ Server(("0.0.0.0", 8080), Handler).serve_forever()
             target_srv.shutdown()
             target_srv.server_close()
 
+    def test_runbook_loopback_scratch_excludes_fstrim_and_verifies_post_trim_allocation(self):
+        doc = RUNBOOK.read_text(encoding="utf-8")
+        sh_blocks = re.findall(r"```sh\n(.*?)```", doc, re.S)
+
+        provision_blocks = [b for b in sh_blocks if "SCRATCH_IMG=/var/lib/divine-upload/scratch.img" in b and "mkfs.ext4" in b]
+        self.assertEqual(len(provision_blocks), 1, "Expected exactly one loopback scratch provisioning block")
+        post_trim_blocks = [b for b in sh_blocks if "systemctl start fstrim.service" in b and "SCRATCH_IMG=/var/lib/divine-upload/scratch.img" in b]
+        self.assertEqual(len(post_trim_blocks), 1, "Expected exactly one post-trim reservation verification block")
+
+        def dedent_block(src: str) -> str:
+            non_empty = [line for line in src.splitlines() if line.strip()]
+            indent = min(len(line) - len(line.lstrip(" ")) for line in non_empty)
+            return "\n".join(line[indent:] if len(line) >= indent else line for line in src.splitlines()) + "\n"
+
+        provision_src = dedent_block(provision_blocks[0])
+        post_trim_src = dedent_block(post_trim_blocks[0])
+
+        def run_block(
+            src: str,
+            *,
+            fstab_initial: str,
+            img_exists: bool,
+            mounted: bool,
+            stat_output: str = "50331648 25769803776",
+            mount_opts: str = "rw,nosuid,nodev,noexec,relatime",
+            fstrim_load_state: str = "loaded",
+            fstrim_exec_start: str = "{ path=/sbin/fstrim ; argv[]=/sbin/fstrim --listed-in /etc/fstab:/proc/self/mountinfo --verbose --quiet-unsupported ; ignore_errors=no ; }",
+        ) -> tuple[subprocess.CompletedProcess[str], str, str]:
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                bin_dir = tmp_path / "bin"
+                bin_dir.mkdir()
+                scratch_dir = tmp_path / "scratch"
+                scratch_img = tmp_path / "scratch.img"
+                tmp_img = tmp_path / "scratch.img.tmp"
+                fstab = tmp_path / "fstab"
+                fstab.write_text(
+                    fstab_initial.replace("/var/lib/divine-upload/scratch.img", str(scratch_img))
+                    .replace("/var/lib/divine-upload/scratch", str(scratch_dir)),
+                    encoding="utf-8",
+                )
+                calls_log = tmp_path / "calls.log"
+                mounted_flag = tmp_path / "mounted"
+                if img_exists:
+                    scratch_img.write_bytes(b"img")
+                if mounted:
+                    scratch_dir.mkdir(parents=True, exist_ok=True)
+                    mounted_flag.write_text("1", encoding="utf-8")
+
+                def write_stub(name: str, body: str) -> None:
+                    p = bin_dir / name
+                    p.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+                    p.chmod(0o755)
+
+                write_stub("df", 'exit 0\n')
+                write_stub("du", 'exit 0\n')
+                write_stub("journalctl", 'printf "journalctl %s\\n" "$*" >> "$CALLS_LOG"\nexit 0\n')
+                write_stub("fallocate", 'target=""\nfor a in "$@"; do target="$a"; done\n: > "$target"\nexit 0\n')
+                write_stub("mkfs.ext4", 'printf "mkfs.ext4 %s\\n" "$*" >> "$CALLS_LOG"\nexit 0\n')
+                write_stub("mountpoint", 'test -f "$MOUNTED_FLAG"\n')
+                write_stub("mount", 'mkdir -p "$1"\n: > "$MOUNTED_FLAG"\nexit 0\n')
+                write_stub(
+                    "findmnt",
+                    'if [ "$3" = "FSTYPE" ]; then echo ext4; else printf "%s\\n" "$FAKE_MOUNT_OPTS"; fi\n',
+                )
+                write_stub("stat", 'printf "%s\\n" "$FAKE_STAT_OUTPUT"\n')
+                write_stub(
+                    "install",
+                    'mode=""\nwhile [ "$#" -gt 0 ]; do\n'
+                    '  case "$1" in\n'
+                    '    -d) dir_mode=1; shift ;;\n'
+                    '    -m|-o|-g) shift 2 ;;\n'
+                    '    *) break ;;\n'
+                    '  esac\n'
+                    'done\n'
+                    'if [ "${dir_mode:-0}" = "1" ]; then mkdir -p "$1"; else cp "$1" "$2"; fi\n',
+                )
+                write_stub(
+                    "systemctl",
+                    'printf "systemctl %s\\n" "$*" >> "$CALLS_LOG"\n'
+                    'if [ "$1" = "show" ] && [ "$3" = "LoadState" ]; then\n'
+                    '  printf "%s\\n" "$FAKE_FSTRIM_LOAD_STATE"\n'
+                    'elif [ "$1" = "show" ] && [ "$3" = "ExecStart" ]; then\n'
+                    '  printf "%s\\n" "$FAKE_FSTRIM_EXEC_START"\n'
+                    'fi\n'
+                    'exit 0\n',
+                )
+
+                rewritten = (
+                    src.replace("/var/lib/divine-upload/scratch.img.tmp", str(tmp_img))
+                    .replace("/var/lib/divine-upload/scratch.img", str(scratch_img))
+                    .replace("/var/lib/divine-upload/scratch", str(scratch_dir))
+                    .replace(" /etc/fstab", f" {fstab}")
+                )
+                env = os.environ.copy()
+                env.update(
+                    {
+                        "PATH": f"{bin_dir}:{env['PATH']}",
+                        "CALLS_LOG": str(calls_log),
+                        "MOUNTED_FLAG": str(mounted_flag),
+                        "FAKE_MOUNT_OPTS": mount_opts,
+                        "FAKE_STAT_OUTPUT": stat_output,
+                        "FAKE_FSTRIM_LOAD_STATE": fstrim_load_state,
+                        "FAKE_FSTRIM_EXEC_START": fstrim_exec_start,
+                    }
+                )
+                res = subprocess.run(["sh", "-c", rewritten], env=env, text=True, capture_output=True)
+                calls = calls_log.read_text(encoding="utf-8") if calls_log.exists() else ""
+                fstab_out = (
+                    fstab.read_text(encoding="utf-8")
+                    .replace(str(scratch_img), "/var/lib/divine-upload/scratch.img")
+                    .replace(str(scratch_dir), "/var/lib/divine-upload/scratch")
+                )
+                return res, fstab_out, calls
+
+        # 1. Fresh loopback provisioning writes nodiscard + X-fstrim.notrim to fstab and succeeds.
+        res, fstab_after, _ = run_block(
+            provision_src,
+            fstab_initial="UUID=root / ext4 defaults 0 1\n",
+            img_exists=False,
+            mounted=False,
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("nodiscard", fstab_after)
+        self.assertIn("X-fstrim.notrim", fstab_after)
+
+        # 2. Retry with valid fstab entry and safe fstrim.service forms succeeds.
+        for safe_exec in (
+            "{ path=/sbin/fstrim ; argv[]=/sbin/fstrim --listed-in /etc/fstab:/proc/self/mountinfo --verbose --quiet-unsupported ; ignore_errors=no ; }",
+            "{ path=/usr/sbin/fstrim ; argv[]=/usr/sbin/fstrim -Av ; ignore_errors=no ; }",
+            "{ path=/sbin/fstrim ; argv[]=/sbin/fstrim --fstab -m 1M -t ext4,xfs ; ignore_errors=no ; }",
+            "{ path=/sbin/fstrim ; argv[]=/sbin/fstrim -I/etc/fstab:/proc/self/mountinfo -v ; ignore_errors=no ; }",
+        ):
+            res, _, _ = run_block(
+                provision_src,
+                fstab_initial=fstab_after,
+                img_exists=True,
+                mounted=True,
+                fstrim_exec_start=safe_exec,
+            )
+            self.assertEqual(res.returncode, 0, f"Expected safe fstrim ExecStart to pass: {safe_exec}\n{res.stderr}")
+
+        # 3. Retry fails closed if an existing fstab entry omits X-fstrim.notrim, omits nodiscard, or enables discard.
+        for bad_opts in (
+            "loop,nosuid,nodev,noexec,nofail,x-systemd.before=docker.service",
+            "loop,nosuid,nodev,noexec,nofail,X-fstrim.notrim,x-systemd.before=docker.service",
+            "loop,nosuid,nodev,noexec,nodiscard,discard,nofail,X-fstrim.notrim,x-systemd.before=docker.service",
+        ):
+            bad_fstab = re.sub(r"loop,[^\s]+", bad_opts, fstab_after)
+            res, _, _ = run_block(provision_src, fstab_initial=bad_fstab, img_exists=True, mounted=True)
+            self.assertNotEqual(res.returncode, 0, f"Expected bad fstab options to fail closed: {bad_opts}")
+
+        # 4. Retry fails closed if the live mount has discard enabled.
+        res, _, _ = run_block(
+            provision_src,
+            fstab_initial=fstab_after,
+            img_exists=True,
+            mounted=True,
+            mount_opts="rw,nosuid,nodev,noexec,discard,relatime",
+        )
+        self.assertNotEqual(res.returncode, 0, "Expected live discard mount option to fail closed")
+
+        # 5. Retry fails closed if loaded fstrim.service bypasses /etc/fstab exclusions.
+        for unsafe_exec in (
+            "{ path=/sbin/fstrim ; argv[]=/sbin/fstrim -av ; ignore_errors=no ; }",
+            "{ path=/sbin/fstrim ; argv[]=/sbin/fstrim --all --verbose ; ignore_errors=no ; }",
+            "{ path=/sbin/fstrim ; argv[]=/sbin/fstrim --listed-in /proc/self/mountinfo --verbose ; ignore_errors=no ; }",
+            "{ path=/sbin/fstrim ; argv[]=/sbin/fstrim --listed-in=/etc/fstab.bak ; ignore_errors=no ; }",
+            "{ path=/bin/sh ; argv[]=/bin/sh -c /sbin/fstrim -av ; ignore_errors=no ; }",
+            "{ path=/sbin/fstrim ; argv[]=/sbin/fstrim -Av ; ignore_errors=no ; }\n{ path=/sbin/fstrim ; argv[]=/sbin/fstrim -a ; ignore_errors=no ; }",
+        ):
+            res, _, _ = run_block(
+                provision_src,
+                fstab_initial=fstab_after,
+                img_exists=True,
+                mounted=True,
+                fstrim_exec_start=unsafe_exec,
+            )
+            self.assertNotEqual(res.returncode, 0, f"Expected unsafe fstrim ExecStart to fail closed: {unsafe_exec}")
+
+        # 6. Dedicated pre-mounted LV/partition (no scratch.img) succeeds without appending a loopback fstab line.
+        res, lv_fstab, _ = run_block(
+            provision_src,
+            fstab_initial="UUID=root / ext4 defaults 0 1\n",
+            img_exists=False,
+            mounted=True,
+            fstrim_exec_start="{ path=/sbin/fstrim ; argv[]=/sbin/fstrim -av ; ignore_errors=no ; }",
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(lv_fstab, "UUID=root / ext4 defaults 0 1\n")
+
+        # 7. Post-trim verification triggers fstrim.service, passes when allocated >= size, and fails closed when sparse.
+        res, _, calls = run_block(
+            post_trim_src,
+            fstab_initial=fstab_after,
+            img_exists=True,
+            mounted=True,
+            stat_output="50331648 25769803776",
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("systemctl start fstrim.service", calls)
+
+        res_sparse, _, _ = run_block(
+            post_trim_src,
+            fstab_initial=fstab_after,
+            img_exists=True,
+            mounted=True,
+            stat_output="65536 25769803776",
+        )
+        self.assertNotEqual(res_sparse.returncode, 0, "Expected sparse post-trim scratch image to fail closed")
+
 
 if __name__ == "__main__":
     unittest.main()

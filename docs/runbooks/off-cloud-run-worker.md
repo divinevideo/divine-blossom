@@ -233,11 +233,22 @@ sole writer.
    (`16` uploads + `2` mirrors at `1 GiB`, `12` thumbnails × `100 MiB`, and `64`
    × `16 MiB` proxy body spills ≈ `20.2 GiB` peak), provision at least **`24 GiB`**
    (`24G`–`32G`, scaling up if you raise those concurrency or size caps). Prefer
-   a dedicated logical volume/partition; otherwise verify root disk headroom
-   (`df -h /`) and run the fail-closed loopback provisioning subshell below
-   (create `scratch/tmp` and `scratch/proxy-tmp` **only after** verifying the
-   bounded `ext4` filesystem is mounted, never on `/`, and never reformat an
-   existing or mounted image):
+   a **dedicated logical volume/partition** (which keeps upload scratch isolated
+   from `/` even under scheduled host `fstrim`); otherwise verify root disk
+   headroom (`df -h /`) and run the fail-closed loopback provisioning subshell
+   below. Because `mkfs.ext4 -E nodiscard` only skips discard during formatting
+   and scheduled `fstrim` (or online `discard`) punches holes through the loop
+   device back into `scratch.img`, making it sparse again, the loopback entry
+   must include `nodiscard,X-fstrim.notrim`, every provisioning run/retry
+   re-verifies that `/etc/fstab` exclusion and live mount options, and loaded
+   `fstrim.service` units must read `/etc/fstab` first (not `-a`/`--all`, which
+   bypasses `X-fstrim.notrim`; check `/etc/cron.*` and custom timers for any
+   `fstrim -a`/`--all` jobs as well — if host trim cannot honor
+   `X-fstrim.notrim`, use a dedicated logical volume/partition or override
+   `fstrim.service` via a systemd drop-in to use
+   `--listed-in /etc/fstab:/proc/self/mountinfo`). Create `scratch/tmp` and
+   `scratch/proxy-tmp` **only after** verifying the bounded `ext4` filesystem is
+   mounted, never on `/`, and never reformat an existing or mounted image:
    ```sh
    (
      set -eu
@@ -255,20 +266,150 @@ sole writer.
        mv -n "$TMP_IMG" "$SCRATCH_IMG"
      fi
      if [ -e "$SCRATCH_IMG" ]; then
-       set -- $(stat -c '%b %s' "$SCRATCH_IMG")
-       test $(( $1 * 512 )) -ge "$2"
+       stat_out="$(stat -c '%b %s' "$SCRATCH_IMG")"
+       blocks="${stat_out%% *}"
+       bytes="${stat_out#* }"
+       test $((blocks * 512)) -ge "$bytes"
+
+       if ! awk -v img="$SCRATCH_IMG" -v dir="$SCRATCH_DIR" '
+         $0 ~ /^[[:space:]]*(#|$)/ { next }
+         $1 == img || $2 == dir { found = 1 }
+         END { exit !found }
+       ' /etc/fstab; then
+         echo "$SCRATCH_IMG $SCRATCH_DIR ext4 loop,nosuid,nodev,noexec,nodiscard,nofail,X-fstrim.notrim,x-systemd.before=docker.service 0 2" >> /etc/fstab
+       fi
+
+       # Re-verify on every run/retry that /etc/fstab excludes this loopback mount from fstrim and online discard.
+       awk -v img="$SCRATCH_IMG" -v dir="$SCRATCH_DIR" '
+         $0 ~ /^[[:space:]]*(#|$)/ { next }
+         $1 == img || $2 == dir {
+           count++
+           n = split($4, opts, ",")
+           has_notrim = 0
+           has_nodiscard = 0
+           has_discard = 0
+           for (i = 1; i <= n; i++) {
+             if (opts[i] == "X-fstrim.notrim") has_notrim = 1
+             if (opts[i] == "nodiscard") has_nodiscard = 1
+             if (opts[i] == "discard") has_discard = 1
+           }
+           if ($1 != img || $2 != dir || !has_notrim || !has_nodiscard || has_discard) {
+             bad = 1
+           }
+         }
+         END { exit !(count == 1 && !bad) }
+       ' /etc/fstab
+
+       if [ "$(systemctl show -p LoadState --value fstrim.service 2>/dev/null || true)" = "loaded" ]; then
+         # X-fstrim.notrim is honored only when fstrim reads /etc/fstab (--fstab / -A / --listed-in /etc/fstab...).
+         systemctl show -p ExecStart --value fstrim.service | awk '
+           /^[[:space:]]*$/ { next }
+           {
+             seen++
+             line = $0
+             pos = index(line, "argv[]=")
+             if (pos == 0) { bad = 1; next }
+             rest = substr(line, pos + 7)
+             sep = index(rest, " ; ")
+             if (sep > 0) rest = substr(rest, 1, sep - 1)
+             n = split(rest, args, /[[:space:]]+/)
+             if (n < 1 || (args[1] != "fstrim" && args[1] !~ /\/fstrim$/)) {
+               bad = 1
+               next
+             }
+             line_fstab = 0
+             expect_listed = 0
+             skip_next = 0
+             for (i = 2; i <= n; i++) {
+               tok = args[i]
+               if (skip_next) { skip_next = 0; continue }
+               if (expect_listed) {
+                 expect_listed = 0
+                 if (tok ~ /^\/etc\/fstab(:|$)/) line_fstab = 1
+                 else bad = 1
+                 continue
+               }
+               if (tok == "--all") { bad = 1 }
+               else if (tok == "--fstab") { line_fstab = 1 }
+               else if (tok == "--listed-in" || tok == "-I") { expect_listed = 1 }
+               else if (tok ~ /^--listed-in=/) {
+                 val = substr(tok, 13)
+                 if (val ~ /^\/etc\/fstab(:|$)/) line_fstab = 1
+                 else bad = 1
+               } else if (tok == "--offset" || tok == "--length" || tok == "--minimum" || tok == "--types") {
+                 skip_next = 1
+               } else if (tok ~ /^--(offset|length|minimum|types)=/ || tok == "--verbose" || tok == "--quiet-unsupported" || tok == "--dry-run") {
+                 continue
+               } else if (tok ~ /^-[^-]/) {
+                 flags = substr(tok, 2)
+                 for (j = 1; j <= length(flags); j++) {
+                   ch = substr(flags, j, 1)
+                   if (ch == "a") { bad = 1 }
+                   else if (ch == "A") { line_fstab = 1 }
+                   else if (ch == "I") {
+                     val = substr(flags, j + 1)
+                     if (val == "") expect_listed = 1
+                     else if (val ~ /^\/etc\/fstab(:|$)/) line_fstab = 1
+                     else bad = 1
+                     break
+                   } else if (ch == "o" || ch == "l" || ch == "m" || ch == "t") {
+                     if (j == length(flags)) skip_next = 1
+                     break
+                   }
+                 }
+               } else {
+                 bad = 1
+               }
+             }
+             if (expect_listed || skip_next || !line_fstab) bad = 1
+           }
+           END { exit !(seen > 0 && !bad) }
+         '
+       fi
      fi
-     grep -q "$SCRATCH_IMG" /etc/fstab || \
-       echo "$SCRATCH_IMG $SCRATCH_DIR ext4 loop,nosuid,nodev,noexec,nofail,x-systemd.before=docker.service 0 2" >> /etc/fstab
      systemctl daemon-reload
      mountpoint -q "$SCRATCH_DIR" || mount "$SCRATCH_DIR"
      mountpoint -q "$SCRATCH_DIR"
      test "$(findmnt -rn -o FSTYPE --target "$SCRATCH_DIR")" = "ext4"
+     if [ -e "$SCRATCH_IMG" ]; then
+       mount_opts="$(findmnt -rn -o OPTIONS --target "$SCRATCH_DIR")"
+       test -n "$mount_opts"
+       if printf '%s\n' "$mount_opts" | tr ',' '\n' | grep -qx 'discard'; then
+         echo "ERROR: $SCRATCH_DIR is mounted with discard; remount with nodiscard" >&2
+         exit 1
+       fi
+     fi
      install -d -m 1777 -o 0 -g 0 "$SCRATCH_DIR/tmp"
      install -m 0644 -o 0 -g 0 /dev/null "$SCRATCH_DIR/tmp/.divine-upload-scratch"
      install -d -m 0700 -o 101 -g 101 "$SCRATCH_DIR/proxy-tmp"
      install -m 0644 -o 101 -g 101 /dev/null "$SCRATCH_DIR/proxy-tmp/.divine-upload-scratch"
      if [ -e "$SCRATCH_IMG" ]; then
+       stat_out="$(stat -c '%b %s' "$SCRATCH_IMG")"
+       blocks="${stat_out%% *}"
+       bytes="${stat_out#* }"
+       test $((blocks * 512)) -ge "$bytes"
+       du -h --apparent-size "$SCRATCH_IMG"
+       du -h "$SCRATCH_IMG"
+     fi
+   )
+   ```
+   When using a loopback image, immediately run the host's trim job (and confirm
+   no `/etc/cron.*` or custom timer runs `fstrim -a`/`--all`) and verify that
+   `/var/lib/divine-upload/scratch` was skipped and allocated bytes on disk
+   still cover the full image size:
+   ```sh
+   (
+     set -eu
+     SCRATCH_IMG=/var/lib/divine-upload/scratch.img
+     if [ -e "$SCRATCH_IMG" ]; then
+       if [ "$(systemctl show -p LoadState --value fstrim.service 2>/dev/null || true)" = "loaded" ]; then
+         systemctl start fstrim.service
+         journalctl -u fstrim.service -n 20 --no-pager || true
+       fi
+       stat_out="$(stat -c '%b %s' "$SCRATCH_IMG")"
+       blocks="${stat_out%% *}"
+       bytes="${stat_out#* }"
+       test $((blocks * 512)) -ge "$bytes"
        du -h --apparent-size "$SCRATCH_IMG"
        du -h "$SCRATCH_IMG"
      fi
@@ -685,7 +826,9 @@ sole writer.
    Confirm the pinned image can read `/run/secrets/gcp-sa.json` under
    `cap_drop: ALL`, write scratch files to the bounded disk-backed `/tmp`
    mount (`/var/lib/divine-upload/scratch/tmp`, failing closed with
-   `create_host_path: false` if unmounted) with a read-only root, reach both
+   `create_host_path: false` if unmounted, and for loopback images keeping
+   allocated bytes >= image size after running the host's `fstrim` job in Step 1)
+   with a read-only root, reach both
    configured storage buckets, and reach `TRANSCODER_URL` from inside the
    container (plus container-to-host HTTPS hairpinning if using the worker's
    `/transcode/queue` admission path).
