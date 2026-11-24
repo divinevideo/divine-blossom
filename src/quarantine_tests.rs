@@ -1025,6 +1025,139 @@ fn bunny_delivery_policy_purge_and_durable_retry() {
         return;
     }
 
+    if mode == "vanish-b2-replica-admin-auth-budget" {
+        // 1. POST /admin/api/vanish with webhook_secret skips loading admin_token:
+        // Attempt 1 spends webhook_secret + kv_origin_read_token -> DeferForKvOriginRetry (202),
+        // Attempt 2 hits the local phase (0 kv_origin reads) -> Ready within 5 secrets,
+        // drain completes Phase::Final, Attempt 3 finishes (200, vanished=true).
+        let owner_webhook = "e".repeat(64);
+        let webhook_hash = hash();
+        let webhook_meta = serde_json::from_value(serde_json::json!({
+            "sha256": webhook_hash,
+            "size": 9,
+            "type": "video/mp4",
+            "uploaded": "2026-01-01T00:00:00Z",
+            "owner": owner_webhook,
+            "status": "active"
+        }))
+        .unwrap();
+        put_blob_metadata(&webhook_meta).unwrap();
+        crate::metadata::add_to_user_list(&owner_webhook, &webhook_hash).unwrap();
+
+        let mut wh1 = request(Method::POST, "/admin/api/vanish", false)
+            .with_header("Authorization", "Bearer synthetic-webhook-token");
+        wh1.set_body(serde_json::json!({"pubkey": owner_webhook}).to_string());
+        let mut wh1_resp = crate::request_bindings::metered(wh1);
+        assert_eq!(wh1_resp.get_status(), StatusCode::ACCEPTED);
+        let wh1_body: serde_json::Value =
+            serde_json::from_str(&wh1_resp.take_body_str()).unwrap();
+        assert_eq!(wh1_body["errors"], 0);
+        assert_eq!(wh1_body["pending"], 1);
+        assert!(!b2_cdn_phase::physical_absent(&webhook_hash).unwrap());
+
+        let mut wh2 = request(Method::POST, "/admin/api/vanish", false)
+            .with_header("Authorization", "Bearer synthetic-webhook-token");
+        wh2.set_body(serde_json::json!({"pubkey": owner_webhook}).to_string());
+        let mut wh2_resp = crate::request_bindings::metered(wh2);
+        assert_eq!(wh2_resp.get_status(), StatusCode::ACCEPTED);
+        let wh2_body: serde_json::Value =
+            serde_json::from_str(&wh2_resp.take_body_str()).unwrap();
+        assert_eq!(wh2_body["errors"], 0);
+        assert_eq!(wh2_body["pending"], 1);
+        assert!(b2_cdn_phase::physical_absent(&webhook_hash).unwrap());
+
+        let mut cleared = 0u64;
+        for _ in 0..5 {
+            let drain_req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false)
+                .with_header("Authorization", "Bearer synthetic-drain-token");
+            let mut drain_resp = crate::request_bindings::metered(drain_req);
+            assert_eq!(drain_resp.get_status(), StatusCode::OK);
+            let reply: serde_json::Value =
+                serde_json::from_str(&drain_resp.take_body_str()).unwrap();
+            assert_eq!(reply["errors"], 0);
+            let drained = reply["result"].as_u64().unwrap_or(0);
+            cleared += drained;
+            if drained == 0 && reply["pending"] == 0 {
+                break;
+            }
+        }
+        assert!(cleared >= 1, "expected queued intents to drain");
+        assert!(storage::vanish_complete(&webhook_hash));
+
+        let mut wh3 = request(Method::POST, "/admin/api/vanish", false)
+            .with_header("Authorization", "Bearer synthetic-webhook-token");
+        wh3.set_body(serde_json::json!({"pubkey": owner_webhook}).to_string());
+        let mut wh3_resp = crate::request_bindings::metered(wh3);
+        assert_eq!(wh3_resp.get_status(), StatusCode::OK);
+        let wh3_body: serde_json::Value =
+            serde_json::from_str(&wh3_resp.take_body_str()).unwrap();
+        assert_eq!(wh3_body["errors"], 0);
+        assert_eq!(wh3_body["pending"], 0);
+        assert_eq!(wh3_body["vanished"], true);
+
+        // 2. Creator delete via /admin/api/moderate with admin_token under
+        // b2_replica_enabled=true cannot fit 5 FOS/B2/webhook secrets alongside
+        // admin_token even on retries; fail visibly (502) rather than looping 409.
+        let admin_delete_hash = "c".repeat(64);
+        let admin_delete_meta = serde_json::from_value(serde_json::json!({
+            "sha256": admin_delete_hash,
+            "size": 9,
+            "type": "video/mp4",
+            "uploaded": "2026-01-01T00:00:00Z",
+            "owner": "c".repeat(64),
+            "status": "active"
+        }))
+        .unwrap();
+        put_blob_metadata(&admin_delete_meta).unwrap();
+        let mut del_req = request(Method::POST, "/admin/api/moderate", true);
+        del_req.set_body(
+            serde_json::json!({"sha256": admin_delete_hash, "action": "DELETE"}).to_string(),
+        );
+        assert_eq!(
+            crate::request_bindings::metered(del_req).get_status(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            get_blob_metadata_uncached(&admin_delete_hash)
+                .unwrap()
+                .unwrap()
+                .status,
+            BlobStatus::Deleted
+        );
+        assert!(!b2_cdn_phase::physical_absent(&admin_delete_hash).unwrap());
+
+        // 3. POST /admin/api/vanish with admin_token cannot fit 5 physical wave
+        // secrets alongside admin_token; report error (500, errors=1, pending=0)
+        // instead of silent indefinite pending.
+        let owner_admin = "d".repeat(64);
+        let admin_vanish_hash = "d".repeat(64);
+        let admin_vanish_meta = serde_json::from_value(serde_json::json!({
+            "sha256": admin_vanish_hash,
+            "size": 9,
+            "type": "video/mp4",
+            "uploaded": "2026-01-01T00:00:00Z",
+            "owner": owner_admin,
+            "status": "active"
+        }))
+        .unwrap();
+        put_blob_metadata(&admin_vanish_meta).unwrap();
+        crate::metadata::add_to_user_list(&owner_admin, &admin_vanish_hash).unwrap();
+        let mut admin_vanish_req = request(Method::POST, "/admin/api/vanish", true);
+        admin_vanish_req.set_body(serde_json::json!({"pubkey": owner_admin}).to_string());
+        let mut admin_vanish_resp = crate::request_bindings::metered(admin_vanish_req);
+        assert_eq!(
+            admin_vanish_resp.get_status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let admin_vanish_body: serde_json::Value =
+            serde_json::from_str(&admin_vanish_resp.take_body_str()).unwrap();
+        assert_eq!(admin_vanish_body["errors"], 1);
+        assert_eq!(admin_vanish_body["pending"], 0);
+        assert_eq!(admin_vanish_body["vanished"], false);
+        assert!(!b2_cdn_phase::physical_absent(&admin_vanish_hash).unwrap());
+        return;
+    }
+
     if mode == "vanish-b2-replica-cold-pop-rollback" {
         let hash = hash();
         let metadata = serde_json::from_value(serde_json::json!({

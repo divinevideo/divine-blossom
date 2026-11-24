@@ -240,6 +240,7 @@ def run_case(mode):
             "vanish-cold-pop-rollback-5-secret-budget",
             "vanish-already-deleted-5-secret-budget",
             "vanish-b2-replica-cold-pop-rollback",
+            "vanish-b2-replica-admin-auth-budget",
             "webhook-admin-moderate",
         ):
             server.origin_retained_zones = f"{PRIMARY_HOST},{ALIAS_HOST}"
@@ -377,7 +378,10 @@ def run_case(mode):
                     secrets["kv_origin_read_token"] = "synthetic-policy-key"
                     secrets["fos_access_key"] = "synthetic-fos-key"
                     secrets["fos_secret_key"] = "synthetic-fos-secret"
-                elif mode == "vanish-b2-replica-cold-pop-rollback":
+                elif mode in (
+                    "vanish-b2-replica-cold-pop-rollback",
+                    "vanish-b2-replica-admin-auth-budget",
+                ):
                     configuration = {
                         "fixture_delivery_mode": mode,
                         "b2_replica_enabled": "true",
@@ -514,6 +518,7 @@ def run_case(mode):
                     "vanish-cold-pop-rollback-5-secret-budget",
                     "vanish-already-deleted-5-secret-budget",
                     "vanish-b2-replica-cold-pop-rollback",
+                    "vanish-b2-replica-admin-auth-budget",
                 ):
                     # Queued intents drain (2 rounds per intent per alias/service).
                     assert server.bunny_counts[PRIMARY_HOST] >= 2, server.bunny_counts
@@ -551,6 +556,7 @@ if __name__ == "__main__":
         "vanish-cold-pop-rollback-5-secret-budget",
         "vanish-already-deleted-5-secret-budget",
         "vanish-b2-replica-cold-pop-rollback",
+        "vanish-b2-replica-admin-auth-budget",
         "vanish-cold-pop-pilot-rollback-blocks-completion",
         "bunny-retry-clears-on-target-error",
         "webhook-admin-moderate",

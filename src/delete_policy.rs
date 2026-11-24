@@ -303,17 +303,30 @@ fn handle_phased_creator_delete(
             physical.push(candidate.clone());
         }
     }
-    // Only execute the physical storage wave when this request still has room
-    // in Fastly's 5-secret Compute budget. If Attempt 1 spent a slot on
-    // `kv_origin_read_token` (e.g. cold-POP rollback or zone-rotation CAS),
-    // return retryable 409 Conflict with the phase opened and metadata denied
-    // so Attempt 2 executes `erase_vanish_batch` with the full 5-secret budget.
-    if !physical.is_empty() && crate::storage::has_vanish_physical_secret_budget() {
-        let result = crate::storage::erase_vanish_batch(&physical);
-        for candidate in &physical {
-            crate::storage::finish_vanish_phase(
-                candidate, &epochs[candidate], &result.failed_hashes, &result.remaining_hashes,
-            )?;
+    if !physical.is_empty() {
+        match crate::storage::vanish_physical_secret_budget() {
+            crate::storage::VanishPhysicalSecretBudget::Ready => {
+                let result = crate::storage::erase_vanish_batch(&physical);
+                for candidate in &physical {
+                    crate::storage::finish_vanish_phase(
+                        candidate,
+                        &epochs[candidate],
+                        &result.failed_hashes,
+                        &result.remaining_hashes,
+                    )?;
+                }
+            }
+            crate::storage::VanishPhysicalSecretBudget::DeferForKvOriginRetry => {
+                // Attempt 1 spent a slot on `kv_origin_read_token` (e.g. cold-POP
+                // rollback or zone-rotation CAS); return retryable 409 Conflict
+                // below with the phase opened and metadata denied so Attempt 2
+                // runs `erase_vanish_batch` within 5 secrets.
+            }
+            crate::storage::VanishPhysicalSecretBudget::Exhausted => {
+                return Err(BlossomError::StorageError(
+                    "Creator physical erasure cannot fit in Compute 5-secret budget under current authentication; retry via /admin/moderate webhook_secret or admin session".into(),
+                ));
+            }
         }
     }
     // A crash after recording absence but before enqueue must remain retryable.

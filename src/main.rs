@@ -5610,21 +5610,33 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         for hash in &physical_plan.skipped {
             phase_blocked.insert(hash.to_lowercase());
         }
-        let (physical_hashes, budget_deferred) =
-            if crate::storage::has_vanish_physical_secret_budget() {
-                (physical_plan.run, Vec::new())
-            } else {
-                (Vec::new(), physical_plan.run)
-            };
-        for hash in &budget_deferred {
-            retry_hashes.push(hash.clone());
-            deferred_pending = deferred_pending.saturating_add(1);
-            phase_blocked.insert(hash.to_lowercase());
-        }
-        let storage_result = if physical_hashes.is_empty() {
-            crate::storage::VanishStorageResult::default()
+        let (physical_hashes, storage_result) = if physical_plan.run.is_empty() {
+            (Vec::new(), crate::storage::VanishStorageResult::default())
         } else {
-            erase_vanish_batch(&physical_hashes)
+            match crate::storage::vanish_physical_secret_budget() {
+                crate::storage::VanishPhysicalSecretBudget::Ready => {
+                    let result = erase_vanish_batch(&physical_plan.run);
+                    (physical_plan.run, result)
+                }
+                crate::storage::VanishPhysicalSecretBudget::DeferForKvOriginRetry => {
+                    for hash in &physical_plan.run {
+                        phase_blocked.insert(hash.to_lowercase());
+                    }
+                    (Vec::new(), crate::storage::VanishStorageResult::default())
+                }
+                crate::storage::VanishPhysicalSecretBudget::Exhausted => {
+                    let mut failed = crate::storage::VanishStorageResult::default();
+                    for hash in &physical_plan.run {
+                        eprintln!(
+                            "[VANISH] pubkey={} hash={} physical erasure cannot fit in 5-secret budget under current auth",
+                            pubkey, hash
+                        );
+                        failed.failed_hashes.insert(hash.clone());
+                        phase_blocked.insert(hash.to_lowercase());
+                    }
+                    (Vec::new(), failed)
+                }
+            }
         };
         storage_attempts = storage_attempts.saturating_add(u32::from(!erase_hashes.is_empty()));
         add_vanish_storage_timings(&mut storage_timings, &storage_result.timings);
@@ -5689,7 +5701,7 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
             // before its final purge is acknowledged would lose discovery while
             // the cached audio still serves. Keep the source pending until the
             // audio phase completes.
-            if crate::storage::cdn_invalidation_configured()
+            if crate::storage::phase_or_cdn_invalidation_active(&plan.audio_hash)
                 && !crate::storage::vanish_complete(&plan.audio_hash)
             {
                 deferred_derived_sources.insert(plan.source_hash.clone());
@@ -5703,7 +5715,7 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
                 failed_derived_sources.insert(plan.source_hash.clone());
                 continue;
             }
-            if crate::storage::cdn_invalidation_configured() {
+            if crate::storage::phase_or_cdn_invalidation_active(&plan.audio_hash) {
                 let _ = crate::b2_cdn_phase::mark_complete(&plan.audio_hash);
             }
         }
@@ -6112,8 +6124,8 @@ fn handle_vanish(req: Request) -> Result<Response> {
 
 /// POST /admin/api/vanish - Admin-initiated vanish (for funnelcake janitor NIP-62 integration)
 fn handle_admin_vanish(req: Request) -> Result<Response> {
-    // Validate admin auth
-    admin::validate_admin_auth(&req)?;
+    // Prefer webhook_secret so webhook callers do not burn a slot on admin_token.
+    admin::validate_admin_auth_prefer_webhook(&req)?;
 
     // Parse request body
     let body = req.into_body_str();

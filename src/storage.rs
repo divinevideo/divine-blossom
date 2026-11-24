@@ -3751,26 +3751,60 @@ pub(crate) fn phase_or_cdn_invalidation_active(hash: &str) -> bool {
         || cdn_invalidation_configured()
 }
 
-/// Whether the current Compute request still has enough of its 5-secret budget
-/// to run `erase_vanish_batch` without breaching Fastly's secret limit.
-pub(crate) fn has_vanish_physical_secret_budget() -> bool {
-    if is_local_mode() {
-        return true;
+/// Classification of the current request's remaining 5-secret Compute budget
+/// for `erase_vanish_batch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VanishPhysicalSecretBudget {
+    /// Current request has room within Fastly's 5-secret limit to run
+    /// `erase_vanish_batch` now.
+    Ready,
+    /// Current request spent a slot on `kv_origin_read_token` (e.g. cold-POP
+    /// origin-retention lookup on Attempt 1), and a retry that hits the local
+    /// phase record without `kv_origin_read_token` will fit within 5 secrets.
+    DeferForKvOriginRetry,
+    /// Even without `kv_origin_read_token`, already-cached secrets in this
+    /// request (such as `admin_token` alongside `b2_replica_enabled=true`)
+    /// leave fewer slots than `erase_vanish_batch` requires; deferring would
+    /// loop forever without progress.
+    Exhausted,
+}
+
+/// Classify whether the current Compute request has enough of its 5-secret
+/// budget to run `erase_vanish_batch`, can retry once `kv_origin_read_token`
+/// is skipped, or can never fit under the current request's cached auth.
+pub(crate) fn vanish_physical_secret_budget() -> VanishPhysicalSecretBudget {
+    vanish_physical_secret_budget_for(is_local_mode(), b2_replica_enabled())
+}
+
+pub(crate) fn vanish_physical_secret_budget_for(
+    local_mode: bool,
+    b2_replica: bool,
+) -> VanishPhysicalSecretBudget {
+    if local_mode {
+        return VanishPhysicalSecretBudget::Ready;
     }
-    if b2_replica_enabled() {
-        crate::request_bindings::has_secret_budget(&[
+    let required: &[&str] = if b2_replica {
+        &[
             "fos_access_key",
             "fos_secret_key",
             "b2_vanish_application_key_id",
             "b2_vanish_application_key",
             "webhook_secret",
-        ])
+        ]
     } else {
-        crate::request_bindings::has_secret_budget(&[
-            "fos_access_key",
-            "fos_secret_key",
-            "webhook_secret",
-        ])
+        &["fos_access_key", "fos_secret_key", "webhook_secret"]
+    };
+    if crate::request_bindings::has_secret_budget(required) {
+        VanishPhysicalSecretBudget::Ready
+    } else if crate::request_bindings::secret_cached("kv_origin_read_token")
+        && crate::request_bindings::has_secret_budget_excluding(
+            required,
+            "kv_origin_read_token",
+        )
+    {
+        VanishPhysicalSecretBudget::DeferForKvOriginRetry
+    } else {
+        VanishPhysicalSecretBudget::Exhausted
     }
 }
 
@@ -7257,6 +7291,55 @@ mod tests {
         let purged = super::purge_vanish_hashes(std::slice::from_ref(&hash), &mut result);
         assert!(purged.is_empty());
         assert!(result.purge_deferred);
+    }
+
+    #[test]
+    fn vanish_physical_secret_budget_distinguishes_kv_origin_retry_from_exhausted_auth() {
+        {
+            let _scope = crate::request_bindings::begin();
+            assert_eq!(
+                super::vanish_physical_secret_budget_for(false, true),
+                super::VanishPhysicalSecretBudget::Ready
+            );
+            let _ = crate::request_bindings::secret("webhook_secret");
+            assert_eq!(
+                super::vanish_physical_secret_budget_for(false, true),
+                super::VanishPhysicalSecretBudget::Ready
+            );
+            let _ = crate::request_bindings::secret("kv_origin_read_token");
+            assert_eq!(
+                super::vanish_physical_secret_budget_for(false, true),
+                super::VanishPhysicalSecretBudget::DeferForKvOriginRetry
+            );
+        }
+        {
+            let _scope = crate::request_bindings::begin();
+            let _ = crate::request_bindings::secret("admin_token");
+            assert_eq!(
+                super::vanish_physical_secret_budget_for(false, true),
+                super::VanishPhysicalSecretBudget::Exhausted
+            );
+            let _ = crate::request_bindings::secret("kv_origin_read_token");
+            assert_eq!(
+                super::vanish_physical_secret_budget_for(false, true),
+                super::VanishPhysicalSecretBudget::Exhausted
+            );
+            let _ = crate::request_bindings::secret("webhook_secret");
+            assert_eq!(
+                super::vanish_physical_secret_budget_for(false, true),
+                super::VanishPhysicalSecretBudget::Exhausted
+            );
+        }
+        {
+            let _scope = crate::request_bindings::begin();
+            for key in ["admin_token", "webhook_secret", "kv_origin_read_token"] {
+                let _ = crate::request_bindings::secret(key);
+            }
+            assert_eq!(
+                super::vanish_physical_secret_budget_for(false, false),
+                super::VanishPhysicalSecretBudget::Ready
+            );
+        }
     }
 }
 

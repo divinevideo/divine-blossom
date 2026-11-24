@@ -183,6 +183,30 @@ pub(crate) fn has_secret_budget(keys: &[&str]) -> bool {
     })
 }
 
+/// Whether `keys` would fit inside the 5-secret Compute limit on a fresh retry
+/// that avoids loading `excluded` (such as `kv_origin_read_token` after Attempt 1
+/// has opened a local phase record).
+pub(crate) fn has_secret_budget_excluding(keys: &[&str], excluded: &str) -> bool {
+    CURRENT.with(|slot| {
+        slot.borrow().as_ref().is_none_or(|bindings| {
+            let base = bindings
+                .secrets
+                .len()
+                .saturating_sub(usize::from(bindings.secrets.contains_key(excluded)));
+            let mut needed = 0usize;
+            for (index, key) in keys.iter().enumerate() {
+                if *key != excluded
+                    && !bindings.secrets.contains_key(*key)
+                    && !keys[..index].contains(key)
+                {
+                    needed += 1;
+                }
+            }
+            base + needed <= 5
+        })
+    })
+}
+
 pub(crate) fn secret(key: &str) -> Result<Option<String>> {
     lookup(|bindings| bindings.secret(key))
 }

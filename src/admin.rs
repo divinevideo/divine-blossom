@@ -54,6 +54,27 @@ pub fn validate_admin_auth(req: &Request) -> Result<()> {
     ))
 }
 
+/// Validate admin authentication on routes that subsequently require `webhook_secret`,
+/// checking `webhook_secret` before `admin_token` so webhook callers do not consume
+/// an extra Compute secret slot on `admin_token`.
+pub fn validate_admin_auth_prefer_webhook(req: &Request) -> Result<()> {
+    if let Some(provided) = extract_bearer_token(req) {
+        if validate_bearer_token_against_secret_keys(&provided, &["webhook_secret", "admin_token"])
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+
+    if validate_session(req).is_ok() {
+        return Ok(());
+    }
+
+    Err(BlossomError::AuthRequired(
+        "Admin authentication required".into(),
+    ))
+}
+
 /// The recurring eviction worker has authority only on the bounded drain route.
 /// Never add this secret to the general admin/webhook credential list.
 pub(crate) fn validate_b2_cdn_purge_drain_auth(req: &Request) -> Result<()> {
