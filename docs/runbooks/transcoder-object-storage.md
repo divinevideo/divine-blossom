@@ -6,11 +6,11 @@ extracted audio, and newly generated transcript VTT. This source change does not
 change public media URLs. Derived-media readers have separate configuration.
 
 `MEDIA_STORAGE_PROVIDER=b2_primary` uses B2 for those media reads and requires
-verified GCS backups for every write through this adapter. It requires the same
+verified GCS backups for every write through this adapter by default. It requires the same
 B2 settings plus the existing authenticated GCS client and nonempty GCS bucket.
 Processing originals fall back to the pinned, verified legacy GCS copy only
 when the B2 metadata lookup reports absence; all other failures remain errors.
-Both immutable provider versions and their bytes/metadata are verified before
+With backups enabled, both immutable provider versions and their bytes/metadata are verified before
 `put_verified` succeeds; its receipt includes `required_backup`. A failed backup
 returns an error even if B2 already accepted the primary. It does not delete
 that primary or report the output complete. HLS reuse in the new mode checks
@@ -23,6 +23,36 @@ requests read and compare those outputs instead of encoding or writing again;
 incomplete or mismatched copies require regeneration. Shared-audio backup repair verifies the existing
 primary bytes and writes the backup with the existing provenance, leaving the
 primary version unchanged. Legacy `gcs` and `b2` modes retain their behavior.
+
+### Disable GCS media backups while retaining legacy reads
+
+For `MEDIA_STORAGE_PROVIDER=b2_primary`, set `MEDIA_GCS_BACKUP_ENABLED=false`
+on the candidate revision to publish new adapter-managed HLS, progressive MP4,
+audio and transcript objects only to B2. Omission or `true` retains replication;
+other values fail startup. The switch has no effect in `gcs` or plain `b2` mode.
+Use `--update-env-vars` to preserve other runtime configuration. The deploy script
+preserves existing storage settings; set this switch explicitly on the candidate
+before promoting it under [the single-writer runbook](hls-single-writer.md).
+
+This removes backup uploads, backup readback verification and backup repair for
+existing primary outputs. B2 writes still require pinned version, metadata and
+byte verification. HLS reuse still requires every required nonempty B2 artifact;
+a master alone is insufficient. Existing GCS objects are not deleted or changed
+by disabling backups.
+
+The legacy GCS reader remains configured separately from the optional writer.
+An original or processing segment missing from B2 can still be read from GCS,
+with the same pinned-version and integrity checks. GCS is also retained for
+locks and for reconciling an earlier journaled backup write. Disabling backups
+never clears an uncertain write: the recorded provider/key must still expose
+the matching attempt marker before recovery. Keep the GCS bucket/client and
+permissions needed for these reads and coordination.
+
+This is not whole-service GCS retirement: mutable job state, translation output
+and sound analysis keep their existing paths. Re-enabling backups restores
+required-copy checks for subsequent work and can cause regeneration or backup
+repair for artifacts produced while backups were off. It does not bulk-copy
+historical output at startup.
 
 This is synchronous replication through the existing processing paths. It adds
 no database, queue, credentials, or processing service. It does not activate a
@@ -97,8 +127,8 @@ output. Default GCS metadata lookup errors preserve the legacy fall-through to
 locked processing. Translation source lookup retains historical GCS read
 compatibility only when the selected object is absent; selected-provider errors
 and failed pinned reads do not use that compatibility path.
-Before transcription deduplication acknowledges an existing B2-primary transcript,
-it holds the existing transcript lock and verifies the required backup's pinned
+With backups enabled, before transcription deduplication acknowledges an existing
+B2-primary transcript, it holds the existing transcript lock and verifies the required backup's pinned
 metadata and bytes. Missing or mismatched backups are repaired from pinned primary
 bytes with their existing provenance and GCS generation preconditions. Matching
 backups are not rewritten. A failed cache check or repair sends a failed status

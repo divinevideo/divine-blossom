@@ -246,6 +246,20 @@ fn hls_alias_failed_admission_keeps_playback_retryable() {
         StatusCode::ACCEPTED
     );
 
+    if crate::request_bindings::config("hetzner_transcode_admission")
+        .unwrap()
+        .as_deref()
+        == Some("true")
+    {
+        let _scope = crate::request_bindings::begin();
+        for key in ["admin_token", "gcs_access_key", "gcs_secret_key", "fixture_a", "fixture_b"] {
+            assert!(crate::request_bindings::secret(key).unwrap().is_some());
+        }
+        // The request already spent all five secret lookups; legacy intake
+        // should remain available without reading or forwarding another secret.
+        assert!(queue_transcode(&"e".repeat(64), &"b".repeat(64)).unwrap());
+    }
+
     // A terminal callback that beats admission must retain its newer state.
     let before = get_blob_metadata(&hash).unwrap().unwrap();
     crate::metadata::update_transcode_status(&hash, TranscodeStatus::Complete).unwrap();
@@ -254,4 +268,20 @@ fn hls_alias_failed_admission_keeps_playback_retryable() {
         get_blob_metadata(&hash).unwrap().unwrap().transcode_status,
         Some(TranscodeStatus::Complete)
     );
+}
+
+#[test]
+#[ignore = "requires local synthetic metadata and HLS origin"]
+fn hls_alias_copy_only_missing_mp4_uses_original_fallback() {
+    let hash = "9".repeat(64);
+    metadata(&hash, "active", "complete");
+    let url = format!("https://media.example.test/{hash}/480p.mp4");
+    for req in [Request::get(&url), Request::head(&url),
+        Request::get(format!("https://media.example.test/admin/api/blob/{hash}/480p.mp4"))
+            .with_header("Authorization", "Bearer synthetic-admin-token")] {
+        let resp = response(req);
+        assert_eq!(resp.get_status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(resp.get_header_str("Cache-Control").unwrap().contains("no-store"));
+        assert!(resp.get_header_str("Retry-After").is_none());
+    }
 }

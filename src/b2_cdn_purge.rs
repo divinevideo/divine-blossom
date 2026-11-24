@@ -176,7 +176,11 @@ pub(crate) fn configured() -> bool {
     // default. A store outage must not disable durable revocation while old
     // outer objects may still be serving. Checked purging then reports the
     // unavailable configuration and retains the intent instead of acknowledging.
-    fastly_configured().unwrap_or(true) || crate::storage::bunny_pilot_configured().unwrap_or(true)
+    fastly_configured().unwrap_or(true)
+        || crate::storage::bunny_delivery_config_present().unwrap_or(true)
+        || crate::storage::bunny_pilot_config_present().unwrap_or(true)
+        || crate::storage::bunny_delivery_configured().unwrap_or(true)
+        || crate::storage::bunny_pilot_configured().unwrap_or(true)
 }
 
 pub(crate) fn fastly_configured() -> Result<bool> {
@@ -405,6 +409,7 @@ pub(crate) fn begin_phase(hash: &str, phase: Phase) -> Result<Token> {
         state: RecordState::Prepared,
     };
     let store = open_store()?;
+    crate::storage::retain_bunny_delivery_zones()?;
     store
         .build_insert()
         .mode(InsertMode::Add)
@@ -878,7 +883,11 @@ pub(crate) fn handle_drain(
         return Err(BlossomError::BadRequest("POST required".into()));
     }
     let mut limit = parse_drain_limit(req.get_query_parameter("max"))?;
-    if crate::storage::bunny_pilot_configured().unwrap_or(true) {
+    if crate::storage::bunny_delivery_config_present().unwrap_or(true)
+        || crate::storage::bunny_pilot_config_present().unwrap_or(true)
+        || crate::storage::bunny_delivery_configured().unwrap_or(true)
+        || crate::storage::bunny_pilot_configured().unwrap_or(true)
+    {
         // A single hash can need two provider purge rounds plus version
         // listing and deletion. Two such hashes may exhaust the execution.
         limit = 1;

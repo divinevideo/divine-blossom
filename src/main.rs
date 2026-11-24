@@ -315,7 +315,8 @@ fn route_request(req: Request) -> Result<Response> {
         // BUD-02: Upload
         (Method::PUT, "/upload") => with_upload_log(req, UploadRoute::DirectPut, handle_upload),
         // BUD-06: Upload requirements/pre-validation
-        (Method::HEAD, "/upload") => handle_upload_requirements(req),
+        // Some CDNs satisfy HEAD from a GET to the origin.
+        (Method::HEAD | Method::GET, "/upload") => handle_upload_requirements(req),
         // Synchronous audio transcription — thin forward to the upload service's
         // authenticated /transcribe proxy (which calls the transcoder).
         (Method::POST, "/transcribe") => handle_transcribe_proxy(req),
@@ -343,6 +344,14 @@ fn route_request(req: Request) -> Result<Response> {
 
         // BUD-04: Mirror
         (Method::PUT, "/mirror") => handle_mirror(req),
+
+        (Method::GET, p) if p.starts_with("/internal/media-policy/") => {
+            let result = handle_media_processing_policy(&req, p);
+            let mut response = result.unwrap_or_else(|error| error_response(&error));
+            add_no_cache_headers(&mut response);
+            response.set_header("Surrogate-Control", "no-store");
+            Ok(response)
+        }
 
         // Admin: Moderation webhook from divine-moderation-service
         (Method::POST, "/admin/moderate") => handle_admin_moderate(req),
@@ -428,6 +437,9 @@ fn route_request(req: Request) -> Result<Response> {
         }
 
         // CORS preflight
+        (Method::OPTIONS, "/upload") => {
+            Ok(cors_preflight_response().with_header(header::ALLOW, "GET, HEAD, PUT, OPTIONS"))
+        }
         (Method::OPTIONS, _) => Ok(cors_preflight_response()),
 
         // Not found
@@ -2726,6 +2738,7 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
     // Do NOT add to user lists or recent indexes for derived blobs.
     let audio_metadata = BlobMetadata {
         archive_storage: None,
+        video_encoding_allowed: false,
         sha256: audio_sha256.clone(),
         size,
         mime_type: mime_type.clone(),
@@ -2887,6 +2900,13 @@ fn handle_get_quality_variant(req: Request, path: &str) -> Result<Response> {
             Ok(resp)
         }
         Err(BlossomError::NotFound(_)) => {
+            if content_type == "video/mp4" && !meta.allows_video_encoding() {
+                return Ok(derivative_failure_response(
+                    Some("copy_only_variant_unavailable"),
+                    Some("Use the original video; this media does not permit re-encoding"),
+                    "Use the original video",
+                ));
+            }
             // For .mp4 requests, check if the .ts counterpart exists for lazy remux
             if content_type == "video/mp4" {
                 let ts_name = ts_filename.replace(".mp4", ".ts");
@@ -2969,7 +2989,16 @@ fn handle_head_quality_variant(path: &str) -> Result<Response> {
     }
 
     let gcs_path = format!("{}/hls/{}", hash, ts_filename);
-    download_hls_content(&gcs_path, None)?;
+    match download_hls_content(&gcs_path, None) {
+        Err(BlossomError::NotFound(_)) if content_type == "video/mp4" && !metadata.allows_video_encoding() => {
+            return Ok(derivative_failure_response(
+                Some("copy_only_variant_unavailable"),
+                Some("Use the original video; this media does not permit re-encoding"),
+                "Use the original video",
+            ));
+        }
+        result => { result?; }
+    }
 
     let mut resp = Response::from_status(StatusCode::OK);
     resp.set_header("Content-Type", content_type);
@@ -3043,6 +3072,13 @@ fn handle_admin_quality_variant(req: Request, path: &str) -> Result<Response> {
             Ok(resp)
         }
         Err(BlossomError::NotFound(_)) => {
+            if content_type == "video/mp4" && !meta.allows_video_encoding() {
+                return Ok(derivative_failure_response(
+                    Some("copy_only_variant_unavailable"),
+                    Some("Use the original video; this media does not permit re-encoding"),
+                    "Use the original video",
+                ));
+            }
             // For .mp4 requests, check if .ts counterpart exists for lazy remux
             if content_type == "video/mp4" {
                 let ts_name = ts_filename.replace(".mp4", ".ts");
@@ -3274,6 +3310,8 @@ const CLOUD_RUN_TRANSCODER_HOST: &str = "divine-transcoder-149672065768.us-centr
 /// /transcode, /backfill-fmp4, /transcribe silently misroute to the upload
 /// service and 404, leaving videos stuck in `Processing` forever.
 const TRANSCODER_BACKEND: &str = "cloud_run_transcoder";
+const HETZNER_TRANSCODE_ADMISSION_HOST: &str = "transcoder-worker.divine.video";
+const HETZNER_TRANSCODE_ADMISSION_BACKEND: &str = "hetzner_transcode_admission";
 
 /// Generate thumbnail on-demand by proxying to Cloud Run
 fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
@@ -3334,9 +3372,19 @@ fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
                 "Thumbnail cannot be generated for this video".into(),
             ))
         }
-        StatusCode::SERVICE_UNAVAILABLE => Err(BlossomError::StorageError(
-            "Thumbnail generation is busy".into(),
-        )),
+        StatusCode::SERVICE_UNAVAILABLE => {
+            let retry_after = resp
+                .get_header(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| valid_upload_retry_after(value))
+                .map(str::to_owned)
+                .or_else(|| Some("5".into()));
+            Err(BlossomError::ServiceUnavailable {
+                message: "Thumbnail generation is busy".into(),
+                retry_after,
+            })
+        }
         status => Err(BlossomError::StorageError(format!(
             "Thumbnail generation failed with status: {}",
             status
@@ -3444,7 +3492,7 @@ fn trigger_on_demand_transcoding(hash: &str, owner: &str) -> Result<()> {
     }
     if !queue_transcode(hash, owner)? {
         // Support edge-first rollout and rollback when the admission route is absent.
-        transcode_dispatch_request("/transcode", hash, owner)
+        transcode_dispatch_request(CLOUD_RUN_TRANSCODER_HOST, "/transcode", hash, owner)
             .send_async(TRANSCODER_BACKEND)
             .map_err(|_| transcode_admission_unavailable())?;
     }
@@ -3453,12 +3501,9 @@ fn trigger_on_demand_transcoding(hash: &str, owner: &str) -> Result<()> {
     Ok(())
 }
 
-fn transcode_dispatch_request(path: &str, hash: &str, owner: &str) -> Request {
-    let mut request = Request::new(
-        Method::POST,
-        format!("https://{CLOUD_RUN_TRANSCODER_HOST}{path}"),
-    );
-    request.set_header("Host", CLOUD_RUN_TRANSCODER_HOST);
+fn transcode_dispatch_request(host: &str, path: &str, hash: &str, owner: &str) -> Request {
+    let mut request = Request::new(Method::POST, format!("https://{host}{path}"));
+    request.set_header("Host", host);
     request.set_header("Content-Type", "application/json");
     request.set_body(serde_json::json!({"hash":hash,"owner":owner}).to_string());
     request
@@ -3474,12 +3519,41 @@ fn transcode_admission_unavailable() -> BlossomError {
 /// `Ok(true)` requires durable admission. `Ok(false)` identifies a legacy
 /// transcoder that does not implement the queue-only route.
 fn queue_transcode(hash: &str, owner: &str) -> Result<bool> {
-    let response = transcode_dispatch_request("/transcode/queue", hash, owner)
-        .send(TRANSCODER_BACKEND)
+    const ADMISSION_SECRET: &str = "transcode_admission_secret";
+    let hetzner_enabled = match crate::request_bindings::config("hetzner_transcode_admission")
+        .map_err(|_| transcode_admission_unavailable())?
+        .as_deref()
+    {
+        Some("true") => true,
+        Some("false") | None => false,
+        _ => return Err(transcode_admission_unavailable()),
+    };
+    // Storage fallbacks and admin auth can spend all Fastly secret reads.
+    // Select Cloud Run before dispatch on those requests.
+    let use_hetzner = hetzner_enabled && crate::request_bindings::can_read_secret(ADMISSION_SECRET);
+    let (host, backend) = if use_hetzner {
+        (
+            HETZNER_TRANSCODE_ADMISSION_HOST,
+            HETZNER_TRANSCODE_ADMISSION_BACKEND,
+        )
+    } else {
+        (CLOUD_RUN_TRANSCODER_HOST, TRANSCODER_BACKEND)
+    };
+    let mut request = transcode_dispatch_request(host, "/transcode/queue", hash, owner);
+    if use_hetzner {
+        let credential = crate::storage::get_secret(ADMISSION_SECRET)
+            .ok()
+            .filter(|secret| !secret.trim().is_empty())
+            .and_then(|secret| secret.trim().parse::<fastly::http::HeaderValue>().ok())
+            .ok_or_else(transcode_admission_unavailable)?;
+        request.set_header("x-divine-transcode-admission", credential);
+    }
+    let response = request
+        .send(backend)
         .map_err(|_| transcode_admission_unavailable())?;
     match response.get_status() {
         StatusCode::ACCEPTED => Ok(true),
-        StatusCode::NOT_FOUND => Ok(false),
+        StatusCode::NOT_FOUND if !use_hetzner => Ok(false),
         _ => Err(transcode_admission_unavailable()),
     }
 }
@@ -3690,6 +3764,7 @@ fn trigger_moderation_scan(sha256: &str, pubkey: &str) {
 fn handle_upload(mut req: Request, record: &mut UploadLogRecord) -> Result<Response> {
     // Validate auth
     let auth = validate_auth(&req, AuthAction::Upload)?;
+    let encoding_requested = upload_encoding_requested(&req)?;
 
     // Serialize auth event for provenance (before consuming request)
     let auth_event_json = serde_json::to_string(&auth).unwrap_or_default();
@@ -3772,6 +3847,10 @@ fn handle_upload(mut req: Request, record: &mut UploadLogRecord) -> Result<Respo
     if blob_exists(&hash)? {
         // Return existing blob descriptor but track this re-uploader
         if let Some(mut metadata) = get_blob_metadata(&hash)? {
+            if !encoding_requested && metadata.video_encoding_allowed {
+                metadata = crate::metadata::restrict_video_encoding(&hash)?;
+            }
+
             // Add re-uploader to their list and refs (best effort)
             let _ = add_to_user_list(&auth.pubkey, &hash);
             let _ = add_to_blob_refs(&hash, &auth.pubkey);
@@ -3789,7 +3868,9 @@ fn handle_upload(mut req: Request, record: &mut UploadLogRecord) -> Result<Respo
                 metadata.transcript_status,
             );
             let descriptor = metadata.to_descriptor(&base_url);
-            return Ok(json_response(StatusCode::OK, &descriptor));
+            let mut resp = json_response(StatusCode::OK, &descriptor);
+            add_cors_headers(&mut resp);
+            return Ok(resp);
         }
     }
 
@@ -3805,6 +3886,7 @@ fn handle_upload(mut req: Request, record: &mut UploadLogRecord) -> Result<Respo
     // Store metadata
     let metadata = BlobMetadata {
         archive_storage: None,
+        video_encoding_allowed: encoding_requested && is_video_mime_type(&content_type),
         sha256: hash.clone(),
         size: actual_size,
         mime_type: content_type.clone(),
@@ -3884,7 +3966,7 @@ fn handle_upload(mut req: Request, record: &mut UploadLogRecord) -> Result<Respo
 
     // Return blob descriptor
     let descriptor = metadata.to_descriptor(&base_url);
-    let mut resp = json_response(StatusCode::OK, &descriptor);
+    let mut resp = json_response(StatusCode::CREATED, &descriptor);
     add_cors_headers(&mut resp);
 
     Ok(resp)
@@ -4105,8 +4187,16 @@ fn publish_upload_service_upload(
     auth: crate::blossom::BlossomAuthEvent,
     base_url: String,
     upload: UploadServicePublishedUpload,
+    encoding_requested: bool,
 ) -> Result<Response> {
-    publish_upload_service_upload_with_policy(auth, base_url, upload, false)
+    publish_upload_service_upload_with_policy(
+        auth,
+        base_url,
+        upload,
+        false,
+        encoding_requested,
+        StatusCode::OK,
+    )
 }
 
 fn publish_upload_service_upload_with_policy(
@@ -4114,6 +4204,8 @@ fn publish_upload_service_upload_with_policy(
     base_url: String,
     upload: UploadServicePublishedUpload,
     preserve_inline_dedupe: bool,
+    encoding_requested: bool,
+    new_blob_status: StatusCode,
 ) -> Result<Response> {
     let hash = upload.sha256;
     let size = upload.size;
@@ -4146,6 +4238,10 @@ fn publish_upload_service_upload_with_policy(
 
     // Read authoritative metadata before updating the full record.
     if let Some(mut metadata) = get_blob_metadata_uncached(&hash)? {
+        if !encoding_requested && metadata.video_encoding_allowed {
+            metadata = crate::metadata::restrict_video_encoding(&hash)?;
+        }
+
         let _ = add_to_user_list(&auth.pubkey, &hash);
         let _ = add_to_blob_refs(&hash, &auth.pubkey);
 
@@ -4184,7 +4280,7 @@ fn publish_upload_service_upload_with_policy(
             // webhook) stays terminal — a reupload of the same bytes is not
             // evidence that the media became transcodable.
             metadata.transcode_terminal = metadata.transcode_terminal || transcode_terminal;
-        } else if should_reset_transcode_failure_on_clean_upload(
+        } else if metadata.allows_video_encoding() && should_reset_transcode_failure_on_clean_upload(
             &metadata.mime_type,
             metadata.transcode_status,
             upload.transcode_observation,
@@ -4240,6 +4336,7 @@ fn publish_upload_service_upload_with_policy(
 
     let metadata = BlobMetadata {
         archive_storage: None,
+        video_encoding_allowed: encoding_requested && is_video_mime_type(&content_type),
         sha256: hash.clone(),
         size,
         mime_type: content_type.clone(),
@@ -4328,7 +4425,7 @@ fn publish_upload_service_upload_with_policy(
     );
 
     let descriptor = metadata.to_descriptor(&base_url);
-    let mut resp = json_response(StatusCode::OK, &descriptor);
+    let mut resp = json_response(new_blob_status, &descriptor);
     add_cors_headers(&mut resp);
 
     Ok(resp)
@@ -4336,6 +4433,11 @@ fn publish_upload_service_upload_with_policy(
 
 fn handle_upload_init(mut req: Request, record: &mut UploadLogRecord) -> Result<Response> {
     let auth = validate_auth(&req, AuthAction::Upload)?;
+    if !upload_encoding_requested(&req)? {
+        return Err(BlossomError::BadRequest(
+            "Copy-only uploads must use PUT /upload or PUT /mirror".into(),
+        ));
+    }
     let auth_header = extract_authorization_header(&req)?;
     let base_url = get_base_url(&req);
     let control_host = get_public_host(&req).unwrap_or_else(|| "media.divine.video".into());
@@ -4468,6 +4570,7 @@ fn handle_upload_complete(
     record: &mut UploadLogRecord,
 ) -> Result<Response> {
     let auth = validate_auth(&req, AuthAction::Upload)?;
+    let encoding_requested = upload_encoding_requested(&req)?;
     let auth_header = extract_authorization_header(&req)?;
     let base_url = get_base_url(&req);
     let upload_id = path
@@ -4497,6 +4600,10 @@ fn handle_upload_complete(
     );
     proxy_req.set_header("Host", UPLOAD_SERVICE_HOST);
     proxy_req.set_header(header::AUTHORIZATION, &auth_header);
+    if !encoding_requested {
+        proxy_req.set_header("X-Divine-Video-Processing", "copy-only");
+    }
+
     proxy_req.set_header(upload_log::CORRELATION_HEADER, &record.req_id);
     if expected_request_hash.is_some() {
         proxy_req.set_header(header::CONTENT_TYPE, "application/json");
@@ -4532,6 +4639,7 @@ fn handle_upload_complete(
         auth,
         base_url,
         upload_from_resumable_completion(complete_response),
+        encoding_requested,
     )
 }
 
@@ -4645,6 +4753,7 @@ fn handle_upload_service_proxy(
     record: &mut UploadLogRecord,
     expected_hash: Option<&str>,
 ) -> Result<Response> {
+    let encoding_requested = upload_encoding_requested(&req)?;
     let auth_header = extract_authorization_header(&req)?;
 
     // Get the body to forward
@@ -4657,6 +4766,10 @@ fn handle_upload_service_proxy(
     );
     proxy_req.set_header("Host", UPLOAD_SERVICE_HOST);
     proxy_req.set_header(header::AUTHORIZATION, &auth_header);
+    if !encoding_requested {
+        proxy_req.set_header("X-Divine-Video-Processing", "copy-only");
+    }
+
     proxy_req.set_header(header::CONTENT_TYPE, &content_type);
     proxy_req.set_header(header::CONTENT_LENGTH, content_length.to_string());
     proxy_req.set_header(upload_log::CORRELATION_HEADER, &record.req_id);
@@ -4680,7 +4793,14 @@ fn handle_upload_service_proxy(
             "Upload service returned a different content hash".into(),
         ));
     }
-    publish_upload_service_upload_with_policy(auth, base_url, upload, expected_hash.is_some())
+    publish_upload_service_upload_with_policy(
+        auth,
+        base_url,
+        upload,
+        expected_hash.is_some(),
+        encoding_requested,
+        StatusCode::CREATED,
+    )
 }
 
 /// HEAD /upload - BUD-06 upload pre-validation
@@ -4716,17 +4836,10 @@ fn handle_upload_requirements(req: Request) -> Result<Response> {
                 add_cors_headers(&mut resp);
                 return Ok(resp);
             }
-
-            // Check if blob already exists (optimization - client can skip upload)
-            if blob_exists(hash)? {
-                let mut resp = Response::from_status(StatusCode::OK);
-                resp.set_header("X-Reason", "Blob already exists");
-                resp.set_header("X-Exists", "true");
-                add_upload_capability_headers(&mut resp, &control_host);
-                add_cors_headers(&mut resp);
-                return Ok(resp);
-            }
         }
+
+        // Preflight validates the request only. Clients check whether the blob
+        // exists with HEAD /<sha256>, which enforces visibility and holds.
 
         // Validate content length
         if let Some(size) = content_length {
@@ -5374,6 +5487,7 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     let mut storage_timings = VanishStorageTimings::default();
     let mut erase_main_candidates: HashSet<String> = HashSet::new();
     let mut purged_main_hashes: HashSet<String> = HashSet::new();
+    let mut purge_deferred_to_final = false;
     let mut prepare_ms = 0u128;
     let mut kv_finalize_ms = 0u128;
     let mut last_wave = Duration::ZERO;
@@ -5476,7 +5590,7 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         let physical_plan = plan_vanish_physical(
             &erase_hashes,
             &wave_epochs,
-            crate::storage::cdn_invalidation_configured(),
+            !wave_epochs.is_empty() || crate::storage::cdn_invalidation_configured(),
             |hash| vanish_needs_physical(hash),
         );
         // Held: no durable epoch or unreadable phase. Never erase without a
@@ -5496,14 +5610,37 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
         for hash in &physical_plan.skipped {
             phase_blocked.insert(hash.to_lowercase());
         }
-        let physical_hashes = physical_plan.run;
-        let storage_result = if physical_hashes.is_empty() {
-            crate::storage::VanishStorageResult::default()
+        let (physical_hashes, storage_result) = if physical_plan.run.is_empty() {
+            (Vec::new(), crate::storage::VanishStorageResult::default())
         } else {
-            erase_vanish_batch(&physical_hashes)
+            match crate::storage::vanish_physical_secret_budget() {
+                crate::storage::VanishPhysicalSecretBudget::Ready => {
+                    let result = erase_vanish_batch(&physical_plan.run);
+                    (physical_plan.run, result)
+                }
+                crate::storage::VanishPhysicalSecretBudget::DeferForKvOriginRetry => {
+                    for hash in &physical_plan.run {
+                        phase_blocked.insert(hash.to_lowercase());
+                    }
+                    (Vec::new(), crate::storage::VanishStorageResult::default())
+                }
+                crate::storage::VanishPhysicalSecretBudget::Exhausted => {
+                    let mut failed = crate::storage::VanishStorageResult::default();
+                    for hash in &physical_plan.run {
+                        eprintln!(
+                            "[VANISH] pubkey={} hash={} physical erasure cannot fit in 5-secret budget under current auth",
+                            pubkey, hash
+                        );
+                        failed.failed_hashes.insert(hash.clone());
+                        phase_blocked.insert(hash.to_lowercase());
+                    }
+                    (Vec::new(), failed)
+                }
+            }
         };
         storage_attempts = storage_attempts.saturating_add(u32::from(!erase_hashes.is_empty()));
         add_vanish_storage_timings(&mut storage_timings, &storage_result.timings);
+        purge_deferred_to_final |= storage_result.purge_deferred;
         purged_main_hashes.extend(
             storage_result
                 .purged_hashes
@@ -5564,7 +5701,7 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
             // before its final purge is acknowledged would lose discovery while
             // the cached audio still serves. Keep the source pending until the
             // audio phase completes.
-            if crate::storage::cdn_invalidation_configured()
+            if crate::storage::phase_or_cdn_invalidation_active(&plan.audio_hash)
                 && !crate::storage::vanish_complete(&plan.audio_hash)
             {
                 deferred_derived_sources.insert(plan.source_hash.clone());
@@ -5578,7 +5715,7 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
                 failed_derived_sources.insert(plan.source_hash.clone());
                 continue;
             }
-            if crate::storage::cdn_invalidation_configured() {
+            if crate::storage::phase_or_cdn_invalidation_active(&plan.audio_hash) {
                 let _ = crate::b2_cdn_phase::mark_complete(&plan.audio_hash);
             }
         }
@@ -5701,7 +5838,12 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     // through the public media host. Aggregate counters only; a 2xx records a
     // `present` failure signal without gating erasure completion, because a
     // residual edge copy cannot be repaired by retrying the vanish.
-    let (delivery_probe, delivery_probe_skipped) = if should_probe_delivery(
+    let (delivery_probe, delivery_probe_skipped) = if purge_deferred_to_final
+        && purged_main_hashes.is_empty()
+    {
+        eprintln!("[VANISH] delivery_probe stage=deferred_to_final_purge skipped");
+        (DeliveryProbeCounts::default(), 1u32)
+    } else if should_probe_delivery(
         started.elapsed(),
         DELIVERY_PROBE_BUDGET_RESERVE,
         VANISH_TIME_BUDGET,
@@ -5982,8 +6124,8 @@ fn handle_vanish(req: Request) -> Result<Response> {
 
 /// POST /admin/api/vanish - Admin-initiated vanish (for funnelcake janitor NIP-62 integration)
 fn handle_admin_vanish(req: Request) -> Result<Response> {
-    // Validate admin auth
-    admin::validate_admin_auth(&req)?;
+    // Prefer webhook_secret so webhook callers do not burn a slot on admin_token.
+    admin::validate_admin_auth_prefer_webhook(&req)?;
 
     // Parse request body
     let body = req.into_body_str();
@@ -6159,6 +6301,7 @@ fn handle_report(mut req: Request) -> Result<Response> {
 fn handle_mirror(mut req: Request) -> Result<Response> {
     // Validate auth (upload permission required)
     let auth = validate_auth(&req, AuthAction::Upload)?;
+    let encoding_requested = upload_encoding_requested(&req)?;
 
     // Parse request body as JSON
     let body = req.take_body().into_string();
@@ -6245,6 +6388,10 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
 
     // Check if metadata already exists
     if let Some(mut metadata) = get_blob_metadata(&hash)? {
+        if !encoding_requested && metadata.video_encoding_allowed {
+            metadata = crate::metadata::restrict_video_encoding(&hash)?;
+        }
+
         if is_transcribable_mime_type(&metadata.mime_type) && metadata.transcript_status.is_none() {
             metadata.transcript_status = Some(TranscriptStatus::Pending);
             let _ = put_blob_metadata(&metadata);
@@ -6264,6 +6411,7 @@ fn handle_mirror(mut req: Request) -> Result<Response> {
     // Store metadata
     let metadata = BlobMetadata {
         archive_storage: None,
+        video_encoding_allowed: encoding_requested && is_video_mime_type(&content_type),
         sha256: hash.clone(),
         size,
         mime_type: content_type.clone(),
@@ -6595,12 +6743,11 @@ fn handle_admin_backfill_vtt(req: Request) -> Result<Response> {
 fn handle_admin_moderate(mut req: Request) -> Result<Response> {
     let req_id = crate::req_id::for_request(&req);
 
-    // Try to get webhook secret from secret store (optional)
-    let expected_secret: Option<String> =
-        fastly::secret_store::SecretStore::open("blossom_secrets")
-            .ok()
-            .and_then(|store| store.get("webhook_secret"))
-            .map(|secret| String::from_utf8(secret.plaintext().to_vec()).unwrap_or_default());
+    // Try to get webhook secret from secret store (optional) via request_bindings
+    // so downstream purge paths accurately account for Fastly's 5-secret limit.
+    let expected_secret: Option<String> = crate::request_bindings::secret("webhook_secret")
+        .ok()
+        .flatten();
 
     // Get Authorization header
     let auth_header = req
@@ -6749,6 +6896,43 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
             Err(e)
         }
     }
+}
+
+/// This header only removes processing permission; it does not establish provenance.
+fn upload_encoding_requested(req: &Request) -> Result<bool> {
+    match req.get_header("X-Divine-Video-Processing") {
+        None => Ok(true),
+        Some(value) if value.to_str().ok() == Some("copy-only") => Ok(false),
+        Some(_) => Err(BlossomError::BadRequest(
+            "X-Divine-Video-Processing must be copy-only when supplied".into(),
+        )),
+    }
+}
+
+fn handle_media_processing_policy(req: &Request, path: &str) -> Result<Response> {
+    validate_transcoder_webhook(req, "MEDIA_POLICY")?;
+    let hash = path.strip_prefix("/internal/media-policy/").unwrap_or("");
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(BlossomError::BadRequest("Invalid media hash".into()));
+    }
+    // POP KV reads can be stale even without the application cache. Only the
+    // origin may grant encoding permission; missing configuration must retry.
+    let metadata = match crate::kv_origin::lookup(&format!("blob:{}", hash.to_lowercase()))? {
+        Some(Some(entry)) => serde_json::from_slice::<Option<BlobMetadata>>(&entry.body)
+            .map_err(|_| BlossomError::MetadataError("Invalid media policy metadata".into()))?,
+        _ => None,
+    };
+    let Some(metadata) = metadata else {
+        let mut response = json_response(StatusCode::SERVICE_UNAVAILABLE,
+            &serde_json::json!({"error":"Media policy is not available yet"}));
+        response.set_header("Retry-After", "5");
+        return Ok(response);
+    };
+    if !metadata.sha256.eq_ignore_ascii_case(hash) {
+        return Err(BlossomError::MetadataError("Media policy hash mismatch".into()));
+    }
+    let policy = if metadata.allows_video_encoding() { "allow_encode" } else { "copy_only" };
+    Ok(json_response(StatusCode::OK, &serde_json::json!({"sha256":hash,"policy":policy})))
 }
 
 fn validate_transcoder_webhook(req: &Request, label: &str) -> Result<()> {
@@ -7099,320 +7283,7 @@ fn handle_transcript_status(mut req: Request) -> Result<Response> {
 
 /// GET / - Landing page
 fn handle_landing_page() -> Response {
-    let html = r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Divine Blossom Server</title>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-            line-height: 1.6;
-            color: #333;
-            background: #f8fafc;
-        }
-        .container {
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 2rem;
-        }
-        header {
-            text-align: center;
-            margin-bottom: 3rem;
-            padding: 2rem 0;
-        }
-        h1 {
-            font-size: 2.5rem;
-            color: #1a202c;
-            margin-bottom: 0.5rem;
-        }
-        .badge {
-            display: inline-block;
-            padding: 0.25rem 0.75rem;
-            border-radius: 9999px;
-            font-size: 0.75rem;
-            font-weight: 600;
-            text-transform: uppercase;
-            margin-left: 0.5rem;
-        }
-        .badge-beta { background: #c6f6d5; color: #276749; }
-        .badge-fastly { background: #fed7d7; color: #c53030; }
-        .tagline {
-            color: #718096;
-            font-size: 1.1rem;
-            margin-top: 1rem;
-        }
-        section {
-            background: white;
-            border-radius: 12px;
-            padding: 1.5rem;
-            margin-bottom: 1.5rem;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        }
-        h2 {
-            font-size: 1.25rem;
-            color: #2d3748;
-            margin-bottom: 1rem;
-            padding-bottom: 0.5rem;
-            border-bottom: 2px solid #e2e8f0;
-        }
-        .endpoint {
-            display: flex;
-            align-items: flex-start;
-            padding: 0.75rem 0;
-            border-bottom: 1px solid #edf2f7;
-        }
-        .endpoint:last-child { border-bottom: none; }
-        .method {
-            display: inline-block;
-            padding: 0.25rem 0.5rem;
-            border-radius: 4px;
-            font-size: 0.75rem;
-            font-weight: 700;
-            font-family: monospace;
-            min-width: 60px;
-            text-align: center;
-            margin-right: 1rem;
-        }
-        .method-get { background: #c6f6d5; color: #276749; }
-        .method-head { background: #bee3f8; color: #2b6cb0; }
-        .method-put { background: #feebc8; color: #c05621; }
-        .method-delete { background: #fed7d7; color: #c53030; }
-        .endpoint-info { flex: 1; }
-        .endpoint-path {
-            font-family: monospace;
-            font-weight: 600;
-            color: #5a67d8;
-        }
-        .endpoint-desc {
-            color: #718096;
-            font-size: 0.9rem;
-            margin-top: 0.25rem;
-        }
-        .features {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 1rem;
-        }
-        .feature {
-            padding: 1rem;
-            background: #f7fafc;
-            border-radius: 8px;
-        }
-        .feature h3 {
-            font-size: 0.9rem;
-            color: #4a5568;
-            margin-bottom: 0.5rem;
-        }
-        .feature p {
-            font-size: 0.85rem;
-            color: #718096;
-        }
-        footer {
-            text-align: center;
-            padding: 2rem 0;
-            color: #a0aec0;
-            font-size: 0.875rem;
-        }
-        footer a {
-            color: #5a67d8;
-            text-decoration: none;
-        }
-        footer a:hover { text-decoration: underline; }
-        code {
-            background: #edf2f7;
-            padding: 0.125rem 0.375rem;
-            border-radius: 4px;
-            font-size: 0.875rem;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <header>
-            <h1>Divine Blossom Server <span class="badge badge-beta">BETA</span><span class="badge badge-fastly">FASTLY</span></h1>
-            <p class="tagline">Content-addressable blob storage implementing the Blossom protocol with AI-powered moderation, HLS, and transcript generation</p>
-        </header>
-
-        <section>
-            <h2>API Endpoints</h2>
-            <div class="endpoint">
-                <span class="method method-get">GET</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/&lt;sha256&gt;[.ext]</span>
-                    <p class="endpoint-desc">Retrieve a blob by its SHA-256 hash. Supports optional file extension and range requests. Use <code>.jpg</code> extension to get video thumbnails. <em>(BUD-01)</em></p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-get">GET</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/&lt;sha256&gt;.hls</span>
-                    <p class="endpoint-desc">Get HLS master manifest for adaptive streaming. Automatically triggers on-demand transcoding for videos that haven't been transcoded yet. Returns <code>202 Accepted</code> with <code>Retry-After</code> header while transcoding is in progress.</p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-get">GET</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/&lt;sha256&gt;/hls/master.m3u8</span>
-                    <p class="endpoint-desc">Alternative HLS manifest URL for player compatibility. Same behavior as the <code>.hls</code> endpoint above.</p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-get">GET</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/&lt;sha256&gt;/720p</span>
-                    <p class="endpoint-desc">Direct download of the 720p H.264 transcoded variant (2.5 Mbps). Triggers transcoding on-demand if not yet available.</p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-get">GET</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/&lt;sha256&gt;/480p</span>
-                    <p class="endpoint-desc">Direct download of the 480p H.264 transcoded variant (1 Mbps). Triggers transcoding on-demand if not yet available.</p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-get">GET</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/&lt;sha256&gt;.vtt</span>
-                    <p class="endpoint-desc">Stable WebVTT URL for audio/video transcripts. Automatically triggers on-demand transcription if it has not been generated yet.</p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-get">GET</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/&lt;sha256&gt;/VTT</span>
-                    <p class="endpoint-desc">Alias for transcript retrieval, compatible with legacy clients.</p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-put">POST</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/v1/subtitles/jobs</span>
-                    <p class="endpoint-desc">Create or reuse a subtitle job by hash. Request body: <code>video_sha256</code>, optional <code>lang</code>, optional <code>force</code>.</p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-get">GET</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/v1/subtitles/jobs/&lt;job_id&gt;</span>
-                    <p class="endpoint-desc">Get subtitle job status: <code>queued</code>, <code>processing</code>, <code>ready</code>, or <code>failed</code>.</p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-get">GET</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/v1/subtitles/by-hash/&lt;sha256&gt;</span>
-                    <p class="endpoint-desc">Idempotent lookup for the current subtitle job by media hash.</p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-head">HEAD</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/&lt;sha256&gt;[.ext]</span>
-                    <p class="endpoint-desc">Check if a blob exists and get its metadata. <em>(BUD-01)</em></p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-put">PUT</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/upload</span>
-                    <p class="endpoint-desc">Upload a new blob. Requires Nostr authentication (kind 24242 event). Video uploads automatically generate a thumbnail. <em>(BUD-02)</em></p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-head">HEAD</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/upload</span>
-                    <p class="endpoint-desc">Pre-validate upload with X-SHA-256, X-Content-Length, X-Content-Type headers. <em>(BUD-06)</em></p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-get">GET</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/list/&lt;pubkey&gt;</span>
-                    <p class="endpoint-desc">List all blobs uploaded by a public key. <em>(BUD-02)</em></p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-delete">DELETE</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/&lt;sha256&gt;</span>
-                    <p class="endpoint-desc">Soft-delete a blob you own so it stops serving publicly while remaining recoverable. Non-owner refs only unlink themselves. Requires Nostr authentication. <em>(BUD-02)</em></p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-delete">DELETE</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/vanish</span>
-                    <p class="endpoint-desc">GDPR Right to Erasure. Deletes all blobs and data for the authenticated user. Requires Nostr authentication.</p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-put">PUT</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/report</span>
-                    <p class="endpoint-desc">Report problematic content using NIP-56 events (kind 1984). <em>(BUD-09)</em></p>
-                </div>
-            </div>
-            <div class="endpoint">
-                <span class="method method-put">PUT</span>
-                <div class="endpoint-info">
-                    <span class="endpoint-path">/mirror</span>
-                    <p class="endpoint-desc">Mirror a blob from a remote URL. Requires Nostr authentication. <em>(BUD-04)</em></p>
-                </div>
-            </div>
-        </section>
-
-        <section>
-            <h2>Features</h2>
-            <div class="features">
-                <div class="feature">
-                    <h3>Nostr Authentication</h3>
-                    <p>Viewer requests accept Blossom list auth or NIP-98 HTTP auth. Upload and delete operations require signed Blossom events (kind <code>24242</code>).</p>
-                </div>
-                <div class="feature">
-                    <h3>Content Moderation</h3>
-                    <p>AI-powered moderation with SAFE, REVIEW, AGE_RESTRICTED, and PERMANENT_BAN levels.</p>
-                </div>
-                <div class="feature">
-                    <h3>Edge Computing</h3>
-                    <p>Powered by Fastly Compute for low-latency global delivery.</p>
-                </div>
-                <div class="feature">
-                    <h3>Video Thumbnails</h3>
-                    <p>Automatic JPEG thumbnail generation for uploaded videos, accessible at <code>/&lt;sha256&gt;.jpg</code>.</p>
-                </div>
-                <div class="feature">
-                    <h3>HLS Video Streaming</h3>
-                    <p>On-demand H.264 transcoding to 720p and 480p with HLS adaptive streaming. Direct quality access via <code>/&lt;sha256&gt;/720p</code> and <code>/&lt;sha256&gt;/480p</code>.</p>
-                </div>
-                <div class="feature">
-                    <h3>WebVTT Transcripts</h3>
-                    <p>On-demand transcript generation for audio/video blobs, served from immutable URLs at <code>/&lt;sha256&gt;.vtt</code>.</p>
-                </div>
-                <div class="feature">
-                    <h3>GCS Storage</h3>
-                    <p>Reliable blob storage backed by Google Cloud Storage.</p>
-                </div>
-            </div>
-        </section>
-
-        <section>
-            <h2>Protocol</h2>
-            <p>This server implements the <a href="https://github.com/hzrd149/blossom">Blossom protocol</a> for decentralized media hosting on Nostr.</p>
-            <p style="margin-top: 0.5rem;"><strong>Implemented BUDs:</strong> BUD-01 (Blob Retrieval), BUD-02 (Upload/List/Delete), BUD-04 (Mirroring), BUD-06 (Upload Pre-validation), BUD-09 (Reporting)</p>
-            <p style="margin-top: 0.5rem;">Maximum upload size: <code>50 GB</code></p>
-        </section>
-
-        <footer>
-            <p>Powered by <a href="https://www.fastly.com/products/edge-compute">Fastly Compute</a> | <a href="https://divine.video">Divine</a></p>
-        </footer>
-    </div>
-</body>
-</html>"#;
+    let html = include_str!("landing.html");
 
     let mut resp = Response::from_status(StatusCode::OK);
     resp.set_header(header::CONTENT_TYPE, "text/html; charset=utf-8");
@@ -7520,24 +7391,165 @@ fn add_no_cache_headers(resp: &mut Response) {
     resp.set_header("Surrogate-Control", "no-store");
 }
 
-/// Purge content from both the VCL website cache and the Compute media cache
-/// by Surrogate-Key. Calls POST /service/{id}/purge/{key} on api.fastly.com
-/// for each service. Best-effort: logs errors but never fails the calling request.
-pub(crate) fn purge_edge_cache(surrogate_key: &str) {
-    let api_token = match storage::get_secret("fastly_api_token").ok() {
-        Some(token) if !token.is_empty() => token,
-        _ => {
-            eprintln!("[PURGE] fastly_api_token not configured, skipping cache purge");
-            return;
+const MAX_BUNNY_EDGE_PURGE_ZONES: usize = 2;
+const BUNNY_BATCH_PURGE_REQUEST_MARGIN: usize = 2;
+const FASTLY_PURGE_SERVICES: &[(&str, &str)] = &[
+    ("ML7R82HKfmTaqTpHExIDVN", "VCL"),     // divine.video website
+    ("pOvEEWykEbpnylqst1KTrR", "Compute"), // media.divine.video (Blossom)
+];
+
+std::thread_local! {
+    static DEFER_BUNNY_EDGE_PURGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) struct DeferBunnyEdgePurge {
+    previous: bool,
+}
+
+impl Drop for DeferBunnyEdgePurge {
+    fn drop(&mut self) {
+        DEFER_BUNNY_EDGE_PURGE.with(|flag| flag.set(self.previous));
+    }
+}
+
+/// Defer Bunny edge purges within `purge_edge_cache` so callers that still
+/// need origin credentials (e.g. legacy physical creator delete) do not spend a
+/// Fastly secret slot or issue duplicate Bunny purges before origin erasure.
+pub(crate) fn defer_bunny_edge_purge() -> DeferBunnyEdgePurge {
+    let previous = DEFER_BUNNY_EDGE_PURGE.with(|flag| flag.replace(true));
+    DeferBunnyEdgePurge { previous }
+}
+
+fn normalize_bunny_purge_hash(surrogate_key: &str) -> Option<String> {
+    if surrogate_key.len() == 64 && surrogate_key.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(surrogate_key.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+fn is_valid_bunny_purge_zone(zone: &str) -> bool {
+    if zone.is_empty() || zone.len() > 253 || !zone.contains('.') {
+        return false;
+    }
+    zone.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    })
+}
+
+fn parse_bunny_edge_purge_zones(raw: &str) -> Option<Vec<String>> {
+    let mut zones = Vec::new();
+    for part in raw.split(',') {
+        let zone = part.trim().to_ascii_lowercase();
+        if zone.is_empty() {
+            continue;
         }
+        if !is_valid_bunny_purge_zone(&zone) {
+            return None;
+        }
+        if !zones.contains(&zone) {
+            zones.push(zone);
+        }
+    }
+    if zones.is_empty() || zones.len() > MAX_BUNNY_EDGE_PURGE_ZONES {
+        return None;
+    }
+    Some(zones)
+}
+
+fn build_bunny_edge_purge_url(zone: &str, surrogate_key: &str) -> Option<String> {
+    let hash = normalize_bunny_purge_hash(surrogate_key)?;
+    if !is_valid_bunny_purge_zone(zone) {
+        return None;
+    }
+    let zone = zone.to_ascii_lowercase();
+    let purge_url = format!("https%3A%2F%2F{zone}%2F{hash}%2A");
+    Some(format!(
+        "https://api.bunny.net/purge?url={purge_url}&async=false"
+    ))
+}
+
+fn parse_purge_header_secret(raw: &str) -> Option<fastly::http::HeaderValue> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    fastly::http::HeaderValue::from_str(trimmed).ok()
+}
+
+fn collect_bunny_batch_hashes(surrogate_keys: &[String]) -> Vec<String> {
+    let mut hashes = Vec::new();
+    for key in surrogate_keys {
+        let Some(hash) = normalize_bunny_purge_hash(key) else {
+            continue;
+        };
+        if !hashes.contains(&hash) {
+            hashes.push(hash);
+        }
+    }
+    hashes
+}
+
+fn bunny_batch_purge_hash_limit(zone_count: usize, fastly_requests_sent: usize) -> usize {
+    if zone_count == 0 {
+        return 0;
+    }
+    let reserved = fastly_requests_sent.saturating_add(BUNNY_BATCH_PURGE_REQUEST_MARGIN);
+    COMPUTE_BACKEND_REQUEST_LIMIT.saturating_sub(reserved) / zone_count
+}
+
+/// Purge content from the Fastly VCL/Compute caches by Surrogate-Key and from
+/// configured outer Bunny CDN delivery zones (`bunny_delivery_zones`) by hash
+/// prefix wildcard. Best-effort: logs errors but never fails the calling request.
+pub(crate) fn purge_edge_cache(surrogate_key: &str) {
+    purge_fastly_edge_cache(surrogate_key);
+    if !DEFER_BUNNY_EDGE_PURGE.with(std::cell::Cell::get) {
+        purge_bunny_edge_cache(surrogate_key);
+    }
+}
+
+/// Batch purge for callers approving multiple hashes in one execution.
+/// Sends multi-key Fastly purges first, then bounds Bunny wildcard purges so
+/// total backend requests stay within Fastly Compute's 32-request ceiling.
+pub(crate) fn purge_edge_cache_batch(surrogate_keys: &[String]) {
+    let fastly_requests_sent = purge_fastly_edge_cache_batch(surrogate_keys);
+    if !DEFER_BUNNY_EDGE_PURGE.with(std::cell::Cell::get) {
+        purge_bunny_edge_cache_batch(surrogate_keys, fastly_requests_sent);
+    }
+}
+
+fn read_fastly_purge_token(key_label: &str) -> Option<fastly::http::HeaderValue> {
+    if !crate::request_bindings::can_read_secret("fastly_api_token") {
+        eprintln!(
+            "[PURGE] Fastly purge skipped for {}: secret read budget exhausted",
+            key_label
+        );
+        return None;
+    }
+    match storage::get_secret("fastly_api_token")
+        .ok()
+        .and_then(|token| parse_purge_header_secret(&token))
+    {
+        Some(token) => Some(token),
+        None => {
+            eprintln!("[PURGE] fastly_api_token not configured or invalid, skipping Fastly cache purge");
+            None
+        }
+    }
+}
+
+fn purge_fastly_edge_cache(surrogate_key: &str) {
+    let Some(api_token) = read_fastly_purge_token(surrogate_key) else {
+        return;
     };
 
-    let services: &[(&str, &str)] = &[
-        ("ML7R82HKfmTaqTpHExIDVN", "VCL"),     // divine.video website
-        ("pOvEEWykEbpnylqst1KTrR", "Compute"), // media.divine.video (Blossom)
-    ];
-
-    for &(service_id, label) in services {
+    for &(service_id, label) in FASTLY_PURGE_SERVICES {
         let url = format!(
             "https://api.fastly.com/service/{}/purge/{}",
             service_id, surrogate_key
@@ -7545,7 +7557,7 @@ pub(crate) fn purge_edge_cache(surrogate_key: &str) {
 
         let mut purge_req = Request::new(Method::POST, &url);
         purge_req.set_header("Host", "api.fastly.com");
-        purge_req.set_header("Fastly-Key", &api_token);
+        purge_req.set_header("Fastly-Key", api_token.clone());
         purge_req.set_header("Accept", "application/json");
 
         match purge_req.send("fastly_api") {
@@ -7572,6 +7584,202 @@ pub(crate) fn purge_edge_cache(surrogate_key: &str) {
     }
 }
 
+fn purge_fastly_edge_cache_batch(surrogate_keys: &[String]) -> usize {
+    let hashes = collect_bunny_batch_hashes(surrogate_keys);
+    if hashes.is_empty() {
+        return 0;
+    }
+    let Some(api_token) = read_fastly_purge_token("batch") else {
+        return 0;
+    };
+
+    let mut sent = 0usize;
+    for chunk in hashes.chunks(256) {
+        let joined = chunk.join(" ");
+        let Ok(header_val) = fastly::http::HeaderValue::from_str(&joined) else {
+            eprintln!("[PURGE] Fastly batch purge skipped chunk: invalid Surrogate-Key header");
+            continue;
+        };
+        for &(service_id, label) in FASTLY_PURGE_SERVICES {
+            let url = format!("https://api.fastly.com/service/{}/purge", service_id);
+            let mut purge_req = Request::new(Method::POST, &url);
+            purge_req.set_header("Host", "api.fastly.com");
+            purge_req.set_header("Fastly-Key", api_token.clone());
+            purge_req.set_header("Accept", "application/json");
+            purge_req.set_header("Surrogate-Key", header_val.clone());
+
+            sent += 1;
+            match purge_req.send("fastly_api") {
+                Ok(resp) => {
+                    let status = resp.get_status();
+                    if status.is_success() {
+                        eprintln!(
+                            "[PURGE] {} batch cache purged for {} key(s)",
+                            label,
+                            chunk.len()
+                        );
+                    } else {
+                        eprintln!(
+                            "[PURGE] {} batch purge failed for {} key(s): HTTP {}",
+                            label,
+                            chunk.len(),
+                            status.as_u16()
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[PURGE] {} batch purge request failed for {} key(s): {}",
+                        label,
+                        chunk.len(),
+                        e
+                    );
+                }
+            }
+        }
+    }
+    sent
+}
+
+fn load_bunny_edge_purge_context(key_label: &str) -> Option<(Vec<String>, fastly::http::HeaderValue)> {
+    let raw_zones = match storage::optional_config("bunny_delivery_zones") {
+        Ok(Some(raw)) if !raw.trim().is_empty() => raw,
+        Ok(Some(_)) | Ok(None) => return None,
+        Err(e) => {
+            eprintln!(
+                "[PURGE] Bunny purge config lookup failed for key={}: {}",
+                key_label, e
+            );
+            return None;
+        }
+    };
+    let Some(zones) = parse_bunny_edge_purge_zones(&raw_zones) else {
+        eprintln!(
+            "[PURGE] Invalid bunny_delivery_zones config, skipping Bunny cache purge for key={}",
+            key_label
+        );
+        return None;
+    };
+    if !crate::request_bindings::can_read_secret("bunny_api_key") {
+        eprintln!(
+            "[PURGE] Bunny purge skipped for key={}: secret read budget exhausted",
+            key_label
+        );
+        return None;
+    }
+    let api_key = match storage::get_secret("bunny_api_key")
+        .ok()
+        .and_then(|key| parse_purge_header_secret(&key))
+    {
+        Some(key) => key,
+        None => {
+            eprintln!(
+                "[PURGE] bunny_api_key not configured or invalid, skipping Bunny cache purge for key={}",
+                key_label
+            );
+            return None;
+        }
+    };
+    Some((zones, api_key))
+}
+
+fn dispatch_bunny_purge_for_hash(
+    hash: &str,
+    zones: &[String],
+    api_key: &fastly::http::HeaderValue,
+) {
+    let mut pending = Vec::new();
+    for zone in zones {
+        let Some(url) = build_bunny_edge_purge_url(zone, hash) else {
+            continue;
+        };
+        let mut purge_req = Request::new(Method::POST, &url);
+        purge_req.set_header("Host", "api.bunny.net");
+        purge_req.set_header("AccessKey", api_key.clone());
+        match purge_req.send_async("bunny_api") {
+            Ok(handle) => pending.push(handle),
+            Err(e) => {
+                eprintln!(
+                    "[PURGE] Bunny ({}) purge request failed for key={}: {}",
+                    zone, hash, e
+                );
+            }
+        }
+    }
+
+    while !pending.is_empty() {
+        let (result, remaining) = fastly::http::request::select(pending);
+        pending = remaining;
+        match result {
+            Ok(resp) => {
+                let status = resp.get_status();
+                let target = resp
+                    .get_backend_request()
+                    .map(|r| r.get_url_str())
+                    .unwrap_or("unknown");
+                if status.is_success() {
+                    eprintln!("[PURGE] Bunny cache purged for key={} ({})", hash, target);
+                } else {
+                    eprintln!(
+                        "[PURGE] Bunny purge failed for key={} ({}): HTTP {}",
+                        hash,
+                        target,
+                        status.as_u16()
+                    );
+                }
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                let sent = e.into_sent_req();
+                eprintln!(
+                    "[PURGE] Bunny purge request failed for key={} ({}): {}",
+                    hash,
+                    sent.get_url_str(),
+                    err_msg
+                );
+            }
+        }
+    }
+}
+
+pub(crate) fn purge_bunny_edge_cache(surrogate_key: &str) {
+    let Some(hash) = normalize_bunny_purge_hash(surrogate_key) else {
+        return;
+    };
+    let Some((zones, api_key)) = load_bunny_edge_purge_context(&hash) else {
+        return;
+    };
+    dispatch_bunny_purge_for_hash(&hash, &zones, &api_key);
+}
+
+fn purge_bunny_edge_cache_batch(surrogate_keys: &[String], fastly_requests_sent: usize) {
+    let hashes = collect_bunny_batch_hashes(surrogate_keys);
+    if hashes.is_empty() {
+        return;
+    }
+    let Some((zones, api_key)) = load_bunny_edge_purge_context("batch") else {
+        return;
+    };
+    let max_hashes = bunny_batch_purge_hash_limit(zones.len(), fastly_requests_sent);
+    if max_hashes == 0 {
+        eprintln!(
+            "[PURGE] Bunny batch purge skipped for {} hash(es): backend request budget exhausted",
+            hashes.len()
+        );
+        return;
+    }
+    for hash in hashes.iter().take(max_hashes) {
+        dispatch_bunny_purge_for_hash(hash, &zones, &api_key);
+    }
+    if hashes.len() > max_hashes {
+        eprintln!(
+            "[PURGE] Bunny batch purge truncated after {}/{} hashes to stay within Compute backend request budget",
+            max_hashes,
+            hashes.len()
+        );
+    }
+}
+
 fn add_cors_headers(resp: &mut Response) {
     resp.set_header("Access-Control-Allow-Origin", "*");
     resp.set_header(
@@ -7580,7 +7788,7 @@ fn add_cors_headers(resp: &mut Response) {
     );
     resp.set_header(
         "Access-Control-Allow-Headers",
-        "Authorization, Content-Type, X-Sha256, X-Request-Id",
+        "Authorization, Content-Type, X-Sha256, X-SHA-256, X-Content-Length, X-Content-Type, X-Request-Id, X-Divine-Video-Processing",
     );
     resp.set_header("Access-Control-Expose-Headers", upload_exposed_headers());
 }
@@ -7594,7 +7802,7 @@ struct UploadCapabilityHeaders {
 
 fn upload_exposed_headers() -> &'static str {
     // Retry-After lets a browser client read the throttle backoff on a 429.
-    "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256, X-Content-SHA256, X-Audio-Duration, X-Audio-Size, X-Divine-Upload-Extensions, X-Divine-Upload-Control-Host, X-Divine-Upload-Data-Host, Retry-After, Content-Language, X-Divine-Machine-Translated"
+    "X-Sha256, X-Content-Length, X-C2PA-Manifest-Id, X-Source-Sha256, X-Content-SHA256, X-Audio-Duration, X-Audio-Size, X-Divine-Upload-Extensions, X-Divine-Upload-Control-Host, X-Divine-Upload-Data-Host, X-Reason, Retry-After, Content-Language, X-Divine-Machine-Translated"
 }
 
 fn upload_control_host(public_host: Option<&str>) -> String {
@@ -7614,6 +7822,7 @@ fn add_upload_capability_headers(resp: &mut Response, control_host: &str) {
     resp.set_header("X-Divine-Upload-Extensions", headers.extensions);
     resp.set_header("X-Divine-Upload-Control-Host", headers.control_host);
     resp.set_header("X-Divine-Upload-Data-Host", headers.data_host);
+    add_no_cache_headers(resp);
 }
 
 /// CORS preflight response
@@ -8955,6 +9164,25 @@ mod tests {
     }
 
     #[test]
+    fn upload_preflight_validates_digest_without_lookup() {
+        use super::{handle_upload_requirements, Method, Request};
+
+        // This fixture has no storage backend or metadata store.
+        for method in [Method::HEAD, Method::GET] {
+            let req = Request::new(method, "https://media.divine.video/upload")
+                .with_header("X-SHA-256", "a".repeat(64))
+                .with_header("X-Content-Length", "10");
+            let resp = handle_upload_requirements(req).unwrap();
+            assert_eq!(resp.get_status(), StatusCode::OK);
+            assert_eq!(
+                resp.get_header_str("X-Reason"),
+                Some("Upload would be accepted")
+            );
+            assert!(resp.get_header("X-Exists").is_none());
+        }
+    }
+
+    #[test]
     fn pending_blob_get_uses_short_browser_cache_with_purgeable_edge_ttl() {
         let mut resp = Response::from_status(StatusCode::OK);
 
@@ -9163,6 +9391,111 @@ mod tests {
         assert_eq!(record["delivery_probe_errors"], 0);
         assert_eq!(record["total_ms"], 0);
     }
+
+    #[test]
+    fn parse_bunny_edge_purge_zones_normalizes_deduplicates_and_validates() {
+        use super::parse_bunny_edge_purge_zones;
+        assert_eq!(
+            parse_bunny_edge_purge_zones(" Media.Divine.Video , divine-media-cdn.b-cdn.net "),
+            Some(vec![
+                "media.divine.video".to_string(),
+                "divine-media-cdn.b-cdn.net".to_string(),
+            ])
+        );
+        assert_eq!(
+            parse_bunny_edge_purge_zones("media.divine.video,MEDIA.DIVINE.VIDEO"),
+            Some(vec!["media.divine.video".to_string()])
+        );
+        assert_eq!(parse_bunny_edge_purge_zones(""), None);
+        assert_eq!(parse_bunny_edge_purge_zones("   ,  "), None);
+        assert_eq!(parse_bunny_edge_purge_zones("localhost"), None);
+        assert_eq!(
+            parse_bunny_edge_purge_zones("https://media.divine.video"),
+            None
+        );
+        assert_eq!(parse_bunny_edge_purge_zones(".media.divine.video"), None);
+        assert_eq!(parse_bunny_edge_purge_zones("media..divine.video"), None);
+        assert_eq!(parse_bunny_edge_purge_zones("media.-divine.video"), None);
+        assert_eq!(parse_bunny_edge_purge_zones("media-.divine.video"), None);
+        assert_eq!(
+            parse_bunny_edge_purge_zones(&format!("{}.divine.video", "a".repeat(64))),
+            None
+        );
+        assert_eq!(
+            parse_bunny_edge_purge_zones("a.example.com,b.example.com,c.example.com"),
+            None
+        );
+    }
+
+    #[test]
+    fn build_bunny_edge_purge_url_uses_lowercase_hash_wildcard() {
+        use super::build_bunny_edge_purge_url;
+        let upper = "A".repeat(64);
+        let lower = "a".repeat(64);
+        assert_eq!(
+            build_bunny_edge_purge_url("Media.Divine.Video", &upper),
+            Some(format!(
+                "https://api.bunny.net/purge?url=https%3A%2F%2Fmedia.divine.video%2F{lower}%2A&async=false"
+            ))
+        );
+        assert_eq!(
+            build_bunny_edge_purge_url("media.divine.video", "not-a-sha256"),
+            None
+        );
+        assert_eq!(
+            build_bunny_edge_purge_url("media.divine.video/bad", &lower),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_purge_header_secret_trims_and_rejects_invalid_header_bytes() {
+        use super::parse_purge_header_secret;
+        let valid = parse_purge_header_secret("  secret-token\r\n").expect("trimmed token valid");
+        assert_eq!(valid.to_str().unwrap(), "secret-token");
+        assert!(parse_purge_header_secret("   \n").is_none());
+        assert!(parse_purge_header_secret("line1\nline2").is_none());
+    }
+
+    #[test]
+    fn defer_bunny_edge_purge_restores_previous_state() {
+        use super::{defer_bunny_edge_purge, DEFER_BUNNY_EDGE_PURGE};
+        assert!(!DEFER_BUNNY_EDGE_PURGE.with(std::cell::Cell::get));
+        {
+            let _outer = defer_bunny_edge_purge();
+            assert!(DEFER_BUNNY_EDGE_PURGE.with(std::cell::Cell::get));
+            {
+                let _inner = defer_bunny_edge_purge();
+                assert!(DEFER_BUNNY_EDGE_PURGE.with(std::cell::Cell::get));
+            }
+            assert!(DEFER_BUNNY_EDGE_PURGE.with(std::cell::Cell::get));
+        }
+        assert!(!DEFER_BUNNY_EDGE_PURGE.with(std::cell::Cell::get));
+    }
+
+    #[test]
+    fn collect_bunny_batch_hashes_normalizes_deduplicates_and_filters() {
+        use super::collect_bunny_batch_hashes;
+        let upper_a = "A".repeat(64);
+        let lower_a = "a".repeat(64);
+        let lower_b = "b".repeat(64);
+        let keys = vec![
+            upper_a,
+            "not-a-hash".to_string(),
+            lower_a.clone(),
+            lower_b.clone(),
+        ];
+        assert_eq!(collect_bunny_batch_hashes(&keys), vec![lower_a, lower_b]);
+    }
+
+    #[test]
+    fn bunny_batch_purge_hash_limit_stays_within_compute_budget() {
+        use super::bunny_batch_purge_hash_limit;
+        assert_eq!(bunny_batch_purge_hash_limit(2, 2), 14);
+        assert_eq!(bunny_batch_purge_hash_limit(1, 2), 28);
+        assert_eq!(bunny_batch_purge_hash_limit(2, 30), 0);
+        assert_eq!(bunny_batch_purge_hash_limit(0, 2), 0);
+    }
 }
 
 #[cfg(test)]
@@ -9217,3 +9550,11 @@ mod derived_origin_provenance_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "media_processing_policy_tests.rs"]
+mod media_processing_policy_tests;
+
+#[cfg(test)]
+#[path = "bunny_edge_purge_tests.rs"]
+mod bunny_edge_purge_tests;

@@ -30,17 +30,17 @@ WEBHOOK_SECRET="${WEBHOOK_SECRET:-webhook_secret}"
 
 # --- Autoscaling -----------------------------------------------------------
 #
-# This service streams uploads to GCS rather than buffering them, so it is
-# I/O-bound and a high concurrency per instance is appropriate here -- unlike
-# the CPU-bound transcoder, where the same setting prevents scale-out.
-CONCURRENCY="${CONCURRENCY:-80}"
+# This service handles both streaming uploads and CPU-bound on-demand ffmpeg
+# thumbnail extraction (bounded per instance by MAX_CONCURRENT_THUMBNAIL_EXTRACTIONS).
+# Keeping per-instance concurrency at 16 with 2 vCPU / 1 GiB ensures Cloud Run
+# scales out promptly under cold-cache thumbnail bursts instead of queuing 80
+# requests behind a single instance's extraction semaphore.
+CONCURRENCY="${CONCURRENCY:-16}"
 MAX_INSTANCES="${MAX_INSTANCES:-100}"
 
-# This service sits in the synchronous upload path, so a cold start is visible
-# to the user who is waiting on it. MIN_INSTANCES is billed continuously, so it
-# defaults to scale-to-zero; raise it ahead of scheduled traffic events, where
-# autoscaling reacts far slower than a burst arrives.
-MIN_INSTANCES="${MIN_INSTANCES:-0}"
+# Keep one warm instance so synchronous PUT /upload and on-demand thumbnail
+# requests avoid 15s cold-start stalls.
+MIN_INSTANCES="${MIN_INSTANCES:-1}"
 
 # Production CI inherits derivative routes and the legacy queue bindings.
 # Explicit operator values still update those settings, including an empty value.
@@ -67,8 +67,8 @@ gcloud run deploy "${SERVICE_NAME}" \
   --source "${BUILD_CONTEXT}" \
   --allow-unauthenticated \
   --service-account "${SERVICE_ACCOUNT}" \
-  --cpu 1 \
-  --memory 512Mi \
+  --cpu 2 \
+  --memory 1Gi \
   --concurrency "${CONCURRENCY}" \
   --timeout 300 \
   --max-instances "${MAX_INSTANCES}" \

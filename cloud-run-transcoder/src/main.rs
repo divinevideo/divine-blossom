@@ -45,7 +45,9 @@ mod hls_claim;
 mod hls_dispatch;
 use hls_claim::{Claim, ClaimStore, Dirty};
 mod media_command;
+mod media_policy;
 mod media_reuse;
+use media_policy::MediaPolicy;
 mod mp4;
 mod object_storage;
 mod sound_classification;
@@ -63,6 +65,8 @@ struct Config {
     webhook_url: Option<String>,
     /// Secret for authenticating webhook calls
     webhook_secret: Option<String>,
+    /// Authoritative per-hash permission; absent means stream copy only.
+    media_processing_policy_url: Option<String>,
     /// URL of transcription provider API (e.g. OpenAI /audio/transcriptions endpoint)
     transcription_api_url: Option<String>,
     /// API key for the transcription provider
@@ -141,6 +145,8 @@ struct Config {
     transcode_queue: Option<String>,
     transcode_worker_url: Option<String>,
     transcode_dispatch_secret: Option<String>,
+    transcode_admission_auth_required: bool,
+    transcode_admission_secret: Option<String>,
     /// Admit ordinary jobs during cutover while all rendition writes are paused.
     transcode_writes_paused: bool,
 }
@@ -186,6 +192,7 @@ impl Config {
             webhook_url: lookup("WEBHOOK_URL"),
             // Secret for webhook authentication
             webhook_secret: lookup("WEBHOOK_SECRET"),
+            media_processing_policy_url: lookup("MEDIA_PROCESSING_POLICY_URL"),
             // Transcription provider URL (defaults to OpenAI transcription endpoint)
             transcription_api_url: lookup("TRANSCRIPTION_API_URL")
                 .or_else(|| lookup("OPENAI_API_URL"))
@@ -297,6 +304,13 @@ impl Config {
             transcode_worker_url: lookup("TRANSCODE_WORKER_URL").filter(|v| !v.trim().is_empty()),
             transcode_dispatch_secret: lookup("TRANSCODE_DISPATCH_SECRET")
                 .filter(|v| !v.is_empty()),
+            // Only explicit false or 0 disables the flag. A typo cannot open admission.
+            transcode_admission_auth_required: lookup("TRANSCODE_ADMISSION_AUTH_REQUIRED")
+                .is_some_and(|value| {
+                    !matches!(value.trim().to_ascii_lowercase().as_str(), "false" | "0")
+                }),
+            transcode_admission_secret: lookup("TRANSCODE_ADMISSION_SECRET")
+                .map(|value| value.trim().to_string()),
             transcode_writes_paused: parse_bool(&mut lookup, "TRANSCODE_WRITES_PAUSED", false),
             status_queue_enabled: parse_bool(&mut lookup, "STATUS_QUEUE_ENABLED", false),
             status_queue_location: lookup("STATUS_QUEUE_LOCATION")
@@ -461,6 +475,9 @@ struct TranscodeResponse {
     /// Repair completed, but its lock needs operator investigation before retrying.
     #[serde(skip_serializing_if = "Option::is_none")]
     repair_lock_warning: Option<String>,
+    /// Copy-only HLS succeeded, but these optional MP4 aliases were not regenerated.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    skipped_progressive_aliases: Vec<String>,
 }
 
 // Transcript response
@@ -906,11 +923,12 @@ async fn handle_transcode(
         }
         return transcode_response(await_repair(process_transcode(state, request)).await, false);
     }
-    admit_transcode(state, request).await
+    admit_transcode(state, headers, request).await
 }
 
 async fn handle_queue_transcode(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(mut request): Json<TranscodeRequest>,
 ) -> Response {
     request.hash.make_ascii_lowercase();
@@ -921,10 +939,17 @@ async fn handle_queue_transcode(
         )
             .into_response();
     }
-    admit_transcode(state, request).await
+    admit_transcode(state, headers, request).await
 }
 
-async fn admit_transcode(state: Arc<AppState>, request: TranscodeRequest) -> Response {
+async fn admit_transcode(
+    state: Arc<AppState>,
+    headers: axum::http::HeaderMap,
+    request: TranscodeRequest,
+) -> Response {
+    if let Err(rejection) = hls_dispatch::authorize_admission(&state.config, &headers) {
+        return rejection;
+    }
     let hash = request.hash.clone();
     match await_repair(async move { hls_dispatch::enqueue(&state.config, &request).await }).await {
         Ok(()) => (
@@ -1031,7 +1056,7 @@ fn repair_outcome<T>(result: Result<T>, release: Result<()>) -> Result<(T, Optio
             warn!("{}", warning);
             match result {
                 Ok(value) => Ok((value, Some(warning))),
-                Err(error) => Err(anyhow!("Repair failed: {:#}; {}", error, warning)),
+                Err(error) => Err(error.context(format!("Repair failed; {warning}"))),
             }
         }
     }
@@ -1256,6 +1281,7 @@ async fn handle_backfill_fmp4(
     }
     let force = request.force;
     let result = await_repair(async move {
+        let policy = media_policy::resolve(&state.config, &hash).await?;
         let mut claim = claim_hls(&state, &hash).await?;
         if claim.dirty() >= Dirty::Hls {
             claim.finish(false).await?;
@@ -1267,9 +1293,13 @@ async fn handle_backfill_fmp4(
             &hash,
             request.force,
             Some(&mut claim),
-            |ts, mp4, variant| async move { remux_variant(&ts, &mp4, variant).await },
+            |ts, mp4, variant| async move { remux_variant(&ts, &mp4, variant, policy).await },
         )
         .await;
+        let result = match result {
+            Err(error) if error.is::<hls_claim::OwnershipLost>() => return Err(error),
+            other => other,
+        };
         let release = claim.finish(result.is_ok()).await;
         if release.is_err() {
             hls_claim::count("release_failed");
@@ -1347,12 +1377,15 @@ where
         ));
     }
     let expected_count = segments.len();
-    let mut published_count = 0;
+    let publish_dir = temp_path.join("publish");
+    tokio::fs::create_dir(&publish_dir).await?;
+    let mut ready_variants = Vec::new();
     for (variant, segment) in segments {
         // Publish only a successful remux, never input TS or failed output files.
-        let output_dir = temp_path.join(variant);
-        tokio::fs::create_dir(&output_dir).await?;
-        let output = output_dir.join(format!("{variant}.mp4"));
+        let work_dir = temp_path.join(variant);
+        tokio::fs::create_dir(&work_dir).await?;
+        let filename = format!("{variant}.mp4");
+        let output = work_dir.join(&filename);
         if let Some(claim) = claim.as_deref_mut() {
             claim.confirm().await?;
         }
@@ -1374,22 +1407,30 @@ where
         {
             continue;
         }
+        tokio::fs::rename(&output, publish_dir.join(&filename)).await?;
+        ready_variants.push(variant);
+    }
+    let published_count = if ready_variants.is_empty() {
+        0
+    } else {
         let published = upload_hls(
             storage,
             hash,
-            &output_dir,
+            &publish_dir,
             &SourceObjectMetadata::default(),
             claim.as_deref_mut(),
         )
         .await?;
-        let expected = format!("{hash}/hls/{variant}.mp4");
-        if published
-            .iter()
-            .any(|receipt| receipt.object.reference.key == expected && receipt.object.size > 0)
-        {
-            published_count += 1;
-        }
-    }
+        ready_variants
+            .into_iter()
+            .filter(|variant| {
+                let expected = format!("{hash}/hls/{variant}.mp4");
+                published.iter().any(|receipt| {
+                    receipt.object.reference.key == expected && receipt.object.size > 0
+                })
+            })
+            .count()
+    };
     if published_count != expected_count {
         return Err(anyhow!(
             "Backfill published {published_count} of {expected_count} MP4 variants"
@@ -1591,9 +1632,23 @@ async fn process_transcode(
     if !valid_transcode_hash(&hash) {
         return Err(anyhow!("Invalid hash format: must be 64 hex characters"));
     }
+    let policy = media_policy::resolve(&state.config, &hash).await?;
+    process_transcode_authorized(state, request, hash, policy).await
+}
+
+// Only the trusted lookup above admits production requests to this transaction.
+async fn process_transcode_authorized(
+    state: Arc<AppState>,
+    request: TranscodeRequest,
+    hash: String,
+    policy: MediaPolicy,
+) -> Result<TranscodeResponse> {
     let mut claim = claim_hls(&state, &hash).await?;
     let force = request.force;
-    let result = process_transcode_inner(&state, request, &hash, &mut claim).await;
+    let result = match process_transcode_inner(&state, request, &hash, &mut claim, policy).await {
+        Err(error) if error.is::<hls_claim::OwnershipLost>() => return Err(error),
+        other => other,
+    };
     let release = claim.finish(result.is_ok()).await;
     if release.is_err() {
         hls_claim::count("release_failed");
@@ -1623,6 +1678,7 @@ async fn process_transcode_inner(
     request: TranscodeRequest,
     hash: &str,
     claim: &mut Claim,
+    policy: MediaPolicy,
 ) -> Result<TranscodeResponse> {
     let attempt_generation = next_status_generation();
     let repair = request.force || claim.dirty() == Dirty::Repair;
@@ -1695,6 +1751,7 @@ async fn process_transcode_inner(
             display_width: dimensions.as_ref().map(|info| info.display_width),
             display_height: dimensions.as_ref().map(|info| info.display_height),
             repair_lock_warning: None,
+            skipped_progressive_aliases: vec![],
         });
     }
 
@@ -1830,6 +1887,7 @@ async fn process_transcode_inner(
             state.config.use_gpu,
             &video_info,
             !repair,
+            policy,
         ))
         .await;
 
@@ -1838,8 +1896,11 @@ async fn process_transcode_inner(
         Err(e) => {
             claim.confirm().await?;
             let error_message = e.to_string();
-            let (error_code, terminal) =
-                classify_invalid_media_error(&error_message, "transcode_failed");
+            let (error_code, terminal) = if e.is::<TerminalTranscode>() {
+                ("archive_remux_incompatible", true)
+            } else {
+                classify_invalid_media_error(&error_message, "transcode_failed")
+            };
             if terminal {
                 report_derivative_failure_to_sentry(
                     "divine-transcoder",
@@ -1866,7 +1927,7 @@ async fn process_transcode_inner(
                 terminal,
             )
             .await;
-            if terminal && !repair {
+            if terminal && (!repair || e.is::<TerminalTranscode>()) {
                 callback?;
                 return Err(TerminalTranscode(e).into());
             }
@@ -1876,17 +1937,17 @@ async fn process_transcode_inner(
 
     info!("Generated HLS with {} variants", generation.variants.len());
 
-    let remux_result = claim.hold(remux_ts_to_fmp4(&output_dir)).await;
+    let remux_result = claim.hold(remux_ts_to_fmp4(&output_dir, policy)).await;
     // The best-effort remuxer can skip failed variants and still return Ok.
-    let remux_result = if repair && remux_result.is_ok() {
+    let remux_result = if repair && policy == MediaPolicy::AllowEncode && remux_result.is_ok() {
         require_progressive_outputs(&output_dir).await
     } else {
         remux_result
     };
     if let Err(e) = remux_result {
         claim.confirm().await?;
-        if repair {
-            // Repairs must replace the progressive MP4 aliases as well as HLS.
+        if repair && policy == MediaPolicy::AllowEncode {
+            // Encoding-permitted repairs must replace the progressive MP4 aliases as well as HLS.
             let _ = send_status_webhook(
                 &state.config,
                 hash,
@@ -1915,11 +1976,16 @@ async fn process_transcode_inner(
             return Err(anyhow!("Missing required HLS output: {filename}"));
         }
     }
+    let mut extra_uploads = Vec::new();
+    let mut skipped_progressive_aliases = Vec::new();
     for filename in object_storage::OPTIONAL_HLS_FILES {
         if !tokio::fs::metadata(output_dir.join(filename))
             .await
             .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
         {
+            if policy == MediaPolicy::CopyOnly {
+                skipped_progressive_aliases.push(filename.to_string());
+            }
             let key = format!("{hash}/hls/{filename}");
             if let Some(existing) = claim.hold(state.media_storage.stat(&key)).await? {
                 if existing.size > 0
@@ -1928,26 +1994,24 @@ async fn process_transcode_inner(
                         .await?
                 {
                     let bytes = claim.hold(state.media_storage.read(&existing)).await?;
-                    state
-                        .media_storage
-                        .put_hls_verified(
-                            &key,
-                            Bytes::from(bytes),
-                            &existing.content_type,
-                            existing.custom,
-                            existing.cache_control,
-                            claim,
-                        )
-                        .await?;
+                    extra_uploads.push(object_storage::HlsUploadItem {
+                        tier: 0,
+                        key,
+                        body: Bytes::from(bytes),
+                        mime: existing.content_type,
+                        custom: existing.custom,
+                        cache_control: existing.cache_control,
+                    });
                 }
             }
         }
     }
-    let upload_result = upload_hls(
+    let upload_result = upload_hls_with_extra(
         &state.media_storage,
         hash,
         &output_dir,
         &source_metadata,
+        extra_uploads,
         Some(claim),
     )
     .await;
@@ -2000,6 +2064,7 @@ async fn process_transcode_inner(
         display_width: Some(video_info.display_width),
         display_height: Some(video_info.display_height),
         repair_lock_warning: None,
+        skipped_progressive_aliases,
     })
 }
 
@@ -3643,17 +3708,114 @@ fn token_fetch_retry_delay(attempt: u32) -> Duration {
     }
 }
 
-/// Fetch a GCP access token from the metadata server (works on Cloud Run)
-/// or fall back to `gcloud auth print-access-token` locally.
+const GCP_CLOUD_PLATFORM_SCOPES: &[&str] = &["https://www.googleapis.com/auth/cloud-platform"];
+
+fn has_explicit_gcp_credentials_in_lookup<F>(mut lookup: F) -> bool
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    [
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_APPLICATION_CREDENTIALS_JSON",
+    ]
+    .into_iter()
+    .any(|key| lookup(key).is_some_and(|value| !value.trim().is_empty()))
+}
+
+fn has_explicit_gcp_credentials_env() -> bool {
+    has_explicit_gcp_credentials_in_lookup(|key| std::env::var(key).ok())
+}
+
+fn token_expires_in_secs(expiry: Option<time::OffsetDateTime>, now_unix: i64) -> Option<u64> {
+    expiry.map(|exp| exp.unix_timestamp().saturating_sub(now_unix).max(0) as u64)
+}
+
+const GCP_TOKEN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn is_valid_service_account_email(email: &str) -> bool {
+    let mut parts = email.split('@');
+    let (Some(local), Some(domain), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    !local.is_empty()
+        && !domain.is_empty()
+        && domain.contains('.')
+        && local
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        && domain
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+}
+
+async fn fetch_token_from_google_credentials() -> std::result::Result<MetadataAccessToken, String> {
+    let creds = google_cloud_auth::credentials::CredentialsFile::new()
+        .await
+        .map_err(|e| format!("failed to load GCP credentials: {}", e))?;
+    let source = tokio::time::timeout(
+        GCP_TOKEN_EXCHANGE_TIMEOUT,
+        google_cloud_auth::project::create_token_source_from_credentials(
+            &creds,
+            &google_cloud_auth::project::Config {
+                audience: None,
+                scopes: Some(GCP_CLOUD_PLATFORM_SCOPES),
+                sub: None,
+            },
+        ),
+    )
+    .await
+    .map_err(|_| "timed out creating GCP token source".to_string())?
+    .map_err(|e| format!("failed to create GCP token source: {}", e))?;
+    let token = tokio::time::timeout(GCP_TOKEN_EXCHANGE_TIMEOUT, source.token())
+        .await
+        .map_err(|_| "timed out exchanging GCP credentials for token".to_string())?
+        .map_err(|e| format!("failed to exchange GCP credentials for token: {}", e))?;
+    if token.access_token.trim().is_empty() {
+        return Err("GCP credentials returned empty access token".to_string());
+    }
+    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+    let expires_in = token_expires_in_secs(token.expiry, now_unix);
+    Ok(MetadataAccessToken {
+        token: token.access_token,
+        expires_in,
+    })
+}
+
+/// Fetch a GCP access token from explicit `GOOGLE_APPLICATION_CREDENTIALS` /
+/// `GOOGLE_APPLICATION_CREDENTIALS_JSON` (for off-GCP workers), the GCE/Cloud
+/// Run metadata server, or `gcloud auth print-access-token` locally.
 ///
 /// Tokens are cached process-wide for no longer than `ACCESS_TOKEN_CACHE_TTL`.
-/// On a cache miss, the metadata server is retried `METADATA_FETCH_MAX_ATTEMPTS`
-/// times before giving up — a transient hiccup used to fall straight
-/// through to a `gcloud` exec that doesn't exist in the container, which
-/// in turn triggered an expensive Vertex AI Gemini fallback.
+/// On a cache miss, the active credential source is retried
+/// `METADATA_FETCH_MAX_ATTEMPTS` times before giving up — a transient hiccup
+/// used to fall straight through to a `gcloud` exec that doesn't exist in the
+/// container, which in turn triggered an expensive Vertex AI Gemini fallback.
 async fn fetch_gcp_access_token() -> std::result::Result<String, ProviderFailure> {
     if let Some(token) = access_token_cache().get(Instant::now()) {
         return Ok(token);
+    }
+
+    if has_explicit_gcp_credentials_env() {
+        let mut last_error: Option<String> = None;
+        for attempt in 0..METADATA_FETCH_MAX_ATTEMPTS {
+            match fetch_token_from_google_credentials().await {
+                Ok(cred_token) => {
+                    let cache_ttl = cred_token.cache_ttl();
+                    access_token_cache().set(cred_token.token.clone(), cache_ttl, Instant::now());
+                    return Ok(cred_token.token);
+                }
+                Err(err) => {
+                    last_error = Some(err);
+                    if attempt + 1 < METADATA_FETCH_MAX_ATTEMPTS {
+                        tokio::time::sleep(token_fetch_retry_delay(attempt)).await;
+                    }
+                }
+            }
+        }
+        return Err(provider_credential_failure(&format!(
+            "Failed to get GCP access token from configured credentials: {}",
+            last_error.unwrap_or_else(|| "unknown credential error".to_string())
+        )));
     }
 
     let mut last_metadata_error: Option<String> = None;
@@ -3915,13 +4077,120 @@ pub(crate) fn identity_token_cache_for_audience(audience: &str) -> &'static Acce
     leaked
 }
 
+fn parse_iam_id_token_response(body: &str) -> std::result::Result<String, String> {
+    #[derive(serde::Deserialize)]
+    struct IamIdTokenResponse {
+        token: String,
+    }
+    let parsed: IamIdTokenResponse = serde_json::from_str(body)
+        .map_err(|e| format!("failed to parse IAM generateIdToken json: {}", e))?;
+    let token = parsed.token.trim();
+    if token.is_empty() {
+        return Err("IAM generateIdToken returned empty token".to_string());
+    }
+    Ok(token.to_string())
+}
+
+async fn fetch_identity_token_via_iam_credentials(
+    audience: &str,
+    service_account_email: &str,
+    access_token: &str,
+) -> std::result::Result<String, String> {
+    let url = format!(
+        "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{}:generateIdToken",
+        service_account_email
+    );
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .bearer_auth(access_token)
+        .json(&serde_json::json!({
+            "audience": audience,
+            "includeEmail": true
+        }))
+        .timeout(GCP_TOKEN_EXCHANGE_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| format!("IAM generateIdToken request failed: {}", e))?;
+
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("failed to read IAM generateIdToken body: {}", e))?;
+    if !status.is_success() {
+        invalidate_gcp_access_token_if_expired_response(access_token, Some(status.as_u16()), &body);
+        warn!(
+            status = status.as_u16(),
+            service_account = service_account_email,
+            audience = audience,
+            "IAM generateIdToken failed"
+        );
+        return Err(format!(
+            "IAM generateIdToken returned status {}",
+            status.as_u16()
+        ));
+    }
+    parse_iam_id_token_response(&body)
+}
+
 /// Fetch a Cloud Run identity token (OIDC) for `audience`. Cached per
-/// audience for 50 minutes. On metadata-server failure we apply the same
+/// audience for 50 minutes. Uses IAM `generateIdToken` when explicit
+/// `GOOGLE_APPLICATION_CREDENTIALS*` env vars are configured (off-GCP
+/// workers), otherwise queries the GCE/Cloud Run metadata server with the same
 /// 3-attempt retry as `fetch_gcp_access_token`.
 async fn fetch_gcp_identity_token(audience: &str) -> std::result::Result<String, ProviderFailure> {
     let cache = identity_token_cache_for_audience(audience);
     if let Some(token) = cache.get(Instant::now()) {
         return Ok(token);
+    }
+
+    if has_explicit_gcp_credentials_env() {
+        let creds = google_cloud_auth::credentials::CredentialsFile::new()
+            .await
+            .map_err(|e| {
+                provider_credential_failure(&format!("Failed to load GCP credentials: {}", e))
+            })?;
+        let service_account_email = creds
+            .client_email
+            .as_deref()
+            .map(str::trim)
+            .filter(|email| is_valid_service_account_email(email))
+            .ok_or_else(|| {
+                provider_credential_failure(
+                    "GCP credentials missing valid client_email for OIDC identity token",
+                )
+            })?;
+
+        let mut last_error: Option<String> = None;
+        for attempt in 0..METADATA_FETCH_MAX_ATTEMPTS {
+            // Fetch OAuth access token once (served from cache on retries unless
+            // a 401 from IAM invalidated it), avoiding nested 3x3 retry storms.
+            let access_token = fetch_gcp_access_token().await?;
+            match fetch_identity_token_via_iam_credentials(
+                audience,
+                service_account_email,
+                &access_token,
+            )
+            .await
+            {
+                Ok(token) => {
+                    cache.set(token.clone(), ACCESS_TOKEN_CACHE_TTL, Instant::now());
+                    return Ok(token);
+                }
+                Err(err) => {
+                    last_error = Some(err);
+                    if attempt + 1 < METADATA_FETCH_MAX_ATTEMPTS {
+                        tokio::time::sleep(token_fetch_retry_delay(attempt)).await;
+                    }
+                }
+            }
+        }
+        return Err(provider_credential_failure(&format!(
+            "Failed to get GCP identity token via IAM credentials (audience={}): {}",
+            audience,
+            last_error.unwrap_or_else(|| "unknown IAM credential error".to_string())
+        )));
     }
 
     let mut last_metadata_error: Option<String> = None;
@@ -4770,6 +5039,148 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "probe failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn transcode_admission_authenticates_both_routes_without_changing_repair() {
+        use super::*;
+        use axum::body::{to_bytes, Body};
+        use tower::ServiceExt;
+
+        async fn request(
+            config: Config,
+            path: &str,
+            force: bool,
+            headers: &[(&str, &str)],
+        ) -> (StatusCode, String) {
+            let gcs_client = GcsClient::new(ClientConfig::default().anonymous());
+            let media_storage =
+                object_storage::MediaStorage::gcs(gcs_client.clone(), config.gcs_bucket.clone());
+            let state = Arc::new(AppState {
+                gcs_client,
+                media_storage,
+                config,
+                provider_semaphore: Arc::new(Semaphore::new(1)),
+            });
+            let app = Router::new()
+                .route("/transcode", post(handle_transcode))
+                .route("/transcode/queue", post(handle_queue_transcode))
+                .with_state(state);
+            let mut request =
+                axum::http::Request::post(path).header(header::CONTENT_TYPE, "application/json");
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
+            let body = serde_json::json!({"hash": "a".repeat(64), "force": force});
+            let response = app
+                .oneshot(request.body(Body::from(body.to_string())).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+            (status, String::from_utf8(bytes.to_vec()).unwrap())
+        }
+
+        let config = |required: Option<&str>, secret: Option<&str>| {
+            Config::from_lookup(|key| match key {
+                "TRANSCODE_ADMISSION_AUTH_REQUIRED" => required.map(str::to_owned),
+                "TRANSCODE_ADMISSION_SECRET" => secret.map(str::to_owned),
+                "TRANSCODE_REPAIR_SECRET" => Some("synthetic-repair".into()),
+                "TRANSCODE_WRITES_PAUSED" => Some("true".into()),
+                _ => None,
+            })
+        };
+        let header = "x-divine-transcode-admission";
+        let valid = [(header, "synthetic-intake")];
+        for path in ["/transcode", "/transcode/queue"] {
+            assert_eq!(
+                request(config(None, None), path, false, &[]).await,
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Could not queue transcode".into()
+                )
+            );
+            for headers in [
+                &[][..],
+                &[(header, "wrong")],
+                &[(header, "synthetic-intake"), (header, "wrong")],
+            ] {
+                assert_eq!(
+                    request(
+                        config(Some("true"), Some("synthetic-intake")),
+                        path,
+                        false,
+                        headers
+                    )
+                    .await
+                    .0,
+                    StatusCode::UNAUTHORIZED
+                );
+            }
+            for (required, secret) in [
+                (Some("true"), None),
+                (Some("ture"), None),
+                (None, Some("  ")),
+            ] {
+                assert_eq!(
+                    request(config(required, secret), path, false, &valid).await,
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "transcode admission not configured".into()
+                    )
+                );
+            }
+            for required in [Some("true"), None] {
+                assert_eq!(
+                    request(
+                        config(required, Some("synthetic-intake")),
+                        path,
+                        false,
+                        &valid
+                    )
+                    .await,
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Could not queue transcode".into()
+                    )
+                );
+            }
+        }
+        assert_eq!(
+            request(
+                config(Some("true"), Some("synthetic-intake")),
+                "/transcode",
+                true,
+                &valid
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            request(
+                config(Some("true"), Some("synthetic-intake")),
+                "/transcode",
+                true,
+                &[("x-divine-repair-secret", "synthetic-repair")]
+            )
+            .await,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Transcode writes paused".into()
+            )
+        );
+        assert_eq!(
+            request(
+                config(Some("true"), Some("synthetic-intake")),
+                "/transcode/queue",
+                true,
+                &valid
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
         );
     }
 
@@ -6876,6 +7287,383 @@ mod tests {
             ["-c:a", "aac", "-b:a", "128k"]
         );
     }
+
+    #[test]
+    fn explicit_gcp_credentials_detection_ignores_blank_values() {
+        assert!(!crate::has_explicit_gcp_credentials_in_lookup(|_| None));
+        assert!(!crate::has_explicit_gcp_credentials_in_lookup(|_| {
+            Some("   ".to_string())
+        }));
+        assert!(crate::has_explicit_gcp_credentials_in_lookup(|k| {
+            (k == "GOOGLE_APPLICATION_CREDENTIALS").then(|| "/run/secrets/gcp-sa.json".to_string())
+        }));
+        assert!(crate::has_explicit_gcp_credentials_in_lookup(|k| {
+            (k == "GOOGLE_APPLICATION_CREDENTIALS_JSON").then(|| "{}".to_string())
+        }));
+    }
+
+    #[test]
+    fn token_expires_in_secs_clamps_expired_timestamps_to_zero() {
+        let now = 1_700_000_000_i64;
+        let future = time::OffsetDateTime::from_unix_timestamp(now + 3600).unwrap();
+        let past = time::OffsetDateTime::from_unix_timestamp(now - 30).unwrap();
+        assert_eq!(crate::token_expires_in_secs(Some(future), now), Some(3600));
+        assert_eq!(crate::token_expires_in_secs(Some(past), now), Some(0));
+        assert_eq!(crate::token_expires_in_secs(None, now), None);
+    }
+
+    #[test]
+    fn parse_iam_id_token_response_accepts_token_and_rejects_empty_or_invalid() {
+        assert_eq!(
+            crate::parse_iam_id_token_response(r#"{"token":"  jwt.body.sig  "}"#).unwrap(),
+            "jwt.body.sig"
+        );
+        assert!(crate::parse_iam_id_token_response(r#"{"token":"   "}"#).is_err());
+        assert!(crate::parse_iam_id_token_response(r#"{}"#).is_err());
+        assert!(crate::parse_iam_id_token_response("not json").is_err());
+    }
+
+    #[test]
+    fn service_account_email_validation_rejects_url_injection() {
+        assert!(crate::is_valid_service_account_email(
+            "divine-transcoder-worker@rich-compiler-479518-d2.iam.gserviceaccount.com"
+        ));
+        for invalid in [
+            "",
+            "no-at-sign.iam.gserviceaccount.com",
+            "user@nodot",
+            "user@a@b.com",
+            "user/../other@project.iam.gserviceaccount.com",
+            "user@project.iam.gserviceaccount.com?alt=json",
+            "user@project.iam.gserviceaccount.com#frag",
+            "user name@project.iam.gserviceaccount.com",
+        ] {
+            assert!(
+                !crate::is_valid_service_account_email(invalid),
+                "unexpectedly accepted {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn add_720p_entry_to_master_mirrors_single_480p_variant() {
+        let input = "\
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=480x480,CODECS=\"avc1.4d401e,mp4a.40.2\"
+stream_480p.m3u8
+";
+        let output = crate::add_720p_entry_to_master(input).unwrap();
+        assert_eq!(
+            output,
+            "\
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=480x480,CODECS=\"avc1.4d401e,mp4a.40.2\"
+stream_720p.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=480x480,CODECS=\"avc1.4d401e,mp4a.40.2\"
+stream_480p.m3u8
+"
+        );
+        assert!(crate::add_720p_entry_to_master("#EXTM3U\n").is_err());
+        assert!(crate::add_720p_entry_to_master("#EXTM3U\nstream_480p.m3u8\n").is_err());
+        assert!(crate::add_720p_entry_to_master(&output).is_err());
+        let crlf = input.replace('\n', "\r\n");
+        assert_eq!(crate::add_720p_entry_to_master(&crlf).unwrap(), output);
+    }
+
+    #[tokio::test]
+    async fn files_identical_streams_chunks_and_rejects_mismatches() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.ts");
+        let b = dir.path().join("b.ts");
+        let missing = dir.path().join("missing.ts");
+
+        // Empty files must return false.
+        tokio::fs::write(&a, b"").await.unwrap();
+        tokio::fs::write(&b, b"").await.unwrap();
+        assert!(!crate::files_identical(&a, &b).await);
+        assert!(!crate::files_identical(&a, &missing).await);
+
+        // Multi-chunk identical payload (> 64 KiB) returns true.
+        let mut payload = vec![0xABu8; 150_000];
+        tokio::fs::write(&a, &payload).await.unwrap();
+        tokio::fs::write(&b, &payload).await.unwrap();
+        assert!(crate::files_identical(&a, &b).await);
+
+        // Same length, single byte flipped in the final chunk returns false.
+        payload[149_999] ^= 0xFF;
+        tokio::fs::write(&b, &payload).await.unwrap();
+        assert!(!crate::files_identical(&a, &b).await);
+
+        // Different lengths return false.
+        tokio::fs::write(&b, &payload[..100_000]).await.unwrap();
+        assert!(!crate::files_identical(&a, &b).await);
+    }
+
+    #[tokio::test]
+    async fn mirror_480p_as_720p_validates_and_mirrors_all_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("stream_480p.ts"), b"ts-bytes")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            dir.path().join("stream_480p.m3u8"),
+            "#EXTM3U\n#EXTINF:2.0,\nstream_480p.ts\n#EXT-X-ENDLIST\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            dir.path().join("master.m3u8"),
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=480x480\nstream_480p.m3u8\n",
+        )
+        .await
+        .unwrap();
+
+        crate::mirror_480p_as_720p(dir.path()).await.unwrap();
+        assert_eq!(
+            tokio::fs::read(dir.path().join("stream_720p.ts"))
+                .await
+                .unwrap(),
+            b"ts-bytes"
+        );
+        let pl720 = tokio::fs::read_to_string(dir.path().join("stream_720p.m3u8"))
+            .await
+            .unwrap();
+        assert!(pl720.contains("stream_720p.ts"));
+        assert!(!pl720.contains("stream_480p.ts"));
+
+        // Re-running must fail because master.m3u8 already has stream_720p.m3u8.
+        assert!(crate::mirror_480p_as_720p(dir.path()).await.is_err());
+
+        // Missing stream_480p.ts reference in playlist must fail.
+        let bad = tempfile::tempdir().unwrap();
+        tokio::fs::write(bad.path().join("stream_480p.ts"), b"ts-bytes")
+            .await
+            .unwrap();
+        tokio::fs::write(bad.path().join("stream_480p.m3u8"), "#EXTM3U\n")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            bad.path().join("master.m3u8"),
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1200000\nstream_480p.m3u8\n",
+        )
+        .await
+        .unwrap();
+        assert!(crate::mirror_480p_as_720p(bad.path()).await.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ffmpeg and ffprobe"]
+    async fn encode_hls_single_variant_video_only_480p_mirrors_720p_and_mp4() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("source_480_silent.mp4");
+        let output = dir.path().join("hls");
+        tokio::fs::create_dir(&output).await.unwrap();
+
+        let status = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=480x480:rate=25:duration=2",
+                "-c:v",
+                "libx264",
+                "-profile:v",
+                "main",
+                "-bf",
+                "2",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&input)
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+
+        let info = crate::probe_video(&input).await.unwrap();
+        assert!(!info.has_audio);
+        crate::encode_hls(&input, &output, false, &info)
+            .await
+            .unwrap();
+        crate::remux_ts_to_fmp4(&output, crate::MediaPolicy::AllowEncode)
+            .await
+            .unwrap();
+        crate::require_progressive_outputs(&output).await.unwrap();
+        assert_eq!(
+            tokio::fs::read(output.join("stream_720p.mp4"))
+                .await
+                .unwrap(),
+            tokio::fs::read(output.join("stream_480p.mp4"))
+                .await
+                .unwrap()
+        );
+        let probed = crate::probe_video(&output.join("stream_720p.mp4"))
+            .await
+            .unwrap();
+        assert_eq!((probed.display_width, probed.display_height), (480, 480));
+        assert!(!probed.has_audio);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ffmpeg and ffprobe"]
+    async fn encode_hls_single_variant_for_480p_mirrors_720p_and_mp4() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("source_480.mp4");
+        let output = dir.path().join("hls");
+        tokio::fs::create_dir(&output).await.unwrap();
+
+        let status = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=480x480:rate=25:duration=2",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100:duration=2",
+                "-c:v",
+                "libx264",
+                "-profile:v",
+                "main",
+                "-bf",
+                "2",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "64k",
+            ])
+            .arg(&input)
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+
+        let info = crate::probe_video(&input).await.unwrap();
+        let variants = crate::encode_hls(&input, &output, false, &info)
+            .await
+            .unwrap();
+        assert_eq!(variants.len(), 2);
+
+        let master = tokio::fs::read_to_string(output.join("master.m3u8"))
+            .await
+            .unwrap();
+        assert!(master.contains("stream_720p.m3u8"));
+        assert!(master.contains("stream_480p.m3u8"));
+
+        let pl_720 = tokio::fs::read_to_string(output.join("stream_720p.m3u8"))
+            .await
+            .unwrap();
+        let pl_480 = tokio::fs::read_to_string(output.join("stream_480p.m3u8"))
+            .await
+            .unwrap();
+        assert!(pl_720.contains("stream_720p.ts"));
+        assert!(!pl_720.contains("stream_480p.ts"));
+        assert!(pl_480.contains("stream_480p.ts"));
+
+        assert_eq!(
+            tokio::fs::read(output.join("stream_720p.ts"))
+                .await
+                .unwrap(),
+            tokio::fs::read(output.join("stream_480p.ts"))
+                .await
+                .unwrap(),
+            "single-variant <=480p encode should mirror stream_480p.ts to stream_720p.ts"
+        );
+
+        crate::remux_ts_to_fmp4(&output, crate::MediaPolicy::AllowEncode)
+            .await
+            .unwrap();
+        crate::require_progressive_outputs(&output).await.unwrap();
+        assert_eq!(
+            tokio::fs::read(output.join("stream_720p.mp4"))
+                .await
+                .unwrap(),
+            tokio::fs::read(output.join("stream_480p.mp4"))
+                .await
+                .unwrap(),
+            "identical TS variants should mirror stream_720p.mp4 to stream_480p.mp4"
+        );
+        let probed = crate::probe_video(&output.join("stream_720p.mp4"))
+            .await
+            .unwrap();
+        assert_eq!((probed.display_width, probed.display_height), (480, 480));
+        assert!(probed.has_audio);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ffmpeg and ffprobe"]
+    async fn encode_hls_dual_variant_for_720p_produces_distinct_renditions() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("source_720.mp4");
+        let output = dir.path().join("hls");
+        tokio::fs::create_dir(&output).await.unwrap();
+
+        let status = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=720x720:rate=25:duration=2",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100:duration=2",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "64k",
+            ])
+            .arg(&input)
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+
+        let info = crate::probe_video(&input).await.unwrap();
+        crate::encode_hls(&input, &output, false, &info)
+            .await
+            .unwrap();
+        crate::remux_ts_to_fmp4(&output, crate::MediaPolicy::AllowEncode)
+            .await
+            .unwrap();
+        crate::require_progressive_outputs(&output).await.unwrap();
+
+        assert_ne!(
+            tokio::fs::read(output.join("stream_720p.ts"))
+                .await
+                .unwrap(),
+            tokio::fs::read(output.join("stream_480p.ts"))
+                .await
+                .unwrap(),
+            ">480p inputs must still produce distinct 720p and 480p renditions"
+        );
+        let p720 = crate::probe_video(&output.join("stream_720p.mp4"))
+            .await
+            .unwrap();
+        let p480 = crate::probe_video(&output.join("stream_480p.mp4"))
+            .await
+            .unwrap();
+        assert_eq!((p720.display_width, p720.display_height), (720, 720));
+        assert_eq!((p480.display_width, p480.display_height), (480, 480));
+    }
 }
 
 fn summarize_vtt(vtt: &str) -> (u32, u64) {
@@ -7192,8 +7980,9 @@ async fn run_ffmpeg_hls(
     use_gpu: bool,
     video_info: &VideoInfo,
     allow_reuse: bool,
+    policy: MediaPolicy,
 ) -> Result<HlsGeneration> {
-    if allow_reuse {
+    if allow_reuse || policy == MediaPolicy::CopyOnly {
         match media_reuse::try_reuse(input_path, output_dir).await {
             Ok(true) => {
                 hls_claim::count("stream_copy_completed");
@@ -7202,7 +7991,11 @@ async fn run_ffmpeg_hls(
                     method: HlsMethod::StreamCopy,
                 });
             }
+            Ok(false) if policy == MediaPolicy::CopyOnly => {
+                return Err(TerminalTranscode(anyhow!("archive_remux_incompatible")).into());
+            }
             Ok(false) => hls_claim::count("stream_copy_rejected"),
+            Err(error) if policy == MediaPolicy::CopyOnly => return Err(error),
             Err(error) => {
                 warn!(%error, "Stream-copy attempt failed; using normal encoding");
                 hls_claim::count("stream_copy_failed");
@@ -7257,6 +8050,11 @@ async fn encode_hls(
         );
     }
 
+    // When both renditions resolve to identical dimensions (all <=480p sources,
+    // including 480x480 Vines), encode once and mirror the single HLS output
+    // to stream_720p so we preserve client contracts at half the encoder CPU.
+    let single_variant = w_720 == w_480 && h_720 == h_480;
+
     // Build FFmpeg command
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-y"); // Overwrite output
@@ -7270,8 +8068,14 @@ async fn encode_hls(
 
     cmd.args(["-i", &input_str]);
 
-    // Output mapping: create two video streams (720p, 480p), with audio if present
-    if video_info.has_audio {
+    // Output mapping: single stream when 720p==480p, otherwise two streams (720p, 480p)
+    if single_variant {
+        if video_info.has_audio {
+            cmd.args(["-map", "0:v:0", "-map", "0:a:0"]);
+        } else {
+            cmd.args(["-map", "0:v:0"]);
+        }
+    } else if video_info.has_audio {
         cmd.args([
             "-map", "0:v:0", "-map", "0:a:0", // 720p with audio
             "-map", "0:v:0", "-map", "0:a:0", // 480p with audio
@@ -7307,7 +8111,49 @@ async fn encode_hls(
         format!("scale={}:-2", w_480)
     };
 
-    if effective_gpu {
+    if single_variant {
+        if effective_gpu {
+            cmd.args([
+                "-filter:v:0",
+                &scale_480,
+                "-c:v:0",
+                "h264_nvenc",
+                "-profile:v:0",
+                "main",
+                "-level:v:0",
+                "3.1",
+                "-cq:v:0",
+                "23",
+                "-maxrate:v:0",
+                "1200k",
+                "-bufsize:v:0",
+                "2400k",
+                "-bf:v:0",
+                "0",
+            ]);
+        } else {
+            cmd.args([
+                "-filter:v:0",
+                &scale_480,
+                "-c:v:0",
+                "libx264",
+                "-profile:v:0",
+                "main",
+                "-level:v:0",
+                "3.1",
+                "-crf:v:0",
+                "23",
+                "-maxrate:v:0",
+                "1200k",
+                "-bufsize:v:0",
+                "2400k",
+                "-preset:v:0",
+                "fast",
+                "-bf:v:0",
+                "0",
+            ]);
+        }
+    } else if effective_gpu {
         cmd.args([
             // 720p variant
             "-filter:v:0",
@@ -7394,7 +8240,11 @@ async fn encode_hls(
 
     // Audio encoding (only if audio stream exists)
     if video_info.has_audio {
-        cmd.args(["-c:a", "aac", "-b:a:0", "128k", "-b:a:1", "96k"]);
+        if single_variant {
+            cmd.args(["-c:a", "aac", "-b:a:0", "128k"]);
+        } else {
+            cmd.args(["-c:a", "aac", "-b:a:0", "128k", "-b:a:1", "96k"]);
+        }
     }
 
     // HLS output settings
@@ -7403,10 +8253,11 @@ async fn encode_hls(
     // -hls_flags single_file: Put all segments in single .ts file (efficient for short clips)
     // -master_pl_name: Name of master playlist
     // -var_stream_map: Map variants to output streams
-    let var_stream_map = if video_info.has_audio {
-        "v:0,a:0,name:720p v:1,a:1,name:480p"
-    } else {
-        "v:0,name:720p v:1,name:480p"
+    let var_stream_map = match (single_variant, video_info.has_audio) {
+        (true, true) => "v:0,a:0,name:480p",
+        (true, false) => "v:0,name:480p",
+        (false, true) => "v:0,a:0,name:720p v:1,a:1,name:480p",
+        (false, false) => "v:0,name:720p v:1,name:480p",
     };
 
     cmd.args([
@@ -7435,12 +8286,93 @@ async fn encode_hls(
         return Err(anyhow!("FFmpeg failed: {}", stderr));
     }
 
+    if single_variant {
+        mirror_480p_as_720p(output_dir).await?;
+    }
+
     // Verify outputs exist
     if !master_playlist.exists() {
         return Err(anyhow!("Master playlist not created"));
     }
 
     Ok(hls_variants())
+}
+
+/// Mirror a single-encoded 480p HLS output to the 720p variant paths so
+/// existing client and storage contracts stay intact without running a second
+/// identical libx264 encode.
+async fn mirror_480p_as_720p(output_dir: &Path) -> Result<()> {
+    let ts_480 = output_dir.join("stream_480p.ts");
+    let ts_720 = output_dir.join("stream_720p.ts");
+    let pl_480 = output_dir.join("stream_480p.m3u8");
+    let pl_720 = output_dir.join("stream_720p.m3u8");
+    let master_path = output_dir.join("master.m3u8");
+
+    tokio::fs::copy(&ts_480, &ts_720)
+        .await
+        .context("Mirror stream_480p.ts to stream_720p.ts")?;
+
+    let playlist_480 = tokio::fs::read_to_string(&pl_480)
+        .await
+        .context("Read stream_480p.m3u8")?;
+    if !playlist_480.contains("stream_480p.ts") {
+        return Err(anyhow!("stream_480p.m3u8 did not reference stream_480p.ts"));
+    }
+    let playlist_720 = playlist_480.replace("stream_480p.ts", "stream_720p.ts");
+    tokio::fs::write(&pl_720, playlist_720)
+        .await
+        .context("Write stream_720p.m3u8")?;
+
+    let master = tokio::fs::read_to_string(&master_path)
+        .await
+        .context("Read master.m3u8")?;
+    let rewritten = add_720p_entry_to_master(&master)?;
+    tokio::fs::write(&master_path, rewritten)
+        .await
+        .context("Write mirrored master.m3u8")?;
+
+    for name in [
+        "master.m3u8",
+        "stream_720p.m3u8",
+        "stream_480p.m3u8",
+        "stream_720p.ts",
+        "stream_480p.ts",
+    ] {
+        let len = tokio::fs::metadata(output_dir.join(name))
+            .await
+            .with_context(|| format!("Missing mirrored HLS output {name}"))?
+            .len();
+        if len == 0 {
+            return Err(anyhow!("Empty mirrored HLS output {name}"));
+        }
+    }
+    Ok(())
+}
+
+fn add_720p_entry_to_master(master: &str) -> Result<String> {
+    let lines: Vec<&str> = master.lines().collect();
+    if lines.iter().any(|line| line.trim() == "stream_720p.m3u8") {
+        return Err(anyhow!("master.m3u8 already references stream_720p.m3u8"));
+    }
+    let idx = lines
+        .iter()
+        .position(|line| line.trim() == "stream_480p.m3u8")
+        .ok_or_else(|| anyhow!("master.m3u8 did not reference stream_480p.m3u8"))?;
+    if idx == 0
+        || !lines[idx - 1]
+            .trim_start()
+            .starts_with("#EXT-X-STREAM-INF:")
+    {
+        return Err(anyhow!(
+            "master.m3u8 missing #EXT-X-STREAM-INF before stream_480p.m3u8"
+        ));
+    }
+    let mut out = Vec::with_capacity(lines.len() + 2);
+    out.extend_from_slice(&lines[..idx - 1]);
+    out.push(lines[idx - 1]);
+    out.push("stream_720p.m3u8");
+    out.extend_from_slice(&lines[idx - 1..]);
+    Ok(format!("{}\n", out.join("\n")))
 }
 
 fn hls_variants() -> Vec<HlsVariant> {
@@ -7503,7 +8435,87 @@ async fn require_progressive_outputs(hls_dir: &Path) -> Result<()> {
 /// bytes of AAC-LC config plus an explicit "SBR absent" marker. Copying avoids
 /// an unnecessary generation of lossy re-encoding and produces the measured
 /// 2-byte configuration without claiming an unverified playback cost (#235).
-async fn remux_ts_to_fmp4(hls_dir: &Path) -> Result<()> {
+async fn files_identical(a: &Path, b: &Path) -> bool {
+    use tokio::io::AsyncReadExt;
+
+    let Ok((ma, mb)) = tokio::try_join!(tokio::fs::metadata(a), tokio::fs::metadata(b)) else {
+        return false;
+    };
+    if !ma.is_file() || !mb.is_file() || ma.len() == 0 || ma.len() != mb.len() {
+        return false;
+    }
+    let Ok((mut fa, mut fb)) = tokio::try_join!(tokio::fs::File::open(a), tokio::fs::File::open(b))
+    else {
+        return false;
+    };
+
+    const CHUNK_SIZE: usize = 64 * 1024;
+    let mut buf_a = vec![0u8; CHUNK_SIZE];
+    let mut buf_b = vec![0u8; CHUNK_SIZE];
+    let mut remaining = ma.len();
+
+    while remaining > 0 {
+        let to_read = (remaining as usize).min(CHUNK_SIZE);
+        if fa.read_exact(&mut buf_a[..to_read]).await.is_err()
+            || fb.read_exact(&mut buf_b[..to_read]).await.is_err()
+        {
+            return false;
+        }
+        if buf_a[..to_read] != buf_b[..to_read] {
+            return false;
+        }
+        remaining -= to_read as u64;
+    }
+    // Verify neither file grew while reading.
+    matches!(
+        tokio::try_join!(fa.read(&mut buf_a[..1]), fb.read(&mut buf_b[..1])),
+        Ok((0, 0))
+    )
+}
+
+async fn remux_ts_to_fmp4(hls_dir: &Path, policy: MediaPolicy) -> Result<()> {
+    let ts_720 = hls_dir.join("stream_720p.ts");
+    let ts_480 = hls_dir.join("stream_480p.ts");
+    if files_identical(&ts_720, &ts_480).await {
+        let mp4_720 = hls_dir.join("stream_720p.mp4");
+        let mp4_480 = hls_dir.join("stream_480p.mp4");
+        match remux_variant(&ts_720, &mp4_720, "stream_720p", policy).await {
+            Ok(()) => {
+                info!("Remuxed stream_720p to MP4");
+                match tokio::fs::copy(&mp4_720, &mp4_480).await {
+                    Ok(_) => {
+                        info!("Mirrored stream_720p.mp4 to stream_480p.mp4");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        warn!("Failed to mirror stream_720p.mp4 to stream_480p.mp4: {}", e);
+                        let _ = tokio::fs::remove_file(&mp4_480).await;
+                        // Fall back to remuxing stream_480p directly without redoing stream_720p.
+                        if let Err(e) =
+                            remux_variant(&ts_480, &mp4_480, "stream_480p", policy).await
+                        {
+                            warn!("MP4 remux failed for stream_480p: {}", e);
+                            let _ = tokio::fs::remove_file(&mp4_480).await;
+                        } else {
+                            info!("Remuxed stream_480p to MP4");
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("MP4 remux failed for stream_720p: {}", e);
+                match tokio::fs::remove_file(&mp4_720).await {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        warn!("Could not remove failed stream_720p MP4: {}", e);
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
+        }
+    }
+
     for variant in &["stream_720p", "stream_480p"] {
         let ts_path = hls_dir.join(format!("{}.ts", variant));
         let mp4_path = hls_dir.join(format!("{}.mp4", variant));
@@ -7513,7 +8525,7 @@ async fn remux_ts_to_fmp4(hls_dir: &Path) -> Result<()> {
             continue;
         }
 
-        if let Err(e) = remux_variant(&ts_path, &mp4_path, variant).await {
+        if let Err(e) = remux_variant(&ts_path, &mp4_path, variant, policy).await {
             warn!("MP4 remux failed for {}: {}", variant, e);
             // ffmpeg truncates its output the moment it opens it, so a failed
             // run leaves a zero-byte .mp4 here. upload_hls uploads
@@ -7535,9 +8547,15 @@ async fn remux_ts_to_fmp4(hls_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn remux_variant(ts_path: &Path, mp4_path: &Path, variant: &str) -> Result<()> {
+async fn remux_variant(
+    ts_path: &Path,
+    mp4_path: &Path,
+    variant: &str,
+    policy: MediaPolicy,
+) -> Result<()> {
     match remux_with_audio(ts_path, mp4_path, variant, AudioRemux::Copy).await {
         Ok(()) => Ok(()),
+        Err(e) if policy == MediaPolicy::CopyOnly => Err(e),
         Err(e) => {
             // The copy path needs the .ts to carry well-formed ADTS. If it
             // does not, a missing or unplayable variant would be worse than
@@ -7632,7 +8650,18 @@ async fn upload_hls(
     hash: &str,
     hls_dir: &Path,
     source_metadata: &SourceObjectMetadata,
-    mut claim: Option<&mut Claim>,
+    claim: Option<&mut Claim>,
+) -> Result<Vec<object_storage::VerifiedObject>> {
+    upload_hls_with_extra(storage, hash, hls_dir, source_metadata, Vec::new(), claim).await
+}
+
+async fn upload_hls_with_extra(
+    storage: &object_storage::MediaStorage,
+    hash: &str,
+    hls_dir: &Path,
+    source_metadata: &SourceObjectMetadata,
+    mut items: Vec<object_storage::HlsUploadItem>,
+    claim: Option<&mut Claim>,
 ) -> Result<Vec<object_storage::VerifiedObject>> {
     let mut entries = tokio::fs::read_dir(hls_dir).await?;
     let mut files = Vec::new();
@@ -7644,14 +8673,15 @@ async fn upload_hls(
         files.push(path);
     }
     // Publish referenced objects before each playlist and the master last.
-    files.sort_by_key(
-        |path| match path.file_name().and_then(|name| name.to_str()) {
-            Some("master.m3u8") => 2,
-            Some(name) if name.ends_with(".m3u8") => 1,
-            _ => 0,
-        },
-    );
-    let mut verified = Vec::new();
+    files.sort_by_key(|path| {
+        let name = path.file_name().and_then(|name| name.to_str());
+        let tier = match name {
+            Some("master.m3u8") => 2u8,
+            Some(name) if name.ends_with(".m3u8") => 1u8,
+            _ => 0u8,
+        };
+        (tier, name.unwrap_or_default().to_owned())
+    });
     for path in files {
         let filename = path.file_name().unwrap().to_string_lossy();
         let key = format!("{}/hls/{}", hash, filename);
@@ -7663,6 +8693,13 @@ async fn upload_hls(
             "video/mp4"
         } else {
             "application/octet-stream"
+        };
+        let tier = if filename == "master.m3u8" {
+            2
+        } else if filename.ends_with(".m3u8") {
+            1
+        } else {
+            0
         };
         let mut metadata = source_metadata.custom.clone();
         metadata.insert("source_sha256".to_string(), hash.to_string());
@@ -7678,17 +8715,35 @@ async fn upload_hls(
             continue;
         }
         let cache = Some("public, max-age=31536000, immutable".to_string());
-        let receipt = if let Some(claim) = claim.as_deref_mut() {
-            storage
-                .put_hls_verified(&key, bytes, content_type, metadata, cache, claim)
-                .await?
-        } else {
-            storage
-                .put_verified(&key, bytes, content_type, metadata, cache)
-                .await?
-        };
+        items.push(object_storage::HlsUploadItem {
+            tier,
+            key,
+            body: bytes,
+            mime: content_type.to_string(),
+            custom: metadata,
+            cache_control: cache,
+        });
+    }
+    if let Some(claim) = claim {
+        let verified = storage.put_hls_batch_verified(items, claim).await?;
+        for receipt in &verified {
+            info!("Uploaded {}", receipt.object.reference.key);
+        }
+        return Ok(verified);
+    }
+    let mut verified = Vec::new();
+    for item in items {
+        let receipt = storage
+            .put_verified(
+                &item.key,
+                item.body,
+                &item.mime,
+                item.custom,
+                item.cache_control,
+            )
+            .await?;
+        info!("Uploaded {}", receipt.object.reference.key);
         verified.push(receipt);
-        info!("Uploaded {}", key);
     }
     Ok(verified)
 }

@@ -3,7 +3,10 @@
 
 use crate::blossom::{AuthAction, BlossomAuthEvent};
 use crate::error::{BlossomError, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD},
+    Engine,
+};
 use blossom_core::transcribe;
 use k256::schnorr::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
@@ -55,8 +58,9 @@ pub fn parse_auth_header(auth_header: &str) -> Result<BlossomAuthEvent> {
     }
     let base64_event = rest.trim_start();
 
-    let event_json = BASE64
+    let event_json = URL_SAFE_NO_PAD
         .decode(base64_event)
+        .or_else(|_| BASE64.decode(base64_event))
         .map_err(|_| BlossomError::AuthInvalid("Invalid base64 in authorization".into()))?;
 
     serde_json::from_slice(&event_json)
@@ -1075,6 +1079,24 @@ mod tests {
                 panic!("scheme {scheme:?} should parse, got {}", e.message())
             });
         }
+    }
+
+    #[test]
+    fn parse_auth_header_accepts_unpadded_base64url() {
+        let event = signed_event(
+            BLOSSOM_AUTH_KIND,
+            vec![vec!["t".into(), "upload".into()]],
+            1_000,
+        );
+        let mut json = serde_json::to_vec(&event).unwrap();
+        if json.len() % 3 == 0 {
+            json.push(b' ');
+        }
+        let wire = URL_SAFE_NO_PAD.encode(&json);
+        assert_eq!(
+            parse_auth_header(&format!("Nostr {wire}")).unwrap().id,
+            event.id
+        );
     }
 
     #[test]

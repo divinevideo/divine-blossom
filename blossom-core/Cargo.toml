@@ -9,6 +9,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 http = "1"
 url = "2"
+time = { version = "0.3.36", features = ["parsing"] }
 
 # Existing workspace SigV4 primitives, shared without a transport SDK.
 hmac = "0.12"

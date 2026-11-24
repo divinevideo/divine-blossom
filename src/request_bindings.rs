@@ -13,6 +13,8 @@ type Value = Binding<Option<String>>;
 struct Bindings {
     configs: BTreeMap<String, Value>,
     secrets: BTreeMap<String, Value>,
+    origin_kv: BTreeMap<String, (Option<String>, Option<u64>)>,
+    delivery_zones_retained: Option<String>,
     config_store: Option<Binding<ConfigStoreHandle>>,
     secret_store: Option<Binding<u32>>,
     #[cfg(test)]
@@ -154,15 +156,122 @@ pub(crate) fn config(key: &str) -> Result<Option<String>> {
 /// The exceptional purge fallback must leave a native read slot for any
 /// credential still needed by this execution.
 pub(crate) fn can_read_secret(key: &str) -> bool {
+    has_secret_budget(&[key])
+}
+
+/// Whether `key` has already been loaded in the current request's secret cache.
+pub(crate) fn secret_cached(key: &str) -> bool {
     CURRENT.with(|slot| {
         slot.borrow()
             .as_ref()
-            .is_none_or(|bindings| bindings.secrets.contains_key(key) || bindings.secrets.len() < 5)
+            .is_some_and(|bindings| bindings.secrets.contains_key(key))
+    })
+}
+
+/// Whether all distinct `keys` fit inside the 5-secret per-request Compute limit.
+pub(crate) fn has_secret_budget(keys: &[&str]) -> bool {
+    CURRENT.with(|slot| {
+        slot.borrow().as_ref().is_none_or(|bindings| {
+            let mut needed = 0usize;
+            for (index, key) in keys.iter().enumerate() {
+                if !bindings.secrets.contains_key(*key) && !keys[..index].contains(key) {
+                    needed += 1;
+                }
+            }
+            bindings.secrets.len() + needed <= 5
+        })
+    })
+}
+
+/// Whether `keys` would fit inside the 5-secret Compute limit on a fresh retry
+/// that avoids loading `excluded` (such as `kv_origin_read_token` after Attempt 1
+/// has opened a local phase record).
+pub(crate) fn has_secret_budget_excluding(keys: &[&str], excluded: &str) -> bool {
+    CURRENT.with(|slot| {
+        slot.borrow().as_ref().is_none_or(|bindings| {
+            let base = bindings
+                .secrets
+                .len()
+                .saturating_sub(usize::from(bindings.secrets.contains_key(excluded)));
+            let mut needed = 0usize;
+            for (index, key) in keys.iter().enumerate() {
+                if *key != excluded
+                    && !bindings.secrets.contains_key(*key)
+                    && !keys[..index].contains(key)
+                {
+                    needed += 1;
+                }
+            }
+            base + needed <= 5
+        })
     })
 }
 
 pub(crate) fn secret(key: &str) -> Result<Option<String>> {
     lookup(|bindings| bindings.secret(key))
+}
+
+/// Cache successful KV-origin lookups (value and optional generation) for static
+/// target-retention keys within one Compute request so repeated policy/drain
+/// checks do not re-spend backend subrequests. Errors are never cached.
+pub(crate) fn cached_origin_kv(
+    key: &str,
+    fetch: impl FnOnce() -> Result<Option<String>>,
+) -> Result<Option<String>> {
+    cached_origin_kv_with_gen(key, || fetch().map(|value| (value, None))).map(|(value, _)| value)
+}
+
+pub(crate) fn cached_origin_kv_with_gen(
+    key: &str,
+    fetch: impl FnOnce() -> Result<(Option<String>, Option<u64>)>,
+) -> Result<(Option<String>, Option<u64>)> {
+    let cached = CURRENT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|bindings| bindings.origin_kv.get(key).cloned())
+    });
+    if let Some(entry) = cached {
+        return Ok(entry);
+    }
+    let entry = fetch()?;
+    CURRENT.with(|slot| {
+        if let Some(bindings) = slot.borrow_mut().as_mut() {
+            bindings.origin_kv.insert(key.to_owned(), entry.clone());
+        }
+    });
+    Ok(entry)
+}
+
+pub(crate) fn set_cached_origin_kv(key: &str, value: Option<String>) {
+    CURRENT.with(|slot| {
+        if let Some(bindings) = slot.borrow_mut().as_mut() {
+            bindings.origin_kv.insert(key.to_owned(), (value, None));
+        }
+    });
+}
+
+pub(crate) fn delivery_zones_already_retained(configured_key: &str) -> bool {
+    CURRENT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|bindings| bindings.delivery_zones_retained.as_deref() == Some(configured_key))
+    })
+}
+
+pub(crate) fn mark_delivery_zones_retained(configured_key: &str) {
+    CURRENT.with(|slot| {
+        if let Some(bindings) = slot.borrow_mut().as_mut() {
+            bindings.delivery_zones_retained = Some(configured_key.to_owned());
+        }
+    });
+}
+
+pub(crate) fn invalidate_cached_origin_kv(key: &str) {
+    CURRENT.with(|slot| {
+        if let Some(bindings) = slot.borrow_mut().as_mut() {
+            bindings.origin_kv.remove(key);
+        }
+    });
 }
 
 #[cfg(test)]

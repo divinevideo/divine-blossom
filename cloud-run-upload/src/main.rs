@@ -372,6 +372,7 @@ async fn main() -> Result<()> {
             header::AUTHORIZATION,
             header::CONTENT_TYPE,
             header::CONTENT_RANGE,
+            HeaderName::from_static("x-divine-video-processing"),
         ])
         .expose_headers([
             HeaderName::from_static("upload-offset"),
@@ -953,6 +954,22 @@ async fn handle_vanish_audit_log(
     emit_audit_log(&body)
 }
 
+// This header only defers eager HLS work; it never grants encoding permission.
+#[derive(Debug, thiserror::Error)]
+#[error("X-Divine-Video-Processing must contain exactly one copy-only value")]
+struct InvalidVideoProcessing;
+
+fn upload_copy_only(headers: &HeaderMap) -> std::result::Result<bool, InvalidVideoProcessing> {
+    let mut values = headers.get_all("x-divine-video-processing").iter();
+    let Some(value) = values.next() else {
+        return Ok(false);
+    };
+    if values.next().is_some() || value.as_bytes() != b"copy-only" {
+        return Err(InvalidVideoProcessing);
+    }
+    Ok(true)
+}
+
 async fn handle_upload(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -962,7 +979,9 @@ async fn handle_upload(
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => {
             error!("Upload error: {}", e);
-            let status = if e.to_string().contains("auth") || e.to_string().contains("Auth") {
+            let status = if e.is::<InvalidVideoProcessing>() {
+                StatusCode::BAD_REQUEST
+            } else if e.to_string().contains("auth") || e.to_string().contains("Auth") {
                 StatusCode::UNAUTHORIZED
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -1130,6 +1149,18 @@ async fn handle_resumable_complete(
     Path(upload_id): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Response {
+    let copy_only = match upload_copy_only(&headers) {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: error.to_string(),
+                }),
+            )
+                .into_response()
+        }
+    };
     let auth_event = match validate_auth(&headers, "upload") {
         Ok(event) => event,
         Err(error) => return auth_error_response(error),
@@ -1155,6 +1186,7 @@ async fn handle_resumable_complete(
                 state.config.transcriber_url.as_deref(),
                 &response,
                 &auth_event.pubkey,
+                copy_only,
             )
             .await;
 
@@ -1189,6 +1221,7 @@ async fn process_upload(
     headers: axum::http::HeaderMap,
     body: Body,
 ) -> Result<UploadResponse> {
+    let copy_only = upload_copy_only(&headers)?;
     // Validate auth
     let auth_event = validate_auth(&headers, "upload")?;
 
@@ -1257,7 +1290,8 @@ async fn process_upload(
 
     // Trigger HLS transcoding for videos. Never blocks the upload response, and
     // never fails the upload: the GCS object is already durable at this point.
-    if thumbnail::is_video_type(&content_type) && derivative_failure.is_none() {
+    // Copy-only callers defer HLS admission until edge policy metadata is committed.
+    if !copy_only && thumbnail::is_video_type(&content_type) && derivative_failure.is_none() {
         if let Some(ref transcoder_url) = state.config.transcoder_url {
             let transcoder_url = transcoder_url.clone();
             let hash = sha256_hash.clone();
@@ -1546,8 +1580,8 @@ async fn download_best_available_media_bytes(
 /// `spawn_blocking` alone would let a cold-feed burst launch one per request
 /// up to the blocking pool's size; this bound keeps such a burst from
 /// exhausting the instance's CPU and memory while queued requests wait.
-const MAX_CONCURRENT_THUMBNAIL_EXTRACTIONS: usize = 4;
-const THUMBNAIL_EXTRACTION_WAIT: Duration = Duration::from_secs(10);
+const MAX_CONCURRENT_THUMBNAIL_EXTRACTIONS: usize = 8;
+const THUMBNAIL_EXTRACTION_WAIT: Duration = Duration::from_secs(12);
 const THUMBNAIL_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 static THUMBNAIL_EXTRACTION_SLOTS: LazyLock<Semaphore> =
@@ -1800,7 +1834,11 @@ async fn clear_thumbnail_generation_failure(hash: &str) {
 fn thumbnail_generation_busy_response() -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        [(header::CONTENT_TYPE, "application/json")],
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::RETRY_AFTER, "5"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
         Json(ErrorResponse {
             error: "Thumbnail generation is busy".to_string(),
         })
@@ -2085,8 +2123,11 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_readiness_advertises_private_generation_contract() {
-        let response = axum::response::IntoResponse::into_response(super::handle_delete_blobs_ready().await);
-        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let response =
+            axum::response::IntoResponse::into_response(super::handle_delete_blobs_ready().await);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["private_family_cleanup"], "all-versions-v1");
     }
@@ -2544,6 +2585,7 @@ mod derivative_trigger_tests {
             Some(&server.uri()),
             &response,
             "pubkey_abc",
+            false,
         )
         .await;
 
@@ -2580,6 +2622,7 @@ mod derivative_trigger_tests {
             Some(&server.uri()),
             &response,
             "pubkey_abc",
+            false,
         )
         .await;
 
@@ -2614,6 +2657,7 @@ mod derivative_trigger_tests {
             Some(&server.uri()),
             &response,
             "pubkey_abc",
+            false,
         )
         .await;
 
@@ -2645,7 +2689,7 @@ mod derivative_trigger_tests {
 
         let response = fake_response("video/mp4");
         // transcoder_url = None, transcriber_url = Some
-        maybe_trigger_derivatives(None, Some(&server.uri()), &response, "pubkey_abc").await;
+        maybe_trigger_derivatives(None, Some(&server.uri()), &response, "pubkey_abc", false).await;
 
         // Only /transcribe fires (transcoder_url is None).
         wait_for_n_requests(&server, 1).await;
@@ -2680,6 +2724,7 @@ mod derivative_trigger_tests {
             Some(&server.uri()),
             &response,
             "pubkey_abc",
+            false,
         )
         .await;
 
@@ -2703,12 +2748,15 @@ fn validate_auth(headers: &axum::http::HeaderMap, required_action: &str) -> Resu
         return Err(anyhow!("Authorization must start with 'Nostr '"));
     }
 
-    // Decode base64 event
-    let event_json = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        &auth_header[6..],
-    )
-    .map_err(|e| anyhow!("Invalid base64: {}", e))?;
+    use base64::{
+        engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+        Engine,
+    };
+    let encoded_event = &auth_header[6..];
+    let event_json = URL_SAFE_NO_PAD
+        .decode(encoded_event)
+        .or_else(|_| STANDARD.decode(encoded_event))
+        .map_err(|e| anyhow!("Invalid base64: {}", e))?;
 
     let event: NostrEvent =
         serde_json::from_slice(&event_json).map_err(|e| anyhow!("Invalid event JSON: {}", e))?;
@@ -2830,19 +2878,21 @@ fn is_transcribable_type(content_type: &str) -> bool {
 /// Spawn derivative-generation tasks (transcoding + transcription) for a newly completed upload.
 ///
 /// This is the authoritative branching point: video → transcode + transcribe, audio → transcribe
-/// only, image → neither. Extracted from `handle_resumable_complete` so it can be unit-tested in
+/// only, image → neither. Copy-only callers defer HLS but still transcribe.
+/// Extracted from `handle_resumable_complete` so it can be unit-tested in
 /// isolation. See PR #59 for the regression where resumable uploads skipped these triggers.
 async fn maybe_trigger_derivatives(
     transcoder_url: Option<&str>,
     transcriber_url: Option<&str>,
     response: &resumable::CompleteUploadResponse,
     pubkey: &str,
+    copy_only: bool,
 ) {
     // Trigger HLS transcoding for videos (fire-and-forget).
     // Without this, resumable uploads never reach the transcoder and
     // /{hash}/720p.mp4 stays in "Processing" forever. See the
     // 2026-04-05 720p-mp4-stuck investigation.
-    if thumbnail::is_video_type(&response.content_type) {
+    if !copy_only && thumbnail::is_video_type(&response.content_type) {
         if let Some(url) = transcoder_url {
             let transcoder_url = url.to_owned();
             let hash = response.sha256.clone();
@@ -3298,4 +3348,31 @@ fn decode_nsec(nsec: &str) -> Result<[u8; 32]> {
     let mut key = [0u8; 32];
     key.copy_from_slice(&result[..32]);
     Ok(key)
+}
+
+#[cfg(test)]
+mod upload_policy_tests;
+
+#[cfg(test)]
+mod thumbnail_busy_tests {
+    use super::*;
+
+    #[test]
+    fn busy_response_is_503_with_retry_after_and_no_store() {
+        let resp = thumbnail_generation_busy_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("5")
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        assert_eq!(MAX_CONCURRENT_THUMBNAIL_EXTRACTIONS, 8);
+    }
 }

@@ -54,6 +54,27 @@ pub fn validate_admin_auth(req: &Request) -> Result<()> {
     ))
 }
 
+/// Validate admin authentication on routes that subsequently require `webhook_secret`,
+/// checking `webhook_secret` before `admin_token` so webhook callers do not consume
+/// an extra Compute secret slot on `admin_token`.
+pub fn validate_admin_auth_prefer_webhook(req: &Request) -> Result<()> {
+    if let Some(provided) = extract_bearer_token(req) {
+        if validate_bearer_token_against_secret_keys(&provided, &["webhook_secret", "admin_token"])
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+
+    if validate_session(req).is_ok() {
+        return Ok(());
+    }
+
+    Err(BlossomError::AuthRequired(
+        "Admin authentication required".into(),
+    ))
+}
+
 /// The recurring eviction worker has authority only on the bounded drain route.
 /// Never add this secret to the general admin/webhook credential list.
 pub(crate) fn validate_b2_cdn_purge_drain_auth(req: &Request) -> Result<()> {
@@ -178,6 +199,7 @@ mod tests {
         let hash = "b".repeat(64);
         let metadata = BlobMetadata {
             archive_storage: None,
+            video_encoding_allowed: false,
             sha256: hash.clone(),
             size: 1234,
             mime_type: "video/mp4".to_string(),
@@ -1123,9 +1145,6 @@ pub fn handle_admin_bulk_approve(mut req: Request) -> Result<Response> {
                             if !skip_purge {
                                 let _ =
                                     update_stats_on_status_change(meta.status, BlobStatus::Active);
-                                if !queued_cdn_invalidation {
-                                    crate::purge_edge_cache(hash);
-                                }
                             }
                             approved += 1;
                             approved_hashes.push(hash.clone());
@@ -1139,6 +1158,10 @@ pub fn handle_admin_bulk_approve(mut req: Request) -> Result<Response> {
             Ok(None) => not_found += 1,
             Err(_) => errors += 1,
         }
+    }
+
+    if !skip_purge && !queued_cdn_invalidation && !approved_hashes.is_empty() {
+        crate::purge_edge_cache_batch(&approved_hashes);
     }
 
     eprintln!(
