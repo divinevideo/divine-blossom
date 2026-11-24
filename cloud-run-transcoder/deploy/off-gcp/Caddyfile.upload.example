@@ -28,6 +28,11 @@
 	# Wrap proxy and fallback in handle blocks so respond 404 never shadows
 	# reverse_proxy under Caddy 2's built-in directive order.
 	handle @public_upload {
+		# Match GKE HTTPRoute's 16 MiB upload-body-size filter so direct/chunked
+		# request bodies cannot exceed the bounded 4G /tmp tmpfs and 6G memory cap.
+		request_body {
+			max_size 16MiB
+		}
 		reverse_proxy upload:8080 {
 			# Stream direct/resumable video uploads and thumbnail bytes without buffering.
 			flush_interval -1

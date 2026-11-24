@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
@@ -29,6 +30,8 @@ class OffGcpUploadConfigTest(unittest.TestCase):
         # Caddy 2 executes bare `respond` before `reverse_proxy`; both must live
         # inside `handle` blocks so the 404 fallback cannot shadow allowed routes.
         self.assertRegex(text, r"(?m)^\thandle @public_upload \{$")
+        self.assertRegex(text, r"(?m)^\t\trequest_body \{$")
+        self.assertRegex(text, r"(?m)^\t\t\tmax_size 16MiB$")
         self.assertRegex(text, r"(?m)^\t\treverse_proxy upload:8080 \{$")
         self.assertRegex(text, r"(?m)^\thandle \{$")
         self.assertRegex(text, r"(?m)^\t\trespond 404$")
@@ -166,7 +169,11 @@ class OffGcpUploadConfigTest(unittest.TestCase):
             first_handler = subroutes[0]["handle"][0]
             second_handler = subroutes[1]["handle"][0]
             self.assertEqual(first_handler["handler"], "subroute")
-            proxy_handler = first_handler["routes"][0]["handle"][0]
+            first_handlers = first_handler["routes"][0]["handle"]
+            self.assertEqual(len(first_handlers), 2, f"Expected request_body + reverse_proxy, got: {first_handlers}")
+            self.assertEqual(first_handlers[0]["handler"], "request_body")
+            self.assertEqual(first_handlers[0]["max_size"], 16 * 1024 * 1024)
+            proxy_handler = first_handlers[1]
             self.assertEqual(proxy_handler["handler"], "reverse_proxy")
             self.assertEqual(proxy_handler["upstreams"][0]["dial"], "upload:8080")
             self.assertEqual(proxy_handler["flush_interval"], -1)
@@ -190,9 +197,12 @@ class OffGcpUploadConfigTest(unittest.TestCase):
                 pass
 
             def _ok(self, tag: str) -> None:
-                length = int(self.headers.get("Content-Length") or 0)
-                if length:
-                    self.rfile.read(length)
+                remaining = int(self.headers.get("Content-Length") or 0)
+                while remaining > 0:
+                    chunk = self.rfile.read(min(remaining, 65536))
+                    if not chunk:
+                        return
+                    remaining -= len(chunk)
                 recorded.append((tag, self.command, self.path))
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain")
@@ -268,6 +278,7 @@ class OffGcpUploadConfigTest(unittest.TestCase):
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
+                    start_new_session=True,
                 )
 
                 deadline = time.monotonic() + 10.0
@@ -283,10 +294,16 @@ class OffGcpUploadConfigTest(unittest.TestCase):
                 else:
                     self.fail("caddy did not open loopback port in time")
 
-                def send(host: str, method: str, path: str) -> int:
+                def send(host: str, method: str, path: str, body: bytes | None = None) -> int:
                     conn = http.client.HTTPConnection("127.0.0.1", caddy_port, timeout=5)
+                    headers = {"Host": f"{host}:{caddy_port}"}
+                    if body is not None:
+                        headers["Content-Length"] = str(len(body))
                     try:
-                        conn.request(method, path, headers={"Host": f"{host}:{caddy_port}"})
+                        try:
+                            conn.request(method, path, body=body, headers=headers)
+                        except (BrokenPipeError, ConnectionResetError):
+                            pass
                         resp = conn.getresponse()
                         resp.read()
                         return resp.status
@@ -358,14 +375,36 @@ class OffGcpUploadConfigTest(unittest.TestCase):
                     404,
                 )
                 self.assertEqual(recorded, [])
+
+                # Enforce 16 MiB request body cap on allowed upload routes.
+                limit = 16 * 1024 * 1024
+                recorded.clear()
+                self.assertEqual(
+                    send("upload.example.test", "PUT", "/upload", body=b"x" * limit),
+                    200,
+                )
+                self.assertEqual(recorded, [("upload", "PUT", "/upload")])
+
+                recorded.clear()
+                self.assertEqual(
+                    send("upload.example.test", "PUT", "/upload", body=b"x" * (limit + 1)),
+                    413,
+                )
+                self.assertEqual(recorded, [])
         finally:
             if proc is not None:
                 if proc.poll() is None:
-                    proc.terminate()
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
                     try:
                         proc.wait(timeout=5)
                     except subprocess.TimeoutExpired:
-                        proc.kill()
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
                         proc.wait(timeout=5)
                 if proc.stdout is not None:
                     proc.stdout.close()
