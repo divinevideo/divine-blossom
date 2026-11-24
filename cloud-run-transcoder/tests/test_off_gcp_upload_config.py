@@ -29,6 +29,7 @@ UPLOAD_COMPOSE = OFF_GCP_DIR / "docker-compose.upload.yml"
 UPLOAD_ENV_EXAMPLE = OFF_GCP_DIR / ".env.upload.example"
 GITIGNORE = REPO_ROOT / ".gitignore"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+RUNBOOK = REPO_ROOT / "docs" / "runbooks" / "off-cloud-run-worker.md"
 
 
 def _stop_process(proc: subprocess.Popen[str]) -> None:
@@ -1077,6 +1078,124 @@ Server(("0.0.0.0", 8080), Handler).serve_forever()
                 )
                 if net_created:
                     subprocess.run([docker_bin, "network", "rm", net_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def test_runbook_phase_c_health_probes_require_200_transcoder_json_and_reject_redirects(self):
+        doc = RUNBOOK.read_text(encoding="utf-8")
+        probes = re.findall(
+            r"^([ \t]*probe_local_transcoder_health\(\)\s*\{.*?^[ \t]*\})",
+            doc,
+            re.M | re.S,
+        )
+        self.assertEqual(len(probes), 2, "Expected Phase C and Phase C recovery probe functions")
+        dedented = [
+            re.sub(r"(?m)^" + re.escape(re.match(r"([ \t]*)", p).group(1)), "", p)
+            for p in probes
+        ]
+        self.assertEqual(
+            dedented[0].replace("docker compose exec -T", "COMPOSE"),
+            dedented[1].replace("docker compose -f docker-compose.yml exec -T", "COMPOSE"),
+        )
+
+        proxy_hits = 0
+        target_hits = 0
+        response_spec = {"code": 200, "headers": [], "body": b""}
+
+        class ForgingProxyHandler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+            def do_CONNECT(self):
+                nonlocal proxy_hits
+                proxy_hits += 1
+                self.send_response(403)
+                self.end_headers()
+            def do_GET(self):
+                nonlocal proxy_hits
+                proxy_hits += 1
+                body = b'{"status":"healthy","gpu_available":false}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        class MockCaddyHandler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+            def do_GET(self):
+                nonlocal target_hits
+                target_hits += 1
+                body = response_spec["body"]
+                self.send_response(response_spec["code"])
+                for hk, hv in response_spec["headers"]:
+                    self.send_header(hk, hv)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if body:
+                    self.wfile.write(body)
+
+        proxy_srv = ThreadingHTTPServer(("127.0.0.1", 0), ForgingProxyHandler)
+        target_srv = ThreadingHTTPServer(("127.0.0.1", 0), MockCaddyHandler)
+        threading.Thread(target=proxy_srv.serve_forever, daemon=True).start()
+        threading.Thread(target=target_srv.serve_forever, daemon=True).start()
+        try:
+            proxy_url = f"http://127.0.0.1:{proxy_srv.server_address[1]}"
+            tport = target_srv.server_address[1]
+            with tempfile.TemporaryDirectory() as tmp:
+                bin_dir = Path(tmp) / "bin"
+                bin_dir.mkdir()
+                stub_docker = bin_dir / "docker"
+                stub_docker.write_text(
+                    '#!/bin/sh\nprintf "%s\\n" "${FAKE_TRANSCODER_DOMAIN:-}"\n',
+                    encoding="utf-8",
+                )
+                stub_docker.chmod(0o755)
+
+                cases = [
+                    (308, [("Location", f"https://transcoder-worker.divine.video:{tport}/health")], b"", False),
+                    (308, [("Location", f"https://transcoder-worker.divine.video:{tport}/health")], b'{"status":"healthy","gpu_available":false}', False),
+                    (301, [("Location", f"https://transcoder-worker.divine.video:{tport}/health")], b"", False),
+                    (200, [], b"", False),
+                    (200, [("Content-Type", "text/plain")], b"ok", False),
+                    (200, [("Content-Type", "application/json")], b'{"status":"unhealthy","gpu_available":false}', False),
+                    (200, [("Content-Type", "application/json")], b'{"status":"healthy"}', False),
+                    (502, [], b"Bad Gateway", False),
+                    (200, [("Content-Type", "application/json")], b'{"status":"healthy","gpu_available":false}', True),
+                    (200, [("Content-Type", "application/json")], b'{"status":"healthy","gpu_available":true}', True),
+                ]
+
+                for code, headers, body, should_pass in cases:
+                    response_spec["code"] = code
+                    response_spec["headers"] = headers
+                    response_spec["body"] = body
+                    for label, fn_src in [("phase_c", dedented[0]), ("phase_c_recovery", dedented[1])]:
+                        before_proxy = proxy_hits
+                        before_target = target_hits
+                        env = os.environ.copy()
+                        env["PATH"] = f"{bin_dir}:{env['PATH']}"
+                        env["FAKE_TRANSCODER_DOMAIN"] = f"http://transcoder-worker.divine.video:{tport}"
+                        env["LOCAL_CADDY_ADDR"] = "127.0.0.1"
+                        env["http_proxy"] = proxy_url
+                        env["HTTP_PROXY"] = proxy_url
+                        env["https_proxy"] = proxy_url
+                        env["HTTPS_PROXY"] = proxy_url
+                        env["ALL_PROXY"] = proxy_url
+                        res = subprocess.run(
+                            ["sh", "-c", "set -eu\n" + fn_src + "\nprobe_local_transcoder_health\n"],
+                            env=env,
+                            text=True,
+                            capture_output=True,
+                        )
+                        self.assertEqual(proxy_hits, before_proxy, f"{label} unexpectedly contacted proxy")
+                        self.assertEqual(target_hits, before_target + 1, f"{label} did not hit local listener")
+                        if should_pass:
+                            self.assertEqual(res.returncode, 0, f"{label} expected 0 for {code} {body!r}: {res.stderr}")
+                        else:
+                            self.assertNotEqual(res.returncode, 0, f"{label} unexpectedly passed for {code} {body!r}")
+        finally:
+            proxy_srv.shutdown()
+            proxy_srv.server_close()
+            target_srv.shutdown()
+            target_srv.server_close()
 
 
 if __name__ == "__main__":

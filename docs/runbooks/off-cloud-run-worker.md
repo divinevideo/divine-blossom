@@ -464,8 +464,11 @@ sole writer.
    startup/pulls cannot open a post-drain race window, verifies `num_requests == 0`
    and no `ffmpeg` immediately before replacing `caddy`, reloads and verifies
    the local `/health` listener using the Compose-resolved `TRANSCODER_DOMAIN`
-   with `--resolve` and `--noproxy '*'`, and clears `/var/lib/divine-upload/pre-sync-backup`;
-   leaves `divine-transcode` paused for explicit operator resume):
+   with `--resolve` and `--noproxy '*'` (requiring HTTP `200` and the
+   transcoder's `{"status":"healthy","gpu_available":...}` JSON response so
+   redirects and unmatched listeners fail closed), and clears
+   `/var/lib/divine-upload/pre-sync-backup`; leaves `divine-transcode` paused
+   for explicit operator resume):
    ```sh
    (
      set -eu
@@ -508,12 +511,13 @@ sole writer.
          '*.'*) host="healthcheck.${host#\*.}" ;;
        esac
        if [ -z "$host" ]; then
-         curl -fsS --noproxy '*' --max-time 5 "${scheme}://${local_addr}:${port}/health" >/dev/null
+         resp="$(curl -fsS --noproxy '*' --max-time 5 -w '\n%{http_code}' "${scheme}://${local_addr}:${port}/health")" || return 1
        elif [ "$port" = "$default_port" ]; then
-         curl -fsS --noproxy '*' --max-time 5 --resolve "${host}:${port}:${local_addr}" "${scheme}://${host}/health" >/dev/null
+         resp="$(curl -fsS --noproxy '*' --max-time 5 --resolve "${host}:${port}:${local_addr}" -w '\n%{http_code}' "${scheme}://${host}/health")" || return 1
        else
-         curl -fsS --noproxy '*' --max-time 5 --resolve "${host}:${port}:${local_addr}" "${scheme}://${host}:${port}/health" >/dev/null
+         resp="$(curl -fsS --noproxy '*' --max-time 5 --resolve "${host}:${port}:${local_addr}" -w '\n%{http_code}' "${scheme}://${host}:${port}/health")" || return 1
        fi
+       printf '%s' "$resp" | python3 -c 'import json, sys; body, sep, code = sys.stdin.read().rpartition("\n"); d = json.loads(body) if sep and code == "200" and body.strip() else {}; sys.exit(0 if isinstance(d, dict) and d.get("status") == "healthy" and isinstance(d.get("gpu_available"), bool) else 1)'
      }
      wait_transcoder_health() {
        i=0
@@ -570,8 +574,10 @@ sole writer.
    held until the operator lifts them; reads the Compose-resolved
    `TRANSCODER_DOMAIN` from the running base `caddy` container and pins each
    `/health` readiness probe to `${LOCAL_CADDY_ADDR:-127.0.0.1}` with
-   `--noproxy '*'` so shell proxies and healthy peer nodes behind shared DNS/LB
-   cannot mask a failed replacement; if the updated base `docker-compose.yml` or
+   `--noproxy '*'` (requiring HTTP `200` and the transcoder's
+   `{"status":"healthy","gpu_available":...}` JSON response so redirects,
+   shell proxies, and healthy peer nodes behind shared DNS/LB cannot mask a
+   failed replacement); if the updated base `docker-compose.yml` or
    `Caddyfile` fails `/health`, falls back automatically to
    `/var/lib/divine-upload/pre-sync-backup`, clears the pre-sync backup once
    local `/health` passes so subsequent rollouts take a fresh baseline, and
@@ -606,12 +612,13 @@ sole writer.
          '*.'*) host="healthcheck.${host#\*.}" ;;
        esac
        if [ -z "$host" ]; then
-         curl -fsS --noproxy '*' --max-time 5 "${scheme}://${local_addr}:${port}/health" >/dev/null
+         resp="$(curl -fsS --noproxy '*' --max-time 5 -w '\n%{http_code}' "${scheme}://${local_addr}:${port}/health")" || return 1
        elif [ "$port" = "$default_port" ]; then
-         curl -fsS --noproxy '*' --max-time 5 --resolve "${host}:${port}:${local_addr}" "${scheme}://${host}/health" >/dev/null
+         resp="$(curl -fsS --noproxy '*' --max-time 5 --resolve "${host}:${port}:${local_addr}" -w '\n%{http_code}' "${scheme}://${host}/health")" || return 1
        else
-         curl -fsS --noproxy '*' --max-time 5 --resolve "${host}:${port}:${local_addr}" "${scheme}://${host}:${port}/health" >/dev/null
+         resp="$(curl -fsS --noproxy '*' --max-time 5 --resolve "${host}:${port}:${local_addr}" -w '\n%{http_code}' "${scheme}://${host}:${port}/health")" || return 1
        fi
+       printf '%s' "$resp" | python3 -c 'import json, sys; body, sep, code = sys.stdin.read().rpartition("\n"); d = json.loads(body) if sep and code == "200" and body.strip() else {}; sys.exit(0 if isinstance(d, dict) and d.get("status") == "healthy" and isinstance(d.get("gpu_available"), bool) else 1)'
      }
      wait_transcoder_health() {
        i=0
