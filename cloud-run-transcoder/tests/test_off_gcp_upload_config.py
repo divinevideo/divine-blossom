@@ -1,5 +1,7 @@
 """Regression checks for off-GCP co-located upload Caddy and Compose config."""
 
+from __future__ import annotations
+
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
