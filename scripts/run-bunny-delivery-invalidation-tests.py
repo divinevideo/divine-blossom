@@ -44,6 +44,11 @@ class Provider(BaseHTTPRequestHandler):
         if self.path.startswith("/resources/stores/kv/fixture-store/keys/"):
             assert self.headers.get("Fastly-Key") == "synthetic-policy-key"
             if (
+                self.server.pilot_enrolled
+                and self.path.endswith(f"/bunny-pilot-enrolled:v1:{HASH}")
+            ):
+                return self.reply(200, 1, "1")
+            if (
                 self.server.origin_retained_zones is not None
                 and self.path.endswith("/bunny-delivery-retained-zones:v1")
             ):
@@ -63,6 +68,33 @@ class Provider(BaseHTTPRequestHandler):
             with self.server.lock:
                 self.server.meter.append([raw.decode(), 0])
             return self.reply(200, {})
+        parsed = urlsplit(self.path)
+        if parsed.query == "delete":
+            xml = f"<DeleteResult><Deleted><Key>{HASH}</Key></Deleted></DeleteResult>".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/xml")
+            self.send_header("Content-Length", str(len(xml)))
+            self.end_headers()
+            return self.wfile.write(xml)
+        if parsed.path == "/delete-blobs":
+            return self.reply(
+                200,
+                {
+                    "status": "completed",
+                    "results": [
+                        {
+                            "hash": HASH,
+                            "status": "completed",
+                            "main_deleted_or_absent": True,
+                            "private_family": "absent",
+                            "bounded_progress": False,
+                            "failures": [],
+                        }
+                    ],
+                },
+            )
+        if parsed.path.startswith("/audit") or parsed.path.startswith("/vanish-audit"):
+            return self.reply(200, {"status": "ok"})
         with self.server.lock:
             try:
                 status, payload = self.dispatch()
@@ -112,7 +144,7 @@ class Provider(BaseHTTPRequestHandler):
 
 
 def manifest(port, kv, settings, secrets):
-    backends = ("bunny_api", "fastly_api", "kv-origin-api", "fixture_control")
+    backends = ("bunny_api", "fastly_api", "kv-origin-api", "fos_storage", "cloud_run_upload", "fixture_control")
     backend_sections = "\n".join(
         f'[local_server.backends."{name}"]\nurl = "http://127.0.0.1:{port}"'
         for name in backends
@@ -146,10 +178,13 @@ def run_case(mode):
         server.fastly_services = Counter()
         server.fastly_url_purges = []
         server.fail_primary_first_n = 4 if mode == "bunny-only" else 0
+        server.pilot_enrolled = mode == "pilot-plus-delivery-missing-bundle-webhook"
         if mode in (
             "cold-pop-origin-retention",
             "webhook-packed-budget",
             "webhook-no-bundle-safe-failclosed",
+            "pilot-plus-delivery-missing-bundle-webhook",
+            "vanish-kv-origin-5-secret-budget",
             "webhook-admin-moderate",
         ):
             server.origin_retained_zones = f"{PRIMARY_HOST},{ALIAS_HOST}"
@@ -250,6 +285,26 @@ def run_case(mode):
                         "bunny_delivery_zones": f"{PRIMARY_HOST},{ALIAS_HOST}",
                         "b2_replica_enabled": "true",
                     }
+                elif mode == "vanish-kv-origin-5-secret-budget":
+                    configuration = {
+                        "fixture_delivery_mode": mode,
+                        "bunny_delivery_zones": f"{PRIMARY_HOST},{ALIAS_HOST}",
+                        "b2_replica_enabled": "false",
+                        "ENABLE_PHYSICAL_DELETE": "true",
+                        "gcs_bucket": "synthetic-gcs-bucket",
+                        "metadata_kv_store_id": "fixture-store",
+                    }
+                    secrets["kv_origin_read_token"] = "synthetic-policy-key"
+                    secrets["fos_access_key"] = "synthetic-fos-key"
+                    secrets["fos_secret_key"] = "synthetic-fos-secret"
+                elif mode == "pilot-plus-delivery-missing-bundle-webhook":
+                    configuration = {
+                        "fixture_delivery_mode": mode,
+                        "bunny_delivery_zones": f"{PRIMARY_HOST},{ALIAS_HOST}",
+                        "bunny_pilot_zone_hosts": "media-bunny.divine.video,divine-media-bunny-pilot.b-cdn.net",
+                        "metadata_kv_store_id": "fixture-store",
+                    }
+                    secrets["kv_origin_read_token"] = "synthetic-policy-key"
                 elif mode == "bunny-retry-clears-on-target-error":
                     configuration = {
                         "fixture_delivery_mode": mode,
@@ -344,8 +399,13 @@ def run_case(mode):
                     # Pass 2 (Fastly) + Pass 3 (Bunny retry) + Pass 4 (both together) = 4 each.
                     assert server.bunny_counts == {PRIMARY_HOST: 4, ALIAS_HOST: 4}, server.bunny_counts
                     assert server.fastly_services == dict.fromkeys(FASTLY_SERVICES, 4), server.fastly_services
+                elif mode == "vanish-kv-origin-5-secret-budget":
+                    # 1 inline vanish Fastly purge + 2 Phase::Final drain rounds = 3 Fastly calls per service.
+                    assert server.bunny_counts == {PRIMARY_HOST: 2, ALIAS_HOST: 2}, server.bunny_counts
+                    assert server.fastly_services == dict.fromkeys(FASTLY_SERVICES, 3), server.fastly_services
                 elif mode in (
                     "webhook-packed-budget",
+                    "pilot-plus-delivery-missing-bundle-webhook",
                     "bunny-only-vanish-no-replica",
                     "vanish-b2-replica-budget",
                     "webhook-admin-moderate",
@@ -367,8 +427,10 @@ if __name__ == "__main__":
         "rotation-overflow",
         "webhook-packed-budget",
         "webhook-no-bundle-safe-failclosed",
+        "pilot-plus-delivery-missing-bundle-webhook",
         "bunny-only-vanish-no-replica",
         "vanish-b2-replica-budget",
+        "vanish-kv-origin-5-secret-budget",
         "bunny-retry-clears-on-target-error",
         "webhook-admin-moderate",
         "invalid-config",

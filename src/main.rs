@@ -5501,6 +5501,7 @@ fn execute_vanish(pubkey: &str) -> VanishExecution {
     // retained CDN invalidation configuration is active. Turning the replica
     // flag off during rollback must not silently restore the unbounded 10-source
     // wave while warm outer bytes remain and phases still run.
+    let _defer_delivery_origin = crate::request_bindings::defer_delivery_origin_retention();
     let b2_enabled = b2_replica_enabled();
     let phased = b2_enabled || crate::storage::cdn_invalidation_configured();
     let wave_fanout = if phased {

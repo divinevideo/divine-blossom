@@ -1004,6 +1004,68 @@ fn bunny_delivery_policy_purge_and_durable_retry() {
         return;
     }
 
+    if mode == "pilot-plus-delivery-missing-bundle-webhook" {
+        let hash = hash();
+        b2_cdn_purge::enqueue(&hash, b2_cdn_purge::Phase::Single).unwrap();
+        // Pass 1: webhook drain with 4 secrets spent tries missing bundle,
+        // stages Standalone ("1").
+        // Pass 2: Standalone purges Fastly and stages BunnyRetry ("bunny-retry")
+        // even though bunny_pilot_configured() is also true.
+        // Pass 3: BunnyRetry purges outer Bunny delivery zones and stages Packed
+        // ("packed") so neither Fastly nor outer Bunny delivery is starved.
+        for _ in 0..3 {
+            let req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false)
+                .with_header("Authorization", "Bearer synthetic-webhook-token");
+            let mut resp = crate::request_bindings::metered(req);
+            assert_eq!(resp.get_status(), StatusCode::OK);
+            let reply: serde_json::Value = serde_json::from_str(&resp.take_body_str()).unwrap();
+            assert_eq!(reply["result"], 0);
+            assert_eq!(reply["pending"], 1);
+        }
+        return;
+    }
+
+    if mode == "vanish-kv-origin-5-secret-budget" {
+        let hash = hash();
+        let metadata = serde_json::from_value(serde_json::json!({
+            "sha256": hash,
+            "size": 9,
+            "type": "video/mp4",
+            "uploaded": "2026-01-01T00:00:00Z",
+            "owner": "b".repeat(64),
+            "status": "active"
+        }))
+        .unwrap();
+        put_blob_metadata(&metadata).unwrap();
+        // Physical creator delete with kv_origin + bunny_delivery_zones + FOS
+        // must stay within the 5-secret Compute limit (admin_token,
+        // fos_access_key, fos_secret_key, fastly_api_token, webhook_secret)
+        // without spending a 6th slot on kv_origin_read_token.
+        let mut delete_req = request(Method::POST, "/admin/api/moderate", true);
+        delete_req.set_body(serde_json::json!({"sha256": hash, "action": "DELETE"}).to_string());
+        let delete_resp = crate::request_bindings::metered(delete_req);
+        assert_eq!(delete_resp.get_status(), StatusCode::CONFLICT);
+        assert!(b2_cdn_phase::physical_absent(&hash).unwrap());
+
+        let drain_req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false)
+            .with_header("Authorization", "Bearer synthetic-drain-token");
+        let mut drain_resp = crate::request_bindings::metered(drain_req);
+        assert_eq!(drain_resp.get_status(), StatusCode::OK);
+        let reply: serde_json::Value = serde_json::from_str(&drain_resp.take_body_str()).unwrap();
+        assert_eq!(reply["result"], 1);
+        assert_eq!(reply["errors"], 0);
+        assert!(storage::vanish_complete(&hash));
+
+        let mut finish_req = request(Method::POST, "/admin/api/moderate", true);
+        finish_req.set_body(serde_json::json!({"sha256": hash, "action": "DELETE"}).to_string());
+        let mut finish_resp = crate::request_bindings::metered(finish_req);
+        assert_eq!(finish_resp.get_status(), StatusCode::OK);
+        let finish_body: serde_json::Value =
+            serde_json::from_str(&finish_resp.take_body_str()).unwrap();
+        assert_eq!(finish_body["physical_deleted"], true);
+        return;
+    }
+
     if mode == "bunny-retry-clears-on-target-error" {
         let hash = hash();
         let store = open_store().unwrap();

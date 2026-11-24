@@ -312,6 +312,9 @@ def run(versions, resume, fallback=None, with_delivery=False, rotated_delivery=F
                 if with_delivery or rotated_delivery:
                     for host in server.delivery_hosts:
                         assert server.delivery_counts[host] >= 6, (host, server.delivery_counts)
+                    fastly_counts = Counter(entry for event, entry in server.events if event == 'fastly')
+                    for service in FASTLY_SERVICES:
+                        assert fastly_counts[service] >= 6, (service, fastly_counts)
                 else:
                     assert Counter(entry for event, entry in server.events if event == 'fastly') == dict.fromkeys(FASTLY_SERVICES, 14 if resume else 8), server.events
                 for report in result.stderr.splitlines():

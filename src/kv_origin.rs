@@ -19,7 +19,7 @@ struct Settings {
 }
 
 fn settings() -> Result<Option<Settings>> {
-    let Some(store_id) = crate::admin::get_config(STORE_ID_CONFIG)
+    let Some(store_id) = crate::storage::optional_config(STORE_ID_CONFIG)?
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
     else {

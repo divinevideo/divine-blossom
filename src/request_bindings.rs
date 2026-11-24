@@ -15,6 +15,7 @@ struct Bindings {
     secrets: BTreeMap<String, Value>,
     origin_kv: BTreeMap<String, (Option<String>, Option<u64>)>,
     delivery_zones_retained: Option<String>,
+    defer_delivery_origin_retention: bool,
     config_store: Option<Binding<ConfigStoreHandle>>,
     secret_store: Option<Binding<u32>>,
     #[cfg(test)]
@@ -248,6 +249,42 @@ pub(crate) fn invalidate_cached_origin_kv(key: &str) {
             bindings.origin_kv.remove(key);
         }
     });
+}
+
+/// Guard that prevents `retain_bunny_delivery_zones()` from spending a Compute
+/// secret slot on `kv_origin_read_token` during 5-secret physical-erasure waves
+/// (local KV lookup + atomic `Add`/`if_generation_match` still run; any cold-POP
+/// rotation merge is completed in the fresh-budget `Phase::Final` drain).
+pub(crate) struct DeferDeliveryOriginRetention {
+    previous: bool,
+}
+
+pub(crate) fn defer_delivery_origin_retention() -> DeferDeliveryOriginRetention {
+    let previous = CURRENT.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .map(|bindings| std::mem::replace(&mut bindings.defer_delivery_origin_retention, true))
+            .unwrap_or(false)
+    });
+    DeferDeliveryOriginRetention { previous }
+}
+
+impl Drop for DeferDeliveryOriginRetention {
+    fn drop(&mut self) {
+        CURRENT.with(|slot| {
+            if let Some(bindings) = slot.borrow_mut().as_mut() {
+                bindings.defer_delivery_origin_retention = self.previous;
+            }
+        });
+    }
+}
+
+pub(crate) fn delivery_origin_retention_deferred() -> bool {
+    CURRENT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|bindings| bindings.defer_delivery_origin_retention)
+    })
 }
 
 #[cfg(test)]

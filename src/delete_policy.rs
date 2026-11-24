@@ -275,6 +275,11 @@ fn handle_phased_creator_delete(
 ) -> Result<CreatorDeleteOutcome> {
     use crate::error::BlossomError;
     use std::collections::HashMap;
+    // Physical erasure waves can require all 5 Compute secrets (admin_token,
+    // webhook_secret, fos_access_key, fos_secret_key, fastly_api_token).
+    // Keep zone retention local-first and defer any cold-POP origin CAS merge
+    // to the fresh-budget Phase::Final drain.
+    let _defer_delivery_origin = crate::request_bindings::defer_delivery_origin_retention();
 
     // Retain the source->audio mapping until BOTH hashes have proven physical
     // absence and a final eviction receipt. Otherwise retries lose discovery.
