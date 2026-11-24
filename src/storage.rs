@@ -304,19 +304,23 @@ fn download_media_object(
     download_object_with_policy(media_read_policy()?, key, range, immutable, uncached)
 }
 
+pub(super) fn derived_media_read_policy() -> Result<MediaReadPolicy> {
+    // Originals and derived artifacts are migrated independently. Never inherit
+    // an original-only rollout flag before the artifact family is available.
+    MediaReadPolicy::parse(
+        get_config("derived_media_read_primary").ok().as_deref(),
+        get_config("derived_media_gcs_fallback_enabled").ok().as_deref(),
+    )
+    .map_err(|_| BlossomError::StorageError("Invalid derived media origin policy".into()))
+}
+
 fn download_derived_media_object(
     key: &str,
     range: Option<&str>,
     uncached: bool,
 ) -> Result<Response> {
-    // Originals and derived artifacts are migrated independently. Never inherit
-    // an original-only rollout flag before the artifact family is available.
-    let policy = MediaReadPolicy::parse(
-        get_config("derived_media_read_primary").ok().as_deref(),
-        get_config("derived_media_gcs_fallback_enabled").ok().as_deref(),
-    )
-    .map_err(|_| BlossomError::StorageError("Invalid derived media origin policy".into()))?;
-    let (mut response, source) = download_object_with_policy(policy, key, range, false, uncached)?;
+    let (mut response, source) =
+        download_object_with_policy(derived_media_read_policy()?, key, range, false, uncached)?;
     // Attribute the selected transport, never an origin-supplied claim. Cached
     // downstream responses retain fill provenance, not a new provider read.
     response.set_header("X-Divine-Source", source);

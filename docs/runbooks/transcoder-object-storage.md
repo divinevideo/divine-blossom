@@ -48,11 +48,11 @@ never clears an uncertain write: the recorded provider/key must still expose
 the matching attempt marker before recovery. Keep the GCS bucket/client and
 permissions needed for these reads and coordination.
 
-This is not whole-service GCS retirement: mutable job state, translation output
-and sound analysis keep their existing paths. Re-enabling backups restores
-required-copy checks for subsequent work and can cause regeneration or backup
-repair for artifacts produced while backups were off. It does not bulk-copy
-historical output at startup.
+Mutable job state and write journals remain in GCS. Translated VTTs and sound
+analysis follow the configured media destination at their existing object keys.
+Re-enabling backups restores required-copy checks for subsequent work and can
+cause regeneration or backup repair for artifacts produced while backups were off.
+It does not bulk-copy historical output at startup.
 
 This is synchronous replication through the existing processing paths. It adds
 no database, queue, credentials, or processing service. It does not activate a
@@ -139,6 +139,11 @@ the adapter and verifies the requested source digest before claiming work. Defau
 GCS selection does not repeat the lookup in a fallback store. Translated VTTs and
 sound-analysis JSON are written through the selected media adapter. Translation
 repairs a missing or mismatched required GCS backup under its existing job claim.
+B2-first edge polling waits on that claim while a required backup is being
+verified, and retries a visible primary after a retryable failure's cooldown.
+Successful verification clears the claim. During a GCS job-record outage,
+the edge serves existing subtitles. Backup detection and repair dispatch
+resume when the job record is readable.
 In `b2_primary` mode, the GCS journal at `.internal/sound-claims/{hash}`
 serializes sound publication across worker instances with or without backups.
 Keep this namespace outside lifecycle deletion and manual cleanup while writers

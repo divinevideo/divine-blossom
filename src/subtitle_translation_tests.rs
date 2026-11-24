@@ -147,6 +147,43 @@ fn subtitle_translation_routes_use_source_lifecycle_and_versioned_artifacts() {
 
 #[test]
 #[ignore = "requires loopback storage configured by run-subtitle-translation-tests.py"]
+fn subtitle_translation_b2_visible_output_retries_failed_backup() {
+    let hash = seed('8', "complete", false);
+    let mut verifying = translated_get(&hash, false).unwrap();
+    assert_eq!(verifying.get_status(), StatusCode::ACCEPTED);
+    assert_eq!(verifying.get_header_str("Cache-Control"), Some("no-store"));
+    assert!(verifying.take_body_str().contains("translating"));
+
+    let hash = seed('7', "complete", false);
+    let mut cooling_down = translated_get(&hash, false).unwrap();
+    assert_eq!(cooling_down.get_status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(cooling_down.get_header_str("Cache-Control"), Some("no-store"));
+    assert!(cooling_down.get_header_str("Retry-After").is_some());
+    assert!(cooling_down.take_body_str().contains("translation_unavailable"));
+
+    let hash = seed('6', "complete", false);
+    let mut pending = translated_get(&hash, true).unwrap();
+    assert_eq!(pending.get_status(), StatusCode::ACCEPTED);
+    assert_eq!(pending.get_header_str("Cache-Control"), Some("no-store"));
+    assert!(pending.take_body_str().contains("translating"));
+    finish_subtitle_translation();
+
+    let mut repaired = translated_get(&hash, false).unwrap();
+    assert_eq!(repaired.get_status(), StatusCode::OK);
+    assert_eq!(
+        repaired.get_header_str("X-Divine-Machine-Translated"),
+        Some("true"),
+    );
+    assert!(repaired.take_body_str().contains("B2 translation"));
+
+    let hash = seed('9', "complete", false);
+    let mut control_unavailable = translated_get(&hash, false).unwrap();
+    assert_eq!(control_unavailable.get_status(), StatusCode::OK);
+    assert!(control_unavailable.take_body_str().contains("B2 translation"));
+}
+
+#[test]
+#[ignore = "requires loopback storage configured by run-subtitle-translation-tests.py"]
 fn subtitle_translation_disabled_returns_contract_without_storage() {
     let hash = seed('4', "complete", false);
     for alias in [false, true] {

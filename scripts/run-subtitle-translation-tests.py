@@ -46,7 +46,24 @@ class Backend(BaseHTTPRequestHandler):
             assert f"/translations/{digest}/pt-BR.vtt" in path, path
             text = b"Repaired translation" if self.server.source_reads > 1 else b"Original translation"
             return self.reply(200, b"WEBVTT\n\nNOTE\nMachine-translated\n\n00:00:00.000 --> 00:00:01.000\n" + text)
+        if marker in "6789" and path.endswith(".vtt"):
+            assert path.startswith("/test-b2/"), path
+            return self.reply(200, SOURCE.replace(b"Original", b"B2 translation"))
         if path.endswith(".json"):
+            if marker in "6789":
+                assert path.startswith("/test/"), path
+                if marker == "9":
+                    return self.reply(503)
+                if marker == "6" and any(body["hash"][0] == "6" for _, body, _ in self.server.posts):
+                    return self.reply(404)
+                if marker == "8":
+                    job = {"status": "processing", "retry_at": 4102444800, "publication_pending": True}
+                else:
+                    job = {
+                        "status": "failed", "code": "translation_unavailable",
+                        "retry_at": 0 if marker == "6" else 4102444800,
+                    }
+                return self.reply(200, json.dumps(job).encode())
             if marker == "d":
                 return self.reply(200, json.dumps({"status": "failed", "code": "translation_rejected", "retry_at": None}).encode())
             if marker == "e":
@@ -69,12 +86,18 @@ def main():
             with tempfile.TemporaryDirectory(prefix="subtitle-translation-") as directory:
                 root = Path(directory)
                 (root / "kv.json").write_text("{}")
-                (root / "config.json").write_text(json.dumps({"gcs_bucket": "test", "local_mode": "false"}))
+                storage_config = {
+                    "gcs_bucket": "test", "local_mode": "false",
+                    "b2_media_bucket": "test-b2", "b2_media_region": "us-west-004",
+                }
+                (root / "config.json").write_text(json.dumps(storage_config))
                 config = root / "fastly.toml"
                 config.write_text(f'''manifest_version = 3
 name = "subtitle-translation-test"
 language = "rust"
 [local_server.backends.gcs_storage]
+url = "http://127.0.0.1:{server.server_port}"
+[local_server.backends.b2_storage]
 url = "http://127.0.0.1:{server.server_port}"
 [local_server.backends.cloud_run_transcoder]
 url = "http://127.0.0.1:{server.server_port}"
@@ -85,7 +108,7 @@ format = "json"
 file = "{root / 'config.json'}"
 format = "json"
 [local_server.secret_stores]
-blossom_secrets = [{{ key = "gcs_access_key", data = "synthetic-key" }}, {{ key = "gcs_secret_key", data = "synthetic-secret" }}, {{ key = "translate_shared_secret", data = "{SECRET}" }}]
+blossom_secrets = [{{ key = "gcs_access_key", data = "synthetic-key" }}, {{ key = "gcs_secret_key", data = "synthetic-secret" }}, {{ key = "translate_shared_secret", data = "{SECRET}" }}, {{ key = "b2_media_access_key", data = "test-b2-key" }}, {{ key = "b2_media_secret_key", data = "test-b2-secret" }}]
 ''')
                 env = os.environ.copy()
                 env["CARGO_TARGET_WASM32_WASIP1_RUNNER"] = shlex.join([env.get("VICEROY", "viceroy"), "run", "-C", str(config), "--"])
@@ -93,6 +116,13 @@ blossom_secrets = [{{ key = "gcs_access_key", data = "synthetic-key" }}, {{ key 
                 print(result.stdout, end="")
                 if not re.search(r"test result: ok\. 1 passed; 0 failed; 0 ignored;", result.stdout):
                     raise RuntimeError("expected the subtitle routing test to execute")
+                storage_config["derived_media_read_primary"] = "b2"
+                (root / "config.json").write_text(json.dumps(storage_config))
+                repair = subprocess.run(["cargo", "test", "--locked", "--target", "wasm32-wasip1", "--bin", "fastly-blossom", "subtitle_translation_b2_visible_output", "--", "--ignored", "--nocapture"], cwd=repo, env=env, check=True, timeout=180, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                print(repair.stdout, end="")
+                assert "test result: ok. 1 passed; 0 failed; 0 ignored;" in repair.stdout
+                repair_posts = [body for path, body, _ in server.posts if path == "/translate" and body["hash"][0] in "6789"]
+                assert repair_posts == [{"hash": "6" * 64, "source_digest": hashlib.sha256(SOURCE).hexdigest(), "lang": "pt-BR"}], repair_posts
                 config.write_text(config.read_text().replace(f', {{ key = "translate_shared_secret", data = "{SECRET}" }}', ""))
                 reads_before = len(server.reads)
                 posts_before = len(server.posts)

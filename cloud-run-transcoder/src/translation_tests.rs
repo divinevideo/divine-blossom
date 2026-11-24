@@ -296,37 +296,57 @@ async fn selected_and_legacy_transcripts_reach_translation_and_transcription_ded
 }
 
 #[tokio::test]
-async fn b2_primary_translation_dedup_repairs_missing_gcs_backup_without_retranslating() {
-    let storage = StorageDouble::new().await;
-    let origin = object_storage::tests::Origin::start().await;
-    let media = origin.with_gcs_backup(storage.state.gcs_client.clone());
-    upload_transcript_to_storage(&media, &"a".repeat(64), std::str::from_utf8(SOURCE).unwrap())
-        .await
-        .unwrap();
-    let req = request(SOURCE);
-    let target_path = translated_vtt_path(&req.hash, &req.source_digest, &req.lang);
-    // Simulate an earlier B2 write whose required GCS backup failed before completion.
-    origin
-        .store()
-        .put_verified(
-            &target_path,
-            Bytes::from_static(b"WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nOl\xc3\xa1\n"),
-            "text/vtt",
-            HashMap::new(),
-            None,
-        )
-        .await
-        .unwrap();
-    assert!(!storage.objects.lock().await.contains_key(&target_path));
+async fn b2_primary_translation_reconciles_failed_backup_on_poll_retry() {
+    for backups_enabled in [true, false] {
+        let storage = StorageDouble::new().await;
+        let origin = object_storage::tests::Origin::start().await;
+        let media = if backups_enabled {
+            origin.with_gcs_backup(storage.state.gcs_client.clone())
+        } else {
+            origin.with_gcs_input_only(storage.state.gcs_client.clone())
+        };
+        upload_transcript_to_storage(&media, &"a".repeat(64), std::str::from_utf8(SOURCE).unwrap())
+            .await
+            .unwrap();
+        let req = request(SOURCE);
+        let target_path = translated_vtt_path(&req.hash, &req.source_digest, &req.lang);
+        // The primary write is present but the previous job reported a backup failure.
+        origin
+            .store()
+            .put_verified(
+                &target_path,
+                Bytes::from_static(b"WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nOl\xc3\xa1\n"),
+                "text/vtt",
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let job_path = format!("{target_path}.json");
+        storage.objects.lock().await.insert(
+            job_path.clone(),
+            (
+                serde_json::to_vec(&TranslationJob::Failed {
+                    code: "translation_unavailable".into(),
+                    retry_at: Some(0),
+                })
+                .unwrap(),
+                1,
+            ),
+        );
+        assert!(!storage.objects.lock().await.contains_key(&target_path));
 
-    let state = with_media(&storage, media);
-    let repaired = process_translate_with(state, req, |_, _| async move {
-        panic!("backup repair must not call translation provider");
-    })
-    .await
-    .unwrap();
-    assert_eq!(repaired.status, "already_exists");
-    assert!(storage.objects.lock().await.contains_key(&target_path));
+        let state = with_media(&storage, media);
+        let repaired = process_translate_with(state, req, |_, _| async move {
+            panic!("publication repair must not call translation provider");
+        })
+        .await
+        .unwrap();
+        assert_eq!(repaired.status, "already_exists");
+        let objects = storage.objects.lock().await;
+        assert_eq!(objects.contains_key(&target_path), backups_enabled);
+        assert!(!objects.contains_key(&job_path));
+    }
 }
 
 #[tokio::test]
@@ -598,7 +618,7 @@ async fn translation_expired_claim_is_recovered_and_empty_source_is_terminal() {
     storage.objects.lock().await.insert(
         format!("{path}.json"),
         (
-            serde_json::to_vec(&TranslationJob::Processing { retry_at: 0 }).unwrap(),
+            br#"{"status":"processing","retry_at":0}"#.to_vec(),
             1,
         ),
     );

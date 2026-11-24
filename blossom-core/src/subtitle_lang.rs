@@ -72,14 +72,35 @@ pub const TRANSLATION_RETRY_SECS: u64 = 60;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum TranslationJob {
-    Processing { retry_at: u64 },
-    Failed { code: String, retry_at: Option<u64> },
+    Processing {
+        retry_at: u64,
+        /// A primary object may be visible before the required backup is verified.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        publication_pending: bool,
+    },
+    Failed {
+        code: String,
+        retry_at: Option<u64>,
+    },
 }
 
 impl TranslationJob {
+    pub fn defers_existing_output(&self) -> bool {
+        matches!(
+            self,
+            Self::Processing {
+                publication_pending: true,
+                ..
+            } | Self::Failed {
+                retry_at: Some(_),
+                ..
+            }
+        )
+    }
+
     pub fn can_start(&self, now: u64) -> bool {
         match self {
-            Self::Processing { retry_at } => now >= *retry_at,
+            Self::Processing { retry_at, .. } => now >= *retry_at,
             Self::Failed {
                 retry_at: Some(retry_at),
                 ..
@@ -168,7 +189,14 @@ mod tests {
 
     #[test]
     fn claims_and_failures_control_retries() {
-        let processing = TranslationJob::Processing { retry_at: 120 };
+        let processing = TranslationJob::Processing {
+            retry_at: 120,
+            publication_pending: false,
+        };
+        let legacy: TranslationJob =
+            serde_json::from_str(r#"{"status":"processing","retry_at":120}"#).unwrap();
+        assert_eq!(processing, legacy);
+        assert!(!legacy.defers_existing_output());
         assert!(!processing.can_start(119));
         assert!(processing.can_start(120));
         let cooldown = TranslationJob::Failed {
