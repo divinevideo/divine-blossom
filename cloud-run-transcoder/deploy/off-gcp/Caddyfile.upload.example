@@ -35,13 +35,15 @@
 		request_body {
 			max_size 16MiB
 		}
-		reverse_proxy upload:8080 {
-			# Buffer request bodies up to 16 MiB at Caddy (matching GKE's ingress
-			# gateway) so slow mobile uplinks do not tie up divine-upload-server's
-			# admission slots at client network speed. Bounded by global
-			# `timeouts { read_body 300s }` in Caddyfile and `CADDY_MEM_LIMIT`
-			# in docker-compose.upload.yml.
-			request_buffers 16MiB
+		reverse_proxy upload-proxy:8081 {
+			# Stream request bodies directly to isolated upload-proxy (nginx on
+			# upload_edge), which enforces an aggregate limit_conn cap of 64
+			# concurrent PUT/POST requests across body buffering and upstream
+			# response wait (returning 429 before body allocation, with no per-IP
+			# cap so Fastly POP egress IPs are not throttled) while buffering
+			# <=16 MiB bodies on bounded scratch disk (128 KiB RAM buffer) ahead
+			# of upload:8080. This keeps slow or flooding upload clients out of
+			# shared Caddy memory so transcoder-worker stays isolated.
 			# Flush response headers/chunks immediately for thumbnail and upload responses.
 			flush_interval -1
 			transport http {

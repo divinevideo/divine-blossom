@@ -23,6 +23,7 @@ OFF_GCP_DIR = Path(__file__).resolve().parents[1] / "deploy" / "off-gcp"
 BASE_COMPOSE = OFF_GCP_DIR / "docker-compose.yml"
 CADDYFILE = OFF_GCP_DIR / "Caddyfile"
 UPLOAD_CADDYFILE = OFF_GCP_DIR / "Caddyfile.upload.example"
+UPLOAD_PROXY_NGINX = OFF_GCP_DIR / "nginx.upload-proxy.conf"
 UPLOAD_COMPOSE = OFF_GCP_DIR / "docker-compose.upload.yml"
 UPLOAD_ENV_EXAMPLE = OFF_GCP_DIR / ".env.upload.example"
 GITIGNORE = REPO_ROOT / ".gitignore"
@@ -66,8 +67,8 @@ class OffGcpUploadConfigTest(unittest.TestCase):
         self.assertRegex(text, r"(?m)^\thandle @public_upload \{$")
         self.assertRegex(text, r"(?m)^\t\trequest_body \{$")
         self.assertRegex(text, r"(?m)^\t\t\tmax_size 16MiB$")
-        self.assertRegex(text, r"(?m)^\t\treverse_proxy upload:8080 \{$")
-        self.assertRegex(text, r"(?m)^\t\t\trequest_buffers 16MiB$")
+        self.assertRegex(text, r"(?m)^\t\treverse_proxy upload-proxy:8081 \{$")
+        self.assertNotIn("request_buffers", text)
         self.assertRegex(text, r"(?m)^\t\t\t\tresponse_header_timeout 310s$")
         self.assertNotIn("read_timeout", text)
         self.assertNotIn("write_timeout", text)
@@ -120,12 +121,32 @@ class OffGcpUploadConfigTest(unittest.TestCase):
         # Match divine-upload-server's 300s graceful shutdown drain window (GKE: 330s).
         self.assertRegex(text, r"(?m)^\s+stop_grace_period:\s+330s$")
 
-        # Back /tmp with a required bounded host scratch mount, check sentinel
-        # marker, sweep only .tmp* spools without crash-looping, and cap logs.
-        caddy_overlay = text.split("  caddy:", 1)[1].split("  upload:", 1)[0]
+        # Back /tmp with required bounded host scratch mounts, check sentinel
+        # markers, sweep only .tmp* / proxy spools without crash-looping, and cap logs.
+        caddy_overlay = text.split("  caddy:", 1)[1].split("  upload-proxy:", 1)[0]
         self.assertRegex(caddy_overlay, r"(?m)^\s+mem_limit:\s+\$\{CADDY_MEM_LIMIT:-2g\}$")
+        self.assertRegex(caddy_overlay, r"(?m)^\s+GOMEMLIMIT:\s+\$\{CADDY_GOMEMLIMIT:-1600MiB\}$")
         self.assertRegex(caddy_overlay, r"(?m)^\s+-\s+default$")
         self.assertRegex(caddy_overlay, r"(?m)^\s+-\s+upload_edge$")
+
+        upload_proxy_block = text.split("  upload-proxy:", 1)[1].split("  upload:", 1)[0]
+        self.assertIn("image: nginx:1.27.5-alpine", upload_proxy_block)
+        self.assertIn('user: "101:101"', upload_proxy_block)
+        self.assertRegex(upload_proxy_block, r"(?m)^\s+stop_grace_period:\s+330s$")
+        self.assertRegex(upload_proxy_block, r"(?m)^\s+mem_limit:\s+\$\{UPLOAD_PROXY_MEM_LIMIT:-512m\}$")
+        self.assertIn("read_only: true", upload_proxy_block)
+        self.assertIn("no-new-privileges:true", upload_proxy_block)
+        self.assertIn("driver: json-file", upload_proxy_block)
+        self.assertIn("./nginx.upload-proxy.conf:/etc/nginx/nginx.conf:ro", upload_proxy_block)
+        self.assertIn(
+            "source: ${UPLOAD_PROXY_TMP_DIR:-/var/lib/divine-upload/scratch/proxy-tmp}",
+            upload_proxy_block,
+        )
+        self.assertIn("create_host_path: false", upload_proxy_block)
+        self.assertIn("/tmp/.divine-upload-scratch", upload_proxy_block)
+        proxy_networks = upload_proxy_block.split("networks:", 1)[1].split("healthcheck:", 1)[0]
+        self.assertRegex(proxy_networks, r"(?m)^\s+-\s+upload_edge$")
+        self.assertNotRegex(proxy_networks, r"(?m)^\s+-\s+default$")
 
         upload_block = text.split("  upload:", 1)[1].split("\nnetworks:", 1)[0]
         upload_volumes = upload_block.split("volumes:", 1)[1].split("networks:", 1)[0]
@@ -160,6 +181,33 @@ class OffGcpUploadConfigTest(unittest.TestCase):
             "MAX_CONCURRENT_MIRRORS",
         ):
             self.assertNotIn(key, env_block)
+
+    def test_upload_proxy_nginx_config_bounds_concurrency_and_buffers_to_disk(self) -> None:
+        text = UPLOAD_PROXY_NGINX.read_text(encoding="utf-8")
+        for required in (
+            "server_tokens off;",
+            "pid /tmp/nginx.pid;",
+            "client_body_temp_path /tmp/body 1 2;",
+            "real_ip_header X-Forwarded-For;",
+            "real_ip_recursive off;",
+            "limit_conn_status 429;",
+            "limit_conn upload_body_total 64;",
+            "limit_conn upload_all_total 256;",
+            "proxy_set_header X-Forwarded-For $remote_addr;",
+            "client_max_body_size 16m;",
+            "client_body_buffer_size 128k;",
+            "client_body_timeout 60s;",
+            "proxy_request_buffering on;",
+            "proxy_buffering off;",
+            "proxy_next_upstream off;",
+            "resolver 127.0.0.11 valid=10s ipv6=off;",
+            'set $upload_upstream "http://upload:8080";',
+            "proxy_pass $upload_upstream;",
+            "proxy_connect_timeout 10s;",
+            "proxy_read_timeout 310s;",
+        ):
+            self.assertIn(required, text)
+        self.assertNotIn("upload_body_per_ip", text)
 
     def test_upload_env_example_documents_parity_keys(self) -> None:
         text = UPLOAD_ENV_EXAMPLE.read_text(encoding="utf-8")
@@ -298,8 +346,8 @@ class OffGcpUploadConfigTest(unittest.TestCase):
             self.assertEqual(first_handlers[0]["max_size"], 16 * 1024 * 1024)
             proxy_handler = first_handlers[1]
             self.assertEqual(proxy_handler["handler"], "reverse_proxy")
-            self.assertEqual(proxy_handler["upstreams"][0]["dial"], "upload:8080")
-            self.assertEqual(proxy_handler["request_buffers"], 16 * 1024 * 1024)
+            self.assertEqual(proxy_handler["upstreams"][0]["dial"], "upload-proxy:8081")
+            self.assertNotIn("request_buffers", proxy_handler)
             self.assertEqual(proxy_handler["flush_interval"], -1)
             self.assertEqual(proxy_handler["transport"]["response_header_timeout"], 310_000_000_000)
             self.assertNotIn("read_timeout", proxy_handler["transport"])
@@ -384,7 +432,7 @@ class OffGcpUploadConfigTest(unittest.TestCase):
                 xdg_data.mkdir()
 
                 upload_template = UPLOAD_CADDYFILE.read_text(encoding="utf-8").replace(
-                    "upload:8080", f"127.0.0.1:{upload_server.server_port}"
+                    "upload-proxy:8081", f"127.0.0.1:{upload_server.server_port}"
                 )
 
                 # Retry ephemeral port binding to avoid flaking if another local
@@ -523,6 +571,7 @@ class OffGcpUploadConfigTest(unittest.TestCase):
                     )
 
                 blocked_upload = [
+                    ("GET", "/healthz"),
                     ("POST", "/audit"),
                     ("GET", "/metrics"),
                     ("GET", "/upload"),

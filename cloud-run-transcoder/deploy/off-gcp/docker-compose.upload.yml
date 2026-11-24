@@ -3,14 +3,54 @@
 
 services:
   caddy:
-    # Bound Caddy memory when request_buffers 16MiB is active so concurrent slow
-    # upload bodies cannot OOM the host or co-located transcoder.
+    # Shared Caddy streams upload bodies directly to isolated upload-proxy
+    # without buffering bodies in Caddy RAM; mem_limit and GOMEMLIMIT bound
+    # connection overhead so Go GC tightens before hitting the cgroup ceiling.
     mem_limit: ${CADDY_MEM_LIMIT:-2g}
+    environment:
+      GOMEMLIMIT: ${CADDY_GOMEMLIMIT:-1600MiB}
     # Attach Caddy to upload_edge alongside default without adding depends_on
     # so upload failures can never block transcoder ingress startup.
     networks:
       - default
       - upload_edge
+
+  upload-proxy:
+    image: nginx:1.27.5-alpine
+    user: "101:101"
+    restart: unless-stopped
+    # Match upload's 300s graceful drain window (nginx stops gracefully on SIGQUIT).
+    stop_grace_period: 330s
+    command:
+      - /bin/sh
+      - -ec
+      - "if [ ! -f /tmp/.divine-upload-scratch ]; then echo 'ERROR: /tmp/.divine-upload-scratch missing; refusing to start upload-proxy on unverified scratch mount' >&2; exit 1; fi; rm -rf /tmp/body /tmp/proxy /tmp/fastcgi /tmp/uwsgi /tmp/scgi /tmp/nginx.pid || echo 'proxy tmp sweep incomplete' >&2; exec nginx -c /etc/nginx/nginx.conf -g 'daemon off;'"
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    cpus: "${UPLOAD_PROXY_CPUS:-1.0}"
+    mem_limit: ${UPLOAD_PROXY_MEM_LIMIT:-512m}
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    volumes:
+      - ./nginx.upload-proxy.conf:/etc/nginx/nginx.conf:ro
+      - type: bind
+        source: ${UPLOAD_PROXY_TMP_DIR:-/var/lib/divine-upload/scratch/proxy-tmp}
+        target: /tmp
+        bind:
+          create_host_path: false
+    networks:
+      - upload_edge
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
 
   upload:
     image: ${UPLOAD_IMAGE:?Set UPLOAD_IMAGE, e.g. us-central1-docker.pkg.dev/dv-platform-prod/containers-production/divine-upload-server@sha256:...}

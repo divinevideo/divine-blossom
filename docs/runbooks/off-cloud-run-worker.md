@@ -217,23 +217,25 @@ sole writer.
    `0600` key file must be owned by UID `0` (or match the image's runtime UID if
    the Dockerfile later switches to a non-root user).
    Also provision a **bounded** disk scratch filesystem at
-   `/var/lib/divine-upload/scratch` with an inner directory
-   `/var/lib/divine-upload/scratch/tmp` (`chown 0:0`, `chmod 1777`) mounted
-   into the container's `/tmp` (`UPLOAD_TMP_DIR` defaults to
-   `/var/lib/divine-upload/scratch/tmp`). Size the filesystem from your
-   configured limits: worst-case concurrent `/tmp` spooling (`divine-upload-server`
-   resumable completion/verification, `/migrate`, and sync `ffmpeg` thumbnail
-   extraction up to `MAX_SYNC_VIDEO_BYTES=100 MiB`) is
-   `(MAX_CONCURRENT_UPLOADS + MAX_CONCURRENT_MIRRORS) * MAX_UPLOAD_BYTES + MAX_CONCURRENT_THUMBNAILS * 100 MiB`
+   `/var/lib/divine-upload/scratch` with two inner directories —
+   `/var/lib/divine-upload/scratch/tmp` (`chown 0:0`, `chmod 1777`, mounted into
+   `upload:/tmp`) and `/var/lib/divine-upload/scratch/proxy-tmp` (`chown 101:101`,
+   `chmod 0700`, mounted into `upload-proxy:/tmp`) — and verify the bounded
+   filesystem from your configured limits: worst-case concurrent `/tmp` spooling
+   (`divine-upload-server` resumable completion/verification, `/migrate`, and
+   sync `ffmpeg` thumbnail extraction up to `MAX_SYNC_VIDEO_BYTES=100 MiB`, plus
+   up to `64` concurrent `16 MiB` request bodies buffered on scratch disk by
+   `upload-proxy` before upstream admission) is
+   `(MAX_CONCURRENT_UPLOADS + MAX_CONCURRENT_MIRRORS) * MAX_UPLOAD_BYTES + MAX_CONCURRENT_THUMBNAILS * 100 MiB + 64 * 16 MiB`
    plus MP4 remux and filesystem overhead. With `.env.upload.example` defaults
-   (`16` uploads + `2` mirrors at `1 GiB`, plus `12` thumbnails × `100 MiB` ≈
-   `19.2 GiB` peak), provision at least **`24 GiB`** (`24G`–`32G`, scaling up
-   if you raise those concurrency or size caps). Prefer a dedicated logical
-   volume/partition; otherwise verify root disk headroom (`df -h /`) and run the
-   fail-closed loopback provisioning subshell below (create
-   `/var/lib/divine-upload/scratch/tmp` **only after** verifying the bounded
-   `ext4` filesystem is mounted, never on `/`, and never reformat an existing or
-   mounted image):
+   (`16` uploads + `2` mirrors at `1 GiB`, `12` thumbnails × `100 MiB`, and `64`
+   × `16 MiB` proxy body spills ≈ `20.2 GiB` peak), provision at least **`24 GiB`**
+   (`24G`–`32G`, scaling up if you raise those concurrency or size caps). Prefer
+   a dedicated logical volume/partition; otherwise verify root disk headroom
+   (`df -h /`) and run the fail-closed loopback provisioning subshell below
+   (create `scratch/tmp` and `scratch/proxy-tmp` **only after** verifying the
+   bounded `ext4` filesystem is mounted, never on `/`, and never reformat an
+   existing or mounted image):
    ```sh
    (
      set -eu
@@ -262,19 +264,22 @@ sole writer.
      test "$(findmnt -rn -o FSTYPE --target "$SCRATCH_DIR")" = "ext4"
      install -d -m 1777 -o 0 -g 0 "$SCRATCH_DIR/tmp"
      install -m 0644 -o 0 -g 0 /dev/null "$SCRATCH_DIR/tmp/.divine-upload-scratch"
+     install -d -m 0700 -o 101 -g 101 "$SCRATCH_DIR/proxy-tmp"
+     install -m 0644 -o 101 -g 101 /dev/null "$SCRATCH_DIR/proxy-tmp/.divine-upload-scratch"
      if [ -e "$SCRATCH_IMG" ]; then
        du -h --apparent-size "$SCRATCH_IMG"
        du -h "$SCRATCH_IMG"
      fi
    )
    ```
-   Using the inner `tmp/` directory plus the `.divine-upload-scratch` marker
-   paired with `create_host_path: false` in `docker-compose.upload.yml` guarantees
-   Docker refuses to start `upload` if `scratch/tmp` does not exist on `/`,
-   and the entrypoint fails closed if `/tmp/.divine-upload-scratch` is absent
-   from the mounted directory (always verify
-   `mountpoint -q /var/lib/divine-upload/scratch && test -f /var/lib/divine-upload/scratch/tmp/.divine-upload-scratch`
-   before starting `upload`).
+   Using the inner `tmp/` and `proxy-tmp/` directories plus the
+   `.divine-upload-scratch` markers paired with `create_host_path: false` in
+   `docker-compose.upload.yml` guarantees Docker refuses to start `upload` or
+   `upload-proxy` if those directories do not exist on `/`, and both
+   entrypoints fail closed if `/tmp/.divine-upload-scratch` is absent from
+   their mounted directory (always verify
+   `mountpoint -q /var/lib/divine-upload/scratch && test -f /var/lib/divine-upload/scratch/tmp/.divine-upload-scratch && test -f /var/lib/divine-upload/scratch/proxy-tmp/.divine-upload-scratch`
+   before starting `upload` or `upload-proxy`).
    Because OOM kills or forced stops can leave orphaned `NamedTempFile` `.tmp*`
    dotfiles behind, `docker-compose.upload.yml` sweeps `.tmp*` entries on
    container start (warning rather than crash-looping if an entry cannot be
@@ -288,7 +293,7 @@ sole writer.
    and start only `upload` (`docker compose up -d --no-deps upload`).
 2. Sync the updated deployment files (`docker-compose.yml`,
    `docker-compose.upload.yml`, `Caddyfile`, `Caddyfile.upload.example`,
-   `.env.upload.example`, and `conf.d/.gitkeep`) from
+   `nginx.upload-proxy.conf`, `.env.upload.example`, and `conf.d/.gitkeep`) from
    `cloud-run-transcoder/deploy/off-gcp/` into `/opt/divine-transcoder/` without
    overwriting existing `/opt/divine-transcoder/.env` or `.env.upload` (required
    on existing workers so `Caddyfile` gains `import /etc/caddy/conf.d/*.caddy`
@@ -368,10 +373,15 @@ sole writer.
    start `upload`, replace `caddy` with `--no-deps` (so Compose does **not**
    recreate `transcoder`), verify `/health`, and resume `divine-transcode` only if
    Phase A created the pause marker (leaving any pre-existing publication hold
-   intact). Run these three fail-closed phases in order. If a phase fails,
-   resume from the failed phase rather than re-running from Phase A (re-running
-   Phase A preserves an existing `/var/lib/divine-upload/activation-paused-queue`
-   marker and only Phase C removes it upon resuming):
+   intact). Run these three fail-closed phases in order. If Phase A or Phase B
+   fails, resume from the failed phase rather than re-running from Phase A
+   (re-running Phase A preserves an existing
+   `/var/lib/divine-upload/activation-paused-queue` marker and only Phase C removes
+   it upon resuming). If Phase C fails **before** `docker compose up -d --no-deps caddy`
+   stops live `caddy`, re-run Phase C; if Phase C fails **during or after**
+   replacing `caddy` (leaving `caddy` stopped or unhealthy), do **not** re-run
+   Phase C's live-Caddy admin API query — run **Phase C recovery** below to
+   restore last known-good transcoder ingress while keeping the queue paused:
 
    Phase A — Preflight checks and pause `divine-transcode` only if not already paused:
    ```sh
@@ -379,6 +389,7 @@ sole writer.
      set -eu
      mountpoint -q /var/lib/divine-upload/scratch
      test -f /var/lib/divine-upload/scratch/tmp/.divine-upload-scratch
+     test -f /var/lib/divine-upload/scratch/proxy-tmp/.divine-upload-scratch
      docker compose ps --status running --services | grep -qx transcoder
      docker compose run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile
      init_state="$(gcloud tasks queues describe divine-transcode \
@@ -426,6 +437,7 @@ sole writer.
      set -eu
      mountpoint -q /var/lib/divine-upload/scratch
      test -f /var/lib/divine-upload/scratch/tmp/.divine-upload-scratch
+     test -f /var/lib/divine-upload/scratch/proxy-tmp/.divine-upload-scratch
      docker compose run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile
      test "$(gcloud tasks queues describe divine-transcode \
        --location=us-central1 --project=rich-compiler-479518-d2 \
@@ -439,9 +451,43 @@ sole writer.
        echo 'transcoder still running ffmpeg' >&2
        exit 1
      fi
-     docker compose up -d --no-deps upload
+     docker compose up -d --no-deps upload-proxy upload
      docker compose up -d --no-deps caddy
      docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile
+     curl -fsS https://transcoder-worker.divine.video/health
+     if [ -f /var/lib/divine-upload/activation-paused-queue ]; then
+       gcloud tasks queues resume divine-transcode \
+         --location=us-central1 --project=rich-compiler-479518-d2
+       rm -f /var/lib/divine-upload/activation-paused-queue
+     else
+       echo 'Preserving pre-existing divine-transcode pause for its owner'
+     fi
+   )
+   ```
+
+   Phase C recovery — Restore last known-good transcoder-only `caddy` ingress if
+   Phase C failed after stopping or replacing `caddy` (keeps `transcoder` untouched
+   and resumes `divine-transcode` only after `/health` passes and only if Phase A
+   created the pause marker):
+   ```sh
+   (
+     set -eu
+     cd /opt/divine-transcoder
+     test "$(gcloud tasks queues describe divine-transcode \
+       --location=us-central1 --project=rich-compiler-479518-d2 \
+       --format='value(state)')" = "PAUSED"
+     top_out="$(docker compose top transcoder)"
+     test -n "$top_out"
+     if printf '%s\n' "$top_out" | grep -q '[f]fmpeg'; then
+       echo 'transcoder still running ffmpeg' >&2
+       exit 1
+     fi
+     if [ -f conf.d/upload-candidate.caddy ]; then
+       mv -f conf.d/upload-candidate.caddy conf.d/upload-candidate.caddy.disabled
+     fi
+     docker compose stop upload-proxy upload 2>/dev/null || true
+     docker compose -f docker-compose.yml run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile
+     docker compose -f docker-compose.yml up -d --no-deps caddy
      curl -fsS https://transcoder-worker.divine.video/health
      if [ -f /var/lib/divine-upload/activation-paused-queue ]; then
        gcloud tasks queues resume divine-transcode \
@@ -494,9 +540,20 @@ sole writer.
    other's sessions in both directions (GKE → Hetzner and Hetzner → GKE).
    Confirm both submit to the existing single transcoder writer. Exercise
    `HEAD`, browser preflights, and throttled slow-client uploads near the 16 MiB
-   body limit. Load test uploads, thumbnail misses, and transcoding together.
-   Measure Caddy memory usage alongside `request_buffers 16MiB`, global
-   `timeouts { read_body 300s }`, and `CADDY_MEM_LIMIT` (`2g` default), bounded
+   body limit (note Caddy's global `timeouts { read_body 300s }` requires at
+   least `~450 kbit/s` for a full `16 MiB` direct `PUT`, whereas `1 MiB`
+   resumable chunks succeed down to `~28 kbit/s`). Load test concurrent slow
+   uploads, thumbnail misses, and transcoding together: verify `upload-proxy`
+   caps aggregate concurrent `PUT`/`POST` requests at `64` across their full
+   lifetime (body buffering on scratch disk plus upstream wait up to `310s` for
+   `/upload`, `/upload/init`, `/upload/:id/complete`, `/transcribe`, and
+   `/migrate`, with no per-IP cap so Fastly POP egress IPs are not throttled
+   after cutover) and rejects excess `PUT`/`POST` load with `429` before body
+   allocation without starving `GET /` / `/thumbnail/:hash` or holding Caddy RAM,
+   measure shared `caddy` memory (`CADDY_MEM_LIMIT=2g`, `CADDY_GOMEMLIMIT=1600MiB`) and
+   `upload-proxy` memory (`UPLOAD_PROXY_MEM_LIMIT=512m`), confirm
+   `https://transcoder-worker.divine.video/health` and `/internal/transcode` keep
+   succeeding under upload flood/saturation, and check bounded
    `/var/lib/divine-upload/scratch` (`df -h /var/lib/divine-upload/scratch`)
    disk usage (confirming peak stays well within the `>= 24 GiB` budget),
    `upload` container memory usage, CPU saturation, and transcode queue latency.
@@ -630,14 +687,14 @@ sole writer.
       if [ -n "$PREV" ] && [ -f "$CERT_DIR/$PREV/upload.pem" ]; then
         PREV_SERIAL="$(openssl x509 -in "$CERT_DIR/$PREV/upload.pem" -noout -serial 2>/dev/null || true)"
       fi
-      SWAPPED=0
       RELOADED=0
 
       rollback() {
         rc=$?
         trap - EXIT INT TERM
         rm -f "$CERT_DIR/current.next" "$CERT_DIR/current.prev"
-        if [ "$SWAPPED" -eq 0 ]; then
+        CUR_TARGET="$(readlink "$CERT_DIR/current" 2>/dev/null || true)"
+        if [ "$CUR_TARGET" != "$REL" ]; then
           rm -rf "$STAGE"
           exit "$rc"
         fi
@@ -679,7 +736,6 @@ sole writer.
 
       ln -sfn "$REL" "$CERT_DIR/current.next"
       mv -Tf "$CERT_DIR/current.next" "$CERT_DIR/current"
-      SWAPPED=1
 
       cd /opt/divine-transcoder
       docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile
@@ -890,13 +946,14 @@ candidate sessions remain). Only then:
    `AAAA`) so the candidate name never points to a released provider IP, then
    remove `conf.d/upload-candidate.caddy`, validate, and reload Caddy
    (`docker compose exec caddy caddy validate --config /etc/caddy/Caddyfile && docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile`).
-2. Stop and remove `upload` (`docker compose stop upload && docker compose rm -f upload`), then unmount `/var/lib/divine-upload/scratch`, remove its `/etc/fstab` entry and run `systemctl daemon-reload`, and delete `/var/lib/divine-upload/scratch.img` and `/var/lib/divine-upload/scratch` (or remove the dedicated LV/partition).
+2. Stop and remove `upload-proxy` and `upload` (`docker compose stop upload-proxy upload && docker compose rm -f upload-proxy upload`), then unmount `/var/lib/divine-upload/scratch`, remove its `/etc/fstab` entry and run `systemctl daemon-reload`, and delete `/var/lib/divine-upload/scratch.img` and `/var/lib/divine-upload/scratch` (or remove the dedicated LV/partition).
 3. Delete `/etc/divine-upload/gcp-sa.json` and revoke that service-account key
    in GCP IAM (and remove/revoke `/etc/divine-upload/ar-pull-key.json` and run
    `docker logout https://us-central1-docker.pkg.dev` if no other service on the
    host pulls from Artifact Registry).
-4. Remove `/opt/divine-transcoder/.env.upload`, and remove `COMPOSE_FILE` and
-   `UPLOAD_IMAGE` (plus `UPLOAD_DOMAIN`, if set) from `/opt/divine-transcoder/.env`
-   so `upload` is not left behind or restarted on reboot. Remember that editing
+4. Remove `/opt/divine-transcoder/.env.upload`, remove `COMPOSE_FILE` and
+   `UPLOAD_IMAGE` (plus `UPLOAD_DOMAIN`, if set) from `/opt/divine-transcoder/.env`,
+   and optionally remove `/opt/divine-transcoder/nginx.upload-proxy.conf` so
+   `upload` and `upload-proxy` are not left behind or restarted on reboot. Remember that editing
    `.env` still changes `transcoder`'s Compose hash; avoid broad
    `docker compose up -d` until `transcoder` is intentionally drained.

@@ -1,9 +1,10 @@
 {
 	# Publish only HTTP/1.1 and HTTP/2 because docker-compose.yml maps TCP 443
 	# only; avoids advertising Alt-Svc h3 over an unpublished UDP 443 port.
-	# Cap total request-body read duration so slow-trickling clients cannot pin
-	# request_buffers memory indefinitely across HTTP/1.1 or HTTP/2 streams
-	# (transcoder responses still stream up to 910s via reverse_proxy timeouts).
+	# Cap total request-body read duration across HTTP/1.1 and HTTP/2 streams
+	# (~450 kbit/s minimum for a full 16 MiB direct PUT; 1 MiB resumable chunks
+	# work down to ~28 kbit/s). Transcoder responses still stream up to 910s via
+	# reverse_proxy timeouts because Go clears the read deadline after reading the request.
 	servers {
 		protocols h1 h2
 		timeouts {
