@@ -5,7 +5,8 @@ services:
   upload:
     image: ${UPLOAD_IMAGE:?Set UPLOAD_IMAGE, e.g. us-central1-docker.pkg.dev/dv-platform-prod/containers-production/divine-upload-server@sha256:...}
     restart: unless-stopped
-    stop_grace_period: 60s
+    # Match divine-upload-server's 300s graceful shutdown drain window (GKE uses 330s).
+    stop_grace_period: 330s
     cpus: "${UPLOAD_CPUS:-6.0}"
     mem_limit: ${UPLOAD_MEM_LIMIT:-6g}
     cap_drop:
