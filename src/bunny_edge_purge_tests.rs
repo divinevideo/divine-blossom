@@ -107,6 +107,23 @@ fn legacy_physical_creator_delete_preserves_origin_secret_budget() {
 
 #[test]
 #[ignore = "requires loopback purge backends; scripts/run-bunny-edge-purge-tests.py"]
+fn legacy_physical_creator_delete_early_gcs_failure_purges_bunny_fallback() {
+    let hash = test_hash(6);
+    seed_blob(&hash, "active");
+    let session = "f".repeat(64);
+    seed_admin_session(&session);
+    let mut req = Request::post("https://media.divine.video/admin/api/moderate");
+    req.set_header("Cookie", format!("admin_session={session}"));
+    req.set_body(
+        serde_json::json!({"sha256": hash, "action": "DELETE", "reason": "creator delete"})
+            .to_string(),
+    );
+    let resp = crate::request_bindings::metered(req);
+    assert!(resp.get_status().is_server_error());
+}
+
+#[test]
+#[ignore = "requires loopback purge backends; scripts/run-bunny-edge-purge-tests.py"]
 fn bulk_approve_batches_fastly_and_bounds_bunny_within_backend_limit() {
     let hashes: Vec<String> = (10u8..26u8).map(test_hash).collect();
     for hash in &hashes {

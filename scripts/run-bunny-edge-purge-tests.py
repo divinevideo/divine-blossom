@@ -47,10 +47,11 @@ class PurgeBackends(BaseHTTPRequestHandler):
         if self.server.in_meter:
             self.server.metered_calls.append(record)
         self.server.all_calls.append(record)
-        self.send_response(200)
+        status = 500 if (self.server.fail_gcs and self.command == "DELETE" and "/synthetic-gcs/" in self.path) else 200
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(b'{"status":"ok"}')
+        self.wfile.write(b'{"status":"error"}' if status >= 500 else b'{"status":"ok"}')
 
 
 def parse_quota(output):
@@ -65,7 +66,7 @@ def parse_quota(output):
     }
 
 
-def run_case(repo, server, config_dir, test_name, settings_data, secrets_list, metered=True):
+def run_case(repo, server, config_dir, test_name, settings_data, secrets_list, metered=True, fail_gcs=False):
     kv = config_dir / "kv.json"
     settings = config_dir / "settings.json"
     fastly_toml = config_dir / "fastly.toml"
@@ -104,6 +105,7 @@ blossom_secrets = [{secrets_toml}]
     server.in_meter = False
     server.metered_calls = []
     server.all_calls = []
+    server.fail_gcs = fail_gcs
     env = os.environ.copy()
     env["CARGO_TARGET_WASM32_WASIP1_RUNNER"] = shlex.join([
         env.get("VICEROY", "viceroy"), "run", "-C", str(fastly_toml), "--"
@@ -140,6 +142,7 @@ def main():
         server.in_meter = False
         server.metered_calls = []
         server.all_calls = []
+        server.fail_gcs = False
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
@@ -244,7 +247,36 @@ def main():
                 assert sum(1 for c in c4 if c["host"] == "api.bunny.net") == 0, c4
                 print("PASS legacy_physical_creator_delete_preserves_origin_secret_budget", flush=True)
 
-                # 5. Bulk approve batches Fastly and caps Bunny purges within 32-request budget
+                # 6. Early GCS failure in legacy physical creator delete fires deferred Bunny fallback
+                q4_fail, c4_fail = run_case(
+                    repo, server, cfg,
+                    "legacy_physical_creator_delete_early_gcs_failure_purges_bunny_fallback",
+                    {
+                        "bunny_delivery_zones": zones,
+                        "ENABLE_PHYSICAL_DELETE": "true",
+                        "local_mode": "true",
+                        "gcs_bucket": "synthetic-gcs",
+                        "fos_bucket": "synthetic-fos",
+                    },
+                    [
+                        ("fastly_api_token", "fastly-tok"),
+                        ("bunny_api_key", "bunny-tok"),
+                        ("gcs_access_key", "gcs-ak"),
+                        ("gcs_secret_key", "gcs-sk"),
+                        ("fos_access_key", "fos-ak"),
+                        ("fos_secret_key", "fos-sk"),
+                    ],
+                    metered=True,
+                    fail_gcs=True,
+                )
+                assert q4_fail["secrets"] <= 5 and q4_fail["plaintext"] == 4, q4_fail
+                assert any(c["method"] == "DELETE" and "/synthetic-gcs/" in c["path"] for c in c4_fail), c4_fail
+                assert not any(c["method"] == "DELETE" and "/synthetic-fos/" in c["path"] for c in c4_fail), c4_fail
+                assert sum(1 for c in c4_fail if c["host"] == "api.fastly.com") == 2, c4_fail
+                assert sum(1 for c in c4_fail if c["host"] == "api.bunny.net") == 2, c4_fail
+                print("PASS legacy_physical_creator_delete_early_gcs_failure_purges_bunny_fallback", flush=True)
+
+                # 7. Bulk approve batches Fastly and caps Bunny purges within 32-request budget
                 q5, c5 = run_case(
                     repo, server, cfg,
                     "bulk_approve_batches_fastly_and_bounds_bunny_within_backend_limit",

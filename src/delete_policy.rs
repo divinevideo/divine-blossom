@@ -77,9 +77,14 @@ impl CreatorDeleteOps for DefaultCreatorDeleteOps {
     }
 }
 
-/// Physical creator-delete defers Bunny edge purges during `soft_delete` so
-/// `bunny_api_key` never consumes a secret slot needed by downstream origin
-/// erasure (`gcs_*` / `fos_*`) and Bunny is purged at most once at the end.
+/// Legacy single-execution physical creator-delete defers Bunny edge purges
+/// during `soft_delete` so `bunny_api_key` never consumes a secret slot needed
+/// by downstream origin erasure (`gcs_*` / `fos_*`). Because `fastly_api_token`
+/// plus GCS and FOS credentials already fill Fastly Compute's 5-secret ceiling,
+/// Bunny purging is skipped at the end on a full 5-secret run and only runs
+/// inline when a secret slot remains (e.g. `fastly_api_token` absent or early
+/// GCS failure before FOS loads). Durable Bunny eviction for physical creator
+/// delete requires phased outbox mode (`cdn_invalidation_configured()`).
 #[derive(Default)]
 struct PhysicalCreatorDeleteOps {
     soft_delete_succeeded: std::cell::Cell<bool>,
