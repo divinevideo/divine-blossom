@@ -327,14 +327,26 @@ sole writer.
       obtain a **publicly trusted** certificate for `upload.divine.video` on the
       host via DNS-01 (for example `certbot certonly --dns-cloudflare` or
       `acme.sh --dns dns_cf` — do **not** use a Cloudflare Origin CA cert, which
-      fails direct TLS verification on DNS-only records) and configure automated
-      external renewal with a deploy hook that runs
-      `docker compose exec caddy caddy validate --config /etc/caddy/Caddyfile && docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile`.
-      Place the certificate and key at `conf.d/certs/upload.pem` and
-      `conf.d/certs/upload.key` (`chmod 600 conf.d/certs/upload.key`, readable
-      by Caddy inside the existing `./conf.d:/etc/caddy/conf.d:ro` mount), copy
-      `Caddyfile.upload.example` to `conf.d/upload.caddy` with literal site
-      address `upload.divine.video` and
+      fails direct TLS verification on DNS-only records). Copy regular files (not
+      symlinks, which break inside `./conf.d:/etc/caddy/conf.d:ro`) for the full
+      chain and private key to `/opt/divine-transcoder/conf.d/certs/upload.pem`
+      (`fullchain.pem`, including intermediates) and
+      `/opt/divine-transcoder/conf.d/certs/upload.key` (`privkey.pem`,
+      `install -m 600` so it is readable only by root/Caddy). Configure an
+      automated renewal hook that copies both renewed files into `conf.d/certs/`
+      (`certbot` `--deploy-hook` or `acme.sh --install-cert --fullchain-file /opt/divine-transcoder/conf.d/certs/upload.pem --key-file /opt/divine-transcoder/conf.d/certs/upload.key --reloadcmd "..."`)
+      and forces Caddy to reload its in-memory file certificate from outside the
+      Compose directory:
+      ```sh
+      docker compose --project-directory /opt/divine-transcoder exec -T caddy caddy validate --config /etc/caddy/Caddyfile && \
+      docker compose --project-directory /opt/divine-transcoder exec -T caddy caddy reload --force --config /etc/caddy/Caddyfile
+      ```
+      *(Both `--force` and `--project-directory` are required: plain
+      `caddy reload` is a no-op when the Caddyfile text is unchanged and would
+      keep serving the old in-memory cert until expiry, and non-interactive
+      `certbot`/`acme.sh` hooks run without a Compose working directory or TTY.)*
+      Next, copy `Caddyfile.upload.example` to `conf.d/upload.caddy` with
+      literal site address `upload.divine.video` and
       `tls /etc/caddy/conf.d/certs/upload.pem /etc/caddy/conf.d/certs/upload.key`
       inside the site block, then validate and reload Caddy without recreating
       `caddy` or `transcoder`:
@@ -369,7 +381,9 @@ sole writer.
       against `https://upload.divine.video`. Keep the DNS-01 file certificate
       (`conf.d/certs/upload.pem` / `upload.key`) and `tls` directive in
       `conf.d/upload.caddy` active under the automated `certbot` / `acme.sh`
-      renewal hook installed in step 7.2 — do **not** remove `tls` and reload
+      renewal hook installed in step 7.2 (which copies the renewed fullchain and
+      private key into `conf.d/certs/` and runs `caddy reload --force`) — do
+      **not** remove `tls` and reload
       Caddy while Caddy's managed ACME storage is empty, because Caddy unloads
       the file certificate immediately and fails TLS SNI handshakes until a
       managed issuer certificate is obtained. Only transition to Caddy-managed

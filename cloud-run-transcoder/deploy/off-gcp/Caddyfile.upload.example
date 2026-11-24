@@ -4,7 +4,7 @@
 # - Production cutover: copy to conf.d/upload.caddy with literal
 #   upload.divine.video (or set UPLOAD_DOMAIN=upload.divine.video in .env right
 #   before adding conf.d/upload.caddy), stage an externally renewed DNS-01 cert
-#   under conf.d/certs/ with a Caddy validate+reload hook, and keep
+#   under conf.d/certs/ with a Caddy validate + reload --force hook, and keep
 #   conf.d/upload-candidate.caddy active until candidate sessions drain.
 # Never leave a conf.d/*.caddy file referencing {$UPLOAD_DOMAIN} while
 # UPLOAD_DOMAIN is unset/empty, or Caddy will fail to start.
