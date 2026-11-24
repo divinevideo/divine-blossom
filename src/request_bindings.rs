@@ -14,6 +14,7 @@ struct Bindings {
     configs: BTreeMap<String, Value>,
     secrets: BTreeMap<String, Value>,
     origin_kv: BTreeMap<String, Option<String>>,
+    delivery_zones_retained: Option<String>,
     config_store: Option<Binding<ConfigStoreHandle>>,
     secret_store: Option<Binding<u32>>,
     #[cfg(test)]
@@ -208,6 +209,30 @@ pub(crate) fn cached_origin_kv(
         }
     });
     Ok(value)
+}
+
+pub(crate) fn set_cached_origin_kv(key: &str, value: Option<String>) {
+    CURRENT.with(|slot| {
+        if let Some(bindings) = slot.borrow_mut().as_mut() {
+            bindings.origin_kv.insert(key.to_owned(), value);
+        }
+    });
+}
+
+pub(crate) fn delivery_zones_already_retained(configured_key: &str) -> bool {
+    CURRENT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|bindings| bindings.delivery_zones_retained.as_deref() == Some(configured_key))
+    })
+}
+
+pub(crate) fn mark_delivery_zones_retained(configured_key: &str) {
+    CURRENT.with(|slot| {
+        if let Some(bindings) = slot.borrow_mut().as_mut() {
+            bindings.delivery_zones_retained = Some(configured_key.to_owned());
+        }
+    });
 }
 
 pub(crate) fn invalidate_cached_origin_kv(key: &str) {

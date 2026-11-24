@@ -926,28 +926,31 @@ fn bunny_delivery_policy_purge_and_durable_retry() {
         return;
     }
 
-    if mode == "webhook-no-bundle-livelock" {
+    if mode == "webhook-no-bundle-safe-failclosed" {
         b2_cdn_purge::enqueue(&hash(), b2_cdn_purge::Phase::Single).unwrap();
-        let drain = || {
+        let drain_with = |token: &str| {
             let req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false)
-                .with_header("Authorization", "Bearer synthetic-webhook-token");
+                .with_header("Authorization", format!("Bearer {token}"));
             let mut response = crate::request_bindings::metered(req);
             assert_eq!(response.get_status(), StatusCode::OK);
             serde_json::from_str::<serde_json::Value>(&response.take_body_str()).unwrap()
         };
-        // Pass 1: missing bundle stages standalone Fastly priority.
-        assert_eq!(drain()["result"], 0);
-        // Pass 2: Fastly completes and hands off to Bunny delivery priority.
-        assert_eq!(drain()["result"], 0);
-        // Pass 3: Bunny delivery completes and clears the outbox intent.
-        let final_reply = drain();
+        // Pass 1 (webhook, 4 secrets used): missing bundle stages standalone Fastly priority.
+        assert_eq!(drain_with("synthetic-webhook-token")["result"], 0);
+        // Pass 2 (webhook): Fastly purges and stages Bunny retry hint without clearing.
+        assert_eq!(drain_with("synthetic-webhook-token")["result"], 0);
+        // Pass 3 (webhook): Bunny delivery purges and clears hint, STILL does not clear intent
+        // so Fastly is never bypassed on a stale priority hint.
+        assert_eq!(drain_with("synthetic-webhook-token")["result"], 0);
+        // Pass 4 (dedicated drain token): both Fastly and Bunny succeed together and clear intent.
+        let final_reply = drain_with("synthetic-drain-token");
         assert_eq!(final_reply["result"], 1);
         assert_eq!(final_reply["errors"], 0);
         assert_eq!(final_reply["pending"], 0);
         return;
     }
 
-    if mode == "cold-pop-origin-retention" {
+    if mode == "cold-pop-origin-retention" || mode == "stale-pop-origin-rotation" {
         assert!(b2_cdn_purge::configured());
         b2_cdn_purge::enqueue(&hash(), b2_cdn_purge::Phase::Single).unwrap();
         let req = request(Method::POST, "/admin/api/b2-cdn-purge/drain?max=2", false)

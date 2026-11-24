@@ -18,14 +18,20 @@ struct Settings {
     store_id: String,
 }
 
-fn settings() -> Option<Settings> {
-    let store_id = crate::admin::get_config(STORE_ID_CONFIG)
+fn settings() -> Result<Option<Settings>> {
+    let Some(store_id) = crate::admin::get_config(STORE_ID_CONFIG)
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())?;
-    let token = crate::storage::get_secret(TOKEN_SECRET).ok()
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(token) = crate::request_bindings::secret(TOKEN_SECRET)?
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())?;
-    Some(Settings { token, store_id })
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Settings { token, store_id }))
 }
 
 fn backend() -> Result<Backend> {
@@ -47,13 +53,13 @@ fn backend() -> Result<Backend> {
 
 /// Whether origin reads are configured for this service.
 pub(crate) fn enabled() -> bool {
-    settings().is_some()
+    matches!(settings(), Ok(Some(_)))
 }
 
 /// Read `key` from the KV origin. `Ok(None)` means origin reads are not configured;
 /// `Ok(Some(None))` means the key does not exist at the origin.
 pub(crate) fn lookup(key: &str) -> Result<Option<Option<OriginEntry>>> {
-    let Some(settings) = settings() else {
+    let Some(settings) = settings()? else {
         return Ok(None);
     };
     let mut request = Request::get(format!("https://{HOST}{}", key_path(&settings.store_id, key)))

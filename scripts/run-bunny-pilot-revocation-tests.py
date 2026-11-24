@@ -66,6 +66,13 @@ class Provider(BaseHTTPRequestHandler):
                 self.send_header('generation', '1')
                 self.end_headers()
                 return self.wfile.write(body)
+            if self.server.with_delivery and self.path.endswith('/bunny-delivery-retained-zones:v1'):
+                body = ','.join(self.server.delivery_hosts).encode()
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header('generation', '1')
+                self.end_headers()
+                return self.wfile.write(body)
             if self.path.endswith(f'/b2-sync:v1:{HASH}'):
                 return self.reply(404, {})
             if self.path.endswith(f'/refs:{HASH}'):

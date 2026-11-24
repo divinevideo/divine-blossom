@@ -58,10 +58,10 @@ class Provider(BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
-        self.rfile.read(length)
+        raw = self.rfile.read(length)
         if self.path == "/fixture/meter":
             with self.server.lock:
-                self.server.meter.append([self.path, 0])
+                self.server.meter.append([raw.decode(), 0])
             return self.reply(200, {})
         with self.server.lock:
             try:
@@ -146,12 +146,22 @@ def run_case(mode):
         server.fastly_services = Counter()
         server.fastly_url_purges = []
         server.fail_primary_first_n = 4 if mode == "bunny-only" else 0
-        server.origin_retained_zones = (
-            f"{PRIMARY_HOST},{ALIAS_HOST}" if mode == "cold-pop-origin-retention" else None
-        )
+        if mode in (
+            "cold-pop-origin-retention",
+            "webhook-packed-budget",
+            "webhook-no-bundle-safe-failclosed",
+            "webhook-admin-moderate",
+        ):
+            server.origin_retained_zones = f"{PRIMARY_HOST},{ALIAS_HOST}"
+        elif mode == "stale-pop-origin-rotation":
+            server.origin_retained_zones = (
+                f"{OLD_PRIMARY_HOST},{OLD_ALIAS_HOST},{PRIMARY_HOST},{ALIAS_HOST}"
+            )
+        else:
+            server.origin_retained_zones = None
         server.allowed_bunny_hosts = (
             {PRIMARY_HOST, ALIAS_HOST, OLD_PRIMARY_HOST, OLD_ALIAS_HOST}
-            if mode == "zone-rotation"
+            if mode in ("zone-rotation", "stale-pop-origin-rotation")
             else {PRIMARY_HOST, ALIAS_HOST}
         )
         server.expected_hash = UNENROLLED_HASH if mode == "webhook-packed-budget" else HASH
@@ -200,7 +210,7 @@ def run_case(mode):
                     kv_initial["bunny-delivery-retained-zones:v1"] = (
                         f"{OLD_PRIMARY_HOST},{OLD_ALIAS_HOST},{PRIMARY_HOST},{ALIAS_HOST}"
                     )
-                elif mode == "webhook-no-bundle-livelock":
+                elif mode == "webhook-no-bundle-safe-failclosed":
                     configuration = {
                         "fixture_delivery_mode": mode,
                         "bunny_delivery_zones": f"{PRIMARY_HOST},{ALIAS_HOST}",
@@ -214,6 +224,19 @@ def run_case(mode):
                         "b2_cdn_purge_hosts": "media-b2-cdn.divine.video,media-b2.divine.video",
                         "metadata_kv_store_id": "fixture-store",
                     }
+                    secrets["kv_origin_read_token"] = "synthetic-policy-key"
+                elif mode == "stale-pop-origin-rotation":
+                    # Edge KV holds stale old.* while origin already has old.*,new.* and
+                    # bunny_delivery_zones was removed from config during rollback.
+                    configuration = {
+                        "fixture_delivery_mode": mode,
+                        "b2_cdn_host": "media-b2-cdn.divine.video",
+                        "b2_cdn_purge_hosts": "media-b2-cdn.divine.video,media-b2.divine.video",
+                        "metadata_kv_store_id": "fixture-store",
+                    }
+                    kv_initial["bunny-delivery-retained-zones:v1"] = (
+                        f"{OLD_PRIMARY_HOST},{OLD_ALIAS_HOST}"
+                    )
                     secrets["kv_origin_read_token"] = "synthetic-policy-key"
                 elif mode == "bunny-only-vanish-no-replica":
                     configuration = {
@@ -298,7 +321,7 @@ def run_case(mode):
                     assert server.bunny_counts == {PRIMARY_HOST: 2, ALIAS_HOST: 2}, server.bunny_counts
                     assert server.fastly_services == dict.fromkeys(FASTLY_SERVICES, 2), server.fastly_services
                     assert len(server.fastly_url_purges) == 4, server.fastly_url_purges
-                elif mode == "zone-rotation":
+                elif mode in ("zone-rotation", "stale-pop-origin-rotation"):
                     assert server.bunny_counts == {
                         PRIMARY_HOST: 2,
                         ALIAS_HOST: 2,
@@ -306,9 +329,12 @@ def run_case(mode):
                         OLD_ALIAS_HOST: 2,
                     }, server.bunny_counts
                     assert server.fastly_services == dict.fromkeys(FASTLY_SERVICES, 2), server.fastly_services
+                elif mode == "webhook-no-bundle-safe-failclosed":
+                    # Pass 2 (Fastly) + Pass 3 (Bunny retry) + Pass 4 (both together) = 4 each.
+                    assert server.bunny_counts == {PRIMARY_HOST: 4, ALIAS_HOST: 4}, server.bunny_counts
+                    assert server.fastly_services == dict.fromkeys(FASTLY_SERVICES, 4), server.fastly_services
                 elif mode in (
                     "webhook-packed-budget",
-                    "webhook-no-bundle-livelock",
                     "bunny-only-vanish-no-replica",
                     "webhook-admin-moderate",
                 ):
@@ -324,10 +350,11 @@ if __name__ == "__main__":
         "bunny-only",
         "retained-after-removal",
         "cold-pop-origin-retention",
+        "stale-pop-origin-rotation",
         "zone-rotation",
         "rotation-overflow",
         "webhook-packed-budget",
-        "webhook-no-bundle-livelock",
+        "webhook-no-bundle-safe-failclosed",
         "bunny-only-vanish-no-replica",
         "webhook-admin-moderate",
         "invalid-config",
