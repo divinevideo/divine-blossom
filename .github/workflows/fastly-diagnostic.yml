@@ -1,0 +1,41 @@
+name: Recovered Fastly source
+
+on:
+  pull_request:
+    paths: ["tools/fastly-test/**", ".github/workflows/fastly-diagnostic.yml"]
+  push:
+    branches: [main]
+    paths: ["tools/fastly-test/**", ".github/workflows/fastly-diagnostic.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  recovered-fastly-sdk-checks:
+    env:
+      RUSTUP_TOOLCHAIN: "1.98.1"
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: tools/fastly-test
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --target wasm32-wasip1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: tools/fastly-test -> target
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Build patched Wasm
+        run: cargo build --locked --release --target wasm32-wasip1
+      - name: Install checksum-verified Viceroy
+        run: |
+          curl --retry 3 --retry-all-errors -fsSL -o /tmp/recovered-viceroy.tar.gz https://github.com/fastly/Viceroy/releases/download/v0.22.0/viceroy_v0.22.0_linux-amd64.tar.gz
+          echo '03f66f27275e8adc0c1857c4f571bd6f5ae997e38cc43760b19c6840a92b298d  /tmp/recovered-viceroy.tar.gz' | sha256sum -c -
+          tar xzf /tmp/recovered-viceroy.tar.gz -C /usr/local/bin/
+          viceroy --version
+      - name: Check isolated HTTP behavior
+        run: python3 tests/smoke.py --wasm target/wasm32-wasip1/release/fastly-compute-project.wasm
