@@ -2820,6 +2820,7 @@ fn generate_thumbnail_on_demand(hash: &str) -> Result<Response> {
     );
 
     let mut proxy_req = Request::new(Method::GET, &url);
+    proxy_req.set_stale_if_error(0);
     proxy_req.set_header("Host", UPLOAD_SERVICE_THUMBNAIL_HOST);
 
     let resp = proxy_req.send(UPLOAD_SERVICE_BACKEND).map_err(|e| {
