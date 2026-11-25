@@ -13,12 +13,12 @@ authors = ["Divine <hello@divine.video>"]
 description = "Blossom media server for Nostr running on Fastly Compute"
 
 [dependencies]
-# Fastly Compute SDK - pin to avoid edition2024 dependencies
-fastly = "=0.11.12"
+# Fastly Compute SDK with patched URL origin handling
+fastly = "=0.13.3"
 # Timed readiness waits for the optional delivery probe (same SDK host ABI).
-fastly-sys = "=0.11.12"
+fastly-sys = "=0.13.3"
 # Classify the SDK's raw KV rate-limit result without replaying other failures.
-fastly-shared = "=0.11.12"
+fastly-shared = "=0.13.3"
 httpdate = "1.0"
 
 # Request-boundary telemetry IDs, backed by WASI random_get

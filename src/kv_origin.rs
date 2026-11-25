@@ -41,6 +41,7 @@ fn settings() -> Result<Option<Settings>> {
 
 fn backend() -> Result<Backend> {
     match Backend::builder(BACKEND_NAME, HOST)
+        .max_connections(0)
         .override_host(HOST)
         .enable_ssl()
         .check_certificate(HOST)
