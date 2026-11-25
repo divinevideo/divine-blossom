@@ -6,13 +6,18 @@ bytes and performs no provider verification downloads. A dedicated
 this interface. `archive_import_enabled=true` enables admissions. Existing
 registration, reconciliation and settlement remain available when admissions pause.
 
-`admit`, `admit-copy`, `check`, `register`, `reconcile`, and `settle` accept:
+`admit`, `admit-copy`, `check`, `register`, `reconcile`, `settle`, and
+`settle-copy` accept:
 
 ```json
 {"version":1,"items":[{"sha256":"<64 lowercase hex>","owner":"<64 lowercase hex>","attempt":"<32 lowercase hex>","source":"<immutable source identity>","provenance":"<approved archive manifest identity>","size":99,"content_type":"video/mp4"}]}
 ```
 
-Maximum 16 items and 64 KiB per request. Results preserve input order and identify the
+Maximum 16 items and 64 KiB per request. Submit exactly one item per `settle-copy`
+request. A larger typed batch returns HTTP 400 before making any changes. One
+item uses at most 30 Fastly KV origin requests, including up to four attempts to
+retire the admission, within the 32-backend-request limit.
+Results preserve input order and identify the
 hash and owner; each contains `ok` and `result`, or `error` (`policy_denied`, `invalid`,
 `retry`). Retrying one item does not replay successful items. The importer is trusted
 to bind approved archive identity to its existing creator account; this is not a public
@@ -27,6 +32,88 @@ before releasing the gate. `reconcile` returns any existing admission and owner 
 registered. `settle` releases only the matching attempt; the durable CloudSQL authority
 must establish that all physical effects have finished or were explicitly rejected.
 Never use settlement to time out an uncertain write.
+
+Cleanup MUST continue to use legacy `settle` once the durable authority establishes
+that physical effects have finished or were explicitly rejected. This includes
+policy-denied copies (vanish, quarantine or tombstone) and partial admissions that
+claimed a gate without returning a generation or retaining an admission. Legacy
+settlement drains only its owning attempt without requiring serving policy or
+returning a copy proof. `settle-copy` obtains proof before processing; it MUST NOT
+replace this generic cleanup drain. A policy-denied proof request leaves its gate
+for legacy settlement to drain if policy denies before release. Policy can also
+deny after release, leaving no copying gate to drain; legacy settlement is then
+an idempotent no-op. Neither denial authorizes processing. A generic response
+does not confirm current gate state.
+
+For `settle-copy`, add the `generation` returned by `admit-copy` to the original
+admitted item. Every item field must match the admission, or the exact item retained
+by an earlier copy settlement. Blossom records the copy marker when it creates the
+admission through `admit-copy`. A replay cannot add or remove a marker. Use
+generic cleanup or reconciliation for in-flight admissions created before the
+upgrade. A new attempt can produce typed proof after the earlier attempt has been
+safely closed. Admissions without a marker cannot produce a typed proof. The generation must be
+a canonical, nonzero decimal `u64` string. Before retiring the attempt, the
+operation requires either its exact copying gate or the released gate for that
+same attempt and admission generation.
+
+A successful item returns this object in `items[n].result`:
+
+```json
+{
+  "settled": true,
+  "copy_settlement": {
+    "version": 1,
+    "sha256": "<64 lowercase hex>",
+    "owner": "<64 lowercase hex>",
+    "attempt": "<32 lowercase hex>",
+    "state": "released",
+    "admission_generation": "<admitted generation>",
+    "released_from_generation": "<same admitted generation>",
+    "parent_generation": "<observed released-gate generation>"
+  }
+}
+```
+
+Retirement atomically retains the admitted item and clears the active admission.
+The operation conditionally releases the owning gate, observes that exact
+released gate at the origin, and then rechecks policy before returning proof.
+The initial policy check, ownership checks during retirement, and gate and
+binding reads also use the Fastly KV origin. A blob record cleared by erasure
+denies proof. A new admission may have no blob record. Missing
+`metadata_kv_store_id` or `kv_origin_read_token`, or an unavailable origin,
+returns `retry`.
+`owner` comes from the retained item.
+Both `admission_generation` and `released_from_generation` equal the
+supplied generation; `parent_generation` identifies the observed released gate.
+All three are canonical, nonzero decimal `u64` strings used as equality fences.
+
+The proof describes the gate when read, followed by a fresh policy check.
+These reads use separate KV keys and do not form a transaction. A later attempt
+can claim the released gate, making this attempt's proof unobtainable.
+A delayed admission for the same attempt can also pass its initial retirement
+check before settlement, then reclaim and release the gate at a new generation
+after settlement. That changes the release fence even without another attempt,
+so the original proof can become unobtainable and require reconciliation.
+Missing or changed admission/binding, or a gate that no longer matches the attempt
+and generation, returns `invalid`. These permanent refusals require reconciliation,
+not retrying the same proof request. `retry` remains for unavailable KV state and
+conditional-update contention; policy refusal remains `policy_denied`.
+
+Retry the identical item after a lost response; the retained binding is reused,
+and proof still requires the exact released gate and current policy. A missing
+gate, a different attempt or admission generation, or an erasing parent cannot
+produce this proof. Retired copy attempts cannot be readmitted with `admit-copy`.
+Legacy `settle` returns only `{"settled":true}`; that acknowledgment
+is not a copy-release proof, and a historical settlement without a retained copy
+item cannot be upgraded to one by replaying `settle-copy`.
+
+Rollback compatibility: edge versions predating typed settlement drop the copy
+marker and retained `settled_copies` bindings when they rewrite an archive record.
+Rolling forward cannot restore them. An affected attempt returns `invalid` on the
+typed proof path. Legacy `settle` keeps its existing cleanup behavior.
+
+See the [archive handler and synthetic contract](../../src/archive_import.rs) and
+[parent-gate helpers](../../src/parent_gate.rs) for the implementation.
 
 Registration preserves moderation status and existing ownership. New records start
 pending. An `archive_storage` receipt makes bare original GET and Range use B2 even
@@ -45,8 +132,9 @@ monotonic batch cursor; replaying an acknowledged batch does not count it twice.
 work runs separately from registration. Drain the aggregate queue before a full admin
 statistics rebuild. Existing status-change counters remain eventually consistent.
 
-Owner unlink removes archive receipts and provenance and writes a permanent,
-non-identifying owner/hash removal fence. Full metadata erasure removes the private
+Owner unlink removes archive receipts, provenance and retained copy-settlement
+bindings, and writes a permanent, non-identifying owner/hash removal fence.
+Full metadata erasure removes the private
 archive record. Neither ordinary retries nor enabling the feature can override erasure.
 
 Run `scripts/run-archive-import-tests.py` with Viceroy for real synthetic KV, ownership,

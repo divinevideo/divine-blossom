@@ -1,6 +1,7 @@
 //! Shared no-TTL writer/erasure exclusion. Generations are equality fences.
-use crate::error::{BlossomError, Result};
 use crate::archive_diagnostics::{note, observe_kv, KvOperation, Reason};
+use crate::error::{BlossomError, Result};
+use blossom_core::kv_origin::OriginEntry;
 use fastly::http::{Method, StatusCode};
 use fastly::kv_store::{InsertMode, KVStore, KVStoreError};
 use fastly::{Request, Response};
@@ -449,11 +450,18 @@ fn lookup_origin(hash: &str) -> Result<Option<Observed>> {
     let Some(Some(entry)) = crate::kv_origin::lookup(&key(hash))? else {
         return Ok(None);
     };
+    parse_origin_entry(entry).map(Some)
+}
+
+fn parse_origin_entry(entry: OriginEntry) -> Result<Observed> {
     let gate = parse(&entry.body).ok_or_else(|| {
         note(Reason::GateRecordInvalid);
         unavailable()
     })?;
-    Ok(Some(Observed {gate, generation: entry.generation.to_string()}))
+    Ok(Observed {
+        gate,
+        generation: entry.generation.to_string(),
+    })
 }
 /// Why `attempt` does not hold the gate at `expected` (any generation when `None`).
 /// Returns `None` when it does.
@@ -474,7 +482,7 @@ pub(crate) fn archive_release(hash: &str, attempt: &str, expected: &str) -> Resu
         if settled_attempt_id == attempt && released_from_generation == expected {return Ok(());}
     }
     archive_check(hash,attempt,expected)?;
-    insert(&store,hash,&Gate::Released {version:1,settled_attempt_id:attempt.to_owned(),released_from_generation:expected.to_owned()},generation(expected))
+    write_archive_release(&store, hash, attempt, generation(expected).ok_or_else(unavailable)?)
 }
 
 pub(crate) fn archive_owned(hash:&str,attempt:&str)->Result<bool> {
@@ -646,6 +654,99 @@ pub(crate) fn archive_settle_current(hash:&str,attempt:&str)->Result<()> {
         if attempt_id==attempt {return archive_release(hash,attempt,&generation);}
     }
     Ok(())
+}
+
+fn invalid_copy_settlement() -> BlossomError {
+    BlossomError::BadRequest("Invalid copy settlement".into())
+}
+
+fn lookup_archive_copy_gate(hash: &str) -> Result<Option<Observed>> {
+    crate::kv_origin::required_lookup(&key(hash))?
+        .map(parse_origin_entry)
+        .transpose()
+}
+
+/// Return the CAS generation for an owned copying gate, or None for an exact
+/// release already observed at the origin.
+pub(crate) fn archive_copy_settlement_precheck(
+    hash: &str,
+    attempt: &str,
+    expected: &str,
+) -> Result<Option<u64>> {
+    let release_generation = generation(expected).ok_or_else(invalid_copy_settlement)?;
+    match lookup_archive_copy_gate(hash)? {
+        Some(Observed {
+            gate: Gate::Copying { attempt_id },
+            generation,
+        }) if attempt_id == attempt && generation == expected => Ok(Some(release_generation)),
+        Some(Observed {
+            gate:
+                Gate::Released {
+                    settled_attempt_id,
+                    released_from_generation,
+                    ..
+                },
+            ..
+        }) if settled_attempt_id == attempt && released_from_generation == expected => Ok(None),
+        Some(Observed {
+            gate: Gate::Erasing {},
+            ..
+        }) => Err(BlossomError::Forbidden("Parent is erasing".into())),
+        _ => Err(invalid_copy_settlement()),
+    }
+}
+
+pub(crate) fn archive_release_copy(hash: &str, attempt: &str, expected: u64) -> Result<()> {
+    // The origin supplied this exact generation. A new gate owner changes it,
+    // so the conditional write cannot release a later writer's gate.
+    write_archive_release(&crate::metadata::open_store()?, hash, attempt, expected)
+}
+
+fn write_archive_release(store: &KVStore, hash: &str, attempt: &str, expected: u64) -> Result<()> {
+    insert(
+        store,
+        hash,
+        &Gate::Released {
+            version: 1,
+            settled_attempt_id: attempt.to_owned(),
+            released_from_generation: expected.to_string(),
+        },
+        Some(expected),
+    )
+}
+
+pub(crate) fn archive_copy_release_proof(
+    hash: &str,
+    attempt: &str,
+    expected: &str,
+) -> Result<serde_json::Value> {
+    generation(expected).ok_or_else(invalid_copy_settlement)?;
+    match lookup_archive_copy_gate(hash)? {
+        Some(Observed {
+            gate:
+                Gate::Released {
+                    version: 1,
+                    settled_attempt_id,
+                    released_from_generation,
+                },
+            generation,
+        }) if settled_attempt_id == attempt && released_from_generation == expected => {
+            Ok(serde_json::json!({
+                "version": 1,
+                "sha256": hash,
+                "attempt": attempt,
+                "state": "released",
+                "admission_generation": expected,
+                "released_from_generation": released_from_generation,
+                "parent_generation": generation,
+            }))
+        }
+        Some(Observed {
+            gate: Gate::Erasing {},
+            ..
+        }) => Err(BlossomError::Forbidden("Parent is erasing".into())),
+        _ => Err(invalid_copy_settlement()),
+    }
 }
 
 #[cfg(test)]
