@@ -1,0 +1,15 @@
+{
+  "upstream": "https://github.com/fastly/compute-starter-kit-rust-default/tree/c8f2a6248b6d8fb43ef8f245ccfaeb800d5e2606",
+  "source_commit": "c8f2a6248b6d8fb43ef8f245ccfaeb800d5e2606",
+  "files": [
+    ".cargo/config.toml",
+    ".gitignore",
+    "Cargo.toml",
+    "LICENSE",
+    "fastly.toml",
+    "rust-toolchain.toml",
+    "src/main.rs",
+    "src/welcome-to-compute.html"
+  ],
+  "basis": "Last official template commit before the recorded2025-12-02 initialization; live landing HTML matches this starter. Original package source SHA was not embedded."
+}
