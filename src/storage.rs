@@ -196,6 +196,7 @@ pub fn download_thumbnail(gcs_key: &str) -> Result<Response> {
     let url = format!("{}{}", config.endpoint(), path);
 
     let mut req = Request::new(Method::GET, &url);
+    req.set_stale_if_error(0);
     req.set_header("Host", config.host());
 
     sign_request(&mut req, &config, Some("UNSIGNED-PAYLOAD".into()))?;
@@ -222,6 +223,7 @@ pub fn download_hls_from_gcs(gcs_key: &str, range: Option<&str>) -> Result<Respo
     let url = format!("{}{}", config.endpoint(), path);
 
     let mut req = Request::new(Method::GET, &url);
+    req.set_stale_if_error(0);
     req.set_header("Host", config.host());
 
     if let Some(range_value) = range {
@@ -252,6 +254,7 @@ pub fn download_transcript_from_gcs(gcs_key: &str) -> Result<Response> {
     let url = format!("{}{}", config.endpoint(), path);
 
     let mut req = Request::new(Method::GET, &url);
+    req.set_stale_if_error(0);
     req.set_header("Host", config.host());
 
     sign_request(&mut req, &config, Some("UNSIGNED-PAYLOAD".into()))?;
@@ -278,6 +281,7 @@ pub fn download_blob(hash: &str, range: Option<&str>) -> Result<Response> {
     let url = format!("{}{}", config.endpoint(), config.object_path(hash));
 
     let mut req = Request::new(Method::GET, &url);
+    req.set_stale_if_error(0);
     req.set_header("Host", config.host());
 
     if let Some(range_value) = range {
@@ -365,6 +369,7 @@ fn try_fallback_download(
     let url = format!("https://{}{}{}", host, path_prefix, hash);
 
     let mut req = Request::new(Method::GET, &url);
+    req.set_stale_if_error(0);
     req.set_header("Host", host);
 
     if let Some(range_value) = range {
@@ -420,6 +425,7 @@ fn download_blob_from_fos(hash: &str, range: Option<&str>) -> Result<Response> {
     let url = format!("{}{}", config.endpoint(), config.object_path(hash));
 
     let mut req = Request::new(Method::GET, &url);
+    req.set_stale_if_error(0);
     req.set_header("Host", config.host());
 
     if let Some(range_value) = range {
@@ -623,6 +629,7 @@ pub fn blob_exists(hash: &str) -> Result<bool> {
     let path = format!("/{}/{}", config.bucket, hash);
 
     let mut req = Request::new(Method::HEAD, format!("{}{}", config.endpoint(), path));
+    req.set_stale_if_error(0);
     req.set_header("Host", config.host());
 
     sign_request(&mut req, &config, Some("UNSIGNED-PAYLOAD".into()))?;
@@ -965,6 +972,7 @@ fn compute_hash_from_gcs(key: &str) -> Result<String> {
     let path = format!("/{}/{}", config.bucket, key);
 
     let mut req = Request::new(Method::GET, format!("{}{}", config.endpoint(), path));
+    req.set_stale_if_error(0);
     req.set_header("Host", config.host());
 
     sign_request(&mut req, &config, Some("UNSIGNED-PAYLOAD".into()))?;
@@ -1719,6 +1727,7 @@ pub fn check_funnelcake_audio_reuse(hash: &str) -> Result<bool> {
     );
 
     let mut req = Request::new(Method::GET, &url);
+    req.set_stale_if_error(0);
     // Set Host header from the URL
     if let Some(host) = funnelcake_url
         .strip_prefix("https://")
