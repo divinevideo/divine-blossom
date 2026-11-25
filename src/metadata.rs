@@ -1911,6 +1911,37 @@ pub fn get_blob_refs(hash: &str) -> Result<Vec<String>> {
     parse_blob_refs_lookup(store.lookup(&key))
 }
 
+/// A duplicate response needs a bounded check for in-progress account erasure.
+pub(crate) fn blob_uploaders_allow_dedup(metadata: &BlobMetadata) -> Result<bool> {
+    let mut uploaders = get_blob_refs(&metadata.sha256)?;
+    if uploaders.len() >= blossom_core::canary::MAX_DEMAND_REFERENCES {
+        return Ok(false);
+    }
+    uploaders.push(metadata.owner.clone());
+    for uploader in &mut uploaders {
+        uploader.make_ascii_lowercase();
+    }
+    uploaders.sort_unstable();
+    uploaders.dedup();
+
+    let store = open_store()?;
+    for uploader in uploaders {
+        if uploader.len() != 64 || !uploader.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Ok(false);
+        }
+        match store.lookup(&vanish_in_progress_key(&uploader)) {
+            Ok(_) => return Ok(false),
+            Err(KVStoreError::ItemNotFound) => {}
+            Err(error) => {
+                return Err(BlossomError::MetadataError(format!(
+                    "Account erasure state unavailable: {error}"
+                )));
+            }
+        }
+    }
+    Ok(true)
+}
+
 /// Remove a pubkey from the blob's references list. Returns the remaining refs.
 pub fn remove_from_blob_refs(hash: &str, pubkey: &str) -> Result<Vec<String>> {
     crate::archive_import::unlink_owner(hash,&pubkey.to_lowercase())?;

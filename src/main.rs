@@ -69,14 +69,15 @@ use crate::metadata::{
     TranscodeMetadataUpdate, TranscriptMetadataUpdate, VanishAuditState,
 };
 use crate::storage::{
-    b2_replica_enabled, blob_exists, check_funnelcake_audio_reuse, current_timestamp,
+    audio_blob_presence, b2_replica_enabled, check_funnelcake_audio_reuse, current_timestamp,
     delete_blob as storage_delete, delivery_probe_sample, dispatch_vanish_timing_log,
     download_blob_read_through, download_blob_with_fallback, download_thumbnail,
     begin_vanish_phase, erase_vanish_batch, finish_vanish_phase, plan_vanish_physical,
     probe_erased_delivery,
     trigger_audio_extraction, vanish_complete, vanish_needs_physical,
     trigger_cloud_run_delete_blob, upload_blob, write_audit_log, write_vanish_audit_log,
-    DeliveryProbeCounts, VanishAuditInitiator, VanishAuditPhase, VanishStorageTimings,
+    AudioBlobPresence, DeliveryProbeCounts, VanishAuditInitiator, VanishAuditPhase,
+    VanishStorageTimings,
     B2_VANISH_MAX_HASHES_PER_WAVE, B2_VANISH_MAX_STORAGE_BACKEND_REQUESTS, DELIVERY_PROBE_LIMIT,
 };
 use crate::viewer_auth::{ViewerAuthDiagnostics, ViewerAuthState};
@@ -85,6 +86,7 @@ use blossom_core::cache_policy::{
     status_requires_private_response, BlobCachePolicy, CacheHeaders,
 };
 use blossom_core::request_diagnostics::{diagnostic_probe_id, route_category};
+use blossom_core::storage_origin::StorageProvider;
 use blossom_core::subtitle_lang::sanitize_subtitle_lang;
 use blossom_core::upload_log::{
     record_failure, record_response, record_send_attempt, OriginSendResult, UploadLogRecord,
@@ -577,11 +579,12 @@ fn should_hide_direct_blob(hash: &str, is_admin: bool) -> Result<bool> {
     Ok(is_alias_only_audio_blob(true, &blob_refs))
 }
 
-fn audio_lookup_unavailable_response() -> Response {
-    let mut resp = Response::from_status(StatusCode::SERVICE_UNAVAILABLE);
-    resp.set_header("Content-Type", "application/json");
+fn audio_unavailable_response(error: &str) -> Response {
+    let mut resp = json_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &serde_json::json!({"error": error}),
+    );
     resp.set_header("Retry-After", "30");
-    resp.set_body(r#"{"error":"permission_lookup_unavailable"}"#);
     add_no_cache_headers(&mut resp);
     add_cors_headers(&mut resp);
     resp
@@ -2663,7 +2666,9 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
     match permission {
         AudioReuseAvailability::Allowed => {}
         AudioReuseAvailability::Denied => return Ok(audio_reuse_denied_response()),
-        AudioReuseAvailability::LookupUnavailable => return Ok(audio_lookup_unavailable_response()),
+        AudioReuseAvailability::LookupUnavailable => {
+            return Ok(audio_unavailable_response("permission_lookup_unavailable"));
+        }
     }
 
     // Admin responses stay private; otherwise the source video's moderation
@@ -2690,26 +2695,29 @@ fn handle_get_audio(req: Request, path: &str) -> Result<Response> {
 
     // 5. Check cache: source->audio mapping
     if let Some(mapping) = get_audio_mapping(&hash)? {
-        // Verify the audio blob still exists in GCS
-        if blob_exists(&mapping.audio_sha256)? {
-            add_to_audio_source_refs(&mapping.audio_sha256, &hash).map_err(|e| {
-                BlossomError::Internal(format!("Failed to persist audio source refs: {}", e))
-            })?;
-            // Serve cached audio via redirect or proxy
-            let result = download_blob_with_fallback(&mapping.audio_sha256, range.as_deref())?;
-            let mut resp = result.response;
-            add_audio_response_headers(
-                &mut resp,
-                &hash,
-                audio_cache_policy,
-                &mapping.mime_type,
-                mapping.size_bytes,
-                mapping.duration_seconds,
-            );
-            return Ok(resp);
+        match audio_blob_presence(&mapping.audio_sha256)? {
+            AudioBlobPresence::ServingOriginMiss => {
+                return Ok(audio_unavailable_response("audio_storage_unavailable"));
+            }
+            AudioBlobPresence::Missing => clear_stale_audio_mapping(&hash, &mapping.audio_sha256),
+            AudioBlobPresence::Present => {
+                add_to_audio_source_refs(&mapping.audio_sha256, &hash).map_err(|e| {
+                    BlossomError::Internal(format!("Failed to persist audio source refs: {}", e))
+                })?;
+                // Serve cached audio via redirect or proxy
+                let result = download_blob_with_fallback(&mapping.audio_sha256, range.as_deref())?;
+                let mut resp = result.response;
+                add_audio_response_headers(
+                    &mut resp,
+                    &hash,
+                    audio_cache_policy,
+                    &mapping.mime_type,
+                    mapping.size_bytes,
+                    mapping.duration_seconds,
+                );
+                return Ok(resp);
+            }
         }
-        // Audio blob gone, fall through to re-extract
-        clear_stale_audio_mapping(&hash, &mapping.audio_sha256);
     }
 
     // 6. Trigger Cloud Run audio extraction (synchronous)
@@ -2820,7 +2828,9 @@ fn handle_head_audio(path: &str) -> Result<Response> {
     match permission {
         AudioReuseAvailability::Allowed => {}
         AudioReuseAvailability::Denied => return Ok(audio_reuse_denied_response()),
-        AudioReuseAvailability::LookupUnavailable => return Ok(audio_lookup_unavailable_response()),
+        AudioReuseAvailability::LookupUnavailable => {
+            return Ok(audio_unavailable_response("permission_lookup_unavailable"));
+        }
     }
 
     if !is_video_mime_type(&metadata.mime_type) {
@@ -2834,22 +2844,27 @@ fn handle_head_audio(path: &str) -> Result<Response> {
 
     // Check if audio mapping exists
     if let Some(mapping) = get_audio_mapping(&hash)? {
-        if blob_exists(&mapping.audio_sha256)? {
-            add_to_audio_source_refs(&mapping.audio_sha256, &hash).map_err(|e| {
-                BlossomError::Internal(format!("Failed to persist audio source refs: {}", e))
-            })?;
-            let mut resp = Response::from_status(StatusCode::OK);
-            add_audio_response_headers(
-                &mut resp,
-                &hash,
-                blob_cache_policy(metadata.status),
-                &mapping.mime_type,
-                mapping.size_bytes,
-                mapping.duration_seconds,
-            );
-            return Ok(resp);
+        match audio_blob_presence(&mapping.audio_sha256)? {
+            AudioBlobPresence::ServingOriginMiss => {
+                return Ok(audio_unavailable_response("audio_storage_unavailable"));
+            }
+            AudioBlobPresence::Missing => clear_stale_audio_mapping(&hash, &mapping.audio_sha256),
+            AudioBlobPresence::Present => {
+                add_to_audio_source_refs(&mapping.audio_sha256, &hash).map_err(|e| {
+                    BlossomError::Internal(format!("Failed to persist audio source refs: {}", e))
+                })?;
+                let mut resp = Response::from_status(StatusCode::OK);
+                add_audio_response_headers(
+                    &mut resp,
+                    &hash,
+                    blob_cache_policy(metadata.status),
+                    &mapping.mime_type,
+                    mapping.size_bytes,
+                    mapping.duration_seconds,
+                );
+                return Ok(resp);
+            }
         }
-        clear_stale_audio_mapping(&hash, &mapping.audio_sha256);
     }
 
     // No audio extracted yet
@@ -3935,8 +3950,8 @@ fn handle_upload(mut req: Request, record: &mut UploadLogRecord) -> Result<Respo
         ));
     }
 
-    // Check if blob already exists (first-uploader-wins)
-    if blob_exists(&hash)? {
+    // Check if blob already exists (first-uploader-wins) on this inline GCS path
+    if storage::blob_exists_in_gcs(&hash)? {
         // Return existing blob descriptor but track this re-uploader
         if let Some(mut metadata) = get_blob_metadata(&hash)? {
             if !encoding_requested && metadata.video_encoding_allowed {
@@ -4523,6 +4538,57 @@ fn publish_upload_service_upload_with_policy(
     Ok(resp)
 }
 
+fn b2_resumable_duplicate_metadata(hash: &str) -> Result<Option<BlobMetadata>> {
+    let Some(metadata) = get_blob_metadata_uncached(hash)? else {
+        return Ok(None);
+    };
+    if metadata.sha256 != hash
+        || metadata.access_for(None, false) != BlobAccess::Allowed
+        || should_hide_direct_blob(hash, false)?
+        || get_tombstone(hash)?.is_some()
+        || !crate::metadata::blob_uploaders_allow_dedup(&metadata)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(metadata))
+}
+
+fn resumable_duplicate(hash: &str, base_url: &str) -> Result<Option<serde_json::Value>> {
+    let policy = storage::media_read_policy()?;
+    let metadata = if policy.primary == StorageProvider::B2 {
+        let hash = hash.to_ascii_lowercase();
+        if b2_resumable_duplicate_metadata(&hash)
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let probe = storage::blob_exists_for_upload(&hash, policy);
+        if matches!(probe, Ok(false)) {
+            return Ok(None);
+        }
+        // The probe can outlive a hold or erasure mutation. Re-read policy
+        // before returning its result.
+        let Some(metadata) = b2_resumable_duplicate_metadata(&hash).ok().flatten() else {
+            return Ok(None);
+        };
+        probe?;
+        Some(metadata)
+    } else {
+        if !storage::blob_exists_for_upload(hash, policy)? {
+            return Ok(None);
+        }
+        get_blob_metadata(hash)?
+    };
+    let payload = if let Some(metadata) = metadata {
+        serde_json::json!({"error": "Blob already exists", "descriptor": metadata.to_descriptor(base_url)})
+    } else {
+        serde_json::json!({"error": "Blob already exists", "sha256": hash})
+    };
+    Ok(Some(payload))
+}
+
 fn handle_upload_init(mut req: Request, record: &mut UploadLogRecord) -> Result<Response> {
     let auth = validate_auth(&req, AuthAction::Upload)?;
     if !upload_encoding_requested(&req)? {
@@ -4586,18 +4652,7 @@ fn handle_upload_init(mut req: Request, record: &mut UploadLogRecord) -> Result<
         ));
     }
 
-    if blob_exists(&init_request.sha256)? {
-        let payload = if let Some(metadata) = get_blob_metadata(&init_request.sha256)? {
-            serde_json::json!({
-                "error": "Blob already exists",
-                "descriptor": metadata.to_descriptor(&base_url),
-            })
-        } else {
-            serde_json::json!({
-                "error": "Blob already exists",
-                "sha256": init_request.sha256,
-            })
-        };
+    if let Some(payload) = resumable_duplicate(&init_request.sha256, &base_url)? {
         let mut resp = json_response(StatusCode::CONFLICT, &payload);
         add_upload_capability_headers(&mut resp, &control_host);
         add_cors_headers(&mut resp);

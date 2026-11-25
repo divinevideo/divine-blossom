@@ -15,6 +15,75 @@ class Storage(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
+    def do_HEAD(self):
+        bucket, key = self.path.strip("/").split("/", 1)
+        self.server.reads.append(("HEAD", bucket, key))
+        scope = "/us-west-004/s3/aws4_request" if bucket == "b2" else "/auto/s3/aws4_request"
+        assert scope in self.headers.get("Authorization", "")
+        if key == "disconnect" or (bucket == "b2" and key in (
+            "transport", "transport_b2_only", "f" * 64, "5" * 64, "1" * 64, "e" * 64,
+        )):
+            self.connection.shutdown(socket.SHUT_RDWR)
+            self.connection.close()
+            return
+        if bucket == "b2":
+            status = {
+                "missing": 404,
+                "absent_everywhere": 404,
+                "transient": 503,
+                "transient_b2_only": 503,
+                "forbidden": 403,
+                "3" * 64: 404,
+                "8" * 64: 404,
+            }.get(key, 200)
+            if key == "7" * 64:
+                # Simulate Platform restoring the object after GET and HEAD miss.
+                before_restore = self.server.reads.count(("HEAD", "b2", key)) <= 2
+                status = 404 if before_restore else 200
+        else:
+            status = {
+                "absent_everywhere": 404,
+                "transient_b2_only": 404,
+                "transport_b2_only": 404,
+                "forbidden": 403,
+                "unavailable": 503,
+                "f" * 64: 403,
+                "5" * 64: 503,
+                "8" * 64: 404,
+            }.get(key, 200)
+        self.send_response(status)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_DELETE(self):
+        bucket, key = self.path.strip("/").split("/", 1)
+        self.server.reads.append(("DELETE", bucket, key))
+        self.send_response(204)
+        self.end_headers()
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.path == "/audio/extract":
+            self.server.reads.append(("POST", "extract", body["sha256"]))
+            return self.reply_json(422, {"error": "no_audio_track"})
+        assert self.path == "/upload/init"
+        assert self.headers["Authorization"].startswith("Nostr ")
+        self.server.reads.append(("POST", "upload", body["sha256"]))
+        self.reply_json(200, {
+            "uploadId": "synthetic-session",
+            "uploadUrl": "https://media.example.com/upload/synthetic-session",
+            "expiresAt": "2026-12-01T00:00:00Z",
+            "chunkSize": 1024,
+            "nextOffset": 0,
+        })
+
+    def reply_json(self, status, payload):
+        response = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(response)))
+        self.end_headers()
+        self.wfile.write(response)
+
     def do_GET(self):
         bucket, key = self.path.strip("/").split("/", 1)
         self.server.reads.append((bucket, key, self.headers.get("Range")))
@@ -32,6 +101,8 @@ class Storage(BaseHTTPRequestHandler):
         else:
             status = {"forbidden": 403, "unavailable": 503, "invalid-range": 416}.get(key, 200)
         body = f"{bucket} bytes".encode()
+        if bucket == "b2" and key == "7" * 64:
+            body = b"synthetic audio"
         derived_range = bucket == "b2" and key == "fixture/hls/720p.mp4" and self.headers.get("Range") == "bytes=1-3"
         if derived_range:
             status, body = 206, body[1:4]
@@ -58,19 +129,29 @@ def main():
                 root = Path(directory)
                 config = root / "fastly.toml"
                 settings = root / "settings.json"
-                config.write_text(f'''manifest_version = 3
+                backends = f'''manifest_version = 3
 name = "media-origins-test"
 language = "rust"
 [local_server.backends.gcs_storage]
 url = "http://127.0.0.1:{server.server_port}"
 [local_server.backends.b2_storage]
 url = "http://127.0.0.1:{server.server_port}"
+[local_server.backends.fos_storage]
+url = "http://127.0.0.1:{server.server_port}"
+[local_server.backends.upload_service]
+url = "http://127.0.0.1:{server.server_port}"
+[local_server.backends.cloud_run_upload]
+url = "http://127.0.0.1:{server.server_port}"
+[local_server.kv_stores]
+blossom_metadata = []
+'''
+                bindings = f'''
 [local_server.config_stores.blossom_config]
 file = "{settings}"
 format = "json"
 [local_server.secret_stores]
-blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_key",data="synthetic"}},{{key="b2_media_access_key",data="synthetic"}},{{key="b2_media_secret_key",data="synthetic"}}]
-''')
+blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_key",data="synthetic"}},{{key="b2_media_access_key",data="synthetic"}},{{key="b2_media_secret_key",data="synthetic"}},{{key="fos_access_key",data="synthetic"}},{{key="fos_secret_key",data="synthetic"}},{{key="webhook_secret",data="synthetic"}}]
+'''
                 env = os.environ.copy()
                 env["CARGO_TARGET_WASM32_WASIP1_RUNNER"] = shlex.join([
                     env.get("VICEROY", "viceroy"), "run", "-C", str(config), "--"
@@ -84,9 +165,18 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                     ("derived_origin_invalid_config_contract", "gcs", "true"),
                     ("media_origin_routing_contract", "b2", "true"),
                     ("media_origin_disabled_fallback_contract", "b2", "false"),
+                    ("blob_exists_b2_without_gcs_contract", "b2", "false"),
+                    ("blob_exists_b2_with_gcs_fallback_contract", "b2", "true"),
                     ("media_origin_invalid_config_contract", "invalid", "true"),
                     ("media_origin_gcs_errors_contract", None, "true"),
                     ("media_origin_gcs_missing_config_contract", None, "true"),
+                    ("upload_dedup_gcs_status_contract", None, "false"),
+                    ("blob_exists_unavailable_config_contract", None, "false"),
+                    ("creator_storage_cleanup_remains_mandatory_contract", "b2", "false"),
+                    ("upload_dedup_b2_transport_contract", "b2", "true"),
+                    ("upload_dedup_b2_visibility_contract", "b2", "false"),
+                    ("audio_route_single_origin_miss_contract", "b2", "false"),
+                    ("audio_route_confirmed_absence_contract", "b2", "true"),
                 ]
                 for test, primary, fallback in cases:
                     values = {
@@ -101,11 +191,27 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                     if test in ("derived_origin_b2_without_gcs_contract", "derived_body_cache_source_contract"):
                         values.update(derived_media_read_primary="b2", derived_media_gcs_fallback_enabled="false")
                         del values["gcs_bucket"]
+                    elif test == "blob_exists_b2_without_gcs_contract":
+                        del values["gcs_bucket"]
+                    elif test == "creator_storage_cleanup_remains_mandatory_contract":
+                        values.update(
+                            derived_media_read_primary="b2",
+                            derived_media_gcs_fallback_enabled="false",
+                            upload_service_all_uploads="true",
+                            b2_replica_enabled="true",
+                            gcs_erasure_enabled="false",
+                            fos_erasure_enabled="false",
+                            local_mode="true",
+                            fos_bucket="fos",
+                        )
                     elif test in ("derived_origin_fallback_contract", "derived_body_fallback_source_contract"):
                         values.update(derived_media_read_primary="b2", derived_media_gcs_fallback_enabled="true")
                     elif test == "derived_origin_invalid_config_contract":
                         values["derived_media_read_primary"] = "invalid"
+                    elif test.startswith("audio_route_"):
+                        values["local_mode"] = "true"
                     settings.write_text(json.dumps(values))
+                    config.write_text(backends + ("" if test == "blob_exists_unavailable_config_contract" else bindings))
                     before = len(server.reads)
                     result = subprocess.run([
                         "cargo", "test", "--locked", "--target", "wasm32-wasip1",
@@ -144,9 +250,73 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                         ], reads
                     elif test == "media_origin_disabled_fallback_contract":
                         assert reads == [("b2", "missing", None)], reads
+                    elif test == "blob_exists_b2_without_gcs_contract":
+                        assert reads == [
+                            ("HEAD", "b2", "hit"),
+                            ("HEAD", "b2", "missing"),
+                            ("HEAD", "b2", "forbidden"),
+                            ("HEAD", "b2", "transient"),
+                        ], reads
+                    elif test == "blob_exists_b2_with_gcs_fallback_contract":
+                        assert reads == [
+                            ("HEAD", "b2", "hit"),
+                            ("HEAD", "b2", "missing"),
+                            ("HEAD", "gcs", "missing"),
+                            ("HEAD", "b2", "absent_everywhere"),
+                            ("HEAD", "gcs", "absent_everywhere"),
+                            ("HEAD", "b2", "transient"),
+                            ("HEAD", "gcs", "transient"),
+                            ("HEAD", "b2", "transient_b2_only"),
+                            ("HEAD", "gcs", "transient_b2_only"),
+                            ("HEAD", "b2", "transport"),
+                            ("HEAD", "gcs", "transport"),
+                            ("HEAD", "b2", "transport_b2_only"),
+                            ("HEAD", "gcs", "transport_b2_only"),
+                            ("HEAD", "b2", "forbidden"),
+                        ], reads
                     elif test == "media_origin_gcs_errors_contract":
                         assert reads == [("gcs", key, None) for key in
                                          ("forbidden", "unavailable", "invalid-range", "disconnect")], reads
+                    elif test == "upload_dedup_gcs_status_contract":
+                        assert reads == [
+                            ("HEAD", "gcs", "f" * 64), ("POST", "upload", "f" * 64),
+                            ("HEAD", "gcs", "5" * 64), ("POST", "upload", "5" * 64),
+                            *(("HEAD", "gcs", key) for key in
+                              ("forbidden", "forbidden", "unavailable", "unavailable", "disconnect")),
+                        ], reads
+                    elif test == "upload_dedup_b2_transport_contract":
+                        assert reads == [("HEAD", bucket, key * 64) for key in "f51"
+                                        for bucket in ("b2", "gcs")], reads
+                    elif test == "upload_dedup_b2_visibility_contract":
+                        assert reads == [
+                            ("HEAD", "b2", "a" * 64),
+                            *(("POST", "upload", key * 64) for key in "bcde024"),
+                            ("HEAD", "b2", "3" * 64), ("POST", "upload", "3" * 64),
+                        ], reads
+                    elif test == "audio_route_single_origin_miss_contract":
+                        audio = "7" * 64
+                        probe = ("HEAD", "b2", audio)
+                        assert reads == [
+                            probe, probe, probe, ("b2", audio, None), probe,
+                        ], reads
+                    elif test == "audio_route_confirmed_absence_contract":
+                        assert reads == [
+                            ("HEAD", "b2", "8" * 64), ("HEAD", "gcs", "8" * 64),
+                            ("POST", "extract", "6" * 64),
+                            ("HEAD", "b2", "8" * 64), ("HEAD", "gcs", "8" * 64),
+                        ], reads
+                    elif test == "creator_storage_cleanup_remains_mandatory_contract":
+                        hash_value = "a" * 64
+                        assert reads == [
+                            ("DELETE", "gcs", hash_value),
+                            ("DELETE", "gcs", hash_value + ".jpg"),
+                            *(("DELETE", "gcs", f"{hash_value}/{path}") for path in (
+                                "hls/master.m3u8", "hls/stream_720p.m3u8", "hls/stream_720p.ts",
+                                "hls/stream_480p.m3u8", "hls/stream_480p.ts", "hls/stream_720p.mp4",
+                                "hls/stream_480p.mp4", "vtt/main.vtt",
+                            )),
+                            ("DELETE", "fos", hash_value),
+                        ], reads
                     else:
                         assert reads == [], reads
                     print(f"PASS {test}")

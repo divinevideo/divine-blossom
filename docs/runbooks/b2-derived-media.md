@@ -11,10 +11,11 @@ change client source selection, or establish playback parity by itself.
 | derived_media_read_primary | gcs | gcs, b2 |
 | derived_media_gcs_fallback_enabled | true | true, false |
 
-These settings are independent of media_read_primary and gcs_fallback_enabled,
-which previously selected only originals. B2 uses the existing b2_storage backend,
-b2_media_bucket and b2_media_region configuration and secret bindings
-b2_media_access_key and b2_media_secret_key. No secret values belong in reports.
+These settings are independent of `media_read_primary` and `gcs_fallback_enabled`,
+which govern original reads and cached audio aliases. B2 uses the existing
+`b2_storage` backend, `b2_media_bucket` and `b2_media_region` configuration, and
+the `b2_media_access_key` and `b2_media_secret_key` secret bindings. No secret
+values belong in reports.
 
 When B2 is selected, fallback follows the existing origin adapter: object absence,
 origin 5xx and transport failure may use GCS only when enabled. Configuration and
@@ -70,6 +71,40 @@ warm native/web playback with normal rendition selection, range/HEAD, subtitles,
 thumbnails, restart and denial. A storage helper test proves only its own boundary.
 Use the complete media replacement plan for upload, processing, backfill, rollback
 and final GCS retirement. Do not enable this setting based only on local tests.
+
+## Mapped audio cutover and recovery
+
+Cached audio aliases (`/{source_sha256}.audio.m4a`) follow the original-read
+settings. Before rolling out this behavior with `media_read_primary=b2` and
+`gcs_fallback_enabled=false`, Platform must verify every audio hash referenced by
+a live, permitted mapping in the private B2 serving bucket. This applies both to
+disabling fallback and to deploying into an environment that already has it
+disabled. Verify the pinned object's SHA-256, size and MIME type, and make sure
+all active audio writers keep that bucket current through cutover. The
+[original-video mirror](b2-original-sync.md) skips audio. Changing the
+transcoder's writer also leaves historical objects where they were. Keep fallback
+enabled while this coverage is incomplete.
+
+When only B2 serves reads, a mapped object missing from B2 returns non-cacheable
+HTTP 503 on GET and HEAD. Retrying only checks the serving origin again. Both
+methods keep the mapping and reverse references, and neither starts extraction
+for this miss. Platform handles the repair outside the edge. Use an approved
+media migration to restore a verified copy from GCS or backup at the same audio
+hash in the serving bucket. Recheck current source and audio policy and erasure
+eligibility, preserve the original bytes and provenance, and verify the
+destination version before checking the normal audio alias on a cold read.
+
+If no verified copy remains, keep the mapping and reverse references while
+Platform reviews regeneration and metadata reconciliation. A new extraction can
+produce a different hash. It must never be written under the old hash or published
+without reconciling its source mapping and erasure references. The general
+[blob reconciliation tool](blob-reconciliation.md#classification-meanings)
+excludes alias-only derived audio from missing-byte repair.
+
+Before rolling back to GCS-primary reads, verify mapped audio in GCS as well. A
+GCS-only miss still follows legacy stale-mapping cleanup. A B2-only writer can
+leave GCS without a copy even when the B2 cutover was fully verified. Retain the
+current serving policy until the rollback inventory is complete.
 
 ## Local verification
 
