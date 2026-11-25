@@ -75,13 +75,15 @@ and final GCS retirement. Do not enable this setting based only on local tests.
 ## Mapped audio cutover and recovery
 
 Cached audio aliases (`/{source_sha256}.audio.m4a`) follow the original-read
-settings. Before setting `media_read_primary=b2` with
+settings. Before rolling out this behavior with `media_read_primary=b2` and
 `gcs_fallback_enabled=false`, Platform must verify every audio hash referenced by
-a live, permitted mapping in the private B2 serving bucket. Verify the pinned
-object's SHA-256, size and MIME type, and make sure all active audio writers keep
-that bucket current through cutover. The [original-video mirror](b2-original-sync.md)
-skips audio. Changing the transcoder's writer also leaves historical objects where
-they were. Keep fallback enabled while this coverage is incomplete.
+a live, permitted mapping in the private B2 serving bucket. This applies both to
+disabling fallback and to deploying into an environment that already has it
+disabled. Verify the pinned object's SHA-256, size and MIME type, and make sure
+all active audio writers keep that bucket current through cutover. The
+[original-video mirror](b2-original-sync.md) skips audio. Changing the
+transcoder's writer also leaves historical objects where they were. Keep fallback
+enabled while this coverage is incomplete.
 
 When only B2 serves reads, a mapped object missing from B2 returns non-cacheable
 HTTP 503 on GET and HEAD. Retrying only checks the serving origin again. Both
