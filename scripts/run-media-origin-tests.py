@@ -34,9 +34,12 @@ class Storage(BaseHTTPRequestHandler):
                 "transient_b2_only": 503,
                 "forbidden": 403,
                 "3" * 64: 404,
-                "7" * 64: 404,
                 "8" * 64: 404,
             }.get(key, 200)
+            if key == "7" * 64:
+                # Simulate Platform restoring the object after GET and HEAD miss.
+                before_restore = self.server.reads.count(("HEAD", "b2", key)) <= 2
+                status = 404 if before_restore else 200
         else:
             status = {
                 "absent_everywhere": 404,
@@ -98,6 +101,8 @@ class Storage(BaseHTTPRequestHandler):
         else:
             status = {"forbidden": 403, "unavailable": 503, "invalid-range": 416}.get(key, 200)
         body = f"{bucket} bytes".encode()
+        if bucket == "b2" and key == "7" * 64:
+            body = b"synthetic audio"
         derived_range = bucket == "b2" and key == "fixture/hls/720p.mp4" and self.headers.get("Range") == "bytes=1-3"
         if derived_range:
             status, body = 206, body[1:4]
@@ -289,7 +294,11 @@ blossom_secrets = [{{key="gcs_access_key",data="synthetic"}},{{key="gcs_secret_k
                             ("HEAD", "b2", "3" * 64), ("POST", "upload", "3" * 64),
                         ], reads
                     elif test == "audio_route_single_origin_miss_contract":
-                        assert reads == [("HEAD", "b2", "7" * 64)] * 2, reads
+                        audio = "7" * 64
+                        probe = ("HEAD", "b2", audio)
+                        assert reads == [
+                            probe, probe, probe, ("b2", audio, None), probe,
+                        ], reads
                     elif test == "audio_route_confirmed_absence_contract":
                         assert reads == [
                             ("HEAD", "b2", "8" * 64), ("HEAD", "gcs", "8" * 64),

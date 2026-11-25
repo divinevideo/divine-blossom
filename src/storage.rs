@@ -6291,6 +6291,20 @@ mod tests {
                 [source.clone()]
             );
         }
+
+        let mut response =
+            super::with_uncached_storage_for_test(|| request_audio(Method::GET, &source));
+        assert_eq!(response.get_status().as_u16(), 200);
+        assert_eq!(response.get_header_str("Content-Type"), Some("audio/mp4"));
+        assert_eq!(response.take_body().into_string(), "synthetic audio");
+
+        let response = request_audio(Method::HEAD, &source);
+        assert_eq!(response.get_status().as_u16(), 200);
+        assert_eq!(response.get_header_str("X-Audio-Size"), Some("15"));
+        assert_eq!(
+            crate::metadata::get_audio_source_refs(&audio).unwrap(),
+            [source]
+        );
     }
 
     #[test]
