@@ -16,7 +16,9 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
 import sqlite3
+import ssl
 import sys
 import time
 import urllib.error
@@ -38,6 +40,57 @@ VALIDATION_FAILURES = frozenset({
     "destination_length", "destination_checksum",
     "readiness_identity", "readiness_publication",
 })
+
+CONTROL_OPERATIONS = frozenset({
+    "demand_list", "demand_snapshot", "demand_ack", "demand_state", "readiness_read",
+})
+CONTROL_VALIDATIONS = frozenset({
+    "response_too_large", "json_duplicate", "generation_missing",
+    "generation_invalid", "list_invalid", "cursor_invalid",
+})
+CONTROL_FAILURES = CONTROL_VALIDATIONS | frozenset({
+    "http_400", "http_401", "http_403", "http_404", "http_409", "http_412",
+    "http_429", "http_5xx", "http_other", "timeout", "dns", "tls", "transport",
+    "json_invalid", "response_invalid", "state_error", "other",
+})
+CONTROL_DIAGNOSTIC_COUNTERS = frozenset(
+    "failure_control_" + operation + "_" + kind
+    for operation in CONTROL_OPERATIONS for kind in CONTROL_FAILURES)
+
+
+def control_validation_error(kind, message):
+    error = ValueError(message)
+    error._b2_control_kind = kind
+    return error
+
+
+def control_failure(error):
+    """Return a finite label without formatting provider errors, values or URLs."""
+    if isinstance(error, (ControlAPIError, urllib.error.HTTPError)):
+        status = error.status if isinstance(error, ControlAPIError) else error.code
+        if type(status) is int:
+            if status in (400, 401, 403, 404, 409, 412, 429):
+                return "http_" + str(status)
+            if 500 <= status <= 599:
+                return "http_5xx"
+        return "http_other"
+    reason = error.reason if isinstance(error, urllib.error.URLError) else error
+    if isinstance(reason, TimeoutError):
+        return "timeout"
+    if isinstance(reason, socket.gaierror):
+        return "dns"
+    if isinstance(reason, ssl.SSLError):
+        return "tls"
+    if isinstance(error, (OSError, http.client.HTTPException)):
+        return "transport"
+    if isinstance(error, sqlite3.Error):
+        return "state_error"
+    if isinstance(error, json.JSONDecodeError):
+        return "json_invalid"
+    if isinstance(error, ValueError):
+        kind = getattr(error, "_b2_control_kind", None)
+        return kind if isinstance(kind, str) and kind in CONTROL_VALIDATIONS else "response_invalid"
+    return "other"
 
 
 def validation_error(kind, message):
@@ -464,6 +517,7 @@ class Worker:
         self.metrics = Counter()
         self.failure_stage = None
         self.failure_detail = None
+        self.control_failure_kind = None
         if hasattr(kv, "attempt_journal"):
             kv.attempt_journal = state.attempt_event
 
@@ -489,10 +543,12 @@ class Worker:
         """Remember only a fixed call-site label, never SDK diagnostics or keys."""
         try:
             return operation(*args, **kwargs)
-        except Exception:
+        except Exception as error:
             # A gate-release failure must not hide the earlier transfer failure.
             if self.failure_stage is None:
                 self.failure_stage = stage
+                if stage == "readiness_read":
+                    self.control_failure_kind = control_failure(error)
                 detail = getattr(self.kv, "claim_failure", None)
                 if stage == "gate_claim" and isinstance(detail, str) and detail in CLAIM_FAILURES:
                     self.failure_detail = detail
@@ -748,6 +804,9 @@ class Worker:
                 except Exception:
                     report[label + "_errors"] += 1
                     report["errors"] += 1
+                finally:
+                    if isinstance(intake, DemandHints):
+                        report.update(intake.diagnostics)
         if not demand_only:
             try:
                 keys, cursor = self.source.page(self.state.setting("cursor"), discovery_limit or max_objects)
@@ -807,6 +866,7 @@ class Worker:
             result = "errors"
             self.failure_stage = None
             self.failure_detail = None
+            self.control_failure_kind = None
             try:
                 image_observed = self.observe("readiness_read", self.kv.snapshot, "b2-ready:" + key) if generation is not None and self.kv is not None else None
                 metadata = self.observe("policy_or_gate_read", self.kv.get, "blob:" + key) if generation is not None and self.kv is not None else None
@@ -825,6 +885,8 @@ class Worker:
                 # fixed operation names cross the aggregate report boundary.
                 report["errors"] += 1
                 report["failure_" + (self.failure_stage or "validation_or_state")] += 1
+                if self.control_failure_kind is not None:
+                    report["failure_control_readiness_read_" + self.control_failure_kind] += 1
                 if self.failure_stage is None and type(error) is ValueError:
                     kind = getattr(error, "_b2_validation_kind", None)
                     if isinstance(kind, str) and kind in VALIDATION_FAILURES:
@@ -869,7 +931,7 @@ def unambiguous_json_object(pairs):
     result = {}
     for key, value in pairs:
         if key in result:
-            raise ValueError("duplicate JSON object member")
+            raise control_validation_error("json_duplicate", "duplicate JSON object member")
         result[key] = value
     return result
 
@@ -887,7 +949,7 @@ class JsonHTTP:
             with self.opener.open(request, timeout=timeout) as response:
                 data = response.read(max_response_bytes + 1)
                 if len(data) > max_response_bytes:
-                    raise ValueError("control response too large")
+                    raise control_validation_error("response_too_large", "control response too large")
                 value = json.loads(data, object_pairs_hook=unambiguous_json_object) if data else None
                 return (value, response.headers) if include_headers else value
         except urllib.error.HTTPError as error:
@@ -913,14 +975,28 @@ class DemandHints:
         if type(pending_cap) is not int or not 1 <= pending_cap <= 100000:
             raise ValueError("invalid pending demand cap")
         self.kv, self.pending_cap = kv, pending_cap
+        self.diagnostics = Counter()
 
     def ingest(self, state, limit):
-        report = Counter()
+        self.diagnostics.clear()
+        self.operation = "demand_state"
         try:
-            keys, cursor = self.kv.demand_page(state.setting("demand_cursor"), min(limit, 100))
+            return self._ingest(state, limit)
+        except Exception as error:
+            self.diagnostics["failure_control_" + self.operation + "_" + control_failure(error)] += 1
+            raise
+
+    def _ingest(self, state, limit):
+        report = Counter()
+        cursor = state.setting("demand_cursor")
+        self.operation = "demand_list"
+        try:
+            keys, cursor = self.kv.demand_page(cursor, min(limit, 100))
         except ControlAPIError as error:
+            self.operation = "demand_state"
             if error.status == 400 and state.setting("demand_cursor") is not None:
                 state.set_setting("demand_cursor", None)
+            self.operation = "demand_list"
             raise
         for key in keys:
             report["demand_received"] += 1
@@ -928,12 +1004,14 @@ class DemandHints:
                 report["demand_unknown_key"] += 1
                 continue
             try:
+                self.operation = "demand_snapshot"
                 snapshot = self.kv.snapshot(key)
-            except Exception:
+            except Exception as error:
                 # Retain this key for the next scan without letting an oversized
                 # or unavailable value strand every later page indefinitely.
                 report["demand_snapshot_errors"] += 1
                 report["errors"] += 1
+                self.diagnostics["failure_control_demand_snapshot_" + control_failure(error)] += 1
                 continue
             if snapshot is None:
                 continue
@@ -943,6 +1021,7 @@ class DemandHints:
                 report["demand_future_schema"] += 1
                 continue
             hash_key = key[len(DEMAND_PREFIX):]
+            self.operation = "demand_state"
             if valid_hint(hash_key, record):
                 if not state.queue_demand(hash_key, record, cap=self.pending_cap):
                     report["demand_saturated"] += 1
@@ -950,12 +1029,14 @@ class DemandHints:
                 report["demand_enqueued"] += 1
             else:
                 report["demand_invalid"] += 1
+            self.operation = "demand_ack"
             if self.kv.delete_if_generation(key, generation):
                 report["demand_acknowledged"] += 1
             else:
                 report["demand_conflicts"] += 1
         # Retained/saturated entries are reconsidered at cursor wrap; no dropped
         # work and no unbounded rescanning of the first page in one invocation.
+        self.operation = "demand_state"
         state.set_setting("demand_cursor", cursor)
         return dict(report)
 
@@ -1058,7 +1139,8 @@ class FastlyKV:
         value, headers = result
         generation = headers.get("generation")
         if not valid_generation(generation):
-            raise ValueError("snapshot generation unavailable")
+            raise control_validation_error("generation_missing" if generation is None else "generation_invalid",
+                                           "snapshot generation unavailable")
         # A present null must not look like an absent readiness/hint.
         return ({} if value is None else value), generation
 
@@ -1078,18 +1160,18 @@ class FastlyKV:
         params = {"prefix": "b2-demand", "limit": limit}
         if cursor is not None:
             if not isinstance(cursor, str) or not 1 <= len(cursor) <= 4096:
-                raise ValueError("invalid demand cursor")
+                raise control_validation_error("cursor_invalid", "invalid demand cursor")
             params["cursor"] = cursor
         reply = self.http.request(self.base.rstrip("/") + "?" + urllib.parse.urlencode(params))
         keys = reply.get("data") if isinstance(reply, dict) else None
         meta = reply.get("meta", {}) if isinstance(reply, dict) else {}
         if not isinstance(keys, list) or len(keys) > limit or not isinstance(meta, dict):
-            raise ValueError("invalid demand listing")
+            raise control_validation_error("list_invalid", "invalid demand listing")
         next_cursor = meta.get("next_cursor")
         if next_cursor is not None and (not isinstance(next_cursor, str) or len(next_cursor) > 4096):
-            raise ValueError("invalid next demand cursor")
+            raise control_validation_error("cursor_invalid", "invalid next demand cursor")
         if any(not isinstance(k, str) or not k.startswith("b2-demand") or len(k) > 1024 for k in keys):
-            raise ValueError("out-of-prefix demand listing")
+            raise control_validation_error("list_invalid", "out-of-prefix demand listing")
         return keys, next_cursor or None
 
     def claim_request(self, phase, operation, *args, **kwargs):
