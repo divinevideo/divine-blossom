@@ -1,7 +1,7 @@
 # Multi-stage build: compile WASM, then run with Viceroy
 # Usage: docker build -f Dockerfile.local -t divine-blossom-local .
 
-FROM rust:1.83-bookworm AS builder
+FROM rust:1.88.0-bookworm AS builder
 
 # Install wasm32-wasip1 target
 RUN rustup target add wasm32-wasip1
@@ -19,7 +19,7 @@ RUN mkdir -p bin && cp target/wasm32-wasip1/release/fastly-blossom.wasm bin/main
 FROM debian:bookworm-slim
 
 ARG TARGETARCH
-ARG VICEROY_VERSION=0.16.4
+ARG VICEROY_VERSION=0.22.0
 
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
     ARCH=$(case ${TARGETARCH} in arm64) echo "arm64" ;; *) echo "amd64" ;; esac) && \
