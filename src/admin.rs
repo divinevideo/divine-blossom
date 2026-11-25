@@ -374,6 +374,7 @@ pub fn handle_google_auth(mut req: Request) -> Result<Response> {
     );
 
     let mut google_req = Request::new(Method::GET, &tokeninfo_url);
+    google_req.set_stale_if_error(0);
     google_req.set_header("Host", "oauth2.googleapis.com");
 
     let mut google_resp = google_req
@@ -554,6 +555,7 @@ pub fn handle_github_callback(req: Request) -> Result<Response> {
 
     // Get user info
     let mut user_req = Request::new(Method::GET, "https://api.github.com/user");
+    user_req.set_stale_if_error(0);
     user_req.set_header("Host", "api.github.com");
     user_req.set_header("Authorization", &format!("Bearer {}", access_token));
     user_req.set_header("User-Agent", "Divine-Blossom-Admin");
@@ -579,6 +581,7 @@ pub fn handle_github_callback(req: Request) -> Result<Response> {
     let allowed_org = get_config("github_allowed_org");
     if let Some(ref org) = allowed_org {
         let mut orgs_req = Request::new(Method::GET, "https://api.github.com/user/orgs");
+        orgs_req.set_stale_if_error(0);
         orgs_req.set_header("Host", "api.github.com");
         orgs_req.set_header("Authorization", &format!("Bearer {}", access_token));
         orgs_req.set_header("User-Agent", "Divine-Blossom-Admin");

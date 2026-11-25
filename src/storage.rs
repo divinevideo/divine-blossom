@@ -245,6 +245,7 @@ fn build_media_read_request(
     #[cfg(test)]
     let uncached = uncached || TEST_STORAGE_CACHE_BYPASS.with(|value| value.get());
     let mut req = Request::get(format!("{}{}", config.endpoint(), config.object_path(key)));
+    req.set_stale_if_error(0);
     req.set_header("Host", config.host());
     if let Some(range) = range {
         req.set_header("Range", range);
@@ -623,9 +624,9 @@ fn send_demand(request: Request, backend: &str, deadline: Instant) -> Result<Opt
         crate::delivery_telemetry::media_origin_attempt(provider);
     }
     let (request, body) = request.into_handles();
-    let pending = match request.send_async(
+    let pending = match request.send_async_to_backend(
         body.unwrap_or_else(fastly::handle::BodyHandle::new),
-        backend,
+        &fastly::Backend::from_name(backend).expect("valid static backend name"),
     ) {
         Ok(pending) => pending,
         Err(cause) if transient_canary_origin_error(&cause) => return Ok(None),
@@ -1135,6 +1136,7 @@ fn try_fallback_download(
     let url = format!("https://{}{}{}", host, path_prefix, hash);
 
     let mut req = Request::new(Method::GET, &url);
+    req.set_stale_if_error(0);
     req.set_header("Host", host);
 
     if let Some(range_value) = range {
@@ -1228,6 +1230,8 @@ fn download_blob_from_fos(hash: &str, range: Option<&str>) -> Result<Response> {
 /// authorized request can reuse the same immutable bytes while authorization
 /// is still rechecked on every outer request.
 fn enable_immutable_storage_cache(req: &mut Request, hash: &str) {
+    // Preserve the pre-0.13 policy: origin failures must not serve stale media.
+    req.set_stale_if_error(0);
     let surrogate_key = hash.to_ascii_lowercase();
 
     // Keep Range on the cache lookup so Fastly can synthesize a 206 from a
@@ -1538,6 +1542,7 @@ pub fn blob_exists(hash: &str) -> Result<bool> {
     let path = format!("/{}/{}", config.bucket, hash);
 
     let mut req = Request::new(Method::HEAD, format!("{}{}", config.endpoint(), path));
+    req.set_stale_if_error(0);
     req.set_header("Host", config.host());
 
     sign_request(&mut req, &config, Some("UNSIGNED-PAYLOAD".into()))?;
@@ -1821,6 +1826,7 @@ fn b2_storage_backend(host: &str) -> Result<Backend> {
 
     let name = b2_dynamic_backend_name(host);
     match Backend::builder(&name, host)
+        .max_connections(0)
         .override_host(host)
         .enable_ssl()
         .check_certificate(host)
@@ -2357,9 +2363,9 @@ impl BunnySourceHeads {
             sign_request(&mut request, &config, Some("UNSIGNED-PAYLOAD".into())).ok()?;
             let (request, body) = request.into_handles();
             let pending = request
-                .send_async(
+                .send_async_to_backend(
                     body.unwrap_or_else(fastly::handle::BodyHandle::new),
-                    backend,
+                    &fastly::Backend::from_name(backend).expect("valid static backend name"),
                 )
                 .ok()?;
             requests.push((pending, expected));
@@ -5559,9 +5565,9 @@ fn send_delivery_probe(request: Request, deadline: Instant) -> io::Result<(Statu
     }
     let (request, body) = request.into_handles();
     let pending = request
-        .send_async(
+        .send_async_to_backend(
             body.unwrap_or_else(fastly::handle::BodyHandle::new),
-            CLOUD_RUN_BACKEND,
+            &fastly::Backend::from_name(CLOUD_RUN_BACKEND).expect("valid static backend name"),
         )
         .map_err(|error| io::Error::other(format!("probe send: {error}")))?;
     wait_for_probe_io(pending.as_u32(), deadline)?;
@@ -5797,6 +5803,7 @@ pub fn check_funnelcake_audio_reuse(hash: &str) -> Result<bool> {
     );
 
     let mut req = Request::new(Method::GET, &url);
+    req.set_stale_if_error(0);
     // Set Host header from the URL
     if let Some(host) = funnelcake_url
         .strip_prefix("https://")
