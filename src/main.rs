@@ -3588,7 +3588,20 @@ fn trigger_on_demand_transcoding(hash: &str, owner: &str) -> Result<()> {
             .send_async(TRANSCODER_BACKEND)
             .map_err(|_| transcode_admission_unavailable())?;
     }
-    crate::metadata::mark_transcode_admitted(&before)?;
+    if let Err(error) = crate::metadata::mark_transcode_admitted(&before) {
+        if crate::metadata::is_transcode_admission_cas_conflict(&error) {
+            // The transcode job is already durably admitted above. A CAS conflict
+            // here means either another writer/worker already advanced this blob's
+            // metadata or this POP's edge KV copy is serving a stale generation —
+            // do not fail the viewer's 202 Accepted response with HTTP 500.
+            eprintln!(
+                "[HLS] Advisory transcode admission status write skipped after CAS conflict for {}: {}",
+                hash, error
+            );
+        } else {
+            return Err(error);
+        }
+    }
     let _ = simple_cache::get_or_set(key, "submitted", Duration::from_secs(10));
     Ok(())
 }
