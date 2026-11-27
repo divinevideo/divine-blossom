@@ -1109,33 +1109,46 @@ pub fn update_transcode_status(hash: &str, status: crate::blossom::TranscodeStat
 /// A fast worker callback must not be overwritten by its slower admission response.
 pub(crate) fn mark_transcode_admitted(before: &BlobMetadata) -> Result<()> {
     let key = format!("{}{}", BLOB_PREFIX, before.sha256.to_lowercase());
-    update_json_conditionally(
-        &key,
-        5,
-        "transcode admission",
-        |current: Option<BlobMetadata>| {
-            let Some(mut current) = current else {
-                return Ok(ConditionalJsonMutation::Complete(()));
-            };
-            if current.transcode_status != before.transcode_status
-                || current.transcode_generation != before.transcode_generation
-                || current.transcode_last_attempt_at != before.transcode_last_attempt_at
-                || current.transcode_attempt_count != before.transcode_attempt_count
-                || current.transcode_retry_after != before.transcode_retry_after
-                || current.transcode_terminal != before.transcode_terminal
-            {
-                return Ok(ConditionalJsonMutation::Complete(()));
-            }
-            current.transcode_status = Some(crate::blossom::TranscodeStatus::Processing);
-            Ok(ConditionalJsonMutation::Write {
-                value: current,
-                result: (),
-                time_to_live: None,
-            })
-        },
-    )?;
+    with_json_store_io(&key, "transcode admission", true, |lookup, write| {
+        update_json_conditionally_with_io(
+            5,
+            "transcode admission",
+            |current: Option<BlobMetadata>| {
+                let Some(mut current) = current else {
+                    return Ok(ConditionalJsonMutation::Complete(()));
+                };
+                if current.transcode_status != before.transcode_status
+                    || current.transcode_generation != before.transcode_generation
+                    || current.transcode_last_attempt_at != before.transcode_last_attempt_at
+                    || current.transcode_attempt_count != before.transcode_attempt_count
+                    || current.transcode_retry_after != before.transcode_retry_after
+                    || current.transcode_terminal != before.transcode_terminal
+                {
+                    return Ok(ConditionalJsonMutation::Complete(()));
+                }
+                current.transcode_status = Some(crate::blossom::TranscodeStatus::Processing);
+                Ok(ConditionalJsonMutation::Write {
+                    value: current,
+                    result: (),
+                    time_to_live: None,
+                })
+            },
+            lookup,
+            write,
+        )
+    })?;
     invalidate_metadata_cache(&before.sha256);
     Ok(())
+}
+
+/// Returns true when a `mark_transcode_admitted` failure was caused solely by
+/// CAS precondition exhaustion (another writer or worker callback advanced the
+/// key, or the edge KV copy served a stale generation).
+pub(crate) fn is_transcode_admission_cas_conflict(error: &BlossomError) -> bool {
+    matches!(
+        error,
+        BlossomError::MetadataError(message) if message == "transcode admission changed too many times"
+    )
 }
 
 /// Additional metadata recorded alongside transcode status updates.
@@ -2823,5 +2836,18 @@ mod kv_write_rate_tests {
             Err(KVStoreError::ItemPreconditionFailed)
         ));
         assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn transcode_admission_cas_conflict_matches_only_retry_exhaustion() {
+        assert!(is_transcode_admission_cas_conflict(
+            &BlossomError::MetadataError("transcode admission changed too many times".into())
+        ));
+        assert!(!is_transcode_admission_cas_conflict(
+            &BlossomError::MetadataError("Failed to store transcode admission: timeout".into())
+        ));
+        assert!(!is_transcode_admission_cas_conflict(
+            &BlossomError::StorageError("transcode admission changed too many times".into())
+        ));
     }
 }
