@@ -353,6 +353,19 @@ fn init_sentry(service_name: &str) -> sentry::ClientInitGuard {
     })
 }
 
+fn derivative_failure_sentry_level(error_code: &str) -> Option<sentry::Level> {
+    match error_code {
+        // Expected terminal rejection under MediaPolicy::CopyOnly (stream-copy-only
+        // archive clips that cannot be remuxed without re-encoding). Tracked via
+        // logs, metrics, and the terminal status webhook — not a Sentry fault.
+        "archive_remux_incompatible" => None,
+        // User-caused invalid media (corrupt uploads, missing moov atom, etc.) are warnings,
+        // not errors — they don't indicate system failures.
+        "invalid_media" => Some(sentry::Level::Warning),
+        _ => Some(sentry::Level::Error),
+    }
+}
+
 fn report_derivative_failure_to_sentry(
     service: &'static str,
     derivative: &'static str,
@@ -364,12 +377,8 @@ fn report_derivative_failure_to_sentry(
     owner: Option<&str>,
     attempt_count: Option<u32>,
 ) {
-    // User-caused invalid media (corrupt uploads, missing moov atom, etc.) are warnings,
-    // not errors — they don't indicate system failures.
-    let level = if error_code == "invalid_media" {
-        sentry::Level::Warning
-    } else {
-        sentry::Level::Error
+    let Some(level) = derivative_failure_sentry_level(error_code) else {
+        return;
     };
     let fingerprint = [service, derivative, error_code];
     sentry::with_scope(
@@ -5043,6 +5052,22 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("probe failed"));
         assert!(message.contains("delete denied"));
+    }
+
+    #[test]
+    fn derivative_failure_sentry_level_skips_expected_archive_remux_rejection() {
+        assert_eq!(
+            super::derivative_failure_sentry_level("archive_remux_incompatible"),
+            None
+        );
+        assert_eq!(
+            super::derivative_failure_sentry_level("invalid_media"),
+            Some(sentry::Level::Warning)
+        );
+        assert_eq!(
+            super::derivative_failure_sentry_level("transcode_failed"),
+            Some(sentry::Level::Error)
+        );
     }
 
     #[test]
